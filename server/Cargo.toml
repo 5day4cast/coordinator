@@ -1,0 +1,29 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.6.19", features = ["macros", "tracing", "multipart"] }
+tokio = { version = "1.29.1", features = ["macros", "rt-multi-thread"] }
+tokio-util = "0.7.9"
+hyper = "0.14.27"
+time = { version = "0.3.25", features = ["parsing", "formatting"] }
+uuid = { version = "1.4.1", features = ["v4"] }
+anyhow = "1.0.72"
+mime = "0.3.17"
+tower-http = { version= "0.4.4", features = ["fs", "cors"] }
+futures = "0.3.28"
+serde = { version="1.0.188", features= ["derive"]}
+openssl = { version = "0.10", features = ["vendored"] }
+num_cpus = "1.16.0"
+config = "0.13.1"
+log = "0.4.18"
+slog = "2.7.0"
+slog-term = "2.9.0"
+slog-async = "2.7.0"
+clap = { version = "4.3.23", features = ["derive", "env"] }
+toml = "0.5.10"
+
+[dev-dependencies]
+tower = "0.4.13"
