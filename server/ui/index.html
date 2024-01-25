@@ -6,6 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Noaa data visualizer</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
+    <link rel="stylesheet" href="/ui/styles.css">
 </head>
 
 <body>
@@ -18,13 +19,34 @@
             <h1 class="title">
                 Fantasy Weather
             </h1>
-        </div> 
+        </div>
         <div>
-            <h4 class="title">
-                Competitions
-            </h4>
+            <a role="button" class="navbar-burger" data-target="navMenu" aria-label="menu" aria-expanded="false">
+                <span aria-hidden="true"></span>
+                <span aria-hidden="true"></span>
+                <span aria-hidden="true"></span>
+            </a>
+            <div class="navbar-menu" id="navMenu">
+                <div class="navbar-start">
+                    <a href="#" class="navbar-item" id="allCompetitionsNavClick">
+                        Competitions
+                    </a>
+                    <a href="#" class="navbar-item" id="entriesNavClick">
+                        Entries
+                    </a>
+                    <a href="#" class="navbar-item" id="payoutsNavClick">
+                        Payouts
+                    </a>
+                </div>
+            </div>
+            <div id="allCompetitions" class="container"><span>competitions</span></div>
+            <div id="currentCompetition" class="container hidden"><span>current competition</span></div>
+            <div id="entry" class="container hidden"><span>entry</span></div>
+            <div id="entries" class="container hidden"><span>entries</span></div>
+            <div id="payouts" class="container hidden"><span>payouts</span></div>
+
             <!-- overview competition page-->
-            <!-- competition map (https://opensource.com/life/15/7/open-source-mapping-primer)-->
+            <!-- competition (optional in map (https://opensource.com/life/15/7/open-source-mapping-primer))-->
             <!-- entry module -->
             <!-- scoreboard screen -->
             <!-- payout screen -->

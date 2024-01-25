@@ -22,7 +22,71 @@ console.log("api location:", apiBase);
 const parquetFileApi = "https://www.4casttruth.win";
 console.log("parquets location:", apiBase);
 
-// Setting the date
+
+
+/*
+# navbar code
+*/
+// Get all "navbar-burger" elements
+const $navbarBurgers = Array.prototype.slice.call(document.querySelectorAll('.navbar-burger'), 0);
+const $navbarItems = document.querySelectorAll('.navbar-item');
+const $navDivs = document.querySelectorAll('a[id$="NavClick"]');
+
+// Function to hide all containers
+function hideAllContainers() {
+    $navDivs.forEach(function ($container) {
+        const containerId = $container.id.split("NavClick")[0];
+        const $containerToHide = document.getElementById(containerId);
+        if ($containerToHide) {
+            $containerToHide.classList.add('hidden');
+        }
+    });
+}
+
+// Function to show a specific container
+function showContainer(containerId) {
+    const $containerToShow = document.getElementById(containerId);
+    if ($containerToShow) {
+        $containerToShow.classList.remove('hidden');
+    }
+}
+// Add a click event on each of them
+$navbarBurgers.forEach(el => {
+    el.addEventListener('click', (event) => {
+        event.preventDefault();
+        // Get the target from the "data-target" attribute
+        const target = el.dataset.target;
+        const pageName = target.split("NavClick")[0];
+        const $target = document.getElementById(pageName);
+        // Toggle the "is-active" class on both the "navbar-burger" and the "navbar-menu"
+        el.classList.toggle('is-active');
+        $target.classList.toggle('is-active');
+    });
+});
+
+$navbarItems.forEach(function ($navbarItem) {
+    $navbarItem.addEventListener('click', function (event) {
+        event.preventDefault();
+        // Hide all containers
+        hideAllContainers();
+        // Extract the ID from the clicked navbar item
+        const targetContainerId = this.id.replace('NavClick', '');
+        // Show the corresponding container
+        showContainer(targetContainerId);
+    });
+});
+
+/*
+# all competitions
+*/
+
+
+
+/*
+# data download code
+*/
+
+/* Setting the date
 const currentUTCDate = new Date();
 const oneDayAgoUTCDate = new Date(currentUTCDate.getTime() - 86400000);
 const rfc3339TimeOneDayAgo = oneDayAgoUTCDate.toISOString();
@@ -35,6 +99,7 @@ endTime.value = rfc3339TimeUTC;
 
 // Download todays files on initial load
 submitDownloadRequest(null);
+*/
 
 async function submitDownloadRequest(event) {
     if (event !== null) { event.preventDefault() };
