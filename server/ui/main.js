@@ -22,15 +22,40 @@ console.log("api location:", apiBase);
 const parquetFileApi = "https://www.4casttruth.win";
 console.log("parquets location:", apiBase);
 
-
-
 /*
 # navbar code
 */
-// Get all "navbar-burger" elements
-const $navbarBurgers = Array.prototype.slice.call(document.querySelectorAll('.navbar-burger'), 0);
 const $navbarItems = document.querySelectorAll('.navbar-item');
 const $navDivs = document.querySelectorAll('a[id$="NavClick"]');
+const $navbarBurgers = Array.prototype.slice.call(document.querySelectorAll('.navbar-burger'), 0);
+
+// Add a click event on each of them
+$navbarBurgers.forEach(el => {
+    el.addEventListener('click', () => {
+
+        // Get the target from the "data-target" attribute
+        const target = el.dataset.target;
+        const $target = document.getElementById(target);
+
+        // Toggle the "is-active" class on both the "navbar-burger" and the "navbar-menu"
+        el.classList.toggle('is-active');
+        $target.classList.toggle('is-active');
+
+    });
+});
+
+$navbarItems.forEach(function ($navbarItem) {
+    $navbarItem.addEventListener('click', function (event) {
+        event.preventDefault();
+        // Hide all containers
+        hideAllContainers();
+        // Extract the ID from the clicked navbar item
+        const targetContainerId = this.id.replace('NavClick', '');
+        // Show the corresponding container
+        console.log(targetContainerId);
+        showContainer(targetContainerId);
+    });
+});
 
 // Function to hide all containers
 function hideAllContainers() {
@@ -50,56 +75,106 @@ function showContainer(containerId) {
         $containerToShow.classList.remove('hidden');
     }
 }
-// Add a click event on each of them
-$navbarBurgers.forEach(el => {
-    el.addEventListener('click', (event) => {
-        event.preventDefault();
-        // Get the target from the "data-target" attribute
-        const target = el.dataset.target;
-        const pageName = target.split("NavClick")[0];
-        const $target = document.getElementById(pageName);
-        // Toggle the "is-active" class on both the "navbar-burger" and the "navbar-menu"
-        el.classList.toggle('is-active');
-        $target.classList.toggle('is-active');
-    });
-});
 
-$navbarItems.forEach(function ($navbarItem) {
-    $navbarItem.addEventListener('click', function (event) {
-        event.preventDefault();
-        // Hide all containers
-        hideAllContainers();
-        // Extract the ID from the clicked navbar item
-        const targetContainerId = this.id.replace('NavClick', '');
-        // Show the corresponding container
-        showContainer(targetContainerId);
-    });
-});
 
 /*
 # all competitions
 */
+const stations_to_cities = {
+    "KDCA": "LWX",
+    "KLGA": "OKX",
+    "KLAX": "LOX",
+    "KORD": "LOT",
+    "KPHL": "PHI",
+    "KIAH": "HGX",
+    "KPHX": "PSR",
+    "KSJC": "MTR",
+    "KSFO": "MTR",
+    "KCMH": "ILN",
+    "KDTW": "DTX",
+    "KCLT": "GSP",
+    "KIND": "IND",
+    "KDEN": "BOU",
+    "KSEA": "SEW",
+    "KBOS": "BOX",
+    "KLAS": "VEF",
+    "KJAX": "JAX",
+    "KIDA": "PIH",
+    "KPDX": "PQR",
+    "KGTF": "TFX",
+    "KJAC": "RIW",
+    "KBIS": "BIS",
+    "KFSD": "FSD",
+    "KOMA": "OAX",
+    "KICT": "ICT",
+    "KTUL": "TSA",
+    "KABQ": "ABQ",
+    "KMSP": "MPX",
+    "KCID": "DVN",
+    "KSTL": "LSX",
+    "KMCI": "EAX",
+    "KLIT": "LZK",
+    "KMSY": "LIX",
+    "KBHM": "BMX",
+    "KBFM": "MOB",
+    "KBNA": "OHX",
+    "KSDF": "LMK",
+    "KATL": "FFC",
+    "KMIA": "MFL",
+    "KTPA": "TBW",
+    "KCHS": "CHS",
+    "KCRW": "RLX",
+    "KPIT": "PBZ",
+    "KBUF": "BUF",
+    "KEWR": "OKX",
+    "KBWI": "LWX",
+    "KRDU": "RAH",
+    "KHFD": "BOX",
+    "KBTV": "BTV",
+    "KMHT": "GYX",
+    "KPWM": "GYX",
+    "KJAN": "JAN",
+    "KRAP": "UNR",
+    "KBOI": "BOI",
+    "KGRB": "GRB",
+}
+const stations_ids = Object.keys(stations_to_cities);
+console.log(stations_ids);
 
+async function forecasts(stations_ids) {
+
+    //TODO: set the query for which locations the competitions
+    const rawQuery = document.getElementById('customQuery').value;
+    try {
+        const conn = await db.connect();
+        const queryResult = await conn.query(rawQuery);
+        loadTable("queryResult", queryResult);
+        await conn.close();
+    } catch (error) {
+        console.error(error);
+    }
+}
+
+async function observations(stations_ids) {
+    //TODO: set the query for which locations the competitions
+    const rawQuery = document.getElementById('customQuery').value;
+    try {
+        const conn = await db.connect();
+        const queryResult = await conn.query(rawQuery);
+        loadTable("queryResult", queryResult);
+        await conn.close();
+    } catch (error) {
+        console.error(error);
+    }
+}
 
 
 /*
 # data download code
 */
 
-/* Setting the date
-const currentUTCDate = new Date();
-const oneDayAgoUTCDate = new Date(currentUTCDate.getTime() - 86400000);
-const rfc3339TimeOneDayAgo = oneDayAgoUTCDate.toISOString();
-const startTime = document.getElementById('start');
-startTime.value = rfc3339TimeOneDayAgo;
-
-const rfc3339TimeUTC = currentUTCDate.toISOString();
-const endTime = document.getElementById('end');
-endTime.value = rfc3339TimeUTC;
-
-// Download todays files on initial load
+// Download last 4 hour's files on initial load
 submitDownloadRequest(null);
-*/
 
 async function submitDownloadRequest(event) {
     if (event !== null) { event.preventDefault() };
@@ -114,13 +189,13 @@ async function submitDownloadRequest(event) {
 }
 
 function fetchFileNames() {
-    const startTime = document.getElementById('start').value;
-    const endTime = document.getElementById('end').value;
-    const forecasts = document.getElementById('forecasts').checked;
-    const observations = document.getElementById('observations').checked;
+    const currentUTCDate = new Date();
+    const fourHoursAgoUTCDate = new Date(currentUTCDate.getTime() - (4 * 3600 * 1000));
+    const rfc3339TimeFourHoursAgo = fourHoursAgoUTCDate.toISOString();
+    const rfc3339TimeUTC = currentUTCDate.toISOString();
 
     return new Promise((resolve, reject) => {
-        let url = `${parquetFileApi}/files?start=${startTime}&end=${endTime}&observations=${observations}&forecasts=${forecasts}`;
+        let url = `${parquetFileApi}/files?start=${rfc3339TimeFourHoursAgo}&end=${rfc3339TimeUTC}`;
         console.log(`Requesting: ${url}`)
         fetch(url)
             .then(response => {
@@ -159,8 +234,6 @@ async function loadFiles(fileNames) {
         await conn.query(`
         CREATE TABLE observations AS SELECT * FROM read_parquet(['${observation_files.join('\', \'')}'], union_by_name = true);
         `);
-        const observations = await conn.query(`SELECT * FROM observations LIMIT 1;`);
-        loadSchema("observations", observations);
     }
 
     if (Array.isArray(forecast_files) && forecast_files.length > 0) {
@@ -168,24 +241,9 @@ async function loadFiles(fileNames) {
             await conn.query(`
     CREATE TABLE forecasts AS SELECT * FROM read_parquet(['${forecast_files.join('\', \'')}'], union_by_name = true);
     `);
-        const forecasts = await conn.query(`SELECT * FROM forecasts LIMIT 1;`);
-        loadSchema("forecasts", forecasts);
     }
     await conn.close();
 }
-
-/*
-async function runQuery(event) {
-    const rawQuery = document.getElementById('customQuery').value;
-    try {
-        const conn = await db.connect();
-        const queryResult = await conn.query(rawQuery);
-        loadTable("queryResult", queryResult);
-        await conn.close();
-    } catch (error) {
-        displayQueryErr(error);
-    }
-}*/
 
 function getArrayType(arr) {
     if (arr instanceof Uint8Array) {
