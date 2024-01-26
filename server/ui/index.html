@@ -5,8 +5,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>5day4cast</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
     <link rel="stylesheet" href="/ui/styles.css">
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 </head>
 
 <body>
@@ -32,7 +34,7 @@
                 </div>
                 <div class="navbar-menu" id="navMenu">
                     <div class="navbar-start">
-                        <a href="#" class="navbar-item" id="allCompetitionsNavClick">
+                        <a href="#" class="navbar-item " id="allCompetitionsNavClick">
                             Competitions
                         </a>
                         <a href="#" class="navbar-item" id="entriesNavClick">
@@ -45,7 +47,6 @@
                 </div>
             </nav>
             <div id="allCompetitions" class="container">
-                <div>competitions</div>
                 <div class="table-container" id="competitions">
                     <table id="competitionsDataTable" class="table is-striped is-bordered is-narrow">
                         <thead>
@@ -62,11 +63,11 @@
                     </table>
                 </div>
             </div>
-            <div id="entry" class="container hidden"><!--maybe this should be a module?--></div>
             <div id="currentCompetition" class="container hidden">
-                <!--optionally turn into a visual map, otherwise just make it a table-->
-                <div>Current Competition</div>
+                <div>map div</div>
+                <div id="map" class="usmap"></div>
             </div>
+            <div id="entry" class="container hidden"><!--maybe this should be a module?--></div>
             <div id="competitionLeaderboard" class="container hidden">
                 <!--should work for current and past competitions-->
                 <div>Leader Board</div>
