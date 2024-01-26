@@ -47,18 +47,30 @@
             <div id="allCompetitions" class="container">
                 <div>competitions</div>
                 <div class="table-container" id="competitions">
-                    <!-- Live competitions to enter will appear here -->
+                    <table id="competitionsDataTable" class="table is-striped is-bordered is-narrow">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Start Time</th>
+                                <th>End Time</th>
+                                <th>Total Prize Pool Amt</th>
+                                <th>Total Entries</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                        </tbody>
+                    </table>
                 </div>
             </div>
+            <div id="entry" class="container hidden"><!--maybe this should be a module?--></div>
             <div id="currentCompetition" class="container hidden">
-                <!--optionally turn into a visual map-->
+                <!--optionally turn into a visual map, otherwise just make it a table-->
                 <div>Current Competition</div>
             </div>
             <div id="competitionLeaderboard" class="container hidden">
                 <!--should work for current and past competitions-->
                 <div>Leader Board</div>
             </div>
-            <div id="entry" class="container hidden"><!--maybe this should be a module?--></div>
             <div id="entries" class="container hidden">
                 <div>enteries</div>
                 <div class="table-container" id="usersEntries">

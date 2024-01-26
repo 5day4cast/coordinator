@@ -141,6 +141,30 @@ const stations_to_cities = {
 const stations_ids = Object.keys(stations_to_cities);
 console.log(stations_ids);
 
+const competition = {
+    "name": "",
+    "startTime": "",
+    "endTime": "",
+    "totalPrizePoolAmt": "",
+    "totalEntries": "",
+    "cities": [],
+}
+
+function addCompetitions() {
+    let $competitionsDataTable = document.getElementById("competitionsDataTable");
+
+    let $tbody = $competitionsDataTable.querySelector("tbody");
+    if (!$tbody) {
+        $tbody = document.createElement("tbody");
+        $competitionsDataTable.appendChild($tbody);
+    }
+
+    let newRow = document.createElement("tr");
+    $tbody.appendChild(newRow);
+
+}
+
+
 async function forecasts(stations_ids) {
 
     //TODO: set the query for which locations the competitions
