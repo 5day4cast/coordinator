@@ -2,6 +2,7 @@
 <html lang="en">
 
 <head>
+    <base href=".">
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>5day4cast</title>
@@ -16,6 +17,11 @@
         const API_BASE = "{SERVER_ADDRESS}";
     </script>
     <script type="module" src="/ui/main.js"></script>
+    <script type="module" src="/ui/data_access.js"></script>
+    <script type="module" src="/ui/competitions.js"></script>
+    <script type="module" src="/ui/navbar.js"></script>
+    
+    
     <section class="section">
         <div class="container">
             <h1 class="title">
@@ -63,10 +69,10 @@
                     </table>
                 </div>
             </div>
-            <div id="currentCompetition" class="container hidden">
+            <!--<div id="currentCompetition" class="container hidden">
                 <div>map div</div>
                 <div id="map" class="usmap"></div>
-            </div>
+            </div> -->
             <div id="entry" class="container hidden"><!--maybe this should be a module?--></div>
             <div id="competitionLeaderboard" class="container hidden">
                 <!--should work for current and past competitions-->
