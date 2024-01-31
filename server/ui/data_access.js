@@ -161,7 +161,9 @@ function convertUintArrayToStrings(uint8Array, valueOffsets) {
 export async function queryDb(query) {
     try {
         const conn = await db.connect();
+        console.log(query);
         const queryResult = await conn.query(query);
+        console.log(queryResult);
         const results = buildObjectFromResult(queryResult);
         await conn.close();
         return results;

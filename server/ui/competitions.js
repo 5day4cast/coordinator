@@ -2,7 +2,7 @@ import { queryDb } from './data_access.js';
 
 // Define the number of arrays and the maximum number of items per array
 const numArrays = 9;
-const maxItemsPerArray = 10;
+const maxItemsPerArray = 5;
 const seed = 123;
 
 // Function to generate a pseudo-random number based on a seed
@@ -83,7 +83,7 @@ for (let i = 0; i < numArrays; i++) {
 
 console.log(arrays);
 
-export const COMPETITIONS = [
+let competitions = [
     {
         "name": "Tiger Roar Challenge",
         "startTime": "2024-02-25T00:00:00Z",
@@ -159,7 +159,7 @@ export const COMPETITIONS = [
 ];
 
 
-COMPETITIONS.forEach((competition, index) => {
+competitions.forEach((competition, index) => {
     competition.cities = arrays[index];
 });
 
@@ -167,11 +167,11 @@ let currentMaps = {};
 
 
 export async function getCompetitionPoints(station_ids) {
-    const query = `SELECT latitude, longitude FROM observations WHERE station_id IN ('${station_ids.join('\', \'')}')  GROUP BY station_id, station_name, latitude, longitude;`;
-    return queryDb(queryResult);
+    const query = `SELECT station_id, latitude, longitude FROM observations WHERE station_id IN ('${station_ids.join('\', \'')}')  GROUP BY station_id, station_name, latitude, longitude;`;
+    return queryDb(query);
 }
 
-export function displayCompetitions(competitions) {
+export function displayCompetitions() {
     let $competitionsDataTable = document.getElementById("competitionsDataTable");
 
     let $tbody = $competitionsDataTable.querySelector("tbody");
@@ -211,13 +211,11 @@ function handleCompetitionClick(row, competition) {
     });
     row.classList.toggle('is-selected');
     let rowIsSelected = row.classList.contains('is-selected');
-    /*
-    this is extra, need a button for them to make an entry
     makeCompetitionMap(competition, rowIsSelected).then(result => {
         console.log("map displayed")
     }).catch(error => {
         console.error(error);
-    });*/
+    });
 }
 
 async function makeCompetitionMap(competition, isSelected) {
@@ -234,38 +232,32 @@ async function makeCompetitionMap(competition, isSelected) {
         oldMap.remove();
     }
 
-    let map = L.map('map').setView([0, 0], 2);
+    var map = L.map('map').setView([39.8283, -98.5795], 4); // Centered on the US
     currentMaps['map'] = map;
 
-    const svgImageUrl = `${API_BASE}/ui/us.svg`;
-    console.log(svgImageUrl);
-
     var bounds = [
-        [25.84, -124.67], // Southwest coordinates (latitude, longitude)
-        [49.38, -66.95]   // Northeast coordinates (latitude, longitude)
+        [24.396308, -125.0], // Southwest coordinates (latitude, longitude)
+        [49.384358, -66.93457]   // Northeast coordinates (latitude, longitude)
     ];
-    map.fitBounds(bounds);
-    L.imageOverlay(svgImageUrl, bounds).addTo(map);
+    const svgImageUrl = `${API_BASE}/ui/us_map.svg`;
+    var bounds = [[24.396308, -125.0], [49.384358, -66.93457]]; // Continental US bounding box
+    L.svgOverlay(svgImageUrl, bounds, {
+      className: 'continental-us-svg-overlay'
+    }).addTo(map);
 
-    // Create custom SVG marker
-    let svgMarker = '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="10" cy="10" r="10" fill="red"/><circle cx="10" cy="10" r="6" fill="white"/><circle cx="10" cy="10" r="2" fill="black"/></svg>';
-
-    // Example coordinates
     const points = await getCompetitionPoints(competition.cities);
-
     // Add markers to the map
     points.forEach(point => {
-        let marker = L.marker([point.latitude, point.longitude], {
-            icon: L.divIcon({
-                html: svgMarker,
-                iconSize: [20, 20],
-                className: 'city-point'
-            })
+        let marker = L.circleMarker([point.latitude, point.longitude], {
         }).addTo(map);
 
         // Add click event listener to marker
         marker.on('click', function () {
-            console.log('Clicked at: ' + point.latitude + ', ' + point.longitude);
+            handle_clicked_comptition_dot(point);
         });
     });
+}
+
+function handle_clicked_comptition_dot(point) {
+    console.log(`Clicked at: '${point.station_id} (${point.latitude}, ${point.longitude})`);
 }

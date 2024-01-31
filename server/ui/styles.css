@@ -2,4 +2,7 @@
     display: none;
 }
 
-.usmap { height: 600px; }
+.usmap {
+    width: 100vw;
+    height: 100vh;
+}
