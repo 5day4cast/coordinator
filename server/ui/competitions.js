@@ -1,5 +1,5 @@
 import { queryDb } from './data_access.js';
-
+import { displayLeaderboard } from './leader_board.js';
 // Define the number of arrays and the maximum number of items per array
 const numArrays = 9;
 const maxItemsPerArray = 5;
@@ -89,6 +89,7 @@ let competitions = [
         "name": "Tiger Roar Challenge",
         "startTime": "2024-02-25T00:00:00Z",
         "endTime": "2024-02-26T00:00:00Z",
+        "status": "live",
         "totalPrizePoolAmt": "$50,000",
         "totalEntries": 500,
         "cities": []
@@ -97,6 +98,7 @@ let competitions = [
         "name": "Phoenix Flight Showdown",
         "startTime": "2024-02-25T00:00:00Z",
         "endTime": "2024-02-26T00:00:00Z",
+        "status": "completed",
         "totalPrizePoolAmt": "$100,000",
         "totalEntries": 300,
         "cities": []
@@ -105,6 +107,7 @@ let competitions = [
         "name": "Dragon's Breath Competition",
         "startTime": "2024-02-25T00:00:00Z",
         "endTime": "2024-02-26T00:00:00Z",
+        "status": "running",
         "totalPrizePoolAmt": "$75,000",
         "totalEntries": 200,
         "cities": []
@@ -113,6 +116,7 @@ let competitions = [
         "name": "Unicorn Gallop Grand Prix",
         "startTime": "2024-02-24T00:00:00Z",
         "endTime": "2024-02-25T00:00:00Z",
+        "status": "running",
         "totalPrizePoolAmt": "$200,000",
         "totalEntries": 400,
         "cities": []
@@ -121,6 +125,7 @@ let competitions = [
         "name": "Gryphon's Claws Tournament",
         "startTime": "2024-02-24T00:00:00Z",
         "endTime": "2024-02-25T00:00:00Z",
+        "status": "completed",
         "totalPrizePoolAmt": "$150,000",
         "totalEntries": 600,
         "cities": []
@@ -129,6 +134,7 @@ let competitions = [
         "name": "Mermaid's Song Showcase",
         "startTime": "2024-02-24T00:00:00Z",
         "endTime": "2024-02-25T00:00:00Z",
+        "status": "live",
         "totalPrizePoolAmt": "$300,000",
         "totalEntries": 1000,
         "cities": []
@@ -137,6 +143,7 @@ let competitions = [
         "name": "Centaur Sprint Invitational",
         "startTime": "2024-02-23T00:00:00Z",
         "endTime": "2024-02-24T00:00:00Z",
+        "status": "completed",
         "totalPrizePoolAmt": "$80,000",
         "totalEntries": 150,
         "cities": []
@@ -145,6 +152,7 @@ let competitions = [
         "name": "Kraken's Dive Challenge",
         "startTime": "2024-02-23T00:00:00Z",
         "endTime": "2024-02-24T00:00:00Z",
+        "status": "running",
         "totalPrizePoolAmt": "$120,000",
         "totalEntries": 400,
         "cities": []
@@ -153,6 +161,7 @@ let competitions = [
         "name": "Chimera Chase Extravaganza",
         "startTime": "2024-02-23T00:00:00Z",
         "endTime": "2024-02-24T00:00:00Z",
+        "status": "live",
         "totalPrizePoolAmt": "$250,000",
         "totalEntries": 800,
         "cities": []
@@ -212,11 +221,19 @@ function handleCompetitionClick(row, competition) {
     });
     row.classList.toggle('is-selected');
     let rowIsSelected = row.classList.contains('is-selected');
-    makeCompetitionMap(competition, rowIsSelected).then(result => {
-        console.log("map displayed")
-    }).catch(error => {
-        console.error(error);
-    });
+    if (competition['status'] == 'live') {
+        makeCompetitionMap(competition, rowIsSelected).then(result => {
+            console.log("map displayed")
+        }).catch(error => {
+            console.error(error);
+        });
+    } else {
+        displayLeaderboard(competition, rowIsSelected).then(result => {
+            console.log("leaderboard displayed");
+        }).catch(error => {
+            console.error(error);
+        })
+    }
 }
 
 async function makeCompetitionMap(competition, isSelected) {
