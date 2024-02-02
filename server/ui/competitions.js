@@ -2,7 +2,7 @@ import { queryDb } from './data_access.js';
 
 // Define the number of arrays and the maximum number of items per array
 const numArrays = 9;
-const maxItemsPerArray = 10;
+const maxItemsPerArray = 5;
 const seed = 123;
 
 // Function to generate a pseudo-random number based on a seed
@@ -11,63 +11,64 @@ function seededRandom(seed) {
     return x - Math.floor(x);
 }
 const stations_to_cities = {
-    "KDCA": "LWX",
-    "KLGA": "OKX",
-    "KLAX": "LOX",
-    "KORD": "LOT",
-    "KPHL": "PHI",
-    "KIAH": "HGX",
-    "KPHX": "PSR",
-    "KSJC": "MTR",
-    "KSFO": "MTR",
-    "KCMH": "ILN",
-    "KDTW": "DTX",
-    "KCLT": "GSP",
-    "KIND": "IND",
-    "KDEN": "BOU",
-    "KSEA": "SEW",
-    "KBOS": "BOX",
-    "KLAS": "VEF",
-    "KJAX": "JAX",
-    "KIDA": "PIH",
-    "KPDX": "PQR",
-    "KGTF": "TFX",
-    "KJAC": "RIW",
-    "KBIS": "BIS",
-    "KFSD": "FSD",
-    "KOMA": "OAX",
-    "KICT": "ICT",
-    "KTUL": "TSA",
-    "KABQ": "ABQ",
-    "KMSP": "MPX",
-    "KCID": "DVN",
-    "KSTL": "LSX",
-    "KMCI": "EAX",
-    "KLIT": "LZK",
-    "KMSY": "LIX",
-    "KBHM": "BMX",
-    "KBFM": "MOB",
-    "KBNA": "OHX",
-    "KSDF": "LMK",
-    "KATL": "FFC",
-    "KMIA": "MFL",
-    "KTPA": "TBW",
-    "KCHS": "CHS",
-    "KCRW": "RLX",
-    "KPIT": "PBZ",
-    "KBUF": "BUF",
-    "KEWR": "OKX",
-    "KBWI": "LWX",
-    "KRDU": "RAH",
-    "KHFD": "BOX",
-    "KBTV": "BTV",
-    "KMHT": "GYX",
-    "KPWM": "GYX",
-    "KJAN": "JAN",
-    "KRAP": "UNR",
-    "KBOI": "BOI",
-    "KGRB": "GRB",
+    "KDCA": "Washington, D.C.",
+    "KLGA": "New York City, NY",
+    "KLAX": "Los Angeles, CA",
+    "KORD": "Chicago, IL",
+    "KPHL": "Philadelphia, PA",
+    "KIAH": "Houston, TX",
+    "KPHX": "Phoenix, AZ",
+    "KSJC": "San Jose, CA",
+    "KSFO": "San Francisco, CA",
+    "KCMH": "Columbus, OH",
+    "KDTW": "Detroit, MI",
+    "KCLT": "Charlotte, NC",
+    "KIND": "Indianapolis, IN",
+    "KDEN": "Denver, CO",
+    "KSEA": "Seattle, WA",
+    "KBOS": "Boston, MA",
+    "KLAS": "Las Vegas, NV",
+    "KJAX": "Jacksonville, FL",
+    "KIDA": "Idaho Falls, ID",
+    "KPDX": "Portland, OR",
+    "KGTF": "Great Falls, MT",
+    "KJAC": "Jackson, WY",
+    "KBIS": "Bismarck, ND",
+    "KFSD": "Sioux Falls, SD",
+    "KOMA": "Omaha, NE",
+    "KICT": "Wichita, KS",
+    "KTUL": "Tulsa, OK",
+    "KABQ": "Albuquerque, NM",
+    "KMSP": "Minneapolis, MN",
+    "KCID": "Cedar Rapids, IA",
+    "KSTL": "St. Louis, MO",
+    "KMCI": "Kansas City, MO",
+    "KLIT": "Little Rock, AR",
+    "KMSY": "New Orleans, LA",
+    "KBHM": "Birmingham, AL",
+    "KBFM": "Mobile, AL",
+    "KBNA": "Nashville, TN",
+    "KSDF": "Louisville, KY",
+    "KATL": "Atlanta, GA",
+    "KMIA": "Miami, FL",
+    "KTPA": "Tampa, FL",
+    "KCHS": "Charleston, SC",
+    "KCRW": "Charleston, WV",
+    "KPIT": "Pittsburgh, PA",
+    "KBUF": "Buffalo, NY",
+    "KEWR": "Newark, NJ",
+    "KBWI": "Baltimore, MD",
+    "KRDU": "Raleigh, NC",
+    "KHFD": "Hartford, CT",
+    "KBTV": "Burlington, VT",
+    "KMHT": "Manchester, NH",
+    "KPWM": "Portland, ME",
+    "KJAN": "Jackson, MS",
+    "KRAP": "Rapid City, SD",
+    "KBOI": "Boise, ID",
+    "KGRB": "Green Bay, WI",
 }
+
 let station_ids = Object.keys(stations_to_cities);
 // Shuffle the keys using the seeded random number generator
 const shuffledKeys = station_ids.sort(() => seededRandom(seed) - 0.5);
@@ -83,7 +84,7 @@ for (let i = 0; i < numArrays; i++) {
 
 console.log(arrays);
 
-export const COMPETITIONS = [
+let competitions = [
     {
         "name": "Tiger Roar Challenge",
         "startTime": "2024-02-25T00:00:00Z",
@@ -159,7 +160,7 @@ export const COMPETITIONS = [
 ];
 
 
-COMPETITIONS.forEach((competition, index) => {
+competitions.forEach((competition, index) => {
     competition.cities = arrays[index];
 });
 
@@ -167,11 +168,11 @@ let currentMaps = {};
 
 
 export async function getCompetitionPoints(station_ids) {
-    const query = `SELECT latitude, longitude FROM observations WHERE station_id IN ('${station_ids.join('\', \'')}')  GROUP BY station_id, station_name, latitude, longitude;`;
-    return queryDb(queryResult);
+    const query = `SELECT station_id, latitude, longitude FROM observations WHERE station_id IN ('${station_ids.join('\', \'')}')  GROUP BY station_id, station_name, latitude, longitude;`;
+    return queryDb(query);
 }
 
-export function displayCompetitions(competitions) {
+export function displayCompetitions() {
     let $competitionsDataTable = document.getElementById("competitionsDataTable");
 
     let $tbody = $competitionsDataTable.querySelector("tbody");
@@ -211,61 +212,50 @@ function handleCompetitionClick(row, competition) {
     });
     row.classList.toggle('is-selected');
     let rowIsSelected = row.classList.contains('is-selected');
-    /*
-    this is extra, need a button for them to make an entry
     makeCompetitionMap(competition, rowIsSelected).then(result => {
         console.log("map displayed")
     }).catch(error => {
         console.error(error);
-    });*/
+    });
 }
 
 async function makeCompetitionMap(competition, isSelected) {
     let $currentCompetitionCurrent = document.getElementById("currentCompetition");
     if (!isSelected) {
+        console.log('is not selected');
         $currentCompetitionCurrent.classList.add('hidden');
         return
     }
-    $currentCompetitionCurrent.classList.toggle('hidden');
+    $currentCompetitionCurrent.classList.remove('hidden');
 
     console.log(competition);
     let oldMap = currentMaps["map"]; // Retrieve map instance by div ID
+    console.log(oldMap);
     if (oldMap !== undefined) {
         oldMap.remove();
     }
 
-    let map = L.map('map').setView([0, 0], 2);
-    currentMaps['map'] = map;
+    var map = L.map('map', { dragging: false, trackResize: true }).setView([39.8283, -98.5795], 4.5); // Centered on the US
+    L.tileLayer('https://tiles.stadiamaps.com/tiles/stamen_toner_background/{z}/{x}/{y}{r}.{ext}', {
+        minZoom: 4.3,
+        maxZoom: 7,
+        attribution: '&copy; <a href="https://www.stadiamaps.com/" target="_blank">Stadia Maps</a> &copy; <a href="https://www.stamen.com/" target="_blank">Stamen Design</a> &copy; <a href="https://openmaptiles.org/" target="_blank">OpenMapTiles</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+        ext: 'png',
+        maxBounds: [
+            [25.84, -124.67], // Southwest coordinates (latitude, longitude)
+            [49.38, -66.95]   // Northeast coordinates (latitude, longitude)
+        ]
+    }).addTo(map);
 
-    const svgImageUrl = `${API_BASE}/ui/us.svg`;
-    console.log(svgImageUrl);
-
-    var bounds = [
-        [25.84, -124.67], // Southwest coordinates (latitude, longitude)
-        [49.38, -66.95]   // Northeast coordinates (latitude, longitude)
-    ];
-    map.fitBounds(bounds);
-    L.imageOverlay(svgImageUrl, bounds).addTo(map);
-
-    // Create custom SVG marker
-    let svgMarker = '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="10" cy="10" r="10" fill="red"/><circle cx="10" cy="10" r="6" fill="white"/><circle cx="10" cy="10" r="2" fill="black"/></svg>';
-
-    // Example coordinates
     const points = await getCompetitionPoints(competition.cities);
-
-    // Add markers to the map
     points.forEach(point => {
-        let marker = L.marker([point.latitude, point.longitude], {
-            icon: L.divIcon({
-                html: svgMarker,
-                iconSize: [20, 20],
-                className: 'city-point'
-            })
+        let marker = L.circleMarker([point.latitude, point.longitude], {
         }).addTo(map);
 
-        // Add click event listener to marker
-        marker.on('click', function () {
-            console.log('Clicked at: ' + point.latitude + ', ' + point.longitude);
-        });
+        let location_name = stations_to_cities[point.station_id];
+        // Extend the pop here
+        marker.bindPopup(`${location_name} (${point.station_id})`).openPopup();
     });
+
+    currentMaps['map'] = map;
 }
