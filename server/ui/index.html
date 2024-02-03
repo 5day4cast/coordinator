@@ -12,7 +12,6 @@
     <link rel="stylesheet" href="/ui/styles.css">
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.1/moment.min.js"></script>
 </head>
 
 <body>
@@ -22,6 +21,7 @@
     <script type="module" src="/ui/main.js"></script>
     <script type="module" src="/ui/data_access.js"></script>
     <script type="module" src="/ui/competitions.js"></script>
+    <script type="module" src="/ui/entries.js"></script>
     <script type="module" src="/ui/navbar.js"></script>
     <script type="module" src="/ui/leader_board.js"></script>
 
@@ -32,28 +32,26 @@
             </h1>
         </div>
         <div>
-            <div class="container">
-                <nav class="navbar" role="navigation" aria-label="main navigation">
-                    <div class="navbar-brand">
-                        <a role="button" class="navbar-burger" data-target="navMenu" aria-label="menu"
-                            aria-expanded="false">
-                            <span aria-hidden="true"></span>
-                            <span aria-hidden="true"></span>
-                            <span aria-hidden="true"></span>
+            <nav class="navbar" role="navigation" aria-label="main navigation">
+                <div class="navbar-brand">
+                    <a role="button" class="navbar-burger" data-target="navMenu" aria-label="menu"
+                        aria-expanded="false">
+                        <span aria-hidden="true"></span>
+                        <span aria-hidden="true"></span>
+                        <span aria-hidden="true"></span>
+                    </a>
+                </div>
+                <div class="navbar-menu" id="navMenu">
+                    <div class="navbar-start">
+                        <a href="#" class="navbar-item " id="allCompetitionsNavClick">
+                            Lobby
                         </a>
-                    </div>
-                    <div class="navbar-menu" id="navMenu">
-                        <div class="navbar-start">
-                            <a href="#" class="navbar-item " id="allCompetitionsNavClick">
-                                Competitions
-                            </a>
-                            <a href="#" class="navbar-item" id="entriesNavClick">
-                                Entries
-                            </a>
-                            <a href="#" class="navbar-item" id="payoutsNavClick">
-                                Payouts
-                            </a>
-                        </div>
+                        <a href="#" class="navbar-item" id="entriesNavClick">
+                            Lineups
+                        </a>
+                        <a href="#" class="navbar-item" id="payoutsNavClick">
+                            Payouts
+                        </a>
                     </div>
                 </nav>
             </div>
@@ -100,16 +98,29 @@
             </div>
         </div>
         <div id="entry" class="container hidden"><!--maybe this should be a module?--></div>
-        <div id="entries" class="container hidden">
-            <div>enteries</div>
+        <div id="entries" class="container">
             <div class="table-container" id="usersEntries">
-                <!-- all enteries that have been entered into-->
+                <table id="entriesDataTable" class="table is-striped is-bordered is-narrow">
+                    <thead>
+                        <tr>
+                            <th>Contest Name</th>
+                            <th>Status</th>
+                            <th>Live At</th>
+                            <th>Entry Fee</th>
+                            <th>Total Prizes</th>
+                            <th>Cities</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    </tbody>
+                </table>
             </div>
+        </div>
         </div>
         <div id="payouts" class="container hidden">
             <div>payouts</div>
             <div class="table-container" id="usersPayouts">
-                <!-- all payouts for enteries that have won-->
+                <!-- all payouts for entries that have won-->
             </div>
         </div>
 

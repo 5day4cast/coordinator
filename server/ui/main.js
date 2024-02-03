@@ -1,5 +1,6 @@
 import { submitDownloadRequest } from "./data_access.js";
 import { displayCompetitions } from "./competitions.js";
+import { displayEntries } from "./entries.js";
 
 const apiBase = API_BASE;
 console.log("api location:", apiBase);
@@ -8,3 +9,4 @@ console.log("api location:", apiBase);
 submitDownloadRequest();
 
 displayCompetitions();
+displayEntries();

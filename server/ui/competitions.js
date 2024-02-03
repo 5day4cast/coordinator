@@ -163,7 +163,7 @@ async function makeCompetitionMap(competition) {
         ]
     }).addTo(map);
     const points = await getCompetitionPoints(competition.cities);
-    let stations_to_cities = get_stations(); //TODO: make async for backend code
+    let stations_to_cities = getStations(); //TODO: make async for backend code
     points.forEach(point => {
         let marker = L.circleMarker([point.latitude, point.longitude], {
         }).addTo(map);
@@ -180,65 +180,4 @@ async function makeCompetitionMap(competition) {
 async function getCompetitionPoints(station_ids) {
     const query = `SELECT station_id, latitude, longitude FROM observations WHERE station_id IN ('${station_ids.join('\', \'')}')  GROUP BY station_id, station_name, latitude, longitude;`;
     return queryDb(query);
-}
-
-function get_stations() {
-    return {
-        "KDCA": "Washington, D.C.",
-        "KLGA": "New York City, NY",
-        "KLAX": "Los Angeles, CA",
-        "KORD": "Chicago, IL",
-        "KPHL": "Philadelphia, PA",
-        "KIAH": "Houston, TX",
-        "KPHX": "Phoenix, AZ",
-        "KSJC": "San Jose, CA",
-        "KSFO": "San Francisco, CA",
-        "KCMH": "Columbus, OH",
-        "KDTW": "Detroit, MI",
-        "KCLT": "Charlotte, NC",
-        "KIND": "Indianapolis, IN",
-        "KDEN": "Denver, CO",
-        "KSEA": "Seattle, WA",
-        "KBOS": "Boston, MA",
-        "KLAS": "Las Vegas, NV",
-        "KJAX": "Jacksonville, FL",
-        "KIDA": "Idaho Falls, ID",
-        "KPDX": "Portland, OR",
-        "KGTF": "Great Falls, MT",
-        "KJAC": "Jackson, WY",
-        "KBIS": "Bismarck, ND",
-        "KFSD": "Sioux Falls, SD",
-        "KOMA": "Omaha, NE",
-        "KICT": "Wichita, KS",
-        "KTUL": "Tulsa, OK",
-        "KABQ": "Albuquerque, NM",
-        "KMSP": "Minneapolis, MN",
-        "KCID": "Cedar Rapids, IA",
-        "KSTL": "St. Louis, MO",
-        "KMCI": "Kansas City, MO",
-        "KLIT": "Little Rock, AR",
-        "KMSY": "New Orleans, LA",
-        "KBHM": "Birmingham, AL",
-        "KBFM": "Mobile, AL",
-        "KBNA": "Nashville, TN",
-        "KSDF": "Louisville, KY",
-        "KATL": "Atlanta, GA",
-        "KMIA": "Miami, FL",
-        "KTPA": "Tampa, FL",
-        "KCHS": "Charleston, SC",
-        "KCRW": "Charleston, WV",
-        "KPIT": "Pittsburgh, PA",
-        "KBUF": "Buffalo, NY",
-        "KEWR": "Newark, NJ",
-        "KBWI": "Baltimore, MD",
-        "KRDU": "Raleigh, NC",
-        "KHFD": "Hartford, CT",
-        "KBTV": "Burlington, VT",
-        "KMHT": "Manchester, NH",
-        "KPWM": "Portland, ME",
-        "KJAN": "Jackson, MS",
-        "KRAP": "Rapid City, SD",
-        "KBOI": "Boise, ID",
-        "KGRB": "Green Bay, WI",
-    };
 }
