@@ -5,7 +5,19 @@ import { queryDb } from './data_access.js';
 // display the entries in a table
 // have the table replace the competition table
 // highlight the entries that placed when competition is completed
-function get_entries(competition) {
+
+export async function displayLeaderboard(competition, rowIsSelected) {
+    const entries = getEntries(competition); //Would normally be async as need to grab entries from remote
+    const currentReadings = await getReadings(competition);
+    console.log(currentReadings);
+    const lastForecasts = await getLastForecast(competition);
+    console.log(lastForecasts);
+    const scores = calculateScores(currentReadings, lastForecasts, entries);
+    console.log(scores);
+
+}
+
+function getEntries(competition) {
     //TODO: change to be a request to remove server for list of enteries in competition
     const entries = [
         {
@@ -18,17 +30,17 @@ function get_entries(competition) {
                     "wind_speed": {
                         "forecast_val": "25 knots",
                         "forecast_time": "2024-02-24T12:00:00Z",
-                        "val": "high"
+                        "val": "par"
                     },
                     "temp_high": {
                         "forecast_val": "72°F",
                         "forecast_time": "2024-02-24T15:00:00Z",
-                        "val": "par"
+                        "val": "over"
                     },
                     "temp_low": {
                         "forecast_val": "60°F",
                         "forecast_time": "2024-02-24T03:00:00Z",
-                        "val": "low"
+                        "val": "par"
                     }
                 }
             ]
@@ -43,17 +55,17 @@ function get_entries(competition) {
                     "wind_speed": {
                         "forecast_val": "20 knots",
                         "forecast_time": "2024-02-24T11:00:00Z",
-                        "val": "high"
+                        "val": "par"
                     },
                     "temp_high": {
                         "forecast_val": "70°F",
                         "forecast_time": "2024-02-24T14:00:00Z",
-                        "val": "par"
+                        "val": "under"
                     },
                     "temp_low": {
                         "forecast_val": "55°F",
                         "forecast_time": "2024-02-24T02:00:00Z",
-                        "val": "low"
+                        "val": "over"
                     }
                 }
             ]
@@ -68,7 +80,7 @@ function get_entries(competition) {
                     "wind_speed": {
                         "forecast_val": "25 knots",
                         "forecast_time": "2024-02-24T12:00:00Z",
-                        "val": "high"
+                        "val": "over"
                     },
                     "temp_high": {
                         "forecast_val": "72°F",
@@ -78,7 +90,7 @@ function get_entries(competition) {
                     "temp_low": {
                         "forecast_val": "60°F",
                         "forecast_time": "2024-02-24T03:00:00Z",
-                        "val": "low"
+                        "val": "under"
                     }
                 }
             ]
@@ -93,7 +105,7 @@ function get_entries(competition) {
                     "wind_speed": {
                         "forecast_val": "20 knots",
                         "forecast_time": "2024-02-24T11:00:00Z",
-                        "val": "high"
+                        "val": "over"
                     },
                     "temp_high": {
                         "forecast_val": "70°F",
@@ -103,7 +115,7 @@ function get_entries(competition) {
                     "temp_low": {
                         "forecast_val": "55°F",
                         "forecast_time": "2024-02-24T02:00:00Z",
-                        "val": "low"
+                        "val": "under"
                     }
                 }
             ]
@@ -118,7 +130,7 @@ function get_entries(competition) {
                     "wind_speed": {
                         "forecast_val": "18 knots",
                         "forecast_time": "2024-02-24T10:00:00Z",
-                        "val": "high"
+                        "val": "over"
                     },
                     "temp_high": {
                         "forecast_val": "68°F",
@@ -128,7 +140,7 @@ function get_entries(competition) {
                     "temp_low": {
                         "forecast_val": "52°F",
                         "forecast_time": "2024-02-24T01:00:00Z",
-                        "val": "low"
+                        "val": "under"
                     }
                 }
             ]
@@ -143,7 +155,7 @@ function get_entries(competition) {
                     "wind_speed": {
                         "forecast_val": "22 knots",
                         "forecast_time": "2024-02-24T09:00:00Z",
-                        "val": "high"
+                        "val": "over"
                     },
                     "temp_high": {
                         "forecast_val": "69°F",
@@ -153,7 +165,7 @@ function get_entries(competition) {
                     "temp_low": {
                         "forecast_val": "54°F",
                         "forecast_time": "2024-02-24T00:00:00Z",
-                        "val": "low"
+                        "val": "under"
                     }
                 }
             ]
@@ -168,7 +180,7 @@ function get_entries(competition) {
                     "wind_speed": {
                         "forecast_val": "19 knots",
                         "forecast_time": "2024-02-24T08:00:00Z",
-                        "val": "high"
+                        "val": "over"
                     },
                     "temp_high": {
                         "forecast_val": "67°F",
@@ -178,7 +190,7 @@ function get_entries(competition) {
                     "temp_low": {
                         "forecast_val": "53°F",
                         "forecast_time": "2024-02-24T23:00:00Z",
-                        "val": "low"
+                        "val": "under"
                     }
                 }
             ]
@@ -193,7 +205,7 @@ function get_entries(competition) {
                     "wind_speed": {
                         "forecast_val": "23 knots",
                         "forecast_time": "2024-02-24T07:00:00Z",
-                        "val": "high"
+                        "val": "over"
                     },
                     "temp_high": {
                         "forecast_val": "68°F",
@@ -203,7 +215,7 @@ function get_entries(competition) {
                     "temp_low": {
                         "forecast_val": "55°F",
                         "forecast_time": "2024-02-24T22:00:00Z",
-                        "val": "low"
+                        "val": "under"
                     }
                 }
             ]
@@ -218,7 +230,7 @@ function get_entries(competition) {
                     "wind_speed": {
                         "forecast_val": "21 knots",
                         "forecast_time": "2024-02-24T06:00:00Z",
-                        "val": "high"
+                        "val": "over"
                     },
                     "temp_high": {
                         "forecast_val": "71°F",
@@ -228,7 +240,7 @@ function get_entries(competition) {
                     "temp_low": {
                         "forecast_val": "56°F",
                         "forecast_time": "2024-02-24T21:00:00Z",
-                        "val": "low"
+                        "val": "under"
                     }
                 }
             ]
@@ -237,32 +249,83 @@ function get_entries(competition) {
     return entries
 }
 
-
-
-export async function displayLeaderboard(competition, rowIsSelected) {
-    const entries = get_entries(competition); //Would normally be async as need to grab entries from remote
-    const currentReadings = get_readings(competition); // """
-    console.log(currentReadings);
-    const last_forecasts = get_last_forecast(competition);
-    const scores = calculatScores(currentReadings, last_forecasts, entries);
-
-}
-
-function get_readings(competition) {
+async function getReadings(competition) {
     const station_ids = competition.cities;
     //TODO: change start and end time to be the start and end time of the competition
-    const query = `SELECT station_id, min(generated_at) as start_time, max(generated_at) as end_time, min(temperature_value) as temp_min, max(temperature_value) as max_temp, max(wind_speed) as wind_speed FROM observations WHERE station_id IN ('${station_ids.join('\', \'')}') AND generated_at <= NOW() AND generated_at >= (NOW()::TIMESTAMP - INTERVAL 12 hours) GROUP BY station_id;`;
-    return queryDb(query);
+    const query = `
+        SELECT 
+            station_id, 
+            min(generated_at) as start_time, 
+            max(generated_at) as end_time, 
+            min(temperature_value) as temp_low, 
+            max(temperature_value) as temp_high, 
+            max(wind_speed) as wind_speed 
+        FROM observations 
+        WHERE station_id IN ('${station_ids.join('\', \'')}') 
+            AND generated_at <= NOW() 
+            AND generated_at >= (NOW()::TIMESTAMP - INTERVAL 12 hours) 
+        GROUP BY station_id;`;
+    const readings = await queryDb(query);
+    console.log(readings);
+    const station_readings = {};
+    for (let reading in readings) {
+        station_readings[reading.station_id] = reading;
+    }
+
+    return station_readings;
 }
 
-function get_last_forecast(competition) {
+async function getLastForecast(competition) {
     const station_ids = competition.cities;
-    const query = `SELECT station_id, max(generated_at) as last_time, last(max_temp) as max_temp, last(min_temp) as min_temp, last(wind_speed) as wind_speed FROM forecasts WHERE station_id IN ('${station_ids.join('\', \'')}') AND generated_at <= '${competition.startTime}'::TIMESTAMPTZ GROUP BY station_id;`;
-    return queryDb(query);
+    const query = `
+    SELECT 
+        station_id, 
+        max(generated_at) as last_time, 
+        last(max_temp) as temp_high, 
+        last(min_temp) as temp_low, 
+        last(wind_speed) as wind_speed 
+    FROM forecasts 
+    WHERE station_id IN ('${station_ids.join('\', \'')}') 
+        AND generated_at <= '${competition.startTime}'::TIMESTAMPTZ 
+    GROUP BY station_id;`;
+    const forecasts = await queryDb(query);
+    const station_forecast = {};
+    for (forecast in forecasts) {
+        station_forecast[forecast.station_id] = forecasts;
+    }
+    return station_forecast;
 }
 
-function calculatScores(weatherReadings, last_forecasts, entries) {
-    console.log(weatherReadings);
-    console.log(last_forecasts);
-    console.log(entries);
+function calculateScores(weatherReadings, lastForecasts, entries) {
+    for (var i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        let currentScore = 0;
+        for (var j = 0; j < entry.options.length; j++) {
+            const option = entry.options[j];
+            const station_id = option.station_id;
+            console.log(lastForecasts);
+            console.log(station_id);
+            const forecast = lastForecasts[station_id];
+            const observation = weatherReadings[station_id];
+            Object.keys(option).forEach((key) => {
+                if (key == "station_id") {
+                    return;
+                }
+                const optionScore = calculateOptionScore(forecast[key], observation[key], option[key].val);
+                currentScore += optionScore;
+            });
+        }
+        entries[i]['score'] = currentScore;
+    }
+    return entries;
+}
+
+function calculateOptionScore(forecast_val, observation_val, entry_val) {
+    if (forecast_val > observation_val) {
+        return (entry_val == "over") ? 1 : 0
+    } else if (forecast_val == observation_val) {
+        return (entry_val == "par") ? 2 : 0
+    } else {
+        return (entry_val == "under") ? 1 : 0
+    }
 }
