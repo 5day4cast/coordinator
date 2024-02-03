@@ -257,9 +257,10 @@ function get_readings(competition) {
 
 function get_last_forecast(competition) {
     const station_ids = competition.cities;
-    const query = `SELECT station_id, max(generated_at) as start_time, last(max_temp), last(min_temp), last(wind_speed) FROM forecasts WHERE station_id IN ('${station_ids.join('\', \'')}') AND generated_at <= '${competition.startTime}'::TIMESTAMPTZ GROUP BY station_id;`;
+    const query = `SELECT station_id, max(generated_at) as last_time, last(max_temp) as max_temp, last(min_temp) as min_temp, last(wind_speed) as wind_speed FROM forecasts WHERE station_id IN ('${station_ids.join('\', \'')}') AND generated_at <= '${competition.startTime}'::TIMESTAMPTZ GROUP BY station_id;`;
     return queryDb(query);
 }
+
 function calculatScores(weatherReadings, last_forecasts, entries) {
     console.log(weatherReadings);
     console.log(last_forecasts);

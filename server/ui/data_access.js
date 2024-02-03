@@ -172,6 +172,20 @@ export async function queryDb(query) {
     }
 }
 
+function formatInts(intArray) {
+    const maxSafeInteger = BigInt(Number.MAX_SAFE_INTEGER);
+    let formattedVals = [];
+    for (let i = 0; i < intArray.length; i++) {
+        if (intArray[i] > maxSafeInteger || intArray[i] < -maxSafeInteger) {
+            formattedVals[i] = "NaN";
+        } else {
+            formattedVals[i] = `${intArray[i]}`
+        }
+    }
+
+    return formattedVals
+}
+
 function buildObjectFromResult(queryResult) {
     // build object properties
     let baseObject = {};
@@ -212,19 +226,4 @@ function buildObjectFromResult(queryResult) {
     }
     console.log(results);
     return results;
-}
-
-
-function formatInts(intArray) {
-    const maxSafeInteger = BigInt(Number.MAX_SAFE_INTEGER);
-    let formattedVals = [];
-    for (let i = 0; i < intArray.length; i++) {
-        if (intArray[i] > maxSafeInteger || intArray[i] < -maxSafeInteger) {
-            formattedVals[i] = "NaN";
-        } else {
-            formattedVals[i] = `${intArray[i]}`
-        }
-    }
-
-    return formattedVals
 }
