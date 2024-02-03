@@ -258,6 +258,7 @@ async function makeCompetitionMap(competition, isSelected) {
     }
     console.log("creating map");
     var map = L.map('map', { dragging: false, trackResize: true }).setView([39.8283, -98.5795], 4.5); // Centered on the US
+    //NOTE: hitting issue in browser with this tile "NS_BINDING_ABORTED", probably need to download an actual png and use that instead
     L.tileLayer('https://tiles.stadiamaps.com/tiles/stamen_toner_background/{z}/{x}/{y}{r}.{ext}', {
         minZoom: 4.3,
         maxZoom: 7,
