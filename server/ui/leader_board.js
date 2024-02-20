@@ -1,9 +1,8 @@
 import { queryDb } from './data_access.js';
 
 //TODO:
-// display the entries in a table
-// have the table replace the competition table
-// highlight the entries that placed when competition is completed
+// highlight the entries that placed/won money when competition is completed
+// pop-up showing entry
 
 export async function displayLeaderboard(competition, rowIsSelected) {
     console.log(competition);
@@ -56,183 +55,363 @@ function handleEntryClick($row, entry) {
 }
 
 function getEntries(competition) {
-    //TODO: change to be a request to remove server for list of enteries in competition
-    const entries = [
-
-        {
-            "id": "1965d723-6119-433f-a171-609c215f30d3",
-            "user_id": "2bbcddd2-e034-4bf3-974d-c44719f71d2e",
-            "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
-            "options": [
-                {
-                    "station_id": "KBFM",
-                    "wind_speed": {
-                        "val": "par"
-                    },
-                    "temp_high": {
-                        "val": "over"
-                    },
-                    "temp_low": {
-                        "val": "par"
-                    }
-                }
-            ]
-        },
-        {
-            "id": "c0f3da7b-0f35-418f-9d3f-1e9621ed4f21",
-            "user_id": "3d65e025-49b9-4a2d-9f6d-3b73f34880c1",
-            "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
-            "options": [
-                {
-                    "station_id": "KBHM",
-                    "wind_speed": {
-                        "val": "par"
-                    },
-                    "temp_high": {
-                        "val": "under"
-                    },
-                    "temp_low": {
-                        "val": "over"
-                    }
-                }
-            ]
-        },
-        {
-            "id": "1965d723-6119-433f-a171-609c215f30d3",
-            "user_id": "2bbcddd2-e034-4bf3-974d-c44719f71d2e",
-            "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
-            "options": [
-                {
-                    "station_id": "KBFM",
-                    "wind_speed": {
-                        "val": "over"
-                    },
-                    "temp_high": {
-                        "val": "par"
-                    },
-                    "temp_low": {
-                        "val": "under"
-                    }
-                }
-            ]
-        },
-        {
-            "id": "c0f3da7b-0f35-418f-9d3f-1e9621ed4f21",
-            "user_id": "3d65e025-49b9-4a2d-9f6d-3b73f34880c1",
-            "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
-            "options": [
-                {
-                    "station_id": "KBHM",
-                    "wind_speed": {
-                        "val": "over"
-                    },
-                    "temp_high": {
-                        "val": "par"
-                    },
-                    "temp_low": {
-                        "val": "under"
-                    }
-                }
-            ]
-        },
-        {
-            "id": "4e6f8a5d-6fe7-4987-8821-12d51b801e5b",
-            "user_id": "3b3b0255-1c7d-4a65-afd7-1fe75ac9e540",
-            "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
-            "options": [
-                {
-                    "station_id": "KMSY",
-                    "wind_speed": {
-                        "val": "over"
-                    },
-                    "temp_high": {
-                        "val": "par"
-                    },
-                    "temp_low": {
-                        "val": "under"
-                    }
-                }
-            ]
-        },
-        {
-            "id": "13f23a1c-3bcf-4d8e-8fa3-241d289ae106",
-            "user_id": "54cfb591-26f7-45a5-bd12-094a88b47d84",
-            "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
-            "options": [
-                {
-                    "station_id": "KLIT",
-                    "wind_speed": {
-                        "val": "over"
-                    },
-                    "temp_high": {
-                        "val": "par"
-                    },
-                    "temp_low": {
-                        "val": "under"
-                    }
-                }
-            ]
-        },
-        {
-            "id": "891d2314-3eb2-4410-ba06-857a9a302aa2",
-            "user_id": "7a6ee926-4d89-4a95-aa9b-df732d14ef9b",
-            "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
-            "options": [
-                {
-                    "station_id": "KMCI",
-                    "wind_speed": {
-                        "val": "over"
-                    },
-                    "temp_high": {
-                        "val": "par"
-                    },
-                    "temp_low": {
-                        "val": "under"
-                    }
-                }
-            ]
-        },
-        {
-            "id": "eb474ef0-7f37-4a34-a205-09890b2c7d9b",
-            "user_id": "53b1732f-5179-49aa-b8d7-c1318f27b16d",
-            "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
-            "options": [
-                {
-                    "station_id": "KBFM",
-                    "wind_speed": {
-                        "val": "over"
-                    },
-                    "temp_high": {
-                        "val": "par"
-                    },
-                    "temp_low": {
-                        "val": "under"
-                    }
-                }
-            ]
-        },
-        {
-            "id": "d4d01269-6170-4d64-976d-2989b57cbb05",
-            "user_id": "0b42e158-d164-4de4-9a11-17fb0483f86c",
-            "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
-            "options": [
-                {
-                    "station_id": "KBHM",
-                    "wind_speed": {
-                        "val": "over"
-                    },
-                    "temp_high": {
-                        "val": "par"
-                    },
-                    "temp_low": {
-                        "val": "under"
-                    }
-                }
-            ]
-        }
-    ];
-    return entries
+    if (competition['id'] == '295ecf23-ef65-4708-9314-0fc7614b623d') {
+        return completedEntries
+    } else {
+        return runningEntries
+    }
 }
+
+const runningEntries = [
+
+    {
+        "id": "1965d723-6119-433f-a171-609c215f30d3",
+        "user_id": "2bbcddd2-e034-4bf3-974d-c44719f71d2e",
+        "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
+        "options": [
+            {
+                "station_id": "KTPA",
+                "wind_speed": {
+                    "val": "par"
+                },
+                "temp_high": {
+                    "val": "over"
+                },
+                "temp_low": {
+                    "val": "par"
+                }
+            }
+        ]
+    },
+    {
+        "id": "c0f3da7b-0f35-418f-9d3f-1e9621ed4f21",
+        "user_id": "3d65e025-49b9-4a2d-9f6d-3b73f34880c1",
+        "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
+        "options": [
+            {
+                "station_id": "KMIA",
+                "wind_speed": {
+                    "val": "par"
+                },
+                "temp_high": {
+                    "val": "under"
+                },
+                "temp_low": {
+                    "val": "over"
+                }
+            }
+        ]
+    },
+    {
+        "id": "1965d723-6119-433f-a171-609c215f30d3",
+        "user_id": "2bbcddd2-e034-4bf3-974d-c44719f71d2e",
+        "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
+        "options": [
+            {
+                "station_id": "KATL",
+                "wind_speed": {
+                    "val": "over"
+                },
+                "temp_high": {
+                    "val": "par"
+                },
+                "temp_low": {
+                    "val": "under"
+                }
+            }
+        ]
+    },
+    {
+        "id": "c0f3da7b-0f35-418f-9d3f-1e9621ed4f21",
+        "user_id": "3d65e025-49b9-4a2d-9f6d-3b73f34880c1",
+        "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
+        "options": [
+            {
+                "station_id": "KSDF",
+                "wind_speed": {
+                    "val": "over"
+                },
+                "temp_high": {
+                    "val": "par"
+                },
+                "temp_low": {
+                    "val": "under"
+                }
+            }
+        ]
+    },
+    {
+        "id": "4e6f8a5d-6fe7-4987-8821-12d51b801e5b",
+        "user_id": "3b3b0255-1c7d-4a65-afd7-1fe75ac9e540",
+        "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
+        "options": [
+            {
+                "station_id": "KBNA",
+                "wind_speed": {
+                    "val": "over"
+                },
+                "temp_high": {
+                    "val": "par"
+                },
+                "temp_low": {
+                    "val": "under"
+                }
+            }
+        ]
+    },
+    {
+        "id": "13f23a1c-3bcf-4d8e-8fa3-241d289ae106",
+        "user_id": "54cfb591-26f7-45a5-bd12-094a88b47d84",
+        "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
+        "options": [
+            {
+                "station_id": "KBNA",
+                "wind_speed": {
+                    "val": "over"
+                },
+                "temp_high": {
+                    "val": "par"
+                },
+                "temp_low": {
+                    "val": "under"
+                }
+            }
+        ]
+    },
+    {
+        "id": "891d2314-3eb2-4410-ba06-857a9a302aa2",
+        "user_id": "7a6ee926-4d89-4a95-aa9b-df732d14ef9b",
+        "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
+        "options": [
+            {
+                "station_id": "KSDF",
+                "wind_speed": {
+                    "val": "over"
+                },
+                "temp_high": {
+                    "val": "par"
+                },
+                "temp_low": {
+                    "val": "under"
+                }
+            }
+        ]
+    },
+    {
+        "id": "eb474ef0-7f37-4a34-a205-09890b2c7d9b",
+        "user_id": "53b1732f-5179-49aa-b8d7-c1318f27b16d",
+        "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
+        "options": [
+            {
+                "station_id": "KMIA",
+                "wind_speed": {
+                    "val": "over"
+                },
+                "temp_high": {
+                    "val": "par"
+                },
+                "temp_low": {
+                    "val": "under"
+                }
+            }
+        ]
+    },
+    {
+        "id": "d4d01269-6170-4d64-976d-2989b57cbb05",
+        "user_id": "0b42e158-d164-4de4-9a11-17fb0483f86c",
+        "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
+        "options": [
+            {
+                "station_id": "KATL",
+                "wind_speed": {
+                    "val": "over"
+                },
+                "temp_high": {
+                    "val": "par"
+                },
+                "temp_low": {
+                    "val": "under"
+                }
+            }
+        ]
+    }
+];
+//TODO: change to be a request to remove server for list of enteries in competition
+const completedEntries = [
+
+    {
+        "id": "1965d723-6119-433f-a171-609c215f30d3",
+        "user_id": "2bbcddd2-e034-4bf3-974d-c44719f71d2e",
+        "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
+        "options": [
+            {
+                "station_id": "KBFM",
+                "wind_speed": {
+                    "val": "par"
+                },
+                "temp_high": {
+                    "val": "over"
+                },
+                "temp_low": {
+                    "val": "par"
+                }
+            }
+        ]
+    },
+    {
+        "id": "c0f3da7b-0f35-418f-9d3f-1e9621ed4f21",
+        "user_id": "3d65e025-49b9-4a2d-9f6d-3b73f34880c1",
+        "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
+        "options": [
+            {
+                "station_id": "KBHM",
+                "wind_speed": {
+                    "val": "par"
+                },
+                "temp_high": {
+                    "val": "under"
+                },
+                "temp_low": {
+                    "val": "over"
+                }
+            }
+        ]
+    },
+    {
+        "id": "1965d723-6119-433f-a171-609c215f30d3",
+        "user_id": "2bbcddd2-e034-4bf3-974d-c44719f71d2e",
+        "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
+        "options": [
+            {
+                "station_id": "KBFM",
+                "wind_speed": {
+                    "val": "over"
+                },
+                "temp_high": {
+                    "val": "par"
+                },
+                "temp_low": {
+                    "val": "under"
+                }
+            }
+        ]
+    },
+    {
+        "id": "c0f3da7b-0f35-418f-9d3f-1e9621ed4f21",
+        "user_id": "3d65e025-49b9-4a2d-9f6d-3b73f34880c1",
+        "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
+        "options": [
+            {
+                "station_id": "KBHM",
+                "wind_speed": {
+                    "val": "over"
+                },
+                "temp_high": {
+                    "val": "par"
+                },
+                "temp_low": {
+                    "val": "under"
+                }
+            }
+        ]
+    },
+    {
+        "id": "4e6f8a5d-6fe7-4987-8821-12d51b801e5b",
+        "user_id": "3b3b0255-1c7d-4a65-afd7-1fe75ac9e540",
+        "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
+        "options": [
+            {
+                "station_id": "KMSY",
+                "wind_speed": {
+                    "val": "over"
+                },
+                "temp_high": {
+                    "val": "par"
+                },
+                "temp_low": {
+                    "val": "under"
+                }
+            }
+        ]
+    },
+    {
+        "id": "13f23a1c-3bcf-4d8e-8fa3-241d289ae106",
+        "user_id": "54cfb591-26f7-45a5-bd12-094a88b47d84",
+        "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
+        "options": [
+            {
+                "station_id": "KLIT",
+                "wind_speed": {
+                    "val": "over"
+                },
+                "temp_high": {
+                    "val": "par"
+                },
+                "temp_low": {
+                    "val": "under"
+                }
+            }
+        ]
+    },
+    {
+        "id": "891d2314-3eb2-4410-ba06-857a9a302aa2",
+        "user_id": "7a6ee926-4d89-4a95-aa9b-df732d14ef9b",
+        "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
+        "options": [
+            {
+                "station_id": "KMCI",
+                "wind_speed": {
+                    "val": "over"
+                },
+                "temp_high": {
+                    "val": "par"
+                },
+                "temp_low": {
+                    "val": "under"
+                }
+            }
+        ]
+    },
+    {
+        "id": "eb474ef0-7f37-4a34-a205-09890b2c7d9b",
+        "user_id": "53b1732f-5179-49aa-b8d7-c1318f27b16d",
+        "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
+        "options": [
+            {
+                "station_id": "KBFM",
+                "wind_speed": {
+                    "val": "over"
+                },
+                "temp_high": {
+                    "val": "par"
+                },
+                "temp_low": {
+                    "val": "under"
+                }
+            }
+        ]
+    },
+    {
+        "id": "d4d01269-6170-4d64-976d-2989b57cbb05",
+        "user_id": "0b42e158-d164-4de4-9a11-17fb0483f86c",
+        "competition_id": "295ecf23-ef65-4708-9314-0fc7614b623d",
+        "options": [
+            {
+                "station_id": "KBHM",
+                "wind_speed": {
+                    "val": "over"
+                },
+                "temp_high": {
+                    "val": "par"
+                },
+                "temp_low": {
+                    "val": "under"
+                }
+            }
+        ]
+    }
+];
+
 
 async function getReadings(competition) {
     console.log(competition);
