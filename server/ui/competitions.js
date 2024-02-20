@@ -5,7 +5,6 @@ let currentMaps = {};
 
 export function displayCompetitions() {
     let $competitionsDataTable = document.getElementById("competitionsDataTable");
-
     let $tbody = $competitionsDataTable.querySelector("tbody");
     if (!$tbody) {
         $tbody = document.createElement("tbody");
@@ -34,12 +33,24 @@ export function displayCompetitions() {
 }
 
 function get_competitions() {
+    const currentUTCDate = new Date();
+    const twelveHoursAgoUTCDate = new Date(currentUTCDate.getTime() - (12 * 3600 * 1000));
+    const twentyFourHoursAgoUTCDate = new Date(currentUTCDate.getTime() - (24 * 3600 * 1000));
+
+    const oneHourFromNowUTCDate = new Date(currentUTCDate.getTime() + (1 * 3600 * 1000));
+    const twelveHoursFromNowUTCDate = new Date(currentUTCDate.getTime() + (12 * 3600 * 1000));
+    const rfc3339TimetwentyFourHoursAgo = twentyFourHoursAgoUTCDate.toISOString();
+    const rfc3339TimetwelveHoursFromNow = twelveHoursFromNowUTCDate.toISOString();
+    const rfc3339TimeTwelveHoursAgo = twelveHoursAgoUTCDate.toISOString();
+    const rfc3339TimeOneHourFromNow = oneHourFromNowUTCDate.toISOString();
+    const rfc3339TimeUTC = currentUTCDate.toISOString();
+
     return [
         {
             "id": "671657f5-a437-453e-b9fa-4c50705dc607",
             "name": "Tiger Roar Challenge",
-            "startTime": "2024-02-25T00:00:00Z",
-            "endTime": "2024-02-26T00:00:00Z",
+            "startTime": rfc3339TimeOneHourFromNow,
+            "endTime": rfc3339TimetwelveHoursFromNow,
             "status": "live",
             "totalPrizePoolAmt": "$60",
             "totalEntries": 30,
@@ -48,8 +59,8 @@ function get_competitions() {
         {
             "id": "4539963e-80b4-43e1-bd94-bf47c7a665ec",
             "name": "Phoenix Flight Showdown",
-            "startTime": "2024-02-25T00:00:00Z",
-            "endTime": "2024-02-26T00:00:00Z",
+            "startTime": rfc3339TimetwentyFourHoursAgo,
+            "endTime": rfc3339TimeTwelveHoursAgo,
             "status": "completed",
             "totalPrizePoolAmt": "$20",
             "totalEntries": 10,
@@ -58,8 +69,8 @@ function get_competitions() {
         {
             "id": "626da387-df90-40a1-9f64-1fcf5f13fba3",
             "name": "Dragon's Breath Competition",
-            "startTime": "2024-02-25T00:00:00Z",
-            "endTime": "2024-02-26T00:00:00Z",
+            "startTime": rfc3339TimeTwelveHoursAgo,
+            "endTime": oneHourFromNowUTCDate,
             "status": "running",
             "totalPrizePoolAmt": "$20",
             "totalEntries": 10,
@@ -68,8 +79,8 @@ function get_competitions() {
         {
             "id": "70bc176c-4b30-46c0-8720-b1535d15ba34",
             "name": "Unicorn Gallop Grand Prix",
-            "startTime": "2024-02-24T00:00:00Z",
-            "endTime": "2024-02-25T00:00:00Z",
+            "startTime": rfc3339TimeTwelveHoursAgo,
+            "endTime": oneHourFromNowUTCDate,
             "status": "running",
             "totalPrizePoolAmt": "$20",
             "totalEntries": 10,
@@ -78,8 +89,8 @@ function get_competitions() {
         {
             "id": "295ecf23-ef65-4708-9314-0fc7614b623d",
             "name": "Gryphon's Claws Tournament",
-            "startTime": "2024-02-24T00:00:00Z",
-            "endTime": "2024-02-25T00:00:00Z",
+            "startTime": rfc3339TimetwentyFourHoursAgo,
+            "endTime": rfc3339TimeTwelveHoursAgo,
             "status": "completed",
             "totalPrizePoolAmt": "$16",
             "totalEntries": 8,
@@ -88,8 +99,8 @@ function get_competitions() {
         {
             "id": "57bd5d1e-a7ae-422e-8673-81ebb6227bf8",
             "name": "Mermaid's Song Showcase",
-            "startTime": "2024-02-24T00:00:00Z",
-            "endTime": "2024-02-25T00:00:00Z",
+            "startTime": rfc3339TimeOneHourFromNow,
+            "endTime": rfc3339TimetwelveHoursFromNow,
             "status": "live",
             "totalPrizePoolAmt": "$60",
             "totalEntries": 30,
@@ -98,8 +109,8 @@ function get_competitions() {
         {
             "id": "12d58c34-d61d-4205-8677-8b8b99502324",
             "name": "Centaur Sprint Invitational",
-            "startTime": "2024-02-23T00:00:00Z",
-            "endTime": "2024-02-24T00:00:00Z",
+            "startTime": rfc3339TimetwentyFourHoursAgo,
+            "endTime": rfc3339TimeTwelveHoursAgo,
             "status": "completed",
             "totalPrizePoolAmt": "$10",
             "totalEntries": 5,
@@ -108,8 +119,8 @@ function get_competitions() {
         {
             "id": "58ee4971-d451-44d3-a072-c328c57af49c",
             "name": "Kraken's Dive Challenge",
-            "startTime": "2024-02-23T00:00:00Z",
-            "endTime": "2024-02-24T00:00:00Z",
+            "startTime": rfc3339TimeTwelveHoursAgo,
+            "endTime": oneHourFromNowUTCDate,
             "status": "running",
             "totalPrizePoolAmt": "$40",
             "totalEntries": 20,
@@ -118,8 +129,8 @@ function get_competitions() {
         {
             "id": "cdf5b892-8d21-4264-ab65-9bc3e80e535d",
             "name": "Chimera Chase Extravaganza",
-            "startTime": "2024-02-23T00:00:00Z",
-            "endTime": "2024-02-24T00:00:00Z",
+            "startTime": rfc3339TimeOneHourFromNow,
+            "endTime": rfc3339TimetwelveHoursFromNow,
             "status": "live",
             "totalPrizePoolAmt": "$20",
             "totalEntries": 10,
@@ -171,8 +182,7 @@ async function makeCompetitionMap(competition, isSelected) {
         oldMap.remove();
     }
     console.log("creating map");
-    var map = L.map('map', { dragging: false, trackResize: true }).setView([39.8283, -98.5795], 4.5); // Centered on the US
-    //NOTE: hitting issue in browser with this tile "NS_BINDING_ABORTED", probably need to download an actual png and use that instead
+   var map = L.map('map', { dragging: false, trackResize: true }).setView([39.8283, -98.5795], 4.2); // Centered on the US
     L.tileLayer('https://tiles.stadiamaps.com/tiles/stamen_toner_background/{z}/{x}/{y}{r}.{ext}', {
         minZoom: 4.3,
         maxZoom: 7,
@@ -183,7 +193,6 @@ async function makeCompetitionMap(competition, isSelected) {
             [49.38, -66.95]   // Northeast coordinates (latitude, longitude)
         ]
     }).addTo(map);
-
     const points = await getCompetitionPoints(competition.cities);
     let stations_to_cities = get_stations(); //TODO: make async for backend code
     points.forEach(point => {

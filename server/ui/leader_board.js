@@ -20,6 +20,7 @@ export async function displayLeaderboard(competition, rowIsSelected) {
 function getEntries(competition) {
     //TODO: change to be a request to remove server for list of enteries in competition
     const entries = [
+
         {
             "id": "1965d723-6119-433f-a171-609c215f30d3",
             "user_id": "2bbcddd2-e034-4bf3-974d-c44719f71d2e",
@@ -29,17 +30,17 @@ function getEntries(competition) {
                     "station_id": "KBFM",
                     "wind_speed": {
                         "forecast_val": "25 knots",
-                        "forecast_time": "2024-02-24T12:00:00Z",
+                        "forecast_time": "2024-02-19T12:00:00Z",
                         "val": "par"
                     },
                     "temp_high": {
                         "forecast_val": "72°F",
-                        "forecast_time": "2024-02-24T15:00:00Z",
+                        "forecast_time": "2024-02-19T15:00:00Z",
                         "val": "over"
                     },
                     "temp_low": {
                         "forecast_val": "60°F",
-                        "forecast_time": "2024-02-24T03:00:00Z",
+                        "forecast_time": "2024-02-19T03:00:00Z",
                         "val": "par"
                     }
                 }
@@ -251,7 +252,6 @@ function getEntries(competition) {
 
 async function getReadings(competition) {
     const station_ids = competition.cities;
-    //TODO: change start and end time to be the start and end time of the competition
     const query = `
         SELECT 
             station_id, 
@@ -262,8 +262,8 @@ async function getReadings(competition) {
             max(wind_speed) as wind_speed 
         FROM observations 
         WHERE station_id IN ('${station_ids.join('\', \'')}') 
-            AND generated_at <= NOW() 
-            AND generated_at >= (NOW()::TIMESTAMP - INTERVAL 12 hours) 
+            AND generated_at <= '${competition.endTime}'::TIMESTAMPTZ 
+            AND generated_at >= '${competition.startTime}'::TIMESTAMPTZ 
         GROUP BY station_id;`;
     const readings = await queryDb(query);
     console.log(readings);
