@@ -6,10 +6,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>5day4cast</title>
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
     <link rel="stylesheet" href="/ui/styles.css">
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.1/moment.min.js"></script>
 </head>
 
 <body>
@@ -21,7 +24,7 @@
     <script type="module" src="/ui/competitions.js"></script>
     <script type="module" src="/ui/navbar.js"></script>
     <script type="module" src="/ui/leader_board.js"></script>
-    
+
     <section class="section">
         <div class="container">
             <h1 class="title">
@@ -29,29 +32,31 @@
             </h1>
         </div>
         <div>
-            <nav class="navbar" role="navigation" aria-label="main navigation">
-                <div class="navbar-brand">
-                    <a role="button" class="navbar-burger" data-target="navMenu" aria-label="menu"
-                        aria-expanded="false">
-                        <span aria-hidden="true"></span>
-                        <span aria-hidden="true"></span>
-                        <span aria-hidden="true"></span>
-                    </a>
-                </div>
-                <div class="navbar-menu" id="navMenu">
-                    <div class="navbar-start">
-                        <a href="#" class="navbar-item " id="allCompetitionsNavClick">
-                            Competitions
-                        </a>
-                        <a href="#" class="navbar-item" id="entriesNavClick">
-                            Entries
-                        </a>
-                        <a href="#" class="navbar-item" id="payoutsNavClick">
-                            Payouts
+            <div class="container">
+                <nav class="navbar" role="navigation" aria-label="main navigation">
+                    <div class="navbar-brand">
+                        <a role="button" class="navbar-burger" data-target="navMenu" aria-label="menu"
+                            aria-expanded="false">
+                            <span aria-hidden="true"></span>
+                            <span aria-hidden="true"></span>
+                            <span aria-hidden="true"></span>
                         </a>
                     </div>
-                </div>
-            </nav>
+                    <div class="navbar-menu" id="navMenu">
+                        <div class="navbar-start">
+                            <a href="#" class="navbar-item " id="allCompetitionsNavClick">
+                                Competitions
+                            </a>
+                            <a href="#" class="navbar-item" id="entriesNavClick">
+                                Entries
+                            </a>
+                            <a href="#" class="navbar-item" id="payoutsNavClick">
+                                Payouts
+                            </a>
+                        </div>
+                    </div>
+                </nav>
+            </div>
             <div id="allCompetitions" class="container">
                 <div class="table-container" id="competitions">
                     <table id="competitionsDataTable" class="table is-striped is-bordered is-narrow">
@@ -60,6 +65,7 @@
                                 <th>Name</th>
                                 <th>Start Time</th>
                                 <th>End Time</th>
+                                <th>Status</th>
                                 <th>Total Prize Pool Amt</th>
                                 <th>Total Entries</th>
                             </tr>
@@ -70,32 +76,46 @@
                 </div>
             </div>
             <div id="currentCompetition" class="hidden">
-                <div id="map" class="usmap"></div>
-            </div>
-            <div id="competitionLeaderboard" class="container hidden">
-                <!--should work for current and past competitions-->
-                <div>Leader Board</div>
-            </div>
-            <div id="entry" class="container hidden"><!--maybe this should be a module?--></div>
-            <div id="entries" class="container hidden">
-                <div>enteries</div>
-                <div class="table-container" id="usersEntries">
-                    <!-- all enteries that have been entered into-->
+                </br>
+                <div class="parent">
+                    <div id="map" class="usmap"></div>
                 </div>
             </div>
-            <div id="payouts" class="container hidden">
-                <div>payouts</div>
-                <div class="table-container" id="usersPayouts">
-                    <!-- all payouts for enteries that have won-->
-                </div>
+        </div>
+        <div id="competitionLeaderboard" class="container hidden">
+            <!--should work for current and past competitions-->
+            <div>Leader Board</div>
+            <div class="table-container" id="competitions">
+                <table id="competitionLeaderboardData" class="table is-striped is-bordered is-narrow">
+                    <thead>
+                        <tr>
+                            <th>Rank</th>
+                            <th>Entry ID</th> <!--change to user name of entry-->
+                            <th>Score</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    </tbody>
+                </table>
             </div>
+        </div>
+        <div id="entry" class="container hidden"><!--maybe this should be a module?--></div>
+        <div id="entries" class="container hidden">
+            <div>enteries</div>
+            <div class="table-container" id="usersEntries">
+                <!-- all enteries that have been entered into-->
+            </div>
+        </div>
+        <div id="payouts" class="container hidden">
+            <div>payouts</div>
+            <div class="table-container" id="usersPayouts">
+                <!-- all payouts for enteries that have won-->
+            </div>
+        </div>
 
-            <!-- overview competition page-->
-            <!-- competition (optional in map (https://opensource.com/life/15/7/open-source-mapping-primer))-->
-            <!-- entry module -->
-            <!-- scoreboard screen -->
-            <!-- payout screen -->
-            <!-- (optional) chat powered by nostr (cheap/open source communication) -->
+        <!-- entry module -->
+        <!-- (leave to the end) payout screen -->
+        <!-- (optional) chat powered by nostr (cheap/open source communication) -->
         </div>
     </section>
 </body>

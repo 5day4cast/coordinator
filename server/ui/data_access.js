@@ -20,7 +20,7 @@ URL.revokeObjectURL(worker_url);
 const parquetFileApi = "https://www.4casttruth.win";
 console.log("parquets location:", parquetFileApi);
 
-export async  function submitDownloadRequest() {
+export async function submitDownloadRequest() {
     try {
         const fileNames = await fetchFileNames();
         console.log(`Files to download: ${fileNames}`);
@@ -58,33 +58,6 @@ function fetchFileNames() {
     });
 }
 
-async function forecasts(stations_ids) {
-
-
-    //TODO: set the query for which locations the competitions
-    try {
-        const conn = await db.connect();
-        const queryResult = await conn.query(rawQuery);
-        console.log("queryResult", queryResult);
-        await conn.close();
-    } catch (error) {
-        console.error(error);
-    }
-}
-
-async function observations(stations_ids) {
-    //TODO: set the query for which locations the competitions
-    const rawQuery = "";
-    try {
-        const conn = await db.connect();
-        const queryResult = await conn.query(rawQuery);
-        console.log("queryResult", queryResult);
-        await conn.close();
-    } catch (error) {
-        console.error(error);
-    }
-}
-
 async function loadFiles(fileNames) {
     const conn = await db.connect();
     let observation_files = [];
@@ -113,49 +86,6 @@ async function loadFiles(fileNames) {
     `);
     }
     await conn.close();
-}
-
-function getArrayType(arr) {
-    if (arr instanceof Uint8Array) {
-        return 'Uint8Array';
-    } else if (arr instanceof Float64Array) {
-        return 'Float64Array';
-    } else if (arr instanceof BigInt64Array) {
-        return 'BigInt64Array';
-    } else {
-        return 'Unknown';
-    }
-}
-
-function getType(arr) {
-    if (arr instanceof Uint8Array) {
-        return 'Text';
-    } else if (arr instanceof Float64Array) {
-        return 'Float64';
-    } else if (arr instanceof BigInt64Array) {
-        return 'BigInt64';
-    } else {
-        return 'Unknown';
-    }
-}
-
-function convertUintArrayToStrings(uint8Array, valueOffsets) {
-    const textDecoder = new TextDecoder('utf-8');
-    // Array to store the decoded strings
-    const decodedStrings = [];
-
-    for (let i = 0; i < valueOffsets.length; i++) {
-        const start = (i === 0) ? 0 : valueOffsets[i - 1]; // Start position for the first string is 0
-        const end = valueOffsets[i];
-        const stringBytes = uint8Array.subarray(start, end);
-        const decodedString = textDecoder.decode(stringBytes);
-        if (decodedString.length != 0) {
-            decodedStrings.push(decodedString);
-        }
-    }
-
-    console.log(decodedStrings);
-    return decodedStrings
 }
 
 export async function queryDb(query) {
@@ -212,4 +142,50 @@ function buildObjectFromResult(queryResult) {
     }
     console.log(results);
     return results;
+}
+
+function getArrayType(arr) {
+    if (arr instanceof Uint8Array) {
+        return 'Uint8Array';
+    } else if (arr instanceof Float64Array) {
+        return 'Float64Array';
+    } else if (arr instanceof BigInt64Array) {
+        return 'BigInt64Array';
+    } else {
+        return 'Unknown';
+    }
+}
+
+function formatInts(intArray) {
+    const maxSafeInteger = BigInt(Number.MAX_SAFE_INTEGER);
+    let formattedVals = [];
+    for (let i = 0; i < intArray.length; i++) {
+        if (intArray[i] > maxSafeInteger || intArray[i] < -maxSafeInteger) {
+            formattedVals[i] = "NaN";
+        } else {
+            formattedVals[i] = `${intArray[i]}`
+        }
+    }
+
+    return formattedVals
+}
+
+
+function convertUintArrayToStrings(uint8Array, valueOffsets) {
+    const textDecoder = new TextDecoder('utf-8');
+    // Array to store the decoded strings
+    const decodedStrings = [];
+
+    for (let i = 0; i < valueOffsets.length; i++) {
+        const start = (i === 0) ? 0 : valueOffsets[i - 1]; // Start position for the first string is 0
+        const end = valueOffsets[i];
+        const stringBytes = uint8Array.subarray(start, end);
+        const decodedString = textDecoder.decode(stringBytes);
+        if (decodedString.length != 0) {
+            decodedStrings.push(decodedString);
+        }
+    }
+
+    console.log(decodedStrings);
+    return decodedStrings
 }

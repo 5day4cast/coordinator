@@ -31,8 +31,7 @@ $navbarItems.forEach(function ($navbarItem) {
     });
 });
 
-// Function to hide all containers
-export function hideAllContainers() {
+function hideAllContainers() {
     $navDivs.forEach(function ($container) {
         const containerId = $container.id.split("NavClick")[0];
         const $containerToHide = document.getElementById(containerId);
@@ -42,8 +41,7 @@ export function hideAllContainers() {
     });
 }
 
-// Function to show a specific container
-export function showContainer(containerId) {
+function showContainer(containerId) {
     const $containerToShow = document.getElementById(containerId);
     if ($containerToShow) {
         $containerToShow.classList.remove('hidden');
