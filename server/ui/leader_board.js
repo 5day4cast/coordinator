@@ -1,20 +1,58 @@
 import { queryDb } from './data_access.js';
 
 //TODO:
-// create fake entries and scores of those entries
 // display the entries in a table
 // have the table replace the competition table
 // highlight the entries that placed when competition is completed
 
 export async function displayLeaderboard(competition, rowIsSelected) {
+    console.log(competition);
     const entries = getEntries(competition); //Would normally be async as need to grab entries from remote
+    // if we get no readings during the competition window 
+    // we should cancel the competition and refund people
     const currentReadings = await getReadings(competition);
     console.log(currentReadings);
     const lastForecasts = await getLastForecast(competition);
     console.log(lastForecasts);
-    const scores = calculateScores(currentReadings, lastForecasts, entries);
-    console.log(scores);
+    const entryScores = calculateScores(currentReadings, lastForecasts, entries);
+    console.log(entryScores);
+    displayScore(entryScores);
+}
 
+function displayScore(entryScores) {
+    let $competitionsDataTable = document.getElementById("competitionLeaderboardData");
+    let $tbody = $competitionsDataTable.querySelector("tbody");
+    if (!$tbody) {
+        $tbody = document.createElement("tbody");
+        $competitionsDataTable.appendChild($tbody);
+    }
+    entryScores.forEach((entryScore, index) => {
+        let $row = document.createElement("tr");
+
+        const rank = document.createElement("td");
+        cell.textContent = index;
+        $row.appendChild(rank);
+
+        const cellId = document.createElement("td");
+        cell.textContent = entryScore['id'];
+        $row.appendChild(cellId);
+
+        const cellScore = document.createElement("td");
+        cell.textContent = entryScore['score'];
+        $row.appendChild(cellScore);
+
+        $row.addEventListener("click", () => {
+            handleEntryClick($row, entry);
+        });
+
+        $tbody.appendChild($row);
+    });
+
+}
+
+function handleEntryClick($row, entry) {
+    console.log(row);
+    console.log(entry);
 }
 
 function getEntries(competition) {
@@ -29,18 +67,12 @@ function getEntries(competition) {
                 {
                     "station_id": "KBFM",
                     "wind_speed": {
-                        "forecast_val": "25 knots",
-                        "forecast_time": "2024-02-19T12:00:00Z",
                         "val": "par"
                     },
                     "temp_high": {
-                        "forecast_val": "72°F",
-                        "forecast_time": "2024-02-19T15:00:00Z",
                         "val": "over"
                     },
                     "temp_low": {
-                        "forecast_val": "60°F",
-                        "forecast_time": "2024-02-19T03:00:00Z",
                         "val": "par"
                     }
                 }
@@ -54,18 +86,12 @@ function getEntries(competition) {
                 {
                     "station_id": "KBHM",
                     "wind_speed": {
-                        "forecast_val": "20 knots",
-                        "forecast_time": "2024-02-24T11:00:00Z",
                         "val": "par"
                     },
                     "temp_high": {
-                        "forecast_val": "70°F",
-                        "forecast_time": "2024-02-24T14:00:00Z",
                         "val": "under"
                     },
                     "temp_low": {
-                        "forecast_val": "55°F",
-                        "forecast_time": "2024-02-24T02:00:00Z",
                         "val": "over"
                     }
                 }
@@ -79,18 +105,12 @@ function getEntries(competition) {
                 {
                     "station_id": "KBFM",
                     "wind_speed": {
-                        "forecast_val": "25 knots",
-                        "forecast_time": "2024-02-24T12:00:00Z",
                         "val": "over"
                     },
                     "temp_high": {
-                        "forecast_val": "72°F",
-                        "forecast_time": "2024-02-24T15:00:00Z",
                         "val": "par"
                     },
                     "temp_low": {
-                        "forecast_val": "60°F",
-                        "forecast_time": "2024-02-24T03:00:00Z",
                         "val": "under"
                     }
                 }
@@ -104,18 +124,12 @@ function getEntries(competition) {
                 {
                     "station_id": "KBHM",
                     "wind_speed": {
-                        "forecast_val": "20 knots",
-                        "forecast_time": "2024-02-24T11:00:00Z",
                         "val": "over"
                     },
                     "temp_high": {
-                        "forecast_val": "70°F",
-                        "forecast_time": "2024-02-24T14:00:00Z",
                         "val": "par"
                     },
                     "temp_low": {
-                        "forecast_val": "55°F",
-                        "forecast_time": "2024-02-24T02:00:00Z",
                         "val": "under"
                     }
                 }
@@ -129,18 +143,12 @@ function getEntries(competition) {
                 {
                     "station_id": "KMSY",
                     "wind_speed": {
-                        "forecast_val": "18 knots",
-                        "forecast_time": "2024-02-24T10:00:00Z",
                         "val": "over"
                     },
                     "temp_high": {
-                        "forecast_val": "68°F",
-                        "forecast_time": "2024-02-24T13:00:00Z",
                         "val": "par"
                     },
                     "temp_low": {
-                        "forecast_val": "52°F",
-                        "forecast_time": "2024-02-24T01:00:00Z",
                         "val": "under"
                     }
                 }
@@ -154,18 +162,12 @@ function getEntries(competition) {
                 {
                     "station_id": "KLIT",
                     "wind_speed": {
-                        "forecast_val": "22 knots",
-                        "forecast_time": "2024-02-24T09:00:00Z",
                         "val": "over"
                     },
                     "temp_high": {
-                        "forecast_val": "69°F",
-                        "forecast_time": "2024-02-24T12:00:00Z",
                         "val": "par"
                     },
                     "temp_low": {
-                        "forecast_val": "54°F",
-                        "forecast_time": "2024-02-24T00:00:00Z",
                         "val": "under"
                     }
                 }
@@ -179,18 +181,12 @@ function getEntries(competition) {
                 {
                     "station_id": "KMCI",
                     "wind_speed": {
-                        "forecast_val": "19 knots",
-                        "forecast_time": "2024-02-24T08:00:00Z",
                         "val": "over"
                     },
                     "temp_high": {
-                        "forecast_val": "67°F",
-                        "forecast_time": "2024-02-24T11:00:00Z",
                         "val": "par"
                     },
                     "temp_low": {
-                        "forecast_val": "53°F",
-                        "forecast_time": "2024-02-24T23:00:00Z",
                         "val": "under"
                     }
                 }
@@ -204,18 +200,12 @@ function getEntries(competition) {
                 {
                     "station_id": "KBFM",
                     "wind_speed": {
-                        "forecast_val": "23 knots",
-                        "forecast_time": "2024-02-24T07:00:00Z",
                         "val": "over"
                     },
                     "temp_high": {
-                        "forecast_val": "68°F",
-                        "forecast_time": "2024-02-24T10:00:00Z",
                         "val": "par"
                     },
                     "temp_low": {
-                        "forecast_val": "55°F",
-                        "forecast_time": "2024-02-24T22:00:00Z",
                         "val": "under"
                     }
                 }
@@ -229,18 +219,12 @@ function getEntries(competition) {
                 {
                     "station_id": "KBHM",
                     "wind_speed": {
-                        "forecast_val": "21 knots",
-                        "forecast_time": "2024-02-24T06:00:00Z",
                         "val": "over"
                     },
                     "temp_high": {
-                        "forecast_val": "71°F",
-                        "forecast_time": "2024-02-24T09:00:00Z",
                         "val": "par"
                     },
                     "temp_low": {
-                        "forecast_val": "56°F",
-                        "forecast_time": "2024-02-24T21:00:00Z",
                         "val": "under"
                     }
                 }
@@ -251,7 +235,16 @@ function getEntries(competition) {
 }
 
 async function getReadings(competition) {
+    console.log(competition);
+    // remove this once hooked up to the backend, just used for now for testing
+
+    const startTime = new Date(competition.startTime);
+    const threeHoursAgoUTCDate = new Date(startTime.getTime() - (3 * 3600 * 1000));
+
     const station_ids = competition.cities;
+    // change to `AND generated_at >= '${competition.startTime}'::TIMESTAMPTZ`
+    // once observation data is definitely there
+
     const query = `
         SELECT 
             station_id, 
@@ -263,12 +256,11 @@ async function getReadings(competition) {
         FROM observations 
         WHERE station_id IN ('${station_ids.join('\', \'')}') 
             AND generated_at <= '${competition.endTime}'::TIMESTAMPTZ 
-            AND generated_at >= '${competition.startTime}'::TIMESTAMPTZ 
+            AND generated_at >= '${threeHoursAgoUTCDate.toISOString()}'::TIMESTAMPTZ 
         GROUP BY station_id;`;
     const readings = await queryDb(query);
-    console.log(readings);
     const station_readings = {};
-    for (let reading in readings) {
+    for (let reading of readings) {
         station_readings[reading.station_id] = reading;
     }
 
@@ -276,6 +268,7 @@ async function getReadings(competition) {
 }
 
 async function getLastForecast(competition) {
+    console.log(competition);
     const station_ids = competition.cities;
     const query = `
     SELECT 
@@ -286,27 +279,29 @@ async function getLastForecast(competition) {
         last(wind_speed) as wind_speed 
     FROM forecasts 
     WHERE station_id IN ('${station_ids.join('\', \'')}') 
-        AND generated_at <= '${competition.startTime}'::TIMESTAMPTZ 
+        AND begin_time >= '${competition.startTime}'::TIMESTAMPTZ 
+        AND end_time <= '${competition.endTime}'::TIMESTAMPTZ 
     GROUP BY station_id;`;
     const forecasts = await queryDb(query);
     const station_forecast = {};
-    for (forecast in forecasts) {
+    for (let forecast of forecasts) {
         station_forecast[forecast.station_id] = forecasts;
     }
     return station_forecast;
 }
 
 function calculateScores(weatherReadings, lastForecasts, entries) {
-    for (var i = 0; i < entries.length; i++) {
-        const entry = entries[i];
+    for (let entry of entries) {
         let currentScore = 0;
-        for (var j = 0; j < entry.options.length; j++) {
-            const option = entry.options[j];
+        for (let option of entry.options) {
             const station_id = option.station_id;
             console.log(lastForecasts);
+            console.log(weatherReadings);
             console.log(station_id);
             const forecast = lastForecasts[station_id];
+            console.log(forecast);
             const observation = weatherReadings[station_id];
+            console.log(observation);
             Object.keys(option).forEach((key) => {
                 if (key == "station_id") {
                     return;
@@ -317,6 +312,7 @@ function calculateScores(weatherReadings, lastForecasts, entries) {
         }
         entries[i]['score'] = currentScore;
     }
+    entries.sort((a, b) => b.score - a.score);
     return entries;
 }
 

@@ -33,8 +33,7 @@ export async function submitDownloadRequest() {
 
 function fetchFileNames() {
     const currentUTCDate = new Date();
-    // 1hour
-    const fourHoursAgoUTCDate = new Date(currentUTCDate.getTime() - (1 * 3600 * 1000));
+    const fourHoursAgoUTCDate = new Date(currentUTCDate.getTime() - (4 * 3600 * 1000));
     const rfc3339TimeFourHoursAgo = fourHoursAgoUTCDate.toISOString();
     const rfc3339TimeUTC = currentUTCDate.toISOString();
 
