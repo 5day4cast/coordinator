@@ -10,13 +10,14 @@ class LeaderBoard {
     }
 
     async init() {
-        const entries = this.getEntries(this.competition); //Would normally be async as need to grab entries from remote
+        this.clearTable();
         // if we get no readings during the competition window 
         // we should cancel the competition and refund people
         Promise.all([
+            this.getEntries(this.competition),
             this.getReadings(this.competition),
             this.getLastForecast(this.competition)
-        ]).then(([observations, lastForecasts]) => {
+        ]).then(([entries, observations, lastForecasts]) => {
             console.log(observations);
             console.log(lastForecasts);
             const entryScores = this.calculateScores(observations, lastForecasts, entries);
@@ -26,7 +27,6 @@ class LeaderBoard {
     }
 
     async getReadings(competition) {
-        console.log(competition);
         // remove this once hooked up to the backend, just used for now for testing
         // should use competition start/end instead
         const startTime = new Date(competition.startTime);
@@ -101,6 +101,16 @@ class LeaderBoard {
         }
     }
 
+    clearTable() {
+        let $competitionsDataTable = document.getElementById("competitionLeaderboardData");
+        let $tbody = $competitionsDataTable.querySelector("tbody");
+        if ($tbody) {
+            while ($tbody.firstChild) {
+                $tbody.removeChild($tbody.firstChild);
+            }
+        }
+    }
+
     displayScore(entryScores) {
         let $competitionsDataTable = document.getElementById("competitionLeaderboardData");
         let $tbody = $competitionsDataTable.querySelector("tbody");
@@ -114,7 +124,7 @@ class LeaderBoard {
             const rank = document.createElement("td");
             rank.textContent = index;
             $row.appendChild(rank);
-            if (entryScore['score'] == undefined || entryScore['score'] == null){
+            if (entryScore['score'] == undefined || entryScore['score'] == null) {
                 console.error("no score found for entry:", entryScore['id']);
                 return
             }
@@ -128,29 +138,133 @@ class LeaderBoard {
             $row.appendChild(cellScore);
 
             $row.addEventListener("click", () => {
-                this.handleEntryClick($row, entry);
+                this.handleEntryClick($row, entryScore);
             });
 
             $tbody.appendChild($row);
+            this.showLeaderboard();
         });
+    }
+
+    showLeaderboard() {
+        let $currentCompetitionCurrent = document.getElementById("competitionLeaderboard");
+        $currentCompetitionCurrent.classList.remove('hidden');
+    }
+
+    hideLeaderboard() {
+        let $currentCompetitionCurrent = document.getElementById("competitionLeaderboard");
+        $currentCompetitionCurrent.classList.add('hidden');
     }
 
     getEntries(competition) {
         if (competition['id'] == '295ecf23-ef65-4708-9314-0fc7614b623d') {
-            return completedEntries
+            return new Promise((resolve, reject) => {
+                setTimeout(() => {
+                    resolve(completedEntries)
+                }, 500)
+            });
         } else {
-            return runningEntries
+            return new Promise((resolve, reject) => {
+                setTimeout(() => {
+                    resolve(runningEntries)
+                }, 500)
+            });
         }
     }
 
     handleEntryClick($row, entry) {
-        console.log(row);
+        console.log($row);
         console.log(entry);
+        const $parentElement = $row.parentElement;
+        const $rows = $parentElement.querySelectorAll("tr");
+        $rows.forEach($currentRow => {
+            if ($currentRow != $row) {
+                $currentRow.classList.remove('is-selected');
+            }
+        });
+        $row.classList.toggle('is-selected');
+        console.log(entry);
+        this.showEntry(entry);
+    }
+
+
+    showEntry(entry) {
+        let $entryScoreModal = document.getElementById("entryScore");
+        this.clearEntry();
+
+        let $entryValues = document.getElementById('entryValues');
+        let $competitionId = document.createElement('h3');
+        console.log(entry);
+        $competitionId.textContent = `Competition: ${entry.competition_id}`
+        $entryValues.appendChild($competitionId);
+
+        for (let option of entry['options']) {
+            let $stationDiv = document.createElement('div');
+            if (option['station_id']) {
+                let $stationHeader = document.createElement('h5');
+                $stationHeader.textContent = `Station: ${option.station_id}`;
+                $stationHeader.classList.add("ml-2");
+                $stationDiv.appendChild($stationHeader);
+            }
+            let $stationList = document.createElement('ul');
+            if (option['wind_speed']) {
+                let $optionListItem = document.createElement('li');
+                // forecast val, observation val, val, score
+                //$optionListItem.textContent = `Wind Speed ${} ${} ${} ${}`
+                $optionListItem.classList.add("ml-4");
+                $optionListItem.textContent = `Wind Speed: ${option['wind_speed']['val']}`
+                $stationList.appendChild($optionListItem);
+            }
+            if (option['temp_high']) {
+                let $optionListItem = document.createElement('li');
+                // forecast val, observation val, val, score
+                //$optionListItem.textContent = `Wind Speed ${} ${} ${} ${}`
+                $optionListItem.classList.add("ml-4");
+                $optionListItem.textContent = `High Temp: ${option['temp_high']['val']}`
+                $stationList.appendChild($optionListItem);
+            }
+
+            if (option['temp_low']) {
+                let $optionListItem = document.createElement('li');
+                // forecast val, observation val, val, score
+                //$optionListItem.textContent = `Wind Speed ${} ${} ${} ${}`
+                $optionListItem.classList.add("ml-4");
+                $optionListItem.textContent = `High Low: ${option['temp_low']['val']}`
+                $stationList.appendChild($optionListItem);
+            }
+
+            $stationDiv.appendChild($stationList);
+            $entryValues.appendChild($stationDiv);
+
+        }
+
+        let $totalPts = document.createElement('h6');
+        $totalPts.textContent = `Total Points: ${entry.score}`
+        $entryValues.appendChild($totalPts);
+
+
+        if (!$entryScoreModal.classList.contains('is-active')) {
+            $entryScoreModal.classList.add('is-active');
+        }
+    }
+
+    hideEntry() {
+        let $entryScoreModal = document.getElementById("entryScore");
+        if ($entryScoreModal.classList.contains('is-active')) {
+            $entryScoreModal.classList.remove('is-active');
+        }
+    }
+
+    clearEntry() {
+        let $entryValues = document.getElementById('entryValues');
+        if ($entryValues) {
+            while ($entryValues.firstChild) {
+                $entryValues.removeChild($entryValues.firstChild);
+            }
+        }
     }
 
 }
-
-export default LeaderBoard;
 
 const runningEntries = [
 
@@ -164,12 +278,15 @@ const runningEntries = [
                 "wind_speed": {
                     "val": "par"
                 },
+            },
+            {
+                "station_id": "v",
+                "wind_speed": {
+                    "val": "par"
+                },
                 "temp_high": {
                     "val": "over"
                 },
-                "temp_low": {
-                    "val": "par"
-                }
             }
         ]
     },
@@ -339,11 +456,14 @@ const completedEntries = [
                 "wind_speed": {
                     "val": "par"
                 },
+            },
+            {
+                "station_id": "KMSY",
                 "temp_high": {
-                    "val": "over"
+                    "val": "par"
                 },
                 "temp_low": {
-                    "val": "par"
+                    "val": "under"
                 }
             }
         ]

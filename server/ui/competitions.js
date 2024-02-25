@@ -27,7 +27,6 @@ class Competitions {
             this.get_stations(),
             this.get_competitions()
         ]).then(([stations, competitions]) => {
-            console.log(stations);
             this.stations = stations;
             this.competitions = competitions;
             this.competitions.forEach(competition => {
@@ -126,7 +125,6 @@ class Competitions {
     }
 
     handleCompetitionClick(row, competition) {
-        console.log(row);
         const parentElement = row.parentElement;
         const rows = parentElement.querySelectorAll("tr");
         rows.forEach(currentRow => {
@@ -137,6 +135,9 @@ class Competitions {
         row.classList.toggle('is-selected');
         let rowIsSelected = row.classList.contains('is-selected');
         if (competition['status'] == 'live') {
+            if (this.leader_board){
+                this.leader_board.hideLeaderboard();
+            }
             this.makeCompetitionMap(competition).then(result => {
                 this.showCurrentCompetition(rowIsSelected);
             }).catch(error => {
@@ -144,8 +145,8 @@ class Competitions {
             });
         } else {
             this.hideCurrentCompetition();
-            let leader_board = new LeaderBoard(this.base_url, competition);
-            leader_board.init().then(result => {
+            this.leader_board = new LeaderBoard(this.base_url, competition);
+            this.leader_board.init().then(result => {
                 console.log("leaderboard displayed");
             }).catch(error => {
                 console.error(error);
@@ -156,7 +157,6 @@ class Competitions {
     showCurrentCompetition(isSelected) {
         let $currentCompetitionCurrent = document.getElementById("currentCompetition");
         if (!isSelected) {
-            console.log('is not selected');
             $currentCompetitionCurrent.classList.add('hidden');
             return
         }
@@ -169,14 +169,10 @@ class Competitions {
     }
 
     async makeCompetitionMap(competition) {
-
-        console.log(competition);
         let oldMap = this.currentMaps["map"]; // Retrieve map instance by div ID
-        console.log(oldMap);
         if (oldMap !== undefined) {
             oldMap.remove();
         }
-        console.log("creating map");
         const map = L.map('map', { dragging: false, trackResize: true }).setView([39.8283, -98.5795], 4.4); // Centered on the US
         L.tileLayer('https://tiles.stadiamaps.com/tiles/stamen_toner_background/{z}/{x}/{y}{r}.{ext}', {
             minZoom: 4,
@@ -189,22 +185,16 @@ class Competitions {
             ]
         }).addTo(map);
         const points = await this.getCompetitionPoints(competition.cities);
-        console.log(points);
         points.forEach(point => {
             let marker = L.circleMarker([point.latitude, point.longitude], {
             }).addTo(map);
             // Extend the pop here
             marker.bindPopup(`${point.station_name} (${point.station_id})`).openPopup();
         });
-        console.log("creating map 2");
-
         this.currentMaps['map'] = map;
     }
 
     async getCompetitionPoints(station_ids) {
-        //build from stations list
-        console.log(station_ids);
-        console.log(this.stations);
         let competitionPoints = [];
         for (let station_id of station_ids) {
             let station = this.stations[station_id];
@@ -212,19 +202,15 @@ class Competitions {
                 competitionPoints.push(station);
             }
         }
-        console.log(competitionPoints);
         return competitionPoints;
     }
 
     async get_stations() {
         const stations = await this.weather_data.get_stations();
-        console.log(stations);
         let stations_mapping = {};
         for (let station of stations) {
-            console.log(station);
             stations_mapping[station.station_id] = station
         }
-        console.log(stations_mapping);
         return stations_mapping;
     }
 }
