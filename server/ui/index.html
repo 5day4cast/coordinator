@@ -83,8 +83,9 @@
             </div>
         </div>
         <div id="competitionLeaderboard" class="container hidden">
-            <!--should work for current and past competitions-->
-            <div>Leader Board</div>
+            <h4 class="title">
+                Leader Board
+            </h4>
             <div class="table-container" id="competitions">
                 <table id="competitionLeaderboardData" class="table is-striped is-bordered is-narrow">
                     <thead>
@@ -101,7 +102,7 @@
         </div>
         <div id="entry" class="container hidden"><!--maybe this should be a module?--></div>
         <div id="entries" class="container hidden">
-            <div>enteries</div>
+            <div>entries</div>
             <div class="table-container" id="usersEntries">
                 <!-- all enteries that have been entered into-->
             </div>
@@ -118,6 +119,16 @@
         <!-- (optional) chat powered by nostr (cheap/open source communication) -->
         </div>
     </section>
+
+    <div id="entryScore" class="modal">
+        <div class="modal-background"></div>
+        <div class="modal-content">
+            <div class="box">
+                <div id="entryValues"></div>
+            </div>
+        </div>
+        <button class="modal-close is-large" aria-label="close"></button>
+    </div>
 </body>
 
 </html>
