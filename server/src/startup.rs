@@ -14,9 +14,10 @@ pub struct AppState {
     pub logger: Logger,
     pub ui_dir: String,
     pub remote_url: String,
+    pub oracle_url: String,
 }
 
-pub fn app(logger: Logger, remote_url: String, ui_dir: String) -> Router {
+pub fn app(logger: Logger, remote_url: String, oracle_url: String, ui_dir: String) -> Router {
     let cors = CorsLayer::new()
         // allow `GET` and `POST` when accessing the resource
         .allow_methods([Method::GET, Method::POST])
@@ -24,11 +25,12 @@ pub fn app(logger: Logger, remote_url: String, ui_dir: String) -> Router {
         .allow_origin(Any);
 
     // The ui folder needs to be generated and have this relative path from where the binary is being run
-    let serve_dir = ServeDir::new("ui").not_found_service(ServeFile::new(ui_dir.clone()));
+    let serve_dir = ServeDir::new(ui_dir.clone()).not_found_service(ServeFile::new(ui_dir.clone()));
     let app_state = AppState {
         logger,
         ui_dir,
         remote_url,
+        oracle_url
     };
     Router::new()
         .route("/", get(index_handler))

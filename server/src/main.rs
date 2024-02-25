@@ -20,7 +20,9 @@ async fn main() -> anyhow::Result<()> {
         logger,
         cli.remote_url
             .unwrap_or(String::from("http://127.0.0.1:9990")),
-        cli.ui_dir.unwrap_or(String::from("./ui")),
+        cli.oracle_url
+            .unwrap_or(String::from("https://www.4casttruth.win")),
+        cli.ui_dir.unwrap_or(String::from("./server/ui")),
     );
     Server::bind(&address)
         .serve(app.into_make_service())

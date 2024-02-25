@@ -53,6 +53,10 @@ pub struct Cli {
     /// Path to files used to make the browser UI (default: ./ui)
     #[arg(short, long)]
     pub ui_dir: Option<String>,
+
+    // Url UI should hit for oracle weather data (default: https://www.4casttruth.win)
+    #[arg(short, long)]
+    pub oracle_url: Option<String>
 }
 
 pub fn get_config_info() -> Cli {

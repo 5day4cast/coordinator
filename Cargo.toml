@@ -1,0 +1,4 @@
+# [PROJECT_DIR]/Cargo.toml
+[workspace]
+resolver = "2"
+members = ["server"]
