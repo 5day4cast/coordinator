@@ -54,15 +54,15 @@ class Competitions {
 
     get_competitions() {
         var date = new Date();
-        const oneHoursAgoUTCDate = new Date(date.getTime() - (1 * 3600 * 1000));
-        const twoHoursAgoUTCDate = new Date(date.getTime() - (2 * 3600 * 1000));
-        const oneHourFromNowUTCDate = new Date(date.getTime() + (1 * 3600 * 1000));
+        const sixHoursAgoUTCDate = new Date(date.getTime() - (6 * 3600 * 1000));
+
         const twelveHoursFromNowUTCDate = new Date(date.getTime() + (12 * 3600 * 1000));
+        const oneDayAndHalfFromNowUTCDate = new Date(date.getTime() + (36 * 3600 * 1000));
 
         const rfc3339TimetwelveHoursFromNow = twelveHoursFromNowUTCDate.toISOString();
-        const rfc3339TwoHoursAgoUTCDate = twoHoursAgoUTCDate.toISOString();
-        const rfc3339TimeOneHourFromNow = oneHourFromNowUTCDate.toISOString();
-        const rfc3339TimeOneHourAgo = oneHoursAgoUTCDate.toISOString();
+
+        const rfc3339SixHoursAgo = sixHoursAgoUTCDate.toISOString();
+        const rfc3339OneDayAndHalfFromNow = oneDayAndHalfFromNowUTCDate.toISOString();
 
         //NOTE: for real competitions we should be doing this over 12 or 24 hour windows
         //observation reports don't always get created every hour for every station's value
@@ -72,8 +72,8 @@ class Competitions {
                     {
                         "id": "671657f5-a437-453e-b9fa-4c50705dc607",
                         "name": "Tiger Roar Challenge",
-                        "startTime": rfc3339TimeOneHourFromNow,
-                        "endTime": rfc3339TimetwelveHoursFromNow,
+                        "startTime": rfc3339TimetwelveHoursFromNow,
+                        "endTime": rfc3339OneDayAndHalfFromNow,
                         "status": "live",
                         "totalPrizePoolAmt": "$60",
                         "totalEntries": 30,
@@ -82,8 +82,8 @@ class Competitions {
                     {
                         "id": "70bc176c-4b30-46c0-8720-b1535d15ba34",
                         "name": "Unicorn Gallop Grand Prix",
-                        "startTime": rfc3339TwoHoursAgoUTCDate,
-                        "endTime": rfc3339TimeOneHourFromNow,
+                        "startTime": rfc3339SixHoursAgo,
+                        "endTime": rfc3339OneDayAndHalfFromNow,
                         "status": "running",
                         "totalPrizePoolAmt": "$20",
                         "totalEntries": 10,
@@ -92,8 +92,8 @@ class Competitions {
                     {
                         "id": "295ecf23-ef65-4708-9314-0fc7614b623d",
                         "name": "Gryphon's Claws Tournament",
-                        "startTime": rfc3339TwoHoursAgoUTCDate,
-                        "endTime": rfc3339TimeOneHourAgo,
+                        "startTime": rfc3339SixHoursAgo,
+                        "endTime": rfc3339OneDayAndHalfFromNow, //Change to a time in the past once data catches up
                         "status": "completed",
                         "totalPrizePoolAmt": "$16",
                         "totalEntries": 8,
@@ -102,8 +102,8 @@ class Competitions {
                     {
                         "id": "57bd5d1e-a7ae-422e-8673-81ebb6227bf8",
                         "name": "Mermaid's Song Showcase",
-                        "startTime": rfc3339TimeOneHourFromNow,
-                        "endTime": rfc3339TimetwelveHoursFromNow,
+                        "startTime": rfc3339TimetwelveHoursFromNow,
+                        "endTime": rfc3339OneDayAndHalfFromNow,
                         "status": "live",
                         "totalPrizePoolAmt": "$60",
                         "totalEntries": 30,
@@ -112,8 +112,8 @@ class Competitions {
                     {
                         "id": "cdf5b892-8d21-4264-ab65-9bc3e80e535d",
                         "name": "Chimera Chase Extravaganza",
-                        "startTime": rfc3339TimeOneHourFromNow,
-                        "endTime": rfc3339TimetwelveHoursFromNow,
+                        "startTime": rfc3339TimetwelveHoursFromNow,
+                        "endTime": rfc3339OneDayAndHalfFromNow,
                         "status": "live",
                         "totalPrizePoolAmt": "$20",
                         "totalEntries": 10,

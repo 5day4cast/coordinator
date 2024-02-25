@@ -2,7 +2,6 @@ import { WeatherData } from './weather_data.js';
 
 //TODO:
 // highlight the entries that placed/won money when competition is completed
-// pop-up showing entry
 class LeaderBoard {
     constructor(base_url, competition) {
         this.competition = competition;
@@ -27,27 +26,23 @@ class LeaderBoard {
     }
 
     async getReadings(competition) {
-        // remove this once hooked up to the backend, just used for now for testing
-        // should use competition start/end instead
-        const startTime = new Date(competition.startTime);
-        const threeHoursAgoUTCDate = new Date(startTime.getTime() - (3 * 3600 * 1000));
-
-        const station_ids = competition.cities;
-        return await this.weather_data.get_observations(station_ids, {
-            'start': startTime.toISOString(),
-            'end': threeHoursAgoUTCDate.toISOString()
+        const observations = await this.weather_data.get_observations(competition.cities, {
+            'start': competition.startTime,
+            'end': competition.endTime
         });
+        console.log(observations);
+        const station_observations = {};
+        for (let observation of observations) {
+            station_observations[observation.station_id] = observation;
+        }
+        return station_observations;
     }
 
     async getLastForecast(competition) {
         console.log(competition);
-        const station_ids = competition.cities;
-        const startTime = new Date(competition.startTime);
-        const threeHoursAgoUTCDate = new Date(startTime.getTime() - (3 * 3600 * 1000));
-
-        const forecasts = await this.weather_data.get_forecasts(station_ids, {
-            'start': startTime.toISOString(),
-            'end': threeHoursAgoUTCDate.toISOString()
+        const forecasts = await this.weather_data.get_forecasts(competition.cities, {
+            'start': competition.startTime,
+            'end': competition.endTime
         })
         console.log(forecasts);
         const station_forecast = {};
