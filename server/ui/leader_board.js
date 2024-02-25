@@ -47,7 +47,7 @@ class LeaderBoard {
         console.log(forecasts);
         const station_forecast = {};
         for (let forecast of forecasts) {
-            station_forecast[forecast.station_id] = forecasts;
+            station_forecast[forecast.station_id] = forecast;
         }
         return station_forecast;
     }
@@ -77,6 +77,9 @@ class LeaderBoard {
                         return;
                     }
                     const optionScore = this.calculateOptionScore(forecast[key], observation[key], option[key].val);
+                    option[key]['score'] = optionScore;
+                    option[key]['forecast'] = forecast[key];
+                    option[key]['observation'] = observation[key];
                     currentScore += optionScore;
                 });
             }
@@ -117,7 +120,7 @@ class LeaderBoard {
             let $row = document.createElement("tr");
 
             const rank = document.createElement("td");
-            rank.textContent = index;
+            rank.textContent = index+1;
             $row.appendChild(rank);
             if (entryScore['score'] == undefined || entryScore['score'] == null) {
                 console.error("no score found for entry:", entryScore['id']);
@@ -203,29 +206,14 @@ class LeaderBoard {
             }
             let $stationList = document.createElement('ul');
             if (option['wind_speed']) {
-                let $optionListItem = document.createElement('li');
-                // forecast val, observation val, val, score
-                //$optionListItem.textContent = `Wind Speed ${} ${} ${} ${}`
-                $optionListItem.classList.add("ml-4");
-                $optionListItem.textContent = `Wind Speed: ${option['wind_speed']['val']}`
-                $stationList.appendChild($optionListItem);
+                this.buildEntryScorePick($stationList, "Wind Speed", option['wind_speed']);
             }
             if (option['temp_high']) {
-                let $optionListItem = document.createElement('li');
-                // forecast val, observation val, val, score
-                //$optionListItem.textContent = `Wind Speed ${} ${} ${} ${}`
-                $optionListItem.classList.add("ml-4");
-                $optionListItem.textContent = `High Temp: ${option['temp_high']['val']}`
-                $stationList.appendChild($optionListItem);
+                this.buildEntryScorePick($stationList, "High Temp", option['temp_high']);
             }
 
             if (option['temp_low']) {
-                let $optionListItem = document.createElement('li');
-                // forecast val, observation val, val, score
-                //$optionListItem.textContent = `Wind Speed ${} ${} ${} ${}`
-                $optionListItem.classList.add("ml-4");
-                $optionListItem.textContent = `High Low: ${option['temp_low']['val']}`
-                $stationList.appendChild($optionListItem);
+                this.buildEntryScorePick($stationList, "Low Temp", option['temp_low']);
             }
 
             $stationDiv.appendChild($stationList);
@@ -241,6 +229,37 @@ class LeaderBoard {
         if (!$entryScoreModal.classList.contains('is-active')) {
             $entryScoreModal.classList.add('is-active');
         }
+    }
+
+    buildEntryScorePick($stationList, type, option) {
+        let $optionListItem = document.createElement('li');
+        // forecast val, observation val, val, score
+        //$optionListItem.textContent = `Wind Speed ${} ${} ${} ${}`
+        $optionListItem.classList.add("ml-4");
+        $optionListItem.textContent = `${type}: `;
+        let $breakdown = document.createElement('ul');
+
+        let $forecast = document.createElement('li');
+        $forecast.classList.add("ml-6");
+        $forecast.textContent = `Forecast: ${option['forecast']}`;
+        $breakdown.appendChild($forecast);
+
+        let $observation = document.createElement('li');
+        $observation.classList.add("ml-6");
+        $observation.textContent = `Observation: ${option['observation']}`;
+        $breakdown.appendChild($observation);
+
+        let $pick = document.createElement('li');
+        $pick.classList.add("ml-6");
+        $pick.textContent = `Pick: ${option['val']}`;
+        $breakdown.appendChild($pick);
+
+        let $score = document.createElement('li');
+        $score.classList.add("ml-6");
+        $score.textContent = `Score: ${option['score']}`;
+        $breakdown.appendChild($score);
+        $optionListItem.appendChild($breakdown);
+        $stationList.appendChild($optionListItem);
     }
 
     hideEntry() {
