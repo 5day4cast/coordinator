@@ -1,5 +1,0 @@
-level = "debug"
-ui_dir = "./server/ui"
-host = "127.0.0.1"
-port = "9990"
-remote_url = "http://127.0.0.1:9990"

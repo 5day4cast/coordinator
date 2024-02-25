@@ -1,66 +1,156 @@
-import { queryDb } from './data_access.js';
+import { WeatherData } from './weather_data.js';
 
 //TODO:
 // highlight the entries that placed/won money when competition is completed
 // pop-up showing entry
-
-export async function displayLeaderboard(competition, rowIsSelected) {
-    console.log(competition);
-    const entries = getEntries(competition); //Would normally be async as need to grab entries from remote
-    // if we get no readings during the competition window 
-    // we should cancel the competition and refund people
-    const currentReadings = await getReadings(competition);
-    console.log(currentReadings);
-    const lastForecasts = await getLastForecast(competition);
-    console.log(lastForecasts);
-    const entryScores = calculateScores(currentReadings, lastForecasts, entries);
-    console.log(entryScores);
-    displayScore(entryScores);
-}
-
-function displayScore(entryScores) {
-    let $competitionsDataTable = document.getElementById("competitionLeaderboardData");
-    let $tbody = $competitionsDataTable.querySelector("tbody");
-    if (!$tbody) {
-        $tbody = document.createElement("tbody");
-        $competitionsDataTable.appendChild($tbody);
+class LeaderBoard {
+    constructor(base_url, competition) {
+        this.competition = competition;
+        this.weather_data = new WeatherData(base_url);
     }
-    entryScores.forEach((entryScore, index) => {
-        let $row = document.createElement("tr");
 
-        const rank = document.createElement("td");
-        cell.textContent = index;
-        $row.appendChild(rank);
-
-        const cellId = document.createElement("td");
-        cell.textContent = entryScore['id'];
-        $row.appendChild(cellId);
-
-        const cellScore = document.createElement("td");
-        cell.textContent = entryScore['score'];
-        $row.appendChild(cellScore);
-
-        $row.addEventListener("click", () => {
-            handleEntryClick($row, entry);
+    async init() {
+        const entries = this.getEntries(this.competition); //Would normally be async as need to grab entries from remote
+        // if we get no readings during the competition window 
+        // we should cancel the competition and refund people
+        Promise.all([
+            this.getReadings(this.competition),
+            this.getLastForecast(this.competition)
+        ]).then(([observations, lastForecasts]) => {
+            console.log(observations);
+            console.log(lastForecasts);
+            const entryScores = this.calculateScores(observations, lastForecasts, entries);
+            console.log(entryScores);
+            this.displayScore(entryScores);
         });
-
-        $tbody.appendChild($row);
-    });
-
-}
-
-function handleEntryClick($row, entry) {
-    console.log(row);
-    console.log(entry);
-}
-
-function getEntries(competition) {
-    if (competition['id'] == '295ecf23-ef65-4708-9314-0fc7614b623d') {
-        return completedEntries
-    } else {
-        return runningEntries
     }
+
+    async getReadings(competition) {
+        console.log(competition);
+        // remove this once hooked up to the backend, just used for now for testing
+        // should use competition start/end instead
+        const startTime = new Date(competition.startTime);
+        const threeHoursAgoUTCDate = new Date(startTime.getTime() - (3 * 3600 * 1000));
+
+        const station_ids = competition.cities;
+        return await this.weather_data.get_observations(station_ids, {
+            'start': startTime.toISOString(),
+            'end': threeHoursAgoUTCDate.toISOString()
+        });
+    }
+
+    async getLastForecast(competition) {
+        console.log(competition);
+        const station_ids = competition.cities;
+        const startTime = new Date(competition.startTime);
+        const threeHoursAgoUTCDate = new Date(startTime.getTime() - (3 * 3600 * 1000));
+
+        const forecasts = await this.weather_data.get_forecasts(station_ids, {
+            'start': startTime.toISOString(),
+            'end': threeHoursAgoUTCDate.toISOString()
+        })
+        console.log(forecasts);
+        const station_forecast = {};
+        for (let forecast of forecasts) {
+            station_forecast[forecast.station_id] = forecasts;
+        }
+        return station_forecast;
+    }
+
+    calculateScores(weatherReadings, lastForecasts, entries) {
+        for (let entry of entries) {
+            let currentScore = 0;
+            for (let option of entry.options) {
+                const station_id = option.station_id;
+                console.log(lastForecasts);
+                console.log(weatherReadings);
+                console.log(station_id);
+                const forecast = lastForecasts[station_id];
+                console.log(forecast);
+                if (!forecast) {
+                    console.error("no forecast found for:", station_id);
+                    continue;
+                }
+                const observation = weatherReadings[station_id];
+                console.log(observation);
+                if (!forecast) {
+                    console.error("no observations found for:", station_id);
+                    continue;
+                }
+                Object.keys(option).forEach((key) => {
+                    if (key == "station_id") {
+                        return;
+                    }
+                    const optionScore = this.calculateOptionScore(forecast[key], observation[key], option[key].val);
+                    currentScore += optionScore;
+                });
+            }
+            entry['score'] = currentScore;
+        }
+        entries.sort((a, b) => b.score - a.score);
+        return entries;
+    }
+
+    calculateOptionScore(forecast_val, observation_val, entry_val) {
+        if (forecast_val > observation_val) {
+            return (entry_val == "over") ? 1 : 0
+        } else if (forecast_val == observation_val) {
+            return (entry_val == "par") ? 2 : 0
+        } else {
+            return (entry_val == "under") ? 1 : 0
+        }
+    }
+
+    displayScore(entryScores) {
+        let $competitionsDataTable = document.getElementById("competitionLeaderboardData");
+        let $tbody = $competitionsDataTable.querySelector("tbody");
+        if (!$tbody) {
+            $tbody = document.createElement("tbody");
+            $competitionsDataTable.appendChild($tbody);
+        }
+        entryScores.forEach((entryScore, index) => {
+            let $row = document.createElement("tr");
+
+            const rank = document.createElement("td");
+            rank.textContent = index;
+            $row.appendChild(rank);
+            if (entryScore['score'] == undefined || entryScore['score'] == null){
+                console.error("no score found for entry:", entryScore['id']);
+                return
+            }
+
+            const cellId = document.createElement("td");
+            cellId.textContent = entryScore['id'];
+            $row.appendChild(cellId);
+
+            const cellScore = document.createElement("td");
+            cellScore.textContent = entryScore['score'];
+            $row.appendChild(cellScore);
+
+            $row.addEventListener("click", () => {
+                this.handleEntryClick($row, entry);
+            });
+
+            $tbody.appendChild($row);
+        });
+    }
+
+    getEntries(competition) {
+        if (competition['id'] == '295ecf23-ef65-4708-9314-0fc7614b623d') {
+            return completedEntries
+        } else {
+            return runningEntries
+        }
+    }
+
+    handleEntryClick($row, entry) {
+        console.log(row);
+        console.log(entry);
+    }
+
 }
+
+export default LeaderBoard;
 
 const runningEntries = [
 
@@ -412,95 +502,4 @@ const completedEntries = [
     }
 ];
 
-
-async function getReadings(competition) {
-    console.log(competition);
-    // remove this once hooked up to the backend, just used for now for testing
-
-    const startTime = new Date(competition.startTime);
-    const threeHoursAgoUTCDate = new Date(startTime.getTime() - (3 * 3600 * 1000));
-
-    const station_ids = competition.cities;
-    // change to `AND generated_at >= '${competition.startTime}'::TIMESTAMPTZ`
-    // once observation data is definitely there
-
-    const query = `
-        SELECT 
-            station_id, 
-            min(generated_at) as start_time, 
-            max(generated_at) as end_time, 
-            min(temperature_value) as temp_low, 
-            max(temperature_value) as temp_high, 
-            max(wind_speed) as wind_speed 
-        FROM observations 
-        WHERE station_id IN ('${station_ids.join('\', \'')}') 
-            AND generated_at <= '${competition.endTime}'::TIMESTAMPTZ 
-            AND generated_at >= '${threeHoursAgoUTCDate.toISOString()}'::TIMESTAMPTZ 
-        GROUP BY station_id;`;
-    const readings = await queryDb(query);
-    const station_readings = {};
-    for (let reading of readings) {
-        station_readings[reading.station_id] = reading;
-    }
-
-    return station_readings;
-}
-
-async function getLastForecast(competition) {
-    console.log(competition);
-    const station_ids = competition.cities;
-    const query = `
-    SELECT 
-        station_id, 
-        max(generated_at) as last_time, 
-        last(max_temp) as temp_high, 
-        last(min_temp) as temp_low, 
-        last(wind_speed) as wind_speed 
-    FROM forecasts 
-    WHERE station_id IN ('${station_ids.join('\', \'')}') 
-        AND begin_time >= '${competition.startTime}'::TIMESTAMPTZ 
-        AND end_time <= '${competition.endTime}'::TIMESTAMPTZ 
-    GROUP BY station_id;`;
-    const forecasts = await queryDb(query);
-    const station_forecast = {};
-    for (let forecast of forecasts) {
-        station_forecast[forecast.station_id] = forecasts;
-    }
-    return station_forecast;
-}
-
-function calculateScores(weatherReadings, lastForecasts, entries) {
-    for (let entry of entries) {
-        let currentScore = 0;
-        for (let option of entry.options) {
-            const station_id = option.station_id;
-            console.log(lastForecasts);
-            console.log(weatherReadings);
-            console.log(station_id);
-            const forecast = lastForecasts[station_id];
-            console.log(forecast);
-            const observation = weatherReadings[station_id];
-            console.log(observation);
-            Object.keys(option).forEach((key) => {
-                if (key == "station_id") {
-                    return;
-                }
-                const optionScore = calculateOptionScore(forecast[key], observation[key], option[key].val);
-                currentScore += optionScore;
-            });
-        }
-        entries[i]['score'] = currentScore;
-    }
-    entries.sort((a, b) => b.score - a.score);
-    return entries;
-}
-
-function calculateOptionScore(forecast_val, observation_val, entry_val) {
-    if (forecast_val > observation_val) {
-        return (entry_val == "over") ? 1 : 0
-    } else if (forecast_val == observation_val) {
-        return (entry_val == "par") ? 2 : 0
-    } else {
-        return (entry_val == "under") ? 1 : 0
-    }
-}
+export { LeaderBoard };
