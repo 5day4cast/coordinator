@@ -13,6 +13,27 @@ export async function displayCompetitions(apiBase) {
     console.log("initialized competitions");
 }
 
+export async function toggleCompetitionStatus(status) {
+    const statusButtons = document.querySelectorAll('.status-button');
+    statusButtons.forEach(button => {
+        if (button.id == status) {
+            button.classList.add('active');
+        } else {
+            button.classList.remove('active');
+        }
+    });
+    const activeButton = document.querySelector('.status-button.active');
+    let competitionsDataTable = document.getElementById("competitionsDataTable");
+    let tbody = competitionsDataTable.querySelector("tbody");
+    tbody.querySelectorAll("tr").forEach(row => {
+        let cellValue = row.querySelector("td:nth-child(4)").textContent;
+        if (activeButton.id != cellValue) {
+            row.classList.add("hidden");
+        } else {
+            row.classList.remove("hidden");
+        }
+    })
+}
 class Competitions {
     constructor(base_url, $competitionsDataTable, $tbody) {
         this.weather_data = new WeatherData(base_url);
@@ -28,27 +49,40 @@ class Competitions {
             this.get_competitions()
         ]).then(([stations, competitions]) => {
             this.stations = stations;
-            this.competitions = competitions;
-            this.competitions.forEach(competition => {
-                let $row = document.createElement("tr");
-                // Exclude the "cities" property
-                Object.keys(competition).forEach(key => {
-                    if (key !== "cities" && key !== "id") {
-                        const cell = document.createElement("td");
-                        cell.textContent = competition[key];
-                        $row.appendChild(cell);
-                    }
-                });
-
-                $row.addEventListener("click", () => {
-                    this.handleCompetitionClick($row, competition);
-                });
-
-                this.$tbody.appendChild($row);
-            });
+            this.displayCompetitionRows(competitions)
         }).catch(error => {
             // Handle errors if any of the promises reject
             console.error("Error occurred while fetching data:", error);
+        });
+    }
+
+    displayCompetitionRows(competitions) {
+        competitions = competitions;
+        // let competitionToggleStatus = document.getElementById('competitionStatus')
+        const activeButton = document.querySelector('.status-button.active');
+        competitions.forEach(competition => {
+            let $row = document.createElement("tr");
+            $row.setAttribute("id", "competition");
+            // Exclude the "cities" property
+            Object.keys(competition).forEach(key => {
+                if (key !== "cities" && key !== "id") {
+                    const cell = document.createElement("td");
+                    cell.textContent = competition[key];
+                    $row.appendChild(cell);
+                }
+            });
+
+            $row.addEventListener("click", () => {
+                this.handleCompetitionClick($row, competition);
+            });
+
+            if (activeButton.id != competition.status) {
+                $row.classList.add("hidden");
+            } else {
+                $row.classList.remove("hidden");
+            }
+
+            this.$tbody.appendChild($row);
         });
     }
 
@@ -74,7 +108,7 @@ class Competitions {
                         "name": "Tiger Roar Challenge",
                         "startTime": rfc3339TimetwelveHoursFromNow,
                         "endTime": rfc3339OneDayAndHalfFromNow,
-                        "status": "live",
+                        "status": "upcoming",
                         "totalPrizePoolAmt": "$60",
                         "totalEntries": 30,
                         "cities": ["KGRB", "KBOI", "KRAP", "KJAN"]
@@ -84,7 +118,7 @@ class Competitions {
                         "name": "Unicorn Gallop Grand Prix",
                         "startTime": rfc3339SixHoursAgo,
                         "endTime": rfc3339OneDayAndHalfFromNow,
-                        "status": "running",
+                        "status": "live",
                         "totalPrizePoolAmt": "$20",
                         "totalEntries": 10,
                         "cities": ["KTPA", "KMIA", "KATL", "KSDF", "KBNA"]
@@ -104,7 +138,7 @@ class Competitions {
                         "name": "Mermaid's Song Showcase",
                         "startTime": rfc3339TimetwelveHoursFromNow,
                         "endTime": rfc3339OneDayAndHalfFromNow,
-                        "status": "live",
+                        "status": "upcoming",
                         "totalPrizePoolAmt": "$60",
                         "totalEntries": 30,
                         "cities": ["KSTL", "KCID", "KMSP", "KABQ", "KTUL"]
@@ -114,7 +148,7 @@ class Competitions {
                         "name": "Chimera Chase Extravaganza",
                         "startTime": rfc3339TimetwelveHoursFromNow,
                         "endTime": rfc3339OneDayAndHalfFromNow,
-                        "status": "live",
+                        "status": "upcoming",
                         "totalPrizePoolAmt": "$20",
                         "totalEntries": 10,
                         "cities": ["KBOS", "KSEA", "KDEN", "KIND", "KCLT"]
@@ -135,7 +169,7 @@ class Competitions {
         row.classList.toggle('is-selected');
         let rowIsSelected = row.classList.contains('is-selected');
         if (competition['status'] == 'live') {
-            if (this.leader_board){
+            if (this.leader_board) {
                 this.leader_board.hideLeaderboard();
             }
             this.makeCompetitionMap(competition).then(result => {
@@ -198,7 +232,7 @@ class Competitions {
         let competitionPoints = [];
         for (let station_id of station_ids) {
             let station = this.stations[station_id];
-            if (station){
+            if (station) {
                 competitionPoints.push(station);
             }
         }

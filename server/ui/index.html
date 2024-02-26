@@ -58,6 +58,38 @@
                 </nav>
             </div>
             <div id="allCompetitions" class="container">
+                <style>
+                    .status-button {
+                        cursor: pointer;
+                        padding: 10px 20px;
+                        border: 1px solid #ccc;
+                        border-radius: 5px;
+                        margin-right: 10px;
+                        background-color: #f0f0f0;
+                        flex: 1;
+                        text-align: center;
+                    }
+
+                    #statusButtons {
+                        display: flex;
+                    }
+
+                    .status-button.active {
+                        background-color: #007bff;
+                        color: #fff;
+                    }
+
+                    .hidden {
+                        display: none;
+                    }
+                </style>
+                <div id="statusButtons">
+                    <div class="status-button" id="upcoming">Upcoming</div>
+                    <div class="status-button" id="live">Live</div>
+                    <div class="status-button" id="completed">Completed</div>
+                </div>
+
+
                 <div class="table-container" id="competitions">
                     <table id="competitionsDataTable" class="table is-striped is-bordered is-narrow">
                         <thead>
@@ -105,6 +137,7 @@
             <div>entries</div>
             <div class="table-container" id="usersEntries">
                 <!-- all enteries that have been entered into-->
+                men will literally build a toggle instead of an entry screen
             </div>
         </div>
         <div id="payouts" class="container hidden">
