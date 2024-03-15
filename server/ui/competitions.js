@@ -1,5 +1,6 @@
 import { WeatherData } from './weather_data.js';
 import { LeaderBoard } from './leader_board.js';
+import { Entry } from './entry.js';
 
 export async function displayCompetitions(apiBase) {
     let $competitionsDataTable = document.getElementById("competitionsDataTable");
@@ -39,15 +40,31 @@ class Competitions {
                         $row.appendChild(cell);
                     }
                 });
+                //TODO: change text depending on what competition state we're at
+                const cell = document.createElement("td");
+                if (competition.status == 'live') {
+                    cell.textContent = "Create Entry";
+                } else {
+                    cell.textContent = "View Competition"
+                }
+                $row.appendChild(cell);
 
-                $row.addEventListener("click", () => {
+                $row.addEventListener("click", (event) => {
                     this.handleCompetitionClick($row, competition);
+                    if (event.target.tagName === 'TD') {
+                        if (event.target === event.target.parentNode.lastElementChild) {
+                            if (competition.status == 'live') {
+                                let entry = new Entry(this.base_url, this.stations, competition);
+                                entry.init().then(() => {
+                                    entry.showEntry();
+                                });
+                            }
+                        }
+                    }
                 });
-
                 this.$tbody.appendChild($row);
             });
         }).catch(error => {
-            // Handle errors if any of the promises reject
             console.error("Error occurred while fetching data:", error);
         });
     }
@@ -135,7 +152,7 @@ class Competitions {
         row.classList.toggle('is-selected');
         let rowIsSelected = row.classList.contains('is-selected');
         if (competition['status'] == 'live') {
-            if (this.leader_board){
+            if (this.leader_board) {
                 this.leader_board.hideLeaderboard();
             }
             this.makeCompetitionMap(competition).then(result => {
@@ -191,6 +208,9 @@ class Competitions {
             // Extend the pop here
             marker.bindPopup(`${point.station_name} (${point.station_id})`).openPopup();
         });
+        if (map) {
+            map.invalidateSize();
+        }
         this.currentMaps['map'] = map;
     }
 
@@ -198,7 +218,7 @@ class Competitions {
         let competitionPoints = [];
         for (let station_id of station_ids) {
             let station = this.stations[station_id];
-            if (station){
+            if (station) {
                 competitionPoints.push(station);
             }
         }

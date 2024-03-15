@@ -15,12 +15,9 @@ class LeaderBoard {
         Promise.all([
             this.getEntries(this.competition),
             this.getReadings(this.competition),
-            this.getLastForecast(this.competition)
+            this.weather_data.get_competition_last_forecast(this.competition)
         ]).then(([entries, observations, lastForecasts]) => {
-            console.log(observations);
-            console.log(lastForecasts);
             const entryScores = this.calculateScores(observations, lastForecasts, entries);
-            console.log(entryScores);
             this.displayScore(entryScores);
         });
     }
@@ -30,7 +27,6 @@ class LeaderBoard {
             'start': competition.startTime,
             'end': competition.endTime
         });
-        console.log(observations);
         const station_observations = {};
         for (let observation of observations) {
             station_observations[observation.station_id] = observation;
@@ -38,36 +34,17 @@ class LeaderBoard {
         return station_observations;
     }
 
-    async getLastForecast(competition) {
-        console.log(competition);
-        const forecasts = await this.weather_data.get_forecasts(competition.cities, {
-            'start': competition.startTime,
-            'end': competition.endTime
-        })
-        console.log(forecasts);
-        const station_forecast = {};
-        for (let forecast of forecasts) {
-            station_forecast[forecast.station_id] = forecast;
-        }
-        return station_forecast;
-    }
-
     calculateScores(weatherReadings, lastForecasts, entries) {
         for (let entry of entries) {
             let currentScore = 0;
             for (let option of entry.options) {
                 const station_id = option.station_id;
-                console.log(lastForecasts);
-                console.log(weatherReadings);
-                console.log(station_id);
                 const forecast = lastForecasts[station_id];
-                console.log(forecast);
                 if (!forecast) {
                     console.error("no forecast found for:", station_id);
                     continue;
                 }
                 const observation = weatherReadings[station_id];
-                console.log(observation);
                 if (!forecast) {
                     console.error("no observations found for:", station_id);
                     continue;
@@ -171,8 +148,6 @@ class LeaderBoard {
     }
 
     handleEntryClick($row, entry) {
-        console.log($row);
-        console.log(entry);
         const $parentElement = $row.parentElement;
         const $rows = $parentElement.querySelectorAll("tr");
         $rows.forEach($currentRow => {
@@ -181,18 +156,16 @@ class LeaderBoard {
             }
         });
         $row.classList.toggle('is-selected');
-        console.log(entry);
-        this.showEntry(entry);
+        this.showEntryScores(entry);
     }
 
 
-    showEntry(entry) {
+    showEntryScores(entry) {
         let $entryScoreModal = document.getElementById("entryScore");
         this.clearEntry();
 
         let $entryValues = document.getElementById('entryValues');
         let $competitionId = document.createElement('h3');
-        console.log(entry);
         $competitionId.textContent = `Competition: ${entry.competition_id}`
         $entryValues.appendChild($competitionId);
 
