@@ -12,10 +12,21 @@ class WeatherData {
         return response.json()
     }
 
+    async get_competition_last_forecast(competition) {
+        const forecasts = await this.get_forecasts(competition.cities, {
+            'start': competition.startTime,
+            'end': competition.endTime
+        })
+        const station_forecast = {};
+        for (let forecast of forecasts) {
+            station_forecast[forecast.station_id] = forecast;
+        }
+        return station_forecast;
+    }
+
     async get_forecasts(station_ids, time_range) {
         let stations = station_ids.join(',');
         let response = await fetch(`${this.base_url}/stations/forecasts?start=${time_range.start}&end=${time_range.end}&station_ids=${stations}`);
-        console.log(response);
         if (!response.ok) {
             throw new Error(`Failed to get stations, status: ${response.status}`)
         }
