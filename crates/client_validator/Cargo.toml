@@ -1,0 +1,7 @@
+[package]
+name = "client_validator"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/tee8z/5day4cast"
+
+[dependencies]

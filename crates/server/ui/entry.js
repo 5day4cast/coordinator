@@ -19,7 +19,6 @@ class Entry {
         return Promise.all([
             this.weather_data.get_competition_last_forecast(this.competition)
         ]).then(([competition_forecasts]) => {
-            console.log(competition_forecasts);
             this.competition_forecasts = competition_forecasts;
             this.entry['options'] = [];
             for (const station_id in competition_forecasts) {
@@ -154,14 +153,11 @@ class Entry {
     handleEntryClick($event, station_id, weather_type, selected_val) {
         const $buttons = document.getElementsByTagName('button');
         const pattern = `${station_id}_${weather_type}`;
-        console.log(pattern);
         $event.target.classList.toggle('is-active');
         $event.target.classList.toggle('is-outlined');
 
         for (let $button of $buttons) {
-            console.log($button);
             if ($button.id.includes(pattern) && $button.id != `${pattern}_${selected_val}`) {
-                console.log('removing');
                 $button.classList.remove('is-active');
                 $button.classList.add('is-outlined');
             }

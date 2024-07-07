@@ -1,12 +1,12 @@
 use axum::Server;
+use log::info;
 use server::{app, get_config_info, setup_logger};
-use slog::info;
 use std::{net::SocketAddr, str::FromStr};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli: server::Cli = get_config_info();
-    let logger = setup_logger(&cli);
+    setup_logger(&cli)?;
     let address = SocketAddr::from_str(&format!(
         "{}:{}",
         cli.domain.unwrap_or(String::from("127.0.0.1")),
@@ -14,10 +14,9 @@ async fn main() -> anyhow::Result<()> {
     ))
     .unwrap();
 
-    info!(logger, "listening on http://{}", address);
+    info!("listening on http://{}", address);
 
     let app = app(
-        logger,
         cli.remote_url
             .unwrap_or(String::from("http://127.0.0.1:9990")),
         cli.oracle_url

@@ -25,8 +25,6 @@ $navbarItems.forEach(function ($navbarItem) {
         hideAllContainers();
         // Extract the ID from the clicked navbar item
         const targetContainerId = this.id.replace('NavClick', '');
-        // Show the corresponding container
-        console.log(targetContainerId);
         showContainer(targetContainerId);
     });
 });
