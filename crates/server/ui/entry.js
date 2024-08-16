@@ -1,5 +1,6 @@
 import { WeatherData } from './weather_data.js';
 import { LeaderBoard } from './leader_board.js';
+import { uuidv7 } from "uuidv7";
 
 export async function displayEntry(apiBase, stations, competition) {
 
@@ -166,11 +167,26 @@ class Entry {
     }
 
     submit($event) {
-        setTimeout(() => {
+        let event_body = {
+            'id': uuidv7(),
+            'event_id': this.entry.comptition_id,
+            'expected_observations': this.entry['submit']
+        }
+        console.log(event_body);
+        const headers = {
+            "Content-Type": "application/json"
+        };
+        fetch(`${this.base_url}/events/${this.entry.comptition_id}/entry`, {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify(data)
+        }).then(response => {
             console.log("entry: ", this.entry);
             $event.target.classList.remove("is-loading");
             this.showSuccess();
-        }, 300);
+        }).catch(e => {
+            console.error("Error submitting entry: {}", e);
+        })
     }
 
     showSuccess() {

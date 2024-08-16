@@ -69,76 +69,10 @@ class Competitions {
         });
     }
 
-    get_competitions() {
-        var date = new Date();
-        const sixHoursAgoUTCDate = new Date(date.getTime() - (6 * 3600 * 1000));
-
-        const twelveHoursFromNowUTCDate = new Date(date.getTime() + (12 * 3600 * 1000));
-        const oneDayAndHalfFromNowUTCDate = new Date(date.getTime() + (36 * 3600 * 1000));
-
-        const rfc3339TimetwelveHoursFromNow = twelveHoursFromNowUTCDate.toISOString();
-
-        const rfc3339SixHoursAgo = sixHoursAgoUTCDate.toISOString();
-        const rfc3339OneDayAndHalfFromNow = oneDayAndHalfFromNowUTCDate.toISOString();
-
-        //NOTE: for real competitions we should be doing this over 12 or 24 hour windows
-        //observation reports don't always get created every hour for every station's value
-        return new Promise((resolve, reject) => {
-            setTimeout(() => {
-                resolve([
-                    {
-                        "id": "671657f5-a437-453e-b9fa-4c50705dc607",
-                        "name": "Tiger Roar Challenge",
-                        "startTime": rfc3339TimetwelveHoursFromNow,
-                        "endTime": rfc3339OneDayAndHalfFromNow,
-                        "status": "live",
-                        "totalPrizePoolAmt": "$60",
-                        "totalEntries": 30,
-                        "cities": ["KGRB", "KBOI", "KRAP", "KJAN"]
-                    },
-                    {
-                        "id": "70bc176c-4b30-46c0-8720-b1535d15ba34",
-                        "name": "Unicorn Gallop Grand Prix",
-                        "startTime": rfc3339SixHoursAgo,
-                        "endTime": rfc3339OneDayAndHalfFromNow,
-                        "status": "running",
-                        "totalPrizePoolAmt": "$20",
-                        "totalEntries": 10,
-                        "cities": ["KTPA", "KMIA", "KATL", "KSDF", "KBNA"]
-                    },
-                    {
-                        "id": "295ecf23-ef65-4708-9314-0fc7614b623d",
-                        "name": "Gryphon's Claws Tournament",
-                        "startTime": rfc3339SixHoursAgo,
-                        "endTime": rfc3339OneDayAndHalfFromNow, //Change to a time in the past once data catches up
-                        "status": "completed",
-                        "totalPrizePoolAmt": "$16",
-                        "totalEntries": 8,
-                        "cities": ["KBFM", "KBHM", "KMSY", "KLIT", "KMCI"]
-                    },
-                    {
-                        "id": "57bd5d1e-a7ae-422e-8673-81ebb6227bf8",
-                        "name": "Mermaid's Song Showcase",
-                        "startTime": rfc3339TimetwelveHoursFromNow,
-                        "endTime": rfc3339OneDayAndHalfFromNow,
-                        "status": "live",
-                        "totalPrizePoolAmt": "$60",
-                        "totalEntries": 30,
-                        "cities": ["KSTL", "KCID", "KMSP", "KABQ", "KTUL"]
-                    },
-                    {
-                        "id": "cdf5b892-8d21-4264-ab65-9bc3e80e535d",
-                        "name": "Chimera Chase Extravaganza",
-                        "startTime": rfc3339TimetwelveHoursFromNow,
-                        "endTime": rfc3339OneDayAndHalfFromNow,
-                        "status": "live",
-                        "totalPrizePoolAmt": "$20",
-                        "totalEntries": 10,
-                        "cities": ["KBOS", "KSEA", "KDEN", "KIND", "KCLT"]
-                    },
-                ])
-            }, 1000);
-        });
+    async get_competitions() {
+        let events = fetch(`${this.base_url}/oracle/events`).await;
+        console.log(events);
+        return events;
     }
 
     handleCompetitionClick(row, competition) {
@@ -198,13 +132,12 @@ class Competitions {
             ext: 'png',
             maxBounds: [
                 [25.84, -124.67], // Southwest coordinates (latitude, longitude)
-                [49.38, -66.95]   // Northeast coordinates (latitude, longitude)
+                [49.38, -66.95] // Northeast coordinates (latitude, longitude)
             ]
         }).addTo(map);
         const points = await this.getCompetitionPoints(competition.cities);
         points.forEach(point => {
-            let marker = L.circleMarker([point.latitude, point.longitude], {
-            }).addTo(map);
+            let marker = L.circleMarker([point.latitude, point.longitude], {}).addTo(map);
             // Extend the pop here
             marker.bindPopup(`${point.station_name} (${point.station_id})`).openPopup();
         });

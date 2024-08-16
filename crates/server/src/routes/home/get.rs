@@ -5,6 +5,7 @@ use tokio::fs;
 
 use crate::AppState;
 
+//TODO: add pulling down wasm that holds the cryptograph needed for signing transactions
 pub async fn index_handler(State(state): State<Arc<AppState>>) -> Html<String> {
     Html(index(&state.remote_url, &state.oracle_url, &state.ui_dir).await)
 }
