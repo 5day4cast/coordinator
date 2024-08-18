@@ -134,7 +134,7 @@ class LeaderBoard {
     }
 
     async getEntries(competition) {
-        const event = fetch(`${this.base_url}/oracle/events/${competition.id}`).await;
+        const event = await fetch(`${this.base_url}/oracle/events/${competition.id}`);
         console.log(event);
         return event.entries
     }

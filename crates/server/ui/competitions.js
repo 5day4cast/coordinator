@@ -34,7 +34,7 @@ class Competitions {
                 let $row = document.createElement("tr");
                 // Exclude the "cities" property
                 Object.keys(competition).forEach(key => {
-                    if (key !== "cities" && key !== "id") {
+                    if (key !== "cities") {
                         const cell = document.createElement("td");
                         cell.textContent = competition[key];
                         $row.appendChild(cell);
@@ -70,9 +70,25 @@ class Competitions {
     }
 
     async get_competitions() {
-        let events = fetch(`${this.base_url}/oracle/events`).await;
-        console.log(events);
-        return events;
+        let response = await fetch(`${this.base_url}/oracle/events`);
+        if (!response.ok) {
+            console.error(response);
+            throw new Error(`Failed to get competitions, status: ${response.status}`)
+        }
+        let oracle_events = await response.json();
+        console.log("known events: ", oracle_events);
+        let competitions = oracle_events.map(event => ({
+            "id": event["id"],
+            "startTime": event["observation_date"],
+            "endTime": one_day_ahead(event["observation_date"]),
+            "status": event["status"].toLowerCase(),
+            //TODO: change to a real number based on what we want to charge per entry
+            "totalPrizePoolAmt": "$60",
+            "totalEntries": event["total_entries"],
+            "cities": event["locations"],
+        }));
+
+        return competitions;
     }
 
     handleCompetitionClick(row, competition) {
@@ -166,6 +182,14 @@ class Competitions {
         }
         return stations_mapping;
     }
+}
+
+function one_day_ahead(rfc3339String) {
+    const date = new Date(rfc3339String);
+    date.setDate(date.getDate() + 1);
+    const originalOffset = rfc3339String.match(/[-+]\d{2}:\d{2}/)[0];
+    const updatedRfc3339String = date.toISOString().replace('Z', originalOffset);
+    return updatedRfc3339String;
 }
 
 export { Competitions };

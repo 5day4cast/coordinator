@@ -1,11 +1,6 @@
 import { WeatherData } from './weather_data.js';
 import { LeaderBoard } from './leader_board.js';
-import { uuidv7 } from "uuidv7";
-
-export async function displayEntry(apiBase, stations, competition) {
-
-}
-
+import { uuidv7 } from "https://unpkg.com/uuidv7@^1";
 
 class Entry {
     constructor(base_url, stations, competition) {
@@ -167,19 +162,21 @@ class Entry {
     }
 
     submit($event) {
-        let event_body = {
+
+        let entry_body = {
             'id': uuidv7(),
             'event_id': this.entry.comptition_id,
-            'expected_observations': this.entry['submit']
+            'expected_observations': build_expected_observations_from_submit(this.entry['submit'])
         }
-        console.log(event_body);
+        console.log("Sending entry:", entry_body);
         const headers = {
             "Content-Type": "application/json"
         };
-        fetch(`${this.base_url}/events/${this.entry.comptition_id}/entry`, {
+
+        fetch(`${this.base_url}/oracle/events/${this.entry.comptition_id}/entry`, {
             method: 'POST',
             headers: headers,
-            body: JSON.stringify(data)
+            body: JSON.stringify(entry_body)
         }).then(response => {
             console.log("entry: ", this.entry);
             $event.target.classList.remove("is-loading");
@@ -197,6 +194,34 @@ class Entry {
             this.hideEntry();
             this.clearEntry();
         }, 600);
+    }
+}
+
+function build_expected_observations_from_submit(submit) {
+    console.log(submit);
+    let expected_observations = [];
+    for (let [station_id, choices] of Object.entries(submit)) {
+        let stations = {
+            'stations': station_id,
+        };
+        for (let [weather_type, selected_val] of Object.entries(choices)) {
+            stations[weather_type] = convert_select_val(selected_val);
+        }
+        expected_observations.push(stations);
+    }
+    return expected_observations;
+}
+
+function convert_select_val(raw_select) {
+    switch (raw_select) {
+        case 'par':
+            return 'Par'
+        case 'over':
+            return 'Over'
+        case 'under':
+            return 'Under'
+        default:
+            throw new Error(`Failed to match selected option value: ${raw_select}`)
     }
 }
 
