@@ -1,10 +1,6 @@
 import { WeatherData } from './weather_data.js';
 import { LeaderBoard } from './leader_board.js';
-
-export async function displayEntry(apiBase, stations, competition) {
-
-}
-
+import { uuidv7 } from "https://unpkg.com/uuidv7@^1";
 
 class Entry {
     constructor(base_url, stations, competition) {
@@ -19,7 +15,6 @@ class Entry {
         return Promise.all([
             this.weather_data.get_competition_last_forecast(this.competition)
         ]).then(([competition_forecasts]) => {
-            console.log(competition_forecasts);
             this.competition_forecasts = competition_forecasts;
             this.entry['options'] = [];
             for (const station_id in competition_forecasts) {
@@ -154,14 +149,11 @@ class Entry {
     handleEntryClick($event, station_id, weather_type, selected_val) {
         const $buttons = document.getElementsByTagName('button');
         const pattern = `${station_id}_${weather_type}`;
-        console.log(pattern);
         $event.target.classList.toggle('is-active');
         $event.target.classList.toggle('is-outlined');
 
         for (let $button of $buttons) {
-            console.log($button);
             if ($button.id.includes(pattern) && $button.id != `${pattern}_${selected_val}`) {
-                console.log('removing');
                 $button.classList.remove('is-active');
                 $button.classList.add('is-outlined');
             }
@@ -170,11 +162,28 @@ class Entry {
     }
 
     submit($event) {
-        setTimeout(() => {
+
+        let entry_body = {
+            'id': uuidv7(),
+            'event_id': this.entry.comptition_id,
+            'expected_observations': build_expected_observations_from_submit(this.entry['submit'])
+        }
+        console.log("Sending entry:", entry_body);
+        const headers = {
+            "Content-Type": "application/json"
+        };
+
+        fetch(`${this.base_url}/oracle/events/${this.entry.comptition_id}/entry`, {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify(entry_body)
+        }).then(response => {
             console.log("entry: ", this.entry);
             $event.target.classList.remove("is-loading");
             this.showSuccess();
-        }, 300);
+        }).catch(e => {
+            console.error("Error submitting entry: {}", e);
+        })
     }
 
     showSuccess() {
@@ -185,6 +194,34 @@ class Entry {
             this.hideEntry();
             this.clearEntry();
         }, 600);
+    }
+}
+
+function build_expected_observations_from_submit(submit) {
+    console.log(submit);
+    let expected_observations = [];
+    for (let [station_id, choices] of Object.entries(submit)) {
+        let stations = {
+            'stations': station_id,
+        };
+        for (let [weather_type, selected_val] of Object.entries(choices)) {
+            stations[weather_type] = convert_select_val(selected_val);
+        }
+        expected_observations.push(stations);
+    }
+    return expected_observations;
+}
+
+function convert_select_val(raw_select) {
+    switch (raw_select) {
+        case 'par':
+            return 'Par'
+        case 'over':
+            return 'Over'
+        case 'under':
+            return 'Under'
+        default:
+            throw new Error(`Failed to match selected option value: ${raw_select}`)
     }
 }
 

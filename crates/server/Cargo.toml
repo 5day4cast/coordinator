@@ -1,0 +1,32 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/tee8z/5day4cast"
+
+[dependencies]
+anyhow = "1.0.72"
+axum = { version = "0.6.19", features = ["macros", "tracing", "multipart"] }
+config = "0.14.0"
+clap = { version = "4.3.23", features = ["derive", "env"] }
+futures = "0.3.28"
+hyper = "0.14.27"
+log = "0.4.18"
+mime = "0.3.17"
+num_cpus = "1.16.0"
+openssl = { version = "0.10", features = ["vendored"] }
+serde = { version="1.0.188", features= ["derive"]}
+time = { version = "0.3.36", features = ["parsing", "formatting", "macros"] }
+tokio = { version = "1.35.1", features = [
+    "macros",
+    "rt-multi-thread",
+    "signal",
+] }
+tokio-util = "0.7.9"
+toml = "0.8.10"
+tower-http = { version= "0.4.4", features = ["fs", "cors"] }
+uuid = { version = "1.4.1", features = ["v4"] }
+fern = { version = "0.6.2", features = ["colored"] }
+
+[dev-dependencies]
+tower = "0.4.13"
