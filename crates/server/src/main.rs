@@ -1,30 +1,52 @@
-use axum::Server;
+use anyhow::anyhow;
+use axum::serve;
 use log::info;
-use server::{app, get_config_info, setup_logger};
+use server::{app, create_folder, get_config_info, setup_logger};
 use std::{net::SocketAddr, str::FromStr};
+use tokio::{net::TcpListener, signal};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli: server::Cli = get_config_info();
-    setup_logger(&cli)?;
-    let address = SocketAddr::from_str(&format!(
-        "{}:{}",
-        cli.domain.unwrap_or(String::from("127.0.0.1")),
-        cli.port.unwrap_or(String::from("9990"))
-    ))
-    .unwrap();
+    let settings = get_config_info();
+    setup_logger(settings.level.clone())?;
+    let address = SocketAddr::from_str(&format!("{}:{}", settings.domain, settings.port)).unwrap();
+    create_folder(&settings.competition_db.clone());
+    let listener = TcpListener::bind(address)
+        .await
+        .map_err(|e| anyhow!("error binding to IO socket: {}", e.to_string()))?;
+    info!("listening on http://{}", address.clone());
 
-    info!("listening on http://{}", address);
+    let app = app(settings);
 
-    let app = app(
-        cli.remote_url
-            .unwrap_or(String::from("http://127.0.0.1:9990")),
-        cli.oracle_url
-            .unwrap_or(String::from("https://www.4casttruth.win")),
-        cli.ui_dir.unwrap_or(String::from("./server/ui")),
-    );
-    Server::bind(&address)
-        .serve(app.into_make_service())
-        .await?;
+    serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }

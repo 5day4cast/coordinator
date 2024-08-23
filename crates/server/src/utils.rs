@@ -8,6 +8,7 @@ use std::{
 use clap::{command, Parser};
 use fern::colors::{Color, ColoredLevelConfig};
 use log::{error, info, LevelFilter};
+use reqwest_middleware::reqwest::Url;
 use time::{format_description::well_known::Iso8601, OffsetDateTime};
 
 pub fn create_folder(root_path: &str) {
@@ -56,12 +57,48 @@ pub struct Cli {
     #[arg(short, long)]
     pub ui_dir: Option<String>,
 
-    // Url UI should hit for oracle weather data (default: https://www.4casttruth.win)
+    /// Url to hit for oracle weather data (default: https://www.4casttruth.win)
     #[arg(short, long)]
-    pub oracle_url: Option<String>
+    pub oracle_url: Option<String>,
+
+    /// Path to db holding dlc data (default: competition_data/)
+    #[arg(long)]
+    pub competition_db: Option<String>,
 }
 
-pub fn get_config_info() -> Cli {
+pub struct Settings {
+    pub level: Option<String>,
+    pub domain: String,
+    pub port: String,
+    pub remote_url: String,
+    pub ui_dir: String,
+    pub oracle_url: Url,
+    pub competition_db: String,
+}
+
+impl From<Cli> for Settings {
+    fn from(value: Cli) -> Self {
+        Self {
+            level: value.level,
+            domain: value.domain.unwrap_or(String::from("127.0.0.1")),
+            port: value.port.unwrap_or(String::from("9100")),
+            remote_url: value
+                .remote_url
+                .unwrap_or(String::from("http://127.0.0.1:9990")),
+            ui_dir: value.ui_dir.unwrap_or(String::from("./ui")),
+            oracle_url: Url::parse(
+                &value
+                    .oracle_url
+                    .unwrap_or(String::from("https://www.4casttruth.win")),
+            )
+            .unwrap(),
+            competition_db: value
+                .competition_db
+                .unwrap_or(String::from("./competition_data")),
+        }
+    }
+}
+pub fn get_config_info() -> Settings {
     let mut cli = Cli::parse();
 
     if let Some(config_path) = cli.config.clone() {
@@ -72,11 +109,11 @@ pub fn get_config_info() -> Cli {
             cli = toml::from_str(&content).expect("Failed to deserialize config")
         };
     };
-    cli
+    cli.into()
 }
 
-pub fn setup_logger(cli: &Cli) -> Result<(), fern::InitError> {
-    let rust_log = get_log_level(cli);
+pub fn setup_logger(level: Option<String>) -> Result<(), fern::InitError> {
+    let rust_log = get_log_level(level);
     let colors = ColoredLevelConfig::new()
         .trace(Color::White)
         .debug(Color::Cyan)
@@ -100,9 +137,9 @@ pub fn setup_logger(cli: &Cli) -> Result<(), fern::InitError> {
     Ok(())
 }
 
-pub fn get_log_level(cli: &Cli) -> LevelFilter {
-    if cli.level.is_some() {
-        let level = cli.level.as_ref().unwrap();
+pub fn get_log_level(level: Option<String>) -> LevelFilter {
+    if level.is_some() {
+        let level = level.as_ref().unwrap();
         match level.as_ref() {
             "trace" => LevelFilter::Trace,
             "debug" => LevelFilter::Debug,
