@@ -1,11 +1,11 @@
+use clap::{command, Parser};
+use log::{error, info};
+use secrecy::Secret;
 use std::{
     fs::{self, File},
     io::Read,
     path::Path,
 };
-use clap::{command, Parser};
-use log::{error, info};
-use secrecy::Secret;
 
 pub fn create_folder(root_path: &str) {
     let path = Path::new(root_path);
@@ -48,7 +48,7 @@ pub struct Cli {
 
     /// Url UI should hit for oracle weather data (default: https://www.4casttruth.win)
     #[arg(short, long)]
-    pub oracle_url: Option<String>
+    pub oracle_url: Option<String>,
 }
 
 pub fn get_config_info() -> Cli {
