@@ -10,6 +10,10 @@ pub async fn index_handler(State(state): State<Arc<AppState>>) -> Html<String> {
     Html(index(&state.remote_url, &state.oracle_url, &state.ui_dir).await)
 }
 
+pub async fn admin_index_handler(State(state): State<Arc<AppState>>) -> Html<String> {
+    Html(index(&state.remote_url, &state.oracle_url, &state.admin_ui_dir).await)
+}
+
 pub async fn index(remote_url: &str, oracle_url: &str, ui_dir: &str) -> String {
     let mut file_content = fs::read_to_string(&format!("{}/index.html", ui_dir))
         .await

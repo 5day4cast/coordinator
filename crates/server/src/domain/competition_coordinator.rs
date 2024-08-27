@@ -1,5 +1,4 @@
 use anyhow::anyhow;
-use base64::{engine::general_purpose, Engine};
 use dlctix::{
     bitcoin::{
         key::{Keypair, Secp256k1},
@@ -61,7 +60,7 @@ impl Coordinator {
 
     pub fn public_key(&self) -> String {
         let key = Point::from(self.public_key).serialize();
-        general_purpose::STANDARD.encode(key)
+        hex::encode(key)
     }
 
     pub fn keypair(&self) -> Keypair {

@@ -123,7 +123,6 @@ class Competitions {
       if (this.leader_board) {
         this.leader_board.hideLeaderboard();
       }
-      //TODO: add map logic here if we want to use it
     } else {
       this.hideCurrentCompetition();
       this.leader_board = new LeaderBoard(
@@ -157,46 +156,6 @@ class Competitions {
       document.getElementById("currentCompetition");
     $currentCompetitionCurrent.classList.add("hidden");
   }
-
-  /* Not using as we get an auth error sometimes from the map provider
-  async makeCompetitionMap(competition) {
-    let oldMap = this.currentMaps["map"]; // Retrieve map instance by div ID
-    if (oldMap !== undefined) {
-      oldMap.remove();
-    }
-    const map = L.map("map", { dragging: false, trackResize: true }).setView(
-      [39.8283, -98.5795],
-      4.4,
-    ); // Centered on the US
-    L.tileLayer(
-      "https://tiles.stadiamaps.com/tiles/stamen_toner_background/{z}/{x}/{y}{r}.{ext}",
-      {
-        minZoom: 4,
-        maxZoom: 7,
-        attribution:
-          '&copy; <a href="https://www.stadiamaps.com/" target="_blank">Stadia Maps</a> &copy; <a href="https://www.stamen.com/" target="_blank">Stamen Design</a> &copy; <a href="https://openmaptiles.org/" target="_blank">OpenMapTiles</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-        ext: "png",
-        maxBounds: [
-          [25.84, -124.67], // Southwest coordinates (latitude, longitude)
-          [49.38, -66.95], // Northeast coordinates (latitude, longitude)
-        ],
-      },
-    ).addTo(map);
-    const points = await this.getCompetitionPoints(competition.locations);
-    points.forEach((point) => {
-      let marker = L.circleMarker([point.latitude, point.longitude], {}).addTo(
-        map,
-      );
-      // Extend the pop here
-      marker
-        .bindPopup(`${point.station_name} (${point.station_id})`)
-        .openPopup();
-    });
-    if (map) {
-      map.invalidateSize();
-    }
-    this.currentMaps["map"] = map;
-  }*/
 
   async getCompetitionPoints(station_ids) {
     let competitionPoints = [];

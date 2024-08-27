@@ -70,6 +70,10 @@ pub struct Cli {
     /// Path to file holding the coordinator's private key (default: ./coordinator_private_key.pem)
     #[arg(long)]
     pub private_key_file: Option<String>,
+
+    /// Path to files used to make the browser UI (default: ./admin_ui)
+    #[arg(short, long)]
+    pub admin_ui_dir: Option<String>,
 }
 
 pub struct Settings {
@@ -78,6 +82,7 @@ pub struct Settings {
     pub port: String,
     pub remote_url: String,
     pub ui_dir: String,
+    pub admin_ui_dir: String,
     pub oracle_url: Url,
     pub competition_db: String,
     pub private_key_file: String,
@@ -93,6 +98,7 @@ impl From<Cli> for Settings {
                 .remote_url
                 .unwrap_or(String::from("http://127.0.0.1:9990")),
             ui_dir: value.ui_dir.unwrap_or(String::from("./ui")),
+            admin_ui_dir: value.admin_ui_dir.unwrap_or(String::from("./admin_ui")),
             oracle_url: Url::parse(
                 &value
                     .oracle_url

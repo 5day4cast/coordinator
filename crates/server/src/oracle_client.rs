@@ -1,12 +1,11 @@
 use anyhow::anyhow;
-use log::error;
+use log::{debug, error};
 use reqwest_middleware::{
     self,
     reqwest::{Method, StatusCode, Url},
     ClientWithMiddleware, RequestBuilder,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -115,9 +114,10 @@ impl OracleClient {
     }
 
     pub async fn create_event(&self, event: CreateEvent) -> Result<(), Error> {
+        debug!("event: {:?}", event);
         let url = self
             .base_url
-            .join(&format!("/oracle/events/{}", event.id))
+            .join("/oracle/events")
             .map_err(|e| Error::Request(e.to_string()))?;
         let req = self.client.request(Method::POST, url).json(&event);
         self.send_request(req, String::from("event not found"))
@@ -158,13 +158,10 @@ impl OracleClient {
         } else {
             let status = response.status();
 
-            let body = response.json::<Value>().await.map_err(|e| {
-                error!("error parsing response from billing: {}", e);
-                Error::Send(e)
-            })?;
+            let body = response.text().await?;
 
             Err(Error::Request(format!(
-                "error response from billing with status {}: {:?}",
+                "error response from oracle with status {}: {:?}",
                 status, body
             )))
         }
