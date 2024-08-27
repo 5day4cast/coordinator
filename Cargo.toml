@@ -5,17 +5,23 @@ members = ["crates/client_validator", "crates/server"]
 # Config for 'cargo dist'
 [workspace.metadata.dist]
 # The preferred cargo-dist version to use in CI (Cargo.toml SemVer syntax)
-cargo-dist-version = "0.18.0"
+cargo-dist-version = "0.21.1"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
 installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["x86_64-unknown-linux-gnu"]
-# Publish jobs to run in CI
+# Which actions to run on pull requests
 pr-run-mode = "plan"
 # Whether to install an updater program
 install-updater = true
+github-build-setup = "../../git_duckdb/build-setup.yml"
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+
+[workspace.metadata.dist.dependencies.apt]
+musl-tools = '*'
 
 # The profile that 'cargo dist' will build with
 [profile.dist]
