@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <base href="." />
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>5day4cast Admin</title>
+        <link
+            rel="stylesheet"
+            href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css"
+        />
+        <link rel="stylesheet" href="/ui/styles.css" />
+        <script type="module">
+            import uuidv7 from "https://cdn.jsdelivr.net/npm/uuidv7@1.0.1/+esm";
+        </script>
+        <script type="module" src="/admin_ui/main.js"></script>
+
+        <style>
+            pre {
+                background-color: #f4f4f4;
+                padding: 10px;
+                border-radius: 5px;
+                overflow-x: auto;
+                white-space: pre-wrap; /* Wrap long lines */
+                font-family: monospace;
+                outline: none; /* Remove the outline when focused */
+            }
+            .invalid {
+                border: 2px solid red;
+            }
+        </style>
+    </head>
+
+    <body>
+        <script>
+            const API_BASE = "{SERVER_ADDRESS}";
+            const ORACLE_BASE = "{ORACLE_BASE}";
+        </script>
+
+        <section class="section">
+            <div class="container">
+                <h1 class="title">Fantasy Weather Admin</h1>
+            </div>
+            <div>
+                <div class="container">
+                    <h6 class="subtitle">Create Competition</h6>
+                    <div>
+                        <pre id="competition_payload" contenteditable="true">
+                            <code>
+                            {
+                                "number_of_values_per_entry": 6,
+                                "total_allowed_entries": 10,
+                                "number_of_places_win": 1,
+                                "locations": ["KRSW","KEWR","KBOS","KPHL"]
+                            }
+                            </code>
+                        </pre>
+                        <button
+                            class="button is-primary"
+                            onclick="createCompetition(event)"
+                        >
+                            Submit
+                        </button>
+                    </div>
+                </div>
+        </section>
+        <section class="section">
+            <div class="container">
+              <div class="columns is-centered is-mobile">
+                <div class="column">
+                <table id="stations_container" class="table is-striped is-bordered is-narrow">
+                    <thead>
+                        <tr>
+                            <th>Station ID</th>
+                            <th>Station Name</th>
+                            <th>Latitude</th>
+                            <th>Longitude</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    </tbody>
+                </table>
+                </div>
+                </div>
+            </div>
+        </section>
+    </body>
+</html>

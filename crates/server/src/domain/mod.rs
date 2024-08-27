@@ -2,15 +2,15 @@ mod competition_coordinator;
 mod competition_data;
 mod competition_db_migrations;
 
+use crate::oracle_client::WeatherChoices;
 pub use competition_coordinator::*;
 pub use competition_data::*;
 pub use competition_db_migrations::*;
 use dlctix::{bitcoin::hashes::sha256, musig2::secp256k1::Message};
 use duckdb::{types::Type, Row};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 use uuid::Uuid;
-
-use crate::oracle_client::WeatherChoices;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddEntry {
@@ -123,4 +123,91 @@ impl SearchByMessage {
         let message = Message::from_hashed_data::<sha256::Hash>(message_str.as_bytes());
         Ok(message)
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateEvent {
+    /// Client needs to provide a valid Uuidv7
+    pub id: Uuid,
+    #[serde(with = "time::serde::rfc3339")]
+    /// Time at which the attestation will be added to the event, needs to be after the observation date
+    pub signing_date: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    /// Date of when the weather observations occured (midnight UTC), all entries must be made before this time
+    pub observation_date: OffsetDateTime,
+    /// NOAA observation stations used in this event
+    pub locations: Vec<String>,
+    /// The number of values that can be selected per entry in the event (default to number_of_locations * 3, (temp_low, temp_high, wind_speed))
+    pub number_of_values_per_entry: usize,
+    /// Total number of allowed entries into the event
+    pub total_allowed_entries: usize,
+    /// Total amount of places that are part of the winnings split
+    pub number_of_places_win: usize,
+    /// Add a coordinator that will use the event entries in a competition
+    pub coordinator: Option<CoordinatorInfo>,
+}
+
+impl CreateEvent {
+    pub fn new(create_event: CreateEventMessage, coordinator_info: CoordinatorInfo) -> Self {
+        Self {
+            id: create_event.id,
+            signing_date: create_event.signing_date,
+            observation_date: create_event.observation_date,
+            locations: create_event.locations,
+            number_of_values_per_entry: create_event.number_of_values_per_entry,
+            total_allowed_entries: create_event.total_allowed_entries,
+            number_of_places_win: create_event.number_of_places_win,
+            coordinator: Some(coordinator_info),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateEventMessage {
+    /// Client needs to provide a valid Uuidv7
+    pub id: Uuid,
+    #[serde(with = "time::serde::rfc3339")]
+    /// Time at which the attestation will be added to the event, needs to be after the observation date
+    pub signing_date: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    /// Date of when the weather observations occured (midnight UTC), all entries must be made before this time
+    pub observation_date: OffsetDateTime,
+    /// NOAA observation stations used in this event
+    pub locations: Vec<String>,
+    /// The number of values that can be selected per entry in the event (default to number_of_locations * 3, (temp_low, temp_high, wind_speed))
+    pub number_of_values_per_entry: usize,
+    /// Total number of allowed entries into the event
+    pub total_allowed_entries: usize,
+    /// Total amount of places that are part of the winnings split
+    pub number_of_places_win: usize,
+}
+
+impl CreateEventMessage {
+    pub fn message(&self) -> Result<Message, serde_json::Error> {
+        let message_str = serde_json::to_string(self)?;
+        let message = Message::from_hashed_data::<sha256::Hash>(message_str.as_bytes());
+        Ok(message)
+    }
+}
+
+impl From<CreateEvent> for CreateEventMessage {
+    fn from(value: CreateEvent) -> Self {
+        Self {
+            id: value.id,
+            signing_date: value.signing_date,
+            observation_date: value.observation_date,
+            locations: value.locations,
+            number_of_values_per_entry: value.number_of_values_per_entry,
+            total_allowed_entries: value.total_allowed_entries,
+            number_of_places_win: value.number_of_places_win,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoordinatorInfo {
+    /// The pubkey of the coordinator
+    pub pubkey: String,
+    /// The values of the payload signed by the coordinator
+    pub signature: String,
 }

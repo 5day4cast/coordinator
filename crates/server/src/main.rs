@@ -16,7 +16,7 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow!("error binding to IO socket: {}", e.to_string()))?;
     info!("listening on http://{}", address.clone());
 
-    let app = app(settings);
+    let app = app(settings).await?;
 
     serve(
         listener,

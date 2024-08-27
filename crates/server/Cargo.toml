@@ -13,6 +13,7 @@ axum = { version = "0.7.5", features = [
     "multipart",
     "http1",
 ] }
+base64 = "0.22.1"
 config = "0.14.0"
 clap = { version = "4.3.23", features = ["derive", "env"] }
 dlctix = "0.0.6"
@@ -27,13 +28,18 @@ mime = "0.3.17"
 num_cpus = "1.16.0"
 openssl = { version = "0.10", features = ["vendored"] }
 pem-rfc7468 = { version = "0.7.0", features = ["alloc"] }
-reqwest-middleware = { version = "0.3.3", features = ["json"] }
+reqwest-middleware = { version = "0.3.3", features = ["json", "rustls-tls"] }
 reqwest-retry = { version = "0.6.1" }
 scooby = "0.5.0"
 serde = { version = "1.0.188", features = ["derive"] }
 serde_json = "1.0.117"
 thiserror = "1.0.62"
-time = { version = "0.3.36", features = ["parsing", "formatting", "macros"] }
+time = { version = "0.3.36", features = [
+    "parsing",
+    "formatting",
+    "macros",
+    "serde",
+] }
 tokio = { version = "1.35.1", features = [
     "macros",
     "rt-multi-thread",

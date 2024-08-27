@@ -9,13 +9,6 @@
     z-index: 1;
 }
 
-.usmap {
-    width: 100%;
-    height: 100%;
-    position: absolute;
-    z-index: 2;
-}
-
 .modal {
     z-index: 9999 !important; /* Adjust the value as needed */
 }

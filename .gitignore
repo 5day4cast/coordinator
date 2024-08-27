@@ -10,3 +10,4 @@ server/target/
 *.pdb
 .vscode/
 duckdb_lib/
+coordinator_private_key.pem

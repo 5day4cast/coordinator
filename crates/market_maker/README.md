@@ -1,1 +1,0 @@
-Cooridinates the competitions, creates the transactions/tickets and communicating them to the users/network
