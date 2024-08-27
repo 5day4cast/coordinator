@@ -1,19 +1,27 @@
+use anyhow::anyhow;
+use base64::{engine::general_purpose, Engine};
 use dlctix::{
-    bitcoin::XOnlyPublicKey,
-    musig2::secp256k1::{schnorr::Signature, Message},
+    bitcoin::{
+        key::{Keypair, Secp256k1},
+        XOnlyPublicKey,
+    },
+    musig2::secp256k1::{schnorr::Signature, Message, PublicKey, SecretKey},
+    secp::Point,
 };
 use futures::TryFutureExt;
 use log::{debug, error, info};
 use std::sync::Arc;
 use thiserror::Error;
 
-use crate::{OracleClient, OracleError};
+use crate::{get_key, OracleClient, OracleError};
 
 use super::{AddEntry, AddEntryMessage, CompetitionData, SearchBy, SearchByMessage, UserEntry};
 
 pub struct Coordinator {
     oracle_client: Arc<OracleClient>,
     competiton_data: Arc<CompetitionData>,
+    private_key: SecretKey,
+    public_key: PublicKey,
 }
 
 #[derive(Error, Debug)]
@@ -33,11 +41,58 @@ pub enum Error {
 }
 
 impl Coordinator {
-    pub fn new(oracle_client: OracleClient, competition_data: CompetitionData) -> Self {
-        Self {
+    pub async fn new(
+        oracle_client: OracleClient,
+        competition_data: CompetitionData,
+        private_key_file_path: &str,
+    ) -> Result<Self, anyhow::Error> {
+        let secret_key = get_key(private_key_file_path)?;
+        let secp = Secp256k1::new();
+        let public_key = secret_key.public_key(&secp);
+        let coordinator = Self {
             oracle_client: Arc::new(oracle_client),
             competiton_data: Arc::new(competition_data),
+            private_key: secret_key,
+            public_key,
+        };
+        coordinator.validate_coordinator_metadata().await?;
+        Ok(coordinator)
+    }
+
+    pub fn public_key(&self) -> String {
+        let key = Point::from(self.public_key).serialize();
+        general_purpose::STANDARD.encode(key)
+    }
+
+    pub fn keypair(&self) -> Keypair {
+        let secp = Secp256k1::new();
+        self.private_key.keypair(&secp)
+    }
+
+    pub async fn validate_coordinator_metadata(&self) -> Result<(), anyhow::Error> {
+        let stored_public_key = match self.competiton_data.get_stored_public_key().await {
+            Ok(key) => key,
+            Err(duckdb::Error::QueryReturnedNoRows) => {
+                self.add_metadata().await?;
+                return Ok(());
+            }
+            Err(e) => return Err(anyhow!("error getting stored public key: {}", e)),
+        };
+        if stored_public_key != self.public_key.x_only_public_key().0 {
+            return Err(anyhow!(
+                "stored_pubkey: {:?} pem_pubkey: {:?}",
+                stored_public_key,
+                self.public_key()
+            ));
         }
+        Ok(())
+    }
+
+    async fn add_metadata(&self) -> Result<(), anyhow::Error> {
+        self.competiton_data
+            .add_coordinator_metadata(self.public_key.x_only_public_key().0)
+            .await
+            .map_err(|e| anyhow!("failed to add coordinator metadata: {}", e))
     }
 
     // Becareful with these two operations, there's a possibility here of an

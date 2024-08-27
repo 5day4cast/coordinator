@@ -90,7 +90,7 @@ impl CompetitionData {
     }
 
     pub async fn get_stored_public_key(&self) -> Result<XOnlyPublicKey, duckdb::Error> {
-        let select = select("pubkey").from("oracle_metadata");
+        let select = select("pubkey").from("coordinator_metadata");
         let conn = self.new_readonly_connection_retry().await?;
         let mut stmt = conn.prepare(&select.to_string())?;
         let key: Vec<u8> = stmt.query_row([], |row| row.get(0))?;

@@ -1,14 +1,16 @@
-use std::{
-    env,
-    fs::{self, File},
-    io::Read,
-    path::Path,
-};
-
+use anyhow::anyhow;
 use clap::{command, Parser};
+use dlctix::musig2::secp256k1::{rand, SecretKey};
 use fern::colors::{Color, ColoredLevelConfig};
 use log::{error, info, LevelFilter};
+use pem_rfc7468::{decode_vec, encode_string};
 use reqwest_middleware::reqwest::Url;
+use std::{
+    env,
+    fs::{self, metadata, File},
+    io::{Read, Write},
+    path::Path,
+};
 use time::{format_description::well_known::Iso8601, OffsetDateTime};
 
 pub fn create_folder(root_path: &str) {
@@ -64,6 +66,10 @@ pub struct Cli {
     /// Path to db holding dlc data (default: competition_data/)
     #[arg(long)]
     pub competition_db: Option<String>,
+
+    /// Path to file holding the coordinator's private key (default: ./coordinator_private_key.pem)
+    #[arg(long)]
+    pub private_key_file: Option<String>,
 }
 
 pub struct Settings {
@@ -74,6 +80,7 @@ pub struct Settings {
     pub ui_dir: String,
     pub oracle_url: Url,
     pub competition_db: String,
+    pub private_key_file: String,
 }
 
 impl From<Cli> for Settings {
@@ -95,6 +102,9 @@ impl From<Cli> for Settings {
             competition_db: value
                 .competition_db
                 .unwrap_or(String::from("./competition_data")),
+            private_key_file: value
+                .private_key_file
+                .unwrap_or(String::from("./coordinator_private_key.pem")),
         }
     }
 }
@@ -159,4 +169,61 @@ pub fn get_log_level(level: Option<String>) -> LevelFilter {
             _ => LevelFilter::Info,
         }
     }
+}
+
+pub fn get_key(file_path: &str) -> Result<SecretKey, anyhow::Error> {
+    if !is_pem_file(file_path) {
+        return Err(anyhow!("not a '.pem' file extension"));
+    }
+
+    if metadata(file_path).is_ok() {
+        read_key(file_path)
+    } else {
+        let key = generate_new_key();
+        save_key(file_path, key)?;
+        Ok(key)
+    }
+}
+
+fn generate_new_key() -> SecretKey {
+    SecretKey::new(&mut rand::thread_rng())
+}
+
+fn is_pem_file(file_path: &str) -> bool {
+    Path::new(file_path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map_or(false, |ext| ext == "pem")
+}
+
+fn read_key(file_path: &str) -> Result<SecretKey, anyhow::Error> {
+    let mut file = File::open(file_path)?;
+    let mut pem_data = String::new();
+    file.read_to_string(&mut pem_data)?;
+
+    // Decode the PEM content
+    let (label, decoded_key) = decode_vec(pem_data.as_bytes()).map_err(|e| anyhow!(e))?;
+
+    // Verify the label
+    if label != "EC PRIVATE KEY" {
+        return Err(anyhow!("Invalid key format"));
+    }
+
+    // Parse the private key
+    let secret_key = SecretKey::from_slice(&decoded_key)?;
+    Ok(secret_key)
+}
+
+fn save_key(file_path: &str, key: SecretKey) -> Result<(), anyhow::Error> {
+    let pem = encode_string(
+        "EC PRIVATE KEY",
+        pem_rfc7468::LineEnding::LF,
+        &key.secret_bytes(),
+    )
+    .map_err(|e| anyhow!("Failed to encode key: {}", e))?;
+
+    // Private key file path needs to end in ".pem"
+    let mut file = File::create(file_path)?;
+    file.write_all(pem.as_bytes())?;
+    Ok(())
 }

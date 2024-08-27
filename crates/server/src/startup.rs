@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::{
-    add_event_entry, get_entries, index_handler, CompetitionData, Coordinator, OracleClient,
-    Settings,
+    add_event_entry, create_event, get_entries, index_handler, CompetitionData, Coordinator,
+    OracleClient, Settings,
 };
 use axum::{
     body::Body,
@@ -29,10 +29,11 @@ pub struct AppState {
     pub ui_dir: String,
     pub remote_url: String,
     pub oracle_url: String,
+    pub oracle_client: Arc<OracleClient>,
     pub coordinator: Arc<Coordinator>,
 }
 
-pub fn app(config: Settings) -> Router {
+pub async fn app(config: Settings) -> Result<Router, anyhow::Error> {
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([ACCEPT, CONTENT_TYPE])
@@ -45,7 +46,12 @@ pub fn app(config: Settings) -> Router {
     let competition_data = CompetitionData::new(&config.competition_db).unwrap();
     let reqwest_client = build_reqwest_client();
     let oracle_client = OracleClient::new(&config.oracle_url, reqwest_client);
-    let coordinator = Coordinator::new(oracle_client, competition_data);
+    let coordinator = Coordinator::new(
+        oracle_client.clone(),
+        competition_data,
+        &config.private_key_file,
+    )
+    .await?;
     let mut oracle_url: String = config.oracle_url.to_string();
     // removes the ending "/"
     oracle_url.pop();
@@ -54,17 +60,19 @@ pub fn app(config: Settings) -> Router {
         ui_dir: config.ui_dir,
         remote_url: config.remote_url,
         oracle_url,
+        oracle_client: Arc::new(oracle_client),
         coordinator: Arc::new(coordinator),
     };
-    Router::new()
+    Ok(Router::new()
         .route("/", get(index_handler))
+        .route("/competitions", post(create_event))
         .route("/entries", post(add_event_entry))
         .route("/entries", get(get_entries))
         .layer(middleware::from_fn(log_request))
         .with_state(Arc::new(app_state))
         .nest_service("/ui", serve_dir.clone())
         .fallback_service(serve_dir)
-        .layer(cors)
+        .layer(cors))
 }
 
 async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {

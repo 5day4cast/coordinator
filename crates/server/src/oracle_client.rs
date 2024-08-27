@@ -10,7 +10,7 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::domain::AddEntry;
+use crate::domain::{AddEntry, CreateEvent};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -26,6 +26,7 @@ pub enum Error {
     BadRequest(String),
 }
 
+#[derive(Clone)]
 pub struct OracleClient {
     pub base_url: Url,
     pub client: ClientWithMiddleware,
@@ -111,6 +112,16 @@ impl OracleClient {
             base_url: base_url.to_owned(),
             client,
         }
+    }
+
+    pub async fn create_event(&self, event: CreateEvent) -> Result<(), Error> {
+        let url = self
+            .base_url
+            .join(&format!("/oracle/events/{}", event.id))
+            .map_err(|e| Error::Request(e.to_string()))?;
+        let req = self.client.request(Method::POST, url).json(&event);
+        self.send_request(req, String::from("event not found"))
+            .await
     }
 
     pub async fn submit_entry(&self, entry: AddEventEntry) -> Result<(), Error> {
