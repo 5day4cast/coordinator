@@ -5,7 +5,6 @@ use dlctix::{
         XOnlyPublicKey,
     },
     musig2::secp256k1::{schnorr::Signature, Message, PublicKey, SecretKey},
-    secp::Point,
 };
 use futures::TryFutureExt;
 use log::{debug, error, info};
@@ -59,7 +58,7 @@ impl Coordinator {
     }
 
     pub fn public_key(&self) -> String {
-        let key = Point::from(self.public_key).serialize();
+        let key = self.public_key.x_only_public_key().0.serialize();
         hex::encode(key)
     }
 

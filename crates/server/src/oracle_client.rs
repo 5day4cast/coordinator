@@ -140,7 +140,7 @@ impl OracleClient {
         not_found_message: String,
     ) -> Result<(), Error> {
         let response = request.send().await.map_err(|e| {
-            error!("error sending to billing: {}", e);
+            error!("error sending to oracle: {}", e);
             Error::SendRetry(e)
         })?;
 

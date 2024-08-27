@@ -3,7 +3,6 @@ mod competition_data;
 mod competition_db_migrations;
 
 use crate::oracle_client::WeatherChoices;
-use crate::ser::utc_datetime;
 pub use competition_coordinator::*;
 pub use competition_data::*;
 pub use competition_db_migrations::*;
@@ -130,10 +129,10 @@ impl SearchByMessage {
 pub struct CreateEvent {
     /// Client needs to provide a valid Uuidv7
     pub id: Uuid,
-    #[serde(with = "utc_datetime")]
+    #[serde(with = "time::serde::rfc3339")]
     /// Time at which the attestation will be added to the event, needs to be after the observation date
     pub signing_date: OffsetDateTime,
-    #[serde(with = "utc_datetime")]
+    #[serde(with = "time::serde::rfc3339")]
     /// Date of when the weather observations occured (midnight UTC), all entries must be made before this time
     pub observation_date: OffsetDateTime,
     /// NOAA observation stations used in this event
@@ -167,10 +166,10 @@ impl CreateEvent {
 pub struct CreateEventMessage {
     /// Client needs to provide a valid Uuidv7
     pub id: Uuid,
-    #[serde(with = "utc_datetime")]
+    #[serde(with = "time::serde::rfc3339")]
     /// Time at which the attestation will be added to the event, needs to be after the observation date
     pub signing_date: OffsetDateTime,
-    #[serde(with = "utc_datetime")]
+    #[serde(with = "time::serde::rfc3339")]
     /// Date of when the weather observations occured (midnight UTC), all entries must be made before this time
     pub observation_date: OffsetDateTime,
     /// NOAA observation stations used in this event
