@@ -11,7 +11,7 @@ pub async fn index_handler(State(state): State<Arc<AppState>>) -> Html<String> {
 }
 
 pub async fn admin_index_handler(State(state): State<Arc<AppState>>) -> Html<String> {
-    Html(index(&state.remote_url, &state.oracle_url, &state.admin_ui_dir).await)
+    Html(index(&state.private_url, &state.oracle_url, &state.admin_ui_dir).await)
 }
 
 pub async fn index(remote_url: &str, oracle_url: &str, ui_dir: &str) -> String {

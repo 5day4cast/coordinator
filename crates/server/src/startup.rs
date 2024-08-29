@@ -28,6 +28,7 @@ use tower_http::{
 pub struct AppState {
     pub ui_dir: String,
     pub admin_ui_dir: String,
+    pub private_url: String,
     pub remote_url: String,
     pub oracle_url: String,
     pub oracle_client: Arc<OracleClient>,
@@ -64,6 +65,7 @@ pub async fn app(config: Settings) -> Result<Router, anyhow::Error> {
     info!("oracle: {}", oracle_url);
     let app_state = AppState {
         ui_dir: config.ui_dir,
+        private_url: config.private_url,
         remote_url: config.remote_url,
         oracle_url,
         admin_ui_dir: config.admin_ui_dir,

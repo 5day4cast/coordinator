@@ -1,5 +1,6 @@
 import { WeatherData } from "./weather_data.js";
 import { uuidv7 } from "https://unpkg.com/uuidv7@^1";
+import { hash_object } from "./utils.js";
 
 class Entry {
   constructor(coordinator_url, oracle_url, stations, competition) {
@@ -7,7 +8,7 @@ class Entry {
     this.coordinator_url = coordinator_url;
     this.competition = competition;
     this.stations = stations;
-    this.entry = { comptition_id: this.competition.id, submit: {} };
+    this.entry = { competition_id: this.competition.id, submit: {} };
   }
 
   async init() {
@@ -189,17 +190,19 @@ class Entry {
       this.showError("user needs to login before submitting");
       return;
     }
-    let pubkey = await window.nostr.getPublicKey();
+    let xonly_pubkey_hex = await window.nostr.getPublicKey();
+    let submit = this.entry["submit"];
+    let expected_observations = build_expected_observations_from_submit(submit);
+    let competition_id = this.entry.competition_id;
     let entry_body = {
       id: uuidv7(),
-      pubkey: pubkey,
-      event_id: this.entry.comptition_id,
-      expected_observations: build_expected_observations_from_submit(
-        this.entry["submit"],
-      ),
+      pubkey: xonly_pubkey_hex,
+      event_id: competition_id,
+      expected_observations: expected_observations,
     };
+    console.log(entry_body);
     let entry_hash = await hash_object(entry_body);
-    console.log(entry_hash);
+    console.log("entry_hash", entry_hash);
     const signature = await window.nostr.signSchnorr(entry_hash);
     console.log(signature);
     entry_body["signature"] = signature;
@@ -252,26 +255,7 @@ class Entry {
   }
 }
 
-export async function hash_object(obj) {
-  const objString = JSON.stringify(obj);
-
-  // Step 2: Convert the string to an ArrayBuffer using TextEncoder
-  const encoder = new TextEncoder();
-  const data = encoder.encode(objString);
-
-  // Step 3: Generate the SHA-256 hash
-  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-
-  // Step 4: Convert the ArrayBuffer to a hexadecimal string
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  const hashHex = hashArray
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-
-  return hashHex;
-}
-
-export function build_expected_observations_from_submit(submit) {
+function build_expected_observations_from_submit(submit) {
   console.log(submit);
   let expected_observations = [];
   for (let [station_id, choices] of Object.entries(submit)) {
@@ -286,7 +270,7 @@ export function build_expected_observations_from_submit(submit) {
   return expected_observations;
 }
 
-export function convert_select_val(raw_select) {
+function convert_select_val(raw_select) {
   switch (raw_select) {
     case "par":
       return "Par";

@@ -1,5 +1,4 @@
-import { hash_object } from "./entry.js";
-import { one_day_ahead } from "./competitions.js";
+import { get_xonly_pubkey, one_day_ahead } from "./utils.js";
 
 export async function displayEntries(apiBase, oracleBase) {
   let $entriesDataTable = document.getElementById("entriesDataTable");
@@ -87,10 +86,10 @@ class Entries {
       this.showError("user needs to login before submitting");
       return;
     }
-    let pubkey = await window.nostr.getPublicKey();
+    let xonly_pubkey_hex = await window.nostr.getPublicKey();
     //TODO: fix the filter for event_ids
     let search_query = {
-      pubkey: pubkey,
+      pubkey: xonly_pubkey_hex,
     };
     let query_hash = await hash_object(search_query);
     console.log(query_hash);

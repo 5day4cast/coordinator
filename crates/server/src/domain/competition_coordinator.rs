@@ -139,9 +139,9 @@ fn validate(message: Message, pubkey: &str, signature: &str) -> Result<(), Error
     let raw_pubkey: Vec<u8> = hex::decode(pubkey).unwrap();
     let sig: Signature = Signature::from_slice(raw_signature.as_slice())
         .map_err(|e| Error::InvalidSignature(format!("invalid signature: {}", e)))?;
-    let pubkey: XOnlyPublicKey = XOnlyPublicKey::from_slice(raw_pubkey.as_slice())
+    let xonly_pubkey: XOnlyPublicKey = XOnlyPublicKey::from_slice(raw_pubkey.as_slice())
         .map_err(|e| Error::InvalidSignature(format!("invalid pubkey: {}", e)))?;
-    sig.verify(&message, &pubkey).map_err(|e| {
+    sig.verify(&message, &xonly_pubkey).map_err(|e| {
         Error::InvalidSignature(format!(
             "invalid signature {} for pubkey {} {}",
             signature, pubkey, e
