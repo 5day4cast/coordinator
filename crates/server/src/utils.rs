@@ -51,6 +51,10 @@ pub struct Cli {
     #[arg(short, long)]
     pub port: Option<String>,
 
+    /// Url Admin UI should hit for the backend (default: http://127.0.0.1:9100)
+    #[arg(long)]
+    pub private_url: Option<String>,
+
     /// Url UI should hit for the backend (default: http://127.0.0.1:9100)
     #[arg(short, long)]
     pub remote_url: Option<String>,
@@ -80,6 +84,7 @@ pub struct Settings {
     pub level: Option<String>,
     pub domain: String,
     pub port: String,
+    pub private_url: String,
     pub remote_url: String,
     pub ui_dir: String,
     pub admin_ui_dir: String,
@@ -94,6 +99,9 @@ impl From<Cli> for Settings {
             level: value.level,
             domain: value.domain.unwrap_or(String::from("127.0.0.1")),
             port: value.port.unwrap_or(String::from("9100")),
+            private_url: value
+                .private_url
+                .unwrap_or(String::from("http://127.0.0.1:9990")),
             remote_url: value
                 .remote_url
                 .unwrap_or(String::from("http://127.0.0.1:9990")),

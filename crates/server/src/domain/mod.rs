@@ -6,8 +6,12 @@ use crate::oracle_client::WeatherChoices;
 pub use competition_coordinator::*;
 pub use competition_data::*;
 pub use competition_db_migrations::*;
-use dlctix::{bitcoin::hashes::sha256, musig2::secp256k1::Message};
+use dlctix::{
+    bitcoin::hashes::{sha256, Hash},
+    musig2::secp256k1::Message,
+};
 use duckdb::{types::Type, Row};
+use log::info;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -46,7 +50,11 @@ struct AddEntryMessage {
 impl AddEntryMessage {
     pub fn message(&self) -> Result<Message, Error> {
         let message_str = serde_json::to_string(self)?;
-        let message = Message::from_hashed_data::<sha256::Hash>(message_str.as_bytes());
+        info!("message_str: {}", message_str);
+        let message_hash = sha256::Hash::hash(message_str.as_bytes());
+        info!("message hash: {}", message_hash);
+        let message = Message::from(message_hash);
+        info!("message: {}", message);
         Ok(message)
     }
 }

@@ -54,11 +54,11 @@ pub struct WeatherChoices {
     // NOAA weather stations
     pub stations: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub wind_speed: Option<ValueOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub temp_high: Option<ValueOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temp_low: Option<ValueOptions>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wind_speed: Option<ValueOptions>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
