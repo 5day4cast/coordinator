@@ -24,6 +24,7 @@ class LeaderBoard {
         lastForecasts,
         entries,
       );
+      console.log(entryScores);
       this.displayScore(entryScores);
     });
   }
@@ -59,17 +60,32 @@ class LeaderBoard {
           continue;
         }
         Object.keys(option).forEach((key) => {
-          if (key == "station_id") {
+          if (key == "stations") {
             return;
+          }
+          console.log(option);
+          console.log(key);
+          if (option[key] !== null && option[key] !== undefined) {
+            const val = option[key];
+            console.log(val);
+            option[key] = val.toLowerCase();
           }
           const optionScore = this.calculateOptionScore(
             forecast[key],
             observation[key],
-            option[key].to_lowercase(),
+            option[key],
           );
-          option[key]["score"] = optionScore;
-          option[key]["forecast"] = forecast[key];
-          option[key]["observation"] = observation[key];
+          console.log(optionScore);
+          console.log(option[key]);
+          if (option[key]) {
+            const picked = option[key];
+            option[key] = {
+              score: optionScore,
+              val: picked,
+              forecast: forecast[key],
+              observation: observation[key],
+            };
+          }
           currentScore += optionScore;
         });
       }
@@ -194,12 +210,12 @@ class LeaderBoard {
     let $competitionId = document.createElement("h3");
     $competitionId.textContent = `Competition: ${entry.competition_id}`;
     $entryValues.appendChild($competitionId);
-
-    for (let option of entry["options"]) {
+    console.log(entry);
+    for (let option of entry["expected_observations"]) {
       let $stationDiv = document.createElement("div");
-      if (option["station_id"]) {
+      if (option["stations"]) {
         let $stationHeader = document.createElement("h5");
-        $stationHeader.textContent = `Station: ${option.station_id}`;
+        $stationHeader.textContent = `Station: ${option.stations}`;
         $stationHeader.classList.add("ml-2");
         $stationDiv.appendChild($stationHeader);
       }
