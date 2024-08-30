@@ -1,4 +1,4 @@
-import { get_xonly_pubkey, one_day_ahead } from "./utils.js";
+import { one_day_ahead } from "./utils.js";
 
 export async function displayEntries(apiBase, oracleBase) {
   let $entriesDataTable = document.getElementById("entriesDataTable");
