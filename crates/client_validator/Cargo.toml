@@ -4,4 +4,58 @@ version = "0.1.2"
 edition = "2021"
 repository = "https://github.com/tee8z/5day4cast"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+nostr-sdk = { version = "0.38", features = [
+    "indexeddb",
+    "nip07",     # browser extension signing
+] }
+js-sys = "0.3.77"
+getrandom = { version = "0.2", features = ["js"] }
+
 [dependencies]
+wasm-bindgen = { version = "0.2.100", features = ["serde-serialize", "std"] }
+wasm-bindgen-futures = "0.4.43"
+wasm-logger = "0.2.0"
+async-trait = "0.1.85"
+nostr-sdk = { version = "0.38.0", features = [
+    "nip44", # encrypt a message
+    "nip04", # encrypt a message
+    "nip49", # private key encryption
+] }
+thiserror = "2.0.11"
+serde-wasm-bindgen = "0.6.5"
+getrandom = { version = "0.2" }
+dlctix = { git = "https://github.com/tee8z/dlctix", branch = "update-bitcoin-dep" }
+rand = "0.8"
+aes-gcm = "0.10"
+secrecy = "0.10.3"
+sha2 = "0.10"
+log = "0.4.25"
+hex = "0.4"
+serde = "1.0.217"
+bdk_wallet = { version = "1.0.0", features = ["keys-bip39"] }
+blake2 = "0.10.6"
+zeroize = { version = "1.6", features = ["zeroize_derive"] }
+
+[dependencies.web-sys]
+version = "0.3.77"
+features = [
+    'Document',
+    'Element',
+    'HtmlElement',
+    'Node',
+    'Window',
+    'CustomEventInit',
+    'console',
+    'Headers',
+    'Request',
+    'RequestInit',
+    'RequestMode',
+]
+
+
+[package.metadata.wasm-pack.profile.dev]
+wasm-opt = false

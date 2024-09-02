@@ -8,3 +8,4 @@ remote_url = "http://127.0.0.1:9990"
 oracle_url = "https://www.4casttruth.win"
 #oracle_url = "http://127.0.0.1:9100"
 competition_db = "./competition_data"
+competition_watch_sleep = 10

@@ -35,25 +35,16 @@ pub fn create_version_table(conn: &mut Connection) -> Result<(), duckdb::Error> 
 
 pub fn create_initial_schema(conn: &mut Connection) -> Result<(), duckdb::Error> {
     let initial_schema = r#"
-    -- Table of information about the oracle, mostly to prevent multiple keys from being used with the same database
-    -- singleton_constant is a dummy column to ensure there is only one row
-    CREATE TABLE IF NOT EXISTS coordinator_metadata
+    -- TODO add password login
+    CREATE TABLE IF NOT EXISTS user
     (
-            pubkey             BLOB     NOT NULL UNIQUE PRIMARY KEY, -- pubkey to private key coordinator will use to sign
-            name               TEXT      NOT NULL UNIQUE,
+            nostr_pubkey TEXT NOT NULL UNIQUE, -- login via verifying a random hash being signed
+            -- could be ln-auth, nostr login, etc, need to be able to sign a randomly generated 32 bytes of data
+            encrypted_bitcoin_private_key TEXT NOT NULL UNIQUE, -- user encrypted bitcoin key for dlctix wallet
+            network                                 TEXT NOT NULL,
             created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            singleton_constant BOOLEAN   NOT NULL DEFAULT TRUE, -- make sure there is only one row
-            CONSTRAINT one_row_check UNIQUE (singleton_constant)
     );
-
-    CREATE TABLE IF NOT EXISTS entries
-    (
-        id UUID PRIMARY KEY, -- should match entry_id with the oracle
-        event_id UUID NOT NULL, -- should match event_id with the oracle
-        pubkey STRING NOT NULL -- user pubkey
-    );
-
     INSERT INTO db_version (version) VALUES (1);
     "#;
     conn.execute_batch(initial_schema)?;

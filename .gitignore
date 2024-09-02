@@ -11,3 +11,5 @@ server/target/
 .vscode/
 duckdb_lib/
 coordinator_private_key.pem
+config/
+data/

@@ -33,7 +33,6 @@ $navbarItems.forEach(function ($navbarItem) {
     switch (targetContainerId) {
       case "logout":
         console.log("logging out");
-        document.dispatchEvent(new Event("nlLogout"));
         break;
       case "allEntries":
         console.log("displaying entries");
