@@ -149,8 +149,6 @@ pub struct CreateEvent {
     pub number_of_values_per_entry: usize,
     /// Total number of allowed entries into the event
     pub total_allowed_entries: usize,
-    /// Total amount of places that are part of the winnings split
-    pub number_of_places_win: usize,
     /// Add a coordinator that will use the event entries in a competition
     pub coordinator: Option<CoordinatorInfo>,
 }
@@ -164,7 +162,6 @@ impl CreateEvent {
             locations: create_event.locations,
             number_of_values_per_entry: create_event.number_of_values_per_entry,
             total_allowed_entries: create_event.total_allowed_entries,
-            number_of_places_win: create_event.number_of_places_win,
             coordinator: Some(coordinator_info),
         }
     }
@@ -178,7 +175,7 @@ pub struct CreateEventMessage {
     /// Time at which the attestation will be added to the event, needs to be after the observation date
     pub signing_date: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
-    /// Date of when the weather observations occured (midnight UTC), all entries must be made before this time
+    /// Date of when the weather observations occurred (midnight UTC), all entries must be made before this time
     pub observation_date: OffsetDateTime,
     /// NOAA observation stations used in this event
     pub locations: Vec<String>,
@@ -186,8 +183,6 @@ pub struct CreateEventMessage {
     pub number_of_values_per_entry: usize,
     /// Total number of allowed entries into the event
     pub total_allowed_entries: usize,
-    /// Total amount of places that are part of the winnings split
-    pub number_of_places_win: usize,
 }
 
 impl CreateEventMessage {
@@ -207,7 +202,6 @@ impl From<CreateEvent> for CreateEventMessage {
             locations: value.locations,
             number_of_values_per_entry: value.number_of_values_per_entry,
             total_allowed_entries: value.total_allowed_entries,
-            number_of_places_win: value.number_of_places_win,
         }
     }
 }

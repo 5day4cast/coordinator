@@ -45,6 +45,9 @@ function createCompetition($event) {
 
 function validateCompetition() {
   let $competitionElement = document.getElementById("competition_payload");
+  if (!$competitionElement || !$competitionElement.innerText) {
+    return;
+  }
   let competition = $competitionElement.innerText.trim();
   console.log("comeptition", competition);
 
