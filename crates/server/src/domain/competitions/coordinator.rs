@@ -32,11 +32,7 @@ use uuid::Uuid;
 
 use super::{AddEntry, CompetitionError, CompetitionStore, SearchBy, Ticket, UserEntry};
 use crate::{
-    bitcoin_client::Bitcoin,
-    domain::{Competition, CreateEvent, Error},
-    get_key,
-    oracle_client::Event,
-    OracleClient, OracleError,
+    bitcoin_client::Bitcoin, domain::{Competition, CreateEvent, Error}, get_key, oracle_client::Event, Ln, OracleClient, OracleError
 };
 
 pub struct CompetitionWatcher {
@@ -93,6 +89,7 @@ pub struct Coordinator {
     oracle_client: Arc<OracleClient>,
     competition_store: Arc<CompetitionStore>,
     bitcoin: Arc<Bitcoin>,
+    ln: Arc<dyn Ln>,
     private_key: SecretKey,
     public_key: PublicKey,
     relative_locktime_block_delta: u16,
@@ -103,6 +100,7 @@ impl Coordinator {
         oracle_client: OracleClient,
         competition_store: CompetitionStore,
         bitcoin: Arc<Bitcoin>,
+        ln: Arc<dyn Ln>,
         private_key_file_path: &str,
         relative_locktime_block_delta: u16,
     ) -> Result<Self, anyhow::Error> {
@@ -113,6 +111,7 @@ impl Coordinator {
             oracle_client: Arc::new(oracle_client),
             competition_store: Arc::new(competition_store),
             bitcoin,
+            ln,
             private_key: secret_key,
             public_key,
             relative_locktime_block_delta,
@@ -482,7 +481,7 @@ impl Coordinator {
         })
     }
 
-    // Becareful with these two operations, there's a possibility here of an
+    // Be-careful with these two operations, there's a possibility here of an
     // entry being added to the oracle but never saved to our local DB (low, but possible)
     pub async fn add_entry(&self, pubkey: String, entry: AddEntry) -> Result<UserEntry, Error> {
         info!("add_entry: {:?}", entry);

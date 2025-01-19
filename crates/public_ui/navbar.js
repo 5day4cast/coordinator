@@ -25,10 +25,8 @@ $navbarBurgers.forEach((el) => {
 
 $navbarItems.forEach(function ($navbarItem) {
   $navbarItem.addEventListener("click", function (event) {
-    console.log("click", event);
     event.preventDefault();
     const targetContainerId = this.id.replace("NavClick", "");
-    console.log("in nav click ", targetContainerId);
     //router
     switch (targetContainerId) {
       case "logout":

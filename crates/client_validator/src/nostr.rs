@@ -1,7 +1,5 @@
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use log::error;
-use log::info;
 use nostr_sdk::prelude::*;
 #[cfg(target_arch = "wasm32")]
 use nostr_sdk::serde_json;
@@ -369,7 +367,7 @@ impl NostrClientWrapper {
         url: &str,
         body_string: Option<String>,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        info!("in auth header");
+
         let http_method = HttpMethod::from_str(method)?;
         let http_url = Url::from_str(url)?;
 
