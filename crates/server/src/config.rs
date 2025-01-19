@@ -33,6 +33,7 @@ pub struct Settings {
     pub ui_settings: UISettings,
     pub coordinator_settings: CoordinatorSettings,
     pub bitcoin_settings: BitcoinSettings,
+    pub ln_settings: LnSettings,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -44,6 +45,26 @@ impl Default for DBSettings {
     fn default() -> Self {
         DBSettings {
             data_folder: String::from("./data"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LnSettings {
+    /// Url to find the lnd lightning node's REST api
+    pub base_url: String,
+    /// File path to the lnd macaroon that has the needed permissions
+    pub macaroon_file_path: String,
+    /// Optional file path to the lnd tls cert (typically only used in local development, with self signed certs)
+    pub tls_cert_path: Option<String>,
+}
+
+impl Default for LnSettings {
+    fn default() -> Self {
+        LnSettings {
+            base_url: String::from("https://localhost:9095"),
+            macaroon_file_path: String::from("./creds/admin.macaroon"),
+            tls_cert_path: Some(String::from("./creds/tls.cert")),
         }
     }
 }
@@ -71,7 +92,7 @@ impl Default for BitcoinSettings {
             network: Network::Regtest,
             esplora_url: String::from("http://localhost:9102"),
             storage_file: String::from("./data/bitcoin.db"),
-            seed_path: String::from("./coordinator_private_key.pem"),
+            seed_path: String::from("./creds/coordinator_private_key.pem"),
             refresh_blocks_secs: 15,
         }
     }
@@ -151,6 +172,7 @@ impl Default for Settings {
             ui_settings: UISettings::default(),
             coordinator_settings: CoordinatorSettings::default(),
             bitcoin_settings: BitcoinSettings::default(),
+            ln_settings: LnSettings::default(),
         }
     }
 }

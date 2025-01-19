@@ -10,7 +10,6 @@ class AuthorizedClient {
 
   async get(url, options = {}) {
     const authHeader = await this._getAuthHeader(url, "GET", options.body);
-    console.log(authHeader);
     return fetch(url, {
       ...options,
       method: "GET",

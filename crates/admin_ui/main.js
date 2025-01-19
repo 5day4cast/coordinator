@@ -94,7 +94,7 @@ function validateCompetition() {
     JSON.parse(competition);
     $competitionElement.classList.remove("invalid");
   } catch (e) {
-    console.log(e);
+    console.log(`Failed to parse competition {e}`);
     $competitionElement.classList.add("invalid");
   }
 }
@@ -214,7 +214,6 @@ async function refreshOutputs() {
     tbody.innerHTML = '';
 
     data.outputs.forEach(output => {
-      console.log(output);
       const row = document.createElement('tr');
       row.innerHTML = `
                 <td><code>${output.outpoint.split(':')[0]}</code></td>

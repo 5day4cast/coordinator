@@ -56,7 +56,6 @@ class AuthManager {
     document
       .getElementById("privateKeySavedCheckbox")
       .addEventListener("change", (e) => {
-        console.log("private key saved", e);
         document.getElementById("registerStep1Button").disabled =
           !e.target.checked;
       });
@@ -201,7 +200,6 @@ class AuthManager {
 
   handleCopyPrivateKey() {
     const privateKey = document.getElementById("privateKeyDisplay").value;
-    console.log(privateKey);
     navigator.clipboard.writeText(privateKey);
   }
 
@@ -212,9 +210,8 @@ class AuthManager {
       .network(this.network)
       .nostr_client(window.nostrClient)
       .build();
-    console.log("pubkey", pubkey);
+
     const payload = await wallet.getEncryptedMasterKey(pubkey);
-    console.log("payload", payload);
 
     const response = await this.authorizedClient.post(
       `${this.apiBase}/users/register`,

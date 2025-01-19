@@ -1,6 +1,5 @@
 import { WeatherData } from "./weather_data.js";
 import { uuidv7 } from "https://unpkg.com/uuidv7@^1";
-import { hash_object } from "./utils.js";
 
 class Entry {
   constructor(coordinator_url, oracle_url, stations, competition) {

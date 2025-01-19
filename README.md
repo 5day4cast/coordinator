@@ -23,7 +23,7 @@ With the Musig signing
 4) once the coordinator has reached the total number of pubkeys required for the competition (we need to split the contract with all users)
     we generate the musig public key with the coordinator, and all users keys -- (aggregate pubkey)
 5) at the point we mark all entries are still set as "pending", every user needs to now sign the aggregate nonce and return back to the coordinator
-    -- there is some issues here around UX, how do we insure that a user comes back and does the signing? we need to notify them some how
+    -- there is some issues here around UX, how do we insure that a user comes back and does the signing? we need to notify them some how (probably via nostr)
 
 6) once the musig aggregate signature is verified we can now sign the dlc transactions
 
@@ -52,7 +52,7 @@ sequenceDiagram
         C->>U: Resolve hodl invoice, preimage is the ticket
     else User Never Returns
         Note over C: Signing deadline passes
-        C->>C: Keeps deposit as penalty
-        C->>C: Restarts signing without user
+        C->>C: Keeps deposit as penalty if user didn't sign, otherwise cancel hodl invoice
+        C->>C: Restarts signing without user or cancel competition
     end
 ```

@@ -116,7 +116,7 @@ impl TryFrom<String> for ValueOptions {
 }
 
 impl OracleClient {
-    pub fn new(base_url: &Url, client: ClientWithMiddleware) -> Self {
+    pub fn new(client: ClientWithMiddleware, base_url: &Url, ) -> Self {
         Self {
             base_url: base_url.to_owned(),
             client,

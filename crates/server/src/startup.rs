@@ -1,9 +1,5 @@
 use crate::{
-    add_event_entry, admin_index_handler, create_event, create_folder,
-    domain::{CompetitionStore, CompetitionWatcher, DBConnection, UserInfo},
-    get_balance, get_entries, get_estimated_fee_rates, get_next_address, get_outputs, health,
-    index_handler, login, register, send_to_address, Bitcoin, BitcoinSyncWatcher, Coordinator,
-    OracleClient, Settings, UserStore,
+    add_event_entry, admin_index_handler, create_event, create_folder, domain::{CompetitionStore, CompetitionWatcher, DBConnection, UserInfo}, get_balance, get_entries, get_estimated_fee_rates, get_next_address, get_outputs, health, index_handler, login, register, send_to_address, Bitcoin, BitcoinSyncWatcher, Coordinator, Ln, LnClient, OracleClient, Settings, UserStore
 };
 use anyhow::anyhow;
 use axum::{
@@ -137,11 +133,17 @@ pub async fn build_app(
     let bitcoin = Bitcoin::new(&config.bitcoin_settings).await.map(Arc::new)?;
     info!("Bitcoin service configured");
 
+
     let reqwest_client = build_reqwest_client();
+    let ln = LnClient::new(reqwest_client.clone(), config.ln_settings).await.map(Arc::new)?;
+
+    // TODO: add background thread to monitor how lnd node is doing, alert if there is an issue
+    ln.ping().await?;
+    info!("Lnd client configured");
 
     let orcale_url = Url::parse(&config.coordinator_settings.oracle_url)
         .map_err(|e| anyhow!("Failed to parse oracle url: {}", e))?;
-    let oracle_client = OracleClient::new(&orcale_url, reqwest_client);
+    let oracle_client = OracleClient::new(reqwest_client, &orcale_url);
     info!("Oracle client configured");
 
     create_folder(&config.db_settings.data_folder.clone());
@@ -158,6 +160,7 @@ pub async fn build_app(
         oracle_client.clone(),
         competition_store,
         bitcoin.clone(),
+        ln.clone(),
         &config.coordinator_settings.private_key_file,
         config.coordinator_settings.relative_locktime_block_delta,
     )
