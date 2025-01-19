@@ -12,7 +12,7 @@ rm libduckdb-linux-amd64.zip
 ```
 
 ### How to run
-- at the root of the repo run `cargo run --bin server -- --config ./crates/server/config/local.toml`
+- at the root of the repo run `cargo run --bin server`
 
 ### How transaction creation works
 
