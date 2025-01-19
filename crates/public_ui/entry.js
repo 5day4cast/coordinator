@@ -8,13 +8,20 @@ class Entry {
     this.coordinator_url = coordinator_url;
     this.competition = competition;
     this.stations = stations;
-    this.entry = { competition_id: this.competition.id, submit: {} };
+    let preimage = generateRandomPreimage();
+    let preimage_hash = (this.entry = {
+      competition_id: this.competition.id,
+      submit: {},
+      payout_preimage: preimageToHex(preimage),
+      payout_hash: sha256(preimage),
+    });
   }
 
   async init() {
-    return Promise.all([
+    /*return Promise.all([
       this.weather_data.get_competition_last_forecast(this.competition),
-    ]).then(([competition_forecasts]) => {
+      generateKeyPair(),
+    ]).then(([competition_forecasts, key_pair]) => {
       this.competition_forecasts = competition_forecasts;
       this.entry["options"] = [];
       for (const station_id in competition_forecasts) {
@@ -28,8 +35,9 @@ class Entry {
         };
         this.entry["options"].push(option);
         this.entry["submit"][station_id] = {};
+        this.entry.ephemeral_keys = key_pair;
       }
-    });
+    });*/
   }
 
   showEntry() {
@@ -186,31 +194,49 @@ class Entry {
   }
 
   async submit($event) {
-    if (!window.nostr) {
-      this.showError("user needs to login before submitting");
-      return;
-    }
-    let xonly_pubkey_hex = await window.nostr.getPublicKey();
+    let xonly_pubkey_hex = await window.nostrClient.getPublicKey();
     let submit = this.entry["submit"];
     let expected_observations = build_expected_observations_from_submit(submit);
     let competition_id = this.entry.competition_id;
+
+    let encrypted_private_key = await window.nostrClient.nip44.encrypt(
+      xonly_pubkey_hex,
+      this.entry.ephemeral_keys.privateKey,
+    );
+    let encrypted_payout_preimage = await window.nostrClient.nip44.encrypt(
+      xonly_pubkey_hex,
+      this.entry.payout_preimage,
+    );
+
     let entry_body = {
       id: uuidv7(),
       pubkey: xonly_pubkey_hex,
+      ephemeral_private_key: encrypted_private_key, // encrypt to nostr pubkey via nip 04
+      ephemeral_pubkey: this.entry.ephemeral_keys.publicKey, // needs to be associated to an ephemeral private key as this may be exposed to the market maker on payout
+      payout_preimage: encrypted_payout_preimage, // encrypt to nostr pubkey via nip 04
+      payout_hash: this.entry.payout_hash, // needs to be ephemeral preimage, used to get the payout
       event_id: competition_id,
       expected_observations: expected_observations,
     };
-    console.log(entry_body);
-    let entry_hash = await hash_object(entry_body);
-    console.log("entry_hash", entry_hash);
-    const signature = await window.nostr.signSchnorr(entry_hash);
-    console.log(signature);
-    entry_body["signature"] = signature;
+
+    /* broadcasted to nostr relays so user has ability to complete the payout even if coordinator is gone
+    TODO: need to add the ability to publish to a list of relays, user defined with sane defaults
+    let nostr_store_data = {
+      event_id: competition_id,
+      entry_id: entry_body.id,
+      ephemeral_pubkey: this.entry.ephemeral_keys.publicKey,
+      ephemeral_private_key: encrypted_private_key, // encrypt to nostr pubkey via nip 04
+      payout_preimage: encrypted_payout_preimage, // encrypt to nostr pubkey via nip 04
+      payout_hash: this.entry.payout_hash,
+    };
+    console.log("Sending nostr backup:", nostr_store_data);
+    */ m;
+
     console.log("Sending entry:", entry_body);
+
     const headers = {
       "Content-Type": "application/json",
     };
-
     fetch(`${this.coordinator_url}/entries`, {
       method: "POST",
       headers: headers,

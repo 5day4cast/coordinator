@@ -6,49 +6,60 @@ repository = "https://github.com/tee8z/5day4cast"
 
 [dependencies]
 anyhow = "1.0.72"
-axum = { version = "0.7.5", features = [
+async-trait = "0.1.85"
+async-channel = "2.3.1"
+axum = { version = "0.8.1", features = [
+    "http1",
     "macros",
+    "multipart",
+    "tokio",
     "tokio",
     "tracing",
-    "multipart",
-    "http1",
+    "original-uri",
 ] }
 base64 = "0.22.1"
-config = "0.14.0"
+bdk_esplora = { version = "0.20.1", features = ["async", "tokio"] }
+bdk_wallet = { version = "1.0.0", features = ["file_store"] }
+blake2 = "0.10.6"
 clap = { version = "4.3.23", features = ["derive", "env"] }
-dlctix = "0.0.6"
-duckdb = { version = "1.0.0" }
+config = "0.14.0"
+dlctix = { git = "https://github.com/tee8z/dlctix", branch = "update-bitcoin-dep" }
+duckdb = { version = "1.1.1" }
 fern = { version = "0.6.2", features = ["colored"] }
 futures = "0.3.28"
+itertools = "0.14.0"
+h2 = "0.4.5"
 hex = "0.4.3"
 hyper = "1.4.0"
-h2 = "0.4.5"
 log = "0.4.18"
 mime = "0.3.17"
+nostr-sdk = { version = "0.38.0" }
 num_cpus = "1.16.0"
 openssl = { version = "0.10", features = ["vendored"] }
 pem-rfc7468 = { version = "0.7.0", features = ["alloc"] }
+rand = "0.8.5"
 reqwest-middleware = { version = "0.3.3", features = ["json", "rustls-tls"] }
 reqwest-retry = { version = "0.6.1" }
 scooby = "0.5.0"
+secrecy = { version = "0.8.0", features = ["serde"] }
 serde = { version = "1.0.188", features = ["derive"] }
 serde_json = "1.0.117"
 thiserror = "1.0.62"
 time = { version = "0.3.36", features = [
-    "parsing",
     "formatting",
     "macros",
+    "parsing",
     "serde",
 ] }
-tokio = { version = "1.35.1", features = [
+tokio = { version = "1.39.2", features = [
     "macros",
     "rt-multi-thread",
     "signal",
 ] }
-tokio-util = "0.7.9"
+tokio-util = { version = "0.7.11", features = ["rt"] }
 toml = "0.8.10"
-tower-http = { version = "0.5.2", features = ["fs", "cors"] }
-uuid = { version = "1.4.1", features = ["v7", "serde"] }
+tower-http = { version = "0.5.2", features = ["cors", "fs"] }
+uuid = { version = "1.4.1", features = ["serde", "v7"] }
 
 [dev-dependencies]
 tower = "0.4.13"

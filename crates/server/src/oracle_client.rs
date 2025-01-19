@@ -1,15 +1,25 @@
 use anyhow::anyhow;
+use dlctix::{secp::Scalar, EventLockingConditions};
 use log::{debug, error};
 use reqwest_middleware::{
     self,
     reqwest::{Method, StatusCode, Url},
     ClientWithMiddleware, RequestBuilder,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::domain::{AddEntry, CreateEvent};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Event {
+    pub id: Uuid,
+    /// Nonce the oracle committed to use as part of signing final results
+    pub nonce: Scalar,
+    /// Holds the predefined outcomes the oracle will attest to at event completes
+    pub event_annoucement: EventLockingConditions,
+}
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -113,14 +123,14 @@ impl OracleClient {
         }
     }
 
-    pub async fn create_event(&self, event: CreateEvent) -> Result<(), Error> {
+    pub async fn create_event(&self, event: CreateEvent) -> Result<Event, Error> {
         debug!("event: {:?}", event);
         let url = self
             .base_url
             .join("/oracle/events")
             .map_err(|e| Error::Request(e.to_string()))?;
         let req = self.client.request(Method::POST, url).json(&event);
-        self.send_request(req, String::from("event not found"))
+        self.send_request::<Event>(req, String::from("event not found"))
             .await
     }
 
@@ -134,18 +144,22 @@ impl OracleClient {
             .await
     }
 
-    async fn send_request(
+    async fn send_request<T>(
         &self,
         request: RequestBuilder,
         not_found_message: String,
-    ) -> Result<(), Error> {
+    ) -> Result<T, Error>
+    where
+        T: DeserializeOwned,
+    {
         let response = request.send().await.map_err(|e| {
             error!("error sending to oracle: {}", e);
             Error::SendRetry(e)
         })?;
 
         if response.status().is_success() {
-            Ok(())
+            let body: T = response.json::<T>().await?;
+            Ok(body)
         } else if response.status() == StatusCode::NOT_FOUND {
             Err(Error::NotFound(not_found_message))
         } else if response.status() == StatusCode::BAD_REQUEST {

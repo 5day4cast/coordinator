@@ -13,9 +13,10 @@ export async function displayEntries(apiBase, oracleBase) {
 }
 
 class Entries {
-  constructor(coordinator_url, oracle_url, $tbody) {
+  constructor(coordinator_url, oracle_url, $tbody, nostrClient) {
     this.coordinator_url = coordinator_url;
     this.oracle_url = oracle_url;
+    this.nostrClient = nostrClient;
     this.entries = [];
     this.$tbody = $tbody;
   }
@@ -82,23 +83,19 @@ class Entries {
   }
 
   async get_user_entries() {
-    if (!window.nostr) {
-      this.showError("user needs to login before submitting");
-      return;
+    if (!window.nostrClient) {
     }
-    let xonly_pubkey_hex = await window.nostr.getPublicKey();
-    //TODO: fix the filter for event_ids
-    let search_query = {
-      pubkey: xonly_pubkey_hex,
-    };
-    let query_hash = await hash_object(search_query);
-    console.log(query_hash);
-
-    const signature = await window.nostr.signSchnorr(query_hash);
-
-    let response = await fetch(
-      `${this.coordinator_url}/entries?pubkey=${pubkey}&signature=${signature}`,
+    //TODO: filter by entry ids here is possible
+    const { input, init } = window.nostrClient.prepareFetch(
+      `${this.coordinator_url}/entries`,
+      "GET",
+      null,
+      {
+        "Content-Type": "application/json",
+      },
     );
+    const response = await fetch(input, init);
+
     if (!response.ok) {
       console.error(response);
       throw new Error(`Failed to get competitions, status: ${response.status}`);

@@ -1,0 +1,111 @@
+.hidden {
+    display: none;
+}
+
+.parent {
+    width: 95vw;
+    height: 100vh;
+    position: relative;
+    z-index: 1;
+}
+
+.modal {
+    z-index: 9999 !important; /* Adjust the value as needed */
+}
+
+.steps {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 2rem;
+}
+
+.step-item {
+    flex: 1;
+    text-align: center;
+    position: relative;
+}
+
+.step-item:not(:last-child):after {
+    content: "";
+    position: absolute;
+    left: calc(50% + 1.5rem);
+    top: 1rem;
+    width: calc(100% - 3rem);
+    height: 2px;
+    background: #dbdbdb;
+}
+
+.step-marker {
+    width: 2rem;
+    height: 2rem;
+    border-radius: 50%;
+    background: #dbdbdb;
+    color: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0 auto 0.5rem;
+}
+
+.step-item.is-active .step-marker {
+    background: #3273dc;
+}
+
+.step-item.is-completed .step-marker {
+    background: #23d160;
+}
+
+.step-title {
+    font-size: 0.875rem;
+    color: #363636;
+}
+
+.modal-card {
+    background-color: #1a1a1a;
+    max-width: 480px;
+    margin: 0 20px;
+}
+
+.modal-card-head,
+.modal-card-foot {
+    background-color: #1a1a1a;
+    border-color: #363636;
+}
+
+.modal-card-body {
+    background-color: #1a1a1a;
+    color: white;
+}
+
+.modal-card-title {
+    color: white;
+}
+
+.private-key-box {
+    background-color: #1a1a1a;
+    border: 1px solid #363636;
+    padding: 1rem;
+    border-radius: 6px;
+    margin: 1rem 0;
+}
+
+.tabs li.is-active a {
+    border-color: #485fc7;
+    color: #485fc7;
+}
+
+.input {
+    background-color: #0d0d0d;
+    border-color: #363636;
+    color: white;
+}
+
+.input:focus {
+    border-color: #485fc7;
+    box-shadow: 0 0 0 0.125em rgba(72, 95, 199, 0.25);
+}
+
+.input::placeholder {
+    color: #666;
+}
