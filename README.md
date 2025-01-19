@@ -34,16 +34,15 @@ With the Musig signing
 sequenceDiagram
     participant U as User
     participant C as Coordinator
-    participant MM as Market Maker
     
-    Note over U,MM: Phase 1: Entry With Deposit
+    Note over U,C: Phase 1: Entry With Deposit
     U->>U: Generates entry private key
     U->>C: Submits entry with public key
     C->>U: Returns Lightning hodl invoice for:<br/>1. Entry fee<br/>2. Signing deposit
     U->>C: Pays full amount
     Note right of C: Holds deposit in escrow
     
-    Note over U,MM: Phase 2: Signing Window
+    Note over U,C: Phase 2: Signing Window
     C->>C: Finalizes contract parameters
     C->>C: Generates nonces
     C->>U: Notifies signing ready
