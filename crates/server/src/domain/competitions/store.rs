@@ -1,4 +1,8 @@
-use dlctix::bitcoin::XOnlyPublicKey;
+use dlctix::{
+    bitcoin::XOnlyPublicKey,
+    musig2::{PartialSignature, PubNonce},
+    SigMap,
+};
 use duckdb::{params, params_from_iter, types::Value, Connection};
 use scooby::postgres::{select, with, Aliasable, Joinable};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -83,6 +87,47 @@ impl CompetitionStore {
         Ok(entry)
     }
 
+    pub async fn add_partial_signatures(
+        &self,
+        entry_id: Uuid,
+        partial_sigs: SigMap<PartialSignature>,
+    ) -> Result<(), duckdb::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+        let sigs_blob = serde_json::to_vec(&partial_sigs)
+            .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+        let mut stmt = conn.prepare(
+            "UPDATE entries
+                SET partial_signatures = ?,
+                    signed_at = NOW()
+                WHERE id = ?",
+        )?;
+
+        stmt.execute(params![Value::Blob(sigs_blob), entry_id.to_string(),])?;
+
+        Ok(())
+    }
+
+    pub async fn add_public_nonces(
+        &self,
+        entry_id: Uuid,
+        public_nonces: SigMap<PubNonce>,
+    ) -> Result<(), duckdb::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+        let nonces_blob = serde_json::to_vec(&public_nonces)
+            .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+        let mut stmt = conn.prepare(
+            "UPDATE entries
+            SET public_nonces = ?
+            WHERE id = ?",
+        )?;
+
+        stmt.execute(params![Value::Blob(nonces_blob), entry_id.to_string(),])?;
+
+        Ok(())
+    }
+
     pub async fn get_competition_entries(
         &self,
         event_id: Uuid,
@@ -91,7 +136,18 @@ impl CompetitionStore {
             "id",
             "event_id",
             "pubkey",
+            "ephemeral_pubkey",
+            "ephemeral_privatekey_user_encrypted",
+            "ephemeral_privatekey",
+            "public_nonces",
+        ))
+        .and_select((
+            "partial_signatures",
             "ticket_preimage",
+            "ticket_hash",
+            "payout_preimage_user_encrypted",
+            "payout_hash",
+            "payout_preimage",
             "signed_at::TEXT",
             "paid_at::TEXT",
         ))
@@ -120,12 +176,17 @@ impl CompetitionStore {
             "event_id",
             "pubkey",
             "ephemeral_pubkey",
-            "ephemeral_privatekey_encrypted",
+            "ephemeral_privatekey_user_encrypted",
+            "ephemeral_privatekey",
+            "public_nonces",
         ))
         .and_select((
-            "payout_hash",
-            "payout_preimage_encrypted",
+            "partial_signatures",
+            "ticket_preimage",
             "ticket_hash",
+            "payout_preimage_user_encrypted",
+            "payout_hash",
+            "payout_preimage",
             "signed_at::TEXT",
             "paid_at::TEXT",
         ))
@@ -204,68 +265,78 @@ impl CompetitionStore {
         let mut values = String::from("VALUES");
         let number_competitions = competitions.len();
         for (index, competition) in competitions.iter().enumerate() {
-            values.push_str("(?,?,?,?,?,?,?,?,?,?)");
+            values.push_str("(?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
             if index + 1 < number_competitions {
                 values.push(',');
             }
             params.push(Value::Text(competition.id.to_string()));
-            if let Some(funding_transaction) = competition.funding_transaction {
-                let funding_transaction = serde_json::to_vec(&funding_transaction)
+
+            // Add all the fields that need updating
+            if let Some(funding_transaction) = &competition.funding_transaction {
+                let funding_transaction = serde_json::to_vec(funding_transaction)
                     .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
                 params.push(Value::Blob(funding_transaction));
             } else {
                 params.push(Value::Null)
             }
-            if let Some(contract_parameters) = competition.contract_parameters.clone() {
-                let contract = serde_json::to_vec(&contract_parameters)
+
+            if let Some(contract_parameters) = &competition.contract_parameters {
+                let contract = serde_json::to_vec(contract_parameters)
                     .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
                 params.push(Value::Blob(contract));
             } else {
                 params.push(Value::Null)
             }
-            if let Some(public_nonces) = competition.public_nonces.clone() {
-                let nonces = serde_json::to_vec(&public_nonces)
+
+            if let Some(public_nonces) = &competition.public_nonces {
+                let nonces = serde_json::to_vec(public_nonces)
                     .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
                 params.push(Value::Blob(nonces));
             } else {
                 params.push(Value::Null)
             }
-            if let Some(cancelled_at) = competition.cancelled_at.clone() {
-                let cancelled_at = OffsetDateTime::format(cancelled_at, &Rfc3339)
+
+            if let Some(aggregated_nonces) = &competition.aggregated_nonces {
+                let nonces = serde_json::to_vec(aggregated_nonces)
                     .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
-                params.push(Value::Text(cancelled_at));
+                params.push(Value::Blob(nonces));
             } else {
                 params.push(Value::Null)
             }
-            if let Some(contracted_at) = competition.contracted_at.clone() {
-                let contracted_at = OffsetDateTime::format(contracted_at, &Rfc3339)
+
+            if let Some(partial_signatures) = &competition.partial_signatures {
+                let sigs = serde_json::to_vec(partial_signatures)
                     .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
-                params.push(Value::Text(contracted_at));
+                params.push(Value::Blob(sigs));
             } else {
                 params.push(Value::Null)
             }
-            if let Some(signed_at) = competition.signed_at.clone() {
-                let signed_at = OffsetDateTime::format(signed_at, &Rfc3339)
+
+            if let Some(signed_contract) = &competition.signed_contract {
+                let contract = serde_json::to_vec(signed_contract)
                     .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
-                params.push(Value::Text(signed_at));
+                params.push(Value::Blob(contract));
             } else {
                 params.push(Value::Null)
             }
-            if let Some(funding_broadcasted_at) = competition.funding_broadcasted_at.clone() {
-                let funding_broadcasted_at =
-                    OffsetDateTime::format(funding_broadcasted_at, &Rfc3339)
+
+            // Add all the timestamps
+            for timestamp in [
+                &competition.contracted_at,
+                &competition.signed_at,
+                &competition.funding_broadcasted_at,
+                &competition.cancelled_at,
+                &competition.failed_at,
+            ] {
+                if let Some(ts) = timestamp {
+                    let formatted = OffsetDateTime::format(*ts, &Rfc3339)
                         .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
-                params.push(Value::Text(funding_broadcasted_at));
-            } else {
-                params.push(Value::Null)
+                    params.push(Value::Text(formatted));
+                } else {
+                    params.push(Value::Null)
+                }
             }
-            if let Some(failed_at) = competition.funding_broadcasted_at.clone() {
-                let failed_at = OffsetDateTime::format(failed_at, &Rfc3339)
-                    .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
-                params.push(Value::Text(failed_at));
-            } else {
-                params.push(Value::Null)
-            }
+
             if !competition.errors.is_empty() {
                 let errors = serde_json::to_vec(&competition.errors)
                     .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -301,13 +372,19 @@ impl CompetitionStore {
                 "update_competitions.contract_parameters",
             )
             .set("public_nonces", "update_competitions.public_nonces")
-            .set("cancelled_at", "update_competitions.cancelled_at")
+            .set("aggregated_nonces", "update_competitions.aggregated_nonces")
+            .set(
+                "partial_signatures",
+                "update_competitions.partial_signatures",
+            )
+            .set("signed_contract", "update_competitions.signed_contract")
             .set("contracted_at", "update_competitions.contracted_at")
             .set("signed_at", "update_competitions.signed_at")
             .set(
                 "funding_broadcasted_at",
                 "update_competitions.funding_broadcasted_at",
             )
+            .set("cancelled_at", "update_competitions.cancelled_at")
             .set("failed_at", "update_competitions.failed_at")
             .set("errors", "update_competitions.errors")
             .where_("competitions.id = update_competitions.id")
@@ -326,7 +403,9 @@ impl CompetitionStore {
             "total_competition_pool",
             "total_allowed_entries",
             "entry_fee",
+            "event_announcement",
             "COUNT(entries.id) as total_entries",
+            "COUNT(entries.id) FILTER (entries.public_nonces IS NOT NULL) as total_entry_nonces",
             "COUNT(entries.id) FILTER (entries.signed_at IS NOT NULL) as total_signed_entries",
             "COUNT(entries.id) FILTER (entries.paid_at IS NOT NULL) as total_paid_entries",
         ))
@@ -334,6 +413,9 @@ impl CompetitionStore {
             "funding_transaction",
             "contract_parameters",
             "public_nonces",
+            "aggregated_nonces",
+            "partial_signatures",
+            "signed_contract",
             "cancelled_at::TEXT",
             "contracted_at::TEXT",
             "competitions.signed_at::TEXT as signed_at",
@@ -354,9 +436,13 @@ impl CompetitionStore {
             "total_competition_pool",
             "total_allowed_entries",
             "entry_fee",
+            "event_announcement",
             "funding_transaction",
             "contract_parameters",
             "public_nonces",
+            "aggregated_nonces",
+            "partial_signatures",
+            "signed_contract",
             "cancelled_at",
         ))
         .group_by((

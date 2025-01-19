@@ -1,5 +1,10 @@
 use crate::{
-    add_event_entry, admin_index_handler, create_event, create_folder, domain::{CompetitionStore, CompetitionWatcher, DBConnection, UserInfo}, get_balance, get_entries, get_estimated_fee_rates, get_next_address, get_outputs, health, index_handler, login, register, send_to_address, Bitcoin, BitcoinSyncWatcher, Coordinator, Ln, LnClient, OracleClient, Settings, UserStore
+    add_event_entry, admin_index_handler, create_event, create_folder,
+    domain::{CompetitionStore, CompetitionWatcher, DBConnection, UserInfo},
+    get_aggregate_nonces, get_balance, get_contract_parameters, get_entries,
+    get_estimated_fee_rates, get_next_address, get_outputs, health, index_handler, login, register,
+    send_to_address, submit_partial_signatures, submit_public_nonces, Bitcoin, BitcoinSyncWatcher,
+    Coordinator, Ln, LnClient, OracleClient, Settings, UserStore,
 };
 use anyhow::anyhow;
 use axum::{
@@ -133,9 +138,10 @@ pub async fn build_app(
     let bitcoin = Bitcoin::new(&config.bitcoin_settings).await.map(Arc::new)?;
     info!("Bitcoin service configured");
 
-
     let reqwest_client = build_reqwest_client();
-    let ln = LnClient::new(reqwest_client.clone(), config.ln_settings).await.map(Arc::new)?;
+    let ln = LnClient::new(reqwest_client.clone(), config.ln_settings)
+        .await
+        .map(Arc::new)?;
 
     // TODO: add background thread to monitor how lnd node is doing, alert if there is an issue
     ln.ping().await?;
@@ -282,6 +288,16 @@ pub fn app(
         .route("/admin", get(admin_index_handler))
         .route("/health_check", get(health))
         .route("/competitions", post(create_event))
+        .route("/competitions/:id/contract", get(get_contract_parameters))
+        .route(
+            "/competitions/:competition_id/entries/:entry_id/public_nonces",
+            post(submit_public_nonces),
+        )
+        .route("/competitions/:id/nonces", get(get_aggregate_nonces))
+        .route(
+            "/competitions/:competition_id/entries/:entry_id/signatures",
+            post(submit_partial_signatures),
+        )
         .route("/entries", post(add_event_entry))
         .route("/entries", get(get_entries))
         .nest("/wallet", wallet_endpoints)
