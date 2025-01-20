@@ -31,9 +31,9 @@ use futures::TryFutureExt;
 use itertools::Itertools;
 use log::{debug, error, info};
 use rand::SeedableRng;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{collections::BTreeMap, str::FromStr};
 use time::OffsetDateTime;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -192,8 +192,11 @@ impl Coordinator {
                     }
                 }
                 CompetitionState::NoncesCollected => {
-                    // Generate aggregate nonces
-                    match self.generate_aggregate_nonces(competition.clone()).await {
+                    // Generate aggregate nonces and coordinators partial signatures
+                    match self
+                        .generate_aggregate_nonces_and_coord_partial_signatures(competition.clone())
+                        .await
+                    {
                         Ok(updated) => updated_competitions.push(updated),
                         Err(e) => {
                             competition
@@ -230,39 +233,6 @@ impl Coordinator {
         Ok(())
     }
 
-    async fn generate_aggregate_nonces(
-        &self,
-        mut competition: Competition,
-    ) -> Result<Competition, anyhow::Error> {
-        let Some(contract_parameters) = &competition.contract_parameters else {
-            return Err(anyhow!("contract parameters don't exist"));
-        };
-
-        let Some(funding_transaction) = &competition.funding_transaction else {
-            return Err(anyhow!("funding transaction doesn't exist"));
-        };
-
-        let ticketed_dlc = TicketedDLC::new(
-            contract_parameters.to_owned(),
-            funding_transaction.to_owned(),
-        )?;
-
-        let mut rng = rand::rngs::StdRng::from_entropy();
-        let signing_session = SigningSession::<NonceSharingRound>::new(
-            ticketed_dlc,
-            &mut rng,
-            Scalar::from(self.private_key),
-        )?;
-
-        let received_nonces = self.get_received_nonces(competition.id).await?;
-        let aggregate =
-            signing_session.aggregate_nonces_and_compute_partial_signatures(received_nonces)?;
-        competition.partial_signatures = Some(aggregate.our_partial_signatures().to_owned());
-        competition.aggregated_nonces = Some(aggregate.aggregated_nonces().to_owned());
-
-        Ok(competition)
-    }
-
     pub async fn create_transactions(
         &self,
         mut competition: Competition,
@@ -272,7 +242,7 @@ impl Coordinator {
             .competition_store
             .get_competition_entries(competition.id)
             .await?;
-        debug!("Competition has {} entries", entries.len());
+        debug!("Competition entries {:?}", entries);
 
         let players = generate_players(&entries)?;
         debug!("Generated players:");
@@ -360,7 +330,7 @@ impl Coordinator {
         Ok(competition)
     }
 
-    pub async fn generate_partial_signatures(
+    pub async fn generate_aggregate_nonces_and_coord_partial_signatures(
         &self,
         mut competition: Competition,
     ) -> Result<Competition, anyhow::Error> {
@@ -396,7 +366,10 @@ impl Coordinator {
 
         let coordinator_sessions =
             signing_session.aggregate_nonces_and_compute_partial_signatures(received_nonces)?;
-
+        debug!(
+            "Received_nonces aggregated nonces 1: {:?}",
+            coordinator_sessions.aggregated_nonces()
+        );
         competition.aggregated_nonces = Some(coordinator_sessions.aggregated_nonces().to_owned());
         competition.partial_signatures =
             Some(coordinator_sessions.our_partial_signatures().to_owned());
@@ -414,11 +387,11 @@ impl Coordinator {
         let Some(funding_transaction) = &competition.funding_transaction else {
             return Err(anyhow!("funding transaction doesn't exists, failed publishing competition {} funding transaction", competition.id));
         };
-        let Some(_) = competition.partial_signatures.clone() else {
+        let Some(coordinator_partial_sigantures) = competition.partial_signatures.clone() else {
             return Err(anyhow!("coordinator partial signatures do not exist, failed publishing competition {} funding transaction", competition.id));
         };
 
-        let Some(our_nonces) = competition.public_nonces.as_ref() else {
+        let Some(coordinator_nonces) = competition.public_nonces.as_ref() else {
             return Err(anyhow!("coordinator nonces missing"));
         };
 
@@ -437,87 +410,38 @@ impl Coordinator {
             Scalar::from(self.private_key),
         )?;
 
-        if signing_session.our_public_nonces() != our_nonces {
+        if signing_session.our_public_nonces() != coordinator_nonces {
             return Err(anyhow!("coordinator nonce mismatch"));
         }
 
         let received_nonces = self.get_received_nonces(competition.id).await?;
-        debug!("Received nonces");
+        debug!("Built coordinator session before publishing");
 
         let coordinator_session =
             signing_session.aggregate_nonces_and_compute_partial_signatures(received_nonces)?;
         debug!("Built coordinator session before publishing");
 
+        if *coordinator_session.our_partial_signatures() != coordinator_partial_sigantures {
+            return Err(anyhow!("coordinator partial signatures mismatch"));
+        }
+
         let partial_sigs_by_sender: BTreeMap<Point, SigMap<PartialSignature>> =
             self.get_partial_sigs_by_sender(competition.id).await?;
 
-        let mut ordered_signatures: Vec<(usize, Point, &SigMap<PartialSignature>)> =
-            partial_sigs_by_sender
-                .iter()
-                .map(|(&pubkey, sigs)| {
-                    let position = contract_parameters
-                        .players
-                        .iter()
-                        .position(|p| p.pubkey == pubkey)
-                        .unwrap_or(usize::MAX); // Market maker or unknown pubkey goes last
-                    (position, pubkey, sigs)
-                })
-                .collect::<Vec<_>>();
-
-        ordered_signatures.sort_by_key(|(pos, _, _)| *pos);
-        debug!(
-            "Player pubkeys from contract: {:?}",
-            contract_parameters
-                .players
-                .iter()
-                .map(|p| p.pubkey)
-                .collect::<Vec<_>>()
-        );
-        debug!(
-            "Verifying signatures in order: {:?}",
-            ordered_signatures
-                .iter()
-                .map(|(pos, pubkey, _)| (pos, pubkey))
-                .collect::<Vec<_>>()
-        );
-        for (position, sender_pubkey, partial_sigs) in ordered_signatures {
-            debug!(
-                "Verifying signatures for sender {:?} at position {:?}",
-                sender_pubkey, position
-            );
-
-            // For known players (not market maker), log their expected outcomes
-            if position != usize::MAX {
-                debug!("Found sender as player {}", position);
-                // Check which outcomes this player should be signing
-                for (outcome, weights) in &contract_parameters.outcome_payouts {
-                    if let Some(weight) = weights.get(&position) {
-                        debug!(
-                            "Player {} should sign outcome {:?} with weight {}",
-                            position, outcome, weight
-                        );
-                    }
-                }
-            } else {
-                debug!("Sender is market maker");
-            }
-
-            debug!(
-                "Received signatures for outcomes: {:?}",
-                partial_sigs.by_outcome.keys().collect::<Vec<_>>()
-            );
-
-            match coordinator_session.verify_partial_signatures(sender_pubkey, partial_sigs) {
-                Ok(_) => debug!("✓ Signature verification succeeded for player {}", position),
+        for (sender_pubkey, partial_sigs) in &partial_sigs_by_sender {
+            match coordinator_session.verify_partial_signatures(*sender_pubkey, &partial_sigs) {
+                Ok(_) => debug!(
+                    "✓ Signature verification succeeded for player {}",
+                    sender_pubkey
+                ),
                 Err(e) => {
                     error!(
                         "✗ Signature verification failed for player {}: {}",
-                        position, e
+                        sender_pubkey, e
                     );
                     return Err(anyhow!(
-                        "Signature verification failed for {:?} at position {}: {}",
+                        "Signature verification failed for {:?}: {}",
                         sender_pubkey,
-                        position,
                         e
                     ));
                 }
@@ -913,10 +837,12 @@ fn generate_players(entries: &Vec<UserEntry>) -> Result<Vec<Player>, anyhow::Err
             .ok_or_else(|| anyhow!("ticket_hash is missing for entry: {}", entry.id))?;
 
         let payout_hash = entry.payout_hash.as_str();
-
         debug!("player_pubkey: {}", entry.ephemeral_pubkey);
+
+        let pubkey = Point::from_hex(&entry.ephemeral_pubkey)
+            .map_err(|e| anyhow!("failed to get point: {}", e))?;
         let player = Player {
-            pubkey: Point::from_hex(&entry.ephemeral_pubkey)?,
+            pubkey,
             // coordinator generates this preimage and only shares after player has paid for a ticket
             ticket_hash: string_to_byte_array(ticket_hash),
             // players generate this preimage and only share after winning with the coordinator
@@ -931,6 +857,17 @@ fn string_to_byte_array(hex_str: &str) -> [u8; 32] {
     let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     let bytes = hex::decode(hex_str).expect("valid hex string");
     bytes.try_into().expect("32 bytes")
+}
+
+fn get_percentage_weights(num_winners: usize) -> Vec<u64> {
+    match num_winners {
+        1 => vec![100],
+        2 => vec![60, 40],
+        3 => vec![45, 35, 20],
+        4 => vec![42, 30, 18, 10],
+        5 => vec![40, 27, 16, 9, 8],
+        _ => vec![100], // fallback to winner takes all
+    }
 }
 
 fn generate_payouts(
@@ -960,7 +897,14 @@ fn generate_payouts(
         let player_indices = find_player_indices(players, entry_pubkeys)?;
         debug!("Mapped to player indices: {:?}", player_indices);
 
-        let percentage_weights = vec![60, 40]; // For 2 winners
+        if player_indices.len() != competition.number_of_places_win {
+            return Err(anyhow!(
+                "Incorrect number of winners for outcome {}",
+                outcome_index
+            ));
+        }
+
+        let percentage_weights = get_percentage_weights(competition.number_of_places_win);
         let mut payout_weights: BTreeMap<PlayerIndex, u64> = BTreeMap::new();
 
         for (rank, &player_index) in player_indices.iter().enumerate() {
@@ -976,8 +920,36 @@ fn generate_payouts(
             "Final weights for outcome {}: {:?}",
             outcome_index, payout_weights
         );
+
+        // Verify total weight is 100
+        let total_weight: u64 = payout_weights.values().sum();
+        if total_weight != 100 {
+            return Err(anyhow!(
+                "Total weight for outcome {} should be 100, got {}",
+                outcome_index,
+                total_weight
+            ));
+        }
+
         payouts.insert(Outcome::Attestation(outcome_index), payout_weights);
     }
+
+    // Add expiry outcome with equal distribution
+    let mut expiry_weights = BTreeMap::new();
+    let player_count = players.len() as u64;
+    let base_weight = 100 / player_count;
+    let remainder = 100 % player_count;
+
+    for i in 0..players.len() {
+        // Distribute remainder one point at a time to early indices
+        let weight = if (i as u64) < remainder {
+            base_weight + 1
+        } else {
+            base_weight
+        };
+        expiry_weights.insert(i, weight);
+    }
+    payouts.insert(Outcome::Expiry, expiry_weights);
 
     debug!("Generated {} total outcomes", payouts.len());
     Ok(payouts)

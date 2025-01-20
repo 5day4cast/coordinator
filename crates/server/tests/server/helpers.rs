@@ -8,9 +8,8 @@ use dlctix::{
     secp::Scalar,
     EventLockingConditions,
 };
-use log::{debug, info};
+use log::info;
 use mockall::mock;
-use nostr_sdk::ToBech32;
 use server::{
     domain::{generate_ranking_permutations, AddEntry, CoordinatorInfo, CreateEvent},
     get_key, AddEventEntry, Bitcoin, Ln, Oracle, OracleError as Error, OracleEvent, ValueOptions,
@@ -81,44 +80,16 @@ pub async fn create_test_wallet(nostr_client: &NostrClientCore) -> TaprootWallet
 
 pub struct TestParticipant {
     pub wallet: client_validator::TaprootWalletCore,
-    pub entry_count: u32,
     pub nostr_pubkey: String,
-    pub current_entry_index: u32,
 }
 
 impl TestParticipant {
     pub fn new(wallet: client_validator::TaprootWalletCore, nostr_pubkey: String) -> Self {
         Self {
             wallet,
-            entry_count: 0,
             nostr_pubkey,
-            current_entry_index: 1,
         }
     }
-
-    pub fn next_entry_index(&mut self) -> u32 {
-        self.entry_count += 1;
-        self.entry_count
-    }
-}
-
-pub async fn create_test_participants(count: usize) -> Result<Vec<TestParticipant>, anyhow::Error> {
-    let mut participants = Vec::with_capacity(count);
-
-    for i in 0..count {
-        // Use a deterministic seed based on index
-        let seed = format!("test_participant_{}", i);
-        let nostr_client = create_test_nostr_client().await;
-        let wallet = create_test_wallet(&nostr_client).await;
-        let nostr_pubkey = nostr_client.get_public_key().await?;
-        let nostr_bech_32 = nostr_pubkey.to_bech32().unwrap();
-        debug!("participant {} added: {}", i, nostr_bech_32);
-        participants.push(TestParticipant::new(
-            wallet,
-            nostr_pubkey.to_bech32().unwrap(),
-        ));
-    }
-    Ok(participants)
 }
 
 pub async fn create_test_nostr_client() -> NostrClientCore {
@@ -171,7 +142,7 @@ pub async fn generate_test_entry(
         .await?;
 
     let ephemeral_pubkey = wallet.get_dlc_public_key(entry_index).await?;
-
+    info!("entry ephemeral_pubkey: {}", ephemeral_pubkey);
     // Generate payout hash
     let payout_hash = wallet.add_entry_index(entry_index)?;
 

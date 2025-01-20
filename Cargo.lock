@@ -1211,6 +1211,7 @@ dependencies = [
 [[package]]
 name = "dlctix"
 version = "0.0.6"
+source = "git+https://github.com/tee8z/dlctix?branch=add-errors#58bd0f1fed587a0c52774dd001d5fb3dac4562f3"
 dependencies = [
  "bitcoin",
  "hex",

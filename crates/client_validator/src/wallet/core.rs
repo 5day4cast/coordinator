@@ -1,8 +1,8 @@
-use super::{DlcEntryData, SigningState, WalletError};
+use super::{DlcEntryData, WalletError};
 use crate::NostrClientCore;
 use bdk_wallet::{
     bitcoin::{
-        bip32::{ChainCode, ChildNumber, DerivationPath, Xpriv},
+        bip32::{ChainCode, ChildNumber, DerivationPath},
         secp256k1::{Secp256k1, SecretKey},
         Network, NetworkKind as BDKNetworkKind,
     },
@@ -12,10 +12,10 @@ use bdk_wallet::{
 };
 use blake2::{Blake2b512, Digest};
 use dlctix::{
-    bitcoin::OutPoint,
+    bitcoin::{bip32::Xpriv, OutPoint},
     musig2::{AggNonce, PartialSignature},
-    secp::Scalar,
-    ContractParameters, NonceSharingRound, SigMap, SigningSession, TicketedDLC, WinCondition,
+    secp::{Point as DlcPoint, Scalar},
+    ContractParameters, NonceSharingRound, SigMap, SigningSession, TicketedDLC,
 };
 use log::debug;
 use nostr_sdk::{FromBech32, NostrSigner};
@@ -23,10 +23,7 @@ use rand::{rngs::StdRng, thread_rng, RngCore, SeedableRng};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    str::FromStr,
-};
+use std::{collections::HashMap, str::FromStr};
 
 use super::DlcEntry;
 
@@ -327,8 +324,23 @@ impl TaprootWalletCore {
         let child_xpriv = self.derive_dlc_key(entry_index)?;
         let secp = Secp256k1::new();
         let public_key = child_xpriv.private_key.public_key(&secp);
-        let compressed_hex = hex::encode(public_key.serialize());
-        Ok(compressed_hex)
+        // Get x-only public key
+        let (x_only, parity) = public_key.x_only_public_key();
+
+        // Convert to dlctix's XOnlyPublicKey type
+        let dlctix_xonly =
+            dlctix::musig2::secp256k1::XOnlyPublicKey::from_slice(&x_only.serialize())
+                .map_err(|e| WalletError::KeyError(e.to_string()))?;
+
+        // Convert to dlctix's Parity type
+        let dlctix_parity = match parity {
+            dlctix::bitcoin::secp256k1::Parity::Odd => dlctix::musig2::secp256k1::Parity::Odd,
+            dlctix::bitcoin::secp256k1::Parity::Even => dlctix::musig2::secp256k1::Parity::Even,
+        };
+
+        // Create Point from XOnlyPublicKey and Parity
+        let point = DlcPoint::from((dlctix_xonly, dlctix_parity));
+        Ok(point.to_string())
     }
 
     fn derive_dlc_key(&self, entry_index: u32) -> Result<Xpriv, WalletError> {
@@ -348,11 +360,6 @@ impl TaprootWalletCore {
             .derive_priv(&secp, &path)
             .map_err(|e| WalletError::DlcKeyError(format!("Key derivation error: {}", e)))?;
 
-        debug!("Derived child private key: {:?}", child_xpriv.private_key);
-        debug!(
-            "Derived child public key: {:?}",
-            child_xpriv.private_key.public_key(&secp)
-        );
         Ok(child_xpriv)
     }
 
@@ -365,20 +372,16 @@ impl TaprootWalletCore {
         let payout_preimage = SecretString::from(hex::encode(payout_preimage));
         let payout_hash = hex::encode(payout_hash);
 
-        let secret_bytes = child_xpriv.private_key.secret_bytes();
-        let child_key = hex::encode(secret_bytes);
         self.dlc_contracts.insert(
             entry_index,
             DlcEntry {
                 contract: None,
                 data: DlcEntryData {
-                    child_key: SecretString::from(child_key),
                     payout_preimage,
                     params: None,
                     funding_outpoint: None,
                     ticket_preimage: None,
                 },
-                signing_state: None,
             },
         );
 
@@ -429,13 +432,18 @@ impl TaprootWalletCore {
             return Err(WalletError::ContractError("No contract found".into()));
         };
 
-        let signing_key = Scalar::from_str(dlc_data.data.child_key.expose_secret())
+        let child_xpriv = self.derive_dlc_key(entry_index)?;
+
+        let secret_bytes = child_xpriv.private_key.secret_bytes();
+
+        let secret_key = dlctix::musig2::secp256k1::SecretKey::from_slice(&secret_bytes)
             .map_err(|e| WalletError::KeyError(e.to_string()))?;
 
-        let mut rng = StdRng::from_seed(signing_key.serialize());
+        let secret_scalar = Scalar::from(secret_key);
+        let mut rng = StdRng::from_seed(secret_scalar.serialize());
 
         let signing_session =
-            SigningSession::<NonceSharingRound>::new(contract.to_owned(), &mut rng, signing_key)
+            SigningSession::<NonceSharingRound>::new(contract.to_owned(), &mut rng, secret_scalar)
                 .map_err(|e| WalletError::DlcError(e.to_string()))?;
 
         Ok(signing_session.our_public_nonces().to_owned())
@@ -454,58 +462,43 @@ impl TaprootWalletCore {
             return Err(WalletError::ContractError("No contract found".into()));
         };
 
-        let signing_key = Scalar::from_str(dlc_data.data.child_key.expose_secret())
+        let child_xpriv = self.derive_dlc_key(entry_index)?;
+
+        let secret_bytes = child_xpriv.private_key.secret_bytes();
+
+        let secret_key = dlctix::musig2::secp256k1::SecretKey::from_slice(&secret_bytes)
             .map_err(|e| WalletError::KeyError(e.to_string()))?;
 
-        let pubkey = signing_key.base_point_mul();
-        debug!("Client signing with pubkey: {:?}", pubkey);
+        let secret_scalar = Scalar::from(secret_key);
 
-        let player_index = contract
+        let pubkey = secret_scalar.base_point_mul();
+        debug!("Client signing");
+
+        contract
             .params()
             .players
             .iter()
             .position(|p| p.pubkey == pubkey)
             .ok_or_else(|| WalletError::DlcError("Player not found in contract".into()))?;
 
-        debug!("Found player at index: {}", player_index);
-
-        // Log the complete contract parameters for debugging
         debug!("Contract parameters: {:?}", contract.params());
-
-        // Log aggregate nonces we received
         debug!("Received aggregate nonces: {:?}", aggregate_nonces);
 
-        let mut rng = StdRng::from_seed(signing_key.serialize());
+        let mut rng = StdRng::from_seed(secret_scalar.serialize());
 
         // Create initial signing session and log the nonces we generate
         let initial_session =
-            SigningSession::<NonceSharingRound>::new(contract.to_owned(), &mut rng, signing_key)
+            SigningSession::<NonceSharingRound>::new(contract.to_owned(), &mut rng, secret_scalar)
                 .map_err(|e| WalletError::DlcError(e.to_string()))?;
 
-        debug!(
-            "Generated initial nonces: {:?}",
-            initial_session.our_public_nonces()
-        );
-
-        // Log the outcomes this player is involved in
-        for (outcome, weights) in &contract.params().outcome_payouts {
-            if let Some(weight) = weights.get(&player_index) {
-                debug!(
-                    "Player {} involved in outcome {:?} with weight {}",
-                    player_index, outcome, weight
-                );
-            }
-        }
+        debug!("Generated initial nonces",);
 
         // Use all aggregate nonces for signing
         let partial_sigs = initial_session
             .compute_partial_signatures(aggregate_nonces)
             .map_err(|e| WalletError::DlcError(format!("Signature computation failed: {}", e)))?;
 
-        debug!(
-            "Generated partial signatures: {:?}",
-            partial_sigs.our_partial_signatures()
-        );
+        debug!("Generated partial signatures",);
 
         Ok(partial_sigs.our_partial_signatures().to_owned())
     }

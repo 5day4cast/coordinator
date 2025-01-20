@@ -81,7 +81,6 @@ pub struct EncryptedKey {
 pub struct DlcEntry {
     pub contract: Option<TicketedDLC>,
     pub data: DlcEntryData,
-    pub signing_state: Option<SigningState>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -92,7 +91,6 @@ pub struct SigningState {
 
 #[derive(Clone)]
 pub struct DlcEntryData {
-    pub child_key: SecretString,
     pub payout_preimage: SecretString,
     pub funding_outpoint: Option<OutPoint>,
     pub params: Option<ContractParameters>,
