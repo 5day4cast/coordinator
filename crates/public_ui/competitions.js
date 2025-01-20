@@ -34,8 +34,13 @@ class Competitions {
     return this.$tbody.querySelector(`tr[id="competition-${id}"]`);
   }
 
+  async refreshData() {
+    this.$tbody.innerHTML = "";
+    await this.init();
+  }
+
   async init() {
-    Promise.all([this.get_stations(), this.get_competitions()])
+    Promise.all([this.get_stations(), this.get_combined_competitions()])
       .then(([stations, competitions]) => {
         this.stations = stations;
         this.competitions = competitions;
@@ -66,12 +71,43 @@ class Competitions {
             this.handleCompetitionClick($row, competition);
             if (event.target.tagName === "TD") {
               if (event.target === event.target.parentNode.lastElementChild) {
+                if (!window.taprootWallet) {
+                  const notification = document.createElement("div");
+                  notification.className = "notification is-info";
+                  notification.style.position = "fixed";
+                  notification.style.top = "20px";
+                  notification.style.right = "20px";
+                  notification.style.zIndex = "1000";
+                  notification.innerHTML = `
+                    <button class="delete"></button>
+                    Please log in to create/view an entry
+                  `;
+
+                  document.body.appendChild(notification);
+
+                  notification
+                    .querySelector(".delete")
+                    .addEventListener("click", () => {
+                      notification.remove();
+                    });
+
+                  setTimeout(() => {
+                    notification.remove();
+                  }, 2000);
+
+                  const loginModal = document.getElementById("loginModal");
+                  loginModal.classList.add("is-active");
+                  document.documentElement.classList.add("is-clipped");
+                  return;
+                }
+
                 if (competition.status == "live") {
                   let entry = new Entry(
                     this.coordinator_url,
                     this.oracle_url,
                     this.stations,
                     competition,
+                    () => this.refreshData(),
                   );
                   entry.init().then(() => {
                     entry.showEntry();
@@ -88,26 +124,52 @@ class Competitions {
       });
   }
 
-  async get_competitions() {
-    let response = await fetch(`${this.oracle_url}/oracle/events`);
-    if (!response.ok) {
-      console.error(response);
-      throw new Error(`Failed to get competitions, status: ${response.status}`);
-    }
-    let oracle_events = await response.json();
-    console.log("known events: ", oracle_events);
-    let competitions = oracle_events.map((event) => ({
-      id: event["id"],
-      startTime: event["observation_date"],
-      endTime: one_day_ahead(event["observation_date"]),
-      status: event["status"].toLowerCase(),
-      //TODO: change to a real number based on what we want to charge per entry
-      totalPrizePoolAmt: "$60",
-      totalEntries: event["total_entries"],
-      locations: event["locations"],
-    }));
+  async get_combined_competitions() {
+    console.log(this.coordinator_url);
+    const [competitionsResponse, eventsResponse] = await Promise.all([
+      fetch(`${this.coordinator_url}/competitions`),
+      fetch(`${this.oracle_url}/oracle/events`),
+    ]);
 
-    return competitions;
+    if (!competitionsResponse.ok) {
+      throw new Error(
+        `Failed to get competitions, status: ${competitionsResponse.status}`,
+      );
+    }
+    if (!eventsResponse.ok) {
+      throw new Error(
+        `Failed to get oracle events, status: ${eventsResponse.status}`,
+      );
+    }
+
+    const competitions = await competitionsResponse.json();
+    const events = await eventsResponse.json();
+
+    const eventsMap = new Map(events.map((event) => [event.id, event]));
+
+    return competitions
+      .map((competition) => {
+        const event = eventsMap.get(competition.id);
+        if (!event) {
+          console.warn(
+            `No matching event found for competition ${competition.id}`,
+          );
+          return null;
+        }
+
+        return {
+          id: competition.id,
+          startTime: event.observation_date,
+          endTime: one_day_ahead(event.observation_date),
+          status: event.status.toLowerCase(),
+          entry_fee: competition.entry_fee,
+          totalPrizePoolAmt: competition.total_competition_pool,
+          totalEntries: event.total_entries,
+          numOfWinners: competition.number_of_places_win,
+          locations: event.locations,
+        };
+      })
+      .filter(Boolean);
   }
 
   handleCompetitionClick(row, competition) {

@@ -1,28 +1,31 @@
 import { WeatherData } from "./weather_data.js";
 import { uuidv7 } from "https://unpkg.com/uuidv7@^1";
+import { AuthorizedClient } from "./authorized_client.js";
+import { getMusigRegistry } from "./main.js";
 
 class Entry {
-  constructor(coordinator_url, oracle_url, stations, competition) {
+  constructor(
+    coordinator_url,
+    oracle_url,
+    stations,
+    competition,
+    onSubmitSuccess,
+  ) {
     this.weather_data = new WeatherData(oracle_url);
     this.coordinator_url = coordinator_url;
+    this.client = new AuthorizedClient(window.nostrClient, coordinator_url);
     this.competition = competition;
     this.stations = stations;
-    let preimage = generateRandomPreimage();
-    let preimage_hash = (this.entry = {
-      competition_id: this.competition.id,
-      submit: {},
-      payout_preimage: preimageToHex(preimage),
-      payout_hash: sha256(preimage),
-    });
+    this.onSubmitSuccess = onSubmitSuccess;
   }
 
   async init() {
-    /*return Promise.all([
+    return Promise.all([
       this.weather_data.get_competition_last_forecast(this.competition),
-      generateKeyPair(),
-    ]).then(([competition_forecasts, key_pair]) => {
+      this.setupEntry(),
+    ]).then(([competition_forecasts, _]) => {
       this.competition_forecasts = competition_forecasts;
-      this.entry["options"] = [];
+
       for (const station_id in competition_forecasts) {
         const forecast = competition_forecasts[station_id];
         const option = {
@@ -34,9 +37,8 @@ class Entry {
         };
         this.entry["options"].push(option);
         this.entry["submit"][station_id] = {};
-        this.entry.ephemeral_keys = key_pair;
       }
-    });*/
+    });
   }
 
   showEntry() {
@@ -97,6 +99,47 @@ class Entry {
     if (!$entryModal.classList.contains("is-active")) {
       $entryModal.classList.add("is-active");
     }
+  }
+
+  async setupEntry() {
+    const response = await this.client.get(`${this.coordinator_url}/entries`);
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch existing entries: ${response.status}`);
+    }
+
+    const existingEntries = await response.json();
+    existingEntries.sort((a, b) => a.id.localeCompare(b.id));
+
+    this.entryIndex = existingEntries.length;
+    const payout_hash = await window.taprootWallet.addEntryIndex(
+      this.entryIndex,
+    );
+    const nostrPubkey = await window.nostrClient.getPublicKey();
+    const encryptedPayoutPreimage =
+      await window.taprootWallet.getEncryptedDlcPayoutPreimage(
+        this.entryIndex,
+        nostrPubkey,
+      );
+    const ephemeralPrivateKeyEncrypted =
+      await window.taprootWallet.getEncryptedDlcPrivateKey(
+        this.entryIndex,
+        nostrPubkey,
+      );
+    const ephemeralPubkey = await window.taprootWallet.getDlcPublicKey(
+      this.entryIndex,
+    );
+
+    this.entry = {
+      id: uuidv7(),
+      competition_id: this.competition.id,
+      submit: {},
+      options: [],
+      payout_hash,
+      payout_preimage_encrypted: encryptedPayoutPreimage,
+      ephemeral_pubkey: ephemeralPubkey,
+      ephemeral_privatekey_encrypted: ephemeralPrivateKeyEncrypted,
+    };
   }
 
   buildEntry($stationList, station_id, type_view, type, val) {
@@ -193,68 +236,55 @@ class Entry {
   }
 
   async submit($event) {
-    let xonly_pubkey_hex = await window.nostrClient.getPublicKey();
-    let submit = this.entry["submit"];
-    let expected_observations = build_expected_observations_from_submit(submit);
-    let competition_id = this.entry.competition_id;
+    try {
+      let submit = this.entry["submit"];
+      let expected_observations = this.buildExpectedObservations(submit);
 
-    let encrypted_private_key = await window.nostrClient.nip44.encrypt(
-      xonly_pubkey_hex,
-      this.entry.ephemeral_keys.privateKey,
-    );
-    let encrypted_payout_preimage = await window.nostrClient.nip44.encrypt(
-      xonly_pubkey_hex,
-      this.entry.payout_preimage,
-    );
+      const entry_body = {
+        id: this.entry.id,
+        ephemeral_pubkey: this.entry.ephemeral_pubkey,
+        ephemeral_privatekey_encrypted:
+          this.entry.ephemeral_privatekey_encrypted,
+        payout_hash: this.entry.payout_hash,
+        payout_preimage_encrypted: this.entry.payout_preimage_encrypted,
+        event_id: this.competition.id,
+        expected_observations: expected_observations,
+      };
 
-    let entry_body = {
-      id: uuidv7(),
-      pubkey: xonly_pubkey_hex,
-      ephemeral_private_key: encrypted_private_key, // encrypt to nostr pubkey via nip 04
-      ephemeral_pubkey: this.entry.ephemeral_keys.publicKey, // needs to be associated to an ephemeral private key as this may be exposed to the market maker on payout
-      payout_preimage: encrypted_payout_preimage, // encrypt to nostr pubkey via nip 04
-      payout_hash: this.entry.payout_hash, // needs to be ephemeral preimage, used to get the payout
-      event_id: competition_id,
-      expected_observations: expected_observations,
-    };
+      console.log("Sending entry:", entry_body);
 
-    /* broadcasted to nostr relays so user has ability to complete the payout even if coordinator is gone
-    TODO: need to add the ability to publish to a list of relays, user defined with sane defaults
-    let nostr_store_data = {
-      event_id: competition_id,
-      entry_id: entry_body.id,
-      ephemeral_pubkey: this.entry.ephemeral_keys.publicKey,
-      ephemeral_private_key: encrypted_private_key, // encrypt to nostr pubkey via nip 04
-      payout_preimage: encrypted_payout_preimage, // encrypt to nostr pubkey via nip 04
-      payout_hash: this.entry.payout_hash,
-    };
-    console.log("Sending nostr backup:", nostr_store_data);
-    */ m;
+      const response = await this.client.post(
+        `${this.coordinator_url}/entries`,
+        entry_body,
+      );
 
-    console.log("Sending entry:", entry_body);
+      if (!response.ok) {
+        throw new Error(`Failed to create entry, status: ${response.status}`);
+      }
 
-    const headers = {
-      "Content-Type": "application/json",
-    };
-    fetch(`${this.coordinator_url}/entries`, {
-      method: "POST",
-      headers: headers,
-      body: JSON.stringify(entry_body),
-    })
-      .then((response) => {
-        if (!response.ok) {
-          console.error(response);
-          $event.target.classList.remove("is-loading");
-          this.showError(`Failed to create entry, status: ${response.status}`);
-        } else {
-          console.log("entry: ", this.entry);
-          $event.target.classList.remove("is-loading");
-          this.showSuccess();
-        }
-      })
-      .catch((e) => {
-        console.error("Error submitting entry: {}", e);
-      });
+      const responseData = await response.json();
+
+      const registry = getMusigRegistry();
+      if (registry) {
+        await registry.createSession(
+          window.taprootWallet,
+          this.competition.id,
+          this.entry.id,
+          this.client,
+          this.entryIndex,
+        );
+      }
+
+      $event.target.classList.remove("is-loading");
+      this.showSuccess();
+    } catch (e) {
+      console.error("Error submitting entry:", e);
+      $event.target.classList.remove("is-loading");
+      this.showError(e.message);
+      if (this.onSubmitSuccess) {
+        this.onSubmitSuccess();
+      }
+    }
   }
 
   showSuccess() {
@@ -278,33 +308,29 @@ class Entry {
       this.clearEntry();
     }, 600);
   }
-}
 
-function build_expected_observations_from_submit(submit) {
-  console.log(submit);
-  let expected_observations = [];
-  for (let [station_id, choices] of Object.entries(submit)) {
-    let stations = {
+  buildExpectedObservations(submit) {
+    return Object.entries(submit).map(([station_id, choices]) => ({
       stations: station_id,
-    };
-    for (let [weather_type, selected_val] of Object.entries(choices)) {
-      stations[weather_type] = convert_select_val(selected_val);
-    }
-    expected_observations.push(stations);
+      ...Object.entries(choices).reduce((acc, [weather_type, selected_val]) => {
+        acc[weather_type] = this.convertSelectVal(selected_val);
+        return acc;
+      }, {}),
+    }));
   }
-  return expected_observations;
-}
 
-function convert_select_val(raw_select) {
-  switch (raw_select) {
-    case "par":
-      return "Par";
-    case "over":
-      return "Over";
-    case "under":
-      return "Under";
-    default:
+  convertSelectVal(raw_select) {
+    const valueMap = {
+      par: "Par",
+      over: "Over",
+      under: "Under",
+    };
+
+    if (!(raw_select in valueMap)) {
       throw new Error(`Failed to match selected option value: ${raw_select}`);
+    }
+
+    return valueMap[raw_select];
   }
 }
 

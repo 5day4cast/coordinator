@@ -23,7 +23,9 @@ window.onload = async function () {
     .getElementById("competition_payload")
     .addEventListener("input", validateCompetition);
 
-  if (document.getElementById('wallet-section').classList.contains('is-active')) {
+  if (
+    document.getElementById("wallet-section").classList.contains("is-active")
+  ) {
     await refreshBalance();
     await refreshOutputs();
     await refreshFeeEstimates();
@@ -31,24 +33,24 @@ window.onload = async function () {
 };
 
 function setupTabNavigation() {
-  const tabs = document.querySelectorAll('.tabs li');
-  tabs.forEach(tab => {
-    tab.addEventListener('click', () => {
+  const tabs = document.querySelectorAll(".tabs li");
+  tabs.forEach((tab) => {
+    tab.addEventListener("click", () => {
       // Remove active class from all tabs
-      tabs.forEach(t => t.classList.remove('is-active'));
+      tabs.forEach((t) => t.classList.remove("is-active"));
       // Add active class to clicked tab
-      tab.classList.add('is-active');
+      tab.classList.add("is-active");
 
       // Hide all content sections
-      const contents = document.querySelectorAll('.tabs-content > div');
-      contents.forEach(content => content.classList.remove('is-active'));
+      const contents = document.querySelectorAll(".tabs-content > div");
+      contents.forEach((content) => content.classList.remove("is-active"));
 
       // Show the selected content section
       const targetId = tab.dataset.target;
-      document.getElementById(targetId).classList.add('is-active');
+      document.getElementById(targetId).classList.add("is-active");
 
       // If switching to wallet tab, refresh the data
-      if (targetId === 'wallet-section') {
+      if (targetId === "wallet-section") {
         refreshBalance();
         refreshOutputs();
       }
@@ -60,6 +62,8 @@ function createCompetition($event) {
   console.log("createCompetition");
   let $competitionElement = document.getElementById("competition_payload");
   let competition = JSON.parse($competitionElement.innerText.trim());
+  competition.total_competition_pool =
+    competition.entry_fee * competition.total_allowed_entries;
   console.log("competition", competition);
 
   const headers = {
@@ -137,7 +141,9 @@ async function get_stations() {
 }
 
 function load_stations(stations) {
-  const $tbody = document.getElementById(`stations_container`).querySelector('tbody');
+  const $tbody = document
+    .getElementById(`stations_container`)
+    .querySelector("tbody");
   stations.forEach((station) => {
     let $row = document.createElement("tr");
     $row.id = `station-${station.station_id}`;
@@ -156,11 +162,12 @@ async function refreshBalance() {
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
     const data = await response.json();
 
-    document.getElementById('confirmed-balance').textContent = data.confirmed;
-    document.getElementById('unconfirmed-balance').textContent = data.unconfirmed;
+    document.getElementById("confirmed-balance").textContent = data.confirmed;
+    document.getElementById("unconfirmed-balance").textContent =
+      data.unconfirmed;
   } catch (error) {
-    console.error('Error fetching balance:', error);
-    alert('Failed to fetch balance');
+    console.error("Error fetching balance:", error);
+    alert("Failed to fetch balance");
   }
 }
 
@@ -170,10 +177,10 @@ async function getNewAddress() {
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
     const data = await response.json();
 
-    document.getElementById('current-address').textContent = data.address;
+    document.getElementById("current-address").textContent = data.address;
   } catch (error) {
-    console.error('Error getting new address:', error);
-    alert('Failed to get new address');
+    console.error("Error getting new address:", error);
+    alert("Failed to get new address");
   }
 }
 
@@ -183,15 +190,16 @@ async function refreshFeeEstimates() {
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
     const data = await response.json();
 
-    const tbody = document.getElementById('fee-estimates-table');
-    tbody.innerHTML = '';
+    const tbody = document.getElementById("fee-estimates-table");
+    tbody.innerHTML = "";
 
     // Sort by confirmation target (number of blocks)
-    const sortedEstimates = Object.entries(data.fee_estimates)
-      .sort(([blocksA, _a], [blocksB, _b]) => parseInt(blocksA) - parseInt(blocksB));
+    const sortedEstimates = Object.entries(data.fee_estimates).sort(
+      ([blocksA, _a], [blocksB, _b]) => parseInt(blocksA) - parseInt(blocksB),
+    );
 
     sortedEstimates.forEach(([blocks, feeRate]) => {
-      const row = document.createElement('tr');
+      const row = document.createElement("tr");
       row.innerHTML = `
         <td>${blocks}</td>
         <td>${feeRate.toFixed(1)}</td>
@@ -199,8 +207,8 @@ async function refreshFeeEstimates() {
       tbody.appendChild(row);
     });
   } catch (error) {
-    console.error('Error fetching fee estimates:', error);
-    alert('Failed to fetch fee estimates');
+    console.error("Error fetching fee estimates:", error);
+    alert("Failed to fetch fee estimates");
   }
 }
 
@@ -210,16 +218,16 @@ async function refreshOutputs() {
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
     const data = await response.json();
 
-    const tbody = document.getElementById('outputs-table');
-    tbody.innerHTML = '';
+    const tbody = document.getElementById("outputs-table");
+    tbody.innerHTML = "";
 
-    data.outputs.forEach(output => {
-      const row = document.createElement('tr');
+    data.outputs.forEach((output) => {
+      const row = document.createElement("tr");
       row.innerHTML = `
-                <td><code>${output.outpoint.split(':')[0]}</code></td>
+                <td><code>${output.outpoint.split(":")[0]}</code></td>
                 <td>${output.txout.value}</td>
-                <td><code>${output.txout.script_pubkey || '-'}</code></td>
-                <td>${output.is_spent ? 'Spent' : 'Unspent'}</td>
+                <td><code>${output.txout.script_pubkey || "-"}</code></td>
+                <td>${output.is_spent ? "Spent" : "Unspent"}</td>
                 <td>
                   <button onclick="toggleJson(this)" class="json-btn">View JSON</button>
                   <pre class="json-data" style="display:none">${JSON.stringify(output, null, 2)}</pre>
@@ -228,59 +236,59 @@ async function refreshOutputs() {
       tbody.appendChild(row);
     });
   } catch (error) {
-    console.error('Error fetching outputs:', error);
-    alert('Failed to fetch outputs');
+    console.error("Error fetching outputs:", error);
+    alert("Failed to fetch outputs");
   }
 }
 
 function toggleJson(button) {
   const jsonData = button.nextElementSibling;
-  if (jsonData.style.display === 'none') {
-    jsonData.style.display = 'block';
-    button.textContent = 'Hide JSON';
+  if (jsonData.style.display === "none") {
+    jsonData.style.display = "block";
+    button.textContent = "Hide JSON";
   } else {
-    jsonData.style.display = 'none';
-    button.textContent = 'View JSON';
+    jsonData.style.display = "none";
+    button.textContent = "View JSON";
   }
 }
 
 async function sendBitcoin() {
-  const address = document.getElementById('send-address').value;
-  const amount = parseInt(document.getElementById('send-amount').value);
-  const maxFee = parseInt(document.getElementById('send-fee').value);
+  const address = document.getElementById("send-address").value;
+  const amount = parseInt(document.getElementById("send-amount").value);
+  const maxFee = parseInt(document.getElementById("send-fee").value);
 
   if (!address) {
-    alert('Please enter a destination address');
+    alert("Please enter a destination address");
     return;
   }
 
   const payload = {
     address_to: address,
     amount: amount || undefined,
-    max_fee: maxFee || undefined
+    max_fee: maxFee || undefined,
   };
 
   try {
     const response = await fetch(`${apiBase}/wallet/send`, {
-      method: 'POST',
+      method: "POST",
       headers: {
-        'Content-Type': 'application/json',
+        "Content-Type": "application/json",
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
     });
 
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
     const data = await response.json();
 
-    const resultDiv = document.getElementById('send-result');
-    const resultContent = document.getElementById('send-result-content');
+    const resultDiv = document.getElementById("send-result");
+    const resultContent = document.getElementById("send-result-content");
     resultContent.textContent = JSON.stringify(data, null, 2);
-    resultDiv.classList.remove('is-hidden');
+    resultDiv.classList.remove("is-hidden");
 
     await refreshBalance();
     await refreshOutputs();
   } catch (error) {
-    console.error('Error sending bitcoin:', error);
-    alert('Failed to send bitcoin: ' + error.message);
+    console.error("Error sending bitcoin:", error);
+    alert("Failed to send bitcoin: " + error);
   }
 }

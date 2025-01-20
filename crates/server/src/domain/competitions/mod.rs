@@ -6,7 +6,7 @@ use crate::oracle_client::{Event, WeatherChoices};
 pub use coordinator::*;
 pub use db_migrations::*;
 use dlctix::{
-    bitcoin::OutPoint,
+    bitcoin::{OutPoint, Transaction},
     musig2::{AggNonce, PartialSignature, PubNonce},
     ContractParameters, EventLockingConditions, SigMap, SignedContract,
 };
@@ -14,6 +14,7 @@ use duckdb::{
     types::{Type, Value},
     Row,
 };
+use log::debug;
 use serde::{Deserialize, Serialize};
 pub use store::*;
 use time::{macros::format_description, Duration, OffsetDateTime};
@@ -213,8 +214,6 @@ pub struct CreateEvent {
     pub entry_fee: usize,
     /// Total sats in competition pool to be won
     pub total_competition_pool: usize,
-    /// Add a coordinator that will use the event entries in a competition
-    pub coordinator: Option<CoordinatorInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,7 +238,8 @@ pub struct Competition {
     pub total_signed_entries: u64,
     pub total_paid_entries: u64,
     pub number_of_places_win: usize,
-    pub funding_transaction: Option<OutPoint>,
+    pub funding_transaction: Option<Transaction>,
+    pub funding_outpoint: Option<OutPoint>,
     pub contract_parameters: Option<ContractParameters>,
     pub public_nonces: Option<SigMap<PubNonce>>,
     pub aggregated_nonces: Option<SigMap<AggNonce>>,
@@ -256,6 +256,12 @@ pub struct Competition {
     #[serde(with = "time::serde::rfc3339::option")]
     pub failed_at: Option<OffsetDateTime>,
     pub errors: Vec<CompetitionError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FundedContract {
+    pub contract_params: ContractParameters,
+    pub funding_outpoint: OutPoint,
 }
 
 #[derive(Debug, PartialEq, PartialOrd, Eq)]
@@ -287,6 +293,7 @@ impl Competition {
             total_paid_entries: 0,
             number_of_places_win: create_event.number_of_places_win,
             funding_transaction: None,
+            funding_outpoint: None,
             contract_parameters: None,
             public_nonces: None,
             aggregated_nonces: None,
@@ -385,12 +392,20 @@ impl Competition {
             return CompetitionState::SigningComplete;
         }
         if self.has_all_entry_partial_signatures() {
+            debug!(
+                "All signatures collected: {}/{}",
+                self.total_signed_entries, self.total_entries
+            );
             return CompetitionState::PartialSignaturesCollected;
         }
         if self.aggregated_nonces.is_some() {
             return CompetitionState::AggregateNoncesGenerated;
         }
         if self.has_all_entry_nonces() {
+            debug!(
+                "All nonces collected: {}/{}",
+                self.total_entry_nonces, self.total_entries
+            );
             return CompetitionState::NoncesCollected;
         }
         if self.has_full_entries() {
@@ -453,35 +468,42 @@ impl<'a> TryFrom<&Row<'a>> for Competition {
                 })
             })?,
 
-            contract_parameters: row.get::<usize, Option<Value>>(12).map(|opt| {
+            funding_outpoint: row.get::<usize, Option<Value>>(12).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            public_nonces: row.get::<usize, Option<Value>>(13).map(|opt| {
+            contract_parameters: row.get::<usize, Option<Value>>(13).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            aggregated_nonces: row.get::<usize, Option<Value>>(14).map(|opt| {
+            public_nonces: row.get::<usize, Option<Value>>(14).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            partial_signatures: row.get::<usize, Option<Value>>(15).map(|opt| {
+            aggregated_nonces: row.get::<usize, Option<Value>>(15).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            signed_contract: row.get::<usize, Option<Value>>(16).map(|opt| {
+            partial_signatures: row.get::<usize, Option<Value>>(16).map(|opt| {
+                opt.and_then(|raw| match raw {
+                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
+                    _ => None,
+                })
+            })?,
+
+            signed_contract: row.get::<usize, Option<Value>>(17).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
@@ -489,27 +511,27 @@ impl<'a> TryFrom<&Row<'a>> for Competition {
             })?,
 
             cancelled_at: row
-                .get::<usize, Option<String>>(17)
-                .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
-
-            contracted_at: row
                 .get::<usize, Option<String>>(18)
                 .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
 
-            signed_at: row
+            contracted_at: row
                 .get::<usize, Option<String>>(19)
                 .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
 
-            funding_broadcasted_at: row
+            signed_at: row
                 .get::<usize, Option<String>>(20)
                 .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
 
-            failed_at: row
+            funding_broadcasted_at: row
                 .get::<usize, Option<String>>(21)
                 .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
 
+            failed_at: row
+                .get::<usize, Option<String>>(22)
+                .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
+
             errors: row
-                .get::<usize, Option<Value>>(22)
+                .get::<usize, Option<Value>>(23)
                 .map(|opt| {
                     opt.and_then(|raw| match raw {
                         Value::Blob(val) => {

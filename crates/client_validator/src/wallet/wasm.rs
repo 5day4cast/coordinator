@@ -1,6 +1,7 @@
 use super::core::{TaprootWalletCore, TaprootWalletCoreBuilder};
 use crate::NostrClientWrapper;
 use dlctix::{bitcoin::OutPoint, musig2::AggNonce, ContractParameters, SigMap};
+use log::info;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -23,22 +24,20 @@ impl TaprootWalletBuilder {
     }
 
     #[wasm_bindgen]
-    pub fn network(self, network: String) -> TaprootWalletBuilder {
-        self.inner.clone().network(network);
+    pub fn network(mut self, network: String) -> TaprootWalletBuilder {
+        self.inner = self.inner.network(network);
         self
     }
 
     #[wasm_bindgen]
-    #[wasm_bindgen]
-    pub fn nostr_client(self, client: &NostrClientWrapper) -> TaprootWalletBuilder {
-        let mut builder = TaprootWalletBuilder::new();
-        builder.inner = self.inner.nostr_client(client.get_core());
-        builder
+    pub fn nostr_client(mut self, client: &NostrClientWrapper) -> TaprootWalletBuilder {
+        self.inner = self.inner.nostr_client(client.get_core());
+        self
     }
 
     #[wasm_bindgen]
-    pub fn encrypted_key(self, key: String) -> TaprootWalletBuilder {
-        self.inner.clone().encrypted_key(key);
+    pub fn encrypted_key(mut self, key: String) -> TaprootWalletBuilder {
+        self.inner = self.inner.encrypted_key(key);
         self
     }
 
@@ -96,6 +95,18 @@ impl TaprootWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    #[wasm_bindgen(js_name = "getEncryptedDlcPayoutPreimage")]
+    pub async fn get_encrypted_dlc_payout_preimage(
+        &self,
+        entry_index: u32,
+        nostr_pubkey: &str,
+    ) -> Result<String, JsValue> {
+        self.inner
+            .get_encrypted_dlc_payout_preimage(entry_index, nostr_pubkey)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     #[wasm_bindgen(js_name = "getDlcPublicKey")]
     pub async fn get_dlc_public_key(&self, entry_index: u32) -> Result<String, JsValue> {
         self.inner
@@ -118,6 +129,7 @@ impl TaprootWallet {
         params: JsValue,
         funding_outpoint: JsValue,
     ) -> Result<(), JsValue> {
+        info!("params: {:?}", params);
         let params: ContractParameters = serde_wasm_bindgen::from_value(params)
             .map_err(|e| JsValue::from_str(&format!("Params deserialization error: {}", e)))?;
 
@@ -136,6 +148,12 @@ impl TaprootWallet {
             .generate_public_nonces(entry_index)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
+        debug!("Generated nonces: {:?}", nonces);
+
+        if nonces.by_outcome.is_empty() && nonces.by_win_condition.is_empty() {
+            return Err(JsValue::from_str("No nonces generated"));
+        }
+
         serde_wasm_bindgen::to_value(&nonces)
             .map_err(|e| JsValue::from_str(&format!("Nonce serialization error: {}", e)))
     }
@@ -146,15 +164,20 @@ impl TaprootWallet {
         aggregate_nonces: JsValue,
         entry_index: u32,
     ) -> Result<JsValue, JsValue> {
+        debug!("Received aggregate nonces JsValue: {:?}", aggregate_nonces);
+
         let agg_nonces: SigMap<AggNonce> = serde_wasm_bindgen::from_value(aggregate_nonces)
             .map_err(|e| {
                 JsValue::from_str(&format!("Aggregate nonces deserialization error: {}", e))
             })?;
 
+        debug!("Deserialized aggregate nonces: {:?}", agg_nonces);
+
         let partial_sigs = self
             .inner
             .sign_aggregate_nonces(agg_nonces, entry_index)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        debug!("Generated partial signatures: {:?}", partial_sigs);
 
         serde_wasm_bindgen::to_value(&partial_sigs).map_err(|e| {
             JsValue::from_str(&format!("Partial signatures serialization error: {}", e))

@@ -1,17 +1,17 @@
 use anyhow::anyhow;
 use async_trait::async_trait;
+use bdk_wallet::{bitcoin::Psbt, SignOptions};
 use client_validator::{NostrClientCore, SignerType, TaprootWalletCore, TaprootWalletCoreBuilder};
 use dlctix::{
     attestation_locking_point,
-    bitcoin::OutPoint,
     musig2::secp256k1::{PublicKey, Secp256k1, SecretKey},
     secp::Scalar,
     EventLockingConditions,
 };
-use log::info;
+use log::{debug, info};
 use mockall::mock;
 use server::{
-    domain::{generate_ranking_permutations, AddEntry, CoordinatorInfo, CreateEvent},
+    domain::{generate_ranking_permutations, AddEntry, CreateEvent},
     get_key, AddEventEntry, Bitcoin, Ln, Oracle, OracleError as Error, OracleEvent, ValueOptions,
     WeatherChoices,
 };
@@ -36,9 +36,17 @@ mock! {
 
     #[async_trait]
     impl Bitcoin for BitcoinClient {
-        async fn get_spendable_utxo(&self, amount: u64) -> Result<OutPoint, anyhow::Error>;
+        async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<bdk_wallet::LocalOutput, anyhow::Error>;
+        async fn get_current_height(&self) -> Result<u32, anyhow::Error>;
         async fn get_estimated_fee_rates(&self) -> Result<HashMap<u16, f64>, anyhow::Error>;
-        async fn broadcast(&self, tx: String) -> Result<(), anyhow::Error>;
+        async fn broadcast(&self, transaction: &bdk_wallet::bitcoin::Transaction) -> Result<(), anyhow::Error>;
+        async fn get_next_address(&self) -> Result<bdk_wallet::AddressInfo, anyhow::Error>;
+        async fn get_derived_private_key(&self) -> Result<dlctix::musig2::secp256k1::SecretKey, anyhow::Error>;
+        async fn sign_psbt(
+            &self,
+            psbt: &mut Psbt,
+            sign_options: SignOptions,
+        ) -> Result<bool, anyhow::Error>;
     }
 }
 
@@ -119,10 +127,6 @@ pub fn generate_request_create_event(
         total_allowed_entries,
         entry_fee: 1000,
         total_competition_pool: 10000,
-        coordinator: Some(CoordinatorInfo {
-            pubkey: "test_coordinator_pubkey".to_string(),
-            signature: "test_coordinator_signature".to_string(),
-        }),
         number_of_places_win,
     }
 }
@@ -227,10 +231,16 @@ pub fn generate_oracle_event(
     }
 }
 
-pub fn get_oracle_keys(private_key_file_path: String) -> (PublicKey, SecretKey) {
+pub fn get_keys(private_key_file_path: String) -> (PublicKey, SecretKey) {
+    debug!("private_key_file_path: {:?}", private_key_file_path);
+
     let secret_key: SecretKey = get_key(&private_key_file_path).expect("Failed to find key");
+    debug!("get_keys secret key: {:?}", secret_key);
+
     let secp = Secp256k1::new();
     let public_key = secret_key.public_key(&secp);
+    debug!("get_keys public key: {:?}", public_key);
+
     (public_key, secret_key)
 }
 

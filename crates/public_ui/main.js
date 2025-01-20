@@ -1,5 +1,7 @@
 import { displayCompetitions } from "./competitions.js";
 import { setupAuthManager } from "./auth_manager.js";
+import { SigningProgressUI } from "./signing_progress_ui.js";
+import { MusigSessionRegistry } from "./musig_session_registry.js";
 
 const apiBase = API_BASE;
 console.log("api location:", apiBase);
@@ -8,6 +10,83 @@ console.log("oracle location:", oracleBase);
 
 const network = NETWORK;
 console.log("bitcoin network:", network);
+
+let musigRegistry = null;
+
+export function getMusigRegistry() {
+  if (!musigRegistry) {
+    console.warn("Attempting to access musig registry before initialization");
+    return null;
+  }
+  return musigRegistry;
+}
+
+export function cleanupMusigSystem() {
+  if (musigRegistry) {
+    musigRegistry.clearAllSessions();
+    musigRegistry = null;
+  }
+}
+
+function initializeMusigSystem() {
+  if (!musigRegistry) {
+    const signingUI = new SigningProgressUI();
+    musigRegistry = new MusigSessionRegistry();
+
+    // Connect the components both ways
+    signingUI.setRegistry(musigRegistry);
+    musigRegistry.addObserver(signingUI);
+  }
+  return musigRegistry;
+}
+
+export async function initializeMusigSessions(wallet, client) {
+  console.log("Initializing musig sessions");
+
+  if (!musigRegistry) {
+    console.warn("Musig system not initialized. Login required.");
+    return;
+  }
+
+  try {
+    console.log("Fetching entries from:", `${client.apiBase}/entries`);
+
+    const response = await client.get(`${client.apiBase}/entries`);
+    if (!response.ok) {
+      throw new Error("Failed to fetch user entries");
+    }
+
+    const entries = await response.json();
+    console.log("Retrieved entries:", entries);
+
+    entries.sort((a, b) => a.id.localeCompare(b.id));
+
+    // Start sessions for entries that need signing
+    for (const entry of entries) {
+      console.log("Checking entry:", entry);
+      if (entry.public_nonces === null && entry.signed_at === null) {
+        console.log("Entry needs signing:", entry);
+
+        try {
+          const entryIndex = entries.indexOf(entry);
+          console.log(entryIndex);
+          await musigRegistry.createSession(
+            wallet,
+            entry.event_id,
+            entry.id,
+            client,
+            entryIndex,
+          );
+        } catch (error) {
+          console.error("Error creating session for entry:", entry.id, error);
+        }
+      }
+    }
+  } catch (error) {
+    console.error("Error initializing musig sessions:", error);
+    throw error;
+  }
+}
 
 document.addEventListener("DOMContentLoaded", async () => {
   // Functions to open and close a modal
@@ -151,9 +230,25 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   const originalOnLoginSuccess = auth_manager.onLoginSuccess;
-  auth_manager.onLoginSuccess = function () {
+  auth_manager.onLoginSuccess = async function () {
     closeAllModals();
-    originalOnLoginSuccess.call(auth_manager);
+
+    // Initialize musig system after successful login
+    musigRegistry = initializeMusigSystem();
+
+    // Initialize musig sessions with the current wallet and client
+    if (window.taprootWallet && this.authorizedClient) {
+      try {
+        await initializeMusigSessions(
+          window.taprootWallet,
+          this.authorizedClient,
+        );
+      } catch (error) {
+        console.error("Failed to initialize musig sessions:", error);
+      }
+    }
+
+    originalOnLoginSuccess.call(this);
   };
 
   await displayCompetitions(apiBase, oracleBase);

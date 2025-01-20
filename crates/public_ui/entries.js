@@ -1,4 +1,5 @@
 import { one_day_ahead } from "./utils.js";
+import { AuthorizedClient } from "./authorized_client.js";
 
 export async function displayEntries(apiBase, oracleBase) {
   let $entriesDataTable = document.getElementById("entriesDataTable");
@@ -13,10 +14,10 @@ export async function displayEntries(apiBase, oracleBase) {
 }
 
 class Entries {
-  constructor(coordinator_url, oracle_url, $tbody, nostrClient) {
+  constructor(coordinator_url, oracle_url, $tbody) {
     this.coordinator_url = coordinator_url;
     this.oracle_url = oracle_url;
-    this.nostrClient = nostrClient;
+    this.client = new AuthorizedClient(window.nostrClient, coordinator_url);
     this.entries = [];
     this.$tbody = $tbody;
   }
@@ -71,8 +72,8 @@ class Entries {
   }
 
   async get_events() {
-    //TODO: fix the filter for event_ids
-    let response = await fetch(`${this.oracle_url}/oracle/events`);
+    // Oracle endpoints don't need authentication
+    const response = await fetch(`${this.oracle_url}/oracle/events`);
     if (!response.ok) {
       console.error(response);
       throw new Error(`Failed to get competitions, status: ${response.status}`);
@@ -83,22 +84,11 @@ class Entries {
   }
 
   async get_user_entries() {
-    if (!window.nostrClient) {
-    }
-    //TODO: filter by entry ids here is possible
-    const { input, init } = window.nostrClient.prepareFetch(
-      `${this.coordinator_url}/entries`,
-      "GET",
-      null,
-      {
-        "Content-Type": "application/json",
-      },
-    );
-    const response = await fetch(input, init);
+    const response = await this.client.get(`${this.coordinator_url}/entries`);
 
     if (!response.ok) {
       console.error(response);
-      throw new Error(`Failed to get competitions, status: ${response.status}`);
+      throw new Error(`Failed to get entries, status: ${response.status}`);
     }
     let user_entries = await response.json();
     return user_entries;

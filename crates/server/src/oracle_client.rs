@@ -1,16 +1,27 @@
 use anyhow::anyhow;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use dlctix::{secp::Scalar, EventLockingConditions};
+use hyper::header::{AUTHORIZATION, CONTENT_TYPE};
 use log::{debug, error};
+use mime::APPLICATION_JSON;
+use nostr_sdk::{
+    hashes::Hash as Sha256Hash, secp256k1::SecretKey as Secp256k1SecretKey, Keys,
+    SecretKey as NostrSecretKey,
+};
 use reqwest_middleware::{
     self,
-    reqwest::{Method, StatusCode, Url},
-    ClientWithMiddleware, RequestBuilder,
+    reqwest::{Method, Response, StatusCode, Url},
+    ClientWithMiddleware,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::domain::{AddEntry, CreateEvent};
+use crate::{
+    domain::{AddEntry, CreateEvent},
+    get_key,
+    nostr_extractor::create_auth_event,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Event {
@@ -39,6 +50,7 @@ pub enum Error {
 pub struct OracleClient {
     pub base_url: Url,
     pub client: ClientWithMiddleware,
+    nostr_keys: Keys,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +127,14 @@ impl TryFrom<String> for ValueOptions {
     }
 }
 
+fn secp256k1_to_nostr_keys(secp_key: &Secp256k1SecretKey) -> Result<Keys, &'static str> {
+    let key_bytes = secp_key.secret_bytes();
+
+    let secret_key =
+        NostrSecretKey::from_slice(&key_bytes).map_err(|_| "Failed to convert secret key")?;
+    Ok(Keys::new(secret_key))
+}
+
 #[async_trait::async_trait]
 pub trait Oracle: Send + Sync {
     async fn create_event(&self, event: CreateEvent) -> Result<Event, Error>;
@@ -122,29 +142,66 @@ pub trait Oracle: Send + Sync {
 }
 
 impl OracleClient {
-    pub fn new(client: ClientWithMiddleware, base_url: &Url) -> Self {
-        Self {
+    pub fn new(
+        client: ClientWithMiddleware,
+        base_url: &Url,
+        nostr_key_path: &str,
+    ) -> Result<Self, Error> {
+        let secret_key: Secp256k1SecretKey = get_key(nostr_key_path)
+            .map_err(|e| Error::Request(format!("Failed to load nostr key: {}", e)))?;
+
+        let nostr_keys = secp256k1_to_nostr_keys(&secret_key)
+            .map_err(|e| Error::Request(format!("Invalid nostr key: {}", e)))?;
+
+        Ok(Self {
             base_url: base_url.to_owned(),
             client,
-        }
+            nostr_keys,
+        })
     }
 
-    async fn send_request<T>(
+    async fn send_authenticated_request_internal(
         &self,
-        request: RequestBuilder,
+        method: Method,
+        url: Url,
+        body: Option<Vec<u8>>,
         not_found_message: String,
-    ) -> Result<T, Error>
-    where
-        T: DeserializeOwned,
-    {
+    ) -> Result<Response, Error> {
+        let payload_hash = body.as_deref().map(Sha256Hash::hash);
+
+        let event = create_auth_event(
+            method.as_str(),
+            url.as_str(),
+            payload_hash,
+            &self.nostr_keys,
+        )
+        .await;
+
+        let auth_header = format!(
+            "Nostr {}",
+            BASE64.encode(
+                serde_json::to_string(&event)
+                    .map_err(|e| Error::Request(format!("Failed to serialize event: {}", e)))?
+            )
+        );
+
+        let mut request = self
+            .client
+            .request(method, url)
+            .header(AUTHORIZATION, auth_header)
+            .header(CONTENT_TYPE, APPLICATION_JSON.to_string());
+
+        if let Some(b) = body {
+            request = request.body(b);
+        }
+
         let response = request.send().await.map_err(|e| {
             error!("error sending to oracle: {}", e);
             Error::SendRetry(e)
         })?;
 
         if response.status().is_success() {
-            let body: T = response.json::<T>().await?;
-            Ok(body)
+            Ok(response)
         } else if response.status() == StatusCode::NOT_FOUND {
             Err(Error::NotFound(not_found_message))
         } else if response.status() == StatusCode::BAD_REQUEST {
@@ -156,14 +213,42 @@ impl OracleClient {
             ))
         } else {
             let status = response.status();
-
             let body = response.text().await?;
-
             Err(Error::Request(format!(
                 "error response from oracle with status {}: {:?}",
                 status, body
             )))
         }
+    }
+
+    pub async fn send_authenticated_request<T>(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<Vec<u8>>,
+        not_found_message: String,
+    ) -> Result<T, Error>
+    where
+        T: DeserializeOwned,
+    {
+        let response = self
+            .send_authenticated_request_internal(method, url, body, not_found_message)
+            .await?;
+
+        response.json::<T>().await.map_err(Into::into)
+    }
+
+    pub async fn send_authenticated_request_ignore_body(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<Vec<u8>>,
+        not_found_message: String,
+    ) -> Result<(), Error> {
+        self.send_authenticated_request_internal(method, url, body, not_found_message)
+            .await?;
+
+        Ok(())
     }
 }
 
@@ -175,9 +260,17 @@ impl Oracle for OracleClient {
             .base_url
             .join("/oracle/events")
             .map_err(|e| Error::Request(e.to_string()))?;
-        let req = self.client.request(Method::POST, url).json(&event);
-        self.send_request::<Event>(req, String::from("event not found"))
-            .await
+
+        let body = serde_json::to_vec(&event)
+            .map_err(|e| Error::Request(format!("Failed to serialize event: {}", e)))?;
+
+        self.send_authenticated_request::<Event>(
+            Method::POST,
+            url,
+            Some(body),
+            String::from("event not found"),
+        )
+        .await
     }
 
     async fn submit_entry(&self, entry: AddEventEntry) -> Result<(), Error> {
@@ -185,8 +278,16 @@ impl Oracle for OracleClient {
             .base_url
             .join(&format!("/oracle/events/{}/entry", entry.id))
             .map_err(|e| Error::Request(e.to_string()))?;
-        let req = self.client.request(Method::POST, url).json(&entry);
-        self.send_request(req, String::from("event not found"))
-            .await
+
+        let body = serde_json::to_vec(&entry)
+            .map_err(|e| Error::Request(format!("Failed to serialize entry: {}", e)))?;
+
+        self.send_authenticated_request_ignore_body(
+            Method::POST,
+            url,
+            Some(body),
+            String::from("event not found"),
+        )
+        .await
     }
 }

@@ -9,17 +9,18 @@ use bdk_wallet::{
     bitcoin::{
         address::NetworkChecked,
         bip32::{ChildNumber, Xpriv},
-        consensus::{Decodable, Encodable},
-        secp256k1::SecretKey,
+        secp256k1::{Secp256k1, SecretKey as BdkSecretKey},
         Address, Amount, Network, NetworkKind, Psbt, Transaction, Txid,
     },
     coin_selection::DefaultCoinSelectionAlgorithm,
     descriptor::calc_checksum,
     file_store::Store,
-    Balance, ChangeSet, KeychainKind, LocalOutput, PersistedWallet, SignOptions, TxBuilder, Wallet,
+    AddressInfo, Balance, ChangeSet, KeychainKind, LocalOutput, PersistedWallet, SignOptions,
+    TxBuilder, Wallet,
 };
-use dlctix::bitcoin::OutPoint;
-use log::{error, info};
+use dlctix::{bitcoin::bip32::ChainCode, musig2::secp256k1::SecretKey as DlcSecretKey};
+use log::{debug, error, info};
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use std::{
     collections::{BTreeSet, HashMap},
@@ -34,13 +35,22 @@ use tokio_util::sync::CancellationToken;
 
 #[async_trait]
 pub trait Bitcoin: Send + Sync {
-    async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<OutPoint, anyhow::Error>;
+    async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<LocalOutput, anyhow::Error>;
+    async fn get_current_height(&self) -> Result<u32, anyhow::Error>;
     async fn get_estimated_fee_rates(&self) -> Result<HashMap<u16, f64>, anyhow::Error>;
-    async fn broadcast(&self, raw_transaction: String) -> Result<(), anyhow::Error>;
+    async fn broadcast(&self, transaction: &Transaction) -> Result<(), anyhow::Error>;
+    async fn get_next_address(&self) -> Result<AddressInfo, anyhow::Error>;
+    async fn get_derived_private_key(&self) -> Result<DlcSecretKey, anyhow::Error>;
+    async fn sign_psbt(
+        &self,
+        psbt: &mut Psbt,
+        sign_options: SignOptions,
+    ) -> Result<bool, anyhow::Error>;
 }
 
 pub struct BitcoinClient {
     pub network: Network,
+    seed_path: SecretString,
     wallet: RwLock<PersistedWallet<Store<ChangeSet>>>,
     client: AsyncClient,
     wallet_store: RwLock<Store<bdk_wallet::ChangeSet>>,
@@ -127,22 +137,72 @@ impl SendOptions {
 
 #[async_trait]
 impl Bitcoin for BitcoinClient {
-    async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<OutPoint, anyhow::Error> {
+    async fn get_derived_private_key(&self) -> Result<DlcSecretKey, anyhow::Error> {
+        // Get the secret key directly from the path
+        let secret_key: BdkSecretKey = get_key(&self.seed_path.expose_secret())?;
+
+        // Convert to DLC secret key format
+        let dlc_key = DlcSecretKey::from_slice(&secret_key.secret_bytes())
+            .map_err(|e| anyhow!("Invalid secret key bytes: {}", e))?;
+
+        Ok(dlc_key)
+    }
+
+    async fn sign_psbt(
+        &self,
+        psbt: &mut Psbt,
+        sign_options: SignOptions,
+    ) -> Result<bool, anyhow::Error> {
+        let wallet = self.wallet.write().await;
+        let finalized = wallet.sign(psbt, sign_options)?;
+        Ok(finalized)
+    }
+
+    async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<LocalOutput, anyhow::Error> {
         let amount = Amount::from_sat(amount_sats);
+        let current_height = self.get_current_height().await?;
         let utxo = self.wallet.read().await.list_unspent().find(|utxo| {
+            // If this is a coinbase-derived UTXO, check maturity
+            if let Some(conf_height) = utxo.chain_position.confirmation_height_upper_bound() {
+                if utxo.outpoint.vout == 0 {
+                    debug!("Coinbase UTXO found at height {}", conf_height);
+                    if current_height < conf_height + 100 {
+                        debug!(
+                            "Coinbase UTXO not mature yet. Current height: {}, Need: {}",
+                            current_height,
+                            conf_height + 100
+                        );
+                        return false;
+                    }
+                }
+            }
+
             // Check if UTXO is confirmed, not spent, bigger than amount, and not locked
             utxo.txout.value >= amount && !utxo.is_spent && utxo.chain_position.is_confirmed()
         });
-        if let Some(utxo) = utxo {
-            let dlc_utxo = dlctix::bitcoin::OutPoint {
-                txid: dlctix::bitcoin::Txid::from_str(&utxo.outpoint.txid.to_string())?,
-                vout: utxo.outpoint.vout,
-            };
 
-            Ok(dlc_utxo)
+        if let Some(utxo) = utxo {
+            Ok(utxo)
         } else {
             Err(anyhow!("No utxos with the request amount available"))
         }
+    }
+
+    async fn get_next_address(&self) -> Result<AddressInfo, anyhow::Error> {
+        let (mut wallet, mut store) = tokio::join!(self.wallet.write(), self.wallet_store.write());
+
+        let address = wallet.next_unused_address(KeychainKind::External);
+        //Might need to apply update here, not sure
+        wallet.persist(&mut store)?;
+
+        Ok(address)
+    }
+
+    async fn get_current_height(&self) -> Result<u32, anyhow::Error> {
+        self.client
+            .get_height()
+            .await
+            .map_err(|e| anyhow!("Failed to get block height: {}", e))
     }
 
     /// Get an object where the key is the confirmation target (in number of blocks) and the value is the estimated feerate (in sat/vB).
@@ -153,25 +213,13 @@ impl Bitcoin for BitcoinClient {
         Ok(fee_estimates)
     }
 
-    async fn broadcast(&self, raw_transaction: String) -> Result<(), anyhow::Error> {
-        let mut buf = [0u8; 1024];
-        let raw_tx = hex::decode(raw_transaction.clone())?;
-        let tx: Transaction = Decodable::consensus_decode(&mut raw_tx.as_slice())?;
+    async fn broadcast(&self, transaction: &Transaction) -> Result<(), anyhow::Error> {
+        //TODO: add child-pays-for-parent if fees are too low
 
-        let size = tx.consensus_encode(&mut &mut buf[..])?;
-        let expected_size = raw_transaction.len() / 2;
-        if size != expected_size {
-            Err(anyhow!(
-                "encoded transaction {} length doesn't match expected {}",
-                size,
-                expected_size
-            ))
-        } else {
-            self.client
-                .broadcast(&tx)
-                .await
-                .map_err(|e| anyhow!("error broadcasting: {}", e))
-        }
+        self.client
+            .broadcast(transaction)
+            .await
+            .map_err(|e| anyhow!("error broadcasting: {}", e))
     }
 }
 
@@ -189,6 +237,10 @@ impl BitcoinClient {
         .map_err(|e| anyhow!("Failed to open or create bitcoin db: {}", e))?;
         info!("Bitcoin db configured");
 
+        let path = Path::new(&settings.seed_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         // Set up wallet with EC private key
         let (external_desc, internal_desc) =
             setup_wallet_descriptors(&settings.seed_path, settings.network.into())
@@ -254,19 +306,10 @@ impl BitcoinClient {
         Ok(BitcoinClient {
             network: settings.network,
             wallet: RwLock::new(wallet),
+            seed_path: SecretString::new(settings.seed_path.clone()),
             client,
             wallet_store: RwLock::new(db),
         })
-    }
-
-    pub async fn get_next_address(&self) -> Result<String, anyhow::Error> {
-        let (mut wallet, mut store) = tokio::join!(self.wallet.write(), self.wallet_store.write());
-
-        let address = wallet.next_unused_address(KeychainKind::External);
-        //Might need to apply update here, not sure
-        wallet.persist(&mut store)?;
-
-        Ok(address.to_string())
     }
 
     pub async fn get_balance(&self) -> Result<Balance, anyhow::Error> {
@@ -343,16 +386,27 @@ fn setup_wallet_descriptors(
     seed_path: &str,
     network: NetworkKind,
 ) -> Result<(String, String), anyhow::Error> {
-    // Get the secret key from the provided path
-    let secret_key: SecretKey = get_key(seed_path)?;
+    let xpriv = derive_wallet_key(seed_path, network)?;
 
-    // Create chain code with proper entropy
-    use blake2::{Blake2b512, Digest};
-    let mut hasher = Blake2b512::new();
-    hasher.update(&secret_key[..]);
-    let hash = hasher.finalize();
-    let mut chain_code = [0u8; 32];
-    chain_code.copy_from_slice(&hash[0..32]);
+    // Use standard tr descriptor
+    let external_base = format!("tr({}/0/*)", xpriv);
+    let internal_base = format!("tr({}/1/*)", xpriv);
+
+    let external_checksum = calc_checksum(&external_base)?;
+    let internal_checksum = calc_checksum(&internal_base)?;
+
+    let external_descriptor = format!("{}#{}", external_base, external_checksum);
+    let internal_descriptor = format!("{}#{}", internal_base, internal_checksum);
+
+    Ok((external_descriptor, internal_descriptor))
+}
+
+fn derive_wallet_key(seed_path: &str, network: NetworkKind) -> Result<Xpriv, anyhow::Error> {
+    // Get the secret key from the provided path
+    let secret_key: BdkSecretKey = get_key(seed_path)?;
+    let secp = Secp256k1::new();
+
+    let chain_code = ChainCode::from(secret_key.secret_bytes());
 
     // Create extended private key with network support
     let xpriv = Xpriv {
@@ -364,18 +418,7 @@ fn setup_wallet_descriptors(
         private_key: secret_key,
     };
 
-    // Format similar to the example descriptors
-    let external_base = format!("tr({}/0/*)", xpriv);
-    let internal_base = format!("tr({}/1/*)", xpriv);
-
-    // Calculate and append checksums
-    let external_checksum = calc_checksum(&external_base)?;
-    let internal_checksum = calc_checksum(&internal_base)?;
-
-    let external_descriptor = format!("{}#{}", external_base, external_checksum);
-    let internal_descriptor = format!("{}#{}", internal_base, internal_checksum);
-
-    Ok((external_descriptor, internal_descriptor))
+    Ok(xpriv)
 }
 
 pub struct BitcoinSyncWatcher {

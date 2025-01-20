@@ -109,3 +109,76 @@
 .input::placeholder {
     color: #666;
 }
+
+/* Container for all signing progress content */
+.signing-progress-content {
+    background: white;
+    border-radius: 6px;
+    padding: 1.5rem;
+    margin-top: 1rem;
+}
+
+#signingProgressContainer {
+    min-height: 100px;
+    padding: 1rem;
+}
+
+/* Individual session cards */
+.signing-session-card {
+    background: white;
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+    margin-bottom: 15px;
+    padding: 20px;
+    transition: box-shadow 0.3s ease;
+    border-left: 4px solid transparent; /* Default border */
+}
+
+.signing-session-card:hover {
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.2);
+}
+
+/* State-specific styling */
+.signing-session-card.initialized {
+    border-left-color: #3273dc;
+}
+
+.signing-session-card.completed {
+    border-left-color: #48c774;
+}
+
+.signing-session-card.error {
+    border-left-color: #f14668;
+}
+
+/* Card content styling */
+.competition-details {
+    font-size: 0.9em;
+    color: #666;
+    margin: 10px 0;
+}
+
+.session-status {
+    font-weight: 500;
+    color: #3273dc;
+    margin-top: 10px;
+}
+
+/* Progress indicators */
+.progress-steps {
+    margin-top: 15px;
+    position: relative;
+}
+
+.progress-line {
+    height: 2px;
+    background: #dbdbdb;
+    position: relative;
+    margin: 10px 0;
+}
+
+.progress-line-fill {
+    height: 100%;
+    background: #3273dc;
+    transition: width 0.3s ease;
+}

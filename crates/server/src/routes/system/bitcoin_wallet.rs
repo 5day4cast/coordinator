@@ -51,7 +51,9 @@ pub async fn get_next_address(
     debug!("Getting next unused address");
 
     match state.bitcoin.get_next_address().await {
-        Ok(address) => Ok(Json(AddressResponse { address })),
+        Ok(address) => Ok(Json(AddressResponse {
+            address: address.to_string(),
+        })),
         Err(e) => {
             error!("Failed to get next address: {}", e);
             Err(ErrorResponse::from(Error::Bitcoin(e)))
