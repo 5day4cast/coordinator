@@ -48,18 +48,3 @@ impl From<NostrError> for wasm_bindgen::JsValue {
         wasm_bindgen::JsValue::from_str(&error.to_string())
     }
 }
-
-#[cfg(test)]
-pub(crate) mod test_utils {
-    use nostr_sdk::Keys;
-
-    use super::*;
-
-    pub fn create_test_client() -> NostrClientCore {
-        NostrClientCore::new()
-    }
-
-    pub fn generate_test_keys() -> Keys {
-        Keys::generate()
-    }
-}

@@ -96,7 +96,7 @@ impl TaprootWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
-    #[wasm_bindgen(js_name = "getDlcPrivateKey")]
+    #[wasm_bindgen(js_name = "getDlcPublicKey")]
     pub async fn get_dlc_public_key(&self, entry_index: u32) -> Result<String, JsValue> {
         self.inner
             .get_dlc_public_key(entry_index)
@@ -130,7 +130,7 @@ impl TaprootWallet {
     }
 
     #[wasm_bindgen(js_name = "generatePublicNonces")]
-    pub fn generate_public_nonces(&self, entry_index: u32) -> Result<JsValue, JsValue> {
+    pub fn generate_public_nonces(&mut self, entry_index: u32) -> Result<JsValue, JsValue> {
         let nonces = self
             .inner
             .generate_public_nonces(entry_index)

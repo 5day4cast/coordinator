@@ -3,10 +3,7 @@ mod core;
 #[cfg(target_arch = "wasm32")]
 mod wasm;
 
-use dlctix::{
-    bitcoin::OutPoint, musig2::PubNonce, ContractParameters, NonceSharingRound, SigMap,
-    SigningSession, TicketedDLC,
-};
+use dlctix::{bitcoin::OutPoint, musig2::PubNonce, ContractParameters, SigMap, TicketedDLC};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

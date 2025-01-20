@@ -128,6 +128,7 @@ pub struct TaprootWalletCore {
     nostr_client: NostrClientCore,
     network: Network,
     dlc_contracts: HashMap<u32, DlcEntry>,
+    //TODO: add functionality for payouts via bdk_wallet
     bdk_wallet: Wallet,
     change_set: ChangeSet,
 }
@@ -250,10 +251,12 @@ impl TaprootWalletCore {
     }
 
     fn update_changes(&mut self) {
-        if let Some(new_changes) = self.bdk_wallet.staged() {
+        todo!();
+        //TODO: serialize and backup self.new_changes here
+        /*if let Some(new_changes) = self.bdk_wallet.staged() {
             self.change_set.merge(new_changes.to_owned());
-            //TODO: serialize and backup self.new_changes here
-        }
+
+        }*/
     }
 
     pub async fn get_encrypted_master_key(
