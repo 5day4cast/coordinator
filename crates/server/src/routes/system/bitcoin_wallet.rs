@@ -9,7 +9,7 @@ use log::{debug, error};
 use serde::Serialize;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::{domain::Error, AppState, SendOptions};
+use crate::{domain::Error, AppState, Bitcoin, SendOptions};
 
 #[derive(Debug, Serialize)]
 pub struct AddressResponse {

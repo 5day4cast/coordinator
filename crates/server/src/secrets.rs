@@ -1,6 +1,6 @@
 use anyhow::anyhow;
 use bdk_wallet::bitcoin::secp256k1::SecretKey as BitcoinSecretKey;
-use dlctix::musig2::secp256k1::rand;
+use dlctix::musig2::secp256k1::{rand, SecretKey as DlctixSecretKey};
 use pem_rfc7468::{decode_vec, encode_string};
 use rand::{rngs::ThreadRng, thread_rng};
 use std::{
@@ -22,6 +22,21 @@ impl SecretKeyHandler for BitcoinSecretKey {
 
     fn from_slice(data: &[u8]) -> Result<Self, anyhow::Error> {
         BitcoinSecretKey::from_slice(data).map_err(|e| anyhow!(e))
+    }
+
+    fn secret_bytes(&self) -> [u8; 32] {
+        self.secret_bytes()
+    }
+}
+
+impl SecretKeyHandler for DlctixSecretKey {
+    fn new(rng: &mut ThreadRng) -> Self {
+        // Since dlctix is using the newer secp256k1, we use the new API
+        DlctixSecretKey::new(rng)
+    }
+
+    fn from_slice(data: &[u8]) -> Result<Self, anyhow::Error> {
+        DlctixSecretKey::from_slice(data).map_err(|e| anyhow!(e))
     }
 
     fn secret_bytes(&self) -> [u8; 32] {

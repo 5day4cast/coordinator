@@ -16,7 +16,7 @@ use duckdb::{
 };
 use serde::{Deserialize, Serialize};
 pub use store::*;
-use time::{macros::format_description, OffsetDateTime};
+use time::{macros::format_description, Duration, OffsetDateTime};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +77,7 @@ pub struct UserEntry {
     /// purchase the preimages of these hashes. Expects the hash in hex.
     pub ticket_hash: Option<String>,
     pub public_nonces: Option<SigMap<PubNonce>>,
+    pub partial_signatures: Option<SigMap<PartialSignature>>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub signed_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
@@ -91,7 +92,7 @@ impl<'a> TryFrom<&Row<'a>> for UserEntry {
         let sql_time_format = format_description!(
             "[year]-[month]-[day] [hour]:[minute]:[second][optional [.[subsecond]]][offset_hour]"
         );
-        let signed_at: Option<OffsetDateTime> = match row.get::<usize, Option<String>>(8)? {
+        let signed_at: Option<OffsetDateTime> = match row.get::<usize, Option<String>>(13)? {
             Some(val) => match OffsetDateTime::parse(&val, &sql_time_format) {
                 Ok(datetime) => Some(datetime),
                 Err(e) => {
@@ -104,7 +105,7 @@ impl<'a> TryFrom<&Row<'a>> for UserEntry {
             },
             _ => None,
         };
-        let paid_at: Option<OffsetDateTime> = match row.get::<usize, Option<String>>(9)? {
+        let paid_at: Option<OffsetDateTime> = match row.get::<usize, Option<String>>(14)? {
             Some(val) => match OffsetDateTime::parse(&val, &sql_time_format) {
                 Ok(datetime) => Some(datetime),
                 Err(e) => {
@@ -117,6 +118,22 @@ impl<'a> TryFrom<&Row<'a>> for UserEntry {
             },
             _ => None,
         };
+
+        let public_nonces: Option<SigMap<PubNonce>> =
+            row.get::<usize, Option<Value>>(6).map(|opt| {
+                opt.and_then(|raw| match raw {
+                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
+                    _ => None,
+                })
+            })?;
+        let partial_signatures: Option<SigMap<PartialSignature>> =
+            row.get::<usize, Option<Value>>(7).map(|opt| {
+                opt.and_then(|raw| match raw {
+                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
+                    _ => None,
+                })
+            })?;
+
         let user_entry = UserEntry {
             id: row
                 .get::<usize, String>(0)
@@ -129,15 +146,16 @@ impl<'a> TryFrom<&Row<'a>> for UserEntry {
             pubkey: row.get::<usize, String>(2)?,
             ephemeral_pubkey: row.get::<usize, String>(3)?,
             ephemeral_privatekey_encrypted: row.get::<usize, String>(4)?,
-            payout_hash: row.get::<usize, String>(5)?,
-            payout_preimage_encrypted: row.get::<usize, String>(6)?,
-            ticket_hash: row.get::<usize, Option<String>>(7)?,
+            ephemeral_privatekey: row.get::<usize, Option<String>>(5)?,
+            public_nonces,
+            partial_signatures,
+            ticket_preimage: row.get::<usize, Option<String>>(8)?,
+            ticket_hash: row.get::<usize, Option<String>>(9)?,
+            payout_preimage_encrypted: row.get(10)?,
+            payout_hash: row.get(11)?,
+            payout_preimage: row.get::<usize, Option<String>>(12)?,
             signed_at,
             paid_at,
-            public_nonces: None,
-            ephemeral_privatekey: None,
-            payout_preimage: None,
-            ticket_preimage: None,
         };
         Ok(user_entry)
     }
@@ -155,6 +173,7 @@ impl AddEntry {
             payout_preimage_encrypted: self.payout_preimage_encrypted,
             signed_at: None,
             paid_at: None,
+            partial_signatures: None,
             public_nonces: None,
             ephemeral_privatekey: None,
             payout_preimage: None,
@@ -186,6 +205,8 @@ pub struct CreateEvent {
     pub locations: Vec<String>,
     /// The number of values that can be selected per entry in the event (default to number_of_locations * 3, (temp_low, temp_high, wind_speed))
     pub number_of_values_per_entry: usize,
+    /// The number of ranks that can win, 1st -> 40%, 2nd -> 35%, 3rd -> 25% (something like that from the prize pool)
+    pub number_of_places_win: usize,
     /// Total number of allowed entries into the event
     pub total_allowed_entries: usize,
     /// Total sats required per entry for ticket
@@ -217,6 +238,7 @@ pub struct Competition {
     pub total_entry_nonces: u64,
     pub total_signed_entries: u64,
     pub total_paid_entries: u64,
+    pub number_of_places_win: usize,
     pub funding_transaction: Option<OutPoint>,
     pub contract_parameters: Option<ContractParameters>,
     pub public_nonces: Option<SigMap<PubNonce>>,
@@ -236,6 +258,20 @@ pub struct Competition {
     pub errors: Vec<CompetitionError>,
 }
 
+#[derive(Debug, PartialEq, PartialOrd, Eq)]
+pub enum CompetitionState {
+    Created,
+    EntriesCollected,
+    ContractCreated,
+    NoncesCollected,
+    AggregateNoncesGenerated,
+    PartialSignaturesCollected,
+    SigningComplete,
+    Broadcasted,
+    Failed,
+    Cancelled,
+}
+
 impl Competition {
     pub fn new(create_event: &CreateEvent, oracle_event: &Event) -> Self {
         Self {
@@ -244,11 +280,12 @@ impl Competition {
             total_competition_pool: create_event.total_competition_pool as u64,
             total_allowed_entries: create_event.total_allowed_entries as u64,
             entry_fee: create_event.entry_fee as u64,
-            event_announcement: oracle_event.event_annoucement.clone(),
+            event_announcement: oracle_event.event_announcement.clone(),
             total_entries: 0,
             total_entry_nonces: 0,
             total_signed_entries: 0,
             total_paid_entries: 0,
+            number_of_places_win: create_event.number_of_places_win,
             funding_transaction: None,
             contract_parameters: None,
             public_nonces: None,
@@ -264,7 +301,7 @@ impl Competition {
         }
     }
     pub fn has_full_entries(&self) -> bool {
-        self.total_entries >= self.total_allowed_entries
+        (self.total_entries > 0) && self.total_entries >= self.total_allowed_entries
     }
 
     pub fn is_contract_created(&self) -> bool {
@@ -272,15 +309,15 @@ impl Competition {
     }
 
     pub fn has_all_entry_nonces(&self) -> bool {
-        self.total_entry_nonces >= self.total_entries
+        (self.total_entries > 0) && (self.total_entry_nonces >= self.total_entries)
     }
 
     pub fn has_all_entry_partial_signatures(&self) -> bool {
-        self.total_signed_entries >= self.total_entries
+        (self.total_entries > 0) && (self.total_signed_entries >= self.total_entries)
     }
 
     pub fn has_all_entries_paid(&self) -> bool {
-        self.total_paid_entries >= self.total_entries
+        (self.total_entries > 0) && (self.total_paid_entries >= self.total_entries)
     }
 
     pub fn is_contract_signed(&self) -> bool {
@@ -300,8 +337,69 @@ impl Competition {
     }
 
     pub fn is_failed(&self) -> bool {
-        //We treat as failed if generate more than 5 errors, allows for some retrying
-        self.failed_at.is_some() && self.errors.len() > 3
+        //NOTE: may want to use to enable retry logic, check if error > n
+        self.failed_at.is_some()
+    }
+
+    pub fn is_expired(&self) -> bool {
+        let now = OffsetDateTime::now_utc();
+
+        // Competition should expire if not enough entries collected before observation date
+        if let Some(observation_date) = self.event_announcement.expiry {
+            if now.unix_timestamp() as u32 >= observation_date && !self.has_full_entries() {
+                return true;
+            }
+        }
+
+        // Add timeouts for different stages
+        match self.get_state() {
+            CompetitionState::ContractCreated => {
+                // Give users 1 hour to submit nonces after contract creation
+                self.contracted_at
+                    .map(|t| now - t > Duration::hours(1))
+                    .unwrap_or(false)
+            }
+            CompetitionState::AggregateNoncesGenerated => {
+                // Give users 1 hour to submit partial signatures
+                self.aggregated_nonces.is_some()
+                    && self
+                        .contracted_at
+                        .map(|t| now - t > Duration::hours(2))
+                        .unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+
+    pub fn get_state(&self) -> CompetitionState {
+        if self.is_cancelled() {
+            return CompetitionState::Cancelled;
+        }
+        if self.is_failed() {
+            return CompetitionState::Failed;
+        }
+        if self.funding_broadcasted_at.is_some() {
+            return CompetitionState::Broadcasted;
+        }
+        if self.signed_at.is_some() {
+            return CompetitionState::SigningComplete;
+        }
+        if self.has_all_entry_partial_signatures() {
+            return CompetitionState::PartialSignaturesCollected;
+        }
+        if self.aggregated_nonces.is_some() {
+            return CompetitionState::AggregateNoncesGenerated;
+        }
+        if self.has_all_entry_nonces() {
+            return CompetitionState::NoncesCollected;
+        }
+        if self.has_full_entries() {
+            return CompetitionState::EntriesCollected;
+        }
+        if self.contract_parameters.is_some() {
+            return CompetitionState::ContractCreated;
+        }
+        CompetitionState::Created
     }
 }
 
@@ -318,117 +416,110 @@ impl<'a> TryFrom<&Row<'a>> for Competition {
                 .get::<usize, String>(0)
                 .map(|val| Uuid::parse_str(&val))?
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(0, Type::Any, Box::new(e)))?,
+
             created_at: row
                 .get::<usize, String>(1)
                 .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(1, Type::Any, Box::new(e)))?,
+
             total_competition_pool: row.get::<usize, u64>(2)?,
             total_allowed_entries: row.get::<usize, u64>(3)?,
-            total_signed_entries: row.get::<usize, u64>(4)?,
-            total_paid_entries: row.get::<usize, u64>(5)?,
-            total_entry_nonces: row.get::<usize, u64>(6)?,
-            entry_fee: row.get::<usize, u64>(6)?,
+            number_of_places_win: row.get(4)?,
+            entry_fee: row.get::<usize, u64>(5)?,
+            event_announcement: row.get::<usize, Option<Value>>(6).map(|opt| match opt {
+                Some(Value::Blob(val)) => serde_json::from_slice::<EventLockingConditions>(&val)
+                    .map_err(|e| {
+                        duckdb::Error::FromSqlConversionFailure(6, Type::Any, Box::new(e))
+                    }),
+                _ => Err(duckdb::Error::FromSqlConversionFailure(
+                    6,
+                    Type::Any,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Missing required event announcement data",
+                    )),
+                )),
+            })??,
+
             total_entries: row.get::<usize, u64>(7)?,
-            event_announcement: row
-                .get::<usize, Value>(8)
-                .map(|raw| {
-                    let blob = match raw {
-                        Value::Blob(val) => val,
-                        _ => vec![],
-                    };
-                    serde_json::from_slice(&blob)
-                })?
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(8, Type::Any, Box::new(e)))?,
-            funding_transaction: row
-                .get::<usize, Value>(9)
-                .map(|raw| {
-                    let blob = match raw {
-                        Value::Blob(val) => val,
-                        _ => vec![],
-                    };
-                    serde_json::from_slice(&blob)
-                })?
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(9, Type::Any, Box::new(e)))?,
-            contract_parameters: row
-                .get::<usize, Value>(10)
-                .map(|raw| {
-                    let blob = match raw {
-                        Value::Blob(val) => val,
-                        _ => vec![],
-                    };
-                    serde_json::from_slice(&blob)
-                })?
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(10, Type::Any, Box::new(e)))?,
-            signed_contract: row
-                .get::<usize, Value>(10)
-                .map(|raw| {
-                    let blob = match raw {
-                        Value::Blob(val) => val,
-                        _ => vec![],
-                    };
-                    serde_json::from_slice(&blob)
-                })?
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(10, Type::Any, Box::new(e)))?,
-            public_nonces: row
-                .get::<usize, Value>(11)
-                .map(|raw| {
-                    let blob = match raw {
-                        Value::Blob(val) => val,
-                        _ => vec![],
-                    };
-                    serde_json::from_slice(&blob)
-                })?
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(11, Type::Any, Box::new(e)))?,
-            aggregated_nonces: row
-                .get::<usize, Value>(11)
-                .map(|raw| {
-                    let blob = match raw {
-                        Value::Blob(val) => val,
-                        _ => vec![],
-                    };
-                    serde_json::from_slice(&blob)
-                })?
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(11, Type::Any, Box::new(e)))?,
-            partial_signatures: row
-                .get::<usize, Value>(11)
-                .map(|raw| {
-                    let blob = match raw {
-                        Value::Blob(val) => val,
-                        _ => vec![],
-                    };
-                    serde_json::from_slice(&blob)
-                })?
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(11, Type::Any, Box::new(e)))?,
+            total_entry_nonces: row.get::<usize, u64>(8)?,
+            total_signed_entries: row.get::<usize, u64>(9)?,
+            total_paid_entries: row.get::<usize, u64>(10)?,
+
+            funding_transaction: row.get::<usize, Option<Value>>(11).map(|opt| {
+                opt.and_then(|raw| match raw {
+                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
+                    _ => None,
+                })
+            })?,
+
+            contract_parameters: row.get::<usize, Option<Value>>(12).map(|opt| {
+                opt.and_then(|raw| match raw {
+                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
+                    _ => None,
+                })
+            })?,
+
+            public_nonces: row.get::<usize, Option<Value>>(13).map(|opt| {
+                opt.and_then(|raw| match raw {
+                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
+                    _ => None,
+                })
+            })?,
+
+            aggregated_nonces: row.get::<usize, Option<Value>>(14).map(|opt| {
+                opt.and_then(|raw| match raw {
+                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
+                    _ => None,
+                })
+            })?,
+
+            partial_signatures: row.get::<usize, Option<Value>>(15).map(|opt| {
+                opt.and_then(|raw| match raw {
+                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
+                    _ => None,
+                })
+            })?,
+
+            signed_contract: row.get::<usize, Option<Value>>(16).map(|opt| {
+                opt.and_then(|raw| match raw {
+                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
+                    _ => None,
+                })
+            })?,
+
             cancelled_at: row
-                .get::<usize, Option<String>>(12)
-                .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(12, Type::Any, Box::new(e)))?,
+                .get::<usize, Option<String>>(17)
+                .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
+
             contracted_at: row
-                .get::<usize, Option<String>>(13)
-                .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(13, Type::Any, Box::new(e)))?,
+                .get::<usize, Option<String>>(18)
+                .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
+
             signed_at: row
-                .get::<usize, Option<String>>(14)
-                .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(14, Type::Any, Box::new(e)))?,
+                .get::<usize, Option<String>>(19)
+                .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
+
             funding_broadcasted_at: row
-                .get::<usize, Option<String>>(15)
-                .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(15, Type::Any, Box::new(e)))?,
+                .get::<usize, Option<String>>(20)
+                .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
+
             failed_at: row
-                .get::<usize, Option<String>>(16)
-                .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(15, Type::Any, Box::new(e)))?,
+                .get::<usize, Option<String>>(21)
+                .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
+
             errors: row
-                .get::<usize, Value>(16)
-                .map(|raw| {
-                    let blob = match raw {
-                        Value::Blob(val) => val,
-                        _ => vec![],
-                    };
-                    serde_json::from_slice(&blob)
-                })?
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(16, Type::Any, Box::new(e)))?,
+                .get::<usize, Option<Value>>(22)
+                .map(|opt| {
+                    opt.and_then(|raw| match raw {
+                        Value::Blob(val) => {
+                            serde_json::from_slice::<Vec<CompetitionError>>(&val).ok()
+                        }
+                        _ => Some(Vec::new()),
+                    })
+                })
+                .unwrap_or_else(|_| Some(Vec::new()))
+                .unwrap_or_default(),
         };
         Ok(competition)
     }
@@ -440,4 +531,10 @@ pub enum CompetitionError {
     FailedCreateTransaction(String),
     #[error("Failed to broadcast error: {0}")]
     FailedBroadcast(String),
+    #[error("Failed to aggregate nonces: {0}")]
+    FailedNonceAggregation(String),
+    #[error("Competition expired: {0}")]
+    Expired(String),
+    #[error("Invalid state transition: {0}")]
+    InvalidStateTransition(String),
 }

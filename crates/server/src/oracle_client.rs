@@ -18,7 +18,7 @@ pub struct Event {
     /// Nonce the oracle committed to use as part of signing final results
     pub nonce: Scalar,
     /// Holds the predefined outcomes the oracle will attest to at event completes
-    pub event_annoucement: EventLockingConditions,
+    pub event_announcement: EventLockingConditions,
 }
 
 #[derive(Error, Debug)]
@@ -115,33 +115,18 @@ impl TryFrom<String> for ValueOptions {
     }
 }
 
+#[async_trait::async_trait]
+pub trait Oracle: Send + Sync {
+    async fn create_event(&self, event: CreateEvent) -> Result<Event, Error>;
+    async fn submit_entry(&self, entry: AddEventEntry) -> Result<(), Error>;
+}
+
 impl OracleClient {
-    pub fn new(client: ClientWithMiddleware, base_url: &Url, ) -> Self {
+    pub fn new(client: ClientWithMiddleware, base_url: &Url) -> Self {
         Self {
             base_url: base_url.to_owned(),
             client,
         }
-    }
-
-    pub async fn create_event(&self, event: CreateEvent) -> Result<Event, Error> {
-        debug!("event: {:?}", event);
-        let url = self
-            .base_url
-            .join("/oracle/events")
-            .map_err(|e| Error::Request(e.to_string()))?;
-        let req = self.client.request(Method::POST, url).json(&event);
-        self.send_request::<Event>(req, String::from("event not found"))
-            .await
-    }
-
-    pub async fn submit_entry(&self, entry: AddEventEntry) -> Result<(), Error> {
-        let url = self
-            .base_url
-            .join(&format!("/oracle/events/{}/entry", entry.id))
-            .map_err(|e| Error::Request(e.to_string()))?;
-        let req = self.client.request(Method::POST, url).json(&entry);
-        self.send_request(req, String::from("event not found"))
-            .await
     }
 
     async fn send_request<T>(
@@ -179,5 +164,29 @@ impl OracleClient {
                 status, body
             )))
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl Oracle for OracleClient {
+    async fn create_event(&self, event: CreateEvent) -> Result<Event, Error> {
+        debug!("event: {:?}", event);
+        let url = self
+            .base_url
+            .join("/oracle/events")
+            .map_err(|e| Error::Request(e.to_string()))?;
+        let req = self.client.request(Method::POST, url).json(&event);
+        self.send_request::<Event>(req, String::from("event not found"))
+            .await
+    }
+
+    async fn submit_entry(&self, entry: AddEventEntry) -> Result<(), Error> {
+        let url = self
+            .base_url
+            .join(&format!("/oracle/events/{}/entry", entry.id))
+            .map_err(|e| Error::Request(e.to_string()))?;
+        let req = self.client.request(Method::POST, url).json(&entry);
+        self.send_request(req, String::from("event not found"))
+            .await
     }
 }

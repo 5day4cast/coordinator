@@ -1,7 +1,7 @@
 use duckdb::Connection;
 use log::info;
 
-pub fn run_migrations(conn: &mut Connection) -> Result<(), duckdb::Error> {
+pub fn run_comeptition_migrations(conn: &mut Connection) -> Result<(), duckdb::Error> {
     create_version_table(conn)?;
     let mut stmt = conn.prepare("SELECT version FROM db_version")?;
     let mut rows = stmt.query([])?;
@@ -14,7 +14,7 @@ pub fn run_migrations(conn: &mut Connection) -> Result<(), duckdb::Error> {
 
     match current_version {
         0 => {
-            create_initial_schema(conn)?;
+            create_competitions_initial_schema(conn)?;
         }
         /*1 => {
         migrate_to_version_2(conn)?;
@@ -25,7 +25,7 @@ pub fn run_migrations(conn: &mut Connection) -> Result<(), duckdb::Error> {
     Ok(())
 }
 
-pub fn create_version_table(conn: &mut Connection) -> Result<(), duckdb::Error> {
+fn create_version_table(conn: &mut Connection) -> Result<(), duckdb::Error> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS db_version ( version INTEGER PRIMARY KEY);",
         [],
@@ -33,7 +33,7 @@ pub fn create_version_table(conn: &mut Connection) -> Result<(), duckdb::Error> 
     Ok(())
 }
 
-pub fn create_initial_schema(conn: &mut Connection) -> Result<(), duckdb::Error> {
+pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), duckdb::Error> {
     let initial_schema = r#"
     -- Table of information about the oracle, mostly to prevent multiple keys from being used with the same database
     -- singleton_constant is a dummy column to ensure there is only one row
@@ -49,43 +49,44 @@ pub fn create_initial_schema(conn: &mut Connection) -> Result<(), duckdb::Error>
 
     CREATE TABLE IF NOT EXISTS competitions
     (
-        id UUID PRIMARY KEY, -- should match event_id with oracle
+        id UUID PRIMARY KEY,
         created_at TIMESTAMPTZ NOT NULL,
         total_competition_pool BIGINT NOT NULL,
         total_allowed_entries BIGINT NOT NULL,
+        number_of_places_win INT NOT NULL,
         entry_fee BIGINT NOT NULL,
-        event_annoucement BLOB NOT NULL,
-        funding_transaction BLOB,
-        contract_parameters BLOB,
-        public_nonces BLOB,
-        cancelled_at TIMESTAMPTZ,
-        -- if not enough users have entered before contract created, cancel the competition (make this 1 hour before observation time begins to start)
-        -- need to send to the oracle to cancel the event
-        contracted_at TIMESTAMPTZ, -- when the contract parameters have been created
-        signed_at TIMESTAMPTZ,  -- when the musig signing session completes
-        funding_broadcasted_at TIMESTAMPTZ, -- when funding transaction broadcasted
-        failed_at TIMESTAMPTZ,
-        errors BLOB -- list of errors that lead to failed_at being added
+        event_announcement BLOB NOT NULL,
+        funding_transaction BLOB,                -- Funding transaction outpoint
+        contract_parameters BLOB,                -- DLC contract parameters
+        public_nonces BLOB,                      -- Coordinator's public nonces
+        aggregated_nonces BLOB,                  -- Aggregated nonces from all participants
+        partial_signatures BLOB,                 -- Coordinator's partial signatures
+        signed_contract BLOB,                    -- Final signed contract
+        contracted_at TIMESTAMPTZ,              -- When contract parameters were created
+        signed_at TIMESTAMPTZ,                  -- When musig2 signing completed
+        funding_broadcasted_at TIMESTAMPTZ,     -- When funding transaction was broadcast
+        cancelled_at TIMESTAMPTZ,               -- If competition was cancelled
+        failed_at TIMESTAMPTZ,                  -- If competition failed
+        errors BLOB                             -- List of errors that lead to failed_at
     );
 
     CREATE TABLE IF NOT EXISTS entries
     (
-        id UUID PRIMARY KEY, -- should match entry_id with the oracle
-        event_id UUID NOT NULL REFERENCES competitions (id), -- should match event_id with the oracle
-        pubkey STRING NOT NULL, -- user wallet pubkey, used to authenticate/authorize messages
-        -- user ephemeral pubkey, secret may be used by market maker to recover entries split TX output unilaterally.
-        -- May be used more than once in a single competition/event by the user, but not across multiple competitions/events
-        ephemeral_pubkey TEXT NOT NULL,
-        ephemeral_privatekey_user_encrypted TEXT NOT NULL,  -- store here for better user experience, backed up in nostr relays
-        ephemeral_privatekey TEXT, -- provided by the user on payout depending on method, encrypted by coordinator_key
-        signed_nonces BLOB, -- player signed nonces during musig signing session, needs to be restarted if player never signs
-        ticket_preimage TEXT NOT NULL, -- market maker generated preimage user needs to get winnings, encrypted by coordinator_key
-        ticket_hash TEXT NOT NULL, -- hash of market marker preimage
-        payout_preimage_user_encrypted TEXT NOT NULL, -- store here for better user experience, backed up in nostr relays
-        payout_hash TEXT NOT NULL, -- user provided ephemeral hash of preimage to get winnings
-        payout_preimage TEXT, -- provided by the user on payout,  encrypted by coordinator_key
-        signed_at TIMESTAMPTZ, -- when user signs in musig
-        paid_at TIMESTAMPTZ -- when user pays for the ticket
+        id UUID PRIMARY KEY,
+        event_id UUID NOT NULL REFERENCES competitions (id),
+        pubkey STRING NOT NULL,                 -- user nostr pubkey
+        ephemeral_pubkey TEXT NOT NULL,         -- user ephemeral pubkey for DLC
+        ephemeral_privatekey_user_encrypted TEXT NOT NULL,  -- store for better UX, backed up in user wallet
+        ephemeral_privatekey TEXT,              -- provided by user on payout, encrypted by coordinator_key
+        public_nonces BLOB,                     -- player signed nonces during musig signing session
+        partial_signatures BLOB,                -- player partial signatures
+        ticket_preimage TEXT,                   -- market maker generated preimage user needs for winnings
+        ticket_hash TEXT,                       -- hash of market marker preimage
+        payout_preimage_user_encrypted TEXT NOT NULL, -- store for better UX, backed up in user wallet
+        payout_hash TEXT NOT NULL,              -- user provided hash of preimage to get winnings
+        payout_preimage TEXT,                   -- provided by user on payout, encrypted by coordinator_key
+        signed_at TIMESTAMPTZ,                  -- when user completes musig signing
+        paid_at TIMESTAMPTZ                     -- when user pays for the ticket
     );
 
     INSERT INTO db_version (version) VALUES (1);

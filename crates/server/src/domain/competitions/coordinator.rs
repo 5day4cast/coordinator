@@ -1,18 +1,27 @@
+use super::{
+    AddEntry, CompetitionError, CompetitionState, CompetitionStore, SearchBy, Ticket, UserEntry,
+};
+use crate::{
+    bitcoin_client::Bitcoin,
+    domain::{Competition, CreateEvent, Error},
+    get_key,
+    oracle_client::{Event, Oracle},
+    Ln, OracleError,
+};
 use anyhow::anyhow;
 use dlctix::{
     bitcoin::{
         absolute::LockTime,
         hex::DisplayHex,
-        key::{Keypair, Secp256k1},
         sighash::{Prevouts, SighashCache},
         transaction, Amount, FeeRate, OutPoint, ScriptBuf, TapSighashType, Transaction, TxIn,
         TxOut,
     },
-    hashlock,
+    convert_xonly_key, hashlock,
     musig2::{
         self,
-        secp256k1::{PublicKey, Scalar, SecretKey},
-        CompactSignature, PartialSignature, PubNonce,
+        secp256k1::{Keypair, PublicKey, Scalar, Secp256k1, SecretKey},
+        AggNonce, CompactSignature, PartialSignature, PubNonce,
     },
     secp::Point,
     ContractParameters, NonceSharingRound, Outcome, PayoutWeights, Player, PlayerIndex, SigMap,
@@ -20,7 +29,7 @@ use dlctix::{
 };
 use futures::TryFutureExt;
 use itertools::Itertools;
-use log::{error, info};
+use log::{debug, error, info};
 use rand::SeedableRng;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -29,11 +38,6 @@ use time::OffsetDateTime;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-
-use super::{AddEntry, CompetitionError, CompetitionStore, SearchBy, Ticket, UserEntry};
-use crate::{
-    bitcoin_client::Bitcoin, domain::{Competition, CreateEvent, Error}, get_key, oracle_client::Event, Ln, OracleClient, OracleError
-};
 
 pub struct CompetitionWatcher {
     coordinator: Arc<Coordinator>,
@@ -86,9 +90,9 @@ impl CompetitionWatcher {
 }
 
 pub struct Coordinator {
-    oracle_client: Arc<OracleClient>,
+    oracle_client: Arc<dyn Oracle>,
     competition_store: Arc<CompetitionStore>,
-    bitcoin: Arc<Bitcoin>,
+    bitcoin: Arc<dyn Bitcoin>,
     ln: Arc<dyn Ln>,
     private_key: SecretKey,
     public_key: PublicKey,
@@ -97,9 +101,9 @@ pub struct Coordinator {
 
 impl Coordinator {
     pub async fn new(
-        oracle_client: OracleClient,
+        oracle_client: Arc<dyn Oracle>,
         competition_store: CompetitionStore,
-        bitcoin: Arc<Bitcoin>,
+        bitcoin: Arc<dyn Bitcoin>,
         ln: Arc<dyn Ln>,
         private_key_file_path: &str,
         relative_locktime_block_delta: u16,
@@ -108,7 +112,7 @@ impl Coordinator {
         let secp = Secp256k1::new();
         let public_key = secret_key.public_key(&secp);
         let coordinator = Self {
-            oracle_client: Arc::new(oracle_client),
+            oracle_client,
             competition_store: Arc::new(competition_store),
             bitcoin,
             ln,
@@ -155,70 +159,71 @@ impl Coordinator {
     pub async fn competition_handler(&self) -> Result<(), anyhow::Error> {
         let competitions: Vec<Competition> = self.competition_store.get_competitions().await?;
         let mut updated_competitions: Vec<Competition> = vec![];
-        for competition in competitions {
+
+        for mut competition in competitions {
             if competition.skip_competition() {
-                //Competition as either failed multiple times, cancelled, or already published the funding transactions, skipping
                 continue;
             }
 
-            //1) build the transactions and start musig
-            if competition.has_full_entries()
-                && !competition.is_contract_created()
-                && !competition.is_contract_signed()
-            {
-                //TODO: add handling error case
-                let updated_competition = match self.create_transactions(competition.clone()).await
-                {
-                    Ok(competition) => competition,
-                    Err(e) => {
-                        let mut comp = competition.clone();
-                        comp.errors
-                            .push(CompetitionError::FailedCreateTransaction(e.to_string()));
-                        comp.failed_at = Some(OffsetDateTime::now_utc());
-                        comp
-                    }
-                };
-                updated_competitions.push(updated_competition);
+            // Check for timeouts first
+            if competition.is_expired() {
+                competition.cancelled_at = Some(OffsetDateTime::now_utc());
+                updated_competitions.push(competition);
                 continue;
             }
 
-            //2) musig aggregate nonce generated
-            if !competition.has_all_entry_nonces() {
-                let updated_competition =
-                    match self.generate_partial_signatures(competition.clone()).await {
-                        Ok(competition) => competition,
+            // Process based on current state
+            match competition.get_state() {
+                CompetitionState::Created => {
+                    // Wait for more entries
+                    continue;
+                }
+                CompetitionState::EntriesCollected => {
+                    // Create contract
+                    match self.create_transactions(competition.clone()).await {
+                        Ok(updated) => updated_competitions.push(updated),
                         Err(e) => {
-                            let mut comp = competition.clone();
-                            comp.errors
-                                .push(CompetitionError::FailedBroadcast(e.to_string()));
-                            comp.failed_at = Some(OffsetDateTime::now_utc());
-                            comp
+                            competition
+                                .errors
+                                .push(CompetitionError::FailedCreateTransaction(e.to_string()));
+                            competition.failed_at = Some(OffsetDateTime::now_utc());
+                            updated_competitions.push(competition);
                         }
-                    };
-                updated_competitions.push(updated_competition);
-                continue;
-            }
-
-            //3) musig complete, publish the funding transaction
-            if competition.has_all_entry_partial_signatures() {
-                let updated_competition = match self.publish_transactions(competition.clone()).await
-                {
-                    Ok(competition) => competition,
-                    Err(e) => {
-                        let mut comp = competition.clone();
-                        comp.errors
-                            .push(CompetitionError::FailedBroadcast(e.to_string()));
-                        comp.failed_at = Some(OffsetDateTime::now_utc());
-                        comp
                     }
-                };
-                updated_competitions.push(updated_competition);
-                continue;
+                }
+                CompetitionState::NoncesCollected => {
+                    // Generate aggregate nonces and coordinators partial signatures
+                    match self
+                        .generate_aggregate_nonces_and_coord_partial_signatures(competition.clone())
+                        .await
+                    {
+                        Ok(updated) => updated_competitions.push(updated),
+                        Err(e) => {
+                            competition
+                                .errors
+                                .push(CompetitionError::FailedNonceAggregation(e.to_string()));
+                            competition.failed_at = Some(OffsetDateTime::now_utc());
+                            updated_competitions.push(competition);
+                        }
+                    }
+                }
+                CompetitionState::PartialSignaturesCollected => {
+                    // Publish transactions
+                    match self.publish_transactions(competition.clone()).await {
+                        Ok(updated) => updated_competitions.push(updated),
+                        Err(e) => {
+                            competition
+                                .errors
+                                .push(CompetitionError::FailedBroadcast(e.to_string()));
+                            competition.failed_at = Some(OffsetDateTime::now_utc());
+                            updated_competitions.push(competition);
+                        }
+                    }
+                }
+                _ => continue,
             }
-
-            //Note: we can add logic here to wait until the competition has been fully paid, otherwise cancel
-            //undecided if that is actually how we would like to run these so holding off for now
         }
+
         if !updated_competitions.is_empty() {
             self.competition_store
                 .update_competitions(updated_competitions)
@@ -232,12 +237,27 @@ impl Coordinator {
         &self,
         mut competition: Competition,
     ) -> Result<Competition, anyhow::Error> {
+        debug!("Creating transactions for competition: {}", competition.id);
         let mut entries = self
             .competition_store
             .get_competition_entries(competition.id)
             .await?;
+        debug!("Competition entries {:?}", entries);
+
         let players = generate_players(&entries)?;
+        debug!("Generated players:");
+        for (i, player) in players.iter().enumerate() {
+            debug!(
+                "Player {}: pubkey={:?}, ticket_hash={:?}, payout_hash={:?}",
+                i, player.pubkey, player.ticket_hash, player.payout_hash
+            );
+        }
+
         let outcome_payouts = generate_payouts(&competition, &mut entries, &players)?;
+        debug!("Generated outcome payouts:");
+        for (outcome, weights) in &outcome_payouts {
+            debug!("Outcome {:?}: weights={:?}", outcome, weights);
+        }
 
         let contract_amount_sats = competition.total_competition_pool;
         let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
@@ -257,11 +277,13 @@ impl Coordinator {
             relative_locktime_block_delta: self.relative_locktime_block_delta,
         };
         competition.contract_parameters = Some(contract_params.clone());
+        debug!("contract params have been built");
 
         let wallet_outpoint: OutPoint = self
             .bitcoin
             .get_spendable_utxo(contract_amount_sats)
             .await?;
+        debug!("spendable utxo found");
 
         // Prepare a funding transaction (value should be total value of competition money pool)
         let tx_out = TxOut {
@@ -275,6 +297,8 @@ impl Coordinator {
             wallet_outpoint,
             &tx_out,
         );
+        debug!("signed funding tx");
+
         //At this point, store the funding_outpoint with the event in the DB
         let funding_outpoint = OutPoint {
             txid: funding_tx.compute_txid(),
@@ -288,20 +312,25 @@ impl Coordinator {
         // some thought will need to be done on the best way to do this for the least amount of user interaction
         // even after musig is signed, users then need to additionally pay the coordinator to get the secret allowing them to claim their winnings (maybe after competition completes?)
         // Note: word of warning, the ticketed_dlc may be very large in memory depending on the contract params
+
         let ticketed_dlc = TicketedDLC::new(contract_params, funding_outpoint)?;
-        let mut rng = rand::rngs::StdRng::from_entropy();
+        debug!("built ticketed dlc");
+
+        let seed = self.private_key.secret_bytes();
+        let mut rng = rand::rngs::StdRng::from_seed(seed);
 
         let signing_session = SigningSession::<NonceSharingRound>::new(
             ticketed_dlc,
             &mut rng,
             Scalar::from(self.private_key),
         )?;
+        debug!("started musig nonce sharing round");
 
-        competition.public_nonces = Some(signing_session.our_public_nonces().clone());
+        competition.public_nonces = Some(signing_session.our_public_nonces().to_owned());
         Ok(competition)
     }
 
-    pub async fn generate_partial_signatures(
+    pub async fn generate_aggregate_nonces_and_coord_partial_signatures(
         &self,
         mut competition: Competition,
     ) -> Result<Competition, anyhow::Error> {
@@ -311,11 +340,16 @@ impl Coordinator {
         let Some(funding_transaction) = &competition.funding_transaction else {
             return Err(anyhow!("funding transaction doesn't exists, failed publishing competition {} funding transaction", competition.id));
         };
+        let Some(our_nonces) = competition.public_nonces.as_ref() else {
+            return Err(anyhow!("coordinator nonces missing"));
+        };
         let ticketed_dlc = TicketedDLC::new(
             contract_parameters.to_owned(),
             funding_transaction.to_owned(),
         )?;
-        let mut rng = rand::rngs::StdRng::from_entropy();
+
+        let seed = self.private_key.secret_bytes();
+        let mut rng = rand::rngs::StdRng::from_seed(seed);
 
         let signing_session = SigningSession::<NonceSharingRound>::new(
             ticketed_dlc,
@@ -323,12 +357,22 @@ impl Coordinator {
             Scalar::from(self.private_key),
         )?;
 
+        // Verify our stored nonces match what would be generated
+        if signing_session.our_public_nonces() != our_nonces {
+            return Err(anyhow!("coordinator nonce mismatch"));
+        }
+
         let received_nonces = self.get_received_nonces(competition.id).await?;
 
         let coordinator_sessions =
             signing_session.aggregate_nonces_and_compute_partial_signatures(received_nonces)?;
-
+        debug!(
+            "Received_nonces aggregated nonces 1: {:?}",
+            coordinator_sessions.aggregated_nonces()
+        );
         competition.aggregated_nonces = Some(coordinator_sessions.aggregated_nonces().to_owned());
+        competition.partial_signatures =
+            Some(coordinator_sessions.our_partial_signatures().to_owned());
 
         Ok(competition)
     }
@@ -343,11 +387,22 @@ impl Coordinator {
         let Some(funding_transaction) = &competition.funding_transaction else {
             return Err(anyhow!("funding transaction doesn't exists, failed publishing competition {} funding transaction", competition.id));
         };
+        let Some(coordinator_partial_sigantures) = competition.partial_signatures.clone() else {
+            return Err(anyhow!("coordinator partial signatures do not exist, failed publishing competition {} funding transaction", competition.id));
+        };
+
+        let Some(coordinator_nonces) = competition.public_nonces.as_ref() else {
+            return Err(anyhow!("coordinator nonces missing"));
+        };
+
         let ticketed_dlc = TicketedDLC::new(
             contract_parameters.to_owned(),
             funding_transaction.to_owned(),
         )?;
-        let mut rng = rand::rngs::StdRng::from_entropy();
+
+        let seed = self.private_key.secret_bytes();
+        let mut rng = rand::rngs::StdRng::from_seed(seed);
+        debug!("Built ticketed dlc before publishing");
 
         let signing_session = SigningSession::<NonceSharingRound>::new(
             ticketed_dlc,
@@ -355,20 +410,49 @@ impl Coordinator {
             Scalar::from(self.private_key),
         )?;
 
+        if signing_session.our_public_nonces() != coordinator_nonces {
+            return Err(anyhow!("coordinator nonce mismatch"));
+        }
+
         let received_nonces = self.get_received_nonces(competition.id).await?;
+        debug!("Built coordinator session before publishing");
 
         let coordinator_session =
             signing_session.aggregate_nonces_and_compute_partial_signatures(received_nonces)?;
+        debug!("Built coordinator session before publishing");
+
+        if *coordinator_session.our_partial_signatures() != coordinator_partial_sigantures {
+            return Err(anyhow!("coordinator partial signatures mismatch"));
+        }
 
         let partial_sigs_by_sender: BTreeMap<Point, SigMap<PartialSignature>> =
             self.get_partial_sigs_by_sender(competition.id).await?;
 
-        for (&sender_pubkey, partial_sigs) in &partial_sigs_by_sender {
-            coordinator_session.verify_partial_signatures(sender_pubkey, partial_sigs)?;
+        for (sender_pubkey, partial_sigs) in &partial_sigs_by_sender {
+            match coordinator_session.verify_partial_signatures(*sender_pubkey, &partial_sigs) {
+                Ok(_) => debug!(
+                    "✓ Signature verification succeeded for player {}",
+                    sender_pubkey
+                ),
+                Err(e) => {
+                    error!(
+                        "✗ Signature verification failed for player {}: {}",
+                        sender_pubkey, e
+                    );
+                    return Err(anyhow!(
+                        "Signature verification failed for {:?}: {}",
+                        sender_pubkey,
+                        e
+                    ));
+                }
+            }
         }
+
+        debug!("Verified all paritial signatures");
 
         let signed_contract =
             coordinator_session.aggregate_all_signatures(partial_sigs_by_sender)?;
+        debug!("Signed dlc contract");
 
         competition.signed_contract = Some(signed_contract);
         competition.signed_at = Some(OffsetDateTime::now_utc());
@@ -377,23 +461,92 @@ impl Coordinator {
             .broadcast(funding_transaction.to_string())
             .await?;
 
+        competition.funding_broadcasted_at = Some(OffsetDateTime::now_utc());
+
         Ok(competition)
     }
 
     //Nonces from every entry into competition
     pub async fn get_received_nonces(
         &self,
-        _competition_id: Uuid,
+        competition_id: Uuid,
     ) -> Result<BTreeMap<Point, SigMap<PubNonce>>, anyhow::Error> {
-        todo!()
+        // Get all entries for this competition
+        let entries = self
+            .competition_store
+            .get_competition_entries(competition_id)
+            .await?;
+
+        let mut nonces_map: BTreeMap<Point, SigMap<PubNonce>> = BTreeMap::new();
+        let entry_count = entries.len();
+
+        for entry in entries {
+            // Skip entries that haven't submitted nonces
+            let Some(public_nonces) = entry.public_nonces else {
+                continue;
+            };
+
+            // Convert ephemeral pubkey string to Point
+            let pubkey = Point::from_hex(&entry.ephemeral_pubkey)
+                .map_err(|e| anyhow!("Invalid ephemeral pubkey for entry {}: {}", entry.id, e))?;
+
+            nonces_map.insert(pubkey, public_nonces);
+        }
+
+        // Verify we have nonces from all entries
+        if nonces_map.len() != entry_count {
+            return Err(anyhow!(
+                "Missing nonces from some entries. Expected {}, got {}",
+                entry_count,
+                nonces_map.len()
+            ));
+        }
+
+        Ok(nonces_map)
     }
 
     //Signed transaction from every entry into competition
     pub async fn get_partial_sigs_by_sender(
         &self,
-        _competition_id: Uuid,
+        competition_id: Uuid,
     ) -> Result<BTreeMap<Point, SigMap<PartialSignature>>, anyhow::Error> {
-        todo!()
+        // Get all entries for this competition
+        let entries = self
+            .competition_store
+            .get_competition_entries(competition_id)
+            .await?;
+
+        let entry_count = entries.len();
+        let mut sigs_map: BTreeMap<Point, SigMap<PartialSignature>> = BTreeMap::new();
+
+        for entry in entries {
+            // Skip entries that haven't submitted partial signatures
+            let Some(partial_signatures) = entry.partial_signatures else {
+                continue;
+            };
+
+            // Verify entry has been signed (has a signed_at timestamp)
+            if entry.signed_at.is_none() {
+                continue;
+            }
+
+            // Convert ephemeral pubkey string to Point
+            let pubkey = Point::from_hex(&entry.ephemeral_pubkey)
+                .map_err(|e| anyhow!("Invalid ephemeral pubkey for entry {}: {}", entry.id, e))?;
+
+            sigs_map.insert(pubkey, partial_signatures);
+        }
+
+        // Verify we have signatures from all entries
+        if sigs_map.len() != entry_count {
+            return Err(anyhow!(
+                "Missing partial signatures from some entries. Expected {}, got {}",
+                entry_count,
+                sigs_map.len()
+            ));
+        }
+
+        Ok(sigs_map)
     }
 
     pub async fn validate_coordinator_metadata(&self) -> Result<(), anyhow::Error> {
@@ -405,7 +558,7 @@ impl Coordinator {
             }
             Err(e) => return Err(anyhow!("error getting stored public key: {}", e)),
         };
-        if stored_public_key != self.public_key.x_only_public_key().0 {
+        if stored_public_key != convert_xonly_key(self.public_key.x_only_public_key().0) {
             return Err(anyhow!(
                 "stored_pubkey: {:?} pem_pubkey: {:?}",
                 stored_public_key,
@@ -417,7 +570,7 @@ impl Coordinator {
 
     async fn add_metadata(&self) -> Result<(), anyhow::Error> {
         self.competition_store
-            .add_coordinator_metadata(self.public_key.x_only_public_key().0)
+            .add_coordinator_metadata(convert_xonly_key(self.public_key.x_only_public_key().0))
             .await
             .map_err(|e| anyhow!("failed to add coordinator metadata: {}", e))
     }
@@ -522,6 +675,157 @@ impl Coordinator {
             .map_err(Error::DbError)
             .await
     }
+
+    pub async fn get_contract_parameters(
+        &self,
+        pubkey: String,
+        competition_id: Uuid,
+    ) -> Result<ContractParameters, Error> {
+        let competition = self
+            .competition_store
+            .get_competition(competition_id)
+            .await?;
+
+        // Verify user has an entry in this competition
+        let entries = self
+            .competition_store
+            .get_user_entries(
+                pubkey,
+                SearchBy {
+                    event_ids: Some(vec![competition_id]),
+                },
+            )
+            .await?;
+
+        if entries.is_empty() {
+            return Err(Error::NotFound(format!(
+                "No entry found for user in competition {}",
+                competition_id
+            )));
+        }
+
+        competition.contract_parameters.ok_or_else(|| {
+            Error::NotFound(format!(
+                "Contract parameters not yet available for competition {}",
+                competition_id
+            ))
+        })
+    }
+
+    pub async fn submit_public_nonces(
+        &self,
+        pubkey: String,
+        competition_id: Uuid,
+        entry_id: Uuid,
+        public_nonces: SigMap<PubNonce>,
+    ) -> Result<(), Error> {
+        let competition = self
+            .competition_store
+            .get_competition(competition_id)
+            .await?;
+
+        // Verify the competition has contract parameters
+        if competition.contract_parameters.is_none() {
+            return Err(Error::BadRequest(
+                "Contract parameters not yet available".to_string(),
+            ));
+        }
+
+        // Verify user has an entry in this competition
+        let entries = self
+            .competition_store
+            .get_user_entries(
+                pubkey,
+                SearchBy {
+                    event_ids: Some(vec![competition_id]),
+                },
+            )
+            .await?;
+
+        let entry = entries
+            .iter()
+            .find(|e| e.id == entry_id)
+            .ok_or_else(|| Error::NotFound(format!("Entry {} not found", entry_id)))?;
+
+        // Verify entry hasn't already submitted nonces
+        if entry.public_nonces.is_some() {
+            return Err(Error::BadRequest(
+                "Public nonces already submitted for this entry".to_string(),
+            ));
+        }
+
+        // Save the public nonces
+        self.competition_store
+            .add_public_nonces(entry_id, public_nonces)
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn get_aggregate_nonces(
+        &self,
+        pubkey: String,
+        competition_id: Uuid,
+    ) -> Result<SigMap<AggNonce>, Error> {
+        let competition = self
+            .competition_store
+            .get_competition(competition_id)
+            .await?;
+
+        // Verify user has an entry in this competition
+        let entries = self
+            .competition_store
+            .get_user_entries(
+                pubkey,
+                SearchBy {
+                    event_ids: Some(vec![competition_id]),
+                },
+            )
+            .await?;
+
+        if entries.is_empty() {
+            return Err(Error::NotFound(format!(
+                "No entry found for user in competition {}",
+                competition_id
+            )));
+        }
+
+        competition.aggregated_nonces.ok_or_else(|| {
+            Error::NotFound(format!(
+                "Aggregate nonces not yet available for competition {}",
+                competition_id
+            ))
+        })
+    }
+
+    pub async fn submit_partial_signatures(
+        &self,
+        pubkey: String,
+        competition_id: Uuid,
+        entry_id: Uuid,
+        partial_sigs: SigMap<PartialSignature>,
+    ) -> Result<(), Error> {
+        let entries = self
+            .competition_store
+            .get_user_entries(
+                pubkey,
+                SearchBy {
+                    event_ids: Some(vec![competition_id]),
+                },
+            )
+            .await?;
+
+        entries
+            .iter()
+            .find(|e| e.id == entry_id)
+            .ok_or_else(|| Error::NotFound(format!("Entry {} not found", entry_id)))?;
+
+        self.competition_store
+            .add_partial_signatures(entry_id, partial_sigs)
+            .await?;
+
+        Ok(())
+    }
 }
 
 fn generate_players(entries: &Vec<UserEntry>) -> Result<Vec<Player>, anyhow::Error> {
@@ -533,9 +837,12 @@ fn generate_players(entries: &Vec<UserEntry>) -> Result<Vec<Player>, anyhow::Err
             .ok_or_else(|| anyhow!("ticket_hash is missing for entry: {}", entry.id))?;
 
         let payout_hash = entry.payout_hash.as_str();
+        debug!("player_pubkey: {}", entry.ephemeral_pubkey);
 
+        let pubkey = Point::from_hex(&entry.ephemeral_pubkey)
+            .map_err(|e| anyhow!("failed to get point: {}", e))?;
         let player = Player {
-            pubkey: Point::from_hex(&entry.ephemeral_pubkey)?,
+            pubkey,
             // coordinator generates this preimage and only shares after player has paid for a ticket
             ticket_hash: string_to_byte_array(ticket_hash),
             // players generate this preimage and only share after winning with the coordinator
@@ -552,44 +859,99 @@ fn string_to_byte_array(hex_str: &str) -> [u8; 32] {
     bytes.try_into().expect("32 bytes")
 }
 
+fn get_percentage_weights(num_winners: usize) -> Vec<u64> {
+    match num_winners {
+        1 => vec![100],
+        2 => vec![60, 40],
+        3 => vec![45, 35, 20],
+        4 => vec![42, 30, 18, 10],
+        5 => vec![40, 27, 16, 9, 8],
+        _ => vec![100], // fallback to winner takes all
+    }
+}
+
 fn generate_payouts(
     competition: &Competition,
     entries: &mut Vec<UserEntry>,
     players: &Vec<Player>,
 ) -> Result<BTreeMap<Outcome, PayoutWeights>, anyhow::Error> {
-    // Sort entries by ID (UUID v7) for consistent indexing
+    debug!("Generating payouts for {} players", players.len());
+
+    // Sort entries by ID for consistent indexing
     entries.sort_by_key(|entry| entry.id);
     let mut payouts: BTreeMap<Outcome, PayoutWeights> = BTreeMap::new();
 
-    let allowed_scored_ranks = 3; // Will be configurable in future
+    let possible_rankings =
+        generate_ranking_permutations(entries.len(), competition.number_of_places_win);
+    debug!("Generated {} possible rankings", possible_rankings.len());
 
-    // Generate all possible ranking permutations
-    let possible_rankings = generate_ranking_permutations(entries.len(), allowed_scored_ranks);
-
-    // For each possible ranking combination, create a payout mapping
-    // The index in possible_rankings matches the oracle's attestation index
     for (outcome_index, winner_indices) in possible_rankings.iter().enumerate() {
-        let entry_pubkeys = find_winning_entries_pubkeys(entries, winner_indices.to_owned());
-        let player_indices = find_player_indices(players, entry_pubkeys)?;
+        debug!(
+            "Processing outcome {} with winner indices: {:?}",
+            outcome_index, winner_indices
+        );
 
+        let entry_pubkeys = find_winning_entries_pubkeys(entries, winner_indices.to_owned());
+        debug!("Winner pubkeys: {:?}", entry_pubkeys);
+
+        let player_indices = find_player_indices(players, entry_pubkeys)?;
+        debug!("Mapped to player indices: {:?}", player_indices);
+
+        if player_indices.len() != competition.number_of_places_win {
+            return Err(anyhow!(
+                "Incorrect number of winners for outcome {}",
+                outcome_index
+            ));
+        }
+
+        let percentage_weights = get_percentage_weights(competition.number_of_places_win);
         let mut payout_weights: BTreeMap<PlayerIndex, u64> = BTreeMap::new();
+
         for (rank, &player_index) in player_indices.iter().enumerate() {
-            let weight = allowed_scored_ranks - rank;
-            payout_weights.insert(player_index, weight as u64);
+            let weight = percentage_weights[rank];
+            debug!(
+                "Assigning weight {} to player index {}",
+                weight, player_index
+            );
+            payout_weights.insert(player_index, weight);
+        }
+
+        debug!(
+            "Final weights for outcome {}: {:?}",
+            outcome_index, payout_weights
+        );
+
+        // Verify total weight is 100
+        let total_weight: u64 = payout_weights.values().sum();
+        if total_weight != 100 {
+            return Err(anyhow!(
+                "Total weight for outcome {} should be 100, got {}",
+                outcome_index,
+                total_weight
+            ));
         }
 
         payouts.insert(Outcome::Attestation(outcome_index), payout_weights);
     }
 
-    // Add expiry outcome if configured
-    if competition.event_announcement.expiry.is_some() {
-        let mut refund_payout: BTreeMap<PlayerIndex, u64> = BTreeMap::new();
-        for (player_index, _) in players.iter().enumerate() {
-            refund_payout.insert(player_index, 1);
-        }
-        payouts.insert(Outcome::Expiry, refund_payout);
-    }
+    // Add expiry outcome with equal distribution
+    let mut expiry_weights = BTreeMap::new();
+    let player_count = players.len() as u64;
+    let base_weight = 100 / player_count;
+    let remainder = 100 % player_count;
 
+    for i in 0..players.len() {
+        // Distribute remainder one point at a time to early indices
+        let weight = if (i as u64) < remainder {
+            base_weight + 1
+        } else {
+            base_weight
+        };
+        expiry_weights.insert(i, weight);
+    }
+    payouts.insert(Outcome::Expiry, expiry_weights);
+
+    debug!("Generated {} total outcomes", payouts.len());
     Ok(payouts)
 }
 
@@ -601,28 +963,25 @@ fn find_player_indices(
     players: &Vec<Player>,
     entry_ticket_pubkeys: Vec<String>,
 ) -> Result<Vec<usize>, anyhow::Error> {
-    let mut player_indecies = vec![];
-    for entry_ticket_pubkey in entry_ticket_pubkeys {
-        let pubkey_ticket = Point::from_hex(&entry_ticket_pubkey)?;
-        if let Some(index) = players
-            .iter()
-            .position(|player| player.pubkey == pubkey_ticket)
-        {
-            player_indecies.push(index);
-        }
-    }
-    Ok(player_indecies)
+    entry_ticket_pubkeys
+        .into_iter()
+        .map(|pubkey| {
+            let pubkey_point = Point::from_hex(&pubkey)?;
+            players
+                .iter()
+                .position(|player| player.pubkey == pubkey_point)
+                .ok_or_else(|| anyhow!("No player found for pubkey: {}", pubkey))
+        })
+        .collect()
 }
 
 fn find_winning_entries_pubkeys(
     entries: &Vec<UserEntry>,
     winning_entry_indices: Vec<usize>,
 ) -> Vec<String> {
-    entries
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| winning_entry_indices.contains(i))
-        .map(|(_, entry)| entry.ephemeral_pubkey.clone())
+    winning_entry_indices
+        .into_iter()
+        .map(|idx| entries[idx].ephemeral_pubkey.clone())
         .collect()
 }
 

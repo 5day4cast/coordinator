@@ -2,7 +2,7 @@ mod nostr;
 mod wallet;
 
 pub use nostr::*;
-pub use wallet::TaprootWallet;
+pub use wallet::*;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;

@@ -23,7 +23,7 @@ bdk_wallet = { version = "1.0.0", features = ["file_store"] }
 blake2 = "0.10.6"
 clap = { version = "4.3.23", features = ["derive", "env"] }
 config = "0.14.0"
-dlctix = { git = "https://github.com/tee8z/dlctix", branch = "update-bitcoin-dep" }
+dlctix = { git = "https://github.com/tee8z/dlctix", branch = "add-errors" }
 duckdb = { version = "1.1.1" }
 fern = { version = "0.6.2", features = ["colored"] }
 futures = "0.3.28"
@@ -62,4 +62,8 @@ tower-http = { version = "0.5.2", features = ["cors", "fs"] }
 uuid = { version = "1.4.1", features = ["serde", "v7"] }
 
 [dev-dependencies]
-tower = "0.4.13"
+maplit = "1.0.2"
+mockall = "0.11"
+tokio-test = "0.4"
+env_logger = "0.11.6"
+client_validator = { path = "../client_validator" }

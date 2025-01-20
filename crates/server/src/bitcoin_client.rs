@@ -1,5 +1,6 @@
 use crate::{get_key, BitcoinSettings};
 use anyhow::anyhow;
+use async_trait::async_trait;
 use bdk_esplora::{
     esplora_client::{r#async::DefaultSleeper, AsyncClient, Builder},
     EsploraAsyncExt,
@@ -31,7 +32,14 @@ use std::{
 use tokio::{sync::RwLock, time::sleep};
 use tokio_util::sync::CancellationToken;
 
-pub struct Bitcoin {
+#[async_trait]
+pub trait Bitcoin: Send + Sync {
+    async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<OutPoint, anyhow::Error>;
+    async fn get_estimated_fee_rates(&self) -> Result<HashMap<u16, f64>, anyhow::Error>;
+    async fn broadcast(&self, raw_transaction: String) -> Result<(), anyhow::Error>;
+}
+
+pub struct BitcoinClient {
     pub network: Network,
     wallet: RwLock<PersistedWallet<Store<ChangeSet>>>,
     client: AsyncClient,
@@ -117,8 +125,58 @@ impl SendOptions {
     }
 }
 
-impl Bitcoin {
-    pub async fn new(settings: &BitcoinSettings) -> Result<Bitcoin, anyhow::Error> {
+#[async_trait]
+impl Bitcoin for BitcoinClient {
+    async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<OutPoint, anyhow::Error> {
+        let amount = Amount::from_sat(amount_sats);
+        let utxo = self.wallet.read().await.list_unspent().find(|utxo| {
+            // Check if UTXO is confirmed, not spent, bigger than amount, and not locked
+            utxo.txout.value >= amount && !utxo.is_spent && utxo.chain_position.is_confirmed()
+        });
+        if let Some(utxo) = utxo {
+            let dlc_utxo = dlctix::bitcoin::OutPoint {
+                txid: dlctix::bitcoin::Txid::from_str(&utxo.outpoint.txid.to_string())?,
+                vout: utxo.outpoint.vout,
+            };
+
+            Ok(dlc_utxo)
+        } else {
+            Err(anyhow!("No utxos with the request amount available"))
+        }
+    }
+
+    /// Get an object where the key is the confirmation target (in number of blocks) and the value is the estimated feerate (in sat/vB).
+    /// The available confirmation targets are 1-25, 144, 504 and 1008 blocks.
+    /// For example: { "1": 87.882, "2": 87.882, "3": 87.882, "4": 87.882, "5": 81.129, "6": 68.285, ..., "144": 1.027, "504": 1.027, "1008": 1.027 }
+    async fn get_estimated_fee_rates(&self) -> Result<HashMap<u16, f64>, anyhow::Error> {
+        let fee_estimates = self.client.get_fee_estimates().await?;
+        Ok(fee_estimates)
+    }
+
+    async fn broadcast(&self, raw_transaction: String) -> Result<(), anyhow::Error> {
+        let mut buf = [0u8; 1024];
+        let raw_tx = hex::decode(raw_transaction.clone())?;
+        let tx: Transaction = Decodable::consensus_decode(&mut raw_tx.as_slice())?;
+
+        let size = tx.consensus_encode(&mut &mut buf[..])?;
+        let expected_size = raw_transaction.len() / 2;
+        if size != expected_size {
+            Err(anyhow!(
+                "encoded transaction {} length doesn't match expected {}",
+                size,
+                expected_size
+            ))
+        } else {
+            self.client
+                .broadcast(&tx)
+                .await
+                .map_err(|e| anyhow!("error broadcasting: {}", e))
+        }
+    }
+}
+
+impl BitcoinClient {
+    pub async fn new(settings: &BitcoinSettings) -> Result<BitcoinClient, anyhow::Error> {
         let path = Path::new(&settings.storage_file);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -193,30 +251,12 @@ impl Bitcoin {
 
         info!("Initial scan completed");
 
-        Ok(Bitcoin {
+        Ok(BitcoinClient {
             network: settings.network,
             wallet: RwLock::new(wallet),
             client,
             wallet_store: RwLock::new(db),
         })
-    }
-
-    pub async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<OutPoint, anyhow::Error> {
-        let amount = Amount::from_sat(amount_sats);
-        let utxo = self.wallet.read().await.list_unspent().find(|utxo| {
-            // Check if UTXO is confirmed, not spent, bigger than amount, and not locked
-            utxo.txout.value >= amount && !utxo.is_spent && utxo.chain_position.is_confirmed()
-        });
-        if let Some(utxo) = utxo {
-            let dlc_utxo = dlctix::bitcoin::OutPoint {
-                txid: dlctix::bitcoin::Txid::from_str(&utxo.outpoint.txid.to_string())?,
-                vout: utxo.outpoint.vout,
-            };
-
-            Ok(dlc_utxo)
-        } else {
-            Err(anyhow!("No utxos with the request amount available"))
-        }
     }
 
     pub async fn get_next_address(&self) -> Result<String, anyhow::Error> {
@@ -274,35 +314,6 @@ impl Bitcoin {
         self.client.broadcast(&tx).await?;
 
         Ok(tx.compute_txid())
-    }
-
-    pub async fn broadcast(&self, raw_transaction: String) -> Result<(), anyhow::Error> {
-        let mut buf = [0u8; 1024];
-        let raw_tx = hex::decode(raw_transaction.clone())?;
-        let tx: Transaction = Decodable::consensus_decode(&mut raw_tx.as_slice())?;
-
-        let size = tx.consensus_encode(&mut &mut buf[..])?;
-        let expected_size = raw_transaction.len() / 2;
-        if size != expected_size {
-            Err(anyhow!(
-                "encoded transaction {} length doesn't match expected {}",
-                size,
-                expected_size
-            ))
-        } else {
-            self.client
-                .broadcast(&tx)
-                .await
-                .map_err(|e| anyhow!("error broadcasting: {}", e))
-        }
-    }
-
-    /// Get an object where the key is the confirmation target (in number of blocks) and the value is the estimated feerate (in sat/vB).
-    /// The available confirmation targets are 1-25, 144, 504 and 1008 blocks.
-    /// For example: { "1": 87.882, "2": 87.882, "3": 87.882, "4": 87.882, "5": 81.129, "6": 68.285, ..., "144": 1.027, "504": 1.027, "1008": 1.027 }
-    pub async fn get_estimated_fee_rates(&self) -> Result<HashMap<u16, f64>, anyhow::Error> {
-        let fee_estimates = self.client.get_fee_estimates().await?;
-        Ok(fee_estimates)
     }
 
     pub async fn sync(&self) -> Result<(), anyhow::Error> {
@@ -368,14 +379,14 @@ fn setup_wallet_descriptors(
 }
 
 pub struct BitcoinSyncWatcher {
-    bitcoin: Arc<Bitcoin>,
+    bitcoin: Arc<BitcoinClient>,
     cancel_token: CancellationToken,
     sync_interval: Duration,
 }
 
 impl BitcoinSyncWatcher {
     pub fn new(
-        bitcoin: Arc<Bitcoin>,
+        bitcoin: Arc<BitcoinClient>,
         cancel_token: CancellationToken,
         sync_interval: Duration,
     ) -> Self {
