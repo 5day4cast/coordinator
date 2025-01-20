@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use client_validator::{NostrClientCore, SignerType, TaprootWalletCore, TaprootWalletCoreBuilder};
 use dlctix::{
     attestation_locking_point,
-    bitcoin::{secp256k1::Secp256k1, OutPoint},
-    musig2::secp256k1::{PublicKey, SecretKey},
+    bitcoin::OutPoint,
+    musig2::secp256k1::{PublicKey, Secp256k1, SecretKey},
     secp::Scalar,
     EventLockingConditions,
 };

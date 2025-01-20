@@ -12,17 +12,15 @@ use anyhow::anyhow;
 use dlctix::{
     bitcoin::{
         absolute::LockTime,
-        bech32::{self, segwit},
         hex::DisplayHex,
-        key::{Keypair, Secp256k1},
         sighash::{Prevouts, SighashCache},
-        transaction, Address, Amount, FeeRate, OutPoint, ScriptBuf, TapSighashType, Transaction,
-        TxIn, TxOut,
+        transaction, Amount, FeeRate, OutPoint, ScriptBuf, TapSighashType, Transaction, TxIn,
+        TxOut,
     },
-    hashlock,
+    convert_xonly_key, hashlock,
     musig2::{
         self,
-        secp256k1::{PublicKey, Scalar, SecretKey},
+        secp256k1::{Keypair, PublicKey, Scalar, Secp256k1, SecretKey},
         AggNonce, CompactSignature, PartialSignature, PubNonce,
     },
     secp::Point,
@@ -537,7 +535,7 @@ impl Coordinator {
             }
             Err(e) => return Err(anyhow!("error getting stored public key: {}", e)),
         };
-        if stored_public_key != self.public_key.x_only_public_key().0 {
+        if stored_public_key != convert_xonly_key(self.public_key.x_only_public_key().0) {
             return Err(anyhow!(
                 "stored_pubkey: {:?} pem_pubkey: {:?}",
                 stored_public_key,
@@ -549,7 +547,7 @@ impl Coordinator {
 
     async fn add_metadata(&self) -> Result<(), anyhow::Error> {
         self.competition_store
-            .add_coordinator_metadata(self.public_key.x_only_public_key().0)
+            .add_coordinator_metadata(convert_xonly_key(self.public_key.x_only_public_key().0))
             .await
             .map_err(|e| anyhow!("failed to add coordinator metadata: {}", e))
     }

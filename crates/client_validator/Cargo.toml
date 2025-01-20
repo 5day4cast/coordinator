@@ -28,7 +28,8 @@ nostr-sdk = { version = "0.38.0", features = [
 thiserror = "2.0.11"
 serde-wasm-bindgen = "0.6.5"
 getrandom = { version = "0.2" }
-dlctix = { git = "https://github.com/tee8z/dlctix", branch = "update-bitcoin-dep" }
+#dlctix = { git = "https://github.com/tee8z/dlctix", branch = "update-bitcoin-dep" }
+dlctix = { path = "/home/teebz/repos/dlctix" }
 rand = "0.8"
 aes-gcm = "0.10"
 secrecy = "0.10.3"
