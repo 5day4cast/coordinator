@@ -18,7 +18,7 @@ pub struct Event {
     /// Nonce the oracle committed to use as part of signing final results
     pub nonce: Scalar,
     /// Holds the predefined outcomes the oracle will attest to at event completes
-    pub event_annoucement: EventLockingConditions,
+    pub event_announcement: EventLockingConditions,
 }
 
 #[derive(Error, Debug)]

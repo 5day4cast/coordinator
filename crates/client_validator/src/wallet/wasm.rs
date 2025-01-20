@@ -84,22 +84,23 @@ impl TaprootWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
-    #[wasm_bindgen(js_name = "encryptDlcKey")]
-    pub async fn encrypt_dlc_key(
+    #[wasm_bindgen(js_name = "getEncryptedDlcPrivateKey")]
+    pub async fn get_encrypted_dlc_private_key(
         &self,
         entry_index: u32,
         nostr_pubkey: &str,
     ) -> Result<String, JsValue> {
         self.inner
-            .encrypt_dlc_key(entry_index, nostr_pubkey)
+            .get_encrypted_dlc_private_key(entry_index, nostr_pubkey)
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
-    #[wasm_bindgen(js_name = "getDlcAddress")]
-    pub fn get_dlc_address(&mut self, entry_index: u32) -> Result<String, JsValue> {
+    #[wasm_bindgen(js_name = "getDlcPrivateKey")]
+    pub async fn get_dlc_public_key(&self, entry_index: u32) -> Result<String, JsValue> {
         self.inner
-            .get_dlc_address(entry_index)
+            .get_dlc_public_key(entry_index)
+            .await
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 

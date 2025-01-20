@@ -14,7 +14,7 @@ pub fn run_comeptition_migrations(conn: &mut Connection) -> Result<(), duckdb::E
 
     match current_version {
         0 => {
-            create_comeptitions_initial_schema(conn)?;
+            create_competitions_initial_schema(conn)?;
         }
         /*1 => {
         migrate_to_version_2(conn)?;
@@ -33,7 +33,7 @@ fn create_version_table(conn: &mut Connection) -> Result<(), duckdb::Error> {
     Ok(())
 }
 
-pub fn create_comeptitions_initial_schema(conn: &mut Connection) -> Result<(), duckdb::Error> {
+pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), duckdb::Error> {
     let initial_schema = r#"
     -- Table of information about the oracle, mostly to prevent multiple keys from being used with the same database
     -- singleton_constant is a dummy column to ensure there is only one row
@@ -54,7 +54,7 @@ pub fn create_comeptitions_initial_schema(conn: &mut Connection) -> Result<(), d
         total_competition_pool BIGINT NOT NULL,
         total_allowed_entries BIGINT NOT NULL,
         entry_fee BIGINT NOT NULL,
-        event_annoucement BLOB NOT NULL,
+        event_announcement BLOB NOT NULL,
         funding_transaction BLOB,                -- Funding transaction outpoint
         contract_parameters BLOB,                -- DLC contract parameters
         public_nonces BLOB,                      -- Coordinator's public nonces

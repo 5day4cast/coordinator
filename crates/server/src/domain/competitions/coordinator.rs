@@ -1,12 +1,23 @@
+use super::{
+    AddEntry, CompetitionError, CompetitionState, CompetitionStore, SearchBy, Ticket, UserEntry,
+};
+use crate::{
+    bitcoin_client::Bitcoin,
+    domain::{Competition, CreateEvent, Error},
+    get_key,
+    oracle_client::{Event, Oracle},
+    Ln, OracleError,
+};
 use anyhow::anyhow;
 use dlctix::{
     bitcoin::{
         absolute::LockTime,
+        bech32::{self, segwit},
         hex::DisplayHex,
         key::{Keypair, Secp256k1},
         sighash::{Prevouts, SighashCache},
-        transaction, Amount, FeeRate, OutPoint, ScriptBuf, TapSighashType, Transaction, TxIn,
-        TxOut,
+        transaction, Address, Amount, FeeRate, OutPoint, ScriptBuf, TapSighashType, Transaction,
+        TxIn, TxOut,
     },
     hashlock,
     musig2::{
@@ -20,26 +31,15 @@ use dlctix::{
 };
 use futures::TryFutureExt;
 use itertools::Itertools;
-use log::{error, info};
+use log::{debug, error, info};
 use rand::SeedableRng;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{collections::BTreeMap, str::FromStr};
 use time::OffsetDateTime;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-
-use super::{
-    AddEntry, CompetitionError, CompetitionState, CompetitionStore, SearchBy, Ticket, UserEntry,
-};
-use crate::{
-    bitcoin_client::Bitcoin,
-    domain::{Competition, CreateEvent, Error},
-    get_key,
-    oracle_client::{Event, Oracle},
-    Ln, OracleError,
-};
 
 pub struct CompetitionWatcher {
     coordinator: Arc<Coordinator>,
@@ -269,12 +269,19 @@ impl Coordinator {
         &self,
         mut competition: Competition,
     ) -> Result<Competition, anyhow::Error> {
+        debug!("creating dlc contract for competition: {}", competition.id);
         let mut entries = self
             .competition_store
             .get_competition_entries(competition.id)
             .await?;
-        let players = generate_players(&entries)?;
-        let outcome_payouts = generate_payouts(&competition, &mut entries, &players)?;
+        debug!("competition has {} entries", entries.len());
+        let players =
+            generate_players(&entries).map_err(|e| anyhow!("Failed to generate players: {}", e))?;
+        debug!("generated players for each entry");
+
+        let outcome_payouts = generate_payouts(&competition, &mut entries, &players)
+            .map_err(|e| anyhow!("Failed to generate payouts: {}", e))?;
+        debug!("generated outcome payouts");
 
         let contract_amount_sats = competition.total_competition_pool;
         let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
@@ -294,11 +301,13 @@ impl Coordinator {
             relative_locktime_block_delta: self.relative_locktime_block_delta,
         };
         competition.contract_parameters = Some(contract_params.clone());
+        debug!("contract params have been built");
 
         let wallet_outpoint: OutPoint = self
             .bitcoin
             .get_spendable_utxo(contract_amount_sats)
             .await?;
+        debug!("spendable utxo found");
 
         // Prepare a funding transaction (value should be total value of competition money pool)
         let tx_out = TxOut {
@@ -312,6 +321,8 @@ impl Coordinator {
             wallet_outpoint,
             &tx_out,
         );
+        debug!("signed funding tx");
+
         //At this point, store the funding_outpoint with the event in the DB
         let funding_outpoint = OutPoint {
             txid: funding_tx.compute_txid(),
@@ -325,7 +336,10 @@ impl Coordinator {
         // some thought will need to be done on the best way to do this for the least amount of user interaction
         // even after musig is signed, users then need to additionally pay the coordinator to get the secret allowing them to claim their winnings (maybe after competition completes?)
         // Note: word of warning, the ticketed_dlc may be very large in memory depending on the contract params
+
         let ticketed_dlc = TicketedDLC::new(contract_params, funding_outpoint)?;
+        debug!("built ticketed dlc");
+
         let mut rng = rand::rngs::StdRng::from_entropy();
 
         let signing_session = SigningSession::<NonceSharingRound>::new(
@@ -333,6 +347,7 @@ impl Coordinator {
             &mut rng,
             Scalar::from(self.private_key),
         )?;
+        debug!("started musig nonce sharing round");
 
         competition.public_nonces = Some(signing_session.our_public_nonces().to_owned());
         Ok(competition)
@@ -380,11 +395,16 @@ impl Coordinator {
         let Some(funding_transaction) = &competition.funding_transaction else {
             return Err(anyhow!("funding transaction doesn't exists, failed publishing competition {} funding transaction", competition.id));
         };
+        let Some(_) = competition.partial_signatures.clone() else {
+            return Err(anyhow!("coordinator partial signatures do not exist, failed publishing competition {} funding transaction", competition.id));
+        };
+
         let ticketed_dlc = TicketedDLC::new(
             contract_parameters.to_owned(),
             funding_transaction.to_owned(),
         )?;
         let mut rng = rand::rngs::StdRng::from_entropy();
+        debug!("built ticketed dlc before publishing");
 
         let signing_session = SigningSession::<NonceSharingRound>::new(
             ticketed_dlc,
@@ -393,19 +413,25 @@ impl Coordinator {
         )?;
 
         let received_nonces = self.get_received_nonces(competition.id).await?;
+        debug!("got received nonces");
 
         let coordinator_session =
             signing_session.aggregate_nonces_and_compute_partial_signatures(received_nonces)?;
+        debug!("built coordinator session before publishing");
 
         let partial_sigs_by_sender: BTreeMap<Point, SigMap<PartialSignature>> =
             self.get_partial_sigs_by_sender(competition.id).await?;
 
+        debug!("got partial sigs by sender");
+        //Bug here, things aren't mapping up with the setup outcome/payouts
         for (&sender_pubkey, partial_sigs) in &partial_sigs_by_sender {
             coordinator_session.verify_partial_signatures(sender_pubkey, partial_sigs)?;
         }
+        debug!("verified all paritial signatures");
 
         let signed_contract =
             coordinator_session.aggregate_all_signatures(partial_sigs_by_sender)?;
+        debug!("signed dlc contract");
 
         competition.signed_contract = Some(signed_contract);
         competition.signed_at = Some(OffsetDateTime::now_utc());
@@ -791,6 +817,7 @@ fn generate_players(entries: &Vec<UserEntry>) -> Result<Vec<Player>, anyhow::Err
 
         let payout_hash = entry.payout_hash.as_str();
 
+        debug!("player_pubkey: {}", entry.ephemeral_pubkey);
         let player = Player {
             pubkey: Point::from_hex(&entry.ephemeral_pubkey)?,
             // coordinator generates this preimage and only shares after player has paid for a ticket
@@ -860,10 +887,11 @@ fn find_player_indices(
 ) -> Result<Vec<usize>, anyhow::Error> {
     let mut player_indecies = vec![];
     for entry_ticket_pubkey in entry_ticket_pubkeys {
-        let pubkey_ticket = Point::from_hex(&entry_ticket_pubkey)?;
+        let pubkey_point = Point::from_hex(&entry_ticket_pubkey)?;
+
         if let Some(index) = players
             .iter()
-            .position(|player| player.pubkey == pubkey_ticket)
+            .position(|player| player.pubkey == pubkey_point)
         {
             player_indecies.push(index);
         }

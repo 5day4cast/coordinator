@@ -8,8 +8,9 @@ use dlctix::{
     secp::Scalar,
     EventLockingConditions,
 };
-use log::info;
+use log::{debug, info};
 use mockall::mock;
+use nostr_sdk::ToBech32;
 use server::{
     domain::{generate_ranking_permutations, AddEntry, CoordinatorInfo, CreateEvent},
     get_key, AddEventEntry, Bitcoin, Ln, Oracle, OracleError as Error, OracleEvent, ValueOptions,
@@ -69,10 +70,10 @@ mock! {
     }
 }
 
-pub async fn create_test_wallet() -> TaprootWalletCore {
+pub async fn create_test_wallet(nostr_client: &NostrClientCore) -> TaprootWalletCore {
     let builder = TaprootWalletCoreBuilder::new()
         .network("regtest".to_string())
-        .nostr_client(&create_test_nostr_client().await);
+        .nostr_client(&nostr_client);
 
     builder.build().await.expect("Failed to create test wallet")
 }
@@ -101,13 +102,16 @@ pub async fn create_test_participants(count: usize) -> Result<Vec<TestParticipan
     let mut participants = Vec::with_capacity(count);
 
     for _ in 0..count {
-        let wallet = create_test_wallet().await;
         let nostr_client = create_test_nostr_client().await;
+        let wallet = create_test_wallet(&nostr_client).await;
         let nostr_pubkey = nostr_client.get_public_key().await?;
-
-        participants.push(TestParticipant::new(wallet, nostr_pubkey.to_string()));
+        let nostr_bech_32 = nostr_pubkey.to_bech32().unwrap();
+        debug!("participant added: {}", nostr_bech_32);
+        participants.push(TestParticipant::new(
+            wallet,
+            nostr_pubkey.to_bech32().unwrap(),
+        ));
     }
-
     Ok(participants)
 }
 
@@ -147,17 +151,16 @@ pub async fn generate_competition_entries(
     participants: &mut [TestParticipant],
     stations: &Vec<String>,
     entries_per_participant: usize,
-) -> Result<Vec<AddEntry>, anyhow::Error> {
-    let mut all_entries = Vec::new();
-
+) -> Result<HashMap<String, AddEntry>, anyhow::Error> {
+    let mut participant_entries = HashMap::new();
     for participant in participants.iter_mut() {
         for _ in 0..entries_per_participant {
             let entry = generate_test_entry(competition_id, participant, stations).await?;
-            all_entries.push(entry);
+            participant_entries.insert(participant.nostr_pubkey.clone(), entry);
         }
     }
 
-    Ok(all_entries)
+    Ok(participant_entries)
 }
 
 pub async fn generate_test_entry(
@@ -168,18 +171,20 @@ pub async fn generate_test_entry(
     let entry_id = Uuid::now_v7();
     let entry_index = participant.next_entry_index();
 
-    // Get the DLC key and derive the address - this will be our ephemeral pubkey
-    let dlc_address = participant.wallet.get_dlc_address(entry_index)?;
-
     // Encrypt the DLC key - this will be our ephemeral private key
     let ephemeral_privatekey_encrypted = participant
         .wallet
-        .encrypt_dlc_key(entry_index, &participant.nostr_pubkey)
+        .get_encrypted_dlc_private_key(entry_index, &participant.nostr_pubkey)
         .await?;
+    debug!(
+        "encrypted dlc child key: {}",
+        ephemeral_privatekey_encrypted
+    );
+    let ephemeral_pubkey = participant.wallet.get_dlc_public_key(entry_index).await?;
 
     // Generate payout hash
     let payout_hash = participant.wallet.add_entry_index(entry_index)?;
-
+    debug!("generated payout hash: {}", payout_hash);
     // Get the payout preimage from the DLC contract and encrypt it
     let dlc_entry = participant
         .wallet
@@ -190,15 +195,17 @@ pub async fn generate_test_entry(
         .wallet
         .encrypt_key(&dlc_entry.payout_preimage, &participant.nostr_pubkey)
         .await?;
+    debug!("encrypted payout preimage: {}", payout_preimage_encrypted);
 
     let mut choices = vec![];
     for station_id in station_ids {
         choices.push(generate_random_weather_choices(station_id));
     }
+    debug!("generated weather station choices");
 
     Ok(AddEntry {
         id: entry_id,
-        ephemeral_pubkey: dlc_address,
+        ephemeral_pubkey,
         ephemeral_privatekey_encrypted,
         payout_hash,
         payout_preimage_encrypted,
@@ -236,7 +243,6 @@ pub fn generate_oracle_event(
 ) -> OracleEvent {
     let possible_user_outcomes: Vec<Vec<usize>> =
         generate_ranking_permutations(total_allowed_entries, number_of_places_win);
-    info!("user outcomes: {:?}", possible_user_outcomes);
 
     let outcome_messages: Vec<Vec<u8>> = generate_outcome_messages(possible_user_outcomes);
 
@@ -257,7 +263,7 @@ pub fn generate_oracle_event(
         id: event_id,
         nonce,
         // The actual announcement the oracle is going to attest the outcome
-        event_annoucement: EventLockingConditions {
+        event_announcement: EventLockingConditions {
             expiry: Some(expiry),
             locking_points,
         },

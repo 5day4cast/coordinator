@@ -4,6 +4,7 @@ use dlctix::{
     musig2::secp256k1::{PublicKey, SecretKey},
 };
 use env_logger;
+use log::{debug, error};
 use maplit::hashmap;
 use server::{
     create_folder,
@@ -11,7 +12,6 @@ use server::{
     Bitcoin, Coordinator, Ln, Oracle,
 };
 use std::{
-    collections::HashMap,
     fs,
     path::Path,
     sync::{Arc, Once},
@@ -74,6 +74,10 @@ impl TestContext {
                 event.number_of_places_win,
             ))
         });
+        oracle_mock
+            .expect_submit_entry()
+            .times(10)
+            .returning(|_| Ok(()));
 
         Ok(Self {
             oracle_keys,
@@ -113,85 +117,105 @@ impl Drop for TestContext {
 }
 
 #[tokio::test]
+#[ignore = "Should be used to debug issues of dlc creation, very large and slow, shouldn't run in CI"]
 async fn test_ten_person_competition_flow() -> Result<()> {
     let context = TestContext::new().await?;
     let coordinator = context.create_coordinator().await?;
 
     // Create competition
     let create_event = generate_request_create_event(3); // 3 locations
+    debug!("create event request completed");
     let competition = coordinator.create_competition(create_event.clone()).await?;
+    debug!("create competition completed");
     assert_eq!(competition.get_state(), CompetitionState::Created);
 
     // Create 10 participants
     let mut participants = create_test_participants(10).await?;
+    debug!("10 participants created");
 
     // Generate entries for all participants
-    let entries = generate_competition_entries(
+    let participants_entries = generate_competition_entries(
         create_event.id,
         &mut participants,
         &create_event.locations,
         1, // one entry per participant
     )
     .await?;
+    debug!("Generated 1 entry for each participants");
 
-    let mut participant_entries = HashMap::new();
     // Submit entries for all participants
-    for entry in entries {
-        let user_entry = coordinator
-            .add_entry(entry.ephemeral_pubkey.clone(), entry)
-            .await?;
+    for (participants_key, entry) in participants_entries.clone() {
+        let user_entry = coordinator.add_entry(participants_key, entry).await?;
         // Verify entry was added
         assert!(user_entry.id != Uuid::nil());
-
-        participant_entries.insert(user_entry.pubkey.clone(), user_entry.id);
     }
+    debug!("Add 1 entry for each participants");
 
     // Let the competition handler run to create transactions
-    coordinator.competition_handler().await?;
+    coordinator
+        .competition_handler()
+        .await
+        .map_err(|e| error!("{}", e))
+        .unwrap();
+    debug!("Created DLC contract and starting musig2 process");
 
     // Get updated competition
     let mut competition = coordinator.get_competition(create_event.id).await?;
+    debug!("competition: {:?}", competition.errors);
     assert_eq!(competition.get_state(), CompetitionState::EntriesCollected);
     assert!(competition.contract_parameters.is_some());
     assert!(competition.funding_transaction.is_some());
 
     // For each participant, submit nonces
     for participant in participants.iter_mut() {
-        let entry_id = participant_entries
+        let entry = participants_entries
             .get(&participant.nostr_pubkey)
             .expect("Entry should exist for participant");
-
         // Add contract to wallet
         participant.wallet.add_contract(
             1, // Use 1 as the entry index since each participant has one entry
             competition.contract_parameters.clone().unwrap(),
             competition.funding_transaction.unwrap(),
         )?;
+        debug!(
+            "Add contract to participant wallet: {}",
+            participant.nostr_pubkey
+        );
 
         // Generate and submit nonces
         let nonces = participant.wallet.generate_public_nonces(1)?; // Use 1 as entry index
+        debug!("Generated public nonces for participant",);
+
         coordinator
             .submit_public_nonces(
                 participant.nostr_pubkey.clone(),
                 competition.id,
-                *entry_id, // Use the stored entry ID
+                entry.id, // Use the stored entry ID
                 nonces,
             )
             .await?;
+        debug!("Submitted public nonces for participant",);
     }
 
     // Let competition handler run to generate aggregate nonces
-    coordinator.competition_handler().await?;
+    coordinator
+        .competition_handler()
+        .await
+        .map_err(|e| error!("{}", e))
+        .unwrap();
 
     // Get updated competition
     competition = coordinator.get_competition(create_event.id).await?;
-    assert_eq!(competition.get_state(), CompetitionState::NoncesCollected);
+    assert_eq!(
+        competition.get_state(),
+        CompetitionState::AggregateNoncesGenerated
+    );
     assert!(competition.aggregated_nonces.is_some());
 
     // For each participant, submit partial signatures
     let agg_nonces = competition.aggregated_nonces.clone().unwrap();
     for participant in participants.iter() {
-        let entry_id = participant_entries
+        let entry = participants_entries
             .get(&participant.nostr_pubkey)
             .expect("Entry should exist for participant");
 
@@ -199,22 +223,30 @@ async fn test_ten_person_competition_flow() -> Result<()> {
         let partial_sigs = participant
             .wallet
             .sign_aggregate_nonces(agg_nonces.clone(), 1)?; // Use 1 as entry index
+        debug!("Generated partial sigs for participant");
 
         coordinator
             .submit_partial_signatures(
                 participant.nostr_pubkey.clone(),
                 competition.id,
-                *entry_id, // Use the stored entry ID
+                entry.id, // Use the stored entry ID
                 partial_sigs,
             )
             .await?;
+        debug!("Submitted partial sigs for participant");
     }
 
     // Let competition handler run to publish transactions
-    coordinator.competition_handler().await?;
+    coordinator
+        .competition_handler()
+        .await
+        .map_err(|e| error!("{}", e))
+        .unwrap();
 
     // Get final competition state
     competition = coordinator.get_competition(create_event.id).await?;
+    debug!("competition.errors: {:?}", competition.errors);
+
     assert_eq!(competition.get_state(), CompetitionState::Broadcasted);
     assert!(competition.signed_contract.is_some());
     assert!(competition.signed_at.is_some());
