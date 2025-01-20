@@ -10,8 +10,9 @@ use uuid::Uuid;
 
 use crate::domain::DBConnection;
 
-use super::{run_migrations, Competition, SearchBy, UserEntry};
+use super::{run_comeptition_migrations, Competition, SearchBy, UserEntry};
 
+#[derive(Clone)]
 pub struct CompetitionStore {
     db_connection: DBConnection,
 }
@@ -19,7 +20,7 @@ pub struct CompetitionStore {
 impl CompetitionStore {
     pub fn new(db_connection: DBConnection) -> Result<Self, duckdb::Error> {
         let mut conn = Connection::open(db_connection.connection_path.clone())?;
-        run_migrations(&mut conn)?;
+        run_comeptition_migrations(&mut conn)?;
         Ok(Self { db_connection })
     }
 

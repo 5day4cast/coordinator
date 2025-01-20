@@ -2,7 +2,7 @@ use duckdb::{params, types::Type, Connection};
 use serde::{Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, macros::format_description, OffsetDateTime};
 
-use super::run_migrations;
+use super::run_users_migrations;
 use crate::{
     domain::{DBConnection, Error},
     RegisterPayload,
@@ -26,7 +26,7 @@ pub struct UserStore {
 impl UserStore {
     pub fn new(db_connection: DBConnection) -> Result<Self, duckdb::Error> {
         let mut conn = Connection::open(db_connection.connection_path.clone())?;
-        run_migrations(&mut conn)?;
+        run_users_migrations(&mut conn)?;
         Ok(Self { db_connection })
     }
 

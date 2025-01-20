@@ -50,10 +50,6 @@ features = [
     'Window',
     'CustomEventInit',
     'console',
-    'Headers',
-    'Request',
-    'RequestInit',
-    'RequestMode',
 ]
 
 

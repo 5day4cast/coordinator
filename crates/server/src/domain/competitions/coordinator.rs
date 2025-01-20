@@ -37,8 +37,8 @@ use crate::{
     bitcoin_client::Bitcoin,
     domain::{Competition, CreateEvent, Error},
     get_key,
-    oracle_client::Event,
-    Ln, OracleClient, OracleError,
+    oracle_client::{Event, Oracle},
+    Ln, OracleError,
 };
 
 pub struct CompetitionWatcher {
@@ -92,9 +92,9 @@ impl CompetitionWatcher {
 }
 
 pub struct Coordinator {
-    oracle_client: Arc<OracleClient>,
+    oracle_client: Arc<dyn Oracle>,
     competition_store: Arc<CompetitionStore>,
-    bitcoin: Arc<Bitcoin>,
+    bitcoin: Arc<dyn Bitcoin>,
     ln: Arc<dyn Ln>,
     private_key: SecretKey,
     public_key: PublicKey,
@@ -103,9 +103,9 @@ pub struct Coordinator {
 
 impl Coordinator {
     pub async fn new(
-        oracle_client: OracleClient,
+        oracle_client: Arc<dyn Oracle>,
         competition_store: CompetitionStore,
-        bitcoin: Arc<Bitcoin>,
+        bitcoin: Arc<dyn Bitcoin>,
         ln: Arc<dyn Ln>,
         private_key_file_path: &str,
         relative_locktime_block_delta: u16,
@@ -114,7 +114,7 @@ impl Coordinator {
         let secp = Secp256k1::new();
         let public_key = secret_key.public_key(&secp);
         let coordinator = Self {
-            oracle_client: Arc::new(oracle_client),
+            oracle_client,
             competition_store: Arc::new(competition_store),
             bitcoin,
             ln,
@@ -413,6 +413,8 @@ impl Coordinator {
         self.bitcoin
             .broadcast(funding_transaction.to_string())
             .await?;
+
+        competition.funding_broadcasted_at = Some(OffsetDateTime::now_utc());
 
         Ok(competition)
     }
@@ -766,7 +768,7 @@ impl Coordinator {
             )
             .await?;
 
-        let entry = entries
+        entries
             .iter()
             .find(|e| e.id == entry_id)
             .ok_or_else(|| Error::NotFound(format!("Entry {} not found", entry_id)))?;

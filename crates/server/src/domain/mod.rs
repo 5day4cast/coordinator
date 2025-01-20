@@ -32,8 +32,9 @@ pub enum Error {
     Bitcoin(#[from] anyhow::Error),
 }
 
+#[derive(Clone)]
 pub struct DBConnection {
-    connection_path: String,
+    pub connection_path: String,
     retry_duration: StdDuration,
     retry_max_attemps: i32,
 }

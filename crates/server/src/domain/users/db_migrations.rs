@@ -1,7 +1,7 @@
 use duckdb::Connection;
 use log::info;
 
-pub fn run_migrations(conn: &mut Connection) -> Result<(), duckdb::Error> {
+pub fn run_users_migrations(conn: &mut Connection) -> Result<(), duckdb::Error> {
     create_version_table(conn)?;
     let mut stmt = conn.prepare("SELECT version FROM db_version")?;
     let mut rows = stmt.query([])?;
@@ -14,7 +14,7 @@ pub fn run_migrations(conn: &mut Connection) -> Result<(), duckdb::Error> {
 
     match current_version {
         0 => {
-            create_initial_schema(conn)?;
+            create_users_initial_schema(conn)?;
         }
         /*1 => {
         migrate_to_version_2(conn)?;
@@ -25,7 +25,7 @@ pub fn run_migrations(conn: &mut Connection) -> Result<(), duckdb::Error> {
     Ok(())
 }
 
-pub fn create_version_table(conn: &mut Connection) -> Result<(), duckdb::Error> {
+fn create_version_table(conn: &mut Connection) -> Result<(), duckdb::Error> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS db_version ( version INTEGER PRIMARY KEY);",
         [],
@@ -33,7 +33,7 @@ pub fn create_version_table(conn: &mut Connection) -> Result<(), duckdb::Error> 
     Ok(())
 }
 
-pub fn create_initial_schema(conn: &mut Connection) -> Result<(), duckdb::Error> {
+pub fn create_users_initial_schema(conn: &mut Connection) -> Result<(), duckdb::Error> {
     let initial_schema = r#"
     -- TODO add password login
     CREATE TABLE IF NOT EXISTS user

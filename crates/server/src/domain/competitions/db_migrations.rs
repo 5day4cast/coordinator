@@ -1,7 +1,7 @@
 use duckdb::Connection;
 use log::info;
 
-pub fn run_migrations(conn: &mut Connection) -> Result<(), duckdb::Error> {
+pub fn run_comeptition_migrations(conn: &mut Connection) -> Result<(), duckdb::Error> {
     create_version_table(conn)?;
     let mut stmt = conn.prepare("SELECT version FROM db_version")?;
     let mut rows = stmt.query([])?;
@@ -14,7 +14,7 @@ pub fn run_migrations(conn: &mut Connection) -> Result<(), duckdb::Error> {
 
     match current_version {
         0 => {
-            create_initial_schema(conn)?;
+            create_comeptitions_initial_schema(conn)?;
         }
         /*1 => {
         migrate_to_version_2(conn)?;
@@ -25,7 +25,7 @@ pub fn run_migrations(conn: &mut Connection) -> Result<(), duckdb::Error> {
     Ok(())
 }
 
-pub fn create_version_table(conn: &mut Connection) -> Result<(), duckdb::Error> {
+fn create_version_table(conn: &mut Connection) -> Result<(), duckdb::Error> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS db_version ( version INTEGER PRIMARY KEY);",
         [],
@@ -33,7 +33,7 @@ pub fn create_version_table(conn: &mut Connection) -> Result<(), duckdb::Error> 
     Ok(())
 }
 
-pub fn create_initial_schema(conn: &mut Connection) -> Result<(), duckdb::Error> {
+pub fn create_comeptitions_initial_schema(conn: &mut Connection) -> Result<(), duckdb::Error> {
     let initial_schema = r#"
     -- Table of information about the oracle, mostly to prevent multiple keys from being used with the same database
     -- singleton_constant is a dummy column to ensure there is only one row
@@ -62,7 +62,7 @@ pub fn create_initial_schema(conn: &mut Connection) -> Result<(), duckdb::Error>
         partial_signatures BLOB,                 -- Coordinator's partial signatures
         signed_contract BLOB,                    -- Final signed contract
         contracted_at TIMESTAMPTZ,              -- When contract parameters were created
-        signed_at TIMESTAMPTZ,                  -- When musig signing completed
+        signed_at TIMESTAMPTZ,                  -- When musig2 signing completed
         funding_broadcasted_at TIMESTAMPTZ,     -- When funding transaction was broadcast
         cancelled_at TIMESTAMPTZ,               -- If competition was cancelled
         failed_at TIMESTAMPTZ,                  -- If competition failed
@@ -73,15 +73,15 @@ pub fn create_initial_schema(conn: &mut Connection) -> Result<(), duckdb::Error>
     (
         id UUID PRIMARY KEY,
         event_id UUID NOT NULL REFERENCES competitions (id),
-        pubkey STRING NOT NULL,                 -- user wallet pubkey
+        pubkey STRING NOT NULL,                 -- user nostr pubkey
         ephemeral_pubkey TEXT NOT NULL,         -- user ephemeral pubkey for DLC
-        ephemeral_privatekey_user_encrypted TEXT NOT NULL,  -- store for better UX, backed up in nostr relays
+        ephemeral_privatekey_user_encrypted TEXT NOT NULL,  -- store for better UX, backed up in user wallet
         ephemeral_privatekey TEXT,              -- provided by user on payout, encrypted by coordinator_key
         public_nonces BLOB,                     -- player signed nonces during musig signing session
         partial_signatures BLOB,                -- player partial signatures
         ticket_preimage TEXT,                   -- market maker generated preimage user needs for winnings
         ticket_hash TEXT,                       -- hash of market marker preimage
-        payout_preimage_user_encrypted TEXT NOT NULL, -- store for better UX, backed up in nostr relays
+        payout_preimage_user_encrypted TEXT NOT NULL, -- store for better UX, backed up in user wallet
         payout_hash TEXT NOT NULL,              -- user provided hash of preimage to get winnings
         payout_preimage TEXT,                   -- provided by user on payout, encrypted by coordinator_key
         signed_at TIMESTAMPTZ,                  -- when user completes musig signing

@@ -3,8 +3,8 @@ use crate::{
     domain::{CompetitionStore, CompetitionWatcher, DBConnection, UserInfo},
     get_aggregate_nonces, get_balance, get_contract_parameters, get_entries,
     get_estimated_fee_rates, get_next_address, get_outputs, health, index_handler, login, register,
-    send_to_address, submit_partial_signatures, submit_public_nonces, Bitcoin, BitcoinSyncWatcher,
-    Coordinator, Ln, LnClient, OracleClient, Settings, UserStore,
+    send_to_address, submit_partial_signatures, submit_public_nonces, BitcoinClient,
+    BitcoinSyncWatcher, Coordinator, Ln, LnClient, OracleClient, Settings, UserStore,
 };
 use anyhow::anyhow;
 use axum::{
@@ -107,7 +107,7 @@ pub struct AppState {
     pub remote_url: String,
     pub oracle_url: String,
     pub esplora_url: String,
-    pub bitcoin: Arc<Bitcoin>,
+    pub bitcoin: Arc<BitcoinClient>,
     pub coordinator: Arc<Coordinator>,
     pub users_info: Arc<UserInfo>,
     pub background_threads: Arc<HashMap<String, JoinHandle<()>>>,
@@ -135,7 +135,9 @@ pub async fn build_app(
         .not_found_service(ServeFile::new(config.ui_settings.admin_ui_dir.clone()));
     info!("Admin UI configured");
 
-    let bitcoin = Bitcoin::new(&config.bitcoin_settings).await.map(Arc::new)?;
+    let bitcoin_client = BitcoinClient::new(&config.bitcoin_settings)
+        .await
+        .map(Arc::new)?;
     info!("Bitcoin service configured");
 
     let reqwest_client = build_reqwest_client();
@@ -163,9 +165,9 @@ pub async fn build_app(
         UserStore::new(users_db).map_err(|e| anyhow!("Error setting up user store: {}", e))?;
 
     let coordinator = Coordinator::new(
-        oracle_client.clone(),
+        Arc::new(oracle_client),
         competition_store,
-        bitcoin.clone(),
+        bitcoin_client.clone(),
         ln.clone(),
         &config.coordinator_settings.private_key_file,
         config.coordinator_settings.relative_locktime_block_delta,
@@ -195,7 +197,7 @@ pub async fn build_app(
     });
 
     let bitcoin_watcher = BitcoinSyncWatcher::new(
-        bitcoin.clone(),
+        bitcoin_client.clone(),
         cancel_token.clone(),
         Duration::from_secs(config.bitcoin_settings.refresh_blocks_secs),
     );
@@ -226,7 +228,7 @@ pub async fn build_app(
         oracle_url: config.coordinator_settings.oracle_url,
         coordinator,
         users_info: Arc::new(UserInfo::new(users_store)),
-        bitcoin,
+        bitcoin: bitcoin_client,
         background_threads: Arc::new(threads),
     };
     Ok((app_state, serve_dir, serve_admin_dir, tracker, cancel_token))

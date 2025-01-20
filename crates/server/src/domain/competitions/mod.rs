@@ -212,6 +212,8 @@ pub struct CreateEvent {
     pub locations: Vec<String>,
     /// The number of values that can be selected per entry in the event (default to number_of_locations * 3, (temp_low, temp_high, wind_speed))
     pub number_of_values_per_entry: usize,
+    /// The number of ranks that can win, 1st -> 40%, 2nd -> 35%, 3rd -> 25% (something like that from the prize pool)
+    pub number_of_places_win: usize,
     /// Total number of allowed entries into the event
     pub total_allowed_entries: usize,
     /// Total sats required per entry for ticket
@@ -262,6 +264,7 @@ pub struct Competition {
     pub errors: Vec<CompetitionError>,
 }
 
+#[derive(Debug, PartialEq, PartialOrd, Eq)]
 pub enum CompetitionState {
     Created,
     EntriesCollected,
