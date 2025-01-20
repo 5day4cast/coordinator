@@ -71,16 +71,19 @@ mock! {
 }
 
 pub async fn create_test_wallet(nostr_client: &NostrClientCore) -> TaprootWalletCore {
-    let builder = TaprootWalletCoreBuilder::new()
+    TaprootWalletCoreBuilder::new()
         .network("regtest".to_string())
-        .nostr_client(&nostr_client);
-
-    builder.build().await.expect("Failed to create test wallet")
+        .nostr_client(nostr_client)
+        .build()
+        .await
+        .expect("Failed to create test wallet")
 }
+
 pub struct TestParticipant {
     pub wallet: client_validator::TaprootWalletCore,
     pub entry_count: u32,
     pub nostr_pubkey: String,
+    pub current_entry_index: u32,
 }
 
 impl TestParticipant {
@@ -89,6 +92,7 @@ impl TestParticipant {
             wallet,
             entry_count: 0,
             nostr_pubkey,
+            current_entry_index: 1,
         }
     }
 
@@ -101,12 +105,14 @@ impl TestParticipant {
 pub async fn create_test_participants(count: usize) -> Result<Vec<TestParticipant>, anyhow::Error> {
     let mut participants = Vec::with_capacity(count);
 
-    for _ in 0..count {
+    for i in 0..count {
+        // Use a deterministic seed based on index
+        let seed = format!("test_participant_{}", i);
         let nostr_client = create_test_nostr_client().await;
         let wallet = create_test_wallet(&nostr_client).await;
         let nostr_pubkey = nostr_client.get_public_key().await?;
         let nostr_bech_32 = nostr_pubkey.to_bech32().unwrap();
-        debug!("participant added: {}", nostr_bech_32);
+        debug!("participant {} added: {}", i, nostr_bech_32);
         participants.push(TestParticipant::new(
             wallet,
             nostr_pubkey.to_bech32().unwrap(),
@@ -124,7 +130,11 @@ pub async fn create_test_nostr_client() -> NostrClientCore {
     client
 }
 
-pub fn generate_request_create_event(num_locations: usize) -> CreateEvent {
+pub fn generate_request_create_event(
+    num_locations: usize,
+    total_allowed_entries: usize,
+    number_of_places_win: usize,
+) -> CreateEvent {
     let now = OffsetDateTime::now_utc();
     let observation_date = now + Duration::days(1);
     let signing_date = observation_date + Duration::hours(2); // Signing happens after observation
@@ -135,73 +145,49 @@ pub fn generate_request_create_event(num_locations: usize) -> CreateEvent {
         observation_date,
         locations: (0..num_locations).map(|i| format!("LOC_{}", i)).collect(),
         number_of_values_per_entry: num_locations * 3, // 3 values per location
-        total_allowed_entries: 10,
+        total_allowed_entries,
         entry_fee: 1000,
         total_competition_pool: 10000,
         coordinator: Some(CoordinatorInfo {
             pubkey: "test_coordinator_pubkey".to_string(),
             signature: "test_coordinator_signature".to_string(),
         }),
-        number_of_places_win: 3,
+        number_of_places_win,
     }
-}
-
-pub async fn generate_competition_entries(
-    competition_id: Uuid,
-    participants: &mut [TestParticipant],
-    stations: &Vec<String>,
-    entries_per_participant: usize,
-) -> Result<HashMap<String, AddEntry>, anyhow::Error> {
-    let mut participant_entries = HashMap::new();
-    for participant in participants.iter_mut() {
-        for _ in 0..entries_per_participant {
-            let entry = generate_test_entry(competition_id, participant, stations).await?;
-            participant_entries.insert(participant.nostr_pubkey.clone(), entry);
-        }
-    }
-
-    Ok(participant_entries)
 }
 
 pub async fn generate_test_entry(
     competition_id: Uuid,
-    participant: &mut TestParticipant,
+    wallet: &mut TaprootWalletCore,
+    nostr_pubkey: &str,
     station_ids: &Vec<String>,
+    entry_index: u32,
 ) -> Result<AddEntry, anyhow::Error> {
     let entry_id = Uuid::now_v7();
-    let entry_index = participant.next_entry_index();
 
-    // Encrypt the DLC key - this will be our ephemeral private key
-    let ephemeral_privatekey_encrypted = participant
-        .wallet
-        .get_encrypted_dlc_private_key(entry_index, &participant.nostr_pubkey)
+    // Use the provided wallet and entry index
+    let ephemeral_privatekey_encrypted = wallet
+        .get_encrypted_dlc_private_key(entry_index, nostr_pubkey)
         .await?;
-    debug!(
-        "encrypted dlc child key: {}",
-        ephemeral_privatekey_encrypted
-    );
-    let ephemeral_pubkey = participant.wallet.get_dlc_public_key(entry_index).await?;
+
+    let ephemeral_pubkey = wallet.get_dlc_public_key(entry_index).await?;
 
     // Generate payout hash
-    let payout_hash = participant.wallet.add_entry_index(entry_index)?;
-    debug!("generated payout hash: {}", payout_hash);
-    // Get the payout preimage from the DLC contract and encrypt it
-    let dlc_entry = participant
-        .wallet
+    let payout_hash = wallet.add_entry_index(entry_index)?;
+
+    // Get the payout preimage
+    let dlc_entry = wallet
         .get_dlc_entry(entry_index)
         .ok_or_else(|| anyhow!("No DLC entry found for index {}", entry_index))?;
 
-    let payout_preimage_encrypted = participant
-        .wallet
-        .encrypt_key(&dlc_entry.payout_preimage, &participant.nostr_pubkey)
+    let payout_preimage_encrypted = wallet
+        .encrypt_key(&dlc_entry.payout_preimage, nostr_pubkey)
         .await?;
-    debug!("encrypted payout preimage: {}", payout_preimage_encrypted);
 
     let mut choices = vec![];
     for station_id in station_ids {
         choices.push(generate_random_weather_choices(station_id));
     }
-    debug!("generated weather station choices");
 
     Ok(AddEntry {
         id: entry_id,

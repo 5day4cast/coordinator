@@ -4,7 +4,7 @@ use dlctix::{
     SigMap,
 };
 use duckdb::{params, params_from_iter, types::Value, Connection};
-use log::debug;
+use log::{debug, trace};
 use scooby::postgres::{select, Joinable};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
@@ -157,7 +157,7 @@ impl CompetitionStore {
         ))
         .from("entries");
         let query_str = select.where_("event_id = ?").to_string();
-        debug!("get competition entries: {}", query_str);
+        trace!("get competition entries query: {}", query_str);
         let conn = self.db_connection.new_readonly_connection_retry().await?;
         let mut stmt = conn.prepare(&query_str)?;
         let mut rows = stmt.query(params![event_id.to_string()])?;
@@ -210,7 +210,7 @@ impl CompetitionStore {
             select = select.clone().where_(where_clause);
         }
         let query_str = select.where_("pubkey = ?").to_string();
-        debug!("get user entries query: {}", query_str);
+        trace!("get user entries query: {}", query_str);
         let conn = self.db_connection.new_readonly_connection_retry().await?;
         let mut stmt = conn.prepare(&query_str)?;
         let mut rows = if let Some(ids) = filter.event_ids {
@@ -247,8 +247,9 @@ impl CompetitionStore {
                       created_at,
                       total_competition_pool,
                       total_allowed_entries,
+                      number_of_places_win,
                       entry_fee,
-                      event_announcement) VALUES(?,?,?,?,?,?)",
+                      event_announcement) VALUES(?,?,?,?,?,?,?)",
         )?;
         let announcement = serde_json::to_vec(&competition.event_announcement)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -257,6 +258,7 @@ impl CompetitionStore {
             created_at,
             competition.total_competition_pool,
             competition.total_allowed_entries,
+            competition.number_of_places_win,
             competition.entry_fee,
             Value::Blob(announcement)
         ])?;
@@ -378,23 +380,21 @@ impl CompetitionStore {
 
     pub async fn get_competitions(&self) -> Result<Vec<Competition>, duckdb::Error> {
         let query_str = select((
-            // Basic identification and metadata (indices 0-5)
             "competitions.id as id",
             "created_at::TEXT as created_at",
             "total_competition_pool",
             "total_allowed_entries",
+            "number_of_places_win",
             "entry_fee",
             "event_announcement",
         ))
         .and_select((
-            // Count fields (indices 6-9)
             "COUNT(entries.id) as total_entries",
             "COUNT(entries.id) FILTER (entries.public_nonces IS NOT NULL) as total_entry_nonces",
             "COUNT(entries.id) FILTER (entries.signed_at IS NOT NULL) as total_signed_entries",
             "COUNT(entries.id) FILTER (entries.paid_at IS NOT NULL) as total_paid_entries",
         ))
         .and_select((
-            // Transaction and contract fields (indices 10-15)
             "funding_transaction",
             "contract_parameters",
             "competitions.public_nonces as public_nonces",
@@ -403,7 +403,6 @@ impl CompetitionStore {
             "signed_contract",
         ))
         .and_select((
-            // Timestamp fields (indices 16-20)
             "cancelled_at::TEXT as cancelled_at",
             "contracted_at::TEXT as contracted_at",
             "competitions.signed_at::TEXT as signed_at",
@@ -423,6 +422,7 @@ impl CompetitionStore {
             "created_at",
             "total_competition_pool",
             "total_allowed_entries",
+            "number_of_places_win",
             "entry_fee",
             "event_announcement",
             "funding_transaction",
@@ -443,7 +443,7 @@ impl CompetitionStore {
             "errors",
         ))
         .to_string();
-        debug!("competitions query: {}", query_str);
+        trace!("competitions query: {}", query_str);
         let conn = self.db_connection.new_readonly_connection_retry().await?;
         let mut stmt = conn.prepare(&query_str)?;
         let mut rows = stmt.query([])?;
@@ -461,23 +461,21 @@ impl CompetitionStore {
         competition_id: Uuid,
     ) -> Result<Competition, duckdb::Error> {
         let query_str = select((
-            // Basic identification and metadata (indices 0-5)
             "competitions.id as id",
             "created_at::TEXT as created_at",
             "total_competition_pool",
             "total_allowed_entries",
+            "number_of_places_win",
             "entry_fee",
             "event_announcement",
         ))
         .and_select((
-            // Count fields (indices 6-9)
             "COUNT(entries.id) as total_entries",
             "COUNT(entries.id) FILTER (entries.public_nonces IS NOT NULL) as total_entry_nonces",
             "COUNT(entries.id) FILTER (entries.signed_at IS NOT NULL) as total_signed_entries",
             "COUNT(entries.id) FILTER (entries.paid_at IS NOT NULL) as total_paid_entries",
         ))
         .and_select((
-            // Transaction and contract fields (indices 10-15)
             "funding_transaction",
             "contract_parameters",
             "competitions.public_nonces as public_nonces",
@@ -486,7 +484,6 @@ impl CompetitionStore {
             "signed_contract",
         ))
         .and_select((
-            // Timestamp fields (indices 16-20)
             "cancelled_at::TEXT as cancelled_at",
             "contracted_at::TEXT as contracted_at",
             "competitions.signed_at::TEXT as signed_at",
@@ -505,6 +502,7 @@ impl CompetitionStore {
             "created_at",
             "total_competition_pool",
             "total_allowed_entries",
+            "number_of_places_win",
             "entry_fee",
             "event_announcement",
             "funding_transaction",
@@ -525,7 +523,7 @@ impl CompetitionStore {
             "errors",
         ))
         .to_string();
-        debug!("competition query: {}", query_str);
+        trace!("competition query: {}", query_str);
 
         let conn = self.db_connection.new_readonly_connection_retry().await?;
         let mut stmt = conn.prepare(&query_str)?;

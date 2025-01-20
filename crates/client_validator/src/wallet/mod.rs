@@ -3,7 +3,10 @@ mod core;
 #[cfg(target_arch = "wasm32")]
 mod wasm;
 
-use dlctix::{bitcoin::OutPoint, ContractParameters, TicketedDLC};
+use dlctix::{
+    bitcoin::OutPoint, musig2::PubNonce, ContractParameters, NonceSharingRound, SigMap,
+    SigningSession, TicketedDLC,
+};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -78,6 +81,13 @@ pub struct EncryptedKey {
 pub struct DlcEntry {
     pub contract: Option<TicketedDLC>,
     pub data: DlcEntryData,
+    pub signing_state: Option<SigningState>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SigningState {
+    pub seed: [u8; 32],
+    pub public_nonces: SigMap<PubNonce>,
 }
 
 #[derive(Clone)]

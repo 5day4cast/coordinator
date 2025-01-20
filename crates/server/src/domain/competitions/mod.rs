@@ -238,6 +238,7 @@ pub struct Competition {
     pub total_entry_nonces: u64,
     pub total_signed_entries: u64,
     pub total_paid_entries: u64,
+    pub number_of_places_win: usize,
     pub funding_transaction: Option<OutPoint>,
     pub contract_parameters: Option<ContractParameters>,
     pub public_nonces: Option<SigMap<PubNonce>>,
@@ -284,6 +285,7 @@ impl Competition {
             total_entry_nonces: 0,
             total_signed_entries: 0,
             total_paid_entries: 0,
+            number_of_places_win: create_event.number_of_places_win,
             funding_transaction: None,
             contract_parameters: None,
             public_nonces: None,
@@ -410,29 +412,27 @@ impl<'a> TryFrom<&Row<'a>> for Competition {
             "[year]-[month]-[day] [hour]:[minute]:[second][optional [.[subsecond]]][offset_hour]"
         );
         let competition = Competition {
-            // 1. competitions.id as id
             id: row
                 .get::<usize, String>(0)
                 .map(|val| Uuid::parse_str(&val))?
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(0, Type::Any, Box::new(e)))?,
 
-            // 2. created_at::TEXT as created_at
             created_at: row
                 .get::<usize, String>(1)
                 .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(1, Type::Any, Box::new(e)))?,
 
-            // 3-6. Basic fields
             total_competition_pool: row.get::<usize, u64>(2)?,
             total_allowed_entries: row.get::<usize, u64>(3)?,
-            entry_fee: row.get::<usize, u64>(4)?,
-            event_announcement: row.get::<usize, Option<Value>>(5).map(|opt| match opt {
+            number_of_places_win: row.get(4)?,
+            entry_fee: row.get::<usize, u64>(5)?,
+            event_announcement: row.get::<usize, Option<Value>>(6).map(|opt| match opt {
                 Some(Value::Blob(val)) => serde_json::from_slice::<EventLockingConditions>(&val)
                     .map_err(|e| {
-                        duckdb::Error::FromSqlConversionFailure(5, Type::Any, Box::new(e))
+                        duckdb::Error::FromSqlConversionFailure(6, Type::Any, Box::new(e))
                     }),
                 _ => Err(duckdb::Error::FromSqlConversionFailure(
-                    5,
+                    6,
                     Type::Any,
                     Box::new(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -441,78 +441,75 @@ impl<'a> TryFrom<&Row<'a>> for Competition {
                 )),
             })??,
 
-            // 7-10. Count fields
-            total_entries: row.get::<usize, u64>(6)?,
-            total_entry_nonces: row.get::<usize, u64>(7)?,
-            total_signed_entries: row.get::<usize, u64>(8)?,
-            total_paid_entries: row.get::<usize, u64>(9)?,
+            total_entries: row.get::<usize, u64>(7)?,
+            total_entry_nonces: row.get::<usize, u64>(8)?,
+            total_signed_entries: row.get::<usize, u64>(9)?,
+            total_paid_entries: row.get::<usize, u64>(10)?,
 
-            // 11-16. Transaction and contract fields
-            funding_transaction: row.get::<usize, Option<Value>>(10).map(|opt| {
+            funding_transaction: row.get::<usize, Option<Value>>(11).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            contract_parameters: row.get::<usize, Option<Value>>(11).map(|opt| {
+            contract_parameters: row.get::<usize, Option<Value>>(12).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            public_nonces: row.get::<usize, Option<Value>>(12).map(|opt| {
+            public_nonces: row.get::<usize, Option<Value>>(13).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            aggregated_nonces: row.get::<usize, Option<Value>>(13).map(|opt| {
+            aggregated_nonces: row.get::<usize, Option<Value>>(14).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            partial_signatures: row.get::<usize, Option<Value>>(14).map(|opt| {
+            partial_signatures: row.get::<usize, Option<Value>>(15).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            signed_contract: row.get::<usize, Option<Value>>(15).map(|opt| {
+            signed_contract: row.get::<usize, Option<Value>>(16).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            // 17-21. Timestamp fields
             cancelled_at: row
-                .get::<usize, Option<String>>(16)
-                .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
-
-            contracted_at: row
                 .get::<usize, Option<String>>(17)
                 .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
 
-            signed_at: row
+            contracted_at: row
                 .get::<usize, Option<String>>(18)
                 .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
 
-            funding_broadcasted_at: row
+            signed_at: row
                 .get::<usize, Option<String>>(19)
                 .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
 
-            failed_at: row
+            funding_broadcasted_at: row
                 .get::<usize, Option<String>>(20)
                 .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
 
+            failed_at: row
+                .get::<usize, Option<String>>(21)
+                .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
+
             errors: row
-                .get::<usize, Option<Value>>(21)
+                .get::<usize, Option<Value>>(22)
                 .map(|opt| {
                     opt.and_then(|raw| match raw {
                         Value::Blob(val) => {

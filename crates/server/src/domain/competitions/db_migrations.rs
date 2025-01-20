@@ -53,6 +53,7 @@ pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), d
         created_at TIMESTAMPTZ NOT NULL,
         total_competition_pool BIGINT NOT NULL,
         total_allowed_entries BIGINT NOT NULL,
+        number_of_places_win INT NOT NULL,
         entry_fee BIGINT NOT NULL,
         event_announcement BLOB NOT NULL,
         funding_transaction BLOB,                -- Funding transaction outpoint
