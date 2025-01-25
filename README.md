@@ -1,5 +1,5 @@
-# 5day4cast
-Holds the MVP of fantasy weather
+# 5day4cast Coordinator
+Holds the MVP of fantasy weather dlctix coordinator
 
 ### To compile server add duckdb lib:
 ```
