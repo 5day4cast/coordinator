@@ -6,7 +6,6 @@ use bdk_wallet::{
         secp256k1::{Secp256k1, SecretKey},
         Network, NetworkKind as BDKNetworkKind,
     },
-    chain::Merge,
     descriptor::calc_checksum,
     ChangeSet, KeychainKind, Wallet,
 };
@@ -323,6 +322,19 @@ impl TaprootWalletCore {
             .await
     }
 
+    pub async fn get_encrypted_dlc_payout_preimage(
+        &self,
+        entry_index: u32,
+        nostr_pubkey: &str,
+    ) -> Result<String, WalletError> {
+        if let Some(entry) = self.get_dlc_entry(entry_index) {
+            self.encrypt_key(&SecretString::from(entry.payout_preimage), nostr_pubkey)
+                .await
+        } else {
+            Err(WalletError::DlcEntryNotFound(entry_index))
+        }
+    }
+
     pub async fn get_dlc_public_key(&self, entry_index: u32) -> Result<String, WalletError> {
         let child_xpriv = self.derive_dlc_key(entry_index)?;
         let secp = Secp256k1::new();
@@ -358,6 +370,10 @@ impl TaprootWalletCore {
         let master_xpriv =
             dlctix::bitcoin::bip32::Xpriv::from_str(self.extended_key.expose_secret())
                 .map_err(|e| WalletError::DlcKeyError(format!("Invalid master key: {}", e)))?;
+        debug!(
+            "Master key fingerprint: {}",
+            master_xpriv.fingerprint(&Secp256k1::new())
+        );
 
         let child_xpriv = master_xpriv
             .derive_priv(&secp, &path)
@@ -423,17 +439,31 @@ impl TaprootWalletCore {
         Ok(())
     }
 
+    fn reconstruct_contract(&self, entry_index: u32) -> Result<TicketedDLC, WalletError> {
+        let Some(entry) = self.dlc_contracts.get(&entry_index) else {
+            return Err(WalletError::NoContract(entry_index));
+        };
+
+        let Some(ref params) = entry.data.params else {
+            return Err(WalletError::ContractError("No parameters found".into()));
+        };
+
+        let Some(funding_outpoint) = entry.data.funding_outpoint else {
+            return Err(WalletError::ContractError(
+                "No funding outpoint found".into(),
+            ));
+        };
+
+        // Reconstruct the contract from parameters
+        TicketedDLC::new(params.clone(), funding_outpoint)
+            .map_err(|e| WalletError::ContractError(e.to_string()))
+    }
+
     pub fn generate_public_nonces(
         &mut self,
         entry_index: u32,
     ) -> Result<dlctix::SigMap<dlctix::musig2::PubNonce>, WalletError> {
-        let Some(dlc_data) = self.dlc_contracts.get(&entry_index) else {
-            return Err(WalletError::NoContract(entry_index));
-        };
-
-        let Some(ref contract) = dlc_data.contract else {
-            return Err(WalletError::ContractError("No contract found".into()));
-        };
+        let contract = self.reconstruct_contract(entry_index)?;
 
         let child_xpriv = self.derive_dlc_key(entry_index)?;
 
@@ -457,13 +487,7 @@ impl TaprootWalletCore {
         aggregate_nonces: SigMap<AggNonce>,
         entry_index: u32,
     ) -> Result<SigMap<PartialSignature>, WalletError> {
-        let Some(dlc_data) = self.dlc_contracts.get(&entry_index) else {
-            return Err(WalletError::NoContract(entry_index));
-        };
-
-        let Some(ref contract) = dlc_data.contract else {
-            return Err(WalletError::ContractError("No contract found".into()));
-        };
+        let contract = self.reconstruct_contract(entry_index)?;
 
         let child_xpriv = self.derive_dlc_key(entry_index)?;
 

@@ -30,6 +30,8 @@ pub enum Error {
     Thread(String),
     #[error("internal error")]
     Bitcoin(#[from] anyhow::Error),
+    #[error("signing error: {0}")]
+    SigningError(String),
 }
 
 #[derive(Clone)]

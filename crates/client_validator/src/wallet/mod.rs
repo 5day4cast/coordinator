@@ -47,6 +47,8 @@ pub enum WalletError {
     InvalidXpriv(String),
     #[error("Invalid bech32 nostr public key: {0}")]
     InvalidPublicKey(String),
+    #[error("Dlc entry with index {0} not found")]
+    DlcEntryNotFound(u32),
 }
 
 #[cfg(target_arch = "wasm32")]

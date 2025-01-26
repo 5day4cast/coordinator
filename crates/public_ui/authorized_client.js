@@ -10,60 +10,97 @@ class AuthorizedClient {
 
   async get(url, options = {}) {
     const authHeader = await this._getAuthHeader(url, "GET", options.body);
-    return fetch(url, {
-      ...options,
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-        ...options.headers,
-        Authorization: authHeader,
-      },
-    });
+    try {
+      const response = await fetch(url, {
+        ...options,
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+          ...options.headers,
+          Authorization: authHeader,
+        },
+      }).then((res) => {
+        if (!res.ok) {
+          throw new Error(`HTTP error! status: ${res.status}`);
+        }
+        return res;
+      });
+      return response;
+    } catch (error) {
+      throw error;
+    }
   }
 
   async post(url, body = null, options = {}) {
     const authHeader = await this._getAuthHeader(url, "POST", body);
-
-    return fetch(url, {
-      ...options,
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...options.headers,
-        Authorization: authHeader,
-      },
-      body: JSON.stringify(body),
-    });
+    try {
+      const response = await fetch(url, {
+        ...options,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...options.headers,
+          Authorization: authHeader,
+        },
+        body: JSON.stringify(body),
+      }).then((res) => {
+        if (!res.ok) {
+          throw new Error(`HTTP error! status: ${res.status}`);
+        }
+        return res;
+      });
+      return response;
+    } catch (error) {
+      throw error;
+    }
   }
 
   async put(url, body = null, options = {}) {
     const authHeader = await this._getAuthHeader(url, "PUT", body);
-
-    return fetch(url, {
-      ...options,
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        ...options.headers,
-        Authorization: authHeader,
-      },
-      body: JSON.stringify(body),
-    });
+    try {
+      const response = await fetch(url, {
+        ...options,
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          ...options.headers,
+          Authorization: authHeader,
+        },
+        body: JSON.stringify(body),
+      }).then((res) => {
+        if (!res.ok) {
+          throw new Error(`HTTP error! status: ${res.status}`);
+        }
+        return res;
+      });
+      return response;
+    } catch (error) {
+      throw error;
+    }
   }
 
   async delete(url, body = null, options = {}) {
     const authHeader = await this._getAuthHeader(url, "DELETE", body);
-
-    return fetch(url, {
-      ...options,
-      method: "DELETE",
-      headers: {
-        "Content-Type": "application/json",
-        ...options.headers,
-        Authorization: authHeader,
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    });
+    try {
+      const response = await fetch(url, {
+        ...options,
+        method: "DELETE",
+        headers: {
+          "Content-Type": "application/json",
+          ...options.headers,
+          Authorization: authHeader,
+        },
+        body: body ? JSON.stringify(body) : undefined,
+      }).then((res) => {
+        if (!res.ok) {
+          throw new Error(`HTTP error! status: ${res.status}`);
+        }
+        return res;
+      });
+      return response;
+    } catch (error) {
+      throw error;
+    }
   }
 }
 

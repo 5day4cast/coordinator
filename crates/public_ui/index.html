@@ -27,8 +27,10 @@
     <script type="module" src="/ui/leader_board.js"></script>
     <script type="module" src="/ui/entry.js"></script>
     <script type="module" src="/ui/utils.js"></script>
+    <script type="module" src="/ui/musig_session_manager.js"></script>
+    <script type="module" src="/ui/musig_session_registry.js"></script>
+    <script type="module" src="/ui/signing_progress_ui.js"></script>
     <script type="module" src="/ui/dist/client_validator.js"></script>
-
 
     <section class="section">
         <div class="container">
@@ -53,6 +55,10 @@
                             </a>
                             <a href="#" class="navbar-item" id="allEntriesNavClick">
                                 Entries
+                            </a>
+                            <a href="#" class="navbar-item is-hidden" id="signingStatusNavClick">
+                              <span>Signing Status</span>
+                              <span class="tag is-info ml-2 is-hidden" id="activeSigningCount">0</span>
                             </a>
                             <!--
                                 Add back once the coordinator is ready to be used
@@ -79,6 +85,11 @@
                     </div>
                 </nav>
             </div>
+            <div id="signingStatus" class="container hidden">
+                <div class="signing-progress-content box">
+                    <div id="signingProgressContainer"></div>
+                </div>
+            </div>
             <div id="allCompetitions" class="container hidden">
                 <div class="table-container" id="competitions">
                     <table id="competitionsDataTable" class="table is-striped is-bordered is-narrow">
@@ -88,8 +99,10 @@
                                 <th>Start Time</th>
                                 <th>End Time</th>
                                 <th>Status</th>
-                                <th>Total Prize Pool Amt</th>
+                                <th>Entry fee (sats)</th>
+                                <th>Total Prize Pool Amt (sats)</th>
                                 <th>Total Entries</th>
+                                <th>Number Of Places 'In The Money'</th>
                                 <th>Enter/View</th>
                             </tr>
                         </thead>

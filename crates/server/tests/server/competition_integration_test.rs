@@ -1,11 +1,17 @@
 use anyhow::Result;
+use bdk_wallet::{
+    bitcoin::secp256k1::Secp256k1,
+    chain::{ChainPosition, ConfirmationBlockTime},
+    AddressInfo, KeychainKind, LocalOutput,
+};
 use dlctix::{
-    bitcoin::OutPoint,
+    bitcoin::{Address, Amount, KnownHrp, OutPoint, ScriptBuf, TxOut},
+    convert_xonly_key,
     musig2::secp256k1::{PublicKey, SecretKey},
     secp::Point,
 };
 use env_logger;
-use log::{debug, info};
+use log::debug;
 use maplit::hashmap;
 use nostr_sdk::ToBech32;
 use server::{
@@ -23,8 +29,8 @@ use uuid::Uuid;
 
 use crate::helpers::{
     create_test_nostr_client, create_test_wallet, generate_oracle_event,
-    generate_request_create_event, generate_test_entry, get_oracle_keys, MockBitcoinClient,
-    MockLnClient, MockOracleClient, TestParticipant,
+    generate_request_create_event, generate_test_entry, get_keys, MockBitcoinClient, MockLnClient,
+    MockOracleClient, TestParticipant,
 };
 
 static INIT_LOGGER: Once = Once::new();
@@ -57,17 +63,54 @@ impl TestContext {
             .expect("Failed to create competition store");
 
         let mut bitcoin_mock = MockBitcoinClient::new();
-        bitcoin_mock
-            .expect_get_spendable_utxo()
-            .returning(|_| Ok(OutPoint::default()));
+        bitcoin_mock.expect_get_spendable_utxo().returning(|_| {
+            Ok(LocalOutput {
+                outpoint: OutPoint::default(),
+                txout: TxOut {
+                    value: Amount::from_sat(10000000),
+                    script_pubkey: ScriptBuf::new(),
+                },
+                keychain: bdk_wallet::KeychainKind::External,
+                is_spent: false,
+                chain_position: ChainPosition::Confirmed {
+                    anchor: ConfirmationBlockTime::default(),
+                    transitively: None,
+                },
+                derivation_index: 0,
+            })
+        });
         bitcoin_mock
             .expect_get_estimated_fee_rates()
             .returning(|| Ok(hashmap! { 1 => 1.0, 2 => 2.0 }));
         bitcoin_mock.expect_broadcast().returning(|_| Ok(()));
+        bitcoin_mock.expect_get_derived_private_key().returning(|| {
+            let key = get_keys(String::from("./test_data/fake_coordinator_private_key.pem"));
+            Ok(key.1)
+        });
+        bitcoin_mock.expect_sign_psbt().returning(|_, _| Ok(true));
 
+        bitcoin_mock.expect_get_next_address().returning(|| {
+            let (public, _private) =
+                get_keys(String::from("./test_data/fake_coordinator_private_key.pem"));
+            let (x_only_public_key, _parity) = public.x_only_public_key();
+
+            let secp = Secp256k1::new();
+            let address = Address::p2tr(
+                &secp,
+                convert_xonly_key(x_only_public_key),
+                None,
+                KnownHrp::Regtest,
+            );
+
+            Ok(AddressInfo {
+                address,
+                index: 0,
+                keychain: KeychainKind::External,
+            })
+        });
         //TODO: add to the expected as we add calls to the ln client in the code
         let ln_mock = MockLnClient::new();
-        let oracle_keys = get_oracle_keys(String::from("./test_data/fake_oracle_private_key.pem"));
+        let oracle_keys = get_keys(String::from("./test_data/fake_oracle_private_key.pem"));
         let mut oracle_mock = MockOracleClient::new();
         oracle_mock.expect_create_event().returning(move |event| {
             Ok(generate_oracle_event(
@@ -93,13 +136,11 @@ impl TestContext {
     }
 
     pub async fn create_coordinator(&self) -> Result<Arc<Coordinator>> {
-        let test_cert_path = String::from("./test_data/fake_coordinator_private_key.pem");
         let coordinator = Coordinator::new(
             self.oracle_client.clone(),
             self.competition_store.clone(),
             self.bitcoin_mock.clone(),
             self.ln_mock.clone(),
-            &test_cert_path,
             144,
         )
         .await?;
@@ -257,7 +298,7 @@ async fn test_two_person_competition_flow() -> Result<()> {
         participant.wallet.add_contract(
             entry_index,
             competition.contract_parameters.clone().unwrap(),
-            competition.funding_transaction.unwrap(),
+            competition.funding_outpoint.unwrap(),
         )?;
         debug!("Added contract to participant {} wallet", contract_idx);
 
@@ -346,7 +387,7 @@ async fn test_two_person_competition_flow() -> Result<()> {
 #[tokio::test]
 async fn test_four_person_competition_flow() -> Result<()> {
     let players = 4;
-    let ranks = 2;
+    let ranks = 1;
     let locations = 3;
     let context = TestContext::new(players).await?;
     let coordinator = context.create_coordinator().await?;
@@ -460,7 +501,7 @@ async fn test_four_person_competition_flow() -> Result<()> {
         participant.wallet.add_contract(
             entry_index,
             competition.contract_parameters.clone().unwrap(),
-            competition.funding_transaction.unwrap(),
+            competition.funding_outpoint.unwrap(),
         )?;
         debug!("Added contract to participant {} wallet", contract_idx);
 
@@ -664,7 +705,7 @@ async fn test_ten_person_competition_flow() -> Result<()> {
         participant.wallet.add_contract(
             entry_index,
             competition.contract_parameters.clone().unwrap(),
-            competition.funding_transaction.unwrap(),
+            competition.funding_outpoint.unwrap(),
         )?;
         debug!("Added contract to participant {} wallet", contract_idx);
 

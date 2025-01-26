@@ -1,7 +1,7 @@
 use crate::{
     add_event_entry, admin_index_handler, create_event, create_folder,
     domain::{CompetitionStore, CompetitionWatcher, DBConnection, UserInfo},
-    get_aggregate_nonces, get_balance, get_contract_parameters, get_entries,
+    get_aggregate_nonces, get_balance, get_competitions, get_contract_parameters, get_entries,
     get_estimated_fee_rates, get_next_address, get_outputs, health, index_handler, login, register,
     send_to_address, submit_partial_signatures, submit_public_nonces, BitcoinClient,
     BitcoinSyncWatcher, Coordinator, Ln, LnClient, OracleClient, Settings, UserStore,
@@ -17,7 +17,7 @@ use axum::{
     Router,
 };
 use hyper::{
-    header::{ACCEPT, CONTENT_TYPE},
+    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
     Method,
 };
 use log::{error, info, warn};
@@ -151,9 +151,12 @@ pub async fn build_app(
 
     let orcale_url = Url::parse(&config.coordinator_settings.oracle_url)
         .map_err(|e| anyhow!("Failed to parse oracle url: {}", e))?;
-    let oracle_client = OracleClient::new(reqwest_client, &orcale_url);
+    let oracle_client = OracleClient::new(
+        reqwest_client,
+        &orcale_url,
+        &config.coordinator_settings.private_key_file,
+    )?;
     info!("Oracle client configured");
-
     create_folder(&config.db_settings.data_folder.clone());
     let competition_db = DBConnection::new(&config.db_settings.data_folder, "competitions")
         .map_err(|e| anyhow!("Error setting up competition db: {}", e))?;
@@ -169,7 +172,6 @@ pub async fn build_app(
         competition_store,
         bitcoin_client.clone(),
         ln.clone(),
-        &config.coordinator_settings.private_key_file,
         config.coordinator_settings.relative_locktime_block_delta,
     )
     .await
@@ -271,7 +273,7 @@ pub fn app(
 ) -> Router {
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([ACCEPT, CONTENT_TYPE])
+        .allow_headers([ACCEPT, CONTENT_TYPE, AUTHORIZATION])
         .allow_origin(Any);
 
     let wallet_endpoints = Router::new()
@@ -290,14 +292,18 @@ pub fn app(
         .route("/admin", get(admin_index_handler))
         .route("/health_check", get(health))
         .route("/competitions", post(create_event))
-        .route("/competitions/:id/contract", get(get_contract_parameters))
+        .route("/competitions", get(get_competitions))
+        .route("/competitions/{id}/contract", get(get_contract_parameters))
         .route(
-            "/competitions/:competition_id/entries/:entry_id/public_nonces",
+            "/competitions/{competition_id}/entries/{entry_id}/public_nonces",
             post(submit_public_nonces),
         )
-        .route("/competitions/:id/nonces", get(get_aggregate_nonces))
         .route(
-            "/competitions/:competition_id/entries/:entry_id/signatures",
+            "/competitions/{id}/aggregate_nonces",
+            get(get_aggregate_nonces),
+        )
+        .route(
+            "/competitions/{competition_id}/entries/{entry_id}/partial_signatures",
             post(submit_partial_signatures),
         )
         .route("/entries", post(add_event_entry))

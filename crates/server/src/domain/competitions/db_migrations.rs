@@ -56,7 +56,8 @@ pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), d
         number_of_places_win INT NOT NULL,
         entry_fee BIGINT NOT NULL,
         event_announcement BLOB NOT NULL,
-        funding_transaction BLOB,                -- Funding transaction outpoint
+        funding_transaction BLOB,                -- Funding transaction
+        funding_outpoint BLOB,                   -- Funding transaction outpoint
         contract_parameters BLOB,                -- DLC contract parameters
         public_nonces BLOB,                      -- Coordinator's public nonces
         aggregated_nonces BLOB,                  -- Aggregated nonces from all participants

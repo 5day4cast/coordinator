@@ -1,27 +1,29 @@
 use super::{
-    AddEntry, CompetitionError, CompetitionState, CompetitionStore, SearchBy, Ticket, UserEntry,
+    AddEntry, CompetitionError, CompetitionState, CompetitionStore, FundedContract, SearchBy,
+    Ticket, UserEntry,
 };
 use crate::{
     bitcoin_client::Bitcoin,
     domain::{Competition, CreateEvent, Error},
-    get_key,
     oracle_client::{Event, Oracle},
     Ln, OracleError,
 };
 use anyhow::anyhow;
-use dlctix::{
+use bdk_wallet::{
     bitcoin::{
-        absolute::LockTime,
-        hex::DisplayHex,
-        sighash::{Prevouts, SighashCache},
-        transaction, Amount, FeeRate, OutPoint, ScriptBuf, TapSighashType, Transaction, TxIn,
-        TxOut,
+        absolute::LockTime, hex::DisplayHex, transaction::Version, Amount, FeeRate, OutPoint, Psbt,
+        ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
     },
+    LocalOutput, SignOptions,
+};
+use dlctix::{
     convert_xonly_key, hashlock,
     musig2::{
-        self,
-        secp256k1::{Keypair, PublicKey, Scalar, Secp256k1, SecretKey},
-        AggNonce, CompactSignature, PartialSignature, PubNonce,
+        secp256k1::{
+            Keypair as Musig2Kepair, PublicKey, Scalar as Musig2Scalar, Secp256k1 as Musig2Secp256,
+            SecretKey as Musig2SecretKey,
+        },
+        AggNonce, PartialSignature, PubNonce,
     },
     secp::Point,
     ContractParameters, NonceSharingRound, Outcome, PayoutWeights, Player, PlayerIndex, SigMap,
@@ -94,7 +96,7 @@ pub struct Coordinator {
     competition_store: Arc<CompetitionStore>,
     bitcoin: Arc<dyn Bitcoin>,
     ln: Arc<dyn Ln>,
-    private_key: SecretKey,
+    private_key: Musig2SecretKey,
     public_key: PublicKey,
     relative_locktime_block_delta: u16,
 }
@@ -105,18 +107,18 @@ impl Coordinator {
         competition_store: CompetitionStore,
         bitcoin: Arc<dyn Bitcoin>,
         ln: Arc<dyn Ln>,
-        private_key_file_path: &str,
         relative_locktime_block_delta: u16,
     ) -> Result<Self, anyhow::Error> {
-        let secret_key: SecretKey = get_key(private_key_file_path)?;
-        let secp = Secp256k1::new();
-        let public_key = secret_key.public_key(&secp);
+        let private_key = bitcoin.get_derived_private_key().await?;
+        let secp = Musig2Secp256::new();
+        let public_key = private_key.public_key(&secp);
+
         let coordinator = Self {
             oracle_client,
             competition_store: Arc::new(competition_store),
             bitcoin,
             ln,
-            private_key: secret_key,
+            private_key,
             public_key,
             relative_locktime_block_delta,
         };
@@ -129,8 +131,8 @@ impl Coordinator {
         hex::encode(key)
     }
 
-    pub fn keypair(&self) -> Keypair {
-        let secp = Secp256k1::new();
+    pub fn keypair(&self) -> Musig2Kepair {
+        let secp = Musig2Secp256::new();
         self.private_key.keypair(&secp)
     }
 
@@ -157,32 +159,57 @@ impl Coordinator {
     */
 
     pub async fn competition_handler(&self) -> Result<(), anyhow::Error> {
-        let competitions: Vec<Competition> = self.competition_store.get_competitions().await?;
+        let competitions: Vec<Competition> = self.competition_store.get_competitions(true).await?;
         let mut updated_competitions: Vec<Competition> = vec![];
-
+        info!("running competition handler");
         for mut competition in competitions {
+            //TODO: change to propert retry logic
+            competition.failed_at = None;
+            competition.errors = vec![];
             if competition.skip_competition() {
+                info!(
+                    "skipping process competition {} {:?}",
+                    competition.id,
+                    competition.get_state()
+                );
                 continue;
             }
 
             // Check for timeouts first
             if competition.is_expired() {
                 competition.cancelled_at = Some(OffsetDateTime::now_utc());
-                updated_competitions.push(competition);
+                updated_competitions.push(competition.clone());
+                info!(
+                    "skipping process competition {} {:?}",
+                    competition.id,
+                    competition.get_state()
+                );
                 continue;
             }
-
-            // Process based on current state
+            info!(
+                "competition {} {:?} {:?}",
+                competition.id,
+                competition.get_state(),
+                competition
+            );
             match competition.get_state() {
                 CompetitionState::Created => {
-                    // Wait for more entries
+                    debug!(
+                        "competition {}, waiting for more entries: {}/{}",
+                        competition.id,
+                        competition.total_entries,
+                        competition.total_allowed_entries
+                    );
                     continue;
                 }
                 CompetitionState::EntriesCollected => {
-                    // Create contract
                     match self.create_transactions(competition.clone()).await {
                         Ok(updated) => updated_competitions.push(updated),
                         Err(e) => {
+                            error!(
+                                "competition {} failed to generate contract params: {}",
+                                competition.id, e
+                            );
                             competition
                                 .errors
                                 .push(CompetitionError::FailedCreateTransaction(e.to_string()));
@@ -192,13 +219,16 @@ impl Coordinator {
                     }
                 }
                 CompetitionState::NoncesCollected => {
-                    // Generate aggregate nonces and coordinators partial signatures
                     match self
                         .generate_aggregate_nonces_and_coord_partial_signatures(competition.clone())
                         .await
                     {
                         Ok(updated) => updated_competitions.push(updated),
                         Err(e) => {
+                            error!(
+                                "competition {} failed to generate aggregate nonce: {}",
+                                competition.id, e
+                            );
                             competition
                                 .errors
                                 .push(CompetitionError::FailedNonceAggregation(e.to_string()));
@@ -208,10 +238,10 @@ impl Coordinator {
                     }
                 }
                 CompetitionState::PartialSignaturesCollected => {
-                    // Publish transactions
                     match self.publish_transactions(competition.clone()).await {
                         Ok(updated) => updated_competitions.push(updated),
                         Err(e) => {
+                            error!("competition {} failed to broadcast: {}", competition.id, e);
                             competition
                                 .errors
                                 .push(CompetitionError::FailedBroadcast(e.to_string()));
@@ -225,6 +255,8 @@ impl Coordinator {
         }
 
         if !updated_competitions.is_empty() {
+            info!("updating contract");
+
             self.competition_store
                 .update_competitions(updated_competitions)
                 .await?;
@@ -261,9 +293,26 @@ impl Coordinator {
 
         let contract_amount_sats = competition.total_competition_pool;
         let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
-
+        info!("fee rates: {:?}", fee_rates);
         // TODO: make this configurable from the admin screen
-        let rate_confirm_within_2_blocks = fee_rates[&1_u16].ceil() as u64;
+        let rate_confirm_within_2_blocks = if fee_rates.is_empty() {
+            1 as u64
+        } else {
+            fee_rates[&1_u16].ceil() as u64
+        };
+
+        let fee_rate = FeeRate::from_sat_per_vb_unchecked(rate_confirm_within_2_blocks);
+        let estimated_tx_size = 200; // Approximate size for taproot tx with 1 input, 2 outputs
+        let estimated_fee = fee_rate
+            .fee_vb(estimated_tx_size)
+            .ok_or_else(|| anyhow!("Failed to calculate estimated fee"))?;
+        debug!("Estimated fee: {}", estimated_fee);
+
+        // Get UTXO first to ensure we have enough funds
+        let utxo: LocalOutput = self
+            .bitcoin
+            .get_spendable_utxo(contract_amount_sats + estimated_fee.to_sat())
+            .await?;
 
         let contract_params = ContractParameters {
             market_maker: dlctix::MarketMaker {
@@ -272,32 +321,42 @@ impl Coordinator {
             players,
             event: competition.event_announcement.clone(),
             outcome_payouts,
-            fee_rate: FeeRate::from_sat_per_vb_unchecked(rate_confirm_within_2_blocks),
+            fee_rate,
             funding_value: Amount::from_sat(contract_amount_sats),
             relative_locktime_block_delta: self.relative_locktime_block_delta,
         };
         competition.contract_parameters = Some(contract_params.clone());
         debug!("contract params have been built");
 
-        let wallet_outpoint: OutPoint = self
+        let change_amount = utxo
+            .txout
+            .value
+            .to_sat()
+            .checked_sub(contract_amount_sats)
+            .and_then(|amt| amt.checked_sub(estimated_fee.to_sat()))
+            .ok_or_else(|| anyhow!("UTXO value insufficient for contract amount plus fees"))?;
+
+        let utxo: LocalOutput = self
             .bitcoin
             .get_spendable_utxo(contract_amount_sats)
             .await?;
-        debug!("spendable utxo found");
+        debug!("Spendable utxo found");
+        debug!("UTXO value: {}", utxo.txout.value);
 
-        // Prepare a funding transaction (value should be total value of competition money pool)
-        let tx_out = TxOut {
-            value: Amount::from_sat(contract_amount_sats),
-            script_pubkey: ScriptBuf::new(),
-        };
+        debug!("Contract amount needed: {}", contract_amount_sats);
 
-        let funding_tx = signed_funding_tx(
-            Scalar::from(self.private_key),
-            contract_params.funding_output().unwrap(),
-            wallet_outpoint,
-            &tx_out,
-        );
-        debug!("signed funding tx");
+        let mut outputs = vec![contract_params.funding_output().unwrap()];
+        // Dust threshold
+        if change_amount > 1000 {
+            let change_address = self.bitcoin.get_next_address().await?;
+            outputs.push(TxOut {
+                value: Amount::from_sat(change_amount),
+                script_pubkey: change_address.script_pubkey(),
+            });
+        }
+        let funding_tx = signed_funding_tx(self.bitcoin.clone(), outputs, utxo).await?;
+
+        debug!("signed funding tx: {:?}", funding_tx);
 
         //At this point, store the funding_outpoint with the event in the DB
         let funding_outpoint = OutPoint {
@@ -305,8 +364,8 @@ impl Coordinator {
             vout: 0,
         };
 
-        competition.funding_transaction = Some(funding_outpoint);
-
+        competition.funding_transaction = Some(funding_tx);
+        competition.funding_outpoint = Some(funding_outpoint);
         // at this point time to perform musig with the players
         // this needs to be done in an async manner and a background thread waiting for users to sign
         // some thought will need to be done on the best way to do this for the least amount of user interaction
@@ -322,7 +381,7 @@ impl Coordinator {
         let signing_session = SigningSession::<NonceSharingRound>::new(
             ticketed_dlc,
             &mut rng,
-            Scalar::from(self.private_key),
+            Musig2Scalar::from(self.private_key),
         )?;
         debug!("started musig nonce sharing round");
 
@@ -337,16 +396,15 @@ impl Coordinator {
         let Some(contract_parameters) = &competition.contract_parameters else {
             return Err(anyhow!("contract parameters don't exists, failed publishing competition {} funding transaction", competition.id));
         };
-        let Some(funding_transaction) = &competition.funding_transaction else {
-            return Err(anyhow!("funding transaction doesn't exists, failed publishing competition {} funding transaction", competition.id));
+        let Some(funding_outpoint) = &competition.funding_outpoint else {
+            return Err(anyhow!("funding outpoint doesn't exists, failed publishing competition {} funding transaction", competition.id));
         };
         let Some(our_nonces) = competition.public_nonces.as_ref() else {
             return Err(anyhow!("coordinator nonces missing"));
         };
-        let ticketed_dlc = TicketedDLC::new(
-            contract_parameters.to_owned(),
-            funding_transaction.to_owned(),
-        )?;
+
+        let ticketed_dlc =
+            TicketedDLC::new(contract_parameters.to_owned(), funding_outpoint.to_owned())?;
 
         let seed = self.private_key.secret_bytes();
         let mut rng = rand::rngs::StdRng::from_seed(seed);
@@ -354,16 +412,17 @@ impl Coordinator {
         let signing_session = SigningSession::<NonceSharingRound>::new(
             ticketed_dlc,
             &mut rng,
-            Scalar::from(self.private_key),
+            Musig2Scalar::from(self.private_key),
         )?;
 
         // Verify our stored nonces match what would be generated
         if signing_session.our_public_nonces() != our_nonces {
             return Err(anyhow!("coordinator nonce mismatch"));
         }
+        debug!("our_nonces: {:?}", our_nonces);
 
         let received_nonces = self.get_received_nonces(competition.id).await?;
-
+        debug!("received_nonces: {:?}", received_nonces);
         let coordinator_sessions =
             signing_session.aggregate_nonces_and_compute_partial_signatures(received_nonces)?;
         debug!(
@@ -384,6 +443,9 @@ impl Coordinator {
         let Some(contract_parameters) = &competition.contract_parameters else {
             return Err(anyhow!("contract parameters don't exists, failed publishing competition {} funding transaction", competition.id));
         };
+        let Some(funding_outpoint) = &competition.funding_outpoint else {
+            return Err(anyhow!("funding outpoint doesn't exists, failed publishing competition {} funding transaction", competition.id));
+        };
         let Some(funding_transaction) = &competition.funding_transaction else {
             return Err(anyhow!("funding transaction doesn't exists, failed publishing competition {} funding transaction", competition.id));
         };
@@ -395,10 +457,8 @@ impl Coordinator {
             return Err(anyhow!("coordinator nonces missing"));
         };
 
-        let ticketed_dlc = TicketedDLC::new(
-            contract_parameters.to_owned(),
-            funding_transaction.to_owned(),
-        )?;
+        let ticketed_dlc =
+            TicketedDLC::new(contract_parameters.to_owned(), funding_outpoint.to_owned())?;
 
         let seed = self.private_key.secret_bytes();
         let mut rng = rand::rngs::StdRng::from_seed(seed);
@@ -407,7 +467,7 @@ impl Coordinator {
         let signing_session = SigningSession::<NonceSharingRound>::new(
             ticketed_dlc,
             &mut rng,
-            Scalar::from(self.private_key),
+            Musig2Scalar::from(self.private_key),
         )?;
 
         if signing_session.our_public_nonces() != coordinator_nonces {
@@ -415,7 +475,7 @@ impl Coordinator {
         }
 
         let received_nonces = self.get_received_nonces(competition.id).await?;
-        debug!("Built coordinator session before publishing");
+        debug!("Received all aggregate nonces from entries");
 
         let coordinator_session =
             signing_session.aggregate_nonces_and_compute_partial_signatures(received_nonces)?;
@@ -457,9 +517,11 @@ impl Coordinator {
         competition.signed_contract = Some(signed_contract);
         competition.signed_at = Some(OffsetDateTime::now_utc());
 
-        self.bitcoin
-            .broadcast(funding_transaction.to_string())
-            .await?;
+        debug!(
+            "Broadcasting funding transaction: {:?}",
+            funding_transaction
+        );
+        self.bitcoin.broadcast(funding_transaction).await?;
 
         competition.funding_broadcasted_at = Some(OffsetDateTime::now_utc());
 
@@ -558,7 +620,11 @@ impl Coordinator {
             }
             Err(e) => return Err(anyhow!("error getting stored public key: {}", e)),
         };
-        if stored_public_key != convert_xonly_key(self.public_key.x_only_public_key().0) {
+        let dlc_pubkey = Point::from(self.public_key);
+        let (xonly, _) = dlc_pubkey.into();
+        let bitcoin_key = convert_xonly_key(xonly);
+
+        if stored_public_key != bitcoin_key {
             return Err(anyhow!(
                 "stored_pubkey: {:?} pem_pubkey: {:?}",
                 stored_public_key,
@@ -569,8 +635,12 @@ impl Coordinator {
     }
 
     async fn add_metadata(&self) -> Result<(), anyhow::Error> {
+        let dlc_pubkey = Point::from(self.public_key);
+        let (xonly, _) = dlc_pubkey.into();
+        let bitcoin_key = convert_xonly_key(xonly);
+
         self.competition_store
-            .add_coordinator_metadata(convert_xonly_key(self.public_key.x_only_public_key().0))
+            .add_coordinator_metadata(bitcoin_key)
             .await
             .map_err(|e| anyhow!("failed to add coordinator metadata: {}", e))
     }
@@ -609,6 +679,16 @@ impl Coordinator {
         Ok(competition)
     }
 
+    pub async fn get_competitions(&self) -> Result<Vec<Competition>, Error> {
+        self.competition_store
+            .get_competitions(false)
+            .map_err(|e| {
+                error!("failed to get competitions: {:?}", e);
+                Error::DbError(e)
+            })
+            .await
+    }
+
     pub async fn get_competition(&self, competition_id: Uuid) -> Result<Competition, Error> {
         self.competition_store
             .get_competition(competition_id)
@@ -645,7 +725,6 @@ impl Coordinator {
             Err(OracleError::BadRequest(e)) => Err(Error::BadRequest(e)),
             Err(e) => Err(Error::OracleFailed(e)),
         }?;
-
         let user_entry = self
             .competition_store
             .add_entry(
@@ -680,7 +759,7 @@ impl Coordinator {
         &self,
         pubkey: String,
         competition_id: Uuid,
-    ) -> Result<ContractParameters, Error> {
+    ) -> Result<FundedContract, Error> {
         let competition = self
             .competition_store
             .get_competition(competition_id)
@@ -704,11 +783,23 @@ impl Coordinator {
             )));
         }
 
-        competition.contract_parameters.ok_or_else(|| {
+        let contract = competition.contract_parameters.ok_or_else(|| {
             Error::NotFound(format!(
                 "Contract parameters not yet available for competition {}",
                 competition_id
             ))
+        })?;
+
+        let funding_outpoint = competition.funding_outpoint.ok_or_else(|| {
+            Error::NotFound(format!(
+                "Funding transaction is not yet available for competition {}",
+                competition_id
+            ))
+        })?;
+
+        Ok(FundedContract {
+            contract_params: contract,
+            funding_outpoint,
         })
     }
 
@@ -719,19 +810,28 @@ impl Coordinator {
         entry_id: Uuid,
         public_nonces: SigMap<PubNonce>,
     ) -> Result<(), Error> {
+        debug!(
+            "Submitting nonces for entry {}: {:?}",
+            entry_id, public_nonces
+        );
         let competition = self
             .competition_store
             .get_competition(competition_id)
             .await?;
 
-        // Verify the competition has contract parameters
         if competition.contract_parameters.is_none() {
             return Err(Error::BadRequest(
                 "Contract parameters not yet available".to_string(),
             ));
         }
 
-        // Verify user has an entry in this competition
+        if public_nonces.is_mirror(&competition.public_nonces.unwrap()) {
+            return Err(Error::BadRequest(format!(
+                "public nonces do not match competitions: {}",
+                entry_id
+            )));
+        }
+
         let entries = self
             .competition_store
             .get_user_entries(
@@ -747,17 +847,22 @@ impl Coordinator {
             .find(|e| e.id == entry_id)
             .ok_or_else(|| Error::NotFound(format!("Entry {} not found", entry_id)))?;
 
-        // Verify entry hasn't already submitted nonces
         if entry.public_nonces.is_some() {
             return Err(Error::BadRequest(
                 "Public nonces already submitted for this entry".to_string(),
             ));
         }
 
-        // Save the public nonces
         self.competition_store
             .add_public_nonces(entry_id, public_nonces)
-            .await?;
+            .await
+            .map_err(|e| {
+                error!(
+                    "failed save entry public nonces: entry_id {}, event_id {} {:?}",
+                    entry_id, competition_id, e
+                );
+                Error::DbError(e)
+            })?;
 
         Ok(())
     }
@@ -772,7 +877,6 @@ impl Coordinator {
             .get_competition(competition_id)
             .await?;
 
-        // Verify user has an entry in this competition
         let entries = self
             .competition_store
             .get_user_entries(
@@ -805,6 +909,30 @@ impl Coordinator {
         entry_id: Uuid,
         partial_sigs: SigMap<PartialSignature>,
     ) -> Result<(), Error> {
+        let competition = self
+            .competition_store
+            .get_competition(competition_id)
+            .await?;
+
+        if competition.contract_parameters.is_none() {
+            return Err(Error::BadRequest(
+                "Contract parameters not yet available".to_string(),
+            ));
+        }
+
+        let Some(comp_partial_signatures) = competition.partial_signatures else {
+            return Err(Error::BadRequest(
+                "Contract partial_signatures not yet available".to_string(),
+            ));
+        };
+
+        if partial_sigs.is_mirror(&comp_partial_signatures) {
+            return Err(Error::BadRequest(format!(
+                "parital signatures do not match competitions: {}",
+                entry_id
+            )));
+        }
+        debug!("adding signatures on entry {} for {}", entry_id, pubkey);
         let entries = self
             .competition_store
             .get_user_entries(
@@ -822,7 +950,14 @@ impl Coordinator {
 
         self.competition_store
             .add_partial_signatures(entry_id, partial_sigs)
-            .await?;
+            .await
+            .map_err(|e| {
+                error!(
+                    "failed save entry signatures: entry_id {}, event_id {} {:?}",
+                    entry_id, competition_id, e
+                );
+                Error::DbError(e)
+            })?;
 
         Ok(())
     }
@@ -985,33 +1120,41 @@ fn find_winning_entries_pubkeys(
         .collect()
 }
 
-fn signed_funding_tx(
-    market_maker_seckey: Scalar,
-    funding_output: TxOut,
-    mm_utxo_outpoint: OutPoint,
-    mm_utxo_prevout: &TxOut,
-) -> Transaction {
-    let mut funding_tx = Transaction {
-        version: transaction::Version::TWO,
+async fn signed_funding_tx(
+    bitcoin_client: Arc<dyn Bitcoin>,
+    outputs: Vec<TxOut>,
+    utxo: LocalOutput,
+) -> Result<Transaction, anyhow::Error> {
+    // Create unsigned transaction first
+    let funding_tx = Transaction {
+        version: Version::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: mm_utxo_outpoint,
-            ..TxIn::default()
+            previous_output: utxo.outpoint,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::default(),
         }],
-        output: vec![funding_output],
+        output: outputs,
     };
 
-    let funding_tx_sighash = SighashCache::new(&funding_tx)
-        .taproot_key_spend_signature_hash(
-            0,
-            &Prevouts::All(&[mm_utxo_prevout]),
-            TapSighashType::Default,
-        )
-        .unwrap();
+    // Create PSBT from unsigned transaction
+    let mut psbt = Psbt::from_unsigned_tx(funding_tx)?;
 
-    let signature: CompactSignature =
-        musig2::deterministic::sign_solo(market_maker_seckey, funding_tx_sighash);
+    // Add input data
+    psbt.inputs[0].witness_utxo = Some(utxo.txout.clone());
 
-    funding_tx.input[0].witness.push(signature.serialize());
-    funding_tx
+    let finalized = bitcoin_client
+        .sign_psbt(&mut psbt, SignOptions::default())
+        .await?;
+    if !finalized {
+        return Err(anyhow!("Failed to sign PSBT"));
+    }
+
+    let final_tx = psbt.extract_tx()?;
+
+    debug!("Successfully signed funding transaction");
+    debug!("Txid: {}", final_tx.compute_txid());
+
+    Ok(final_tx)
 }

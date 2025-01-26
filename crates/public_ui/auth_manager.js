@@ -8,6 +8,8 @@ import init, {
 import { AuthorizedClient } from "./authorized_client.js";
 
 export async function setupAuthManager(apiBase, network) {
+  console.log(apiBase);
+  console.log(network);
   const auth_manager = new AuthManager(apiBase, network);
   console.log("initialized auth manager");
   return auth_manager;
@@ -148,7 +150,6 @@ class AuthManager {
 
       const privateKeyDisplay = document.getElementById("privateKeyDisplay");
       privateKeyDisplay.value = await window.nostrClient.getPrivateKey();
-
       // Show step 1 (in case it was hidden)
       document.getElementById("registerStep1").classList.remove("is-hidden");
       document.getElementById("registerStep2").classList.add("is-hidden");
@@ -205,14 +206,14 @@ class AuthManager {
 
   async performRegistration() {
     const pubkey = await window.nostrClient.getPublicKey();
-
+    console.log(this.network);
     const wallet = await new TaprootWalletBuilder()
       .network(this.network)
       .nostr_client(window.nostrClient)
       .build();
-
+    console.log("wallet built");
     const payload = await wallet.getEncryptedMasterKey(pubkey);
-
+    console.log(this.apiBase);
     const response = await this.authorizedClient.post(
       `${this.apiBase}/users/register`,
       payload,
@@ -274,15 +275,26 @@ class AuthManager {
 
     document.getElementById("authButtons").classList.remove("is-hidden");
     document.getElementById("logoutNavClick").classList.add("is-hidden");
+    document.getElementById("signingStatusNavClick").classList.add("is-hidden");
 
     // Clear any sensitive data
     document.getElementById("loginPrivateKey").value = "";
     document.getElementById("privateKeyDisplay").value = "";
+
+    const competitionsNavClick = document.getElementById(
+      "allCompetitionsNavClick",
+    );
+    if (competitionsNavClick) {
+      competitionsNavClick.click();
+    }
   }
 
   onLoginSuccess() {
     document.getElementById("authButtons").classList.add("is-hidden");
     document.getElementById("logoutNavClick").classList.remove("is-hidden");
+    document
+      .getElementById("signingStatusNavClick")
+      .classList.remove("is-hidden");
 
     // Close any open modals
     document.querySelectorAll(".modal.is-active").forEach((modal) => {

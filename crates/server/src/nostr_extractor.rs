@@ -8,13 +8,33 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use hyper::{header::AUTHORIZATION, StatusCode};
 use log::{info, warn};
 use nostr_sdk::{
+    hashes::sha256::Hash as Sha256Hash,
     nips::nip98::{HttpData, HttpMethod},
-    Event, Kind, PublicKey, Url,
+    Event, EventBuilder, Keys, Kind, PublicKey, Url,
 };
 use serde::{ser::SerializeStruct, Serialize, Serializer};
 use serde_json::json;
 use std::str::FromStr;
 use time::OffsetDateTime;
+
+pub async fn create_auth_event(
+    method: &str,
+    url: &str,
+    payload_hash: Option<Sha256Hash>,
+    keys: &Keys,
+) -> Event {
+    let http_method = HttpMethod::from_str(method).unwrap();
+    let http_url = Url::from_str(url).unwrap();
+    let mut http_data = HttpData::new(http_url, http_method);
+
+    if let Some(hash) = payload_hash {
+        http_data = http_data.payload(hash);
+    }
+
+    EventBuilder::http_auth(http_data)
+        .sign_with_keys(keys)
+        .expect("Failed to sign event")
+}
 
 #[derive(Clone, Debug)]
 pub struct NostrAuth {
@@ -216,25 +236,6 @@ mod tests {
     use std::{str::FromStr, sync::Arc};
     #[derive(Clone)]
     pub struct AppState;
-
-    async fn create_auth_event(
-        method: &str,
-        url: &str,
-        payload_hash: Option<Sha256Hash>,
-        keys: &Keys,
-    ) -> Event {
-        let http_method = HttpMethod::from_str(method).unwrap();
-        let http_url = Url::from_str(url).unwrap();
-        let mut http_data = HttpData::new(http_url, http_method);
-
-        if let Some(hash) = payload_hash {
-            http_data = http_data.payload(hash);
-        }
-
-        EventBuilder::http_auth(http_data)
-            .sign_with_keys(keys)
-            .expect("Failed to sign event")
-    }
 
     #[tokio::test]
     async fn test_valid_get_request() {

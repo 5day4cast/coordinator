@@ -122,7 +122,7 @@ impl Default for CoordinatorSettings {
     fn default() -> Self {
         CoordinatorSettings {
             oracle_url: String::from("https://www.4casttruth.win"),
-            private_key_file: String::from("./coordinator_private_key.pem"),
+            private_key_file: String::from("./creds/coordinator_private_key.pem"),
             relative_locktime_block_delta: 144,
         }
     }
@@ -139,8 +139,8 @@ pub struct UISettings {
 impl Default for UISettings {
     fn default() -> Self {
         UISettings {
-            private_url: String::from("http://127.0.0.1:9100"),
-            remote_url: String::from("http://127.0.0.1:9100"),
+            private_url: String::from("http://127.0.0.1:8900"),
+            remote_url: String::from("http://127.0.0.1:8900"),
             ui_dir: String::from("./crates/public_ui"),
             admin_ui_dir: String::from("./crates/admin_ui"),
         }

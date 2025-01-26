@@ -4,7 +4,7 @@ use dlctix::{
     SigMap,
 };
 use duckdb::{params, params_from_iter, types::Value, Connection};
-use log::{debug, trace};
+use log::trace;
 use scooby::postgres::{select, Joinable};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
@@ -276,6 +276,7 @@ impl CompetitionStore {
 
             let query = "UPDATE competitions SET
                 funding_transaction = ?,
+                funding_outpoint = ?,
                 contract_parameters = ?,
                 public_nonces = ?,
                 aggregated_nonces = ?,
@@ -294,6 +295,15 @@ impl CompetitionStore {
                     serde_json::to_vec(funding_transaction)
                         .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?,
                 ));
+            } else {
+                params.push(Value::Null);
+            }
+
+            if let Some(funding_outpoint) = &competition.funding_outpoint {
+                params
+                    .push(Value::Blob(serde_json::to_vec(funding_outpoint).map_err(
+                        |e| duckdb::Error::ToSqlConversionFailure(Box::new(e)),
+                    )?));
             } else {
                 params.push(Value::Null);
             }
@@ -378,8 +388,11 @@ impl CompetitionStore {
         Ok(())
     }
 
-    pub async fn get_competitions(&self) -> Result<Vec<Competition>, duckdb::Error> {
-        let query_str = select((
+    pub async fn get_competitions(
+        &self,
+        active_only: bool,
+    ) -> Result<Vec<Competition>, duckdb::Error> {
+        let mut query = select((
             "competitions.id as id",
             "created_at::TEXT as created_at",
             "total_competition_pool",
@@ -396,6 +409,7 @@ impl CompetitionStore {
         ))
         .and_select((
             "funding_transaction",
+            "funding_outpoint",
             "contract_parameters",
             "competitions.public_nonces as public_nonces",
             "aggregated_nonces",
@@ -412,37 +426,43 @@ impl CompetitionStore {
         ))
         .from(
             "competitions"
-                .join("entries")
+                .left_join("entries")
                 .on("entries.event_id = competitions.id"),
-        )
-        // filters out competitions in terminal states
-        .where_("funding_broadcasted_at IS NULL AND cancelled_at IS NULL AND failed_at IS NULL")
-        .group_by((
-            "competitions.id",
-            "created_at",
-            "total_competition_pool",
-            "total_allowed_entries",
-            "number_of_places_win",
-            "entry_fee",
-            "event_announcement",
-            "funding_transaction",
-        ))
-        .group_by((
-            "contract_parameters",
-            "competitions.public_nonces",
-            "aggregated_nonces",
-            "competitions.partial_signatures",
-        ))
-        .group_by((
-            "signed_contract",
-            "cancelled_at",
-            "contracted_at",
-            "competitions.signed_at",
-            "funding_broadcasted_at",
-            "failed_at",
-            "errors",
-        ))
-        .to_string();
+        );
+
+        if active_only {
+            // filters out competitions in terminal states
+            query = query.where_("funding_broadcasted_at IS NULL AND cancelled_at IS NULL");
+        }
+
+        let query_str = query
+            .group_by((
+                "competitions.id",
+                "created_at",
+                "total_competition_pool",
+                "total_allowed_entries",
+                "number_of_places_win",
+                "entry_fee",
+                "event_announcement",
+                "funding_transaction",
+            ))
+            .group_by((
+                "funding_outpoint",
+                "contract_parameters",
+                "competitions.public_nonces",
+                "aggregated_nonces",
+                "competitions.partial_signatures",
+            ))
+            .group_by((
+                "signed_contract",
+                "cancelled_at",
+                "contracted_at",
+                "competitions.signed_at",
+                "funding_broadcasted_at",
+                "failed_at",
+                "errors",
+            ))
+            .to_string();
         trace!("competitions query: {}", query_str);
         let conn = self.db_connection.new_readonly_connection_retry().await?;
         let mut stmt = conn.prepare(&query_str)?;
@@ -477,6 +497,7 @@ impl CompetitionStore {
         ))
         .and_select((
             "funding_transaction",
+            "funding_outpoint",
             "contract_parameters",
             "competitions.public_nonces as public_nonces",
             "aggregated_nonces",
@@ -508,6 +529,7 @@ impl CompetitionStore {
             "funding_transaction",
         ))
         .group_by((
+            "funding_outpoint",
             "contract_parameters",
             "competitions.public_nonces",
             "aggregated_nonces",

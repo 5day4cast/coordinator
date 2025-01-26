@@ -1,5 +1,7 @@
 import { displayCompetitions } from "./competitions.js";
 import { displayEntries } from "./entries.js";
+import { getMusigRegistry } from "./main.js";
+
 const oracleBase = ORACLE_BASE;
 const apiBase = API_BASE;
 
@@ -44,6 +46,22 @@ $navbarItems.forEach(function ($navbarItem) {
         showContainer(targetContainerId);
         displayCompetitions(apiBase, oracleBase);
         break;
+      case "signingStatus":
+        console.log("displaying signing status");
+        hideAllContainers();
+        showContainer(targetContainerId);
+        const registry = getMusigRegistry();
+        if (registry) {
+          const observers = Array.from(registry.observers);
+          console.log("Observers:", observers);
+          const signingUI = observers.find((obs) => obs.toggleVisibility);
+          console.log("SigningUI:", signingUI);
+          if (signingUI) {
+            signingUI.show();
+            signingUI.updateUI();
+          }
+        }
+        break;
       default:
     }
   });
@@ -61,7 +79,13 @@ function hideAllContainers() {
 
 function showContainer(containerId) {
   const $containerToShow = document.getElementById(containerId);
+  console.log("Showing container:", containerId, $containerToShow);
+
   if ($containerToShow) {
     $containerToShow.classList.remove("hidden");
+    console.log(
+      "Container classes after show:",
+      $containerToShow.classList.toString(),
+    );
   }
 }
