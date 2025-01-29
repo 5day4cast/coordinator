@@ -32,6 +32,7 @@ pub trait Ln: Send + Sync {
     ) -> Result<InvoiceAddResponse, anyhow::Error>;
     async fn cancel_hold_invoice(&self, ticket_hash: String) -> Result<(), anyhow::Error>;
     async fn settle_hold_invoice(&self, ticket_preimage: String) -> Result<(), anyhow::Error>;
+    async fn lookup_invoices(&self, invoice_preimage: String) -> Result<(), anyhow::Error>;
     async fn send_payment(
         &self,
         payout_payment_request: String,

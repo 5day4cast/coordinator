@@ -9,7 +9,7 @@ use bdk_wallet::{
     bitcoin::{
         address::NetworkChecked,
         bip32::{ChildNumber, Xpriv},
-        secp256k1::{Secp256k1, SecretKey as BdkSecretKey},
+        secp256k1::SecretKey as BdkSecretKey,
         Address, Amount, Network, NetworkKind, Psbt, Transaction, Txid,
     },
     coin_selection::DefaultCoinSelectionAlgorithm,
@@ -404,8 +404,6 @@ fn setup_wallet_descriptors(
 fn derive_wallet_key(seed_path: &str, network: NetworkKind) -> Result<Xpriv, anyhow::Error> {
     // Get the secret key from the provided path
     let secret_key: BdkSecretKey = get_key(seed_path)?;
-    let secp = Secp256k1::new();
-
     let chain_code = ChainCode::from(secret_key.secret_bytes());
 
     // Create extended private key with network support

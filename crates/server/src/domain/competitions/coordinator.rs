@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     bitcoin_client::Bitcoin,
-    domain::{Competition, CreateEvent, Error},
+    domain::{Competition, CreateEvent, EntryStatus, Error},
     oracle_client::{Event, Oracle},
     Ln, OracleError,
 };
@@ -272,7 +272,7 @@ impl Coordinator {
         debug!("Creating transactions for competition: {}", competition.id);
         let mut entries = self
             .competition_store
-            .get_competition_entries(competition.id)
+            .get_competition_entries(competition.id, vec![EntryStatus::Paid])
             .await?;
         debug!("Competition entries {:?}", entries);
 
@@ -519,7 +519,7 @@ impl Coordinator {
 
         debug!(
             "Broadcasting funding transaction: {:?}",
-            funding_transaction
+            funding_transaction.compute_txid()
         );
         self.bitcoin.broadcast(funding_transaction).await?;
 
@@ -536,7 +536,7 @@ impl Coordinator {
         // Get all entries for this competition
         let entries = self
             .competition_store
-            .get_competition_entries(competition_id)
+            .get_competition_entries(competition_id, vec![EntryStatus::Paid])
             .await?;
 
         let mut nonces_map: BTreeMap<Point, SigMap<PubNonce>> = BTreeMap::new();
@@ -575,7 +575,7 @@ impl Coordinator {
         // Get all entries for this competition
         let entries = self
             .competition_store
-            .get_competition_entries(competition_id)
+            .get_competition_entries(competition_id, vec![EntryStatus::Paid])
             .await?;
 
         let entry_count = entries.len();

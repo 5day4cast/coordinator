@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::domain::DBConnection;
 
-use super::{run_comeptition_migrations, Competition, SearchBy, UserEntry};
+use super::{run_comeptition_migrations, Competition, EntryStatus, SearchBy, UserEntry};
 
 #[derive(Clone)]
 pub struct CompetitionStore {
@@ -133,8 +133,9 @@ impl CompetitionStore {
     pub async fn get_competition_entries(
         &self,
         event_id: Uuid,
+        statuses: Vec<EntryStatus>,
     ) -> Result<Vec<UserEntry>, duckdb::Error> {
-        let select = select((
+        let mut select = select((
             "id",
             "event_id",
             "pubkey",
@@ -156,6 +157,18 @@ impl CompetitionStore {
             "paid_at::TEXT",
         ))
         .from("entries");
+        if !statuses.is_empty() {
+            for status in statuses {
+                match status {
+                    EntryStatus::Paid => {
+                        select = select.where_("signed_at");
+                    }
+                    EntryStatus::Signed => {
+                        select = select.where_("paid_at");
+                    }
+                }
+            }
+        }
         let query_str = select.where_("event_id = ?").to_string();
         trace!("get competition entries query: {}", query_str);
         let conn = self.db_connection.new_readonly_connection_retry().await?;

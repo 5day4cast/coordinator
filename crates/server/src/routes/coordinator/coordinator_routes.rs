@@ -33,7 +33,11 @@ pub async fn create_event(
             e.into()
         })
 }
-
+/* Two steps
+1) submit entry with preimage_hash for the hold invoice, receive hold invoice payment request
+2) pay the hold invoice (server watching invoice state to become accepted)
+3) server marks entry as paid -> include in competition
+*/
 pub async fn add_event_entry(
     NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
