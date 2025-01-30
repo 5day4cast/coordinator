@@ -9,6 +9,7 @@ use dlctix::{
 };
 use hyper::StatusCode;
 use log::{debug, error};
+use serde::Serialize;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -33,10 +34,33 @@ pub async fn create_event(
             e.into()
         })
 }
+
+#[derive(Debug, Serialize)]
+pub struct TicketResponse {
+    pub ticket_id: Uuid,
+    pub payment_request: String, // Lightning HODL invoice
+}
+
+pub async fn request_competition_ticket(
+    NostrAuth { pubkey, .. }: NostrAuth,
+    State(state): State<Arc<AppState>>,
+    Path(competition_id): Path<Uuid>,
+) -> Result<Json<TicketResponse>, ErrorResponse> {
+    state
+        .coordinator
+        .request_ticket(pubkey.to_hex(), competition_id)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            error!("error requesting ticket: {:?}", e);
+            e.into()
+        })
+}
+
 /* Two steps
-1) submit entry with preimage_hash for the hold invoice, receive hold invoice payment request
+1) submit entry with ticket_id for the hold invoice
 2) pay the hold invoice (server watching invoice state to become accepted)
-3) server marks entry as paid -> include in competition
+3) server marks ticket as paid -> include in competition
 */
 pub async fn add_event_entry(
     NostrAuth { pubkey, .. }: NostrAuth,

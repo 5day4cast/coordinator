@@ -6,7 +6,7 @@ use crate::{
     bitcoin_client::Bitcoin,
     domain::{Competition, CreateEvent, EntryStatus, Error},
     oracle_client::{Event, Oracle},
-    Ln, OracleError,
+    Ln, OracleError, TicketResponse,
 };
 use anyhow::anyhow;
 use bdk_wallet::{
@@ -663,13 +663,16 @@ impl Coordinator {
         }?;
 
         let competition = Competition::new(&create_event, &oracle_event);
+        let tickets = competition
+            .generate_competition_tickets(create_event.total_allowed_entries, &self.ln)
+            .await?;
 
         let competition = self
             .competition_store
-            .add_competition(competition)
+            .add_competition_with_tickets(competition)
             .map_err(|e| {
                 error!(
-                    "competition added to oracle, but failed to be saved: competition_id {} {:?}",
+                    "competition added to oracle, but failed to be saved with tickets: competition_id {} {:?}",
                     create_event.id, e
                 );
                 Error::DbError(e)
@@ -687,6 +690,31 @@ impl Coordinator {
                 Error::DbError(e)
             })
             .await
+    }
+
+    pub async fn request_ticket(
+        &self,
+        pubkey: String,
+        competition_id: Uuid,
+    ) -> Result<TicketResponse, Error> {
+        let competition = self
+            .competition_store
+            .get_competition(competition_id)
+            .await?;
+
+        if competition.total_entries >= competition.total_allowed_entries {
+            return Err(Error::CompetitionFull);
+        }
+
+        let ticket = self
+            .competition_store
+            .get_available_ticket(competition_id)
+            .await?;
+
+        Ok(TicketResponse {
+            ticket_id: ticket.id,
+            payment_request: ticket.payment_request,
+        })
     }
 
     pub async fn get_competition(&self, competition_id: Uuid) -> Result<Competition, Error> {
@@ -710,7 +738,8 @@ impl Coordinator {
         let ticket_preimage_encrypt = ticket_preimage.to_lower_hex_string();
         Ok(Ticket {
             hash: ticket_hash.to_lower_hex_string(),
-            preimage: ticket_preimage_encrypt,
+            encrypted_preimage: ticket_preimage_encrypt,
+            payment_request: "".to_owned(),
         })
     }
 

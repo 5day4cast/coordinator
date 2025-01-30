@@ -71,23 +71,31 @@ pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), d
         errors BLOB                             -- List of errors that lead to failed_at
     );
 
+    CREATE TABLE IF NOT EXISTS tickets
+    (
+        id UUID PRIMARY KEY,
+        event_id UUID NOT NULL          REFERENCES competitions (id),
+        entry_id UUID UNIQUE                REFERENCES entries (id),
+        encrypted_preimage TEXT NOT NULL,       -- encrypted with the cooridinator private key
+        hash TEXT NOT NULL,                     -- hash of the preimage, used in generating payment_request for user
+        payment_request TEXT                    -- hodl invoice payment request generated for the ticket
+        paid_at TIMESTAMPTZ                     -- when user payment is pending for the ticket
+    );
+
     CREATE TABLE IF NOT EXISTS entries
     (
         id UUID PRIMARY KEY,
-        event_id UUID NOT NULL REFERENCES competitions (id),
+        event_id UUID NOT NULL          REFERENCES competitions (id),
         pubkey STRING NOT NULL,                 -- user nostr pubkey
         ephemeral_pubkey TEXT NOT NULL,         -- user ephemeral pubkey for DLC
         ephemeral_privatekey_user_encrypted TEXT NOT NULL,  -- store for better UX, backed up in user wallet
         ephemeral_privatekey TEXT,              -- provided by user on payout, encrypted by coordinator_key
         public_nonces BLOB,                     -- player signed nonces during musig signing session
         partial_signatures BLOB,                -- player partial signatures
-        ticket_preimage TEXT,                   -- market maker generated preimage user needs for winnings
-        ticket_hash TEXT,                       -- hash of market marker preimage
         payout_preimage_user_encrypted TEXT NOT NULL, -- store for better UX, backed up in user wallet
         payout_hash TEXT NOT NULL,              -- user provided hash of preimage to get winnings
         payout_preimage TEXT,                   -- provided by user on payout, encrypted by coordinator_key
         signed_at TIMESTAMPTZ,                  -- when user completes musig signing
-        paid_at TIMESTAMPTZ                     -- when user pays for the ticket
     );
 
     INSERT INTO db_version (version) VALUES (1);

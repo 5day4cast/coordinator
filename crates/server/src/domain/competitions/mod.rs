@@ -15,7 +15,6 @@ use duckdb::{
     Row,
 };
 use log::debug;
-use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 pub use store::*;
 use time::{macros::format_description, Duration, OffsetDateTime};
@@ -25,6 +24,8 @@ use uuid::Uuid;
 pub struct AddEntry {
     /// Client needs to provide a valid Uuidv7
     pub id: Uuid,
+    /// ID that matches a ticket in this competition that the user paid
+    pub ticket_id: Uuid,
     pub ephemeral_pubkey: String,
     /// User provided private encrypted to their nostr key, only stored for easier UX,
     /// backed up via dm to user
@@ -51,6 +52,8 @@ pub struct UserEntry {
     pub id: Uuid,
     /// The id used by the oracle to assoicate the event with this entry
     pub event_id: Uuid,
+    /// The id used for the ticket the user needs to have paid for entry to be valid
+    pub ticket_id: Uuid,
     /// The user's nostr pubkey
     pub pubkey: String,
     /// Pubkey created for this entry for the user
@@ -70,24 +73,10 @@ pub struct UserEntry {
     pub ephemeral_privatekey: Option<String>,
     /// User provided preimage de-encrypted, only used during payout
     pub payout_preimage: Option<String>,
-    /// ticker preimage encrypted by the cooridinator's private key
-    /// will be used by the user to claim their winnings
-    pub ticket_preimage_encrypted: String,
-    /// raw preimage user needs to claim winnings, only added once the competition has it's funding transaction
-    /// broadcasted and confirmed in a block
-    pub ticket_preimgae: Option<String>,
-    /// The ticket hashes used for HTLCs. To buy into the DLC, players must
-    /// purchase the preimages of these hashes. Expects the hash in hex.
-    pub ticket_hash: String,
-    /// The payment request shown to the user for their payment into the competition
-    /// This will be a hold invoice (active for only 3 hours, otherwise competition cancelled and users refunded)
-    pub ticket_payment_request: String,
     pub public_nonces: Option<SigMap<PubNonce>>,
     pub partial_signatures: Option<SigMap<PartialSignature>>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub signed_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
-    pub paid_at: Option<OffsetDateTime>,
 }
 
 impl<'a> TryFrom<&Row<'a>> for UserEntry {
@@ -98,7 +87,7 @@ impl<'a> TryFrom<&Row<'a>> for UserEntry {
         let sql_time_format = format_description!(
             "[year]-[month]-[day] [hour]:[minute]:[second][optional [.[subsecond]]][offset_hour]"
         );
-        let signed_at: Option<OffsetDateTime> = match row.get::<usize, Option<String>>(13)? {
+        let signed_at: Option<OffsetDateTime> = match row.get::<usize, Option<String>>(12)? {
             Some(val) => match OffsetDateTime::parse(&val, &sql_time_format) {
                 Ok(datetime) => Some(datetime),
                 Err(e) => {
@@ -111,29 +100,16 @@ impl<'a> TryFrom<&Row<'a>> for UserEntry {
             },
             _ => None,
         };
-        let paid_at: Option<OffsetDateTime> = match row.get::<usize, Option<String>>(14)? {
-            Some(val) => match OffsetDateTime::parse(&val, &sql_time_format) {
-                Ok(datetime) => Some(datetime),
-                Err(e) => {
-                    return Err(duckdb::Error::FromSqlConversionFailure(
-                        4,
-                        Type::Any,
-                        Box::new(e),
-                    ))
-                }
-            },
-            _ => None,
-        };
 
         let public_nonces: Option<SigMap<PubNonce>> =
-            row.get::<usize, Option<Value>>(6).map(|opt| {
+            row.get::<usize, Option<Value>>(7).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?;
         let partial_signatures: Option<SigMap<PartialSignature>> =
-            row.get::<usize, Option<Value>>(7).map(|opt| {
+            row.get::<usize, Option<Value>>(8).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
@@ -145,45 +121,41 @@ impl<'a> TryFrom<&Row<'a>> for UserEntry {
                 .get::<usize, String>(0)
                 .map(|val| Uuid::parse_str(&val))?
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(0, Type::Text, Box::new(e)))?,
-            event_id: row
+            ticket_id: row
                 .get::<usize, String>(1)
                 .map(|val| Uuid::parse_str(&val))?
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(0, Type::Text, Box::new(e)))?,
+            event_id: row
+                .get::<usize, String>(2)
+                .map(|val| Uuid::parse_str(&val))?
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(1, Type::Text, Box::new(e)))?,
-            pubkey: row.get::<usize, String>(2)?,
-            ephemeral_pubkey: row.get::<usize, String>(3)?,
-            ephemeral_privatekey_encrypted: row.get::<usize, String>(4)?,
-            ephemeral_privatekey: row.get::<usize, Option<String>>(5)?,
+            pubkey: row.get::<usize, String>(3)?,
+            ephemeral_pubkey: row.get::<usize, String>(4)?,
+            ephemeral_privatekey_encrypted: row.get::<usize, String>(5)?,
+            ephemeral_privatekey: row.get::<usize, Option<String>>(6)?,
             public_nonces,
             partial_signatures,
-            ticket_preimage_encrypted: row.get::<usize, String>(8)?,
-            ticket_hash: row.get::<usize, String>(9)?, //TODO: fix ordering
-            ticket_preimgae: row.get::<usize, Option<String>>(9)?,
-            ticket_payment_request: row.get::<usize, String>(10)?,
-            payout_preimage_encrypted: row.get(10)?,
-            payout_hash: row.get(11)?,
-            payout_preimage: row.get::<usize, Option<String>>(12)?,
+            payout_preimage_encrypted: row.get(9)?,
+            payout_hash: row.get(10)?,
+            payout_preimage: row.get::<usize, Option<String>>(11)?,
             signed_at,
-            paid_at,
         };
         Ok(user_entry)
     }
 }
 
 impl AddEntry {
-    fn into_user_entry(self, pubkey: String, ticket: Ticket) -> UserEntry {
+    fn into_user_entry(self, pubkey: String, ticket_id: Uuid) -> UserEntry {
         UserEntry {
             id: self.id,
             event_id: self.event_id,
+            ticket_id,
             pubkey,
             ephemeral_pubkey: self.ephemeral_pubkey,
             ephemeral_privatekey_encrypted: self.ephemeral_privatekey_encrypted,
             payout_hash: self.payout_hash,
             payout_preimage_encrypted: self.payout_preimage_encrypted,
-            ticket_payment_request: ticket.payment_request,
-            ticket_hash: ticket.hash,
-            encrypted_preimage: ticket.encrypted_preimage,
             signed_at: None,
-            paid_at: None,
             partial_signatures: None,
             public_nonces: None,
             ephemeral_privatekey: None,
@@ -196,6 +168,22 @@ pub struct Ticket {
     payment_request: String,
     hash: String,
     encrypted_preimage: String,
+}
+
+impl Ticket {
+    pub fn get_status(&self) -> TicketStatus {
+        TicketStatus::Created
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TicketStatus {
+    Created,   // Initial state
+    Reserved,  // Payment request generated
+    Paid,      // HODL invoice accepted
+    Used,      // Entry created with this ticket
+    Expired,   // Payment time window expired
+    Cancelled, // Competition cancelled
 }
 
 //TODO: add pagination when it's needed
@@ -270,6 +258,79 @@ pub struct Competition {
     #[serde(with = "time::serde::rfc3339::option")]
     pub failed_at: Option<OffsetDateTime>,
     pub errors: Vec<CompetitionError>,
+}
+
+impl Competition {
+    async fn generate_competition_tickets(
+        &self,
+        total_tickets: usize,
+        ln_client: &Arc<dyn Ln>,
+    ) -> Result<Vec<Ticket>, Error> {
+        let (total_expiry_secs, expiry_time) = self.calculate_ticket_expiry()?;
+        let mut tickets = Vec::with_capacity(total_tickets);
+
+        for _ in 0..total_tickets {
+            let ticket = self
+                .create_ticket(total_expiry_secs, expiry_time, ln_client)
+                .await?;
+            tickets.push(ticket);
+        }
+
+        Ok(tickets)
+    }
+
+    fn calculate_ticket_expiry(&self) -> Result<(u32, OffsetDateTime), Error> {
+        let observation_date = self.event_announcement.expiry;
+        let signing_window = Duration::hours(2); // Configure as needed
+        let now = OffsetDateTime::now_utc();
+
+        let expiry_time = observation_date
+            .checked_sub(now.unix_timestamp() as u32)
+            .ok_or_else(|| Error::InvalidTime("Competition observation date is in the past"))?;
+
+        let total_expiry_secs = expiry_time + signing_window.whole_seconds() as u32;
+
+        Ok((
+            total_expiry_secs,
+            now + Duration::seconds(total_expiry_secs as i64),
+        ))
+    }
+
+    async fn create_ticket(
+        &self,
+        expiry_secs: u32,
+        expiry_time: OffsetDateTime,
+        ln_client: &Arc<dyn Ln>,
+    ) -> Result<Ticket, Error> {
+        let ticket_preimage = hashlock::preimage_random(&mut rand::thread_rng());
+        let ticket_hash = hashlock::sha256(&ticket_preimage);
+
+        let invoice = ln_client
+            .add_hold_invoice(
+                self.entry_fee,
+                expiry_secs,
+                ticket_hash.to_lower_hex_string(),
+                self.id,
+            )
+            .await
+            .map_err(|e| {
+                error!("Failed to create HODL invoice: {:?}", e);
+                Error::LightningError(format!("Failed to create HODL invoice: {}", e))
+            })?;
+
+        Ok(Ticket {
+            id: Uuid::new_v4(),
+            competition_id: self.id,
+            entry_id: None,
+            encrypted_preimage: ticket_preimage.to_lower_hex_string(), // TODO: encrypt this
+            hash: ticket_hash.to_lower_hex_string(),
+            payment_request: invoice.payment_request,
+            expiry: expiry_time,
+            reserved_at: None,
+            paid_at: None,
+            used_at: None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

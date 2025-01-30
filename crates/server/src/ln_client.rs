@@ -26,13 +26,12 @@ pub trait Ln: Send + Sync {
         value: u64,
         expiry_time_secs: u64,
         ticket_hash: String,
-        entry_id: Uuid,
-        entry_index: u64,
         competition_id: Uuid,
     ) -> Result<InvoiceAddResponse, anyhow::Error>;
     async fn cancel_hold_invoice(&self, ticket_hash: String) -> Result<(), anyhow::Error>;
     async fn settle_hold_invoice(&self, ticket_preimage: String) -> Result<(), anyhow::Error>;
-    async fn lookup_invoices(&self, invoice_preimage: String) -> Result<(), anyhow::Error>;
+    //TODO: add lookup
+    //async fn lookup_invoices(&self, invoice_preimage: String) -> Result<(), anyhow::Error>;
     async fn send_payment(
         &self,
         payout_payment_request: String,
@@ -207,20 +206,13 @@ impl Ln for LnClient {
         value: u64,
         expiry_time_secs: u64,
         ticket_hash: String,
-        entry_id: Uuid,
-        entry_index: u64,
         competition_id: Uuid,
     ) -> Result<InvoiceAddResponse, anyhow::Error> {
         let body = HoldInvoiceRequest {
             hash: ticket_hash,
             value: value.to_string(),
             expiry: expiry_time_secs.to_string(),
-            memo: Some(format!(
-                "competition_id:{0}|entry_id:{1}|entry_index:{2}",
-                competition_id.to_string(),
-                entry_id.to_string(),
-                entry_index
-            )),
+            memo: Some(format!("competition_id:{0}", competition_id.to_string(),)),
         };
 
         let response = self
