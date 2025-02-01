@@ -161,6 +161,30 @@
         </div>
     </section>
 
+    <div id="ticketPaymentModal" class="modal">
+        <div class="modal-background"></div>
+        <div class="modal-content">
+            <div class="box">
+                <h3 class="title is-4">Entry Ticket Payment</h3>
+                <div class="content">
+                    <p>Please pay the lightning invoice to enter the competition:</p>
+                    <div class="field">
+                        <div class="control">
+                            <textarea class="textarea" id="paymentRequest" readonly></textarea>
+                        </div>
+                    </div>
+                    <button class="button is-info" id="copyInvoice">Copy Invoice</button>
+                    <div id="paymentStatus" class="mt-4">
+                        <p>Waiting for payment...</p>
+                        <progress class="progress is-info" max="100"></progress>
+                    </div>
+                    <div id="ticketPaymentError" class="notification is-danger is-hidden"></div>
+                </div>
+            </div>
+        </div>
+        <button class="modal-close is-large" aria-label="close"></button>
+    </div>
+
     <div id="entryScore" class="modal">
         <div class="modal-background"></div>
         <div class="modal-content">

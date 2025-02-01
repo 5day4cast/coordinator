@@ -30,14 +30,35 @@ pub trait Ln: Send + Sync {
     ) -> Result<InvoiceAddResponse, anyhow::Error>;
     async fn cancel_hold_invoice(&self, ticket_hash: String) -> Result<(), anyhow::Error>;
     async fn settle_hold_invoice(&self, ticket_preimage: String) -> Result<(), anyhow::Error>;
-    //TODO: add lookup
-    //async fn lookup_invoices(&self, invoice_preimage: String) -> Result<(), anyhow::Error>;
+    async fn lookup_invoice(&self, r_hash: &str) -> Result<InvoiceLookupResponse, anyhow::Error>;
     async fn send_payment(
         &self,
         payout_payment_request: String,
         timeout_seconds: u64,
         fee_limit_sat: u64,
     ) -> Result<(), anyhow::Error>;
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum InvoiceState {
+    Open,
+    Settled,
+    Canceled,
+    Accepted,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InvoiceLookupResponse {
+    pub state: InvoiceState,
+    pub memo: Option<String>,
+    pub r_hash: String,
+    pub value: String,
+    pub settled: bool,
+    pub creation_date: String,
+    pub settle_date: String,
+    pub payment_request: String,
+    pub expiry: String,
 }
 
 //TODO: we might need to add tls cert as an option, skipping for now
@@ -233,6 +254,7 @@ impl Ln for LnClient {
         let invoice_response = response.json::<InvoiceAddResponse>().await?;
         Ok(invoice_response)
     }
+
     async fn cancel_hold_invoice(&self, ticket_hash: String) -> Result<(), anyhow::Error> {
         let response = self
             .client
@@ -272,6 +294,22 @@ impl Ln for LnClient {
         }
 
         Ok(())
+    }
+
+    async fn lookup_invoice(&self, r_hash: &str) -> Result<InvoiceLookupResponse, anyhow::Error> {
+        let response = self
+            .client
+            .get(format!("{}v2/invoices/lookup/{}", self.base_url, r_hash))
+            .header(MACAROON_HEADER, self.macaroon.expose_secret())
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("Failed to lookup invoice: {}", response.status()));
+        }
+
+        let invoice = response.json::<InvoiceLookupResponse>().await?;
+        Ok(invoice)
     }
 
     async fn send_payment(

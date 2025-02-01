@@ -19,6 +19,8 @@ pub use system::*;
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let (status, error_message) = match self.borrow() {
+            Error::NoAvailableTickets => (StatusCode::BAD_REQUEST, self.to_string()),
+            Error::CompetitionFull => (StatusCode::BAD_REQUEST, self.to_string()),
             Error::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             Error::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             Error::InvalidSignature(_) => (StatusCode::FORBIDDEN, self.to_string()),

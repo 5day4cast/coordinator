@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use dlctix::{
     bitcoin::XOnlyPublicKey,
     musig2::{PartialSignature, PubNonce},
@@ -11,7 +13,7 @@ use uuid::Uuid;
 
 use crate::domain::DBConnection;
 
-use super::{run_comeptition_migrations, Competition, EntryStatus, SearchBy, UserEntry};
+use super::{run_comeptition_migrations, Competition, EntryStatus, SearchBy, Ticket, UserEntry};
 
 #[derive(Clone)]
 pub struct CompetitionStore {
@@ -56,12 +58,7 @@ impl CompetitionStore {
         Ok(())
     }
 
-    pub async fn add_entry(
-        &self,
-        entry: UserEntry,
-        ticket_hash: String,
-        ticket_preimage: String,
-    ) -> Result<UserEntry, duckdb::Error> {
+    pub async fn add_entry(&self, entry: UserEntry) -> Result<UserEntry, duckdb::Error> {
         let conn = self.db_connection.new_write_connection_retry().await?;
         let mut stmt = conn.prepare(
             "INSERT INTO entries (
@@ -81,8 +78,6 @@ impl CompetitionStore {
             entry.pubkey,
             entry.ephemeral_pubkey,
             entry.ephemeral_privatekey_encrypted,
-            ticket_preimage,
-            ticket_hash,
             entry.payout_preimage_encrypted,
             entry.payout_hash
         ])?;
@@ -246,14 +241,19 @@ impl CompetitionStore {
         Ok(user_entries)
     }
 
-    pub async fn add_competition(
+    pub async fn add_competition_with_tickets(
         &self,
         competition: Competition,
+        tickets: Vec<Ticket>,
     ) -> Result<Competition, duckdb::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+
+        // Start a transaction
+        conn.execute("BEGIN TRANSACTION", [])?;
+
         let created_at = OffsetDateTime::format(competition.created_at, &Rfc3339)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
 
-        let conn = self.db_connection.new_write_connection_retry().await?;
         let mut stmt = conn.prepare(
             "INSERT INTO competitions (
                       id,
@@ -275,6 +275,29 @@ impl CompetitionStore {
             competition.entry_fee,
             Value::Blob(announcement)
         ])?;
+
+        let mut stmt = conn.prepare(
+            "INSERT INTO tickets (
+                id,
+                event_id,
+                encrypted_preimage,
+                hash,
+                payment_request
+            ) VALUES (?, ?, ?, ?, ?)",
+        )?;
+
+        for ticket in tickets {
+            stmt.execute(params![
+                ticket.id.to_string(),
+                ticket.competition_id.to_string(),
+                ticket.encrypted_preimage,
+                ticket.hash,
+                ticket.payment_request,
+            ])?;
+        }
+
+        conn.execute("COMMIT", [])?;
+
         Ok(competition)
     }
 
@@ -570,5 +593,184 @@ impl CompetitionStore {
         } else {
             Err(duckdb::Error::QueryReturnedNoRows)
         }
+    }
+
+    pub async fn get_and_reserve_ticket(
+        &self,
+        competition_id: Uuid,
+        pubkey: &str,
+    ) -> Result<Ticket, duckdb::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+
+        conn.execute("BEGIN TRANSACTION", [])?;
+
+        // This query will:
+        // 1. Find a ticket that is either:
+        //    a) Never reserved (reserved_at IS NULL)
+        //    b) Reserved but expired (reserved_at < NOW() - interval '10 minutes' AND paid_at IS NULL)
+        //    c) Not yet used for an entry (entry_id IS NULL)
+        // 2. Update it atomically to prevent race conditions
+        let query = r#"
+            UPDATE tickets
+            SET reserved_at = NOW(),
+                reserved_by = ?
+            WHERE id = (
+                SELECT id
+                FROM tickets
+                WHERE event_id = ?
+                  AND entry_id IS NULL
+                  AND (
+                      reserved_at IS NULL
+                      OR (
+                          reserved_at < NOW() - INTERVAL '10 minutes'
+                          AND paid_at IS NULL
+                      )
+                  )
+                ORDER BY
+                    -- Prefer tickets that were never reserved
+                    reserved_at IS NOT NULL,
+                    -- Then take the oldest reservation if dealing with expired ones
+                    reserved_at NULLS FIRST,
+                    id
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id,
+                      event_id,
+                      entry_id,
+                      encrypted_preimage,
+                      hash,
+                      payment_request,
+                      expiry::TEXT,
+                      reserved_by::TEXT,
+                      reserved_at::TEXT,
+                      paid_at::TEXT"#;
+
+        let mut stmt = conn.prepare(query)?;
+        let mut rows = stmt.query(params![pubkey, competition_id.to_string()])?;
+
+        if let Some(row) = rows.next()? {
+            let ticket: Ticket = row.try_into()?;
+            conn.execute("COMMIT", [])?;
+            Ok(ticket)
+        } else {
+            conn.execute("ROLLBACK", [])?;
+            Err(duckdb::Error::QueryReturnedNoRows)
+        }
+    }
+
+    pub async fn get_pending_tickets(&self) -> Result<Vec<Ticket>, duckdb::Error> {
+        let query = r#"
+            SELECT id,
+                   event_id,
+                   entry_id,
+                   encrypted_preimage,
+                   hash,
+                   payment_request,
+                   reserved_at::TEXT,
+                   reserved_by,
+                   paid_at::TEXT
+            FROM tickets
+            WHERE reserved_at IS NOT NULL
+              AND paid_at IS NULL
+              AND entry_id IS NULL
+              AND reserved_at > NOW() - INTERVAL '10 minutes'"#;
+
+        let conn = self.db_connection.new_readonly_connection_retry().await?;
+        let mut stmt = conn.prepare(query)?;
+        let mut rows = stmt.query([])?;
+
+        let mut tickets = Vec::new();
+        while let Some(row) = rows.next()? {
+            tickets.push(row.try_into()?);
+        }
+
+        Ok(tickets)
+    }
+
+    pub async fn get_ticket(&self, ticket_id: Uuid) -> Result<Ticket, duckdb::Error> {
+        let query = r#"
+            SELECT id,
+                   event_id,
+                   entry_id,
+                   encrypted_preimage,
+                   hash,
+                   payment_request,
+                   reserved_by,
+                   reserved_at::TEXT,
+                   paid_at::TEXT
+            FROM tickets
+            WHERE id = ?"#;
+
+        let conn = self.db_connection.new_readonly_connection_retry().await?;
+        let mut stmt = conn.prepare(query)?;
+        let mut rows = stmt.query(params![ticket_id.to_string()])?;
+
+        if let Some(row) = rows.next()? {
+            row.try_into()
+        } else {
+            Err(duckdb::Error::QueryReturnedNoRows)
+        }
+    }
+
+    pub async fn mark_ticket_paid(
+        &self,
+        ticket_hash: &str,
+        competition_id: Uuid,
+    ) -> Result<(), duckdb::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+
+        let query = r#"
+            UPDATE tickets
+            SET paid_at = NOW()
+            WHERE hash = ?
+            AND event_id = ?
+            AND paid_at IS NULL
+            AND reserved_at IS NOT NULL
+            AND reserved_at > NOW() - INTERVAL '10 minutes'"#;
+
+        let mut stmt = conn.prepare(query)?;
+        let affected = stmt.execute(params![ticket_hash, competition_id.to_string(),])?;
+
+        if affected == 0 {
+            return Err(duckdb::Error::QueryReturnedNoRows);
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_tickets(
+        &self,
+        competition_id: Uuid,
+    ) -> Result<HashMap<Uuid, Ticket>, duckdb::Error> {
+        let query = select((
+            "id",
+            "event_id",
+            "entry_id",
+            "encrypted_preimage",
+            "hash",
+            "payment_request",
+            "expiry::TEXT",
+            "reserved_by::TEXT",
+            "reserved_at::TEXT",
+            "paid_at::TEXT",
+        ))
+        .from("tickets")
+        .where_("event_id = ?")
+        .to_string();
+
+        let conn = self.db_connection.new_readonly_connection_retry().await?;
+        let mut stmt = conn.prepare(&query)?;
+        let mut rows = stmt.query(params![competition_id.to_string()])?;
+
+        let mut tickets = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let ticket: Ticket = row.try_into()?;
+            if let Some(entry_id) = ticket.entry_id {
+                tickets.insert(entry_id, ticket);
+            }
+        }
+
+        Ok(tickets)
     }
 }

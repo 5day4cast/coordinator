@@ -1,6 +1,6 @@
 use super::{
     AddEntry, CompetitionError, CompetitionState, CompetitionStore, FundedContract, SearchBy,
-    Ticket, UserEntry,
+    Ticket, TicketStatus, UserEntry,
 };
 use crate::{
     bitcoin_client::Bitcoin,
@@ -11,13 +11,13 @@ use crate::{
 use anyhow::anyhow;
 use bdk_wallet::{
     bitcoin::{
-        absolute::LockTime, hex::DisplayHex, transaction::Version, Amount, FeeRate, OutPoint, Psbt,
-        ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+        absolute::LockTime, transaction::Version, Amount, FeeRate, OutPoint, Psbt, ScriptBuf,
+        Sequence, Transaction, TxIn, TxOut, Witness,
     },
     LocalOutput, SignOptions,
 };
 use dlctix::{
-    convert_xonly_key, hashlock,
+    convert_xonly_key,
     musig2::{
         secp256k1::{
             Keypair as Musig2Kepair, PublicKey, Scalar as Musig2Scalar, Secp256k1 as Musig2Secp256,
@@ -33,7 +33,7 @@ use futures::TryFutureExt;
 use itertools::Itertools;
 use log::{debug, error, info};
 use rand::SeedableRng;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -93,7 +93,7 @@ impl CompetitionWatcher {
 
 pub struct Coordinator {
     oracle_client: Arc<dyn Oracle>,
-    competition_store: Arc<CompetitionStore>,
+    pub competition_store: Arc<CompetitionStore>,
     bitcoin: Arc<dyn Bitcoin>,
     ln: Arc<dyn Ln>,
     private_key: Musig2SecretKey,
@@ -275,8 +275,10 @@ impl Coordinator {
             .get_competition_entries(competition.id, vec![EntryStatus::Paid])
             .await?;
         debug!("Competition entries {:?}", entries);
+        let tickets = self.competition_store.get_tickets(competition.id).await?;
 
-        let players = generate_players(&entries)?;
+        let players = generate_players(&entries, &tickets)?;
+
         debug!("Generated players:");
         for (i, player) in players.iter().enumerate() {
             debug!(
@@ -669,7 +671,7 @@ impl Coordinator {
 
         let competition = self
             .competition_store
-            .add_competition_with_tickets(competition)
+            .add_competition_with_tickets(competition, tickets)
             .map_err(|e| {
                 error!(
                     "competition added to oracle, but failed to be saved with tickets: competition_id {} {:?}",
@@ -708,13 +710,47 @@ impl Coordinator {
 
         let ticket = self
             .competition_store
-            .get_available_ticket(competition_id)
-            .await?;
+            .get_and_reserve_ticket(competition_id, &pubkey)
+            .await
+            .map_err(|e| match e {
+                duckdb::Error::QueryReturnedNoRows => Error::NoAvailableTickets,
+                e => Error::DbError(e),
+            })?;
 
         Ok(TicketResponse {
             ticket_id: ticket.id,
             payment_request: ticket.payment_request,
         })
+    }
+
+    pub async fn get_ticket_status(
+        &self,
+        pubkey: String,
+        competition_id: Uuid,
+        ticket_id: Uuid,
+    ) -> Result<TicketStatus, Error> {
+        let ticket = self
+            .competition_store
+            .get_ticket(ticket_id)
+            .await
+            .map_err(|e| match e {
+                duckdb::Error::QueryReturnedNoRows => Error::NotFound("Ticket not found".into()),
+                e => Error::DbError(e),
+            })?;
+
+        // Verify this ticket belongs to this competition
+        if ticket.competition_id != competition_id {
+            return Err(Error::BadRequest(
+                "Ticket does not belong to this competition".into(),
+            ));
+        }
+
+        // Verify this ticket was reserved by this user
+        if ticket.reserved_by.as_deref() != Some(&pubkey) {
+            return Err(Error::BadRequest("Ticket not reserved by this user".into()));
+        }
+
+        Ok(ticket.get_status())
     }
 
     pub async fn get_competition(&self, competition_id: Uuid) -> Result<Competition, Error> {
@@ -729,46 +765,75 @@ impl Coordinator {
             })
             .await
     }
+    pub async fn handle_invoice_accepted(
+        &self,
+        competition_id: Uuid,
+        ticket_hash: &str,
+    ) -> Result<(), Error> {
+        self.competition_store
+            .mark_ticket_paid(ticket_hash, competition_id)
+            .await
+            .map_err(|e| match e {
+                duckdb::Error::QueryReturnedNoRows => {
+                    Error::BadRequest("Invalid ticket or competition".into())
+                }
+                e => Error::DbError(e),
+            })?;
 
-    async fn create_ticket(&self) -> Result<Ticket, Error> {
-        let mut rng = rand::thread_rng();
-        let ticket_preimage = hashlock::preimage_random(&mut rng);
-        let ticket_hash = hashlock::sha256(&ticket_preimage);
-        //TODO: encrypt preimage hex with market maker key
-        let ticket_preimage_encrypt = ticket_preimage.to_lower_hex_string();
-        Ok(Ticket {
-            hash: ticket_hash.to_lower_hex_string(),
-            encrypted_preimage: ticket_preimage_encrypt,
-            payment_request: "".to_owned(),
-        })
+        Ok(())
     }
 
     // Be-careful with these two operations, there's a possibility here of an
     // entry being added to the oracle but never saved to our local DB (low, but possible)
     pub async fn add_entry(&self, pubkey: String, entry: AddEntry) -> Result<UserEntry, Error> {
-        info!("add_entry: {:?}", entry);
-        let ticket = self.create_ticket().await?;
+        let ticket = self
+            .competition_store
+            .get_ticket(entry.ticket_id)
+            .await
+            .map_err(|e| match e {
+                duckdb::Error::QueryReturnedNoRows => Error::BadRequest("Ticket not found".into()),
+                e => Error::DbError(e),
+            })?;
+
+        if ticket.reserved_by.as_deref() != Some(&pubkey) {
+            return Err(Error::BadRequest("Ticket not reserved by this user".into()));
+        }
+
+        if ticket.paid_at.is_none() {
+            return Err(Error::BadRequest("Ticket has not been paid".into()));
+        }
+
+        if ticket.entry_id.is_some() {
+            return Err(Error::BadRequest("Ticket has already been used".into()));
+        }
+
+        // Submit entry to oracle
         match self.oracle_client.submit_entry(entry.clone().into()).await {
             Ok(_) => Ok(()),
             Err(OracleError::NotFound(e)) => Err(Error::NotFound(e)),
             Err(OracleError::BadRequest(e)) => Err(Error::BadRequest(e)),
             Err(e) => Err(Error::OracleFailed(e)),
         }?;
+
         let user_entry = self
             .competition_store
-            .add_entry(
-                entry.clone().into_user_entry(pubkey),
-                ticket.hash,
-                ticket.preimage,
-            )
-            .map_err(|e| {
-                error!(
-                    "entry added to oracle, but failed to be saved: entry_id {}, event_id {} {:?}",
-                    entry.id, entry.event_id, e
-                );
-                Error::DbError(e)
-            })
-            .await?;
+            .add_entry(entry.clone().into_user_entry(pubkey))
+            .await
+            .map_err(|e| match e {
+                duckdb::Error::QueryReturnedNoRows => {
+                    Error::BadRequest(
+                        "Failed to claim ticket - may have expired or been claimed by another entry"
+                            .into(),
+                    )
+                }
+                e => {
+                    error!(
+                        "entry added to oracle, but failed to be saved: entry_id {}, event_id {} {:?}",
+                        entry.id, entry.event_id, e
+                    );
+                    Error::DbError(e)
+                }
+            })?;
 
         Ok(user_entry)
     }
@@ -992,13 +1057,16 @@ impl Coordinator {
     }
 }
 
-fn generate_players(entries: &Vec<UserEntry>) -> Result<Vec<Player>, anyhow::Error> {
+fn generate_players(
+    entries: &Vec<UserEntry>,
+    tickets: &HashMap<Uuid, Ticket>,
+) -> Result<Vec<Player>, anyhow::Error> {
     let mut players = vec![];
     for entry in entries {
-        let ticket_hash = entry
-            .ticket_hash
-            .as_ref()
-            .ok_or_else(|| anyhow!("ticket_hash is missing for entry: {}", entry.id))?;
+        let Some(ticket) = tickets.get(&entry.id) else {
+            error!("ticket missing for entry {} , skipping", entry.id);
+            continue;
+        };
 
         let payout_hash = entry.payout_hash.as_str();
         debug!("player_pubkey: {}", entry.ephemeral_pubkey);
@@ -1008,7 +1076,7 @@ fn generate_players(entries: &Vec<UserEntry>) -> Result<Vec<Player>, anyhow::Err
         let player = Player {
             pubkey,
             // coordinator generates this preimage and only shares after player has paid for a ticket
-            ticket_hash: string_to_byte_array(ticket_hash),
+            ticket_hash: string_to_byte_array(&ticket.hash),
             // players generate this preimage and only share after winning with the coordinator
             payout_hash: string_to_byte_array(payout_hash),
         };

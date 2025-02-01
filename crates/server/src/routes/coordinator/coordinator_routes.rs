@@ -14,7 +14,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{
-    domain::{AddEntry, Competition, CreateEvent, FundedContract},
+    domain::{AddEntry, Competition, CreateEvent, FundedContract, TicketStatus},
     nostr_extractor::NostrAuth,
     AppState, SearchBy, UserEntry,
 };
@@ -53,6 +53,22 @@ pub async fn request_competition_ticket(
         .map(Json)
         .map_err(|e| {
             error!("error requesting ticket: {:?}", e);
+            e.into()
+        })
+}
+
+pub async fn get_ticket_status(
+    NostrAuth { pubkey, .. }: NostrAuth,
+    State(state): State<Arc<AppState>>,
+    Path((competition_id, ticket_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<TicketStatus>, ErrorResponse> {
+    state
+        .coordinator
+        .get_ticket_status(pubkey.to_hex(), competition_id, ticket_id)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            error!("error getting ticket status: {:?}", e);
             e.into()
         })
 }

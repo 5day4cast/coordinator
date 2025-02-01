@@ -1,10 +1,11 @@
 use crate::{
     add_event_entry, admin_index_handler, create_event, create_folder,
-    domain::{CompetitionStore, CompetitionWatcher, DBConnection, UserInfo},
+    domain::{CompetitionStore, CompetitionWatcher, DBConnection, InvoiceWatcher, UserInfo},
     get_aggregate_nonces, get_balance, get_competitions, get_contract_parameters, get_entries,
-    get_estimated_fee_rates, get_next_address, get_outputs, health, index_handler, login, register,
-    send_to_address, submit_partial_signatures, submit_public_nonces, BitcoinClient,
-    BitcoinSyncWatcher, Coordinator, Ln, LnClient, OracleClient, Settings, UserStore,
+    get_estimated_fee_rates, get_next_address, get_outputs, get_ticket_status, health,
+    index_handler, login, register, request_competition_ticket, send_to_address,
+    submit_partial_signatures, submit_public_nonces, BitcoinClient, BitcoinSyncWatcher,
+    Coordinator, Ln, LnClient, OracleClient, Settings, UserStore,
 };
 use anyhow::anyhow;
 use axum::{
@@ -221,6 +222,22 @@ pub async fn build_app(
         competition_watcher_task,
     );
     threads.insert(String::from("bitcoin_sync_watcher"), bitcoin_watcher_task);
+
+    let invoice_watcher = InvoiceWatcher::new(
+        coordinator.clone(),
+        ln.clone(),
+        cancel_token.clone(),
+        Duration::from_secs(30), //TODO: make configurable, check every 30 seconds
+    );
+
+    let invoice_watcher_handle = tokio::spawn(async move {
+        if let Err(e) = invoice_watcher.watch().await {
+            error!("Invoice watcher error: {}", e);
+        }
+    });
+
+    threads.insert("invoice_watcher".to_string(), invoice_watcher_handle);
+
     let app_state = AppState {
         ui_dir: config.ui_settings.ui_dir,
         private_url: config.ui_settings.private_url,
@@ -293,6 +310,14 @@ pub fn app(
         .route("/health_check", get(health))
         .route("/competitions", post(create_event))
         .route("/competitions", get(get_competitions))
+        .route(
+            "/competitions/{competition_id}/ticket",
+            get(request_competition_ticket),
+        )
+        .route(
+            "/competitions/{competition_id}/tickets/{ticket_id}/status",
+            get(get_ticket_status),
+        )
         .route("/competitions/{id}/contract", get(get_contract_parameters))
         .route(
             "/competitions/{competition_id}/entries/{entry_id}/public_nonces",

@@ -79,6 +79,8 @@ pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), d
         encrypted_preimage TEXT NOT NULL,       -- encrypted with the cooridinator private key
         hash TEXT NOT NULL,                     -- hash of the preimage, used in generating payment_request for user
         payment_request TEXT                    -- hodl invoice payment request generated for the ticket
+        reserved_at TIMESTAMPTZ,                -- used to determine if reserve is still valid
+        reserved_by TEXT,                       -- pubkey of user that is trying to use this ticket
         paid_at TIMESTAMPTZ                     -- when user payment is pending for the ticket
     );
 

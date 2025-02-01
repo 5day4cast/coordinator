@@ -2,11 +2,20 @@ mod coordinator;
 mod db_migrations;
 mod store;
 
-use crate::oracle_client::{Event, WeatherChoices};
+use std::sync::Arc;
+
+use crate::{
+    oracle_client::{Event, WeatherChoices},
+    Ln,
+};
 pub use coordinator::*;
 pub use db_migrations::*;
 use dlctix::{
-    bitcoin::{OutPoint, Transaction},
+    bitcoin::{
+        hex::{Case, DisplayHex},
+        OutPoint, Transaction,
+    },
+    hashlock,
     musig2::{AggNonce, PartialSignature, PubNonce},
     ContractParameters, EventLockingConditions, SigMap, SignedContract,
 };
@@ -14,11 +23,13 @@ use duckdb::{
     types::{Type, Value},
     Row,
 };
-use log::debug;
+use log::{debug, error};
 use serde::{Deserialize, Serialize};
 pub use store::*;
 use time::{macros::format_description, Duration, OffsetDateTime};
 use uuid::Uuid;
+
+use super::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddEntry {
@@ -83,24 +94,6 @@ impl<'a> TryFrom<&Row<'a>> for UserEntry {
     type Error = duckdb::Error;
 
     fn try_from(row: &Row) -> Result<Self, Self::Error> {
-        //raw date format 2024-08-11 00:27:39.013046-04
-        let sql_time_format = format_description!(
-            "[year]-[month]-[day] [hour]:[minute]:[second][optional [.[subsecond]]][offset_hour]"
-        );
-        let signed_at: Option<OffsetDateTime> = match row.get::<usize, Option<String>>(12)? {
-            Some(val) => match OffsetDateTime::parse(&val, &sql_time_format) {
-                Ok(datetime) => Some(datetime),
-                Err(e) => {
-                    return Err(duckdb::Error::FromSqlConversionFailure(
-                        3,
-                        Type::Any,
-                        Box::new(e),
-                    ))
-                }
-            },
-            _ => None,
-        };
-
         let public_nonces: Option<SigMap<PubNonce>> =
             row.get::<usize, Option<Value>>(7).map(|opt| {
                 opt.and_then(|raw| match raw {
@@ -138,18 +131,18 @@ impl<'a> TryFrom<&Row<'a>> for UserEntry {
             payout_preimage_encrypted: row.get(9)?,
             payout_hash: row.get(10)?,
             payout_preimage: row.get::<usize, Option<String>>(11)?,
-            signed_at,
+            signed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(12)?, 12)?,
         };
         Ok(user_entry)
     }
 }
 
 impl AddEntry {
-    fn into_user_entry(self, pubkey: String, ticket_id: Uuid) -> UserEntry {
+    fn into_user_entry(self, pubkey: String) -> UserEntry {
         UserEntry {
             id: self.id,
             event_id: self.event_id,
-            ticket_id,
+            ticket_id: self.ticket_id,
             pubkey,
             ephemeral_pubkey: self.ephemeral_pubkey,
             ephemeral_privatekey_encrypted: self.ephemeral_privatekey_encrypted,
@@ -164,19 +157,77 @@ impl AddEntry {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ticket {
-    payment_request: String,
-    hash: String,
-    encrypted_preimage: String,
+    pub id: Uuid,
+    pub competition_id: Uuid,
+    pub entry_id: Option<Uuid>,
+    pub encrypted_preimage: String,
+    pub hash: String,
+    pub payment_request: String,
+    pub expiry: OffsetDateTime,
+    pub reserved_by: Option<String>,
+    pub reserved_at: Option<OffsetDateTime>,
+    pub paid_at: Option<OffsetDateTime>,
 }
 
 impl Ticket {
     pub fn get_status(&self) -> TicketStatus {
+        let now = OffsetDateTime::now_utc();
+
+        // Check if ticket has been used for an entry
+        if self.entry_id.is_some() {
+            return TicketStatus::Used;
+        }
+
+        // Check if ticket has expired
+        if now > self.expiry {
+            return TicketStatus::Expired;
+        }
+
+        // Check if ticket has been paid
+        if self.paid_at.is_some() {
+            return TicketStatus::Paid;
+        }
+
+        // Check if ticket is reserved
+        if let Some(reserved_at) = self.reserved_at {
+            // If reservation is older than 10 minutes and not paid, consider it expired
+            if now - reserved_at > Duration::minutes(10) {
+                return TicketStatus::Expired;
+            }
+            return TicketStatus::Reserved;
+        }
+
         TicketStatus::Created
+    }
+
+    pub fn is_paid(&self) -> bool {
+        matches!(self.get_status(), TicketStatus::Paid)
+    }
+
+    pub fn is_reserved(&self) -> bool {
+        matches!(self.get_status(), TicketStatus::Reserved)
+    }
+
+    pub fn is_used(&self) -> bool {
+        matches!(self.get_status(), TicketStatus::Used)
+    }
+
+    pub fn is_expired(&self) -> bool {
+        matches!(self.get_status(), TicketStatus::Expired)
+    }
+
+    pub fn can_be_used(&self) -> bool {
+        matches!(self.get_status(), TicketStatus::Paid)
+    }
+
+    pub fn can_be_reserved(&self) -> bool {
+        matches!(self.get_status(), TicketStatus::Created)
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TicketStatus {
     Created,   // Initial state
     Reserved,  // Payment request generated
@@ -279,16 +330,10 @@ impl Competition {
         Ok(tickets)
     }
 
-    fn calculate_ticket_expiry(&self) -> Result<(u32, OffsetDateTime), Error> {
-        let observation_date = self.event_announcement.expiry;
-        let signing_window = Duration::hours(2); // Configure as needed
+    fn calculate_ticket_expiry(&self) -> Result<(u64, OffsetDateTime), Error> {
+        let signing_window = Duration::hours(3); //TODO: making signing window configurable
         let now = OffsetDateTime::now_utc();
-
-        let expiry_time = observation_date
-            .checked_sub(now.unix_timestamp() as u32)
-            .ok_or_else(|| Error::InvalidTime("Competition observation date is in the past"))?;
-
-        let total_expiry_secs = expiry_time + signing_window.whole_seconds() as u32;
+        let total_expiry_secs = signing_window.whole_seconds() as u64;
 
         Ok((
             total_expiry_secs,
@@ -298,7 +343,7 @@ impl Competition {
 
     async fn create_ticket(
         &self,
-        expiry_secs: u32,
+        expiry_secs: u64,
         expiry_time: OffsetDateTime,
         ln_client: &Arc<dyn Ln>,
     ) -> Result<Ticket, Error> {
@@ -309,26 +354,23 @@ impl Competition {
             .add_hold_invoice(
                 self.entry_fee,
                 expiry_secs,
-                ticket_hash.to_lower_hex_string(),
+                ticket_hash.to_hex_string(Case::Lower),
                 self.id,
             )
             .await
-            .map_err(|e| {
-                error!("Failed to create HODL invoice: {:?}", e);
-                Error::LightningError(format!("Failed to create HODL invoice: {}", e))
-            })?;
+            .map_err(Error::HoldError)?;
 
         Ok(Ticket {
-            id: Uuid::new_v4(),
+            id: Uuid::now_v7(),
             competition_id: self.id,
             entry_id: None,
             encrypted_preimage: ticket_preimage.to_lower_hex_string(), // TODO: encrypt this
             hash: ticket_hash.to_lower_hex_string(),
             payment_request: invoice.payment_request,
             expiry: expiry_time,
+            reserved_by: None,
             reserved_at: None,
             paid_at: None,
-            used_at: None,
         })
     }
 }
@@ -497,21 +539,12 @@ impl<'a> TryFrom<&Row<'a>> for Competition {
     type Error = duckdb::Error;
 
     fn try_from(row: &Row) -> Result<Self, Self::Error> {
-        //raw date format 2024-08-11 00:27:39.013046-04
-        let sql_time_format = format_description!(
-            "[year]-[month]-[day] [hour]:[minute]:[second][optional [.[subsecond]]][offset_hour]"
-        );
         let competition = Competition {
             id: row
                 .get::<usize, String>(0)
                 .map(|val| Uuid::parse_str(&val))?
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(0, Type::Any, Box::new(e)))?,
-
-            created_at: row
-                .get::<usize, String>(1)
-                .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(1, Type::Any, Box::new(e)))?,
-
+            created_at: parse_timestamp_or_error(row.get::<usize, String>(1)?, 1)?,
             total_competition_pool: row.get::<usize, u64>(2)?,
             total_allowed_entries: row.get::<usize, u64>(3)?,
             number_of_places_win: row.get(4)?,
@@ -585,25 +618,14 @@ impl<'a> TryFrom<&Row<'a>> for Competition {
                 })
             })?,
 
-            cancelled_at: row
-                .get::<usize, Option<String>>(18)
-                .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
-
-            contracted_at: row
-                .get::<usize, Option<String>>(19)
-                .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
-
-            signed_at: row
-                .get::<usize, Option<String>>(20)
-                .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
-
-            funding_broadcasted_at: row
-                .get::<usize, Option<String>>(21)
-                .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
-
-            failed_at: row
-                .get::<usize, Option<String>>(22)
-                .map(|val| val.and_then(|s| OffsetDateTime::parse(&s, &sql_time_format).ok()))?,
+            cancelled_at: parse_optional_timestamp(row.get::<usize, Option<String>>(18)?, 18)?,
+            contracted_at: parse_optional_timestamp(row.get::<usize, Option<String>>(19)?, 19)?,
+            signed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(20)?, 20)?,
+            funding_broadcasted_at: parse_optional_timestamp(
+                row.get::<usize, Option<String>>(21)?,
+                21,
+            )?,
+            failed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(22)?, 22)?,
 
             errors: row
                 .get::<usize, Option<Value>>(23)
@@ -634,4 +656,64 @@ pub enum CompetitionError {
     Expired(String),
     #[error("Invalid state transition: {0}")]
     InvalidStateTransition(String),
+}
+
+impl<'a> TryFrom<&Row<'a>> for Ticket {
+    type Error = duckdb::Error;
+
+    fn try_from(row: &Row) -> Result<Self, Self::Error> {
+        Ok(Ticket {
+            id: Uuid::parse_str(&row.get::<usize, String>(0)?)
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(0, Type::Text, Box::new(e)))?,
+            competition_id: Uuid::parse_str(&row.get::<usize, String>(1)?)
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(1, Type::Text, Box::new(e)))?,
+            entry_id: row
+                .get::<usize, Option<String>>(2)?
+                .map(|s| {
+                    Uuid::parse_str(&s).map_err(|e| {
+                        duckdb::Error::FromSqlConversionFailure(2, Type::Text, Box::new(e))
+                    })
+                })
+                .transpose()?,
+            encrypted_preimage: row.get(3)?,
+            hash: row.get(4)?,
+            payment_request: row.get(5)?,
+            expiry: parse_timestamp_or_error(row.get::<usize, String>(6)?, 6)?,
+            reserved_by: row.get(7)?,
+            reserved_at: parse_optional_timestamp(row.get::<usize, Option<String>>(8)?, 8)?,
+            paid_at: parse_optional_timestamp(row.get::<usize, Option<String>>(9)?, 9)?,
+        })
+    }
+}
+
+fn parse_timestamp_or_error(
+    timestamp: String,
+    position: usize,
+) -> Result<OffsetDateTime, duckdb::Error> {
+    //raw date format 2024-08-11 00:27:39.013046-04
+    let sql_time_format = format_description!(
+        "[year]-[month]-[day] [hour]:[minute]:[second][optional [.[subsecond]]][offset_hour]"
+    );
+
+    OffsetDateTime::parse(&timestamp, &sql_time_format)
+        .map_err(|e| duckdb::Error::FromSqlConversionFailure(position, Type::Text, Box::new(e)))
+}
+
+fn parse_optional_timestamp(
+    timestamp: Option<String>,
+    position: usize,
+) -> Result<Option<OffsetDateTime>, duckdb::Error> {
+    //raw date format 2024-08-11 00:27:39.013046-04
+    let sql_time_format = format_description!(
+        "[year]-[month]-[day] [hour]:[minute]:[second][optional [.[subsecond]]][offset_hour]"
+    );
+
+    match timestamp {
+        Some(ts) => OffsetDateTime::parse(&ts, &sql_time_format)
+            .map(Some)
+            .map_err(|e| {
+                duckdb::Error::FromSqlConversionFailure(position, Type::Text, Box::new(e))
+            }),
+        None => Ok(None),
+    }
 }

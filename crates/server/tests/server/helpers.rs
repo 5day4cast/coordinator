@@ -62,12 +62,11 @@ mock! {
             value: u64,
             expiry_time_secs: u64,
             ticket_hash: String,
-            entry_id: Uuid,
-            entry_index: u64,
             competition_id: Uuid,
         ) -> Result<server::InvoiceAddResponse, anyhow::Error>;
         async fn cancel_hold_invoice(&self, ticket_hash: String) -> Result<(), anyhow::Error>;
         async fn settle_hold_invoice(&self, ticket_preimage: String) -> Result<(), anyhow::Error>;
+        async fn lookup_invoice(&self, r_hash: &str) -> Result<server::InvoiceLookupResponse, anyhow::Error>;
         async fn send_payment(
             &self,
             payout_payment_request: String,
@@ -166,6 +165,7 @@ pub async fn generate_test_entry(
 
     Ok(AddEntry {
         id: entry_id,
+        ticket_id: Uuid::now_v7(),
         ephemeral_pubkey,
         ephemeral_privatekey_encrypted,
         payout_hash,

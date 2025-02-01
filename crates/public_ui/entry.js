@@ -17,6 +17,7 @@ class Entry {
     this.competition = competition;
     this.stations = stations;
     this.onSubmitSuccess = onSubmitSuccess;
+    this.ticket = null;
   }
 
   async init() {
@@ -99,6 +100,104 @@ class Entry {
     if (!$entryModal.classList.contains("is-active")) {
       $entryModal.classList.add("is-active");
     }
+    // Start ticket process with promise chain
+    if (!this.canSubmitEntry) {
+      this.handleTicketPayment()
+        .then(() => {
+          this.canSubmitEntry = true;
+          $submitEntry.disabled = false;
+          $paymentStatus.classList.remove("has-text-info");
+          $paymentStatus.classList.add("has-text-success");
+          $paymentStatus.textContent = "Payment received!";
+        })
+        .catch((error) => {
+          console.error("Error handling ticket payment:", error);
+          this.showError(error.message);
+          this.hideEntry();
+        });
+    }
+  }
+
+  async handleTicketPayment() {
+    const response = await this.client.get(
+      `${this.coordinator_url}/competitions/${this.competition.id}/ticket`,
+    );
+
+    if (!response.ok) {
+      throw new Error(`Failed to get ticket: ${response.status}`);
+    }
+
+    const ticketData = await response.json();
+    this.ticket = {
+      id: ticketData.ticket_id,
+      payment_request: ticketData.payment_request,
+    };
+
+    return this.showPaymentModal();
+  }
+
+  showPaymentModal() {
+    const $modal = document.getElementById("ticketPaymentModal");
+    const $paymentRequest = document.getElementById("paymentRequest");
+    const $copyButton = document.getElementById("copyInvoice");
+    const $error = document.getElementById("ticketPaymentError");
+
+    $paymentRequest.value = this.ticket.payment_request;
+    $modal.classList.add("is-active");
+
+    $copyButton.onclick = () => {
+      navigator.clipboard.writeText(this.ticket.payment_request);
+      $copyButton.textContent = "Copied!";
+      setTimeout(() => {
+        $copyButton.textContent = "Copy Invoice";
+      }, 2000);
+    };
+
+    return new Promise((resolve, reject) => {
+      const checkPayment = () => {
+        this.client
+          .get(
+            `${this.coordinator_url}/competitions/${this.competition.id}/tickets/${this.ticket.id}/status`,
+          )
+          .then((response) => {
+            if (!response.ok) {
+              throw new Error(
+                `Failed to check ticket status: ${response.status}`,
+              );
+            }
+            return response.json();
+          })
+          .then((status) => {
+            switch (status) {
+              case "Paid":
+                $modal.classList.remove("is-active");
+                resolve();
+                break;
+              case "Expired":
+                throw new Error(
+                  "Ticket payment expired. Please request a new ticket.",
+                );
+              case "Used":
+                throw new Error("Ticket has already been used.");
+              case "Cancelled":
+                throw new Error("Competition has been cancelled.");
+              case "Reserved":
+                // Continue polling
+                setTimeout(checkPayment, 2000);
+                break;
+              default:
+                throw new Error(`Unexpected ticket status: ${status}`);
+            }
+          })
+          .catch((error) => {
+            $error.textContent = error.message;
+            $error.classList.remove("is-hidden");
+            reject(error);
+          });
+      };
+
+      checkPayment();
+    });
   }
 
   async setupEntry() {
