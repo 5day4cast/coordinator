@@ -3,25 +3,27 @@ use dlctix::{
     bitcoin::Amount,
     musig2::secp256k1::{PublicKey, SecretKey},
 };
-use env_logger;
 use log::{debug, info};
 use nostr_sdk::ToBech32;
+use reqwest_middleware::ClientWithMiddleware;
 use server::{
-    create_folder,
-    domain::{CompetitionState, CompetitionStore, DBConnection},
-    Bitcoin, BitcoinClient, BitcoinSettings, Coordinator, Ln, Oracle,
+    build_reqwest_client, create_folder,
+    domain::{CompetitionState, DBConnection, InvoiceWatcher, TicketStatus},
+    Bitcoin, BitcoinClient, CompetitionStore, Coordinator, Ln, LnClient, LnSettings, Oracle,
 };
 use std::{
     collections::HashMap,
     fs,
     path::Path,
     sync::{Arc, Once},
+    time::Duration,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::helpers::{
     create_test_nostr_client, create_test_wallet, generate_oracle_event,
-    generate_request_create_event, generate_test_entry, get_keys, MockLnClient, MockOracleClient,
+    generate_request_create_event, generate_test_entry, get_keys, MockOracleClient,
     TestParticipant,
 };
 
@@ -38,18 +40,18 @@ pub struct TestContext {
     pub test_database: String,
     pub competition_store: CompetitionStore,
     pub bitcoin_client: Arc<dyn Bitcoin>,
-    pub ln_mock: Arc<dyn Ln>,
+    pub coord_ln: Arc<dyn Ln>,
     pub oracle_client: Arc<dyn Oracle>,
 }
 
 impl TestContext {
-    pub async fn new(entries: usize) -> Result<Self> {
+    pub async fn new_with_ln(entries: usize, client: ClientWithMiddleware) -> Result<Self> {
         setup_static_logger();
         let test_data_folder = "./test_data";
         create_folder(test_data_folder);
 
         // Setup real Bitcoin client
-        let bitcoin_settings = BitcoinSettings {
+        let bitcoin_settings = server::BitcoinSettings {
             network: dlctix::bitcoin::Network::Regtest,
             esplora_url: "http://localhost:9102".to_string(),
             seed_path: "./test_data/fake_coordinator_private_key.pem".to_string(),
@@ -74,7 +76,14 @@ impl TestContext {
         let db_connection = DBConnection::new(test_data_folder, &test_db_name)?;
         let competition_store = CompetitionStore::new(db_connection.clone())?;
 
-        let ln_mock = MockLnClient::new();
+        let coordinator_ln = LnSettings {
+            base_url: String::from("https://localhost:9095"),
+            macaroon_file_path: String::from("./test_data/coord_ln/admin.macaroon"),
+            tls_cert_path: Some(String::from("./test_data/coord_ln/tls.cert")),
+        };
+
+        let ln = LnClient::new(client, coordinator_ln).await?;
+        ln.ping().await?;
         let oracle_keys = get_keys(String::from("./test_data/fake_oracle_private_key.pem"));
         let mut oracle_mock = MockOracleClient::new();
         oracle_mock.expect_create_event().returning(move |event| {
@@ -95,7 +104,7 @@ impl TestContext {
             test_database: db_connection.connection_path,
             competition_store,
             bitcoin_client: Arc::new(bitcoin_client),
-            ln_mock: Arc::new(ln_mock),
+            coord_ln: Arc::new(ln),
             oracle_client: Arc::new(oracle_mock),
         })
     }
@@ -105,11 +114,11 @@ impl TestContext {
             self.oracle_client.clone(),
             self.competition_store.clone(),
             self.bitcoin_client.clone(),
-            self.ln_mock.clone(),
+            self.coord_ln.clone(),
             144,
         )
         .await?;
-
+        debug!("coordinator created");
         Ok(Arc::new(coordinator))
     }
 }
@@ -125,41 +134,111 @@ impl Drop for TestContext {
     }
 }
 
-/// Requires an esplora instance pointed at a bitcoind instance that has funds in it's wallet ready to be spent
-/// Do not run this test in ci, should be run locally for development only
-
 #[tokio::test]
-#[ignore = "requires local regtest environment"]
-async fn test_two_person_competition_flow_with_real_bitcoin() -> Result<()> {
+#[ignore = "requires local regtest environment and lightning nodes"]
+async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
     let players = 2;
     let ranks = 1;
     let locations = 1;
-    let context = TestContext::new(players).await?;
+    let client = build_reqwest_client();
+    let alice = LnSettings {
+        base_url: String::from("https://localhost:9092"),
+        macaroon_file_path: String::from("./test_data/alice_ln/admin.macaroon"),
+        tls_cert_path: Some(String::from("./test_data/alice_ln/tls.cert")),
+    };
+    let alice_ln = LnClient::new(client.clone(), alice).await?;
+    alice_ln.ping().await?;
+    let bob = LnSettings {
+        base_url: String::from("https://localhost:9098"),
+        macaroon_file_path: String::from("./test_data/bob_ln/admin.macaroon"),
+        tls_cert_path: Some(String::from("./test_data/bob_ln/tls.cert")),
+    };
+    let bob_ln = LnClient::new(client.clone(), bob).await?;
+    bob_ln.ping().await?;
+    let user_ln_clients = vec![alice_ln, bob_ln];
+
+    // Create test context with real coordinator lightning node
+    let context = TestContext::new_with_ln(players, client).await?;
+
     let coordinator = context.create_coordinator().await?;
+    let cancel_token = CancellationToken::new();
+    let cancel_token_clone = cancel_token.clone();
+
+    let invoice_watcher = InvoiceWatcher::new(
+        coordinator.clone(),
+        context.coord_ln.clone(),
+        cancel_token_clone,
+        Duration::from_secs(2),
+    );
+
+    tokio::spawn(async move { invoice_watcher.watch().await });
 
     // Create competition
     let create_event = generate_request_create_event(locations, players, ranks);
-    debug!("create event request completed");
+
     let competition = coordinator.create_competition(create_event.clone()).await?;
-    debug!("create competition completed");
     assert_eq!(competition.get_state(), CompetitionState::Created);
 
     let mut participants = Vec::new();
-    for i in 0..players {
+
+    // Create participants and process their entries with real lightning payments
+    for (i, user_ln_client) in user_ln_clients.into_iter().enumerate() {
         let nostr_client = create_test_nostr_client().await;
         let wallet = create_test_wallet(&nostr_client).await;
         let nostr_pubkey = nostr_client.get_public_key().await?;
-        debug!("participant {} added: {}", i, nostr_pubkey.to_bech32()?);
+        let nostr_bech32 = nostr_pubkey.to_bech32()?;
+        debug!("requesting ticket");
+        let ticket_response = coordinator
+            .request_ticket(nostr_bech32.clone(), competition.id)
+            .await?;
+        debug!("ticket: {:?}", ticket_response);
+        // Actually pay the invoice using the user's lightning node
+        user_ln_client
+            .send_payment(
+                ticket_response.payment_request.clone(),
+                300,  // timeout in seconds
+                1000, // fee limit in sats
+            )
+            .await?;
+        debug!("sent payment");
+        // Wait for payment confirmation
+        let mut payment_confirmed = false;
+        for _ in 0..30 {
+            // Try for 30 seconds
+            debug!("checking invoice status");
+            let invoice_status = coordinator
+                .get_ticket_status(
+                    nostr_bech32.clone(),
+                    competition.id,
+                    ticket_response.ticket_id,
+                )
+                .await?;
+            debug!("invoice_status: {:?}", invoice_status);
+            if invoice_status == TicketStatus::Paid {
+                payment_confirmed = true;
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        assert!(
+            payment_confirmed,
+            "Payment was not confirmed for participant {}",
+            i
+        );
+
         participants.push(TestParticipant::new(
             wallet,
-            nostr_pubkey.to_bech32()?,
-            Uuid::now_v7(),
+            nostr_bech32,
+            ticket_response.ticket_id,
         ));
     }
 
     // Generate and submit entries
     let mut participant_entry_indices = HashMap::new();
     let mut participants_entries = HashMap::new();
+
     for (i, participant) in participants.iter_mut().enumerate() {
         let entry = generate_test_entry(
             create_event.id,
@@ -170,17 +249,17 @@ async fn test_two_person_competition_flow_with_real_bitcoin() -> Result<()> {
             participant.ticket_id,
         )
         .await?;
+
         participants_entries.insert(participant.nostr_pubkey.clone(), entry.clone());
         participant_entry_indices.insert(participant.nostr_pubkey.clone(), i as u32);
 
-        debug!(
-            "Submitting entry for participant {} with pubkey: {}",
-            i, participant.nostr_pubkey
-        );
+        debug!("Submitting entry for participant {}", i);
         coordinator
             .add_entry(participant.nostr_pubkey.clone(), entry)
             .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Create transactions
     coordinator.competition_handler().await?;
@@ -257,12 +336,9 @@ async fn test_two_person_competition_flow_with_real_bitcoin() -> Result<()> {
 
     // Verify final state
     let competition = coordinator.get_competition(create_event.id).await?;
-    debug!("Final competition state: {:?}", competition.get_state());
-    debug!("Competition errors: {:?}", competition.errors);
-
     assert_eq!(competition.get_state(), CompetitionState::Broadcasted);
     assert!(competition.signed_contract.is_some());
     assert!(competition.signed_at.is_some());
-
+    cancel_token.cancel();
     Ok(())
 }

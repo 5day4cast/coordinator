@@ -88,13 +88,19 @@ pub async fn create_test_wallet(nostr_client: &NostrClientCore) -> TaprootWallet
 pub struct TestParticipant {
     pub wallet: client_validator::TaprootWalletCore,
     pub nostr_pubkey: String,
+    pub ticket_id: Uuid,
 }
 
 impl TestParticipant {
-    pub fn new(wallet: client_validator::TaprootWalletCore, nostr_pubkey: String) -> Self {
+    pub fn new(
+        wallet: client_validator::TaprootWalletCore,
+        nostr_pubkey: String,
+        ticket_id: Uuid,
+    ) -> Self {
         Self {
             wallet,
             nostr_pubkey,
+            ticket_id,
         }
     }
 }
@@ -136,6 +142,7 @@ pub async fn generate_test_entry(
     nostr_pubkey: &str,
     station_ids: &Vec<String>,
     entry_index: u32,
+    ticket_id: Uuid,
 ) -> Result<AddEntry, anyhow::Error> {
     let entry_id = Uuid::now_v7();
 
@@ -165,7 +172,7 @@ pub async fn generate_test_entry(
 
     Ok(AddEntry {
         id: entry_id,
-        ticket_id: Uuid::now_v7(),
+        ticket_id,
         ephemeral_pubkey,
         ephemeral_privatekey_encrypted,
         payout_hash,

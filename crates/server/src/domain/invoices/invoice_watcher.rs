@@ -65,10 +65,11 @@ impl InvoiceWatcher {
             .competition_store
             .get_pending_tickets()
             .await?;
-
+        info!("pending tickets: {:?}", pending_tickets);
         for ticket in pending_tickets {
             match self.ln.lookup_invoice(&ticket.hash).await {
                 Ok(invoice) => {
+                    info!("invoice: {:?}", invoice);
                     if invoice.state == InvoiceState::Accepted {
                         match self
                             .coordinator
@@ -84,7 +85,7 @@ impl InvoiceWatcher {
                     }
                 }
                 Err(e) => {
-                    error!("Failed to lookup invoice for ticket {}: {}", ticket.id, e);
+                    debug!("Failed to lookup invoice for ticket {}: {}", ticket.id, e);
                 }
             }
         }

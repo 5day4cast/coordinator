@@ -665,10 +665,11 @@ impl Coordinator {
         }?;
 
         let competition = Competition::new(&create_event, &oracle_event);
+        debug!("created competition");
         let tickets = competition
             .generate_competition_tickets(create_event.total_allowed_entries, &self.ln)
             .await?;
-
+        debug!("tickets: {:?}", tickets);
         let competition = self
             .competition_store
             .add_competition_with_tickets(competition, tickets)
@@ -703,11 +704,10 @@ impl Coordinator {
             .competition_store
             .get_competition(competition_id)
             .await?;
-
         if competition.total_entries >= competition.total_allowed_entries {
             return Err(Error::CompetitionFull);
         }
-
+        debug!("got competition: {:?}", competition);
         let ticket = self
             .competition_store
             .get_and_reserve_ticket(competition_id, &pubkey)
@@ -733,9 +733,14 @@ impl Coordinator {
             .competition_store
             .get_ticket(ticket_id)
             .await
-            .map_err(|e| match e {
-                duckdb::Error::QueryReturnedNoRows => Error::NotFound("Ticket not found".into()),
-                e => Error::DbError(e),
+            .map_err(|e| {
+                debug!("error: {:?}", e);
+                match e {
+                    duckdb::Error::QueryReturnedNoRows => {
+                        Error::NotFound("Ticket not found".into())
+                    }
+                    e => Error::DbError(e),
+                }
             })?;
 
         // Verify this ticket belongs to this competition
@@ -786,13 +791,19 @@ impl Coordinator {
     // Be-careful with these two operations, there's a possibility here of an
     // entry being added to the oracle but never saved to our local DB (low, but possible)
     pub async fn add_entry(&self, pubkey: String, entry: AddEntry) -> Result<UserEntry, Error> {
+        debug!("entry: {:?}", entry);
         let ticket = self
             .competition_store
             .get_ticket(entry.ticket_id)
             .await
-            .map_err(|e| match e {
-                duckdb::Error::QueryReturnedNoRows => Error::BadRequest("Ticket not found".into()),
-                e => Error::DbError(e),
+            .map_err(|e| {
+                debug!("er {:?}", e);
+                match e {
+                    duckdb::Error::QueryReturnedNoRows => {
+                        Error::BadRequest("Ticket not found".into())
+                    }
+                    e => Error::DbError(e),
+                }
             })?;
 
         if ticket.reserved_by.as_deref() != Some(&pubkey) {
@@ -817,7 +828,7 @@ impl Coordinator {
 
         let user_entry = self
             .competition_store
-            .add_entry(entry.clone().into_user_entry(pubkey))
+            .add_entry(entry.clone().into_user_entry(pubkey), ticket.id)
             .await
             .map_err(|e| match e {
                 duckdb::Error::QueryReturnedNoRows => {

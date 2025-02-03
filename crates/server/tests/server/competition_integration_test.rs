@@ -206,6 +206,7 @@ async fn test_two_person_competition_flow() -> Result<()> {
         participants.push(TestParticipant::new(
             wallet,
             nostr_pubkey.to_bech32().unwrap(),
+            Uuid::now_v7(),
         ));
     }
     debug!("participants created");
@@ -220,7 +221,8 @@ async fn test_two_person_competition_flow() -> Result<()> {
             &mut participant.wallet,
             &participant.nostr_pubkey,
             &create_event.locations,
-            i as u32, // Fixed entry index
+            i as u32, // Fixed entry index,
+            participant.ticket_id,
         )
         .await?;
         participants_entries.insert(participant.nostr_pubkey.clone(), entry);
@@ -409,6 +411,7 @@ async fn test_four_person_competition_flow() -> Result<()> {
         participants.push(TestParticipant::new(
             wallet,
             nostr_pubkey.to_bech32().unwrap(),
+            Uuid::now_v7(),
         ));
     }
     debug!("participants created");
@@ -424,6 +427,7 @@ async fn test_four_person_competition_flow() -> Result<()> {
             &participant.nostr_pubkey,
             &create_event.locations,
             i as u32, // Fixed entry index
+            participant.ticket_id,
         )
         .await?;
         participants_entries.insert(participant.nostr_pubkey.clone(), entry);
@@ -613,6 +617,7 @@ async fn test_ten_person_competition_flow() -> Result<()> {
         participants.push(TestParticipant::new(
             wallet,
             nostr_pubkey.to_bech32().unwrap(),
+            Uuid::now_v7(),
         ));
     }
     debug!("participants created");
@@ -628,6 +633,7 @@ async fn test_ten_person_competition_flow() -> Result<()> {
             &participant.nostr_pubkey,
             &create_event.locations,
             i as u32, // Fixed entry index
+            participant.ticket_id,
         )
         .await?;
         participants_entries.insert(participant.nostr_pubkey.clone(), entry);

@@ -11,6 +11,7 @@ use anyhow::anyhow;
 use axum::{
     body::Body,
     extract::{connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, Request},
+    http::Extensions,
     middleware::{self, AddExtension, Next},
     response::IntoResponse,
     routing::{get, post},
@@ -23,8 +24,8 @@ use hyper::{
 };
 use log::{error, info, warn};
 use reqwest_middleware::{
-    reqwest::{Client, Url},
-    ClientBuilder, ClientWithMiddleware,
+    reqwest::{self, Client, Response, Url},
+    ClientBuilder, ClientWithMiddleware, Middleware,
 };
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 use std::{collections::HashMap, net::SocketAddr, str::FromStr};
@@ -362,8 +363,39 @@ async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {
 pub fn build_reqwest_client() -> ClientWithMiddleware {
     let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
     ClientBuilder::new(Client::new())
+        .with(LoggingMiddleware)
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
         .build()
+}
+
+struct LoggingMiddleware;
+
+#[async_trait::async_trait]
+impl Middleware for LoggingMiddleware {
+    async fn handle(
+        &self,
+        req: reqwest::Request,
+        extensions: &mut Extensions,
+        next: reqwest_middleware::Next<'_>,
+    ) -> reqwest_middleware::Result<Response> {
+        let method = req.method().clone();
+        let url = req.url().clone();
+
+        info!("Making {} request to: {}", method, url);
+
+        let result = next.run(req, extensions).await;
+
+        match &result {
+            Ok(response) => {
+                info!("{} {} -> Status: {}", method, url, response.status());
+            }
+            Err(error) => {
+                warn!("{} {} -> Error: {:?}", method, url, error);
+            }
+        }
+
+        result
+    }
 }
 
 async fn shutdown_signal() {

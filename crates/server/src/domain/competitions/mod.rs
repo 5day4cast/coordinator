@@ -88,6 +88,8 @@ pub struct UserEntry {
     pub partial_signatures: Option<SigMap<PartialSignature>>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub signed_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub paid_at: Option<OffsetDateTime>,
 }
 
 impl<'a> TryFrom<&Row<'a>> for UserEntry {
@@ -132,6 +134,7 @@ impl<'a> TryFrom<&Row<'a>> for UserEntry {
             payout_hash: row.get(10)?,
             payout_preimage: row.get::<usize, Option<String>>(11)?,
             signed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(12)?, 12)?,
+            paid_at: parse_optional_timestamp(row.get::<usize, Option<String>>(13)?, 13)?,
         };
         Ok(user_entry)
     }
@@ -153,6 +156,7 @@ impl AddEntry {
             public_nonces: None,
             ephemeral_privatekey: None,
             payout_preimage: None,
+            paid_at: None,
         }
     }
 }
@@ -320,11 +324,16 @@ impl Competition {
         let (total_expiry_secs, expiry_time) = self.calculate_ticket_expiry()?;
         let mut tickets = Vec::with_capacity(total_tickets);
 
-        for _ in 0..total_tickets {
+        for i in 0..total_tickets {
             let ticket = self
                 .create_ticket(total_expiry_secs, expiry_time, ln_client)
                 .await?;
+
             tickets.push(ticket);
+
+            if i < total_tickets - 1 {
+                tokio::time::sleep(std::time::Duration::from_micros(1)).await;
+            }
         }
 
         Ok(tickets)
