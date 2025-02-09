@@ -116,6 +116,7 @@ impl TestContext {
             self.bitcoin_client.clone(),
             self.coord_ln.clone(),
             144,
+            1,
         )
         .await?;
         debug!("coordinator created");
@@ -331,14 +332,74 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
             .await?;
     }
 
-    // Final handler run to broadcast
+    // Broadcast funding transaction
     coordinator.competition_handler().await?;
 
-    // Verify final state
     let competition = coordinator.get_competition(create_event.id).await?;
-    assert_eq!(competition.get_state(), CompetitionState::Broadcasted);
+    assert_eq!(
+        competition.get_state(),
+        CompetitionState::FundingBroadcasted
+    );
     assert!(competition.signed_contract.is_some());
     assert!(competition.signed_at.is_some());
+
+    // Wait for automatic block generation on mutinynet to confirm transaction
+    let funding_txid = competition
+        .funding_transaction
+        .as_ref()
+        .unwrap()
+        .compute_txid();
+
+    // Wait for transaction to be confirmed (should take at most 30 seconds if using mutinynet)
+    let mut confirmed = false;
+    for _ in 0..30 {
+        if let Ok(Some(confirmations)) = context
+            .bitcoin_client
+            .get_tx_confirmation_height(&funding_txid)
+            .await
+        {
+            debug!("Transaction has {} confirmations", confirmations);
+            if confirmations >= 1 {
+                confirmed = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(
+        confirmed,
+        "Funding transaction was not confirmed within 30 seconds"
+    );
+
+    // Run handler to process confirmation
+    coordinator.competition_handler().await?;
+
+    // Verify funding confirmed state
+    let competition = coordinator.get_competition(create_event.id).await?;
+    assert_eq!(competition.get_state(), CompetitionState::FundingConfirmed);
+    assert!(competition.funding_confirmed_at.is_some());
+
+    // Run to process invoice settlement
+    coordinator.competition_handler().await?;
+
+    // Verify final state with settled invoices
+    let competition = coordinator.get_competition(create_event.id).await?;
+    assert_eq!(competition.get_state(), CompetitionState::FundingSettled);
+    assert!(competition.funding_settled_at.is_some());
+
+    // Verify all tickets are properly settled
+    let tickets = context
+        .competition_store
+        .get_tickets(competition.id)
+        .await?;
+    for ticket in tickets.values() {
+        assert!(
+            ticket.settled_at.is_some(),
+            "Ticket {} was not settled",
+            ticket.id
+        );
+    }
+
     cancel_token.cancel();
     Ok(())
 }

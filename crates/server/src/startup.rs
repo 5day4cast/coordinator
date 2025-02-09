@@ -175,6 +175,7 @@ pub async fn build_app(
         bitcoin_client.clone(),
         ln.clone(),
         config.coordinator_settings.relative_locktime_block_delta,
+        config.coordinator_settings.required_confirmations,
     )
     .await
     .map(Arc::new)?;

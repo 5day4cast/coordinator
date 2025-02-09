@@ -38,6 +38,7 @@ pub trait Bitcoin: Send + Sync {
     async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<LocalOutput, anyhow::Error>;
     async fn get_current_height(&self) -> Result<u32, anyhow::Error>;
     async fn get_estimated_fee_rates(&self) -> Result<HashMap<u16, f64>, anyhow::Error>;
+    async fn get_tx_confirmation_height(&self, txid: &Txid) -> Result<Option<u32>, anyhow::Error>;
     async fn broadcast(&self, transaction: &Transaction) -> Result<(), anyhow::Error>;
     async fn get_next_address(&self) -> Result<AddressInfo, anyhow::Error>;
     async fn get_derived_private_key(&self) -> Result<DlcSecretKey, anyhow::Error>;
@@ -156,6 +157,11 @@ impl Bitcoin for BitcoinClient {
         let wallet = self.wallet.write().await;
         let finalized = wallet.sign(psbt, sign_options)?;
         Ok(finalized)
+    }
+
+    async fn get_tx_confirmation_height(&self, txid: &Txid) -> Result<Option<u32>, anyhow::Error> {
+        let tx_status = self.client.get_tx_status(txid).await?;
+        Ok(tx_status.block_height)
     }
 
     async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<LocalOutput, anyhow::Error> {

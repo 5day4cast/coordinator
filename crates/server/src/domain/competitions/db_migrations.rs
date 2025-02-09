@@ -66,6 +66,8 @@ pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), d
         contracted_at TIMESTAMPTZ,              -- When contract parameters were created
         signed_at TIMESTAMPTZ,                  -- When musig2 signing completed
         funding_broadcasted_at TIMESTAMPTZ,     -- When funding transaction was broadcast
+        funding_confirmed_at TIMESTAMPTZ,       -- When funding transaction has at least 1 confirmation
+        funding_settled_at TIMESTAMPTZ,         -- When all hodl invoices have been settled for the competition
         cancelled_at TIMESTAMPTZ,               -- If competition was cancelled
         failed_at TIMESTAMPTZ,                  -- If competition failed
         errors BLOB                             -- List of errors that lead to failed_at
@@ -80,7 +82,8 @@ pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), d
         payment_request TEXT,                   -- hodl invoice payment request generated for the ticket
         reserved_at TIMESTAMPTZ,                -- used to determine if reserve is still valid
         reserved_by TEXT,                       -- pubkey of user that is trying to use this ticket
-        paid_at TIMESTAMPTZ                     -- when user payment is pending for the ticket
+        paid_at TIMESTAMPTZ,                    -- when user payment is pending for the ticket
+        settled_at TIMESTAMPTZ                  -- when user payment has settled (ie hodl invoice completes)
     );
 
     CREATE TABLE IF NOT EXISTS entries

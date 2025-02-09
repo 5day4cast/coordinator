@@ -173,28 +173,29 @@ pub struct Ticket {
     pub reserved_by: Option<String>,
     pub reserved_at: Option<OffsetDateTime>,
     pub paid_at: Option<OffsetDateTime>,
+    pub settled_at: Option<OffsetDateTime>,
 }
 
 impl Ticket {
     pub fn get_status(&self) -> TicketStatus {
         let now = OffsetDateTime::now_utc();
 
-        // Check if ticket has been used for an entry
         if self.entry_id.is_some() {
             return TicketStatus::Used;
         }
 
-        // Check if ticket has expired
         if now > self.expiry {
             return TicketStatus::Expired;
         }
 
-        // Check if ticket has been paid
+        if self.settled_at.is_some() {
+            return TicketStatus::Settled;
+        }
+
         if self.paid_at.is_some() {
             return TicketStatus::Paid;
         }
 
-        // Check if ticket is reserved
         if let Some(reserved_at) = self.reserved_at {
             // If reservation is older than 10 minutes and not paid, consider it expired
             if now - reserved_at > Duration::minutes(10) {
@@ -236,6 +237,7 @@ pub enum TicketStatus {
     Created,   // Initial state
     Reserved,  // Payment request generated
     Paid,      // HODL invoice accepted
+    Settled,   // HODL invoice settled
     Used,      // Entry created with this ticket
     Expired,   // Payment time window expired
     Cancelled, // Competition cancelled
@@ -310,6 +312,12 @@ pub struct Competition {
     pub signed_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub funding_broadcasted_at: Option<OffsetDateTime>,
+    /// Funding transaction is considered settled after 1 confirmation by default
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub funding_confirmed_at: Option<OffsetDateTime>,
+    /// Funding transaction is considered settled after all hold invoices have been closed
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub funding_settled_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub failed_at: Option<OffsetDateTime>,
     pub errors: Vec<CompetitionError>,
@@ -380,6 +388,7 @@ impl Competition {
             reserved_by: None,
             reserved_at: None,
             paid_at: None,
+            settled_at: None,
         })
     }
 }
@@ -399,7 +408,10 @@ pub enum CompetitionState {
     AggregateNoncesGenerated,
     PartialSignaturesCollected,
     SigningComplete,
-    Broadcasted,
+    FundingBroadcasted,
+    FundingConfirmed, // once funding transaction has been confirmed at least once (default)
+    FundingSettled,   // once all hold invoices have settled/tickets have been paid
+    PaidOut,          // contract has been completed, ie all tickets have been paid out
     Failed,
     Cancelled,
 }
@@ -429,6 +441,8 @@ impl Competition {
             signed_contract: None,
             partial_signatures: None,
             funding_broadcasted_at: None,
+            funding_confirmed_at: None,
+            funding_settled_at: None,
             failed_at: None,
             errors: vec![],
         }
@@ -511,8 +525,11 @@ impl Competition {
         if self.is_failed() {
             return CompetitionState::Failed;
         }
+        if self.funding_settled_at.is_some() {
+            return CompetitionState::FundingConfirmed;
+        }
         if self.funding_broadcasted_at.is_some() {
-            return CompetitionState::Broadcasted;
+            return CompetitionState::FundingBroadcasted;
         }
         if self.signed_at.is_some() {
             return CompetitionState::SigningComplete;
@@ -634,10 +651,18 @@ impl<'a> TryFrom<&Row<'a>> for Competition {
                 row.get::<usize, Option<String>>(21)?,
                 21,
             )?,
-            failed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(22)?, 22)?,
+            funding_confirmed_at: parse_optional_timestamp(
+                row.get::<usize, Option<String>>(22)?,
+                22,
+            )?,
+            funding_settled_at: parse_optional_timestamp(
+                row.get::<usize, Option<String>>(23)?,
+                23,
+            )?,
+            failed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(24)?, 24)?,
 
             errors: row
-                .get::<usize, Option<Value>>(23)
+                .get::<usize, Option<Value>>(25)
                 .map(|opt| {
                     opt.and_then(|raw| match raw {
                         Value::Blob(val) => {
@@ -659,6 +684,10 @@ pub enum CompetitionError {
     FailedCreateTransaction(String),
     #[error("Failed to broadcast error: {0}")]
     FailedBroadcast(String),
+    #[error("Failed to check funding confirmation error: {0}")]
+    FailedFundingConfirmation(String),
+    #[error("Failed to settled funding invoices error: {0}")]
+    FailedFundingSettled(String),
     #[error("Failed to aggregate nonces: {0}")]
     FailedNonceAggregation(String),
     #[error("Competition expired: {0}")]
@@ -691,6 +720,7 @@ impl<'a> TryFrom<&Row<'a>> for Ticket {
             reserved_by: row.get(7)?,
             reserved_at: parse_optional_timestamp(row.get::<usize, Option<String>>(8)?, 8)?,
             paid_at: parse_optional_timestamp(row.get::<usize, Option<String>>(9)?, 9)?,
+            settled_at: parse_optional_timestamp(row.get::<usize, Option<String>>(10)?, 10)?,
         })
     }
 }

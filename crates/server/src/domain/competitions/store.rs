@@ -334,6 +334,7 @@ impl CompetitionStore {
                 contracted_at = ?,
                 signed_at = ?,
                 funding_broadcasted_at = ?,
+                funding_settled_at = ?,
                 cancelled_at = ?,
                 failed_at = ?,
                 errors = ?
@@ -406,6 +407,7 @@ impl CompetitionStore {
                 &competition.contracted_at,
                 &competition.signed_at,
                 &competition.funding_broadcasted_at,
+                &competition.funding_settled_at,
                 &competition.cancelled_at,
                 &competition.failed_at,
             ] {
@@ -470,6 +472,7 @@ impl CompetitionStore {
             "contracted_at::TEXT as contracted_at",
             "competitions.signed_at::TEXT as signed_at",
             "funding_broadcasted_at::TEXT as funding_broadcasted_at",
+            "funding_settled_at::TEXT as funding_settled_at",
             "failed_at::TEXT as failed_at",
             "errors",
         ))
@@ -510,6 +513,7 @@ impl CompetitionStore {
                 "contracted_at",
                 "competitions.signed_at",
                 "funding_broadcasted_at",
+                "funding_settled_at",
                 "failed_at",
                 "errors",
             ))
@@ -560,6 +564,7 @@ impl CompetitionStore {
             "contracted_at::TEXT as contracted_at",
             "competitions.signed_at::TEXT as signed_at",
             "funding_broadcasted_at::TEXT as funding_broadcasted_at",
+            "funding_settled_at::TEXT as funding_settled_at",
             "failed_at::TEXT as failed_at",
             "errors",
         ))
@@ -594,6 +599,7 @@ impl CompetitionStore {
             "contracted_at",
             "competitions.signed_at",
             "funding_broadcasted_at",
+            "funding_settled_at",
             "failed_at",
             "errors",
         ))
@@ -630,7 +636,8 @@ impl CompetitionStore {
                    payment_request,
                    reserved_by,
                    reserved_at::TEXT,
-                   paid_at::TEXT
+                   paid_at::TEXT,
+                   settled_at::TEXT
             FROM tickets
             LEFT JOIN entries ON tickets.id = entries.ticket_id
             WHERE tickets.event_id = ?
@@ -684,7 +691,8 @@ impl CompetitionStore {
                    (NOW() + INTERVAL '10 minutes')::TEXT as expiry,
                    reserved_by,
                    reserved_at::TEXT,
-                   paid_at::TEXT
+                   paid_at::TEXT,
+                   settled_at::TEXT
             FROM tickets
             LEFT JOIN entries ON tickets.id = entries.ticket_id
             WHERE tickets.id = ?"#;
@@ -715,7 +723,8 @@ impl CompetitionStore {
                    (NOW() + INTERVAL '10 minutes')::TEXT as expiry,
                    reserved_by,
                    reserved_at::TEXT,
-                   paid_at::TEXT
+                   paid_at::TEXT,
+                   settled_at::TEXT
             FROM tickets
             LEFT JOIN entries ON tickets.id = entries.ticket_id
             WHERE reserved_at IS NOT NULL
@@ -746,7 +755,8 @@ impl CompetitionStore {
                    (NOW() + INTERVAL '10 minutes')::TEXT as expiry,
                    reserved_by,
                    reserved_at::TEXT,
-                   paid_at::TEXT
+                   paid_at::TEXT,
+                   settled_at::TEXT
             FROM tickets
             LEFT JOIN entries ON tickets.id = entries.ticket_id
             WHERE tickets.id = ?"#;
@@ -775,6 +785,34 @@ impl CompetitionStore {
             WHERE hash = ?
             AND event_id = ?
             AND paid_at IS NULL
+            AND settled_at IS NULL
+            AND reserved_at IS NOT NULL
+            AND reserved_at > NOW() - INTERVAL '10 minutes'"#;
+
+        let mut stmt = conn.prepare(query)?;
+        let affected = stmt.execute(params![ticket_hash, competition_id.to_string(),])?;
+
+        if affected == 0 {
+            return Err(duckdb::Error::QueryReturnedNoRows);
+        }
+
+        Ok(())
+    }
+
+    pub async fn mark_ticket_settled(
+        &self,
+        ticket_hash: &str,
+        competition_id: Uuid,
+    ) -> Result<(), duckdb::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+
+        let query = r#"
+            UPDATE tickets
+            SET settled_at = NOW()
+            WHERE hash = ?
+            AND event_id = ?
+            AND settled_at IS NULL
+            AND paid_at IS NOT NULL
             AND reserved_at IS NOT NULL
             AND reserved_at > NOW() - INTERVAL '10 minutes'"#;
 
@@ -801,9 +839,8 @@ impl CompetitionStore {
             "payment_request",
             "(NOW() + INTERVAL '10 minutes')::TEXT as expiry",
             "reserved_by::TEXT",
-            "reserved_at::TEXT",
-            "paid_at::TEXT",
         ))
+        .and_select(("reserved_at::TEXT", "paid_at::TEXT", "settled_at::TEXT"))
         .from(
             "tickets"
                 .left_join("entries")

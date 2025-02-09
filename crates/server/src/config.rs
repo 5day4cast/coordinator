@@ -116,6 +116,10 @@ pub struct CoordinatorSettings {
     /// - `432`: ~72 hours
     /// - `1008`: ~1 week
     pub relative_locktime_block_delta: u16,
+
+    /// The number of confirmations required for a transaction to be considered confirmed
+    /// by the coordinator system
+    pub required_confirmations: u32,
 }
 
 impl Default for CoordinatorSettings {
@@ -124,6 +128,7 @@ impl Default for CoordinatorSettings {
             oracle_url: String::from("https://www.4casttruth.win"),
             private_key_file: String::from("./creds/coordinator_private_key.pem"),
             relative_locktime_block_delta: 144,
+            required_confirmations: 1,
         }
     }
 }

@@ -142,6 +142,7 @@ impl TestContext {
             self.bitcoin_mock.clone(),
             self.ln_mock.clone(),
             144,
+            1,
         )
         .await?;
 
@@ -379,7 +380,10 @@ async fn test_two_person_competition_flow() -> Result<()> {
     debug!("Final competition state: {:?}", competition.get_state());
     debug!("Competition errors: {:?}", competition.errors);
 
-    assert_eq!(competition.get_state(), CompetitionState::Broadcasted);
+    assert_eq!(
+        competition.get_state(),
+        CompetitionState::FundingBroadcasted
+    );
     assert!(competition.signed_contract.is_some());
     assert!(competition.signed_at.is_some());
 
@@ -584,7 +588,10 @@ async fn test_four_person_competition_flow() -> Result<()> {
     debug!("Final competition state: {:?}", competition.get_state());
     debug!("Competition errors: {:?}", competition.errors);
 
-    assert_eq!(competition.get_state(), CompetitionState::Broadcasted);
+    assert_eq!(
+        competition.get_state(),
+        CompetitionState::FundingBroadcasted
+    );
     assert!(competition.signed_contract.is_some());
     assert!(competition.signed_at.is_some());
 
@@ -790,7 +797,10 @@ async fn test_ten_person_competition_flow() -> Result<()> {
     debug!("Final competition state: {:?}", competition.get_state());
     debug!("Competition errors: {:?}", competition.errors);
 
-    assert_eq!(competition.get_state(), CompetitionState::Broadcasted);
+    assert_eq!(
+        competition.get_state(),
+        CompetitionState::FundingBroadcasted
+    );
     assert!(competition.signed_contract.is_some());
     assert!(competition.signed_at.is_some());
 

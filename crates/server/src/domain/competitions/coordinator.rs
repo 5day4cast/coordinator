@@ -99,6 +99,7 @@ pub struct Coordinator {
     private_key: Musig2SecretKey,
     public_key: PublicKey,
     relative_locktime_block_delta: u16,
+    required_confirmations: u32,
 }
 
 impl Coordinator {
@@ -108,6 +109,7 @@ impl Coordinator {
         bitcoin: Arc<dyn Bitcoin>,
         ln: Arc<dyn Ln>,
         relative_locktime_block_delta: u16,
+        required_confirmations: u32,
     ) -> Result<Self, anyhow::Error> {
         let private_key = bitcoin.get_derived_private_key().await?;
         let secp = Musig2Secp256::new();
@@ -121,6 +123,7 @@ impl Coordinator {
             private_key,
             public_key,
             relative_locktime_block_delta,
+            required_confirmations,
         };
         coordinator.validate_coordinator_metadata().await?;
         Ok(coordinator)
@@ -245,6 +248,35 @@ impl Coordinator {
                             competition
                                 .errors
                                 .push(CompetitionError::FailedBroadcast(e.to_string()));
+                            competition.failed_at = Some(OffsetDateTime::now_utc());
+                            updated_competitions.push(competition);
+                        }
+                    }
+                }
+                CompetitionState::FundingBroadcasted => {
+                    match self.check_funding_confirmation(competition.clone()).await {
+                        Ok(updated) => updated_competitions.push(updated),
+                        Err(e) => {
+                            error!(
+                                "competition {} failed to check confirm: {}",
+                                competition.id, e
+                            );
+                            competition
+                                .errors
+                                .push(CompetitionError::FailedFundingConfirmation(e.to_string()));
+                            competition.failed_at = Some(OffsetDateTime::now_utc());
+                            updated_competitions.push(competition);
+                        }
+                    }
+                }
+                CompetitionState::FundingConfirmed => {
+                    match self.settle_competition_invoices(competition.clone()).await {
+                        Ok(updated) => updated_competitions.push(updated),
+                        Err(e) => {
+                            error!("competition {} failed to broadcast: {}", competition.id, e);
+                            competition
+                                .errors
+                                .push(CompetitionError::FailedFundingSettled(e.to_string()));
                             competition.failed_at = Some(OffsetDateTime::now_utc());
                             updated_competitions.push(competition);
                         }
@@ -526,6 +558,114 @@ impl Coordinator {
         self.bitcoin.broadcast(funding_transaction).await?;
 
         competition.funding_broadcasted_at = Some(OffsetDateTime::now_utc());
+
+        Ok(competition)
+    }
+
+    async fn check_funding_confirmation(
+        &self,
+        mut competition: Competition,
+    ) -> Result<Competition, anyhow::Error> {
+        if competition.get_state() != CompetitionState::FundingBroadcasted {
+            return Err(anyhow!(
+                "Competition {} in invalid state for funding confirmation: {:?}",
+                competition.id,
+                competition.get_state()
+            ));
+        }
+
+        let funding_tx = competition.funding_transaction.as_ref().ok_or_else(|| {
+            anyhow!(
+                "No funding transaction found for competition {}",
+                competition.id
+            )
+        })?;
+
+        let txid = funding_tx.compute_txid();
+        match self.bitcoin.get_tx_confirmation_height(&txid).await? {
+            Some(confirmations) if confirmations >= self.required_confirmations => {
+                info!(
+                    "Funding transaction {} confirmed with {} confirmations for competition {}",
+                    txid, confirmations, competition.id
+                );
+                competition.funding_settled_at = Some(OffsetDateTime::now_utc());
+            }
+            Some(confirmations) => {
+                debug!(
+                    "Funding transaction {} has {} of {} required confirmations for competition {}",
+                    txid, confirmations, self.required_confirmations, competition.id
+                );
+            }
+            None => {
+                debug!(
+                    "Funding transaction {} not yet confirmed for competition {}",
+                    txid, competition.id
+                );
+            }
+        }
+
+        Ok(competition)
+    }
+
+    async fn settle_competition_invoices(
+        &self,
+        mut competition: Competition,
+    ) -> Result<Competition, anyhow::Error> {
+        if competition.get_state() != CompetitionState::FundingConfirmed {
+            return Err(anyhow!(
+                "Competition {} in invalid state for invoice settlement: {:?}",
+                competition.id,
+                competition.get_state()
+            ));
+        }
+
+        if competition.funding_settled_at.is_some() {
+            return Err(anyhow!(
+                "Invoices already settled for competition {}",
+                competition.id
+            ));
+        }
+
+        let tickets = self.competition_store.get_tickets(competition.id).await?;
+        let mut settlement_errors = Vec::new();
+
+        for ticket in tickets.values() {
+            //TODO: add decryption of the preimage to settle the hodl invoice
+            match self
+                .ln
+                .settle_hold_invoice(ticket.encrypted_preimage.clone())
+                .await
+            {
+                Ok(_) => {
+                    self.competition_store
+                        .mark_ticket_settled(&ticket.hash, competition.id)
+                        .await?;
+                    debug!(
+                        "Settled invoice for ticket {} in competition {}",
+                        ticket.id, competition.id
+                    );
+                }
+                Err(e) => {
+                    let error_msg = format!(
+                        "Failed to settle invoice for ticket {} in competition {}: {}",
+                        ticket.id, competition.id, e
+                    );
+                    error!("{}", error_msg);
+                    settlement_errors.push(error_msg);
+                }
+            }
+        }
+
+        if !settlement_errors.is_empty() {
+            return Err(anyhow!(
+                "Failed to settle some invoices for competition {}: {:?}",
+                competition.id,
+                settlement_errors
+            ));
+        }
+
+        competition.funding_settled_at = Some(OffsetDateTime::now_utc());
+        info!("All invoices settled for competition {}", competition.id);
 
         Ok(competition)
     }
