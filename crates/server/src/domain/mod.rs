@@ -40,6 +40,8 @@ pub enum Error {
     CompetitionFull,
     #[error("No ticket available for competition")]
     NoAvailableTickets,
+    #[error("Payout payment failed: {0}")]
+    PaymentFailed(String),
 }
 
 #[derive(Clone)]

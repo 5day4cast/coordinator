@@ -134,6 +134,78 @@ impl CompetitionStore {
         Ok(())
     }
 
+    pub async fn mark_entry_sellback_broadcast(
+        &self,
+        entry_id: Uuid,
+        broadcast_time: OffsetDateTime,
+    ) -> Result<(), duckdb::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+
+        let mut stmt = conn.prepare(
+            "UPDATE entries
+                SET sellback_broadcasted_at = ?
+                WHERE id = ?",
+        )?;
+
+        stmt.execute(params![
+            broadcast_time.format(&Rfc3339).unwrap(),
+            entry_id.to_string(),
+        ])?;
+
+        Ok(())
+    }
+
+    pub async fn mark_entry_reclaim_broadcast(
+        &self,
+        entry_id: Uuid,
+        broadcast_time: OffsetDateTime,
+    ) -> Result<(), duckdb::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+
+        let mut stmt = conn.prepare(
+            "UPDATE entries
+                SET reclaimed_broadcasted_at = ?
+                WHERE id = ?",
+        )?;
+
+        stmt.execute(params![
+            broadcast_time.format(&Rfc3339).unwrap(),
+            entry_id.to_string(),
+        ])?;
+
+        Ok(())
+    }
+
+    pub async fn store_payout_info(
+        &self,
+        entry_id: Uuid,
+        payout_preimage: String,
+        ephemeral_private_key: String,
+        ln_invoice: String,
+        paid_time: OffsetDateTime,
+    ) -> Result<(), duckdb::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+
+        let mut stmt = conn.prepare(
+            "UPDATE entries
+            SET payout_preimage = ?,
+                ephemeral_privatekey = ?,
+                payout_ln_invoice = ?,
+                paid_out_at = ?
+            WHERE id = ?",
+        )?;
+
+        stmt.execute(params![
+            payout_preimage,
+            ephemeral_private_key,
+            ln_invoice,
+            paid_time.format(&Rfc3339).unwrap(),
+            entry_id.to_string(),
+        ])?;
+
+        Ok(())
+    }
+
     pub async fn get_competition_entries(
         &self,
         event_id: Uuid,
@@ -154,8 +226,14 @@ impl CompetitionStore {
             "payout_preimage_encrypted",
             "payout_hash",
             "payout_preimage",
+            "payout_ln_invoice",
+        ))
+        .and_select((
             "signed_at::TEXT",
             "tickets.paid_at::TEXT AS paid_at",
+            "paid_out_at::TEXT",
+            "sellback_broadcasted_at::TEXT",
+            "reclaimed_broadcasted_at::TEXT",
         ))
         .from(
             "entries"
@@ -209,8 +287,14 @@ impl CompetitionStore {
             "payout_preimage_encrypted",
             "payout_hash",
             "payout_preimage",
+            "payout_ln_invoice",
+        ))
+        .and_select((
             "signed_at::TEXT",
             "tickets.paid_at::TEXT AS paid_at",
+            "paid_out_at::TEXT",
+            "sellback_broadcasted_at::TEXT",
+            "reclaimed_broadcasted_at::TEXT",
         ))
         .from(
             "entries"
@@ -324,6 +408,7 @@ impl CompetitionStore {
             let mut params: Vec<Value> = vec![];
 
             let query = "UPDATE competitions SET
+                outcome_transaction = ?,
                 funding_transaction = ?,
                 funding_outpoint = ?,
                 contract_parameters = ?,
@@ -331,14 +416,29 @@ impl CompetitionStore {
                 aggregated_nonces = ?,
                 partial_signatures = ?,
                 signed_contract = ?,
+                attestation = ?,
+                cancelled_at = ?,
                 contracted_at = ?,
                 signed_at = ?,
                 funding_broadcasted_at = ?,
+                funding_confirmed_at = ?,
                 funding_settled_at = ?,
-                cancelled_at = ?,
+                expiry_broadcasted_at = ?,
+                outcome_broadcasted_at = ?,
+                delta_broadcasted_at = ?,
+                close_broadcasted_at = ?,
                 failed_at = ?,
                 errors = ?
                 WHERE id = ?";
+
+            if let Some(outcome_transaction) = &competition.outcome_transaction {
+                params.push(Value::Blob(
+                    serde_json::to_vec(outcome_transaction)
+                        .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?,
+                ));
+            } else {
+                params.push(Value::Null);
+            }
 
             if let Some(funding_transaction) = &competition.funding_transaction {
                 params.push(Value::Blob(
@@ -403,12 +503,26 @@ impl CompetitionStore {
                 params.push(Value::Null);
             }
 
+            if let Some(attestation) = &competition.attestation {
+                params
+                    .push(Value::Blob(serde_json::to_vec(attestation).map_err(
+                        |e| duckdb::Error::ToSqlConversionFailure(Box::new(e)),
+                    )?));
+            } else {
+                params.push(Value::Null);
+            }
+
             for timestamp in [
+                &competition.cancelled_at,
                 &competition.contracted_at,
                 &competition.signed_at,
                 &competition.funding_broadcasted_at,
+                &competition.funding_confirmed_at,
                 &competition.funding_settled_at,
-                &competition.cancelled_at,
+                &competition.expiry_broadcasted_at,
+                &competition.outcome_broadcasted_at,
+                &competition.delta_broadcasted_at,
+                &competition.close_broadcasted_at,
                 &competition.failed_at,
             ] {
                 if let Some(ts) = timestamp {
@@ -457,22 +571,34 @@ impl CompetitionStore {
             "COUNT(entries.id) FILTER (entries.public_nonces IS NOT NULL) as total_entry_nonces",
             "COUNT(entries.id) FILTER (entries.signed_at IS NOT NULL) as total_signed_entries",
             "COUNT(tickets.paid_at) as total_paid_entries",
+            "COUNT(entries.id) FILTER (entries.paid_out_at IS NOT NULL) as total_paid_out_entries",
         ))
         .and_select((
+            "outcome_transaction",
             "funding_transaction",
             "funding_outpoint",
             "contract_parameters",
             "competitions.public_nonces as public_nonces",
+        ))
+        .and_select((
             "aggregated_nonces",
             "competitions.partial_signatures as partial_signatures",
             "signed_contract",
+            "attestation",
         ))
         .and_select((
             "cancelled_at::TEXT as cancelled_at",
             "contracted_at::TEXT as contracted_at",
             "competitions.signed_at::TEXT as signed_at",
             "funding_broadcasted_at::TEXT as funding_broadcasted_at",
+            "funding_confirmed_at::TEXT as funding_confirmed_at",
             "funding_settled_at::TEXT as funding_settled_at",
+        ))
+        .and_select((
+            "expiry_broadcasted_at::TEXT as expiry_broadcasted_at",
+            "outcome_broadcasted_at::TEXT as outcome_broadcasted_at",
+            "delta_broadcasted_at::TEXT as delta_broadcasted_at",
+            "close_broadcasted_at::TEXT as close_broadcasted_at",
             "failed_at::TEXT as failed_at",
             "errors",
         ))
@@ -486,7 +612,7 @@ impl CompetitionStore {
 
         if active_only {
             // filters out competitions in terminal states
-            query = query.where_("funding_broadcasted_at IS NULL AND cancelled_at IS NULL");
+            query = query.where_("expiry_broadcasted_at IS NULL AND close_broadcasted_at IS NULL AND cancelled_at IS NULL");
         }
 
         let query_str = query
@@ -498,22 +624,31 @@ impl CompetitionStore {
                 "number_of_places_win",
                 "entry_fee",
                 "event_announcement",
-                "funding_transaction",
+                "outcome_transaction",
             ))
             .group_by((
+                "funding_transaction",
                 "funding_outpoint",
                 "contract_parameters",
                 "competitions.public_nonces",
                 "aggregated_nonces",
                 "competitions.partial_signatures",
+                "signed_contract",
+                "attestation",
             ))
             .group_by((
-                "signed_contract",
                 "cancelled_at",
                 "contracted_at",
                 "competitions.signed_at",
                 "funding_broadcasted_at",
+                "funding_confirmed_at",
+            ))
+            .group_by((
                 "funding_settled_at",
+                "expiry_broadcasted_at",
+                "outcome_broadcasted_at",
+                "delta_broadcasted_at",
+                "close_broadcasted_at",
                 "failed_at",
                 "errors",
             ))
@@ -549,32 +684,37 @@ impl CompetitionStore {
             "COUNT(entries.id) FILTER (entries.public_nonces IS NOT NULL) as total_entry_nonces",
             "COUNT(entries.id) FILTER (entries.signed_at IS NOT NULL) as total_signed_entries",
             "COUNT(tickets.paid_at) as total_paid_entries",
+            "COUNT(entries.id) FILTER (entries.paid_out_at IS NOT NULL) as total_paid_out_entries",
         ))
         .and_select((
+            "outcome_transaction",
             "funding_transaction",
             "funding_outpoint",
             "contract_parameters",
             "competitions.public_nonces as public_nonces",
+        ))
+        .and_select((
             "aggregated_nonces",
             "competitions.partial_signatures as partial_signatures",
             "signed_contract",
+            "attestation",
         ))
         .and_select((
             "cancelled_at::TEXT as cancelled_at",
             "contracted_at::TEXT as contracted_at",
             "competitions.signed_at::TEXT as signed_at",
             "funding_broadcasted_at::TEXT as funding_broadcasted_at",
+            "funding_confirmed_at::TEXT as funding_confirmed_at",
             "funding_settled_at::TEXT as funding_settled_at",
+        ))
+        .and_select((
+            "expiry_broadcasted_at::TEXT as expiry_broadcasted_at",
+            "outcome_broadcasted_at::TEXT as outcome_broadcasted_at",
+            "delta_broadcasted_at::TEXT as delta_broadcasted_at",
+            "close_broadcasted_at::TEXT as close_broadcasted_at",
             "failed_at::TEXT as failed_at",
             "errors",
         ))
-        .from(
-            "competitions"
-                .left_join("entries")
-                .on("entries.event_id = competitions.id")
-                .left_join("tickets")
-                .on("entries.ticket_id = tickets.id"),
-        )
         .where_("competitions.id = ? ")
         .group_by((
             "competitions.id",
@@ -584,22 +724,31 @@ impl CompetitionStore {
             "number_of_places_win",
             "entry_fee",
             "event_announcement",
-            "funding_transaction",
+            "outcome_transaction",
         ))
         .group_by((
+            "funding_transaction",
             "funding_outpoint",
             "contract_parameters",
             "competitions.public_nonces",
             "aggregated_nonces",
             "competitions.partial_signatures",
+            "signed_contract",
+            "attestation",
         ))
         .group_by((
-            "signed_contract",
             "cancelled_at",
             "contracted_at",
             "competitions.signed_at",
             "funding_broadcasted_at",
+            "funding_confirmed_at",
+        ))
+        .group_by((
             "funding_settled_at",
+            "expiry_broadcasted_at",
+            "outcome_broadcasted_at",
+            "delta_broadcasted_at",
+            "close_broadcasted_at",
             "failed_at",
             "errors",
         ))
@@ -862,47 +1011,5 @@ impl CompetitionStore {
         }
 
         Ok(tickets)
-    }
-
-    pub async fn mark_entry_sellback_broadcast(
-        &self,
-        entry_id: Uuid,
-        broadcast_time: OffsetDateTime,
-    ) -> Result<(), duckdb::Error> {
-        let conn = self.db_connection.new_write_connection_retry().await?;
-
-        let mut stmt = conn.prepare(
-            "UPDATE entries
-                SET sellback_broadcasted_at = ?
-                WHERE id = ?",
-        )?;
-
-        stmt.execute(params![
-            broadcast_time.format(&Rfc3339).unwrap(),
-            entry_id.to_string(),
-        ])?;
-
-        Ok(())
-    }
-
-    pub async fn mark_entry_reclaim_broadcast(
-        &self,
-        entry_id: Uuid,
-        broadcast_time: OffsetDateTime,
-    ) -> Result<(), duckdb::Error> {
-        let conn = self.db_connection.new_write_connection_retry().await?;
-
-        let mut stmt = conn.prepare(
-            "UPDATE entries
-                SET reclaimed_broadcasted_at = ?
-                WHERE id = ?",
-        )?;
-
-        stmt.execute(params![
-            broadcast_time.format(&Rfc3339).unwrap(),
-            entry_id.to_string(),
-        ])?;
-
-        Ok(())
     }
 }

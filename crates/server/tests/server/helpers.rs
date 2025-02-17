@@ -30,6 +30,7 @@ mock! {
     impl Oracle for OracleClient {
         async fn create_event(&self, event: CreateEvent) -> Result<OracleEvent, Error>;
         async fn submit_entry(&self, entry: AddEventEntry) -> Result<(), Error>;
+        async fn get_event(&self, event_id: &Uuid) -> Result<OracleEvent, Error>;
     }
 }
 
@@ -239,6 +240,7 @@ pub fn generate_oracle_event(
             expiry: Some(expiry),
             locking_points,
         },
+        attestation: None,
     }
 }
 

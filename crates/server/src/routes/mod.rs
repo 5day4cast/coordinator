@@ -21,8 +21,9 @@ impl IntoResponse for Error {
         let (status, error_message) = match self.borrow() {
             Error::NoAvailableTickets => (StatusCode::BAD_REQUEST, self.to_string()),
             Error::CompetitionFull => (StatusCode::BAD_REQUEST, self.to_string()),
-            Error::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             Error::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            Error::PaymentFailed(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            Error::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             Error::InvalidSignature(_) => (StatusCode::FORBIDDEN, self.to_string()),
             _ => (
                 StatusCode::INTERNAL_SERVER_ERROR,

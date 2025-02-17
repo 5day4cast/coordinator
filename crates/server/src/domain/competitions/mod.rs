@@ -371,7 +371,10 @@ pub struct Competition {
     /// Outcome transaction is broadcasted after the attestation is provided
     #[serde(with = "time::serde::rfc3339::option")]
     pub outcome_broadcasted_at: Option<OffsetDateTime>,
-    /// All closing transaction have been broadcasted via the coordinator
+    /// First delta transactions have been broadcasted via the coordinator
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub delta_broadcasted_at: Option<OffsetDateTime>,
+    /// All closing transactions (delta 2 transactions) have been broadcasted via the coordinator
     #[serde(with = "time::serde::rfc3339::option")]
     pub close_broadcasted_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
@@ -439,6 +442,34 @@ impl Competition {
         Ok(outcome)
     }
 
+    pub fn verify_event_attestation(&self, attestation: &MaybeScalar) -> Result<Outcome, Error> {
+        let attestation_point = attestation.base_point_mul();
+
+        // Find which outcome this attestation corresponds to
+        let outcome = self
+            .event_announcement
+            .all_outcomes()
+            .into_iter()
+            .find(|outcome| {
+                match outcome {
+                    Outcome::Attestation(i) => {
+                        // The attestation point should match one of the locking points
+                        self.event_announcement.locking_points[*i] == attestation_point
+                    }
+                    Outcome::Expiry => false,
+                }
+            })
+            .ok_or_else(|| {
+                Error::BadRequest("Attestation doesn't match any valid outcome".into())
+            })?;
+
+        if !self.event_announcement.is_valid_outcome(&outcome) {
+            return Err(Error::BadRequest("Invalid outcome for this event".into()));
+        }
+
+        Ok(outcome)
+    }
+
     async fn create_ticket(
         &self,
         expiry_secs: u64,
@@ -490,14 +521,22 @@ pub enum CompetitionState {
     PartialSignaturesCollected,
     SigningComplete,
     FundingBroadcasted,
-    FundingConfirmed, // Once funding transaction has been confirmed at least once (default)
-    FundingSettled,   // Once all hold invoices have settled/tickets have been paid
-    Attested,         // Oracle has attested to the results
-    ExpiryBroadcasted, // Oracle event has expired & players refunded before an attestation was provided
-    OutcomeBroadcasted, // Outcome transaction has been broadcasted
-    DeltaBroadcasted,  // First Delta transaction has been broadcasted
-    PaidOut,           // All tickets have been paid out over lightning
-    Completed,         // Closing transactions has been broadcasted
+    /// Once funding transaction has been confirmed at least once (default)
+    FundingConfirmed,
+    /// Once all hold invoices have settled/tickets have been paid
+    FundingSettled,
+    /// Oracle has attested to the results
+    Attested,
+    /// Oracle event has expired & players refunded before an attestation was provided
+    ExpiryBroadcasted,
+    /// Outcome transaction has been broadcasted
+    OutcomeBroadcasted,
+    /// First Delta transactions have been broadcasted
+    DeltaBroadcasted,
+    /// All tickets have been paid out over lightning
+    PaidOut,
+    /// Closing transactions (second delta) have been broadcasted
+    Completed,
     Failed,
     Cancelled,
 }
@@ -511,12 +550,12 @@ impl Competition {
             total_allowed_entries: create_event.total_allowed_entries as u64,
             entry_fee: create_event.entry_fee as u64,
             event_announcement: oracle_event.event_announcement.clone(),
+            number_of_places_win: create_event.number_of_places_win,
             total_entries: 0,
             total_entry_nonces: 0,
             total_signed_entries: 0,
             total_paid_entries: 0,
             total_paid_out_entries: 0,
-            number_of_places_win: create_event.number_of_places_win,
             funding_transaction: None,
             outcome_transaction: None,
             funding_outpoint: None,
@@ -534,6 +573,7 @@ impl Competition {
             funding_settled_at: None,
             expiry_broadcasted_at: None,
             outcome_broadcasted_at: None,
+            delta_broadcasted_at: None,
             close_broadcasted_at: None,
             failed_at: None,
             errors: vec![],
@@ -561,6 +601,10 @@ impl Competition {
 
     pub fn is_contract_signed(&self) -> bool {
         self.signed_at.is_some()
+    }
+
+    pub fn is_delta_broadcasted(&self) -> bool {
+        self.delta_broadcasted_at.is_some()
     }
 
     pub fn is_funding_tx_broadcasted(&self) -> bool {
@@ -640,14 +684,17 @@ impl Competition {
         if self.is_completed() {
             return CompetitionState::Completed;
         }
+        if self.is_delta_broadcasted() {
+            return CompetitionState::DeltaBroadcasted;
+        }
+        if self.has_all_entries_paid_out() {
+            return CompetitionState::PaidOut;
+        }
         if self.is_outcome_broadcasted() {
             return CompetitionState::OutcomeBroadcasted;
         }
         if self.is_expiry_broadcasted() {
             return CompetitionState::ExpiryBroadcasted;
-        }
-        if self.has_all_entries_paid_out() {
-            return CompetitionState::PaidOut;
         }
         if self.is_attested() {
             return CompetitionState::Attested;
@@ -809,15 +856,18 @@ impl<'a> TryFrom<&Row<'a>> for Competition {
                 row.get::<usize, Option<String>>(28)?,
                 28,
             )?,
-
-            close_broadcasted_at: parse_optional_timestamp(
+            delta_broadcasted_at: parse_optional_timestamp(
                 row.get::<usize, Option<String>>(29)?,
                 29,
             )?,
-            failed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(30)?, 30)?,
+            close_broadcasted_at: parse_optional_timestamp(
+                row.get::<usize, Option<String>>(30)?,
+                31,
+            )?,
+            failed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(32)?, 32)?,
 
             errors: row
-                .get::<usize, Option<Value>>(31)
+                .get::<usize, Option<Value>>(33)
                 .map(|opt| {
                     opt.and_then(|raw| match raw {
                         Value::Blob(val) => {

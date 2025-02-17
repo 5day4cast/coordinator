@@ -18,6 +18,7 @@ use bdk_wallet::{
 };
 use dlctix::{
     bitcoin::{
+        hex::DisplayHex as _,
         key::TweakedPublicKey,
         sighash::Prevouts,
         transaction::{predict_weight, InputWeightPrediction},
@@ -760,6 +761,21 @@ impl Coordinator {
             );
             return Ok(competition);
         };
+        match competition.verify_event_attestation(&attestation) {
+            Ok(outcome) => {
+                info!(
+                    "Oracle attestation verified for competition {}: {}",
+                    competition.id, outcome
+                );
+            }
+            Err(e) => {
+                error!(
+                    "Oracle attestation verification failed for competition {}: {}",
+                    competition.id, e
+                );
+                return Err(anyhow!("Oracle attestation verification failed: {}", e));
+            }
+        }
 
         competition.attestation = Some(attestation);
         info!(
@@ -1290,7 +1306,7 @@ impl Coordinator {
             .map_err(|e| anyhow!("failed to add coordinator metadata: {}", e))
     }
 
-    // Becareful with these two operations, there's a possibility here of a
+    // Be careful with these two operations, there's a possibility here of a
     // competition being added to the oracle but never saved to our local DB (low, but possible)
     pub async fn create_competition(
         &self,
@@ -1717,7 +1733,138 @@ impl Coordinator {
         entry_id: Uuid,
         payout_info: PayoutInfo,
     ) -> Result<(), Error> {
-        Ok(())
+        // Get the competition and verify it's in a valid state for payouts
+        let competition = self
+            .competition_store
+            .get_competition(competition_id)
+            .await?;
+
+        if !competition.is_attested() {
+            return Err(Error::BadRequest(
+                "Competition results not yet attested".into(),
+            ));
+        }
+
+        // Get the entry and verify ownership
+        let entries = self
+            .competition_store
+            .get_user_entries(
+                pubkey.clone(),
+                SearchBy {
+                    event_ids: Some(vec![competition_id]),
+                },
+            )
+            .await?;
+
+        let entry = entries
+            .iter()
+            .find(|e| e.id == entry_id)
+            .ok_or_else(|| Error::NotFound(format!("Entry {} not found", entry_id)))?;
+
+        // Verify the ticket matches
+        if entry.ticket_id != payout_info.ticket_id {
+            return Err(Error::BadRequest("Invalid ticket for this entry".into()));
+        }
+
+        // Get competition tickets to verify against stored data
+        let tickets = self.competition_store.get_tickets(competition_id).await?;
+        _ = tickets
+            .get(&entry.id)
+            .ok_or_else(|| Error::NotFound("Ticket not found".into()))?;
+
+        // Verify the entry hasn't already been paid out
+        if entry.paid_out_at.is_some() {
+            return Err(Error::BadRequest("Entry already paid out".into()));
+        }
+
+        // Get the current outcome
+        let outcome = competition.get_current_outcome()?;
+
+        // Get the signed contract to verify winner
+        let signed_contract = competition
+            .signed_contract
+            .as_ref()
+            .ok_or_else(|| Error::BadRequest("Competition contract not yet signed".into()))?;
+
+        // Verify this entry is a winner
+        let winner_weights = signed_contract
+            .params()
+            .outcome_payouts
+            .get(&outcome)
+            .ok_or_else(|| Error::BadRequest("No payout mapping for outcome".into()))?;
+
+        let ephemeral_pubkey = dlctix::secp::Point::from_hex(&entry.ephemeral_pubkey)
+            .map_err(|e| Error::BadRequest(format!("Invalid ephemeral pubkey: {}", e)))?;
+
+        let is_winner = winner_weights.iter().any(|(player_index, _)| {
+            if let Some(player) = signed_contract.params().players.get(*player_index) {
+                player.pubkey == ephemeral_pubkey
+            } else {
+                false
+            }
+        });
+
+        if !is_winner {
+            return Err(Error::BadRequest("Entry is not a winner".into()));
+        }
+
+        // Verify the private key matches the public key
+        let provided_private_key =
+            dlctix::secp::Scalar::from_hex(&payout_info.ephemeral_private_key)
+                .map_err(|e| Error::BadRequest(format!("Invalid private key: {}", e)))?;
+
+        let derived_public_key = provided_private_key.base_point_mul();
+        if derived_public_key != ephemeral_pubkey {
+            return Err(Error::BadRequest(
+                "Invalid private key for this entry".into(),
+            ));
+        }
+
+        // Verify the payout preimage matches the hash
+        let provided_preimage =
+            dlctix::hashlock::preimage_from_hex(&payout_info.payout_preimage)
+                .map_err(|e| Error::BadRequest(format!("Invalid payout preimage: {}", e)))?;
+
+        let derived_hash = dlctix::hashlock::sha256(&provided_preimage);
+        if derived_hash.to_hex_string(dlctix::bitcoin::hex::Case::Lower) != entry.payout_hash {
+            return Err(Error::BadRequest(
+                "Invalid payout preimage for this entry".into(),
+            ));
+        }
+
+        if payout_info.ln_invoice.is_empty() {
+            return Err(Error::BadRequest("Invalid lightning invoice".into()));
+        }
+
+        match self
+            .ln
+            .send_payment(
+                payout_info.ln_invoice.clone(),
+                60,   // 60 second timeout
+                1000, // 1000 sat fee limit
+            )
+            .await
+        {
+            Ok(_) => {
+                // Update the entry as paid out
+                self.competition_store
+                    .store_payout_info(
+                        entry_id,
+                        payout_info.payout_preimage,
+                        payout_info.ephemeral_private_key,
+                        payout_info.ln_invoice,
+                        OffsetDateTime::now_utc(),
+                    )
+                    .await
+                    .map_err(Error::DbError)
+            }
+            Err(e) => {
+                return Err(Error::PaymentFailed(format!(
+                    "Failed to send lightning payment: {}",
+                    e
+                )));
+            }
+        }
     }
 }
 
