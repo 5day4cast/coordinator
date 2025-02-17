@@ -863,4 +863,46 @@ impl CompetitionStore {
 
         Ok(tickets)
     }
+
+    pub async fn mark_entry_sellback_broadcast(
+        &self,
+        entry_id: Uuid,
+        broadcast_time: OffsetDateTime,
+    ) -> Result<(), duckdb::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+
+        let mut stmt = conn.prepare(
+            "UPDATE entries
+                SET sellback_broadcasted_at = ?
+                WHERE id = ?",
+        )?;
+
+        stmt.execute(params![
+            broadcast_time.format(&Rfc3339).unwrap(),
+            entry_id.to_string(),
+        ])?;
+
+        Ok(())
+    }
+
+    pub async fn mark_entry_reclaim_broadcast(
+        &self,
+        entry_id: Uuid,
+        broadcast_time: OffsetDateTime,
+    ) -> Result<(), duckdb::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+
+        let mut stmt = conn.prepare(
+            "UPDATE entries
+                SET reclaimed_broadcasted_at = ?
+                WHERE id = ?",
+        )?;
+
+        stmt.execute(params![
+            broadcast_time.format(&Rfc3339).unwrap(),
+            entry_id.to_string(),
+        ])?;
+
+        Ok(())
+    }
 }

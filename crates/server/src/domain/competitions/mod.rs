@@ -2,12 +2,11 @@ mod coordinator;
 mod db_migrations;
 mod store;
 
-use std::sync::Arc;
-
 use crate::{
     oracle_client::{Event, WeatherChoices},
     Ln,
 };
+use anyhow::anyhow;
 pub use coordinator::*;
 pub use db_migrations::*;
 use dlctix::{
@@ -17,7 +16,8 @@ use dlctix::{
     },
     hashlock,
     musig2::{AggNonce, PartialSignature, PubNonce},
-    ContractParameters, EventLockingConditions, SigMap, SignedContract,
+    secp::MaybeScalar,
+    ContractParameters, EventLockingConditions, Outcome, SigMap, SignedContract,
 };
 use duckdb::{
     types::{Type, Value},
@@ -25,6 +25,7 @@ use duckdb::{
 };
 use log::{debug, error};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 pub use store::*;
 use time::{macros::format_description, Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -84,12 +85,20 @@ pub struct UserEntry {
     pub ephemeral_privatekey: Option<String>,
     /// User provided preimage de-encrypted, only used during payout
     pub payout_preimage: Option<String>,
+    /// User provided lightning invoice, coordinator pays to user
+    pub payout_ln_invoice: Option<String>,
     pub public_nonces: Option<SigMap<PubNonce>>,
     pub partial_signatures: Option<SigMap<PartialSignature>>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub signed_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub paid_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub paid_out_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub sellback_broadcasted_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub reclaimed_broadcasted_at: Option<OffsetDateTime>,
 }
 
 impl<'a> TryFrom<&Row<'a>> for UserEntry {
@@ -133,8 +142,18 @@ impl<'a> TryFrom<&Row<'a>> for UserEntry {
             payout_preimage_encrypted: row.get(9)?,
             payout_hash: row.get(10)?,
             payout_preimage: row.get::<usize, Option<String>>(11)?,
-            signed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(12)?, 12)?,
-            paid_at: parse_optional_timestamp(row.get::<usize, Option<String>>(13)?, 13)?,
+            payout_ln_invoice: row.get::<usize, Option<String>>(12)?,
+            signed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(13)?, 13)?,
+            paid_at: parse_optional_timestamp(row.get::<usize, Option<String>>(14)?, 14)?,
+            paid_out_at: parse_optional_timestamp(row.get::<usize, Option<String>>(15)?, 15)?,
+            sellback_broadcasted_at: parse_optional_timestamp(
+                row.get::<usize, Option<String>>(16)?,
+                16,
+            )?,
+            reclaimed_broadcasted_at: parse_optional_timestamp(
+                row.get::<usize, Option<String>>(17)?,
+                17,
+            )?,
         };
         Ok(user_entry)
     }
@@ -156,9 +175,33 @@ impl AddEntry {
             public_nonces: None,
             ephemeral_privatekey: None,
             payout_preimage: None,
+            payout_ln_invoice: None,
             paid_at: None,
+            paid_out_at: None,
+            sellback_broadcasted_at: None,
+            reclaimed_broadcasted_at: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PayoutInfo {
+    pub ticket_id: Uuid,
+    /// We are providing the payout preimage & ephemeral private key before being paid,
+    /// At this point we are trusting that the coordinator will not sweep our funds
+    /// prior to paying us out via the ln invoice (the funds are still controlled by us,
+    /// but now we're also giving access to the coordinator). If the coordinator is
+    /// malicious we would need to broadcast the split transaction before them to get paid.
+    /// The coordinator is incentivized to wait until all users have paid out as their reclaim/closing
+    /// transaction becomes much cheaper. In a perfect world we would encrypt this preimage & ephemeral private key
+    /// via AES with the ln_invoice's preimage and add a zkproof to allow the coordinator to
+    /// validate the data before paying the invoice. We are skipping that here for simplicity
+    /// and leaning on the incentives of the coordinator to run a fair game and not steal the funds.
+    /// This allows us to support far more payment methods for playing in the game and seems "good enough".
+    /// If we find in actual practice that this is not the case, we can implement the more secure solution.
+    pub payout_preimage: String,
+    pub ephemeral_private_key: String,
+    pub ln_invoice: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,14 +339,18 @@ pub struct Competition {
     pub total_entry_nonces: u64,
     pub total_signed_entries: u64,
     pub total_paid_entries: u64,
+    pub total_paid_out_entries: usize,
     pub number_of_places_win: usize,
     pub funding_transaction: Option<Transaction>,
     pub funding_outpoint: Option<OutPoint>,
+    pub outcome_transaction: Option<Transaction>,
     pub contract_parameters: Option<ContractParameters>,
     pub public_nonces: Option<SigMap<PubNonce>>,
     pub aggregated_nonces: Option<SigMap<AggNonce>>,
     pub partial_signatures: Option<SigMap<PartialSignature>>,
     pub signed_contract: Option<SignedContract>,
+    /// Oracle attestation checked for and added once oracle announces
+    pub attestation: Option<MaybeScalar>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub cancelled_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
@@ -318,6 +365,15 @@ pub struct Competition {
     /// Funding transaction is considered settled after all hold invoices have been closed
     #[serde(with = "time::serde::rfc3339::option")]
     pub funding_settled_at: Option<OffsetDateTime>,
+    /// Expiry transaction is broadcasted after event has expired
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub expiry_broadcasted_at: Option<OffsetDateTime>,
+    /// Outcome transaction is broadcasted after the attestation is provided
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub outcome_broadcasted_at: Option<OffsetDateTime>,
+    /// All closing transaction have been broadcasted via the coordinator
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub close_broadcasted_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub failed_at: Option<OffsetDateTime>,
     pub errors: Vec<CompetitionError>,
@@ -356,6 +412,31 @@ impl Competition {
             total_expiry_secs,
             now + Duration::seconds(total_expiry_secs as i64),
         ))
+    }
+
+    fn get_current_outcome(&self) -> Result<Outcome, anyhow::Error> {
+        let Some(attestation) = self.attestation else {
+            return Err(anyhow!("No attestation found for competition {}", self.id));
+        };
+
+        let locking_point = attestation.base_point_mul();
+
+        let outcome = self
+            .event_announcement
+            .all_outcomes()
+            .into_iter()
+            .find(|outcome| {
+                match outcome {
+                    Outcome::Attestation(i) => {
+                        // Check if this outcome's locking point matches our attestation point
+                        self.event_announcement.locking_points[*i] == locking_point
+                    }
+                    Outcome::Expiry => false,
+                }
+            })
+            .ok_or_else(|| anyhow!("No matching outcome found for attestation"))?;
+
+        Ok(outcome)
     }
 
     async fn create_ticket(
@@ -409,9 +490,14 @@ pub enum CompetitionState {
     PartialSignaturesCollected,
     SigningComplete,
     FundingBroadcasted,
-    FundingConfirmed, // once funding transaction has been confirmed at least once (default)
-    FundingSettled,   // once all hold invoices have settled/tickets have been paid
-    PaidOut,          // contract has been completed, ie all tickets have been paid out
+    FundingConfirmed, // Once funding transaction has been confirmed at least once (default)
+    FundingSettled,   // Once all hold invoices have settled/tickets have been paid
+    Attested,         // Oracle has attested to the results
+    ExpiryBroadcasted, // Oracle event has expired & players refunded before an attestation was provided
+    OutcomeBroadcasted, // Outcome transaction has been broadcasted
+    DeltaBroadcasted,  // First Delta transaction has been broadcasted
+    PaidOut,           // All tickets have been paid out over lightning
+    Completed,         // Closing transactions has been broadcasted
     Failed,
     Cancelled,
 }
@@ -429,12 +515,15 @@ impl Competition {
             total_entry_nonces: 0,
             total_signed_entries: 0,
             total_paid_entries: 0,
+            total_paid_out_entries: 0,
             number_of_places_win: create_event.number_of_places_win,
             funding_transaction: None,
+            outcome_transaction: None,
             funding_outpoint: None,
             contract_parameters: None,
             public_nonces: None,
             aggregated_nonces: None,
+            attestation: None,
             cancelled_at: None,
             contracted_at: None,
             signed_at: None,
@@ -443,6 +532,9 @@ impl Competition {
             funding_broadcasted_at: None,
             funding_confirmed_at: None,
             funding_settled_at: None,
+            expiry_broadcasted_at: None,
+            outcome_broadcasted_at: None,
+            close_broadcasted_at: None,
             failed_at: None,
             errors: vec![],
         }
@@ -477,6 +569,26 @@ impl Competition {
 
     pub fn skip_competition(&self) -> bool {
         self.is_failed() || self.is_cancelled() || self.is_funding_tx_broadcasted()
+    }
+
+    pub fn is_expiry_broadcasted(&self) -> bool {
+        self.expiry_broadcasted_at.is_some()
+    }
+
+    pub fn is_outcome_broadcasted(&self) -> bool {
+        self.outcome_broadcasted_at.is_some()
+    }
+
+    pub fn is_completed(&self) -> bool {
+        self.close_broadcasted_at.is_some()
+    }
+
+    pub fn has_all_entries_paid_out(&self) -> bool {
+        self.total_paid_out_entries >= self.number_of_places_win
+    }
+
+    pub fn is_attested(&self) -> bool {
+        self.attestation.is_some()
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -524,6 +636,21 @@ impl Competition {
         }
         if self.is_failed() {
             return CompetitionState::Failed;
+        }
+        if self.is_completed() {
+            return CompetitionState::Completed;
+        }
+        if self.is_outcome_broadcasted() {
+            return CompetitionState::OutcomeBroadcasted;
+        }
+        if self.is_expiry_broadcasted() {
+            return CompetitionState::ExpiryBroadcasted;
+        }
+        if self.has_all_entries_paid_out() {
+            return CompetitionState::PaidOut;
+        }
+        if self.is_attested() {
+            return CompetitionState::Attested;
         }
         if self.funding_settled_at.is_some() {
             return CompetitionState::FundingConfirmed;
@@ -594,75 +721,103 @@ impl<'a> TryFrom<&Row<'a>> for Competition {
             total_entry_nonces: row.get::<usize, u64>(8)?,
             total_signed_entries: row.get::<usize, u64>(9)?,
             total_paid_entries: row.get::<usize, u64>(10)?,
+            total_paid_out_entries: row.get(11)?,
 
-            funding_transaction: row.get::<usize, Option<Value>>(11).map(|opt| {
+            outcome_transaction: row.get::<usize, Option<Value>>(12).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            funding_outpoint: row.get::<usize, Option<Value>>(12).map(|opt| {
+            funding_transaction: row.get::<usize, Option<Value>>(13).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            contract_parameters: row.get::<usize, Option<Value>>(13).map(|opt| {
+            funding_outpoint: row.get::<usize, Option<Value>>(14).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            public_nonces: row.get::<usize, Option<Value>>(14).map(|opt| {
+            contract_parameters: row.get::<usize, Option<Value>>(15).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            aggregated_nonces: row.get::<usize, Option<Value>>(15).map(|opt| {
+            public_nonces: row.get::<usize, Option<Value>>(16).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            partial_signatures: row.get::<usize, Option<Value>>(16).map(|opt| {
+            aggregated_nonces: row.get::<usize, Option<Value>>(17).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            signed_contract: row.get::<usize, Option<Value>>(17).map(|opt| {
+            partial_signatures: row.get::<usize, Option<Value>>(18).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            cancelled_at: parse_optional_timestamp(row.get::<usize, Option<String>>(18)?, 18)?,
-            contracted_at: parse_optional_timestamp(row.get::<usize, Option<String>>(19)?, 19)?,
-            signed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(20)?, 20)?,
+            signed_contract: row.get::<usize, Option<Value>>(19).map(|opt| {
+                opt.and_then(|raw| match raw {
+                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
+                    _ => None,
+                })
+            })?,
+
+            attestation: row.get::<usize, Option<Value>>(20).map(|opt| {
+                opt.and_then(|raw| match raw {
+                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
+                    _ => None,
+                })
+            })?,
+
+            cancelled_at: parse_optional_timestamp(row.get::<usize, Option<String>>(21)?, 21)?,
+            contracted_at: parse_optional_timestamp(row.get::<usize, Option<String>>(22)?, 22)?,
+            signed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(23)?, 23)?,
             funding_broadcasted_at: parse_optional_timestamp(
-                row.get::<usize, Option<String>>(21)?,
-                21,
+                row.get::<usize, Option<String>>(24)?,
+                24,
             )?,
             funding_confirmed_at: parse_optional_timestamp(
-                row.get::<usize, Option<String>>(22)?,
-                22,
+                row.get::<usize, Option<String>>(25)?,
+                25,
             )?,
             funding_settled_at: parse_optional_timestamp(
-                row.get::<usize, Option<String>>(23)?,
-                23,
+                row.get::<usize, Option<String>>(26)?,
+                26,
             )?,
-            failed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(24)?, 24)?,
+            expiry_broadcasted_at: parse_optional_timestamp(
+                row.get::<usize, Option<String>>(27)?,
+                27,
+            )?,
+            outcome_broadcasted_at: parse_optional_timestamp(
+                row.get::<usize, Option<String>>(28)?,
+                28,
+            )?,
+
+            close_broadcasted_at: parse_optional_timestamp(
+                row.get::<usize, Option<String>>(29)?,
+                29,
+            )?,
+            failed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(30)?, 30)?,
 
             errors: row
-                .get::<usize, Option<Value>>(25)
+                .get::<usize, Option<Value>>(31)
                 .map(|opt| {
                     opt.and_then(|raw| match raw {
                         Value::Blob(val) => {
@@ -690,6 +845,8 @@ pub enum CompetitionError {
     FailedFundingSettled(String),
     #[error("Failed to aggregate nonces: {0}")]
     FailedNonceAggregation(String),
+    #[error("Failed to check attestation: {0}")]
+    FailedCheckingAttestation(String),
     #[error("Competition expired: {0}")]
     Expired(String),
     #[error("Invalid state transition: {0}")]

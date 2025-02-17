@@ -14,7 +14,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{
-    domain::{AddEntry, Competition, CreateEvent, FundedContract, TicketStatus},
+    domain::{AddEntry, Competition, CreateEvent, FundedContract, PayoutInfo, TicketStatus},
     nostr_extractor::NostrAuth,
     AppState, SearchBy, UserEntry,
 };
@@ -224,6 +224,26 @@ pub async fn submit_partial_signatures(
         .map(|_| StatusCode::OK)
         .map_err(|e| {
             error!("error submitting partial signatures: {:?}", e);
+            e.into()
+        })
+}
+
+pub async fn submit_ticket_payout(
+    NostrAuth { pubkey, .. }: NostrAuth,
+    State(state): State<Arc<AppState>>,
+    Path((competition_id, entry_id)): Path<(Uuid, Uuid)>,
+    Json(payout_info): Json<PayoutInfo>,
+) -> Result<StatusCode, ErrorResponse> {
+    let pubkey = pubkey.to_hex();
+    debug!("submitted payout by: {} {:?}", pubkey, payout_info);
+
+    state
+        .coordinator
+        .submit_ticket_payout(pubkey, competition_id, entry_id, payout_info)
+        .await
+        .map(|_| StatusCode::OK)
+        .map_err(|e| {
+            error!("error submitting payout information: {:?}", e);
             e.into()
         })
 }
