@@ -4,7 +4,9 @@ use bdk_wallet::{
     bitcoin::{Psbt, Txid},
     SignOptions,
 };
-use client_validator::{NostrClientCore, SignerType, TaprootWalletCore, TaprootWalletCoreBuilder};
+use client_validator::{
+    NostrClientCore, SignerType, TaprootWalletCore, TaprootWalletCoreBuilder, WalletError,
+};
 use dlctix::{
     attestation_locking_point,
     musig2::secp256k1::{PublicKey, Secp256k1, SecretKey},
@@ -13,6 +15,7 @@ use dlctix::{
 };
 use log::{debug, info};
 use mockall::mock;
+use secrecy::ExposeSecret;
 use server::{
     domain::{generate_ranking_permutations, AddEntry, CreateEvent},
     get_key, AddEventEntry, Bitcoin, Ln, Oracle, OracleError as Error, OracleEvent, ValueOptions,
@@ -21,7 +24,6 @@ use server::{
 use std::collections::HashMap;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
-
 mock! {
     #[derive(Send, Sync)]
     pub OracleClient { }
@@ -47,6 +49,7 @@ mock! {
         async fn broadcast(&self, transaction: &bdk_wallet::bitcoin::Transaction) -> Result<(), anyhow::Error>;
         async fn get_next_address(&self) -> Result<bdk_wallet::AddressInfo, anyhow::Error>;
         async fn get_derived_private_key(&self) -> Result<dlctix::musig2::secp256k1::SecretKey, anyhow::Error>;
+        async fn get_raw_transaction(&self, txid: &Txid) -> Result<bdk_wallet::bitcoin::Transaction, anyhow::Error>;
         async fn sign_psbt(
             &self,
             psbt: &mut Psbt,
@@ -72,6 +75,11 @@ mock! {
         async fn cancel_hold_invoice(&self, ticket_hash: String) -> Result<(), anyhow::Error>;
         async fn settle_hold_invoice(&self, ticket_preimage: String) -> Result<(), anyhow::Error>;
         async fn lookup_invoice(&self, r_hash: &str) -> Result<server::InvoiceLookupResponse, anyhow::Error>;
+        async fn create_invoice(
+            &self,
+            value: u64,
+            expiry_time_secs: u64,
+        ) -> Result<String, anyhow::Error>;
         async fn send_payment(
             &self,
             payout_payment_request: String,
@@ -107,6 +115,22 @@ impl TestParticipant {
             nostr_pubkey,
             ticket_id,
         }
+    }
+
+    pub fn get_payout_preimage(&self) -> Result<String, anyhow::Error> {
+        let entry = self
+            .wallet
+            .get_dlc_entry(0)
+            .ok_or_else(|| anyhow!("No DLC entry found"))?;
+        Ok(entry.payout_preimage.expose_secret().to_string())
+    }
+
+    pub async fn get_dlc_private_key(&self, entry_index: u32) -> Result<String, WalletError> {
+        let key = self
+            .wallet
+            .get_encrypted_dlc_private_key(entry_index, &self.nostr_pubkey)
+            .await?;
+        self.wallet.decrypt_key(&key, &self.nostr_pubkey).await
     }
 }
 
@@ -267,4 +291,11 @@ pub fn generate_outcome_messages(possible_user_outcomes: Vec<Vec<usize>>) -> Vec
                 .collect::<Vec<u8>>()
         })
         .collect()
+}
+
+pub fn get_winning_bytes(winners: Vec<usize>) -> Vec<u8> {
+    winners
+        .iter()
+        .flat_map(|&idx| idx.to_be_bytes())
+        .collect::<Vec<u8>>()
 }

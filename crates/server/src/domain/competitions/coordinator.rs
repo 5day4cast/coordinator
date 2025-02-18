@@ -662,7 +662,7 @@ impl Coordinator {
                     "Funding transaction {} confirmed with {} confirmations for competition {}",
                     txid, confirmations, competition.id
                 );
-                competition.funding_settled_at = Some(OffsetDateTime::now_utc());
+                competition.funding_confirmed_at = Some(OffsetDateTime::now_utc());
             }
             Some(confirmations) => {
                 debug!(
@@ -954,7 +954,7 @@ impl Coordinator {
             let (close_tx_input, close_tx_prevout) =
                 signed_contract.outcome_close_tx_input_and_prevout(&outcome)?;
 
-            let unsigned_close_tx = simple_sweep_tx(
+            let mut close_tx = simple_sweep_tx(
                 signed_contract.params().market_maker.pubkey,
                 close_tx_input,
                 signed_contract.close_tx_input_weight(),
@@ -962,12 +962,6 @@ impl Coordinator {
                 fee_rate,
             );
 
-            let mut close_tx = sign_sweep_transaction(
-                self.bitcoin.clone(),
-                unsigned_close_tx,
-                close_tx_prevout.clone(),
-            )
-            .await?;
             let winner_seckeys: BTreeMap<Point, Scalar> = paid_winners
                 .iter()
                 .filter_map(|(_, entry)| {
@@ -988,6 +982,7 @@ impl Coordinator {
 
             debug!("Broadcasting unified close transaction");
             self.bitcoin.broadcast(&close_tx).await?;
+            competition.delta_broadcasted_at = Some(OffsetDateTime::now_utc());
 
             // Mark all entries as closed
             let now = OffsetDateTime::now_utc();
@@ -1012,20 +1007,13 @@ impl Coordinator {
                 let (close_tx_input, close_tx_prevout) =
                     signed_contract.split_close_tx_input_and_prevout(&win_condition)?;
 
-                let unsigned_close_tx = simple_sweep_tx(
+                let mut close_tx = simple_sweep_tx(
                     signed_contract.params().market_maker.pubkey,
                     close_tx_input,
                     signed_contract.close_tx_input_weight(),
                     close_tx_prevout.value,
                     fee_rate,
                 );
-
-                let mut close_tx = sign_sweep_transaction(
-                    self.bitcoin.clone(),
-                    unsigned_close_tx,
-                    close_tx_prevout.clone(),
-                )
-                .await?;
 
                 let winner_seckey = Scalar::from_hex(entry.ephemeral_privatekey.as_ref().unwrap())
                     .map_err(|e| anyhow!("Invalid winner secret key: {}", e))?;
@@ -1050,6 +1038,7 @@ impl Coordinator {
                     .mark_entry_sellback_broadcast(entry.id, OffsetDateTime::now_utc())
                     .await?;
             }
+            competition.delta_broadcasted_at = Some(OffsetDateTime::now_utc());
         }
         Ok(competition)
     }
@@ -1149,20 +1138,13 @@ impl Coordinator {
                 let (reclaim_tx_input, reclaim_tx_prevout) =
                     signed_contract.split_reclaim_tx_input_and_prevout(&win_condition)?;
 
-                let unsigned_reclaim_tx = simple_sweep_tx(
+                let mut reclaim_tx = simple_sweep_tx(
                     signed_contract.params().market_maker.pubkey,
                     reclaim_tx_input,
                     signed_contract.split_reclaim_tx_input_weight(),
                     reclaim_tx_prevout.value,
                     fee_rate,
                 );
-
-                let mut reclaim_tx = sign_sweep_transaction(
-                    self.bitcoin.clone(),
-                    unsigned_reclaim_tx,
-                    reclaim_tx_prevout.clone(),
-                )
-                .await?;
 
                 signed_contract.sign_split_reclaim_tx_input(
                     &win_condition,
@@ -1184,7 +1166,7 @@ impl Coordinator {
                     .await?;
             }
         }
-        competition.close_broadcasted_at = Some(OffsetDateTime::now_utc());
+        competition.completed_at = Some(OffsetDateTime::now_utc());
 
         Ok(competition)
     }
@@ -2094,26 +2076,4 @@ fn simple_sweep_tx(
             script_pubkey,
         }],
     }
-}
-
-async fn sign_sweep_transaction(
-    bitcoin_client: Arc<dyn Bitcoin>,
-    unsigned_tx: Transaction,
-    prevout: TxOut,
-) -> Result<Transaction, anyhow::Error> {
-    let mut psbt = Psbt::from_unsigned_tx(unsigned_tx)?;
-    psbt.inputs[0].witness_utxo = Some(prevout);
-
-    let finalized = bitcoin_client
-        .sign_psbt(&mut psbt, SignOptions::default())
-        .await?;
-    if !finalized {
-        return Err(anyhow!("Failed to sign PSBT"));
-    }
-
-    let final_tx = psbt.extract_tx()?;
-    debug!("Successfully signed sweep transaction");
-    debug!("Txid: {}", final_tx.compute_txid());
-
-    Ok(final_tx)
 }

@@ -42,6 +42,7 @@ pub trait Bitcoin: Send + Sync {
     async fn broadcast(&self, transaction: &Transaction) -> Result<(), anyhow::Error>;
     async fn get_next_address(&self) -> Result<AddressInfo, anyhow::Error>;
     async fn get_derived_private_key(&self) -> Result<DlcSecretKey, anyhow::Error>;
+    async fn get_raw_transaction(&self, txid: &Txid) -> Result<Transaction, anyhow::Error>;
     async fn sign_psbt(
         &self,
         psbt: &mut Psbt,
@@ -147,6 +148,13 @@ impl Bitcoin for BitcoinClient {
             .map_err(|e| anyhow!("Invalid secret key bytes: {}", e))?;
 
         Ok(dlc_key)
+    }
+
+    async fn get_raw_transaction(&self, txid: &Txid) -> Result<Transaction, anyhow::Error> {
+        let Some(transaction) = self.client.get_tx(txid).await? else {
+            return Err(anyhow!("Transaction not found: {}", txid));
+        };
+        Ok(transaction)
     }
 
     async fn sign_psbt(
@@ -312,7 +320,7 @@ impl BitcoinClient {
         Ok(BitcoinClient {
             network: settings.network,
             wallet: RwLock::new(wallet),
-            seed_path: SecretString::new(settings.seed_path.clone()),
+            seed_path: SecretString::from(settings.seed_path.clone()),
             client,
             wallet_store: RwLock::new(db),
         })

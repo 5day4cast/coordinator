@@ -1,8 +1,5 @@
 use anyhow::Result;
-use dlctix::{
-    bitcoin::Amount,
-    musig2::secp256k1::{PublicKey, SecretKey},
-};
+use dlctix::bitcoin::Amount;
 use env_logger;
 use log::{debug, info};
 use nostr_sdk::ToBech32;
@@ -34,7 +31,6 @@ pub fn setup_static_logger() {
 }
 
 pub struct TestContext {
-    pub oracle_keys: (PublicKey, SecretKey),
     pub test_database: String,
     pub competition_store: CompetitionStore,
     pub bitcoin_client: Arc<dyn Bitcoin>,
@@ -91,7 +87,6 @@ impl TestContext {
             .returning(|_| Ok(()));
 
         Ok(Self {
-            oracle_keys,
             test_database: db_connection.connection_path,
             competition_store,
             bitcoin_client: Arc::new(bitcoin_client),

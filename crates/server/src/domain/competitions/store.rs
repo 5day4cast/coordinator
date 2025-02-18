@@ -426,7 +426,7 @@ impl CompetitionStore {
                 expiry_broadcasted_at = ?,
                 outcome_broadcasted_at = ?,
                 delta_broadcasted_at = ?,
-                close_broadcasted_at = ?,
+                completed_at = ?,
                 failed_at = ?,
                 errors = ?
                 WHERE id = ?";
@@ -522,7 +522,7 @@ impl CompetitionStore {
                 &competition.expiry_broadcasted_at,
                 &competition.outcome_broadcasted_at,
                 &competition.delta_broadcasted_at,
-                &competition.close_broadcasted_at,
+                &competition.completed_at,
                 &competition.failed_at,
             ] {
                 if let Some(ts) = timestamp {
@@ -598,7 +598,7 @@ impl CompetitionStore {
             "expiry_broadcasted_at::TEXT as expiry_broadcasted_at",
             "outcome_broadcasted_at::TEXT as outcome_broadcasted_at",
             "delta_broadcasted_at::TEXT as delta_broadcasted_at",
-            "close_broadcasted_at::TEXT as close_broadcasted_at",
+            "completed_at::TEXT as completed_at",
             "failed_at::TEXT as failed_at",
             "errors",
         ))
@@ -612,7 +612,9 @@ impl CompetitionStore {
 
         if active_only {
             // filters out competitions in terminal states
-            query = query.where_("expiry_broadcasted_at IS NULL AND close_broadcasted_at IS NULL AND cancelled_at IS NULL");
+            query = query.where_(
+                "expiry_broadcasted_at IS NULL AND completed_at IS NULL AND cancelled_at IS NULL",
+            );
         }
 
         let query_str = query
@@ -648,7 +650,7 @@ impl CompetitionStore {
                 "expiry_broadcasted_at",
                 "outcome_broadcasted_at",
                 "delta_broadcasted_at",
-                "close_broadcasted_at",
+                "completed_at",
                 "failed_at",
                 "errors",
             ))
@@ -711,10 +713,17 @@ impl CompetitionStore {
             "expiry_broadcasted_at::TEXT as expiry_broadcasted_at",
             "outcome_broadcasted_at::TEXT as outcome_broadcasted_at",
             "delta_broadcasted_at::TEXT as delta_broadcasted_at",
-            "close_broadcasted_at::TEXT as close_broadcasted_at",
+            "completed_at::TEXT as completed_at",
             "failed_at::TEXT as failed_at",
             "errors",
         ))
+        .from(
+            "competitions"
+                .left_join("entries")
+                .on("entries.event_id = competitions.id")
+                .left_join("tickets")
+                .on("entries.ticket_id = tickets.id"),
+        )
         .where_("competitions.id = ? ")
         .group_by((
             "competitions.id",
@@ -748,7 +757,7 @@ impl CompetitionStore {
             "expiry_broadcasted_at",
             "outcome_broadcasted_at",
             "delta_broadcasted_at",
-            "close_broadcasted_at",
+            "completed_at",
             "failed_at",
             "errors",
         ))

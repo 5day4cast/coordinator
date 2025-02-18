@@ -7,7 +7,6 @@ use bdk_wallet::{
 use dlctix::{
     bitcoin::{Address, Amount, KnownHrp, OutPoint, ScriptBuf, TxOut},
     convert_xonly_key,
-    musig2::secp256k1::{PublicKey, SecretKey},
     secp::Point,
 };
 use env_logger;
@@ -42,7 +41,6 @@ pub fn setup_static_logger() {
 }
 
 pub struct TestContext {
-    pub oracle_keys: (PublicKey, SecretKey),
     pub test_database: String,
     pub competition_store: CompetitionStore,
     pub bitcoin_mock: Arc<dyn Bitcoin>,
@@ -126,7 +124,6 @@ impl TestContext {
             .returning(|_| Ok(()));
 
         Ok(Self {
-            oracle_keys,
             test_database: db_connection.connection_path,
             competition_store,
             bitcoin_mock: Arc::new(bitcoin_mock),

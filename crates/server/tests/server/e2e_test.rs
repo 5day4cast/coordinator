@@ -1,21 +1,19 @@
 use anyhow::Result;
-use dlctix::{
-    bitcoin::Amount,
-    musig2::secp256k1::{PublicKey, SecretKey},
-};
+use dlctix::{attestation_secret, bitcoin::Amount};
 use log::{debug, info};
 use nostr_sdk::ToBech32;
 use reqwest_middleware::ClientWithMiddleware;
 use server::{
     build_reqwest_client, create_folder,
-    domain::{CompetitionState, DBConnection, InvoiceWatcher, TicketStatus},
+    domain::{CompetitionState, DBConnection, InvoiceWatcher, PayoutInfo, TicketStatus},
     Bitcoin, BitcoinClient, CompetitionStore, Coordinator, Ln, LnClient, LnSettings, Oracle,
+    OracleEvent,
 };
 use std::{
     collections::HashMap,
     fs,
     path::Path,
-    sync::{Arc, Once},
+    sync::{Arc, Mutex, Once},
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
@@ -23,8 +21,8 @@ use uuid::Uuid;
 
 use crate::helpers::{
     create_test_nostr_client, create_test_wallet, generate_oracle_event,
-    generate_request_create_event, generate_test_entry, get_keys, MockOracleClient,
-    TestParticipant,
+    generate_request_create_event, generate_test_entry, get_keys, get_winning_bytes,
+    MockOracleClient, TestParticipant,
 };
 
 static INIT_LOGGER: Once = Once::new();
@@ -36,7 +34,6 @@ pub fn setup_static_logger() {
 }
 
 pub struct TestContext {
-    pub oracle_keys: (PublicKey, SecretKey),
     pub test_database: String,
     pub competition_store: CompetitionStore,
     pub bitcoin_client: Arc<dyn Bitcoin>,
@@ -86,21 +83,50 @@ impl TestContext {
         ln.ping().await?;
         let oracle_keys = get_keys(String::from("./test_data/fake_oracle_private_key.pem"));
         let mut oracle_mock = MockOracleClient::new();
+        let stored_oracle_event = Arc::new(Mutex::new(None));
+        let stored_oracle_event_clone = stored_oracle_event.clone();
+        let stored_oracle_event_clone_2 = stored_oracle_event_clone.clone();
+
         oracle_mock.expect_create_event().returning(move |event| {
-            Ok(generate_oracle_event(
+            let oracle_event = generate_oracle_event(
                 oracle_keys.0.clone(),
                 event.id,
                 event.total_allowed_entries,
                 event.number_of_places_win,
-            ))
+            );
+            debug!(
+                "Created event with locking points: {:?}",
+                oracle_event.event_announcement.locking_points
+            );
+            *stored_oracle_event.lock().unwrap() = Some(oracle_event.clone());
+
+            Ok(oracle_event)
         });
+
         oracle_mock
             .expect_submit_entry()
             .times(entries)
             .returning(|_| Ok(()));
 
+        let oracle_privkey = oracle_keys.1.clone();
+        oracle_mock.expect_get_event().returning(move |_| {
+            let stored_event = stored_oracle_event_clone_2.lock().unwrap();
+            let oracle_event = stored_event.as_ref().unwrap().clone();
+            let winners = vec![0]; // This should correspond to the first locking point
+
+            let winning_bytes = get_winning_bytes(winners);
+            let attestation =
+                attestation_secret(oracle_privkey.clone(), oracle_event.nonce, &winning_bytes);
+
+            Ok(OracleEvent {
+                id: oracle_event.id,
+                nonce: oracle_event.nonce,
+                event_announcement: oracle_event.event_announcement.clone(),
+                attestation: Some(attestation),
+            })
+        });
+
         Ok(Self {
-            oracle_keys,
             test_database: db_connection.connection_path,
             competition_store,
             bitcoin_client: Arc::new(bitcoin_client),
@@ -115,7 +141,7 @@ impl TestContext {
             self.competition_store.clone(),
             self.bitcoin_client.clone(),
             self.coord_ln.clone(),
-            144,
+            4,
             1,
         )
         .await?;
@@ -183,7 +209,7 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
     let mut participants = Vec::new();
 
     // Create participants and process their entries with real lightning payments
-    for (i, user_ln_client) in user_ln_clients.into_iter().enumerate() {
+    for (i, user_ln_client) in user_ln_clients.iter().enumerate() {
         let nostr_client = create_test_nostr_client().await;
         let wallet = create_test_wallet(&nostr_client).await;
         let nostr_pubkey = nostr_client.get_public_key().await?;
@@ -399,6 +425,145 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
             ticket.id
         );
     }
+
+    // Run handler to process attestation
+    coordinator.competition_handler().await?;
+
+    // Verify attestation state
+    let competition = coordinator.get_competition(create_event.id).await?;
+    assert_eq!(competition.get_state(), CompetitionState::Attested);
+    assert!(competition.attestation.is_some());
+
+    // Winner (first participant) submits payout info
+    let winner = &ordered_participants[0];
+    let winner_entry = participants_entries.get(&winner.nostr_pubkey).unwrap();
+
+    // Get the winner's LN client (first client since winner is first participant)
+    let winner_ln = &user_ln_clients[0];
+
+    // Create a real invoice with the expected payout amount
+    let payout_amount = competition.total_competition_pool; // Or calculate based on winner's share
+    let ln_invoice = winner_ln
+        .create_invoice(
+            payout_amount,
+            3600, // 1 hour expiry (default lnd)
+        )
+        .await?;
+    let payout_info = PayoutInfo {
+        ticket_id: winner_entry.ticket_id,
+        payout_preimage: winner.get_payout_preimage().unwrap(),
+        ephemeral_private_key: winner.get_dlc_private_key(0).await.unwrap(),
+        ln_invoice,
+    };
+
+    coordinator
+        .submit_ticket_payout(
+            winner.nostr_pubkey.clone(),
+            competition.id,
+            winner_entry.id,
+            payout_info,
+        )
+        .await?;
+
+    // Run handler to process outcome transaction
+    coordinator.competition_handler().await?;
+
+    // Verify outcome transaction broadcast
+    let competition = coordinator.get_competition(create_event.id).await?;
+    assert_eq!(
+        competition.get_state(),
+        CompetitionState::OutcomeBroadcasted
+    );
+    assert!(competition.outcome_transaction.is_some());
+    assert!(competition.outcome_broadcasted_at.is_some());
+
+    // Wait for outcome transaction confirmation and get its height
+    let outcome_txid = competition.outcome_transaction.unwrap().compute_txid();
+    let mut outcome_height = None;
+    for _ in 0..30 {
+        if let Ok(Some(height)) = context
+            .bitcoin_client
+            .get_tx_confirmation_height(&outcome_txid)
+            .await
+        {
+            if height >= 1 {
+                outcome_height = Some(height);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let outcome_height = outcome_height.expect("Outcome transaction not confirmed");
+
+    // Wait for required blocks to pass for first delta transaction
+    let required_blocks = competition
+        .signed_contract
+        .as_ref()
+        .unwrap()
+        .params()
+        .relative_locktime_block_delta as u32;
+
+    // First delta needs required_blocks blocks
+    let first_delta_target = outcome_height + required_blocks;
+    let mut current_height;
+    for _ in 0..60 {
+        current_height = context.bitcoin_client.get_current_height().await?;
+        if current_height >= first_delta_target {
+            debug!(
+                "Required blocks passed for first delta. Current height: {}, Target height: {}",
+                current_height, first_delta_target
+            );
+            break;
+        }
+        debug!(
+            "Waiting for blocks for first delta. Current height: {}, Target height: {}",
+            current_height, first_delta_target
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    // Run handler to process delta transactions
+    coordinator.competition_handler().await?;
+
+    // Verify delta transactions broadcast
+    let competition = coordinator.get_competition(create_event.id).await?;
+    assert_eq!(competition.get_state(), CompetitionState::DeltaBroadcasted);
+    assert!(competition.delta_broadcasted_at.is_some());
+
+    // Wait for second delta (total of 2 * required_blocks since outcome)
+    let second_delta_target = outcome_height + (2 * required_blocks);
+    for _ in 0..60 {
+        current_height = context.bitcoin_client.get_current_height().await?;
+        if current_height >= second_delta_target {
+            debug!(
+                "Required blocks passed for second delta. Current height: {}, Target height: {}",
+                current_height, second_delta_target
+            );
+            break;
+        }
+        debug!(
+            "Waiting for blocks for second delta. Current height: {}, Target height: {}",
+            current_height, second_delta_target
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    // Verify we reached the target height
+    current_height = context.bitcoin_client.get_current_height().await?;
+    assert!(
+        current_height >= second_delta_target,
+        "Failed to reach target block height for delta2 transactions. Current: {}, Target: {}",
+        current_height,
+        second_delta_target
+    );
+
+    // Run handler to process final closing transactions
+    coordinator.competition_handler().await?;
+
+    // Verify completion
+    let competition = coordinator.get_competition(create_event.id).await?;
+    assert_eq!(competition.get_state(), CompetitionState::Completed);
+    assert!(competition.completed_at.is_some());
 
     cancel_token.cancel();
     Ok(())

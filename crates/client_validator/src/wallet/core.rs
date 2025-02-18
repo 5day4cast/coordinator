@@ -1,6 +1,5 @@
 use super::{DlcEntryData, WalletError};
 use crate::NostrClientCore;
-use async_trait::async_trait;
 use bdk_wallet::{
     bitcoin::{
         bip32::{ChainCode, ChildNumber, DerivationPath},
@@ -18,7 +17,7 @@ use dlctix::{
     ContractParameters, NonceSharingRound, SigMap, SigningSession, TicketedDLC,
 };
 use log::debug;
-use nostr_sdk::{nips::nip47::NostrWalletConnectURI, FromBech32, NostrSigner};
+use nostr_sdk::{FromBech32, NostrSigner};
 use rand::{rngs::StdRng, thread_rng, RngCore, SeedableRng};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -359,7 +358,7 @@ impl TaprootWalletCore {
         Ok(point.to_string())
     }
 
-    fn derive_dlc_key(&self, entry_index: u32) -> Result<Xpriv, WalletError> {
+    pub fn derive_dlc_key(&self, entry_index: u32) -> Result<Xpriv, WalletError> {
         // BIP86 path for Taproot: m/86'/0'/contract_index'
         let path = format!("m/86'/0'/{}'/0/0", entry_index);
         debug!("Deriving key with path: {}", path);
@@ -408,17 +407,6 @@ impl TaprootWalletCore {
         );
 
         Ok(payout_hash)
-    }
-
-    pub async fn create_payout_invoice(
-        &self,
-        entry_index: u32,
-        amount_msat: u64,
-    ) -> Result<String, WalletError> {
-        // generate lightning invoice for cooridinator to pay
-        // using the payout preimage
-
-        Ok(String::from(""))
     }
 
     fn generate_preimage_from_secret(&self, secret_bytes: [u8; 32]) -> [u8; 32] {
@@ -542,50 +530,5 @@ impl TaprootWalletCore {
         debug!("Generated partial signatures",);
 
         Ok(partial_sigs.our_partial_signatures().to_owned())
-    }
-}
-
-pub trait PaymentHandler {
-    async fn create_invoice(&self, amount_msat: u64) -> Result<InvoiceDetails, WalletError>;
-}
-
-#[async_trait]
-impl PaymentHandler for NWCHandler {
-    async fn create_invoice(&self, amount_msat: u64) -> Result<InvoiceDetails, PaymentError> {
-        let request = MakeInvoiceRequest {
-            amount: amount_msat,
-            description: Some("DLC Payout".to_string()),
-            description_hash: None,
-            expiry: Some(365 * 24 * 3600), // 1 year
-        };
-
-        let payment_request = self
-            .nwc
-            .make_invoice(request)
-            .await
-            .map_err(|e| PaymentError::NWCError(e.to_string()))?;
-
-        // Parse the invoice to get payment hash
-        let invoice = Invoice::from_str(&payment_request)
-            .map_err(|e| PaymentError::ParseError(e.to_string()))?;
-
-        let payment_hash = invoice.payment_hash().to_byte_array();
-        let preimage = invoice
-            .payment_preimage()
-            .ok_or(PaymentError::MissingPreimage)?
-            .to_byte_array();
-
-        Ok(InvoiceDetails {
-            payment_request,
-            payment_hash,
-            preimage,
-        })
-    }
-}
-impl NWCPaymentHandler {
-    pub fn new(nwc_uri: &str) -> Result<Self, WalletError> {
-        let uri = NostrWalletConnectURI::from_str(nwc_uri)
-            .map_err(|e| WalletError::WalletConnectError(e.to_string()))?;
-        Ok(Self { nwc: NWC::new(uri) })
     }
 }

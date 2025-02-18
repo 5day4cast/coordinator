@@ -124,7 +124,7 @@ pub async fn get_competitions(
     let competitions = competitions
         .into_iter()
         .map(|mut comp| {
-            if !comp.is_funding_tx_broadcasted() {
+            if !comp.is_funding_broadcasted() {
                 comp.funding_transaction = None;
             }
             comp
@@ -147,7 +147,7 @@ pub async fn get_competition(
             e
         })?;
 
-    if !competition.is_funding_tx_broadcasted() {
+    if !competition.is_funding_broadcasted() {
         competition.funding_transaction = None;
     }
 

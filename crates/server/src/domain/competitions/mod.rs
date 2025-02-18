@@ -374,9 +374,9 @@ pub struct Competition {
     /// First delta transactions have been broadcasted via the coordinator
     #[serde(with = "time::serde::rfc3339::option")]
     pub delta_broadcasted_at: Option<OffsetDateTime>,
-    /// All closing transactions (delta 2 transactions) have been broadcasted via the coordinator
+    /// All reclaim transaction have been broadcasted if needed, otherwise marked as completed
     #[serde(with = "time::serde::rfc3339::option")]
-    pub close_broadcasted_at: Option<OffsetDateTime>,
+    pub completed_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub failed_at: Option<OffsetDateTime>,
     pub errors: Vec<CompetitionError>,
@@ -533,8 +533,6 @@ pub enum CompetitionState {
     OutcomeBroadcasted,
     /// First Delta transactions have been broadcasted
     DeltaBroadcasted,
-    /// All tickets have been paid out over lightning
-    PaidOut,
     /// Closing transactions (second delta) have been broadcasted
     Completed,
     Failed,
@@ -574,7 +572,7 @@ impl Competition {
             expiry_broadcasted_at: None,
             outcome_broadcasted_at: None,
             delta_broadcasted_at: None,
-            close_broadcasted_at: None,
+            completed_at: None,
             failed_at: None,
             errors: vec![],
         }
@@ -607,12 +605,12 @@ impl Competition {
         self.delta_broadcasted_at.is_some()
     }
 
-    pub fn is_funding_tx_broadcasted(&self) -> bool {
+    pub fn is_funding_broadcasted(&self) -> bool {
         self.funding_broadcasted_at.is_some()
     }
 
     pub fn skip_competition(&self) -> bool {
-        self.is_failed() || self.is_cancelled() || self.is_funding_tx_broadcasted()
+        self.is_failed() || self.is_cancelled() || self.is_completed()
     }
 
     pub fn is_expiry_broadcasted(&self) -> bool {
@@ -624,7 +622,7 @@ impl Competition {
     }
 
     pub fn is_completed(&self) -> bool {
-        self.close_broadcasted_at.is_some()
+        self.completed_at.is_some()
     }
 
     pub fn has_all_entries_paid_out(&self) -> bool {
@@ -633,6 +631,18 @@ impl Competition {
 
     pub fn is_attested(&self) -> bool {
         self.attestation.is_some()
+    }
+
+    pub fn is_signed(&self) -> bool {
+        self.signed_at.is_some()
+    }
+
+    pub fn is_funding_settled(&self) -> bool {
+        self.funding_settled_at.is_some()
+    }
+
+    pub fn is_funding_confirmed(&self) -> bool {
+        self.funding_confirmed_at.is_some()
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -687,9 +697,6 @@ impl Competition {
         if self.is_delta_broadcasted() {
             return CompetitionState::DeltaBroadcasted;
         }
-        if self.has_all_entries_paid_out() {
-            return CompetitionState::PaidOut;
-        }
         if self.is_outcome_broadcasted() {
             return CompetitionState::OutcomeBroadcasted;
         }
@@ -699,13 +706,16 @@ impl Competition {
         if self.is_attested() {
             return CompetitionState::Attested;
         }
-        if self.funding_settled_at.is_some() {
+        if self.is_funding_settled() {
+            return CompetitionState::FundingSettled;
+        }
+        if self.is_funding_confirmed() {
             return CompetitionState::FundingConfirmed;
         }
-        if self.funding_broadcasted_at.is_some() {
+        if self.is_funding_broadcasted() {
             return CompetitionState::FundingBroadcasted;
         }
-        if self.signed_at.is_some() {
+        if self.is_signed() {
             return CompetitionState::SigningComplete;
         }
         if self.has_all_entry_partial_signatures() {
@@ -860,14 +870,11 @@ impl<'a> TryFrom<&Row<'a>> for Competition {
                 row.get::<usize, Option<String>>(29)?,
                 29,
             )?,
-            close_broadcasted_at: parse_optional_timestamp(
-                row.get::<usize, Option<String>>(30)?,
-                31,
-            )?,
-            failed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(32)?, 32)?,
+            completed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(30)?, 31)?,
+            failed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(31)?, 31)?,
 
             errors: row
-                .get::<usize, Option<Value>>(33)
+                .get::<usize, Option<Value>>(32)
                 .map(|opt| {
                     opt.and_then(|raw| match raw {
                         Value::Blob(val) => {

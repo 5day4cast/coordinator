@@ -7,7 +7,7 @@ use reqwest_middleware::{
     ClientBuilder, ClientWithMiddleware,
 };
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
-use secrecy::{ExposeSecret, Secret, SecretString};
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -30,6 +30,11 @@ pub trait Ln: Send + Sync {
         ticket_hash: String,
         competition_id: Uuid,
     ) -> Result<InvoiceAddResponse, anyhow::Error>;
+    async fn create_invoice(
+        &self,
+        value: u64,
+        expiry_time_secs: u64,
+    ) -> Result<String, anyhow::Error>;
     async fn cancel_hold_invoice(&self, ticket_hash: String) -> Result<(), anyhow::Error>;
     async fn settle_hold_invoice(&self, ticket_preimage: String) -> Result<(), anyhow::Error>;
     async fn lookup_invoice(&self, r_hash: &str) -> Result<InvoiceLookupResponse, anyhow::Error>;
@@ -151,7 +156,7 @@ fn read_macaroon(macaroon_path: String) -> Result<SecretString, anyhow::Error> {
     let contents =
         fs::read(macaroon_path).map_err(|e| anyhow!("Failed to read macaroon file: {}", e))?;
     let hex_string = buffer_as_hex(contents);
-    Ok(Secret::from(hex_string))
+    Ok(SecretString::from(hex_string))
 }
 
 fn buffer_as_hex(bytes: Vec<u8>) -> String {
@@ -307,13 +312,18 @@ impl Ln for LnClient {
     }
 
     async fn settle_hold_invoice(&self, ticket_preimage: String) -> Result<(), anyhow::Error> {
+        let preimage_bytes = hex::decode(&ticket_preimage)
+            .map_err(|e| anyhow!("Failed to decode hex preimage: {}", e))?;
+
+        let preimage_base64 = base64::engine::general_purpose::STANDARD.encode(&preimage_bytes);
+
         let body = json!({
-            "preimage": ticket_preimage
+            "preimage": preimage_base64
         });
 
         let response = self
             .client
-            .post(format!("{}v2/invoices/hodl/settle", self.base_url))
+            .post(format!("{}v2/invoices/settle", self.base_url))
             .json(&body)
             .header(MACAROON_HEADER, self.macaroon.expose_secret())
             .send()
@@ -327,6 +337,35 @@ impl Ln for LnClient {
         }
 
         Ok(())
+    }
+
+    async fn create_invoice(
+        &self,
+        value: u64,
+        expiry_time_secs: u64,
+    ) -> Result<String, anyhow::Error> {
+        let body = json!({
+            "value": value,
+            "expiry": expiry_time_secs
+        });
+
+        let response = self
+            .client
+            .post(format!("{}v1/invoices", self.base_url))
+            .json(&body)
+            .header(MACAROON_HEADER, self.macaroon.expose_secret())
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "Failed to create invoice: {}",
+                response.text().await?
+            ));
+        }
+
+        let invoice_response = response.json::<InvoiceAddResponse>().await?;
+        Ok(invoice_response.payment_request)
     }
 
     async fn lookup_invoice(

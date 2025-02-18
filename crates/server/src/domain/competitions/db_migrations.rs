@@ -72,7 +72,8 @@ pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), d
         funding_settled_at TIMESTAMPTZ,         -- When all hodl invoices have been settled for the competition
         expiry_broadcasted_at TIMESTAMPTZ,      -- When expiry transaction was broadcast by coordinator
         outcome_broadcasted_at TIMESTAMPTZ,     -- When outcome transaction was broadcast by coordinator
-        close_broadcasted_at TIMESTAMPTZ,       -- When competition closing transactions were broadcast
+        delta_broadcasted_at TIMESTAMPTZ,       -- When first delta transactions were broadcast by coordinator
+        completed_at TIMESTAMPTZ,       -- When competition closing transactions (delta 2) were broadcast
         cancelled_at TIMESTAMPTZ,               -- If competition was cancelled
         failed_at TIMESTAMPTZ,                  -- If competition failed
         errors BLOB                             -- List of errors that lead to failed_at
@@ -99,13 +100,13 @@ pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), d
         pubkey STRING NOT NULL,                         -- User nostr pubkey
         ephemeral_pubkey TEXT NOT NULL,                 -- User ephemeral pubkey for DLC
         ephemeral_privatekey_encrypted TEXT NOT NULL,   -- Store for better UX, backed up in user wallet
-        ephemeral_privatekey TEXT NOT NULL,             -- Provided by user on payout, encrypted by coordinator_key
-        public_nonces BLOB,                             -- Player signed nonces during musig signing session
-        partial_signatures BLOB,                        -- layer partial signatures
         payout_preimage_encrypted TEXT NOT NULL,        -- Store for better UX, backed up in user wallet
         payout_hash TEXT NOT NULL,                      -- User provided hash of preimage to get winnings
+        ephemeral_privatekey TEXT,                      -- Provided by user on payout, encrypted by coordinator_key
         payout_preimage TEXT,                           -- Provided by user on payout, encrypted by coordinator_key
         payout_ln_invoice TEXT,                         -- Provided by user on payout, coordinator pays to user
+        public_nonces BLOB,                             -- Player signed nonces during musig signing session
+        partial_signatures BLOB,                        -- layer partial signatures
         paid_out_at TIMESTAMPTZ,                        -- When ticket have been paid out via lightning
         sellback_broadcasted_at TIMESTAMPTZ,            -- When on chain sellback broadcasted by coordinator for cooperative lightning payout
         reclaimed_broadcasted_at TIMESTAMPTZ,           -- When on chain reclaim broadcasted by coordinator for uncooperative payout
