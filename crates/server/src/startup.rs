@@ -120,7 +120,7 @@ pub async fn build_app(
 ) -> Result<
     (
         AppState,
-        ServeDir<SetStatus<ServeFile>>,
+        ServeDir<ServeFile>,
         ServeDir<SetStatus<ServeFile>>,
         TaskTracker,
         CancellationToken,
@@ -129,7 +129,14 @@ pub async fn build_app(
 > {
     // The ui folder needs to be generated and have this relative path from where the binary is being run
     let serve_dir = ServeDir::new(config.ui_settings.ui_dir.clone())
-        .not_found_service(ServeFile::new(config.ui_settings.ui_dir.clone()));
+        .not_found_service(ServeFile::new(format!(
+            "{}/index.html",
+            config.ui_settings.ui_dir
+        )))
+        .fallback(ServeFile::new(format!(
+            "{}/index.html",
+            config.ui_settings.ui_dir
+        )));
     info!("Public UI configured");
 
     // The admin_ui folder needs to be generated and have this relative path from where the binary is being run
@@ -258,7 +265,7 @@ pub async fn build_app(
 pub async fn build_server(
     socket_addr: SocketAddr,
     app_state: AppState,
-    serve_dir: ServeDir<SetStatus<ServeFile>>,
+    serve_dir: ServeDir<ServeFile>,
     serve_admin_dir: ServeDir<SetStatus<ServeFile>>,
 ) -> Result<
     Serve<
@@ -287,7 +294,7 @@ pub async fn build_server(
 
 pub fn app(
     app_state: AppState,
-    serve_dir: ServeDir<SetStatus<ServeFile>>,
+    serve_dir: ServeDir<ServeFile>,
     serve_admin_dir: ServeDir<SetStatus<ServeFile>>,
 ) -> Router {
     let cors = CorsLayer::new()

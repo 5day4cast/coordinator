@@ -1,97 +1,108 @@
 import { displayCompetitions } from "./competitions.js";
 import { displayEntries } from "./entries.js";
+import { displayPayouts } from "./payouts.js";
 import { getMusigRegistry } from "./main.js";
+import { Router } from "./router.js";
 
 const oracleBase = ORACLE_BASE;
 const apiBase = API_BASE;
 
-const $navDivs = document.querySelectorAll('a[id$="NavClick"]');
-const $navbarItems = document.querySelectorAll(".navbar-item");
-const $navbarBurgers = Array.prototype.slice.call(
-  document.querySelectorAll(".navbar-burger"),
-  0,
-);
-
-// Add a click event on each of them
-$navbarBurgers.forEach((el) => {
-  el.addEventListener("click", () => {
-    // Get the target from the "data-target" attribute
-    const target = el.dataset.target;
-    const $target = document.getElementById(target);
-
-    // Toggle the "is-active" class on both the "navbar-burger" and the "navbar-menu"
-    el.classList.toggle("is-active");
-    $target.classList.toggle("is-active");
-  });
-});
-
-$navbarItems.forEach(function ($navbarItem) {
-  $navbarItem.addEventListener("click", function (event) {
-    event.preventDefault();
-    const targetContainerId = this.id.replace("NavClick", "");
-    //router
-    switch (targetContainerId) {
-      case "logout":
-        console.log("logging out");
-        break;
-      case "allEntries":
-        console.log("displaying entries");
-        hideAllContainers();
-        showContainer(targetContainerId);
-        displayEntries(apiBase, oracleBase);
-        break;
-      case "allCompetitions":
-        console.log("displaying competitions");
-        hideAllContainers();
-        showContainer(targetContainerId);
-        displayCompetitions(apiBase, oracleBase);
-        break;
-      case "signingStatus":
-        console.log("displaying signing status");
-        hideAllContainers();
-        showContainer(targetContainerId);
-        const registry = getMusigRegistry();
-        if (registry) {
-          const observers = Array.from(registry.observers);
-          console.log("Observers:", observers);
-          const signingUI = observers.find((obs) => obs.toggleVisibility);
-          console.log("SigningUI:", signingUI);
-          if (signingUI) {
-            signingUI.show();
-            signingUI.updateUI();
-          }
-        }
-        break;
-      case "payouts":
-        console.log("displaying payouts");
-        hideAllContainers();
-        showContainer(targetContainerId);
-        displayPayouts(apiBase, oracleBase);
-        break;
-      default:
+const routes = {
+  "/competitions": () => {
+    hideAllContainers();
+    showContainer("allCompetitions");
+    displayCompetitions(apiBase, oracleBase);
+  },
+  "/entries": () => {
+    hideAllContainers();
+    showContainer("allEntries");
+    displayEntries(apiBase, oracleBase);
+  },
+  "/signing": () => {
+    hideAllContainers();
+    showContainer("signingStatus");
+    const registry = getMusigRegistry();
+    if (registry) {
+      const observers = Array.from(registry.observers);
+      const signingUI = observers.find((obs) => obs.toggleVisibility);
+      if (signingUI) {
+        signingUI.show();
+        signingUI.updateUI();
+      }
     }
+  },
+  "/payouts": () => {
+    hideAllContainers();
+    showContainer("payouts");
+    displayPayouts(apiBase, oracleBase);
+  },
+};
+
+// Initialize router
+const router = new Router(routes);
+
+document.addEventListener("DOMContentLoaded", () => {
+  // Mobile menu handling
+  const $navbarBurgers = Array.prototype.slice.call(
+    document.querySelectorAll(".navbar-burger"),
+    0,
+  );
+
+  $navbarBurgers.forEach((el) => {
+    el.addEventListener("click", () => {
+      const target = el.dataset.target;
+      const $target = document.getElementById(target);
+      el.classList.toggle("is-active");
+      $target.classList.toggle("is-active");
+    });
   });
+
+  // Handle navigation clicks
+  document
+    .querySelectorAll(".navbar-item[data-route]")
+    .forEach(($navbarItem) => {
+      $navbarItem.addEventListener("click", (event) => {
+        event.preventDefault();
+
+        // Close mobile menu if open
+        const $navbarMenu = document.querySelector(".navbar-menu");
+        const $burger = document.querySelector(".navbar-burger");
+        if ($navbarMenu.classList.contains("is-active")) {
+          $navbarMenu.classList.remove("is-active");
+          $burger.classList.remove("is-active");
+        }
+
+        // Get route from data attribute
+        const route = $navbarItem.dataset.route;
+        if (route) {
+          router.navigate(route);
+        }
+      });
+    });
+
+  // Initialize router
+  router.init();
 });
+
 function hideAllContainers() {
-  $navDivs.forEach(function ($container) {
-    const containerId = $container.id.split("NavClick")[0];
-    const $containerToHide = document.getElementById(containerId);
-    if ($containerToHide) {
-      $containerToHide.classList.add("hidden");
+  const containers = [
+    "allCompetitions",
+    "allEntries",
+    "signingStatus",
+    "payouts",
+  ];
+  containers.forEach((containerId) => {
+    const container = document.getElementById(containerId);
+    if (container) {
+      container.classList.add("hidden");
     }
   });
 }
 
 function showContainer(containerId) {
-  const $containerToShow = document.getElementById(containerId);
-  console.log("Showing container:", containerId, $containerToShow);
-
-  if ($containerToShow) {
-    $containerToShow.classList.remove("hidden");
-    console.log(
-      "Container classes after show:",
-      $containerToShow.classList.toString(),
-    );
+  const container = document.getElementById(containerId);
+  if (container) {
+    container.classList.remove("hidden");
   }
 }
 

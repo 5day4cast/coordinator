@@ -39,8 +39,9 @@ export async function displayPayouts(apiBase, oracleBase) {
     // Show table and populate it
     $table.classList.remove("hidden");
     payableEntries.forEach((entry) => {
-      const row = document.createElement("tr");
-      row.innerHTML = `
+      const $row = document.createElement("tr");
+      $row.classList.add("is-clickable");
+      $row.innerHTML = `
                     <td>${entry.event_id}</td>
                     <td>${entry.id}</td>
                     <td>Ready for payout</td>
@@ -53,7 +54,7 @@ export async function displayPayouts(apiBase, oracleBase) {
                         </button>
                     </td>
                 `;
-      $tableBody.appendChild(row);
+      $tableBody.appendChild($row);
     });
 
     // Add click handlers

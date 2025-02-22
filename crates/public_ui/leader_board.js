@@ -135,6 +135,7 @@ class LeaderBoard {
     }
     entryScores.forEach((entryScore, index) => {
       let $row = document.createElement("tr");
+      $row.classList.add("is-clickable");
 
       const rank = document.createElement("td");
       rank.textContent = index + 1;

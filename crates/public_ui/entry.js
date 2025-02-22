@@ -127,11 +127,10 @@ class Entry {
   showPaymentModal() {
     const $modal = document.getElementById("ticketPaymentModal");
     const $paymentRequest = document.getElementById("paymentRequest");
-    const $copyButton = document.getElementById("copyInvoice");
+    const $copyFeedback = document.getElementById("copyFeedback");
     const $error = document.getElementById("ticketPaymentError");
     const $paymentStatus = document.getElementById("paymentStatus");
     const $qrContainer = document.getElementById("qrContainer");
-    const $modalBackground = $modal.querySelector(".modal-background");
 
     const updateStatus = (message, type = "info") => {
       $paymentStatus.innerHTML = `
@@ -140,111 +139,119 @@ class Entry {
           `;
     };
 
-    // Create new QR code element
+    // Setup QR code
     const $qrCode = document.createElement("bitcoin-qr");
-    $qrCode.id = "paymentQR";
-    $qrCode.setAttribute("width", "300");
-    $qrCode.setAttribute("height", "300");
-    $qrCode.setAttribute("lightning", this.ticket.payment_request);
-    $qrCode.setAttribute("type", "svg");
-    $qrCode.setAttribute("dots-type", "rounded");
-    $qrCode.setAttribute("corners-square-type", "extra-rounded");
-    $qrCode.setAttribute("background-color", "#ffffff");
-    $qrCode.setAttribute("dots-color", "#000000");
-    $qrCode.setAttribute("is-polling", "true");
-    $qrCode.setAttribute("poll-interval", "2000");
+    Object.assign($qrCode, {
+      id: "paymentQR",
+      lightning: this.ticket.payment_request,
+      width: 300,
+      height: 300,
+      type: "svg",
+      isPolling: true,
+      pollInterval: 2000,
+    });
 
-    $qrContainer.innerHTML = "";
-    $qrContainer.appendChild($qrCode);
+    // Set QR styling attributes
+    const styleAttrs = {
+      "dots-type": "rounded",
+      "corners-square-type": "extra-rounded",
+      "background-color": "#ffffff",
+      "dots-color": "#000000",
+    };
+    Object.entries(styleAttrs).forEach(([key, value]) =>
+      $qrCode.setAttribute(key, value),
+    );
 
-    $paymentRequest.value = this.ticket.payment_request;
-    updateStatus("Waiting for payment...");
-    $error.classList.add("is-hidden");
+    // Cleanup function
+    const cleanup = () => {
+      $qrCode.setAttribute("is-polling", "false");
+      $qrContainer.innerHTML = "";
+      $modal.classList.remove("is-active");
+      $copyFeedback.classList.add("is-hidden");
+      $paymentRequest.classList.remove("is-success");
+    };
 
-    // Create a reference to store the success handler
-    let successHandler;
-
-    $qrCode.callback = async () => {
+    // Setup improved payment request copy handling
+    const handleCopy = async () => {
       try {
-        const response = await this.client.get(
-          `${this.coordinator_url}/competitions/${this.competition.id}/tickets/${this.ticket.id}/status`,
-        );
+        await navigator.clipboard.writeText($paymentRequest.value);
+        $paymentRequest.classList.add("is-success");
+        $copyFeedback.classList.remove("is-hidden");
 
-        if (!response.ok) {
-          throw new Error(`Failed to check ticket status: ${response.status}`);
-        }
-
-        const status = await response.json();
-
-        switch (status) {
-          case "Paid":
-            updateStatus("Payment received!", "success");
-            $modal.classList.remove("is-active");
-            $qrContainer.innerHTML = "";
-            $qrCode.setAttribute("is-polling", "false");
-            if (successHandler) {
-              successHandler();
-            }
-            return true;
-          case "Reserved":
-            return false;
-          case "Expired":
-            throw new Error(
-              "Ticket payment expired. Please request a new ticket.",
-            );
-          case "Used":
-            throw new Error("Ticket has already been used.");
-          case "Cancelled":
-            throw new Error("Competition has been cancelled.");
-          default:
-            throw new Error(`Unexpected ticket status: ${status}`);
-        }
-      } catch (error) {
-        $error.textContent = error.message;
-        $error.classList.remove("is-hidden");
-        updateStatus("Payment failed", "danger");
-        return false;
+        // Reset after 2 seconds
+        setTimeout(() => {
+          $copyFeedback.classList.add("is-hidden");
+          $paymentRequest.classList.remove("is-success");
+        }, 2000);
+      } catch (err) {
+        console.error("Failed to copy:", err);
       }
     };
 
-    const handleCopy = () => {
-      navigator.clipboard.writeText(this.ticket.payment_request);
-      $copyButton.textContent = "Copied!";
-      setTimeout(() => {
-        $copyButton.textContent = "Copy Invoice";
-      }, 2000);
-    };
-    $copyButton.addEventListener("click", handleCopy);
+    $paymentRequest.addEventListener("click", handleCopy);
 
+    // Initialize modal
+    $qrContainer.innerHTML = "";
+    $qrContainer.appendChild($qrCode);
+    $paymentRequest.value = this.ticket.payment_request;
+    updateStatus("Waiting for payment...");
+    $error.classList.add("is-hidden");
     $modal.classList.add("is-active");
 
     return new Promise((resolve, reject) => {
       const handleClose = () => {
-        $qrCode.setAttribute("is-polling", "false");
-        $copyButton.removeEventListener("click", handleCopy);
-        $modalBackground.removeEventListener("click", handleClose);
-        $modal
-          .querySelector(".modal-close")
-          .removeEventListener("click", handleClose);
-        $qrContainer.innerHTML = "";
+        cleanup();
         reject(new Error("Payment cancelled by user"));
       };
 
-      successHandler = () => {
-        $qrCode.setAttribute("is-polling", "false");
-        $copyButton.removeEventListener("click", handleCopy);
-        $modalBackground.removeEventListener("click", handleClose);
-        $modal
-          .querySelector(".modal-close")
-          .removeEventListener("click", handleClose);
-        $qrContainer.innerHTML = "";
-        resolve();
-      };
+      // Add modal close handlers
+      const $modalBackground = $modal.querySelector(".modal-background");
+      const $modalClose = $modal.querySelector(".modal-close");
 
-      $modal
-        .querySelector(".modal-close")
-        .addEventListener("click", handleClose);
-      $modalBackground.addEventListener("click", handleClose);
+      $modalBackground.addEventListener("click", handleClose, { once: true });
+      $modalClose.addEventListener("click", handleClose, { once: true });
+
+      $qrCode.callback = async () => {
+        try {
+          const response = await this.client.get(
+            `${this.coordinator_url}/competitions/${this.competition.id}/tickets/${this.ticket.id}/status`,
+          );
+
+          if (!response.ok) {
+            throw new Error(
+              `Failed to check ticket status: ${response.status}`,
+            );
+          }
+
+          const status = await response.json();
+
+          if (status === "Paid") {
+            updateStatus("Payment received!", "success");
+            cleanup();
+            resolve(true);
+            return true;
+          } else if (status === "Reserved") {
+            return false;
+          }
+
+          const errorMessages = {
+            Expired: "Ticket payment expired. Please request a new ticket.",
+            Used: "Ticket has already been used.",
+            Cancelled: "Competition has been cancelled.",
+          };
+
+          throw new Error(
+            errorMessages[status] || `Unexpected ticket status: ${status}`,
+          );
+        } catch (error) {
+          $error.textContent = error.message;
+          $error.classList.remove("is-hidden");
+          updateStatus("Payment failed", "danger");
+          cleanup();
+          reject(error);
+          return false;
+        }
+      };
     });
   }
 
