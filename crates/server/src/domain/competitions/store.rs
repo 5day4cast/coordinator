@@ -359,7 +359,8 @@ impl CompetitionStore {
                       total_allowed_entries,
                       number_of_places_win,
                       entry_fee,
-                      event_announcement) VALUES(?,?,?,?,?,?,?)",
+                      coordinator_fee_percentage,
+                      event_announcement) VALUES(?,?,?,?,?,?,?,?)",
         )?;
         let announcement = serde_json::to_vec(&competition.event_announcement)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -370,6 +371,7 @@ impl CompetitionStore {
             competition.total_allowed_entries,
             competition.number_of_places_win,
             competition.entry_fee,
+            competition.coordinator_fee_percentage,
             Value::Blob(announcement)
         ])?;
 
@@ -562,8 +564,11 @@ impl CompetitionStore {
             "created_at::TEXT as created_at",
             "total_competition_pool",
             "total_allowed_entries",
+        ))
+        .and_select((
             "number_of_places_win",
             "entry_fee",
+            "coordinator_fee_percentage",
             "event_announcement",
         ))
         .and_select((
@@ -625,6 +630,9 @@ impl CompetitionStore {
                 "total_allowed_entries",
                 "number_of_places_win",
                 "entry_fee",
+            ))
+            .group_by((
+                "coordinator_fee_percentage",
                 "event_announcement",
                 "outcome_transaction",
             ))
@@ -677,8 +685,11 @@ impl CompetitionStore {
             "created_at::TEXT as created_at",
             "total_competition_pool",
             "total_allowed_entries",
+        ))
+        .and_select((
             "number_of_places_win",
             "entry_fee",
+            "coordinator_fee_percentage",
             "event_announcement",
         ))
         .and_select((
@@ -732,6 +743,9 @@ impl CompetitionStore {
             "total_allowed_entries",
             "number_of_places_win",
             "entry_fee",
+        ))
+        .group_by((
+            "coordinator_fee_percentage",
             "event_announcement",
             "outcome_transaction",
         ))

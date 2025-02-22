@@ -9,6 +9,7 @@
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
     <link rel="stylesheet" href="/ui/styles.css">
     <script type="module"> import uuidv7 from 'https://cdn.jsdelivr.net/npm/uuidv7@1.0.1/+esm'; </script>
+    <script type="module" src="https://unpkg.com/bitcoin-qr@1.4.1/dist/bitcoin-qr/bitcoin-qr.esm.js"></script>
 </head>
 
 <body>
@@ -27,6 +28,7 @@
     <script type="module" src="/ui/leader_board.js"></script>
     <script type="module" src="/ui/entry.js"></script>
     <script type="module" src="/ui/utils.js"></script>
+    <script type="module" src="/ui/payouts.js"></script>
     <script type="module" src="/ui/musig_session_manager.js"></script>
     <script type="module" src="/ui/musig_session_registry.js"></script>
     <script type="module" src="/ui/signing_progress_ui.js"></script>
@@ -60,11 +62,9 @@
                               <span>Signing Status</span>
                               <span class="tag is-info ml-2 is-hidden" id="activeSigningCount">0</span>
                             </a>
-                            <!--
-                                Add back once the coordinator is ready to be used
-                                <a href="#" class="navbar-item" id="payoutsNavClick">
+                            <a href="#" class="navbar-item" id="payoutsNavClick">
                                 Payouts
-                            </a>-->
+                            </a>
                         </div>
                         <div class="navbar-end">
                             <div class="navbar-item" id="authButtons">
@@ -114,6 +114,26 @@
             <div id="currentCompetition" class="hidden container">
             </div>
         </div>
+        <div id="entryContainer" class="container hidden">
+            <div class="box">
+                <div class="level">
+                    <div class="level-left">
+                        <h2 class="title is-4">Submit Entry</h2>
+                    </div>
+                    <div class="level-right">
+                        <button id="backToCompetitions" class="button is-light">
+                            Back to Competitions
+                        </button>
+                    </div>
+                </div>
+            <div id="entryContent"></div>
+            <div class="mt-4">
+                <button type="submit" id="submitEntry" class="button is-info">Submit</button>
+                <div id="successMessage" class="has-text-success-dark hidden">Successfully Submitted Entry!</div>
+                <div id="errorMessage" class="has-text-danger-dark hidden"></div>
+            </div>
+            </div>
+        </div>
         <div id="competitionLeaderboard" class="container hidden">
             <h4 class="title">
                 Leader Board
@@ -150,16 +170,62 @@
             </div>
         </div>
         <div id="payouts" class="container hidden">
-            <div>payouts</div>
+            <h3 class="title is-4">Available Payouts</h3>
+
             <div class="table-container" id="usersPayouts">
-                <!-- all payouts for entries that have won-->
+                <table class="table is-fullwidth is-striped">
+                    <thead>
+                        <tr>
+                            <th>Competition ID</th>
+                            <th>Entry ID</th>
+                            <th>Status</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="payoutsTableBody">
+                    </tbody>
+                </table>
+            </div>
+
+
+            <div id="noPayoutsMessage" class="notification is-info hidden">
+                No entries eligible for payout at this time.
+            </div>
+
+            <div id="payoutsError" class="notification is-danger hidden">
             </div>
         </div>
 
-        <!-- (leave to the end) payout screen -->
         <!-- (optional) chat powered by nostr (cheap/open source communication) -->
         </div>
     </section>
+
+    <div id="payoutModal" class="modal">
+        <div class="modal-background"></div>
+        <div class="modal-content">
+            <div class="box">
+                <h3 class="title is-4">Submit Lightning Invoice</h3>
+                <div class="field">
+                    <label class="label">Lightning Invoice</label>
+                    <div class="control">
+                        <textarea class="textarea" id="lightningInvoice"
+                            placeholder="Enter your Lightning invoice here..."
+                        ></textarea>
+                    </div>
+                </div>
+                <div class="field is-grouped">
+                    <div class="control">
+                        <button class="button is-primary" id="submitPayoutInvoice">Submit</button>
+                    </div>
+                    <div class="control">
+                        <button class="button is-light" id="cancelPayoutModal">Cancel</button>
+                    </div>
+                </div>
+                <div id="payoutModalError" class="notification is-danger hidden"></div>
+            </div>
+        </div>
+        <button class="modal-close is-large" aria-label="close"></button>
+    </div>
 
     <div id="ticketPaymentModal" class="modal">
         <div class="modal-background"></div>
@@ -168,6 +234,10 @@
                 <h3 class="title is-4">Entry Ticket Payment</h3>
                 <div class="content">
                     <p>Please pay the lightning invoice to enter the competition:</p>
+
+                    <!-- QR Code centered in its own container -->
+                    <div id="qrContainer" class="has-text-centered mb-4"></div>
+
                     <div class="field">
                         <div class="control">
                             <textarea class="textarea" id="paymentRequest" readonly></textarea>
@@ -193,19 +263,6 @@
             </div>
         </div>
         <button class="modal-close is-large" aria-label="close"></button>
-    </div>
-
-    <div id="entry" class="modal">
-        <div class="modal-background"></div>
-        <div class="modal-content">
-            <div class="box">
-                <div id="entryContent"></div>
-                <button type="submit" id="submitEntry" class="button is-info">Submit</button>
-                <div id="successMessage" class="has-text-success-dark hidden">Successfully Submitted Entry!</div>
-                <div id="errorMessage" class="has-text-danger-dark hidden"></div>
-            </div>
-            <button class="modal-close is-large" aria-label="close"></button>
-        </div>
     </div>
 
     <!-- Login Modal -->

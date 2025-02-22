@@ -54,6 +54,7 @@ pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), d
         total_competition_pool BIGINT NOT NULL,
         total_allowed_entries BIGINT NOT NULL,
         entry_fee BIGINT NOT NULL,
+        coordinator_fee_percentage INT NOT NULL, -- Entry fee percentage given to the coordinator
         created_at TIMESTAMPTZ NOT NULL,
         event_announcement BLOB NOT NULL,       -- Event announcement expected from the oracles
         funding_transaction BLOB,               -- Funding transaction

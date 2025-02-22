@@ -2,6 +2,7 @@ import { WeatherData } from "./weather_data.js";
 import { uuidv7 } from "https://unpkg.com/uuidv7@^1";
 import { AuthorizedClient } from "./authorized_client.js";
 import { getMusigRegistry } from "./main.js";
+import { hideAllContainers, showContainer } from "./navbar.js";
 
 class Entry {
   constructor(
@@ -43,13 +44,15 @@ class Entry {
   }
 
   showEntry() {
-    let $entryModal = document.getElementById("entry");
+    hideAllContainers();
+    showContainer("entryContainer");
     this.clearEntry();
 
     let $entryValues = document.getElementById("entryContent");
     let $competitionId = document.createElement("h3");
     $competitionId.textContent = `Competition: ${this.competition.id}`;
     $entryValues.appendChild($competitionId);
+
     for (let option of this.entry["options"]) {
       let $stationDiv = document.createElement("div");
       if (option["station_id"]) {
@@ -77,7 +80,6 @@ class Entry {
           option["temp_high"],
         );
       }
-
       if (option["temp_low"]) {
         this.buildEntry(
           $stationList,
@@ -91,31 +93,17 @@ class Entry {
       $stationDiv.appendChild($stationList);
       $entryValues.appendChild($stationDiv);
     }
+
     let $submitEntry = document.getElementById("submitEntry");
     $submitEntry.addEventListener("click", ($event) => {
       $event.target.classList.add("is-loading");
       this.submit($event);
     });
 
-    if (!$entryModal.classList.contains("is-active")) {
-      $entryModal.classList.add("is-active");
-    }
-    // Start ticket process with promise chain
-    if (!this.canSubmitEntry) {
-      this.handleTicketPayment()
-        .then(() => {
-          this.canSubmitEntry = true;
-          $submitEntry.disabled = false;
-          $paymentStatus.classList.remove("has-text-info");
-          $paymentStatus.classList.add("has-text-success");
-          $paymentStatus.textContent = "Payment received!";
-        })
-        .catch((error) => {
-          console.error("Error handling ticket payment:", error);
-          this.showError(error.message);
-          this.hideEntry();
-        });
-    }
+    let $backButton = document.getElementById("backToCompetitions");
+    $backButton.addEventListener("click", () => {
+      this.hideEntry();
+    });
   }
 
   async handleTicketPayment() {
@@ -141,62 +129,122 @@ class Entry {
     const $paymentRequest = document.getElementById("paymentRequest");
     const $copyButton = document.getElementById("copyInvoice");
     const $error = document.getElementById("ticketPaymentError");
+    const $paymentStatus = document.getElementById("paymentStatus");
+    const $qrContainer = document.getElementById("qrContainer");
+    const $modalBackground = $modal.querySelector(".modal-background");
+
+    const updateStatus = (message, type = "info") => {
+      $paymentStatus.innerHTML = `
+              <p class="has-text-${type}">${message}</p>
+              <progress class="progress is-${type}" max="100"></progress>
+          `;
+    };
+
+    // Create new QR code element
+    const $qrCode = document.createElement("bitcoin-qr");
+    $qrCode.id = "paymentQR";
+    $qrCode.setAttribute("width", "300");
+    $qrCode.setAttribute("height", "300");
+    $qrCode.setAttribute("lightning", this.ticket.payment_request);
+    $qrCode.setAttribute("type", "svg");
+    $qrCode.setAttribute("dots-type", "rounded");
+    $qrCode.setAttribute("corners-square-type", "extra-rounded");
+    $qrCode.setAttribute("background-color", "#ffffff");
+    $qrCode.setAttribute("dots-color", "#000000");
+    $qrCode.setAttribute("is-polling", "true");
+    $qrCode.setAttribute("poll-interval", "2000");
+
+    $qrContainer.innerHTML = "";
+    $qrContainer.appendChild($qrCode);
 
     $paymentRequest.value = this.ticket.payment_request;
-    $modal.classList.add("is-active");
+    updateStatus("Waiting for payment...");
+    $error.classList.add("is-hidden");
 
-    $copyButton.onclick = () => {
+    // Create a reference to store the success handler
+    let successHandler;
+
+    $qrCode.callback = async () => {
+      try {
+        const response = await this.client.get(
+          `${this.coordinator_url}/competitions/${this.competition.id}/tickets/${this.ticket.id}/status`,
+        );
+
+        if (!response.ok) {
+          throw new Error(`Failed to check ticket status: ${response.status}`);
+        }
+
+        const status = await response.json();
+
+        switch (status) {
+          case "Paid":
+            updateStatus("Payment received!", "success");
+            $modal.classList.remove("is-active");
+            $qrContainer.innerHTML = "";
+            $qrCode.setAttribute("is-polling", "false");
+            if (successHandler) {
+              successHandler();
+            }
+            return true;
+          case "Reserved":
+            return false;
+          case "Expired":
+            throw new Error(
+              "Ticket payment expired. Please request a new ticket.",
+            );
+          case "Used":
+            throw new Error("Ticket has already been used.");
+          case "Cancelled":
+            throw new Error("Competition has been cancelled.");
+          default:
+            throw new Error(`Unexpected ticket status: ${status}`);
+        }
+      } catch (error) {
+        $error.textContent = error.message;
+        $error.classList.remove("is-hidden");
+        updateStatus("Payment failed", "danger");
+        return false;
+      }
+    };
+
+    const handleCopy = () => {
       navigator.clipboard.writeText(this.ticket.payment_request);
       $copyButton.textContent = "Copied!";
       setTimeout(() => {
         $copyButton.textContent = "Copy Invoice";
       }, 2000);
     };
+    $copyButton.addEventListener("click", handleCopy);
+
+    $modal.classList.add("is-active");
 
     return new Promise((resolve, reject) => {
-      const checkPayment = () => {
-        this.client
-          .get(
-            `${this.coordinator_url}/competitions/${this.competition.id}/tickets/${this.ticket.id}/status`,
-          )
-          .then((response) => {
-            if (!response.ok) {
-              throw new Error(
-                `Failed to check ticket status: ${response.status}`,
-              );
-            }
-            return response.json();
-          })
-          .then((status) => {
-            switch (status) {
-              case "Paid":
-                $modal.classList.remove("is-active");
-                resolve();
-                break;
-              case "Expired":
-                throw new Error(
-                  "Ticket payment expired. Please request a new ticket.",
-                );
-              case "Used":
-                throw new Error("Ticket has already been used.");
-              case "Cancelled":
-                throw new Error("Competition has been cancelled.");
-              case "Reserved":
-                // Continue polling
-                setTimeout(checkPayment, 2000);
-                break;
-              default:
-                throw new Error(`Unexpected ticket status: ${status}`);
-            }
-          })
-          .catch((error) => {
-            $error.textContent = error.message;
-            $error.classList.remove("is-hidden");
-            reject(error);
-          });
+      const handleClose = () => {
+        $qrCode.setAttribute("is-polling", "false");
+        $copyButton.removeEventListener("click", handleCopy);
+        $modalBackground.removeEventListener("click", handleClose);
+        $modal
+          .querySelector(".modal-close")
+          .removeEventListener("click", handleClose);
+        $qrContainer.innerHTML = "";
+        reject(new Error("Payment cancelled by user"));
       };
 
-      checkPayment();
+      successHandler = () => {
+        $qrCode.setAttribute("is-polling", "false");
+        $copyButton.removeEventListener("click", handleCopy);
+        $modalBackground.removeEventListener("click", handleClose);
+        $modal
+          .querySelector(".modal-close")
+          .removeEventListener("click", handleClose);
+        $qrContainer.innerHTML = "";
+        resolve();
+      };
+
+      $modal
+        .querySelector(".modal-close")
+        .addEventListener("click", handleClose);
+      $modalBackground.addEventListener("click", handleClose);
     });
   }
 
@@ -301,10 +349,11 @@ class Entry {
   }
 
   hideEntry() {
-    let $entryScoreModal = document.getElementById("entry");
-    if ($entryScoreModal.classList.contains("is-active")) {
-      $entryScoreModal.classList.remove("is-active");
+    const $entryContainer = document.getElementById("entryContainer");
+    if (!$entryContainer.classList.contains("hidden")) {
+      $entryContainer.classList.add("hidden");
     }
+    showContainer("allCompetitions");
   }
 
   clearEntry() {
@@ -336,6 +385,9 @@ class Entry {
 
   async submit($event) {
     try {
+      // First handle the ticket payment
+      await this.handleTicketPayment();
+      console.log("Ticket payment handled, creating entry submit");
       let submit = this.entry["submit"];
       let expected_observations = this.buildExpectedObservations(submit);
 
@@ -347,6 +399,7 @@ class Entry {
         payout_hash: this.entry.payout_hash,
         payout_preimage_encrypted: this.entry.payout_preimage_encrypted,
         event_id: this.competition.id,
+        ticket_id: this.ticket.id,
         expected_observations: expected_observations,
       };
 

@@ -156,6 +156,7 @@ pub fn generate_request_create_event(
         id: Uuid::now_v7(),
         signing_date,
         observation_date,
+        coordinator_fee_percentage: 5,
         locations: (0..num_locations).map(|i| format!("LOC_{}", i)).collect(),
         number_of_values_per_entry: num_locations * 3, // 3 values per location
         total_allowed_entries,

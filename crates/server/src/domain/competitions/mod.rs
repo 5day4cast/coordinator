@@ -314,6 +314,8 @@ pub struct CreateEvent {
     pub total_allowed_entries: usize,
     /// Total sats required per entry for ticket
     pub entry_fee: usize,
+    /// Percentage of entry fee that goes to the coordinator
+    pub coordinator_fee_percentage: usize,
     /// Total sats in competition pool to be won
     pub total_competition_pool: usize,
 }
@@ -334,6 +336,7 @@ pub struct Competition {
     pub total_competition_pool: u64,
     pub total_allowed_entries: u64,
     pub entry_fee: u64,
+    pub coordinator_fee_percentage: usize,
     pub event_announcement: EventLockingConditions,
     pub total_entries: u64,
     pub total_entry_nonces: u64,
@@ -470,6 +473,15 @@ impl Competition {
         Ok(outcome)
     }
 
+    pub fn calculate_invoice_amount(&self) -> u64 {
+        let fee_multiplier = self.coordinator_fee_percentage as f64 / 100.0;
+        let coordinator_fee = (self.entry_fee as f64 * fee_multiplier).round() as u64;
+
+        self.entry_fee + coordinator_fee
+    }
+
+    // We add the fee for the coordinator's service at this point in the process,
+    // A user can not enter into the competition without paying the fee
     async fn create_ticket(
         &self,
         expiry_secs: u64,
@@ -478,10 +490,11 @@ impl Competition {
     ) -> Result<Ticket, Error> {
         let ticket_preimage = hashlock::preimage_random(&mut rand::thread_rng());
         let ticket_hash = hashlock::sha256(&ticket_preimage);
+        let invoice_amount = self.calculate_invoice_amount();
 
         let invoice = ln_client
             .add_hold_invoice(
-                self.entry_fee,
+                invoice_amount,
                 expiry_secs,
                 ticket_hash.to_hex_string(Case::Lower),
                 self.id,
@@ -547,6 +560,7 @@ impl Competition {
             total_competition_pool: create_event.total_competition_pool as u64,
             total_allowed_entries: create_event.total_allowed_entries as u64,
             entry_fee: create_event.entry_fee as u64,
+            coordinator_fee_percentage: create_event.coordinator_fee_percentage,
             event_announcement: oracle_event.event_announcement.clone(),
             number_of_places_win: create_event.number_of_places_win,
             total_entries: 0,
@@ -759,7 +773,8 @@ impl<'a> TryFrom<&Row<'a>> for Competition {
             total_allowed_entries: row.get::<usize, u64>(3)?,
             number_of_places_win: row.get(4)?,
             entry_fee: row.get::<usize, u64>(5)?,
-            event_announcement: row.get::<usize, Option<Value>>(6).map(|opt| match opt {
+            coordinator_fee_percentage: row.get(6)?,
+            event_announcement: row.get::<usize, Option<Value>>(7).map(|opt| match opt {
                 Some(Value::Blob(val)) => serde_json::from_slice::<EventLockingConditions>(&val)
                     .map_err(|e| {
                         duckdb::Error::FromSqlConversionFailure(6, Type::Any, Box::new(e))
@@ -774,107 +789,107 @@ impl<'a> TryFrom<&Row<'a>> for Competition {
                 )),
             })??,
 
-            total_entries: row.get::<usize, u64>(7)?,
-            total_entry_nonces: row.get::<usize, u64>(8)?,
-            total_signed_entries: row.get::<usize, u64>(9)?,
-            total_paid_entries: row.get::<usize, u64>(10)?,
-            total_paid_out_entries: row.get(11)?,
+            total_entries: row.get::<usize, u64>(8)?,
+            total_entry_nonces: row.get::<usize, u64>(9)?,
+            total_signed_entries: row.get::<usize, u64>(10)?,
+            total_paid_entries: row.get::<usize, u64>(11)?,
+            total_paid_out_entries: row.get(12)?,
 
-            outcome_transaction: row.get::<usize, Option<Value>>(12).map(|opt| {
+            outcome_transaction: row.get::<usize, Option<Value>>(13).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            funding_transaction: row.get::<usize, Option<Value>>(13).map(|opt| {
+            funding_transaction: row.get::<usize, Option<Value>>(14).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            funding_outpoint: row.get::<usize, Option<Value>>(14).map(|opt| {
+            funding_outpoint: row.get::<usize, Option<Value>>(15).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            contract_parameters: row.get::<usize, Option<Value>>(15).map(|opt| {
+            contract_parameters: row.get::<usize, Option<Value>>(16).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            public_nonces: row.get::<usize, Option<Value>>(16).map(|opt| {
+            public_nonces: row.get::<usize, Option<Value>>(17).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            aggregated_nonces: row.get::<usize, Option<Value>>(17).map(|opt| {
+            aggregated_nonces: row.get::<usize, Option<Value>>(18).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            partial_signatures: row.get::<usize, Option<Value>>(18).map(|opt| {
+            partial_signatures: row.get::<usize, Option<Value>>(19).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            signed_contract: row.get::<usize, Option<Value>>(19).map(|opt| {
+            signed_contract: row.get::<usize, Option<Value>>(20).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            attestation: row.get::<usize, Option<Value>>(20).map(|opt| {
+            attestation: row.get::<usize, Option<Value>>(21).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            cancelled_at: parse_optional_timestamp(row.get::<usize, Option<String>>(21)?, 21)?,
-            contracted_at: parse_optional_timestamp(row.get::<usize, Option<String>>(22)?, 22)?,
-            signed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(23)?, 23)?,
+            cancelled_at: parse_optional_timestamp(row.get::<usize, Option<String>>(22)?, 22)?,
+            contracted_at: parse_optional_timestamp(row.get::<usize, Option<String>>(23)?, 23)?,
+            signed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(24)?, 24)?,
             funding_broadcasted_at: parse_optional_timestamp(
-                row.get::<usize, Option<String>>(24)?,
-                24,
-            )?,
-            funding_confirmed_at: parse_optional_timestamp(
                 row.get::<usize, Option<String>>(25)?,
                 25,
             )?,
-            funding_settled_at: parse_optional_timestamp(
+            funding_confirmed_at: parse_optional_timestamp(
                 row.get::<usize, Option<String>>(26)?,
                 26,
             )?,
-            expiry_broadcasted_at: parse_optional_timestamp(
+            funding_settled_at: parse_optional_timestamp(
                 row.get::<usize, Option<String>>(27)?,
                 27,
             )?,
-            outcome_broadcasted_at: parse_optional_timestamp(
+            expiry_broadcasted_at: parse_optional_timestamp(
                 row.get::<usize, Option<String>>(28)?,
                 28,
             )?,
-            delta_broadcasted_at: parse_optional_timestamp(
+            outcome_broadcasted_at: parse_optional_timestamp(
                 row.get::<usize, Option<String>>(29)?,
                 29,
             )?,
-            completed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(30)?, 31)?,
-            failed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(31)?, 31)?,
+            delta_broadcasted_at: parse_optional_timestamp(
+                row.get::<usize, Option<String>>(30)?,
+                30,
+            )?,
+            completed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(31)?, 31)?,
+            failed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(32)?, 32)?,
 
             errors: row
-                .get::<usize, Option<Value>>(32)
+                .get::<usize, Option<Value>>(33)
                 .map(|opt| {
                     opt.and_then(|raw| match raw {
                         Value::Blob(val) => {

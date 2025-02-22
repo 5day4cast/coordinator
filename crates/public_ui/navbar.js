@@ -62,11 +62,16 @@ $navbarItems.forEach(function ($navbarItem) {
           }
         }
         break;
+      case "payouts":
+        console.log("displaying payouts");
+        hideAllContainers();
+        showContainer(targetContainerId);
+        displayPayouts(apiBase, oracleBase);
+        break;
       default:
     }
   });
 });
-
 function hideAllContainers() {
   $navDivs.forEach(function ($container) {
     const containerId = $container.id.split("NavClick")[0];
@@ -89,3 +94,5 @@ function showContainer(containerId) {
     );
   }
 }
+
+export { hideAllContainers, showContainer };
