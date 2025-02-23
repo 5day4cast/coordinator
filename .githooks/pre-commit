@@ -8,7 +8,7 @@ if echo "$staged_changes" | grep "^crates/client_validator/" > /dev/null; then
     echo "Changes detected in client_validator, rebuilding WASM..."
 
     # Run the build script
-    ./build.sh
+    ./build_ui.sh
 
     # Add the WASM build files to the current commit
     git add crates/public_ui/dist/

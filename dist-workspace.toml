@@ -1,5 +1,5 @@
 [workspace]
-members = ["npm:crates/public_ui" ,"cargo:crates/server",]
+members = ["cargo:crates/server"]
 
 # Config for 'dist'
 [dist]

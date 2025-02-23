@@ -18,4 +18,8 @@ fi
 echo "Building WASM..."
 wasm-pack build --target web --out-dir ../../crates/public_ui/dist "${PROJECT_ROOT}/crates/client_validator"
 
+rm -f "${PROJECT_ROOT}/crates/public_ui/dist/.gitignore"
+rm -f "${PROJECT_ROOT}/crates/public_ui/dist/package.json"
+rm -f "${PROJECT_ROOT}/crates/public_ui/dist/README.md"
+
 echo "Build completed"
