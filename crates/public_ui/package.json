@@ -7,7 +7,7 @@
     "url": "https://github.com/tee8z/5day4cast"
   },
   "scripts": {
-    "build": "bash ../build.sh"
+    "build": "bash ../../build.sh"
   },
   "files": [
     "client_validator_bg.wasm",

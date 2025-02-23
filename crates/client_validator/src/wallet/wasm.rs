@@ -1,7 +1,7 @@
 use super::core::{TaprootWalletCore, TaprootWalletCoreBuilder};
 use crate::NostrClientWrapper;
 use dlctix::{bitcoin::OutPoint, musig2::AggNonce, ContractParameters, SigMap};
-use log::info;
+use log::{debug, info};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
