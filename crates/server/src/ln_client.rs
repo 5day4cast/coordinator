@@ -256,7 +256,7 @@ impl Ln for LnClient {
             expiry: expiry_time_secs.to_string(),
             memo: Some(format!("competition_id:{0}", competition_id.to_string(),)),
         };
-
+        info!("hold invoice: {:?}", body);
         info!("hash_base64: {:?}", hash_base64);
         let response = self
             .client

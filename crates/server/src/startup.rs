@@ -150,7 +150,7 @@ pub async fn build_app(
     info!("Bitcoin service configured");
 
     let reqwest_client = build_reqwest_client();
-    let ln = LnClient::new(reqwest_client.clone(), config.ln_settings)
+    let ln = LnClient::new(reqwest_client.clone(), config.ln_settings.clone())
         .await
         .map(Arc::new)?;
 
@@ -236,7 +236,7 @@ pub async fn build_app(
         coordinator.clone(),
         ln.clone(),
         cancel_token.clone(),
-        Duration::from_secs(30), //TODO: make configurable, check every 30 seconds
+        Duration::from_secs(config.ln_settings.invoice_watch_interval),
     );
 
     let invoice_watcher_handle = tokio::spawn(async move {
@@ -316,39 +316,42 @@ pub fn app(
     Router::new()
         .route("/", get(index_handler))
         .route("/admin", get(admin_index_handler))
-        .route("/health_check", get(health))
-        .route("/competitions", post(create_event))
-        .route("/competitions", get(get_competitions))
+        .fallback(index_handler)
+        .route("/api/v1/health_check", get(health))
+        .route("/api/v1/competitions", post(create_event))
+        .route("/api/v1/competitions", get(get_competitions))
         .route(
-            "/competitions/{competition_id}/ticket",
+            "/api/v1/competitions/{competition_id}/ticket",
             get(request_competition_ticket),
         )
         .route(
-            "/competitions/{competition_id}/tickets/{ticket_id}/status",
+            "/api/v1/competitions/{competition_id}/tickets/{ticket_id}/status",
             get(get_ticket_status),
         )
-        .route("/competitions/{id}/contract", get(get_contract_parameters))
         .route(
-            "/competitions/{competition_id}/entries/{entry_id}/public_nonces",
+            "/api/v1/competitions/{id}/contract",
+            get(get_contract_parameters),
+        )
+        .route(
+            "/api/v1/competitions/{competition_id}/entries/{entry_id}/public_nonces",
             post(submit_public_nonces),
         )
         .route(
-            "/competitions/{id}/aggregate_nonces",
+            "/api/v1/competitions/{id}/aggregate_nonces",
             get(get_aggregate_nonces),
         )
         .route(
-            "/competitions/{competition_id}/entries/{entry_id}/partial_signatures",
+            "/api/v1/competitions/{competition_id}/entries/{entry_id}/partial_signatures",
             post(submit_partial_signatures),
         )
-        .route("/entries", post(add_event_entry))
-        .route("/entries", get(get_entries))
-        .nest("/wallet", wallet_endpoints)
-        .nest("/users", users_endpoints)
+        .route("/api/v1/entries", post(add_event_entry))
+        .route("/api/v1/entries", get(get_entries))
+        .nest("/api/v1/wallet", wallet_endpoints)
+        .nest("/api/v1/users", users_endpoints)
         .layer(middleware::from_fn(log_request))
         .with_state(Arc::new(app_state))
         .nest_service("/ui", serve_dir.clone())
         .nest_service("/admin_ui", serve_admin_dir.clone())
-        .fallback_service(serve_dir)
         .layer(cors)
 }
 

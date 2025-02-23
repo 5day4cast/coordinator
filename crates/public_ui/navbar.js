@@ -7,6 +7,23 @@ import { Router } from "./router.js";
 const oracleBase = ORACLE_BASE;
 const apiBase = API_BASE;
 
+function registerPageReloadHandlers(apiBase, oracleBase) {
+  const pages = {
+    allCompetitions: () => displayCompetitions(apiBase, oracleBase),
+    entriesContainer: () => displayEntries(apiBase, oracleBase),
+    payoutsContainer: () => displayPayouts(apiBase, oracleBase),
+  };
+
+  document.querySelectorAll("[data-container]").forEach((element) => {
+    element.addEventListener("click", () => {
+      const containerId = element.getAttribute("data-container");
+      if (pages[containerId]) {
+        pages[containerId]();
+      }
+    });
+  });
+}
+
 const routes = {
   "/competitions": () => {
     hideAllContainers();
@@ -14,11 +31,26 @@ const routes = {
     displayCompetitions(apiBase, oracleBase);
   },
   "/entries": () => {
+    // Check if user is authenticated
+    if (!window.taprootWallet) {
+      router.navigate("/competitions");
+      // Optionally show login modal
+      const loginModal = document.getElementById("loginModal");
+      if (loginModal) {
+        loginModal.classList.add("is-active");
+        document.documentElement.classList.add("is-clipped");
+      }
+      return;
+    }
     hideAllContainers();
     showContainer("allEntries");
     displayEntries(apiBase, oracleBase);
   },
   "/signing": () => {
+    if (!window.taprootWallet) {
+      router.navigate("/competitions");
+      return;
+    }
     hideAllContainers();
     showContainer("signingStatus");
     const registry = getMusigRegistry();
@@ -32,6 +64,16 @@ const routes = {
     }
   },
   "/payouts": () => {
+    if (!window.taprootWallet) {
+      router.navigate("/competitions");
+      // Optionally show login modal
+      const loginModal = document.getElementById("loginModal");
+      if (loginModal) {
+        loginModal.classList.add("is-active");
+        document.documentElement.classList.add("is-clipped");
+      }
+      return;
+    }
     hideAllContainers();
     showContainer("payouts");
     displayPayouts(apiBase, oracleBase);
@@ -106,4 +148,4 @@ function showContainer(containerId) {
   }
 }
 
-export { hideAllContainers, showContainer };
+export { hideAllContainers, showContainer, registerPageReloadHandlers };

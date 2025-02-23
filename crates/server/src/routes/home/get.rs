@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::{extract::State, response::Html};
+use log::info;
 use tokio::fs;
 
 use crate::AppState;
@@ -27,7 +28,9 @@ pub async fn public_index(
     let mut file_content = fs::read_to_string(&format!("{}/index.html", ui_dir))
         .await
         .expect("Unable to read index.html");
-
+    info!("remote_url: {}", remote_url);
+    info!("oracle_url: {}", oracle_url);
+    info!("bitcoin_network: {}", bitcoin_network);
     file_content = file_content.replace("{SERVER_ADDRESS}", remote_url);
     file_content = file_content.replace("{ORACLE_BASE}", oracle_url);
     file_content.replace("{NETWORK}", bitcoin_network)
@@ -54,7 +57,9 @@ pub async fn admin_index(
     let mut file_content = fs::read_to_string(&format!("{}/index.html", admin_ui_dir))
         .await
         .expect("Unable to read index.html");
-
+    info!("remote_url: {}", remote_url);
+    info!("oracle_url: {}", oracle_url);
+    info!("esplora_url: {}", esplora_url);
     file_content = file_content.replace("{SERVER_ADDRESS}", remote_url);
     file_content = file_content.replace("{ORACLE_BASE}", oracle_url);
     file_content.replace("{ESPLORA_URL}", esplora_url)

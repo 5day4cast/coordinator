@@ -393,7 +393,6 @@ impl Competition {
     ) -> Result<Vec<Ticket>, Error> {
         let (total_expiry_secs, expiry_time) = self.calculate_ticket_expiry()?;
         let mut tickets = Vec::with_capacity(total_tickets);
-
         for i in 0..total_tickets {
             let ticket = self
                 .create_ticket(total_expiry_secs, expiry_time, ln_client)

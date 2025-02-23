@@ -31,7 +31,7 @@ class AuthManager {
   attachEventListeners() {
     // Auth related buttons
     document
-      .getElementById("logoutNavClick")
+      .getElementById("logoutContainer")
       .addEventListener("click", () => this.handleLogout());
 
     document
@@ -274,7 +274,7 @@ class AuthManager {
     window.nostrClient = new NostrClientWrapper();
 
     document.getElementById("authButtons").classList.remove("is-hidden");
-    document.getElementById("logoutNavClick").classList.add("is-hidden");
+    document.getElementById("logoutContainer").classList.add("is-hidden");
     document.getElementById("signingStatusNavClick").classList.add("is-hidden");
 
     // Clear any sensitive data
@@ -291,7 +291,7 @@ class AuthManager {
 
   onLoginSuccess() {
     document.getElementById("authButtons").classList.add("is-hidden");
-    document.getElementById("logoutNavClick").classList.remove("is-hidden");
+    document.getElementById("logoutContainer").classList.remove("is-hidden");
     document
       .getElementById("signingStatusNavClick")
       .classList.remove("is-hidden");

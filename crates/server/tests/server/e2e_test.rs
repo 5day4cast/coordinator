@@ -77,6 +77,7 @@ impl TestContext {
             base_url: String::from("https://localhost:9095"),
             macaroon_file_path: String::from("./test_data/coord_ln/admin.macaroon"),
             tls_cert_path: Some(String::from("./test_data/coord_ln/tls.cert")),
+            invoice_watch_interval: 10,
         };
 
         let ln = LnClient::new(client, coordinator_ln).await?;
@@ -172,6 +173,7 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
         base_url: String::from("https://localhost:9092"),
         macaroon_file_path: String::from("./test_data/alice_ln/admin.macaroon"),
         tls_cert_path: Some(String::from("./test_data/alice_ln/tls.cert")),
+        invoice_watch_interval: 10,
     };
     let alice_ln = LnClient::new(client.clone(), alice).await?;
     alice_ln.ping().await?;
@@ -179,6 +181,7 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
         base_url: String::from("https://localhost:9098"),
         macaroon_file_path: String::from("./test_data/bob_ln/admin.macaroon"),
         tls_cert_path: Some(String::from("./test_data/bob_ln/tls.cert")),
+        invoice_watch_interval: 10,
     };
     let bob_ln = LnClient::new(client.clone(), bob).await?;
     bob_ln.ping().await?;
