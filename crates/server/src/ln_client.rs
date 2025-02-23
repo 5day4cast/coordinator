@@ -167,7 +167,7 @@ fn buffer_as_hex(bytes: Vec<u8>) -> String {
 }
 
 const MACAROON_HEADER: &str = "Grpc-Metadata-macaroon";
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct InvoiceAddResponse {
     pub payment_request: String,
     pub add_index: String,
