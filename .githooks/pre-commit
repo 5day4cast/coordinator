@@ -1,0 +1,20 @@
+#!/bin/bash
+set -e
+
+staged_changes=$(git diff --cached --name-only)
+
+# Check if any staged changes are in client_validator
+if echo "$staged_changes" | grep "^crates/client_validator/" > /dev/null; then
+    echo "Changes detected in client_validator, rebuilding WASM..."
+
+    # Run the build script
+    ./build_ui.sh
+
+    # Add the WASM build files to the current commit
+    git add crates/public_ui/dist/
+
+    # No need for user to make another commit
+    echo "WASM build files automatically added to commit"
+fi
+
+exit 0

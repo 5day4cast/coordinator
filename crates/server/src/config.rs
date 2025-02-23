@@ -57,6 +57,8 @@ pub struct LnSettings {
     pub macaroon_file_path: String,
     /// Optional file path to the lnd tls cert (typically only used in local development, with self signed certs)
     pub tls_cert_path: Option<String>,
+    /// Interval in seconds to check for new invoices
+    pub invoice_watch_interval: u64,
 }
 
 impl Default for LnSettings {
@@ -65,6 +67,7 @@ impl Default for LnSettings {
             base_url: String::from("https://localhost:9095"),
             macaroon_file_path: String::from("./creds/admin.macaroon"),
             tls_cert_path: Some(String::from("./creds/tls.cert")),
+            invoice_watch_interval: 5,
         }
     }
 }
@@ -116,6 +119,10 @@ pub struct CoordinatorSettings {
     /// - `432`: ~72 hours
     /// - `1008`: ~1 week
     pub relative_locktime_block_delta: u16,
+
+    /// The number of confirmations required for a transaction to be considered confirmed
+    /// by the coordinator system
+    pub required_confirmations: u32,
 }
 
 impl Default for CoordinatorSettings {
@@ -124,6 +131,7 @@ impl Default for CoordinatorSettings {
             oracle_url: String::from("https://www.4casttruth.win"),
             private_key_file: String::from("./creds/coordinator_private_key.pem"),
             relative_locktime_block_delta: 144,
+            required_confirmations: 1,
         }
     }
 }

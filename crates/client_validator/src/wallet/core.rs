@@ -358,7 +358,7 @@ impl TaprootWalletCore {
         Ok(point.to_string())
     }
 
-    fn derive_dlc_key(&self, entry_index: u32) -> Result<Xpriv, WalletError> {
+    pub fn derive_dlc_key(&self, entry_index: u32) -> Result<Xpriv, WalletError> {
         // BIP86 path for Taproot: m/86'/0'/contract_index'
         let path = format!("m/86'/0'/{}'/0/0", entry_index);
         debug!("Deriving key with path: {}", path);
@@ -386,6 +386,8 @@ impl TaprootWalletCore {
         let child_xpriv = self.derive_dlc_key(entry_index)?;
         let payout_preimage =
             self.generate_preimage_from_secret(child_xpriv.private_key.secret_bytes());
+
+        //TODO: this should be a lightning invoice hash
         let payout_hash = self.generate_preimage_from_secret(payout_preimage);
 
         let payout_preimage = SecretString::from(hex::encode(payout_preimage));

@@ -1,17 +1,19 @@
 use anyhow::anyhow;
 use async_trait::async_trait;
-use log::info;
+use base64::Engine;
+use log::{debug, info};
 use reqwest_middleware::{
     reqwest::{Certificate, Client, Url},
     ClientBuilder, ClientWithMiddleware,
 };
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
-use secrecy::{ExposeSecret, Secret, SecretString};
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     fs::{self, metadata},
     path::Path,
+    time::Duration,
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
@@ -26,18 +28,44 @@ pub trait Ln: Send + Sync {
         value: u64,
         expiry_time_secs: u64,
         ticket_hash: String,
-        entry_id: Uuid,
-        entry_index: u64,
         competition_id: Uuid,
     ) -> Result<InvoiceAddResponse, anyhow::Error>;
+    async fn create_invoice(
+        &self,
+        value: u64,
+        expiry_time_secs: u64,
+    ) -> Result<String, anyhow::Error>;
     async fn cancel_hold_invoice(&self, ticket_hash: String) -> Result<(), anyhow::Error>;
     async fn settle_hold_invoice(&self, ticket_preimage: String) -> Result<(), anyhow::Error>;
+    async fn lookup_invoice(&self, r_hash: &str) -> Result<InvoiceLookupResponse, anyhow::Error>;
     async fn send_payment(
         &self,
         payout_payment_request: String,
         timeout_seconds: u64,
         fee_limit_sat: u64,
     ) -> Result<(), anyhow::Error>;
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum InvoiceState {
+    Open,
+    Settled,
+    Canceled,
+    Accepted,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InvoiceLookupResponse {
+    pub state: InvoiceState,
+    pub memo: Option<String>,
+    pub r_hash: String,
+    pub value: String,
+    pub settled: bool,
+    pub creation_date: String,
+    pub settle_date: String,
+    pub payment_request: String,
+    pub expiry: String,
 }
 
 //TODO: we might need to add tls cert as an option, skipping for now
@@ -128,7 +156,7 @@ fn read_macaroon(macaroon_path: String) -> Result<SecretString, anyhow::Error> {
     let contents =
         fs::read(macaroon_path).map_err(|e| anyhow!("Failed to read macaroon file: {}", e))?;
     let hex_string = buffer_as_hex(contents);
-    Ok(Secret::from(hex_string))
+    Ok(SecretString::from(hex_string))
 }
 
 fn buffer_as_hex(bytes: Vec<u8>) -> String {
@@ -139,7 +167,7 @@ fn buffer_as_hex(bytes: Vec<u8>) -> String {
 }
 
 const MACAROON_HEADER: &str = "Grpc-Metadata-macaroon";
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct InvoiceAddResponse {
     pub payment_request: String,
     pub add_index: String,
@@ -205,23 +233,31 @@ impl Ln for LnClient {
         &self,
         value: u64,
         expiry_time_secs: u64,
-        ticket_hash: String,
-        entry_id: Uuid,
-        entry_index: u64,
+        ticket_hash_hex: String,
         competition_id: Uuid,
     ) -> Result<InvoiceAddResponse, anyhow::Error> {
+        info!("ticket_hash_hex: {:?}", ticket_hash_hex);
+
+        let hash_bytes = hex::decode(&ticket_hash_hex)
+            .map_err(|e| anyhow!("Failed to decode hex hash: {}", e))?;
+
+        if hash_bytes.len() != 32 {
+            return Err(anyhow!(
+                "Hash must be 32 bytes, got {} bytes",
+                hash_bytes.len()
+            ));
+        }
+
+        let hash_base64 = base64::engine::general_purpose::STANDARD.encode(&hash_bytes);
+
         let body = HoldInvoiceRequest {
-            hash: ticket_hash,
+            hash: hash_base64.clone(),
             value: value.to_string(),
             expiry: expiry_time_secs.to_string(),
-            memo: Some(format!(
-                "competition_id:{0}|entry_id:{1}|entry_index:{2}",
-                competition_id.to_string(),
-                entry_id.to_string(),
-                entry_index
-            )),
+            memo: Some(format!("competition_id:{0}", competition_id.to_string(),)),
         };
-
+        info!("hold invoice: {:?}", body);
+        info!("hash_base64: {:?}", hash_base64);
         let response = self
             .client
             .post(format!("{}v2/invoices/hodl", self.base_url))
@@ -240,10 +276,27 @@ impl Ln for LnClient {
         let invoice_response = response.json::<InvoiceAddResponse>().await?;
         Ok(invoice_response)
     }
-    async fn cancel_hold_invoice(&self, ticket_hash: String) -> Result<(), anyhow::Error> {
+
+    async fn cancel_hold_invoice(&self, ticket_hash_hex: String) -> Result<(), anyhow::Error> {
+        let hash_bytes = hex::decode(&ticket_hash_hex)
+            .map_err(|e| anyhow!("Failed to decode hex hash: {}", e))?;
+
+        if hash_bytes.len() != 32 {
+            return Err(anyhow!(
+                "Hash must be 32 bytes, got {} bytes",
+                hash_bytes.len()
+            ));
+        }
+
+        let hash_base64 = base64::engine::general_purpose::STANDARD.encode(&hash_bytes);
+        let body = json!({
+            "payment_hash":hash_base64
+        });
+
         let response = self
             .client
-            .delete(format!("{}v2/invoices/hodl/{}", self.base_url, ticket_hash))
+            .post(format!("{}v2/invoices/hodl/cancel", self.base_url))
+            .json(&body)
             .header(MACAROON_HEADER, self.macaroon.expose_secret())
             .send()
             .await?;
@@ -259,13 +312,18 @@ impl Ln for LnClient {
     }
 
     async fn settle_hold_invoice(&self, ticket_preimage: String) -> Result<(), anyhow::Error> {
+        let preimage_bytes = hex::decode(&ticket_preimage)
+            .map_err(|e| anyhow!("Failed to decode hex preimage: {}", e))?;
+
+        let preimage_base64 = base64::engine::general_purpose::STANDARD.encode(&preimage_bytes);
+
         let body = json!({
-            "preimage": ticket_preimage
+            "preimage": preimage_base64
         });
 
         let response = self
             .client
-            .post(format!("{}v2/invoices/hodl/settle", self.base_url))
+            .post(format!("{}v2/invoices/settle", self.base_url))
             .json(&body)
             .header(MACAROON_HEADER, self.macaroon.expose_secret())
             .send()
@@ -281,6 +339,69 @@ impl Ln for LnClient {
         Ok(())
     }
 
+    async fn create_invoice(
+        &self,
+        value: u64,
+        expiry_time_secs: u64,
+    ) -> Result<String, anyhow::Error> {
+        let body = json!({
+            "value": value,
+            "expiry": expiry_time_secs
+        });
+
+        let response = self
+            .client
+            .post(format!("{}v1/invoices", self.base_url))
+            .json(&body)
+            .header(MACAROON_HEADER, self.macaroon.expose_secret())
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "Failed to create invoice: {}",
+                response.text().await?
+            ));
+        }
+
+        let invoice_response = response.json::<InvoiceAddResponse>().await?;
+        Ok(invoice_response.payment_request)
+    }
+
+    async fn lookup_invoice(
+        &self,
+        ticket_hash_hex: &str,
+    ) -> Result<InvoiceLookupResponse, anyhow::Error> {
+        let hash_bytes = hex::decode(&ticket_hash_hex)
+            .map_err(|e| anyhow!("Failed to decode hex hash: {}", e))?;
+
+        if hash_bytes.len() != 32 {
+            return Err(anyhow!(
+                "Hash must be 32 bytes, got {} bytes",
+                hash_bytes.len()
+            ));
+        }
+
+        let hash_base64 = base64::engine::general_purpose::URL_SAFE.encode(&hash_bytes);
+
+        let response = self
+            .client
+            .get(format!(
+                "{}v2/invoices/lookup?payment_hash={}",
+                self.base_url, hash_base64
+            ))
+            .header(MACAROON_HEADER, self.macaroon.expose_secret())
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("Failed to lookup invoice: {}", response.status()));
+        }
+
+        let invoice = response.json::<InvoiceLookupResponse>().await?;
+        Ok(invoice)
+    }
+
     async fn send_payment(
         &self,
         payout_payment_request: String,
@@ -291,33 +412,25 @@ impl Ln for LnClient {
             "payment_request": payout_payment_request,
             "timeout_seconds": timeout_seconds,
             "fee_limit_sat": fee_limit_sat.to_string(),
-            "allow_self_payment": true
+            "allow_self_payment": true,
         });
-
+        debug!("sending payment: {:?}", body);
         let response = self
             .client
             .post(format!("{}v2/router/send", self.base_url))
             .json(&body)
             .header(MACAROON_HEADER, self.macaroon.expose_secret())
+            .timeout(Duration::from_secs(2))
             .send()
-            .await?;
+            .await;
 
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "Failed to send payment: {}",
-                response.status()
-            ));
+        match response {
+            Ok(_) => Ok(()),
+            Err(e) if e.is_timeout() => {
+                debug!("Payment request timed out (expected): {}", e);
+                Ok(())
+            }
+            Err(e) => Err(anyhow::anyhow!("Failed to send payment: {}", e)),
         }
-
-        let payment_response = response.json::<PaymentResponse>().await?;
-
-        if !payment_response.payment_error.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Payment failed: {}",
-                payment_response.payment_error
-            ));
-        }
-
-        Ok(())
     }
 }

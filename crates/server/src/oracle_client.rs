@@ -1,6 +1,9 @@
 use anyhow::anyhow;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use dlctix::{secp::Scalar, EventLockingConditions};
+use dlctix::{
+    secp::{MaybeScalar, Scalar},
+    EventLockingConditions,
+};
 use hyper::header::{AUTHORIZATION, CONTENT_TYPE};
 use log::{debug, error};
 use mime::APPLICATION_JSON;
@@ -30,6 +33,8 @@ pub struct Event {
     pub nonce: Scalar,
     /// Holds the predefined outcomes the oracle will attest to at event completes
     pub event_announcement: EventLockingConditions,
+    /// When added it means the oracle has signed that the current data is the final result
+    pub attestation: Option<MaybeScalar>,
 }
 
 #[derive(Error, Debug)]
@@ -138,6 +143,7 @@ fn secp256k1_to_nostr_keys(secp_key: &Secp256k1SecretKey) -> Result<Keys, &'stat
 #[async_trait::async_trait]
 pub trait Oracle: Send + Sync {
     async fn create_event(&self, event: CreateEvent) -> Result<Event, Error>;
+    async fn get_event(&self, event_id: &Uuid) -> Result<Event, Error>;
     async fn submit_entry(&self, entry: AddEventEntry) -> Result<(), Error>;
 }
 
@@ -269,6 +275,21 @@ impl Oracle for OracleClient {
             url,
             Some(body),
             String::from("event not found"),
+        )
+        .await
+    }
+
+    async fn get_event(&self, id: &Uuid) -> Result<Event, Error> {
+        let url = self
+            .base_url
+            .join(&format!("/oracle/events/{}", id))
+            .map_err(|e| Error::Request(e.to_string()))?;
+
+        self.send_authenticated_request::<Event>(
+            Method::GET,
+            url,
+            None,
+            format!("event with id {} not found", id),
         )
         .await
     }

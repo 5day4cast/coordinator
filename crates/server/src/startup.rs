@@ -1,15 +1,17 @@
 use crate::{
     add_event_entry, admin_index_handler, create_event, create_folder,
-    domain::{CompetitionStore, CompetitionWatcher, DBConnection, UserInfo},
+    domain::{CompetitionStore, CompetitionWatcher, DBConnection, InvoiceWatcher, UserInfo},
     get_aggregate_nonces, get_balance, get_competitions, get_contract_parameters, get_entries,
-    get_estimated_fee_rates, get_next_address, get_outputs, health, index_handler, login, register,
-    send_to_address, submit_partial_signatures, submit_public_nonces, BitcoinClient,
-    BitcoinSyncWatcher, Coordinator, Ln, LnClient, OracleClient, Settings, UserStore,
+    get_estimated_fee_rates, get_next_address, get_outputs, get_ticket_status, health,
+    index_handler, login, register, request_competition_ticket, send_to_address,
+    submit_partial_signatures, submit_public_nonces, BitcoinClient, BitcoinSyncWatcher,
+    Coordinator, Ln, LnClient, OracleClient, Settings, UserStore,
 };
 use anyhow::anyhow;
 use axum::{
     body::Body,
     extract::{connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, Request},
+    http::Extensions,
     middleware::{self, AddExtension, Next},
     response::IntoResponse,
     routing::{get, post},
@@ -22,8 +24,8 @@ use hyper::{
 };
 use log::{error, info, warn};
 use reqwest_middleware::{
-    reqwest::{Client, Url},
-    ClientBuilder, ClientWithMiddleware,
+    reqwest::{self, Client, Response, Url},
+    ClientBuilder, ClientWithMiddleware, Middleware,
 };
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 use std::{collections::HashMap, net::SocketAddr, str::FromStr};
@@ -118,7 +120,7 @@ pub async fn build_app(
 ) -> Result<
     (
         AppState,
-        ServeDir<SetStatus<ServeFile>>,
+        ServeDir<ServeFile>,
         ServeDir<SetStatus<ServeFile>>,
         TaskTracker,
         CancellationToken,
@@ -127,7 +129,14 @@ pub async fn build_app(
 > {
     // The ui folder needs to be generated and have this relative path from where the binary is being run
     let serve_dir = ServeDir::new(config.ui_settings.ui_dir.clone())
-        .not_found_service(ServeFile::new(config.ui_settings.ui_dir.clone()));
+        .not_found_service(ServeFile::new(format!(
+            "{}/index.html",
+            config.ui_settings.ui_dir
+        )))
+        .fallback(ServeFile::new(format!(
+            "{}/index.html",
+            config.ui_settings.ui_dir
+        )));
     info!("Public UI configured");
 
     // The admin_ui folder needs to be generated and have this relative path from where the binary is being run
@@ -141,7 +150,7 @@ pub async fn build_app(
     info!("Bitcoin service configured");
 
     let reqwest_client = build_reqwest_client();
-    let ln = LnClient::new(reqwest_client.clone(), config.ln_settings)
+    let ln = LnClient::new(reqwest_client.clone(), config.ln_settings.clone())
         .await
         .map(Arc::new)?;
 
@@ -173,6 +182,7 @@ pub async fn build_app(
         bitcoin_client.clone(),
         ln.clone(),
         config.coordinator_settings.relative_locktime_block_delta,
+        config.coordinator_settings.required_confirmations,
     )
     .await
     .map(Arc::new)?;
@@ -221,6 +231,22 @@ pub async fn build_app(
         competition_watcher_task,
     );
     threads.insert(String::from("bitcoin_sync_watcher"), bitcoin_watcher_task);
+
+    let invoice_watcher = InvoiceWatcher::new(
+        coordinator.clone(),
+        ln.clone(),
+        cancel_token.clone(),
+        Duration::from_secs(config.ln_settings.invoice_watch_interval),
+    );
+
+    let invoice_watcher_handle = tokio::spawn(async move {
+        if let Err(e) = invoice_watcher.watch().await {
+            error!("Invoice watcher error: {}", e);
+        }
+    });
+
+    threads.insert("invoice_watcher".to_string(), invoice_watcher_handle);
+
     let app_state = AppState {
         ui_dir: config.ui_settings.ui_dir,
         private_url: config.ui_settings.private_url,
@@ -239,7 +265,7 @@ pub async fn build_app(
 pub async fn build_server(
     socket_addr: SocketAddr,
     app_state: AppState,
-    serve_dir: ServeDir<SetStatus<ServeFile>>,
+    serve_dir: ServeDir<ServeFile>,
     serve_admin_dir: ServeDir<SetStatus<ServeFile>>,
 ) -> Result<
     Serve<
@@ -268,7 +294,7 @@ pub async fn build_server(
 
 pub fn app(
     app_state: AppState,
-    serve_dir: ServeDir<SetStatus<ServeFile>>,
+    serve_dir: ServeDir<ServeFile>,
     serve_admin_dir: ServeDir<SetStatus<ServeFile>>,
 ) -> Router {
     let cors = CorsLayer::new()
@@ -290,31 +316,42 @@ pub fn app(
     Router::new()
         .route("/", get(index_handler))
         .route("/admin", get(admin_index_handler))
-        .route("/health_check", get(health))
-        .route("/competitions", post(create_event))
-        .route("/competitions", get(get_competitions))
-        .route("/competitions/{id}/contract", get(get_contract_parameters))
+        .fallback(index_handler)
+        .route("/api/v1/health_check", get(health))
+        .route("/api/v1/competitions", post(create_event))
+        .route("/api/v1/competitions", get(get_competitions))
         .route(
-            "/competitions/{competition_id}/entries/{entry_id}/public_nonces",
+            "/api/v1/competitions/{competition_id}/ticket",
+            get(request_competition_ticket),
+        )
+        .route(
+            "/api/v1/competitions/{competition_id}/tickets/{ticket_id}/status",
+            get(get_ticket_status),
+        )
+        .route(
+            "/api/v1/competitions/{id}/contract",
+            get(get_contract_parameters),
+        )
+        .route(
+            "/api/v1/competitions/{competition_id}/entries/{entry_id}/public_nonces",
             post(submit_public_nonces),
         )
         .route(
-            "/competitions/{id}/aggregate_nonces",
+            "/api/v1/competitions/{id}/aggregate_nonces",
             get(get_aggregate_nonces),
         )
         .route(
-            "/competitions/{competition_id}/entries/{entry_id}/partial_signatures",
+            "/api/v1/competitions/{competition_id}/entries/{entry_id}/partial_signatures",
             post(submit_partial_signatures),
         )
-        .route("/entries", post(add_event_entry))
-        .route("/entries", get(get_entries))
-        .nest("/wallet", wallet_endpoints)
-        .nest("/users", users_endpoints)
+        .route("/api/v1/entries", post(add_event_entry))
+        .route("/api/v1/entries", get(get_entries))
+        .nest("/api/v1/wallet", wallet_endpoints)
+        .nest("/api/v1/users", users_endpoints)
         .layer(middleware::from_fn(log_request))
         .with_state(Arc::new(app_state))
         .nest_service("/ui", serve_dir.clone())
         .nest_service("/admin_ui", serve_admin_dir.clone())
-        .fallback_service(serve_dir)
         .layer(cors)
 }
 
@@ -337,8 +374,39 @@ async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {
 pub fn build_reqwest_client() -> ClientWithMiddleware {
     let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
     ClientBuilder::new(Client::new())
+        .with(LoggingMiddleware)
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
         .build()
+}
+
+struct LoggingMiddleware;
+
+#[async_trait::async_trait]
+impl Middleware for LoggingMiddleware {
+    async fn handle(
+        &self,
+        req: reqwest::Request,
+        extensions: &mut Extensions,
+        next: reqwest_middleware::Next<'_>,
+    ) -> reqwest_middleware::Result<Response> {
+        let method = req.method().clone();
+        let url = req.url().clone();
+
+        info!("Making {} request to: {}", method, url);
+
+        let result = next.run(req, extensions).await;
+
+        match &result {
+            Ok(response) => {
+                info!("{} {} -> Status: {}", method, url, response.status());
+            }
+            Err(error) => {
+                warn!("{} {} -> Error: {:?}", method, url, error);
+            }
+        }
+
+        result
+    }
 }
 
 async fn shutdown_signal() {

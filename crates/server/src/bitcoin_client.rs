@@ -9,7 +9,7 @@ use bdk_wallet::{
     bitcoin::{
         address::NetworkChecked,
         bip32::{ChildNumber, Xpriv},
-        secp256k1::{Secp256k1, SecretKey as BdkSecretKey},
+        secp256k1::SecretKey as BdkSecretKey,
         Address, Amount, Network, NetworkKind, Psbt, Transaction, Txid,
     },
     coin_selection::DefaultCoinSelectionAlgorithm,
@@ -38,9 +38,11 @@ pub trait Bitcoin: Send + Sync {
     async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<LocalOutput, anyhow::Error>;
     async fn get_current_height(&self) -> Result<u32, anyhow::Error>;
     async fn get_estimated_fee_rates(&self) -> Result<HashMap<u16, f64>, anyhow::Error>;
+    async fn get_tx_confirmation_height(&self, txid: &Txid) -> Result<Option<u32>, anyhow::Error>;
     async fn broadcast(&self, transaction: &Transaction) -> Result<(), anyhow::Error>;
     async fn get_next_address(&self) -> Result<AddressInfo, anyhow::Error>;
     async fn get_derived_private_key(&self) -> Result<DlcSecretKey, anyhow::Error>;
+    async fn get_raw_transaction(&self, txid: &Txid) -> Result<Transaction, anyhow::Error>;
     async fn sign_psbt(
         &self,
         psbt: &mut Psbt,
@@ -148,6 +150,13 @@ impl Bitcoin for BitcoinClient {
         Ok(dlc_key)
     }
 
+    async fn get_raw_transaction(&self, txid: &Txid) -> Result<Transaction, anyhow::Error> {
+        let Some(transaction) = self.client.get_tx(txid).await? else {
+            return Err(anyhow!("Transaction not found: {}", txid));
+        };
+        Ok(transaction)
+    }
+
     async fn sign_psbt(
         &self,
         psbt: &mut Psbt,
@@ -156,6 +165,11 @@ impl Bitcoin for BitcoinClient {
         let wallet = self.wallet.write().await;
         let finalized = wallet.sign(psbt, sign_options)?;
         Ok(finalized)
+    }
+
+    async fn get_tx_confirmation_height(&self, txid: &Txid) -> Result<Option<u32>, anyhow::Error> {
+        let tx_status = self.client.get_tx_status(txid).await?;
+        Ok(tx_status.block_height)
     }
 
     async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<LocalOutput, anyhow::Error> {
@@ -261,11 +275,15 @@ impl BitcoinClient {
                 .create_wallet(&mut db)
                 .map_err(|e| anyhow!("Failed to create bitcoin wallet from keys: {}", e))?,
         };
-        let esplora_api = if settings.network == Network::Bitcoin {
-            format!("{}/api", settings.network)
-        } else {
-            format!("{}/{}/api", settings.esplora_url, settings.network)
-        };
+
+        let esplora_api =
+            if settings.network == Network::Regtest || settings.network == Network::Testnet {
+                format!("{}/{}/api", settings.esplora_url, settings.network)
+            } else {
+                // For mutinynet and mainnet network is not needed in the path
+                format!("{}/api", settings.esplora_url)
+            };
+
         let client = Builder::new(&esplora_api)
             .build_async_with_sleeper::<DefaultSleeper>()
             .map_err(|e| anyhow!("Failed to create esplora client: {}", e))?;
@@ -306,7 +324,7 @@ impl BitcoinClient {
         Ok(BitcoinClient {
             network: settings.network,
             wallet: RwLock::new(wallet),
-            seed_path: SecretString::new(settings.seed_path.clone()),
+            seed_path: SecretString::from(settings.seed_path.clone()),
             client,
             wallet_store: RwLock::new(db),
         })
@@ -404,8 +422,6 @@ fn setup_wallet_descriptors(
 fn derive_wallet_key(seed_path: &str, network: NetworkKind) -> Result<Xpriv, anyhow::Error> {
     // Get the secret key from the provided path
     let secret_key: BdkSecretKey = get_key(seed_path)?;
-    let secp = Secp256k1::new();
-
     let chain_code = ChainCode::from(secret_key.secret_bytes());
 
     // Create extended private key with network support

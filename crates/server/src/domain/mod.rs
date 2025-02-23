@@ -1,7 +1,9 @@
 mod competitions;
+mod invoices;
 mod users;
 
 pub use competitions::*;
+pub use invoices::*;
 pub use users::*;
 
 use duckdb::{AccessMode, Config, Connection};
@@ -32,6 +34,14 @@ pub enum Error {
     Bitcoin(#[from] anyhow::Error),
     #[error("signing error: {0}")]
     SigningError(String),
+    #[error("Failed to create hold invoice: {0}")]
+    HoldError(anyhow::Error),
+    #[error("Competition full, total_allowed_entries matches total_entries")]
+    CompetitionFull,
+    #[error("No ticket available for competition")]
+    NoAvailableTickets,
+    #[error("Payout payment failed: {0}")]
+    PaymentFailed(String),
 }
 
 #[derive(Clone)]

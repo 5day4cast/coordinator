@@ -1,7 +1,12 @@
 use anyhow::anyhow;
 use async_trait::async_trait;
-use bdk_wallet::{bitcoin::Psbt, SignOptions};
-use client_validator::{NostrClientCore, SignerType, TaprootWalletCore, TaprootWalletCoreBuilder};
+use bdk_wallet::{
+    bitcoin::{Psbt, Txid},
+    SignOptions,
+};
+use client_validator::{
+    NostrClientCore, SignerType, TaprootWalletCore, TaprootWalletCoreBuilder, WalletError,
+};
 use dlctix::{
     attestation_locking_point,
     musig2::secp256k1::{PublicKey, Secp256k1, SecretKey},
@@ -10,6 +15,7 @@ use dlctix::{
 };
 use log::{debug, info};
 use mockall::mock;
+use secrecy::ExposeSecret;
 use server::{
     domain::{generate_ranking_permutations, AddEntry, CreateEvent},
     get_key, AddEventEntry, Bitcoin, Ln, Oracle, OracleError as Error, OracleEvent, ValueOptions,
@@ -18,7 +24,6 @@ use server::{
 use std::collections::HashMap;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
-
 mock! {
     #[derive(Send, Sync)]
     pub OracleClient { }
@@ -27,6 +32,7 @@ mock! {
     impl Oracle for OracleClient {
         async fn create_event(&self, event: CreateEvent) -> Result<OracleEvent, Error>;
         async fn submit_entry(&self, entry: AddEventEntry) -> Result<(), Error>;
+        async fn get_event(&self, event_id: &Uuid) -> Result<OracleEvent, Error>;
     }
 }
 
@@ -39,9 +45,11 @@ mock! {
         async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<bdk_wallet::LocalOutput, anyhow::Error>;
         async fn get_current_height(&self) -> Result<u32, anyhow::Error>;
         async fn get_estimated_fee_rates(&self) -> Result<HashMap<u16, f64>, anyhow::Error>;
+        async fn get_tx_confirmation_height(&self, txid: &Txid) -> Result<Option<u32>, anyhow::Error>;
         async fn broadcast(&self, transaction: &bdk_wallet::bitcoin::Transaction) -> Result<(), anyhow::Error>;
         async fn get_next_address(&self) -> Result<bdk_wallet::AddressInfo, anyhow::Error>;
         async fn get_derived_private_key(&self) -> Result<dlctix::musig2::secp256k1::SecretKey, anyhow::Error>;
+        async fn get_raw_transaction(&self, txid: &Txid) -> Result<bdk_wallet::bitcoin::Transaction, anyhow::Error>;
         async fn sign_psbt(
             &self,
             psbt: &mut Psbt,
@@ -62,12 +70,16 @@ mock! {
             value: u64,
             expiry_time_secs: u64,
             ticket_hash: String,
-            entry_id: Uuid,
-            entry_index: u64,
             competition_id: Uuid,
         ) -> Result<server::InvoiceAddResponse, anyhow::Error>;
         async fn cancel_hold_invoice(&self, ticket_hash: String) -> Result<(), anyhow::Error>;
         async fn settle_hold_invoice(&self, ticket_preimage: String) -> Result<(), anyhow::Error>;
+        async fn lookup_invoice(&self, r_hash: &str) -> Result<server::InvoiceLookupResponse, anyhow::Error>;
+        async fn create_invoice(
+            &self,
+            value: u64,
+            expiry_time_secs: u64,
+        ) -> Result<String, anyhow::Error>;
         async fn send_payment(
             &self,
             payout_payment_request: String,
@@ -89,14 +101,36 @@ pub async fn create_test_wallet(nostr_client: &NostrClientCore) -> TaprootWallet
 pub struct TestParticipant {
     pub wallet: client_validator::TaprootWalletCore,
     pub nostr_pubkey: String,
+    pub ticket_id: Uuid,
 }
 
 impl TestParticipant {
-    pub fn new(wallet: client_validator::TaprootWalletCore, nostr_pubkey: String) -> Self {
+    pub fn new(
+        wallet: client_validator::TaprootWalletCore,
+        nostr_pubkey: String,
+        ticket_id: Uuid,
+    ) -> Self {
         Self {
             wallet,
             nostr_pubkey,
+            ticket_id,
         }
+    }
+
+    pub fn get_payout_preimage(&self) -> Result<String, anyhow::Error> {
+        let entry = self
+            .wallet
+            .get_dlc_entry(0)
+            .ok_or_else(|| anyhow!("No DLC entry found"))?;
+        Ok(entry.payout_preimage.expose_secret().to_string())
+    }
+
+    pub async fn get_dlc_private_key(&self, entry_index: u32) -> Result<String, WalletError> {
+        let key = self
+            .wallet
+            .get_encrypted_dlc_private_key(entry_index, &self.nostr_pubkey)
+            .await?;
+        self.wallet.decrypt_key(&key, &self.nostr_pubkey).await
     }
 }
 
@@ -122,6 +156,7 @@ pub fn generate_request_create_event(
         id: Uuid::now_v7(),
         signing_date,
         observation_date,
+        coordinator_fee_percentage: 5,
         locations: (0..num_locations).map(|i| format!("LOC_{}", i)).collect(),
         number_of_values_per_entry: num_locations * 3, // 3 values per location
         total_allowed_entries,
@@ -137,6 +172,7 @@ pub async fn generate_test_entry(
     nostr_pubkey: &str,
     station_ids: &Vec<String>,
     entry_index: u32,
+    ticket_id: Uuid,
 ) -> Result<AddEntry, anyhow::Error> {
     let entry_id = Uuid::now_v7();
 
@@ -166,6 +202,7 @@ pub async fn generate_test_entry(
 
     Ok(AddEntry {
         id: entry_id,
+        ticket_id,
         ephemeral_pubkey,
         ephemeral_privatekey_encrypted,
         payout_hash,
@@ -228,6 +265,7 @@ pub fn generate_oracle_event(
             expiry: Some(expiry),
             locking_points,
         },
+        attestation: None,
     }
 }
 
@@ -254,4 +292,11 @@ pub fn generate_outcome_messages(possible_user_outcomes: Vec<Vec<usize>>) -> Vec
                 .collect::<Vec<u8>>()
         })
         .collect()
+}
+
+pub fn get_winning_bytes(winners: Vec<usize>) -> Vec<u8> {
+    winners
+        .iter()
+        .flat_map(|&idx| idx.to_be_bytes())
+        .collect::<Vec<u8>>()
 }

@@ -4,14 +4,15 @@ use dlctix::{
     SigMap,
 };
 use duckdb::{params, params_from_iter, types::Value, Connection};
-use log::trace;
+use log::{debug, info, trace};
 use scooby::postgres::{select, Joinable};
+use std::collections::HashMap;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::domain::DBConnection;
 
-use super::{run_comeptition_migrations, Competition, SearchBy, UserEntry};
+use super::{run_comeptition_migrations, Competition, EntryStatus, SearchBy, Ticket, UserEntry};
 
 #[derive(Clone)]
 pub struct CompetitionStore {
@@ -59,33 +60,36 @@ impl CompetitionStore {
     pub async fn add_entry(
         &self,
         entry: UserEntry,
-        ticket_hash: String,
-        ticket_preimage: String,
+        ticket_id: Uuid,
     ) -> Result<UserEntry, duckdb::Error> {
         let conn = self.db_connection.new_write_connection_retry().await?;
+        info!("entry: {:?}", entry);
+
+        // Insert the entry with ticket_id
         let mut stmt = conn.prepare(
             "INSERT INTO entries (
                 id,
+                ticket_id,
                 event_id,
                 pubkey,
                 ephemeral_pubkey,
-                ephemeral_privatekey_user_encrypted,
-                ticket_preimage,
-                ticket_hash,
-                payout_preimage_user_encrypted,
-                payout_hash) VALUES(?,?,?,?,?,?,?,?,?)",
+                ephemeral_privatekey_encrypted,
+                payout_preimage_encrypted,
+                payout_hash
+            ) VALUES(?,?,?,?,?,?,?,?)",
         )?;
+
         stmt.execute(params![
             entry.id.to_string(),
+            ticket_id.to_string(),
             entry.event_id.to_string(),
             entry.pubkey,
             entry.ephemeral_pubkey,
             entry.ephemeral_privatekey_encrypted,
-            ticket_preimage,
-            ticket_hash,
             entry.payout_preimage_encrypted,
             entry.payout_hash
         ])?;
+
         Ok(entry)
     }
 
@@ -130,33 +134,125 @@ impl CompetitionStore {
         Ok(())
     }
 
+    pub async fn mark_entry_sellback_broadcast(
+        &self,
+        entry_id: Uuid,
+        broadcast_time: OffsetDateTime,
+    ) -> Result<(), duckdb::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+
+        let mut stmt = conn.prepare(
+            "UPDATE entries
+                SET sellback_broadcasted_at = ?
+                WHERE id = ?",
+        )?;
+
+        stmt.execute(params![
+            broadcast_time.format(&Rfc3339).unwrap(),
+            entry_id.to_string(),
+        ])?;
+
+        Ok(())
+    }
+
+    pub async fn mark_entry_reclaim_broadcast(
+        &self,
+        entry_id: Uuid,
+        broadcast_time: OffsetDateTime,
+    ) -> Result<(), duckdb::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+
+        let mut stmt = conn.prepare(
+            "UPDATE entries
+                SET reclaimed_broadcasted_at = ?
+                WHERE id = ?",
+        )?;
+
+        stmt.execute(params![
+            broadcast_time.format(&Rfc3339).unwrap(),
+            entry_id.to_string(),
+        ])?;
+
+        Ok(())
+    }
+
+    pub async fn store_payout_info(
+        &self,
+        entry_id: Uuid,
+        payout_preimage: String,
+        ephemeral_private_key: String,
+        ln_invoice: String,
+        paid_time: OffsetDateTime,
+    ) -> Result<(), duckdb::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+
+        let mut stmt = conn.prepare(
+            "UPDATE entries
+            SET payout_preimage = ?,
+                ephemeral_privatekey = ?,
+                payout_ln_invoice = ?,
+                paid_out_at = ?
+            WHERE id = ?",
+        )?;
+
+        stmt.execute(params![
+            payout_preimage,
+            ephemeral_private_key,
+            ln_invoice,
+            paid_time.format(&Rfc3339).unwrap(),
+            entry_id.to_string(),
+        ])?;
+
+        Ok(())
+    }
+
     pub async fn get_competition_entries(
         &self,
         event_id: Uuid,
+        statuses: Vec<EntryStatus>,
     ) -> Result<Vec<UserEntry>, duckdb::Error> {
-        let select = select((
-            "id",
-            "event_id",
+        let mut select = select((
+            "entries.id as id",
+            "ticket_id",
+            "entries.event_id as event_id",
             "pubkey",
             "ephemeral_pubkey",
-            "ephemeral_privatekey_user_encrypted",
-        ))
-        .and_select((
+            "ephemeral_privatekey_encrypted",
             "ephemeral_privatekey",
             "public_nonces",
-            "partial_signatures",
-            "ticket_preimage",
-            "ticket_hash",
-            "payout_preimage_user_encrypted",
         ))
         .and_select((
+            "partial_signatures",
+            "payout_preimage_encrypted",
             "payout_hash",
             "payout_preimage",
-            "signed_at::TEXT",
-            "paid_at::TEXT",
+            "payout_ln_invoice",
         ))
-        .from("entries");
-        let query_str = select.where_("event_id = ?").to_string();
+        .and_select((
+            "signed_at::TEXT",
+            "tickets.paid_at::TEXT AS paid_at",
+            "paid_out_at::TEXT",
+            "sellback_broadcasted_at::TEXT",
+            "reclaimed_broadcasted_at::TEXT",
+        ))
+        .from(
+            "entries"
+                .left_join("tickets")
+                .on("entries.ticket_id = tickets.id"),
+        );
+        if !statuses.is_empty() {
+            for status in statuses {
+                match status {
+                    EntryStatus::Paid => {
+                        select = select.where_("tickets.paid_at IS NOT NULL");
+                    }
+                    EntryStatus::Signed => {
+                        select = select.where_("signed_at IS NOT NULL");
+                    }
+                }
+            }
+        }
+        let query_str = select.where_("entries.event_id = ?").to_string();
         trace!("get competition entries query: {}", query_str);
         let conn = self.db_connection.new_readonly_connection_retry().await?;
         let mut stmt = conn.prepare(&query_str)?;
@@ -177,25 +273,34 @@ impl CompetitionStore {
         filter: SearchBy,
     ) -> Result<Vec<UserEntry>, duckdb::Error> {
         let mut select = select((
-            "id",
-            "event_id",
+            "entries.id as id",
+            "ticket_id",
+            "entries.event_id as event_id",
             "pubkey",
             "ephemeral_pubkey",
-            "ephemeral_privatekey_user_encrypted",
+            "ephemeral_privatekey_encrypted",
             "ephemeral_privatekey",
             "public_nonces",
         ))
         .and_select((
             "partial_signatures",
-            "ticket_preimage",
-            "ticket_hash",
-            "payout_preimage_user_encrypted",
+            "payout_preimage_encrypted",
             "payout_hash",
             "payout_preimage",
-            "signed_at::TEXT",
-            "paid_at::TEXT",
+            "payout_ln_invoice",
         ))
-        .from("entries");
+        .and_select((
+            "signed_at::TEXT",
+            "tickets.paid_at::TEXT AS paid_at",
+            "paid_out_at::TEXT",
+            "sellback_broadcasted_at::TEXT",
+            "reclaimed_broadcasted_at::TEXT",
+        ))
+        .from(
+            "entries"
+                .left_join("tickets")
+                .on("entries.ticket_id = tickets.id"),
+        );
         if let Some(ids) = filter.event_ids.clone() {
             let mut event_ids_val = String::new();
             event_ids_val.push('(');
@@ -206,7 +311,7 @@ impl CompetitionStore {
                 }
             }
             event_ids_val.push(')');
-            let where_clause = format!("event_id IN {}", event_ids_val);
+            let where_clause = format!("entries.event_id IN {}", event_ids_val);
             select = select.clone().where_(where_clause);
         }
         let query_str = select.where_("pubkey = ?").to_string();
@@ -233,14 +338,19 @@ impl CompetitionStore {
         Ok(user_entries)
     }
 
-    pub async fn add_competition(
+    pub async fn add_competition_with_tickets(
         &self,
         competition: Competition,
+        tickets: Vec<Ticket>,
     ) -> Result<Competition, duckdb::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+
+        // Start a transaction
+        conn.execute("BEGIN TRANSACTION", [])?;
+
         let created_at = OffsetDateTime::format(competition.created_at, &Rfc3339)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
 
-        let conn = self.db_connection.new_write_connection_retry().await?;
         let mut stmt = conn.prepare(
             "INSERT INTO competitions (
                       id,
@@ -249,7 +359,8 @@ impl CompetitionStore {
                       total_allowed_entries,
                       number_of_places_win,
                       entry_fee,
-                      event_announcement) VALUES(?,?,?,?,?,?,?)",
+                      coordinator_fee_percentage,
+                      event_announcement) VALUES(?,?,?,?,?,?,?,?)",
         )?;
         let announcement = serde_json::to_vec(&competition.event_announcement)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -260,8 +371,32 @@ impl CompetitionStore {
             competition.total_allowed_entries,
             competition.number_of_places_win,
             competition.entry_fee,
+            competition.coordinator_fee_percentage,
             Value::Blob(announcement)
         ])?;
+
+        let mut stmt = conn.prepare(
+            "INSERT INTO tickets (
+                id,
+                event_id,
+                encrypted_preimage,
+                hash,
+                payment_request
+            ) VALUES (?, ?, ?, ?, ?)",
+        )?;
+
+        for ticket in tickets {
+            stmt.execute(params![
+                ticket.id.to_string(),
+                ticket.competition_id.to_string(),
+                ticket.encrypted_preimage,
+                ticket.hash,
+                ticket.payment_request,
+            ])?;
+        }
+
+        conn.execute("COMMIT", [])?;
+
         Ok(competition)
     }
 
@@ -275,6 +410,7 @@ impl CompetitionStore {
             let mut params: Vec<Value> = vec![];
 
             let query = "UPDATE competitions SET
+                outcome_transaction = ?,
                 funding_transaction = ?,
                 funding_outpoint = ?,
                 contract_parameters = ?,
@@ -282,13 +418,29 @@ impl CompetitionStore {
                 aggregated_nonces = ?,
                 partial_signatures = ?,
                 signed_contract = ?,
+                attestation = ?,
+                cancelled_at = ?,
                 contracted_at = ?,
                 signed_at = ?,
                 funding_broadcasted_at = ?,
-                cancelled_at = ?,
+                funding_confirmed_at = ?,
+                funding_settled_at = ?,
+                expiry_broadcasted_at = ?,
+                outcome_broadcasted_at = ?,
+                delta_broadcasted_at = ?,
+                completed_at = ?,
                 failed_at = ?,
                 errors = ?
                 WHERE id = ?";
+
+            if let Some(outcome_transaction) = &competition.outcome_transaction {
+                params.push(Value::Blob(
+                    serde_json::to_vec(outcome_transaction)
+                        .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?,
+                ));
+            } else {
+                params.push(Value::Null);
+            }
 
             if let Some(funding_transaction) = &competition.funding_transaction {
                 params.push(Value::Blob(
@@ -353,11 +505,26 @@ impl CompetitionStore {
                 params.push(Value::Null);
             }
 
+            if let Some(attestation) = &competition.attestation {
+                params
+                    .push(Value::Blob(serde_json::to_vec(attestation).map_err(
+                        |e| duckdb::Error::ToSqlConversionFailure(Box::new(e)),
+                    )?));
+            } else {
+                params.push(Value::Null);
+            }
+
             for timestamp in [
+                &competition.cancelled_at,
                 &competition.contracted_at,
                 &competition.signed_at,
                 &competition.funding_broadcasted_at,
-                &competition.cancelled_at,
+                &competition.funding_confirmed_at,
+                &competition.funding_settled_at,
+                &competition.expiry_broadcasted_at,
+                &competition.outcome_broadcasted_at,
+                &competition.delta_broadcasted_at,
+                &competition.completed_at,
                 &competition.failed_at,
             ] {
                 if let Some(ts) = timestamp {
@@ -397,42 +564,62 @@ impl CompetitionStore {
             "created_at::TEXT as created_at",
             "total_competition_pool",
             "total_allowed_entries",
+        ))
+        .and_select((
             "number_of_places_win",
             "entry_fee",
+            "coordinator_fee_percentage",
             "event_announcement",
         ))
         .and_select((
             "COUNT(entries.id) as total_entries",
             "COUNT(entries.id) FILTER (entries.public_nonces IS NOT NULL) as total_entry_nonces",
             "COUNT(entries.id) FILTER (entries.signed_at IS NOT NULL) as total_signed_entries",
-            "COUNT(entries.id) FILTER (entries.paid_at IS NOT NULL) as total_paid_entries",
+            "COUNT(tickets.paid_at) as total_paid_entries",
+            "COUNT(entries.id) FILTER (entries.paid_out_at IS NOT NULL) as total_paid_out_entries",
         ))
         .and_select((
+            "outcome_transaction",
             "funding_transaction",
             "funding_outpoint",
             "contract_parameters",
             "competitions.public_nonces as public_nonces",
+        ))
+        .and_select((
             "aggregated_nonces",
             "competitions.partial_signatures as partial_signatures",
             "signed_contract",
+            "attestation",
         ))
         .and_select((
             "cancelled_at::TEXT as cancelled_at",
             "contracted_at::TEXT as contracted_at",
             "competitions.signed_at::TEXT as signed_at",
             "funding_broadcasted_at::TEXT as funding_broadcasted_at",
+            "funding_confirmed_at::TEXT as funding_confirmed_at",
+            "funding_settled_at::TEXT as funding_settled_at",
+        ))
+        .and_select((
+            "expiry_broadcasted_at::TEXT as expiry_broadcasted_at",
+            "outcome_broadcasted_at::TEXT as outcome_broadcasted_at",
+            "delta_broadcasted_at::TEXT as delta_broadcasted_at",
+            "completed_at::TEXT as completed_at",
             "failed_at::TEXT as failed_at",
             "errors",
         ))
         .from(
             "competitions"
                 .left_join("entries")
-                .on("entries.event_id = competitions.id"),
+                .on("entries.event_id = competitions.id")
+                .left_join("tickets")
+                .on("entries.ticket_id = tickets.id"),
         );
 
         if active_only {
             // filters out competitions in terminal states
-            query = query.where_("funding_broadcasted_at IS NULL AND cancelled_at IS NULL");
+            query = query.where_(
+                "expiry_broadcasted_at IS NULL AND completed_at IS NULL AND cancelled_at IS NULL",
+            );
         }
 
         let query_str = query
@@ -443,22 +630,35 @@ impl CompetitionStore {
                 "total_allowed_entries",
                 "number_of_places_win",
                 "entry_fee",
-                "event_announcement",
-                "funding_transaction",
             ))
             .group_by((
+                "coordinator_fee_percentage",
+                "event_announcement",
+                "outcome_transaction",
+            ))
+            .group_by((
+                "funding_transaction",
                 "funding_outpoint",
                 "contract_parameters",
                 "competitions.public_nonces",
                 "aggregated_nonces",
                 "competitions.partial_signatures",
+                "signed_contract",
+                "attestation",
             ))
             .group_by((
-                "signed_contract",
                 "cancelled_at",
                 "contracted_at",
                 "competitions.signed_at",
                 "funding_broadcasted_at",
+                "funding_confirmed_at",
+            ))
+            .group_by((
+                "funding_settled_at",
+                "expiry_broadcasted_at",
+                "outcome_broadcasted_at",
+                "delta_broadcasted_at",
+                "completed_at",
                 "failed_at",
                 "errors",
             ))
@@ -485,37 +685,55 @@ impl CompetitionStore {
             "created_at::TEXT as created_at",
             "total_competition_pool",
             "total_allowed_entries",
+        ))
+        .and_select((
             "number_of_places_win",
             "entry_fee",
+            "coordinator_fee_percentage",
             "event_announcement",
         ))
         .and_select((
             "COUNT(entries.id) as total_entries",
             "COUNT(entries.id) FILTER (entries.public_nonces IS NOT NULL) as total_entry_nonces",
             "COUNT(entries.id) FILTER (entries.signed_at IS NOT NULL) as total_signed_entries",
-            "COUNT(entries.id) FILTER (entries.paid_at IS NOT NULL) as total_paid_entries",
+            "COUNT(tickets.paid_at) as total_paid_entries",
+            "COUNT(entries.id) FILTER (entries.paid_out_at IS NOT NULL) as total_paid_out_entries",
         ))
         .and_select((
+            "outcome_transaction",
             "funding_transaction",
             "funding_outpoint",
             "contract_parameters",
             "competitions.public_nonces as public_nonces",
+        ))
+        .and_select((
             "aggregated_nonces",
             "competitions.partial_signatures as partial_signatures",
             "signed_contract",
+            "attestation",
         ))
         .and_select((
             "cancelled_at::TEXT as cancelled_at",
             "contracted_at::TEXT as contracted_at",
             "competitions.signed_at::TEXT as signed_at",
             "funding_broadcasted_at::TEXT as funding_broadcasted_at",
+            "funding_confirmed_at::TEXT as funding_confirmed_at",
+            "funding_settled_at::TEXT as funding_settled_at",
+        ))
+        .and_select((
+            "expiry_broadcasted_at::TEXT as expiry_broadcasted_at",
+            "outcome_broadcasted_at::TEXT as outcome_broadcasted_at",
+            "delta_broadcasted_at::TEXT as delta_broadcasted_at",
+            "completed_at::TEXT as completed_at",
             "failed_at::TEXT as failed_at",
             "errors",
         ))
         .from(
             "competitions"
-                .join("entries")
-                .on("entries.event_id = competitions.id"),
+                .left_join("entries")
+                .on("entries.event_id = competitions.id")
+                .left_join("tickets")
+                .on("entries.ticket_id = tickets.id"),
         )
         .where_("competitions.id = ? ")
         .group_by((
@@ -525,22 +743,35 @@ impl CompetitionStore {
             "total_allowed_entries",
             "number_of_places_win",
             "entry_fee",
-            "event_announcement",
-            "funding_transaction",
         ))
         .group_by((
+            "coordinator_fee_percentage",
+            "event_announcement",
+            "outcome_transaction",
+        ))
+        .group_by((
+            "funding_transaction",
             "funding_outpoint",
             "contract_parameters",
             "competitions.public_nonces",
             "aggregated_nonces",
             "competitions.partial_signatures",
+            "signed_contract",
+            "attestation",
         ))
         .group_by((
-            "signed_contract",
             "cancelled_at",
             "contracted_at",
             "competitions.signed_at",
             "funding_broadcasted_at",
+            "funding_confirmed_at",
+        ))
+        .group_by((
+            "funding_settled_at",
+            "expiry_broadcasted_at",
+            "outcome_broadcasted_at",
+            "delta_broadcasted_at",
+            "completed_at",
             "failed_at",
             "errors",
         ))
@@ -557,5 +788,251 @@ impl CompetitionStore {
         } else {
             Err(duckdb::Error::QueryReturnedNoRows)
         }
+    }
+
+    pub async fn get_and_reserve_ticket(
+        &self,
+        competition_id: Uuid,
+        pubkey: &str,
+    ) -> Result<Ticket, duckdb::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+        conn.execute("BEGIN TRANSACTION", [])?;
+
+        // First, find an available ticket
+        let select_query = r#"
+            SELECT tickets.id as id,
+                   tickets.event_id as event_id,
+                   entries.id as entry_id,
+                   encrypted_preimage,
+                   hash,
+                   payment_request,
+                   reserved_by,
+                   reserved_at::TEXT,
+                   paid_at::TEXT,
+                   settled_at::TEXT
+            FROM tickets
+            LEFT JOIN entries ON tickets.id = entries.ticket_id
+            WHERE tickets.event_id = ?
+              AND entries.id IS NULL
+              AND (
+                  reserved_at IS NULL
+                  OR (
+                      reserved_at < NOW() - INTERVAL '10 minutes'
+                      AND paid_at IS NULL
+                  )
+              )
+            ORDER BY
+                reserved_at IS NOT NULL,
+                reserved_at NULLS FIRST,
+                id
+            LIMIT 1"#;
+
+        let mut select_stmt = conn.prepare(select_query)?;
+        let mut select_rows = select_stmt.query(params![competition_id.to_string()])?;
+
+        let ticket_id = if let Some(row) = select_rows.next()? {
+            let id: String = row.get(0)?;
+            debug!("Found available ticket: {}", id);
+            id
+        } else {
+            debug!("No available tickets found");
+            conn.execute("ROLLBACK", [])?;
+            return Err(duckdb::Error::QueryReturnedNoRows);
+        };
+
+        // Then do a simple update without RETURNING
+        let update_query = r#"
+            UPDATE tickets
+            SET reserved_at = NOW(),
+                reserved_by = ?
+            WHERE id = ?
+            AND event_id = ?"#;
+
+        conn.execute(
+            update_query,
+            params![pubkey, ticket_id, competition_id.to_string()],
+        )?;
+
+        let get_ticket_query = r#"
+            SELECT tickets.id as id,
+                   tickets.event_id as event_id,
+                   entries.id as entry_id,
+                   encrypted_preimage,
+                   hash,
+                   payment_request,
+                   (NOW() + INTERVAL '10 minutes')::TEXT as expiry,
+                   reserved_by,
+                   reserved_at::TEXT,
+                   paid_at::TEXT,
+                   settled_at::TEXT
+            FROM tickets
+            LEFT JOIN entries ON tickets.id = entries.ticket_id
+            WHERE tickets.id = ?"#;
+
+        let mut get_ticket_stmt = conn.prepare(get_ticket_query)?;
+        let mut get_ticket_rows = get_ticket_stmt.query(params![ticket_id])?;
+
+        if let Some(row) = get_ticket_rows.next()? {
+            let ticket: Ticket = row.try_into()?;
+            debug!("Successfully reserved ticket {}", ticket_id);
+            conn.execute("COMMIT", [])?;
+            Ok(ticket)
+        } else {
+            debug!("Failed to get updated ticket");
+            conn.execute("ROLLBACK", [])?;
+            Err(duckdb::Error::QueryReturnedNoRows)
+        }
+    }
+
+    pub async fn get_pending_tickets(&self) -> Result<Vec<Ticket>, duckdb::Error> {
+        let query = r#"
+            SELECT tickets.id as id,
+                   tickets.event_id as event_id,
+                   entries.id as entry_id,
+                   encrypted_preimage,
+                   hash,
+                   payment_request,
+                   (NOW() + INTERVAL '10 minutes')::TEXT as expiry,
+                   reserved_by,
+                   reserved_at::TEXT,
+                   paid_at::TEXT,
+                   settled_at::TEXT
+            FROM tickets
+            LEFT JOIN entries ON tickets.id = entries.ticket_id
+            WHERE reserved_at IS NOT NULL
+              AND paid_at IS NULL
+              AND entry_id IS NULL
+              AND reserved_at > NOW() - INTERVAL '10 minutes'"#;
+
+        let conn = self.db_connection.new_readonly_connection_retry().await?;
+        let mut stmt = conn.prepare(query)?;
+        let mut rows = stmt.query([])?;
+
+        let mut tickets = Vec::new();
+        while let Some(row) = rows.next()? {
+            tickets.push(row.try_into()?);
+        }
+
+        Ok(tickets)
+    }
+
+    pub async fn get_ticket(&self, ticket_id: Uuid) -> Result<Ticket, duckdb::Error> {
+        let query = r#"
+            SELECT tickets.id as id,
+                   tickets.event_id as event_id,
+                   entries.id as entry_id,
+                   encrypted_preimage,
+                   hash,
+                   payment_request,
+                   (NOW() + INTERVAL '10 minutes')::TEXT as expiry,
+                   reserved_by,
+                   reserved_at::TEXT,
+                   paid_at::TEXT,
+                   settled_at::TEXT
+            FROM tickets
+            LEFT JOIN entries ON tickets.id = entries.ticket_id
+            WHERE tickets.id = ?"#;
+
+        let conn = self.db_connection.new_readonly_connection_retry().await?;
+        let mut stmt = conn.prepare(query)?;
+        let mut rows = stmt.query(params![ticket_id.to_string()])?;
+
+        if let Some(row) = rows.next()? {
+            row.try_into()
+        } else {
+            Err(duckdb::Error::QueryReturnedNoRows)
+        }
+    }
+
+    pub async fn mark_ticket_paid(
+        &self,
+        ticket_hash: &str,
+        competition_id: Uuid,
+    ) -> Result<(), duckdb::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+
+        let query = r#"
+            UPDATE tickets
+            SET paid_at = NOW()
+            WHERE hash = ?
+            AND event_id = ?
+            AND paid_at IS NULL
+            AND settled_at IS NULL
+            AND reserved_at IS NOT NULL
+            AND reserved_at > NOW() - INTERVAL '10 minutes'"#;
+
+        let mut stmt = conn.prepare(query)?;
+        let affected = stmt.execute(params![ticket_hash, competition_id.to_string(),])?;
+
+        if affected == 0 {
+            return Err(duckdb::Error::QueryReturnedNoRows);
+        }
+
+        Ok(())
+    }
+
+    pub async fn mark_ticket_settled(
+        &self,
+        ticket_hash: &str,
+        competition_id: Uuid,
+    ) -> Result<(), duckdb::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+
+        let query = r#"
+            UPDATE tickets
+            SET settled_at = NOW()
+            WHERE hash = ?
+            AND event_id = ?
+            AND settled_at IS NULL
+            AND paid_at IS NOT NULL
+            AND reserved_at IS NOT NULL
+            AND reserved_at > NOW() - INTERVAL '10 minutes'"#;
+
+        let mut stmt = conn.prepare(query)?;
+        let affected = stmt.execute(params![ticket_hash, competition_id.to_string(),])?;
+
+        if affected == 0 {
+            return Err(duckdb::Error::QueryReturnedNoRows);
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_tickets(
+        &self,
+        competition_id: Uuid,
+    ) -> Result<HashMap<Uuid, Ticket>, duckdb::Error> {
+        let query = select((
+            "tickets.id as id",
+            "tickets.event_id as event_id",
+            "entries.id as entry_id",
+            "encrypted_preimage",
+            "hash",
+            "payment_request",
+            "(NOW() + INTERVAL '10 minutes')::TEXT as expiry",
+            "reserved_by::TEXT",
+        ))
+        .and_select(("reserved_at::TEXT", "paid_at::TEXT", "settled_at::TEXT"))
+        .from(
+            "tickets"
+                .left_join("entries")
+                .on("entries.ticket_id = tickets.id"),
+        )
+        .where_("tickets.event_id = ?")
+        .to_string();
+
+        let conn = self.db_connection.new_readonly_connection_retry().await?;
+        let mut stmt = conn.prepare(&query)?;
+        let mut rows = stmt.query(params![competition_id.to_string()])?;
+
+        let mut tickets = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let ticket: Ticket = row.try_into()?;
+            if let Some(entry_id) = ticket.entry_id {
+                tickets.insert(entry_id, ticket);
+            }
+        }
+
+        Ok(tickets)
     }
 }

@@ -37,6 +37,7 @@ class Entries {
           console.log(entry);
           let $row = document.createElement("tr");
           $row.id = `entry-${entry.id}`;
+          $row.classList.add("is-clickable");
           if (this.rowExists(entry.id)) {
             return;
           }

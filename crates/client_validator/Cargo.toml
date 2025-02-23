@@ -1,6 +1,6 @@
 [package]
 name = "client_validator"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 repository = "https://github.com/tee8z/5day4cast"
 
@@ -21,8 +21,9 @@ wasm-bindgen-futures = "0.4.43"
 wasm-logger = "0.2.0"
 async-trait = "0.1.85"
 nostr-sdk = { version = "0.38.0", features = [
-    "nip44", # encrypt a message
     "nip04", # encrypt a message
+    "nip44", # encrypt a message
+    "nip47", # nostr wallet connect
     "nip49", # private key encryption
 ] }
 thiserror = "2.0.11"

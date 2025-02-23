@@ -9,6 +9,7 @@
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
     <link rel="stylesheet" href="/ui/styles.css">
     <script type="module"> import uuidv7 from 'https://cdn.jsdelivr.net/npm/uuidv7@1.0.1/+esm'; </script>
+    <script type="module" src="https://unpkg.com/bitcoin-qr@1.4.1/dist/bitcoin-qr/bitcoin-qr.esm.js"></script>
 </head>
 
 <body>
@@ -19,6 +20,7 @@
     </script>
     <script type="module" src="/ui/main.js"></script>
     <script type="module" src="/ui/navbar.js"></script>
+    <script type="module" src="/ui/router.js"></script>
     <script type="module" src="/ui/authorized_client.js"></script>
     <script type="module" src="/ui/auth_manager.js"></script>
     <script type="module" src="/ui/weather_data.js"></script>
@@ -27,6 +29,7 @@
     <script type="module" src="/ui/leader_board.js"></script>
     <script type="module" src="/ui/entry.js"></script>
     <script type="module" src="/ui/utils.js"></script>
+    <script type="module" src="/ui/payouts.js"></script>
     <script type="module" src="/ui/musig_session_manager.js"></script>
     <script type="module" src="/ui/musig_session_registry.js"></script>
     <script type="module" src="/ui/signing_progress_ui.js"></script>
@@ -34,52 +37,90 @@
 
     <section class="section">
         <div class="container">
-            <h1 class="title">
-                Fantasy Weather
-            </h1>
-        </div>
+                <a href="#"
+                   id="brandNavClick"
+                   data-route="/competitions"
+                   class="is-undecorated">
+                    <h1 class="title">
+                        Fantasy Weather
+                    </h1>
+                </a>
+            </div>
         <div>
             <div class="container">
-                <nav class="navbar" role="navigation" aria-label="main navigation">
-                    <div class="navbar-brand">
-                        <a role="button" class="navbar-burger" data-target="navMenu" aria-label="menu" aria-expanded="false">
-                            <span aria-hidden="true"></span>
-                            <span aria-hidden="true"></span>
-                            <span aria-hidden="true"></span>
-                        </a>
-                    </div>
-                    <div class="navbar-menu" id="navMenu">
-                        <div class="navbar-start">
-                            <a href="#" class="navbar-item " id="allCompetitionsNavClick">
-                                Competitions
+                <nav class="navbar is-light" role="navigation" aria-label="main navigation">
+                    <div class="container">
+                        <!-- Navbar Brand -->
+                        <div class="navbar-brand">
+
+                            <!-- Hamburger menu for mobile -->
+                            <a role="button"
+                               class="navbar-burger"
+                               aria-label="menu"
+                               aria-expanded="false"
+                               data-target="navMenu">
+                                <span aria-hidden="true"></span>
+                                <span aria-hidden="true"></span>
+                                <span aria-hidden="true"></span>
                             </a>
-                            <a href="#" class="navbar-item" id="allEntriesNavClick">
-                                Entries
-                            </a>
-                            <a href="#" class="navbar-item is-hidden" id="signingStatusNavClick">
-                              <span>Signing Status</span>
-                              <span class="tag is-info ml-2 is-hidden" id="activeSigningCount">0</span>
-                            </a>
-                            <!--
-                                Add back once the coordinator is ready to be used
-                                <a href="#" class="navbar-item" id="payoutsNavClick">
-                                Payouts
-                            </a>-->
                         </div>
-                        <div class="navbar-end">
-                            <div class="navbar-item" id="authButtons">
-                                <div class="buttons">
-                                    <a class="button is-info" id="loginNavClick">
-                                        Log in
-                                    </a>
-                                    <a class="button is-info is-outlined" id="registerNavClick">
-                                        Sign up
-                                    </a>
-                                </div>
-                            </div>
-                                <a href="#" class="navbar-item is-hidden" id="logoutNavClick">
-                                    Logout
+
+                        <!-- Navbar Menu -->
+                        <div id="navMenu" class="navbar-menu">
+                            <!-- Left side of navbar -->
+                            <div class="navbar-start">
+                                <a href="#"
+                                   class="navbar-item"
+                                   id="allCompetitionsNavClick"
+                                   data-route="/competitions">
+                                    <span>Competitions</span>
                                 </a>
+
+                                <a href="#"
+                                   class="navbar-item"
+                                   id="allEntriesNavClick"
+                                   data-route="/entries">
+                                    <span>Entries</span>
+                                </a>
+
+                                <a href="#"
+                                   class="navbar-item is-hidden"
+                                   id="signingStatusNavClick"
+                                   data-route="/signing">
+                                    <span>Signing Status</span>
+                                    <span class="tag is-info ml-2 is-hidden" id="activeSigningCount">0</span>
+                                </a>
+
+                                <a href="#"
+                                   class="navbar-item"
+                                   id="payoutsNavClick"
+                                   data-route="/payouts">
+                                    <span>Payouts</span>
+                                </a>
+                            </div>
+
+                            <!-- Right side of navbar -->
+                            <div class="navbar-end">
+                                <!-- Auth buttons for logged out state -->
+                                <div class="navbar-item" id="authButtons">
+                                    <div class="buttons">
+                                        <a class="button is-primary" id="loginNavClick">
+                                            <span>Log in</span>
+                                        </a>
+                                        <a class="button is-light" id="registerNavClick">
+                                            <span>Sign up</span>
+                                        </a>
+                                    </div>
+                                </div>
+
+                                <!-- Logout button for logged in state -->
+                                <div class="navbar-item is-hidden" id="logoutContainer">
+                                    <div class="buttons">
+                                        <a href="#" class="button is-light" id="logoutNavClick">
+                                            <span>Logout</span>
+                                        </a>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -91,75 +132,177 @@
                 </div>
             </div>
             <div id="allCompetitions" class="container hidden">
-                <div class="table-container" id="competitions">
-                    <table id="competitionsDataTable" class="table is-striped is-bordered is-narrow">
-                        <thead>
-                            <tr>
-                                <th>ID</th>
-                                <th>Start Time</th>
-                                <th>End Time</th>
-                                <th>Status</th>
-                                <th>Entry fee (sats)</th>
-                                <th>Total Prize Pool Amt (sats)</th>
-                                <th>Total Entries</th>
-                                <th>Number Of Places 'In The Money'</th>
-                                <th>Enter/View</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                        </tbody>
-                    </table>
+                <div class="box">
+                    <div class="table-container">
+                        <table id="competitionsDataTable" class="table is-fullwidth is-striped is-hoverable">
+                            <thead>
+                                <tr>
+                                    <th>ID</th>
+                                    <th>Start Time</th>
+                                    <th>End Time</th>
+                                    <th>Status</th>
+                                    <th>Entry fee (sats)</th>
+                                    <th>Total Prize Pool Amt (sats)</th>
+                                    <th>Total Entries</th>
+                                    <th>Number Of Places 'In The Money'</th>
+                                    <th>Enter/View</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <!-- Populated dynamically -->
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
             <div id="currentCompetition" class="hidden container">
             </div>
         </div>
+        <div id="entryContainer" class="container hidden">
+            <div class="box">
+                <div class="level">
+                    <div class="level-left">
+                        <h2 class="title is-4">Submit Entry</h2>
+                    </div>
+                    <div class="level-right">
+                        <button id="backToCompetitions" class="button is-light">
+                            Back to Competitions
+                        </button>
+                    </div>
+                </div>
+            <div id="entryContent"></div>
+            <div class="mt-4">
+                <button type="submit" id="submitEntry" class="button is-info">Submit</button>
+                <div id="successMessage" class="has-text-success-dark hidden">Successfully Submitted Entry!</div>
+                <div id="errorMessage" class="has-text-danger-dark hidden"></div>
+            </div>
+            </div>
+        </div>
         <div id="competitionLeaderboard" class="container hidden">
-            <h4 class="title">
-                Leader Board
-            </h4>
-            <div class="table-container" id="competitions">
-                <table id="competitionLeaderboardData" class="table is-striped is-bordered is-narrow">
-                    <thead>
-                        <tr>
-                            <th>Rank</th>
-                            <th>Entry ID</th>
-                            <th>Score</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                    </tbody>
-                </table>
+            <div class="box">
+                <h4 class="title is-4 mb-4">Leader Board</h4>
+                <div class="table-container">
+                    <table id="competitionLeaderboardData" class="table is-fullwidth is-striped is-hoverable">
+                        <thead>
+                            <tr>
+                                <th>Rank</th>
+                                <th>Entry ID</th>
+                                <th>Score</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <!-- Populated dynamically -->
+                        </tbody>
+                    </table>
+                </div>
             </div>
         </div>
         <div id="allEntries" class="container hidden">
-            <div class="table-container" id="entries">
-                <table id="entriesDataTable" class="table is-striped is-bordered is-narrow">
-                    <thead>
-                        <tr>
-                            <th>Competition ID</th>
-                            <th>Start Time</th>
-                            <th>End Time</th>
-                            <th>Status</th>
-                            <th>Entry ID</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                    </tbody>
-                </table>
+            <div class="box">
+                <div class="table-container">
+                    <table id="entriesDataTable" class="table is-fullwidth is-striped is-hoverable">
+                        <thead>
+                            <tr>
+                                <th>Competition ID</th>
+                                <th>Start Time</th>
+                                <th>End Time</th>
+                                <th>Status</th>
+                                <th>Entry ID</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <!-- Populated dynamically -->
+                        </tbody>
+                    </table>
+                </div>
             </div>
         </div>
         <div id="payouts" class="container hidden">
-            <div>payouts</div>
-            <div class="table-container" id="usersPayouts">
-                <!-- all payouts for entries that have won-->
+            <div class="box">
+                <h3 class="title is-4 mb-4">Available Payouts</h3>
+                <div class="table-container">
+                    <table class="table is-fullwidth is-striped is-hoverable">
+                        <thead>
+                            <tr>
+                                <th>Competition ID</th>
+                                <th>Entry ID</th>
+                                <th>Status</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="payoutsTableBody">
+                            <!-- Populated dynamically -->
+                        </tbody>
+                    </table>
+                </div>
+                <div id="noPayoutsMessage" class="notification is-info hidden">
+                    No entries eligible for payout at this time.
+                </div>
+                <div id="payoutsError" class="notification is-danger hidden">
+                </div>
             </div>
         </div>
 
-        <!-- (leave to the end) payout screen -->
         <!-- (optional) chat powered by nostr (cheap/open source communication) -->
         </div>
     </section>
+
+    <div id="payoutModal" class="modal">
+        <div class="modal-background"></div>
+        <div class="modal-content">
+            <div class="box">
+                <h3 class="title is-4">Submit Lightning Invoice</h3>
+                <div class="field">
+                    <label class="label">Lightning Invoice</label>
+                    <div class="control">
+                        <textarea class="textarea" id="lightningInvoice"
+                            placeholder="Enter your Lightning invoice here..."
+                        ></textarea>
+                    </div>
+                </div>
+                <div class="field is-grouped">
+                    <div class="control">
+                        <button class="button is-primary" id="submitPayoutInvoice">Submit</button>
+                    </div>
+                    <div class="control">
+                        <button class="button is-light" id="cancelPayoutModal">Cancel</button>
+                    </div>
+                </div>
+                <div id="payoutModalError" class="notification is-danger hidden"></div>
+            </div>
+        </div>
+        <button class="modal-close is-large" aria-label="close"></button>
+    </div>
+
+    <div id="ticketPaymentModal" class="modal">
+        <div class="modal-background"></div>
+        <div class="modal-content">
+            <div class="box">
+                <h3 class="title is-4">Entry Ticket Payment</h3>
+                <div class="content">
+                    <p>Please pay the lightning invoice to enter the competition:</p>
+
+                    <!-- QR Code centered in its own container -->
+                    <div id="qrContainer" class="has-text-centered mb-4"></div>
+
+                    <div class="field">
+                        <label class="label">Payment Request (click to copy)</label>
+                        <div class="control">
+                            <textarea class="textarea" id="paymentRequest" readonly></textarea>
+                        </div>
+                        <p class="help is-success is-hidden" id="copyFeedback">✓ Copied to clipboard</p>
+                    </div>
+
+                    <div id="paymentStatus" class="mt-4">
+                        <p>Waiting for payment...</p>
+                        <progress class="progress is-info" max="100"></progress>
+                    </div>
+                    <div id="ticketPaymentError" class="notification is-danger is-hidden"></div>
+                </div>
+            </div>
+        </div>
+        <button class="modal-close is-large" aria-label="close"></button>
+    </div>
 
     <div id="entryScore" class="modal">
         <div class="modal-background"></div>
@@ -169,19 +312,6 @@
             </div>
         </div>
         <button class="modal-close is-large" aria-label="close"></button>
-    </div>
-
-    <div id="entry" class="modal">
-        <div class="modal-background"></div>
-        <div class="modal-content">
-            <div class="box">
-                <div id="entryContent"></div>
-                <button type="submit" id="submitEntry" class="button is-info">Submit</button>
-                <div id="successMessage" class="has-text-success-dark hidden">Successfully Submitted Entry!</div>
-                <div id="errorMessage" class="has-text-danger-dark hidden"></div>
-            </div>
-            <button class="modal-close is-large" aria-label="close"></button>
-        </div>
     </div>
 
     <!-- Login Modal -->

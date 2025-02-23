@@ -1,23 +1,29 @@
 use super::{
-    AddEntry, CompetitionError, CompetitionState, CompetitionStore, FundedContract, SearchBy,
-    Ticket, UserEntry,
+    AddEntry, CompetitionError, CompetitionState, CompetitionStore, FundedContract, PayoutInfo,
+    SearchBy, Ticket, TicketStatus, UserEntry,
 };
 use crate::{
     bitcoin_client::Bitcoin,
-    domain::{Competition, CreateEvent, Error},
+    domain::{Competition, CreateEvent, EntryStatus, Error},
     oracle_client::{Event, Oracle},
-    Ln, OracleError,
+    Ln, OracleError, TicketResponse,
 };
 use anyhow::anyhow;
 use bdk_wallet::{
     bitcoin::{
-        absolute::LockTime, hex::DisplayHex, transaction::Version, Amount, FeeRate, OutPoint, Psbt,
-        ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+        absolute::LockTime, transaction::Version, Amount, FeeRate, OutPoint, Psbt, ScriptBuf,
+        Sequence, Transaction, TxIn, TxOut, Witness,
     },
     LocalOutput, SignOptions,
 };
 use dlctix::{
-    convert_xonly_key, hashlock,
+    bitcoin::{
+        hex::DisplayHex as _,
+        key::TweakedPublicKey,
+        sighash::Prevouts,
+        transaction::{predict_weight, InputWeightPrediction},
+    },
+    convert_xonly_key,
     musig2::{
         secp256k1::{
             Keypair as Musig2Kepair, PublicKey, Scalar as Musig2Scalar, Secp256k1 as Musig2Secp256,
@@ -25,15 +31,15 @@ use dlctix::{
         },
         AggNonce, PartialSignature, PubNonce,
     },
-    secp::Point,
+    secp::{Point, Scalar},
     ContractParameters, NonceSharingRound, Outcome, PayoutWeights, Player, PlayerIndex, SigMap,
-    SigningSession, TicketedDLC,
+    SigningSession, TicketedDLC, WinCondition,
 };
 use futures::TryFutureExt;
 use itertools::Itertools;
 use log::{debug, error, info};
 use rand::SeedableRng;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -93,12 +99,13 @@ impl CompetitionWatcher {
 
 pub struct Coordinator {
     oracle_client: Arc<dyn Oracle>,
-    competition_store: Arc<CompetitionStore>,
+    pub competition_store: Arc<CompetitionStore>,
     bitcoin: Arc<dyn Bitcoin>,
     ln: Arc<dyn Ln>,
     private_key: Musig2SecretKey,
     public_key: PublicKey,
     relative_locktime_block_delta: u16,
+    required_confirmations: u32,
 }
 
 impl Coordinator {
@@ -108,6 +115,7 @@ impl Coordinator {
         bitcoin: Arc<dyn Bitcoin>,
         ln: Arc<dyn Ln>,
         relative_locktime_block_delta: u16,
+        required_confirmations: u32,
     ) -> Result<Self, anyhow::Error> {
         let private_key = bitcoin.get_derived_private_key().await?;
         let secp = Musig2Secp256::new();
@@ -121,6 +129,7 @@ impl Coordinator {
             private_key,
             public_key,
             relative_locktime_block_delta,
+            required_confirmations,
         };
         coordinator.validate_coordinator_metadata().await?;
         Ok(coordinator)
@@ -153,9 +162,6 @@ impl Coordinator {
     5) competition running (in time window for when observation runs)
     6) competition window closed (observation window done, waiting for data to be finalized) -- loop checking for oracle attestation
     7) competition results finalized/signed by oracle
-        - here payouts can occur
-
-        3 code paths based on competition status, need to skip code path if already been down it
     */
 
     pub async fn competition_handler(&self) -> Result<(), anyhow::Error> {
@@ -163,7 +169,7 @@ impl Coordinator {
         let mut updated_competitions: Vec<Competition> = vec![];
         info!("running competition handler");
         for mut competition in competitions {
-            //TODO: change to propert retry logic
+            //TODO: change to property retry logic
             competition.failed_at = None;
             competition.errors = vec![];
             if competition.skip_competition() {
@@ -203,8 +209,8 @@ impl Coordinator {
                     continue;
                 }
                 CompetitionState::EntriesCollected => {
-                    match self.create_transactions(competition.clone()).await {
-                        Ok(updated) => updated_competitions.push(updated),
+                    match self.create_transactions(&mut competition).await {
+                        Ok(updated) => updated_competitions.push(updated.clone()),
                         Err(e) => {
                             error!(
                                 "competition {} failed to generate contract params: {}",
@@ -214,16 +220,16 @@ impl Coordinator {
                                 .errors
                                 .push(CompetitionError::FailedCreateTransaction(e.to_string()));
                             competition.failed_at = Some(OffsetDateTime::now_utc());
-                            updated_competitions.push(competition);
+                            updated_competitions.push(competition.clone());
                         }
                     }
                 }
                 CompetitionState::NoncesCollected => {
                     match self
-                        .generate_aggregate_nonces_and_coord_partial_signatures(competition.clone())
+                        .generate_aggregate_nonces_and_coord_partial_signatures(&mut competition)
                         .await
                     {
-                        Ok(updated) => updated_competitions.push(updated),
+                        Ok(updated) => updated_competitions.push(updated.clone()),
                         Err(e) => {
                             error!(
                                 "competition {} failed to generate aggregate nonce: {}",
@@ -233,20 +239,120 @@ impl Coordinator {
                                 .errors
                                 .push(CompetitionError::FailedNonceAggregation(e.to_string()));
                             competition.failed_at = Some(OffsetDateTime::now_utc());
-                            updated_competitions.push(competition);
+                            updated_competitions.push(competition.clone());
                         }
                     }
                 }
                 CompetitionState::PartialSignaturesCollected => {
-                    match self.publish_transactions(competition.clone()).await {
-                        Ok(updated) => updated_competitions.push(updated),
+                    match self.publish_funding_transaction(&mut competition).await {
+                        Ok(updated) => updated_competitions.push(updated.clone()),
                         Err(e) => {
-                            error!("competition {} failed to broadcast: {}", competition.id, e);
+                            error!(
+                                "competition {} failed to funding broadcast: {}",
+                                competition.id, e
+                            );
                             competition
                                 .errors
                                 .push(CompetitionError::FailedBroadcast(e.to_string()));
                             competition.failed_at = Some(OffsetDateTime::now_utc());
-                            updated_competitions.push(competition);
+                            updated_competitions.push(competition.clone());
+                        }
+                    }
+                }
+                CompetitionState::FundingBroadcasted => {
+                    match self.check_funding_confirmation(&mut competition).await {
+                        Ok(updated) => updated_competitions.push(updated.clone()),
+                        Err(e) => {
+                            error!(
+                                "competition {} failed to check confirm: {}",
+                                competition.id, e
+                            );
+                            competition
+                                .errors
+                                .push(CompetitionError::FailedFundingConfirmation(e.to_string()));
+                            competition.failed_at = Some(OffsetDateTime::now_utc());
+                            updated_competitions.push(competition.clone());
+                        }
+                    }
+                }
+                CompetitionState::FundingConfirmed => {
+                    match self.settle_competition_invoices(&mut competition).await {
+                        Ok(updated) => updated_competitions.push(updated.clone()),
+                        Err(e) => {
+                            error!("competition {} failed to settle: {}", competition.id, e);
+                            competition
+                                .errors
+                                .push(CompetitionError::FailedFundingSettled(e.to_string()));
+                            competition.failed_at = Some(OffsetDateTime::now_utc());
+                            updated_competitions.push(competition.clone());
+                        }
+                    }
+                }
+                CompetitionState::FundingSettled => {
+                    match self.check_oracle_attestation(&mut competition).await {
+                        Ok(updated) => updated_competitions.push(updated.clone()),
+                        Err(e) => {
+                            error!(
+                                "failed to check oracle attestation for competition {}: {}",
+                                competition.id, e
+                            );
+                            competition
+                                .errors
+                                .push(CompetitionError::FailedCheckingAttestation(e.to_string()));
+                            competition.failed_at = Some(OffsetDateTime::now_utc());
+                            updated_competitions.push(competition.clone());
+                        }
+                    }
+                }
+                CompetitionState::Attested => {
+                    // An outcome transaction spends the funding outpoint, and locks it into
+                    // a 2nd stage multisig contract between the outcome winners and the market maker.
+                    // If any player knows the attestation to outcome they can
+                    // unlock that outcome TX and publish it.
+                    match self.publish_outcome_transaction(&mut competition).await {
+                        Ok(updated) => updated_competitions.push(updated.clone()),
+                        Err(e) => {
+                            error!(
+                                "failed to broadcast outcome transactions for competition {}: {}",
+                                competition.id, e
+                            );
+                            competition
+                                .errors
+                                .push(CompetitionError::FailedBroadcast(e.to_string()));
+                            competition.failed_at = Some(OffsetDateTime::now_utc());
+                            updated_competitions.push(competition.clone());
+                        }
+                    }
+                }
+                CompetitionState::OutcomeBroadcasted => {
+                    match self.publish_delta_transactions(&mut competition).await {
+                        Ok(updated) => updated_competitions.push(updated.clone()),
+                        Err(e) => {
+                            error!(
+                                "failed to broadcast delta transactions for competition {}: {}",
+                                competition.id, e
+                            );
+                            competition
+                                .errors
+                                .push(CompetitionError::FailedBroadcast(e.to_string()));
+                            competition.failed_at = Some(OffsetDateTime::now_utc());
+                            updated_competitions.push(competition.clone());
+                        }
+                    }
+                }
+                CompetitionState::DeltaBroadcasted => {
+                    match self.publish_delta2_transactions(&mut competition).await {
+                        Ok(updated) => updated_competitions.push(updated.clone()),
+                        Err(e) => {
+                            error!(
+                                "failed to broadcast delta2 transactions for competition {}: {}",
+                                competition.id, e
+                            );
+                            competition
+                                .errors
+                                .push(CompetitionError::FailedBroadcast(e.to_string()));
+                            competition.failed_at = Some(OffsetDateTime::now_utc());
+                            updated_competitions.push(competition.clone());
                         }
                     }
                 }
@@ -265,18 +371,20 @@ impl Coordinator {
         Ok(())
     }
 
-    pub async fn create_transactions(
+    pub async fn create_transactions<'a>(
         &self,
-        mut competition: Competition,
-    ) -> Result<Competition, anyhow::Error> {
+        competition: &'a mut Competition,
+    ) -> Result<&'a mut Competition, anyhow::Error> {
         debug!("Creating transactions for competition: {}", competition.id);
         let mut entries = self
             .competition_store
-            .get_competition_entries(competition.id)
+            .get_competition_entries(competition.id, vec![EntryStatus::Paid])
             .await?;
         debug!("Competition entries {:?}", entries);
+        let tickets = self.competition_store.get_tickets(competition.id).await?;
 
-        let players = generate_players(&entries)?;
+        let players = generate_players(&entries, &tickets)?;
+
         debug!("Generated players:");
         for (i, player) in players.iter().enumerate() {
             debug!(
@@ -389,10 +497,10 @@ impl Coordinator {
         Ok(competition)
     }
 
-    pub async fn generate_aggregate_nonces_and_coord_partial_signatures(
+    pub async fn generate_aggregate_nonces_and_coord_partial_signatures<'a>(
         &self,
-        mut competition: Competition,
-    ) -> Result<Competition, anyhow::Error> {
+        competition: &'a mut Competition,
+    ) -> Result<&'a mut Competition, anyhow::Error> {
         let Some(contract_parameters) = &competition.contract_parameters else {
             return Err(anyhow!("contract parameters don't exists, failed publishing competition {} funding transaction", competition.id));
         };
@@ -436,10 +544,10 @@ impl Coordinator {
         Ok(competition)
     }
 
-    pub async fn publish_transactions(
+    pub async fn publish_funding_transaction<'a>(
         &self,
-        mut competition: Competition,
-    ) -> Result<Competition, anyhow::Error> {
+        competition: &'a mut Competition,
+    ) -> Result<&'a mut Competition, anyhow::Error> {
         let Some(contract_parameters) = &competition.contract_parameters else {
             return Err(anyhow!("contract parameters don't exists, failed publishing competition {} funding transaction", competition.id));
         };
@@ -508,7 +616,7 @@ impl Coordinator {
             }
         }
 
-        debug!("Verified all paritial signatures");
+        debug!("Verified all partial signatures");
 
         let signed_contract =
             coordinator_session.aggregate_all_signatures(partial_sigs_by_sender)?;
@@ -519,11 +627,546 @@ impl Coordinator {
 
         debug!(
             "Broadcasting funding transaction: {:?}",
-            funding_transaction
+            funding_transaction.compute_txid()
         );
         self.bitcoin.broadcast(funding_transaction).await?;
 
         competition.funding_broadcasted_at = Some(OffsetDateTime::now_utc());
+
+        Ok(competition)
+    }
+
+    async fn check_funding_confirmation<'a>(
+        &self,
+        competition: &'a mut Competition,
+    ) -> Result<&'a mut Competition, anyhow::Error> {
+        if competition.get_state() != CompetitionState::FundingBroadcasted {
+            return Err(anyhow!(
+                "Competition {} in invalid state for funding confirmation: {:?}",
+                competition.id,
+                competition.get_state()
+            ));
+        }
+
+        let funding_tx = competition.funding_transaction.as_ref().ok_or_else(|| {
+            anyhow!(
+                "No funding transaction found for competition {}",
+                competition.id
+            )
+        })?;
+
+        let txid = funding_tx.compute_txid();
+        match self.bitcoin.get_tx_confirmation_height(&txid).await? {
+            Some(confirmations) if confirmations >= self.required_confirmations => {
+                info!(
+                    "Funding transaction {} confirmed with {} confirmations for competition {}",
+                    txid, confirmations, competition.id
+                );
+                competition.funding_confirmed_at = Some(OffsetDateTime::now_utc());
+            }
+            Some(confirmations) => {
+                debug!(
+                    "Funding transaction {} has {} of {} required confirmations for competition {}",
+                    txid, confirmations, self.required_confirmations, competition.id
+                );
+            }
+            None => {
+                debug!(
+                    "Funding transaction {} not yet confirmed for competition {}",
+                    txid, competition.id
+                );
+            }
+        }
+
+        Ok(competition)
+    }
+
+    async fn settle_competition_invoices<'a>(
+        &self,
+        competition: &'a mut Competition,
+    ) -> Result<&'a mut Competition, anyhow::Error> {
+        if competition.get_state() != CompetitionState::FundingConfirmed {
+            return Err(anyhow!(
+                "Competition {} in invalid state for invoice settlement: {:?}",
+                competition.id,
+                competition.get_state()
+            ));
+        }
+
+        if competition.funding_settled_at.is_some() {
+            return Err(anyhow!(
+                "Invoices already settled for competition {}",
+                competition.id
+            ));
+        }
+
+        let tickets = self.competition_store.get_tickets(competition.id).await?;
+        let mut settlement_errors = Vec::new();
+
+        for ticket in tickets.values() {
+            //TODO: add decryption of the preimage to settle the hodl invoice
+            match self
+                .ln
+                .settle_hold_invoice(ticket.encrypted_preimage.clone())
+                .await
+            {
+                Ok(_) => {
+                    self.competition_store
+                        .mark_ticket_settled(&ticket.hash, competition.id)
+                        .await?;
+                    debug!(
+                        "Settled invoice for ticket {} in competition {}",
+                        ticket.id, competition.id
+                    );
+                }
+                Err(e) => {
+                    let error_msg = format!(
+                        "Failed to settle invoice for ticket {} in competition {}: {}",
+                        ticket.id, competition.id, e
+                    );
+                    error!("{}", error_msg);
+                    settlement_errors.push(error_msg);
+                }
+            }
+        }
+
+        if !settlement_errors.is_empty() {
+            return Err(anyhow!(
+                "Failed to settle some invoices for competition {}: {:?}",
+                competition.id,
+                settlement_errors
+            ));
+        }
+
+        competition.funding_settled_at = Some(OffsetDateTime::now_utc());
+        info!("All invoices settled for competition {}", competition.id);
+
+        Ok(competition)
+    }
+
+    pub async fn check_oracle_attestation<'a>(
+        &self,
+        competition: &'a mut Competition,
+    ) -> Result<&'a mut Competition, anyhow::Error> {
+        if competition.attestation.is_some() {
+            return Ok(competition);
+        }
+
+        let event = self.oracle_client.get_event(&competition.id).await?;
+
+        let Some(attestation) = event.attestation else {
+            info!(
+                "No oracle attestation found for competition {} yet, skipping add",
+                competition.id
+            );
+            return Ok(competition);
+        };
+        match competition.verify_event_attestation(&attestation) {
+            Ok(outcome) => {
+                info!(
+                    "Oracle attestation verified for competition {}: {}",
+                    competition.id, outcome
+                );
+            }
+            Err(e) => {
+                error!(
+                    "Oracle attestation verification failed for competition {}: {}",
+                    competition.id, e
+                );
+                return Err(anyhow!("Oracle attestation verification failed: {}", e));
+            }
+        }
+
+        competition.attestation = Some(attestation);
+        info!(
+            "Oracle attestation added for competition {}",
+            competition.id
+        );
+
+        Ok(competition)
+    }
+
+    pub async fn publish_outcome_transaction<'a>(
+        &self,
+        competition: &'a mut Competition,
+    ) -> Result<&'a mut Competition, anyhow::Error> {
+        let Some(attestation) = competition.attestation else {
+            return Err(anyhow!(
+                "No attestation found for competition {}",
+                competition.id
+            ));
+        };
+        let Some(signed_contract) = competition.signed_contract.as_ref() else {
+            return Err(anyhow!(
+                "No signed contract found for competition {}",
+                competition.id
+            ));
+        };
+
+        if let Some(expiry) = competition.event_announcement.expiry {
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs() as u32;
+
+            if current_time >= expiry {
+                // Get the expiry transaction
+                let Some(expiry_tx) = signed_contract.expiry_tx() else {
+                    return Err(anyhow!(
+                        "No expiry transaction found for competition {}",
+                        competition.id
+                    ));
+                };
+
+                debug!(
+                    "Broadcasting expiry transaction: {:?}",
+                    expiry_tx.compute_txid()
+                );
+                self.bitcoin.broadcast(&expiry_tx).await?;
+                competition.expiry_broadcasted_at = Some(OffsetDateTime::now_utc());
+
+                return Ok(competition);
+            }
+        }
+
+        let outcome = competition.get_current_outcome()?;
+
+        let outcome_index = match outcome {
+            Outcome::Attestation(i) => i,
+            Outcome::Expiry => return Err(anyhow!("Unexpected expiry outcome")),
+        };
+
+        if !competition.event_announcement.is_valid_outcome(&outcome) {
+            return Err(anyhow!("Invalid outcome for this contract"));
+        }
+
+        let outcome_tx = signed_contract.signed_outcome_tx(outcome_index, attestation)?;
+
+        debug!(
+            "Broadcasting outcome transaction: {:?}",
+            outcome_tx.compute_txid()
+        );
+        competition.outcome_transaction = Some(outcome_tx.clone());
+        self.bitcoin.broadcast(&outcome_tx).await?;
+        competition.outcome_broadcasted_at = Some(OffsetDateTime::now_utc());
+
+        Ok(competition)
+    }
+
+    pub async fn publish_delta_transactions<'a>(
+        &self,
+        competition: &'a mut Competition,
+    ) -> Result<&'a mut Competition, anyhow::Error> {
+        let Some(signed_contract) = competition.signed_contract.as_ref() else {
+            return Err(anyhow!(
+                "No signed contract found for competition {}",
+                competition.id
+            ));
+        };
+
+        if competition.outcome_broadcasted_at.is_none() {
+            return Err(anyhow!(
+                "No outcome broadcast timestamp found for competition {}",
+                competition.id
+            ));
+        };
+        let Some(outcome_transaction) = competition.outcome_transaction.as_ref() else {
+            return Err(anyhow!(
+                "No outcome transaction found for competition {}",
+                competition.id
+            ));
+        };
+        let current_height = self.bitcoin.get_current_height().await?;
+        let Some(outcome_height) = self
+            .bitcoin
+            .get_tx_confirmation_height(&outcome_transaction.compute_txid())
+            .await?
+        else {
+            info!(
+                "Outcome transaction not confirmed yet for competition {}",
+                competition.id
+            );
+            return Ok(competition);
+        };
+
+        let blocks_since_outcome = current_height - outcome_height;
+        let required_delta = signed_contract.params().relative_locktime_block_delta as u32;
+
+        if blocks_since_outcome < required_delta {
+            info!(
+                "Not enough blocks since outcome tx for competition {}. Need {} more blocks",
+                competition.id,
+                required_delta - blocks_since_outcome
+            );
+            return Ok(competition);
+        };
+
+        // Get outcome and winner information
+        let outcome = competition.get_current_outcome()?;
+        let winners = signed_contract
+            .params()
+            .outcome_payouts
+            .get(&outcome)
+            .ok_or_else(|| anyhow!("No payout mapping found for outcome"))?;
+
+        let entries = self
+            .competition_store
+            .get_competition_entries(competition.id, vec![EntryStatus::Paid])
+            .await?;
+
+        // Get fee rate for transactions
+        let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
+        let rate_confirm_within_2_blocks = if fee_rates.is_empty() {
+            1 as u64
+        } else {
+            fee_rates[&1_u16].ceil() as u64
+        };
+        let fee_rate = FeeRate::from_sat_per_vb_unchecked(rate_confirm_within_2_blocks);
+
+        // Check if we can do a unified close
+        let paid_winners: Vec<(PlayerIndex, &UserEntry)> = winners
+            .iter()
+            .filter_map(|(&player_index, _)| {
+                entries
+                    .iter()
+                    .find(|entry| {
+                        let Ok(pubkey) = Point::from_hex(&entry.ephemeral_pubkey) else {
+                            return false;
+                        };
+                        if let Some(player) =
+                            signed_contract.params().players.get(player_index.clone())
+                        {
+                            player.pubkey == pubkey
+                        } else {
+                            false
+                        }
+                    })
+                    .map(move |entry| (player_index, entry))
+            })
+            .filter(|(_, entry)| {
+                entry.paid_out_at.is_some()
+                    && entry.ephemeral_privatekey.is_some()
+                    && entry.sellback_broadcasted_at.is_none()
+            })
+            .collect();
+
+        if paid_winners.len() == winners.len() {
+            // All winners have paid out and none have had sellback broadcast - do unified close
+            let (close_tx_input, close_tx_prevout) =
+                signed_contract.outcome_close_tx_input_and_prevout(&outcome)?;
+
+            let mut close_tx = simple_sweep_tx(
+                signed_contract.params().market_maker.pubkey,
+                close_tx_input,
+                signed_contract.close_tx_input_weight(),
+                close_tx_prevout.value,
+                fee_rate,
+            );
+
+            let winner_seckeys: BTreeMap<Point, Scalar> = paid_winners
+                .iter()
+                .filter_map(|(_, entry)| {
+                    let seckey = Scalar::from_hex(entry.ephemeral_privatekey.as_ref()?).ok()?;
+                    let pubkey = Point::from_hex(&entry.ephemeral_pubkey).ok()?;
+                    Some((pubkey, seckey))
+                })
+                .collect();
+
+            signed_contract.sign_outcome_close_tx_input(
+                &outcome,
+                &mut close_tx,
+                0,
+                &Prevouts::All(&[close_tx_prevout]),
+                self.private_key,
+                &winner_seckeys,
+            )?;
+
+            debug!("Broadcasting unified close transaction");
+            self.bitcoin.broadcast(&close_tx).await?;
+            competition.delta_broadcasted_at = Some(OffsetDateTime::now_utc());
+
+            // Mark all entries as closed
+            let now = OffsetDateTime::now_utc();
+            for (_, entry) in paid_winners {
+                self.competition_store
+                    .mark_entry_sellback_broadcast(entry.id, now)
+                    .await?;
+            }
+        } else {
+            // Handle individual cooperative closes for paid winners
+            for (player_index, entry) in paid_winners {
+                // Skip if already processed
+                if entry.sellback_broadcasted_at.is_some() {
+                    continue;
+                }
+
+                let win_condition = WinCondition {
+                    outcome,
+                    player_index,
+                };
+
+                let (close_tx_input, close_tx_prevout) =
+                    signed_contract.split_close_tx_input_and_prevout(&win_condition)?;
+
+                let mut close_tx = simple_sweep_tx(
+                    signed_contract.params().market_maker.pubkey,
+                    close_tx_input,
+                    signed_contract.close_tx_input_weight(),
+                    close_tx_prevout.value,
+                    fee_rate,
+                );
+
+                let winner_seckey = Scalar::from_hex(entry.ephemeral_privatekey.as_ref().unwrap())
+                    .map_err(|e| anyhow!("Invalid winner secret key: {}", e))?;
+
+                signed_contract.sign_split_close_tx_input(
+                    &win_condition,
+                    &mut close_tx,
+                    0,
+                    &Prevouts::All(&[close_tx_prevout]),
+                    self.private_key,
+                    winner_seckey,
+                )?;
+
+                debug!(
+                    "Broadcasting individual close transaction for player {}",
+                    player_index
+                );
+                self.bitcoin.broadcast(&close_tx).await?;
+
+                // Mark entry as closed
+                self.competition_store
+                    .mark_entry_sellback_broadcast(entry.id, OffsetDateTime::now_utc())
+                    .await?;
+            }
+            competition.delta_broadcasted_at = Some(OffsetDateTime::now_utc());
+        }
+        Ok(competition)
+    }
+
+    pub async fn publish_delta2_transactions<'a>(
+        &self,
+        competition: &'a mut Competition,
+    ) -> Result<&'a mut Competition, anyhow::Error> {
+        let Some(signed_contract) = competition.signed_contract.as_ref() else {
+            return Err(anyhow!(
+                "No signed contract found for competition {}",
+                competition.id
+            ));
+        };
+
+        let Some(outcome_transaction) = competition.outcome_transaction.as_ref() else {
+            return Err(anyhow!(
+                "No outcome transaction found for competition {}",
+                competition.id
+            ));
+        };
+
+        if competition.outcome_broadcasted_at.is_none() {
+            return Err(anyhow!(
+                "No outcome broadcast timestamp found for competition {}",
+                competition.id
+            ));
+        };
+
+        let current_height = self.bitcoin.get_current_height().await?;
+        let Some(outcome_height) = self
+            .bitcoin
+            .get_tx_confirmation_height(&outcome_transaction.compute_txid())
+            .await?
+        else {
+            info!(
+                "Outcome transaction not confirmed yet for competition {}",
+                competition.id
+            );
+            return Ok(competition);
+        };
+
+        let blocks_since_outcome = current_height - outcome_height;
+        let required_delta = signed_contract.params().relative_locktime_block_delta as u32;
+
+        if blocks_since_outcome < (2 * required_delta) {
+            return Err(anyhow!(
+                "Not enough blocks since outcome tx. Need {} more blocks",
+                (2 * required_delta) - blocks_since_outcome
+            ));
+        }
+
+        // Get outcome and winner information
+        let outcome = competition.get_current_outcome()?;
+        let winners = signed_contract
+            .params()
+            .outcome_payouts
+            .get(&outcome)
+            .ok_or_else(|| anyhow!("No payout mapping found for outcome"))?;
+
+        let entries = self
+            .competition_store
+            .get_competition_entries(competition.id, vec![EntryStatus::Paid])
+            .await?;
+
+        // Get fee rate for transactions
+        let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
+        let rate_confirm_within_2_blocks = if fee_rates.is_empty() {
+            1 as u64
+        } else {
+            fee_rates[&1_u16].ceil() as u64
+        };
+        let fee_rate = FeeRate::from_sat_per_vb_unchecked(rate_confirm_within_2_blocks);
+
+        // Get unpaid winners that haven't been reclaimed
+        for (&player_index, _) in winners {
+            if let Some(entry) = entries.iter().find(|entry| {
+                let Ok(pubkey) = Point::from_hex(&entry.ephemeral_pubkey) else {
+                    return false;
+                };
+                if let Some(player) = signed_contract.params().players.get(player_index.clone()) {
+                    player.pubkey == pubkey
+                } else {
+                    false
+                }
+            }) {
+                // Skip if already processed or if paid out
+                if entry.reclaimed_broadcasted_at.is_some() || entry.paid_out_at.is_some() {
+                    continue;
+                }
+
+                let win_condition = WinCondition {
+                    outcome,
+                    player_index,
+                };
+
+                let (reclaim_tx_input, reclaim_tx_prevout) =
+                    signed_contract.split_reclaim_tx_input_and_prevout(&win_condition)?;
+
+                let mut reclaim_tx = simple_sweep_tx(
+                    signed_contract.params().market_maker.pubkey,
+                    reclaim_tx_input,
+                    signed_contract.split_reclaim_tx_input_weight(),
+                    reclaim_tx_prevout.value,
+                    fee_rate,
+                );
+
+                signed_contract.sign_split_reclaim_tx_input(
+                    &win_condition,
+                    &mut reclaim_tx,
+                    0,
+                    &Prevouts::All(&[reclaim_tx_prevout]),
+                    self.private_key,
+                )?;
+
+                debug!(
+                    "Broadcasting reclaim transaction for player {}",
+                    player_index
+                );
+                self.bitcoin.broadcast(&reclaim_tx).await?;
+
+                // Mark entry as reclaimed
+                self.competition_store
+                    .mark_entry_reclaim_broadcast(entry.id, OffsetDateTime::now_utc())
+                    .await?;
+            }
+        }
+        competition.completed_at = Some(OffsetDateTime::now_utc());
 
         Ok(competition)
     }
@@ -536,7 +1179,7 @@ impl Coordinator {
         // Get all entries for this competition
         let entries = self
             .competition_store
-            .get_competition_entries(competition_id)
+            .get_competition_entries(competition_id, vec![EntryStatus::Paid])
             .await?;
 
         let mut nonces_map: BTreeMap<Point, SigMap<PubNonce>> = BTreeMap::new();
@@ -575,7 +1218,7 @@ impl Coordinator {
         // Get all entries for this competition
         let entries = self
             .competition_store
-            .get_competition_entries(competition_id)
+            .get_competition_entries(competition_id, vec![EntryStatus::Paid])
             .await?;
 
         let entry_count = entries.len();
@@ -645,7 +1288,7 @@ impl Coordinator {
             .map_err(|e| anyhow!("failed to add coordinator metadata: {}", e))
     }
 
-    // Becareful with these two operations, there's a possibility here of a
+    // Be careful with these two operations, there's a possibility here of a
     // competition being added to the oracle but never saved to our local DB (low, but possible)
     pub async fn create_competition(
         &self,
@@ -663,13 +1306,17 @@ impl Coordinator {
         }?;
 
         let competition = Competition::new(&create_event, &oracle_event);
-
+        debug!("created competition");
+        let tickets = competition
+            .generate_competition_tickets(create_event.total_allowed_entries, &self.ln)
+            .await?;
+        debug!("tickets: {:?}", tickets);
         let competition = self
             .competition_store
-            .add_competition(competition)
+            .add_competition_with_tickets(competition, tickets)
             .map_err(|e| {
                 error!(
-                    "competition added to oracle, but failed to be saved: competition_id {} {:?}",
+                    "competition added to oracle, but failed to be saved with tickets: competition_id {} {:?}",
                     create_event.id, e
                 );
                 Error::DbError(e)
@@ -689,6 +1336,69 @@ impl Coordinator {
             .await
     }
 
+    pub async fn request_ticket(
+        &self,
+        pubkey: String,
+        competition_id: Uuid,
+    ) -> Result<TicketResponse, Error> {
+        let competition = self
+            .competition_store
+            .get_competition(competition_id)
+            .await?;
+        if competition.total_entries >= competition.total_allowed_entries {
+            return Err(Error::CompetitionFull);
+        }
+        debug!("got competition: {:?}", competition);
+        let ticket = self
+            .competition_store
+            .get_and_reserve_ticket(competition_id, &pubkey)
+            .await
+            .map_err(|e| match e {
+                duckdb::Error::QueryReturnedNoRows => Error::NoAvailableTickets,
+                e => Error::DbError(e),
+            })?;
+
+        Ok(TicketResponse {
+            ticket_id: ticket.id,
+            payment_request: ticket.payment_request,
+        })
+    }
+
+    pub async fn get_ticket_status(
+        &self,
+        pubkey: String,
+        competition_id: Uuid,
+        ticket_id: Uuid,
+    ) -> Result<TicketStatus, Error> {
+        let ticket = self
+            .competition_store
+            .get_ticket(ticket_id)
+            .await
+            .map_err(|e| {
+                debug!("error: {:?}", e);
+                match e {
+                    duckdb::Error::QueryReturnedNoRows => {
+                        Error::NotFound("Ticket not found".into())
+                    }
+                    e => Error::DbError(e),
+                }
+            })?;
+
+        // Verify this ticket belongs to this competition
+        if ticket.competition_id != competition_id {
+            return Err(Error::BadRequest(
+                "Ticket does not belong to this competition".into(),
+            ));
+        }
+
+        // Verify this ticket was reserved by this user
+        if ticket.reserved_by.as_deref() != Some(&pubkey) {
+            return Err(Error::BadRequest("Ticket not reserved by this user".into()));
+        }
+
+        Ok(ticket.get_status())
+    }
+
     pub async fn get_competition(&self, competition_id: Uuid) -> Result<Competition, Error> {
         self.competition_store
             .get_competition(competition_id)
@@ -701,45 +1411,81 @@ impl Coordinator {
             })
             .await
     }
+    pub async fn handle_invoice_accepted(
+        &self,
+        competition_id: Uuid,
+        ticket_hash: &str,
+    ) -> Result<(), Error> {
+        self.competition_store
+            .mark_ticket_paid(ticket_hash, competition_id)
+            .await
+            .map_err(|e| match e {
+                duckdb::Error::QueryReturnedNoRows => {
+                    Error::BadRequest("Invalid ticket or competition".into())
+                }
+                e => Error::DbError(e),
+            })?;
 
-    async fn create_ticket(&self) -> Result<Ticket, Error> {
-        let mut rng = rand::thread_rng();
-        let ticket_preimage = hashlock::preimage_random(&mut rng);
-        let ticket_hash = hashlock::sha256(&ticket_preimage);
-        //TODO: encrypt preimage hex with market maker key
-        let ticket_preimage_encrypt = ticket_preimage.to_lower_hex_string();
-        Ok(Ticket {
-            hash: ticket_hash.to_lower_hex_string(),
-            preimage: ticket_preimage_encrypt,
-        })
+        Ok(())
     }
 
     // Be-careful with these two operations, there's a possibility here of an
     // entry being added to the oracle but never saved to our local DB (low, but possible)
     pub async fn add_entry(&self, pubkey: String, entry: AddEntry) -> Result<UserEntry, Error> {
-        info!("add_entry: {:?}", entry);
-        let ticket = self.create_ticket().await?;
+        debug!("entry: {:?}", entry);
+        let ticket = self
+            .competition_store
+            .get_ticket(entry.ticket_id)
+            .await
+            .map_err(|e| {
+                debug!("er {:?}", e);
+                match e {
+                    duckdb::Error::QueryReturnedNoRows => {
+                        Error::BadRequest("Ticket not found".into())
+                    }
+                    e => Error::DbError(e),
+                }
+            })?;
+
+        if ticket.reserved_by.as_deref() != Some(&pubkey) {
+            return Err(Error::BadRequest("Ticket not reserved by this user".into()));
+        }
+
+        if ticket.paid_at.is_none() {
+            return Err(Error::BadRequest("Ticket has not been paid".into()));
+        }
+
+        if ticket.entry_id.is_some() {
+            return Err(Error::BadRequest("Ticket has already been used".into()));
+        }
+
+        // Submit entry to oracle
         match self.oracle_client.submit_entry(entry.clone().into()).await {
             Ok(_) => Ok(()),
             Err(OracleError::NotFound(e)) => Err(Error::NotFound(e)),
             Err(OracleError::BadRequest(e)) => Err(Error::BadRequest(e)),
             Err(e) => Err(Error::OracleFailed(e)),
         }?;
+
         let user_entry = self
             .competition_store
-            .add_entry(
-                entry.clone().into_user_entry(pubkey),
-                ticket.hash,
-                ticket.preimage,
-            )
-            .map_err(|e| {
-                error!(
-                    "entry added to oracle, but failed to be saved: entry_id {}, event_id {} {:?}",
-                    entry.id, entry.event_id, e
-                );
-                Error::DbError(e)
-            })
-            .await?;
+            .add_entry(entry.clone().into_user_entry(pubkey), ticket.id)
+            .await
+            .map_err(|e| match e {
+                duckdb::Error::QueryReturnedNoRows => {
+                    Error::BadRequest(
+                        "Failed to claim ticket - may have expired or been claimed by another entry"
+                            .into(),
+                    )
+                }
+                e => {
+                    error!(
+                        "entry added to oracle, but failed to be saved: entry_id {}, event_id {} {:?}",
+                        entry.id, entry.event_id, e
+                    );
+                    Error::DbError(e)
+                }
+            })?;
 
         Ok(user_entry)
     }
@@ -961,15 +1707,159 @@ impl Coordinator {
 
         Ok(())
     }
+
+    pub async fn submit_ticket_payout(
+        &self,
+        pubkey: String,
+        competition_id: Uuid,
+        entry_id: Uuid,
+        payout_info: PayoutInfo,
+    ) -> Result<(), Error> {
+        // Get the competition and verify it's in a valid state for payouts
+        let competition = self
+            .competition_store
+            .get_competition(competition_id)
+            .await?;
+
+        if !competition.is_attested() {
+            return Err(Error::BadRequest(
+                "Competition results not yet attested".into(),
+            ));
+        }
+
+        // Get the entry and verify ownership
+        let entries = self
+            .competition_store
+            .get_user_entries(
+                pubkey.clone(),
+                SearchBy {
+                    event_ids: Some(vec![competition_id]),
+                },
+            )
+            .await?;
+
+        let entry = entries
+            .iter()
+            .find(|e| e.id == entry_id)
+            .ok_or_else(|| Error::NotFound(format!("Entry {} not found", entry_id)))?;
+
+        // Verify the ticket matches
+        if entry.ticket_id != payout_info.ticket_id {
+            return Err(Error::BadRequest("Invalid ticket for this entry".into()));
+        }
+
+        // Get competition tickets to verify against stored data
+        let tickets = self.competition_store.get_tickets(competition_id).await?;
+        _ = tickets
+            .get(&entry.id)
+            .ok_or_else(|| Error::NotFound("Ticket not found".into()))?;
+
+        // Verify the entry hasn't already been paid out
+        if entry.paid_out_at.is_some() {
+            return Err(Error::BadRequest("Entry already paid out".into()));
+        }
+
+        // Get the current outcome
+        let outcome = competition.get_current_outcome()?;
+
+        // Get the signed contract to verify winner
+        let signed_contract = competition
+            .signed_contract
+            .as_ref()
+            .ok_or_else(|| Error::BadRequest("Competition contract not yet signed".into()))?;
+
+        // Verify this entry is a winner
+        let winner_weights = signed_contract
+            .params()
+            .outcome_payouts
+            .get(&outcome)
+            .ok_or_else(|| Error::BadRequest("No payout mapping for outcome".into()))?;
+
+        let ephemeral_pubkey = dlctix::secp::Point::from_hex(&entry.ephemeral_pubkey)
+            .map_err(|e| Error::BadRequest(format!("Invalid ephemeral pubkey: {}", e)))?;
+
+        let is_winner = winner_weights.iter().any(|(player_index, _)| {
+            if let Some(player) = signed_contract.params().players.get(*player_index) {
+                player.pubkey == ephemeral_pubkey
+            } else {
+                false
+            }
+        });
+
+        if !is_winner {
+            return Err(Error::BadRequest("Entry is not a winner".into()));
+        }
+
+        // Verify the private key matches the public key
+        let provided_private_key =
+            dlctix::secp::Scalar::from_hex(&payout_info.ephemeral_private_key)
+                .map_err(|e| Error::BadRequest(format!("Invalid private key: {}", e)))?;
+
+        let derived_public_key = provided_private_key.base_point_mul();
+        if derived_public_key != ephemeral_pubkey {
+            return Err(Error::BadRequest(
+                "Invalid private key for this entry".into(),
+            ));
+        }
+
+        // Verify the payout preimage matches the hash
+        let provided_preimage =
+            dlctix::hashlock::preimage_from_hex(&payout_info.payout_preimage)
+                .map_err(|e| Error::BadRequest(format!("Invalid payout preimage: {}", e)))?;
+
+        let derived_hash = dlctix::hashlock::sha256(&provided_preimage);
+        if derived_hash.to_hex_string(dlctix::bitcoin::hex::Case::Lower) != entry.payout_hash {
+            return Err(Error::BadRequest(
+                "Invalid payout preimage for this entry".into(),
+            ));
+        }
+
+        if payout_info.ln_invoice.is_empty() {
+            return Err(Error::BadRequest("Invalid lightning invoice".into()));
+        }
+
+        match self
+            .ln
+            .send_payment(
+                payout_info.ln_invoice.clone(),
+                60,   // 60 second timeout
+                1000, // 1000 sat fee limit
+            )
+            .await
+        {
+            Ok(_) => {
+                // Update the entry as paid out
+                self.competition_store
+                    .store_payout_info(
+                        entry_id,
+                        payout_info.payout_preimage,
+                        payout_info.ephemeral_private_key,
+                        payout_info.ln_invoice,
+                        OffsetDateTime::now_utc(),
+                    )
+                    .await
+                    .map_err(Error::DbError)
+            }
+            Err(e) => {
+                return Err(Error::PaymentFailed(format!(
+                    "Failed to send lightning payment: {}",
+                    e
+                )));
+            }
+        }
+    }
 }
 
-fn generate_players(entries: &Vec<UserEntry>) -> Result<Vec<Player>, anyhow::Error> {
+fn generate_players(
+    entries: &Vec<UserEntry>,
+    tickets: &HashMap<Uuid, Ticket>,
+) -> Result<Vec<Player>, anyhow::Error> {
     let mut players = vec![];
     for entry in entries {
-        let ticket_hash = entry
-            .ticket_hash
-            .as_ref()
-            .ok_or_else(|| anyhow!("ticket_hash is missing for entry: {}", entry.id))?;
+        let Some(ticket) = tickets.get(&entry.id) else {
+            error!("ticket missing for entry {} , skipping", entry.id);
+            continue;
+        };
 
         let payout_hash = entry.payout_hash.as_str();
         debug!("player_pubkey: {}", entry.ephemeral_pubkey);
@@ -979,7 +1869,7 @@ fn generate_players(entries: &Vec<UserEntry>) -> Result<Vec<Player>, anyhow::Err
         let player = Player {
             pubkey,
             // coordinator generates this preimage and only shares after player has paid for a ticket
-            ticket_hash: string_to_byte_array(ticket_hash),
+            ticket_hash: string_to_byte_array(&ticket.hash),
             // players generate this preimage and only share after winning with the coordinator
             payout_hash: string_to_byte_array(payout_hash),
         };
@@ -1157,4 +2047,33 @@ async fn signed_funding_tx(
     debug!("Txid: {}", final_tx.compute_txid());
 
     Ok(final_tx)
+}
+
+fn p2tr_script_pubkey(pubkey: Point) -> ScriptBuf {
+    let (xonly, _) = pubkey.into();
+    let tweaked = TweakedPublicKey::dangerous_assume_tweaked(convert_xonly_key(xonly));
+    ScriptBuf::new_p2tr_tweaked(tweaked)
+}
+
+fn simple_sweep_tx(
+    destination_pubkey: Point,
+    input: TxIn,
+    input_weight: InputWeightPrediction,
+    prevout_value: Amount,
+    fee_rate: FeeRate,
+) -> Transaction {
+    let script_pubkey = p2tr_script_pubkey(destination_pubkey);
+    Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![input],
+        output: vec![TxOut {
+            value: {
+                let tx_weight = predict_weight([input_weight], [script_pubkey.len()]);
+                let fee = tx_weight * fee_rate;
+                prevout_value - fee
+            },
+            script_pubkey,
+        }],
+    }
 }

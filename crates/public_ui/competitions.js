@@ -46,6 +46,7 @@ class Competitions {
         this.competitions = competitions;
         this.competitions.forEach((competition) => {
           let $row = document.createElement("tr");
+          $row.classList.add("is-clickable");
           $row.id = `competition-${competition.id}`;
           if (this.rowExists(competition.id)) {
             return;

@@ -2,6 +2,7 @@ import { displayCompetitions } from "./competitions.js";
 import { setupAuthManager } from "./auth_manager.js";
 import { SigningProgressUI } from "./signing_progress_ui.js";
 import { MusigSessionRegistry } from "./musig_session_registry.js";
+import { registerPageReloadHandlers } from "./navbar.js";
 
 const apiBase = API_BASE;
 console.log("api location:", apiBase);
@@ -89,6 +90,8 @@ export async function initializeMusigSessions(wallet, client) {
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
+  registerPageReloadHandlers(apiBase, oracleBase);
+
   // Functions to open and close a modal
   function openModal($el) {
     $el.classList.add("is-active");

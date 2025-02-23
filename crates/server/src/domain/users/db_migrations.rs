@@ -38,9 +38,8 @@ pub fn create_users_initial_schema(conn: &mut Connection) -> Result<(), duckdb::
     -- TODO add password login
     CREATE TABLE IF NOT EXISTS user
     (
-            nostr_pubkey TEXT NOT NULL UNIQUE, -- login via verifying a random hash being signed
-            -- could be ln-auth, nostr login, etc, need to be able to sign a randomly generated 32 bytes of data
-            encrypted_bitcoin_private_key TEXT NOT NULL UNIQUE, -- user encrypted bitcoin key for dlctix wallet
+            nostr_pubkey TEXT NOT NULL UNIQUE,                      -- Login via verifying a random hash being signed
+            encrypted_bitcoin_private_key TEXT NOT NULL UNIQUE,     -- User encrypted bitcoin key for dlctix wallet
             network                                 TEXT NOT NULL,
             created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),

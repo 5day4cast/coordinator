@@ -9,11 +9,12 @@ use dlctix::{
 };
 use hyper::StatusCode;
 use log::{debug, error};
+use serde::Serialize;
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{
-    domain::{AddEntry, Competition, CreateEvent, FundedContract},
+    domain::{AddEntry, Competition, CreateEvent, FundedContract, PayoutInfo, TicketStatus},
     nostr_extractor::NostrAuth,
     AppState, SearchBy, UserEntry,
 };
@@ -34,6 +35,49 @@ pub async fn create_event(
         })
 }
 
+#[derive(Debug, Serialize)]
+pub struct TicketResponse {
+    pub ticket_id: Uuid,
+    pub payment_request: String, // Lightning HODL invoice
+}
+
+pub async fn request_competition_ticket(
+    NostrAuth { pubkey, .. }: NostrAuth,
+    State(state): State<Arc<AppState>>,
+    Path(competition_id): Path<Uuid>,
+) -> Result<Json<TicketResponse>, ErrorResponse> {
+    state
+        .coordinator
+        .request_ticket(pubkey.to_hex(), competition_id)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            error!("error requesting ticket: {:?}", e);
+            e.into()
+        })
+}
+
+pub async fn get_ticket_status(
+    NostrAuth { pubkey, .. }: NostrAuth,
+    State(state): State<Arc<AppState>>,
+    Path((competition_id, ticket_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<TicketStatus>, ErrorResponse> {
+    state
+        .coordinator
+        .get_ticket_status(pubkey.to_hex(), competition_id, ticket_id)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            error!("error getting ticket status: {:?}", e);
+            e.into()
+        })
+}
+
+/* Two steps
+1) submit entry with ticket_id for the hold invoice
+2) pay the hold invoice (server watching invoice state to become accepted)
+3) server marks ticket as paid -> include in competition
+*/
 pub async fn add_event_entry(
     NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
@@ -80,7 +124,7 @@ pub async fn get_competitions(
     let competitions = competitions
         .into_iter()
         .map(|mut comp| {
-            if !comp.is_funding_tx_broadcasted() {
+            if !comp.is_funding_broadcasted() {
                 comp.funding_transaction = None;
             }
             comp
@@ -103,7 +147,7 @@ pub async fn get_competition(
             e
         })?;
 
-    if !competition.is_funding_tx_broadcasted() {
+    if !competition.is_funding_broadcasted() {
         competition.funding_transaction = None;
     }
 
@@ -180,6 +224,26 @@ pub async fn submit_partial_signatures(
         .map(|_| StatusCode::OK)
         .map_err(|e| {
             error!("error submitting partial signatures: {:?}", e);
+            e.into()
+        })
+}
+
+pub async fn submit_ticket_payout(
+    NostrAuth { pubkey, .. }: NostrAuth,
+    State(state): State<Arc<AppState>>,
+    Path((competition_id, entry_id)): Path<(Uuid, Uuid)>,
+    Json(payout_info): Json<PayoutInfo>,
+) -> Result<StatusCode, ErrorResponse> {
+    let pubkey = pubkey.to_hex();
+    debug!("submitted payout by: {} {:?}", pubkey, payout_info);
+
+    state
+        .coordinator
+        .submit_ticket_payout(pubkey, competition_id, entry_id, payout_info)
+        .await
+        .map(|_| StatusCode::OK)
+        .map_err(|e| {
+            error!("error submitting payout information: {:?}", e);
             e.into()
         })
 }
