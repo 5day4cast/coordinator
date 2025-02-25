@@ -76,6 +76,7 @@ function createCompetition($event) {
     method: "POST",
     headers: headers,
     body: JSON.stringify(competition),
+    credentials: "include",
   })
     .then((response) => {
       if (!response.ok) {
@@ -158,7 +159,9 @@ function load_stations(stations) {
 
 async function refreshBalance() {
   try {
-    const response = await fetch(`${apiBase}/wallet/balance`);
+    const response = await fetch(`${apiBase}/wallet/balance`, {
+      credentials: "include",
+    });
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
     const data = await response.json();
 
@@ -173,7 +176,9 @@ async function refreshBalance() {
 
 async function getNewAddress() {
   try {
-    const response = await fetch(`${apiBase}/wallet/address`);
+    const response = await fetch(`${apiBase}/wallet/address`, {
+      credentials: "include",
+    });
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
     const data = await response.json();
 
@@ -186,7 +191,9 @@ async function getNewAddress() {
 
 async function refreshFeeEstimates() {
   try {
-    const response = await fetch(`${apiBase}/wallet/estimated_fees`);
+    const response = await fetch(`${apiBase}/wallet/estimated_fees`, {
+      credentials: "include",
+    });
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
     const data = await response.json();
 
@@ -214,7 +221,9 @@ async function refreshFeeEstimates() {
 
 async function refreshOutputs() {
   try {
-    const response = await fetch(`${apiBase}/wallet/outputs`);
+    const response = await fetch(`${apiBase}/wallet/outputs`, {
+      credentials: "include",
+    });
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
     const data = await response.json();
 
@@ -274,6 +283,7 @@ async function sendBitcoin() {
       headers: {
         "Content-Type": "application/json",
       },
+      credentials: "include",
       body: JSON.stringify(payload),
     });
 
