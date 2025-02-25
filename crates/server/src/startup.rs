@@ -307,7 +307,7 @@ pub fn app(
         .route("/address", get(get_next_address))
         .route("/outputs", get(get_outputs))
         .route("/send", post(send_to_address))
-        .route("/estimated_fees", post(get_estimated_fee_rates));
+        .route("/estimated_fees", get(get_estimated_fee_rates));
 
     let users_endpoints = Router::new()
         .route("/login", post(login))
