@@ -59,9 +59,9 @@ class Competitions {
               $row.appendChild(cell);
             }
           });
-          //TODO: change text depending on what competition state we're at
+
           const cell = document.createElement("td");
-          if (competition.status == "live") {
+          if (competition.canJoin) {
             cell.textContent = "Create Entry";
           } else {
             cell.textContent = "View Competition";
@@ -102,7 +102,7 @@ class Competitions {
                   return;
                 }
 
-                if (competition.status == "live") {
+                if (competition.canJoin) {
                   let entry = new Entry(
                     this.coordinator_url,
                     this.oracle_url,
@@ -157,12 +157,18 @@ class Competitions {
           );
           return null;
         }
+        const combinedStatus = getCombinedStatus(
+          competition.state,
+          event.status.toLowerCase(),
+        );
 
         return {
           id: competition.id,
           startTime: event.observation_date,
           endTime: one_day_ahead(event.observation_date),
-          status: event.status.toLowerCase(),
+          phase: combinedStatus.phase,
+          status: combinedStatus.status,
+          canJoin: combinedStatus.canJoin,
           entry_fee: competition.entry_fee,
           totalPrizePoolAmt: competition.total_competition_pool,
           totalEntries: event.total_entries,
@@ -171,6 +177,131 @@ class Competitions {
         };
       })
       .filter(Boolean);
+  }
+
+  getCombinedStatus(competitionState, eventStatus) {
+    const PHASE = {
+      REGISTRATION: "registration",
+      SETUP: "setup",
+      READY: "ready",
+      IN_PROGRESS: "in progress",
+      COMPLETING: "completing",
+      FINISHED: "finished",
+      FAILED: "failed",
+    };
+
+    // Early states related to registration
+    if (
+      eventStatus === "live" &&
+      ["created"].includes(competitionState.toLowerCase())
+    ) {
+      return {
+        phase: PHASE.REGISTRATION,
+        status: "Open for Registration",
+        canJoin: true,
+      };
+    }
+
+    // Competition is being setup/funded
+    if (
+      [
+        "entries_collected",
+        "contract_created",
+        "nonces_collected",
+        "aggregate_nonces_generated",
+        "partial_signatures_collected",
+        "signing_complete",
+        "funding_broadcasted",
+      ].includes(competitionState.toLowerCase())
+    ) {
+      return {
+        phase: PHASE.SETUP,
+        status: "Setting Up Competition",
+        canJoin: false,
+      };
+    }
+
+    if (
+      ["funding_confirmed", "funding_settled"].includes(
+        competitionState.toLowerCase(),
+      ) &&
+      eventStatus === "live"
+    ) {
+      return {
+        phase: PHASE.READY,
+        status: "Competition Ready - Waiting to Start",
+        canJoin: false,
+      };
+    }
+
+    // Competition is running
+    if (
+      eventStatus === "running" &&
+      ["funding_confirmed", "funding_settled"].includes(
+        competitionState.toLowerCase(),
+      )
+    ) {
+      return {
+        phase: PHASE.IN_PROGRESS,
+        status: "Competition In Progress",
+        canJoin: false,
+      };
+    }
+
+    // Event completed, waiting for attestation
+    if (
+      eventStatus === "completed" &&
+      !["attested", "signed"].includes(competitionState.toLowerCase())
+    ) {
+      return {
+        phase: PHASE.COMPLETING,
+        status: "Awaiting Results",
+        canJoin: false,
+      };
+    }
+
+    // Results being processed
+    if (
+      (eventStatus === "signed" &&
+        competitionState.toLowerCase() === "attested") ||
+      ["outcome_broadcasted", "delta_broadcasted"].includes(
+        competitionState.toLowerCase(),
+      )
+    ) {
+      return {
+        phase: PHASE.COMPLETING,
+        status: "Competition Completed",
+        canJoin: false,
+      };
+    }
+
+    // Competition completed
+    if (competitionState.toLowerCase() === "completed") {
+      return {
+        phase: PHASE.FINISHED,
+        status: "Competition Paid-Out",
+        canJoin: false,
+      };
+    }
+
+    // Failed or cancelled states
+    if (["failed", "cancelled"].includes(competitionState.toLowerCase())) {
+      return {
+        phase: PHASE.FAILED,
+        status:
+          competitionState === "failed"
+            ? "Competition Failed"
+            : "Competition Cancelled",
+        canJoin: false,
+      };
+    }
+
+    // Default/unknown state
+    return {
+      phase: PHASE.FAILED,
+      status: "Unknown Status",
+      canJoin: false,
+    };
   }
 
   handleCompetitionClick(row, competition) {
@@ -183,7 +314,7 @@ class Competitions {
     });
     row.classList.toggle("is-selected");
     let rowIsSelected = row.classList.contains("is-selected");
-    if (competition["status"] == "live") {
+    if (competition.canJoin) {
       if (this.leader_board) {
         this.leader_board.hideLeaderboard();
       }
