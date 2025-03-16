@@ -25,7 +25,7 @@ use duckdb::{
 };
 use log::{debug, error};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 pub use store::*;
 use time::{macros::format_description, Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -328,7 +328,7 @@ pub struct CoordinatorInfo {
     pub signature: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Competition {
     pub id: Uuid,
     #[serde(with = "time::serde::rfc3339")]
@@ -383,6 +383,28 @@ pub struct Competition {
     #[serde(with = "time::serde::rfc3339::option")]
     pub failed_at: Option<OffsetDateTime>,
     pub errors: Vec<CompetitionError>,
+}
+
+impl Serialize for Competition {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::Error;
+
+        // Convert the Competition to a Value using the derived serialization
+        let mut map = serde_json::to_value(self).map_err(S::Error::custom)?;
+
+        if let serde_json::Value::Object(ref mut map) = map {
+            map.insert(
+                "state".to_string(),
+                serde_json::Value::String(self.get_state().to_string()),
+            );
+        }
+
+        // Serialize the modified map
+        map.serialize(serializer)
+    }
 }
 
 impl Competition {
@@ -549,6 +571,32 @@ pub enum CompetitionState {
     Completed,
     Failed,
     Cancelled,
+}
+
+impl fmt::Display for CompetitionState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompetitionState::Created => write!(f, "created"),
+            CompetitionState::EntriesCollected => write!(f, "entries_collected"),
+            CompetitionState::ContractCreated => write!(f, "contract_created"),
+            CompetitionState::NoncesCollected => write!(f, "nonces_collected"),
+            CompetitionState::AggregateNoncesGenerated => write!(f, "aggregate_nonces_generated"),
+            CompetitionState::PartialSignaturesCollected => {
+                write!(f, "partial_signatures_collected")
+            }
+            CompetitionState::SigningComplete => write!(f, "signing_complete"),
+            CompetitionState::FundingBroadcasted => write!(f, "funding_broadcasted"),
+            CompetitionState::FundingConfirmed => write!(f, "funding_confirmed"),
+            CompetitionState::FundingSettled => write!(f, "funding_settled"),
+            CompetitionState::Attested => write!(f, "attested"),
+            CompetitionState::ExpiryBroadcasted => write!(f, "expiry_broadcasted"),
+            CompetitionState::OutcomeBroadcasted => write!(f, "outcome_broadcasted"),
+            CompetitionState::DeltaBroadcasted => write!(f, "delta_broadcasted"),
+            CompetitionState::Completed => write!(f, "completed"),
+            CompetitionState::Failed => write!(f, "failed"),
+            CompetitionState::Cancelled => write!(f, "cancelled"),
+        }
+    }
 }
 
 impl Competition {

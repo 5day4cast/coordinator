@@ -23,9 +23,10 @@ class LeaderBoard {
         observations,
         lastForecasts,
         entries,
+        this.competition.phase,
       );
       console.log(entryScores);
-      this.displayScore(entryScores);
+      this.displayScore(entryScores, this.competition.phase);
     });
   }
 
@@ -44,61 +45,91 @@ class LeaderBoard {
     return station_observations;
   }
 
-  calculateScores(weatherReadings, lastForecasts, entries) {
+  calculateScores(weatherReadings, lastForecasts, entries, phase) {
+    const isPreCompetition = phase === "ready" || phase === "setup";
+
     for (let entry of entries) {
       let currentScore = 0;
       for (let option of entry.expected_observations) {
         const station_id = option.stations;
         const forecast = lastForecasts[station_id];
+
         if (!forecast) {
           console.error("no forecast found for:", station_id);
           continue;
         }
+
         const observation = weatherReadings[station_id];
-        if (!observation) {
-          console.error("no observations found for:", station_id);
-          continue;
-        }
+
         Object.keys(option).forEach((key) => {
-          if (key == "stations") {
-            return;
-          }
-          console.log(option);
-          console.log(key);
+          if (key === "stations") return;
+
           if (option[key] !== null && option[key] !== undefined) {
-            const val = option[key];
-            console.log(val);
-            option[key] = val.toLowerCase();
+            const val = option[key].toLowerCase();
+
+            if (isPreCompetition) {
+              // If pre-competition, just store forecast data
+              option[key] = {
+                val: val,
+                forecast: forecast[key],
+                observation: "Pending",
+                score: "Pending",
+              };
+            } else {
+              // Calculate scores if we have observations
+              const optionScore = observation
+                ? this.calculateOptionScore(
+                    forecast[key],
+                    observation[key],
+                    val,
+                  )
+                : "No Data";
+
+              option[key] = {
+                score: optionScore,
+                val: val,
+                forecast: forecast[key],
+                observation: observation ? observation[key] : "No Data",
+              };
+
+              if (typeof optionScore === "number") {
+                currentScore += optionScore;
+              }
+            }
           }
-          const optionScore = this.calculateOptionScore(
-            forecast[key],
-            observation[key],
-            option[key],
-          );
-          console.log(optionScore);
-          console.log(option[key]);
-          if (option[key]) {
-            const picked = option[key];
-            option[key] = {
-              score: optionScore,
-              val: picked,
-              forecast: forecast[key],
-              observation: observation[key],
-            };
-          }
-          currentScore += optionScore;
         });
       }
 
-      if (entry.score && entry.score != currentScore) {
-        console.error(
-          "calculated score does not match oracle response: ",
-          entry.score,
-          currentScore,
-        );
+      if (!isPreCompetition) {
+        entry.rawScore = currentScore;
+        // Calculate final score with timestamp if in competition or completed
+        if (entry && entry.id && entry.score) {
+          // Extract timestamp from UUID v7
+          const uuidTimestamp =
+            BigInt("0x" + entry.id.substring(0, 12)) & BigInt("0xFFFFFFFFFFFF");
+          const timeMillis = Number(uuidTimestamp);
+          // Apply the same scoring formula as on the oracle server
+          entry.rawScore = currentScore;
+          const timestampPart = timeMillis % 10000;
+          const totalScore = currentScore * 10000 - timestampPart;
+
+          // Compare with the entry's score
+          if (entry.score && entry.score !== totalScore) {
+            console.error(
+              "calculated score does not match oracle response: ",
+              entry.score,
+              totalScore,
+            );
+          }
+        }
       }
     }
-    entries.sort((a, b) => b.score - a.score);
+
+    // Only sort if we have actual scores
+    if (!isPreCompetition) {
+      entries.sort((a, b) => (b.score || 0) - (a.score || 0));
+    }
+
     return entries;
   }
 
@@ -124,7 +155,7 @@ class LeaderBoard {
     }
   }
 
-  displayScore(entryScores) {
+  displayScore(entryScores, phase) {
     let $competitionsDataTable = document.getElementById(
       "competitionLeaderboardData",
     );
@@ -133,24 +164,28 @@ class LeaderBoard {
       $tbody = document.createElement("tbody");
       $competitionsDataTable.appendChild($tbody);
     }
+
+    const isPreCompetition = phase === "ready" || phase === "setup";
+
     entryScores.forEach((entryScore, index) => {
       let $row = document.createElement("tr");
       $row.classList.add("is-clickable");
 
+      // Rank column
       const rank = document.createElement("td");
-      rank.textContent = index + 1;
+      rank.textContent = isPreCompetition ? "-" : index + 1;
       $row.appendChild(rank);
-      if (entryScore["score"] == undefined || entryScore["score"] == null) {
-        console.error("no score found for entry:", entryScore["id"]);
-        return;
-      }
 
+      // ID column
       const cellId = document.createElement("td");
-      cellId.textContent = entryScore["id"];
+      cellId.textContent = entryScore.id;
       $row.appendChild(cellId);
 
+      // Score column
       const cellScore = document.createElement("td");
-      cellScore.textContent = entryScore["score"];
+      cellScore.textContent = isPreCompetition
+        ? "Pending"
+        : (entryScore.rawScore ?? "No Score");
       $row.appendChild(cellScore);
 
       $row.addEventListener("click", () => {
@@ -158,8 +193,9 @@ class LeaderBoard {
       });
 
       $tbody.appendChild($row);
-      this.showLeaderboard();
     });
+
+    this.showLeaderboard();
   }
 
   showLeaderboard() {
@@ -245,7 +281,7 @@ class LeaderBoard {
     }
 
     let $totalPts = document.createElement("h6");
-    $totalPts.textContent = `Total Points: ${entry.score}`;
+    $totalPts.textContent = `Total Points: ${entry.rawScore}`;
     $entryValues.appendChild($totalPts);
 
     if (!$entryScoreModal.classList.contains("is-active")) {
@@ -255,10 +291,9 @@ class LeaderBoard {
 
   buildEntryScorePick($stationList, type, option) {
     let $optionListItem = document.createElement("li");
-    // forecast val, observation val, val, score
-    //$optionListItem.textContent = `Wind Speed ${} ${} ${} ${}`
     $optionListItem.classList.add("ml-4");
     $optionListItem.textContent = `${type}: `;
+
     let $breakdown = document.createElement("ul");
 
     let $forecast = document.createElement("li");
@@ -280,6 +315,7 @@ class LeaderBoard {
     $score.classList.add("ml-6");
     $score.textContent = `Score: ${option["score"]}`;
     $breakdown.appendChild($score);
+
     $optionListItem.appendChild($breakdown);
     $stationList.appendChild($optionListItem);
   }
