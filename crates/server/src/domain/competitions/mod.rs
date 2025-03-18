@@ -385,25 +385,115 @@ pub struct Competition {
     pub errors: Vec<CompetitionError>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtendCompetition {
+    pub id: Uuid,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    pub total_competition_pool: u64,
+    pub total_allowed_entries: u64,
+    pub entry_fee: u64,
+    pub coordinator_fee_percentage: usize,
+    pub event_announcement: EventLockingConditions,
+    pub total_entries: u64,
+    pub total_entry_nonces: u64,
+    pub total_signed_entries: u64,
+    pub total_paid_entries: u64,
+    pub total_paid_out_entries: usize,
+    pub number_of_places_win: usize,
+    pub funding_transaction: Option<Transaction>,
+    pub funding_outpoint: Option<OutPoint>,
+    pub outcome_transaction: Option<Transaction>,
+    pub contract_parameters: Option<ContractParameters>,
+    pub public_nonces: Option<SigMap<PubNonce>>,
+    pub aggregated_nonces: Option<SigMap<AggNonce>>,
+    pub partial_signatures: Option<SigMap<PartialSignature>>,
+    pub signed_contract: Option<SignedContract>,
+    /// Oracle attestation checked for and added once oracle announces
+    pub attestation: Option<MaybeScalar>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub cancelled_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub contracted_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub signed_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub funding_broadcasted_at: Option<OffsetDateTime>,
+    /// Funding transaction is considered settled after 1 confirmation by default
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub funding_confirmed_at: Option<OffsetDateTime>,
+    /// Funding transaction is considered settled after all hold invoices have been closed
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub funding_settled_at: Option<OffsetDateTime>,
+    /// Expiry transaction is broadcasted after event has expired
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub expiry_broadcasted_at: Option<OffsetDateTime>,
+    /// Outcome transaction is broadcasted after the attestation is provided
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub outcome_broadcasted_at: Option<OffsetDateTime>,
+    /// First delta transactions have been broadcasted via the coordinator
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub delta_broadcasted_at: Option<OffsetDateTime>,
+    /// All reclaim transaction have been broadcasted if needed, otherwise marked as completed
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub completed_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub failed_at: Option<OffsetDateTime>,
+    pub errors: Vec<CompetitionError>,
+    pub state: String,
+}
+
+impl From<Competition> for ExtendCompetition {
+    fn from(competition: Competition) -> Self {
+        let state = competition.get_state().to_string();
+        Self {
+            id: competition.id,
+            created_at: competition.created_at,
+            total_competition_pool: competition.total_competition_pool,
+            total_allowed_entries: competition.total_allowed_entries,
+            entry_fee: competition.entry_fee,
+            coordinator_fee_percentage: competition.coordinator_fee_percentage,
+            event_announcement: competition.event_announcement,
+            total_entries: competition.total_entries,
+            total_entry_nonces: competition.total_entry_nonces,
+            total_signed_entries: competition.total_signed_entries,
+            total_paid_entries: competition.total_paid_entries,
+            total_paid_out_entries: competition.total_paid_out_entries,
+            number_of_places_win: competition.number_of_places_win,
+            funding_transaction: competition.funding_transaction,
+            funding_outpoint: competition.funding_outpoint,
+            outcome_transaction: competition.outcome_transaction,
+            contract_parameters: competition.contract_parameters,
+            public_nonces: competition.public_nonces,
+            aggregated_nonces: competition.aggregated_nonces,
+            partial_signatures: competition.partial_signatures,
+            signed_contract: competition.signed_contract,
+            attestation: competition.attestation,
+            cancelled_at: competition.cancelled_at,
+            contracted_at: competition.contracted_at,
+            signed_at: competition.signed_at,
+            funding_broadcasted_at: competition.funding_broadcasted_at,
+            funding_confirmed_at: competition.funding_confirmed_at,
+            funding_settled_at: competition.funding_settled_at,
+            expiry_broadcasted_at: competition.expiry_broadcasted_at,
+            outcome_broadcasted_at: competition.outcome_broadcasted_at,
+            delta_broadcasted_at: competition.delta_broadcasted_at,
+            completed_at: competition.completed_at,
+            failed_at: competition.failed_at,
+            errors: competition.errors,
+            state,
+        }
+    }
+}
+
 impl Serialize for Competition {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        use serde::ser::Error;
-
-        // Convert the Competition to a Value using the derived serialization
-        let mut map = serde_json::to_value(self).map_err(S::Error::custom)?;
-
-        if let serde_json::Value::Object(ref mut map) = map {
-            map.insert(
-                "state".to_string(),
-                serde_json::Value::String(self.get_state().to_string()),
-            );
-        }
-
+        let ext: ExtendCompetition = self.to_owned().into();
         // Serialize the modified map
-        map.serialize(serializer)
+        ext.serialize(serializer)
     }
 }
 
@@ -545,7 +635,7 @@ pub struct FundedContract {
     pub funding_outpoint: OutPoint,
 }
 
-#[derive(Debug, PartialEq, PartialOrd, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum CompetitionState {
     Created,
     EntriesCollected,

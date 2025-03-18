@@ -72,12 +72,14 @@ function createCompetition($event) {
 
   $event.target.classList.add("is-loading");
 
-  fetch(`${apiBase}/competitions`, {
-    method: "POST",
-    headers: headers,
-    body: JSON.stringify(competition),
-    credentials: "include",
-  })
+  fetch(
+    `${apiBase}/competitions`,
+    getRequestOptions({
+      method: "POST",
+      headers: headers,
+      body: JSON.stringify(competition),
+    }),
+  )
     .then((response) => {
       if (!response.ok) {
         console.error(response);
@@ -159,9 +161,10 @@ function load_stations(stations) {
 
 async function refreshBalance() {
   try {
-    const response = await fetch(`${apiBase}/wallet/balance`, {
-      credentials: "include",
-    });
+    const response = await fetch(
+      `${apiBase}/wallet/balance`,
+      getRequestOptions(),
+    );
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
     const data = await response.json();
 
@@ -176,9 +179,10 @@ async function refreshBalance() {
 
 async function getNewAddress() {
   try {
-    const response = await fetch(`${apiBase}/wallet/address`, {
-      credentials: "include",
-    });
+    const response = await fetch(
+      `${apiBase}/wallet/address`,
+      getRequestOptions(),
+    );
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
     const data = await response.json();
 
@@ -191,9 +195,10 @@ async function getNewAddress() {
 
 async function refreshFeeEstimates() {
   try {
-    const response = await fetch(`${apiBase}/wallet/estimated_fees`, {
-      credentials: "include",
-    });
+    const response = await fetch(
+      `${apiBase}/wallet/estimated_fees`,
+      getRequestOptions(),
+    );
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
     const data = await response.json();
 
@@ -221,9 +226,10 @@ async function refreshFeeEstimates() {
 
 async function refreshOutputs() {
   try {
-    const response = await fetch(`${apiBase}/wallet/outputs`, {
-      credentials: "include",
-    });
+    const response = await fetch(
+      `${apiBase}/wallet/outputs`,
+      getRequestOptions(),
+    );
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
     const data = await response.json();
 
@@ -261,6 +267,13 @@ function toggleJson(button) {
   }
 }
 
+function getRequestOptions(options = {}) {
+  if (!apiBase.includes("localhost")) {
+    return { ...options, credentials: "include" };
+  }
+  return options;
+}
+
 async function sendBitcoin() {
   const address = document.getElementById("send-address").value;
   const amount = parseInt(document.getElementById("send-amount").value);
@@ -278,14 +291,16 @@ async function sendBitcoin() {
   };
 
   try {
-    const response = await fetch(`${apiBase}/wallet/send`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      credentials: "include",
-      body: JSON.stringify(payload),
-    });
+    const response = await fetch(
+      `${apiBase}/wallet/send`,
+      getRequestOptions({
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      }),
+    );
 
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
     const data = await response.json();

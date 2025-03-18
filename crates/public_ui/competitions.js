@@ -51,9 +51,9 @@ class Competitions {
           if (this.rowExists(competition.id)) {
             return;
           }
-          // Exclude the "locations" property
+          // Exclude non-display properties
           Object.keys(competition).forEach((key) => {
-            if (key !== "locations") {
+            if (key !== "locations" && key !== "canJoin" && key !== "phase") {
               const cell = document.createElement("td");
               cell.textContent = competition[key];
               $row.appendChild(cell);
@@ -157,7 +157,7 @@ class Competitions {
           );
           return null;
         }
-        const combinedStatus = getCombinedStatus(
+        const combinedStatus = this.getCombinedStatus(
           competition.state,
           event.status.toLowerCase(),
         );
