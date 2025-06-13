@@ -1,7 +1,7 @@
 use anyhow::anyhow;
 use async_trait::async_trait;
 use bdk_wallet::{
-    bitcoin::{Psbt, Txid},
+    bitcoin::{Amount, FeeRate, Network, OutPoint, Psbt, ScriptBuf, Txid},
     SignOptions,
 };
 use client_validator::{
@@ -18,8 +18,8 @@ use mockall::mock;
 use secrecy::ExposeSecret;
 use server::{
     domain::{generate_ranking_permutations, AddEntry, CreateEvent},
-    get_key, AddEventEntry, Bitcoin, Ln, Oracle, OracleError as Error, OracleEvent, ValueOptions,
-    WeatherChoices,
+    get_key, AddEventEntry, Bitcoin, ForeignUtxo, Ln, Oracle, OracleError as Error, OracleEvent,
+    ValueOptions, WeatherChoices,
 };
 use std::collections::HashMap;
 use time::{Duration, OffsetDateTime};
@@ -42,13 +42,32 @@ mock! {
 
     #[async_trait]
     impl Bitcoin for BitcoinClient {
+        fn get_network(&self) -> Network;
+        async fn sign_psbt_with_escrow_support(
+            &self,
+            psbt: &mut Psbt,
+            options: SignOptions,
+        ) -> Result<bool, anyhow::Error>;
+        async fn finalize_psbt_with_escrow_support(
+            &self,
+            psbt: &mut Psbt,
+        ) -> Result<bool, anyhow::Error>;
+        async fn build_psbt(
+            &self,
+            script_pubkey: ScriptBuf,
+            amount: Amount,
+            fee_rate: FeeRate,
+            selected_utxos: Vec<OutPoint>,
+            foreign_utxos: Vec<ForeignUtxo>,
+        ) -> Result<Psbt, anyhow::Error>;
         async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<bdk_wallet::LocalOutput, anyhow::Error>;
         async fn get_current_height(&self) -> Result<u32, anyhow::Error>;
         async fn get_estimated_fee_rates(&self) -> Result<HashMap<u16, f64>, anyhow::Error>;
         async fn get_tx_confirmation_height(&self, txid: &Txid) -> Result<Option<u32>, anyhow::Error>;
         async fn broadcast(&self, transaction: &bdk_wallet::bitcoin::Transaction) -> Result<(), anyhow::Error>;
         async fn get_next_address(&self) -> Result<bdk_wallet::AddressInfo, anyhow::Error>;
-        async fn get_derived_private_key(&self) -> Result<dlctix::musig2::secp256k1::SecretKey, anyhow::Error>;
+        async fn get_public_key(&self) -> Result<bdk_wallet::bitcoin::PublicKey, anyhow::Error>;
+        async fn get_derived_private_key(&self) -> Result<dlctix::secp::Scalar, anyhow::Error>;
         async fn get_raw_transaction(&self, txid: &Txid) -> Result<bdk_wallet::bitcoin::Transaction, anyhow::Error>;
         async fn sign_psbt(
             &self,
@@ -65,16 +84,24 @@ mock! {
     #[async_trait]
     impl Ln for LnClient {
         async fn ping(&self) -> Result<(), anyhow::Error>;
+        async fn cancel_hold_invoice(&self, ticket_hash: String) -> Result<(), anyhow::Error>;
+        async fn settle_hold_invoice(&self, ticket_preimage: String) -> Result<(), anyhow::Error>;
+        async fn lookup_invoice(&self, r_hash: &str) -> Result<server::InvoiceLookupResponse, anyhow::Error>;
         async fn add_hold_invoice(
             &self,
             value: u64,
             expiry_time_secs: u64,
-            ticket_hash: String,
+            ticket_hash_hex: String,
+            competition_id: Uuid,
+            hex_refund_tx: String,
+        ) -> Result<server::InvoiceAddResponse, anyhow::Error>;
+        async fn add_invoice(
+            &self,
+            value: u64,
+            expiry_time_secs: u64,
+            memo: String,
             competition_id: Uuid,
         ) -> Result<server::InvoiceAddResponse, anyhow::Error>;
-        async fn cancel_hold_invoice(&self, ticket_hash: String) -> Result<(), anyhow::Error>;
-        async fn settle_hold_invoice(&self, ticket_preimage: String) -> Result<(), anyhow::Error>;
-        async fn lookup_invoice(&self, r_hash: &str) -> Result<server::InvoiceLookupResponse, anyhow::Error>;
         async fn create_invoice(
             &self,
             value: u64,

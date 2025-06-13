@@ -23,7 +23,7 @@ bdk_wallet = { version = "1.0.0", features = ["file_store"] }
 blake2 = "0.10.6"
 clap = { version = "4.3.23", features = ["derive", "env"] }
 config = "0.14.0"
-dlctix = { git = "https://github.com/tee8z/dlctix", branch = "add-errors" }
+dlctix = { git = "https://github.com/tee8z/dlctix" }
 duckdb = { version = "1.1.1" }
 fern = { version = "0.6.2", features = ["colored"] }
 futures = "0.3.28"
@@ -38,6 +38,7 @@ num_cpus = "1.16.0"
 openssl = { version = "0.10", features = ["vendored"] }
 pem-rfc7468 = { version = "0.7.0", features = ["alloc"] }
 rand = "0.8.5"
+rand_chacha = "0.3"
 reqwest-middleware = { version = "0.3.3", features = ["json", "rustls-tls"] }
 reqwest-retry = { version = "0.6.1" }
 scooby = "0.5.0"
@@ -67,3 +68,7 @@ mockall = "0.11"
 tokio-test = "0.4"
 env_logger = "0.11.6"
 client_validator = { path = "../client_validator" }
+
+[[bin]]
+name = "wallet-cli"
+path = "src/bin/wallet_cli.rs"

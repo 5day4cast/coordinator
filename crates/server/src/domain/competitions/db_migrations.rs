@@ -57,8 +57,9 @@ pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), d
         coordinator_fee_percentage INT NOT NULL, -- Entry fee percentage given to the coordinator
         created_at TIMESTAMPTZ NOT NULL,
         event_announcement BLOB NOT NULL,       -- Event announcement expected from the oracles
+        funding_psbt BLOB,                      -- Unsigned Funding PSBT
+        funding_outpoint BLOB,                  -- Funding outpoint
         funding_transaction BLOB,               -- Funding transaction
-        funding_outpoint BLOB,                  -- Funding transaction outpoint
         outcome_transaction BLOB,               -- Outcome transaction
         contract_parameters BLOB,               -- DLC contract parameters
         public_nonces BLOB,                     -- Coordinator's public nonces
@@ -68,13 +69,14 @@ pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), d
         attestation BLOB,                       -- Attestation from oracle at event completion
         contracted_at TIMESTAMPTZ,              -- When contract parameters were created
         signed_at TIMESTAMPTZ,                  -- When musig2 signing completed
+        escrow_funds_confirmed_at TIMESTAMPTZ,  -- When all escrow funds were verified as having at least 1 confirmation
         funding_broadcasted_at TIMESTAMPTZ,     -- When funding transaction was broadcast
         funding_confirmed_at TIMESTAMPTZ,       -- When funding transaction has at least 1 confirmation
         funding_settled_at TIMESTAMPTZ,         -- When all hodl invoices have been settled for the competition
         expiry_broadcasted_at TIMESTAMPTZ,      -- When expiry transaction was broadcast by coordinator
         outcome_broadcasted_at TIMESTAMPTZ,     -- When outcome transaction was broadcast by coordinator
         delta_broadcasted_at TIMESTAMPTZ,       -- When first delta transactions were broadcast by coordinator
-        completed_at TIMESTAMPTZ,       -- When competition closing transactions (delta 2) were broadcast
+        completed_at TIMESTAMPTZ,               -- When competition closing transactions (delta 2) were broadcast
         cancelled_at TIMESTAMPTZ,               -- If competition was cancelled
         failed_at TIMESTAMPTZ,                  -- If competition failed
         errors BLOB                             -- List of errors that lead to failed_at
@@ -84,13 +86,15 @@ pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), d
     (
         id UUID PRIMARY KEY,
         event_id UUID NOT NULL              REFERENCES competitions (id),
+        ephemeral_pubkey TEXT,                  -- User ephemeral pubkey for DLC & escrow transaction
         encrypted_preimage TEXT NOT NULL,       -- Encrypted with the cooridinator private key
         hash TEXT NOT NULL,                     -- Hash of the preimage, used in generating payment_request for user
         payment_request TEXT,                   -- Hodl invoice payment request generated for the ticket
         reserved_at TIMESTAMPTZ,                -- Used to determine if reserve is still valid
         reserved_by TEXT,                       -- Pubkey of user that is trying to use this ticket
         paid_at TIMESTAMPTZ,                    -- When user payment is pending for the ticket
-        settled_at TIMESTAMPTZ                  -- When user payment has settled (ie hodl invoice completes)
+        settled_at TIMESTAMPTZ,                 -- When user payment has settled (ie hodl invoice completes)
+        escrow_transaction TEXT                 -- Hex-encoded escrow transaction for refund path
     );
 
     CREATE TABLE IF NOT EXISTS entries
@@ -107,6 +111,7 @@ pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), d
         payout_preimage TEXT,                           -- Provided by user on payout, encrypted by coordinator_key
         payout_ln_invoice TEXT,                         -- Provided by user on payout, coordinator pays to user
         public_nonces BLOB,                             -- Player signed nonces during musig signing session
+        funding_psbt BLOB,                              -- Player signed funding PSBT
         partial_signatures BLOB,                        -- layer partial signatures
         paid_out_at TIMESTAMPTZ,                        -- When ticket have been paid out via lightning
         sellback_broadcasted_at TIMESTAMPTZ,            -- When on chain sellback broadcasted by coordinator for cooperative lightning payout

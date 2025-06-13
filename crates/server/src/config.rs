@@ -36,6 +36,18 @@ pub struct Settings {
     pub ln_settings: LnSettings,
 }
 
+impl ConfigurableSettings for Settings {
+    fn apply_cli_overrides(&mut self, cli_settings: &CliSettings) {
+        if let Some(level) = &cli_settings.level {
+            self.level = Some(level.clone());
+        }
+    }
+
+    fn default_config_path() -> PathBuf {
+        PathBuf::from("./config/local.toml")
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DBSettings {
     pub data_folder: String,
@@ -184,11 +196,42 @@ impl Default for Settings {
         }
     }
 }
-
 pub fn get_settings() -> Result<Settings, anyhow::Error> {
-    let cli = Cli::parse();
+    get_settings_with_cli(Cli::parse().into())
+}
 
-    let mut settings = if let Some(config_path) = cli.config {
+pub struct CliSettings {
+    pub config: Option<String>,
+    pub level: Option<String>,
+}
+
+impl From<Cli> for CliSettings {
+    fn from(cli: Cli) -> Self {
+        Self {
+            config: cli.config,
+            level: cli.level,
+        }
+    }
+}
+pub trait ConfigurableSettings: Serialize + for<'de> Deserialize<'de> + Default {
+    /// Apply CLI settings after loading from file
+    fn apply_cli_overrides(&mut self, cli_settings: &CliSettings);
+
+    /// Get the default config file path
+    fn default_config_path() -> PathBuf {
+        PathBuf::from("./config/settings.toml")
+    }
+
+    /// Get the config directory path
+    fn config_directory() -> PathBuf {
+        PathBuf::from("./config")
+    }
+}
+
+pub fn get_settings_with_cli<T: ConfigurableSettings>(
+    cli_settings: CliSettings,
+) -> Result<T, anyhow::Error> {
+    let mut settings = if let Some(config_path) = cli_settings.config.clone() {
         let path = PathBuf::from(config_path);
 
         let absolute_path = if path.is_absolute() {
@@ -209,7 +252,7 @@ pub fn get_settings() -> Result<Settings, anyhow::Error> {
         };
         file_settings
     } else {
-        let default_path = PathBuf::from("./config/local.toml");
+        let default_path = T::default_config_path();
         match File::open(&default_path) {
             Ok(mut file) => {
                 let mut content = String::new();
@@ -220,10 +263,10 @@ pub fn get_settings() -> Result<Settings, anyhow::Error> {
             }
             Err(_) => {
                 // Create default settings
-                let default_settings = Settings::default();
+                let default_settings = T::default();
 
                 // Create config directory if it doesn't exist
-                fs::create_dir_all("./config")
+                fs::create_dir_all(T::config_directory())
                     .map_err(|e| anyhow!("Failed to create config directory: {}", e))?;
 
                 let toml_content = toml::to_string(&default_settings)
@@ -239,14 +282,15 @@ pub fn get_settings() -> Result<Settings, anyhow::Error> {
         }
     };
 
-    if let Some(cli_level) = cli.level {
-        settings.level = Some(cli_level);
-    }
+    settings.apply_cli_overrides(&cli_settings);
 
     Ok(settings)
 }
 
-pub fn setup_logger(level: Option<String>) -> Result<(), fern::InitError> {
+pub fn setup_logger(
+    level: Option<String>,
+    filter_targets: Vec<String>,
+) -> Result<(), fern::InitError> {
     let rust_log = get_log_level(level);
     let colors = ColoredLevelConfig::new()
         .trace(Color::White)
@@ -266,7 +310,11 @@ pub fn setup_logger(level: Option<String>) -> Result<(), fern::InitError> {
             ));
         })
         .level(rust_log)
-        .filter(|metadata| !metadata.target().starts_with("hyper"))
+        .filter(move |metadata| {
+            !filter_targets
+                .iter()
+                .any(|filter| metadata.target().starts_with(filter))
+        })
         .chain(std::io::stdout())
         .apply()?;
     Ok(())

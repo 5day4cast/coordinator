@@ -10,10 +10,7 @@ use anyhow::anyhow;
 pub use coordinator::*;
 pub use db_migrations::*;
 use dlctix::{
-    bitcoin::{
-        hex::{Case, DisplayHex},
-        OutPoint, Transaction,
-    },
+    bitcoin::{hex::DisplayHex, OutPoint, Psbt, Transaction},
     hashlock,
     musig2::{AggNonce, PartialSignature, PubNonce},
     secp::MaybeScalar,
@@ -88,6 +85,8 @@ pub struct UserEntry {
     /// User provided lightning invoice, coordinator pays to user
     pub payout_ln_invoice: Option<String>,
     pub public_nonces: Option<SigMap<PubNonce>>,
+    /// User signed funding psbt
+    pub funding_psbt: Option<Psbt>,
     pub partial_signatures: Option<SigMap<PartialSignature>>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub signed_at: Option<OffsetDateTime>,
@@ -120,6 +119,13 @@ impl<'a> TryFrom<&Row<'a>> for UserEntry {
                 })
             })?;
 
+        let funding_psbt: Option<Psbt> = row.get::<usize, Option<Value>>(9).map(|opt| {
+            opt.and_then(|raw| match raw {
+                Value::Blob(val) => serde_json::from_slice(&val).ok(),
+                _ => None,
+            })
+        })?;
+
         let user_entry = UserEntry {
             id: row
                 .get::<usize, String>(0)
@@ -139,20 +145,21 @@ impl<'a> TryFrom<&Row<'a>> for UserEntry {
             ephemeral_privatekey: row.get::<usize, Option<String>>(6)?,
             public_nonces,
             partial_signatures,
-            payout_preimage_encrypted: row.get(9)?,
-            payout_hash: row.get(10)?,
-            payout_preimage: row.get::<usize, Option<String>>(11)?,
-            payout_ln_invoice: row.get::<usize, Option<String>>(12)?,
-            signed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(13)?, 13)?,
-            paid_at: parse_optional_timestamp(row.get::<usize, Option<String>>(14)?, 14)?,
-            paid_out_at: parse_optional_timestamp(row.get::<usize, Option<String>>(15)?, 15)?,
+            funding_psbt,
+            payout_preimage_encrypted: row.get(10)?,
+            payout_hash: row.get(11)?,
+            payout_preimage: row.get::<usize, Option<String>>(12)?,
+            payout_ln_invoice: row.get::<usize, Option<String>>(13)?,
+            signed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(14)?, 14)?,
+            paid_at: parse_optional_timestamp(row.get::<usize, Option<String>>(15)?, 15)?,
+            paid_out_at: parse_optional_timestamp(row.get::<usize, Option<String>>(16)?, 16)?,
             sellback_broadcasted_at: parse_optional_timestamp(
-                row.get::<usize, Option<String>>(16)?,
-                16,
-            )?,
-            reclaimed_broadcasted_at: parse_optional_timestamp(
                 row.get::<usize, Option<String>>(17)?,
                 17,
+            )?,
+            reclaimed_broadcasted_at: parse_optional_timestamp(
+                row.get::<usize, Option<String>>(18)?,
+                18,
             )?,
         };
         Ok(user_entry)
@@ -171,6 +178,7 @@ impl AddEntry {
             payout_hash: self.payout_hash,
             payout_preimage_encrypted: self.payout_preimage_encrypted,
             signed_at: None,
+            funding_psbt: None,
             partial_signatures: None,
             public_nonces: None,
             ephemeral_privatekey: None,
@@ -213,10 +221,13 @@ pub struct Ticket {
     pub hash: String,
     pub payment_request: String,
     pub expiry: OffsetDateTime,
+    /// Pubkey created for this entry for the user
+    pub ephemeral_pubkey: Option<String>,
     pub reserved_by: Option<String>,
     pub reserved_at: Option<OffsetDateTime>,
     pub paid_at: Option<OffsetDateTime>,
     pub settled_at: Option<OffsetDateTime>,
+    pub escrow_transaction: Option<String>, // Hex-encoded escrow transaction
 }
 
 impl Ticket {
@@ -344,8 +355,9 @@ pub struct Competition {
     pub total_paid_entries: u64,
     pub total_paid_out_entries: usize,
     pub number_of_places_win: usize,
-    pub funding_transaction: Option<Transaction>,
     pub funding_outpoint: Option<OutPoint>,
+    pub funding_psbt: Option<Psbt>,
+    pub funding_transaction: Option<Transaction>,
     pub outcome_transaction: Option<Transaction>,
     pub contract_parameters: Option<ContractParameters>,
     pub public_nonces: Option<SigMap<PubNonce>>,
@@ -360,6 +372,9 @@ pub struct Competition {
     pub contracted_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub signed_at: Option<OffsetDateTime>,
+    /// Escrow transactions are considered settled after 1 confirmation by default
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub escrow_funds_confirmed_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub funding_broadcasted_at: Option<OffsetDateTime>,
     /// Funding transaction is considered settled after 1 confirmation by default
@@ -403,6 +418,7 @@ pub struct ExtendCompetition {
     pub number_of_places_win: usize,
     pub funding_transaction: Option<Transaction>,
     pub funding_outpoint: Option<OutPoint>,
+    pub funding_psbt: Option<Psbt>,
     pub outcome_transaction: Option<Transaction>,
     pub contract_parameters: Option<ContractParameters>,
     pub public_nonces: Option<SigMap<PubNonce>>,
@@ -417,6 +433,8 @@ pub struct ExtendCompetition {
     pub contracted_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub signed_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub escrow_funds_confirmed_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub funding_broadcasted_at: Option<OffsetDateTime>,
     /// Funding transaction is considered settled after 1 confirmation by default
@@ -472,6 +490,8 @@ impl From<Competition> for ExtendCompetition {
             cancelled_at: competition.cancelled_at,
             contracted_at: competition.contracted_at,
             signed_at: competition.signed_at,
+            funding_psbt: competition.funding_psbt,
+            escrow_funds_confirmed_at: competition.escrow_funds_confirmed_at,
             funding_broadcasted_at: competition.funding_broadcasted_at,
             funding_confirmed_at: competition.funding_confirmed_at,
             funding_settled_at: competition.funding_settled_at,
@@ -603,20 +623,22 @@ impl Competition {
         let ticket_hash = hashlock::sha256(&ticket_preimage);
         let invoice_amount = self.calculate_invoice_amount();
 
+        // Create a regular invoice instead of a HODL invoice
         let invoice = ln_client
-            .add_hold_invoice(
+            .add_invoice(
                 invoice_amount,
                 expiry_secs,
-                ticket_hash.to_hex_string(Case::Lower),
+                format!("DLC Ticket for competition {}", self.id),
                 self.id,
             )
             .await
-            .map_err(Error::HoldError)?;
+            .map_err(Error::LnError)?;
 
         Ok(Ticket {
             id: Uuid::now_v7(),
             competition_id: self.id,
             entry_id: None,
+            ephemeral_pubkey: None,
             encrypted_preimage: ticket_preimage.to_lower_hex_string(), // TODO: encrypt this
             hash: ticket_hash.to_lower_hex_string(),
             payment_request: invoice.payment_request,
@@ -625,6 +647,7 @@ impl Competition {
             reserved_at: None,
             paid_at: None,
             settled_at: None,
+            escrow_transaction: None,
         })
     }
 }
@@ -644,6 +667,8 @@ pub enum CompetitionState {
     AggregateNoncesGenerated,
     PartialSignaturesCollected,
     SigningComplete,
+    /// Verify escrow transactions have confirmed at least once (default), needed to broadcast funding transaction
+    EscrowFundsConfirmed,
     FundingBroadcasted,
     /// Once funding transaction has been confirmed at least once (default)
     FundingConfirmed,
@@ -671,6 +696,7 @@ impl fmt::Display for CompetitionState {
             CompetitionState::ContractCreated => write!(f, "contract_created"),
             CompetitionState::NoncesCollected => write!(f, "nonces_collected"),
             CompetitionState::AggregateNoncesGenerated => write!(f, "aggregate_nonces_generated"),
+            CompetitionState::EscrowFundsConfirmed => write!(f, "escrow_funds_confirmed"),
             CompetitionState::PartialSignaturesCollected => {
                 write!(f, "partial_signatures_collected")
             }
@@ -708,6 +734,7 @@ impl Competition {
             funding_transaction: None,
             outcome_transaction: None,
             funding_outpoint: None,
+            funding_psbt: None,
             contract_parameters: None,
             public_nonces: None,
             aggregated_nonces: None,
@@ -717,6 +744,7 @@ impl Competition {
             signed_at: None,
             signed_contract: None,
             partial_signatures: None,
+            escrow_funds_confirmed_at: None,
             funding_broadcasted_at: None,
             funding_confirmed_at: None,
             funding_settled_at: None,
@@ -800,6 +828,10 @@ impl Competition {
         self.cancelled_at.is_some()
     }
 
+    pub fn is_escrow_funds_confirmed(&self) -> bool {
+        self.escrow_funds_confirmed_at.is_some()
+    }
+
     pub fn is_failed(&self) -> bool {
         //NOTE: may want to use to enable retry logic, check if error > n
         self.failed_at.is_some()
@@ -865,6 +897,9 @@ impl Competition {
         }
         if self.is_funding_broadcasted() {
             return CompetitionState::FundingBroadcasted;
+        }
+        if self.is_escrow_funds_confirmed() {
+            return CompetitionState::EscrowFundsConfirmed;
         }
         if self.is_signed() {
             return CompetitionState::SigningComplete;
@@ -938,8 +973,7 @@ impl<'a> TryFrom<&Row<'a>> for Competition {
                     _ => None,
                 })
             })?,
-
-            funding_transaction: row.get::<usize, Option<Value>>(14).map(|opt| {
+            funding_psbt: row.get::<usize, Option<Value>>(14).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
@@ -953,80 +987,91 @@ impl<'a> TryFrom<&Row<'a>> for Competition {
                 })
             })?,
 
-            contract_parameters: row.get::<usize, Option<Value>>(16).map(|opt| {
+            funding_transaction: row.get::<usize, Option<Value>>(16).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            public_nonces: row.get::<usize, Option<Value>>(17).map(|opt| {
+            contract_parameters: row.get::<usize, Option<Value>>(17).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            aggregated_nonces: row.get::<usize, Option<Value>>(18).map(|opt| {
+            public_nonces: row.get::<usize, Option<Value>>(18).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            partial_signatures: row.get::<usize, Option<Value>>(19).map(|opt| {
+            aggregated_nonces: row.get::<usize, Option<Value>>(19).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            signed_contract: row.get::<usize, Option<Value>>(20).map(|opt| {
+            partial_signatures: row.get::<usize, Option<Value>>(20).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            attestation: row.get::<usize, Option<Value>>(21).map(|opt| {
+            signed_contract: row.get::<usize, Option<Value>>(21).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            cancelled_at: parse_optional_timestamp(row.get::<usize, Option<String>>(22)?, 22)?,
-            contracted_at: parse_optional_timestamp(row.get::<usize, Option<String>>(23)?, 23)?,
-            signed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(24)?, 24)?,
-            funding_broadcasted_at: parse_optional_timestamp(
-                row.get::<usize, Option<String>>(25)?,
-                25,
-            )?,
-            funding_confirmed_at: parse_optional_timestamp(
+            attestation: row.get::<usize, Option<Value>>(22).map(|opt| {
+                opt.and_then(|raw| match raw {
+                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
+                    _ => None,
+                })
+            })?,
+
+            cancelled_at: parse_optional_timestamp(row.get::<usize, Option<String>>(23)?, 23)?,
+            contracted_at: parse_optional_timestamp(row.get::<usize, Option<String>>(24)?, 24)?,
+            signed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(25)?, 25)?,
+            escrow_funds_confirmed_at: parse_optional_timestamp(
                 row.get::<usize, Option<String>>(26)?,
                 26,
             )?,
-            funding_settled_at: parse_optional_timestamp(
+            funding_broadcasted_at: parse_optional_timestamp(
                 row.get::<usize, Option<String>>(27)?,
                 27,
             )?,
-            expiry_broadcasted_at: parse_optional_timestamp(
+            funding_confirmed_at: parse_optional_timestamp(
                 row.get::<usize, Option<String>>(28)?,
                 28,
             )?,
-            outcome_broadcasted_at: parse_optional_timestamp(
+            funding_settled_at: parse_optional_timestamp(
                 row.get::<usize, Option<String>>(29)?,
                 29,
             )?,
-            delta_broadcasted_at: parse_optional_timestamp(
+            expiry_broadcasted_at: parse_optional_timestamp(
                 row.get::<usize, Option<String>>(30)?,
                 30,
             )?,
-            completed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(31)?, 31)?,
-            failed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(32)?, 32)?,
+            outcome_broadcasted_at: parse_optional_timestamp(
+                row.get::<usize, Option<String>>(31)?,
+                31,
+            )?,
+            delta_broadcasted_at: parse_optional_timestamp(
+                row.get::<usize, Option<String>>(32)?,
+                32,
+            )?,
+            completed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(33)?, 33)?,
+            failed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(34)?, 34)?,
 
             errors: row
-                .get::<usize, Option<Value>>(33)
+                .get::<usize, Option<Value>>(35)
                 .map(|opt| {
                     opt.and_then(|raw| match raw {
                         Value::Blob(val) => {
@@ -1046,11 +1091,13 @@ impl<'a> TryFrom<&Row<'a>> for Competition {
 pub enum CompetitionError {
     #[error("Failed to create transaction: {0}")]
     FailedCreateTransaction(String),
+    #[error("Failed to check escrow transaction: {0}")]
+    FailedEscrowConfirmation(String),
     #[error("Failed to broadcast error: {0}")]
     FailedBroadcast(String),
-    #[error("Failed to check funding confirmation error: {0}")]
+    #[error("Failed to check funding confirmation: {0}")]
     FailedFundingConfirmation(String),
-    #[error("Failed to settled funding invoices error: {0}")]
+    #[error("Failed to settled funding invoices: {0}")]
     FailedFundingSettled(String),
     #[error("Failed to aggregate nonces: {0}")]
     FailedNonceAggregation(String),
@@ -1079,14 +1126,16 @@ impl<'a> TryFrom<&Row<'a>> for Ticket {
                     })
                 })
                 .transpose()?,
-            encrypted_preimage: row.get(3)?,
-            hash: row.get(4)?,
-            payment_request: row.get(5)?,
-            expiry: parse_timestamp_or_error(row.get::<usize, String>(6)?, 6)?,
-            reserved_by: row.get(7)?,
-            reserved_at: parse_optional_timestamp(row.get::<usize, Option<String>>(8)?, 8)?,
-            paid_at: parse_optional_timestamp(row.get::<usize, Option<String>>(9)?, 9)?,
-            settled_at: parse_optional_timestamp(row.get::<usize, Option<String>>(10)?, 10)?,
+            ephemeral_pubkey: row.get(3)?,
+            encrypted_preimage: row.get(4)?,
+            hash: row.get(5)?,
+            payment_request: row.get(6)?,
+            expiry: parse_timestamp_or_error(row.get::<usize, String>(7)?, 7)?,
+            reserved_by: row.get(8)?,
+            reserved_at: parse_optional_timestamp(row.get::<usize, Option<String>>(9)?, 9)?,
+            paid_at: parse_optional_timestamp(row.get::<usize, Option<String>>(10)?, 10)?,
+            settled_at: parse_optional_timestamp(row.get::<usize, Option<String>>(11)?, 11)?,
+            escrow_transaction: row.get::<usize, Option<String>>(12)?,
         })
     }
 }

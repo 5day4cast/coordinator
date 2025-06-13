@@ -72,7 +72,6 @@ export interface InitOutput {
   readonly __wbg_nip44methods_free: (a: number, b: number) => void;
   readonly nip44methods_encrypt: (a: number, b: number, c: number, d: number, e: number) => any;
   readonly nip44methods_decrypt: (a: number, b: number, c: number, d: number, e: number) => any;
-  readonly main: () => void;
   readonly __wbg_taprootwallet_free: (a: number, b: number) => void;
   readonly __wbg_taprootwalletbuilder_free: (a: number, b: number) => void;
   readonly taprootwalletbuilder_new: () => number;
@@ -90,6 +89,7 @@ export interface InitOutput {
   readonly taprootwallet_addContract: (a: number, b: number, c: any, d: any) => [number, number];
   readonly taprootwallet_generatePublicNonces: (a: number, b: number) => [number, number, number];
   readonly taprootwallet_signAggregateNonces: (a: number, b: any, c: number) => [number, number, number];
+  readonly main: () => void;
   readonly rustsecp256k1_v0_10_0_context_create: (a: number) => number;
   readonly rustsecp256k1_v0_10_0_context_destroy: (a: number) => void;
   readonly rustsecp256k1_v0_10_0_default_illegal_callback_fn: (a: number, b: number) => void;
@@ -102,11 +102,11 @@ export interface InitOutput {
   readonly __wbindgen_export_5: WebAssembly.Table;
   readonly __externref_table_dealloc: (a: number) => void;
   readonly __wbindgen_free: (a: number, b: number, c: number) => void;
-  readonly closure830_externref_shim: (a: number, b: number, c: any) => void;
-  readonly closure950_externref_shim: (a: number, b: number, c: any) => void;
+  readonly closure834_externref_shim: (a: number, b: number, c: any) => void;
+  readonly closure954_externref_shim: (a: number, b: number, c: any) => void;
   readonly _dyn_core__ops__function__FnMut_____Output___R_as_wasm_bindgen__closure__WasmClosure___describe__invoke__hbdecc228a9ae6e67: (a: number, b: number) => void;
-  readonly closure1316_externref_shim: (a: number, b: number, c: any) => void;
-  readonly closure1328_externref_shim: (a: number, b: number, c: any, d: any) => void;
+  readonly closure1320_externref_shim: (a: number, b: number, c: any) => void;
+  readonly closure1332_externref_shim: (a: number, b: number, c: any, d: any) => void;
   readonly __wbindgen_start: () => void;
 }
 

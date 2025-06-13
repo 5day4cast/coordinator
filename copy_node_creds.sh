@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define base paths
-DOPPLER_PATH="$HOME/.doppler/v0.4.0/data"
+DOPPLER_PATH="$HOME/.doppler/v0.4.3/data"
 TARGET_PATH="crates/server/test_data"
 CREDS_PATH="./creds"
 

@@ -13,3 +13,4 @@ duckdb_lib/
 coordinator_private_key.pem
 config/
 data/
+crates/*/src/bin/settings.toml

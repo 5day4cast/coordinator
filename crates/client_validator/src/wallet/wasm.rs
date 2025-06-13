@@ -183,4 +183,30 @@ impl TaprootWallet {
             JsValue::from_str(&format!("Partial signatures serialization error: {}", e))
         })
     }
+
+    #[wasm_bindgen(js_name = "signFundingPsbt")]
+    pub fn sign_funding_psbt(
+        &self,
+        funding_psbt: JsValue,
+        entry_index: u32,
+    ) -> Result<JsValue, JsValue> {
+        debug!("Received funding psbt JsValue: {:?}", funding_psbt);
+
+        let psbt: Psbt = serde_wasm_bindgen::from_value(funding_psbt).map_err(|e| {
+            JsValue::from_str(&format!("Funding psbt deserialization error: {}", e))
+        })?;
+
+        debug!("Deserialized funding psbt: {:?}", psbt);
+
+        let signed_psbt = self
+            .inner
+            .sign_funding_psbt(psbt, entry_index)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        debug!("Generated signed funding psbt: {:?}", signed_psbt);
+
+        serde_wasm_bindgen::to_value(&signed_psbt).map_err(|e| {
+            JsValue::from_str(&format!("Signed funding psbt serialization error: {}", e))
+        })
+    }
 }

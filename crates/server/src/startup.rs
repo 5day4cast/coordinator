@@ -4,8 +4,8 @@ use crate::{
     get_aggregate_nonces, get_balance, get_competitions, get_contract_parameters, get_entries,
     get_estimated_fee_rates, get_next_address, get_outputs, get_ticket_status, health,
     index_handler, login, register, request_competition_ticket, send_to_address,
-    submit_partial_signatures, submit_public_nonces, BitcoinClient, BitcoinSyncWatcher,
-    Coordinator, Ln, LnClient, OracleClient, Settings, UserStore,
+    submit_final_signatures, submit_public_nonces, BitcoinClient, BitcoinSyncWatcher, Coordinator,
+    Ln, LnClient, OracleClient, Settings, UserStore,
 };
 use anyhow::anyhow;
 use axum::{
@@ -181,7 +181,10 @@ pub async fn build_app(
         competition_store,
         bitcoin_client.clone(),
         ln.clone(),
-        config.coordinator_settings.relative_locktime_block_delta,
+        config
+            .coordinator_settings
+            .relative_locktime_block_delta
+            .into(),
         config.coordinator_settings.required_confirmations,
     )
     .await
@@ -341,8 +344,8 @@ pub fn app(
             get(get_aggregate_nonces),
         )
         .route(
-            "/api/v1/competitions/{competition_id}/entries/{entry_id}/partial_signatures",
-            post(submit_partial_signatures),
+            "/api/v1/competitions/{competition_id}/entries/{entry_id}/final_signatures",
+            post(submit_final_signatures),
         )
         .route("/api/v1/entries", post(add_event_entry))
         .route("/api/v1/entries", get(get_entries))

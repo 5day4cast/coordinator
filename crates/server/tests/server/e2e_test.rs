@@ -1,18 +1,22 @@
 use anyhow::Result;
-use dlctix::{attestation_secret, bitcoin::Amount};
+use dlctix::{
+    attestation_secret,
+    bitcoin::{Amount, PublicKey},
+};
 use log::{debug, info};
 use nostr_sdk::ToBech32;
 use reqwest_middleware::ClientWithMiddleware;
 use server::{
     build_reqwest_client, create_folder,
     domain::{CompetitionState, DBConnection, InvoiceWatcher, PayoutInfo, TicketStatus},
-    Bitcoin, BitcoinClient, CompetitionStore, Coordinator, Ln, LnClient, LnSettings, Oracle,
-    OracleEvent,
+    Bitcoin, BitcoinClient, CompetitionStore, Coordinator, FinalSignatures, Ln, LnClient,
+    LnSettings, Oracle, OracleEvent,
 };
 use std::{
     collections::HashMap,
     fs,
     path::Path,
+    str::FromStr,
     sync::{Arc, Mutex, Once},
     time::Duration,
 };
@@ -215,11 +219,14 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
     for (i, user_ln_client) in user_ln_clients.iter().enumerate() {
         let nostr_client = create_test_nostr_client().await;
         let wallet = create_test_wallet(&nostr_client).await;
+        let btc_pubkey = wallet.get_dlc_public_key(i as u32).await.unwrap();
+        let btc_pubkey = PublicKey::from_str(&btc_pubkey).unwrap();
         let nostr_pubkey = nostr_client.get_public_key().await?;
         let nostr_bech32 = nostr_pubkey.to_bech32()?;
         debug!("requesting ticket");
+
         let ticket_response = coordinator
-            .request_ticket(nostr_bech32.clone(), competition.id)
+            .request_ticket(nostr_bech32.clone(), competition.id, btc_pubkey)
             .await?;
         debug!("ticket: {:?}", ticket_response);
         // Actually pay the invoice using the user's lightning node
@@ -244,7 +251,7 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
                 )
                 .await?;
             debug!("invoice_status: {:?}", invoice_status);
-            if invoice_status == TicketStatus::Paid {
+            if invoice_status == TicketStatus::Settled {
                 payment_confirmed = true;
                 break;
             }
@@ -347,19 +354,52 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
         let entry_index = participant_entry_indices[&participant.nostr_pubkey];
         let entry = participants_entries.get(&participant.nostr_pubkey).unwrap();
 
-        let partial_sigs = participant
+        let partial_signatures = participant
             .wallet
             .sign_aggregate_nonces(agg_nonces.clone(), entry_index)?;
 
+        let funding_psbt = participant
+            .wallet
+            .sign_funding_psbt(competition.funding_psbt.clone().unwrap(), entry_index)?;
+
         coordinator
-            .submit_partial_signatures(
+            .submit_final_signatures(
                 participant.nostr_pubkey.clone(),
                 competition.id,
                 entry.id,
-                partial_sigs,
+                FinalSignatures {
+                    partial_signatures,
+                    funding_psbt,
+                },
             )
             .await?;
     }
+
+    // Sign dlc contract
+    coordinator.competition_handler().await?;
+
+    let competition = coordinator.get_competition(create_event.id).await?;
+    assert_eq!(competition.get_state(), CompetitionState::SigningComplete);
+    assert!(competition.signed_contract.is_some());
+    assert!(competition.signed_at.is_some());
+
+    // Wait for the competition state to change to EscrowFundsConfirmed
+    let mut escrow_confirmed = false;
+    for _ in 0..30 {
+        coordinator.competition_handler().await?;
+        let competition = coordinator.get_competition(create_event.id).await?;
+        debug!("Competition state: {:?}", competition.get_state());
+        if competition.get_state() == CompetitionState::EscrowFundsConfirmed {
+            escrow_confirmed = true;
+            assert!(competition.escrow_funds_confirmed_at.is_some());
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(
+        escrow_confirmed,
+        "Competition state did not change to EscrowFundsConfirmed within 30 seconds"
+    );
 
     // Broadcast funding transaction
     coordinator.competition_handler().await?;
@@ -369,8 +409,7 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
         competition.get_state(),
         CompetitionState::FundingBroadcasted
     );
-    assert!(competition.signed_contract.is_some());
-    assert!(competition.signed_at.is_some());
+    assert!(competition.funding_broadcasted_at.is_some());
 
     // Wait for automatic block generation on mutinynet to confirm transaction
     let funding_txid = competition

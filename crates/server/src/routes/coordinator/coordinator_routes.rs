@@ -1,20 +1,26 @@
+use axum::http::StatusCode;
 use axum::{
     extract::{Path, Query, State},
     response::ErrorResponse,
     Json,
 };
+use bdk_wallet::bitcoin::PublicKey;
+use dlctix::bitcoin::Psbt;
 use dlctix::{
     musig2::{AggNonce, PartialSignature, PubNonce},
     SigMap,
 };
-use hyper::StatusCode;
 use log::{debug, error};
-use serde::Serialize;
+use serde::Deserialize;
+use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{
-    domain::{AddEntry, Competition, CreateEvent, FundedContract, PayoutInfo, TicketStatus},
+    domain::{
+        AddEntry, Competition, CreateEvent, FundedContract, PayoutInfo, TicketResponse,
+        TicketStatus,
+    },
     nostr_extractor::NostrAuth,
     AppState, SearchBy, UserEntry,
 };
@@ -35,20 +41,54 @@ pub async fn create_event(
         })
 }
 
-#[derive(Debug, Serialize)]
-pub struct TicketResponse {
-    pub ticket_id: Uuid,
-    pub payment_request: String, // Lightning HODL invoice
+/// Request to settle a ticket using the escrow preimage
+#[derive(Debug, Deserialize)]
+pub struct SettleEscrowRequest {
+    pub ticket_id: Uuid,   // The ID of the ticket to settle
+    pub preimage: String,  // The preimage that unlocks both the HODL invoice and escrow
+    pub escrow_tx: String, // The escrow transaction hex for verification
 }
 
+/// Request to obtain a ticket, including the user's Bitcoin public key
+/// needed for the escrow transaction refund path
+#[derive(Debug, Deserialize)]
+pub struct TicketRequest {
+    pub btc_pubkey: String, // Bitcoin public key for escrow refund path
+}
+
+/// Request a competition ticket to enter the DLC
+///
+/// This endpoint:
+/// 1. Generates a HODL invoice for the user to pay
+/// 2. Creates an escrow transaction with dual-purpose
+/// 3. Returns both to the user
+///
+/// The refund transaction:
+/// 1. Is fully signed by the coordinator and ready to broadcast
+/// 2. Spends from coordinator UTXOs directly to the user's address
+/// 3. Becomes invalid when the DLC funding transaction is broadcast
+///    - This happens because the funding transaction spends the same UTXOs
+///    - Creates an elegant invalidation mechanism with no additional signatures needed
+///    - Provides security if the coordinator disappears or DLC never forms
+///
+/// The same preimage is used for multiple purposes:
+/// - The HODL invoice (revealed to user when coordinator settles the invoice)
+/// - The ticket secret (to claim winnings if user wins the DLC)
+/// - The escrow transaction refund path (to claim refund if needed)
 pub async fn request_competition_ticket(
     NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
     Path(competition_id): Path<Uuid>,
+    Json(request): Json<TicketRequest>,
 ) -> Result<Json<TicketResponse>, ErrorResponse> {
+    let btc_pubkey = PublicKey::from_str(&request.btc_pubkey).map_err(|e| {
+        error!("Invalid Bitcoin public key: {:?}", e);
+        ErrorResponse::from(StatusCode::BAD_REQUEST)
+    })?;
+
     state
         .coordinator
-        .request_ticket(pubkey.to_hex(), competition_id)
+        .request_ticket(pubkey.to_hex(), competition_id, btc_pubkey)
         .await
         .map(Json)
         .map_err(|e| {
@@ -208,18 +248,27 @@ pub async fn get_aggregate_nonces(
         })
 }
 
-pub async fn submit_partial_signatures(
+#[derive(Debug, Clone, Deserialize)]
+pub struct FinalSignatures {
+    pub funding_psbt: Psbt,
+    pub partial_signatures: SigMap<PartialSignature>,
+}
+
+pub async fn submit_final_signatures(
     NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
     Path((competition_id, entry_id)): Path<(Uuid, Uuid)>,
-    Json(partial_sigs): Json<SigMap<PartialSignature>>,
+    Json(final_signatures): Json<FinalSignatures>,
 ) -> Result<StatusCode, ErrorResponse> {
     let pubkey = pubkey.to_hex();
-    debug!("submitted partial_sigs by: {} {:?}", pubkey, partial_sigs);
+    debug!(
+        "submitted final signatures by: {} {:?}",
+        pubkey, final_signatures
+    );
 
     state
         .coordinator
-        .submit_partial_signatures(pubkey, competition_id, entry_id, partial_sigs)
+        .submit_final_signatures(pubkey, competition_id, entry_id, final_signatures)
         .await
         .map(|_| StatusCode::OK)
         .map_err(|e| {
