@@ -18,7 +18,7 @@ use mockall::mock;
 use secrecy::ExposeSecret;
 use server::{
     domain::{generate_ranking_permutations, AddEntry, CreateEvent},
-    get_key, AddEventEntry, Bitcoin, ForeignUtxo, Ln, Oracle, OracleError as Error, OracleEvent,
+    get_key, AddEventEntries, Bitcoin, ForeignUtxo, Ln, Oracle, OracleError as Error, OracleEvent,
     ValueOptions, WeatherChoices,
 };
 use std::collections::HashMap;
@@ -31,7 +31,7 @@ mock! {
     #[async_trait]
     impl Oracle for OracleClient {
         async fn create_event(&self, event: CreateEvent) -> Result<OracleEvent, Error>;
-        async fn submit_entry(&self, entry: AddEventEntry) -> Result<(), Error>;
+        async fn submit_entries(&self, event_entries: AddEventEntries) -> Result<(), Error>;
         async fn get_event(&self, event_id: &Uuid) -> Result<OracleEvent, Error>;
     }
 }

@@ -351,7 +351,7 @@ impl Ln for LnClient {
 
         let response = self
             .client
-            .post(format!("{}v2/invoices/hodl/cancel", self.base_url))
+            .post(format!("{}v2/invoices/cancel", self.base_url))
             .json(&body)
             .header(MACAROON_HEADER, self.macaroon.expose_secret())
             .send()

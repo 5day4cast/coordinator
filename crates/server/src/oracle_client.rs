@@ -59,6 +59,13 @@ pub struct OracleClient {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddEventEntries {
+    /// Client needs to provide a valid Uuidv7
+    pub event_id: Uuid,
+    pub entries: Vec<AddEventEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddEventEntry {
     /// Client needs to provide a valid Uuidv7
     pub id: Uuid,
@@ -144,7 +151,7 @@ fn secp256k1_to_nostr_keys(secp_key: &Secp256k1SecretKey) -> Result<Keys, &'stat
 pub trait Oracle: Send + Sync {
     async fn create_event(&self, event: CreateEvent) -> Result<Event, Error>;
     async fn get_event(&self, event_id: &Uuid) -> Result<Event, Error>;
-    async fn submit_entry(&self, entry: AddEventEntry) -> Result<(), Error>;
+    async fn submit_entries(&self, event_entries: AddEventEntries) -> Result<(), Error>;
 }
 
 impl OracleClient {
@@ -294,14 +301,17 @@ impl Oracle for OracleClient {
         .await
     }
 
-    async fn submit_entry(&self, entry: AddEventEntry) -> Result<(), Error> {
+    async fn submit_entries(&self, event_entries: AddEventEntries) -> Result<(), Error> {
         let url = self
             .base_url
-            .join(&format!("/oracle/events/{}/entry", entry.id))
+            .join(&format!(
+                "/oracle/events/{}/entries",
+                event_entries.event_id
+            ))
             .map_err(|e| Error::Request(e.to_string()))?;
 
-        let body = serde_json::to_vec(&entry)
-            .map_err(|e| Error::Request(format!("Failed to serialize entry: {}", e)))?;
+        let body = serde_json::to_vec(&event_entries)
+            .map_err(|e| Error::Request(format!("Failed to serialize entries: {}", e)))?;
 
         self.send_authenticated_request_ignore_body(
             Method::POST,

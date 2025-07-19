@@ -8,7 +8,7 @@ use crate::{
     escrow::create_escrow_descriptor,
     generate_escrow_tx, get_escrow_outpoint,
     oracle_client::{Event, Oracle},
-    FinalSignatures, ForeignUtxo, Ln, OracleError,
+    AddEventEntries, AddEventEntry, FinalSignatures, ForeignUtxo, Ln, OracleError,
 };
 use anyhow::anyhow;
 use bdk_wallet::{
@@ -37,6 +37,7 @@ use dlctix::{
     ContractParameters, NonceSharingRound, Outcome, PayoutWeights, Player, PlayerIndex, SigMap,
     SigningSession, TicketedDLC, WinCondition,
 };
+use duckdb::arrow::datatypes::ArrowNativeType;
 use futures::TryFutureExt;
 use itertools::Itertools;
 use log::{debug, error, info};
@@ -159,21 +160,6 @@ impl Coordinator {
         self.competition_store.ping().await.map_err(Error::DbError)
     }
 
-    /*
-    competition events
-    1) users creating entries and pays a hodl invoice which settles immediately with providing them a escrow transaction broadcasted before settling
-    (user has fully paid here)
-    2) create competition contract (have all users enter and pay) -- loop checking for user entries matching total or time window exhausted and competition is cancelled (allow users to reclaim escrow transactions)
-    3) wait for all entry nonces then generate aggregate nonces for competition musig session (cancel if not completed within window)
-    4) wait for all entry partial signatures for competition musig (cancel if not completed within window)
-        - sign contract with all signatures
-        - sign escrow transactions from all users
-        - broadcast funding transaction using escrow transactions as inputs
-    5) competition running (in time window for when observation runs)
-    6) competition window closed (observation window done, waiting for data to be finalized) -- loop checking for oracle attestation
-    7) competition results finalized/signed by oracle
-    */
-
     pub async fn competition_handler(&self) -> Result<(), anyhow::Error> {
         let competitions: Vec<Competition> = self.competition_store.get_competitions(true).await?;
         let mut updated_competitions: Vec<Competition> = vec![];
@@ -207,18 +193,70 @@ impl Coordinator {
                 competition.get_state(),
                 competition
             );
+            debug!(
+                "Competition {} {:?}",
+                competition.id,
+                competition.get_state(),
+            );
             match competition.get_state() {
                 CompetitionState::Created => {
                     debug!(
-                        "competition {}, waiting for more entries: {}/{}",
+                        "Competition {}, waiting for more entries: {}/{}",
                         competition.id,
                         competition.total_entries,
-                        competition.total_allowed_entries
+                        competition.event_submission.total_allowed_entries
                     );
                     continue;
                 }
-                //Here total entries have been paid and settled with all escrow transactions broadcasted
                 CompetitionState::EntriesCollected => {
+                    match self.check_escrow_confirmations(&mut competition).await {
+                        Ok(updated) => updated_competitions.push(updated.clone()),
+                        Err(e) => {
+                            error!(
+                                "competition {} failed to check escrow funds: {}",
+                                competition.id, e
+                            );
+                            competition
+                                .errors
+                                .push(CompetitionError::FailedEscrowConfirmation(e.to_string()));
+                            competition.failed_at = Some(OffsetDateTime::now_utc());
+                            updated_competitions.push(competition.clone());
+                        }
+                    }
+                }
+                CompetitionState::EscrowFundsConfirmed => {
+                    match self.submit_event_to_oracle(&mut competition).await {
+                        Ok(updated) => updated_competitions.push(updated.clone()),
+                        Err(e) => {
+                            error!(
+                                "Competition {} failed to submit entries to oracle: {}",
+                                competition.id, e
+                            );
+                            competition
+                                .errors
+                                .push(CompetitionError::FailedSubmitEntries(e.to_string()));
+                            competition.failed_at = Some(OffsetDateTime::now_utc());
+                            updated_competitions.push(competition.clone());
+                        }
+                    }
+                }
+                CompetitionState::EventCreated => {
+                    match self.submit_entries_to_oracle(&mut competition).await {
+                        Ok(updated) => updated_competitions.push(updated.clone()),
+                        Err(e) => {
+                            error!(
+                                "Competition {} failed to submit entries to oracle: {}",
+                                competition.id, e
+                            );
+                            competition
+                                .errors
+                                .push(CompetitionError::FailedSubmitEntries(e.to_string()));
+                            competition.failed_at = Some(OffsetDateTime::now_utc());
+                            updated_competitions.push(competition.clone());
+                        }
+                    };
+                }
+                CompetitionState::EntriesSubmitted => {
                     match self.create_funding_psbt(&mut competition).await {
                         Ok(updated) => updated_competitions.push(updated.clone()),
                         Err(e) => {
@@ -270,22 +308,6 @@ impl Coordinator {
                     }
                 }
                 CompetitionState::SigningComplete => {
-                    match self.check_escrow_confirmations(&mut competition).await {
-                        Ok(updated) => updated_competitions.push(updated.clone()),
-                        Err(e) => {
-                            error!(
-                                "competition {} failed to check escrow funds: {}",
-                                competition.id, e
-                            );
-                            competition
-                                .errors
-                                .push(CompetitionError::FailedEscrowConfirmation(e.to_string()));
-                            competition.failed_at = Some(OffsetDateTime::now_utc());
-                            updated_competitions.push(competition.clone());
-                        }
-                    }
-                }
-                CompetitionState::EscrowFundsConfirmed => {
                     match self.sign_and_broadcast_funding_tx(&mut competition).await {
                         Ok(updated) => updated_competitions.push(updated.clone()),
                         Err(e) => {
@@ -400,7 +422,7 @@ impl Coordinator {
         }
 
         if !updated_competitions.is_empty() {
-            info!("updating contract");
+            info!("Updating competitions: {}", updated_competitions.len());
 
             self.competition_store
                 .update_competitions(updated_competitions)
@@ -410,11 +432,174 @@ impl Coordinator {
         Ok(())
     }
 
+    async fn check_escrow_confirmations<'a>(
+        &self,
+        competition: &'a mut Competition,
+    ) -> Result<&'a mut Competition, anyhow::Error> {
+        let tickets = self.competition_store.get_tickets(competition.id).await?;
+
+        let mut all_confirmed = true;
+        let mut pending_txids = Vec::new();
+
+        for (_, ticket) in tickets {
+            if let Some(escrow_tx_hex) = &ticket.escrow_transaction {
+                let bytes = hex::decode(escrow_tx_hex)
+                    .map_err(|e| anyhow!("Failed to decode escrow transaction: {}", e))?;
+                let escrow_tx: Transaction = deserialize(&bytes)
+                    .map_err(|e| anyhow!("Failed to deserialize escrow transaction: {}", e))?;
+
+                let txid = escrow_tx.compute_txid();
+
+                // Check if transaction has required confirmations
+                match self.bitcoin.get_tx_confirmation_height(&txid).await? {
+                    Some(confirmations) if confirmations >= self.required_confirmations => {
+                        debug!(
+                            "Escrow transaction {} has {} confirmations for ticket {}",
+                            txid, confirmations, ticket.id
+                        );
+                    }
+                    Some(confirmations) => {
+                        debug!(
+                                "Escrow transaction {} has {} of {} required confirmations for ticket {}",
+                                txid, confirmations, self.required_confirmations, ticket.id
+                            );
+                        all_confirmed = false;
+                        pending_txids.push(txid);
+                    }
+                    None => {
+                        debug!(
+                            "Escrow transaction {} not found on-chain for ticket {}",
+                            txid, ticket.id
+                        );
+                        all_confirmed = false;
+                        pending_txids.push(txid);
+                    }
+                }
+            }
+        }
+
+        if all_confirmed {
+            competition.escrow_funds_confirmed_at = Some(OffsetDateTime::now_utc());
+            debug!("All escrow funds confirmed");
+        } else {
+            debug!(
+                "Competition {} waiting for {} escrow transactions to confirm",
+                competition.id,
+                pending_txids.len()
+            );
+        }
+
+        Ok(competition)
+    }
+
+    async fn submit_event_to_oracle<'a>(
+        &self,
+        competition: &'a mut Competition,
+    ) -> Result<&'a mut Competition, anyhow::Error> {
+        let event: Event = match self
+            .oracle_client
+            .create_event(competition.event_submission.clone())
+            .await
+        {
+            Ok(event) => Ok(event),
+            Err(OracleError::NotFound(e)) => Err(Error::NotFound(e)),
+            Err(OracleError::BadRequest(e)) => Err(Error::BadRequest(e)),
+            Err(e) => Err(Error::OracleFailed(e)),
+        }?;
+        debug!(
+            "Created competition's {} oracle event: {:?}",
+            competition.id, event
+        );
+
+        competition.event_announcement = Some(event.event_announcement);
+        competition.event_created_at = Some(OffsetDateTime::now_utc());
+
+        Ok(competition)
+    }
+
+    async fn submit_entries_to_oracle<'a>(
+        &self,
+        competition: &'a mut Competition,
+    ) -> Result<&'a mut Competition, anyhow::Error> {
+        let entries = self
+            .competition_store
+            .get_competition_entries(competition.id, vec![EntryStatus::Paid])
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to get entries for competition {}: {}",
+                    competition.id,
+                    e
+                )
+            })?;
+
+        if entries.is_empty() {
+            return Err(anyhow!(
+                "No paid entries found for competition {}",
+                competition.id
+            ));
+        }
+
+        let mut oracle_entries: Vec<AddEventEntry> = Vec::new();
+        for entry in entries {
+            oracle_entries.push(entry.entry_submission);
+        }
+
+        if oracle_entries.is_empty() {
+            return Err(anyhow!(
+                "No valid entry submissions found for competition {}",
+                competition.id,
+            ));
+        }
+
+        if oracle_entries.len() != competition.event_submission.total_allowed_entries {
+            return Err(anyhow!(
+                "Entry submissions {} do not match the total allowed entries {} for competition {}",
+                oracle_entries.len(),
+                competition.event_submission.total_allowed_entries,
+                competition.id,
+            ));
+        }
+
+        info!(
+            "Submitting {} entries to oracle for competition {}",
+            oracle_entries.len(),
+            competition.id,
+        );
+
+        let event_entries = AddEventEntries {
+            event_id: competition.id,
+            entries: oracle_entries,
+        };
+
+        self.oracle_client
+            .submit_entries(event_entries)
+            .await
+            .map_err(|e| anyhow!("Failed to submit entries to oracle: {:?}", e))?;
+
+        competition.entries_submitted_at = Some(OffsetDateTime::now_utc());
+
+        info!(
+            "Successfully submitted entries to oracle for competition {}",
+            competition.id
+        );
+
+        Ok(competition)
+    }
+
     pub async fn create_funding_psbt<'a>(
         &self,
         competition: &'a mut Competition,
     ) -> Result<&'a mut Competition, anyhow::Error> {
         debug!("Creating transactions for competition: {}", competition.id);
+
+        let Some(event_announcement) = competition.event_announcement.clone() else {
+            return Err(anyhow!(
+                "Event announcement not found for competition {}",
+                competition.id
+            ));
+        };
+
         let mut entries = self
             .competition_store
             .get_competition_entries(competition.id, vec![EntryStatus::Paid])
@@ -438,7 +623,7 @@ impl Coordinator {
             debug!("Outcome {:?}: weights={:?}", outcome, weights);
         }
 
-        let contract_amount_sats = competition.total_competition_pool;
+        let contract_amount_sats = competition.event_submission.total_competition_pool;
         let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
         info!("Fee rates: {:?}", fee_rates);
 
@@ -456,10 +641,10 @@ impl Coordinator {
                 pubkey: Point::from(self.public_key),
             },
             players,
-            event: competition.event_announcement.clone(),
+            event: event_announcement.clone(),
             outcome_payouts,
             fee_rate,
-            funding_value: Amount::from_sat(contract_amount_sats),
+            funding_value: Amount::from_sat(contract_amount_sats as u64),
             relative_locktime_block_delta: self.relative_locktime_block_delta as u16,
         };
         competition.contract_parameters = Some(contract_params.clone());
@@ -488,8 +673,10 @@ impl Coordinator {
                 let transaction: Transaction = deserialize(&bytes)
                     .map_err(|e| anyhow!("Failed to deserialize escrow transaction: {}", e))?;
                 debug!("Escrow transaction: {:?}", transaction);
-                let outpoint =
-                    get_escrow_outpoint(&transaction, Amount::from_sat(competition.entry_fee))?;
+                let outpoint = get_escrow_outpoint(
+                    &transaction,
+                    Amount::from_sat(competition.event_submission.entry_fee as u64),
+                )?;
 
                 let escrow_output = transaction
                     .output
@@ -567,7 +754,7 @@ impl Coordinator {
             .bitcoin
             .build_psbt(
                 funding_script,
-                Amount::from_sat(contract_amount_sats),
+                Amount::from_sat(contract_amount_sats as u64),
                 fee_rate,
                 vec![],
                 escrow_inputs,
@@ -585,12 +772,8 @@ impl Coordinator {
 
         competition.funding_psbt = Some(psbt);
         competition.funding_outpoint = Some(funding_outpoint);
-        // at this point time to perform musig with the players
-        // this needs to be done in an async manner and a background thread waiting for users to sign
-        // some thought will need to be done on the best way to do this for the least amount of user interaction
-        // even after musig is signed, users then need to additionally pay the coordinator to get the secret allowing them to claim their winnings (maybe after competition completes?)
-        // Note: word of warning, the ticketed_dlc may be very large in memory depending on the contract params
 
+        // Note: word of warning, the ticketed_dlc may be very large in memory depending on the contract params
         let ticketed_dlc = TicketedDLC::new(contract_params, funding_outpoint)?;
         debug!("Built ticketed dlc");
 
@@ -738,66 +921,6 @@ impl Coordinator {
 
         competition.signed_contract = Some(signed_contract);
         competition.signed_at = Some(OffsetDateTime::now_utc());
-
-        Ok(competition)
-    }
-
-    async fn check_escrow_confirmations<'a>(
-        &self,
-        competition: &'a mut Competition,
-    ) -> Result<&'a mut Competition, anyhow::Error> {
-        let tickets = self.competition_store.get_tickets(competition.id).await?;
-
-        let mut all_confirmed = true;
-        let mut pending_txids = Vec::new();
-
-        for (_, ticket) in tickets {
-            if let Some(escrow_tx_hex) = &ticket.escrow_transaction {
-                let bytes = hex::decode(escrow_tx_hex)
-                    .map_err(|e| anyhow!("Failed to decode escrow transaction: {}", e))?;
-                let escrow_tx: Transaction = deserialize(&bytes)
-                    .map_err(|e| anyhow!("Failed to deserialize escrow transaction: {}", e))?;
-
-                let txid = escrow_tx.compute_txid();
-
-                // Check if transaction has required confirmations
-                match self.bitcoin.get_tx_confirmation_height(&txid).await? {
-                    Some(confirmations) if confirmations >= self.required_confirmations => {
-                        debug!(
-                            "Escrow transaction {} has {} confirmations for ticket {}",
-                            txid, confirmations, ticket.id
-                        );
-                    }
-                    Some(confirmations) => {
-                        debug!(
-                                "Escrow transaction {} has {} of {} required confirmations for ticket {}",
-                                txid, confirmations, self.required_confirmations, ticket.id
-                            );
-                        all_confirmed = false;
-                        pending_txids.push(txid);
-                    }
-                    None => {
-                        debug!(
-                            "Escrow transaction {} not found on-chain for ticket {}",
-                            txid, ticket.id
-                        );
-                        all_confirmed = false;
-                        pending_txids.push(txid);
-                    }
-                }
-            }
-        }
-
-        if all_confirmed {
-            competition.escrow_funds_confirmed_at = Some(OffsetDateTime::now_utc());
-            debug!("All escrow funds confirmed");
-        } else {
-            debug!(
-                "Competition {} waiting for {} escrow transactions to confirm",
-                competition.id,
-                pending_txids.len()
-            );
-        }
 
         Ok(competition)
     }
@@ -955,7 +1078,14 @@ impl Coordinator {
             ));
         };
 
-        if let Some(expiry) = competition.event_announcement.expiry {
+        let Some(event_announcement) = competition.event_announcement.as_ref() else {
+            return Err(anyhow!(
+                "No event announcement found for competition {}",
+                competition.id
+            ));
+        };
+
+        if let Some(expiry) = event_announcement.expiry {
             let current_time = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs() as u32;
@@ -973,8 +1103,11 @@ impl Coordinator {
                     "Broadcasting expiry transaction: {:?}",
                     expiry_tx.compute_txid()
                 );
-                self.bitcoin.broadcast(&expiry_tx).await?;
-                competition.expiry_broadcasted_at = Some(OffsetDateTime::now_utc());
+
+                if competition.expiry_broadcasted_at.is_none() {
+                    self.bitcoin.broadcast(&expiry_tx).await?;
+                    competition.expiry_broadcasted_at = Some(OffsetDateTime::now_utc())
+                };
 
                 return Ok(competition);
             }
@@ -987,11 +1120,15 @@ impl Coordinator {
             Outcome::Expiry => return Err(anyhow!("Unexpected expiry outcome")),
         };
 
-        if !competition.event_announcement.is_valid_outcome(&outcome) {
+        if !event_announcement.is_valid_outcome(&outcome) {
             return Err(anyhow!("Invalid outcome for this contract"));
         }
 
-        let outcome_tx = signed_contract.signed_outcome_tx(outcome_index, attestation)?;
+        let outcome_tx = if let Some(outcome_tx) = competition.outcome_transaction.clone() {
+            outcome_tx
+        } else {
+            signed_contract.signed_outcome_tx(outcome_index, attestation)?
+        };
 
         debug!(
             "Broadcasting outcome transaction: txid={:?}, witness={:?}",
@@ -1003,8 +1140,10 @@ impl Coordinator {
                 .collect::<Vec<_>>()
         );
         competition.outcome_transaction = Some(outcome_tx.clone());
-        self.bitcoin.broadcast(&outcome_tx).await?;
-        competition.outcome_broadcasted_at = Some(OffsetDateTime::now_utc());
+        if competition.outcome_broadcasted_at.is_none() {
+            self.bitcoin.broadcast(&outcome_tx).await?;
+            competition.outcome_broadcasted_at = Some(OffsetDateTime::now_utc());
+        }
 
         Ok(competition)
     }
@@ -1456,24 +1595,11 @@ impl Coordinator {
             .map_err(|e| anyhow!("failed to add coordinator metadata: {}", e))
     }
 
-    // Be careful with these two operations, there's a possibility here of a
-    // competition being added to the oracle but never saved to our local DB (low, but possible)
     pub async fn create_competition(
         &self,
         create_event: CreateEvent,
     ) -> Result<Competition, Error> {
-        let oracle_event: Event = match self
-            .oracle_client
-            .create_event(create_event.clone().into())
-            .await
-        {
-            Ok(event) => Ok(event),
-            Err(OracleError::NotFound(e)) => Err(Error::NotFound(e)),
-            Err(OracleError::BadRequest(e)) => Err(Error::BadRequest(e)),
-            Err(e) => Err(Error::OracleFailed(e)),
-        }?;
-
-        let competition = Competition::new(&create_event, &oracle_event);
+        let competition = Competition::new(&create_event);
         debug!("created competition");
         let tickets = competition
             .generate_competition_tickets(create_event.total_allowed_entries, &self.ln)
@@ -1514,7 +1640,9 @@ impl Coordinator {
             .competition_store
             .get_competition(competition_id)
             .await?;
-        if competition.total_entries >= competition.total_allowed_entries {
+        if competition.total_entries.as_usize()
+            >= competition.event_submission.total_allowed_entries
+        {
             return Err(Error::CompetitionFull);
         }
         debug!("got competition: {:?}", competition);
@@ -1543,7 +1671,7 @@ impl Coordinator {
             ticket.id,
             btc_pubkey,
             payment_hash,
-            competition.entry_fee as u64,
+            competition.event_submission.entry_fee as u64,
         )
         .await
         .map_err(|e| {
@@ -1566,7 +1694,7 @@ impl Coordinator {
         let invoice = self
             .ln
             .add_hold_invoice(
-                competition.entry_fee as u64,
+                competition.event_submission.entry_fee as u64,
                 300, // 5 minute timeout
                 hex::encode(payment_hash),
                 competition.id,
@@ -1667,16 +1795,30 @@ impl Coordinator {
         Ok(())
     }
 
-    // Be-careful with these two operations, there's a possibility here of an
-    // entry being added to the oracle but never saved to our local DB (low, but possible)
     pub async fn add_entry(&self, pubkey: String, entry: AddEntry) -> Result<UserEntry, Error> {
+        let competition = self
+            .competition_store
+            .get_competition(entry.event_id)
+            .await
+            .map_err(|e| {
+                error!("error {:?}", e);
+                match e {
+                    duckdb::Error::QueryReturnedNoRows => {
+                        Error::BadRequest("Competition not found".into())
+                    }
+                    e => Error::DbError(e),
+                }
+            })?;
+
+        validate_entry(entry.clone().into(), competition).await?;
+
         debug!("entry: {:?}", entry);
         let ticket = self
             .competition_store
             .get_ticket(entry.ticket_id)
             .await
             .map_err(|e| {
-                debug!("er {:?}", e);
+                error!("error {:?}", e);
                 match e {
                     duckdb::Error::QueryReturnedNoRows => {
                         Error::BadRequest("Ticket not found".into())
@@ -1705,14 +1847,6 @@ impl Coordinator {
                 )));
             }
         }
-
-        // Submit entry to oracle
-        match self.oracle_client.submit_entry(entry.clone().into()).await {
-            Ok(_) => Ok(()),
-            Err(OracleError::NotFound(e)) => Err(Error::NotFound(e)),
-            Err(OracleError::BadRequest(e)) => Err(Error::BadRequest(e)),
-            Err(e) => Err(Error::OracleFailed(e)),
-        }?;
 
         let user_entry = self
             .competition_store
@@ -2163,8 +2297,10 @@ fn generate_payouts(
     entries.sort_by_key(|entry| entry.id);
     let mut payouts: BTreeMap<Outcome, PayoutWeights> = BTreeMap::new();
 
-    let possible_rankings =
-        generate_ranking_permutations(entries.len(), competition.number_of_places_win);
+    let possible_rankings = generate_ranking_permutations(
+        entries.len(),
+        competition.event_submission.number_of_places_win,
+    );
     debug!("Generated {} possible rankings", possible_rankings.len());
 
     for (outcome_index, winner_indices) in possible_rankings.iter().enumerate() {
@@ -2179,14 +2315,15 @@ fn generate_payouts(
         let player_indices = find_player_indices(players, entry_pubkeys)?;
         debug!("Mapped to player indices: {:?}", player_indices);
 
-        if player_indices.len() != competition.number_of_places_win {
+        if player_indices.len() != competition.event_submission.number_of_places_win {
             return Err(anyhow!(
                 "Incorrect number of winners for outcome {}",
                 outcome_index
             ));
         }
 
-        let percentage_weights = get_percentage_weights(competition.number_of_places_win);
+        let percentage_weights =
+            get_percentage_weights(competition.event_submission.number_of_places_win);
         let mut payout_weights: BTreeMap<PlayerIndex, u64> = BTreeMap::new();
 
         for (rank, &player_index) in player_indices.iter().enumerate() {
@@ -2411,4 +2548,50 @@ fn create_deterministic_rng(funding_outpoint: &OutPoint, private_key: Scalar) ->
     let hash = sha256::Hash::from_engine(hasher);
     let seed: [u8; 32] = hash.to_byte_array();
     ChaCha20Rng::from_seed(seed)
+}
+
+async fn validate_entry(entry: AddEventEntry, competition: Competition) -> Result<(), Error> {
+    if entry.id.get_version_num() != 7 {
+        return Err(Error::BadRequest(format!(
+            "Client needs to provide a valid Uuidv7 for entry id {}",
+            entry.id
+        )));
+    }
+
+    let mut choice_count = 0;
+    for weather_choice in &entry.expected_observations {
+        if weather_choice.temp_high.is_some() {
+            choice_count += 1;
+        }
+        if weather_choice.temp_low.is_some() {
+            choice_count += 1;
+        }
+        if weather_choice.wind_speed.is_some() {
+            choice_count += 1;
+        }
+
+        if choice_count > competition.event_submission.number_of_values_per_entry {
+            return Err(Error::BadRequest(format!(
+                "entry_id {0} not valid, too many value choices, max allowed {1} but got {2}",
+                entry.id, competition.event_submission.number_of_values_per_entry, choice_count
+            )));
+        }
+    }
+
+    let locations_choose: Vec<String> = entry
+        .expected_observations
+        .clone()
+        .iter()
+        .map(|weather_vals| weather_vals.stations.clone())
+        .collect();
+    let all_valid_locations = locations_choose
+        .iter()
+        .all(|choose| competition.event_submission.locations.contains(choose));
+    if !all_valid_locations {
+        return Err(Error::BadRequest(format!(
+            "entry_id {0} not valid, choose locations not in the even",
+            entry.id
+        )));
+    }
+    Ok(())
 }

@@ -46,7 +46,7 @@ pub struct TestContext {
 }
 
 impl TestContext {
-    pub async fn new_with_ln(entries: usize, client: ClientWithMiddleware) -> Result<Self> {
+    pub async fn new_with_ln(client: ClientWithMiddleware) -> Result<Self> {
         setup_static_logger();
         let test_data_folder = "./test_data";
         create_folder(test_data_folder);
@@ -109,8 +109,8 @@ impl TestContext {
         });
 
         oracle_mock
-            .expect_submit_entry()
-            .times(entries)
+            .expect_submit_entries()
+            .times(1)
             .returning(|_| Ok(()));
 
         let oracle_privkey = oracle_keys.1.clone();
@@ -192,7 +192,7 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
     let user_ln_clients = vec![alice_ln, bob_ln];
 
     // Create test context with real coordinator lightning node
-    let context = TestContext::new_with_ln(players, client).await?;
+    let context = TestContext::new_with_ln(client).await?;
 
     let coordinator = context.create_coordinator().await?;
     let cancel_token = CancellationToken::new();
@@ -484,7 +484,7 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
     let winner_ln = &user_ln_clients[0];
 
     // Create a real invoice with the expected payout amount
-    let payout_amount = competition.total_competition_pool; // Or calculate based on winner's share
+    let payout_amount = competition.event_submission.total_competition_pool as u64; // Or calculate based on winner's share
     let ln_invoice = winner_ln
         .create_invoice(
             payout_amount,

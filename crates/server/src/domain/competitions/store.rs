@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::{domain::DBConnection, FinalSignatures};
 
-use super::{run_comeptition_migrations, Competition, EntryStatus, SearchBy, Ticket, UserEntry};
+use super::{run_competition_migrations, Competition, EntryStatus, SearchBy, Ticket, UserEntry};
 
 #[derive(Clone)]
 pub struct CompetitionStore {
@@ -18,7 +18,7 @@ pub struct CompetitionStore {
 impl CompetitionStore {
     pub fn new(db_connection: DBConnection) -> Result<Self, duckdb::Error> {
         let mut conn = Connection::open(db_connection.connection_path.clone())?;
-        run_comeptition_migrations(&mut conn)?;
+        run_competition_migrations(&mut conn)?;
         Ok(Self { db_connection })
     }
 
@@ -61,6 +61,9 @@ impl CompetitionStore {
         let conn = self.db_connection.new_write_connection_retry().await?;
         info!("entry: {:?}", entry);
 
+        let entry_submission = serde_json::to_vec(&entry.entry_submission)
+            .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
+
         // Insert the entry with ticket_id
         let mut stmt = conn.prepare(
             "INSERT INTO entries (
@@ -71,8 +74,9 @@ impl CompetitionStore {
                 ephemeral_pubkey,
                 ephemeral_privatekey_encrypted,
                 payout_preimage_encrypted,
-                payout_hash
-            ) VALUES(?,?,?,?,?,?,?,?)",
+                payout_hash,
+                entry_submission
+            ) VALUES(?,?,?,?,?,?,?,?,?)",
         )?;
 
         stmt.execute(params![
@@ -83,7 +87,8 @@ impl CompetitionStore {
             entry.ephemeral_pubkey,
             entry.ephemeral_privatekey_encrypted,
             entry.payout_preimage_encrypted,
-            entry.payout_hash
+            entry.payout_hash,
+            Value::Blob(entry_submission)
         ])?;
 
         Ok(entry)
@@ -227,6 +232,7 @@ impl CompetitionStore {
         .and_select((
             "partial_signatures",
             "funding_psbt",
+            "entry_submission",
             "payout_preimage_encrypted",
             "payout_hash",
             "payout_preimage",
@@ -289,6 +295,7 @@ impl CompetitionStore {
         .and_select((
             "partial_signatures",
             "funding_psbt",
+            "entry_submission",
             "payout_preimage_encrypted",
             "payout_hash",
             "payout_preimage",
@@ -360,24 +367,18 @@ impl CompetitionStore {
             "INSERT INTO competitions (
                       id,
                       created_at,
-                      total_competition_pool,
-                      total_allowed_entries,
-                      number_of_places_win,
-                      entry_fee,
-                      coordinator_fee_percentage,
-                      event_announcement) VALUES(?,?,?,?,?,?,?,?)",
+                      event_submission) VALUES(?,?,?)",
         )?;
-        let announcement = serde_json::to_vec(&competition.event_announcement)
-            .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+        let event_submission = Value::Blob(
+            serde_json::to_vec(&competition.event_submission)
+                .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?,
+        );
+
         stmt.execute(params![
             competition.id.to_string(),
             created_at,
-            competition.total_competition_pool,
-            competition.total_allowed_entries,
-            competition.number_of_places_win,
-            competition.entry_fee,
-            competition.coordinator_fee_percentage,
-            Value::Blob(announcement)
+            event_submission,
         ])?;
 
         let mut stmt = conn.prepare(
@@ -415,6 +416,7 @@ impl CompetitionStore {
             let mut params: Vec<Value> = vec![];
 
             let query = "UPDATE competitions SET
+                event_announcement = ?,
                 outcome_transaction = ?,
                 funding_psbt = ?,
                 funding_transaction = ?,
@@ -429,6 +431,8 @@ impl CompetitionStore {
                 contracted_at = ?,
                 signed_at = ?,
                 escrow_funds_confirmed_at = ?,
+                event_created_at = ?,
+                entries_submitted_at = ?,
                 funding_broadcasted_at = ?,
                 funding_confirmed_at = ?,
                 funding_settled_at = ?,
@@ -439,6 +443,15 @@ impl CompetitionStore {
                 failed_at = ?,
                 errors = ?
                 WHERE id = ?";
+
+            if let Some(event_announcement) = &competition.event_announcement {
+                params.push(Value::Blob(
+                    serde_json::to_vec(event_announcement)
+                        .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?,
+                ));
+            } else {
+                params.push(Value::Null);
+            }
 
             if let Some(outcome_transaction) = &competition.outcome_transaction {
                 params.push(Value::Blob(
@@ -535,6 +548,8 @@ impl CompetitionStore {
                 &competition.contracted_at,
                 &competition.signed_at,
                 &competition.escrow_funds_confirmed_at,
+                &competition.event_created_at,
+                &competition.entries_submitted_at,
                 &competition.funding_broadcasted_at,
                 &competition.funding_confirmed_at,
                 &competition.funding_settled_at,
@@ -579,13 +594,7 @@ impl CompetitionStore {
         let mut query = select((
             "competitions.id as id",
             "created_at::TEXT as created_at",
-            "total_competition_pool",
-            "total_allowed_entries",
-        ))
-        .and_select((
-            "number_of_places_win",
-            "entry_fee",
-            "coordinator_fee_percentage",
+            "event_submission",
             "event_announcement",
         ))
         .and_select((
@@ -614,6 +623,8 @@ impl CompetitionStore {
             "contracted_at::TEXT as contracted_at",
             "competitions.signed_at::TEXT as signed_at",
             "escrow_funds_confirmed_at::TEXT as escrow_funds_confirmed_at",
+            "event_created_at::TEXT as event_created_at",
+            "entries_submitted_at::TEXT as entries_submitted_at",
             "funding_broadcasted_at::TEXT as funding_broadcasted_at",
             "funding_confirmed_at::TEXT as funding_confirmed_at",
             "funding_settled_at::TEXT as funding_settled_at",
@@ -645,13 +656,7 @@ impl CompetitionStore {
             .group_by((
                 "competitions.id",
                 "created_at",
-                "total_competition_pool",
-                "total_allowed_entries",
-                "number_of_places_win",
-                "entry_fee",
-            ))
-            .group_by((
-                "coordinator_fee_percentage",
+                "event_submission",
                 "event_announcement",
                 "outcome_transaction",
                 "competitions.funding_psbt",
@@ -671,6 +676,8 @@ impl CompetitionStore {
                 "contracted_at",
                 "competitions.signed_at",
                 "escrow_funds_confirmed_at",
+                "event_created_at",
+                "entries_submitted_at",
                 "funding_broadcasted_at",
                 "funding_confirmed_at",
             ))
@@ -704,13 +711,7 @@ impl CompetitionStore {
         let query_str = select((
             "competitions.id as id",
             "created_at::TEXT as created_at",
-            "total_competition_pool",
-            "total_allowed_entries",
-        ))
-        .and_select((
-            "number_of_places_win",
-            "entry_fee",
-            "coordinator_fee_percentage",
+            "event_submission",
             "event_announcement",
         ))
         .and_select((
@@ -739,6 +740,8 @@ impl CompetitionStore {
             "contracted_at::TEXT as contracted_at",
             "competitions.signed_at::TEXT as signed_at",
             "escrow_funds_confirmed_at::TEXT as escrow_funds_confirmed_at",
+            "event_created_at::TEXT as event_created_at",
+            "entries_submitted_at::TEXT as entries_submitted_at",
             "funding_broadcasted_at::TEXT as funding_broadcasted_at",
             "funding_confirmed_at::TEXT as funding_confirmed_at",
             "funding_settled_at::TEXT as funding_settled_at",
@@ -762,13 +765,7 @@ impl CompetitionStore {
         .group_by((
             "competitions.id",
             "created_at",
-            "total_competition_pool",
-            "total_allowed_entries",
-            "number_of_places_win",
-            "entry_fee",
-        ))
-        .group_by((
-            "coordinator_fee_percentage",
+            "event_submission",
             "event_announcement",
             "outcome_transaction",
             "competitions.funding_psbt",
@@ -788,6 +785,8 @@ impl CompetitionStore {
             "contracted_at",
             "competitions.signed_at",
             "escrow_funds_confirmed_at",
+            "event_created_at",
+            "entries_submitted_at",
             "funding_broadcasted_at",
             "funding_confirmed_at",
         ))
@@ -1173,6 +1172,28 @@ impl CompetitionStore {
             "UPDATE tickets SET payment_request = ? WHERE id = ?",
             params![payment_request, ticket_id.to_string()],
         )?;
+
+        if affected == 0 {
+            return Err(duckdb::Error::QueryReturnedNoRows);
+        }
+
+        Ok(())
+    }
+
+    pub async fn clear_ticket_reservation(&self, ticket_id: Uuid) -> Result<(), duckdb::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+
+        let query = r#"
+            UPDATE tickets
+            SET reserved_at = NULL,
+                reserved_by = NULL,
+                paid_at = NULL,
+                escrow_transaction = NULL
+            WHERE id = ?
+            AND settled_at IS NULL"#;
+
+        let mut stmt = conn.prepare(query)?;
+        let affected = stmt.execute(params![ticket_id.to_string()])?;
 
         if affected == 0 {
             return Err(duckdb::Error::QueryReturnedNoRows);

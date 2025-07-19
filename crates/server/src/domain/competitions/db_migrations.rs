@@ -1,7 +1,7 @@
 use duckdb::Connection;
 use log::info;
 
-pub fn run_comeptition_migrations(conn: &mut Connection) -> Result<(), duckdb::Error> {
+pub fn run_competition_migrations(conn: &mut Connection) -> Result<(), duckdb::Error> {
     create_version_table(conn)?;
     let mut stmt = conn.prepare("SELECT version FROM db_version")?;
     let mut rows = stmt.query([])?;
@@ -50,13 +50,9 @@ pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), d
     CREATE TABLE IF NOT EXISTS competitions
     (
         id UUID PRIMARY KEY,
-        number_of_places_win INT NOT NULL,
-        total_competition_pool BIGINT NOT NULL,
-        total_allowed_entries BIGINT NOT NULL,
-        entry_fee BIGINT NOT NULL,
-        coordinator_fee_percentage INT NOT NULL, -- Entry fee percentage given to the coordinator
         created_at TIMESTAMPTZ NOT NULL,
-        event_announcement BLOB NOT NULL,       -- Event announcement expected from the oracles
+        event_submission BLOB NOT NULL,         -- Parameters for the event the oracle will attest to
+        event_announcement BLOB,                -- Event announcement expected from the oracles
         funding_psbt BLOB,                      -- Unsigned Funding PSBT
         funding_outpoint BLOB,                  -- Funding outpoint
         funding_transaction BLOB,               -- Funding transaction
@@ -70,6 +66,8 @@ pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), d
         contracted_at TIMESTAMPTZ,              -- When contract parameters were created
         signed_at TIMESTAMPTZ,                  -- When musig2 signing completed
         escrow_funds_confirmed_at TIMESTAMPTZ,  -- When all escrow funds were verified as having at least 1 confirmation
+        event_created_at TIMESTAMPTZ,           -- When the coordinator successfully creates event on the oracle
+        entries_submitted_at TIMESTAMPTZ,       -- When all entries were successfully submitted to the oracle of the event
         funding_broadcasted_at TIMESTAMPTZ,     -- When funding transaction was broadcast
         funding_confirmed_at TIMESTAMPTZ,       -- When funding transaction has at least 1 confirmation
         funding_settled_at TIMESTAMPTZ,         -- When all hodl invoices have been settled for the competition
@@ -107,6 +105,7 @@ pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), d
         ephemeral_privatekey_encrypted TEXT NOT NULL,   -- Store for better UX, backed up in user wallet
         payout_preimage_encrypted TEXT NOT NULL,        -- Store for better UX, backed up in user wallet
         payout_hash TEXT NOT NULL,                      -- User provided hash of preimage to get winnings
+        entry_submission BLOB NOT NULL,                 -- User's entry submission data (should be able to update until all entries have been collected)
         ephemeral_privatekey TEXT,                      -- Provided by user on payout, encrypted by coordinator_key
         payout_preimage TEXT,                           -- Provided by user on payout, encrypted by coordinator_key
         payout_ln_invoice TEXT,                         -- Provided by user on payout, coordinator pays to user
@@ -116,7 +115,7 @@ pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), d
         paid_out_at TIMESTAMPTZ,                        -- When ticket have been paid out via lightning
         sellback_broadcasted_at TIMESTAMPTZ,            -- When on chain sellback broadcasted by coordinator for cooperative lightning payout
         reclaimed_broadcasted_at TIMESTAMPTZ,           -- When on chain reclaim broadcasted by coordinator for uncooperative payout
-        signed_at TIMESTAMPTZ,                          -- When user completes musig signing
+        signed_at TIMESTAMPTZ                          -- When user completes musig signing
     );
 
     INSERT INTO db_version (version) VALUES (1);
