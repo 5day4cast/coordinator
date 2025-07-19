@@ -1790,9 +1790,17 @@ impl Coordinator {
             ))
         })?;
 
+        let funding_psbt = competition.funding_psbt.ok_or_else(|| {
+            Error::NotFound(format!(
+                "Funding psbt is not yet available for competition {}",
+                competition_id
+            ))
+        })?;
+
         Ok(FundedContract {
             contract_params: contract,
             funding_outpoint,
+            funding_psbt,
         })
     }
 

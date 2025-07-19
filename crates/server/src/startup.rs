@@ -325,7 +325,7 @@ pub fn app(
         .route("/api/v1/competitions", get(get_competitions))
         .route(
             "/api/v1/competitions/{competition_id}/ticket",
-            get(request_competition_ticket),
+            post(request_competition_ticket),
         )
         .route(
             "/api/v1/competitions/{competition_id}/tickets/{ticket_id}/status",

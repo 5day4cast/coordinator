@@ -1,6 +1,5 @@
 const isDevelopment = window.location.hostname === "localhost";
 const UI_PREFIX = isDevelopment ? "/ui" : "";
-const API_PREFIX = isDevelopment ? "" : "/api/v1";
 
 class Router {
   constructor(routes) {

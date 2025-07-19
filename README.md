@@ -15,7 +15,7 @@ rm libduckdb-linux-amd64.zip
 - at the root of the repo run `./build_ui.sh`
 
 ### How to run
-- at the root of the repo run `cargo run --bin server`
+- at the root of the repo run `cargo run --bin server -- --config ./config/local.toml`
 
 ### How transaction creation works
 
@@ -34,19 +34,19 @@ With the Musig signing
 sequenceDiagram
     participant U as User
     participant C as Coordinator
-    
+
     Note over U,C: Phase 1: Entry With Deposit
     U->>U: Generates entry private key
     U->>C: Submits entry with public key
     C->>U: Returns Lightning hodl invoice for:<br/>1. Entry fee<br/>2. Signing deposit
     U->>C: Pays full amount
     Note right of C: Holds deposit in escrow
-    
+
     Note over U,C: Phase 2: Signing Window
     C->>C: Finalizes contract parameters
     C->>C: Generates nonces
     C->>U: Notifies signing ready
-    
+
     alt User Returns to Sign
         U->>U: Generates nonces & sigs
         U->>C: Completes signing

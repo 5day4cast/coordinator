@@ -128,9 +128,11 @@ class Payouts {
   async get_user_entries() {
     console.log(
       " Fetching user entries from",
-      `${this.coordinator_url}/entries`,
+      `${this.coordinator_url}/api/v1/entries`,
     );
-    const response = await this.client.get(`${this.coordinator_url}/entries`);
+    const response = await this.client.get(
+      `${this.coordinator_url}/api/v1/entries`,
+    );
     if (!response.ok) {
       throw new Error(`Failed to get entries: ${response.status}`);
     }
@@ -139,7 +141,7 @@ class Payouts {
 
   async get_competitions() {
     const response = await this.client.get(
-      `${this.coordinator_url}/competitions`,
+      `${this.coordinator_url}/api/v1/competitions`,
     );
     if (!response.ok) {
       throw new Error(`Failed to get competitions: ${response.status}`);
@@ -244,7 +246,7 @@ class Payouts {
     );
 
     const payoutResponse = await this.client.post(
-      `${this.coordinator_url}/competitions/${competitionId}/entries/${entryId}/payout`,
+      `${this.coordinator_url}competitions/${competitionId}/entries/${entryId}/payout`,
       {
         ticket_id: entryId,
         payout_preimage,

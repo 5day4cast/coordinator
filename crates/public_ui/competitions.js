@@ -128,7 +128,7 @@ class Competitions {
   async get_combined_competitions() {
     console.log(this.coordinator_url);
     const [competitionsResponse, eventsResponse] = await Promise.all([
-      fetch(`${this.coordinator_url}/competitions`),
+      fetch(`${this.coordinator_url}/api/v1/competitions`),
       fetch(`${this.oracle_url}/oracle/events`),
     ]);
 

@@ -1,6 +1,0 @@
-[bitcoin]
-network = "regtest"
-esplora_url = "http://localhost:9102"
-seed_path = "./creds/coordinator_private_key.pem"
-storage_file = "./data/bitcoin.db"
-refresh_blocks_secs = 15

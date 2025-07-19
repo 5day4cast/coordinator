@@ -7,14 +7,14 @@ use bdk_wallet::{
         hashes::{sha256, Hash},
         secp256k1::{Message, Secp256k1 as BdkSecp256k1, SecretKey},
         sighash::{EcdsaSighashType, SighashCache},
-        Network, NetworkKind as BDKNetworkKind, PublicKey,
+        Network, NetworkKind as BDKNetworkKind, Psbt, PublicKey,
     },
     descriptor::calc_checksum,
     ChangeSet, KeychainKind, Wallet,
 };
 use blake2::{Blake2b512, Digest};
 use dlctix::{
-    bitcoin::{bip32::Xpriv, OutPoint, Psbt},
+    bitcoin::{bip32::Xpriv, OutPoint},
     musig2::{AggNonce, PartialSignature},
     secp::Scalar,
     ContractParameters, NonceSharingRound, SigMap, SigningSession, TicketedDLC,

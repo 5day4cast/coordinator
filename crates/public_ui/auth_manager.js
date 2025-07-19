@@ -215,7 +215,7 @@ class AuthManager {
     const payload = await wallet.getEncryptedMasterKey(pubkey);
     console.log(this.apiBase);
     const response = await this.authorizedClient.post(
-      `${this.apiBase}/users/register`,
+      `${this.apiBase}/api/v1/users/register`,
       payload,
     );
 
@@ -226,7 +226,7 @@ class AuthManager {
 
   async performLogin() {
     const response = await this.authorizedClient.post(
-      `${this.apiBase}/users/login`,
+      `${this.apiBase}/api/v1/users/login`,
     );
 
     if (response.status === 401 || response.status === 403) {

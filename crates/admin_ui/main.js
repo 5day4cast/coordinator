@@ -73,7 +73,7 @@ function createCompetition($event) {
   $event.target.classList.add("is-loading");
 
   fetch(
-    `${apiBase}/competitions`,
+    `${apiBase}/api/v1/competitions`,
     getRequestOptions({
       method: "POST",
       headers: headers,
@@ -162,7 +162,7 @@ function load_stations(stations) {
 async function refreshBalance() {
   try {
     const response = await fetch(
-      `${apiBase}/wallet/balance`,
+      `${apiBase}/api/v1/wallet/balance`,
       getRequestOptions(),
     );
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
@@ -180,7 +180,7 @@ async function refreshBalance() {
 async function getNewAddress() {
   try {
     const response = await fetch(
-      `${apiBase}/wallet/address`,
+      `${apiBase}/api/v1/wallet/address`,
       getRequestOptions(),
     );
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
@@ -196,7 +196,7 @@ async function getNewAddress() {
 async function refreshFeeEstimates() {
   try {
     const response = await fetch(
-      `${apiBase}/wallet/estimated_fees`,
+      `${apiBase}/api/v1/wallet/estimated_fees`,
       getRequestOptions(),
     );
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
@@ -227,7 +227,7 @@ async function refreshFeeEstimates() {
 async function refreshOutputs() {
   try {
     const response = await fetch(
-      `${apiBase}/wallet/outputs`,
+      `${apiBase}/api/v1/wallet/outputs`,
       getRequestOptions(),
     );
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
@@ -292,7 +292,7 @@ async function sendBitcoin() {
 
   try {
     const response = await fetch(
-      `${apiBase}/wallet/send`,
+      `${apiBase}/api/v1/wallet/send`,
       getRequestOptions({
         method: "POST",
         headers: {

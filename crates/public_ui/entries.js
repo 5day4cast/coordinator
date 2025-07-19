@@ -85,7 +85,9 @@ class Entries {
   }
 
   async get_user_entries() {
-    const response = await this.client.get(`${this.coordinator_url}/entries`);
+    const response = await this.client.get(
+      `${this.coordinator_url}/api/v1/entries`,
+    );
 
     if (!response.ok) {
       console.error(response);

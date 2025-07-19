@@ -656,6 +656,7 @@ impl Competition {
 pub struct FundedContract {
     pub contract_params: ContractParameters,
     pub funding_outpoint: OutPoint,
+    pub funding_psbt: Psbt,
 }
 
 #[derive(Debug, PartialEq, Eq)]

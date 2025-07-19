@@ -50,9 +50,9 @@ export async function initializeMusigSessions(wallet, client) {
   }
 
   try {
-    console.log("Fetching entries from:", `${client.apiBase}/entries`);
+    console.log("Fetching entries from:", `${client.apiBase}/api/v1/entries`);
 
-    const response = await client.get(`${client.apiBase}/entries`);
+    const response = await client.get(`${client.apiBase}/api/v1/entries`);
     if (!response.ok) {
       throw new Error("Failed to fetch user entries");
     }
