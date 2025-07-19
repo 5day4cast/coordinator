@@ -3,8 +3,8 @@ level = "info"
 [bitcoin]
 network = "regtest"
 esplora_url = "http://localhost:9102"
-seed_path = "coordinator/crates/server/test_data/fake_coordinator_private_key.pem"
-storage_file = "coordinator/crates/server/test_data/bitcoin.db"
+seed_path = "crates/server/test_data/fake_coordinator_private_key.pem"
+storage_file = "crates/server/test_data/bitcoin.db"
 refresh_blocks_secs = 15
 timeout_secs = 30
 max_parallel_requests = 4
