@@ -3,7 +3,11 @@ mod core;
 #[cfg(target_arch = "wasm32")]
 mod wasm;
 
-use dlctix::{bitcoin::OutPoint, musig2::PubNonce, ContractParameters, SigMap, TicketedDLC};
+use dlctix::{
+    bitcoin::{psbt::PsbtParseError, OutPoint},
+    musig2::PubNonce,
+    ContractParameters, SigMap, TicketedDLC,
+};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -49,6 +53,12 @@ pub enum WalletError {
     InvalidPublicKey(String),
     #[error("Dlc entry with index {0} not found")]
     DlcEntryNotFound(u32),
+    #[error("Invalid escrow descriptor: {0}")]
+    InvalidEscrow(String),
+    #[error("Psbt error: {0}")]
+    PsbtError(#[from] PsbtParseError),
+    #[error("Invalid BOLT11 invoice: {0}")]
+    InvalidInvoice(String),
 }
 
 #[cfg(target_arch = "wasm32")]

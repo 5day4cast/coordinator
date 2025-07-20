@@ -12,6 +12,8 @@ window.refreshOutputs = refreshOutputs;
 window.sendBitcoin = sendBitcoin;
 window.toggleJson = toggleJson;
 window.refreshFeeEstimates = refreshFeeEstimates;
+window.hideNotification = hideNotification;
+window.showNotification = showNotification;
 
 window.onload = async function () {
   addDefaults();
@@ -71,9 +73,10 @@ function createCompetition($event) {
   };
 
   $event.target.classList.add("is-loading");
+  hideNotification("competition-notification");
 
   fetch(
-    `${apiBase}/competitions`,
+    `${apiBase}/api/v1/competitions`,
     getRequestOptions({
       method: "POST",
       headers: headers,
@@ -81,16 +84,34 @@ function createCompetition($event) {
     }),
   )
     .then((response) => {
-      if (!response.ok) {
-        console.error(response);
-      } else {
-        console.log("competition: ", competition);
-      }
       $event.target.classList.remove("is-loading");
+
+      if (!response.ok) {
+        return response.text().then((text) => {
+          showNotification(
+            "competition-notification",
+            `Failed to create competition: ${text || response.statusText}`,
+            "danger",
+          );
+        });
+      } else {
+        showNotification(
+          "competition-notification",
+          "Competition created successfully!",
+          "success",
+        );
+        return response.json().then((data) => {
+          console.log("Competition created:", data);
+        });
+      }
     })
     .catch((e) => {
       $event.target.classList.remove("is-loading");
-      console.error("Error submitting entry: {}", e);
+      showNotification(
+        "competition-notification",
+        `Error submitting competition: ${e.message}`,
+        "danger",
+      );
     });
 }
 
@@ -162,7 +183,7 @@ function load_stations(stations) {
 async function refreshBalance() {
   try {
     const response = await fetch(
-      `${apiBase}/wallet/balance`,
+      `${apiBase}/api/v1/wallet/balance`,
       getRequestOptions(),
     );
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
@@ -180,7 +201,7 @@ async function refreshBalance() {
 async function getNewAddress() {
   try {
     const response = await fetch(
-      `${apiBase}/wallet/address`,
+      `${apiBase}/api/v1/wallet/address`,
       getRequestOptions(),
     );
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
@@ -196,7 +217,7 @@ async function getNewAddress() {
 async function refreshFeeEstimates() {
   try {
     const response = await fetch(
-      `${apiBase}/wallet/estimated_fees`,
+      `${apiBase}/api/v1/wallet/estimated_fees`,
       getRequestOptions(),
     );
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
@@ -227,7 +248,7 @@ async function refreshFeeEstimates() {
 async function refreshOutputs() {
   try {
     const response = await fetch(
-      `${apiBase}/wallet/outputs`,
+      `${apiBase}/api/v1/wallet/outputs`,
       getRequestOptions(),
     );
     if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
@@ -292,7 +313,7 @@ async function sendBitcoin() {
 
   try {
     const response = await fetch(
-      `${apiBase}/wallet/send`,
+      `${apiBase}/api/v1/wallet/send`,
       getRequestOptions({
         method: "POST",
         headers: {
@@ -315,5 +336,36 @@ async function sendBitcoin() {
   } catch (error) {
     console.error("Error sending bitcoin:", error);
     alert("Failed to send bitcoin: " + error);
+  }
+}
+
+function showNotification(notificationId, message, type = "info") {
+  const notification = document.getElementById(notificationId);
+  const messageElement = document.getElementById(`${notificationId}-message`);
+
+  if (notification && messageElement) {
+    // Remove all notification type classes
+    notification.classList.remove(
+      "is-success",
+      "is-danger",
+      "is-warning",
+      "is-info",
+    );
+
+    notification.classList.add(`is-${type}`);
+    messageElement.textContent = message;
+    notification.classList.remove("is-hidden");
+
+    // Auto-hide after 5 seconds for success messages
+    if (type === "success") {
+      setTimeout(() => hideNotification(notificationId), 5000);
+    }
+  }
+}
+
+function hideNotification(notificationId) {
+  const notification = document.getElementById(notificationId);
+  if (notification) {
+    notification.classList.add("is-hidden");
   }
 }

@@ -5,6 +5,7 @@ class MusigSessionManager {
     entryId,
     client,
     entryIndex,
+
     onStateChange = null,
   ) {
     this.wallet = wallet;
@@ -16,6 +17,7 @@ class MusigSessionManager {
     this.entryIndex = entryIndex;
     this.contractParams = null;
     this.fundingOutpoint = null;
+    this.fundingPsbt = null;
     this.onStateChange = onStateChange;
     this.lastError = null;
     if (this.onStateChange) {
@@ -84,13 +86,15 @@ class MusigSessionManager {
   async pollForContractParameters() {
     await this.pollWithBackoff({
       initialState: "INITIALIZED",
-      endpoint: `${this.client.apiBase}/competitions/${this.competitionId}/contract`,
+      endpoint: `${this.client.apiBase}/api/v1/competitions/${this.competitionId}/contract`,
       description: "contract parameters",
       processResponse: async (response) => {
         const fundedContract = await response.json();
         console.log("funded contract:", fundedContract);
         this.contractParams = fundedContract.contract_params;
         this.fundingOutpoint = fundedContract.funding_outpoint;
+        this.fundingPsbt = fundedContract.funding_psbt_base64;
+
         console.log(this.contractParams);
         this.setState("CONTRACT_RECEIVED");
         await this.handleContractReceived();
@@ -158,7 +162,7 @@ class MusigSessionManager {
       );
 
       await this.client.post(
-        `${this.client.apiBase}/competitions/${this.competitionId}/entries/${this.entryId}/public_nonces`,
+        `${this.client.apiBase}/api/v1/competitions/${this.competitionId}/entries/${this.entryId}/public_nonces`,
         serializedNonces,
       );
 
@@ -176,7 +180,7 @@ class MusigSessionManager {
   async pollForAggregateNonces() {
     await this.pollWithBackoff({
       initialState: "NONCES_SUBMITTED",
-      endpoint: `${this.client.apiBase}/competitions/${this.competitionId}/aggregate_nonces`,
+      endpoint: `${this.client.apiBase}/api/v1/competitions/${this.competitionId}/aggregate_nonces`,
       description: "aggregate nonces",
       processResponse: async (response) => {
         const aggregateNonces = await response.json();
@@ -280,20 +284,30 @@ class MusigSessionManager {
       ) {
         throw new Error("One or both partialSigs collections are empty");
       }
+      console.log("partialSigs: {}", partialSigs);
 
-      const serializedPartialSigs = {
-        by_outcome: Object.fromEntries(partialSigs.by_outcome),
-        by_win_condition: Object.fromEntries(partialSigs.by_win_condition),
+      const signedFundingPsbt = await this.wallet.signFundingPsbt(
+        this.fundingPsbt,
+        this.entryIndex,
+      );
+      console.log("Signed funding psbt: {}", signedFundingPsbt);
+
+      const finalSignature = {
+        funding_psbt_base64: signedFundingPsbt,
+        partial_signatures: {
+          by_outcome: Object.fromEntries(partialSigs.by_outcome),
+          by_win_condition: Object.fromEntries(partialSigs.by_win_condition),
+        },
       };
 
       console.log(
-        "Sending partialSigs to server:",
-        JSON.stringify(serializedPartialSigs, null, 2),
+        "Sending final signatures to server:",
+        JSON.stringify(finalSignature, null, 2),
       );
 
       await this.client.post(
-        `${this.client.apiBase}/competitions/${this.competitionId}/entries/${this.entryId}/partial_signatures`,
-        serializedPartialSigs,
+        `${this.client.apiBase}/api/v1/competitions/${this.competitionId}/entries/${this.entryId}/final_signatures`,
+        finalSignature,
       );
 
       this.setState("COMPLETED");

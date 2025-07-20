@@ -3,26 +3,29 @@ use crate::NostrClientCore;
 use bdk_wallet::{
     bitcoin::{
         bip32::{ChainCode, ChildNumber, DerivationPath},
-        secp256k1::{Secp256k1, SecretKey},
-        Network, NetworkKind as BDKNetworkKind,
+        ecdsa,
+        hashes::{sha256, Hash},
+        secp256k1::{Message, Secp256k1 as BdkSecp256k1, SecretKey},
+        sighash::{EcdsaSighashType, SighashCache},
+        Network, NetworkKind as BDKNetworkKind, Psbt, PublicKey,
     },
     descriptor::calc_checksum,
-    ChangeSet, KeychainKind, Wallet,
 };
 use blake2::{Blake2b512, Digest};
 use dlctix::{
     bitcoin::{bip32::Xpriv, OutPoint},
     musig2::{AggNonce, PartialSignature},
-    secp::{Point as DlcPoint, Scalar},
+    secp::Scalar,
     ContractParameters, NonceSharingRound, SigMap, SigningSession, TicketedDLC,
 };
 use log::debug;
 use nostr_sdk::{FromBech32, NostrSigner};
-use rand::{rngs::StdRng, thread_rng, RngCore, SeedableRng};
+use rand::{thread_rng, RngCore, SeedableRng};
+use rand_chacha::ChaCha20Rng;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::{collections::HashMap, str::FromStr};
+use std::{collections::HashMap, io::Write, str::FromStr};
 
 use super::DlcEntry;
 
@@ -127,9 +130,6 @@ pub struct TaprootWalletCore {
     nostr_client: NostrClientCore,
     network: Network,
     dlc_contracts: HashMap<u32, DlcEntry>,
-    //TODO: add functionality for payouts via bdk_wallet
-    bdk_wallet: Wallet,
-    change_set: ChangeSet,
 }
 
 impl TaprootWalletCore {
@@ -186,35 +186,11 @@ impl TaprootWalletCore {
             network: network_kind,
         };
 
-        //TODO: get this stored remotely and reloaded when the user comes back to the site & logs in
-        // we will want the ChangeSet to be a json object and encypted by the user's nostr private key before storing remotely
-        let change_set = ChangeSet::default();
-
-        // Load will always come back as None for now since ChangeSet is empty, this wont be helpful until we have saved state that we load
-        let bdk_wallet = Wallet::load()
-            .descriptor(KeychainKind::External, Some(external_descriptor.clone()))
-            .descriptor(KeychainKind::Internal, Some(internal_descriptor.clone()))
-            .extract_keys()
-            .check_network(network)
-            .load_wallet_no_persist(change_set.clone()) //TODO: we may need to change this for 'existing' wallets
-            .map_err(|e| WalletError::LoadWallet(e.to_string()))?;
-
-        let wallet = if let Some(loaded_wallet) = bdk_wallet {
-            loaded_wallet
-        } else {
-            Wallet::create(external_descriptor, internal_descriptor)
-                .network(network)
-                .create_wallet_no_persist()
-                .map_err(|e| WalletError::LoadWallet(e.to_string()))?
-        };
-
         Ok(Self {
             extended_key,
             public_data,
             nostr_client: nostr_client.to_owned(),
-            bdk_wallet: wallet,
             network,
-            change_set,
             dlc_contracts: HashMap::new(),
         })
     }
@@ -247,15 +223,6 @@ impl TaprootWalletCore {
 
     pub fn get_public_data(&self) -> KeyPair {
         self.public_data.clone()
-    }
-
-    fn update_changes(&mut self) {
-        todo!();
-        //TODO: serialize and backup self.new_changes here
-        /*if let Some(new_changes) = self.bdk_wallet.staged() {
-            self.change_set.merge(new_changes.to_owned());
-
-        }*/
     }
 
     pub async fn get_encrypted_master_key(
@@ -337,24 +304,13 @@ impl TaprootWalletCore {
 
     pub async fn get_dlc_public_key(&self, entry_index: u32) -> Result<String, WalletError> {
         let child_xpriv = self.derive_dlc_key(entry_index)?;
-        let secp = Secp256k1::new();
-        let public_key = child_xpriv.private_key.public_key(&secp);
-        // Get x-only public key
-        let (x_only, parity) = public_key.x_only_public_key();
 
-        // Convert to dlctix's XOnlyPublicKey type
-        let dlctix_xonly =
-            dlctix::musig2::secp256k1::XOnlyPublicKey::from_slice(&x_only.serialize())
-                .map_err(|e| WalletError::KeyError(e.to_string()))?;
+        let secret_bytes = child_xpriv.private_key.secret_bytes();
+        let secret_scalar = Scalar::from_hex(&hex::encode(secret_bytes)).map_err(|e| {
+            WalletError::KeyError(format!("Failed to convert key to scalar: {}", e))
+        })?;
 
-        // Convert to dlctix's Parity type
-        let dlctix_parity = match parity {
-            dlctix::bitcoin::secp256k1::Parity::Odd => dlctix::musig2::secp256k1::Parity::Odd,
-            dlctix::bitcoin::secp256k1::Parity::Even => dlctix::musig2::secp256k1::Parity::Even,
-        };
-
-        // Create Point from XOnlyPublicKey and Parity
-        let point = DlcPoint::from((dlctix_xonly, dlctix_parity));
+        let point = secret_scalar.base_point_mul();
         Ok(point.to_string())
     }
 
@@ -366,13 +322,13 @@ impl TaprootWalletCore {
         let path = DerivationPath::from_str(&path)
             .map_err(|e| WalletError::DlcKeyError(format!("Invalid derivation path: {}", e)))?;
 
-        let secp = Secp256k1::new();
+        let secp = BdkSecp256k1::new();
         let master_xpriv =
             dlctix::bitcoin::bip32::Xpriv::from_str(self.extended_key.expose_secret())
                 .map_err(|e| WalletError::DlcKeyError(format!("Invalid master key: {}", e)))?;
         debug!(
             "Master key fingerprint: {}",
-            master_xpriv.fingerprint(&Secp256k1::new())
+            master_xpriv.fingerprint(&BdkSecp256k1::new())
         );
 
         let child_xpriv = master_xpriv
@@ -467,15 +423,15 @@ impl TaprootWalletCore {
     ) -> Result<dlctix::SigMap<dlctix::musig2::PubNonce>, WalletError> {
         let contract = self.reconstruct_contract(entry_index)?;
 
+        let funding_outpoint = contract.funding_outpoint();
+
         let child_xpriv = self.derive_dlc_key(entry_index)?;
-
         let secret_bytes = child_xpriv.private_key.secret_bytes();
+        let secret_scalar = Scalar::from_hex(&hex::encode(secret_bytes)).map_err(|e| {
+            WalletError::KeyError(format!("Failed to convert key to scalar: {}", e))
+        })?;
 
-        let secret_key = dlctix::musig2::secp256k1::SecretKey::from_slice(&secret_bytes)
-            .map_err(|e| WalletError::KeyError(e.to_string()))?;
-
-        let secret_scalar = Scalar::from(secret_key);
-        let mut rng = StdRng::from_seed(secret_scalar.serialize());
+        let mut rng = self.create_deterministic_rng(&funding_outpoint, secret_scalar);
 
         let signing_session =
             SigningSession::<NonceSharingRound>::new(contract.to_owned(), &mut rng, secret_scalar)
@@ -491,14 +447,15 @@ impl TaprootWalletCore {
     ) -> Result<SigMap<PartialSignature>, WalletError> {
         let contract = self.reconstruct_contract(entry_index)?;
 
+        // Get funding outpoint for deterministic RNG
+        let funding_outpoint = contract.funding_outpoint();
+
         let child_xpriv = self.derive_dlc_key(entry_index)?;
 
         let secret_bytes = child_xpriv.private_key.secret_bytes();
-
-        let secret_key = dlctix::musig2::secp256k1::SecretKey::from_slice(&secret_bytes)
-            .map_err(|e| WalletError::KeyError(e.to_string()))?;
-
-        let secret_scalar = Scalar::from(secret_key);
+        let secret_scalar = Scalar::from_hex(&hex::encode(secret_bytes)).map_err(|e| {
+            WalletError::KeyError(format!("Failed to convert key to scalar: {}", e))
+        })?;
 
         let pubkey = secret_scalar.base_point_mul();
         debug!("Client signing");
@@ -513,22 +470,167 @@ impl TaprootWalletCore {
         debug!("Contract parameters: {:?}", contract.params());
         debug!("Received aggregate nonces: {:?}", aggregate_nonces);
 
-        let mut rng = StdRng::from_seed(secret_scalar.serialize());
+        let mut rng = self.create_deterministic_rng(&funding_outpoint, secret_scalar);
 
-        // Create initial signing session and log the nonces we generate
         let initial_session =
             SigningSession::<NonceSharingRound>::new(contract.to_owned(), &mut rng, secret_scalar)
                 .map_err(|e| WalletError::DlcError(e.to_string()))?;
 
-        debug!("Generated initial nonces",);
+        debug!("Generated initial nonces");
 
         // Use all aggregate nonces for signing
         let partial_sigs = initial_session
             .compute_partial_signatures(aggregate_nonces)
             .map_err(|e| WalletError::DlcError(format!("Signature computation failed: {}", e)))?;
 
-        debug!("Generated partial signatures",);
+        debug!("Generated partial signatures");
 
         Ok(partial_sigs.our_partial_signatures().to_owned())
+    }
+
+    pub fn sign_funding_psbt(&self, mut psbt: Psbt, entry_index: u32) -> Result<Psbt, WalletError> {
+        // Derive the child key specific to this DLC entry
+        let child_xpriv = self.derive_dlc_key(entry_index)?;
+        let child_privkey = child_xpriv.to_priv();
+        let secp = BdkSecp256k1::new();
+        let child_pubkey = PublicKey::from_private_key(&secp, &child_privkey);
+
+        debug!(
+            "Signing funding PSBT for entry {} with derived pubkey: {}",
+            entry_index, child_pubkey
+        );
+
+        let mut signed_count = 0;
+
+        // Clone the transaction for sighash computation
+        let tx = psbt.unsigned_tx.clone();
+
+        // Process each input in the PSBT
+        for (input_index, input) in psbt.inputs.iter_mut().enumerate() {
+            // Check if this is an escrow input by looking for witness_script
+            let witness_script = match &input.witness_script {
+                Some(ws) => ws,
+                None => {
+                    debug!(
+                        "Input {} is not an escrow input (no witness_script), skipping",
+                        input_index
+                    );
+                    continue;
+                }
+            };
+
+            // Ensure we have the witness UTXO for signing
+            let witness_utxo = input.witness_utxo.as_ref().ok_or_else(|| {
+                WalletError::KeyError(format!(
+                    "Missing witness_utxo for escrow input {}",
+                    input_index
+                ))
+            })?;
+
+            // Check if we already have a signature from this key
+            if input.partial_sigs.contains_key(&child_pubkey) {
+                debug!("Input {} already has our signature, skipping", input_index);
+                continue;
+            }
+
+            // For miniscript escrow, verify our key is actually needed
+            // Simple verification: check if our public key bytes appear in the witness script
+            let script_bytes = witness_script.as_bytes();
+            let pubkey_bytes = child_pubkey.to_bytes();
+
+            let key_found = script_bytes
+                .windows(pubkey_bytes.len())
+                .any(|window| window == pubkey_bytes);
+
+            if !key_found {
+                debug!(
+                    "Our pubkey {} not found in witness script for input {}, skipping",
+                    child_pubkey, input_index
+                );
+                continue;
+            }
+
+            debug!(
+                "Found our key in escrow input {}, creating signature",
+                input_index
+            );
+
+            // Get the sighash type from PSBT or default to ALL
+            let sighash_type = match input.sighash_type {
+                Some(psbt_type) => {
+                    EcdsaSighashType::from_standard(psbt_type.to_u32()).map_err(|_| {
+                        WalletError::KeyError("Invalid sighash type in PSBT".to_string())
+                    })?
+                }
+                None => EcdsaSighashType::All,
+            };
+
+            // Create a sighash cache for the transaction
+            let mut sighash_cache = SighashCache::new(&tx);
+
+            // Compute the signature hash
+            let sighash = sighash_cache
+                .p2wsh_signature_hash(
+                    input_index,
+                    witness_script,
+                    witness_utxo.value,
+                    sighash_type,
+                )
+                .map_err(|e| {
+                    WalletError::KeyError(format!(
+                        "Failed to compute sighash for input {}: {}",
+                        input_index, e
+                    ))
+                })?;
+
+            // Create the ECDSA signature
+            let message = Message::from_digest(sighash.to_byte_array());
+            let signature = secp.sign_ecdsa(&message, &child_privkey.inner);
+
+            // Create ecdsa::Signature with the signature and sighash type
+            let ecdsa_sig = ecdsa::Signature {
+                signature,
+                sighash_type,
+            };
+
+            input.partial_sigs.insert(child_pubkey, ecdsa_sig);
+            signed_count += 1;
+
+            debug!(
+                "Added signature for escrow input {} (witness script: {} bytes)",
+                input_index,
+                witness_script.len()
+            );
+        }
+
+        match signed_count {
+            0 => debug!(
+                "No escrow inputs were signed - our key may not be required for these inputs"
+            ),
+            n => debug!(
+                "Successfully signed {} escrow input(s) for entry {}",
+                n, entry_index
+            ),
+        }
+
+        Ok(psbt)
+    }
+
+    fn create_deterministic_rng(
+        &self,
+        funding_outpoint: &OutPoint,
+        private_key: Scalar,
+    ) -> ChaCha20Rng {
+        let mut hasher = sha256::Hash::engine();
+
+        hasher.write_all(&funding_outpoint.txid[..]).unwrap();
+        hasher
+            .write_all(&funding_outpoint.vout.to_le_bytes())
+            .unwrap();
+        hasher.write_all(&private_key.serialize()).unwrap();
+
+        let hash = sha256::Hash::from_engine(hasher);
+        let seed: [u8; 32] = hash.to_byte_array();
+        ChaCha20Rng::from_seed(seed)
     }
 }

@@ -11,7 +11,6 @@ async fn test_dlc_public_key_format() -> Result<()> {
     let pubkey = wallet.get_dlc_public_key(0).await.unwrap();
 
     // Verify format
-    assert!(pubkey.starts_with("02"), "Public key should start with 02");
     assert_eq!(
         pubkey.len(),
         66,

@@ -9,8 +9,13 @@ use bdk_wallet::{
     bitcoin::{
         address::NetworkChecked,
         bip32::{ChildNumber, Xpriv},
-        secp256k1::SecretKey as BdkSecretKey,
-        Address, Amount, Network, NetworkKind, Psbt, Transaction, Txid,
+        ecdsa,
+        hashes::{sha256, Hash},
+        psbt::Input,
+        secp256k1::{Message, Secp256k1, SecretKey as BdkSecretKey},
+        sighash::{EcdsaSighashType, SighashCache},
+        Address, Amount, Network, NetworkKind, OutPoint, Psbt, PublicKey, ScriptBuf, Transaction,
+        Txid, Weight, Witness,
     },
     coin_selection::DefaultCoinSelectionAlgorithm,
     descriptor::calc_checksum,
@@ -18,7 +23,10 @@ use bdk_wallet::{
     AddressInfo, Balance, ChangeSet, KeychainKind, LocalOutput, PersistedWallet, SignOptions,
     TxBuilder, Wallet,
 };
-use dlctix::{bitcoin::bip32::ChainCode, musig2::secp256k1::SecretKey as DlcSecretKey};
+use dlctix::{
+    bitcoin::{bip32::ChainCode, FeeRate},
+    secp::Scalar,
+};
 use log::{debug, error, info};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
@@ -35,19 +43,39 @@ use tokio_util::sync::CancellationToken;
 
 #[async_trait]
 pub trait Bitcoin: Send + Sync {
+    fn get_network(&self) -> Network;
+    async fn sign_psbt_with_escrow_support(
+        &self,
+        psbt: &mut Psbt,
+        options: SignOptions,
+    ) -> Result<bool, anyhow::Error>;
+    async fn finalize_psbt_with_escrow_support(
+        &self,
+        psbt: &mut Psbt,
+    ) -> Result<bool, anyhow::Error>;
+    async fn build_psbt(
+        &self,
+        script_pubkey: ScriptBuf,
+        amount: Amount,
+        fee_rate: FeeRate,
+        selected_utxos: Vec<OutPoint>,
+        foreign_utxos: Vec<ForeignUtxo>,
+    ) -> Result<Psbt, anyhow::Error>;
     async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<LocalOutput, anyhow::Error>;
     async fn get_current_height(&self) -> Result<u32, anyhow::Error>;
     async fn get_estimated_fee_rates(&self) -> Result<HashMap<u16, f64>, anyhow::Error>;
     async fn get_tx_confirmation_height(&self, txid: &Txid) -> Result<Option<u32>, anyhow::Error>;
     async fn broadcast(&self, transaction: &Transaction) -> Result<(), anyhow::Error>;
     async fn get_next_address(&self) -> Result<AddressInfo, anyhow::Error>;
-    async fn get_derived_private_key(&self) -> Result<DlcSecretKey, anyhow::Error>;
+    async fn get_public_key(&self) -> Result<bdk_wallet::bitcoin::PublicKey, anyhow::Error>;
+    async fn get_derived_private_key(&self) -> Result<Scalar, anyhow::Error>;
     async fn get_raw_transaction(&self, txid: &Txid) -> Result<Transaction, anyhow::Error>;
     async fn sign_psbt(
         &self,
         psbt: &mut Psbt,
         sign_options: SignOptions,
     ) -> Result<bool, anyhow::Error>;
+    async fn list_utxos(&self) -> Vec<LocalOutput>;
 }
 
 pub struct BitcoinClient {
@@ -137,15 +165,36 @@ impl SendOptions {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ForeignUtxo {
+    pub outpoint: OutPoint,
+    pub psbt: Input,
+    pub satisfaction_weight: Weight,
+}
+
 #[async_trait]
 impl Bitcoin for BitcoinClient {
-    async fn get_derived_private_key(&self) -> Result<DlcSecretKey, anyhow::Error> {
-        // Get the secret key directly from the path
-        let secret_key: BdkSecretKey = get_key(&self.seed_path.expose_secret())?;
+    fn get_network(&self) -> Network {
+        self.network
+    }
 
-        // Convert to DLC secret key format
-        let dlc_key = DlcSecretKey::from_slice(&secret_key.secret_bytes())
-            .map_err(|e| anyhow!("Invalid secret key bytes: {}", e))?;
+    async fn get_public_key(&self) -> Result<bdk_wallet::bitcoin::PublicKey, anyhow::Error> {
+        let secret_key = get_key::<BdkSecretKey>(&self.seed_path.expose_secret())?;
+        let private_key = bdk_wallet::bitcoin::PrivateKey {
+            compressed: true,
+            network: NetworkKind::from(self.network),
+            inner: secret_key,
+        };
+        let secp = bdk_wallet::bitcoin::secp256k1::Secp256k1::new();
+
+        let public_key = bdk_wallet::bitcoin::PublicKey::from_private_key(&secp, &private_key);
+        Ok(public_key)
+    }
+
+    async fn get_derived_private_key(&self) -> Result<Scalar, anyhow::Error> {
+        let secret_key = get_key::<BdkSecretKey>(&self.seed_path.expose_secret())?;
+        let dlc_key = Scalar::from_hex(&hex::encode(secret_key.secret_bytes()))
+            .map_err(|e| anyhow!("Failed to convert private key to scalar: {}", e))?;
 
         Ok(dlc_key)
     }
@@ -155,6 +204,204 @@ impl Bitcoin for BitcoinClient {
             return Err(anyhow!("Transaction not found: {}", txid));
         };
         Ok(transaction)
+    }
+
+    async fn sign_psbt_with_escrow_support(
+        &self,
+        psbt: &mut Psbt,
+        options: SignOptions,
+    ) -> Result<bool, anyhow::Error> {
+        // First, let BDK sign what it can (non-escrow inputs)
+        let wallet = self.wallet.write().await;
+        let bdk_finalized = wallet.sign(psbt, options.clone())?;
+
+        debug!("BDK signing complete. Finalized: {}", bdk_finalized);
+
+        if bdk_finalized {
+            return Ok(true);
+        }
+
+        // Now manually sign any escrow inputs that BDK couldn't handle
+        let escrow_signed = self.sign_escrow_inputs(psbt).await?;
+
+        if escrow_signed > 0 {
+            debug!("Manually signed {} escrow inputs", escrow_signed);
+        }
+
+        // Return whether the PSBT is fully signed (but not finalized)
+        Ok(self.is_psbt_fully_signed(psbt))
+    }
+
+    async fn finalize_psbt_with_escrow_support(
+        &self,
+        psbt: &mut Psbt,
+    ) -> Result<bool, anyhow::Error> {
+        let wallet = self.wallet.write().await;
+        let finalized = wallet.finalize_psbt(
+            psbt,
+            SignOptions {
+                trust_witness_utxo: true,
+                allow_all_sighashes: true,
+                try_finalize: true,
+                sign_with_tap_internal_key: true,
+                allow_grinding: true,
+                ..Default::default()
+            },
+        )?;
+
+        if finalized {
+            return Ok(true);
+        }
+
+        debug!("BDK finalization incomplete, finalizing escrow inputs manually");
+
+        // Manually finalize each escrow input
+        for (index, input) in psbt.inputs.iter_mut().enumerate() {
+            // Skip already finalized inputs
+            if input.final_script_witness.is_some() {
+                debug!("Input {} is already finalized", index);
+                continue;
+            }
+
+            // Only process escrow inputs (those with witness_script)
+            if let Some(witness_script) = input.witness_script.clone() {
+                debug!("Finalizing escrow input {}", index);
+
+                // For escrow miniscript: wsh(or_d(multi(2,A,B),and_v(v:pk(B),and_v(v:sha256(H),older(144)))))
+                // We're using the 2-of-2 multisig path, so we need:
+                // - Empty byte vector (for OP_FALSE to select the first branch)
+                // - Signature from first key in the multisig
+                // - Signature from second key in the multisig
+                // - The witness script itself
+
+                let mut witness = Witness::new();
+
+                // Add empty byte vector for OP_FALSE (selects the multisig branch in or_d)
+                witness.push(&[]);
+
+                // Extract public keys from the witness script to get the correct order
+                // The multisig format is: OP_PUSHNUM_2 <pubkey1> <pubkey2> OP_PUSHNUM_2 OP_CHECKMULTISIG
+                let script_bytes = witness_script.as_bytes();
+                let mut pubkeys_in_script = Vec::new();
+
+                // Find 33-byte pubkeys in the script (they start after OP_PUSHBYTES_33 = 0x21)
+                let mut i = 0;
+                while i < script_bytes.len() {
+                    if script_bytes[i] == 0x21 && i + 33 < script_bytes.len() {
+                        if let Ok(pk) = PublicKey::from_slice(&script_bytes[i + 1..i + 34]) {
+                            pubkeys_in_script.push(pk);
+                            if pubkeys_in_script.len() == 2 {
+                                break; // We found both pubkeys
+                            }
+                        }
+                        i += 34;
+                    } else {
+                        i += 1;
+                    }
+                }
+
+                if pubkeys_in_script.len() != 2 {
+                    return Err(anyhow!(
+                        "Failed to extract 2 public keys from witness script for input {}",
+                        index
+                    ));
+                }
+
+                debug!(
+                    "Multisig pubkey order in script: {} then {}",
+                    pubkeys_in_script[0], pubkeys_in_script[1]
+                );
+
+                // Add signatures in the order they appear in the script
+                for pubkey in &pubkeys_in_script {
+                    if let Some(sig) = input.partial_sigs.get(pubkey) {
+                        witness.push_ecdsa_signature(sig);
+                    } else {
+                        return Err(anyhow!(
+                            "Missing signature for pubkey {} in input {}",
+                            pubkey,
+                            index
+                        ));
+                    }
+                }
+
+                // Add the witness script
+                witness.push(witness_script.as_bytes());
+
+                // Set the final witness
+                input.final_script_witness = Some(witness);
+
+                // Clear the partial signatures and witness script as they're now in the final witness
+                input.partial_sigs.clear();
+                input.witness_script = None;
+
+                debug!(
+                    "Finalized escrow input {} with {} witness elements",
+                    index,
+                    input.final_script_witness.as_ref().unwrap().len()
+                );
+            } else if input.tap_internal_key.is_some() {
+                // This is a taproot input, let BDK handle it
+                debug!(
+                    "Input {} is taproot, should have been finalized by BDK",
+                    index
+                );
+            }
+        }
+
+        // Check if all inputs are now finalized
+        let all_finalized = psbt.inputs.iter().enumerate().all(|(idx, input)| {
+            let finalized =
+                input.final_script_witness.is_some() || input.final_script_sig.is_some();
+            if !finalized {
+                debug!("Input {} is still not finalized", idx);
+            }
+            finalized
+        });
+
+        Ok(all_finalized)
+    }
+
+    async fn build_psbt(
+        &self,
+        script_pubkey: ScriptBuf,
+        amount: Amount,
+        fee_rate: FeeRate,
+        selected_utxos: Vec<OutPoint>,
+        foreign_utxos: Vec<ForeignUtxo>,
+    ) -> Result<Psbt, anyhow::Error> {
+        let mut wallet = self.wallet.write().await;
+        let mut tx_builder = wallet.build_tx();
+
+        for utxo in selected_utxos {
+            tx_builder
+                .add_utxo(utxo)
+                .map_err(|e| anyhow!("Failed to add utxo: {}", e))?;
+        }
+
+        for foreign_utxo in foreign_utxos {
+            tx_builder
+                .add_foreign_utxo(
+                    foreign_utxo.outpoint,
+                    foreign_utxo.psbt,
+                    foreign_utxo.satisfaction_weight,
+                )
+                .map_err(|e| anyhow!("Failed to add foreign utxo: {}", e))?;
+        }
+
+        tx_builder
+            .add_recipient(script_pubkey, amount)
+            .fee_rate(fee_rate);
+
+        // This ensures the txid won't change after signing
+        tx_builder.only_witness_utxo();
+
+        // This should keep the change output in the wallet
+        tx_builder.do_not_spend_change();
+
+        let psbt = tx_builder.finish()?;
+
+        Ok(psbt)
     }
 
     async fn sign_psbt(
@@ -169,6 +416,7 @@ impl Bitcoin for BitcoinClient {
 
     async fn get_tx_confirmation_height(&self, txid: &Txid) -> Result<Option<u32>, anyhow::Error> {
         let tx_status = self.client.get_tx_status(txid).await?;
+        debug!("Transaction status: {:?}", tx_status);
         Ok(tx_status.block_height)
     }
 
@@ -206,7 +454,6 @@ impl Bitcoin for BitcoinClient {
         let (mut wallet, mut store) = tokio::join!(self.wallet.write(), self.wallet_store.write());
 
         let address = wallet.next_unused_address(KeychainKind::External);
-        //Might need to apply update here, not sure
         wallet.persist(&mut store)?;
 
         Ok(address)
@@ -234,6 +481,11 @@ impl Bitcoin for BitcoinClient {
             .broadcast(transaction)
             .await
             .map_err(|e| anyhow!("error broadcasting: {}", e))
+    }
+
+    async fn list_utxos(&self) -> Vec<LocalOutput> {
+        let wallet = self.wallet.read().await;
+        wallet.list_unspent().collect()
     }
 }
 
@@ -320,7 +572,6 @@ impl BitcoinClient {
         })?;
 
         info!("Initial scan completed");
-
         Ok(BitcoinClient {
             network: settings.network,
             wallet: RwLock::new(wallet),
@@ -397,6 +648,151 @@ impl BitcoinClient {
         info!("Sync completed successfully");
 
         Ok(())
+    }
+
+    async fn sign_escrow_inputs(&self, psbt: &mut Psbt) -> Result<usize, anyhow::Error> {
+        // Load the private key from the seed file
+        let secret_key = get_key::<BdkSecretKey>(&self.seed_path.expose_secret())?;
+        let coordinator_privkey = bdk_wallet::bitcoin::PrivateKey {
+            compressed: true,
+            network: NetworkKind::from(self.network),
+            inner: secret_key,
+        };
+
+        // Verify network
+        if coordinator_privkey.network != self.network.into() {
+            return Err(anyhow!(
+                "Private key network {:?} doesn't match wallet network {}",
+                coordinator_privkey.network,
+                self.network
+            ));
+        }
+
+        let secp = Secp256k1::new();
+        let coordinator_pubkey = PublicKey::from_private_key(&secp, &coordinator_privkey);
+
+        debug!(
+            "Checking for escrow inputs to sign with pubkey: {}",
+            coordinator_pubkey
+        );
+
+        let tx = psbt.unsigned_tx.clone();
+        let mut escrow_inputs_signed = 0;
+
+        for (idx, input) in psbt.inputs.iter_mut().enumerate() {
+            // Skip if already has our signature
+            if input.partial_sigs.contains_key(&coordinator_pubkey) {
+                debug!("Input {} already has coordinator signature", idx);
+                continue;
+            }
+
+            // Check if this is an escrow input by looking for witness_script
+            let witness_script = match &input.witness_script {
+                Some(ws) => ws,
+                None => {
+                    debug!("Input {} is not an escrow input (no witness_script)", idx);
+                    continue;
+                }
+            };
+
+            // Verify this witness script contains our pubkey
+            let script_bytes = witness_script.as_bytes();
+            let pubkey_bytes = coordinator_pubkey.to_bytes();
+
+            if !script_bytes
+                .windows(pubkey_bytes.len())
+                .any(|window| window == pubkey_bytes)
+            {
+                debug!(
+                    "Input {} witness script doesn't contain coordinator pubkey",
+                    idx
+                );
+                continue;
+            }
+
+            // Get witness UTXO for signing
+            let witness_utxo = input
+                .witness_utxo
+                .as_ref()
+                .ok_or_else(|| anyhow!("Missing witness_utxo for escrow input {}", idx))?;
+
+            debug!(
+                "Signing escrow input {} (value: {} sats)",
+                idx, witness_utxo.value
+            );
+            let script_bytes = witness_utxo.script_pubkey.as_bytes();
+            if script_bytes.len() >= 34 && script_bytes[0] == 0x00 && script_bytes[1] == 0x20 {
+                // This is a P2WSH script
+                let expected_hash = &script_bytes[2..34];
+
+                // Calculate the hash of the witness script
+                let actual_hash = sha256::Hash::hash(&witness_script.as_bytes()).to_byte_array();
+
+                debug!("Expected witness hash: {}", hex::encode(expected_hash));
+                debug!("Actual witness hash: {}", hex::encode(actual_hash));
+
+                if expected_hash != actual_hash.as_slice() {
+                    debug!("HASH MISMATCH for input {}", idx);
+                } else {
+                    debug!("Hash verification OK for input {}", idx);
+                }
+            }
+
+            // Create sighash
+            let mut cache = SighashCache::new(&tx);
+            let sighash = cache.p2wsh_signature_hash(
+                idx,
+                witness_script,
+                witness_utxo.value,
+                EcdsaSighashType::All,
+            )?;
+
+            // Sign
+            let message = Message::from_digest(sighash.to_byte_array());
+            let sig = secp.sign_ecdsa(&message, &coordinator_privkey.inner);
+
+            // Add signature to PSBT
+            input.partial_sigs.insert(
+                coordinator_pubkey,
+                ecdsa::Signature {
+                    signature: sig,
+                    sighash_type: EcdsaSighashType::All,
+                },
+            );
+
+            escrow_inputs_signed += 1;
+            debug!("Added coordinator signature to escrow input {}", idx);
+        }
+
+        Ok(escrow_inputs_signed)
+    }
+
+    fn is_psbt_fully_signed(&self, psbt: &Psbt) -> bool {
+        for (i, input) in psbt.inputs.iter().enumerate() {
+            // Skip already finalized inputs
+            if input.final_script_witness.is_some() {
+                continue;
+            }
+
+            // Check escrow inputs
+            if let Some(_) = &input.witness_script {
+                // For 2-of-2 multisig escrow, we need exactly 2 signatures
+                if input.partial_sigs.len() < 2 {
+                    debug!(
+                        "Input {} needs more signatures ({}/2)",
+                        i,
+                        input.partial_sigs.len()
+                    );
+                    return false;
+                }
+            } else if input.partial_sigs.is_empty() {
+                // Non-escrow inputs should have at least one signature
+                debug!("Input {} has no signatures", i);
+                return false;
+            }
+        }
+
+        true
     }
 }
 

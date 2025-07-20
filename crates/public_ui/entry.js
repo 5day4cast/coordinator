@@ -26,6 +26,8 @@ class Entry {
       this.weather_data.get_competition_last_forecast(this.competition),
       this.setupEntry(),
     ]).then(([competition_forecasts, _]) => {
+      console.log("competition forecasts:", competition_forecasts);
+
       this.competition_forecasts = competition_forecasts;
 
       for (const station_id in competition_forecasts) {
@@ -40,6 +42,7 @@ class Entry {
         this.entry["options"].push(option);
         this.entry["submit"][station_id] = {};
       }
+      console.log(this.entry);
     });
   }
 
@@ -106,9 +109,12 @@ class Entry {
     });
   }
 
-  async handleTicketPayment() {
-    const response = await this.client.get(
-      `${this.coordinator_url}/competitions/${this.competition.id}/ticket`,
+  async handleTicketPayment(btc_pubkey) {
+    const response = await this.client.post(
+      `${this.coordinator_url}/api/v1/competitions/${this.competition.id}/ticket`,
+      {
+        btc_pubkey: btc_pubkey,
+      },
     );
 
     if (!response.ok) {
@@ -214,7 +220,7 @@ class Entry {
       $qrCode.callback = async () => {
         try {
           const response = await this.client.get(
-            `${this.coordinator_url}/competitions/${this.competition.id}/tickets/${this.ticket.id}/status`,
+            `${this.coordinator_url}/api/v1/competitions/${this.competition.id}/tickets/${this.ticket.id}/status`,
           );
 
           if (!response.ok) {
@@ -225,7 +231,7 @@ class Entry {
 
           const status = await response.json();
 
-          if (status === "Paid") {
+          if (status === "Settled" || status === "Paid") {
             updateStatus("Payment received!", "success");
             cleanup();
             resolve(true);
@@ -256,7 +262,9 @@ class Entry {
   }
 
   async setupEntry() {
-    const response = await this.client.get(`${this.coordinator_url}/entries`);
+    const response = await this.client.get(
+      `${this.coordinator_url}/api/v1/entries`,
+    );
 
     if (!response.ok) {
       throw new Error(`Failed to fetch existing entries: ${response.status}`);
@@ -393,7 +401,7 @@ class Entry {
   async submit($event) {
     try {
       // First handle the ticket payment
-      await this.handleTicketPayment();
+      await this.handleTicketPayment(this.entry.ephemeral_pubkey);
       console.log("Ticket payment handled, creating entry submit");
       let submit = this.entry["submit"];
       let expected_observations = this.buildExpectedObservations(submit);
@@ -410,10 +418,11 @@ class Entry {
         expected_observations: expected_observations,
       };
 
+      //TODO(@tee8z): do validation on entry that it matches competition rules before submitting
       console.log("Sending entry:", entry_body);
 
       const response = await this.client.post(
-        `${this.coordinator_url}/entries`,
+        `${this.coordinator_url}/api/v1/entries`,
         entry_body,
       );
 

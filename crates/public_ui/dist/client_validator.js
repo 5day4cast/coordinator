@@ -203,6 +203,12 @@ function debugString(val) {
     return className;
 }
 
+function _assertClass(instance, klass) {
+    if (!(instance instanceof klass)) {
+        throw new Error(`expected instance of ${klass.name}`);
+    }
+}
+
 function takeFromExternrefTable0(idx) {
     const value = wasm.__wbindgen_export_4.get(idx);
     wasm.__externref_table_dealloc(idx);
@@ -213,29 +219,24 @@ export function main() {
     wasm.main();
 }
 
-function _assertClass(instance, klass) {
-    if (!(instance instanceof klass)) {
-        throw new Error(`expected instance of ${klass.name}`);
-    }
-}
 function __wbg_adapter_54(arg0, arg1, arg2) {
-    wasm.closure830_externref_shim(arg0, arg1, arg2);
+    wasm.closure639_externref_shim(arg0, arg1, arg2);
 }
 
 function __wbg_adapter_57(arg0, arg1, arg2) {
-    wasm.closure950_externref_shim(arg0, arg1, arg2);
+    wasm.closure766_externref_shim(arg0, arg1, arg2);
 }
 
 function __wbg_adapter_60(arg0, arg1) {
-    wasm._dyn_core__ops__function__FnMut_____Output___R_as_wasm_bindgen__closure__WasmClosure___describe__invoke__hbdecc228a9ae6e67(arg0, arg1);
+    wasm._dyn_core__ops__function__FnMut_____Output___R_as_wasm_bindgen__closure__WasmClosure___describe__invoke__h040ab34d34cccd5c(arg0, arg1);
 }
 
 function __wbg_adapter_63(arg0, arg1, arg2) {
-    wasm.closure1316_externref_shim(arg0, arg1, arg2);
+    wasm.closure1095_externref_shim(arg0, arg1, arg2);
 }
 
-function __wbg_adapter_221(arg0, arg1, arg2, arg3) {
-    wasm.closure1328_externref_shim(arg0, arg1, arg2, arg3);
+function __wbg_adapter_222(arg0, arg1, arg2, arg3) {
+    wasm.closure1107_externref_shim(arg0, arg1, arg2, arg3);
 }
 
 /**
@@ -601,6 +602,31 @@ export class TaprootWallet {
         }
         return takeFromExternrefTable0(ret[0]);
     }
+    /**
+     * @param {string} funding_psbt_base64
+     * @param {number} entry_index
+     * @returns {string}
+     */
+    signFundingPsbt(funding_psbt_base64, entry_index) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const ptr0 = passStringToWasm0(funding_psbt_base64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ret = wasm.taprootwallet_signFundingPsbt(this.__wbg_ptr, ptr0, len0, entry_index);
+            var ptr2 = ret[0];
+            var len2 = ret[1];
+            if (ret[3]) {
+                ptr2 = 0; len2 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+        }
+    }
 }
 
 const TaprootWalletBuilderFinalization = (typeof FinalizationRegistry === 'undefined')
@@ -885,7 +911,7 @@ function __wbg_get_imports() {
                 const a = state0.a;
                 state0.a = 0;
                 try {
-                    return __wbg_adapter_221(a, state0.b, arg0, arg1);
+                    return __wbg_adapter_222(a, state0.b, arg0, arg1);
                 } finally {
                     state0.a = a;
                 }
@@ -1109,20 +1135,20 @@ function __wbg_get_imports() {
         const ret = false;
         return ret;
     };
-    imports.wbg.__wbindgen_closure_wrapper5364 = function(arg0, arg1, arg2) {
-        const ret = makeMutClosure(arg0, arg1, 831, __wbg_adapter_54);
+    imports.wbg.__wbindgen_closure_wrapper2715 = function(arg0, arg1, arg2) {
+        const ret = makeMutClosure(arg0, arg1, 640, __wbg_adapter_54);
         return ret;
     };
-    imports.wbg.__wbindgen_closure_wrapper5653 = function(arg0, arg1, arg2) {
-        const ret = makeMutClosure(arg0, arg1, 951, __wbg_adapter_57);
+    imports.wbg.__wbindgen_closure_wrapper3041 = function(arg0, arg1, arg2) {
+        const ret = makeMutClosure(arg0, arg1, 767, __wbg_adapter_57);
         return ret;
     };
-    imports.wbg.__wbindgen_closure_wrapper8525 = function(arg0, arg1, arg2) {
-        const ret = makeMutClosure(arg0, arg1, 1300, __wbg_adapter_60);
+    imports.wbg.__wbindgen_closure_wrapper6038 = function(arg0, arg1, arg2) {
+        const ret = makeMutClosure(arg0, arg1, 1079, __wbg_adapter_60);
         return ret;
     };
-    imports.wbg.__wbindgen_closure_wrapper8584 = function(arg0, arg1, arg2) {
-        const ret = makeMutClosure(arg0, arg1, 1317, __wbg_adapter_63);
+    imports.wbg.__wbindgen_closure_wrapper6098 = function(arg0, arg1, arg2) {
+        const ret = makeMutClosure(arg0, arg1, 1096, __wbg_adapter_63);
         return ret;
     };
     imports.wbg.__wbindgen_debug_string = function(arg0, arg1) {

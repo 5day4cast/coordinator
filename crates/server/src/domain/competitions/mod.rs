@@ -1,25 +1,19 @@
 mod coordinator;
 mod db_migrations;
 mod store;
-
-use crate::{
-    oracle_client::{Event, WeatherChoices},
-    Ln,
-};
+use crate::{oracle_client::WeatherChoices, AddEventEntry, Ln};
 use anyhow::anyhow;
 pub use coordinator::*;
 pub use db_migrations::*;
 use dlctix::{
-    bitcoin::{
-        hex::{Case, DisplayHex},
-        OutPoint, Transaction,
-    },
+    bitcoin::{hex::DisplayHex, OutPoint, Transaction},
     hashlock,
     musig2::{AggNonce, PartialSignature, PubNonce},
     secp::MaybeScalar,
     ContractParameters, EventLockingConditions, Outcome, SigMap, SignedContract,
 };
 use duckdb::{
+    arrow::datatypes::ArrowNativeType,
     types::{Type, Value},
     Row,
 };
@@ -81,6 +75,8 @@ pub struct UserEntry {
     /// User provided preimage encrypted to their nostr key, only stored for easier UX,
     /// backed up via dm to user
     pub payout_preimage_encrypted: String,
+    /// User's entry submission data (should be able to update until all entries have been collected)
+    pub entry_submission: AddEventEntry,
     /// User provided private de-encrypted, only used during payout
     pub ephemeral_privatekey: Option<String>,
     /// User provided preimage de-encrypted, only used during payout
@@ -88,6 +84,8 @@ pub struct UserEntry {
     /// User provided lightning invoice, coordinator pays to user
     pub payout_ln_invoice: Option<String>,
     pub public_nonces: Option<SigMap<PubNonce>>,
+    /// User signed funding psbt
+    pub funding_psbt_base64: Option<String>,
     pub partial_signatures: Option<SigMap<PartialSignature>>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub signed_at: Option<OffsetDateTime>,
@@ -120,6 +118,32 @@ impl<'a> TryFrom<&Row<'a>> for UserEntry {
                 })
             })?;
 
+        let entry_submission: AddEventEntry = match row.get::<usize, Option<Value>>(10)? {
+            Some(Value::Blob(blob_data)) => serde_json::from_slice(&blob_data).map_err(|e| {
+                duckdb::Error::FromSqlConversionFailure(10, Type::Blob, Box::new(e))
+            })?,
+            Some(_) => {
+                return Err(duckdb::Error::FromSqlConversionFailure(
+                    10,
+                    Type::Blob,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Expected blob",
+                    )),
+                ))
+            }
+            None => {
+                return Err(duckdb::Error::FromSqlConversionFailure(
+                    10,
+                    Type::Blob,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Missing entry_submission",
+                    )),
+                ))
+            }
+        };
+
         let user_entry = UserEntry {
             id: row
                 .get::<usize, String>(0)
@@ -139,20 +163,22 @@ impl<'a> TryFrom<&Row<'a>> for UserEntry {
             ephemeral_privatekey: row.get::<usize, Option<String>>(6)?,
             public_nonces,
             partial_signatures,
-            payout_preimage_encrypted: row.get(9)?,
-            payout_hash: row.get(10)?,
-            payout_preimage: row.get::<usize, Option<String>>(11)?,
-            payout_ln_invoice: row.get::<usize, Option<String>>(12)?,
-            signed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(13)?, 13)?,
-            paid_at: parse_optional_timestamp(row.get::<usize, Option<String>>(14)?, 14)?,
-            paid_out_at: parse_optional_timestamp(row.get::<usize, Option<String>>(15)?, 15)?,
+            funding_psbt_base64: row.get(9)?,
+            entry_submission,
+            payout_preimage_encrypted: row.get(11)?,
+            payout_hash: row.get(12)?,
+            payout_preimage: row.get::<usize, Option<String>>(13)?,
+            payout_ln_invoice: row.get::<usize, Option<String>>(14)?,
+            signed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(15)?, 15)?,
+            paid_at: parse_optional_timestamp(row.get::<usize, Option<String>>(16)?, 16)?,
+            paid_out_at: parse_optional_timestamp(row.get::<usize, Option<String>>(17)?, 17)?,
             sellback_broadcasted_at: parse_optional_timestamp(
-                row.get::<usize, Option<String>>(16)?,
-                16,
+                row.get::<usize, Option<String>>(18)?,
+                18,
             )?,
             reclaimed_broadcasted_at: parse_optional_timestamp(
-                row.get::<usize, Option<String>>(17)?,
-                17,
+                row.get::<usize, Option<String>>(19)?,
+                19,
             )?,
         };
         Ok(user_entry)
@@ -161,6 +187,7 @@ impl<'a> TryFrom<&Row<'a>> for UserEntry {
 
 impl AddEntry {
     fn into_user_entry(self, pubkey: String) -> UserEntry {
+        let entry_submission = self.clone().into();
         UserEntry {
             id: self.id,
             event_id: self.event_id,
@@ -170,7 +197,9 @@ impl AddEntry {
             ephemeral_privatekey_encrypted: self.ephemeral_privatekey_encrypted,
             payout_hash: self.payout_hash,
             payout_preimage_encrypted: self.payout_preimage_encrypted,
+            entry_submission,
             signed_at: None,
+            funding_psbt_base64: None,
             partial_signatures: None,
             public_nonces: None,
             ephemeral_privatekey: None,
@@ -213,10 +242,13 @@ pub struct Ticket {
     pub hash: String,
     pub payment_request: String,
     pub expiry: OffsetDateTime,
+    /// Pubkey created for this entry for the user
+    pub ephemeral_pubkey: Option<String>,
     pub reserved_by: Option<String>,
     pub reserved_at: Option<OffsetDateTime>,
     pub paid_at: Option<OffsetDateTime>,
     pub settled_at: Option<OffsetDateTime>,
+    pub escrow_transaction: Option<String>, // Hex-encoded escrow transaction
 }
 
 impl Ticket {
@@ -333,19 +365,16 @@ pub struct Competition {
     pub id: Uuid,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
-    pub total_competition_pool: u64,
-    pub total_allowed_entries: u64,
-    pub entry_fee: u64,
-    pub coordinator_fee_percentage: usize,
-    pub event_announcement: EventLockingConditions,
+    pub event_submission: CreateEvent,
     pub total_entries: u64,
     pub total_entry_nonces: u64,
     pub total_signed_entries: u64,
     pub total_paid_entries: u64,
     pub total_paid_out_entries: usize,
-    pub number_of_places_win: usize,
-    pub funding_transaction: Option<Transaction>,
+    pub event_announcement: Option<EventLockingConditions>,
     pub funding_outpoint: Option<OutPoint>,
+    pub funding_psbt_base64: Option<String>,
+    pub funding_transaction: Option<Transaction>,
     pub outcome_transaction: Option<Transaction>,
     pub contract_parameters: Option<ContractParameters>,
     pub public_nonces: Option<SigMap<PubNonce>>,
@@ -360,6 +389,15 @@ pub struct Competition {
     pub contracted_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub signed_at: Option<OffsetDateTime>,
+    /// Escrow transactions are considered settled after 1 confirmation by default
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub escrow_funds_confirmed_at: Option<OffsetDateTime>,
+    /// When the coordinator successfully creates event on the oracle
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub event_created_at: Option<OffsetDateTime>,
+    /// When the coordinator successfully batch sends all entries to the oracle
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub entries_submitted_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub funding_broadcasted_at: Option<OffsetDateTime>,
     /// Funding transaction is considered settled after 1 confirmation by default
@@ -390,19 +428,16 @@ pub struct ExtendCompetition {
     pub id: Uuid,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
-    pub total_competition_pool: u64,
-    pub total_allowed_entries: u64,
-    pub entry_fee: u64,
-    pub coordinator_fee_percentage: usize,
-    pub event_announcement: EventLockingConditions,
+    pub event_submission: CreateEvent,
     pub total_entries: u64,
     pub total_entry_nonces: u64,
     pub total_signed_entries: u64,
     pub total_paid_entries: u64,
     pub total_paid_out_entries: usize,
-    pub number_of_places_win: usize,
+    pub event_announcement: Option<EventLockingConditions>,
     pub funding_transaction: Option<Transaction>,
     pub funding_outpoint: Option<OutPoint>,
+    pub funding_psbt_base64: Option<String>,
     pub outcome_transaction: Option<Transaction>,
     pub contract_parameters: Option<ContractParameters>,
     pub public_nonces: Option<SigMap<PubNonce>>,
@@ -417,6 +452,14 @@ pub struct ExtendCompetition {
     pub contracted_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub signed_at: Option<OffsetDateTime>,
+    /// When the coordinator successfully creates event on the oracle
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub event_created_at: Option<OffsetDateTime>,
+    /// When the coordinator successfully batch sends all entries to the oracle
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub entries_submitted_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub escrow_funds_confirmed_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub funding_broadcasted_at: Option<OffsetDateTime>,
     /// Funding transaction is considered settled after 1 confirmation by default
@@ -449,17 +492,13 @@ impl From<Competition> for ExtendCompetition {
         Self {
             id: competition.id,
             created_at: competition.created_at,
-            total_competition_pool: competition.total_competition_pool,
-            total_allowed_entries: competition.total_allowed_entries,
-            entry_fee: competition.entry_fee,
-            coordinator_fee_percentage: competition.coordinator_fee_percentage,
+            event_submission: competition.event_submission,
             event_announcement: competition.event_announcement,
             total_entries: competition.total_entries,
             total_entry_nonces: competition.total_entry_nonces,
             total_signed_entries: competition.total_signed_entries,
             total_paid_entries: competition.total_paid_entries,
             total_paid_out_entries: competition.total_paid_out_entries,
-            number_of_places_win: competition.number_of_places_win,
             funding_transaction: competition.funding_transaction,
             funding_outpoint: competition.funding_outpoint,
             outcome_transaction: competition.outcome_transaction,
@@ -472,6 +511,10 @@ impl From<Competition> for ExtendCompetition {
             cancelled_at: competition.cancelled_at,
             contracted_at: competition.contracted_at,
             signed_at: competition.signed_at,
+            event_created_at: competition.event_created_at,
+            entries_submitted_at: competition.entries_submitted_at,
+            funding_psbt_base64: competition.funding_psbt_base64,
+            escrow_funds_confirmed_at: competition.escrow_funds_confirmed_at,
             funding_broadcasted_at: competition.funding_broadcasted_at,
             funding_confirmed_at: competition.funding_confirmed_at,
             funding_settled_at: competition.funding_settled_at,
@@ -535,40 +578,51 @@ impl Competition {
         let Some(attestation) = self.attestation else {
             return Err(anyhow!("No attestation found for competition {}", self.id));
         };
+        debug!("Found attestation: {:?}", attestation);
+
+        let Some(ref event_announcement) = self.event_announcement else {
+            return Err(anyhow!(
+                "Event announcement not found for competition {}",
+                self.id,
+            ));
+        };
 
         let locking_point = attestation.base_point_mul();
+        debug!("Found event_announcement: {:?}", event_announcement);
 
-        let outcome = self
-            .event_announcement
+        let outcome = event_announcement
             .all_outcomes()
             .into_iter()
             .find(|outcome| {
                 match outcome {
                     Outcome::Attestation(i) => {
                         // Check if this outcome's locking point matches our attestation point
-                        self.event_announcement.locking_points[*i] == locking_point
+                        event_announcement.locking_points[*i] == locking_point
                     }
                     Outcome::Expiry => false,
                 }
             })
             .ok_or_else(|| anyhow!("No matching outcome found for attestation"))?;
-
+        debug!("Found outcome: {:?}", outcome);
         Ok(outcome)
     }
 
     pub fn verify_event_attestation(&self, attestation: &MaybeScalar) -> Result<Outcome, Error> {
         let attestation_point = attestation.base_point_mul();
 
+        let Some(ref event_announcement) = self.event_announcement else {
+            return Err(Error::BadRequest("Event announcement not found".into()));
+        };
+
         // Find which outcome this attestation corresponds to
-        let outcome = self
-            .event_announcement
+        let outcome = event_announcement
             .all_outcomes()
             .into_iter()
             .find(|outcome| {
                 match outcome {
                     Outcome::Attestation(i) => {
                         // The attestation point should match one of the locking points
-                        self.event_announcement.locking_points[*i] == attestation_point
+                        event_announcement.locking_points[*i] == attestation_point
                     }
                     Outcome::Expiry => false,
                 }
@@ -577,7 +631,7 @@ impl Competition {
                 Error::BadRequest("Attestation doesn't match any valid outcome".into())
             })?;
 
-        if !self.event_announcement.is_valid_outcome(&outcome) {
+        if !event_announcement.is_valid_outcome(&outcome) {
             return Err(Error::BadRequest("Invalid outcome for this event".into()));
         }
 
@@ -585,10 +639,11 @@ impl Competition {
     }
 
     pub fn calculate_invoice_amount(&self) -> u64 {
-        let fee_multiplier = self.coordinator_fee_percentage as f64 / 100.0;
-        let coordinator_fee = (self.entry_fee as f64 * fee_multiplier).round() as u64;
+        let fee_multiplier = self.event_submission.coordinator_fee_percentage as f64 / 100.0;
+        let coordinator_fee =
+            (self.event_submission.entry_fee as f64 * fee_multiplier).round() as u64;
 
-        self.entry_fee + coordinator_fee
+        (self.event_submission.entry_fee as u64) + coordinator_fee
     }
 
     // We add the fee for the coordinator's service at this point in the process,
@@ -603,20 +658,22 @@ impl Competition {
         let ticket_hash = hashlock::sha256(&ticket_preimage);
         let invoice_amount = self.calculate_invoice_amount();
 
+        // Create a regular invoice instead of a HODL invoice
         let invoice = ln_client
-            .add_hold_invoice(
+            .add_invoice(
                 invoice_amount,
                 expiry_secs,
-                ticket_hash.to_hex_string(Case::Lower),
+                format!("DLC Ticket for competition {}", self.id),
                 self.id,
             )
             .await
-            .map_err(Error::HoldError)?;
+            .map_err(Error::LnError)?;
 
         Ok(Ticket {
             id: Uuid::now_v7(),
             competition_id: self.id,
             entry_id: None,
+            ephemeral_pubkey: None,
             encrypted_preimage: ticket_preimage.to_lower_hex_string(), // TODO: encrypt this
             hash: ticket_hash.to_lower_hex_string(),
             payment_request: invoice.payment_request,
@@ -625,6 +682,7 @@ impl Competition {
             reserved_at: None,
             paid_at: None,
             settled_at: None,
+            escrow_transaction: None,
         })
     }
 }
@@ -633,12 +691,17 @@ impl Competition {
 pub struct FundedContract {
     pub contract_params: ContractParameters,
     pub funding_outpoint: OutPoint,
+    pub funding_psbt_base64: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CompetitionState {
     Created,
     EntriesCollected,
+    /// Verify escrow transactions have confirmed at least once (default), needed to broadcast funding transaction
+    EscrowFundsConfirmed,
+    EventCreated,
+    EntriesSubmitted,
     ContractCreated,
     NoncesCollected,
     AggregateNoncesGenerated,
@@ -667,6 +730,9 @@ impl fmt::Display for CompetitionState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CompetitionState::Created => write!(f, "created"),
+            CompetitionState::EventCreated => write!(f, "event_created"),
+            CompetitionState::EntriesSubmitted => write!(f, "entries_submitted"),
+            CompetitionState::EscrowFundsConfirmed => write!(f, "escrow_funds_confirmed"),
             CompetitionState::EntriesCollected => write!(f, "entries_collected"),
             CompetitionState::ContractCreated => write!(f, "contract_created"),
             CompetitionState::NoncesCollected => write!(f, "nonces_collected"),
@@ -690,24 +756,21 @@ impl fmt::Display for CompetitionState {
 }
 
 impl Competition {
-    pub fn new(create_event: &CreateEvent, oracle_event: &Event) -> Self {
+    pub fn new(create_event: &CreateEvent) -> Self {
         Self {
             id: create_event.id,
             created_at: OffsetDateTime::now_utc(),
-            total_competition_pool: create_event.total_competition_pool as u64,
-            total_allowed_entries: create_event.total_allowed_entries as u64,
-            entry_fee: create_event.entry_fee as u64,
-            coordinator_fee_percentage: create_event.coordinator_fee_percentage,
-            event_announcement: oracle_event.event_announcement.clone(),
-            number_of_places_win: create_event.number_of_places_win,
+            event_submission: create_event.clone(),
             total_entries: 0,
             total_entry_nonces: 0,
             total_signed_entries: 0,
             total_paid_entries: 0,
             total_paid_out_entries: 0,
+            event_announcement: None,
             funding_transaction: None,
             outcome_transaction: None,
             funding_outpoint: None,
+            funding_psbt_base64: None,
             contract_parameters: None,
             public_nonces: None,
             aggregated_nonces: None,
@@ -717,6 +780,9 @@ impl Competition {
             signed_at: None,
             signed_contract: None,
             partial_signatures: None,
+            event_created_at: None,
+            entries_submitted_at: None,
+            escrow_funds_confirmed_at: None,
             funding_broadcasted_at: None,
             funding_confirmed_at: None,
             funding_settled_at: None,
@@ -729,7 +795,8 @@ impl Competition {
         }
     }
     pub fn has_full_entries(&self) -> bool {
-        (self.total_entries > 0) && self.total_entries >= self.total_allowed_entries
+        (self.total_entries > 0)
+            && self.total_entries.as_usize() >= self.event_submission.total_allowed_entries
     }
 
     pub fn is_contract_created(&self) -> bool {
@@ -777,7 +844,7 @@ impl Competition {
     }
 
     pub fn has_all_entries_paid_out(&self) -> bool {
-        self.total_paid_out_entries >= self.number_of_places_win
+        self.total_paid_out_entries >= self.event_submission.number_of_places_win
     }
 
     pub fn is_attested(&self) -> bool {
@@ -786,6 +853,14 @@ impl Competition {
 
     pub fn is_signed(&self) -> bool {
         self.signed_at.is_some()
+    }
+
+    pub fn is_entries_submitted(&self) -> bool {
+        self.entries_submitted_at.is_some()
+    }
+
+    pub fn is_event_created(&self) -> bool {
+        self.event_created_at.is_some()
     }
 
     pub fn is_funding_settled(&self) -> bool {
@@ -800,16 +875,26 @@ impl Competition {
         self.cancelled_at.is_some()
     }
 
+    pub fn is_escrow_funds_confirmed(&self) -> bool {
+        self.escrow_funds_confirmed_at.is_some()
+    }
+
     pub fn is_failed(&self) -> bool {
-        //NOTE: may want to use to enable retry logic, check if error > n
         self.failed_at.is_some()
+    }
+
+    pub fn should_abort(&self) -> bool {
+        self.errors.len() > 5
     }
 
     pub fn is_expired(&self) -> bool {
         let now = OffsetDateTime::now_utc();
+        let Some(ref event_announcement) = self.event_announcement else {
+            return false;
+        };
 
         // Competition should expire if not enough entries collected before observation date
-        if let Some(observation_date) = self.event_announcement.expiry {
+        if let Some(observation_date) = event_announcement.expiry {
             if now.unix_timestamp() as u32 >= observation_date && !self.has_full_entries() {
                 return true;
             }
@@ -834,7 +919,7 @@ impl Competition {
             _ => false,
         }
     }
-
+    // States change bottom up, so a state that doesn't match any of the conditionals is the first state (ie. Created)
     pub fn get_state(&self) -> CompetitionState {
         if self.is_cancelled() {
             return CompetitionState::Cancelled;
@@ -886,11 +971,20 @@ impl Competition {
             );
             return CompetitionState::NoncesCollected;
         }
-        if self.has_full_entries() && self.has_all_entries_paid() {
-            return CompetitionState::EntriesCollected;
-        }
         if self.contract_parameters.is_some() {
             return CompetitionState::ContractCreated;
+        }
+        if self.is_entries_submitted() {
+            return CompetitionState::EntriesSubmitted;
+        }
+        if self.is_event_created() {
+            return CompetitionState::EventCreated;
+        }
+        if self.is_escrow_funds_confirmed() {
+            return CompetitionState::EscrowFundsConfirmed;
+        }
+        if self.has_full_entries() && self.has_all_entries_paid() {
+            return CompetitionState::EntriesCollected;
         }
         CompetitionState::Created
     }
@@ -906,98 +1000,108 @@ impl<'a> TryFrom<&Row<'a>> for Competition {
                 .map(|val| Uuid::parse_str(&val))?
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(0, Type::Any, Box::new(e)))?,
             created_at: parse_timestamp_or_error(row.get::<usize, String>(1)?, 1)?,
-            total_competition_pool: row.get::<usize, u64>(2)?,
-            total_allowed_entries: row.get::<usize, u64>(3)?,
-            number_of_places_win: row.get(4)?,
-            entry_fee: row.get::<usize, u64>(5)?,
-            coordinator_fee_percentage: row.get(6)?,
-            event_announcement: row.get::<usize, Option<Value>>(7).map(|opt| match opt {
-                Some(Value::Blob(val)) => serde_json::from_slice::<EventLockingConditions>(&val)
-                    .map_err(|e| {
-                        duckdb::Error::FromSqlConversionFailure(6, Type::Any, Box::new(e))
-                    }),
+            event_submission: row.get::<usize, Option<Value>>(2).map(|opt| match opt {
+                Some(Value::Blob(val)) => {
+                    serde_json::from_slice::<CreateEvent>(&val).map_err(|e| {
+                        duckdb::Error::FromSqlConversionFailure(2, Type::Any, Box::new(e))
+                    })
+                }
                 _ => Err(duckdb::Error::FromSqlConversionFailure(
-                    6,
+                    2,
                     Type::Any,
                     Box::new(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        "Missing required event announcement data",
+                        "Missing required created event data",
                     )),
                 )),
             })??,
+            event_announcement: row.get::<usize, Option<Value>>(3).map(|opt| {
+                opt.and_then(|raw| match raw {
+                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
+                    _ => None,
+                })
+            })?,
+            total_entries: row.get::<usize, u64>(4)?,
+            total_entry_nonces: row.get::<usize, u64>(5)?,
+            total_signed_entries: row.get::<usize, u64>(6)?,
+            total_paid_entries: row.get::<usize, u64>(7)?,
+            total_paid_out_entries: row.get(8)?,
 
-            total_entries: row.get::<usize, u64>(8)?,
-            total_entry_nonces: row.get::<usize, u64>(9)?,
-            total_signed_entries: row.get::<usize, u64>(10)?,
-            total_paid_entries: row.get::<usize, u64>(11)?,
-            total_paid_out_entries: row.get(12)?,
-
-            outcome_transaction: row.get::<usize, Option<Value>>(13).map(|opt| {
+            outcome_transaction: row.get::<usize, Option<Value>>(9).map(|opt| {
+                opt.and_then(|raw| match raw {
+                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
+                    _ => None,
+                })
+            })?,
+            funding_psbt_base64: row.get(10)?,
+            funding_outpoint: row.get::<usize, Option<Value>>(11).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            funding_transaction: row.get::<usize, Option<Value>>(14).map(|opt| {
+            funding_transaction: row.get::<usize, Option<Value>>(12).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            funding_outpoint: row.get::<usize, Option<Value>>(15).map(|opt| {
+            contract_parameters: row.get::<usize, Option<Value>>(13).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            contract_parameters: row.get::<usize, Option<Value>>(16).map(|opt| {
+            public_nonces: row.get::<usize, Option<Value>>(14).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            public_nonces: row.get::<usize, Option<Value>>(17).map(|opt| {
+            aggregated_nonces: row.get::<usize, Option<Value>>(15).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            aggregated_nonces: row.get::<usize, Option<Value>>(18).map(|opt| {
+            partial_signatures: row.get::<usize, Option<Value>>(16).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            partial_signatures: row.get::<usize, Option<Value>>(19).map(|opt| {
+            signed_contract: row.get::<usize, Option<Value>>(17).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            signed_contract: row.get::<usize, Option<Value>>(20).map(|opt| {
+            attestation: row.get::<usize, Option<Value>>(18).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
 
-            attestation: row.get::<usize, Option<Value>>(21).map(|opt| {
-                opt.and_then(|raw| match raw {
-                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
-                    _ => None,
-                })
-            })?,
-
-            cancelled_at: parse_optional_timestamp(row.get::<usize, Option<String>>(22)?, 22)?,
-            contracted_at: parse_optional_timestamp(row.get::<usize, Option<String>>(23)?, 23)?,
-            signed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(24)?, 24)?,
+            cancelled_at: parse_optional_timestamp(row.get::<usize, Option<String>>(19)?, 19)?,
+            contracted_at: parse_optional_timestamp(row.get::<usize, Option<String>>(20)?, 20)?,
+            signed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(21)?, 21)?,
+            escrow_funds_confirmed_at: parse_optional_timestamp(
+                row.get::<usize, Option<String>>(22)?,
+                22,
+            )?,
+            event_created_at: parse_optional_timestamp(row.get::<usize, Option<String>>(23)?, 23)?,
+            entries_submitted_at: parse_optional_timestamp(
+                row.get::<usize, Option<String>>(24)?,
+                24,
+            )?,
             funding_broadcasted_at: parse_optional_timestamp(
                 row.get::<usize, Option<String>>(25)?,
                 25,
@@ -1046,11 +1150,17 @@ impl<'a> TryFrom<&Row<'a>> for Competition {
 pub enum CompetitionError {
     #[error("Failed to create transaction: {0}")]
     FailedCreateTransaction(String),
+    #[error("Failed to create event on oracle: {0}")]
+    FailedCreateEvent(String),
+    #[error("Failed to submit entries to oracle: {0}")]
+    FailedSubmitEntries(String),
+    #[error("Failed to check escrow transaction: {0}")]
+    FailedEscrowConfirmation(String),
     #[error("Failed to broadcast error: {0}")]
     FailedBroadcast(String),
-    #[error("Failed to check funding confirmation error: {0}")]
+    #[error("Failed to check funding confirmation: {0}")]
     FailedFundingConfirmation(String),
-    #[error("Failed to settled funding invoices error: {0}")]
+    #[error("Failed to settled funding invoices: {0}")]
     FailedFundingSettled(String),
     #[error("Failed to aggregate nonces: {0}")]
     FailedNonceAggregation(String),
@@ -1079,14 +1189,16 @@ impl<'a> TryFrom<&Row<'a>> for Ticket {
                     })
                 })
                 .transpose()?,
-            encrypted_preimage: row.get(3)?,
-            hash: row.get(4)?,
-            payment_request: row.get(5)?,
-            expiry: parse_timestamp_or_error(row.get::<usize, String>(6)?, 6)?,
-            reserved_by: row.get(7)?,
-            reserved_at: parse_optional_timestamp(row.get::<usize, Option<String>>(8)?, 8)?,
-            paid_at: parse_optional_timestamp(row.get::<usize, Option<String>>(9)?, 9)?,
-            settled_at: parse_optional_timestamp(row.get::<usize, Option<String>>(10)?, 10)?,
+            ephemeral_pubkey: row.get(3)?,
+            encrypted_preimage: row.get(4)?,
+            hash: row.get(5)?,
+            payment_request: row.get(6)?,
+            expiry: parse_timestamp_or_error(row.get::<usize, String>(7)?, 7)?,
+            reserved_by: row.get(8)?,
+            reserved_at: parse_optional_timestamp(row.get::<usize, Option<String>>(9)?, 9)?,
+            paid_at: parse_optional_timestamp(row.get::<usize, Option<String>>(10)?, 10)?,
+            settled_at: parse_optional_timestamp(row.get::<usize, Option<String>>(11)?, 11)?,
+            escrow_transaction: row.get::<usize, Option<String>>(12)?,
         })
     }
 }

@@ -1,17 +1,17 @@
 use crate::{
-    add_event_entry, admin_index_handler, create_event, create_folder,
+    add_event_entry, admin_index_handler, create_competition, create_folder,
     domain::{CompetitionStore, CompetitionWatcher, DBConnection, InvoiceWatcher, UserInfo},
     get_aggregate_nonces, get_balance, get_competitions, get_contract_parameters, get_entries,
     get_estimated_fee_rates, get_next_address, get_outputs, get_ticket_status, health,
     index_handler, login, register, request_competition_ticket, send_to_address,
-    submit_partial_signatures, submit_public_nonces, BitcoinClient, BitcoinSyncWatcher,
-    Coordinator, Ln, LnClient, OracleClient, Settings, UserStore,
+    submit_final_signatures, submit_public_nonces, BitcoinClient, BitcoinSyncWatcher, Coordinator,
+    Ln, LnClient, OracleClient, Settings, UserStore,
 };
 use anyhow::anyhow;
 use axum::{
     body::Body,
     extract::{connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, Request},
-    http::Extensions,
+    http::{Extensions, HeaderValue},
     middleware::{self, AddExtension, Next},
     response::IntoResponse,
     routing::{get, post},
@@ -34,7 +34,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::{net::TcpListener, select, task::JoinHandle};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tower_http::{
-    cors::{Any, CorsLayer},
+    cors::{AllowOrigin, CorsLayer},
     services::{ServeDir, ServeFile},
     set_status::SetStatus,
 };
@@ -56,8 +56,15 @@ impl Application {
         );
         let listener = SocketAddr::from_str(&address)?;
         let (app_state, serve_dir, serve_admin_dir, background_tasks, cancellation_token) =
-            build_app(config).await?;
-        let server = build_server(listener, app_state, serve_dir, serve_admin_dir).await?;
+            build_app(config.clone()).await?;
+        let server = build_server(
+            listener,
+            app_state,
+            serve_dir,
+            serve_admin_dir,
+            config.api_settings.origins,
+        )
+        .await?;
         Ok(Self {
             server,
             cancellation_token,
@@ -181,7 +188,10 @@ pub async fn build_app(
         competition_store,
         bitcoin_client.clone(),
         ln.clone(),
-        config.coordinator_settings.relative_locktime_block_delta,
+        config
+            .coordinator_settings
+            .relative_locktime_block_delta
+            .into(),
         config.coordinator_settings.required_confirmations,
     )
     .await
@@ -195,7 +205,7 @@ pub async fn build_app(
     let competition_watcher = CompetitionWatcher::new(
         coordinator.clone(),
         cancel_token.clone(),
-        Duration::from_secs(30),
+        Duration::from_secs(config.coordinator_settings.sync_interval_secs),
     );
     let competition_watcher_task = tracker.spawn(async move {
         match competition_watcher.watch().await {
@@ -267,6 +277,7 @@ pub async fn build_server(
     app_state: AppState,
     serve_dir: ServeDir<ServeFile>,
     serve_admin_dir: ServeDir<SetStatus<ServeFile>>,
+    origins: Vec<String>,
 ) -> Result<
     Serve<
         TcpListener,
@@ -279,7 +290,7 @@ pub async fn build_server(
     let listener = TcpListener::from_std(std_listener)?;
 
     info!("Setting up service");
-    let app = app(app_state, serve_dir, serve_admin_dir);
+    let app = app(app_state, serve_dir, serve_admin_dir, origins);
     let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -296,11 +307,18 @@ pub fn app(
     app_state: AppState,
     serve_dir: ServeDir<ServeFile>,
     serve_admin_dir: ServeDir<SetStatus<ServeFile>>,
+    origins: Vec<String>,
 ) -> Router {
+    let origins: Vec<HeaderValue> = origins
+        .into_iter()
+        .filter_map(|origin| origin.parse().ok())
+        .collect();
+
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([ACCEPT, CONTENT_TYPE, AUTHORIZATION])
-        .allow_origin(Any);
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_credentials(true);
 
     let wallet_endpoints = Router::new()
         .route("/balance", get(get_balance))
@@ -318,11 +336,11 @@ pub fn app(
         .route("/admin", get(admin_index_handler))
         .fallback(index_handler)
         .route("/api/v1/health_check", get(health))
-        .route("/api/v1/competitions", post(create_event))
+        .route("/api/v1/competitions", post(create_competition))
         .route("/api/v1/competitions", get(get_competitions))
         .route(
             "/api/v1/competitions/{competition_id}/ticket",
-            get(request_competition_ticket),
+            post(request_competition_ticket),
         )
         .route(
             "/api/v1/competitions/{competition_id}/tickets/{ticket_id}/status",
@@ -341,8 +359,8 @@ pub fn app(
             get(get_aggregate_nonces),
         )
         .route(
-            "/api/v1/competitions/{competition_id}/entries/{entry_id}/partial_signatures",
-            post(submit_partial_signatures),
+            "/api/v1/competitions/{competition_id}/entries/{entry_id}/final_signatures",
+            post(submit_final_signatures),
         )
         .route("/api/v1/entries", post(add_event_entry))
         .route("/api/v1/entries", get(get_entries))

@@ -976,7 +976,7 @@ checksum = "f46ad14479a25103f283c0f10005961cf086d8dc42205bb44c46ac563475dca6"
 
 [[package]]
 name = "client_validator"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -987,8 +987,10 @@ dependencies = [
  "hex",
  "js-sys",
  "log",
+ "miniscript",
  "nostr-sdk",
  "rand",
+ "rand_chacha",
  "secrecy",
  "serde",
  "serde-wasm-bindgen",
@@ -1210,8 +1212,8 @@ dependencies = [
 
 [[package]]
 name = "dlctix"
-version = "0.0.6"
-source = "git+https://github.com/tee8z/dlctix?branch=add-errors#58bd0f1fed587a0c52774dd001d5fb3dac4562f3"
+version = "0.0.7"
+source = "git+https://github.com/tee8z/dlctix?rev=a02c800a586538bbf8d6ccc82c964a5bf0b49d93#a02c800a586538bbf8d6ccc82c964a5bf0b49d93"
 dependencies = [
  "bitcoin",
  "hex",
@@ -2441,9 +2443,9 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "miniscript"
-version = "12.3.0"
+version = "12.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5bd3c9608217b0d6fa9c9c8ddd875b85ab72bd4311cfc8db35e1b5a08fc11f4d"
+checksum = "0760e92feaf4ee26bd2e616f557de64712bf1e75f3b1b218dfb475c0a84c7943"
 dependencies = [
  "bech32",
  "bitcoin",
@@ -2532,9 +2534,9 @@ dependencies = [
 
 [[package]]
 name = "musig2"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd55e6cfd1ddd92698a3e456432e16310f0810faad83ac732e2466ed0961b46d"
+checksum = "d89eb08ce8778538f84198774795f418358360a29841cfea8dbbb28c04d777e2"
 dependencies = [
  "base16ct",
  "hmac",
@@ -3643,9 +3645,9 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "secp"
-version = "0.4.2"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3a566e69f272e267e2dea55181ec5155bf454fa923c555e4f10a0a1aeefca8f"
+checksum = "d7ac68feda6cce08c5091b4e87cf93d4b7fa04b4afd9988d4b36121d949f79ec"
 dependencies = [
  "base16ct",
  "once_cell",
@@ -3815,7 +3817,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -3846,6 +3848,7 @@ dependencies = [
  "openssl",
  "pem-rfc7468",
  "rand",
+ "rand_chacha",
  "reqwest-middleware",
  "reqwest-retry",
  "scooby",

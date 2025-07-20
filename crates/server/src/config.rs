@@ -36,6 +36,18 @@ pub struct Settings {
     pub ln_settings: LnSettings,
 }
 
+impl ConfigurableSettings for Settings {
+    fn apply_cli_overrides(&mut self, cli_settings: &CliSettings) {
+        if let Some(level) = &cli_settings.level {
+            self.level = Some(level.clone());
+        }
+    }
+
+    fn default_config_path() -> PathBuf {
+        PathBuf::from("./config/local.toml")
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DBSettings {
     pub data_folder: String,
@@ -123,15 +135,17 @@ pub struct CoordinatorSettings {
     /// The number of confirmations required for a transaction to be considered confirmed
     /// by the coordinator system
     pub required_confirmations: u32,
+    pub sync_interval_secs: u64,
 }
 
 impl Default for CoordinatorSettings {
     fn default() -> Self {
         CoordinatorSettings {
-            oracle_url: String::from("https://www.4casttruth.win"),
+            oracle_url: String::from("http://127.0.0.1:9800"),
             private_key_file: String::from("./creds/coordinator_private_key.pem"),
             relative_locktime_block_delta: 144,
             required_confirmations: 1,
+            sync_interval_secs: 15,
         }
     }
 }
@@ -147,8 +161,8 @@ pub struct UISettings {
 impl Default for UISettings {
     fn default() -> Self {
         UISettings {
-            private_url: String::from("http://127.0.0.1:8900"),
-            remote_url: String::from("http://127.0.0.1:8900"),
+            private_url: String::from("http://127.0.0.1:9990"),
+            remote_url: String::from("http://127.0.0.1:9990"),
             ui_dir: String::from("./crates/public_ui"),
             admin_ui_dir: String::from("./crates/admin_ui"),
         }
@@ -159,13 +173,15 @@ impl Default for UISettings {
 pub struct APISettings {
     pub domain: String,
     pub port: String,
+    pub origins: Vec<String>,
 }
 
 impl Default for APISettings {
     fn default() -> Self {
         APISettings {
             domain: String::from("127.0.0.1"),
-            port: String::from("8900"),
+            port: String::from("9990"),
+            origins: vec![String::from("http://localhost:9990")],
         }
     }
 }
@@ -184,11 +200,42 @@ impl Default for Settings {
         }
     }
 }
-
 pub fn get_settings() -> Result<Settings, anyhow::Error> {
-    let cli = Cli::parse();
+    get_settings_with_cli(Cli::parse().into())
+}
 
-    let mut settings = if let Some(config_path) = cli.config {
+pub struct CliSettings {
+    pub config: Option<String>,
+    pub level: Option<String>,
+}
+
+impl From<Cli> for CliSettings {
+    fn from(cli: Cli) -> Self {
+        Self {
+            config: cli.config,
+            level: cli.level,
+        }
+    }
+}
+pub trait ConfigurableSettings: Serialize + for<'de> Deserialize<'de> + Default {
+    /// Apply CLI settings after loading from file
+    fn apply_cli_overrides(&mut self, cli_settings: &CliSettings);
+
+    /// Get the default config file path
+    fn default_config_path() -> PathBuf {
+        PathBuf::from("./config/settings.toml")
+    }
+
+    /// Get the config directory path
+    fn config_directory() -> PathBuf {
+        PathBuf::from("./config")
+    }
+}
+
+pub fn get_settings_with_cli<T: ConfigurableSettings>(
+    cli_settings: CliSettings,
+) -> Result<T, anyhow::Error> {
+    let mut settings = if let Some(config_path) = cli_settings.config.clone() {
         let path = PathBuf::from(config_path);
 
         let absolute_path = if path.is_absolute() {
@@ -209,7 +256,7 @@ pub fn get_settings() -> Result<Settings, anyhow::Error> {
         };
         file_settings
     } else {
-        let default_path = PathBuf::from("./config/local.toml");
+        let default_path = T::default_config_path();
         match File::open(&default_path) {
             Ok(mut file) => {
                 let mut content = String::new();
@@ -220,10 +267,10 @@ pub fn get_settings() -> Result<Settings, anyhow::Error> {
             }
             Err(_) => {
                 // Create default settings
-                let default_settings = Settings::default();
+                let default_settings = T::default();
 
                 // Create config directory if it doesn't exist
-                fs::create_dir_all("./config")
+                fs::create_dir_all(T::config_directory())
                     .map_err(|e| anyhow!("Failed to create config directory: {}", e))?;
 
                 let toml_content = toml::to_string(&default_settings)
@@ -239,14 +286,15 @@ pub fn get_settings() -> Result<Settings, anyhow::Error> {
         }
     };
 
-    if let Some(cli_level) = cli.level {
-        settings.level = Some(cli_level);
-    }
+    settings.apply_cli_overrides(&cli_settings);
 
     Ok(settings)
 }
 
-pub fn setup_logger(level: Option<String>) -> Result<(), fern::InitError> {
+pub fn setup_logger(
+    level: Option<String>,
+    filter_targets: Vec<String>,
+) -> Result<(), fern::InitError> {
     let rust_log = get_log_level(level);
     let colors = ColoredLevelConfig::new()
         .trace(Color::White)
@@ -266,7 +314,11 @@ pub fn setup_logger(level: Option<String>) -> Result<(), fern::InitError> {
             ));
         })
         .level(rust_log)
-        .filter(|metadata| !metadata.target().starts_with("hyper"))
+        .filter(move |metadata| {
+            !filter_targets
+                .iter()
+                .any(|filter| metadata.target().starts_with(filter))
+        })
         .chain(std::io::stdout())
         .apply()?;
     Ok(())

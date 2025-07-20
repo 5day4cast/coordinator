@@ -1,7 +1,9 @@
 use super::core::{TaprootWalletCore, TaprootWalletCoreBuilder};
 use crate::NostrClientWrapper;
+use bdk_wallet::bitcoin::Psbt;
 use dlctix::{bitcoin::OutPoint, musig2::AggNonce, ContractParameters, SigMap};
 use log::{debug, info};
+use std::str::FromStr;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -182,5 +184,30 @@ impl TaprootWallet {
         serde_wasm_bindgen::to_value(&partial_sigs).map_err(|e| {
             JsValue::from_str(&format!("Partial signatures serialization error: {}", e))
         })
+    }
+
+    #[wasm_bindgen(js_name = "signFundingPsbt")]
+    pub fn sign_funding_psbt(
+        &self,
+        funding_psbt_base64: String,
+        entry_index: u32,
+    ) -> Result<String, JsValue> {
+        debug!("Received funding psbt: {:?}", funding_psbt_base64);
+
+        let psbt = Psbt::from_str(&funding_psbt_base64)
+            .map_err(|e| JsValue::from_str(&format!("Invalid PSBT base64: {}", e)))?;
+
+        debug!("Deserialized funding psbt: {:?}", psbt);
+
+        let signed_psbt = self
+            .inner
+            .sign_funding_psbt(psbt, entry_index)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        debug!("Generated signed funding psbt: {:?}", signed_psbt);
+        let psbt_base64 = signed_psbt.to_string();
+        debug!("Generated signed funding psbt base64: {:?}", psbt_base64);
+
+        Ok(psbt_base64)
     }
 }

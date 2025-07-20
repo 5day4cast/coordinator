@@ -128,7 +128,7 @@ class Competitions {
   async get_combined_competitions() {
     console.log(this.coordinator_url);
     const [competitionsResponse, eventsResponse] = await Promise.all([
-      fetch(`${this.coordinator_url}/competitions`),
+      fetch(`${this.coordinator_url}/api/v1/competitions`),
       fetch(`${this.oracle_url}/oracle/events`),
     ]);
 
@@ -150,30 +150,27 @@ class Competitions {
 
     return competitions
       .map((competition) => {
+        //We will have competition exist prior to the event
         const event = eventsMap.get(competition.id);
-        if (!event) {
-          console.warn(
-            `No matching event found for competition ${competition.id}`,
-          );
-          return null;
-        }
+
         const combinedStatus = this.getCombinedStatus(
           competition.state,
-          event.status.toLowerCase(),
+          event ? event.status.toLowerCase() : null,
         );
-
+        console.log(competition.event_submission);
         return {
           id: competition.id,
-          startTime: event.observation_date,
-          endTime: one_day_ahead(event.observation_date),
+          startTime: competition.event_submission.observation_date,
+          endTime: one_day_ahead(competition.event_submission.observation_date),
           phase: combinedStatus.phase,
           status: combinedStatus.status,
           canJoin: combinedStatus.canJoin,
-          entry_fee: competition.entry_fee,
-          totalPrizePoolAmt: competition.total_competition_pool,
-          totalEntries: event.total_entries,
-          numOfWinners: competition.number_of_places_win,
-          locations: event.locations,
+          entry_fee: competition.event_submission.entry_fee,
+          totalPrizePoolAmt:
+            competition.event_submission.total_competition_pool,
+          totalEntries: competition.total_entries,
+          numOfWinners: competition.event_submission.number_of_places_win,
+          locations: competition.event_submission.locations,
         };
       })
       .filter(Boolean);
@@ -191,10 +188,7 @@ class Competitions {
     };
 
     // Early states related to registration
-    if (
-      eventStatus === "live" &&
-      ["created"].includes(competitionState.toLowerCase())
-    ) {
+    if (["created"].includes(competitionState.toLowerCase())) {
       return {
         phase: PHASE.REGISTRATION,
         status: "Open for Registration",
@@ -205,6 +199,9 @@ class Competitions {
     // Competition is being setup/funded
     if (
       [
+        "event_created",
+        "entries_submitted",
+        "escrow_funds_confirmed",
         "entries_collected",
         "contract_created",
         "nonces_collected",

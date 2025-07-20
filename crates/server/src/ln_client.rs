@@ -1,6 +1,7 @@
 use anyhow::anyhow;
 use async_trait::async_trait;
 use base64::Engine;
+use bdk_wallet::bitcoin::hashes::{sha256, Hash};
 use log::{debug, info};
 use reqwest_middleware::{
     reqwest::{Certificate, Client, Url},
@@ -28,6 +29,14 @@ pub trait Ln: Send + Sync {
         value: u64,
         expiry_time_secs: u64,
         ticket_hash: String,
+        competition_id: Uuid,
+        hex_refund_tx: String,
+    ) -> Result<InvoiceAddResponse, anyhow::Error>;
+    async fn add_invoice(
+        &self,
+        value: u64,
+        expiry_time_secs: u64,
+        memo: String,
         competition_id: Uuid,
     ) -> Result<InvoiceAddResponse, anyhow::Error>;
     async fn create_invoice(
@@ -194,7 +203,14 @@ pub struct HoldInvoiceRequest {
     pub hash: String,         // Base64 encoded payment hash
     pub value: String,        // Amount in satoshis
     pub expiry: String,       // Expiry time in seconds
-    pub memo: Option<String>, // Optional memo field
+    pub memo: Option<String>, // Holds refund transaction and competition id, encrypted to the invoice preimage
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InvoiceRequest {
+    pub value: String,  // Amount in satoshis
+    pub expiry: String, // Expiry time in seconds
+    pub memo: String,   // Memo field (description)
 }
 
 #[async_trait]
@@ -235,6 +251,7 @@ impl Ln for LnClient {
         expiry_time_secs: u64,
         ticket_hash_hex: String,
         competition_id: Uuid,
+        hex_refund_tx: String,
     ) -> Result<InvoiceAddResponse, anyhow::Error> {
         info!("ticket_hash_hex: {:?}", ticket_hash_hex);
 
@@ -248,14 +265,19 @@ impl Ln for LnClient {
             ));
         }
 
+        let refund_tx_hash = sha256::Hash::hash(hex_refund_tx.as_bytes()).to_byte_array();
+
+        let memo = format!("c:{};r:{:?}", competition_id, refund_tx_hash);
+
         let hash_base64 = base64::engine::general_purpose::STANDARD.encode(&hash_bytes);
 
         let body = HoldInvoiceRequest {
             hash: hash_base64.clone(),
             value: value.to_string(),
             expiry: expiry_time_secs.to_string(),
-            memo: Some(format!("competition_id:{0}", competition_id.to_string(),)),
+            memo: Some(memo),
         };
+
         info!("hold invoice: {:?}", body);
         info!("hash_base64: {:?}", hash_base64);
         let response = self
@@ -269,6 +291,40 @@ impl Ln for LnClient {
         if !response.status().is_success() {
             return Err(anyhow::anyhow!(
                 "Failed to create hold invoice: {}",
+                response.status()
+            ));
+        }
+
+        let invoice_response = response.json::<InvoiceAddResponse>().await?;
+        Ok(invoice_response)
+    }
+
+    async fn add_invoice(
+        &self,
+        value: u64,
+        expiry_time_secs: u64,
+        memo: String,
+        competition_id: Uuid,
+    ) -> Result<InvoiceAddResponse, anyhow::Error> {
+        let body = json!({
+            "value": value.to_string(),
+            "expiry": expiry_time_secs.to_string(),
+            "memo": format!("{} - competition_id:{}", memo, competition_id.to_string()),
+        });
+
+        info!("Creating regular invoice: {:?}", body);
+
+        let response = self
+            .client
+            .post(format!("{}v1/invoices", self.base_url))
+            .json(&body)
+            .header(MACAROON_HEADER, self.macaroon.expose_secret())
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "Failed to create invoice: {}",
                 response.status()
             ));
         }
@@ -295,7 +351,7 @@ impl Ln for LnClient {
 
         let response = self
             .client
-            .post(format!("{}v2/invoices/hodl/cancel", self.base_url))
+            .post(format!("{}v2/invoices/cancel", self.base_url))
             .json(&body)
             .header(MACAROON_HEADER, self.macaroon.expose_secret())
             .send()
