@@ -585,6 +585,7 @@ impl Competition {
         let Some(attestation) = self.attestation else {
             return Err(anyhow!("No attestation found for competition {}", self.id));
         };
+        debug!("Found attestation: {:?}", attestation);
 
         let Some(ref event_announcement) = self.event_announcement else {
             return Err(anyhow!(
@@ -594,6 +595,7 @@ impl Competition {
         };
 
         let locking_point = attestation.base_point_mul();
+        debug!("Found event_announcement: {:?}", event_announcement);
 
         let outcome = event_announcement
             .all_outcomes()
@@ -608,7 +610,7 @@ impl Competition {
                 }
             })
             .ok_or_else(|| anyhow!("No matching outcome found for attestation"))?;
-
+        debug!("Found outcome: {:?}", outcome);
         Ok(outcome)
     }
 

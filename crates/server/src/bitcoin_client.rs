@@ -75,6 +75,7 @@ pub trait Bitcoin: Send + Sync {
         psbt: &mut Psbt,
         sign_options: SignOptions,
     ) -> Result<bool, anyhow::Error>;
+    async fn list_utxos(&self) -> Vec<LocalOutput>;
 }
 
 pub struct BitcoinClient {
@@ -481,6 +482,11 @@ impl Bitcoin for BitcoinClient {
             .await
             .map_err(|e| anyhow!("error broadcasting: {}", e))
     }
+
+    async fn list_utxos(&self) -> Vec<LocalOutput> {
+        let wallet = self.wallet.read().await;
+        wallet.list_unspent().collect()
+    }
 }
 
 impl BitcoinClient {
@@ -566,7 +572,6 @@ impl BitcoinClient {
         })?;
 
         info!("Initial scan completed");
-
         Ok(BitcoinClient {
             network: settings.network,
             wallet: RwLock::new(wallet),

@@ -9,8 +9,8 @@ use reqwest_middleware::ClientWithMiddleware;
 use server::{
     build_reqwest_client, create_folder,
     domain::{CompetitionState, DBConnection, InvoiceWatcher, PayoutInfo, TicketStatus},
-    Bitcoin, BitcoinClient, CompetitionStore, Coordinator, FinalSignatures, Ln, LnClient,
-    LnSettings, Oracle, OracleEvent,
+    setup_logger, Bitcoin, BitcoinClient, CompetitionStore, Coordinator, FinalSignatures, Ln,
+    LnClient, LnSettings, Oracle, OracleEvent,
 };
 use std::{
     collections::HashMap,
@@ -33,7 +33,14 @@ static INIT_LOGGER: Once = Once::new();
 
 pub fn setup_static_logger() {
     INIT_LOGGER.call_once(|| {
-        env_logger::init();
+        let filter_targets = vec![
+            "hyper".to_string(),
+            "hyper_util".to_string(),
+            "tungstenite".to_string(),
+            "nostr_relay_pool".to_string(),
+        ];
+        setup_logger(Some("debug".to_string()), filter_targets)
+            .expect("Failed to initialize logger");
     });
 }
 
@@ -298,7 +305,35 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
     }
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // Create transactions
+    // Wait for the competition state to change to EscrowFundsConfirmed
+    let mut escrow_confirmed = false;
+    for _ in 0..30 {
+        coordinator.competition_handler().await?;
+        let competition = coordinator.get_competition(create_event.id).await?;
+        debug!("Competition state: {:?}", competition.get_state());
+        if competition.get_state() == CompetitionState::EscrowFundsConfirmed {
+            escrow_confirmed = true;
+            assert!(competition.escrow_funds_confirmed_at.is_some());
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(
+        escrow_confirmed,
+        "Competition state did not change to EscrowFundsConfirmed within 30 seconds"
+    );
+
+    // Create oracle event announcement
+    coordinator.competition_handler().await?;
+    let competition = coordinator.get_competition(create_event.id).await?;
+    let _ = competition.event_announcement.as_ref().unwrap();
+
+    // Add all entries to oracle event
+    coordinator.competition_handler().await?;
+    let competition = coordinator.get_competition(create_event.id).await?;
+    let _ = competition.entries_submitted_at.unwrap();
+
+    // Create funding transaction and dlc contract
     coordinator.competition_handler().await?;
     let competition = coordinator.get_competition(create_event.id).await?;
     let contract_params = competition.contract_parameters.as_ref().unwrap();
@@ -382,24 +417,6 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
     assert_eq!(competition.get_state(), CompetitionState::SigningComplete);
     assert!(competition.signed_contract.is_some());
     assert!(competition.signed_at.is_some());
-
-    // Wait for the competition state to change to EscrowFundsConfirmed
-    let mut escrow_confirmed = false;
-    for _ in 0..30 {
-        coordinator.competition_handler().await?;
-        let competition = coordinator.get_competition(create_event.id).await?;
-        debug!("Competition state: {:?}", competition.get_state());
-        if competition.get_state() == CompetitionState::EscrowFundsConfirmed {
-            escrow_confirmed = true;
-            assert!(competition.escrow_funds_confirmed_at.is_some());
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    assert!(
-        escrow_confirmed,
-        "Competition state did not change to EscrowFundsConfirmed within 30 seconds"
-    );
 
     // Broadcast funding transaction
     coordinator.competition_handler().await?;

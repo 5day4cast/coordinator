@@ -971,7 +971,7 @@ impl Coordinator {
 
         debug!(
             "Broadcasting funding transaction: {:?}",
-            funding_transaction.compute_txid()
+            funding_transaction
         );
 
         self.bitcoin.broadcast(&funding_transaction).await?;
@@ -1036,6 +1036,8 @@ impl Coordinator {
             );
             return Ok(competition);
         };
+        debug!("attestation above verification: {:?}", attestation);
+
         match competition.verify_event_attestation(&attestation) {
             Ok(outcome) => {
                 info!(
@@ -1071,6 +1073,10 @@ impl Coordinator {
                 competition.id
             ));
         };
+        debug!(
+            "attestation at publish_outcome_transaction: {:?}",
+            attestation
+        );
         let Some(signed_contract) = competition.signed_contract.as_ref() else {
             return Err(anyhow!(
                 "No signed contract found for competition {}",
@@ -1105,6 +1111,7 @@ impl Coordinator {
                 );
 
                 if competition.expiry_broadcasted_at.is_none() {
+                    debug!("expiry_tx: {:?}", expiry_tx);
                     self.bitcoin.broadcast(&expiry_tx).await?;
                     competition.expiry_broadcasted_at = Some(OffsetDateTime::now_utc())
                 };
@@ -1139,6 +1146,7 @@ impl Coordinator {
                 .map(|input| &input.witness)
                 .collect::<Vec<_>>()
         );
+        debug!("outcome_tx: {:?}", outcome_tx);
         competition.outcome_transaction = Some(outcome_tx.clone());
         if competition.outcome_broadcasted_at.is_none() {
             self.bitcoin.broadcast(&outcome_tx).await?;
@@ -1678,6 +1686,8 @@ impl Coordinator {
             error!("Failed to generate escrow transaction: {}", e);
             Error::BadRequest(format!("Failed to generate refund transaction: {}", e))
         })?;
+
+        debug!("escrow_tx: {:?}", escrow_tx);
 
         let escrow_tx_hex = hex::encode(dlctix::bitcoin::consensus::encode::serialize(&escrow_tx));
 

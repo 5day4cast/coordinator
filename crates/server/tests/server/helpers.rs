@@ -2,7 +2,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use bdk_wallet::{
     bitcoin::{Amount, FeeRate, Network, OutPoint, Psbt, ScriptBuf, Txid},
-    SignOptions,
+    LocalOutput, SignOptions,
 };
 use client_validator::{
     NostrClientCore, SignerType, TaprootWalletCore, TaprootWalletCoreBuilder, WalletError,
@@ -74,6 +74,7 @@ mock! {
             psbt: &mut Psbt,
             sign_options: SignOptions,
         ) -> Result<bool, anyhow::Error>;
+        async fn list_utxos(&self) -> Vec<LocalOutput>;
     }
 }
 

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use log::{debug, info};
+use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use server::{
     get_settings_with_cli, setup_logger, Bitcoin, BitcoinClient, BitcoinSettings, CliSettings,
@@ -31,6 +31,8 @@ enum Commands {
     Balance,
     /// Sync wallet
     Sync,
+    /// List unspent transaction outputs (UTXOs)
+    ListUtxos,
 }
 
 impl From<Cli> for CliSettings {
@@ -88,6 +90,13 @@ async fn main() -> Result<()> {
         Commands::Sync => {
             client.sync().await?;
             info!("Wallet synced!");
+        }
+        Commands::ListUtxos => {
+            let utxos = client.list_utxos().await;
+            match serde_json::to_string_pretty(&utxos) {
+                Ok(json) => info!("UTXOs: \n{}", json),
+                Err(e) => error!("Failed to serialize UTXOs: {}", e),
+            }
         }
     }
 
