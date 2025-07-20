@@ -135,6 +135,7 @@ pub struct CoordinatorSettings {
     /// The number of confirmations required for a transaction to be considered confirmed
     /// by the coordinator system
     pub required_confirmations: u32,
+    pub sync_interval_secs: u64,
 }
 
 impl Default for CoordinatorSettings {
@@ -144,6 +145,7 @@ impl Default for CoordinatorSettings {
             private_key_file: String::from("./creds/coordinator_private_key.pem"),
             relative_locktime_block_delta: 144,
             required_confirmations: 1,
+            sync_interval_secs: 15,
         }
     }
 }
@@ -171,6 +173,7 @@ impl Default for UISettings {
 pub struct APISettings {
     pub domain: String,
     pub port: String,
+    pub origins: Vec<String>,
 }
 
 impl Default for APISettings {
@@ -178,6 +181,7 @@ impl Default for APISettings {
         APISettings {
             domain: String::from("127.0.0.1"),
             port: String::from("9990"),
+            origins: vec![String::from("http://localhost:9990")],
         }
     }
 }

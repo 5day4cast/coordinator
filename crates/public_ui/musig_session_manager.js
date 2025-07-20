@@ -93,7 +93,7 @@ class MusigSessionManager {
         console.log("funded contract:", fundedContract);
         this.contractParams = fundedContract.contract_params;
         this.fundingOutpoint = fundedContract.funding_outpoint;
-        this.fundingPsbt = fundedContract.funding_psbt;
+        this.fundingPsbt = fundedContract.funding_psbt_base64;
 
         console.log(this.contractParams);
         this.setState("CONTRACT_RECEIVED");
@@ -284,14 +284,16 @@ class MusigSessionManager {
       ) {
         throw new Error("One or both partialSigs collections are empty");
       }
+      console.log("partialSigs: {}", partialSigs);
 
       const signedFundingPsbt = await this.wallet.signFundingPsbt(
-        competition.this.fundingPsbt,
-        competition.this.entryIndex,
+        this.fundingPsbt,
+        this.entryIndex,
       );
+      console.log("Signed funding psbt: {}", signedFundingPsbt);
 
       const finalSignature = {
-        funding_psbt: signedFundingPsbt,
+        funding_psbt_base64: signedFundingPsbt,
         partial_signatures: {
           by_outcome: Object.fromEntries(partialSigs.by_outcome),
           by_win_condition: Object.fromEntries(partialSigs.by_win_condition),

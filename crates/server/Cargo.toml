@@ -1,6 +1,6 @@
 [package]
 name = "server"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 repository = "https://github.com/tee8z/5day4cast"
 
@@ -23,7 +23,7 @@ bdk_wallet = { version = "1.0.0", features = ["file_store"] }
 blake2 = "0.10.6"
 clap = { version = "4.3.23", features = ["derive", "env"] }
 config = "0.14.0"
-dlctix = { git = "https://github.com/tee8z/dlctix" }
+dlctix = { git = "https://github.com/tee8z/dlctix", rev = "a02c800a586538bbf8d6ccc82c964a5bf0b49d93" }
 duckdb = { version = "1.1.1" }
 fern = { version = "0.6.2", features = ["colored"] }
 futures = "0.3.28"

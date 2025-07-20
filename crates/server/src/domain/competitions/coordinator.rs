@@ -160,264 +160,93 @@ impl Coordinator {
         self.competition_store.ping().await.map_err(Error::DbError)
     }
 
+    fn get_immediate_transition_states() -> Vec<CompetitionState> {
+        vec![
+            CompetitionState::EscrowFundsConfirmed,
+            CompetitionState::EventCreated,
+            CompetitionState::EntriesSubmitted,
+            CompetitionState::SigningComplete,
+            CompetitionState::FundingConfirmed,
+            CompetitionState::FundingSettled,
+        ]
+    }
+
     pub async fn competition_handler(&self) -> Result<(), anyhow::Error> {
+        let immediate_states = Self::get_immediate_transition_states();
         let competitions: Vec<Competition> = self.competition_store.get_competitions(true).await?;
         let mut updated_competitions: Vec<Competition> = vec![];
-        info!("running competition handler");
+
         for mut competition in competitions {
-            competition.failed_at = None;
-            competition.errors = vec![];
+            let mut processed_states = 0;
+            const MAX_CONSECUTIVE_STATES: usize = 10;
             if competition.skip_competition() {
                 info!(
-                    "skipping process competition {} {:?}",
+                    "Skipping process competition {} {:?}",
                     competition.id,
                     competition.get_state()
                 );
                 continue;
             }
 
-            // Check for timeouts first
             if competition.is_expired() {
                 competition.cancelled_at = Some(OffsetDateTime::now_utc());
                 updated_competitions.push(competition.clone());
                 info!(
-                    "skipping process competition {} {:?}",
+                    "Skipping process competition {} {:?}",
                     competition.id,
                     competition.get_state()
                 );
                 continue;
             }
-            info!(
-                "competition {} {:?} {:?}",
-                competition.id,
-                competition.get_state(),
-                competition
-            );
-            debug!(
-                "Competition {} {:?}",
-                competition.id,
-                competition.get_state(),
-            );
-            match competition.get_state() {
-                CompetitionState::Created => {
-                    debug!(
-                        "Competition {}, waiting for more entries: {}/{}",
-                        competition.id,
-                        competition.total_entries,
-                        competition.event_submission.total_allowed_entries
-                    );
-                    continue;
-                }
-                CompetitionState::EntriesCollected => {
-                    match self.check_escrow_confirmations(&mut competition).await {
-                        Ok(updated) => updated_competitions.push(updated.clone()),
-                        Err(e) => {
-                            error!(
-                                "competition {} failed to check escrow funds: {}",
-                                competition.id, e
-                            );
-                            competition
-                                .errors
-                                .push(CompetitionError::FailedEscrowConfirmation(e.to_string()));
-                            competition.failed_at = Some(OffsetDateTime::now_utc());
-                            updated_competitions.push(competition.clone());
+
+            loop {
+                let current_state = competition.get_state();
+                match self.process_competition_state(competition.clone()).await {
+                    Ok(updated_competiton) => {
+                        info!(
+                            "Updated competition {} new state {} previous state: {}",
+                            competition.id,
+                            updated_competiton.get_state(),
+                            current_state
+                        );
+                        if updated_competiton.get_state() != current_state {
+                            processed_states += 1;
+
+                            if immediate_states.contains(&updated_competiton.get_state())
+                                && processed_states < MAX_CONSECUTIVE_STATES
+                            {
+                                match self
+                                    .competition_store
+                                    .update_competitions(vec![updated_competiton.clone()])
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        competition = updated_competiton.clone();
+                                        debug!(
+                                            "Saved update to competition {}",
+                                            updated_competiton.id
+                                        );
+                                    }
+                                    Err(err) => {
+                                        error!(
+                                            "Failed to save updated competition {}: {}",
+                                            updated_competiton.id, err
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
                         }
+                        updated_competitions.push(updated_competiton.clone());
+                        break;
+                    }
+                    Err(err) => {
+                        error!("Failed to process competition: {}: {}", competition.id, err);
+
+                        updated_competitions.push(competition.clone());
+                        break;
                     }
                 }
-                CompetitionState::EscrowFundsConfirmed => {
-                    match self.submit_event_to_oracle(&mut competition).await {
-                        Ok(updated) => updated_competitions.push(updated.clone()),
-                        Err(e) => {
-                            error!(
-                                "Competition {} failed to submit entries to oracle: {}",
-                                competition.id, e
-                            );
-                            competition
-                                .errors
-                                .push(CompetitionError::FailedSubmitEntries(e.to_string()));
-                            competition.failed_at = Some(OffsetDateTime::now_utc());
-                            updated_competitions.push(competition.clone());
-                        }
-                    }
-                }
-                CompetitionState::EventCreated => {
-                    match self.submit_entries_to_oracle(&mut competition).await {
-                        Ok(updated) => updated_competitions.push(updated.clone()),
-                        Err(e) => {
-                            error!(
-                                "Competition {} failed to submit entries to oracle: {}",
-                                competition.id, e
-                            );
-                            competition
-                                .errors
-                                .push(CompetitionError::FailedSubmitEntries(e.to_string()));
-                            competition.failed_at = Some(OffsetDateTime::now_utc());
-                            updated_competitions.push(competition.clone());
-                        }
-                    };
-                }
-                CompetitionState::EntriesSubmitted => {
-                    match self.create_funding_psbt(&mut competition).await {
-                        Ok(updated) => updated_competitions.push(updated.clone()),
-                        Err(e) => {
-                            error!(
-                                "Competition {} failed to generate contract params: {}",
-                                competition.id, e
-                            );
-                            competition
-                                .errors
-                                .push(CompetitionError::FailedCreateTransaction(e.to_string()));
-                            competition.failed_at = Some(OffsetDateTime::now_utc());
-                            updated_competitions.push(competition.clone());
-                        }
-                    }
-                }
-                CompetitionState::NoncesCollected => {
-                    match self
-                        .generate_aggregate_nonces_and_coord_partial_signatures(&mut competition)
-                        .await
-                    {
-                        Ok(updated) => updated_competitions.push(updated.clone()),
-                        Err(e) => {
-                            error!(
-                                "competition {} failed to generate aggregate nonce: {}",
-                                competition.id, e
-                            );
-                            competition
-                                .errors
-                                .push(CompetitionError::FailedNonceAggregation(e.to_string()));
-                            competition.failed_at = Some(OffsetDateTime::now_utc());
-                            updated_competitions.push(competition.clone());
-                        }
-                    }
-                }
-                CompetitionState::PartialSignaturesCollected => {
-                    match self.sign_dlc_contract(&mut competition).await {
-                        Ok(updated) => updated_competitions.push(updated.clone()),
-                        Err(e) => {
-                            error!(
-                                "competition {} failed to sign dlc contract: {}",
-                                competition.id, e
-                            );
-                            competition
-                                .errors
-                                .push(CompetitionError::FailedBroadcast(e.to_string()));
-                            competition.failed_at = Some(OffsetDateTime::now_utc());
-                            updated_competitions.push(competition.clone());
-                        }
-                    }
-                }
-                CompetitionState::SigningComplete => {
-                    match self.sign_and_broadcast_funding_tx(&mut competition).await {
-                        Ok(updated) => updated_competitions.push(updated.clone()),
-                        Err(e) => {
-                            error!(
-                                "competition {} failed to broadcast funding txs: {}",
-                                competition.id, e
-                            );
-                            competition
-                                .errors
-                                .push(CompetitionError::FailedBroadcast(e.to_string()));
-                            competition.failed_at = Some(OffsetDateTime::now_utc());
-                            updated_competitions.push(competition.clone());
-                        }
-                    }
-                }
-                CompetitionState::FundingBroadcasted => {
-                    match self.check_funding_confirmation(&mut competition).await {
-                        Ok(updated) => updated_competitions.push(updated.clone()),
-                        Err(e) => {
-                            error!(
-                                "competition {} failed to check confirm: {}",
-                                competition.id, e
-                            );
-                            competition
-                                .errors
-                                .push(CompetitionError::FailedFundingConfirmation(e.to_string()));
-                            competition.failed_at = Some(OffsetDateTime::now_utc());
-                            updated_competitions.push(competition.clone());
-                        }
-                    }
-                }
-                CompetitionState::FundingConfirmed => {
-                    // Invoices are already settled immediately upon payment
-                    // Just mark the funding as settled and move to next state
-                    competition.funding_settled_at = Some(OffsetDateTime::now_utc());
-                    info!(
-                        "Competition {} funding confirmed, all invoices already settled",
-                        competition.id
-                    );
-                    updated_competitions.push(competition.clone());
-                }
-                CompetitionState::FundingSettled => {
-                    match self.check_oracle_attestation(&mut competition).await {
-                        Ok(updated) => updated_competitions.push(updated.clone()),
-                        Err(e) => {
-                            error!(
-                                "failed to check oracle attestation for competition {}: {}",
-                                competition.id, e
-                            );
-                            competition
-                                .errors
-                                .push(CompetitionError::FailedCheckingAttestation(e.to_string()));
-                            competition.failed_at = Some(OffsetDateTime::now_utc());
-                            updated_competitions.push(competition.clone());
-                        }
-                    }
-                }
-                CompetitionState::Attested => {
-                    // An outcome transaction spends the funding outpoint, and locks it into
-                    // a 2nd stage multisig contract between the outcome winners and the market maker.
-                    // If any player knows the attestation to outcome they can
-                    // unlock that outcome TX and publish it.
-                    match self.publish_outcome_transaction(&mut competition).await {
-                        Ok(updated) => updated_competitions.push(updated.clone()),
-                        Err(e) => {
-                            error!(
-                                "failed to broadcast outcome transactions for competition {}: {}",
-                                competition.id, e
-                            );
-                            competition
-                                .errors
-                                .push(CompetitionError::FailedBroadcast(e.to_string()));
-                            competition.failed_at = Some(OffsetDateTime::now_utc());
-                            updated_competitions.push(competition.clone());
-                        }
-                    }
-                }
-                CompetitionState::OutcomeBroadcasted => {
-                    match self.publish_delta_transactions(&mut competition).await {
-                        Ok(updated) => updated_competitions.push(updated.clone()),
-                        Err(e) => {
-                            error!(
-                                "failed to broadcast delta transactions for competition {}: {}",
-                                competition.id, e
-                            );
-                            competition
-                                .errors
-                                .push(CompetitionError::FailedBroadcast(e.to_string()));
-                            competition.failed_at = Some(OffsetDateTime::now_utc());
-                            updated_competitions.push(competition.clone());
-                        }
-                    }
-                }
-                CompetitionState::DeltaBroadcasted => {
-                    match self.publish_delta2_transactions(&mut competition).await {
-                        Ok(updated) => updated_competitions.push(updated.clone()),
-                        Err(e) => {
-                            error!(
-                                "failed to broadcast delta2 transactions for competition {}: {}",
-                                competition.id, e
-                            );
-                            competition
-                                .errors
-                                .push(CompetitionError::FailedBroadcast(e.to_string()));
-                            competition.failed_at = Some(OffsetDateTime::now_utc());
-                            updated_competitions.push(competition.clone());
-                        }
-                    }
-                }
-                _ => continue,
             }
         }
 
@@ -432,11 +261,244 @@ impl Coordinator {
         Ok(())
     }
 
+    pub async fn process_competition_state(
+        &self,
+        mut competition: Competition,
+    ) -> Result<Competition, Error> {
+        info!(
+            "Competition {} {:?} {:?}",
+            competition.id,
+            competition.get_state(),
+            competition
+        );
+        match competition.get_state() {
+            CompetitionState::Created => {
+                debug!(
+                    "Competition {}, waiting for more entries: {}/{}",
+                    competition.id,
+                    competition.total_entries,
+                    competition.event_submission.total_allowed_entries
+                );
+                return Ok(competition);
+            }
+            CompetitionState::EntriesCollected => {
+                match self.check_escrow_confirmations(&mut competition).await {
+                    Ok(updated) => competition = updated.to_owned(),
+                    Err(e) => {
+                        error!(
+                            "competition {} failed to check escrow funds: {}",
+                            competition.id, e
+                        );
+                        competition
+                            .errors
+                            .push(CompetitionError::FailedEscrowConfirmation(e.to_string()));
+                        if competition.should_abort() {
+                            competition.failed_at = Some(OffsetDateTime::now_utc());
+                        }
+                    }
+                }
+            }
+            CompetitionState::EscrowFundsConfirmed => {
+                match self.submit_event_to_oracle(&mut competition).await {
+                    Ok(updated) => competition = updated.to_owned(),
+                    Err(e) => {
+                        error!(
+                            "Competition {} failed to submit entries to oracle: {}",
+                            competition.id, e
+                        );
+                        competition
+                            .errors
+                            .push(CompetitionError::FailedSubmitEntries(e.to_string()));
+                        competition.failed_at = Some(OffsetDateTime::now_utc());
+                    }
+                }
+            }
+            CompetitionState::EventCreated => {
+                match self.submit_entries_to_oracle(&mut competition).await {
+                    Ok(updated) => competition = updated.to_owned(),
+                    Err(e) => {
+                        error!(
+                            "Competition {} failed to submit entries to oracle: {}",
+                            competition.id, e
+                        );
+                        competition
+                            .errors
+                            .push(CompetitionError::FailedSubmitEntries(e.to_string()));
+                        competition.failed_at = Some(OffsetDateTime::now_utc());
+                    }
+                };
+            }
+            CompetitionState::EntriesSubmitted => {
+                match self.create_funding_psbt(&mut competition).await {
+                    Ok(updated) => competition = updated.to_owned(),
+                    Err(e) => {
+                        error!(
+                            "Competition {} failed to generate contract params: {}",
+                            competition.id, e
+                        );
+                        competition
+                            .errors
+                            .push(CompetitionError::FailedCreateTransaction(e.to_string()));
+                        competition.failed_at = Some(OffsetDateTime::now_utc());
+                    }
+                }
+            }
+            CompetitionState::NoncesCollected => {
+                match self
+                    .generate_aggregate_nonces_and_coord_partial_signatures(&mut competition)
+                    .await
+                {
+                    Ok(updated) => competition = updated.to_owned(),
+                    Err(e) => {
+                        error!(
+                            "Competition {} failed to generate aggregate nonce: {}",
+                            competition.id, e
+                        );
+                        competition
+                            .errors
+                            .push(CompetitionError::FailedNonceAggregation(e.to_string()));
+                        competition.failed_at = Some(OffsetDateTime::now_utc());
+                    }
+                }
+            }
+            CompetitionState::PartialSignaturesCollected => {
+                match self.sign_dlc_contract(&mut competition).await {
+                    Ok(updated) => competition = updated.to_owned(),
+                    Err(e) => {
+                        error!(
+                            "Competition {} failed to sign dlc contract: {}",
+                            competition.id, e
+                        );
+                        competition
+                            .errors
+                            .push(CompetitionError::FailedBroadcast(e.to_string()));
+                        competition.failed_at = Some(OffsetDateTime::now_utc());
+                    }
+                }
+            }
+            CompetitionState::SigningComplete => {
+                match self.sign_and_broadcast_funding_tx(&mut competition).await {
+                    Ok(updated) => competition = updated.to_owned(),
+                    Err(e) => {
+                        error!(
+                            "Competition {} failed to broadcast funding txs: {}",
+                            competition.id, e
+                        );
+                        competition
+                            .errors
+                            .push(CompetitionError::FailedBroadcast(e.to_string()));
+                        competition.failed_at = Some(OffsetDateTime::now_utc());
+                    }
+                }
+            }
+            CompetitionState::FundingBroadcasted => {
+                match self.check_funding_confirmation(&mut competition).await {
+                    Ok(updated) => competition = updated.to_owned(),
+                    Err(e) => {
+                        error!(
+                            "Competition {} failed to check confirm: {}",
+                            competition.id, e
+                        );
+                        competition
+                            .errors
+                            .push(CompetitionError::FailedFundingConfirmation(e.to_string()));
+                        if competition.should_abort() {
+                            competition.failed_at = Some(OffsetDateTime::now_utc());
+                        }
+                    }
+                }
+            }
+            CompetitionState::FundingConfirmed => {
+                // Invoices are already settled immediately upon payment
+                // Just mark the funding as settled and move to next state
+                competition.funding_settled_at = Some(OffsetDateTime::now_utc());
+                info!(
+                    "Competition {} funding confirmed, all invoices already settled",
+                    competition.id
+                );
+            }
+            CompetitionState::FundingSettled => {
+                match self.check_oracle_attestation(&mut competition).await {
+                    Ok(updated) => competition = updated.to_owned(),
+                    Err(e) => {
+                        error!(
+                            "Failed to check oracle attestation for competition {}: {}",
+                            competition.id, e
+                        );
+                        competition
+                            .errors
+                            .push(CompetitionError::FailedCheckingAttestation(e.to_string()));
+                        if competition.should_abort() {
+                            competition.failed_at = Some(OffsetDateTime::now_utc());
+                        }
+                    }
+                }
+            }
+            CompetitionState::Attested => {
+                // An outcome transaction spends the funding outpoint, and locks it into
+                // a 2nd stage multisig contract between the outcome winners and the market maker.
+                // If any player knows the attestation to outcome they can
+                // unlock that outcome TX and publish it.
+                match self.publish_outcome_transaction(&mut competition).await {
+                    Ok(updated) => competition = updated.to_owned(),
+                    Err(e) => {
+                        error!(
+                            "Failed to broadcast outcome transactions for competition {}: {}",
+                            competition.id, e
+                        );
+                        competition
+                            .errors
+                            .push(CompetitionError::FailedBroadcast(e.to_string()));
+                        competition.failed_at = Some(OffsetDateTime::now_utc());
+                    }
+                }
+            }
+            CompetitionState::OutcomeBroadcasted => {
+                match self.publish_delta_transactions(&mut competition).await {
+                    Ok(updated) => competition = updated.to_owned(),
+                    Err(e) => {
+                        error!(
+                            "failed to broadcast delta transactions for competition {}: {}",
+                            competition.id, e
+                        );
+                        competition
+                            .errors
+                            .push(CompetitionError::FailedBroadcast(e.to_string()));
+                        competition.failed_at = Some(OffsetDateTime::now_utc());
+                    }
+                }
+            }
+            CompetitionState::DeltaBroadcasted => {
+                match self.publish_delta2_transactions(&mut competition).await {
+                    Ok(updated) => competition = updated.to_owned(),
+                    Err(e) => {
+                        error!(
+                            "Failed to broadcast delta2 transactions for competition {}: {}",
+                            competition.id, e
+                        );
+                        competition
+                            .errors
+                            .push(CompetitionError::FailedBroadcast(e.to_string()));
+                        competition.failed_at = Some(OffsetDateTime::now_utc());
+                    }
+                }
+            }
+            _ => (),
+        }
+        info!(
+            "Completed processing competition {} , state {}",
+            competition.id,
+            competition.get_state()
+        );
+        Ok(competition)
+    }
+
     async fn check_escrow_confirmations<'a>(
         &self,
         competition: &'a mut Competition,
     ) -> Result<&'a mut Competition, anyhow::Error> {
         let tickets = self.competition_store.get_tickets(competition.id).await?;
+        debug!("Checking escrow confirmations: {:?}", tickets);
 
         let mut all_confirmed = true;
         let mut pending_txids = Vec::new();
@@ -488,6 +550,7 @@ impl Coordinator {
                 pending_txids.len()
             );
         }
+        competition.errors = vec![];
 
         Ok(competition)
     }
@@ -496,24 +559,26 @@ impl Coordinator {
         &self,
         competition: &'a mut Competition,
     ) -> Result<&'a mut Competition, anyhow::Error> {
-        let event: Event = match self
-            .oracle_client
-            .create_event(competition.event_submission.clone())
-            .await
-        {
-            Ok(event) => Ok(event),
-            Err(OracleError::NotFound(e)) => Err(Error::NotFound(e)),
-            Err(OracleError::BadRequest(e)) => Err(Error::BadRequest(e)),
-            Err(e) => Err(Error::OracleFailed(e)),
-        }?;
-        debug!(
-            "Created competition's {} oracle event: {:?}",
-            competition.id, event
-        );
+        if competition.event_created_at.is_none() {
+            let event: Event = match self
+                .oracle_client
+                .create_event(competition.event_submission.clone())
+                .await
+            {
+                Ok(event) => Ok(event),
+                Err(OracleError::NotFound(e)) => Err(Error::NotFound(e)),
+                Err(OracleError::BadRequest(e)) => Err(Error::BadRequest(e)),
+                Err(e) => Err(Error::OracleFailed(e)),
+            }?;
+            debug!(
+                "Created competition's {} oracle event: {:?}",
+                competition.id, event
+            );
 
-        competition.event_announcement = Some(event.event_announcement);
-        competition.event_created_at = Some(OffsetDateTime::now_utc());
-
+            competition.event_announcement = Some(event.event_announcement);
+            competition.event_created_at = Some(OffsetDateTime::now_utc());
+            competition.errors = vec![];
+        }
         Ok(competition)
     }
 
@@ -572,17 +637,19 @@ impl Coordinator {
             entries: oracle_entries,
         };
 
-        self.oracle_client
-            .submit_entries(event_entries)
-            .await
-            .map_err(|e| anyhow!("Failed to submit entries to oracle: {:?}", e))?;
+        if competition.entries_submitted_at.is_none() {
+            self.oracle_client
+                .submit_entries(event_entries)
+                .await
+                .map_err(|e| anyhow!("Failed to submit entries to oracle: {:?}", e))?;
 
-        competition.entries_submitted_at = Some(OffsetDateTime::now_utc());
-
+            competition.entries_submitted_at = Some(OffsetDateTime::now_utc());
+        }
         info!(
             "Successfully submitted entries to oracle for competition {}",
             competition.id
         );
+        competition.errors = vec![];
 
         Ok(competition)
     }
@@ -599,7 +666,9 @@ impl Coordinator {
                 competition.id
             ));
         };
-
+        if competition.public_nonces.is_some() {
+            return Ok(competition);
+        }
         let mut entries = self
             .competition_store
             .get_competition_entries(competition.id, vec![EntryStatus::Paid])
@@ -770,8 +839,10 @@ impl Coordinator {
             vout: 0,
         };
 
-        competition.funding_psbt = Some(psbt);
-        competition.funding_outpoint = Some(funding_outpoint);
+        if competition.funding_psbt_base64.is_none() {
+            competition.funding_psbt_base64 = Some(psbt.to_string());
+            competition.funding_outpoint = Some(funding_outpoint);
+        }
 
         // Note: word of warning, the ticketed_dlc may be very large in memory depending on the contract params
         let ticketed_dlc = TicketedDLC::new(contract_params, funding_outpoint)?;
@@ -782,7 +853,11 @@ impl Coordinator {
             SigningSession::<NonceSharingRound>::new(ticketed_dlc, &mut rng, self.private_key)?
         };
         debug!("Started musig nonce sharing round");
-        competition.public_nonces = Some(signing_session.our_public_nonces().to_owned());
+        if competition.public_nonces.is_none() {
+            competition.public_nonces = Some(signing_session.our_public_nonces().to_owned());
+        }
+        competition.errors = vec![];
+
         Ok(competition)
     }
 
@@ -822,9 +897,15 @@ impl Coordinator {
             "Received_nonces aggregated nonces 1: {:?}",
             coordinator_sessions.aggregated_nonces()
         );
-        competition.aggregated_nonces = Some(coordinator_sessions.aggregated_nonces().to_owned());
-        competition.partial_signatures =
-            Some(coordinator_sessions.our_partial_signatures().to_owned());
+        if competition.aggregated_nonces.is_none() {
+            competition.aggregated_nonces =
+                Some(coordinator_sessions.aggregated_nonces().to_owned());
+        }
+        if competition.partial_signatures.is_none() {
+            competition.partial_signatures =
+                Some(coordinator_sessions.our_partial_signatures().to_owned());
+        }
+        competition.errors = vec![];
 
         Ok(competition)
     }
@@ -918,9 +999,11 @@ impl Coordinator {
             coordinator_session.aggregate_all_signatures(partial_sigs_by_sender)?;
 
         debug!("Signed dlc contract");
-
-        competition.signed_contract = Some(signed_contract);
-        competition.signed_at = Some(OffsetDateTime::now_utc());
+        if competition.signed_contract.is_none() {
+            competition.signed_contract = Some(signed_contract);
+            competition.signed_at = Some(OffsetDateTime::now_utc());
+        }
+        competition.errors = vec![];
 
         Ok(competition)
     }
@@ -929,12 +1012,14 @@ impl Coordinator {
         &self,
         competition: &'a mut Competition,
     ) -> Result<&'a mut Competition, anyhow::Error> {
-        let Some(mut funding_psbt) = competition.funding_psbt.clone() else {
+        let Some(funding_psbt_base64) = competition.funding_psbt_base64.clone() else {
             return Err(anyhow!(
                         "Unsigned funding psbt doesn't exists, failed publishing competition {} funding transaction",
                         competition.id
                     ));
         };
+
+        let mut funding_psbt = Psbt::from_str(&funding_psbt_base64)?;
 
         let final_signatures_by_sender: BTreeMap<Point, FinalSignatures> =
             self.get_final_sigs_by_sender(competition.id).await?;
@@ -949,7 +1034,8 @@ impl Coordinator {
         debug!("Merging all funding psbts");
 
         for (sender_pubkey, final_signature) in &final_signatures_by_sender {
-            match funding_psbt.combine(final_signature.funding_psbt.clone()) {
+            let sender_funding_psbt = Psbt::from_str(&final_signature.funding_psbt_base64)?;
+            match funding_psbt.combine(sender_funding_psbt) {
                 Ok(_) => {
                     debug!(
                         "✓ Funding PSBT combination succeeded for player {}",
@@ -976,8 +1062,10 @@ impl Coordinator {
 
         self.bitcoin.broadcast(&funding_transaction).await?;
 
-        competition.funding_broadcasted_at = Some(OffsetDateTime::now_utc());
-        competition.funding_transaction = Some(funding_transaction);
+        if competition.funding_broadcasted_at.is_none() {
+            competition.funding_broadcasted_at = Some(OffsetDateTime::now_utc());
+            competition.funding_transaction = Some(funding_transaction);
+        }
 
         Ok(competition)
     }
@@ -1000,7 +1088,9 @@ impl Coordinator {
                     "Funding transaction {} confirmed with {} confirmations for competition {}",
                     txid, confirmations, competition.id
                 );
-                competition.funding_confirmed_at = Some(OffsetDateTime::now_utc());
+                if competition.funding_confirmed_at.is_none() {
+                    competition.funding_confirmed_at = Some(OffsetDateTime::now_utc());
+                }
             }
             Some(confirmations) => {
                 debug!(
@@ -1015,6 +1105,7 @@ impl Coordinator {
                 );
             }
         }
+        competition.errors = vec![];
 
         Ok(competition)
     }
@@ -1053,12 +1144,15 @@ impl Coordinator {
                 return Err(anyhow!("Oracle attestation verification failed: {}", e));
             }
         }
+        if competition.attestation.is_none() {
+            competition.attestation = Some(attestation);
+        }
 
-        competition.attestation = Some(attestation);
         info!(
             "Oracle attestation added for competition {}",
             competition.id
         );
+        competition.errors = vec![];
 
         Ok(competition)
     }
@@ -1152,6 +1246,7 @@ impl Coordinator {
             self.bitcoin.broadcast(&outcome_tx).await?;
             competition.outcome_broadcasted_at = Some(OffsetDateTime::now_utc());
         }
+        competition.errors = vec![];
 
         Ok(competition)
     }
@@ -1285,8 +1380,10 @@ impl Coordinator {
             )?;
 
             debug!("Broadcasting unified close transaction");
-            self.bitcoin.broadcast(&close_tx).await?;
-            competition.delta_broadcasted_at = Some(OffsetDateTime::now_utc());
+            if competition.delta_broadcasted_at.is_none() {
+                self.bitcoin.broadcast(&close_tx).await?;
+                competition.delta_broadcasted_at = Some(OffsetDateTime::now_utc());
+            }
 
             // Mark all entries as closed
             let now = OffsetDateTime::now_utc();
@@ -1335,7 +1432,10 @@ impl Coordinator {
                     "Broadcasting individual close transaction for player {}",
                     player_index
                 );
-                self.bitcoin.broadcast(&close_tx).await?;
+
+                if competition.delta_broadcasted_at.is_none() {
+                    self.bitcoin.broadcast(&close_tx).await?;
+                }
 
                 // Mark entry as closed
                 self.competition_store
@@ -1344,6 +1444,8 @@ impl Coordinator {
             }
             competition.delta_broadcasted_at = Some(OffsetDateTime::now_utc());
         }
+        competition.errors = vec![];
+
         Ok(competition)
     }
 
@@ -1462,8 +1564,10 @@ impl Coordinator {
                     "Broadcasting reclaim transaction for player {}",
                     player_index
                 );
-                self.bitcoin.broadcast(&reclaim_tx).await?;
 
+                if competition.completed_at.is_none() {
+                    self.bitcoin.broadcast(&reclaim_tx).await?;
+                }
                 // Mark entry as reclaimed
                 self.competition_store
                     .mark_entry_reclaim_broadcast(entry.id, OffsetDateTime::now_utc())
@@ -1471,6 +1575,7 @@ impl Coordinator {
             }
         }
         competition.completed_at = Some(OffsetDateTime::now_utc());
+        competition.errors = vec![];
 
         Ok(competition)
     }
@@ -1535,7 +1640,7 @@ impl Coordinator {
             };
 
             // Skip entries that haven't submitted signed funding psbt
-            let Some(funding_psbt) = entry.funding_psbt else {
+            let Some(funding_psbt_base64) = entry.funding_psbt_base64 else {
                 continue;
             };
 
@@ -1552,7 +1657,7 @@ impl Coordinator {
                 pubkey,
                 FinalSignatures {
                     partial_signatures,
-                    funding_psbt,
+                    funding_psbt_base64,
                 },
             );
         }
@@ -1664,7 +1769,37 @@ impl Coordinator {
                 duckdb::Error::QueryReturnedNoRows => Error::NoAvailableTickets,
                 e => Error::DbError(e),
             })?;
+        match self
+            .create_ticket_response(
+                ticket.clone(),
+                btc_pubkey,
+                competition.event_submission.entry_fee as u64,
+            )
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(e) => {
+                if let Err(clear_err) = self
+                    .competition_store
+                    .clear_ticket_reservation(ticket.id)
+                    .await
+                {
+                    error!(
+                        "Failed to clear ticket reservation for ticket {}: {}",
+                        ticket.id, clear_err
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
 
+    async fn create_ticket_response(
+        &self,
+        ticket: Ticket,
+        btc_pubkey: BitcoinPublicKey,
+        entry_fee: u64,
+    ) -> Result<TicketResponse, Error> {
         // Decode preimage from encrypted_preimage
         let preimage = hex::decode(&ticket.encrypted_preimage)
             .map_err(|_| Error::BadRequest("Invalid preimage".into()))?;
@@ -1679,7 +1814,7 @@ impl Coordinator {
             ticket.id,
             btc_pubkey,
             payment_hash,
-            competition.event_submission.entry_fee as u64,
+            entry_fee,
         )
         .await
         .map_err(|e| {
@@ -1704,10 +1839,10 @@ impl Coordinator {
         let invoice = self
             .ln
             .add_hold_invoice(
-                competition.event_submission.entry_fee as u64,
+                entry_fee,
                 300, // 5 minute timeout
                 hex::encode(payment_hash),
-                competition.id,
+                ticket.competition_id,
                 escrow_tx_hex.clone(),
             )
             .await
@@ -1934,7 +2069,7 @@ impl Coordinator {
             ))
         })?;
 
-        let funding_psbt = competition.funding_psbt.ok_or_else(|| {
+        let funding_psbt_base64 = competition.funding_psbt_base64.ok_or_else(|| {
             Error::NotFound(format!(
                 "Funding psbt is not yet available for competition {}",
                 competition_id
@@ -1944,7 +2079,7 @@ impl Coordinator {
         Ok(FundedContract {
             contract_params: contract,
             funding_outpoint,
-            funding_psbt,
+            funding_psbt_base64,
         })
     }
 

@@ -3,6 +3,7 @@ use crate::NostrClientWrapper;
 use bdk_wallet::bitcoin::Psbt;
 use dlctix::{bitcoin::OutPoint, musig2::AggNonce, ContractParameters, SigMap};
 use log::{debug, info};
+use std::str::FromStr;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -188,14 +189,13 @@ impl TaprootWallet {
     #[wasm_bindgen(js_name = "signFundingPsbt")]
     pub fn sign_funding_psbt(
         &self,
-        funding_psbt: JsValue,
+        funding_psbt_base64: String,
         entry_index: u32,
-    ) -> Result<JsValue, JsValue> {
-        debug!("Received funding psbt JsValue: {:?}", funding_psbt);
+    ) -> Result<String, JsValue> {
+        debug!("Received funding psbt: {:?}", funding_psbt_base64);
 
-        let psbt: Psbt = serde_wasm_bindgen::from_value(funding_psbt).map_err(|e| {
-            JsValue::from_str(&format!("Funding psbt deserialization error: {}", e))
-        })?;
+        let psbt = Psbt::from_str(&funding_psbt_base64)
+            .map_err(|e| JsValue::from_str(&format!("Invalid PSBT base64: {}", e)))?;
 
         debug!("Deserialized funding psbt: {:?}", psbt);
 
@@ -205,9 +205,9 @@ impl TaprootWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         debug!("Generated signed funding psbt: {:?}", signed_psbt);
+        let psbt_base64 = signed_psbt.to_string();
+        debug!("Generated signed funding psbt base64: {:?}", psbt_base64);
 
-        serde_wasm_bindgen::to_value(&signed_psbt).map_err(|e| {
-            JsValue::from_str(&format!("Signed funding psbt serialization error: {}", e))
-        })
+        Ok(psbt_base64)
     }
 }

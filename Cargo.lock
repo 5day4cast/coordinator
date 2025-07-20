@@ -976,7 +976,7 @@ checksum = "f46ad14479a25103f283c0f10005961cf086d8dc42205bb44c46ac563475dca6"
 
 [[package]]
 name = "client_validator"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -1213,7 +1213,7 @@ dependencies = [
 [[package]]
 name = "dlctix"
 version = "0.0.7"
-source = "git+https://github.com/tee8z/dlctix#c0b04bc39c96051408ba32f73391721064cc5f09"
+source = "git+https://github.com/tee8z/dlctix?rev=a02c800a586538bbf8d6ccc82c964a5bf0b49d93#a02c800a586538bbf8d6ccc82c964a5bf0b49d93"
 dependencies = [
  "bitcoin",
  "hex",
@@ -3817,7 +3817,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-channel",

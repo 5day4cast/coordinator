@@ -157,7 +157,7 @@ class Competitions {
           competition.state,
           event ? event.status.toLowerCase() : null,
         );
-
+        console.log(competition.event_submission);
         return {
           id: competition.id,
           startTime: competition.event_submission.observation_date,
@@ -168,8 +168,8 @@ class Competitions {
           entry_fee: competition.event_submission.entry_fee,
           totalPrizePoolAmt:
             competition.event_submission.total_competition_pool,
-          totalEntries: competition.event_submission.total_entries,
-          numOfWinners: competition.nevent_submission.number_of_places_win,
+          totalEntries: competition.total_entries,
+          numOfWinners: competition.event_submission.number_of_places_win,
           locations: competition.event_submission.locations,
         };
       })

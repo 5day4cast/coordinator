@@ -10,7 +10,6 @@ use bdk_wallet::{
         Network, NetworkKind as BDKNetworkKind, Psbt, PublicKey,
     },
     descriptor::calc_checksum,
-    ChangeSet, KeychainKind, Wallet,
 };
 use blake2::{Blake2b512, Digest};
 use dlctix::{
@@ -131,9 +130,6 @@ pub struct TaprootWalletCore {
     nostr_client: NostrClientCore,
     network: Network,
     dlc_contracts: HashMap<u32, DlcEntry>,
-    //TODO: add functionality for payouts via bdk_wallet
-    bdk_wallet: Wallet,
-    change_set: ChangeSet,
 }
 
 impl TaprootWalletCore {
@@ -190,35 +186,11 @@ impl TaprootWalletCore {
             network: network_kind,
         };
 
-        //TODO: get this stored remotely and reloaded when the user comes back to the site & logs in
-        // we will want the ChangeSet to be a json object and encypted by the user's nostr private key before storing remotely
-        let change_set = ChangeSet::default();
-
-        // Load will always come back as None for now since ChangeSet is empty, this wont be helpful until we have saved state that we load
-        let bdk_wallet = Wallet::load()
-            .descriptor(KeychainKind::External, Some(external_descriptor.clone()))
-            .descriptor(KeychainKind::Internal, Some(internal_descriptor.clone()))
-            .extract_keys()
-            .check_network(network)
-            .load_wallet_no_persist(change_set.clone()) //TODO: we may need to change this for 'existing' wallets
-            .map_err(|e| WalletError::LoadWallet(e.to_string()))?;
-
-        let wallet = if let Some(loaded_wallet) = bdk_wallet {
-            loaded_wallet
-        } else {
-            Wallet::create(external_descriptor, internal_descriptor)
-                .network(network)
-                .create_wallet_no_persist()
-                .map_err(|e| WalletError::LoadWallet(e.to_string()))?
-        };
-
         Ok(Self {
             extended_key,
             public_data,
             nostr_client: nostr_client.to_owned(),
-            bdk_wallet: wallet,
             network,
-            change_set,
             dlc_contracts: HashMap::new(),
         })
     }
@@ -251,15 +223,6 @@ impl TaprootWalletCore {
 
     pub fn get_public_data(&self) -> KeyPair {
         self.public_data.clone()
-    }
-
-    fn update_changes(&mut self) {
-        todo!();
-        //TODO: serialize and backup self.new_changes here
-        /*if let Some(new_changes) = self.bdk_wallet.staged() {
-            self.change_set.merge(new_changes.to_owned());
-
-        }*/
     }
 
     pub async fn get_encrypted_master_key(

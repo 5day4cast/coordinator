@@ -43,6 +43,20 @@
         .tabs-content>div.is-active {
             display: block;
         }
+
+        .tabs-content>div.is-active {
+            display: block;
+        }
+
+        /* Notification animations */
+        .notification {
+            transition: all 0.3s ease-in-out;
+        }
+
+        .notification.is-hidden {
+            opacity: 0;
+            transform: translateY(-10px);
+        }
     </style>
 </head>
 
@@ -88,6 +102,10 @@
                             <button class="button is-primary" onclick="createCompetition(event)">
                                 Submit
                             </button>
+                            <div id="competition-notification" class="notification mt-4 is-hidden">
+                                <button class="delete" onclick="hideNotification('competition-notification')"></button>
+                                <span id="competition-notification-message"></span>
+                            </div>
                         </div>
                     </div>
             </section>

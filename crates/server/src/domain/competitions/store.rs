@@ -102,20 +102,18 @@ impl CompetitionStore {
         let conn = self.db_connection.new_write_connection_retry().await?;
         let sigs_blob = serde_json::to_vec(&final_signatures.partial_signatures)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
-        let psbt_blob = serde_json::to_vec(&final_signatures.funding_psbt)
-            .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
 
         let mut stmt = conn.prepare(
             "UPDATE entries
                 SET partial_signatures = ?,
-                    funding_psbt = ?,
+                    funding_psbt_base64 = ?,
                     signed_at = NOW()
                 WHERE id = ?",
         )?;
 
         stmt.execute(params![
             Value::Blob(sigs_blob),
-            Value::Blob(psbt_blob),
+            final_signatures.funding_psbt_base64,
             entry_id.to_string(),
         ])?;
 
@@ -231,7 +229,7 @@ impl CompetitionStore {
         ))
         .and_select((
             "partial_signatures",
-            "funding_psbt",
+            "funding_psbt_base64",
             "entry_submission",
             "payout_preimage_encrypted",
             "payout_hash",
@@ -294,7 +292,7 @@ impl CompetitionStore {
         ))
         .and_select((
             "partial_signatures",
-            "funding_psbt",
+            "funding_psbt_base64",
             "entry_submission",
             "payout_preimage_encrypted",
             "payout_hash",
@@ -418,7 +416,7 @@ impl CompetitionStore {
             let query = "UPDATE competitions SET
                 event_announcement = ?,
                 outcome_transaction = ?,
-                funding_psbt = ?,
+                funding_psbt_base64 = ?,
                 funding_transaction = ?,
                 funding_outpoint = ?,
                 contract_parameters = ?,
@@ -462,11 +460,8 @@ impl CompetitionStore {
                 params.push(Value::Null);
             }
 
-            if let Some(funding_psbt) = &competition.funding_psbt {
-                params
-                    .push(Value::Blob(serde_json::to_vec(funding_psbt).map_err(
-                        |e| duckdb::Error::ToSqlConversionFailure(Box::new(e)),
-                    )?));
+            if let Some(funding_psbt) = &competition.funding_psbt_base64 {
+                params.push(Value::Text(funding_psbt.to_owned()));
             } else {
                 params.push(Value::Null);
             }
@@ -606,7 +601,7 @@ impl CompetitionStore {
         ))
         .and_select((
             "outcome_transaction",
-            "competitions.funding_psbt as funding_psbt",
+            "competitions.funding_psbt_base64 as funding_psbt_base64",
             "funding_outpoint",
             "funding_transaction",
             "contract_parameters",
@@ -659,7 +654,7 @@ impl CompetitionStore {
                 "event_submission",
                 "event_announcement",
                 "outcome_transaction",
-                "competitions.funding_psbt",
+                "competitions.funding_psbt_base64",
             ))
             .group_by((
                 "funding_outpoint",
@@ -723,7 +718,7 @@ impl CompetitionStore {
         ))
         .and_select((
             "outcome_transaction",
-            "competitions.funding_psbt as funding_psbt",
+            "competitions.funding_psbt_base64 as funding_psbt_base64",
             "funding_outpoint",
             "funding_transaction",
             "contract_parameters",
@@ -768,7 +763,7 @@ impl CompetitionStore {
             "event_submission",
             "event_announcement",
             "outcome_transaction",
-            "competitions.funding_psbt",
+            "competitions.funding_psbt_base64",
         ))
         .group_by((
             "funding_outpoint",
@@ -1196,7 +1191,11 @@ impl CompetitionStore {
         let affected = stmt.execute(params![ticket_id.to_string()])?;
 
         if affected == 0 {
-            return Err(duckdb::Error::QueryReturnedNoRows);
+            debug!(
+                "No ticket reservation found for ticket ID, skipping delete: {}",
+                ticket_id
+            );
+            return Ok(());
         }
 
         Ok(())

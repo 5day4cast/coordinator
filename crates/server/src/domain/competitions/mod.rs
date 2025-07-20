@@ -6,7 +6,7 @@ use anyhow::anyhow;
 pub use coordinator::*;
 pub use db_migrations::*;
 use dlctix::{
-    bitcoin::{hex::DisplayHex, OutPoint, Psbt, Transaction},
+    bitcoin::{hex::DisplayHex, OutPoint, Transaction},
     hashlock,
     musig2::{AggNonce, PartialSignature, PubNonce},
     secp::MaybeScalar,
@@ -85,7 +85,7 @@ pub struct UserEntry {
     pub payout_ln_invoice: Option<String>,
     pub public_nonces: Option<SigMap<PubNonce>>,
     /// User signed funding psbt
-    pub funding_psbt: Option<Psbt>,
+    pub funding_psbt_base64: Option<String>,
     pub partial_signatures: Option<SigMap<PartialSignature>>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub signed_at: Option<OffsetDateTime>,
@@ -117,13 +117,6 @@ impl<'a> TryFrom<&Row<'a>> for UserEntry {
                     _ => None,
                 })
             })?;
-
-        let funding_psbt: Option<Psbt> = row.get::<usize, Option<Value>>(9).map(|opt| {
-            opt.and_then(|raw| match raw {
-                Value::Blob(val) => serde_json::from_slice(&val).ok(),
-                _ => None,
-            })
-        })?;
 
         let entry_submission: AddEventEntry = match row.get::<usize, Option<Value>>(10)? {
             Some(Value::Blob(blob_data)) => serde_json::from_slice(&blob_data).map_err(|e| {
@@ -170,7 +163,7 @@ impl<'a> TryFrom<&Row<'a>> for UserEntry {
             ephemeral_privatekey: row.get::<usize, Option<String>>(6)?,
             public_nonces,
             partial_signatures,
-            funding_psbt,
+            funding_psbt_base64: row.get(9)?,
             entry_submission,
             payout_preimage_encrypted: row.get(11)?,
             payout_hash: row.get(12)?,
@@ -206,7 +199,7 @@ impl AddEntry {
             payout_preimage_encrypted: self.payout_preimage_encrypted,
             entry_submission,
             signed_at: None,
-            funding_psbt: None,
+            funding_psbt_base64: None,
             partial_signatures: None,
             public_nonces: None,
             ephemeral_privatekey: None,
@@ -380,7 +373,7 @@ pub struct Competition {
     pub total_paid_out_entries: usize,
     pub event_announcement: Option<EventLockingConditions>,
     pub funding_outpoint: Option<OutPoint>,
-    pub funding_psbt: Option<Psbt>,
+    pub funding_psbt_base64: Option<String>,
     pub funding_transaction: Option<Transaction>,
     pub outcome_transaction: Option<Transaction>,
     pub contract_parameters: Option<ContractParameters>,
@@ -444,7 +437,7 @@ pub struct ExtendCompetition {
     pub event_announcement: Option<EventLockingConditions>,
     pub funding_transaction: Option<Transaction>,
     pub funding_outpoint: Option<OutPoint>,
-    pub funding_psbt: Option<Psbt>,
+    pub funding_psbt_base64: Option<String>,
     pub outcome_transaction: Option<Transaction>,
     pub contract_parameters: Option<ContractParameters>,
     pub public_nonces: Option<SigMap<PubNonce>>,
@@ -520,7 +513,7 @@ impl From<Competition> for ExtendCompetition {
             signed_at: competition.signed_at,
             event_created_at: competition.event_created_at,
             entries_submitted_at: competition.entries_submitted_at,
-            funding_psbt: competition.funding_psbt,
+            funding_psbt_base64: competition.funding_psbt_base64,
             escrow_funds_confirmed_at: competition.escrow_funds_confirmed_at,
             funding_broadcasted_at: competition.funding_broadcasted_at,
             funding_confirmed_at: competition.funding_confirmed_at,
@@ -698,7 +691,7 @@ impl Competition {
 pub struct FundedContract {
     pub contract_params: ContractParameters,
     pub funding_outpoint: OutPoint,
-    pub funding_psbt: Psbt,
+    pub funding_psbt_base64: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -777,7 +770,7 @@ impl Competition {
             funding_transaction: None,
             outcome_transaction: None,
             funding_outpoint: None,
-            funding_psbt: None,
+            funding_psbt_base64: None,
             contract_parameters: None,
             public_nonces: None,
             aggregated_nonces: None,
@@ -887,8 +880,11 @@ impl Competition {
     }
 
     pub fn is_failed(&self) -> bool {
-        //NOTE: may want to use to enable retry logic, check if error > n
         self.failed_at.is_some()
+    }
+
+    pub fn should_abort(&self) -> bool {
+        self.errors.len() > 5
     }
 
     pub fn is_expired(&self) -> bool {
@@ -975,6 +971,9 @@ impl Competition {
             );
             return CompetitionState::NoncesCollected;
         }
+        if self.contract_parameters.is_some() {
+            return CompetitionState::ContractCreated;
+        }
         if self.is_entries_submitted() {
             return CompetitionState::EntriesSubmitted;
         }
@@ -986,9 +985,6 @@ impl Competition {
         }
         if self.has_full_entries() && self.has_all_entries_paid() {
             return CompetitionState::EntriesCollected;
-        }
-        if self.contract_parameters.is_some() {
-            return CompetitionState::ContractCreated;
         }
         CompetitionState::Created
     }
@@ -1037,13 +1033,7 @@ impl<'a> TryFrom<&Row<'a>> for Competition {
                     _ => None,
                 })
             })?,
-            funding_psbt: row.get::<usize, Option<Value>>(10).map(|opt| {
-                opt.and_then(|raw| match raw {
-                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
-                    _ => None,
-                })
-            })?,
-
+            funding_psbt_base64: row.get(10)?,
             funding_outpoint: row.get::<usize, Option<Value>>(11).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),

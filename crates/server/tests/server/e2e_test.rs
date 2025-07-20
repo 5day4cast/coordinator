@@ -1,4 +1,5 @@
 use anyhow::Result;
+use bdk_wallet::bitcoin::Psbt;
 use dlctix::{
     attestation_secret,
     bitcoin::{Amount, PublicKey},
@@ -304,14 +305,17 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     tokio::time::sleep(Duration::from_secs(1)).await;
-
+    // 1) Wait for all escrow funds to confirm
+    // 2) Create oracle event announcement
+    // 3) Add all entries to oracle event
+    // 4) Create funding transaction and dlc contract
     // Wait for the competition state to change to EscrowFundsConfirmed
     let mut escrow_confirmed = false;
     for _ in 0..30 {
         coordinator.competition_handler().await?;
         let competition = coordinator.get_competition(create_event.id).await?;
         debug!("Competition state: {:?}", competition.get_state());
-        if competition.get_state() == CompetitionState::EscrowFundsConfirmed {
+        if competition.escrow_funds_confirmed_at.is_some() {
             escrow_confirmed = true;
             assert!(competition.escrow_funds_confirmed_at.is_some());
             break;
@@ -323,19 +327,8 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
         "Competition state did not change to EscrowFundsConfirmed within 30 seconds"
     );
 
-    // Create oracle event announcement
-    coordinator.competition_handler().await?;
     let competition = coordinator.get_competition(create_event.id).await?;
-    let _ = competition.event_announcement.as_ref().unwrap();
-
-    // Add all entries to oracle event
-    coordinator.competition_handler().await?;
-    let competition = coordinator.get_competition(create_event.id).await?;
-    let _ = competition.entries_submitted_at.unwrap();
-
-    // Create funding transaction and dlc contract
-    coordinator.competition_handler().await?;
-    let competition = coordinator.get_competition(create_event.id).await?;
+    debug!("competition: {:?}", competition);
     let contract_params = competition.contract_parameters.as_ref().unwrap();
 
     // Map participants to contract indices
@@ -393,9 +386,9 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
             .wallet
             .sign_aggregate_nonces(agg_nonces.clone(), entry_index)?;
 
-        let funding_psbt = participant
-            .wallet
-            .sign_funding_psbt(competition.funding_psbt.clone().unwrap(), entry_index)?;
+        let psbt = Psbt::from_str(&competition.funding_psbt_base64.clone().unwrap()).unwrap();
+
+        let funding_psbt = participant.wallet.sign_funding_psbt(psbt, entry_index)?;
 
         coordinator
             .submit_final_signatures(
@@ -404,24 +397,19 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
                 entry.id,
                 FinalSignatures {
                     partial_signatures,
-                    funding_psbt,
+                    funding_psbt_base64: funding_psbt.to_string(),
                 },
             )
             .await?;
     }
 
-    // Sign dlc contract
+    // 1) Sign dlc contract
+    // 2) Broadcast funding transaction
     coordinator.competition_handler().await?;
 
     let competition = coordinator.get_competition(create_event.id).await?;
-    assert_eq!(competition.get_state(), CompetitionState::SigningComplete);
     assert!(competition.signed_contract.is_some());
     assert!(competition.signed_at.is_some());
-
-    // Broadcast funding transaction
-    coordinator.competition_handler().await?;
-
-    let competition = coordinator.get_competition(create_event.id).await?;
     assert_eq!(
         competition.get_state(),
         CompetitionState::FundingBroadcasted
@@ -459,17 +447,12 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
     // Run handler to process confirmation
     coordinator.competition_handler().await?;
 
-    // Verify funding confirmed state
+    // 1) verify funding confirmed state
+    // 2) add funding settled
+    // 3) attest the competition state
     let competition = coordinator.get_competition(create_event.id).await?;
-    assert_eq!(competition.get_state(), CompetitionState::FundingConfirmed);
+    assert_eq!(competition.get_state(), CompetitionState::Attested);
     assert!(competition.funding_confirmed_at.is_some());
-
-    // Run to process invoice settlement
-    coordinator.competition_handler().await?;
-
-    // Verify final state with settled invoices
-    let competition = coordinator.get_competition(create_event.id).await?;
-    assert_eq!(competition.get_state(), CompetitionState::FundingSettled);
     assert!(competition.funding_settled_at.is_some());
 
     // Verify all tickets are properly settled
@@ -490,7 +473,10 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
 
     // Verify attestation state
     let competition = coordinator.get_competition(create_event.id).await?;
-    assert_eq!(competition.get_state(), CompetitionState::Attested);
+    assert_eq!(
+        competition.get_state(),
+        CompetitionState::OutcomeBroadcasted
+    );
     assert!(competition.attestation.is_some());
 
     // Winner (first participant) submits payout info

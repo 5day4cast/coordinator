@@ -5,7 +5,6 @@ use axum::{
     Json,
 };
 use bdk_wallet::bitcoin::PublicKey;
-use dlctix::bitcoin::Psbt;
 use dlctix::{
     musig2::{AggNonce, PartialSignature, PubNonce},
     SigMap,
@@ -26,7 +25,7 @@ use crate::{
 };
 
 // Private route not exposed publically so NostrAuth is not needed
-pub async fn create_event(
+pub async fn create_competition(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateEvent>,
 ) -> Result<Json<Competition>, ErrorResponse> {
@@ -250,7 +249,7 @@ pub async fn get_aggregate_nonces(
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FinalSignatures {
-    pub funding_psbt: Psbt,
+    pub funding_psbt_base64: String,
     pub partial_signatures: SigMap<PartialSignature>,
 }
 

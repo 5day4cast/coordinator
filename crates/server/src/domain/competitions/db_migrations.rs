@@ -53,7 +53,7 @@ pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), d
         created_at TIMESTAMPTZ NOT NULL,
         event_submission BLOB NOT NULL,         -- Parameters for the event the oracle will attest to
         event_announcement BLOB,                -- Event announcement expected from the oracles
-        funding_psbt BLOB,                      -- Unsigned Funding PSBT
+        funding_psbt_base64 TEXT,               -- Unsigned Funding PSBT
         funding_outpoint BLOB,                  -- Funding outpoint
         funding_transaction BLOB,               -- Funding transaction
         outcome_transaction BLOB,               -- Outcome transaction
@@ -110,7 +110,7 @@ pub fn create_competitions_initial_schema(conn: &mut Connection) -> Result<(), d
         payout_preimage TEXT,                           -- Provided by user on payout, encrypted by coordinator_key
         payout_ln_invoice TEXT,                         -- Provided by user on payout, coordinator pays to user
         public_nonces BLOB,                             -- Player signed nonces during musig signing session
-        funding_psbt BLOB,                              -- Player signed funding PSBT
+        funding_psbt_base64 TEXT,                       -- Player signed funding PSBT
         partial_signatures BLOB,                        -- layer partial signatures
         paid_out_at TIMESTAMPTZ,                        -- When ticket have been paid out via lightning
         sellback_broadcasted_at TIMESTAMPTZ,            -- When on chain sellback broadcasted by coordinator for cooperative lightning payout
