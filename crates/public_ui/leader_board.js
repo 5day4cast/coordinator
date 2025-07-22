@@ -245,7 +245,7 @@ class LeaderBoard {
 
     let $entryValues = document.getElementById("entryValues");
     let $competitionId = document.createElement("h3");
-    $competitionId.textContent = `Competition: ${entry.competition_id}`;
+    $competitionId.textContent = `Competition: ${entry.event_id}`;
     $entryValues.appendChild($competitionId);
     console.log(entry);
     for (let option of entry["expected_observations"]) {
