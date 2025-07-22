@@ -139,11 +139,14 @@ class LeaderBoard {
 
   calculateOptionScore(forecast_val, observation_val, entry_val) {
     if (forecast_val > observation_val) {
-      return entry_val == "over" ? 1 : 0;
+      // Observation was UNDER the forecast - award points if they picked "under"
+      return entry_val == "under" ? 10 : 0;
     } else if (forecast_val == observation_val) {
-      return entry_val == "par" ? 2 : 0;
+      // Exact match - award points if they picked "par"
+      return entry_val == "par" ? 20 : 0;
     } else {
-      return entry_val == "under" ? 1 : 0;
+      // Observation was OVER the forecast - award points if they picked "over"
+      return entry_val == "over" ? 10 : 0;
     }
   }
 
