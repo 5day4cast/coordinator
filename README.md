@@ -69,7 +69,7 @@ The competition progresses through the following states:
 10. **SigningComplete** → When all signatures are aggregated
 11. **FundingBroadcasted** → When funding transaction is broadcast
 12. **FundingConfirmed** → When funding transaction has 1+ confirmations
-13. **FundingSettled** → When all HODL invoices are settled
+13. **FundingSettled** → Depreciated event (to be removed soon)
 14. **Attested** → When oracle provides attestation
 15. **OutcomeBroadcasted** → When outcome transaction is broadcast
 16. **DeltaBroadcasted** → When first delta (cooperative close) transactions are broadcast
