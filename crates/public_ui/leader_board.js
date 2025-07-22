@@ -105,15 +105,17 @@ class LeaderBoard {
         // Calculate final score with timestamp if in competition or completed
         if (entry && entry.id && entry.score !== undefined) {
           // Extract timestamp from UUID v7
-          const cleanUuid = entry.id.replace(/-/g, '');
+          const cleanUuid = entry.id.replace(/-/g, "");
           const uuidTimestamp =
-            BigInt("0x" + cleanUuid.substring(0, 12)) & BigInt("0xFFFFFFFFFFFF");
+            BigInt("0x" + cleanUuid.substring(0, 12)) &
+            BigInt("0xFFFFFFFFFFFF");
           const timeMillis = Number(uuidTimestamp);
 
           entry.rawScore = currentScore;
           const timestampPart = timeMillis % 10000;
           // Ensure unique scores even for 0 base scores
-          const totalScore = Math.max(10000, currentScore * 10000) - timestampPart;
+          const totalScore =
+            Math.max(10000, currentScore * 10000) - timestampPart;
 
           // Compare with the entry's score
           if (entry.score && entry.score !== totalScore) {
@@ -125,6 +127,7 @@ class LeaderBoard {
           }
         }
       }
+    }
 
     // Only sort if we have actual scores
     if (!isPreCompetition) {
