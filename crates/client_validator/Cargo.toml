@@ -1,6 +1,6 @@
 [package]
 name = "client_validator"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 repository = "https://github.com/tee8z/5day4cast"
 
@@ -29,7 +29,7 @@ nostr-sdk = { version = "0.38.0", features = [
 thiserror = "2.0.11"
 serde-wasm-bindgen = "0.6.5"
 getrandom = { version = "0.2" }
-dlctix = { git = "https://github.com/tee8z/dlctix", rev = "a02c800a586538bbf8d6ccc82c964a5bf0b49d93" }
+dlctix = "0.0.8"
 rand = "0.8.5"
 rand_chacha = "0.3"
 aes-gcm = "0.10"
