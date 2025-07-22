@@ -215,25 +215,6 @@ impl Coordinator {
                             if immediate_states.contains(&updated_competiton.get_state())
                                 && processed_states < MAX_CONSECUTIVE_STATES
                             {
-                                match self
-                                    .competition_store
-                                    .update_competitions(vec![updated_competiton.clone()])
-                                    .await
-                                {
-                                    Ok(_) => {
-                                        competition = updated_competiton.clone();
-                                        debug!(
-                                            "Saved update to competition {}",
-                                            updated_competiton.id
-                                        );
-                                    }
-                                    Err(err) => {
-                                        error!(
-                                            "Failed to save updated competition {}: {}",
-                                            updated_competiton.id, err
-                                        );
-                                    }
-                                }
                                 continue;
                             }
                         }
