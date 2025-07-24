@@ -608,26 +608,81 @@ impl Competition {
     }
 
     pub fn verify_event_attestation(&self, attestation: &MaybeScalar) -> Result<Outcome, Error> {
-        let attestation_point = attestation.base_point_mul();
-
         let Some(ref event_announcement) = self.event_announcement else {
             return Err(Error::BadRequest("Event announcement not found".into()));
         };
 
+        let Some(_) = self.signed_contract else {
+            return Err(Error::BadRequest("Signed contract not found".into()));
+        };
+
+        if let Some(expiry) = event_announcement.expiry {
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| Error::BadRequest(format!("Failed to get current time: {}", e)))?
+                .as_secs() as u32;
+
+            if current_time >= expiry {
+                debug!("Contract has expired, returning Expiry outcome");
+                return Ok(Outcome::Expiry);
+            }
+        }
+
+        let attestation_point = attestation.base_point_mul();
+        debug!("Calculated attestation point: {:?}", attestation_point);
+
+        // Log all locking points for debugging
+        debug!(
+            "Event announcement has {} locking points",
+            event_announcement.locking_points.len()
+        );
+        for (idx, locking_point) in event_announcement.locking_points.iter().enumerate() {
+            debug!("Locking point[{}]: {:?}", idx, locking_point);
+            debug!(
+                "Match with attestation: {}",
+                locking_point == &attestation_point
+            );
+        }
+
+        // Get all outcomes and log them
+        let outcome_count = event_announcement.locking_points.len()
+            + if event_announcement.expiry.is_some() {
+                1
+            } else {
+                0
+            };
+        debug!("Total outcomes: {}", outcome_count);
+
+        let all_outcomes = event_announcement.all_outcomes();
         // Find which outcome this attestation corresponds to
-        let outcome = event_announcement
-            .all_outcomes()
+        let outcome = all_outcomes
             .into_iter()
             .find(|outcome| {
                 match outcome {
                     Outcome::Attestation(i) => {
-                        // The attestation point should match one of the locking points
-                        event_announcement.locking_points[*i] == attestation_point
+                        debug!("Checking outcome index {}", i);
+                        // Check bounds first
+                        if *i >= event_announcement.locking_points.len() {
+                            error!(
+                                "Outcome index {} is out of bounds for locking_points (len: {})",
+                                i,
+                                event_announcement.locking_points.len()
+                            );
+                            return false;
+                        }
+
+                        let matches = event_announcement.locking_points[*i] == attestation_point;
+                        debug!("Outcome {} matches attestation: {}", i, matches);
+                        matches
                     }
-                    Outcome::Expiry => false,
+                    Outcome::Expiry => {
+                        debug!("Skipping expiry outcome");
+                        false
+                    }
                 }
             })
             .ok_or_else(|| {
+                error!("No outcome matched the attestation point");
                 Error::BadRequest("Attestation doesn't match any valid outcome".into())
             })?;
 
@@ -635,6 +690,7 @@ impl Competition {
             return Err(Error::BadRequest("Invalid outcome for this event".into()));
         }
 
+        debug!("Found matching outcome: {:?}", outcome);
         Ok(outcome)
     }
 
