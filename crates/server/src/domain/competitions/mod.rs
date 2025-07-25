@@ -334,7 +334,7 @@ pub struct CreateEvent {
     /// Time at which the attestation will be added to the event, needs to be after the observation date
     pub signing_date: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
-    /// Date of when the weather observations occured (midnight UTC), all entries must be made before this time
+    /// Date of when the weather observations occurred (midnight UTC), all entries must be made before this time
     pub observation_date: OffsetDateTime,
     /// NOAA observation stations used in this event
     pub locations: Vec<String>,

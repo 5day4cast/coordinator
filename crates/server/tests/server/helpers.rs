@@ -266,6 +266,7 @@ pub fn generate_oracle_event(
     event_id: Uuid,
     total_allowed_entries: usize,
     number_of_places_win: usize,
+    expiry: u32,
 ) -> OracleEvent {
     let possible_user_outcomes: Vec<Vec<usize>> =
         generate_ranking_permutations(total_allowed_entries, number_of_places_win);
@@ -275,10 +276,6 @@ pub fn generate_oracle_event(
     let mut rng = rand::thread_rng();
     let nonce = Scalar::random(&mut rng);
     let nonce_point = nonce.base_point_mul();
-    // Manually set expiry to 7 days after the signature should have been provided so users can get their funds back
-    let expiry = OffsetDateTime::now_utc()
-        .saturating_add(Duration::DAY * 7)
-        .unix_timestamp() as u32;
 
     let locking_points = outcome_messages
         .iter()

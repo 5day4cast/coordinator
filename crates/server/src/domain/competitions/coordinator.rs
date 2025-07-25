@@ -2477,6 +2477,29 @@ fn generate_payouts(
         }
 
         payouts.insert(Outcome::Attestation(outcome_index), payout_weights);
+
+        // Special handling for "no score" outcome
+        if winner_indices.len() == entries.len() {
+            debug!("Processing special 'no score' outcome");
+
+            // Create equal weights for all players (everyone gets their entry fee back)
+            let mut equal_weights: BTreeMap<PlayerIndex, u64> = BTreeMap::new();
+            let weight_per_player = 100 / players.len() as u64;
+            let remainder = 100 % players.len() as u64;
+
+            for i in 0..players.len() {
+                // Distribute remainder to maintain total of 100
+                let player_weight = if (i as u64) < remainder {
+                    weight_per_player + 1
+                } else {
+                    weight_per_player
+                };
+                equal_weights.insert(i, player_weight);
+            }
+
+            payouts.insert(Outcome::Attestation(outcome_index), equal_weights);
+            continue;
+        }
     }
 
     // Add expiry outcome with equal distribution
@@ -2501,7 +2524,14 @@ fn generate_payouts(
 }
 
 pub fn generate_ranking_permutations(num_players: usize, rankings: usize) -> Vec<Vec<usize>> {
-    (0..num_players).permutations(rankings).collect()
+    let mut permutations = (0..num_players)
+        .permutations(rankings)
+        .collect::<Vec<Vec<usize>>>();
+
+    // Always add the special "refund all" outcome
+    permutations.push((0..num_players).collect());
+
+    permutations
 }
 
 fn find_player_indices(
