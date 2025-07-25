@@ -215,6 +215,7 @@ impl Coordinator {
                             if immediate_states.contains(&updated_competiton.get_state())
                                 && processed_states < MAX_CONSECUTIVE_STATES
                             {
+                                competition = updated_competiton;
                                 continue;
                             }
                         }
