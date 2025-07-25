@@ -24,6 +24,7 @@ use bdk_wallet::{
 };
 use dlctix::{
     bitcoin::{
+        consensus,
         hex::DisplayHex as _,
         key::TweakedPublicKey,
         psbt::Input,
@@ -804,7 +805,7 @@ impl Coordinator {
         let psbt = self
             .bitcoin
             .build_psbt(
-                funding_script,
+                funding_script.clone(),
                 Amount::from_sat(contract_amount_sats as u64),
                 fee_rate,
                 vec![],
@@ -815,10 +816,19 @@ impl Coordinator {
         let funding_txid = psbt.unsigned_tx.compute_txid();
         debug!("unsigned funding txid: {:?}", funding_txid);
 
-        //At this point, store the funding_outpoint with the event in the DB
+        let funding_output_index = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .position(|output| {
+                output.script_pubkey == funding_script
+                    && output.value == Amount::from_sat(contract_amount_sats as u64)
+            })
+            .ok_or_else(|| anyhow!("Funding output not found in PSBT"))?;
+
         let funding_outpoint = OutPoint {
             txid: funding_txid,
-            vout: 0,
+            vout: funding_output_index as u32,
         };
 
         if competition.funding_psbt_base64.is_none() {
@@ -1207,22 +1217,11 @@ impl Coordinator {
             return Err(anyhow!("Invalid outcome for this contract"));
         }
 
-        let outcome_tx = if let Some(outcome_tx) = competition.outcome_transaction.clone() {
-            outcome_tx
-        } else {
-            signed_contract.signed_outcome_tx(outcome_index, attestation)?
-        };
+        let outcome_tx = signed_contract.signed_outcome_tx(outcome_index, attestation)?;
 
-        debug!(
-            "Broadcasting outcome transaction: txid={:?}, witness={:?}",
-            outcome_tx.compute_txid(),
-            outcome_tx
-                .input
-                .iter()
-                .map(|input| &input.witness)
-                .collect::<Vec<_>>()
-        );
-        debug!("outcome_tx: {:?}", outcome_tx);
+        let tx_hex = consensus::encode::serialize_hex(&outcome_tx);
+        debug!("Raw transaction hex: {}", tx_hex);
+        debug!("Transaction ID: {}", outcome_tx.compute_txid());
         competition.outcome_transaction = Some(outcome_tx.clone());
         if competition.outcome_broadcasted_at.is_none() {
             self.bitcoin.broadcast(&outcome_tx).await?;
