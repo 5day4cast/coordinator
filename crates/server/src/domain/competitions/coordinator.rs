@@ -9,6 +9,7 @@ use crate::{
     generate_escrow_tx, get_escrow_outpoint,
     oracle_client::{Event, Oracle},
     AddEventEntries, AddEventEntry, FinalSignatures, ForeignUtxo, Ln, OracleError,
+    REQUIRED_CONFIRMATIONS_FOR_TIME,
 };
 use anyhow::anyhow;
 use bdk_wallet::{
@@ -1110,8 +1111,44 @@ impl Coordinator {
             return Ok(competition);
         }
 
-        let event = self.oracle_client.get_event(&competition.id).await?;
+        let Some(signed_contract) = competition.signed_contract.as_ref() else {
+            return Err(anyhow!(
+                "No signed contract found for competition {}",
+                competition.id
+            ));
+        };
 
+        if let Some(expiry) = signed_contract.dlc().params().event.expiry {
+            let current_time = self
+                .bitcoin
+                .get_confirmed_blockchain_time(REQUIRED_CONFIRMATIONS_FOR_TIME)
+                .await?;
+
+            if current_time > expiry as u64 {
+                // Get the expiry transaction
+                let Some(expiry_tx) = signed_contract.expiry_tx() else {
+                    return Err(anyhow!(
+                        "No expiry transaction found for competition {}",
+                        competition.id
+                    ));
+                };
+
+                debug!(
+                    "Broadcasting expiry transaction, current time {} expiry_tx lock time {} : {:?}",
+                    current_time, expiry_tx.lock_time, expiry_tx
+                );
+
+                if competition.expiry_broadcasted_at.is_none() {
+                    debug!("expiry_tx: {:?}", expiry_tx);
+                    self.bitcoin.broadcast(&expiry_tx).await?;
+                    competition.expiry_broadcasted_at = Some(OffsetDateTime::now_utc())
+                };
+
+                return Ok(competition);
+            }
+        }
+
+        let event = self.oracle_client.get_event(&competition.id).await?;
         let Some(attestation) = event.attestation else {
             info!(
                 "No oracle attestation found for competition {} yet, skipping add",
@@ -1178,11 +1215,12 @@ impl Coordinator {
         };
 
         if let Some(expiry) = event_announcement.expiry {
-            let current_time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs() as u32;
+            let current_time = self
+                .bitcoin
+                .get_confirmed_blockchain_time(REQUIRED_CONFIRMATIONS_FOR_TIME)
+                .await?;
 
-            if current_time >= expiry {
+            if current_time > expiry as u64 {
                 // Get the expiry transaction
                 let Some(expiry_tx) = signed_contract.expiry_tx() else {
                     return Err(anyhow!(
@@ -2428,13 +2466,45 @@ fn generate_payouts(
         competition.event_submission.number_of_places_win,
     );
     debug!("Generated {} possible rankings", possible_rankings.len());
-
     for (outcome_index, winner_indices) in possible_rankings.iter().enumerate() {
         debug!(
             "Processing outcome {} with winner indices: {:?}",
             outcome_index, winner_indices
         );
 
+        // Special handling for "all players" outcome
+        if winner_indices.len() == entries.len() {
+            debug!("Processing special 'all players' outcome for equal refunds");
+
+            // Create equal weights for all players (everyone gets their entry fee back)
+            let mut equal_weights: BTreeMap<PlayerIndex, u64> = BTreeMap::new();
+            let weight_per_player = 100 / players.len() as u64;
+            let remainder = 100 % players.len() as u64;
+
+            for i in 0..players.len() {
+                // Distribute remainder to maintain total of 100
+                let player_weight = if (i as u64) < remainder {
+                    weight_per_player + 1
+                } else {
+                    weight_per_player
+                };
+                equal_weights.insert(i, player_weight);
+                debug!(
+                    "Assigning equal weight {} to player index {} for refund outcome",
+                    player_weight, i
+                );
+            }
+
+            debug!(
+                "Final weights for refund outcome {}: {:?}",
+                outcome_index, equal_weights
+            );
+
+            payouts.insert(Outcome::Attestation(outcome_index), equal_weights);
+            continue;
+        }
+
+        // Normal outcome processing
         let entry_pubkeys = find_winning_entries_pubkeys(entries, winner_indices.to_owned());
         debug!("Winner pubkeys: {:?}", entry_pubkeys);
 
@@ -2477,29 +2547,6 @@ fn generate_payouts(
         }
 
         payouts.insert(Outcome::Attestation(outcome_index), payout_weights);
-
-        // Special handling for "no score" outcome
-        if winner_indices.len() == entries.len() {
-            debug!("Processing special 'no score' outcome");
-
-            // Create equal weights for all players (everyone gets their entry fee back)
-            let mut equal_weights: BTreeMap<PlayerIndex, u64> = BTreeMap::new();
-            let weight_per_player = 100 / players.len() as u64;
-            let remainder = 100 % players.len() as u64;
-
-            for i in 0..players.len() {
-                // Distribute remainder to maintain total of 100
-                let player_weight = if (i as u64) < remainder {
-                    weight_per_player + 1
-                } else {
-                    weight_per_player
-                };
-                equal_weights.insert(i, player_weight);
-            }
-
-            payouts.insert(Outcome::Attestation(outcome_index), equal_weights);
-            continue;
-        }
     }
 
     // Add expiry outcome with equal distribution

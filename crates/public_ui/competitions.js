@@ -160,8 +160,9 @@ class Competitions {
         console.log(competition.event_submission);
         return {
           id: competition.id,
-          startTime: competition.event_submission.observation_date,
-          endTime: one_day_ahead(competition.event_submission.observation_date),
+          startTime: competition.event_submission.start_observation_date,
+          endTime: competition.event_submission.end_observation_date,
+          signingTime: competition.event_submission.signing_date,
           phase: combinedStatus.phase,
           status: combinedStatus.status,
           canJoin: combinedStatus.canJoin,

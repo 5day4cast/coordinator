@@ -41,6 +41,10 @@ use std::{
 use tokio::{sync::RwLock, time::sleep};
 use tokio_util::sync::CancellationToken;
 
+// Needs to be over half of the last 10 blocks block time passed
+// the expiry time for a block to be considered final and able to broadcast
+pub const REQUIRED_CONFIRMATIONS_FOR_TIME: usize = 6;
+
 #[async_trait]
 pub trait Bitcoin: Send + Sync {
     fn get_network(&self) -> Network;
@@ -63,6 +67,7 @@ pub trait Bitcoin: Send + Sync {
     ) -> Result<Psbt, anyhow::Error>;
     async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<LocalOutput, anyhow::Error>;
     async fn get_current_height(&self) -> Result<u32, anyhow::Error>;
+    async fn get_confirmed_blockchain_time(&self, blocks: usize) -> Result<u64, anyhow::Error>;
     async fn get_estimated_fee_rates(&self) -> Result<HashMap<u16, f64>, anyhow::Error>;
     async fn get_tx_confirmation_height(&self, txid: &Txid) -> Result<Option<u32>, anyhow::Error>;
     async fn broadcast(&self, transaction: &Transaction) -> Result<(), anyhow::Error>;
@@ -464,6 +469,26 @@ impl Bitcoin for BitcoinClient {
             .get_height()
             .await
             .map_err(|e| anyhow!("Failed to get block height: {}", e))
+    }
+
+    async fn get_confirmed_blockchain_time(&self, blocks: usize) -> Result<u64, anyhow::Error> {
+        let mut last_blocks = self
+            .client
+            .get_blocks(None)
+            .await
+            .map_err(|e| anyhow!("Failed to get block height: {}", e))?;
+        last_blocks.sort_by_key(|block| std::cmp::Reverse(block.time.height));
+
+        if last_blocks.is_empty() {
+            return Err(anyhow!("No blocks available to calculate median time"));
+        }
+
+        let lastest_time = last_blocks
+            .get(blocks - 1)
+            .map(|val| val.time.timestamp)
+            .unwrap_or_default();
+
+        Ok(lastest_time)
     }
 
     /// Get an object where the key is the confirmation target (in number of blocks) and the value is the estimated feerate (in sat/vB).

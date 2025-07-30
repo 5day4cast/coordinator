@@ -87,6 +87,7 @@ pub struct EncryptedKey {
     pub network: String,
 }
 
+#[derive(Clone)]
 pub struct DlcEntry {
     pub contract: Option<TicketedDLC>,
     pub data: DlcEntryData,
