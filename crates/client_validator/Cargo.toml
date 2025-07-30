@@ -1,6 +1,6 @@
 [package]
 name = "client_validator"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 repository = "https://github.com/tee8z/5day4cast"
 
