@@ -403,9 +403,6 @@ impl Bitcoin for BitcoinClient {
         // This ensures the txid won't change after signing
         tx_builder.only_witness_utxo();
 
-        // This should keep the change output in the wallet
-        tx_builder.do_not_spend_change();
-
         let psbt = tx_builder.finish()?;
 
         Ok(psbt)
