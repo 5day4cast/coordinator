@@ -95,7 +95,7 @@ pub async fn send_to_address(
 ) -> Result<impl IntoResponse, ErrorResponse> {
     debug!("Sending to address: {}", request.address_to);
 
-    match state.bitcoin.send_to_address(request).await {
+    match state.bitcoin.send_to_address(request, vec![]).await {
         Ok(txid) => Ok((
             StatusCode::CREATED,
             Json(SendResponse {

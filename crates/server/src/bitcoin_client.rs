@@ -375,6 +375,8 @@ impl Bitcoin for BitcoinClient {
         selected_utxos: Vec<OutPoint>,
         foreign_utxos: Vec<ForeignUtxo>,
     ) -> Result<Psbt, anyhow::Error> {
+        self.print_balance_info().await?;
+
         let mut wallet = self.wallet.write().await;
         let mut tx_builder = wallet.build_tx();
 
@@ -516,6 +518,12 @@ impl Bitcoin for BitcoinClient {
 
 impl BitcoinClient {
     pub async fn new(settings: &BitcoinSettings) -> Result<BitcoinClient, anyhow::Error> {
+        info!("Creating Bitcoin client with settings:");
+        info!("  Storage file: {}", settings.storage_file);
+        info!("  Seed path: {}", settings.seed_path);
+        info!("  Network: {}", settings.network);
+        info!("  Esplora URL: {}", settings.esplora_url);
+
         let path = Path::new(&settings.storage_file);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -544,6 +552,7 @@ impl BitcoinClient {
             .check_network(settings.network)
             .load_wallet(&mut db)
             .map_err(|e| anyhow!("Failed to load bitcoin wallet store: {}", e))?;
+        info!("Loaded wallet: {}", wallet_opt.is_some());
 
         let mut wallet = match wallet_opt {
             Some(wallet) => wallet,
@@ -552,6 +561,10 @@ impl BitcoinClient {
                 .create_wallet(&mut db)
                 .map_err(|e| anyhow!("Failed to create bitcoin wallet from keys: {}", e))?,
         };
+        info!(
+            "Wallet ready. Has {} UTXOs",
+            wallet.list_unspent().collect::<Vec<_>>().len()
+        );
 
         let esplora_api =
             if settings.network == Network::Regtest || settings.network == Network::Testnet {
@@ -595,8 +608,13 @@ impl BitcoinClient {
                 e
             )
         })?;
-
         info!("Initial scan completed");
+
+        let balance = wallet.balance();
+        info!("Wallet balance after scan: {} sats", balance.total());
+        info!("Confirmed balance: {} sats", balance.confirmed);
+        info!("Unconfirmed balance: {} sats", balance.untrusted_pending);
+
         Ok(BitcoinClient {
             network: settings.network,
             wallet: RwLock::new(wallet),
@@ -604,6 +622,23 @@ impl BitcoinClient {
             client,
             wallet_store: RwLock::new(db),
         })
+    }
+
+    pub async fn print_balance_info(&self) -> Result<(), anyhow::Error> {
+        let balance = self.wallet.read().await.balance();
+        info!("Wallet balance: {} sats", balance.total());
+
+        let all_utxos = self.list_utxos().await;
+        info!("Available UTXOs: {}", all_utxos.len());
+
+        for utxo in &all_utxos {
+            info!(
+                "UTXO: {} - Amount: {} sats, Keychain: {:?}",
+                utxo.outpoint, utxo.txout.value, utxo.keychain
+            );
+        }
+
+        Ok(())
     }
 
     pub async fn get_balance(&self) -> Result<Balance, anyhow::Error> {
@@ -616,13 +651,30 @@ impl BitcoinClient {
         Ok(outputs)
     }
 
-    pub async fn send_to_address(&self, send_options: SendOptions) -> Result<Txid, anyhow::Error> {
+    pub async fn send_to_address(
+        &self,
+        send_options: SendOptions,
+        selected_utxos: Vec<OutPoint>,
+    ) -> Result<Txid, anyhow::Error> {
         // Get wallet read lock first to check addresses and UTXOs
         let wallet = self.wallet.read().await;
 
         // Validate destination address and find source UTXOs
         let dest_addr = send_options.get_destination_address(wallet.network())?;
-        let source_utxos = send_options.find_source_utxos(&wallet)?;
+        let source_utxos = if selected_utxos.is_empty() {
+            send_options.find_source_utxos(&wallet)?
+        } else {
+            // Convert OutPoint to LocalOutput
+            let mut utxos = Vec::new();
+            for outpoint in selected_utxos {
+                if let Some(utxo) = wallet.get_utxo(outpoint) {
+                    utxos.push(utxo);
+                } else {
+                    return Err(anyhow::anyhow!("UTXO not found: {}", outpoint));
+                }
+            }
+            utxos
+        };
 
         // Switch to write lock for transaction building
         drop(wallet);
@@ -636,12 +688,14 @@ impl BitcoinClient {
 
         send_options.configure_tx_builder(&mut builder, dest_addr)?;
 
-        let psbt = builder.finish()?;
+        let mut psbt = builder.finish()?;
 
         send_options.validate_fee(&psbt)?;
 
         // Sign and finalize
-        let finalized = wallet.sign(&mut psbt.clone(), SignOptions::default())?;
+        info!("PSBT before signing: {}", psbt.to_string());
+        let finalized = wallet.sign(&mut psbt, SignOptions::default())?;
+        info!("PSBT after signing: {}", psbt.to_string());
         if !finalized {
             return Err(anyhow!("Failed to sign transaction"));
         }
