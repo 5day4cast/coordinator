@@ -331,11 +331,14 @@ pub struct CreateEvent {
     /// Client needs to provide a valid Uuidv7
     pub id: Uuid,
     #[serde(with = "time::serde::rfc3339")]
-    /// Time at which the attestation will be added to the event, needs to be after the observation date
+    /// Time at which the attestation will be added to the event, needs to be after the end observation date
     pub signing_date: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
-    /// Date of when the weather observations occured (midnight UTC), all entries must be made before this time
-    pub observation_date: OffsetDateTime,
+    /// Time when the weather observations start, all entries must be made before this time, must be before the end observation date
+    pub start_observation_date: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    /// Time when the weather observations ends, must be before the signing date
+    pub end_observation_date: OffsetDateTime,
     /// NOAA observation stations used in this event
     pub locations: Vec<String>,
     /// The number of values that can be selected per entry in the event (default to number_of_locations * 3, (temp_low, temp_high, wind_speed))
@@ -950,8 +953,8 @@ impl Competition {
         };
 
         // Competition should expire if not enough entries collected before observation date
-        if let Some(observation_date) = event_announcement.expiry {
-            if now.unix_timestamp() as u32 >= observation_date && !self.has_full_entries() {
+        if let Some(expiry) = event_announcement.expiry {
+            if now.unix_timestamp() as u32 >= expiry && !self.has_full_entries() {
                 return true;
             }
         }

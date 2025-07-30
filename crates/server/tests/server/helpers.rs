@@ -18,12 +18,13 @@ use mockall::mock;
 use secrecy::ExposeSecret;
 use server::{
     domain::{generate_ranking_permutations, AddEntry, CreateEvent},
-    get_key, AddEventEntries, Bitcoin, ForeignUtxo, Ln, Oracle, OracleError as Error, OracleEvent,
-    ValueOptions, WeatherChoices,
+    get_key, AddEventEntries, Bitcoin, ForeignUtxo, Ln, LnClient, Oracle, OracleError as Error,
+    OracleEvent, ValueOptions, WeatherChoices,
 };
 use std::collections::HashMap;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
+
 mock! {
     #[derive(Send, Sync)]
     pub OracleClient { }
@@ -62,6 +63,7 @@ mock! {
         ) -> Result<Psbt, anyhow::Error>;
         async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<bdk_wallet::LocalOutput, anyhow::Error>;
         async fn get_current_height(&self) -> Result<u32, anyhow::Error>;
+        async fn get_confirmed_blockchain_time(&self, blocks: usize) -> Result<u64, anyhow::Error>;
         async fn get_estimated_fee_rates(&self) -> Result<HashMap<u16, f64>, anyhow::Error>;
         async fn get_tx_confirmation_height(&self, txid: &Txid) -> Result<Option<u32>, anyhow::Error>;
         async fn broadcast(&self, transaction: &bdk_wallet::bitcoin::Transaction) -> Result<(), anyhow::Error>;
@@ -126,10 +128,12 @@ pub async fn create_test_wallet(nostr_client: &NostrClientCore) -> TaprootWallet
         .expect("Failed to create test wallet")
 }
 
+#[derive(Clone)]
 pub struct TestParticipant {
-    pub wallet: client_validator::TaprootWalletCore,
+    pub wallet: TaprootWalletCore,
     pub nostr_pubkey: String,
     pub ticket_id: Uuid,
+    pub ln_client: LnClient,
 }
 
 impl TestParticipant {
@@ -137,18 +141,20 @@ impl TestParticipant {
         wallet: client_validator::TaprootWalletCore,
         nostr_pubkey: String,
         ticket_id: Uuid,
+        ln_client: LnClient,
     ) -> Self {
         Self {
             wallet,
             nostr_pubkey,
             ticket_id,
+            ln_client,
         }
     }
 
-    pub fn get_payout_preimage(&self) -> Result<String, anyhow::Error> {
+    pub fn get_payout_preimage(&self, entry_index: u32) -> Result<String, anyhow::Error> {
         let entry = self
             .wallet
-            .get_dlc_entry(0)
+            .get_dlc_entry(entry_index)
             .ok_or_else(|| anyhow!("No DLC entry found"))?;
         Ok(entry.payout_preimage.expose_secret().to_string())
     }
@@ -177,13 +183,16 @@ pub fn generate_request_create_event(
     number_of_places_win: usize,
 ) -> CreateEvent {
     let now = OffsetDateTime::now_utc();
-    let observation_date = now + Duration::days(1);
-    let signing_date = observation_date + Duration::hours(2); // Signing happens after observation
+    let start_observation_date = now + Duration::hours(6);
+    let end_observation_date = now + Duration::hours(30);
+
+    let signing_date = end_observation_date + Duration::hours(3); // Signing happens after observation
 
     CreateEvent {
         id: Uuid::now_v7(),
         signing_date,
-        observation_date,
+        end_observation_date,
+        start_observation_date,
         coordinator_fee_percentage: 5,
         locations: (0..num_locations).map(|i| format!("LOC_{}", i)).collect(),
         number_of_values_per_entry: num_locations * 3, // 3 values per location
@@ -210,7 +219,10 @@ pub async fn generate_test_entry(
         .await?;
 
     let ephemeral_pubkey = wallet.get_dlc_public_key(entry_index).await?;
-    info!("entry ephemeral_pubkey: {}", ephemeral_pubkey);
+    info!(
+        "entry ephemeral_pubkey: {}, entry index: {}",
+        ephemeral_pubkey, entry_index
+    );
     // Generate payout hash
     let payout_hash = wallet.add_entry_index(entry_index)?;
 
@@ -266,6 +278,7 @@ pub fn generate_oracle_event(
     event_id: Uuid,
     total_allowed_entries: usize,
     number_of_places_win: usize,
+    expiry: u32,
 ) -> OracleEvent {
     let possible_user_outcomes: Vec<Vec<usize>> =
         generate_ranking_permutations(total_allowed_entries, number_of_places_win);
@@ -275,10 +288,6 @@ pub fn generate_oracle_event(
     let mut rng = rand::thread_rng();
     let nonce = Scalar::random(&mut rng);
     let nonce_point = nonce.base_point_mul();
-    // Manually set expiry to 7 days after the signature should have been provided so users can get their funds back
-    let expiry = OffsetDateTime::now_utc()
-        .saturating_add(Duration::DAY * 7)
-        .unix_timestamp() as u32;
 
     let locking_points = outcome_messages
         .iter()

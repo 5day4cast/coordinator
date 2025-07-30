@@ -49,11 +49,11 @@ class Entries {
           $row.appendChild(event_id);
 
           const event_start = document.createElement("td");
-          event_start.textContent = event["observation_date"];
+          event_start.textContent = event["start_observation_date"];
           $row.appendChild(event_start);
 
           const event_end = document.createElement("td");
-          event_end.textContent = one_day_ahead(event["observation_date"]);
+          event_end.textContent = event["end_observation_date"];
           $row.appendChild(event_end);
 
           const status = document.createElement("td");

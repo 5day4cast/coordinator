@@ -124,6 +124,7 @@ impl TaprootWalletCoreBuilder {
     }
 }
 
+#[derive(Clone)]
 pub struct TaprootWalletCore {
     extended_key: SecretString,
     public_data: KeyPair,

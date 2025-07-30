@@ -132,28 +132,38 @@ function addDefaults() {
   let competitionStr = $competitionElement.innerText.trim();
   try {
     let competition = JSON.parse(competitionStr);
-    let tomorrow = getTomorrowUTC();
-    let signingDate = new Date(tomorrow);
-    signingDate.setUTCDate(tomorrow.getUTCDate() + 2);
-    signingDate.setUTCHours(0, 0, 0, 0);
+
+    // Get current UTC time
+    const now = new Date();
+    console.log("Current UTC time:", now.toISOString());
+
+    // Start observation date: 6 hours from now in UTC
+    let startObservation = new Date(now);
+    startObservation.setUTCHours(now.getUTCHours() + 6);
+    console.log("Start observation (UTC+6h):", startObservation.toISOString());
+
+    // End observation date: 6 hours + 24 hours = 30 hours from now in UTC
+    let endObservation = new Date(now);
+    endObservation.setUTCHours(now.getUTCHours() + 24);
+    console.log("End observation (UTC+24h):", endObservation.toISOString());
+
+    // Signing date: 6 hours + 24 hours + 3 hours = 33 hours from now in UTC
+    let signingDate = new Date(now);
+    signingDate.setUTCHours(now.getUTCHours() + 33);
+    console.log("Signing date (UTC+33h):", signingDate.toISOString());
+
     let updatedCompetition = {
       id: uuidv7(),
       signing_date: signingDate.toISOString(),
-      observation_date: tomorrow.toISOString(),
+      start_observation_date: startObservation.toISOString(),
+      end_observation_date: endObservation.toISOString(),
       ...competition,
     };
+
     $competitionElement.innerHTML = `<code>${JSON.stringify(updatedCompetition, null, 2)}</code>`;
   } catch (e) {
     console.error("Error parsing competition:", e.message);
   }
-}
-
-function getTomorrowUTC() {
-  const now = new Date();
-  const tomorrow = new Date(now);
-  tomorrow.setUTCDate(now.getUTCDate() + 1);
-  tomorrow.setUTCHours(0, 0, 0, 0);
-  return tomorrow;
 }
 
 async function get_stations() {
