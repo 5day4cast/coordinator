@@ -91,7 +91,13 @@ class Payouts {
                 playerIndex
               ] || 0;
             const payoutAmount =
-              (competition.total_competition_pool * playerWeight) / totalWeight;
+              (competition.event_submission.total_competition_pool *
+                playerWeight) /
+              totalWeight;
+
+            if (payoutAmount <= 0) {
+              return null;
+            }
 
             return {
               entry,
@@ -111,13 +117,13 @@ class Payouts {
       }
 
       // Show table and populate it
-      validPayableEntries.forEach((payableEntry) =>
+      validPayableEntries.forEach((payableEntry) => {
         this.createPayoutRow(payableEntry.entry, entries, {
           payout_amount: payableEntry.payout_amount,
           weight: payableEntry.weight,
           total_weight: payableEntry.total_weight,
-        }),
-      );
+        });
+      });
     } catch (error) {
       console.error("Error occurred while fetching data:", error);
       this.$error.textContent = `Error loading payouts: ${error.message}`;
@@ -183,15 +189,22 @@ class Payouts {
       this.showPayoutModal(
         button.dataset.competitionId,
         button.dataset.entryId,
+        entry.payout_preimage_encrypted,
         parseInt(button.dataset.entryIndex),
-        window.taprootWallet,
+        payoutInfo.payout_amount,
       ),
     );
 
     this.$tbody.appendChild($row);
   }
 
-  async showPayoutModal(competitionId, entryId, entryIndex, wallet) {
+  async showPayoutModal(
+    competitionId,
+    entryId,
+    encryptedPayoutPreimage,
+    entryIndex,
+    payoutAmount,
+  ) {
     const $modal = document.getElementById("payoutModal");
     const $submitButton = document.getElementById("submitPayoutInvoice");
     const $cancelButton = document.getElementById("cancelPayoutModal");
@@ -216,9 +229,9 @@ class Payouts {
         await this.submitPayout(
           competitionId,
           entryId,
-          entryIndex,
-          wallet,
+          encryptedPayoutPreimage.entryIndex,
           $invoice.value.trim(),
+          payoutAmount,
         );
         closeModal();
         this.init(); // Refresh the payouts table
@@ -230,33 +243,101 @@ class Payouts {
     };
   }
 
-  async submitPayout(competitionId, entryId, entryIndex, wallet, invoice) {
+  async submitPayout(
+    competitionId,
+    entryId,
+    entryIndex,
+    encryptedPayoutPreimage,
+    invoice,
+    payoutAmount,
+  ) {
     if (!invoice) {
       throw new Error("Please enter a Lightning invoice");
     }
+    const validation = this.validateInvoice(invoice, payoutAmount);
+
+    console.log(
+      `Invoice validation: ${validation.type} for ${payoutAmount} sats`,
+    );
 
     const nostrPubkey = await window.nostrClient.getPublicKey();
-    const payout_preimage = await wallet.getEncryptedDlcPayoutPreimage(
-      entryIndex,
+
+    const payoutPreimage = await window.taprootWallet.decryptKey(
+      encryptedPayoutPreimage,
       nostrPubkey,
     );
-    const ephemeral_private_key = await wallet.getEncryptedDlcPrivateKey(
-      entryIndex,
-      nostrPubkey,
-    );
+
+    const encryptedEphemeralPrivateKey =
+      await window.taprootWallet.getEncryptedDlcPrivateKey(
+        entryIndex,
+        nostrPubkey,
+      );
+
+    const ephemeralPrivateKey =
+      await window.taprootWallet.getDecryptedDlcPrivateKey(
+        encryptedEphemeralPrivateKey,
+        nostrPubkey,
+      );
 
     const payoutResponse = await this.client.post(
       `${this.coordinator_url}competitions/${competitionId}/entries/${entryId}/payout`,
       {
         ticket_id: entryId,
-        payout_preimage,
-        ephemeral_private_key,
+        payout_preimage: payoutPreimage,
+        ephemeral_private_key: ephemeralPrivateKey,
         ln_invoice: invoice,
       },
     );
 
     if (!payoutResponse.ok) {
       throw new Error(`Failed to submit payout: ${payoutResponse.status}`);
+    }
+  }
+
+  validateInvoice(invoice, expectedAmount) {
+    try {
+      const decoded = window.lightBolt11Decoder.decode(invoice);
+
+      if (decoded.expiry) {
+        const currentTime = Math.floor(Date.now() / 1000);
+        const createdAt =
+          decoded.sections.find((s) => s.name === "timestamp")?.value || 0;
+        const expiresAt = createdAt + decoded.expiry;
+
+        if (currentTime > expiresAt) {
+          throw new Error("Invoice has expired");
+        }
+      }
+
+      const amountSection = decoded.sections.find((s) => s.name === "amount");
+
+      if (amountSection && amountSection.value) {
+        const invoiceAmountSats = Math.floor(
+          parseInt(amountSection.value) / 1000,
+        );
+
+        if (invoiceAmountSats !== expectedAmount) {
+          throw new Error(
+            `Invoice amount (${invoiceAmountSats} sats) doesn't match expected payout (${expectedAmount} sats)`,
+          );
+        }
+
+        return {
+          isValid: true,
+          hasAmount: true,
+          amount: invoiceAmountSats,
+          type: "fixed-amount",
+        };
+      } else {
+        return {
+          isValid: true,
+          hasAmount: false,
+          amount: null,
+          type: "any-amount",
+        };
+      }
+    } catch (error) {
+      throw new Error(`Invalid invoice: ${error.message}`);
     }
   }
 }

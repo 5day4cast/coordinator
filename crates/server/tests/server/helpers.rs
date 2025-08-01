@@ -15,7 +15,6 @@ use dlctix::{
 };
 use log::{debug, info};
 use mockall::mock;
-use secrecy::ExposeSecret;
 use server::{
     domain::{generate_ranking_permutations, AddEntry, CreateEvent},
     get_key, AddEventEntries, Bitcoin, ForeignUtxo, Ln, LnClient, Oracle, OracleError as Error,
@@ -151,12 +150,15 @@ impl TestParticipant {
         }
     }
 
-    pub fn get_payout_preimage(&self, entry_index: u32) -> Result<String, anyhow::Error> {
-        let entry = self
+    pub async fn get_payout_preimage(
+        &self,
+        encrypted_preimage: &str,
+    ) -> Result<String, anyhow::Error> {
+        let preimage = self
             .wallet
-            .get_dlc_entry(entry_index)
-            .ok_or_else(|| anyhow!("No DLC entry found"))?;
-        Ok(entry.payout_preimage.expose_secret().to_string())
+            .decrypt_key(&encrypted_preimage, &self.nostr_pubkey)
+            .await?;
+        Ok(preimage)
     }
 
     pub async fn get_dlc_private_key(&self, entry_index: u32) -> Result<String, WalletError> {

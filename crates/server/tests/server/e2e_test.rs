@@ -518,10 +518,12 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
         "participant ticket: {:?} participant: {:?}",
         participant.ticket_id, participant.nostr_pubkey,
     );
+    let entry = &participants_entries[&participant.nostr_pubkey];
     let payout_info = PayoutInfo {
         ticket_id: participant.ticket_id,
         payout_preimage: participant
-            .get_payout_preimage(participant_entry_indices[&participant.nostr_pubkey])
+            .get_payout_preimage(&entry.payout_preimage_encrypted)
+            .await
             .unwrap(),
         ephemeral_private_key: participant
             .get_dlc_private_key(participant_entry_indices[&participant.nostr_pubkey])
@@ -959,7 +961,7 @@ async fn test_two_person_competition_flow_nobody_wins_with_real_lightning() -> R
     assert!(competition.attestation.is_some());
 
     // All players should be able to claim a refund from this competition via lightning
-    for (i, participant) in ordered_participants.iter().enumerate() {
+    for participant in ordered_participants.iter() {
         // Create a real invoice with the expected payout amount
         let payout_amount = competition.event_submission.total_competition_pool as u64; // Or calculate based on winner's share
         let ln_invoice = participant
@@ -969,10 +971,17 @@ async fn test_two_person_competition_flow_nobody_wins_with_real_lightning() -> R
                 3600, // 1 hour expiry (default lnd)
             )
             .await?;
+        let entry = &participants_entries[&participant.nostr_pubkey];
         let payout_info = PayoutInfo {
             ticket_id: participant.ticket_id,
-            payout_preimage: participant.get_payout_preimage(i as u32).unwrap(),
-            ephemeral_private_key: participant.get_dlc_private_key(i as u32).await.unwrap(),
+            payout_preimage: participant
+                .get_payout_preimage(&entry.payout_preimage_encrypted)
+                .await
+                .unwrap(),
+            ephemeral_private_key: participant
+                .get_dlc_private_key(participant_entry_indices[&participant.nostr_pubkey])
+                .await
+                .unwrap(),
             ln_invoice,
         };
 
