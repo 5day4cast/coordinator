@@ -1387,7 +1387,7 @@ impl Coordinator {
 
             let mut close_tx = simple_sweep_tx(
                 signed_contract.params().market_maker.pubkey,
-                close_tx_input,
+                close_tx_input.clone(),
                 signed_contract.close_tx_input_weight(),
                 close_tx_prevout.value,
                 fee_rate,
@@ -1402,10 +1402,12 @@ impl Coordinator {
                 })
                 .collect();
 
+            let input_index = close_tx_input.previous_output.vout.clone() as usize;
+
             signed_contract.sign_outcome_close_tx_input(
                 &outcome,
                 &mut close_tx,
-                0,
+                input_index,
                 &Prevouts::All(&[close_tx_prevout]),
                 self.private_key,
                 &winner_seckeys,
@@ -1442,7 +1444,7 @@ impl Coordinator {
 
                 let mut close_tx = simple_sweep_tx(
                     signed_contract.params().market_maker.pubkey,
-                    close_tx_input,
+                    close_tx_input.clone(),
                     signed_contract.close_tx_input_weight(),
                     close_tx_prevout.value,
                     fee_rate,
@@ -1451,10 +1453,12 @@ impl Coordinator {
                 let winner_seckey = Scalar::from_hex(entry.ephemeral_privatekey.as_ref().unwrap())
                     .map_err(|e| anyhow!("Invalid winner secret key: {}", e))?;
 
+                let input_index = close_tx_input.previous_output.vout.clone() as usize;
+
                 signed_contract.sign_split_close_tx_input(
                     &win_condition,
                     &mut close_tx,
-                    0,
+                    input_index,
                     &Prevouts::All(&[close_tx_prevout]),
                     self.private_key,
                     winner_seckey,
@@ -1579,16 +1583,18 @@ impl Coordinator {
 
                 let mut reclaim_tx = simple_sweep_tx(
                     signed_contract.params().market_maker.pubkey,
-                    reclaim_tx_input,
+                    reclaim_tx_input.clone(),
                     signed_contract.split_reclaim_tx_input_weight(),
                     reclaim_tx_prevout.value,
                     fee_rate,
                 );
 
+                let input_index = reclaim_tx_input.previous_output.vout.clone() as usize;
+
                 signed_contract.sign_split_reclaim_tx_input(
                     &win_condition,
                     &mut reclaim_tx,
-                    0,
+                    input_index,
                     &Prevouts::All(&[reclaim_tx_prevout]),
                     self.private_key,
                 )?;
@@ -1746,6 +1752,14 @@ impl Coordinator {
         create_event: CreateEvent,
     ) -> Result<Competition, Error> {
         let competition = Competition::new(&create_event);
+
+        if competition.event_submission.number_of_places_win > 5 {
+            return Err(Error::BadRequest(format!(
+                "Number of winners exceeds maximum allowed 5 {}",
+                competition.event_submission.number_of_places_win
+            )));
+        }
+
         debug!("created competition");
         let tickets = competition
             .generate_competition_tickets(create_event.total_allowed_entries, &self.ln)
@@ -2299,6 +2313,15 @@ impl Coordinator {
 
         if let Some(ref event_announcement) = competition.event_announcement {
             debug!("Locking points: {:?}", event_announcement.locking_points);
+        }
+
+        if competition.is_delta_broadcasted()
+            || competition.is_expiry_broadcasted()
+            || competition.is_completed()
+        {
+            return Err(Error::BadRequest(
+                "Funds already received to user's on-chain key".into(),
+            ));
         }
 
         // Get the entry and verify ownership

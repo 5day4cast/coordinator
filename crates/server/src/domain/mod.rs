@@ -4,6 +4,7 @@ mod users;
 
 pub use competitions::*;
 pub use invoices::*;
+use time::OffsetDateTime;
 pub use users::*;
 
 use duckdb::{AccessMode, Config, Connection};
@@ -42,6 +43,8 @@ pub enum Error {
     CompetitionFull,
     #[error("No ticket available for competition")]
     NoAvailableTickets,
+    #[error("Too late to sign with ticket. Signing must end by {0}, but current time is {1}")]
+    TooLateToSign(OffsetDateTime, OffsetDateTime),
     #[error("Payout payment failed: {0}")]
     PaymentFailed(String),
 }

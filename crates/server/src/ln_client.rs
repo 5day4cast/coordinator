@@ -476,7 +476,7 @@ impl Ln for LnClient {
             .post(format!("{}v2/router/send", self.base_url))
             .json(&body)
             .header(MACAROON_HEADER, self.macaroon.expose_secret())
-            .timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(timeout_seconds))
             .send()
             .await;
 

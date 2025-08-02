@@ -543,6 +543,8 @@ impl Serialize for Competition {
     }
 }
 
+const TICKET_EXPIRY_BUFFER: Duration = Duration::minutes(1);
+
 impl Competition {
     async fn generate_competition_tickets(
         &self,
@@ -567,14 +569,19 @@ impl Competition {
     }
 
     fn calculate_ticket_expiry(&self) -> Result<(u64, OffsetDateTime), Error> {
-        let signing_window = Duration::hours(3); //TODO: making signing window configurable
         let now = OffsetDateTime::now_utc();
+
+        let latest_signing_end =
+            self.event_submission.start_observation_date - TICKET_EXPIRY_BUFFER;
+
+        if now >= latest_signing_end {
+            return Err(Error::TooLateToSign(latest_signing_end, now));
+        }
+
+        let signing_window = latest_signing_end - now;
         let total_expiry_secs = signing_window.whole_seconds() as u64;
 
-        Ok((
-            total_expiry_secs,
-            now + Duration::seconds(total_expiry_secs as i64),
-        ))
+        Ok((total_expiry_secs, latest_signing_end))
     }
 
     fn get_current_outcome(&self) -> Result<Outcome, anyhow::Error> {
