@@ -2297,6 +2297,10 @@ impl Coordinator {
             ));
         }
 
+        if let Some(ref event_announcement) = competition.event_announcement {
+            debug!("Locking points: {:?}", event_announcement.locking_points);
+        }
+
         // Get the entry and verify ownership
         let entries = self
             .competition_store
@@ -2331,6 +2335,7 @@ impl Coordinator {
 
         // Get the current outcome
         let outcome = competition.get_current_outcome()?;
+        debug!("Current outcome: {:?}", outcome);
 
         // Get the signed contract to verify winner
         let signed_contract = competition
@@ -2347,6 +2352,10 @@ impl Coordinator {
 
         let ephemeral_pubkey = Point::from_hex(&entry.ephemeral_pubkey)
             .map_err(|e| Error::BadRequest(format!("Invalid ephemeral pubkey: {}", e)))?;
+
+        debug!("Ephemeral pubkey: {:?}", ephemeral_pubkey);
+        debug!("Winner weights: {:?}", winner_weights);
+        debug!("Players: {:?}", signed_contract.params().players);
 
         let is_winner = winner_weights.iter().any(|(player_index, _)| {
             if let Some(player) = signed_contract.params().players.get(*player_index) {
