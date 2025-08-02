@@ -280,7 +280,7 @@ class Payouts {
     );
 
     const payoutResponse = await this.client.post(
-      `${this.coordinator_url}competitions/${competitionId}/entries/${entryId}/payout`,
+      `${this.coordinator_url}/competitions/${competitionId}/entries/${entryId}/payout`,
       {
         ticket_id: entryId,
         payout_preimage: payoutPreimage,
