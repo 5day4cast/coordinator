@@ -1,7 +1,12 @@
 use super::core::{TaprootWalletCore, TaprootWalletCoreBuilder};
 use crate::NostrClientWrapper;
 use bdk_wallet::bitcoin::Psbt;
-use dlctix::{bitcoin::OutPoint, musig2::AggNonce, ContractParameters, SigMap};
+use dlctix::{
+    bitcoin::OutPoint,
+    musig2::AggNonce,
+    secp::{MaybeScalar, Scalar},
+    ContractParameters, EventLockingConditions, SigMap,
+};
 use log::{debug, info};
 use std::str::FromStr;
 use wasm_bindgen::prelude::*;
@@ -209,5 +214,28 @@ impl TaprootWallet {
         debug!("Generated signed funding psbt base64: {:?}", psbt_base64);
 
         Ok(psbt_base64)
+    }
+
+    #[wasm_bindgen(js_name = "getCurrentOutcome")]
+    pub fn get_current_outcome(
+        &self,
+        attestation_hex: &str,
+        event_announcement: JsValue,
+    ) -> Result<String, JsValue> {
+        let attestation = Scalar::from_hex(attestation_hex)
+            .map_err(|e| JsValue::from_str(&format!("Invalid attestation hex: {}", e)))?;
+        let maybe_attestation = MaybeScalar::Valid(attestation);
+
+        let event_announcement: EventLockingConditions =
+            serde_wasm_bindgen::from_value(event_announcement).map_err(|e| {
+                JsValue::from_str(&format!("Event announcement deserialization error: {}", e))
+            })?;
+
+        let outcome = self
+            .inner
+            .get_current_outcome(maybe_attestation, event_announcement)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        Ok(outcome.to_string())
     }
 }

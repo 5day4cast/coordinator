@@ -43,6 +43,7 @@ export class TaprootWallet {
   generatePublicNonces(entry_index: number): any;
   signAggregateNonces(aggregate_nonces: any, entry_index: number): any;
   signFundingPsbt(funding_psbt_base64: string, entry_index: number): string;
+  getCurrentOutcome(attestation_hex: string, event_announcement: any): string;
 }
 export class TaprootWalletBuilder {
   free(): void;
@@ -57,6 +58,7 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 
 export interface InitOutput {
   readonly memory: WebAssembly.Memory;
+  readonly main: () => void;
   readonly __wbg_taprootwallet_free: (a: number, b: number) => void;
   readonly __wbg_taprootwalletbuilder_free: (a: number, b: number) => void;
   readonly taprootwalletbuilder_new: () => number;
@@ -75,6 +77,7 @@ export interface InitOutput {
   readonly taprootwallet_generatePublicNonces: (a: number, b: number) => [number, number, number];
   readonly taprootwallet_signAggregateNonces: (a: number, b: any, c: number) => [number, number, number];
   readonly taprootwallet_signFundingPsbt: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+  readonly taprootwallet_getCurrentOutcome: (a: number, b: number, c: number, d: any) => [number, number, number, number];
   readonly __wbg_nostrclientwrapper_free: (a: number, b: number) => void;
   readonly nostrclientwrapper_new: () => number;
   readonly nostrclientwrapper_initialize: (a: number, b: number, c: number, d: number) => any;
@@ -91,7 +94,6 @@ export interface InitOutput {
   readonly __wbg_nip44methods_free: (a: number, b: number) => void;
   readonly nip44methods_encrypt: (a: number, b: number, c: number, d: number, e: number) => any;
   readonly nip44methods_decrypt: (a: number, b: number, c: number, d: number, e: number) => any;
-  readonly main: () => void;
   readonly rustsecp256k1_v0_10_0_context_create: (a: number) => number;
   readonly rustsecp256k1_v0_10_0_context_destroy: (a: number) => void;
   readonly rustsecp256k1_v0_10_0_default_illegal_callback_fn: (a: number, b: number) => void;
@@ -104,11 +106,11 @@ export interface InitOutput {
   readonly __wbindgen_export_5: WebAssembly.Table;
   readonly __externref_table_dealloc: (a: number) => void;
   readonly __wbindgen_free: (a: number, b: number, c: number) => void;
-  readonly closure640_externref_shim: (a: number, b: number, c: any) => void;
-  readonly closure767_externref_shim: (a: number, b: number, c: any) => void;
-  readonly _dyn_core__ops__function__FnMut_____Output___R_as_wasm_bindgen__closure__WasmClosure___describe__invoke__h040ab34d34cccd5c: (a: number, b: number) => void;
-  readonly closure1096_externref_shim: (a: number, b: number, c: any) => void;
-  readonly closure1108_externref_shim: (a: number, b: number, c: any, d: any) => void;
+  readonly closure676_externref_shim: (a: number, b: number, c: any) => void;
+  readonly closure777_externref_shim: (a: number, b: number, c: any) => void;
+  readonly _dyn_core__ops__function__FnMut_____Output___R_as_wasm_bindgen__closure__WasmClosure___describe__invoke__h69ac59dfcd2e25fb: (a: number, b: number) => void;
+  readonly closure1112_externref_shim: (a: number, b: number, c: any) => void;
+  readonly closure1124_externref_shim: (a: number, b: number, c: any, d: any) => void;
   readonly __wbindgen_start: () => void;
 }
 

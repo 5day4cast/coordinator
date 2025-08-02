@@ -75,29 +75,85 @@ class Payouts {
               return null;
             }
 
-            // Find this player's index in the contract
             const playerIndex =
               competition.contract_parameters.players.findIndex(
                 (player) => player.pubkey === entry.ephemeral_pubkey,
               );
-            if (playerIndex === -1) return null;
+
+            console.log("Found player index:", playerIndex);
+            if (playerIndex === -1) {
+              console.log("Player not found in competition");
+              return null;
+            }
+
+            const outcomeKey = getCurrentOutcome(competition);
+            console.log("Determined outcome key:", outcomeKey);
+            if (!outcomeKey) {
+              console.log("Could not determine outcome key");
+              return null;
+            }
+
+            const outcomeWeights =
+              competition.contract_parameters.outcome_payouts[outcomeKey];
+            console.log("Outcome weights for", outcomeKey, ":", outcomeWeights);
+            if (!outcomeWeights) {
+              console.log("No outcome weights found for", outcomeKey);
+              return null;
+            }
 
             // Calculate payout amount based on weights
-            const totalWeight = Object.values(
-              competition.contract_parameters.outcome_payouts.att0,
-            ).reduce((a, b) => a + b, 0);
-            const playerWeight =
-              competition.contract_parameters.outcome_payouts.att0[
-                playerIndex
-              ] || 0;
+            const totalWeight = Object.values(outcomeWeights).reduce(
+              (a, b) => a + b,
+              0,
+            );
+            console.log("Total weight for outcome:", totalWeight);
+
+            const playerWeight = outcomeWeights[playerIndex] || 0;
+            console.log(
+              "Player weight at index",
+              playerIndex,
+              ":",
+              playerWeight,
+            );
+
+            if (playerWeight <= 0) {
+              console.log("Player weight is 0 or negative, player didn't win");
+              return null;
+            }
+
             const payoutAmount =
               (competition.event_submission.total_competition_pool *
                 playerWeight) /
               totalWeight;
 
+            console.log("Calculated payout amount:", payoutAmount);
+            console.log(
+              "Competition pool:",
+              competition.event_submission.total_competition_pool,
+            );
+            console.log(
+              "Calculation:",
+              competition.event_submission.total_competition_pool,
+              "*",
+              playerWeight,
+              "/",
+              totalWeight,
+              "=",
+              payoutAmount,
+            );
+
             if (payoutAmount <= 0) {
+              console.log("Payout amount is 0 or negative");
               return null;
             }
+
+            console.log(
+              "Entry",
+              entry.id,
+              "is eligible for payout of",
+              payoutAmount,
+              "sats",
+            );
 
             return {
               entry,
@@ -163,6 +219,22 @@ class Payouts {
       throw new Error(`Failed to get oracle events: ${response.status}`);
     }
     return response.json();
+  }
+
+  getCurrentOutcome(competition) {
+    if (!competition.attestation || !competition.event_announcement) {
+      return null;
+    }
+
+    try {
+      return window.taprootWallet.getCurrentOutcome(
+        competition.attestation,
+        competition.event_announcement,
+      );
+    } catch (error) {
+      console.error("Failed to determine current outcome:", error);
+      return null;
+    }
   }
 
   createPayoutRow(entry, allEntries, payoutInfo) {

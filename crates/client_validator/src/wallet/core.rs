@@ -15,8 +15,9 @@ use blake2::{Blake2b512, Digest};
 use dlctix::{
     bitcoin::{bip32::Xpriv, OutPoint},
     musig2::{AggNonce, PartialSignature},
-    secp::Scalar,
-    ContractParameters, NonceSharingRound, SigMap, SigningSession, TicketedDLC,
+    secp::{MaybeScalar, Scalar},
+    ContractParameters, EventLockingConditions, NonceSharingRound, Outcome, SigMap, SigningSession,
+    TicketedDLC,
 };
 use log::debug;
 use nostr_sdk::{FromBech32, NostrSigner};
@@ -633,5 +634,29 @@ impl TaprootWalletCore {
         let hash = sha256::Hash::from_engine(hasher);
         let seed: [u8; 32] = hash.to_byte_array();
         ChaCha20Rng::from_seed(seed)
+    }
+
+    pub fn get_current_outcome(
+        &self,
+        attestation: MaybeScalar,
+        event_announcement: EventLockingConditions,
+    ) -> Result<Outcome, WalletError> {
+        let locking_point = attestation.base_point_mul();
+        let outcome = event_announcement
+            .all_outcomes()
+            .into_iter()
+            .find(|outcome| {
+                match outcome {
+                    Outcome::Attestation(i) => {
+                        // Check if this outcome's locking point matches our attestation point
+                        event_announcement.locking_points[*i] == locking_point
+                    }
+                    Outcome::Expiry => false,
+                }
+            })
+            .ok_or_else(|| WalletError::NoMatchingOutcome)?;
+
+        debug!("Found outcome: {:?}", outcome);
+        Ok(outcome)
     }
 }

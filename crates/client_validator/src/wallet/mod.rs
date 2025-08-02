@@ -59,6 +59,8 @@ pub enum WalletError {
     PsbtError(#[from] PsbtParseError),
     #[error("Invalid BOLT11 invoice: {0}")]
     InvalidInvoice(String),
+    #[error("No matching outcome found for attestation")]
+    NoMatchingOutcome,
 }
 
 #[cfg(target_arch = "wasm32")]
