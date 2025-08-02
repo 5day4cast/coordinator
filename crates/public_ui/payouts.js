@@ -1,5 +1,4 @@
 import { AuthorizedClient } from "./authorized_client.js";
-import { decode } from "https://cdn.skypack.dev/light-bolt11-decoder@3.2.0";
 
 export async function displayPayouts(apiBase, oracleBase) {
   const $payoutsTableBody = document.getElementById("payoutsTableBody");
@@ -297,39 +296,33 @@ class Payouts {
 
   validateInvoice(invoice, expectedAmount) {
     try {
-      const decoded = decode(invoice);
+      // Use the global lightningPayReq object from bolt11.min.js
+      const decoded = lightningPayReq.decode(invoice);
 
-      if (decoded.expiry) {
+      // Check expiration using bolt11's timeExpireDate field
+      if (decoded.timeExpireDate) {
         const currentTime = Math.floor(Date.now() / 1000);
-        const createdAt =
-          decoded.sections.find((s) => s.name === "timestamp")?.value || 0;
-        const expiresAt = createdAt + decoded.expiry;
-
-        if (currentTime > expiresAt) {
+        if (currentTime > decoded.timeExpireDate) {
           throw new Error("Invoice has expired");
         }
       }
 
-      const amountSection = decoded.sections.find((s) => s.name === "amount");
-
-      if (amountSection && amountSection.value) {
-        const invoiceAmountSats = Math.floor(
-          parseInt(amountSection.value) / 1000,
-        );
-
-        if (invoiceAmountSats !== expectedAmount) {
+      // Check amount - bolt11 provides satoshis directly
+      if (decoded.satoshis !== null && decoded.satoshis !== undefined) {
+        if (decoded.satoshis !== expectedAmount) {
           throw new Error(
-            `Invoice amount (${invoiceAmountSats} sats) doesn't match expected payout (${expectedAmount} sats)`,
+            `Invoice amount (${decoded.satoshis} sats) doesn't match expected payout (${expectedAmount} sats)`,
           );
         }
 
         return {
           isValid: true,
           hasAmount: true,
-          amount: invoiceAmountSats,
+          amount: decoded.satoshis,
           type: "fixed-amount",
         };
       } else {
+        // Zero-amount invoice (user can pay any amount)
         return {
           isValid: true,
           hasAmount: false,

@@ -1,7 +1,7 @@
 {
   "name": "client_validator",
   "type": "module",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "repository": {
     "type": "git",
     "url": "https://github.com/tee8z/5day4cast"
@@ -18,5 +18,8 @@
   "types": "client_validator.d.ts",
   "sideEffects": [
     "./snippets/*"
-  ]
+  ],
+  "dependencies": {
+    "bolt11": "^1.4.1"
+  }
 }
