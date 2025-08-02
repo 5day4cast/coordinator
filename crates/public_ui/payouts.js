@@ -229,7 +229,8 @@ class Payouts {
         await this.submitPayout(
           competitionId,
           entryId,
-          encryptedPayoutPreimage.entryIndex,
+          entryIndex,
+          encryptedPayoutPreimage,
           $invoice.value.trim(),
           payoutAmount,
         );
