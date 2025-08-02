@@ -86,7 +86,7 @@ class Payouts {
               return null;
             }
 
-            const outcomeKey = getCurrentOutcome(competition);
+            const outcomeKey = this.getCurrentOutcome(competition);
             console.log("Determined outcome key:", outcomeKey);
             if (!outcomeKey) {
               console.log("Could not determine outcome key");
