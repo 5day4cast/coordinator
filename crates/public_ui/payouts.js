@@ -189,6 +189,7 @@ class Payouts {
       this.showPayoutModal(
         button.dataset.competitionId,
         button.dataset.entryId,
+        entry.ticket_id,
         entry.payout_preimage_encrypted,
         parseInt(button.dataset.entryIndex),
         payoutInfo.payout_amount,
@@ -201,6 +202,7 @@ class Payouts {
   async showPayoutModal(
     competitionId,
     entryId,
+    ticketId,
     encryptedPayoutPreimage,
     entryIndex,
     payoutAmount,
@@ -229,6 +231,7 @@ class Payouts {
         await this.submitPayout(
           competitionId,
           entryId,
+          ticketId,
           entryIndex,
           encryptedPayoutPreimage,
           $invoice.value.trim(),
@@ -247,6 +250,7 @@ class Payouts {
   async submitPayout(
     competitionId,
     entryId,
+    ticketId,
     entryIndex,
     encryptedPayoutPreimage,
     invoice,
@@ -282,7 +286,7 @@ class Payouts {
     const payoutResponse = await this.client.post(
       `${this.coordinator_url}/api/v1/competitions/${competitionId}/entries/${entryId}/payout`,
       {
-        ticket_id: entryId,
+        ticket_id: ticketId,
         payout_preimage: payoutPreimage,
         ephemeral_private_key: ephemeralPrivateKey,
         ln_invoice: invoice,
