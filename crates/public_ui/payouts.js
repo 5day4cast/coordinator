@@ -274,11 +274,10 @@ class Payouts {
         nostrPubkey,
       );
 
-    const ephemeralPrivateKey =
-      await window.taprootWallet.getDecryptedDlcPrivateKey(
-        encryptedEphemeralPrivateKey,
-        nostrPubkey,
-      );
+    const ephemeralPrivateKey = await window.taprootWallet.decryptKey(
+      encryptedEphemeralPrivateKey,
+      nostrPubkey,
+    );
 
     const payoutResponse = await this.client.post(
       `${this.coordinator_url}competitions/${competitionId}/entries/${entryId}/payout`,
