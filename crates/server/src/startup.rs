@@ -4,8 +4,8 @@ use crate::{
     get_aggregate_nonces, get_balance, get_competitions, get_contract_parameters, get_entries,
     get_estimated_fee_rates, get_next_address, get_outputs, get_ticket_status, health,
     index_handler, login, register, request_competition_ticket, send_to_address,
-    submit_final_signatures, submit_public_nonces, BitcoinClient, BitcoinSyncWatcher, Coordinator,
-    Ln, LnClient, OracleClient, Settings, UserStore,
+    submit_final_signatures, submit_public_nonces, submit_ticket_payout, BitcoinClient,
+    BitcoinSyncWatcher, Coordinator, Ln, LnClient, OracleClient, Settings, UserStore,
 };
 use anyhow::anyhow;
 use axum::{
@@ -361,6 +361,10 @@ pub fn app(
         .route(
             "/api/v1/competitions/{competition_id}/entries/{entry_id}/final_signatures",
             post(submit_final_signatures),
+        )
+        .route(
+            "/api/v1/competitions/{competitionId}/entries/{entryId}/payout",
+            post(submit_ticket_payout),
         )
         .route("/api/v1/entries", post(add_event_entry))
         .route("/api/v1/entries", get(get_entries))
