@@ -1367,6 +1367,19 @@ impl Coordinator {
             })
             .collect();
 
+        if paid_winners.len() != winners.len() {
+            // Technically we are good to broadcast the first delta transaction
+            // once blocks_since_outcome < required_delta, we add this wait to
+            // give users more time to be paid out via lightning
+            if blocks_since_outcome < (2 * required_delta) {
+                info!(
+                    "Not enough blocks since outcome tx. Need {} more blocks",
+                    (2 * required_delta) - blocks_since_outcome
+                );
+                return Ok(competition);
+            }
+        }
+
         if paid_winners.len() == winners.len() {
             // All winners have paid out and none have had sellback broadcast - do unified close
             let (close_tx_input, close_tx_prevout) =
@@ -1510,10 +1523,11 @@ impl Coordinator {
         let required_delta = signed_contract.params().relative_locktime_block_delta as u32;
 
         if blocks_since_outcome < (2 * required_delta) {
-            return Err(anyhow!(
+            info!(
                 "Not enough blocks since outcome tx. Need {} more blocks",
                 (2 * required_delta) - blocks_since_outcome
-            ));
+            );
+            return Ok(competition);
         }
 
         // Get outcome and winner information
