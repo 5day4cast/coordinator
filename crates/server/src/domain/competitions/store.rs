@@ -1200,4 +1200,54 @@ impl CompetitionStore {
 
         Ok(())
     }
+
+    pub async fn update_ticket_escrow_transaction(
+        &self,
+        ticket_id: uuid::Uuid,
+        escrow_transaction_hex: &str,
+    ) -> Result<(), anyhow::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+        let query = "UPDATE tickets SET escrow_transaction = ? WHERE id = ?";
+
+        conn.execute(
+            query,
+            [escrow_transaction_hex, ticket_id.to_string().as_str()],
+        )?;
+
+        Ok(())
+    }
+
+    pub async fn reset_ticket_after_failed_escrow(
+        &self,
+        ticket_id: uuid::Uuid,
+        new_encrypted_preimage: &str,
+        new_hash: &str,
+    ) -> Result<(), anyhow::Error> {
+        let conn = self.db_connection.new_write_connection_retry().await?;
+        let query = "
+            UPDATE tickets
+            SET
+                encrypted_preimage = ?,
+                hash = ?,
+                payment_request = NULL,
+                paid_at = NULL,
+                settled_at = NULL,
+                escrow_transaction = NULL,
+                ephemeral_pubkey = NULL,
+                reserved_by = NULL,
+                reserved_at = NULL
+            WHERE id = ?
+        ";
+
+        conn.execute(
+            query,
+            [
+                new_encrypted_preimage,
+                new_hash,
+                ticket_id.to_string().as_str(),
+            ],
+        )?;
+
+        Ok(())
+    }
 }

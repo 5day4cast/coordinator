@@ -38,6 +38,8 @@ enum Commands {
     ListUtxos,
     /// Send a transaction
     Send(SendCommandArgs),
+    /// Sweep all UTXOs to a destination address
+    Sweep(SweepCommandArgs),
 }
 
 #[derive(Parser, Clone)]
@@ -61,6 +63,17 @@ struct SendCommandArgs {
     /// Specific UTXOs to spend (format: "txid:vout") (optional, can be used multiple times)
     #[arg(long)]
     utxo: Option<Vec<String>>,
+}
+
+#[derive(Parser, Clone)]
+struct SweepCommandArgs {
+    /// Destination address to sweep all funds to
+    #[arg(long)]
+    to: String,
+
+    /// Maximum fee in satoshis (optional)
+    #[arg(long)]
+    max_fee: Option<u64>,
 }
 
 impl From<Cli> for CliSettings {
@@ -176,6 +189,41 @@ async fn main() -> Result<()> {
             match client.send_to_address(send_options, selected_utxos).await {
                 Ok(txid) => info!("Transaction sent! TXID: {}", txid),
                 Err(e) => error!("Failed to send transaction: {}", e),
+            }
+        }
+        Commands::Sweep(args) => {
+            let utxos = client.list_utxos().await;
+
+            if utxos.is_empty() {
+                info!("No UTXOs found in wallet - nothing to sweep");
+                return Ok(());
+            }
+
+            let total_amount: u64 = utxos.iter().map(|utxo| utxo.txout.value.to_sat()).sum();
+
+            info!(
+                "Found {} UTXOs with total value of {} sats",
+                utxos.len(),
+                total_amount
+            );
+
+            let all_outpoints: Vec<OutPoint> = utxos.iter().map(|utxo| utxo.outpoint).collect();
+
+            let send_options = SendOptions {
+                address_to: args.to.clone(),
+                address_from: None,
+                amount: None,
+                max_fee: args.max_fee,
+            };
+
+            info!("Sweeping all {} UTXOs to {}", all_outpoints.len(), args.to);
+
+            match client.send_to_address(send_options, all_outpoints).await {
+                Ok(txid) => {
+                    info!("Sweep transaction sent! TXID: {}", txid);
+                    info!("Wallet should now have zero UTXOs after this transaction confirms");
+                }
+                Err(e) => error!("Failed to sweep wallet: {}", e),
             }
         }
     }

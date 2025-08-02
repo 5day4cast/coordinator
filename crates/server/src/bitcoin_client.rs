@@ -81,6 +81,7 @@ pub trait Bitcoin: Send + Sync {
         sign_options: SignOptions,
     ) -> Result<bool, anyhow::Error>;
     async fn list_utxos(&self) -> Vec<LocalOutput>;
+    async fn sync(&self) -> Result<(), anyhow::Error>;
 }
 
 pub struct BitcoinClient {
@@ -511,6 +512,28 @@ impl Bitcoin for BitcoinClient {
         let wallet = self.wallet.read().await;
         wallet.list_unspent().collect()
     }
+
+    async fn sync(&self) -> Result<(), anyhow::Error> {
+        let wallet = self.wallet.read().await;
+        let request = wallet
+            .start_sync_with_revealed_spks()
+            .inspect(|item, progress| {
+                let pc = (100 * progress.consumed()) as f32 / progress.total() as f32;
+                info!("[ SCANNING {:03.0}% ] {}", pc, item);
+            })
+            .build();
+
+        let update = self.client.sync(request, 5).await?; // parallel_requests: 5
+        drop(wallet);
+
+        let (mut wallet, mut store) = tokio::join!(self.wallet.write(), self.wallet_store.write());
+        wallet.apply_update(update)?;
+        wallet.persist(&mut store)?;
+
+        info!("Sync completed successfully");
+
+        Ok(())
+    }
 }
 
 impl BitcoinClient {
@@ -702,28 +725,6 @@ impl BitcoinClient {
         self.client.broadcast(&tx).await?;
 
         Ok(tx.compute_txid())
-    }
-
-    pub async fn sync(&self) -> Result<(), anyhow::Error> {
-        let wallet = self.wallet.read().await;
-        let request = wallet
-            .start_sync_with_revealed_spks()
-            .inspect(|item, progress| {
-                let pc = (100 * progress.consumed()) as f32 / progress.total() as f32;
-                info!("[ SCANNING {:03.0}% ] {}", pc, item);
-            })
-            .build();
-
-        let update = self.client.sync(request, 5).await?; // parallel_requests: 5
-        drop(wallet);
-
-        let (mut wallet, mut store) = tokio::join!(self.wallet.write(), self.wallet_store.write());
-        wallet.apply_update(update)?;
-        wallet.persist(&mut store)?;
-
-        info!("Sync completed successfully");
-
-        Ok(())
     }
 
     async fn sign_escrow_inputs(&self, psbt: &mut Psbt) -> Result<usize, anyhow::Error> {

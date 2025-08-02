@@ -76,6 +76,7 @@ mock! {
             sign_options: SignOptions,
         ) -> Result<bool, anyhow::Error>;
         async fn list_utxos(&self) -> Vec<LocalOutput>;
+        async fn sync(&self) -> Result<(), anyhow::Error>;
     }
 }
 

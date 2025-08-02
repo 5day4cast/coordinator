@@ -1762,7 +1762,7 @@ impl Coordinator {
 
         debug!("created competition");
         let tickets = competition
-            .generate_competition_tickets(create_event.total_allowed_entries, &self.ln)
+            .generate_competition_tickets(create_event.total_allowed_entries)
             .await?;
         debug!("tickets: {:?}", tickets);
         let competition = self
@@ -1817,11 +1817,7 @@ impl Coordinator {
                 e => Error::DbError(e),
             })?;
         match self
-            .create_ticket_response(
-                ticket.clone(),
-                btc_pubkey,
-                competition.event_submission.entry_fee as u64,
-            )
+            .create_ticket_response(ticket.clone(), btc_pubkey, competition)
             .await
         {
             Ok(response) => Ok(response),
@@ -1845,7 +1841,7 @@ impl Coordinator {
         &self,
         ticket: Ticket,
         btc_pubkey: BitcoinPublicKey,
-        entry_fee: u64,
+        competition: Competition,
     ) -> Result<TicketResponse, Error> {
         // Decode preimage from encrypted_preimage
         let preimage = hex::decode(&ticket.encrypted_preimage)
@@ -1861,7 +1857,7 @@ impl Coordinator {
             ticket.id,
             btc_pubkey,
             payment_hash,
-            entry_fee,
+            competition.event_submission.entry_fee as u64,
         )
         .await
         .map_err(|e| {
@@ -1882,11 +1878,17 @@ impl Coordinator {
                 Error::DbError(e)
             })?;
 
+        let fee_multiplier = competition.event_submission.coordinator_fee_percentage as f64 / 100.0;
+        let coordinator_fee =
+            (competition.event_submission.entry_fee as f64 * fee_multiplier).round() as u64;
+
+        let full_fee = (competition.event_submission.entry_fee as u64) + coordinator_fee;
+
         // Now create the HODL invoice with short timeout
         let invoice = self
             .ln
             .add_hold_invoice(
-                entry_fee,
+                full_fee,
                 300, // 5 minute timeout
                 hex::encode(payment_hash),
                 ticket.competition_id,

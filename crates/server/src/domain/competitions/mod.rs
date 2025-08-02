@@ -1,7 +1,7 @@
 mod coordinator;
 mod db_migrations;
 mod store;
-use crate::{oracle_client::WeatherChoices, AddEventEntry, Ln};
+use crate::{oracle_client::WeatherChoices, AddEventEntry};
 use anyhow::anyhow;
 pub use coordinator::*;
 pub use db_migrations::*;
@@ -19,7 +19,7 @@ use duckdb::{
 };
 use log::{debug, error};
 use serde::{Deserialize, Serialize};
-use std::{fmt, sync::Arc};
+use std::fmt;
 pub use store::*;
 use time::{macros::format_description, Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -240,7 +240,7 @@ pub struct Ticket {
     pub entry_id: Option<Uuid>,
     pub encrypted_preimage: String,
     pub hash: String,
-    pub payment_request: String,
+    pub payment_request: Option<String>,
     pub expiry: OffsetDateTime,
     /// Pubkey created for this entry for the user
     pub ephemeral_pubkey: Option<String>,
@@ -549,14 +549,11 @@ impl Competition {
     async fn generate_competition_tickets(
         &self,
         total_tickets: usize,
-        ln_client: &Arc<dyn Ln>,
     ) -> Result<Vec<Ticket>, Error> {
-        let (total_expiry_secs, expiry_time) = self.calculate_ticket_expiry()?;
+        let expiry_time = self.calculate_ticket_expiry()?;
         let mut tickets = Vec::with_capacity(total_tickets);
         for i in 0..total_tickets {
-            let ticket = self
-                .create_ticket(total_expiry_secs, expiry_time, ln_client)
-                .await?;
+            let ticket = self.create_ticket(expiry_time).await?;
 
             tickets.push(ticket);
 
@@ -568,7 +565,7 @@ impl Competition {
         Ok(tickets)
     }
 
-    fn calculate_ticket_expiry(&self) -> Result<(u64, OffsetDateTime), Error> {
+    fn calculate_ticket_expiry(&self) -> Result<OffsetDateTime, Error> {
         let now = OffsetDateTime::now_utc();
 
         let latest_signing_end =
@@ -578,10 +575,7 @@ impl Competition {
             return Err(Error::TooLateToSign(latest_signing_end, now));
         }
 
-        let signing_window = latest_signing_end - now;
-        let total_expiry_secs = signing_window.whole_seconds() as u64;
-
-        Ok((total_expiry_secs, latest_signing_end))
+        Ok(latest_signing_end)
     }
 
     fn get_current_outcome(&self) -> Result<Outcome, anyhow::Error> {
@@ -714,26 +708,9 @@ impl Competition {
 
     // We add the fee for the coordinator's service at this point in the process,
     // A user can not enter into the competition without paying the fee
-    async fn create_ticket(
-        &self,
-        expiry_secs: u64,
-        expiry_time: OffsetDateTime,
-        ln_client: &Arc<dyn Ln>,
-    ) -> Result<Ticket, Error> {
+    async fn create_ticket(&self, expiry_time: OffsetDateTime) -> Result<Ticket, Error> {
         let ticket_preimage = hashlock::preimage_random(&mut rand::thread_rng());
         let ticket_hash = hashlock::sha256(&ticket_preimage);
-        let invoice_amount = self.calculate_invoice_amount();
-
-        // Create a regular invoice instead of a HODL invoice
-        let invoice = ln_client
-            .add_invoice(
-                invoice_amount,
-                expiry_secs,
-                format!("DLC Ticket for competition {}", self.id),
-                self.id,
-            )
-            .await
-            .map_err(Error::LnError)?;
 
         Ok(Ticket {
             id: Uuid::now_v7(),
@@ -742,7 +719,7 @@ impl Competition {
             ephemeral_pubkey: None,
             encrypted_preimage: ticket_preimage.to_lower_hex_string(), // TODO: encrypt this
             hash: ticket_hash.to_lower_hex_string(),
-            payment_request: invoice.payment_request,
+            payment_request: None,
             expiry: expiry_time,
             reserved_by: None,
             reserved_at: None,
