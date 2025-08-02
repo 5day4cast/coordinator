@@ -1,4 +1,5 @@
 import { AuthorizedClient } from "./authorized_client.js";
+import { decode } from "https://cdn.skypack.dev/light-bolt11-decoder@3.2.0";
 
 export async function displayPayouts(apiBase, oracleBase) {
   const $payoutsTableBody = document.getElementById("payoutsTableBody");
@@ -296,7 +297,7 @@ class Payouts {
 
   validateInvoice(invoice, expectedAmount) {
     try {
-      const decoded = window.lightBolt11Decoder.decode(invoice);
+      const decoded = decode(invoice);
 
       if (decoded.expiry) {
         const currentTime = Math.floor(Date.now() / 1000);
