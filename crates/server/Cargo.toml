@@ -1,6 +1,6 @@
 [package]
 name = "server"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 repository = "https://github.com/tee8z/5day4cast"
 
@@ -24,7 +24,6 @@ blake2 = "0.10.6"
 clap = { version = "4.3.23", features = ["derive", "env"] }
 config = "0.14.0"
 dlctix = "0.0.8"
-duckdb = { version = "1.1.1" }
 fern = { version = "0.6.2", features = ["colored"] }
 futures = "0.3.28"
 itertools = "0.14.0"
@@ -41,7 +40,7 @@ rand = "0.8.5"
 rand_chacha = "0.3"
 reqwest-middleware = { version = "0.3.3", features = ["json", "rustls-tls"] }
 reqwest-retry = { version = "0.6.1" }
-scooby = "0.5.0"
+sqlx = { version = "0.8.6", features = ["sqlite-unbundled", "uuid", "time","json","bigdecimal","macros", "runtime-tokio", "migrate"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.188", features = ["derive"] }
 serde_json = "1.0.117"

@@ -1,6 +1,7 @@
 use crate::{
     add_event_entry, admin_index_handler, create_competition, create_folder,
-    domain::{CompetitionStore, CompetitionWatcher, DBConnection, InvoiceWatcher, UserInfo},
+    db::{DBConnection, DatabasePoolConfig},
+    domain::{CompetitionStore, CompetitionWatcher, InvoiceWatcher, UserInfo},
     get_aggregate_nonces, get_balance, get_competitions, get_contract_parameters, get_entries,
     get_estimated_fee_rates, get_next_address, get_outputs, get_ticket_status, health,
     index_handler, login, register, request_competition_ticket, send_to_address,
@@ -174,14 +175,28 @@ pub async fn build_app(
     )?;
     info!("Oracle client configured");
     create_folder(&config.db_settings.data_folder.clone());
-    let competition_db = DBConnection::new(&config.db_settings.data_folder, "competitions")
-        .map_err(|e| anyhow!("Error setting up competition db: {}", e))?;
-    let competition_store = CompetitionStore::new(competition_db)
-        .map_err(|e| anyhow!("Error setting up competition store: {}", e))?;
-    let users_db = DBConnection::new(&config.db_settings.data_folder, "users")
-        .map_err(|e| anyhow!("Error setting up users db: {}", e))?;
-    let users_store =
-        UserStore::new(users_db).map_err(|e| anyhow!("Error setting up user store: {}", e))?;
+
+    let pool_config: DatabasePoolConfig = config.db_settings.clone().into();
+
+    let competition_db = DBConnection::new(
+        &config.db_settings.data_folder,
+        "competitions",
+        pool_config.clone(),
+    )
+    .await
+    .map_err(|e| anyhow!("Error setting up competition db: {}", e))?;
+
+    let competition_store = CompetitionStore::new(competition_db);
+
+    let users_db = DBConnection::new(
+        &config.db_settings.data_folder,
+        "users",
+        pool_config.clone(),
+    )
+    .await
+    .map_err(|e| anyhow!("Error setting up users db: {}", e))?;
+
+    let users_store = UserStore::new(users_db);
 
     let coordinator = Coordinator::new(
         Arc::new(oracle_client),
@@ -193,6 +208,7 @@ pub async fn build_app(
             .relative_locktime_block_delta
             .into(),
         config.coordinator_settings.required_confirmations,
+        config.coordinator_settings.name,
     )
     .await
     .map(Arc::new)?;

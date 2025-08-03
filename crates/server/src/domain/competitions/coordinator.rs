@@ -39,7 +39,6 @@ use dlctix::{
     ContractParameters, NonceSharingRound, Outcome, PayoutWeights, Player, PlayerIndex, SigMap,
     SigningSession, TicketedDLC, WinCondition,
 };
-use duckdb::arrow::datatypes::ArrowNativeType;
 use futures::TryFutureExt;
 use itertools::Itertools;
 use log::{debug, error, info};
@@ -125,6 +124,7 @@ pub struct Coordinator {
     public_key: Point,
     relative_locktime_block_delta: u32,
     required_confirmations: u32,
+    name: String,
 }
 
 impl Coordinator {
@@ -135,6 +135,7 @@ impl Coordinator {
         ln: Arc<dyn Ln>,
         relative_locktime_block_delta: u32,
         required_confirmations: u32,
+        name: String,
     ) -> Result<Self, anyhow::Error> {
         let private_key = bitcoin.get_derived_private_key().await?;
         let public_key = private_key.base_point_mul();
@@ -148,6 +149,7 @@ impl Coordinator {
             public_key,
             relative_locktime_block_delta,
             required_confirmations,
+            name,
         };
         coordinator.validate_coordinator_metadata().await?;
         Ok(coordinator)
@@ -175,8 +177,8 @@ impl Coordinator {
 
     pub async fn competition_handler(&self) -> Result<(), anyhow::Error> {
         let immediate_states = Self::get_immediate_transition_states();
-        let competitions: Vec<Competition> = self.competition_store.get_competitions(true).await?;
-        let mut updated_competitions: Vec<Competition> = vec![];
+        let competitions: Vec<Competition> =
+            self.competition_store.get_competitions(true, true).await?;
 
         for mut competition in competitions {
             let mut processed_states = 0;
@@ -190,9 +192,18 @@ impl Coordinator {
                 continue;
             }
 
-            if competition.is_expired() {
+            if competition.is_expired() && competition.cancelled_at.is_none() {
                 competition.cancelled_at = Some(OffsetDateTime::now_utc());
-                updated_competitions.push(competition.clone());
+                if let Err(e) = self
+                    .competition_store
+                    .update_competitions(vec![competition.clone()])
+                    .await
+                {
+                    error!(
+                        "Failed to save competition {} after processing cancelled_at: {}",
+                        competition.id, e
+                    );
+                }
                 info!(
                     "Skipping process competition {} {:?}",
                     competition.id,
@@ -217,29 +228,50 @@ impl Coordinator {
                             if immediate_states.contains(&updated_competiton.get_state())
                                 && processed_states < MAX_CONSECUTIVE_STATES
                             {
+                                if let Err(e) = self
+                                    .competition_store
+                                    .update_competitions(vec![updated_competiton.clone()])
+                                    .await
+                                {
+                                    error!(
+                                        "Failed to save competition {} after processing state {}: {}",
+                                        competition.id, updated_competiton.get_state(), e
+                                    );
+                                }
                                 competition = updated_competiton;
                                 continue;
                             }
                         }
-                        updated_competitions.push(updated_competiton.clone());
+                        if let Err(e) = self
+                            .competition_store
+                            .update_competitions(vec![updated_competiton.clone()])
+                            .await
+                        {
+                            error!(
+                                "Failed to save competition {} after processing state {}: {}",
+                                competition.id,
+                                competition.get_state(),
+                                e
+                            );
+                        }
                         break;
                     }
                     Err(err) => {
                         error!("Failed to process competition: {}: {}", competition.id, err);
-
-                        updated_competitions.push(competition.clone());
+                        if let Err(e) = self
+                            .competition_store
+                            .update_competitions(vec![competition.clone()])
+                            .await
+                        {
+                            error!(
+                                "Failed to save competition {} after processing error: {}",
+                                competition.id, e
+                            );
+                        }
                         break;
                     }
                 }
             }
-        }
-
-        if !updated_competitions.is_empty() {
-            info!("Updating competitions: {}", updated_competitions.len());
-
-            self.competition_store
-                .update_competitions(updated_competitions)
-                .await?;
         }
 
         Ok(())
@@ -1716,7 +1748,7 @@ impl Coordinator {
     pub async fn validate_coordinator_metadata(&self) -> Result<(), anyhow::Error> {
         let stored_public_key = match self.competition_store.get_stored_public_key().await {
             Ok(key) => key,
-            Err(duckdb::Error::QueryReturnedNoRows) => {
+            Err(sqlx::Error::RowNotFound) => {
                 self.add_metadata().await?;
                 return Ok(());
             }
@@ -1742,7 +1774,7 @@ impl Coordinator {
         let bitcoin_key = convert_xonly_key(xonly);
 
         self.competition_store
-            .add_coordinator_metadata(bitcoin_key)
+            .add_coordinator_metadata(self.name.clone(), bitcoin_key)
             .await
             .map_err(|e| anyhow!("failed to add coordinator metadata: {}", e))
     }
@@ -1782,7 +1814,7 @@ impl Coordinator {
 
     pub async fn get_competitions(&self) -> Result<Vec<Competition>, Error> {
         self.competition_store
-            .get_competitions(false)
+            .get_competitions(false, false)
             .map_err(|e| {
                 error!("failed to get competitions: {:?}", e);
                 Error::DbError(e)
@@ -1800,8 +1832,7 @@ impl Coordinator {
             .competition_store
             .get_competition(competition_id)
             .await?;
-        if competition.total_entries.as_usize()
-            >= competition.event_submission.total_allowed_entries
+        if competition.total_entries as usize >= competition.event_submission.total_allowed_entries
         {
             return Err(Error::CompetitionFull);
         }
@@ -1813,7 +1844,7 @@ impl Coordinator {
             .get_and_reserve_ticket(competition_id, &pubkey)
             .await
             .map_err(|e| match e {
-                duckdb::Error::QueryReturnedNoRows => Error::NoAvailableTickets,
+                sqlx::Error::RowNotFound => Error::NoAvailableTickets,
                 e => Error::DbError(e),
             })?;
         match self
@@ -1936,9 +1967,7 @@ impl Coordinator {
             .map_err(|e| {
                 debug!("error: {:?}", e);
                 match e {
-                    duckdb::Error::QueryReturnedNoRows => {
-                        Error::NotFound("Ticket not found".into())
-                    }
+                    sqlx::Error::RowNotFound => Error::NotFound("Ticket not found".into()),
                     e => Error::DbError(e),
                 }
             })?;
@@ -1980,7 +2009,7 @@ impl Coordinator {
             .mark_ticket_paid(ticket_hash, competition_id)
             .await
             .map_err(|e| match e {
-                duckdb::Error::QueryReturnedNoRows => {
+                sqlx::Error::RowNotFound => {
                     Error::BadRequest("Invalid ticket or competition".into())
                 }
                 e => Error::DbError(e),
@@ -1997,9 +2026,7 @@ impl Coordinator {
             .map_err(|e| {
                 error!("error {:?}", e);
                 match e {
-                    duckdb::Error::QueryReturnedNoRows => {
-                        Error::BadRequest("Competition not found".into())
-                    }
+                    sqlx::Error::RowNotFound => Error::BadRequest("Competition not found".into()),
                     e => Error::DbError(e),
                 }
             })?;
@@ -2014,9 +2041,7 @@ impl Coordinator {
             .map_err(|e| {
                 error!("error {:?}", e);
                 match e {
-                    duckdb::Error::QueryReturnedNoRows => {
-                        Error::BadRequest("Ticket not found".into())
-                    }
+                    sqlx::Error::RowNotFound => Error::BadRequest("Ticket not found".into()),
                     e => Error::DbError(e),
                 }
             })?;
@@ -2047,7 +2072,7 @@ impl Coordinator {
             .add_entry(entry.clone().into_user_entry(pubkey), ticket.id)
             .await
             .map_err(|e| match e {
-                duckdb::Error::QueryReturnedNoRows => {
+                sqlx::Error::RowNotFound => {
                     Error::BadRequest(
                         "Failed to claim ticket - may have expired or been claimed by another entry"
                             .into(),

@@ -7,7 +7,7 @@ This project leverages several excellent open-source libraries:
 - [dlctix](https://github.com/conduition/dlctix) - Provides the underlying DLC cryptography and protocol implementation
 - [bdk_wallet](https://github.com/bitcoindevkit/bdk) - Bitcoin wallet functionality and transaction building
 - [nostr-sdk](https://github.com/rust-nostr/nostr) - Nostr protocol implementation for user authentication and encryption
-- [duckdb](https://github.com/duckdb/duckdb) - DuckDB for data storage, is a fast, in-process, SQL query engine that supports ACID transactions and is designed for analytics workloads.
+- [sqlite](https://sqlite.org/) - SQlite for data storage, is a fast, in-process, SQL query engine that supports ACID transactions.
 
 ## External Services Required
 
@@ -35,16 +35,45 @@ Also make sure to either use the deployed 4casttruth.win or run your own instanc
 
 ## Setup
 
-### To compile server add duckdb lib:
+### To compile server add sqlite lib:
 ```bash
-wget https://github.com/duckdb/duckdb/releases/download/v1.0.0/libduckdb-linux-amd64.zip
-mkdir duckdb_lib
-unzip libduckdb-linux-amd64.zip -d duckdb_lib
-sudo cp duckdb_lib/lib*.so* /usr/local/lib/
-sudo ldconfig
-rm libduckdb-linux-amd64.zip
-```
+# Download SQLite amalgamation and tools
+wget https://www.sqlite.org/2025/sqlite-autoconf-3500400.tar.gz
+tar xzf sqlite-autoconf-3500400.tar.gz
+cd sqlite-autoconf-3500400
 
+# Configure with all features sqlx requires
+./configure --prefix=/usr/local \
+    --enable-threadsafe \
+    CFLAGS="-DSQLITE_ENABLE_UNLOCK_NOTIFY=1 \
+            -DSQLITE_ENABLE_COLUMN_METADATA=1 \
+            -DSQLITE_ENABLE_DBSTAT_VTAB=1 \
+            -DSQLITE_ENABLE_FTS3=1 \
+            -DSQLITE_ENABLE_FTS4=1 \
+            -DSQLITE_ENABLE_FTS5=1 \
+            -DSQLITE_ENABLE_JSON1=1 \
+            -DSQLITE_ENABLE_RTREE=1 \
+            -DSQLITE_ENABLE_GEOPOLY=1 \
+            -DSQLITE_ENABLE_MATH_FUNCTIONS=1 \
+            -DSQLITE_SOUNDEX=1 \
+            -DSQLITE_ENABLE_STAT4=1"
+
+make                            # Compiles the code
+sudo make install              # Automatically installs:
+                               #   - Headers to /usr/local/include/
+                               #   - Libraries to /usr/local/lib/
+                               #   - Binaries to /usr/local/bin/
+sudo ldconfig                  # Updates dynamic linker cache
+
+# Clean up
+cd ..
+rm -rf sqlite-autoconf-3500400 sqlite-autoconf-3500400.tar.gz
+```
+If the system can't find the SQLite library, you might need to set:
+```bash
+export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH"
+export LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH"
+```
 ### To compile and add WASM to frontend:
 - at the root of the repo run `./build_ui.sh`
 
