@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
-use crate::{db::DBConnection, FinalSignatures};
+use crate::{db::DBConnection, domain::EntryPayout, FinalSignatures};
 
 use super::{Competition, EntryStatus, SearchBy, Ticket, UserEntry};
 
@@ -203,7 +203,7 @@ impl CompetitionStore {
         Ok(())
     }
 
-    pub async fn get_pending_payouts(&self) -> Result<Vec<PendingPayout>, sqlx::Error> {
+    pub async fn get_pending_payouts(&self) -> Result<Vec<EntryPayout>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT
                 id,
@@ -227,7 +227,7 @@ impl CompetitionStore {
             let payment_hash = crate::ln_client::extract_payment_hash_from_invoice(&ln_invoice)
                 .map_err(|e| sqlx::Error::Protocol(format!("Invalid invoice: {}", e)))?;
 
-            payouts.push(PendingPayout {
+            payouts.push(EntryPayout {
                 entry_id,
                 payment_hash,
                 ln_invoice,

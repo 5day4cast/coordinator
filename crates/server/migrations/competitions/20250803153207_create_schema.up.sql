@@ -57,21 +57,31 @@ CREATE TABLE IF NOT EXISTS entries (
     id TEXT PRIMARY KEY,
     event_id TEXT NOT NULL              REFERENCES competitions (id),
     ticket_id TEXT NOT NULL UNIQUE      REFERENCES tickets (id),
-    pubkey TEXT NOT NULL,                         -- User nostr pubkey
+    pubkey TEXT NOT NULL,                           -- User nostr pubkey
     ephemeral_pubkey TEXT NOT NULL,                 -- User ephemeral pubkey for DLC
     ephemeral_privatekey_encrypted TEXT NOT NULL,   -- Store for better UX, backed up in user wallet
     payout_preimage_encrypted TEXT NOT NULL,        -- Store for better UX, backed up in user wallet
     payout_hash TEXT NOT NULL,                      -- User provided hash of preimage to get winnings
     entry_submission BLOB NOT NULL,                 -- User's entry submission data (should be able to update until all entries have been collected)
-    ephemeral_privatekey TEXT,                      -- Provided by user on payout, encrypted by coordinator_key
-    payout_preimage TEXT,                           -- Provided by user on payout, encrypted by coordinator_key
-    payout_ln_invoice TEXT,                         -- Provided by user on payout, coordinator pays to user
     public_nonces BLOB,                             -- Player signed nonces during musig signing session
     funding_psbt_base64 TEXT,                       -- Player signed funding PSBT
     partial_signatures BLOB,                        -- layer partial signatures
-    paid_out_at DATETIME,                           -- When ticket have been paid out via lightning
+    ephemeral_privatekey TEXT,                      -- Provided by user on payout, encrypted by coordinator_key
+    payout_preimage TEXT,                           -- Provided by user on payout, encrypted by coordinator_key
     sellback_broadcasted_at DATETIME,               -- When on chain sellback broadcasted by coordinator for cooperative lightning payout
     reclaimed_broadcasted_at DATETIME,              -- When on chain reclaim broadcasted by coordinator for uncooperative payout
     signed_at DATETIME,                             -- When user completes musig signing
-    payout_amount_sats INTEGER                      -- Amount paid out to user in sats via lightning
  );
+
+-- every lightning payout attempt will be recorded in the payouts table
+-- happy path, we should only see one payout per entry, but realistically payments can fail
+ CREATE TABLE IF NOT EXISTS payouts (
+    id TEXT PRIMARY KEY,
+    entry_id TEXT NOT NULL              REFERENCES entries (id),
+    payout_payment_request TEXT NOT NULL,           -- User provide invoice to pay out user via lightning
+    payout_amount_sats INTEGER NOT NULL,            -- Amount paid out to user in sats via lightning
+    initiated_at DATETIME NOT NULL,
+    succeed_at DATETIME,
+    failed_at DATETIME,
+    error BLOB                                     -- Why the payout failed
+);
