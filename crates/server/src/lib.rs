@@ -1,5 +1,6 @@
 mod bitcoin_client;
 mod config;
+pub mod db;
 pub mod domain;
 mod escrow;
 mod file_utils;
@@ -12,6 +13,7 @@ mod startup;
 
 pub use bitcoin_client::*;
 pub use config::*;
+pub use db::*;
 pub use domain::{
     AddEntry, CompetitionStore, Coordinator, Error as CoordinatorError, SearchBy, TicketResponse,
     UserEntry, UserStore,

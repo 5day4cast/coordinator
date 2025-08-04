@@ -1,10 +1,15 @@
 mod coordinator;
-mod db_migrations;
 mod store;
-use crate::{oracle_client::WeatherChoices, AddEventEntry};
+use crate::{
+    db::{
+        parse_optional_blob_json, parse_optional_datetime, parse_required_blob_json,
+        parse_required_datetime,
+    },
+    oracle_client::WeatherChoices,
+    parse_optional_sqlite_datetime, AddEventEntry,
+};
 use anyhow::anyhow;
 pub use coordinator::*;
-pub use db_migrations::*;
 use dlctix::{
     bitcoin::{hex::DisplayHex, OutPoint, Transaction},
     hashlock,
@@ -12,16 +17,12 @@ use dlctix::{
     secp::MaybeScalar,
     ContractParameters, EventLockingConditions, Outcome, SigMap, SignedContract,
 };
-use duckdb::{
-    arrow::datatypes::ArrowNativeType,
-    types::{Type, Value},
-    Row,
-};
 use log::{debug, error};
 use serde::{Deserialize, Serialize};
+use sqlx::{sqlite::SqliteRow, FromRow, Row};
 use std::fmt;
 pub use store::*;
-use time::{macros::format_description, Duration, OffsetDateTime};
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use super::Error;
@@ -99,89 +100,45 @@ pub struct UserEntry {
     pub reclaimed_broadcasted_at: Option<OffsetDateTime>,
 }
 
-impl<'a> TryFrom<&Row<'a>> for UserEntry {
-    type Error = duckdb::Error;
-
-    fn try_from(row: &Row) -> Result<Self, Self::Error> {
-        let public_nonces: Option<SigMap<PubNonce>> =
-            row.get::<usize, Option<Value>>(7).map(|opt| {
-                opt.and_then(|raw| match raw {
-                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
-                    _ => None,
-                })
-            })?;
-        let partial_signatures: Option<SigMap<PartialSignature>> =
-            row.get::<usize, Option<Value>>(8).map(|opt| {
-                opt.and_then(|raw| match raw {
-                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
-                    _ => None,
-                })
-            })?;
-
-        let entry_submission: AddEventEntry = match row.get::<usize, Option<Value>>(10)? {
-            Some(Value::Blob(blob_data)) => serde_json::from_slice(&blob_data).map_err(|e| {
-                duckdb::Error::FromSqlConversionFailure(10, Type::Blob, Box::new(e))
+impl FromRow<'_, SqliteRow> for UserEntry {
+    fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
+        Ok(UserEntry {
+            id: Uuid::parse_str(&row.get::<String, _>("id")).map_err(|e| {
+                sqlx::Error::ColumnDecode {
+                    index: "id".to_string(),
+                    source: Box::new(e),
+                }
             })?,
-            Some(_) => {
-                return Err(duckdb::Error::FromSqlConversionFailure(
-                    10,
-                    Type::Blob,
-                    Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Expected blob",
-                    )),
-                ))
-            }
-            None => {
-                return Err(duckdb::Error::FromSqlConversionFailure(
-                    10,
-                    Type::Blob,
-                    Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Missing entry_submission",
-                    )),
-                ))
-            }
-        };
-
-        let user_entry = UserEntry {
-            id: row
-                .get::<usize, String>(0)
-                .map(|val| Uuid::parse_str(&val))?
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(0, Type::Text, Box::new(e)))?,
-            ticket_id: row
-                .get::<usize, String>(1)
-                .map(|val| Uuid::parse_str(&val))?
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(0, Type::Text, Box::new(e)))?,
-            event_id: row
-                .get::<usize, String>(2)
-                .map(|val| Uuid::parse_str(&val))?
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(1, Type::Text, Box::new(e)))?,
-            pubkey: row.get::<usize, String>(3)?,
-            ephemeral_pubkey: row.get::<usize, String>(4)?,
-            ephemeral_privatekey_encrypted: row.get::<usize, String>(5)?,
-            ephemeral_privatekey: row.get::<usize, Option<String>>(6)?,
-            public_nonces,
-            partial_signatures,
-            funding_psbt_base64: row.get(9)?,
-            entry_submission,
-            payout_preimage_encrypted: row.get(11)?,
-            payout_hash: row.get(12)?,
-            payout_preimage: row.get::<usize, Option<String>>(13)?,
-            payout_ln_invoice: row.get::<usize, Option<String>>(14)?,
-            signed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(15)?, 15)?,
-            paid_at: parse_optional_timestamp(row.get::<usize, Option<String>>(16)?, 16)?,
-            paid_out_at: parse_optional_timestamp(row.get::<usize, Option<String>>(17)?, 17)?,
-            sellback_broadcasted_at: parse_optional_timestamp(
-                row.get::<usize, Option<String>>(18)?,
-                18,
-            )?,
-            reclaimed_broadcasted_at: parse_optional_timestamp(
-                row.get::<usize, Option<String>>(19)?,
-                19,
-            )?,
-        };
-        Ok(user_entry)
+            event_id: Uuid::parse_str(&row.get::<String, _>("event_id")).map_err(|e| {
+                sqlx::Error::ColumnDecode {
+                    index: "event_id".to_string(),
+                    source: Box::new(e),
+                }
+            })?,
+            ticket_id: Uuid::parse_str(&row.get::<String, _>("ticket_id")).map_err(|e| {
+                sqlx::Error::ColumnDecode {
+                    index: "ticket_id".to_string(),
+                    source: Box::new(e),
+                }
+            })?,
+            pubkey: row.get("pubkey"),
+            ephemeral_pubkey: row.get("ephemeral_pubkey"),
+            ephemeral_privatekey_encrypted: row.get("ephemeral_privatekey_encrypted"),
+            payout_hash: row.get("payout_hash"),
+            payout_preimage_encrypted: row.get("payout_preimage_encrypted"),
+            entry_submission: parse_required_blob_json(row, "entry_submission")?,
+            ephemeral_privatekey: row.get("ephemeral_privatekey"),
+            payout_preimage: row.get("payout_preimage"),
+            payout_ln_invoice: row.get("payout_ln_invoice"),
+            public_nonces: parse_optional_blob_json(row, "public_nonces")?,
+            funding_psbt_base64: row.get("funding_psbt_base64"),
+            partial_signatures: parse_optional_blob_json(row, "partial_signatures")?,
+            signed_at: parse_optional_sqlite_datetime(&row, "signed_at")?, // SQLite functio
+            paid_at: parse_optional_sqlite_datetime(&row, "paid_at")?,
+            paid_out_at: parse_optional_datetime(&row, "paid_out_at")?,
+            sellback_broadcasted_at: parse_optional_datetime(&row, "sellback_broadcasted_at")?,
+            reclaimed_broadcasted_at: parse_optional_datetime(&row, "reclaimed_broadcasted_at")?,
+        })
     }
 }
 
@@ -249,6 +206,48 @@ pub struct Ticket {
     pub paid_at: Option<OffsetDateTime>,
     pub settled_at: Option<OffsetDateTime>,
     pub escrow_transaction: Option<String>, // Hex-encoded escrow transaction
+}
+
+impl FromRow<'_, SqliteRow> for Ticket {
+    fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
+        Ok(Ticket {
+            id: Uuid::parse_str(&row.get::<String, _>("id")).map_err(|e| {
+                sqlx::Error::ColumnDecode {
+                    index: "id".to_string(),
+                    source: Box::new(e),
+                }
+            })?,
+            competition_id: Uuid::parse_str(&row.get::<String, _>("competition_id")).map_err(
+                |e| sqlx::Error::ColumnDecode {
+                    index: "competition_id".to_string(),
+                    source: Box::new(e),
+                },
+            )?,
+            entry_id: row
+                .get::<Option<String>, _>("entry_id")
+                .map(|s| Uuid::parse_str(&s))
+                .transpose()
+                .map_err(|e| sqlx::Error::ColumnDecode {
+                    index: "entry_id".to_string(),
+                    source: Box::new(e),
+                })?,
+            encrypted_preimage: row.get("encrypted_preimage"),
+            hash: row.get("hash"),
+            payment_request: row.get("payment_request"),
+            expiry: row
+                .get::<Option<String>, _>("expiry")
+                .and_then(|s| {
+                    OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc3339).ok()
+                })
+                .unwrap_or_else(|| OffsetDateTime::now_utc() + time::Duration::minutes(60)),
+            ephemeral_pubkey: row.get("ephemeral_pubkey"),
+            reserved_by: row.get("reserved_by"),
+            reserved_at: parse_optional_sqlite_datetime(&row, "reserved_at")?,
+            paid_at: parse_optional_sqlite_datetime(&row, "paid_at")?,
+            settled_at: parse_optional_sqlite_datetime(&row, "settled_at")?,
+            escrow_transaction: row.get("escrow_transaction"),
+        })
+    }
 }
 
 impl Ticket {
@@ -373,7 +372,7 @@ pub struct Competition {
     pub total_entry_nonces: u64,
     pub total_signed_entries: u64,
     pub total_paid_entries: u64,
-    pub total_paid_out_entries: usize,
+    pub total_paid_out_entries: u64,
     pub event_announcement: Option<EventLockingConditions>,
     pub funding_outpoint: Option<OutPoint>,
     pub funding_psbt_base64: Option<String>,
@@ -436,7 +435,7 @@ pub struct ExtendCompetition {
     pub total_entry_nonces: u64,
     pub total_signed_entries: u64,
     pub total_paid_entries: u64,
-    pub total_paid_out_entries: usize,
+    pub total_paid_out_entries: u64,
     pub event_announcement: Option<EventLockingConditions>,
     pub funding_transaction: Option<Transaction>,
     pub funding_outpoint: Option<OutPoint>,
@@ -839,7 +838,7 @@ impl Competition {
     }
     pub fn has_full_entries(&self) -> bool {
         (self.total_entries > 0)
-            && self.total_entries.as_usize() >= self.event_submission.total_allowed_entries
+            && self.total_entries as usize >= self.event_submission.total_allowed_entries
     }
 
     pub fn is_contract_created(&self) -> bool {
@@ -887,7 +886,7 @@ impl Competition {
     }
 
     pub fn has_all_entries_paid_out(&self) -> bool {
-        self.total_paid_out_entries >= self.event_submission.number_of_places_win
+        self.total_paid_out_entries >= self.event_submission.number_of_places_win as u64
     }
 
     pub fn is_attested(&self) -> bool {
@@ -1033,159 +1032,49 @@ impl Competition {
     }
 }
 
-impl<'a> TryFrom<&Row<'a>> for Competition {
-    type Error = duckdb::Error;
-
-    fn try_from(row: &Row) -> Result<Self, Self::Error> {
-        let competition = Competition {
-            id: row
-                .get::<usize, String>(0)
-                .map(|val| Uuid::parse_str(&val))?
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(0, Type::Any, Box::new(e)))?,
-            created_at: parse_timestamp_or_error(row.get::<usize, String>(1)?, 1)?,
-            event_submission: row.get::<usize, Option<Value>>(2).map(|opt| match opt {
-                Some(Value::Blob(val)) => {
-                    serde_json::from_slice::<CreateEvent>(&val).map_err(|e| {
-                        duckdb::Error::FromSqlConversionFailure(2, Type::Any, Box::new(e))
-                    })
+impl FromRow<'_, SqliteRow> for Competition {
+    fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
+        Ok(Competition {
+            id: Uuid::parse_str(&row.get::<String, _>("id")).map_err(|e| {
+                sqlx::Error::ColumnDecode {
+                    index: "id".to_string(),
+                    source: Box::new(e),
                 }
-                _ => Err(duckdb::Error::FromSqlConversionFailure(
-                    2,
-                    Type::Any,
-                    Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Missing required created event data",
-                    )),
-                )),
-            })??,
-            event_announcement: row.get::<usize, Option<Value>>(3).map(|opt| {
-                opt.and_then(|raw| match raw {
-                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
-                    _ => None,
-                })
             })?,
-            total_entries: row.get::<usize, u64>(4)?,
-            total_entry_nonces: row.get::<usize, u64>(5)?,
-            total_signed_entries: row.get::<usize, u64>(6)?,
-            total_paid_entries: row.get::<usize, u64>(7)?,
-            total_paid_out_entries: row.get(8)?,
-
-            outcome_transaction: row.get::<usize, Option<Value>>(9).map(|opt| {
-                opt.and_then(|raw| match raw {
-                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
-                    _ => None,
-                })
-            })?,
-            funding_psbt_base64: row.get(10)?,
-            funding_outpoint: row.get::<usize, Option<Value>>(11).map(|opt| {
-                opt.and_then(|raw| match raw {
-                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
-                    _ => None,
-                })
-            })?,
-
-            funding_transaction: row.get::<usize, Option<Value>>(12).map(|opt| {
-                opt.and_then(|raw| match raw {
-                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
-                    _ => None,
-                })
-            })?,
-
-            contract_parameters: row.get::<usize, Option<Value>>(13).map(|opt| {
-                opt.and_then(|raw| match raw {
-                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
-                    _ => None,
-                })
-            })?,
-
-            public_nonces: row.get::<usize, Option<Value>>(14).map(|opt| {
-                opt.and_then(|raw| match raw {
-                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
-                    _ => None,
-                })
-            })?,
-
-            aggregated_nonces: row.get::<usize, Option<Value>>(15).map(|opt| {
-                opt.and_then(|raw| match raw {
-                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
-                    _ => None,
-                })
-            })?,
-
-            partial_signatures: row.get::<usize, Option<Value>>(16).map(|opt| {
-                opt.and_then(|raw| match raw {
-                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
-                    _ => None,
-                })
-            })?,
-
-            signed_contract: row.get::<usize, Option<Value>>(17).map(|opt| {
-                opt.and_then(|raw| match raw {
-                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
-                    _ => None,
-                })
-            })?,
-
-            attestation: row.get::<usize, Option<Value>>(18).map(|opt| {
-                opt.and_then(|raw| match raw {
-                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
-                    _ => None,
-                })
-            })?,
-
-            cancelled_at: parse_optional_timestamp(row.get::<usize, Option<String>>(19)?, 19)?,
-            contracted_at: parse_optional_timestamp(row.get::<usize, Option<String>>(20)?, 20)?,
-            signed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(21)?, 21)?,
-            escrow_funds_confirmed_at: parse_optional_timestamp(
-                row.get::<usize, Option<String>>(22)?,
-                22,
-            )?,
-            event_created_at: parse_optional_timestamp(row.get::<usize, Option<String>>(23)?, 23)?,
-            entries_submitted_at: parse_optional_timestamp(
-                row.get::<usize, Option<String>>(24)?,
-                24,
-            )?,
-            funding_broadcasted_at: parse_optional_timestamp(
-                row.get::<usize, Option<String>>(25)?,
-                25,
-            )?,
-            funding_confirmed_at: parse_optional_timestamp(
-                row.get::<usize, Option<String>>(26)?,
-                26,
-            )?,
-            funding_settled_at: parse_optional_timestamp(
-                row.get::<usize, Option<String>>(27)?,
-                27,
-            )?,
-            expiry_broadcasted_at: parse_optional_timestamp(
-                row.get::<usize, Option<String>>(28)?,
-                28,
-            )?,
-            outcome_broadcasted_at: parse_optional_timestamp(
-                row.get::<usize, Option<String>>(29)?,
-                29,
-            )?,
-            delta_broadcasted_at: parse_optional_timestamp(
-                row.get::<usize, Option<String>>(30)?,
-                30,
-            )?,
-            completed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(31)?, 31)?,
-            failed_at: parse_optional_timestamp(row.get::<usize, Option<String>>(32)?, 32)?,
-
-            errors: row
-                .get::<usize, Option<Value>>(33)
-                .map(|opt| {
-                    opt.and_then(|raw| match raw {
-                        Value::Blob(val) => {
-                            serde_json::from_slice::<Vec<CompetitionError>>(&val).ok()
-                        }
-                        _ => Some(Vec::new()),
-                    })
-                })
-                .unwrap_or_else(|_| Some(Vec::new()))
-                .unwrap_or_default(),
-        };
-        Ok(competition)
+            created_at: parse_required_datetime(row, "created_at")?,
+            event_submission: parse_required_blob_json(row, "event_submission")?,
+            total_entries: row.try_get("total_entries").unwrap_or(0) as u64,
+            total_entry_nonces: row.try_get("total_entry_nonces").unwrap_or(0) as u64,
+            total_signed_entries: row.try_get("total_signed_entries").unwrap_or(0) as u64,
+            total_paid_entries: row.try_get("total_paid_entries").unwrap_or(0) as u64,
+            total_paid_out_entries: row.try_get("total_paid_out_entries").unwrap_or(0) as u64,
+            event_announcement: parse_optional_blob_json(row, "event_announcement")?,
+            funding_outpoint: parse_optional_blob_json(row, "funding_outpoint")?,
+            funding_psbt_base64: row.get("funding_psbt_base64"),
+            funding_transaction: parse_optional_blob_json(row, "funding_transaction")?,
+            outcome_transaction: parse_optional_blob_json(row, "outcome_transaction")?,
+            contract_parameters: parse_optional_blob_json(row, "contract_parameters")?,
+            public_nonces: parse_optional_blob_json(row, "public_nonces")?,
+            aggregated_nonces: parse_optional_blob_json(row, "aggregated_nonces")?,
+            partial_signatures: parse_optional_blob_json(row, "partial_signatures")?,
+            signed_contract: parse_optional_blob_json(row, "signed_contract")?,
+            attestation: parse_optional_blob_json(row, "attestation")?,
+            cancelled_at: parse_optional_datetime(row, "cancelled_at")?,
+            contracted_at: parse_optional_datetime(row, "contracted_at")?,
+            signed_at: parse_optional_datetime(row, "signed_at")?,
+            escrow_funds_confirmed_at: parse_optional_datetime(row, "escrow_funds_confirmed_at")?,
+            event_created_at: parse_optional_datetime(row, "event_created_at")?,
+            entries_submitted_at: parse_optional_datetime(row, "entries_submitted_at")?,
+            funding_broadcasted_at: parse_optional_datetime(row, "funding_broadcasted_at")?,
+            funding_confirmed_at: parse_optional_datetime(row, "funding_confirmed_at")?,
+            funding_settled_at: parse_optional_datetime(row, "funding_settled_at")?,
+            expiry_broadcasted_at: parse_optional_datetime(row, "expiry_broadcasted_at")?,
+            outcome_broadcasted_at: parse_optional_datetime(row, "outcome_broadcasted_at")?,
+            delta_broadcasted_at: parse_optional_datetime(row, "delta_broadcasted_at")?,
+            completed_at: parse_optional_datetime(row, "completed_at")?,
+            failed_at: parse_optional_datetime(row, "failed_at")?,
+            errors: parse_optional_blob_json(row, "errors")?.unwrap_or_default(),
+        })
     }
 }
 
@@ -1213,67 +1102,4 @@ pub enum CompetitionError {
     Expired(String),
     #[error("Invalid state transition: {0}")]
     InvalidStateTransition(String),
-}
-
-impl<'a> TryFrom<&Row<'a>> for Ticket {
-    type Error = duckdb::Error;
-
-    fn try_from(row: &Row) -> Result<Self, Self::Error> {
-        Ok(Ticket {
-            id: Uuid::parse_str(&row.get::<usize, String>(0)?)
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(0, Type::Text, Box::new(e)))?,
-            competition_id: Uuid::parse_str(&row.get::<usize, String>(1)?)
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(1, Type::Text, Box::new(e)))?,
-            entry_id: row
-                .get::<usize, Option<String>>(2)?
-                .map(|s| {
-                    Uuid::parse_str(&s).map_err(|e| {
-                        duckdb::Error::FromSqlConversionFailure(2, Type::Text, Box::new(e))
-                    })
-                })
-                .transpose()?,
-            ephemeral_pubkey: row.get(3)?,
-            encrypted_preimage: row.get(4)?,
-            hash: row.get(5)?,
-            payment_request: row.get(6)?,
-            expiry: parse_timestamp_or_error(row.get::<usize, String>(7)?, 7)?,
-            reserved_by: row.get(8)?,
-            reserved_at: parse_optional_timestamp(row.get::<usize, Option<String>>(9)?, 9)?,
-            paid_at: parse_optional_timestamp(row.get::<usize, Option<String>>(10)?, 10)?,
-            settled_at: parse_optional_timestamp(row.get::<usize, Option<String>>(11)?, 11)?,
-            escrow_transaction: row.get::<usize, Option<String>>(12)?,
-        })
-    }
-}
-
-fn parse_timestamp_or_error(
-    timestamp: String,
-    position: usize,
-) -> Result<OffsetDateTime, duckdb::Error> {
-    //raw date format 2024-08-11 00:27:39.013046-04
-    let sql_time_format = format_description!(
-        "[year]-[month]-[day] [hour]:[minute]:[second][optional [.[subsecond]]][offset_hour]"
-    );
-
-    OffsetDateTime::parse(&timestamp, &sql_time_format)
-        .map_err(|e| duckdb::Error::FromSqlConversionFailure(position, Type::Text, Box::new(e)))
-}
-
-fn parse_optional_timestamp(
-    timestamp: Option<String>,
-    position: usize,
-) -> Result<Option<OffsetDateTime>, duckdb::Error> {
-    //raw date format 2024-08-11 00:27:39.013046-04
-    let sql_time_format = format_description!(
-        "[year]-[month]-[day] [hour]:[minute]:[second][optional [.[subsecond]]][offset_hour]"
-    );
-
-    match timestamp {
-        Some(ts) => OffsetDateTime::parse(&ts, &sql_time_format)
-            .map(Some)
-            .map_err(|e| {
-                duckdb::Error::FromSqlConversionFailure(position, Type::Text, Box::new(e))
-            }),
-        None => Ok(None),
-    }
 }

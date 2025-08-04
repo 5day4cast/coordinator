@@ -9,14 +9,13 @@ use nostr_sdk::ToBech32;
 use reqwest_middleware::ClientWithMiddleware;
 use server::{
     build_reqwest_client, create_folder,
-    domain::{CompetitionState, DBConnection, InvoiceWatcher, PayoutInfo, TicketStatus},
+    db::{DBConnection, DatabasePoolConfig},
+    domain::{CompetitionState, InvoiceWatcher, PayoutInfo, TicketStatus},
     setup_logger, Bitcoin, BitcoinClient, CompetitionStore, Coordinator, FinalSignatures, Ln,
     LnClient, LnSettings, Oracle, OracleEvent, REQUIRED_CONFIRMATIONS_FOR_TIME,
 };
 use std::{
     collections::HashMap,
-    fs,
-    path::Path,
     str::FromStr,
     sync::{Arc, Mutex, Once},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -47,7 +46,6 @@ pub fn setup_static_logger() {
 }
 
 pub struct TestContext {
-    pub test_database: String,
     pub competition_store: CompetitionStore,
     pub bitcoin_client: Arc<dyn Bitcoin>,
     pub coord_ln: Arc<dyn Ln>,
@@ -86,9 +84,19 @@ impl TestContext {
             "Insufficient funds for test"
         );
 
+        let migrations_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("migrations")
+            .join("competitions");
+
         let test_db_name = format!("test_competition_db_{}", Uuid::now_v7());
-        let db_connection = DBConnection::new(test_data_folder, &test_db_name)?;
-        let competition_store = CompetitionStore::new(db_connection.clone())?;
+        let db_connection = DBConnection::with_migrations(
+            test_data_folder,
+            &test_db_name,
+            DatabasePoolConfig::testing(),
+            migrations_path.to_str().unwrap(),
+        )
+        .await?;
+        let competition_store = CompetitionStore::new(db_connection.clone());
 
         let coordinator_ln = LnSettings {
             base_url: String::from("https://localhost:9095"),
@@ -151,7 +159,6 @@ impl TestContext {
         });
 
         Ok(Self {
-            test_database: db_connection.connection_path,
             competition_store,
             bitcoin_client: Arc::new(bitcoin_client),
             coord_ln: Arc::new(ln),
@@ -167,21 +174,11 @@ impl TestContext {
             self.coord_ln.clone(),
             4,
             1,
+            String::from("testing_coordinator"),
         )
         .await?;
         debug!("coordinator created");
         Ok(Arc::new(coordinator))
-    }
-}
-
-impl Drop for TestContext {
-    fn drop(&mut self) {
-        let test_database = self.test_database.clone();
-        let path = Path::new(&test_database);
-        if let Err(e) = fs::remove_file(path) {
-            eprintln!("Failed to cleanup test database: {}", e);
-        }
-        assert!(!path.exists(), "Test database was not cleaned up properly");
     }
 }
 

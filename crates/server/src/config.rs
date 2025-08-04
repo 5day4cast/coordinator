@@ -51,12 +51,94 @@ impl ConfigurableSettings for Settings {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DBSettings {
     pub data_folder: String,
+    pub read_max_connections: u32,
+    pub read_min_connections: u32,
+    pub write_max_connections: u32,
+    pub write_min_connections: u32,
+    pub idle_timeout_secs: u64,
+    pub acquire_timeout_secs: u64,
+    pub sqlite_config: SqliteConfigSerde,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SqliteConfigSerde {
+    pub mode: String,
+    pub cache: String,
+    pub busy_timeout_ms: u32,
+    pub journal_mode: String,
+    pub synchronous: String,
+    pub cache_size: i32,
+    pub foreign_keys: bool,
+    pub wal_autocheckpoint: Option<u32>,
+    pub temp_store: String,
+    pub mmap_size: Option<u64>,
+    pub page_size: Option<u32>,
 }
 
 impl Default for DBSettings {
     fn default() -> Self {
         DBSettings {
             data_folder: String::from("./data"),
+            read_max_connections: 12,
+            read_min_connections: 2,
+            write_max_connections: 5,
+            write_min_connections: 1,
+            idle_timeout_secs: 600,   // 10 minutes
+            acquire_timeout_secs: 15, // 15 seconds
+            sqlite_config: SqliteConfigSerde::default(),
+        }
+    }
+}
+
+impl Default for SqliteConfigSerde {
+    fn default() -> Self {
+        Self {
+            mode: "ReadWriteCreate".to_string(),
+            cache: "Shared".to_string(),
+            busy_timeout_ms: 5000,
+            journal_mode: "WAL".to_string(),
+            synchronous: "NORMAL".to_string(),
+            cache_size: 1000000,
+            foreign_keys: true,
+            wal_autocheckpoint: Some(1000),
+            temp_store: "Memory".to_string(),
+            mmap_size: Some(268435456), // 256MB
+            page_size: Some(4096),
+        }
+    }
+}
+
+impl SqliteConfigSerde {
+    pub fn development() -> Self {
+        Self {
+            busy_timeout_ms: 10000,
+            cache_size: 100000,
+            ..Default::default()
+        }
+    }
+
+    pub fn production() -> Self {
+        Self {
+            synchronous: "FULL".to_string(),
+            cache_size: 2000000,
+            wal_autocheckpoint: Some(10000),
+            mmap_size: Some(1073741824), // 1GB
+            ..Default::default()
+        }
+    }
+
+    pub fn testing() -> Self {
+        Self {
+            mode: "Memory".to_string(),
+            journal_mode: "MEMORY".to_string(),
+            synchronous: "OFF".to_string(),
+            temp_store: "Memory".to_string(),
+            busy_timeout_ms: 1000,
+            cache_size: 10000,
+            wal_autocheckpoint: None,
+            mmap_size: None,
+            page_size: None,
+            ..Default::default()
         }
     }
 }
@@ -115,6 +197,7 @@ impl Default for BitcoinSettings {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CoordinatorSettings {
+    pub name: String,
     pub oracle_url: String,
     /// Key to use to sign nostr notes and auth, may also be used for the bitcoin private key
     /// The service will generate one for the bitcoin wallet and use as the signing key for nostr by default
@@ -141,6 +224,7 @@ pub struct CoordinatorSettings {
 impl Default for CoordinatorSettings {
     fn default() -> Self {
         CoordinatorSettings {
+            name: String::from("coordinator"),
             oracle_url: String::from("http://127.0.0.1:9800"),
             private_key_file: String::from("./creds/coordinator_private_key.pem"),
             relative_locktime_block_delta: 144,
