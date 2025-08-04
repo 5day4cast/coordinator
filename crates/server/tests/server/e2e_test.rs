@@ -256,10 +256,12 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
             .request_ticket(nostr_bech32.clone(), competition.id, btc_pubkey)
             .await?;
         debug!("ticket: {:?}", ticket_response);
+
         // Actually pay the invoice using the user's lightning node
         user_ln_client
             .send_payment(
                 ticket_response.payment_request.clone(),
+                ticket_response.amount_sats,
                 300,  // timeout in seconds
                 1000, // fee limit in sats
             )
@@ -718,6 +720,7 @@ async fn test_two_person_competition_flow_nobody_wins_with_real_lightning() -> R
         user_ln_client
             .send_payment(
                 ticket_response.payment_request.clone(),
+                ticket_response.amount_sats,
                 300,  // timeout in seconds
                 1000, // fee limit in sats
             )
@@ -1173,6 +1176,7 @@ async fn test_two_person_competition_flow_contract_expires_with_real_lightning()
         user_ln_client
             .send_payment(
                 ticket_response.payment_request.clone(),
+                ticket_response.amount_sats,
                 300,  // timeout in seconds
                 1000, // fee limit in sats
             )

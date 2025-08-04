@@ -72,5 +72,6 @@ CREATE TABLE IF NOT EXISTS entries (
     paid_out_at DATETIME,                           -- When ticket have been paid out via lightning
     sellback_broadcasted_at DATETIME,               -- When on chain sellback broadcasted by coordinator for cooperative lightning payout
     reclaimed_broadcasted_at DATETIME,              -- When on chain reclaim broadcasted by coordinator for uncooperative payout
-    signed_at DATETIME                              -- When user completes musig signing
+    signed_at DATETIME,                             -- When user completes musig signing
+    payout_amount_sats INTEGER                      -- Amount paid out to user in sats via lightning
  );

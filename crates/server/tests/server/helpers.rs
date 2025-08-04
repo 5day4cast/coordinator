@@ -113,6 +113,7 @@ mock! {
         async fn send_payment(
             &self,
             payout_payment_request: String,
+            amount_sats: u64,
             timeout_seconds: u64,
             fee_limit_sat: u64,
         ) -> Result<(), anyhow::Error>;

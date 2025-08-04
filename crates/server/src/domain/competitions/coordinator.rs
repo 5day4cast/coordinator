@@ -63,6 +63,7 @@ pub struct TicketResponse {
     pub payment_request: String, // Lightning HODL invoice to pay for entry
     pub escrow_tx: Option<String>, // escrow transaction the coordinator broadcasts prior to settling the HODL invoice
     pub payment_hash: String,      // Hex-encoded payment hash for verification
+    pub amount_sats: u64,
 }
 
 pub struct CompetitionWatcher {
@@ -1951,6 +1952,7 @@ impl Coordinator {
             payment_request: invoice.payment_request,
             escrow_tx: Some(escrow_tx_hex),
             payment_hash: hex::encode(payment_hash),
+            amount_sats: full_fee,
         })
     }
 
@@ -2326,6 +2328,10 @@ impl Coordinator {
         entry_id: Uuid,
         payout_info: PayoutInfo,
     ) -> Result<(), Error> {
+        if payout_info.ln_invoice.is_empty() {
+            return Err(Error::BadRequest("Invalid lightning invoice".into()));
+        }
+
         // Get the competition and verify it's in a valid state for payouts
         let competition = self
             .competition_store
@@ -2446,31 +2452,70 @@ impl Coordinator {
             return Err(Error::BadRequest("Invalid lightning invoice".into()));
         }
 
+        // Calculate the payout amount based on winner's weight
+        let total_pool_sats = signed_contract.params().funding_value.to_sat();
+        let winner_weight = winner_weights
+            .iter()
+            .find_map(|(player_index, weight)| {
+                if let Some(player) = signed_contract.params().players.get(*player_index) {
+                    if player.pubkey == ephemeral_pubkey {
+                        Some(*weight)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| Error::BadRequest("Unable to determine winner weight".into()))?;
+
+        let payout_amount_sats = (total_pool_sats * winner_weight) / 100;
+
+        debug!(
+            "Total pool: {} sats, Winner weight: {}%, Payout amount: {} sats",
+            total_pool_sats, winner_weight, payout_amount_sats
+        );
+
+        let invoice_amount_sats =
+            crate::ln_client::extract_amount_from_invoice(&payout_info.ln_invoice)
+                .map_err(|e| Error::BadRequest(format!("Invalid lightning invoice: {}", e)))?;
+
+        if let Some(invoice_amount_sats) = invoice_amount_sats {
+            if invoice_amount_sats != payout_amount_sats {
+                return Err(Error::BadRequest(format!(
+                    "Invoice amount {} sats does not match expected payout {} sats",
+                    invoice_amount_sats, payout_amount_sats
+                )));
+            }
+        }
+
         match self
             .ln
             .send_payment(
                 payout_info.ln_invoice.clone(),
-                60,   // 60 second timeout
-                1000, // 1000 sat fee limit
+                payout_amount_sats,
+                60,   // TODO(@tee8z): make this timeout configurable, 60 second timeout
+                1000, // TODO(@tee8z): make this fee configurable, 1000 sat fee limit
             )
             .await
         {
             Ok(_) => {
-                // Update the entry as paid out
+                // Store payout info but DON'T mark as paid out yet
+                // The PayoutWatcher will monitor the payment and mark as paid when it settles
                 self.competition_store
-                    .store_payout_info(
+                    .store_payout_info_pending(
                         entry_id,
                         payout_info.payout_preimage,
                         payout_info.ephemeral_private_key,
                         payout_info.ln_invoice,
-                        OffsetDateTime::now_utc(),
+                        payout_amount_sats,
                     )
                     .await
                     .map_err(Error::DbError)
             }
             Err(e) => {
                 return Err(Error::PaymentFailed(format!(
-                    "Failed to send lightning payment: {}",
+                    "Failed to initiate lightning payment: {}",
                     e
                 )));
             }

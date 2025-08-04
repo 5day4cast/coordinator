@@ -176,30 +176,83 @@ impl CompetitionStore {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn store_payout_info(
+    pub async fn store_payout_info_pending(
         &self,
         entry_id: Uuid,
         payout_preimage: String,
         ephemeral_private_key: String,
         ln_invoice: String,
-        paid_time: OffsetDateTime,
+        payout_amount_sats: u64,
     ) -> Result<(), sqlx::Error> {
-        let paid_time_str = paid_time
-            .format(&Rfc3339)
-            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-
         sqlx::query(
             "UPDATE entries
             SET payout_preimage = ?,
                 ephemeral_privatekey = ?,
                 payout_ln_invoice = ?,
-                paid_out_at = ?
+                payout_amount_sats = ?
             WHERE id = ?",
         )
         .bind(&payout_preimage)
         .bind(&ephemeral_private_key)
         .bind(&ln_invoice)
-        .bind(&paid_time_str)
+        .bind(payout_amount_sats as i64)
+        .bind(entry_id.to_string())
+        .execute(self.db_connection.write())
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn get_pending_payouts(&self) -> Result<Vec<PendingPayout>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT
+                id,
+                payout_ln_invoice,
+                payout_amount_sats,
+            FROM entries
+            WHERE payout_ln_invoice IS NOT NULL
+            AND paid_out_at IS NULL
+            AND sellback_broadcasted_at IS NULL
+            AND reclaimed_broadcasted_at IS NULL",
+        )
+        .fetch_all(self.db_connection.read())
+        .await?;
+
+        let mut payouts = Vec::new();
+        for row in rows {
+            let entry_id = uuid::Uuid::parse_str(&row.get::<String, _>("id")).unwrap();
+            let ln_invoice: String = row.get("payout_ln_invoice");
+            let amount_sats: i64 = row.get("payout_amount_sats");
+
+            let payment_hash = crate::ln_client::extract_payment_hash_from_invoice(&ln_invoice)
+                .map_err(|e| sqlx::Error::Protocol(format!("Invalid invoice: {}", e)))?;
+
+            payouts.push(PendingPayout {
+                entry_id,
+                payment_hash,
+                ln_invoice,
+                amount_sats: amount_sats as u64,
+            });
+        }
+
+        Ok(payouts)
+    }
+
+    pub async fn mark_entry_paid_out(
+        &self,
+        entry_id: uuid::Uuid,
+        paid_out_at: OffsetDateTime,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE entries
+            SET paid_out_at = ?
+            WHERE id = ?",
+        )
+        .bind(
+            paid_out_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        )
         .bind(entry_id.to_string())
         .execute(self.db_connection.write())
         .await?;
