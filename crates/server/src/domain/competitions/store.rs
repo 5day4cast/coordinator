@@ -1,10 +1,15 @@
 use dlctix::{bitcoin::XOnlyPublicKey, musig2::PubNonce, SigMap};
 use log::{debug, info};
+use sqlx::{Execute, Sqlite};
 use std::collections::HashMap;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
-use crate::{db::DBConnection, domain::EntryPayout, FinalSignatures};
+use crate::{
+    db::DBConnection,
+    domain::{EntryPayout, PayoutError, PayoutStatus},
+    FinalSignatures,
+};
 
 use super::{Competition, EntryStatus, SearchBy, Ticket, UserEntry};
 
@@ -183,81 +188,189 @@ impl CompetitionStore {
         ephemeral_private_key: String,
         ln_invoice: String,
         payout_amount_sats: u64,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<Uuid, sqlx::Error> {
+        let mut tx = self.db_connection.write().begin().await?;
+
+        let payout_id = Uuid::now_v7();
+        let initiated_at = OffsetDateTime::now_utc();
+
+        sqlx::query(
+            "INSERT INTO payouts (
+                id,
+                entry_id,
+                payout_payment_request,
+                payout_amount_sats,
+                initiated_at,
+                succeed_at,
+                failed_at,
+                error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(payout_id.to_string())
+        .bind(entry_id.to_string())
+        .bind(&ln_invoice)
+        .bind(payout_amount_sats as i64)
+        .bind(
+            initiated_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        )
+        .bind(None::<String>) // succeed_at
+        .bind(None::<String>) // failed_at
+        .bind(None::<String>)
+        .execute(&mut *tx)
+        .await?;
+
         sqlx::query(
             "UPDATE entries
             SET payout_preimage = ?,
-                ephemeral_privatekey = ?,
-                payout_ln_invoice = ?,
-                payout_amount_sats = ?
+                ephemeral_privatekey = ?
             WHERE id = ?",
         )
         .bind(&payout_preimage)
         .bind(&ephemeral_private_key)
-        .bind(&ln_invoice)
-        .bind(payout_amount_sats as i64)
         .bind(entry_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(payout_id)
+    }
+
+    pub async fn mark_payout_succeeded(
+        &self,
+        payout_id: Uuid,
+        succeed_at: OffsetDateTime,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE payouts
+            SET succeed_at = ?
+            WHERE id = ?",
+        )
+        .bind(
+            succeed_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        )
+        .bind(payout_id.to_string())
         .execute(self.db_connection.write())
         .await?;
 
         Ok(())
     }
 
-    pub async fn get_pending_payouts(&self) -> Result<Vec<EntryPayout>, sqlx::Error> {
-        let rows = sqlx::query(
+    pub async fn mark_payout_failed(
+        &self,
+        payout_id: Uuid,
+        failed_at: OffsetDateTime,
+        error: PayoutError,
+    ) -> Result<(), sqlx::Error> {
+        let error_blob =
+            serde_json::to_string(&error).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+
+        sqlx::query(
+            "UPDATE payouts
+            SET failed_at = ?, error = ?
+            WHERE id = ?",
+        )
+        .bind(
+            failed_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        )
+        .bind(error_blob)
+        .bind(payout_id.to_string())
+        .execute(self.db_connection.write())
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn get_payout(&self, payout_id: Uuid) -> Result<Option<EntryPayout>, sqlx::Error> {
+        sqlx::query_as::<_, EntryPayout>(
             "SELECT
                 id,
-                payout_ln_invoice,
+                entry_id,
+                payout_payment_request,
                 payout_amount_sats,
-            FROM entries
-            WHERE payout_ln_invoice IS NOT NULL
-            AND paid_out_at IS NULL
-            AND sellback_broadcasted_at IS NULL
-            AND reclaimed_broadcasted_at IS NULL",
+                initiated_at,
+                succeed_at,
+                failed_at,
+                error
+            FROM payouts
+            WHERE id = ?",
+        )
+        .bind(payout_id.to_string())
+        .fetch_optional(self.db_connection.read())
+        .await
+    }
+
+    pub async fn get_all_pending_payouts(&self) -> Result<Vec<EntryPayout>, sqlx::Error> {
+        let entry_payouts = sqlx::query_as::<_, EntryPayout>(
+            "SELECT
+                id,
+                entry_id,
+                payout_payment_request,
+                payout_amount_sats,
+                initiated_at,
+                succeed_at,
+                failed_at,
+                error
+            FROM payouts
+            WHERE succeed_at IS NULL AND failed_at IS NULL
+            ORDER BY initiated_at ASC",
         )
         .fetch_all(self.db_connection.read())
         .await?;
 
-        let mut payouts = Vec::new();
-        for row in rows {
-            let entry_id = uuid::Uuid::parse_str(&row.get::<String, _>("id")).unwrap();
-            let ln_invoice: String = row.get("payout_ln_invoice");
-            let amount_sats: i64 = row.get("payout_amount_sats");
-
-            let payment_hash = crate::ln_client::extract_payment_hash_from_invoice(&ln_invoice)
-                .map_err(|e| sqlx::Error::Protocol(format!("Invalid invoice: {}", e)))?;
-
-            payouts.push(EntryPayout {
-                entry_id,
-                payment_hash,
-                ln_invoice,
-                amount_sats: amount_sats as u64,
-            });
-        }
-
-        Ok(payouts)
+        Ok(entry_payouts)
     }
 
-    pub async fn mark_entry_paid_out(
+    pub async fn get_entry_payouts(
         &self,
-        entry_id: uuid::Uuid,
-        paid_out_at: OffsetDateTime,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE entries
-            SET paid_out_at = ?
-            WHERE id = ?",
-        )
-        .bind(
-            paid_out_at
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap(),
-        )
-        .bind(entry_id.to_string())
-        .execute(self.db_connection.write())
-        .await?;
+        entry_id: Uuid,
+        status_filter: Option<PayoutStatus>,
+    ) -> Result<Vec<EntryPayout>, sqlx::Error> {
+        let mut query_builder = sqlx::QueryBuilder::<Sqlite>::new(
+            "SELECT
+                id,
+                entry_id,
+                payout_payment_request,
+                payout_amount_sats,
+                initiated_at,
+                succeed_at,
+                failed_at,
+                error
+            FROM payouts
+            WHERE entry_id = ",
+        );
 
-        Ok(())
+        query_builder.push_bind(entry_id.to_string());
+
+        match status_filter {
+            Some(PayoutStatus::Pending) => {
+                query_builder.push(" AND succeed_at IS NULL AND failed_at IS NULL");
+            }
+            Some(PayoutStatus::Succeeded) => {
+                query_builder.push(" AND succeed_at IS NOT NULL");
+            }
+            Some(PayoutStatus::Failed) => {
+                query_builder.push(" AND failed_at IS NOT NULL");
+            }
+            None => {
+                // No additional conditions
+            }
+        }
+
+        query_builder.push(" ORDER BY initiated_at DESC");
+
+        let query = query_builder.build();
+
+        let entry_payouts = sqlx::query_as::<_, EntryPayout>(&query.sql())
+            .fetch_all(self.db_connection.read())
+            .await?;
+
+        Ok(entry_payouts)
     }
 
     pub async fn get_competition_entries(
@@ -266,7 +379,19 @@ impl CompetitionStore {
         statuses: Vec<EntryStatus>,
     ) -> Result<Vec<UserEntry>, sqlx::Error> {
         let mut base_query = String::from(
-            "SELECT
+            "WITH latest_payouts AS (
+                  SELECT
+                      entry_id,
+                      payout_payment_request,
+                      ROW_NUMBER() OVER (
+                          PARTITION BY entry_id
+                          ORDER BY COALESCE(succeed_at, initiated_at) DESC
+                      ) as rn,
+                      COALESCE(succeed_at, initiated_at) as latest_payout_time
+                  FROM payouts
+                  WHERE failed_at IS NULL
+              )
+            SELECT
                 entries.id as id,
                 ticket_id,
                 entries.event_id as event_id,
@@ -281,14 +406,15 @@ impl CompetitionStore {
                 payout_preimage_encrypted,
                 payout_hash,
                 payout_preimage,
-                payout_ln_invoice,
                 signed_at,
                 tickets.settled_at AS paid_at,
-                paid_out_at,
                 sellback_broadcasted_at,
-                reclaimed_broadcasted_at
+                reclaimed_broadcasted_at,
+                latest_payouts.latest_payout_time as paid_out_at,
+                latest_payouts.payout_payment_request as payout_ln_invoice
             FROM entries
             LEFT JOIN tickets ON entries.ticket_id = tickets.id
+            LEFT JOIN latest_payouts ON entries.id = latest_payouts.entry_id AND latest_payouts.rn = 1
             WHERE entries.event_id = ?",
         );
 
@@ -319,30 +445,43 @@ impl CompetitionStore {
         pubkey: String,
         filter: SearchBy,
     ) -> Result<Vec<UserEntry>, sqlx::Error> {
-        let base_query = "SELECT
-            entries.id as id,
-            ticket_id,
-            entries.event_id as event_id,
-            pubkey,
-            entries.ephemeral_pubkey as ephemeral_pubkey,
-            ephemeral_privatekey_encrypted,
-            ephemeral_privatekey,
-            public_nonces,
-            partial_signatures,
-            funding_psbt_base64,
-            entry_submission,
-            payout_preimage_encrypted,
-            payout_hash,
-            payout_preimage,
-            payout_ln_invoice,
-            signed_at,
-            tickets.paid_at AS paid_at,
-            paid_out_at,
-            sellback_broadcasted_at,
-            reclaimed_broadcasted_at
-        FROM entries
-        LEFT JOIN tickets ON entries.ticket_id = tickets.id
-        WHERE pubkey = ?";
+        let base_query = "WITH latest_payouts AS (
+              SELECT
+                  entry_id,
+                  payout_payment_request,
+                  ROW_NUMBER() OVER (
+                      PARTITION BY entry_id
+                      ORDER BY COALESCE(succeed_at, initiated_at) DESC
+                  ) as rn,
+                  COALESCE(succeed_at, initiated_at) as latest_payout_time
+              FROM payouts
+              WHERE failed_at IS NULL
+          )
+          SELECT
+              entries.id as id,
+              ticket_id,
+              entries.event_id as event_id,
+              pubkey,
+              entries.ephemeral_pubkey as ephemeral_pubkey,
+              ephemeral_privatekey_encrypted,
+              ephemeral_privatekey,
+              public_nonces,
+              partial_signatures,
+              funding_psbt_base64,
+              entry_submission,
+              payout_preimage_encrypted,
+              payout_hash,
+              payout_preimage,
+              signed_at,
+              tickets.paid_at AS paid_at,
+              sellback_broadcasted_at,
+              reclaimed_broadcasted_at,
+              latest_payouts.latest_payout_time as paid_out_at,
+              latest_payouts.payout_payment_request as payout_ln_invoice
+          FROM entries
+          LEFT JOIN tickets ON entries.ticket_id = tickets.id
+          LEFT JOIN latest_payouts ON entries.id = latest_payouts.entry_id AND latest_payouts.rn = 1
+          WHERE pubkey = ?";
 
         let (final_query, params) = if let Some(event_ids) = filter.event_ids {
             if !event_ids.is_empty() {
@@ -656,6 +795,14 @@ impl CompetitionStore {
         use_write_pool: bool,
     ) -> Result<Vec<Competition>, sqlx::Error> {
         let base_query = r#"
+            WITH payout_stats AS (
+                SELECT
+                    entries.event_id,
+                    COUNT(DISTINCT CASE WHEN payouts.succeed_at IS NOT NULL THEN payouts.entry_id END) as total_paid_out_entries
+                FROM entries
+                LEFT JOIN payouts ON entries.id = payouts.entry_id
+                GROUP BY entries.event_id
+            )
             SELECT
                 competitions.id as id,
                 created_at as created_at,
@@ -665,7 +812,7 @@ impl CompetitionStore {
                 COUNT(CASE WHEN entries.public_nonces IS NOT NULL THEN entries.id END) as total_entry_nonces,
                 COUNT(CASE WHEN entries.signed_at IS NOT NULL THEN entries.id END) as total_signed_entries,
                 COUNT(tickets.settled_at) as total_paid_entries,
-                COUNT(CASE WHEN entries.paid_out_at IS NOT NULL THEN entries.id END) as total_paid_out_entries,
+                COALESCE(payout_stats.total_paid_out_entries, 0) as total_paid_out_entries,
                 outcome_transaction,
                 competitions.funding_psbt_base64 as funding_psbt_base64,
                 funding_outpoint,
@@ -692,6 +839,7 @@ impl CompetitionStore {
                 failed_at as failed_at,
                 errors
             FROM competitions
+            LEFT JOIN payout_stats ON competitions.id = payout_stats.event_id
             LEFT JOIN entries ON entries.event_id = competitions.id
             LEFT JOIN tickets ON entries.ticket_id = tickets.id"#;
 
@@ -727,7 +875,8 @@ impl CompetitionStore {
                     delta_broadcasted_at,
                     completed_at,
                     failed_at,
-                    errors",
+                    errors,
+                    payout_stats.total_paid_out_entries",
                 base_query
             )
         } else {
@@ -762,7 +911,8 @@ impl CompetitionStore {
                     delta_broadcasted_at,
                     completed_at,
                     failed_at,
-                    errors",
+                    errors,
+                    payout_stats.total_paid_out_entries",
                 base_query
             )
         };
@@ -782,6 +932,15 @@ impl CompetitionStore {
 
     pub async fn get_competition(&self, competition_id: Uuid) -> Result<Competition, sqlx::Error> {
         let query_str = r#"
+            WITH payout_stats AS (
+                        SELECT
+                            entries.event_id,
+                            COUNT(DISTINCT CASE WHEN payouts.succeed_at IS NOT NULL THEN payouts.entry_id END) as total_paid_out_entries
+                        FROM entries
+                        LEFT JOIN payouts ON entries.id = payouts.entry_id
+                        WHERE entries.event_id = ?
+                        GROUP BY entries.event_id
+                    )
             SELECT
                 competitions.id as id,
                 created_at as created_at,
@@ -791,7 +950,7 @@ impl CompetitionStore {
                 COUNT(CASE WHEN entries.public_nonces IS NOT NULL THEN entries.id END) as total_entry_nonces,
                 COUNT(CASE WHEN entries.signed_at IS NOT NULL THEN entries.id END) as total_signed_entries,
                 COUNT(tickets.settled_at) as total_paid_entries,
-                COUNT(CASE WHEN entries.paid_out_at IS NOT NULL THEN entries.id END) as total_paid_out_entries,
+                COALESCE(payout_stats.total_paid_out_entries, 0) as total_paid_out_entries,
                 outcome_transaction,
                 competitions.funding_psbt_base64 as funding_psbt_base64,
                 funding_outpoint,
@@ -818,6 +977,7 @@ impl CompetitionStore {
                 failed_at as failed_at,
                 errors
             FROM competitions
+            LEFT JOIN payout_stats ON competitions.id = payout_stats.event_id
             LEFT JOIN entries ON entries.event_id = competitions.id
             LEFT JOIN tickets ON entries.ticket_id = tickets.id
             WHERE competitions.id = ?
@@ -853,6 +1013,7 @@ impl CompetitionStore {
                 errors"#;
 
         let competition = sqlx::query_as::<_, Competition>(query_str)
+            .bind(competition_id.to_string())
             .bind(competition_id.to_string())
             .fetch_one(self.db_connection.read())
             .await?;

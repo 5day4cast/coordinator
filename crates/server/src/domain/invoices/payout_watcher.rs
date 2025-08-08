@@ -1,14 +1,13 @@
-use anyhow::anyhow;
 use log::{debug, error, info, warn};
 use std::{sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
-use crate::{domain::PaymentStatus, Coordinator, Ln};
-
-const MAX_PAYMENT_RETRIES: u32 = 3;
-const RETRY_DELAY_MS: u64 = 2000;
+use crate::{
+    domain::{competitions::PayoutError, PaymentStatus},
+    Coordinator, Ln,
+};
 
 pub struct PayoutWatcher {
     coordinator: Arc<Coordinator>,
@@ -66,101 +65,111 @@ impl PayoutWatcher {
         let pending_payouts = self
             .coordinator
             .competition_store
-            .get_pending_payouts()
+            .get_all_pending_payouts()
             .await?;
 
         debug!("Checking {} pending payouts", pending_payouts.len());
 
         for payout in pending_payouts {
-            let payment_hash =
-                match crate::ln_client::extract_payment_hash_from_invoice(&payout.ln_invoice) {
-                    Ok(hash) => hash,
-                    Err(e) => {
-                        error!("Invalid lightning invoice, {}: {}", payout.entry_id, e);
-                        continue;
-                    }
-                };
+            let payment_hash = match crate::ln_client::extract_payment_hash_from_invoice(
+                &payout.payout_payment_request,
+            ) {
+                Ok(hash) => hash,
+                Err(e) => {
+                    error!("Invalid lightning invoice for payout {}: {}", payout.id, e);
 
-            match self.ln.lookup_payment(&payout.payment_hash).await {
+                    // Mark payout as failed due to invalid invoice
+                    if let Err(mark_err) = self
+                        .coordinator
+                        .competition_store
+                        .mark_payout_failed(
+                            payout.id,
+                            OffsetDateTime::now_utc(),
+                            PayoutError::FailedToPayOut(e.to_string()),
+                        )
+                        .await
+                    {
+                        error!(
+                            "Failed to mark payout {} as failed: {}",
+                            payout.id, mark_err
+                        );
+                    }
+                    continue;
+                }
+            };
+
+            match self.ln.lookup_payment(&payment_hash).await {
                 Ok(payment) => {
-                    debug!(
-                        "Payout {}: payment status: {:?}",
-                        payout.entry_id, payment.status
-                    );
+                    debug!("Payout {}: payment status: {:?}", payout.id, payment.status);
 
                     match payment.status {
                         PaymentStatus::Succeeded => {
                             info!(
-                                "Payment succeeded for payout {}, marking as paid out",
-                                payout.entry_id
+                                "Payment succeeded for payout {}, marking as succeeded",
+                                payout.id
                             );
 
                             match self
                                 .coordinator
                                 .competition_store
-                                .mark_entry_paid_out(payout.entry_id, OffsetDateTime::now_utc())
+                                .mark_payout_succeeded(payout.id, OffsetDateTime::now_utc())
                                 .await
                             {
                                 Ok(_) => {
-                                    info!(
-                                        "Successfully marked entry {} as paid out",
-                                        payout.entry_id
-                                    );
+                                    info!("Successfully marked payout {} as succeeded", payout.id);
                                 }
                                 Err(e) => {
                                     error!(
-                                        "Failed to mark entry {} as paid out: {}",
-                                        payout.entry_id, e
+                                        "Failed to mark payout {} as succeeded: {}",
+                                        payout.id, e
                                     );
                                 }
                             }
                         }
                         PaymentStatus::Failed => {
-                            let error_msg = payment
-                                .payment_error
-                                .unwrap_or_else(|| "Payment failed".to_string());
+                            let error_msg = payment.failure_reason;
 
                             warn!(
-                                "Payment failed for payout {}: {}. Will resolve via onchain transaction.",
-                                payout.entry_id, error_msg
+                                "Payment failed for payout {} (entry {}): {}. Will resolve via onchain transaction.",
+                                payout.id, payout.entry_id, error_msg
                             );
 
-                            info!(
-                                "Payout {} will be resolved via onchain sellback or reclaim transaction",
-                                payout.entry_id
-                            );
+                            // Mark the payout as failed
+                            if let Err(e) = self
+                                .coordinator
+                                .competition_store
+                                .mark_payout_failed(
+                                    payout.id,
+                                    OffsetDateTime::now_utc(),
+                                    PayoutError::FailedToPayOut(error_msg),
+                                )
+                                .await
+                            {
+                                error!("Failed to mark payout {} as failed: {}", payout.id, e);
+                            } else {
+                                info!(
+                                    "Payout {} will be resolved via onchain sellback or reclaim transaction for entry {}",
+                                    payout.id, payout.entry_id
+                                );
+                            }
                         }
                         PaymentStatus::InFlight => {
-                            debug!("Payment still in flight for payout {}", payout.entry_id);
+                            debug!("Payment still in flight for payout {}", payout.id);
                         }
                         PaymentStatus::Initiated => {
-                            debug!("Payment initiated for payout {}", payout.entry_id);
+                            debug!("Payment initiated for payout {}", payout.id);
                         }
                         PaymentStatus::Unknown => {
-                            warn!("Payment status unknown for payout {}", payout.entry_id);
+                            warn!("Payment status unknown for payout {}", payout.id);
                         }
                     }
                 }
                 Err(e) => {
-                    debug!(
-                        "Failed to lookup payment for payout {}: {}",
-                        payout.entry_id, e
-                    );
+                    debug!("Failed to lookup payment for payout {}: {}", payout.id, e);
                 }
             }
         }
 
         Ok(())
     }
-}
-
-// Data structure for pending payouts
-#[derive(Debug, Clone)]
-pub struct PendingPayout {
-    pub entry_id: uuid::Uuid,
-    pub payment_hash: String,
-    pub ln_invoice: String,
-    pub amount_sats: u64,
-    pub retry_count: u32,
-    pub initiated_at: OffsetDateTime,
 }

@@ -74,7 +74,44 @@ pub struct EntryPayout {
     /// Time at which the payout failed
     pub failed_at: Option<OffsetDateTime>,
     /// Why the payout failed
-    pub error: PayoutError,
+    pub error: Option<PayoutError>,
+}
+
+impl FromRow<'_, SqliteRow> for EntryPayout {
+    fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
+        let succeed_at: Option<OffsetDateTime> = parse_optional_datetime(row, "succeed_at")?;
+        let failed_at: Option<OffsetDateTime> = parse_optional_datetime(row, "failed_at")?;
+
+        let payout_status = if succeed_at.is_some() {
+            PayoutStatus::Succeeded
+        } else if failed_at.is_some() {
+            PayoutStatus::Failed
+        } else {
+            PayoutStatus::Pending
+        };
+
+        Ok(EntryPayout {
+            id: Uuid::parse_str(&row.get::<String, _>("id")).map_err(|e| {
+                sqlx::Error::ColumnDecode {
+                    index: "id".to_string(),
+                    source: Box::new(e),
+                }
+            })?,
+            entry_id: Uuid::parse_str(&row.get::<String, _>("entry_id")).map_err(|e| {
+                sqlx::Error::ColumnDecode {
+                    index: "entry_id".to_string(),
+                    source: Box::new(e),
+                }
+            })?,
+            payout_status,
+            payout_payment_request: row.try_get("payout_payment_request")?,
+            payout_amount_sats: row.try_get("payout_amount_sats").unwrap_or(0) as u64,
+            initiated_at: parse_required_datetime(row, "initiated_at")?,
+            succeed_at,
+            failed_at,
+            error: parse_optional_blob_json(row, "error")?.unwrap_or_default(),
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Clone, Deserialize)]
@@ -131,6 +168,10 @@ pub struct UserEntry {
     pub sellback_broadcasted_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub reclaimed_broadcasted_at: Option<OffsetDateTime>,
+    // If we have any pending/completed paid out lightning payments, this should be their latest one
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub paid_out_at: Option<OffsetDateTime>,
+    pub payout_ln_invoice: Option<String>,
 }
 
 impl FromRow<'_, SqliteRow> for UserEntry {
@@ -169,6 +210,8 @@ impl FromRow<'_, SqliteRow> for UserEntry {
             paid_at: parse_optional_sqlite_datetime(&row, "paid_at")?,
             sellback_broadcasted_at: parse_optional_datetime(&row, "sellback_broadcasted_at")?,
             reclaimed_broadcasted_at: parse_optional_datetime(&row, "reclaimed_broadcasted_at")?,
+            paid_out_at: parse_optional_datetime(&row, "paid_out_at")?,
+            payout_ln_invoice: row.get("payout_ln_invoice"),
         })
     }
 }
@@ -195,6 +238,8 @@ impl AddEntry {
             paid_at: None,
             sellback_broadcasted_at: None,
             reclaimed_broadcasted_at: None,
+            paid_out_at: None,
+            payout_ln_invoice: None,
         }
     }
 }

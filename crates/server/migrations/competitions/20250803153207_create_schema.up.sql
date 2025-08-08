@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS entries (
     payout_preimage TEXT,                           -- Provided by user on payout, encrypted by coordinator_key
     sellback_broadcasted_at DATETIME,               -- When on chain sellback broadcasted by coordinator for cooperative lightning payout
     reclaimed_broadcasted_at DATETIME,              -- When on chain reclaim broadcasted by coordinator for uncooperative payout
-    signed_at DATETIME,                             -- When user completes musig signing
+    signed_at DATETIME                              -- When user completes musig signing
  );
 
 -- every lightning payout attempt will be recorded in the payouts table

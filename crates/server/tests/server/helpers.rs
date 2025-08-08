@@ -90,6 +90,7 @@ mock! {
         async fn cancel_hold_invoice(&self, ticket_hash: String) -> Result<(), anyhow::Error>;
         async fn settle_hold_invoice(&self, ticket_preimage: String) -> Result<(), anyhow::Error>;
         async fn lookup_invoice(&self, r_hash: &str) -> Result<server::InvoiceLookupResponse, anyhow::Error>;
+        async fn lookup_payment(&self, r_hash: &str) -> Result<server::PaymentLookupResponse, anyhow::Error>;
         async fn add_hold_invoice(
             &self,
             value: u64,

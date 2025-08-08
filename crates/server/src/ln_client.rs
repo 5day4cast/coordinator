@@ -95,6 +95,7 @@ pub struct PaymentLookupResponse {
     pub fee_sat: String,
     pub fee_msat: String,
     pub creation_time_ns: String,
+    pub failure_reason: String,
 }
 
 //TODO: we might need to add tls cert as an option, skipping for now
@@ -516,17 +517,42 @@ impl Ln for LnClient {
         timeout_seconds: u64,
         fee_limit_sat: u64,
     ) -> Result<(), anyhow::Error> {
-        let body = json!({
-            "payment_request": payout_payment_request,
-            "timeout_seconds": timeout_seconds,
-            "amt": amount_sats,
-            "fee_limit_sat": fee_limit_sat.to_string(),
-            "allow_self_payment": true,
-        });
+        let invoice = Bolt11Invoice::from_str(&payout_payment_request)
+            .map_err(|e| anyhow!("invalid invoice: {}", e))?;
+        if let Some(val) = invoice.amount_milli_satoshis() {
+            if val != (amount_sats * 1000) {
+                return Err(anyhow!(
+                    "Invoice amount {} does not equal the requested amount {}",
+                    val,
+                    amount_sats
+                ));
+            }
+        }
+
+        let body = if amount_sats > 0 && invoice.amount_milli_satoshis().is_none() {
+            json!({
+                "payment_request": payout_payment_request,
+                "timeout_seconds": timeout_seconds,
+                "fee_limit_sat": fee_limit_sat.to_string(),
+                "amt": amount_sats,
+                "allow_self_payment": true,
+            })
+        } else {
+            json!({
+                "payment_request": payout_payment_request,
+                "timeout_seconds": timeout_seconds,
+                "fee_limit_sat": fee_limit_sat.to_string(),
+                "allow_self_payment": true,
+            })
+        };
+
         debug!("sending payment: {:?}", body);
+        let url = format!("{}v2/router/send", self.base_url);
+        debug!("Making payment request to: {}", url);
+
         let response = self
             .client
-            .post(format!("{}v2/router/send", self.base_url))
+            .post(url)
             .json(&body)
             .header(MACAROON_HEADER, self.macaroon.expose_secret())
             .timeout(Duration::from_secs(timeout_seconds))
@@ -534,7 +560,10 @@ impl Ln for LnClient {
             .await;
 
         match response {
-            Ok(_) => Ok(()),
+            Ok(response) => {
+                info!("Payment: {}", response.text().await.unwrap());
+                Ok(())
+            }
             Err(e) if e.is_timeout() => {
                 debug!("Payment request timed out (expected): {}", e);
                 Ok(())

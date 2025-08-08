@@ -1,7 +1,7 @@
 use crate::{
     add_event_entry, admin_index_handler, create_competition, create_folder,
     db::{DBConnection, DatabasePoolConfig},
-    domain::{CompetitionStore, CompetitionWatcher, InvoiceWatcher, UserInfo},
+    domain::{CompetitionStore, CompetitionWatcher, InvoiceWatcher, PayoutWatcher, UserInfo},
     get_aggregate_nonces, get_balance, get_competitions, get_contract_parameters, get_entries,
     get_estimated_fee_rates, get_next_address, get_outputs, get_ticket_status, health,
     index_handler, login, register, request_competition_ticket, send_to_address,
@@ -273,6 +273,21 @@ pub async fn build_app(
 
     threads.insert("invoice_watcher".to_string(), invoice_watcher_handle);
 
+    let payout_watcher = PayoutWatcher::new(
+        coordinator.clone(),
+        ln.clone(),
+        cancel_token.clone(),
+        Duration::from_secs(config.ln_settings.payout_watch_interval),
+    );
+
+    let payout_watcher_handle = tokio::spawn(async move {
+        if let Err(e) = payout_watcher.watch().await {
+            error!("Payout watcher error: {}", e);
+        }
+    });
+
+    threads.insert("payout_watcher".to_string(), payout_watcher_handle);
+
     let app_state = AppState {
         ui_dir: config.ui_settings.ui_dir,
         private_url: config.ui_settings.private_url,
@@ -412,8 +427,8 @@ async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {
 pub fn build_reqwest_client() -> ClientWithMiddleware {
     let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
     ClientBuilder::new(Client::new())
-        .with(LoggingMiddleware)
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+        .with(LoggingMiddleware)
         .build()
 }
 

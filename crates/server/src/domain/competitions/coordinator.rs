@@ -2384,9 +2384,12 @@ impl Coordinator {
             .get(&entry.id)
             .ok_or_else(|| Error::NotFound("Ticket not found".into()))?;
 
-        // Verify the entry hasn't already been paid out
-        if entry.paid_out_at.is_some() {
-            return Err(Error::BadRequest("Entry already paid out".into()));
+        // Verify the entry hasn't already been paid out or pending a payout
+        if let Some(paid_out_at) = entry.paid_out_at {
+            return Err(Error::BadRequest(format!(
+                "Entry {} already paid out at {}",
+                entry.id, paid_out_at
+            )));
         }
 
         // Get the current outcome
@@ -2512,6 +2515,8 @@ impl Coordinator {
                     )
                     .await
                     .map_err(Error::DbError)
+                    .inspect(|pay_out_id| info!("Payout initiated with ID: {}", pay_out_id))
+                    .map(|_| ())
             }
             Err(e) => {
                 return Err(Error::PaymentFailed(format!(
