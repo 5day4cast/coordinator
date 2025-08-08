@@ -55,6 +55,80 @@ pub enum EntryStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntryPayout {
+    /// Client needs to provide a valid Uuidv7
+    pub id: Uuid,
+    pub entry_id: Uuid,
+    pub payout_status: PayoutStatus,
+    // User provide invoice to pay out user via lightning
+    pub payout_payment_request: String,
+    //  Amount paid out to user in sats via lightning
+    pub payout_amount_sats: u64,
+    #[serde(with = "time::serde::rfc3339")]
+    /// Time at which the payout initiated to the user
+    pub initiated_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    /// Time at which the payout completed
+    pub succeed_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    /// Time at which the payout failed
+    pub failed_at: Option<OffsetDateTime>,
+    /// Why the payout failed
+    pub error: Option<PayoutError>,
+}
+
+impl FromRow<'_, SqliteRow> for EntryPayout {
+    fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
+        let succeed_at: Option<OffsetDateTime> = parse_optional_datetime(row, "succeed_at")?;
+        let failed_at: Option<OffsetDateTime> = parse_optional_datetime(row, "failed_at")?;
+
+        let payout_status = if succeed_at.is_some() {
+            PayoutStatus::Succeeded
+        } else if failed_at.is_some() {
+            PayoutStatus::Failed
+        } else {
+            PayoutStatus::Pending
+        };
+
+        Ok(EntryPayout {
+            id: Uuid::parse_str(&row.get::<String, _>("id")).map_err(|e| {
+                sqlx::Error::ColumnDecode {
+                    index: "id".to_string(),
+                    source: Box::new(e),
+                }
+            })?,
+            entry_id: Uuid::parse_str(&row.get::<String, _>("entry_id")).map_err(|e| {
+                sqlx::Error::ColumnDecode {
+                    index: "entry_id".to_string(),
+                    source: Box::new(e),
+                }
+            })?,
+            payout_status,
+            payout_payment_request: row.try_get("payout_payment_request")?,
+            payout_amount_sats: row.try_get("payout_amount_sats").unwrap_or(0) as u64,
+            initiated_at: parse_required_datetime(row, "initiated_at")?,
+            succeed_at,
+            failed_at,
+            error: parse_optional_blob_json(row, "error")?.unwrap_or_default(),
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PayoutStatus {
+    Pending,
+    Succeeded,
+    Failed,
+}
+
+#[derive(thiserror::Error, Debug, Serialize, Clone, Deserialize)]
+pub enum PayoutError {
+    #[error("Failed to pay out user: {0}")]
+    FailedToPayOut(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserEntry {
     pub id: Uuid,
     /// The id used by the oracle to assoicate the event with this entry
@@ -82,8 +156,6 @@ pub struct UserEntry {
     pub ephemeral_privatekey: Option<String>,
     /// User provided preimage de-encrypted, only used during payout
     pub payout_preimage: Option<String>,
-    /// User provided lightning invoice, coordinator pays to user
-    pub payout_ln_invoice: Option<String>,
     pub public_nonces: Option<SigMap<PubNonce>>,
     /// User signed funding psbt
     pub funding_psbt_base64: Option<String>,
@@ -93,11 +165,13 @@ pub struct UserEntry {
     #[serde(with = "time::serde::rfc3339::option")]
     pub paid_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
-    pub paid_out_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
     pub sellback_broadcasted_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub reclaimed_broadcasted_at: Option<OffsetDateTime>,
+    // If we have any pending/completed paid out lightning payments, this should be their latest one
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub paid_out_at: Option<OffsetDateTime>,
+    pub payout_ln_invoice: Option<String>,
 }
 
 impl FromRow<'_, SqliteRow> for UserEntry {
@@ -129,15 +203,15 @@ impl FromRow<'_, SqliteRow> for UserEntry {
             entry_submission: parse_required_blob_json(row, "entry_submission")?,
             ephemeral_privatekey: row.get("ephemeral_privatekey"),
             payout_preimage: row.get("payout_preimage"),
-            payout_ln_invoice: row.get("payout_ln_invoice"),
             public_nonces: parse_optional_blob_json(row, "public_nonces")?,
             funding_psbt_base64: row.get("funding_psbt_base64"),
             partial_signatures: parse_optional_blob_json(row, "partial_signatures")?,
-            signed_at: parse_optional_sqlite_datetime(&row, "signed_at")?, // SQLite functio
+            signed_at: parse_optional_sqlite_datetime(&row, "signed_at")?,
             paid_at: parse_optional_sqlite_datetime(&row, "paid_at")?,
-            paid_out_at: parse_optional_datetime(&row, "paid_out_at")?,
             sellback_broadcasted_at: parse_optional_datetime(&row, "sellback_broadcasted_at")?,
             reclaimed_broadcasted_at: parse_optional_datetime(&row, "reclaimed_broadcasted_at")?,
+            paid_out_at: parse_optional_datetime(&row, "paid_out_at")?,
+            payout_ln_invoice: row.get("payout_ln_invoice"),
         })
     }
 }
@@ -161,11 +235,11 @@ impl AddEntry {
             public_nonces: None,
             ephemeral_privatekey: None,
             payout_preimage: None,
-            payout_ln_invoice: None,
             paid_at: None,
-            paid_out_at: None,
             sellback_broadcasted_at: None,
             reclaimed_broadcasted_at: None,
+            paid_out_at: None,
+            payout_ln_invoice: None,
         }
     }
 }
@@ -178,6 +252,10 @@ pub struct PayoutInfo {
     /// prior to paying us out via the ln invoice (the funds are still controlled by us,
     /// but now we're also giving access to the coordinator). If the coordinator is
     /// malicious we would need to broadcast the split transaction before them to get paid.
+    ///
+    /// Key point: The coordinator DOES NOT have unilateral control over the funds
+    /// (since we can still broadcast the split transaction before them)
+    ///
     /// The coordinator is incentivized to wait until all users have paid out as their reclaim/closing
     /// transaction becomes much cheaper. In a perfect world we would encrypt this preimage & ephemeral private key
     /// via AES with the ln_invoice's preimage and add a zkproof to allow the coordinator to

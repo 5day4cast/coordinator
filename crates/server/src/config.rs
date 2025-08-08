@@ -153,6 +153,8 @@ pub struct LnSettings {
     pub tls_cert_path: Option<String>,
     /// Interval in seconds to check for new invoices
     pub invoice_watch_interval: u64,
+    /// Interval in seconds to check for new payouts
+    pub payout_watch_interval: u64,
 }
 
 impl Default for LnSettings {
@@ -162,6 +164,7 @@ impl Default for LnSettings {
             macaroon_file_path: String::from("./creds/admin.macaroon"),
             tls_cert_path: Some(String::from("./creds/tls.cert")),
             invoice_watch_interval: 5,
+            payout_watch_interval: 5,
         }
     }
 }

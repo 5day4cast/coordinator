@@ -2,6 +2,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use base64::Engine;
 use bdk_wallet::bitcoin::hashes::{sha256, Hash};
+use lightning_invoice::Bolt11Invoice;
 use log::{debug, info};
 use reqwest_middleware::{
     reqwest::{Certificate, Client, Url},
@@ -14,12 +15,13 @@ use serde_json::json;
 use std::{
     fs::{self, metadata},
     path::Path,
+    str::FromStr,
     time::Duration,
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
-use crate::LnSettings;
+use crate::{domain::PaymentStatus, LnSettings};
 
 #[async_trait]
 pub trait Ln: Send + Sync {
@@ -47,9 +49,11 @@ pub trait Ln: Send + Sync {
     async fn cancel_hold_invoice(&self, ticket_hash: String) -> Result<(), anyhow::Error>;
     async fn settle_hold_invoice(&self, ticket_preimage: String) -> Result<(), anyhow::Error>;
     async fn lookup_invoice(&self, r_hash: &str) -> Result<InvoiceLookupResponse, anyhow::Error>;
+    async fn lookup_payment(&self, r_hash: &str) -> Result<PaymentLookupResponse, anyhow::Error>;
     async fn send_payment(
         &self,
         payout_payment_request: String,
+        amount_sats: u64,
         timeout_seconds: u64,
         fee_limit_sat: u64,
     ) -> Result<(), anyhow::Error>;
@@ -75,6 +79,23 @@ pub struct InvoiceLookupResponse {
     pub settle_date: String,
     pub payment_request: String,
     pub expiry: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PaymentLookupResponse {
+    pub payment_hash: String,
+    pub value: String,
+    pub creation_date: String,
+    pub fee: String,
+    pub payment_preimage: Option<String>,
+    pub value_sat: String,
+    pub value_msat: String,
+    pub payment_request: String,
+    pub status: PaymentStatus,
+    pub fee_sat: String,
+    pub fee_msat: String,
+    pub creation_time_ns: String,
+    pub failure_reason: String,
 }
 
 //TODO: we might need to add tls cert as an option, skipping for now
@@ -458,22 +479,80 @@ impl Ln for LnClient {
         Ok(invoice)
     }
 
+    async fn lookup_payment(&self, r_hash: &str) -> Result<PaymentLookupResponse, anyhow::Error> {
+        let hash_bytes =
+            hex::decode(&r_hash).map_err(|e| anyhow!("Failed to decode hex hash: {}", e))?;
+
+        if hash_bytes.len() != 32 {
+            return Err(anyhow!(
+                "Hash must be 32 bytes, got {} bytes",
+                hash_bytes.len()
+            ));
+        }
+
+        let hash_base64 = base64::engine::general_purpose::URL_SAFE.encode(&hash_bytes);
+
+        let response = self
+            .client
+            .get(format!(
+                "{}/v2/router/track/{}?no_inflight_updates=true",
+                self.base_url, hash_base64
+            ))
+            .header(MACAROON_HEADER, self.macaroon.expose_secret())
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("Failed to lookup invoice: {}", response.status()));
+        }
+
+        let payment = response.json::<PaymentLookupResponse>().await?;
+        Ok(payment)
+    }
+
     async fn send_payment(
         &self,
         payout_payment_request: String,
+        amount_sats: u64,
         timeout_seconds: u64,
         fee_limit_sat: u64,
     ) -> Result<(), anyhow::Error> {
-        let body = json!({
-            "payment_request": payout_payment_request,
-            "timeout_seconds": timeout_seconds,
-            "fee_limit_sat": fee_limit_sat.to_string(),
-            "allow_self_payment": true,
-        });
+        let invoice = Bolt11Invoice::from_str(&payout_payment_request)
+            .map_err(|e| anyhow!("invalid invoice: {}", e))?;
+        if let Some(val) = invoice.amount_milli_satoshis() {
+            if val != (amount_sats * 1000) {
+                return Err(anyhow!(
+                    "Invoice amount {} does not equal the requested amount {}",
+                    val,
+                    amount_sats
+                ));
+            }
+        }
+
+        let body = if amount_sats > 0 && invoice.amount_milli_satoshis().is_none() {
+            json!({
+                "payment_request": payout_payment_request,
+                "timeout_seconds": timeout_seconds,
+                "fee_limit_sat": fee_limit_sat.to_string(),
+                "amt": amount_sats,
+                "allow_self_payment": true,
+            })
+        } else {
+            json!({
+                "payment_request": payout_payment_request,
+                "timeout_seconds": timeout_seconds,
+                "fee_limit_sat": fee_limit_sat.to_string(),
+                "allow_self_payment": true,
+            })
+        };
+
         debug!("sending payment: {:?}", body);
+        let url = format!("{}v2/router/send", self.base_url);
+        debug!("Making payment request to: {}", url);
+
         let response = self
             .client
-            .post(format!("{}v2/router/send", self.base_url))
+            .post(url)
             .json(&body)
             .header(MACAROON_HEADER, self.macaroon.expose_secret())
             .timeout(Duration::from_secs(timeout_seconds))
@@ -481,7 +560,10 @@ impl Ln for LnClient {
             .await;
 
         match response {
-            Ok(_) => Ok(()),
+            Ok(response) => {
+                info!("Payment: {}", response.text().await.unwrap());
+                Ok(())
+            }
             Err(e) if e.is_timeout() => {
                 debug!("Payment request timed out (expected): {}", e);
                 Ok(())
@@ -489,4 +571,20 @@ impl Ln for LnClient {
             Err(e) => Err(anyhow::anyhow!("Failed to send payment: {}", e)),
         }
     }
+}
+
+pub fn extract_payment_hash_from_invoice(payment_request: &str) -> Result<String, anyhow::Error> {
+    let invoice = Bolt11Invoice::from_str(payment_request)
+        .map_err(|e| anyhow::anyhow!("Failed to parse BOLT11 invoice: {}", e))?;
+
+    let payment_hash = invoice.payment_hash();
+    Ok(hex::encode(payment_hash.as_byte_array()))
+}
+
+pub fn extract_amount_from_invoice(payment_request: &str) -> Result<Option<u64>, anyhow::Error> {
+    let invoice = Bolt11Invoice::from_str(payment_request)
+        .map_err(|e| anyhow::anyhow!("Failed to parse BOLT11 invoice: {}", e))?;
+
+    let amt = invoice.amount_milli_satoshis().map(|amount| amount / 1000);
+    Ok(amt)
 }

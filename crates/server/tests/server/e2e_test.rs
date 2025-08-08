@@ -103,6 +103,7 @@ impl TestContext {
             macaroon_file_path: String::from("./test_data/coord_ln/admin.macaroon"),
             tls_cert_path: Some(String::from("./test_data/coord_ln/tls.cert")),
             invoice_watch_interval: 10,
+            payout_watch_interval: 10,
         };
 
         let ln = LnClient::new(client, coordinator_ln).await?;
@@ -194,6 +195,7 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
         macaroon_file_path: String::from("./test_data/alice_ln/admin.macaroon"),
         tls_cert_path: Some(String::from("./test_data/alice_ln/tls.cert")),
         invoice_watch_interval: 10,
+        payout_watch_interval: 10,
     };
     let alice_ln = LnClient::new(client.clone(), alice).await?;
     alice_ln.ping().await?;
@@ -202,6 +204,7 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
         macaroon_file_path: String::from("./test_data/bob_ln/admin.macaroon"),
         tls_cert_path: Some(String::from("./test_data/bob_ln/tls.cert")),
         invoice_watch_interval: 10,
+        payout_watch_interval: 10,
     };
     let bob_ln = LnClient::new(client.clone(), bob).await?;
     bob_ln.ping().await?;
@@ -256,10 +259,12 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
             .request_ticket(nostr_bech32.clone(), competition.id, btc_pubkey)
             .await?;
         debug!("ticket: {:?}", ticket_response);
+
         // Actually pay the invoice using the user's lightning node
         user_ln_client
             .send_payment(
                 ticket_response.payment_request.clone(),
+                ticket_response.amount_sats,
                 300,  // timeout in seconds
                 1000, // fee limit in sats
             )
@@ -503,7 +508,7 @@ async fn test_two_person_competition_flow_with_real_lightning() -> Result<()> {
     let participant = ordered_participants[winning_entry_index as usize].clone();
 
     // Create a real invoice with the expected payout amount (should be entry fee)
-    let payout_amount = competition.event_submission.entry_fee as u64;
+    let payout_amount = competition.event_submission.total_competition_pool as u64;
     let ln_invoice = participant
         .ln_client
         .create_invoice(
@@ -657,6 +662,7 @@ async fn test_two_person_competition_flow_nobody_wins_with_real_lightning() -> R
         macaroon_file_path: String::from("./test_data/alice_ln/admin.macaroon"),
         tls_cert_path: Some(String::from("./test_data/alice_ln/tls.cert")),
         invoice_watch_interval: 10,
+        payout_watch_interval: 10,
     };
     let alice_ln = LnClient::new(client.clone(), alice).await?;
     alice_ln.ping().await?;
@@ -665,6 +671,7 @@ async fn test_two_person_competition_flow_nobody_wins_with_real_lightning() -> R
         macaroon_file_path: String::from("./test_data/bob_ln/admin.macaroon"),
         tls_cert_path: Some(String::from("./test_data/bob_ln/tls.cert")),
         invoice_watch_interval: 10,
+        payout_watch_interval: 10,
     };
     let bob_ln = LnClient::new(client.clone(), bob).await?;
     bob_ln.ping().await?;
@@ -718,6 +725,7 @@ async fn test_two_person_competition_flow_nobody_wins_with_real_lightning() -> R
         user_ln_client
             .send_payment(
                 ticket_response.payment_request.clone(),
+                ticket_response.amount_sats,
                 300,  // timeout in seconds
                 1000, // fee limit in sats
             )
@@ -960,7 +968,9 @@ async fn test_two_person_competition_flow_nobody_wins_with_real_lightning() -> R
     // All players should be able to claim a refund from this competition via lightning
     for participant in ordered_participants.iter() {
         // Create a real invoice with the expected payout amount
-        let payout_amount = competition.event_submission.total_competition_pool as u64; // Or calculate based on winner's share
+        let payout_amount = competition.event_submission.total_competition_pool as u64
+            / ordered_participants.len() as u64;
+
         let ln_invoice = participant
             .ln_client
             .create_invoice(
@@ -1111,6 +1121,7 @@ async fn test_two_person_competition_flow_contract_expires_with_real_lightning()
         macaroon_file_path: String::from("./test_data/alice_ln/admin.macaroon"),
         tls_cert_path: Some(String::from("./test_data/alice_ln/tls.cert")),
         invoice_watch_interval: 10,
+        payout_watch_interval: 10,
     };
     let alice_ln = LnClient::new(client.clone(), alice).await?;
     alice_ln.ping().await?;
@@ -1119,6 +1130,7 @@ async fn test_two_person_competition_flow_contract_expires_with_real_lightning()
         macaroon_file_path: String::from("./test_data/bob_ln/admin.macaroon"),
         tls_cert_path: Some(String::from("./test_data/bob_ln/tls.cert")),
         invoice_watch_interval: 10,
+        payout_watch_interval: 10,
     };
     let bob_ln = LnClient::new(client.clone(), bob).await?;
     bob_ln.ping().await?;
@@ -1173,6 +1185,7 @@ async fn test_two_person_competition_flow_contract_expires_with_real_lightning()
         user_ln_client
             .send_payment(
                 ticket_response.payment_request.clone(),
+                ticket_response.amount_sats,
                 300,  // timeout in seconds
                 1000, // fee limit in sats
             )
