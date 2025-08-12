@@ -182,6 +182,7 @@ pub async fn build_app(
         &config.db_settings.data_folder,
         "competitions",
         pool_config.clone(),
+        crate::DatabaseType::Competitions,
     )
     .await
     .map_err(|e| anyhow!("Error setting up competition db: {}", e))?;
@@ -192,6 +193,7 @@ pub async fn build_app(
         &config.db_settings.data_folder,
         "users",
         pool_config.clone(),
+        crate::DatabaseType::Users,
     )
     .await
     .map_err(|e| anyhow!("Error setting up users db: {}", e))?;
@@ -317,8 +319,7 @@ pub async fn build_server(
     >,
     anyhow::Error,
 > {
-    let std_listener = std::net::TcpListener::bind(socket_addr)?;
-    let listener = TcpListener::from_std(std_listener)?;
+    let listener = TcpListener::bind(socket_addr).await?;
 
     info!("Setting up service");
     let app = app(app_state, serve_dir, serve_admin_dir, origins);

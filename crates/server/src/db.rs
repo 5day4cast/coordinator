@@ -167,7 +167,11 @@ impl SqliteConfig {
                 options = options.filename(&memory_uri);
             }
             SqliteMode::ReadOnly => {
-                options = options.filename(database_path).read_only(true);
+                return options
+                    .filename(database_path)
+                    .read_only(true)
+                    .shared_cache(matches!(self.cache, SqliteCache::Shared))
+                    .busy_timeout(StdDuration::from_millis(self.busy_timeout_ms as u64));
             }
             SqliteMode::ReadWrite => {
                 options = options.filename(database_path).read_only(false);
@@ -386,6 +390,14 @@ impl From<crate::config::DBSettings> for DatabasePoolConfig {
     }
 }
 
+static COMPETITIONS_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/competitions");
+static USERS_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/users");
+
+pub enum DatabaseType {
+    Competitions,
+    Users,
+}
+
 #[derive(Clone, Debug)]
 pub struct DBConnection {
     pub database_name: String,
@@ -399,6 +411,7 @@ impl DBConnection {
         path: &str,
         db_name: &str,
         database_pool_config: DatabasePoolConfig,
+        db_type: DatabaseType,
     ) -> Result<Self, sqlx::Error> {
         let database_path = format!("{}/{}.db", path, db_name);
 
@@ -413,6 +426,16 @@ impl DBConnection {
         // Create separate read and write pools
         let (read_pool, write_pool) =
             Self::create_pools(&database_path, &database_pool_config).await?;
+
+        let migrator = match db_type {
+            DatabaseType::Competitions => &COMPETITIONS_MIGRATOR,
+            DatabaseType::Users => &USERS_MIGRATOR,
+        };
+
+        migrator
+            .run(&write_pool)
+            .await
+            .map_err(|e| sqlx::Error::Migrate(Box::new(e)))?;
 
         Ok(Self {
             database_name: db_name.to_string(),
@@ -459,35 +482,17 @@ impl DBConnection {
                 (read_config, write_config)
             } else {
                 // For file mode, create separate read-only and read-write pools
-                let read_config = SqliteConfig {
-                    mode: SqliteMode::ReadOnly,
-                    cache_size: database_pool_config.sqlite_config.cache_size * 2, // Larger cache for reads
-                    synchronous: SynchronousMode::OFF, // No writes = no sync needed
-                    ..database_pool_config.sqlite_config.clone()
-                };
+                let mut read_config = SqliteConfig::read_only();
+                read_config.cache_size = database_pool_config.sqlite_config.cache_size * 2; // Larger cache for reads
+                read_config.busy_timeout_ms = database_pool_config.sqlite_config.busy_timeout_ms;
 
                 let write_config = SqliteConfig {
-                    mode: SqliteMode::ReadWriteCreate,
+                    mode: SqliteMode::ReadWrite,
                     ..database_pool_config.sqlite_config.clone()
                 };
 
                 (read_config, write_config)
             };
-
-        let read_connection = read_config.build_connect_options(database_path);
-        debug!("Read connection: {:?}", read_connection);
-
-        let read_pool = SqlitePoolOptions::new()
-            .max_connections(database_pool_config.read_max_connections)
-            .min_connections(database_pool_config.read_min_connections)
-            .acquire_timeout(StdDuration::from_secs(
-                database_pool_config.acquire_timeout_secs,
-            ))
-            .idle_timeout(StdDuration::from_secs(
-                database_pool_config.idle_timeout_secs,
-            ))
-            .connect_with(read_connection)
-            .await?;
 
         let write_connection = write_config.build_connect_options(database_path);
         debug!("Write connection: {:?}", write_connection);
@@ -504,30 +509,22 @@ impl DBConnection {
             .connect_with(write_connection)
             .await?;
 
+        let read_connection = read_config.build_connect_options(database_path);
+        debug!("Read connection: {:?}", read_connection);
+
+        let read_pool = SqlitePoolOptions::new()
+            .max_connections(database_pool_config.read_max_connections)
+            .min_connections(database_pool_config.read_min_connections)
+            .acquire_timeout(StdDuration::from_secs(
+                database_pool_config.acquire_timeout_secs,
+            ))
+            .idle_timeout(StdDuration::from_secs(
+                database_pool_config.idle_timeout_secs,
+            ))
+            .connect_with(read_connection)
+            .await?;
+
         Ok((read_pool, write_pool))
-    }
-
-    // Run migrations automatically after creation
-    pub async fn with_migrations(
-        path: &str,
-        db_name: &str,
-        database_pool_config: DatabasePoolConfig,
-        migrations_path: &str,
-    ) -> Result<Self, sqlx::Error> {
-        let connection = Self::new(path, db_name, database_pool_config).await?;
-        connection
-            .run_migrations_from_path(std::path::Path::new(migrations_path))
-            .await
-            .map_err(|e| sqlx::Error::Migrate(Box::new(e)))?;
-        Ok(connection)
-    }
-
-    pub async fn run_migrations_from_path(
-        &self,
-        migrations_path: &std::path::Path,
-    ) -> Result<(), sqlx::migrate::MigrateError> {
-        let migrator = sqlx::migrate::Migrator::new(migrations_path).await?;
-        migrator.run(&self.write_pool).await
     }
 
     pub async fn ping(&self) -> Result<(), sqlx::Error> {

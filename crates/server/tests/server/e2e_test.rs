@@ -11,8 +11,9 @@ use server::{
     build_reqwest_client, create_folder,
     db::{DBConnection, DatabasePoolConfig},
     domain::{CompetitionState, InvoiceWatcher, PayoutInfo, TicketStatus},
-    setup_logger, Bitcoin, BitcoinClient, CompetitionStore, Coordinator, FinalSignatures, Ln,
-    LnClient, LnSettings, Oracle, OracleEvent, REQUIRED_CONFIRMATIONS_FOR_TIME,
+    setup_logger, Bitcoin, BitcoinClient, CompetitionStore, Coordinator, DatabaseType,
+    FinalSignatures, Ln, LnClient, LnSettings, Oracle, OracleEvent,
+    REQUIRED_CONFIRMATIONS_FOR_TIME,
 };
 use std::{
     collections::HashMap,
@@ -84,16 +85,12 @@ impl TestContext {
             "Insufficient funds for test"
         );
 
-        let migrations_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("migrations")
-            .join("competitions");
-
         let test_db_name = format!("test_competition_db_{}", Uuid::now_v7());
-        let db_connection = DBConnection::with_migrations(
+        let db_connection = DBConnection::new(
             test_data_folder,
             &test_db_name,
             DatabasePoolConfig::testing(),
-            migrations_path.to_str().unwrap(),
+            DatabaseType::Competitions,
         )
         .await?;
         let competition_store = CompetitionStore::new(db_connection.clone());
