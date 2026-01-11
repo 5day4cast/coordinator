@@ -11,55 +11,114 @@ spec:
       {{- include "coordinator.selectorLabels" . | nindent 6 }}
   template:
     metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       labels:
-        {{- include "coordinator.selectorLabels" . | nindent 8 }}
+        {{- include "coordinator.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "coordinator.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if .Values.litestream.enabled }}
+      initContainers:
+        - name: litestream-restore
+          image: "{{ .Values.litestream.image.repository }}:{{ .Values.litestream.image.tag }}"
+          args:
+            - restore
+            - -if-db-not-exists
+            - -if-replica-exists
+            - "{{ .Values.persistence.mountPath }}/coordinator.db"
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+            - name: litestream-config
+              mountPath: /etc/litestream.yml
+              subPath: litestream.yml
+          {{- if .Values.litestream.s3Endpoint }}
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: "testing"
+            - name: AWS_SECRET_ACCESS_KEY
+              value: "testing"
+          {{- end }}
+      {{- end }}
       containers:
         - name: {{ .Chart.Name }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: {{ include "coordinator.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--config"
+            - "/etc/coordinator/config.toml"
           ports:
             - name: http
-              containerPort: 8080
+              containerPort: {{ .Values.service.port }}
               protocol: TCP
           env:
             - name: RUST_LOG
               value: {{ .Values.config.logLevel }}
-            - name: DATABASE_PATH
-              value: {{ .Values.config.dbPath }}
-            - name: KEYMELD_URL
-              value: {{ .Values.keymeld.url }}
-            - name: ORACLE_URL
-              value: {{ .Values.oracle.url }}
-            - name: BITCOIN_RPC_HOST
-              value: {{ .Values.bitcoin.rpcHost }}
-            - name: BITCOIN_RPC_PORT
-              value: "{{ .Values.bitcoin.rpcPort }}"
-            - name: BITCOIN_RPC_USER
-              value: {{ .Values.bitcoin.rpcUser }}
-            - name: BITCOIN_RPC_PASSWORD
-              value: {{ .Values.bitcoin.rpcPassword }}
-            - name: LND_HOST
-              value: {{ .Values.lnd.host }}
-            - name: LND_RPC_PORT
-              value: "{{ .Values.lnd.rpcPort }}"
+            {{- range $key, $value := .Values.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          {{- with .Values.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           volumeMounts:
             - name: data
               mountPath: {{ .Values.persistence.mountPath }}
+            - name: config
+              mountPath: /etc/coordinator
+            - name: secrets
+              mountPath: /etc/coordinator/secrets
+              readOnly: true
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: http
-            initialDelaySeconds: 30
-            periodSeconds: 30
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: http
-            initialDelaySeconds: 10
-            periodSeconds: 10
+        {{- if .Values.litestream.enabled }}
+        - name: litestream
+          image: "{{ .Values.litestream.image.repository }}:{{ .Values.litestream.image.tag }}"
+          args:
+            - replicate
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+            - name: litestream-config
+              mountPath: /etc/litestream.yml
+              subPath: litestream.yml
+          {{- if .Values.litestream.s3Endpoint }}
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: "testing"
+            - name: AWS_SECRET_ACCESS_KEY
+              value: "testing"
+          {{- end }}
+          resources:
+            requests:
+              memory: 32Mi
+              cpu: 10m
+            limits:
+              memory: 64Mi
+        {{- end }}
       volumes:
         - name: data
           {{- if .Values.persistence.enabled }}
@@ -68,3 +127,47 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        - name: config
+          configMap:
+            name: {{ include "coordinator.fullname" . }}
+        - name: secrets
+          projected:
+            sources:
+              {{- if .Values.secrets.privateKey.existingSecret }}
+              - secret:
+                  name: {{ .Values.secrets.privateKey.existingSecret }}
+                  items:
+                    - key: {{ .Values.secrets.privateKey.key }}
+                      path: private-key.pem
+              {{- end }}
+              {{- if .Values.secrets.lndMacaroon.existingSecret }}
+              - secret:
+                  name: {{ .Values.secrets.lndMacaroon.existingSecret }}
+                  items:
+                    - key: {{ .Values.secrets.lndMacaroon.key }}
+                      path: admin.macaroon
+              {{- end }}
+              {{- if .Values.secrets.lndTlsCert.existingSecret }}
+              - secret:
+                  name: {{ .Values.secrets.lndTlsCert.existingSecret }}
+                  items:
+                    - key: {{ .Values.secrets.lndTlsCert.key }}
+                      path: tls.cert
+              {{- end }}
+        {{- if .Values.litestream.enabled }}
+        - name: litestream-config
+          configMap:
+            name: {{ include "coordinator.fullname" . }}-litestream
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
