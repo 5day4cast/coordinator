@@ -152,6 +152,7 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         oracle_client: Arc<dyn Oracle>,
         competition_store: CompetitionStore,
@@ -378,10 +379,7 @@ impl Coordinator {
 
             CompetitionStatus::CollectingEntries(state) => {
                 if state.has_all_entries() {
-                    match state.all_entries_collected() {
-                        Ok(next) => next,
-                        Err(same) => same,
-                    }
+                    state.into_awaiting_escrow()
                 } else {
                     CompetitionStatus::CollectingEntries(state)
                 }
