@@ -45,13 +45,22 @@ pub struct KeygenSessionStatus {
 /// Trait for Keymeld signing operations
 #[async_trait]
 pub trait Keymeld: Send + Sync {
-    /// Create a new keygen session for a DLC competition
-    async fn create_dlc_keygen_session(
+    /// Initialize a keygen session without waiting for participants
+    /// This creates the session, registers the coordinator, and returns immediately
+    /// Users will register themselves via the WASM SDK after payment
+    async fn init_keygen_session(
         &self,
         competition_id: Uuid,
         contract_params: &ContractParameters,
         player_user_ids: Vec<UserId>,
     ) -> Result<DlcKeygenSession, KeymeldError>;
+
+    /// Wait for keygen to complete and get the aggregate key
+    /// Called after all participants have registered
+    async fn wait_for_keygen_completion(
+        &self,
+        session: &DlcKeygenSession,
+    ) -> Result<Vec<u8>, KeymeldError>;
 
     /// Get the status of a keygen session (for polling registrations)
     async fn get_keygen_status(
@@ -194,7 +203,7 @@ impl Keymeld for KeymeldService {
         self.settings.enabled && self.client.is_some()
     }
 
-    async fn create_dlc_keygen_session(
+    async fn init_keygen_session(
         &self,
         competition_id: Uuid,
         contract_params: &ContractParameters,
@@ -203,7 +212,7 @@ impl Keymeld for KeymeldService {
         let client = self.get_client()?;
 
         info!(
-            "Creating DLC keygen session for competition {} with {} players",
+            "Initializing keygen session for competition {} with {} players",
             competition_id,
             player_user_ids.len()
         );
@@ -236,28 +245,52 @@ impl Keymeld for KeymeldService {
             .register_self(RegisterOptions::default())
             .await?;
 
-        debug!(
-            "Keygen session {} created, waiting for participants",
-            keygen_session.session_id()
-        );
-
-        // Wait for keygen to complete (all participants joined and keys generated)
-        let _aggregate_key = keygen_session.wait_for_completion().await?;
-
-        // Decrypt the aggregate public key
-        let aggregate_key = keygen_session.decrypt_aggregate_key()?;
-
         info!(
-            "Keygen session {} completed with aggregate key",
+            "Keygen session {} initialized, waiting for user registrations",
             keygen_session.session_id()
         );
 
+        // Return immediately without waiting for other participants
+        // The aggregate_key will be empty until completion - it's set when wait_for_keygen_completion is called
         Ok(DlcKeygenSession {
             session_id: keygen_session.session_id().clone(),
             session_secret: keygen_session.export_session_secret(),
-            aggregate_key,
+            aggregate_key: vec![], // Will be populated when keygen completes
             outcome_subset_ids: subset_info.outcome_subset_ids,
         })
+    }
+
+    async fn wait_for_keygen_completion(
+        &self,
+        session: &DlcKeygenSession,
+    ) -> Result<Vec<u8>, KeymeldError> {
+        let client = self.get_client()?;
+
+        info!(
+            "Waiting for keygen session {} to complete",
+            session.session_id
+        );
+
+        // Restore session from credentials
+        let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
+
+        let mut restored_session = client
+            .keygen()
+            .restore_session(session.session_id.clone(), credentials)
+            .await?;
+
+        // Wait for all participants to register and keygen to complete
+        let _aggregate_key = restored_session.wait_for_completion().await?;
+
+        // Decrypt the aggregate public key
+        let aggregate_key = restored_session.decrypt_aggregate_key()?;
+
+        info!(
+            "Keygen session {} completed with aggregate key",
+            session.session_id
+        );
+
+        Ok(aggregate_key)
     }
 
     async fn sign_dlc_batch(
@@ -363,12 +396,19 @@ impl Keymeld for MockKeymeld {
         false
     }
 
-    async fn create_dlc_keygen_session(
+    async fn init_keygen_session(
         &self,
         _competition_id: Uuid,
         _contract_params: &ContractParameters,
         _player_user_ids: Vec<UserId>,
     ) -> Result<DlcKeygenSession, KeymeldError> {
+        Err(KeymeldError::NotEnabled)
+    }
+
+    async fn wait_for_keygen_completion(
+        &self,
+        _session: &DlcKeygenSession,
+    ) -> Result<Vec<u8>, KeymeldError> {
         Err(KeymeldError::NotEnabled)
     }
 

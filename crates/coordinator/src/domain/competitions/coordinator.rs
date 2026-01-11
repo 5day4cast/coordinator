@@ -1116,12 +1116,30 @@ impl Coordinator {
                 .map(|entry| user_id_from_pubkey(&entry.ephemeral_pubkey))
                 .collect();
 
-            // Create keygen session - this blocks until all participants join
+            // Initialize keygen session - coordinator registers, users register themselves later
             let keygen_session = self
                 .keymeld
-                .create_dlc_keygen_session(competition.id, &contract_params, player_user_ids)
+                .init_keygen_session(competition.id, &contract_params, player_user_ids)
                 .await
-                .map_err(|e| anyhow!("Failed to create keymeld keygen session: {}", e))?;
+                .map_err(|e| anyhow!("Failed to initialize keymeld keygen session: {}", e))?;
+
+            info!(
+                "Keymeld keygen session {} initialized for competition {}",
+                keygen_session.session_id, competition.id
+            );
+
+            // Wait for all participants to register and complete keygen
+            let aggregate_key = self
+                .keymeld
+                .wait_for_keygen_completion(&keygen_session)
+                .await
+                .map_err(|e| anyhow!("Failed to complete keymeld keygen: {}", e))?;
+
+            // Update session with aggregate key
+            let keygen_session = DlcKeygenSession {
+                aggregate_key,
+                ..keygen_session
+            };
 
             info!(
                 "Keymeld keygen session {} completed for competition {}",
