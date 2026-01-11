@@ -590,10 +590,36 @@
           inherit (commonEnvs) SQLX_OFFLINE RUST_LOG CARGO_INCREMENTAL;
         };
 
+
+        # Docker image for k8s deployment
+        docker-coordinator = pkgs.dockerTools.buildLayeredImage {
+          name = "coordinator";
+          tag = "latest";
+          contents = [
+            coordinator
+            pkgs.cacert
+            pkgs.tzdata
+          ];
+          config = {
+            Cmd = [ "${coordinator}/bin/coordinator" ];
+            Env = [
+              "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+              "RUST_LOG=info"
+            ];
+            ExposedPorts = {
+              "8080/tcp" = {};
+            };
+            WorkingDir = "/data";
+            Volumes = {
+              "/data" = {};
+            };
+          };
+        };
+
       in {
         packages = {
           default = coordinator;
-          inherit coordinator wallet-cli;
+          inherit coordinator wallet-cli docker-coordinator;
           inherit start-regtest stop-regtest mine-blocks;
           inherit setup-lnd setup-channels stop-lnd;
           inherit run-keymeld stop-keymeld;

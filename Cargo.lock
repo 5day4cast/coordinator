@@ -860,6 +860,7 @@ dependencies = [
  "dlctix",
  "getrandom 0.2.16",
  "hex",
+ "keymeld-sdk",
  "log",
  "nostr-sdk",
  "rand 0.9.2",
@@ -867,9 +868,12 @@ dependencies = [
  "secrecy",
  "serde",
  "serde-wasm-bindgen",
+ "serde_json",
  "sha2",
  "thiserror 1.0.69",
+ "uuid",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "wasm-logger",
 ]
 
