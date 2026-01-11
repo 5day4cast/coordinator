@@ -216,6 +216,53 @@ impl Coordinator {
         Ok(status.is_completed)
     }
 
+    /// Complete keymeld keygen after all participants have registered
+    /// Waits for keygen to complete and updates the stored session with aggregate key
+    pub async fn complete_keymeld_keygen(
+        &self,
+        competition: &mut Competition,
+    ) -> Result<(), Error> {
+        let stored_session = self
+            .competition_store
+            .get_keymeld_session(competition.id)
+            .await
+            .map_err(Error::DbError)?
+            .ok_or_else(|| {
+                Error::NotFound(format!(
+                    "Keymeld session not found for competition {}",
+                    competition.id
+                ))
+            })?;
+
+        // Decrypt session secret to restore session
+        let session_secret =
+            self.decrypt_session_secret(&stored_session.encrypted_session_secret)?;
+        let session = stored_session.to_session(session_secret);
+
+        // Wait for keygen to complete and get aggregate key
+        let aggregate_key = self
+            .keymeld
+            .wait_for_keygen_completion(&session)
+            .await
+            .map_err(|e| Error::BadRequest(format!("Failed to complete keymeld keygen: {}", e)))?;
+
+        info!(
+            "Keymeld keygen session {} completed for competition {}",
+            session.session_id, competition.id
+        );
+
+        // Update stored session with aggregate key
+        let updated_session = DlcKeygenSession {
+            aggregate_key,
+            ..session
+        };
+
+        self.store_keymeld_session(competition.id, updated_session)
+            .await?;
+
+        Ok(())
+    }
+
     /// Store a Keymeld session for a competition (for use after keygen completes)
     /// The session secret is encrypted to the coordinator's own nostr pubkey before storage
     pub async fn store_keymeld_session(
@@ -496,8 +543,51 @@ impl Coordinator {
                 }
             }
 
-            CompetitionStatus::ContractCreated(state) => {
-                if state.has_nonces() {
+            CompetitionStatus::ContractCreated(mut state) => {
+                if self.is_keymeld_enabled() {
+                    // Keymeld flow: Poll for registrations, then wait for completion
+                    match self
+                        .check_keymeld_registrations(state.competition().id)
+                        .await
+                    {
+                        Ok(true) => {
+                            // All participants registered, wait for keygen to complete
+                            info!(
+                                "All keymeld registrations complete for competition {}, waiting for keygen completion",
+                                state.competition().id
+                            );
+                            match self.complete_keymeld_keygen(state.competition_mut()).await {
+                                Ok(_) => CompetitionStatus::AwaitingSignatures(
+                                    AwaitingSignatures::from_competition(state.into_competition()),
+                                ),
+                                Err(e) => {
+                                    error!(
+                                        "Competition {} keymeld keygen completion failed: {}",
+                                        competition_id, e
+                                    );
+                                    CompetitionStatus::ContractCreated(state)
+                                        .fail(CompetitionError::FailedBroadcast(e.to_string()))
+                                }
+                            }
+                        }
+                        Ok(false) => {
+                            // Still waiting for registrations
+                            debug!(
+                                "Competition {} waiting for keymeld registrations",
+                                state.competition().id
+                            );
+                            CompetitionStatus::ContractCreated(state)
+                        }
+                        Err(e) => {
+                            error!(
+                                "Competition {} failed to check keymeld registrations: {}",
+                                competition_id, e
+                            );
+                            CompetitionStatus::ContractCreated(state)
+                        }
+                    }
+                } else if state.has_nonces() {
+                    // Legacy flow: proceed when we have nonces
                     CompetitionStatus::AwaitingSignatures(AwaitingSignatures::from_competition(
                         state.into_competition(),
                     ))
@@ -1104,7 +1194,7 @@ impl Coordinator {
         debug!("Built ticketed dlc");
 
         if self.is_keymeld_enabled() {
-            // Keymeld flow: Create keygen session and wait for all participants
+            // Keymeld flow: Initialize keygen session, users register themselves
             info!(
                 "Using Keymeld for MuSig2 signing for competition {}",
                 competition.id
@@ -1124,34 +1214,17 @@ impl Coordinator {
                 .map_err(|e| anyhow!("Failed to initialize keymeld keygen session: {}", e))?;
 
             info!(
-                "Keymeld keygen session {} initialized for competition {}",
+                "Keymeld keygen session {} initialized for competition {}, waiting for user registrations",
                 keygen_session.session_id, competition.id
             );
 
-            // Wait for all participants to register and complete keygen
-            let aggregate_key = self
-                .keymeld
-                .wait_for_keygen_completion(&keygen_session)
-                .await
-                .map_err(|e| anyhow!("Failed to complete keymeld keygen: {}", e))?;
-
-            // Update session with aggregate key
-            let keygen_session = DlcKeygenSession {
-                aggregate_key,
-                ..keygen_session
-            };
-
-            info!(
-                "Keymeld keygen session {} completed for competition {}",
-                keygen_session.session_id, competition.id
-            );
-
-            // Store the session for later signing
+            // Store the session immediately - users will get keymeld info after payment
+            // The aggregate_key is empty until all users register and keygen completes
             self.store_keymeld_session(competition.id, keygen_session.clone())
                 .await?;
 
             // For keymeld, we don't use local nonces - set a placeholder to indicate keymeld mode
-            // The actual aggregate key is stored in the keygen session
+            // The actual aggregate key is stored in the keygen session after completion
             if competition.public_nonces.is_none() {
                 // Create empty SigMap to indicate keymeld mode (no local nonces)
                 competition.public_nonces = Some(SigMap {
