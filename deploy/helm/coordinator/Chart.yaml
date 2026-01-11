@@ -1,0 +1,22 @@
+apiVersion: v2
+name: coordinator
+description: DLC competition platform coordinator service for Bitcoin-based prediction markets
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+
+keywords:
+  - dlc
+  - bitcoin
+  - lightning
+  - coordinator
+  - prediction-market
+  - musig2
+
+home: https://github.com/5day4cast/coordinator
+sources:
+  - https://github.com/5day4cast/coordinator
+
+maintainers:
+  - name: tee8z
+    url: https://github.com/tee8z

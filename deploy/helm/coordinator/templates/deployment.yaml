@@ -1,0 +1,173 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "coordinator.fullname" . }}
+  labels:
+    {{- include "coordinator.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "coordinator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "coordinator.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "coordinator.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if .Values.litestream.enabled }}
+      initContainers:
+        - name: litestream-restore
+          image: "{{ .Values.litestream.image.repository }}:{{ .Values.litestream.image.tag }}"
+          args:
+            - restore
+            - -if-db-not-exists
+            - -if-replica-exists
+            - "{{ .Values.persistence.mountPath }}/coordinator.db"
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+            - name: litestream-config
+              mountPath: /etc/litestream.yml
+              subPath: litestream.yml
+          {{- if .Values.litestream.s3Endpoint }}
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: "testing"
+            - name: AWS_SECRET_ACCESS_KEY
+              value: "testing"
+          {{- end }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: {{ include "coordinator.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--config"
+            - "/etc/coordinator/config.toml"
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.config.logLevel }}
+            {{- range $key, $value := .Values.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          {{- with .Values.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+            - name: config
+              mountPath: /etc/coordinator
+            - name: secrets
+              mountPath: /etc/coordinator/secrets
+              readOnly: true
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+        {{- if .Values.litestream.enabled }}
+        - name: litestream
+          image: "{{ .Values.litestream.image.repository }}:{{ .Values.litestream.image.tag }}"
+          args:
+            - replicate
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+            - name: litestream-config
+              mountPath: /etc/litestream.yml
+              subPath: litestream.yml
+          {{- if .Values.litestream.s3Endpoint }}
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: "testing"
+            - name: AWS_SECRET_ACCESS_KEY
+              value: "testing"
+          {{- end }}
+          resources:
+            requests:
+              memory: 32Mi
+              cpu: 10m
+            limits:
+              memory: 64Mi
+        {{- end }}
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "coordinator.fullname" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: config
+          configMap:
+            name: {{ include "coordinator.fullname" . }}
+        - name: secrets
+          projected:
+            sources:
+              {{- if .Values.secrets.privateKey.existingSecret }}
+              - secret:
+                  name: {{ .Values.secrets.privateKey.existingSecret }}
+                  items:
+                    - key: {{ .Values.secrets.privateKey.key }}
+                      path: private-key.pem
+              {{- end }}
+              {{- if .Values.secrets.lndMacaroon.existingSecret }}
+              - secret:
+                  name: {{ .Values.secrets.lndMacaroon.existingSecret }}
+                  items:
+                    - key: {{ .Values.secrets.lndMacaroon.key }}
+                      path: admin.macaroon
+              {{- end }}
+              {{- if .Values.secrets.lndTlsCert.existingSecret }}
+              - secret:
+                  name: {{ .Values.secrets.lndTlsCert.existingSecret }}
+                  items:
+                    - key: {{ .Values.secrets.lndTlsCert.key }}
+                      path: tls.cert
+              {{- end }}
+        {{- if .Values.litestream.enabled }}
+        - name: litestream-config
+          configMap:
+            name: {{ include "coordinator.fullname" . }}-litestream
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,0 +1,103 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "coordinator.fullname" . }}
+  labels:
+    {{- include "coordinator.labels" . | nindent 4 }}
+data:
+  config.toml: |
+    level = {{ .Values.config.logLevel | quote }}
+
+    [db_settings]
+    data_folder = {{ .Values.config.database.dataFolder | quote }}
+    read_max_connections = {{ .Values.config.database.readMaxConnections }}
+    read_min_connections = {{ .Values.config.database.readMinConnections }}
+    write_max_connections = {{ .Values.config.database.writeMaxConnections }}
+    write_min_connections = {{ .Values.config.database.writeMinConnections }}
+    idle_timeout_secs = {{ .Values.config.database.idleTimeoutSecs }}
+    acquire_timeout_secs = {{ .Values.config.database.acquireTimeoutSecs }}
+
+    [db_settings.sqlite_config]
+    mode = {{ .Values.config.database.sqlite.mode | quote }}
+    cache = {{ .Values.config.database.sqlite.cache | quote }}
+    busy_timeout_ms = {{ .Values.config.database.sqlite.busyTimeoutMs }}
+    journal_mode = {{ .Values.config.database.sqlite.journalMode | quote }}
+    synchronous = {{ .Values.config.database.sqlite.synchronous | quote }}
+    cache_size = {{ .Values.config.database.sqlite.cacheSize }}
+    foreign_keys = {{ .Values.config.database.sqlite.foreignKeys }}
+    wal_autocheckpoint = {{ .Values.config.database.sqlite.walAutocheckpoint }}
+    temp_store = {{ .Values.config.database.sqlite.tempStore | quote }}
+    mmap_size = {{ .Values.config.database.sqlite.mmapSize }}
+    page_size = {{ .Values.config.database.sqlite.pageSize }}
+
+    [api_settings]
+    domain = {{ .Values.config.api.domain | quote }}
+    port = {{ .Values.config.api.port | quote }}
+    origins = [{{ range $i, $origin := .Values.config.api.origins }}{{ if $i }}, {{ end }}{{ $origin | quote }}{{ end }}]
+
+    [ui_settings]
+    private_url = {{ .Values.config.ui.privateUrl | quote }}
+    remote_url = {{ .Values.config.ui.remoteUrl | quote }}
+    ui_dir = {{ .Values.config.ui.uiDir | quote }}
+    admin_ui_dir = {{ .Values.config.ui.adminUiDir | quote }}
+
+    [coordinator_settings]
+    name = {{ .Values.config.coordinator.name | quote }}
+    oracle_url = {{ .Values.oracle.url | quote }}
+    private_key_file = "/etc/coordinator/secrets/private-key.pem"
+    relative_locktime_block_delta = {{ .Values.config.coordinator.relativeLockTimeBlockDelta }}
+    required_confirmations = {{ .Values.config.coordinator.requiredConfirmations }}
+    sync_interval_secs = {{ .Values.config.coordinator.syncIntervalSecs }}
+
+    [bitcoin_settings]
+    network = {{ .Values.bitcoin.network | quote }}
+    esplora_url = {{ .Values.bitcoin.esploraUrl | quote }}
+    storage_file = "{{ .Values.config.database.dataFolder }}/bitcoin.db"
+    seed_path = "/etc/coordinator/secrets/private-key.pem"
+    refresh_blocks_secs = {{ .Values.bitcoin.refreshBlocksSecs }}
+
+    [ln_settings]
+    base_url = {{ .Values.lightning.baseUrl | quote }}
+    macaroon_file_path = "/etc/coordinator/secrets/admin.macaroon"
+    {{- if .Values.lightning.tlsCertPath }}
+    tls_cert_path = "/etc/coordinator/secrets/tls.cert"
+    {{- else }}
+    tls_cert_path = ""
+    {{- end }}
+    invoice_watch_interval = {{ .Values.lightning.invoiceWatchIntervalSecs }}
+    payout_watch_interval = {{ .Values.lightning.payoutWatchIntervalSecs }}
+
+    [keymeld_settings]
+    enabled = {{ .Values.keymeld.enabled }}
+    gateway_url = {{ .Values.keymeld.gatewayUrl | quote }}
+    keygen_timeout_secs = {{ .Values.keymeld.keygenTimeoutSecs }}
+    signing_timeout_secs = {{ .Values.keymeld.signingTimeoutSecs }}
+    max_polling_attempts = {{ .Values.keymeld.maxPollingAttempts }}
+    initial_polling_delay_ms = {{ .Values.keymeld.initialPollingDelayMs }}
+    max_polling_delay_ms = {{ .Values.keymeld.maxPollingDelayMs }}
+    polling_backoff_multiplier = {{ .Values.keymeld.pollingBackoffMultiplier }}
+---
+{{- if .Values.litestream.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "coordinator.fullname" . }}-litestream
+  labels:
+    {{- include "coordinator.labels" . | nindent 4 }}
+data:
+  litestream.yml: |
+    dbs:
+      - path: {{ .Values.persistence.mountPath }}/coordinator.db
+        replicas:
+          - type: s3
+            bucket: {{ .Values.litestream.s3Bucket }}
+            path: {{ .Values.litestream.s3Path }}
+            region: {{ .Values.litestream.s3Region }}
+            {{- if .Values.litestream.s3Endpoint }}
+            endpoint: {{ .Values.litestream.s3Endpoint }}
+            force-path-style: {{ .Values.litestream.s3ForcePathStyle }}
+            {{- end }}
+            sync-interval: {{ .Values.litestream.syncInterval }}
+            retention: {{ .Values.litestream.retention }}
+            snapshot-interval: {{ .Values.litestream.snapshotInterval }}
+{{- end }}
