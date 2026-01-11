@@ -1,7 +1,7 @@
 # Refactor Status
 
 **Last Updated:** 2026-01-11
-**Current Phase:** Part 6 Complete (Session Secret Sharing via NIP-44)
+**Current Phase:** Part 7 Complete (Frontend Simplification & E2E Tests)
 
 ---
 
@@ -319,17 +319,81 @@ $ cargo check
 
 ---
 
-## Next: Part 7 - Frontend Architecture (Maud + HTMX)
+## Completed: Part 7 - Frontend Simplification & E2E Tests ✅
+
+### What Was Done
+
+1. **Removed legacy MuSig signing code (~830 lines deleted):**
+   - Deleted `musig_session_manager.js`
+   - Deleted `musig_session_registry.js`
+   - Deleted `signing_progress_ui.js`
+   - Updated `index.html` to remove deleted script references
+
+2. **Added keymeld client for browser:**
+   - Created `keymeld_client.js` with simple keymeld join flow
+   - `joinKeymeldSession()` - Join keygen session with NIP-44 decryption
+   - `pollForKeymeldInfo()` - Poll until payment unlocks keymeld info
+   - `completeKeymeldRegistration()` - Full registration flow
+
+3. **Updated entry submission flow:**
+   - `entry.js` now uses keymeld after payment
+   - User pays → joins keymeld → submits entry
+   - Removed complex MuSig state machine
+
+4. **Added Playwright E2E test framework:**
+   - Created `e2e/package.json` with Playwright dependencies
+   - Created `e2e/playwright.config.ts` for Chromium
+   - Created `e2e/tsconfig.json` for TypeScript support
+   - Created `e2e/tests/entry-submission.spec.ts` with test suites:
+     - Basic UI tests (page load, navigation, modals)
+     - Authentication tests (register, login)
+     - Competition viewing tests
+     - Entry form tests (up to submission, before payment)
+
+5. **Added Playwright to Nix dev environment:**
+   - Added `nodejs_22` and `playwright-driver.browsers` to flake.nix
+   - Set `PLAYWRIGHT_BROWSERS_PATH` and `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD`
+   - Tests run with Nix-provided Chromium
+
+6. **Updated justfile with Playwright commands:**
+   - `playwright-install` - Install npm deps and browsers
+   - `playwright` - Run tests
+   - `playwright-headed` - Run with visible browser
+   - `playwright-ui` - Interactive UI mode
+   - `playwright-debug` - Debug mode
+   - `playwright-codegen` - Record tests
+
+7. **Added missing config:**
+   - Added `[keymeld_settings]` to `config/local.toml`
+
+### Running E2E Tests
+
+```bash
+# Enter nix shell (gets Node.js, Playwright, all services)
+nix develop
+
+# Start services and coordinator
+just start
+just run  # in another terminal
+
+# Run tests
+just playwright-install  # First time only
+just playwright          # Run all tests
+just playwright-headed   # With visible browser
+```
+
+### Notes
+- Full payment/keymeld integration tests should be in a larger harness
+- Current tests cover UI flow up to entry submission (before payment)
+
+---
+
+## Next: Part 8 - Admin UI (Maud + HTMX)
 
 ### Goals
-- Add Maud templates for server-side rendering
-- Use HTMX for dynamic updates without full page reloads
-- Update frontend JS to use keymeld when enabled (fallback to legacy)
-
-### Current Status
-- Frontend still uses legacy MuSig session manager
-- `musig_session_manager.js` polls for nonces and signatures locally
-- Needs to check keymeld endpoint and use WASM `KeymeldParticipant` when enabled
+- Add Maud templates for admin interface
+- Competition management UI
+- User management UI
 
 ---
 
@@ -345,7 +409,7 @@ $ cargo check
 | 4 | Keymeld SDK Integration (Server) | ✅ Complete |
 | 5 | Keymeld SDK Integration (WASM) | ✅ Complete |
 | 6 | Session Secret Sharing (NIP-44) | ✅ Complete |
-| 7 | Frontend Architecture (Maud + HTMX) | Pending |
+| 7 | Frontend Simplification & E2E Tests | ✅ Complete |
 | 8 | Admin UI (Maud + HTMX) | Pending |
 
 ---

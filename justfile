@@ -170,7 +170,7 @@ wallet *args:
     cargo run --bin wallet-cli -- {{args}}
 
 # ============================================
-# E2E Testing
+# E2E Testing (Rust integration tests)
 # ============================================
 
 # Run e2e tests (starts services, runs tests, stops services)
@@ -183,6 +183,34 @@ e2e: start
 # Run e2e tests without managing services (assumes services are running)
 e2e-only:
     cargo test --test e2e -- --test-threads=1
+
+# ============================================
+# Playwright E2E Tests (browser-based)
+# ============================================
+
+# Install Playwright dependencies
+playwright-install:
+    cd e2e && npm install && npx playwright install chromium
+
+# Run Playwright tests (services must be running)
+playwright:
+    cd e2e && npm test
+
+# Run Playwright tests with visible browser
+playwright-headed:
+    cd e2e && npm run test:headed
+
+# Run Playwright tests with interactive UI
+playwright-ui:
+    cd e2e && npm run test:ui
+
+# Run Playwright tests in debug mode
+playwright-debug:
+    cd e2e && npm run test:debug
+
+# Generate Playwright test code by recording
+playwright-codegen:
+    cd e2e && npm run codegen http://localhost:9990
 
 # ============================================
 # Utility Commands
@@ -253,9 +281,15 @@ help:
     @echo "  just test      - Run tests"
     @echo "  just check-all - Run all code quality checks"
     @echo ""
-    @echo "E2E Testing:"
+    @echo "E2E Testing (Rust):"
     @echo "  just e2e       - Run full e2e tests (manages services)"
     @echo "  just e2e-only  - Run e2e tests (services must be running)"
+    @echo ""
+    @echo "Playwright Testing (Browser):"
+    @echo "  just playwright-install - Install Playwright and browsers"
+    @echo "  just playwright         - Run Playwright tests"
+    @echo "  just playwright-headed  - Run with visible browser"
+    @echo "  just playwright-ui      - Run with interactive UI"
     @echo ""
     @echo "Services:"
     @echo "  just status    - Show status of all services"

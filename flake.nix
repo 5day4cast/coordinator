@@ -677,6 +677,10 @@
             pkgs.procps
             pkgs.netcat
 
+            # Node.js and Playwright for E2E tests
+            pkgs.nodejs_22
+            pkgs.playwright-driver.browsers
+
             # AWS tools for S3 mocking
             moto-env
             pkgs.awscli2
@@ -714,6 +718,10 @@
             # Clear nix eval cache to prevent SQLite conflicts
             rm -rf ~/.cache/nix/eval-cache-* 2>/dev/null || true
 
+            # Playwright browser path from Nix
+            export PLAYWRIGHT_BROWSERS_PATH="${pkgs.playwright-driver.browsers}"
+            export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
             echo ""
             echo "Coordinator Development Environment"
             echo "===================================="
@@ -735,6 +743,11 @@
             echo "  run-moto        - Start Moto (S3 mock) server"
             echo "  run-litestream  - Start database replication"
             echo "  restore-litestream - Restore database from backup"
+            echo ""
+            echo "Playwright E2E tests:"
+            echo "  just playwright         - Run browser tests"
+            echo "  just playwright-headed  - Run with visible browser"
+            echo "  just playwright-ui      - Interactive test UI"
             echo ""
             echo "Use 'just help' to see all available commands"
             echo ""

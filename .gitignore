@@ -51,3 +51,4 @@ pkg/
 # Test artifacts
 *.profraw
 coverage/
+e2e/node_modules/
