@@ -131,6 +131,7 @@ pub struct Coordinator {
     relative_locktime_block_delta: u32,
     required_confirmations: u32,
     name: String,
+    escrow_enabled: bool,
 }
 
 impl Coordinator {
@@ -145,6 +146,7 @@ impl Coordinator {
         relative_locktime_block_delta: u32,
         required_confirmations: u32,
         name: String,
+        escrow_enabled: bool,
     ) -> Result<Self, anyhow::Error> {
         let private_key = bitcoin.get_derived_private_key().await?;
         let public_key = private_key.base_point_mul();
@@ -161,9 +163,15 @@ impl Coordinator {
             relative_locktime_block_delta,
             required_confirmations,
             name,
+            escrow_enabled,
         };
         coordinator.validate_coordinator_metadata().await?;
         Ok(coordinator)
+    }
+
+    /// Check if escrow transactions are enabled
+    pub fn is_escrow_enabled(&self) -> bool {
+        self.escrow_enabled
     }
 
     /// Check if Keymeld signing is enabled
@@ -300,7 +308,12 @@ impl Coordinator {
 
             CompetitionStatus::CollectingEntries(state) => {
                 if state.has_all_entries() {
-                    state.into_awaiting_escrow()
+                    if self.escrow_enabled {
+                        state.into_awaiting_escrow()
+                    } else {
+                        // Skip escrow - go directly to EscrowConfirmed
+                        state.into_escrow_confirmed()
+                    }
                 } else {
                     CompetitionStatus::CollectingEntries(state)
                 }
@@ -2159,33 +2172,48 @@ impl Coordinator {
         // Calculate payment hash from preimage
         let payment_hash = sha256::Hash::hash(&preimage).to_byte_array();
 
-        //Note: we are currently NOT refunding the coordinator fee, we may want to change that
-        // Generate escrow transaction BEFORE creating the invoice
-        let escrow_tx = generate_escrow_tx(
-            self.bitcoin.clone(),
-            ticket.id,
-            btc_pubkey,
-            payment_hash,
-            competition.event_submission.entry_fee as u64,
-        )
-        .await
-        .map_err(|e| {
-            error!("Failed to generate escrow transaction: {}", e);
-            Error::BadRequest(format!("Failed to generate refund transaction: {}", e))
-        })?;
-
-        debug!("escrow_tx: {:?}", escrow_tx);
-
-        let escrow_tx_hex = hex::encode(dlctix::bitcoin::consensus::encode::serialize(&escrow_tx));
-
-        // Store the refund transaction in the database
-        self.competition_store
-            .update_ticket_escrow(ticket.id, btc_pubkey.to_string(), escrow_tx_hex.clone())
+        // Generate escrow transaction only if escrow is enabled
+        let escrow_tx_hex = if self.escrow_enabled {
+            let escrow_tx = generate_escrow_tx(
+                self.bitcoin.clone(),
+                ticket.id,
+                btc_pubkey,
+                payment_hash,
+                competition.event_submission.entry_fee as u64,
+            )
             .await
             .map_err(|e| {
-                error!("Failed to update ticket with refund transaction: {}", e);
-                Error::DbError(e)
+                error!("Failed to generate escrow transaction: {}", e);
+                Error::BadRequest(format!("Failed to generate refund transaction: {}", e))
             })?;
+
+            debug!("escrow_tx: {:?}", escrow_tx);
+
+            let escrow_hex = hex::encode(dlctix::bitcoin::consensus::encode::serialize(&escrow_tx));
+
+            // Store the escrow transaction in the database
+            self.competition_store
+                .update_ticket_escrow(ticket.id, btc_pubkey.to_string(), escrow_hex.clone())
+                .await
+                .map_err(|e| {
+                    error!("Failed to update ticket with escrow transaction: {}", e);
+                    Error::DbError(e)
+                })?;
+
+            debug!(
+                "Created ticket {} with escrow tx {}",
+                ticket.id,
+                escrow_tx.compute_txid()
+            );
+
+            Some(escrow_hex)
+        } else {
+            debug!(
+                "Created ticket {} without escrow (escrow disabled)",
+                ticket.id
+            );
+            None
+        };
 
         let fee_multiplier = competition.event_submission.coordinator_fee_percentage as f64 / 100.0;
         let coordinator_fee =
@@ -2193,7 +2221,8 @@ impl Coordinator {
 
         let full_fee = (competition.event_submission.entry_fee as u64) + coordinator_fee;
 
-        // Now create the HODL invoice with short timeout
+        // Create the HODL invoice
+        // Note: escrow_tx_hex is empty string when escrow disabled
         let invoice = self
             .ln
             .add_hold_invoice(
@@ -2201,7 +2230,7 @@ impl Coordinator {
                 300, // 5 minute timeout
                 hex::encode(payment_hash),
                 ticket.competition_id,
-                escrow_tx_hex.clone(),
+                escrow_tx_hex.clone().unwrap_or_default(),
             )
             .await
             .map_err(|e| {
@@ -2218,16 +2247,10 @@ impl Coordinator {
                 Error::DbError(e)
             })?;
 
-        debug!(
-            "Created ticket {} with refund tx {} and invoice",
-            ticket.id,
-            escrow_tx.compute_txid()
-        );
-
         Ok(TicketResponse {
             ticket_id: ticket.id,
             payment_request: invoice.payment_request,
-            escrow_tx: Some(escrow_tx_hex),
+            escrow_tx: escrow_tx_hex,
             payment_hash: hex::encode(payment_hash),
             amount_sats: full_fee,
         })

@@ -258,6 +258,13 @@ pub struct CoordinatorSettings {
     /// by the coordinator system
     pub required_confirmations: u32,
     pub sync_interval_secs: u64,
+
+    /// Enable on-chain escrow transactions (default: false)
+    /// When disabled, only HODL invoices protect against non-completion.
+    /// With keymeld signing, escrow is typically not needed since signing is fast.
+    /// Enable this as a safety net if HODL invoice timing becomes an issue.
+    #[serde(default)]
+    pub escrow_enabled: bool,
 }
 
 impl Default for CoordinatorSettings {
@@ -269,6 +276,7 @@ impl Default for CoordinatorSettings {
             relative_locktime_block_delta: 144,
             required_confirmations: 1,
             sync_interval_secs: 15,
+            escrow_enabled: false,
         }
     }
 }

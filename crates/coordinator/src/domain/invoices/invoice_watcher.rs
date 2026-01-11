@@ -88,7 +88,7 @@ impl InvoiceWatcher {
                 Ok(invoice) => {
                     debug!("Ticket {}: invoice state: {:?}", ticket.id, invoice.state);
                     if invoice.state == InvoiceState::Accepted {
-                        info!("Invoice accepted for ticket {}, creating escrow", ticket.id);
+                        info!("Invoice accepted for ticket {}", ticket.id);
 
                         debug!("Marking ticket as Paid {}: ", ticket.id);
 
@@ -99,60 +99,47 @@ impl InvoiceWatcher {
                             .await
                         {
                             Ok(_) => {
-                                // Try broadcasting with retries and UTXO regeneration
-                                let broadcast_result =
-                                    self.broadcast_escrow_with_utxo_retries(&ticket).await;
+                                // Check if escrow is enabled
+                                if self.coordinator.is_escrow_enabled() {
+                                    // Try broadcasting escrow with retries and UTXO regeneration
+                                    let broadcast_result =
+                                        self.broadcast_escrow_with_utxo_retries(&ticket).await;
 
-                                match broadcast_result {
-                                    Ok(txid) => {
-                                        info!("Successfully broadcasted escrow transaction for ticket {} in competition {}: {}",
-                                            ticket.id, ticket.competition_id, txid);
+                                    match broadcast_result {
+                                        Ok(txid) => {
+                                            info!("Successfully broadcasted escrow transaction for ticket {} in competition {}: {}",
+                                                ticket.id, ticket.competition_id, txid);
 
-                                        // Proceed to settle the HODL invoice
-                                        match self
-                                            .ln
-                                            .settle_hold_invoice(ticket.encrypted_preimage.clone())
-                                            .await
-                                        {
-                                            Ok(_) => {
-                                                match self
-                                                    .coordinator
-                                                    .competition_store
-                                                    .mark_ticket_settled(ticket.id)
-                                                    .await
-                                                {
-                                                    Ok(_) => info!(
-                                                        "Ticket {} settled for competition {}",
-                                                        ticket.id, ticket.competition_id
-                                                    ),
-                                                    Err(e) => error!(
-                                                        "Failed to mark ticket {} as settled: {}",
-                                                        ticket.id, e
-                                                    ),
+                                            // Proceed to settle the HODL invoice
+                                            self.settle_invoice_and_mark_ticket(&ticket).await;
+                                        }
+                                        Err(e) => {
+                                            // All broadcast attempts failed, cancel the HODL invoice and reset ticket
+                                            error!("Failed to broadcast escrow transaction after all retry attempts for ticket {}: {}",
+                                                ticket.id, e);
+
+                                            match self
+                                                .cancel_invoice_and_reset_ticket(&ticket)
+                                                .await
+                                            {
+                                                Ok(_) => {
+                                                    info!("Successfully cancelled invoice and reset ticket {} for reuse", ticket.id);
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to cancel invoice and reset ticket {}: {}", ticket.id, e);
                                                 }
                                             }
-                                            Err(e) => {
-                                                error!(
-                                                    "Failed to settle HODL invoice for ticket {}: {}",
-                                                    ticket.id, e
-                                                );
-                                            }
                                         }
                                     }
-                                    Err(e) => {
-                                        // All broadcast attempts failed, cancel the HODL invoice and reset ticket
-                                        error!("Failed to broadcast escrow transaction after all retry attempts for ticket {}: {}",
-                                            ticket.id, e);
-
-                                        match self.cancel_invoice_and_reset_ticket(&ticket).await {
-                                            Ok(_) => {
-                                                info!("Successfully cancelled invoice and reset ticket {} for reuse", ticket.id);
-                                            }
-                                            Err(e) => {
-                                                error!("Failed to cancel invoice and reset ticket {}: {}", ticket.id, e);
-                                            }
-                                        }
-                                    }
+                                } else {
+                                    // Escrow disabled - just settle the invoice directly
+                                    // The HODL invoice stays in-flight until contract tx is broadcast
+                                    info!(
+                                        "Escrow disabled, ticket {} marked as paid (invoice stays in-flight)",
+                                        ticket.id
+                                    );
+                                    // Note: We don't settle the invoice here - it stays in-flight
+                                    // until the contract/funding tx is broadcast later
                                 }
                             }
                             Err(e) => error!("Failed to mark ticket {} as paid: {}", ticket.id, e),
@@ -166,6 +153,35 @@ impl InvoiceWatcher {
         }
 
         Ok(())
+    }
+
+    async fn settle_invoice_and_mark_ticket(&self, ticket: &crate::domain::competitions::Ticket) {
+        match self
+            .ln
+            .settle_hold_invoice(ticket.encrypted_preimage.clone())
+            .await
+        {
+            Ok(_) => {
+                match self
+                    .coordinator
+                    .competition_store
+                    .mark_ticket_settled(ticket.id)
+                    .await
+                {
+                    Ok(_) => info!(
+                        "Ticket {} settled for competition {}",
+                        ticket.id, ticket.competition_id
+                    ),
+                    Err(e) => error!("Failed to mark ticket {} as settled: {}", ticket.id, e),
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Failed to settle HODL invoice for ticket {}: {}",
+                    ticket.id, e
+                );
+            }
+        }
     }
 
     async fn cancel_invoice_and_reset_ticket(

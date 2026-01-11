@@ -1,6 +1,6 @@
 //! CollectingEntries state - collecting entries until all slots are filled.
 
-use super::{AwaitingEscrow, CompetitionStatus, HasCompetitionData};
+use super::{AwaitingEscrow, CompetitionStatus, EscrowConfirmed, HasCompetitionData};
 use crate::domain::competitions::Competition;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -46,10 +46,23 @@ impl CollectingEntries {
     /// This transition occurs when:
     /// - All entry slots are filled
     /// - All entries have been paid via Lightning HODL invoices
+    /// - Escrow transactions are enabled
     ///
     /// Caller should check `has_all_entries()` before calling this.
     pub fn into_awaiting_escrow(self) -> CompetitionStatus {
         CompetitionStatus::AwaitingEscrow(AwaitingEscrow::from_competition(self.competition))
+    }
+
+    /// Transition directly to EscrowConfirmed when escrow is disabled.
+    ///
+    /// This skips the AwaitingEscrow state entirely since no escrow
+    /// transactions need to be broadcast or confirmed.
+    ///
+    /// Caller should check `has_all_entries()` before calling this.
+    pub fn into_escrow_confirmed(mut self) -> CompetitionStatus {
+        // Set escrow_funds_confirmed_at to now since we're skipping escrow
+        self.competition.escrow_funds_confirmed_at = Some(OffsetDateTime::now_utc());
+        CompetitionStatus::EscrowConfirmed(EscrowConfirmed::from_competition(self.competition))
     }
 
     /// Check if competition is expired before all entries collected.

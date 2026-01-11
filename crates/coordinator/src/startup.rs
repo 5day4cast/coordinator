@@ -259,9 +259,16 @@ pub async fn build_app(
             .into(),
         config.coordinator_settings.required_confirmations,
         config.coordinator_settings.name,
+        config.coordinator_settings.escrow_enabled,
     )
     .await
     .map(Arc::new)?;
+
+    if config.coordinator_settings.escrow_enabled {
+        info!("Escrow transactions enabled");
+    } else {
+        info!("Escrow transactions disabled (using HODL invoices only)");
+    }
 
     info!("Coordinator service configured");
 
