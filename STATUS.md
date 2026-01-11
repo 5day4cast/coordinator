@@ -420,4 +420,4 @@ just playwright-headed   # With visible browser
 - Dev shell requires keymeld gateway/enclave to be built (pulls from GitHub)
 - E2E tests in CI will use Nix to start all services
 - DataSourceType simplified to Weather only (other variants can be added later)
-- Frontend JS can use either keymeld or legacy MuSig based on coordinator config
+- Frontend uses keymeld for signing (legacy MuSig code removed)
