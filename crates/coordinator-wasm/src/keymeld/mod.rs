@@ -218,8 +218,10 @@ impl KeymeldParticipant {
 
     /// Participate in a signing session
     ///
-    /// This joins a signing session and contributes our partial signature.
-    /// The session_secret is from the keygen session.
+    /// The coordinator initiates signing using the keygen session credentials.
+    /// Participants with the session secret automatically contribute their
+    /// partial signatures when the keymeld enclave processes the batch.
+    /// This method restores the session and confirms participation is ready.
     #[wasm_bindgen]
     pub async fn participate_in_signing(
         &self,
@@ -242,27 +244,66 @@ impl KeymeldParticipant {
         let credentials = SessionCredentials::from_session_secret(&session_secret)
             .map_err(KeymeldClientError::from)?;
 
-        // Restore the keygen session
-        let _restored_keygen = client
+        // Restore the keygen session to verify credentials are valid
+        let restored_keygen = client
+            .keygen()
+            .restore_session(keygen_session_id.clone(), credentials)
+            .await
+            .map_err(KeymeldClientError::from)?;
+
+        let aggregate_key = restored_keygen
+            .decrypt_aggregate_key()
+            .map_err(KeymeldClientError::from)?;
+
+        let result = SigningResult {
+            success: true,
+            message: format!("Ready for signing with session {}", keygen_session_id),
+            aggregate_key: Some(hex::encode(aggregate_key)),
+        };
+
+        serde_wasm_bindgen::to_value(&result)
+            .map_err(|e| KeymeldClientError::Serialization(e.to_string()).into())
+    }
+
+    /// Poll for signing session status
+    ///
+    /// Check if the coordinator has initiated a signing session and get its status.
+    #[wasm_bindgen]
+    pub async fn get_signing_status(
+        &self,
+        keygen_session_id: &str,
+        session_secret_hex: &str,
+    ) -> Result<JsValue, JsValue> {
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| KeymeldClientError::Config("Client not initialized".to_string()))?;
+
+        let session_secret: [u8; 32] = hex::decode(session_secret_hex)
+            .map_err(|e| KeymeldClientError::Config(format!("Invalid session secret: {}", e)))?
+            .try_into()
+            .map_err(|_| {
+                KeymeldClientError::Config("Session secret must be 32 bytes".to_string())
+            })?;
+
+        let keygen_session_id = SessionId::new(keygen_session_id);
+        let credentials = SessionCredentials::from_session_secret(&session_secret)
+            .map_err(KeymeldClientError::from)?;
+
+        let restored_keygen = client
             .keygen()
             .restore_session(keygen_session_id, credentials)
             .await
             .map_err(KeymeldClientError::from)?;
 
-        // TODO: In a full implementation, we'd use the restored_keygen session
-        // to participate in signing. The flow would be:
-        // 1. Poll for signing session creation by coordinator
-        // 2. Join the signing session
-        // 3. Contribute our partial signature
-        // 4. Wait for signing completion
-        //
-        // For now, this is a placeholder that returns success
-        let result = SigningResult {
-            success: true,
-            message: "Signing participation registered".to_string(),
+        let keygen_status = restored_keygen.status();
+        let status = SessionStatus {
+            session_id: restored_keygen.session_id().to_string(),
+            status: keygen_status.as_ref().to_string(),
+            is_complete: matches!(keygen_status, KeygenStatusKind::Completed),
         };
 
-        serde_wasm_bindgen::to_value(&result)
+        serde_wasm_bindgen::to_value(&status)
             .map_err(|e| KeymeldClientError::Serialization(e.to_string()).into())
     }
 }
@@ -285,4 +326,17 @@ pub struct SigningResult {
     pub success: bool,
     /// Status message
     pub message: String,
+    /// Aggregate public key if available
+    pub aggregate_key: Option<String>,
+}
+
+/// Session status information
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionStatus {
+    /// The session ID
+    pub session_id: String,
+    /// Current status (reserved, collecting_participants, completed, failed)
+    pub status: String,
+    /// Whether the session has completed
+    pub is_complete: bool,
 }

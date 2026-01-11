@@ -56,6 +56,7 @@ mod escrow_confirmed;
 mod event_created;
 mod failed;
 mod funding;
+pub mod processor;
 mod settling;
 
 pub use awaiting_attestation::*;
@@ -70,6 +71,7 @@ pub use escrow_confirmed::*;
 pub use event_created::*;
 pub use failed::*;
 pub use funding::*;
+pub use processor::*;
 pub use settling::*;
 
 use super::{Competition, CompetitionError};

@@ -1,6 +1,6 @@
 use super::{
-    AddEntry, CompetitionError, CompetitionState, CompetitionStore, FundedContract, PayoutInfo,
-    SearchBy, Ticket, TicketStatus, UserEntry,
+    states::CompetitionStatus, AddEntry, CompetitionError, CompetitionStore, FundedContract,
+    PayoutInfo, SearchBy, Ticket, TicketStatus, UserEntry,
 };
 use crate::{
     api::routes::FinalSignatures,
@@ -8,7 +8,7 @@ use crate::{
     infra::{
         bitcoin::{Bitcoin, ForeignUtxo, REQUIRED_CONFIRMATIONS_FOR_TIME},
         escrow::{create_escrow_descriptor, generate_escrow_tx, get_escrow_outpoint},
-        keymeld::{Keymeld, StoredDlcKeygenSession},
+        keymeld::{DlcKeygenSession, Keymeld, StoredDlcKeygenSession},
         lightning::Ln,
         oracle::{AddEventEntries, AddEventEntry, Error as OracleError, Event, Oracle},
     },
@@ -38,11 +38,12 @@ use dlctix::{
     convert_xonly_key,
     musig2::{AggNonce, PartialSignature, PubNonce},
     secp::{Point, Scalar},
-    ContractParameters, NonceSharingRound, Outcome, PayoutWeights, Player, PlayerIndex, SigMap,
-    SigningSession, TicketedDLC, WinCondition,
+    ContractParameters, ContractSignatures, NonceSharingRound, Outcome, PayoutWeights, Player,
+    PlayerIndex, SigMap, SigningSession, TicketedDLC, WinCondition,
 };
 use futures::TryFutureExt;
 use itertools::Itertools;
+use keymeld_sdk::prelude::UserId;
 use log::{debug, error, info};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -79,6 +80,11 @@ pub struct KeymeldSessionInfo {
     pub session_id: Option<String>,
     /// Competition ID this session belongs to
     pub competition_id: Uuid,
+    /// Session secret encrypted with NIP-44 for the requesting user (hex encoded)
+    /// Only present if the user has an entry in this competition
+    pub encrypted_session_secret: Option<String>,
+    /// User ID assigned to this participant in the keymeld session
+    pub user_id: Option<String>,
 }
 
 pub struct CompetitionWatcher {
@@ -137,6 +143,7 @@ pub struct Coordinator {
     pub bitcoin: Arc<dyn Bitcoin>,
     ln: Arc<dyn Ln>,
     keymeld: Arc<dyn Keymeld>,
+    keymeld_gateway_url: Option<String>,
     private_key: Scalar,
     public_key: Point,
     relative_locktime_block_delta: u32,
@@ -151,6 +158,7 @@ impl Coordinator {
         bitcoin: Arc<dyn Bitcoin>,
         ln: Arc<dyn Ln>,
         keymeld: Arc<dyn Keymeld>,
+        keymeld_gateway_url: Option<String>,
         relative_locktime_block_delta: u32,
         required_confirmations: u32,
         name: String,
@@ -164,6 +172,7 @@ impl Coordinator {
             bitcoin,
             ln,
             keymeld,
+            keymeld_gateway_url,
             private_key,
             public_key,
             relative_locktime_block_delta,
@@ -181,26 +190,62 @@ impl Coordinator {
 
     /// Get Keymeld session info for a competition
     /// This allows clients to join the remote MuSig2 signing session
+    /// The session secret is encrypted with NIP-44 for the requesting user
     pub async fn get_keymeld_session_info(
         &self,
         competition_id: Uuid,
+        user_pubkey: &str,
     ) -> Result<KeymeldSessionInfo, Error> {
+        use nostr_sdk::nips::nip44;
+        use nostr_sdk::prelude::{PublicKey, SecretKey};
+
         let session = self
             .competition_store
             .get_keymeld_session(competition_id)
             .await
             .map_err(Error::DbError)?;
 
+        // Check if user has an entry in this competition
+        let entries = self
+            .competition_store
+            .get_competition_entries(competition_id, vec![])
+            .await
+            .map_err(Error::DbError)?;
+
+        let user_entry = entries.iter().find(|e| e.pubkey == user_pubkey);
+
+        // Encrypt session secret for the user if they have an entry and session exists
+        let (encrypted_session_secret, user_id) = match (&session, user_entry) {
+            (Some(sess), Some(entry)) => {
+                let nostr_pubkey = PublicKey::from_hex(user_pubkey)
+                    .map_err(|e| Error::BadRequest(format!("Invalid user pubkey: {}", e)))?;
+
+                let coordinator_secret_key = SecretKey::from_slice(&self.private_key.serialize())
+                    .map_err(|e| {
+                    Error::BadRequest(format!("Failed to create secret key: {}", e))
+                })?;
+
+                let encrypted = nip44::encrypt(
+                    &coordinator_secret_key,
+                    &nostr_pubkey,
+                    hex::encode(sess.session_secret),
+                    nip44::Version::V2,
+                )
+                .map_err(|e| Error::BadRequest(format!("NIP-44 encryption failed: {}", e)))?;
+
+                // User ID is derived from entry ID for keymeld
+                (Some(encrypted), Some(entry.id.to_string()))
+            }
+            _ => (None, None),
+        };
+
         Ok(KeymeldSessionInfo {
             enabled: self.is_keymeld_enabled(),
-            gateway_url: if self.is_keymeld_enabled() {
-                // TODO: Expose gateway URL from keymeld service
-                None
-            } else {
-                None
-            },
+            gateway_url: self.keymeld_gateway_url.clone(),
             session_id: session.map(|s| s.session_id),
             competition_id,
+            encrypted_session_secret,
+            user_id,
         })
     }
 
@@ -226,28 +271,17 @@ impl Coordinator {
         self.competition_store.ping().await.map_err(Error::DbError)
     }
 
-    fn get_immediate_transition_states() -> Vec<CompetitionState> {
-        vec![
-            CompetitionState::EscrowFundsConfirmed,
-            CompetitionState::EventCreated,
-            CompetitionState::EntriesSubmitted,
-            CompetitionState::SigningComplete,
-            CompetitionState::FundingConfirmed,
-            CompetitionState::FundingSettled,
-        ]
-    }
-
     pub async fn competition_handler(&self) -> Result<(), anyhow::Error> {
-        let immediate_states = Self::get_immediate_transition_states();
         let competitions: Vec<Competition> =
             self.competition_store.get_competitions(true, true).await?;
 
         for mut competition in competitions {
             let mut processed_states = 0;
             const MAX_CONSECUTIVE_STATES: usize = 10;
+
             if competition.skip_competition() {
                 info!(
-                    "Skipping process competition {} {:?}",
+                    "Skipping competition {} in state {}",
                     competition.id,
                     competition.get_state()
                 );
@@ -262,313 +296,432 @@ impl Coordinator {
                     .await
                 {
                     error!(
-                        "Failed to save competition {} after processing cancelled_at: {}",
+                        "Failed to save competition {} after cancellation: {}",
                         competition.id, e
                     );
                 }
-                info!(
-                    "Skipping process competition {} {:?}",
-                    competition.id,
-                    competition.get_state()
-                );
+                info!("Cancelled expired competition {}", competition.id);
                 continue;
             }
 
             loop {
-                let current_state = competition.get_state();
-                match self.process_competition_state(competition.clone()).await {
-                    Ok(updated_competiton) => {
-                        info!(
-                            "Updated competition {} new state {} previous state: {}",
-                            competition.id,
-                            updated_competiton.get_state(),
-                            current_state
-                        );
-                        if updated_competiton.get_state() != current_state {
-                            processed_states += 1;
+                let status: CompetitionStatus = competition.clone().into();
+                let current_state_name = status.state_name();
 
-                            if immediate_states.contains(&updated_competiton.get_state())
-                                && processed_states < MAX_CONSECUTIVE_STATES
-                            {
-                                if let Err(e) = self
-                                    .competition_store
-                                    .update_competitions(vec![updated_competiton.clone()])
-                                    .await
-                                {
-                                    error!(
-                                        "Failed to save competition {} after processing state {}: {}",
-                                        competition.id, updated_competiton.get_state(), e
-                                    );
-                                }
-                                competition = updated_competiton;
-                                continue;
-                            }
-                        }
+                let new_status = self.process_status(status).await;
+                let new_state_name = new_status.state_name();
+                let is_immediate = new_status.is_immediate_transition();
+
+                let updated_competition = new_status.into_competition();
+
+                info!(
+                    "Competition {} transitioned {} -> {}",
+                    competition.id, current_state_name, new_state_name
+                );
+
+                if new_state_name != current_state_name {
+                    processed_states += 1;
+
+                    if is_immediate && processed_states < MAX_CONSECUTIVE_STATES {
                         if let Err(e) = self
                             .competition_store
-                            .update_competitions(vec![updated_competiton.clone()])
+                            .update_competitions(vec![updated_competition.clone()])
                             .await
                         {
                             error!(
-                                "Failed to save competition {} after processing state {}: {}",
-                                competition.id,
-                                competition.get_state(),
-                                e
+                                "Failed to save competition {} in state {}: {}",
+                                competition.id, new_state_name, e
                             );
                         }
-                        break;
-                    }
-                    Err(err) => {
-                        error!("Failed to process competition: {}: {}", competition.id, err);
-                        if let Err(e) = self
-                            .competition_store
-                            .update_competitions(vec![competition.clone()])
-                            .await
-                        {
-                            error!(
-                                "Failed to save competition {} after processing error: {}",
-                                competition.id, e
-                            );
-                        }
-                        break;
+                        competition = updated_competition;
+                        continue;
                     }
                 }
+
+                if let Err(e) = self
+                    .competition_store
+                    .update_competitions(vec![updated_competition])
+                    .await
+                {
+                    error!(
+                        "Failed to save competition {} in state {}: {}",
+                        competition.id, new_state_name, e
+                    );
+                }
+                break;
             }
         }
 
         Ok(())
     }
 
-    pub async fn process_competition_state(
-        &self,
-        mut competition: Competition,
-    ) -> Result<Competition, Error> {
+    pub async fn process_status(&self, status: CompetitionStatus) -> CompetitionStatus {
+        use super::states::*;
+
+        let competition_id = status.competition_id();
+        let state_name = status.state_name();
         info!(
-            "Competition {} {:?} {:?}",
-            competition.id,
-            competition.get_state(),
-            competition
+            "Processing competition {} in state {}",
+            competition_id, state_name
         );
-        match competition.get_state() {
-            CompetitionState::Created => {
+
+        match status {
+            CompetitionStatus::Created(state) => {
                 debug!(
-                    "Competition {}, waiting for more entries: {}/{}",
-                    competition.id,
-                    competition.total_entries,
-                    competition.event_submission.total_allowed_entries
+                    "Competition {}, waiting for entries: {}/{}",
+                    state.competition_id,
+                    state.competition.total_entries,
+                    state.competition.event_submission.total_allowed_entries
                 );
-                return Ok(competition);
+                CompetitionStatus::Created(state)
             }
-            CompetitionState::EntriesCollected => {
-                match self.check_escrow_confirmations(&mut competition).await {
-                    Ok(updated) => competition = updated.to_owned(),
-                    Err(e) => {
-                        error!(
-                            "competition {} failed to check escrow funds: {}",
-                            competition.id, e
-                        );
-                        competition
-                            .errors
-                            .push(CompetitionError::FailedEscrowConfirmation(e.to_string()));
-                        if competition.should_abort() {
-                            competition.failed_at = Some(OffsetDateTime::now_utc());
-                        }
+
+            CompetitionStatus::CollectingEntries(state) => {
+                if state.has_all_entries() {
+                    match state.all_entries_collected() {
+                        Ok(next) => next,
+                        Err(same) => same,
                     }
+                } else {
+                    CompetitionStatus::CollectingEntries(state)
                 }
             }
-            CompetitionState::EscrowFundsConfirmed => {
-                match self.submit_event_to_oracle(&mut competition).await {
-                    Ok(updated) => competition = updated.to_owned(),
-                    Err(e) => {
-                        error!(
-                            "Competition {} failed to submit entries to oracle: {}",
-                            competition.id, e
-                        );
-                        competition
-                            .errors
-                            .push(CompetitionError::FailedSubmitEntries(e.to_string()));
-                        competition.failed_at = Some(OffsetDateTime::now_utc());
-                    }
-                }
-            }
-            CompetitionState::EventCreated => {
-                match self.submit_entries_to_oracle(&mut competition).await {
-                    Ok(updated) => competition = updated.to_owned(),
-                    Err(e) => {
-                        error!(
-                            "Competition {} failed to submit entries to oracle: {}",
-                            competition.id, e
-                        );
-                        competition
-                            .errors
-                            .push(CompetitionError::FailedSubmitEntries(e.to_string()));
-                        competition.failed_at = Some(OffsetDateTime::now_utc());
-                    }
-                };
-            }
-            CompetitionState::EntriesSubmitted => {
-                match self.create_funding_psbt(&mut competition).await {
-                    Ok(updated) => competition = updated.to_owned(),
-                    Err(e) => {
-                        error!(
-                            "Competition {} failed to generate contract params: {}",
-                            competition.id, e
-                        );
-                        competition
-                            .errors
-                            .push(CompetitionError::FailedCreateTransaction(e.to_string()));
-                        competition.failed_at = Some(OffsetDateTime::now_utc());
-                    }
-                }
-            }
-            CompetitionState::NoncesCollected => {
+
+            CompetitionStatus::AwaitingEscrow(mut state) => {
                 match self
-                    .generate_aggregate_nonces_and_coord_partial_signatures(&mut competition)
+                    .check_escrow_confirmations(state.competition_mut())
                     .await
                 {
-                    Ok(updated) => competition = updated.to_owned(),
+                    Ok(_) => {
+                        if state.competition().escrow_funds_confirmed_at.is_some() {
+                            state.escrow_confirmed()
+                        } else {
+                            CompetitionStatus::AwaitingEscrow(state)
+                        }
+                    }
                     Err(e) => {
                         error!(
-                            "Competition {} failed to generate aggregate nonce: {}",
-                            competition.id, e
+                            "Competition {} failed to check escrow: {}",
+                            competition_id, e
                         );
-                        competition
+                        state
+                            .competition_mut()
                             .errors
-                            .push(CompetitionError::FailedNonceAggregation(e.to_string()));
-                        competition.failed_at = Some(OffsetDateTime::now_utc());
+                            .push(CompetitionError::FailedEscrowConfirmation(e.to_string()));
+                        if state.competition().should_abort() {
+                            CompetitionStatus::AwaitingEscrow(state)
+                                .fail(CompetitionError::FailedEscrowConfirmation(e.to_string()))
+                        } else {
+                            CompetitionStatus::AwaitingEscrow(state)
+                        }
                     }
                 }
             }
-            CompetitionState::PartialSignaturesCollected => {
-                match self.sign_dlc_contract(&mut competition).await {
-                    Ok(updated) => competition = updated.to_owned(),
+
+            CompetitionStatus::EscrowConfirmed(mut state) => {
+                match self.submit_event_to_oracle(state.competition_mut()).await {
+                    Ok(_) => {
+                        if state.competition().event_created_at.is_some() {
+                            CompetitionStatus::EventCreated(
+                                super::states::EventCreated::from_competition(
+                                    state.into_competition(),
+                                ),
+                            )
+                        } else {
+                            CompetitionStatus::EscrowConfirmed(state)
+                        }
+                    }
                     Err(e) => {
                         error!(
-                            "Competition {} failed to sign dlc contract: {}",
-                            competition.id, e
+                            "Competition {} failed to create oracle event: {}",
+                            competition_id, e
                         );
-                        competition
-                            .errors
-                            .push(CompetitionError::FailedBroadcast(e.to_string()));
-                        competition.failed_at = Some(OffsetDateTime::now_utc());
+                        CompetitionStatus::EscrowConfirmed(state)
+                            .fail(CompetitionError::FailedCreateEvent(e.to_string()))
                     }
                 }
             }
-            CompetitionState::SigningComplete => {
-                match self.sign_and_broadcast_funding_tx(&mut competition).await {
-                    Ok(updated) => competition = updated.to_owned(),
+
+            CompetitionStatus::EventCreated(mut state) => {
+                match self.submit_entries_to_oracle(state.competition_mut()).await {
+                    Ok(_) => state.entries_submitted(),
                     Err(e) => {
                         error!(
-                            "Competition {} failed to broadcast funding txs: {}",
-                            competition.id, e
+                            "Competition {} failed to submit entries: {}",
+                            competition_id, e
                         );
-                        competition
-                            .errors
-                            .push(CompetitionError::FailedBroadcast(e.to_string()));
-                        competition.failed_at = Some(OffsetDateTime::now_utc());
+                        CompetitionStatus::EventCreated(state)
+                            .fail(CompetitionError::FailedSubmitEntries(e.to_string()))
                     }
                 }
             }
-            CompetitionState::FundingBroadcasted => {
-                match self.check_funding_confirmation(&mut competition).await {
-                    Ok(updated) => competition = updated.to_owned(),
+
+            CompetitionStatus::EntriesSubmitted(mut state) => {
+                match self.create_funding_psbt(state.competition_mut()).await {
+                    Ok(_) => {
+                        let comp = state.competition();
+                        if let (Some(params), Some(outpoint), Some(psbt)) = (
+                            comp.contract_parameters.clone(),
+                            comp.funding_outpoint,
+                            comp.funding_psbt_base64.clone(),
+                        ) {
+                            state.contract_created(params, outpoint, psbt)
+                        } else {
+                            CompetitionStatus::EntriesSubmitted(state)
+                        }
+                    }
                     Err(e) => {
                         error!(
-                            "Competition {} failed to check confirm: {}",
-                            competition.id, e
+                            "Competition {} failed to create contract: {}",
+                            competition_id, e
                         );
-                        competition
+                        CompetitionStatus::EntriesSubmitted(state)
+                            .fail(CompetitionError::FailedCreateTransaction(e.to_string()))
+                    }
+                }
+            }
+
+            CompetitionStatus::ContractCreated(state) => {
+                if state.has_nonces() {
+                    CompetitionStatus::AwaitingSignatures(AwaitingSignatures::from_competition(
+                        state.into_competition(),
+                    ))
+                } else {
+                    CompetitionStatus::ContractCreated(state)
+                }
+            }
+
+            CompetitionStatus::AwaitingSignatures(mut state) => {
+                if self.is_keymeld_enabled() {
+                    match self.sign_dlc_contract(state.competition_mut()).await {
+                        Ok(_) => {
+                            if let Some(signed) = state.competition().signed_contract.clone() {
+                                state.signing_complete(signed)
+                            } else {
+                                CompetitionStatus::AwaitingSignatures(state)
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                "Competition {} keymeld signing failed: {}",
+                                competition_id, e
+                            );
+                            CompetitionStatus::AwaitingSignatures(state)
+                                .fail(CompetitionError::FailedBroadcast(e.to_string()))
+                        }
+                    }
+                } else {
+                    // Legacy MuSig2 flow
+                    if !state.has_all_nonces() {
+                        return CompetitionStatus::AwaitingSignatures(state);
+                    }
+
+                    match self
+                        .generate_aggregate_nonces_and_coord_partial_signatures(
+                            state.competition_mut(),
+                        )
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!(
+                                "Competition {} nonce aggregation failed: {}",
+                                competition_id, e
+                            );
+                            return CompetitionStatus::AwaitingSignatures(state)
+                                .fail(CompetitionError::FailedNonceAggregation(e.to_string()));
+                        }
+                    }
+
+                    if !state.has_all_signatures() {
+                        return CompetitionStatus::AwaitingSignatures(state);
+                    }
+
+                    match self.sign_dlc_contract(state.competition_mut()).await {
+                        Ok(_) => {
+                            if let Some(signed) = state.competition().signed_contract.clone() {
+                                state.signing_complete(signed)
+                            } else {
+                                CompetitionStatus::AwaitingSignatures(state)
+                            }
+                        }
+                        Err(e) => {
+                            error!("Competition {} signing failed: {}", competition_id, e);
+                            CompetitionStatus::AwaitingSignatures(state)
+                                .fail(CompetitionError::FailedBroadcast(e.to_string()))
+                        }
+                    }
+                }
+            }
+
+            CompetitionStatus::SigningComplete(mut state) => {
+                match self
+                    .sign_and_broadcast_funding_tx(state.competition_mut())
+                    .await
+                {
+                    Ok(_) => {
+                        if let Some(tx) = state.competition().funding_transaction.clone() {
+                            state.funding_broadcasted(tx)
+                        } else {
+                            CompetitionStatus::SigningComplete(state)
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            "Competition {} funding broadcast failed: {}",
+                            competition_id, e
+                        );
+                        CompetitionStatus::SigningComplete(state)
+                            .fail(CompetitionError::FailedBroadcast(e.to_string()))
+                    }
+                }
+            }
+
+            CompetitionStatus::FundingBroadcasted(mut state) => {
+                match self
+                    .check_funding_confirmation(state.competition_mut())
+                    .await
+                {
+                    Ok(_) => {
+                        if state.competition().funding_confirmed_at.is_some() {
+                            state.funding_confirmed()
+                        } else {
+                            CompetitionStatus::FundingBroadcasted(state)
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            "Competition {} funding confirmation failed: {}",
+                            competition_id, e
+                        );
+                        state
+                            .competition_mut()
                             .errors
                             .push(CompetitionError::FailedFundingConfirmation(e.to_string()));
-                        if competition.should_abort() {
-                            competition.failed_at = Some(OffsetDateTime::now_utc());
+                        if state.competition().should_abort() {
+                            CompetitionStatus::FundingBroadcasted(state)
+                                .fail(CompetitionError::FailedFundingConfirmation(e.to_string()))
+                        } else {
+                            CompetitionStatus::FundingBroadcasted(state)
                         }
                     }
                 }
             }
-            CompetitionState::FundingConfirmed => {
-                // Invoices are already settled immediately upon payment
-                // Just mark the funding as settled and move to next state
-                competition.funding_settled_at = Some(OffsetDateTime::now_utc());
+
+            CompetitionStatus::FundingConfirmed(mut state) => {
+                state.competition_mut().funding_settled_at = Some(OffsetDateTime::now_utc());
                 info!(
-                    "Competition {} funding confirmed, all invoices already settled",
-                    competition.id
+                    "Competition {} funding confirmed, invoices settled",
+                    competition_id
                 );
+                state.funding_settled()
             }
-            CompetitionState::FundingSettled => {
-                match self.check_oracle_attestation(&mut competition).await {
-                    Ok(updated) => competition = updated.to_owned(),
+
+            CompetitionStatus::FundingSettled(state) => state.await_attestation(),
+
+            CompetitionStatus::AwaitingAttestation(mut state) => {
+                match self.check_oracle_attestation(state.competition_mut()).await {
+                    Ok(_) => {
+                        if let Some(attestation) = state.competition().attestation {
+                            state.attested(attestation)
+                        } else {
+                            CompetitionStatus::AwaitingAttestation(state)
+                        }
+                    }
                     Err(e) => {
                         error!(
-                            "Failed to check oracle attestation for competition {}: {}",
-                            competition.id, e
+                            "Competition {} attestation check failed: {}",
+                            competition_id, e
                         );
-                        competition
+                        state
+                            .competition_mut()
                             .errors
                             .push(CompetitionError::FailedCheckingAttestation(e.to_string()));
-                        if competition.should_abort() {
-                            competition.failed_at = Some(OffsetDateTime::now_utc());
+                        if state.competition().should_abort() {
+                            CompetitionStatus::AwaitingAttestation(state)
+                                .fail(CompetitionError::FailedCheckingAttestation(e.to_string()))
+                        } else {
+                            CompetitionStatus::AwaitingAttestation(state)
                         }
                     }
                 }
             }
-            CompetitionState::Attested => {
-                // An outcome transaction spends the funding outpoint, and locks it into
-                // a 2nd stage multisig contract between the outcome winners and the market maker.
-                // If any player knows the attestation to outcome they can
-                // unlock that outcome TX and publish it.
-                match self.publish_outcome_transaction(&mut competition).await {
-                    Ok(updated) => competition = updated.to_owned(),
+
+            CompetitionStatus::Attested(mut state) => {
+                match self
+                    .publish_outcome_transaction(state.competition_mut())
+                    .await
+                {
+                    Ok(_) => {
+                        if let Some(tx) = state.competition().outcome_transaction.clone() {
+                            state.outcome_broadcasted(tx)
+                        } else {
+                            CompetitionStatus::Attested(state)
+                        }
+                    }
                     Err(e) => {
                         error!(
-                            "Failed to broadcast outcome transactions for competition {}: {}",
-                            competition.id, e
+                            "Competition {} outcome broadcast failed: {}",
+                            competition_id, e
                         );
-                        competition
-                            .errors
-                            .push(CompetitionError::FailedBroadcast(e.to_string()));
-                        competition.failed_at = Some(OffsetDateTime::now_utc());
+                        CompetitionStatus::Attested(state)
+                            .fail(CompetitionError::FailedBroadcast(e.to_string()))
                     }
                 }
             }
-            CompetitionState::OutcomeBroadcasted => {
-                match self.publish_delta_transactions(&mut competition).await {
-                    Ok(updated) => competition = updated.to_owned(),
+
+            CompetitionStatus::ExpiryBroadcasted(state) => state.completed(),
+
+            CompetitionStatus::OutcomeBroadcasted(mut state) => {
+                match self
+                    .publish_delta_transactions(state.competition_mut())
+                    .await
+                {
+                    Ok(_) => {
+                        if state.competition().delta_broadcasted_at.is_some() {
+                            state.delta_broadcasted()
+                        } else {
+                            CompetitionStatus::OutcomeBroadcasted(state)
+                        }
+                    }
                     Err(e) => {
                         error!(
-                            "failed to broadcast delta transactions for competition {}: {}",
-                            competition.id, e
+                            "Competition {} delta broadcast failed: {}",
+                            competition_id, e
                         );
-                        competition
-                            .errors
-                            .push(CompetitionError::FailedBroadcast(e.to_string()));
-                        competition.failed_at = Some(OffsetDateTime::now_utc());
+                        CompetitionStatus::OutcomeBroadcasted(state)
+                            .fail(CompetitionError::FailedBroadcast(e.to_string()))
                     }
                 }
             }
-            CompetitionState::DeltaBroadcasted => {
-                match self.publish_delta2_transactions(&mut competition).await {
-                    Ok(updated) => competition = updated.to_owned(),
+
+            CompetitionStatus::DeltaBroadcasted(mut state) => {
+                match self
+                    .publish_delta2_transactions(state.competition_mut())
+                    .await
+                {
+                    Ok(_) => {
+                        if state.competition().completed_at.is_some() {
+                            state.completed()
+                        } else {
+                            CompetitionStatus::DeltaBroadcasted(state)
+                        }
+                    }
                     Err(e) => {
                         error!(
-                            "Failed to broadcast delta2 transactions for competition {}: {}",
-                            competition.id, e
+                            "Competition {} delta2 broadcast failed: {}",
+                            competition_id, e
                         );
-                        competition
-                            .errors
-                            .push(CompetitionError::FailedBroadcast(e.to_string()));
-                        competition.failed_at = Some(OffsetDateTime::now_utc());
+                        CompetitionStatus::DeltaBroadcasted(state)
+                            .fail(CompetitionError::FailedBroadcast(e.to_string()))
                     }
                 }
             }
-            _ => (),
+
+            CompetitionStatus::Completed(_)
+            | CompetitionStatus::Failed(_)
+            | CompetitionStatus::Cancelled(_) => status,
         }
-        info!(
-            "Completed processing competition {} , state {}",
-            competition.id,
-            competition.get_state()
-        );
-        Ok(competition)
     }
 
     async fn check_escrow_confirmations<'a>(
@@ -935,22 +1088,56 @@ impl Coordinator {
         let ticketed_dlc = TicketedDLC::new(contract_params.clone(), funding_outpoint)?;
         debug!("Built ticketed dlc");
 
-        // TODO(keymeld): When keymeld is enabled, create a keygen session instead of local nonces
-        // The flow would be:
-        // 1. Create keygen session via self.keymeld.create_dlc_keygen_session()
-        // 2. Store session in DB via self.store_keymeld_session()
-        // 3. Skip local nonce generation - clients will join the keymeld session
-        // 4. The aggregate key from keymeld becomes the funding key
-        //
-        // For now, we continue with local MuSig2 signing:
-        let signing_session = {
-            let mut rng = create_deterministic_rng(&funding_outpoint, self.private_key);
-            SigningSession::<NonceSharingRound>::new(ticketed_dlc, &mut rng, self.private_key)?
-        };
-        debug!("Started musig nonce sharing round");
-        if competition.public_nonces.is_none() {
-            competition.public_nonces = Some(signing_session.our_public_nonces().to_owned());
+        if self.is_keymeld_enabled() {
+            // Keymeld flow: Create keygen session and wait for all participants
+            info!(
+                "Using Keymeld for MuSig2 signing for competition {}",
+                competition.id
+            );
+
+            // Derive UserIds from player ephemeral pubkeys
+            let player_user_ids: Vec<UserId> = entries
+                .iter()
+                .map(|entry| user_id_from_pubkey(&entry.ephemeral_pubkey))
+                .collect();
+
+            // Create keygen session - this blocks until all participants join
+            let keygen_session = self
+                .keymeld
+                .create_dlc_keygen_session(competition.id, &contract_params, player_user_ids)
+                .await
+                .map_err(|e| anyhow!("Failed to create keymeld keygen session: {}", e))?;
+
+            info!(
+                "Keymeld keygen session {} completed for competition {}",
+                keygen_session.session_id, competition.id
+            );
+
+            // Store the session for later signing
+            self.store_keymeld_session(competition.id, keygen_session.clone().into())
+                .await?;
+
+            // For keymeld, we don't use local nonces - set a placeholder to indicate keymeld mode
+            // The actual aggregate key is stored in the keygen session
+            if competition.public_nonces.is_none() {
+                // Create empty SigMap to indicate keymeld mode (no local nonces)
+                competition.public_nonces = Some(SigMap {
+                    by_outcome: BTreeMap::new(),
+                    by_win_condition: BTreeMap::new(),
+                });
+            }
+        } else {
+            // Traditional MuSig2 flow: Generate local nonces
+            let signing_session = {
+                let mut rng = create_deterministic_rng(&funding_outpoint, self.private_key);
+                SigningSession::<NonceSharingRound>::new(ticketed_dlc, &mut rng, self.private_key)?
+            };
+            debug!("Started musig nonce sharing round");
+            if competition.public_nonces.is_none() {
+                competition.public_nonces = Some(signing_session.our_public_nonces().to_owned());
+            }
         }
+
         competition.contracted_at = Some(OffsetDateTime::now_utc());
         competition.errors = vec![];
 
@@ -959,15 +1146,36 @@ impl Coordinator {
 
     /// Aggregate nonces from all participants and generate coordinator's partial signatures
     ///
-    /// TODO(keymeld): When keymeld is enabled, this step is handled differently:
-    /// - The keymeld service coordinates nonce aggregation across all participants
-    /// - Participants join the keygen session via their keymeld SDK clients
-    /// - Once all participants have joined, keymeld returns the aggregate key
-    /// - This method would then just verify the keymeld session completed successfully
+    /// When keymeld is enabled, this step is skipped - keymeld handles nonce aggregation
+    /// and partial signature generation internally during the signing session.
     pub async fn generate_aggregate_nonces_and_coord_partial_signatures<'a>(
         &self,
         competition: &'a mut Competition,
     ) -> Result<&'a mut Competition, anyhow::Error> {
+        // When keymeld is enabled, skip this step - keymeld handles nonce aggregation internally
+        if self.is_keymeld_enabled() {
+            info!(
+                "Keymeld mode: skipping nonce aggregation for competition {} (handled by keymeld)",
+                competition.id
+            );
+            // Set placeholder values to allow state transition
+            if competition.aggregated_nonces.is_none() {
+                competition.aggregated_nonces = Some(SigMap {
+                    by_outcome: BTreeMap::new(),
+                    by_win_condition: BTreeMap::new(),
+                });
+            }
+            if competition.partial_signatures.is_none() {
+                competition.partial_signatures = Some(SigMap {
+                    by_outcome: BTreeMap::new(),
+                    by_win_condition: BTreeMap::new(),
+                });
+            }
+            competition.errors = vec![];
+            return Ok(competition);
+        }
+
+        // Traditional MuSig2 flow
         let Some(contract_parameters) = &competition.contract_parameters else {
             return Err(anyhow!("contract parameters don't exists, failed publishing competition {} funding transaction", competition.id));
         };
@@ -1015,11 +1223,8 @@ impl Coordinator {
 
     /// Sign the DLC contract by aggregating all partial signatures
     ///
-    /// TODO(keymeld): When keymeld is enabled, signing is coordinated via the keymeld service:
-    /// - Use self.keymeld.sign_dlc_batch() to initiate signing
-    /// - The keymeld service coordinates with all participants via their SDK clients
-    /// - Participants sign their shares and keymeld aggregates the final signatures
-    /// - This method would verify the keymeld signing session completed and extract signatures
+    /// When keymeld is enabled, signing is coordinated via the keymeld service which
+    /// handles nonce aggregation and signature generation internally.
     pub async fn sign_dlc_contract<'a>(
         &self,
         competition: &'a mut Competition,
@@ -1037,82 +1242,155 @@ impl Coordinator {
             ));
         };
 
-        let Some(coordinator_partial_sigantures) = competition.partial_signatures.clone() else {
-            return Err(
-                anyhow!("coordinator partial signatures do not exist, failed signing competition dlc contract {}", competition.id),
-            );
-        };
-
-        let Some(coordinator_nonces) = competition.public_nonces.as_ref() else {
-            return Err(anyhow!("coordinator nonces missing"));
-        };
-
         let ticketed_dlc =
             TicketedDLC::new(contract_parameters.to_owned(), funding_outpoint.to_owned())?;
 
-        let signing_session = {
-            let mut rng = create_deterministic_rng(funding_outpoint, self.private_key);
-            SigningSession::<NonceSharingRound>::new(ticketed_dlc, &mut rng, self.private_key)?
-        };
+        if self.is_keymeld_enabled() {
+            // Keymeld flow: Use sign_dlc_batch to get all signatures
+            info!(
+                "Using Keymeld for DLC signing for competition {}",
+                competition.id
+            );
 
-        if signing_session.our_public_nonces() != coordinator_nonces {
-            return Err(anyhow!("coordinator nonce mismatch"));
-        }
-
-        let received_nonces = self.get_received_nonces(competition.id).await?;
-        debug!("Received all aggregate nonces from entries");
-
-        let coordinator_session =
-            signing_session.aggregate_nonces_and_compute_partial_signatures(received_nonces)?;
-        debug!("Built coordinator session before publishing");
-
-        if *coordinator_session.our_partial_signatures() != coordinator_partial_sigantures {
-            return Err(anyhow!("coordinator partial signatures mismatch"));
-        }
-
-        let final_signatures_by_sender: BTreeMap<Point, FinalSignatures> =
-            self.get_final_sigs_by_sender(competition.id).await?;
-        let mut partial_sigs_by_sender: BTreeMap<Point, SigMap<PartialSignature>> = BTreeMap::new();
-
-        for (sender_pubkey, final_signature) in &final_signatures_by_sender {
-            match coordinator_session
-                .verify_partial_signatures(*sender_pubkey, &final_signature.partial_signatures)
-            {
-                Ok(_) => {
-                    partial_sigs_by_sender
-                        .insert(*sender_pubkey, final_signature.partial_signatures.clone());
-
-                    debug!(
-                        "✓ Signature verification succeeded for player {}",
-                        sender_pubkey
+            // Retrieve stored keygen session
+            let stored_session = self
+                .competition_store
+                .get_keymeld_session(competition.id)
+                .await
+                .map_err(|e| anyhow!("Failed to get keymeld session: {}", e))?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "No keymeld session found for competition {}",
+                        competition.id
                     )
+                })?;
+
+            let keygen_session: DlcKeygenSession = stored_session.into();
+
+            // Get signing data from ticketed DLC
+            let signing_data = ticketed_dlc.signing_data()?;
+
+            // Call keymeld to perform batch signing
+            let dlc_signatures = self
+                .keymeld
+                .sign_dlc_batch(&keygen_session, &signing_data)
+                .await
+                .map_err(|e| anyhow!("Keymeld signing failed: {}", e))?;
+
+            info!(
+                "Keymeld signing completed for competition {} with {} outcome signatures and {} split signatures",
+                competition.id,
+                dlc_signatures.outcome_signatures.len(),
+                dlc_signatures.split_signatures.len()
+            );
+
+            // Build ContractSignatures from keymeld results
+            // Note: expiry_tx_signature would come from keymeld if the contract has an expiry outcome
+            // For now we check if there's an expiry outcome in the signing data
+            let signing_data = ticketed_dlc.signing_data()?;
+            let expiry_tx_signature = if signing_data
+                .outcome_sighashes
+                .contains_key(&Outcome::Expiry)
+            {
+                // TODO: Keymeld should return expiry signature separately
+                // For now, this is None - expiry transactions aren't adaptor-signed
+                None
+            } else {
+                None
+            };
+
+            let contract_signatures = ContractSignatures {
+                expiry_tx_signature,
+                outcome_tx_signatures: dlc_signatures.outcome_signatures,
+                split_tx_signatures: dlc_signatures.split_signatures,
+            };
+
+            // Build signed contract from keymeld signatures
+            let signed_contract = ticketed_dlc.into_signed_contract(contract_signatures);
+
+            if competition.signed_contract.is_none() {
+                competition.signed_contract = Some(signed_contract);
+                competition.signed_at = Some(OffsetDateTime::now_utc());
+            }
+        } else {
+            // Traditional MuSig2 flow
+            let Some(coordinator_partial_sigantures) = competition.partial_signatures.clone()
+            else {
+                return Err(anyhow!(
+                    "coordinator partial signatures do not exist, failed signing competition dlc contract {}",
+                    competition.id
+                ));
+            };
+
+            let Some(coordinator_nonces) = competition.public_nonces.as_ref() else {
+                return Err(anyhow!("coordinator nonces missing"));
+            };
+
+            let signing_session = {
+                let mut rng = create_deterministic_rng(funding_outpoint, self.private_key);
+                SigningSession::<NonceSharingRound>::new(ticketed_dlc, &mut rng, self.private_key)?
+            };
+
+            if signing_session.our_public_nonces() != coordinator_nonces {
+                return Err(anyhow!("coordinator nonce mismatch"));
+            }
+
+            let received_nonces = self.get_received_nonces(competition.id).await?;
+            debug!("Received all aggregate nonces from entries");
+
+            let coordinator_session =
+                signing_session.aggregate_nonces_and_compute_partial_signatures(received_nonces)?;
+            debug!("Built coordinator session before publishing");
+
+            if *coordinator_session.our_partial_signatures() != coordinator_partial_sigantures {
+                return Err(anyhow!("coordinator partial signatures mismatch"));
+            }
+
+            let final_signatures_by_sender: BTreeMap<Point, FinalSignatures> =
+                self.get_final_sigs_by_sender(competition.id).await?;
+            let mut partial_sigs_by_sender: BTreeMap<Point, SigMap<PartialSignature>> =
+                BTreeMap::new();
+
+            for (sender_pubkey, final_signature) in &final_signatures_by_sender {
+                match coordinator_session
+                    .verify_partial_signatures(*sender_pubkey, &final_signature.partial_signatures)
+                {
+                    Ok(_) => {
+                        partial_sigs_by_sender
+                            .insert(*sender_pubkey, final_signature.partial_signatures.clone());
+
+                        debug!(
+                            "✓ Signature verification succeeded for player {}",
+                            sender_pubkey
+                        )
+                    }
+                    Err(e) => {
+                        error!(
+                            "✗ Signature verification failed for player {}: {}",
+                            sender_pubkey, e
+                        );
+                        return Err(anyhow!(
+                            "Signature verification failed for {:?}: {}",
+                            sender_pubkey,
+                            e
+                        ));
+                    }
                 }
-                Err(e) => {
-                    error!(
-                        "✗ Signature verification failed for player {}: {}",
-                        sender_pubkey, e
-                    );
-                    return Err(anyhow!(
-                        "Signature verification failed for {:?}: {}",
-                        sender_pubkey,
-                        e
-                    ));
-                }
+            }
+
+            debug!("Verified all partial signatures");
+
+            let signed_contract =
+                coordinator_session.aggregate_all_signatures(partial_sigs_by_sender)?;
+
+            debug!("Signed dlc contract");
+            if competition.signed_contract.is_none() {
+                competition.signed_contract = Some(signed_contract);
+                competition.signed_at = Some(OffsetDateTime::now_utc());
             }
         }
 
-        debug!("Verified all partial signatures");
-
-        let signed_contract =
-            coordinator_session.aggregate_all_signatures(partial_sigs_by_sender)?;
-
-        debug!("Signed dlc contract");
-        if competition.signed_contract.is_none() {
-            competition.signed_contract = Some(signed_contract);
-            competition.signed_at = Some(OffsetDateTime::now_utc());
-        }
         competition.errors = vec![];
-
         Ok(competition)
     }
 
@@ -2638,6 +2916,17 @@ fn string_to_byte_array(hex_str: &str) -> [u8; 32] {
     let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     let bytes = hex::decode(hex_str).expect("valid hex string");
     bytes.try_into().expect("32 bytes")
+}
+
+/// Derive a Keymeld UserId from a player's ephemeral public key.
+/// Uses SHA256 hash of the pubkey to create a deterministic UUID.
+fn user_id_from_pubkey(pubkey_hex: &str) -> UserId {
+    let pubkey_bytes = hex::decode(pubkey_hex).unwrap_or_default();
+    let hash = sha256::Hash::hash(&pubkey_bytes);
+    let hash_bytes = hash.to_byte_array();
+    let mut uuid_bytes = [0u8; 16];
+    uuid_bytes.copy_from_slice(&hash_bytes[..16]);
+    UserId::from(Uuid::from_bytes(uuid_bytes))
 }
 
 fn get_percentage_weights(num_winners: usize) -> Vec<u64> {
