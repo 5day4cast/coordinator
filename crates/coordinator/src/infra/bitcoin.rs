@@ -112,9 +112,9 @@ impl SendOptions {
             .map_err(|e| anyhow!("Invalid destination address: {}", e))
     }
 
-    pub fn find_source_utxos<'a>(
+    pub fn find_source_utxos(
         &self,
-        wallet: &'a bdk_wallet::Wallet,
+        wallet: &bdk_wallet::Wallet,
     ) -> Result<Vec<LocalOutput>, anyhow::Error> {
         match &self.address_from {
             Some(addr) => {
@@ -125,7 +125,7 @@ impl SendOptions {
                     .filter(|utxo| {
                         Address::from_script(&utxo.txout.script_pubkey, wallet.network())
                             .ok()
-                            .map_or(false, |addr| {
+                            .is_some_and(|addr| {
                                 addr == source_addr
                                     && !utxo.is_spent
                                     && utxo.chain_position.is_confirmed()
@@ -185,7 +185,7 @@ impl Bitcoin for BitcoinClient {
     }
 
     async fn get_public_key(&self) -> Result<bdk_wallet::bitcoin::PublicKey, anyhow::Error> {
-        let secret_key = get_key::<BdkSecretKey>(&self.seed_path.expose_secret())?;
+        let secret_key = get_key::<BdkSecretKey>(self.seed_path.expose_secret())?;
         let private_key = bdk_wallet::bitcoin::PrivateKey {
             compressed: true,
             network: NetworkKind::from(self.network),
@@ -198,7 +198,7 @@ impl Bitcoin for BitcoinClient {
     }
 
     async fn get_derived_private_key(&self) -> Result<Scalar, anyhow::Error> {
-        let secret_key = get_key::<BdkSecretKey>(&self.seed_path.expose_secret())?;
+        let secret_key = get_key::<BdkSecretKey>(self.seed_path.expose_secret())?;
         let dlc_key = Scalar::from_hex(&hex::encode(secret_key.secret_bytes()))
             .map_err(|e| anyhow!("Failed to convert private key to scalar: {}", e))?;
 
@@ -283,7 +283,7 @@ impl Bitcoin for BitcoinClient {
                 let mut witness = Witness::new();
 
                 // Add empty byte vector for OP_FALSE (selects the multisig branch in or_d)
-                witness.push(&[]);
+                witness.push([]);
 
                 // Extract public keys from the witness script to get the correct order
                 // The multisig format is: OP_PUSHNUM_2 <pubkey1> <pubkey2> OP_PUSHNUM_2 OP_CHECKMULTISIG
@@ -551,7 +551,7 @@ impl BitcoinClient {
 
         let mut db = Store::<bdk_wallet::ChangeSet>::open_or_create_new(
             DB_MAGIC.as_bytes(),
-            settings.storage_file.to_owned(),
+            &settings.storage_file,
         )
         .map_err(|e| anyhow!("Failed to open or create bitcoin db: {}", e))?;
         info!("Bitcoin db configured");
@@ -713,9 +713,9 @@ impl BitcoinClient {
         send_options.validate_fee(&psbt)?;
 
         // Sign and finalize
-        info!("PSBT before signing: {}", psbt.to_string());
+        info!("PSBT before signing: {}", psbt);
         let finalized = wallet.sign(&mut psbt, SignOptions::default())?;
-        info!("PSBT after signing: {}", psbt.to_string());
+        info!("PSBT after signing: {}", psbt);
         if !finalized {
             return Err(anyhow!("Failed to sign transaction"));
         }
@@ -729,7 +729,7 @@ impl BitcoinClient {
 
     async fn sign_escrow_inputs(&self, psbt: &mut Psbt) -> Result<usize, anyhow::Error> {
         // Load the private key from the seed file
-        let secret_key = get_key::<BdkSecretKey>(&self.seed_path.expose_secret())?;
+        let secret_key = get_key::<BdkSecretKey>(self.seed_path.expose_secret())?;
         let coordinator_privkey = bdk_wallet::bitcoin::PrivateKey {
             compressed: true,
             network: NetworkKind::from(self.network),
@@ -803,7 +803,7 @@ impl BitcoinClient {
                 let expected_hash = &script_bytes[2..34];
 
                 // Calculate the hash of the witness script
-                let actual_hash = sha256::Hash::hash(&witness_script.as_bytes()).to_byte_array();
+                let actual_hash = sha256::Hash::hash(witness_script.as_bytes()).to_byte_array();
 
                 debug!("Expected witness hash: {}", hex::encode(expected_hash));
                 debug!("Actual witness hash: {}", hex::encode(actual_hash));
@@ -852,7 +852,7 @@ impl BitcoinClient {
             }
 
             // Check escrow inputs
-            if let Some(_) = &input.witness_script {
+            if input.witness_script.is_some() {
                 // For 2-of-2 multisig escrow, we need exactly 2 signatures
                 if input.partial_sigs.len() < 2 {
                     debug!(
@@ -902,7 +902,7 @@ fn derive_wallet_key(seed_path: &str, network: NetworkKind) -> Result<Xpriv, any
         network,
         depth: 0,
         parent_fingerprint: Default::default(),
-        chain_code: chain_code.into(),
+        chain_code,
         child_number: ChildNumber::from_normal_idx(0)?,
         private_key: secret_key,
     };

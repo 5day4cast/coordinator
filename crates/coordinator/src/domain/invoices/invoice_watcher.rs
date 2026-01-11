@@ -12,7 +12,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     domain::Coordinator,
-    infra::{escrow::generate_escrow_tx, lightning::{InvoiceState, Ln}},
+    infra::{
+        escrow::generate_escrow_tx,
+        lightning::{InvoiceState, Ln},
+    },
 };
 
 const MAX_BROADCAST_RETRIES: u32 = 3;

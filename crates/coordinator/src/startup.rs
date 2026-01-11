@@ -7,7 +7,10 @@ use crate::{
         submit_final_signatures, submit_public_nonces, submit_ticket_payout,
     },
     config::Settings,
-    domain::{CompetitionStore, CompetitionWatcher, Coordinator, InvoiceWatcher, PayoutWatcher, UserInfo, UserStore},
+    domain::{
+        CompetitionStore, CompetitionWatcher, Coordinator, InvoiceWatcher, PayoutWatcher, UserInfo,
+        UserStore,
+    },
     infra::{
         bitcoin::{BitcoinClient, BitcoinSyncWatcher},
         db::{DBConnection, DatabasePoolConfig, DatabaseType},

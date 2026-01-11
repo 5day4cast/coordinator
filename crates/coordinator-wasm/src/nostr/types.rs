@@ -50,7 +50,7 @@ impl Clone for CustomSigner {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl nostr_sdk::NostrSigner for CustomSigner {
-    fn backend(&self) -> SignerBackend {
+    fn backend(&self) -> SignerBackend<'_> {
         match self {
             CustomSigner::Keys(_) => SignerBackend::Keys,
             #[cfg(target_arch = "wasm32")]

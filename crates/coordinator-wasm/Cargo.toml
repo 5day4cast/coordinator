@@ -14,11 +14,8 @@ coordinator-core.workspace = true
 
 # WASM
 wasm-bindgen.workspace = true
-wasm-bindgen-futures.workspace = true
 wasm-logger.workspace = true
 serde-wasm-bindgen.workspace = true
-js-sys.workspace = true
-web-sys.workspace = true
 
 # Nostr
 nostr-sdk.workspace = true
@@ -26,12 +23,10 @@ nostr-sdk.workspace = true
 # Bitcoin
 bdk_wallet.workspace = true
 dlctix.workspace = true
-miniscript.workspace = true
 
 # Crypto
 blake2.workspace = true
 sha2.workspace = true
-aes-gcm.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 
@@ -41,7 +36,6 @@ hex.workspace = true
 
 # Utilities
 secrecy.workspace = true
-zeroize.workspace = true
 thiserror.workspace = true
 log.workspace = true
 async-trait.workspace = true

@@ -115,8 +115,8 @@ impl LnClient {
         let client = if let Some(tls_cert_path) = settings.tls_cert_path {
             info!("Found tls.crt file, using for lnd client");
             let cert = get_tls_cert(&tls_cert_path)?;
-            let client = build_reqwest_tls_client(cert)?;
-            client
+
+            build_reqwest_tls_client(cert)?
         } else {
             info!("No tls.crt file found, skipping for lnd client");
             client
@@ -154,10 +154,7 @@ pub fn get_tls_cert(file_path: &str) -> Result<Certificate, anyhow::Error> {
 }
 
 fn is_tls_cert_file(file_path: &str) -> bool {
-    Path::new(file_path)
-        .extension()
-        .and_then(|s| s.to_str())
-        .map_or(false, |ext| ext == "cert")
+    Path::new(file_path).extension().and_then(|s| s.to_str()) == Some("cert")
 }
 
 fn read_tls_cert(macaroon_path: String) -> Result<Certificate, anyhow::Error> {
@@ -176,10 +173,7 @@ pub fn get_macaroon(file_path: &str) -> Result<SecretString, anyhow::Error> {
 }
 
 fn is_macaroon_file(file_path: &str) -> bool {
-    Path::new(file_path)
-        .extension()
-        .and_then(|s| s.to_str())
-        .map_or(false, |ext| ext == "macaroon")
+    Path::new(file_path).extension().and_then(|s| s.to_str()) == Some("macaroon")
 }
 
 fn read_macaroon(macaroon_path: String) -> Result<SecretString, anyhow::Error> {
@@ -449,7 +443,7 @@ impl Ln for LnClient {
         &self,
         ticket_hash_hex: &str,
     ) -> Result<InvoiceLookupResponse, anyhow::Error> {
-        let hash_bytes = hex::decode(&ticket_hash_hex)
+        let hash_bytes = hex::decode(ticket_hash_hex)
             .map_err(|e| anyhow!("Failed to decode hex hash: {}", e))?;
 
         if hash_bytes.len() != 32 {
@@ -481,7 +475,7 @@ impl Ln for LnClient {
 
     async fn lookup_payment(&self, r_hash: &str) -> Result<PaymentLookupResponse, anyhow::Error> {
         let hash_bytes =
-            hex::decode(&r_hash).map_err(|e| anyhow!("Failed to decode hex hash: {}", e))?;
+            hex::decode(r_hash).map_err(|e| anyhow!("Failed to decode hex hash: {}", e))?;
 
         if hash_bytes.len() != 32 {
             return Err(anyhow!(
