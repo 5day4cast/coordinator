@@ -96,7 +96,7 @@ impl MockOracle {
 
     fn hash_with_context(&self, context: &[u8]) -> [u8; 32] {
         let mut hasher = Blake2s256::new();
-        hasher.update(&self.seed);
+        hasher.update(self.seed);
         hasher.update(context);
         hasher.finalize().into()
     }
