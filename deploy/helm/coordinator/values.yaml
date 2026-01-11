@@ -41,6 +41,13 @@ keymeld:
 lnd:
   host: "lnd1"
   rpcPort: 10009
+  macaroonPath: /lnd/admin.macaroon
+  tlsCertPath: /lnd/tls.cert
+  # Init container copies creds from LND pod PVC (for regtest)
+  initContainer:
+    enabled: false
+    image: busybox:1.36
+    sourcePvc: lnd1-data
 
 bitcoin:
   rpcHost: "bitcoind"
@@ -49,8 +56,19 @@ bitcoin:
   rpcPassword: "bitcoinpass"
 
 oracle:
-  url: "http://noaa-oracle.oracle.svc.cluster.local:9100"
+  url: "http://noaa-oracle.oracle.svc.cluster.local:8080"
 
 config:
   logLevel: info
   dbPath: /data/coordinator.db
+
+# Secrets configuration
+secrets:
+  privateKey:
+    create: false
+    value: ""
+  lnd:
+    create: false
+    # Base64-encoded macaroon and tls cert (for production)
+    macaroon: ""
+    tlsCert: ""

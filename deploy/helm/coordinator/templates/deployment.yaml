@@ -14,6 +14,28 @@ spec:
       labels:
         {{- include "coordinator.selectorLabels" . | nindent 8 }}
     spec:
+      {{- if .Values.lnd.initContainer.enabled }}
+      initContainers:
+        - name: lnd-creds
+          image: {{ .Values.lnd.initContainer.image }}
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for LND credentials..."
+              until [ -f /lnd-source/data/chain/bitcoin/regtest/admin.macaroon ]; do
+                sleep 2
+              done
+              cp /lnd-source/data/chain/bitcoin/regtest/admin.macaroon /lnd-creds/admin.macaroon
+              cp /lnd-source/tls.cert /lnd-creds/tls.cert
+              echo "LND credentials copied"
+          volumeMounts:
+            - name: lnd-source
+              mountPath: /lnd-source
+              readOnly: true
+            - name: lnd-creds
+              mountPath: /lnd-creds
+      {{- end }}
       containers:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -43,9 +65,31 @@ spec:
               value: {{ .Values.lnd.host }}
             - name: LND_RPC_PORT
               value: "{{ .Values.lnd.rpcPort }}"
+            - name: LND_MACAROON_PATH
+              value: {{ .Values.lnd.macaroonPath }}
+            - name: LND_TLS_CERT_PATH
+              value: {{ .Values.lnd.tlsCertPath }}
+            {{- if .Values.secrets.privateKey.create }}
+            - name: PRIVATE_KEY_PATH
+              value: /secrets/private-key.pem
+            {{- end }}
           volumeMounts:
             - name: data
               mountPath: {{ .Values.persistence.mountPath }}
+            {{- if .Values.secrets.privateKey.create }}
+            - name: private-key
+              mountPath: /secrets
+              readOnly: true
+            {{- end }}
+            {{- if .Values.lnd.initContainer.enabled }}
+            - name: lnd-creds
+              mountPath: /lnd
+              readOnly: true
+            {{- else if .Values.secrets.lnd.create }}
+            - name: lnd-secret
+              mountPath: /lnd
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           livenessProbe:
@@ -68,3 +112,19 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- if .Values.secrets.privateKey.create }}
+        - name: private-key
+          secret:
+            secretName: {{ include "coordinator.fullname" . }}-private-key
+        {{- end }}
+        {{- if .Values.lnd.initContainer.enabled }}
+        - name: lnd-source
+          persistentVolumeClaim:
+            claimName: {{ .Values.lnd.initContainer.sourcePvc }}
+        - name: lnd-creds
+          emptyDir: {}
+        {{- else if .Values.secrets.lnd.create }}
+        - name: lnd-secret
+          secret:
+            secretName: {{ include "coordinator.fullname" . }}-lnd
+        {{- end }}
