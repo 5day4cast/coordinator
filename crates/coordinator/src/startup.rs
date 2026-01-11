@@ -2,9 +2,9 @@ use crate::{
     api::routes::{
         add_event_entry, admin_index_handler, create_competition, get_aggregate_nonces,
         get_balance, get_competitions, get_contract_parameters, get_entries,
-        get_estimated_fee_rates, get_next_address, get_outputs, get_ticket_status, health,
-        index_handler, login, register, request_competition_ticket, send_to_address,
-        submit_final_signatures, submit_public_nonces, submit_ticket_payout,
+        get_estimated_fee_rates, get_keymeld_session, get_next_address, get_outputs,
+        get_ticket_status, health, index_handler, login, register, request_competition_ticket,
+        send_to_address, submit_final_signatures, submit_public_nonces, submit_ticket_payout,
     },
     config::Settings,
     domain::{
@@ -240,12 +240,19 @@ pub async fn build_app(
         info!("Keymeld service configured (disabled - using local MuSig2)");
     }
 
+    let keymeld_gateway_url = if config.keymeld_settings.enabled {
+        Some(config.keymeld_settings.gateway_url.clone())
+    } else {
+        None
+    };
+
     let coordinator = Coordinator::new(
         Arc::new(oracle_client),
         competition_store,
         bitcoin_client.clone(),
         ln.clone(),
         keymeld_service,
+        keymeld_gateway_url,
         config
             .coordinator_settings
             .relative_locktime_block_delta
@@ -438,6 +445,10 @@ pub fn app(
         .route(
             "/api/v1/competitions/{competitionId}/entries/{entryId}/payout",
             post(submit_ticket_payout),
+        )
+        .route(
+            "/api/v1/competitions/{competition_id}/keymeld",
+            get(get_keymeld_session),
         )
         .route("/api/v1/entries", post(add_event_entry))
         .route("/api/v1/entries", get(get_entries))
