@@ -278,3 +278,10 @@ jobs:
             logs/
             data/
           retention-days: 7
+
+      - name: Wait for Nix cache uploads
+        if: always()
+        run: |
+          # Give the magic-nix-cache background process time to finish uploading
+          # This prevents "workflow job run completed" errors in the logs
+          sleep 30
