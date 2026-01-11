@@ -78,6 +78,7 @@ jobs:
           echo "LD_LIBRARY_PATH=${{ env.SQLITE_DIR }}/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
           echo "PKG_CONFIG_PATH=${{ env.SQLITE_DIR }}/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
           echo "SQLITE3_LIB_DIR=${{ env.SQLITE_DIR }}/lib" >> $GITHUB_ENV
+          echo "SQLITE3_INCLUDE_DIR=${{ env.SQLITE_DIR }}/include" >> $GITHUB_ENV
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -137,6 +138,7 @@ jobs:
           echo "LD_LIBRARY_PATH=${{ env.SQLITE_DIR }}/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
           echo "PKG_CONFIG_PATH=${{ env.SQLITE_DIR }}/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
           echo "SQLITE3_LIB_DIR=${{ env.SQLITE_DIR }}/lib" >> $GITHUB_ENV
+          echo "SQLITE3_INCLUDE_DIR=${{ env.SQLITE_DIR }}/include" >> $GITHUB_ENV
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -194,6 +196,7 @@ jobs:
           echo "LD_LIBRARY_PATH=${{ env.SQLITE_DIR }}/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
           echo "PKG_CONFIG_PATH=${{ env.SQLITE_DIR }}/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
           echo "SQLITE3_LIB_DIR=${{ env.SQLITE_DIR }}/lib" >> $GITHUB_ENV
+          echo "SQLITE3_INCLUDE_DIR=${{ env.SQLITE_DIR }}/include" >> $GITHUB_ENV
 
       - uses: dtolnay/rust-toolchain@stable
 
