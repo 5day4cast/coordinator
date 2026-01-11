@@ -14,8 +14,8 @@ spec:
       labels:
         {{- include "coordinator.selectorLabels" . | nindent 8 }}
     spec:
-      {{- if .Values.lnd.initContainer.enabled }}
       initContainers:
+        {{- if .Values.lnd.initContainer.enabled }}
         - name: lnd-creds
           image: {{ .Values.lnd.initContainer.image }}
           command:
@@ -35,10 +35,38 @@ spec:
               readOnly: true
             - name: lnd-creds
               mountPath: /lnd-creds
-      {{- end }}
+        {{- end }}
+        {{- if .Values.litestream.enabled }}
+        - name: litestream-restore
+          image: "{{ .Values.litestream.image.repository }}:{{ .Values.litestream.image.tag }}"
+          args:
+            - restore
+            - -if-db-not-exists
+            - -if-replica-exists
+            - -config
+            - /etc/litestream.yml
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+            - name: litestream-config
+              mountPath: /etc/litestream.yml
+              subPath: litestream.yml
+          {{- if .Values.litestream.s3Endpoint }}
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: "test"
+            - name: AWS_SECRET_ACCESS_KEY
+              value: "test"
+          {{- end }}
+        {{- end }}
       containers:
         - name: {{ .Chart.Name }}
+          {{- if .Values.devMode.enabled }}
+          image: {{ .Values.devMode.baseImage }}
+          command: ["/app/coordinator"]
+          {{- else }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          {{- end }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: http
@@ -90,6 +118,11 @@ spec:
               mountPath: /lnd
               readOnly: true
             {{- end }}
+            {{- if .Values.devMode.enabled }}
+            - name: dev-binary
+              mountPath: /app
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           livenessProbe:
@@ -104,6 +137,33 @@ spec:
               port: http
             initialDelaySeconds: 10
             periodSeconds: 10
+        {{- if .Values.litestream.enabled }}
+        - name: litestream
+          image: "{{ .Values.litestream.image.repository }}:{{ .Values.litestream.image.tag }}"
+          args:
+            - replicate
+            - -config
+            - /etc/litestream.yml
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+            - name: litestream-config
+              mountPath: /etc/litestream.yml
+              subPath: litestream.yml
+          {{- if .Values.litestream.s3Endpoint }}
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: "test"
+            - name: AWS_SECRET_ACCESS_KEY
+              value: "test"
+          {{- end }}
+          resources:
+            requests:
+              memory: 32Mi
+              cpu: 10m
+            limits:
+              memory: 128Mi
+        {{- end }}
       volumes:
         - name: data
           {{- if .Values.persistence.enabled }}
@@ -127,4 +187,15 @@ spec:
         - name: lnd-secret
           secret:
             secretName: {{ include "coordinator.fullname" . }}-lnd
+        {{- end }}
+        {{- if .Values.devMode.enabled }}
+        - name: dev-binary
+          hostPath:
+            path: {{ .Values.devMode.hostPath | dir }}
+            type: Directory
+        {{- end }}
+        {{- if .Values.litestream.enabled }}
+        - name: litestream-config
+          configMap:
+            name: {{ include "coordinator.fullname" . }}-litestream
         {{- end }}

@@ -1437,6 +1437,252 @@ buildInputs = commonDeps ++ [
 
 ---
 
+## Part 2.6: Litestream Database Replication & Serialized Writes
+
+### 2.6.1 Goals
+
+1. **Continuous SQLite replication** - Real-time backup to S3 for disaster recovery
+2. **Serialized database writes** - All writes go through a single channel to ensure WAL consistency
+3. **Local development with Moto** - Mock S3 for testing without AWS credentials
+4. **Production-ready helm chart** - Litestream sidecar for Kubernetes deployments
+
+### 2.6.2 DatabaseWriter Pattern
+
+Following keymeld's pattern, all SQLite writes must be serialized through a single channel. This ensures:
+- WAL mode works correctly with litestream
+- No concurrent write conflicts
+- Predictable replication timing
+
+**Current Problem:**
+```rust
+// Current: Multiple write pool connections can write concurrently
+pub struct DBConnection {
+    read_pool: SqlitePool,
+    write_pool: SqlitePool,  // Multiple connections!
+}
+
+// Writes can happen from any task
+sqlx::query!("INSERT INTO ...").execute(&db.write()).await?;
+```
+
+**Solution - DatabaseWriter:**
+```rust
+// New: All writes serialized through channel
+type WriteOperation = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+pub struct DatabaseWriter {
+    write_tx: mpsc::UnboundedSender<WriteOperation>,
+    _handle: tokio::task::JoinHandle<()>,
+}
+
+impl DatabaseWriter {
+    pub fn new() -> Self {
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<WriteOperation>();
+
+        let handle = tokio::spawn(async move {
+            while let Some(future) = write_rx.recv().await {
+                future.await;
+            }
+        });
+
+        Self { write_tx, _handle: handle }
+    }
+
+    pub async fn execute<T, F, Fut>(&self, pool: SqlitePool, operation: F) -> Result<T, Error>
+    where
+        T: Send + 'static,
+        F: FnOnce(SqlitePool) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, Error>> + Send + 'static,
+    {
+        let (result_tx, result_rx) = oneshot::channel();
+
+        let write_op = Box::pin(async move {
+            let result = operation(pool).await;
+            let _ = result_tx.send(result);
+        });
+
+        self.write_tx.send(write_op)?;
+        result_rx.await?
+    }
+}
+
+// Usage:
+pub struct Database {
+    pool: SqlitePool,
+    writer: DatabaseWriter,
+}
+
+impl Database {
+    pub async fn insert_entry(&self, entry: &Entry) -> Result<(), Error> {
+        self.writer.execute(self.pool.clone(), |pool| async move {
+            sqlx::query!("INSERT INTO entries ...").execute(&pool).await?;
+            Ok(())
+        }).await
+    }
+}
+```
+
+### 2.6.3 Litestream Configuration
+
+**Development (`config/litestream.yml`):**
+```yaml
+dbs:
+  - path: ./data/bitcoin.db
+    replicas:
+      - type: s3
+        bucket: coordinator-db-backups
+        path: bitcoin.db
+        region: us-west-2
+        endpoint: http://localhost:4566  # Moto
+        force-path-style: true
+        sync-interval: 10s
+
+  - path: ./data/competitions.db
+    replicas:
+      - type: s3
+        bucket: coordinator-db-backups
+        path: competitions.db
+        # ... same config
+
+  - path: ./data/users.db
+    replicas:
+      - type: s3
+        bucket: coordinator-db-backups
+        path: users.db
+        # ... same config
+
+access-key-id: test
+secret-access-key: test
+```
+
+**Production (`config/litestream.production.yml`):**
+```yaml
+dbs:
+  - path: /data/bitcoin.db
+    replicas:
+      - type: s3
+        bucket: ${LITESTREAM_S3_BUCKET}
+        path: bitcoin.db
+        region: ${AWS_REGION:-us-west-2}
+        sync-interval: 10s
+        retention: 168h
+        snapshot-interval: 1h
+
+  # ... same for competitions.db, users.db
+
+# Uses IAM roles - no credentials needed
+addr: ":9090"  # Metrics endpoint
+```
+
+### 2.6.4 Helm Chart Integration
+
+The coordinator helm chart includes litestream as a sidecar:
+
+**values.yaml:**
+```yaml
+litestream:
+  enabled: false
+  image:
+    repository: litestream/litestream
+    tag: "0.3.13"
+  s3Bucket: ""
+  s3Region: "us-west-2"
+  s3Endpoint: ""  # Set for local dev with Moto
+  s3ForcePathStyle: false
+  syncInterval: "10s"
+  retention: "168h"
+  snapshotInterval: "1h"
+  databases:
+    - name: bitcoin
+      path: /data/bitcoin.db
+      s3Path: bitcoin.db
+    - name: competitions
+      path: /data/competitions.db
+      s3Path: competitions.db
+    - name: users
+      path: /data/users.db
+      s3Path: users.db
+```
+
+**deployment.yaml additions:**
+- Init container: `litestream restore` on startup
+- Sidecar container: `litestream replicate` continuously
+- ConfigMap: Generated litestream.yml from values
+
+### 2.6.5 Development Scripts
+
+Added to `flake.nix`:
+
+| Script | Purpose |
+|--------|---------|
+| `run-moto` | Start Moto S3 mock server on port 4566 |
+| `stop-moto` | Stop Moto server |
+| `run-litestream` | Start database replication (requires moto) |
+| `restore-litestream` | Restore databases from S3 backup |
+
+**Usage:**
+```bash
+# Start moto (creates coordinator-db-backups bucket)
+run-moto
+
+# Start replication
+run-litestream
+
+# Restore from backup
+restore-litestream
+
+# Point-in-time restore
+LITESTREAM_TIMESTAMP="2026-01-10T10:00:00Z" restore-litestream
+```
+
+### 2.6.6 Migration Steps
+
+**Phase 1: Add DatabaseWriter (this refactor)**
+1. Create `DatabaseWriter` struct in `infra/db.rs`
+2. Update `DBConnection` to include writer
+3. Migrate all write operations to use `writer.execute()`
+4. Keep read operations using direct pool access
+
+**Phase 2: Enable Litestream locally**
+1. Run `run-moto` to start S3 mock
+2. Run `run-litestream` in background
+3. Verify backups in S3: `aws --endpoint-url=http://localhost:4566 s3 ls s3://coordinator-db-backups/`
+
+**Phase 3: Production deployment**
+1. Set `litestream.enabled: true` in values
+2. Configure S3 bucket and IAM roles
+3. Deploy - init container restores, sidecar replicates
+
+### 2.6.7 Recovery
+
+**Automatic (Kubernetes):**
+- Pod restart triggers init container
+- `litestream restore -if-db-not-exists -if-replica-exists`
+- Only restores if database missing AND backup exists
+
+**Manual:**
+```bash
+# Latest backup
+litestream restore -config config/litestream.yml ./data/competitions.db
+
+# Point-in-time
+litestream restore -config config/litestream.yml \
+  -timestamp "2026-01-10T10:00:00Z" \
+  ./data/competitions.db
+```
+
+### 2.6.8 Benefits
+
+| Aspect | Before | After |
+|--------|--------|-------|
+| Data loss window | Full backup frequency | <10 seconds |
+| Recovery time | Manual restore | Automatic on pod start |
+| Concurrent writes | Potential conflicts | Serialized, predictable |
+| WAL compatibility | Issues with multiple writers | Clean single-writer model |
+| Cost | N/A | ~$0.50/month for S3 |
+
+---
+
 ## Part 3: Typestate Machine Architecture
 
 The current `coordinator.rs` uses a runtime enum-based state machine where state is derived from timestamps and flags on the `Competition` struct. This refactor introduces a **compile-time typestate pattern** inspired by the keymeld enclave's operation states.

@@ -1,7 +1,64 @@
 # Refactor Status
 
-**Last Updated:** 2026-01-10
-**Current Phase:** Part 2 Complete, Ready for Part 2.5
+**Last Updated:** 2026-01-11
+**Current Phase:** Part 2.6 Complete (Litestream + DatabaseWriter)
+
+---
+
+## Completed: Part 2.6 - Litestream Database Replication ✅
+
+### What Was Done
+
+1. **Added Moto (S3 mock) to flake.nix:**
+   - Python environment with moto, flask, boto3
+   - `run-moto` script starts S3 mock on port 4566
+   - `stop-moto` script for cleanup
+   - Auto-creates `coordinator-db-backups` bucket
+
+2. **Added Litestream to flake.nix:**
+   - `run-litestream` script starts database replication
+   - `restore-litestream` script for recovery
+   - Supports point-in-time restore via `LITESTREAM_TIMESTAMP`
+
+3. **Created litestream config files:**
+   - `config/litestream.yml` - Development (uses Moto)
+   - `config/litestream.production.yml` - Production (uses real S3)
+   - Configured for all 3 databases: bitcoin.db, competitions.db, users.db
+
+4. **Updated Helm chart for litestream:**
+   - Added litestream values with multi-database support
+   - Init container for restore on pod startup
+   - Sidecar container for continuous replication
+   - ConfigMap template generates litestream.yml from values
+
+5. **Implemented DatabaseWriter pattern:**
+   - `DatabaseWriter` struct with channel-based serialization in `infra/db.rs`
+   - `DatabaseWriteError` error type for write operation errors
+   - `DBConnection.execute_write()` method for WAL-safe serialized writes
+   - Each database (competitions, users) has its own `DatabaseWriter` instance
+
+6. **Migrated all write operations to execute_write():**
+   - `domain/competitions/store.rs` - All 20+ write operations migrated
+   - `domain/users/store.rs` - All 3 write operations migrated
+   - `DBConnection.write()` deprecated but kept for backwards compatibility
+   - No deprecation warnings remain - `cargo check` passes clean
+
+7. **Added sqlx offline mode support:**
+   - Created `.cargo/config.toml` with `SQLX_OFFLINE=true`
+   - Prepared for future migration to `sqlx::query!` macros
+
+### Testing Litestream Locally
+
+```bash
+# Start moto S3 mock
+run-moto
+
+# Start litestream replication
+run-litestream
+
+# To restore from backup
+restore-litestream
+```
 
 ---
 
@@ -145,7 +202,8 @@ $ cargo check
 |------|-------------|--------|
 | 1 | Project Structure Cleanup | ✅ Complete |
 | 2 | Nix Build System & CI | ✅ Complete |
-| 2.5 | Oracle Interface Abstraction & Mock | ⏳ Next |
+| 2.5 | Oracle Interface Abstraction & Mock | Pending |
+| 2.6 | Litestream & DatabaseWriter | ✅ Complete |
 | 3 | Typestate Machine | Pending |
 | 4 | Keymeld SDK Integration (Server) | Pending |
 | 5 | Keymeld SDK Integration (WASM) | Pending |

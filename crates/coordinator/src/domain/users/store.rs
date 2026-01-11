@@ -51,24 +51,35 @@ impl UserStore {
         user: RegisterPayload,
     ) -> Result<User, Error> {
         let now = OffsetDateTime::now_utc();
+        let encrypted_key = user.encrypted_bitcoin_private_key.clone();
+        let network = user.network.clone();
 
-        let user = sqlx::query_as::<_, User>(
-            "INSERT INTO user (
-                nostr_pubkey,
-                encrypted_bitcoin_private_key,
-                network,
-                created_at,
-                updated_at
-            ) VALUES (?, ?, ?, ?, ?)
-            RETURNING nostr_pubkey, encrypted_bitcoin_private_key, network, created_at, updated_at",
-        )
-        .bind(&nostr_pubkey)
-        .bind(&user.encrypted_bitcoin_private_key)
-        .bind(&user.network)
-        .bind(now)
-        .bind(now)
-        .fetch_one(self.db_connection.write())
-        .await?;
+        let user = self
+            .db_connection
+            .execute_write(move |pool| async move {
+                sqlx::query_as::<_, User>(
+                    "INSERT INTO user (
+                        nostr_pubkey,
+                        encrypted_bitcoin_private_key,
+                        network,
+                        created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    RETURNING nostr_pubkey, encrypted_bitcoin_private_key, network, created_at, updated_at",
+                )
+                .bind(nostr_pubkey)
+                .bind(encrypted_key)
+                .bind(network)
+                .bind(now)
+                .bind(now)
+                .fetch_one(&pool)
+                .await
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => Error::DbError(e),
+                e => Error::BadRequest(e.to_string()),
+            })?;
 
         Ok(user)
     }
@@ -97,22 +108,35 @@ impl UserStore {
         user: RegisterPayload,
     ) -> Result<User, Error> {
         let now = OffsetDateTime::now_utc();
+        let nostr_pubkey_owned = nostr_pubkey.to_string();
+        let encrypted_key = user.encrypted_bitcoin_private_key.clone();
+        let network = user.network.clone();
 
-        let result = sqlx::query(
-            "UPDATE user
-             SET encrypted_bitcoin_private_key = ?,
-                 network = ?,
-                 updated_at = ?
-             WHERE nostr_pubkey = ?",
-        )
-        .bind(&user.encrypted_bitcoin_private_key)
-        .bind(&user.network)
-        .bind(now)
-        .bind(nostr_pubkey)
-        .execute(self.db_connection.write())
-        .await?;
+        let rows_affected = self
+            .db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE user
+                     SET encrypted_bitcoin_private_key = ?,
+                         network = ?,
+                         updated_at = ?
+                     WHERE nostr_pubkey = ?",
+                )
+                .bind(encrypted_key)
+                .bind(network)
+                .bind(now)
+                .bind(nostr_pubkey_owned)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected())
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => Error::DbError(e),
+                e => Error::BadRequest(e.to_string()),
+            })?;
 
-        if result.rows_affected() == 0 {
+        if rows_affected == 0 {
             return Err(Error::NotFound(format!(
                 "User not found with pubkey: {}",
                 nostr_pubkey
@@ -124,12 +148,24 @@ impl UserStore {
     }
 
     pub async fn delete_user(&self, nostr_pubkey: &str) -> Result<(), Error> {
-        let result = sqlx::query("DELETE FROM user WHERE nostr_pubkey = ?")
-            .bind(nostr_pubkey)
-            .execute(self.db_connection.write())
-            .await?;
+        let nostr_pubkey_owned = nostr_pubkey.to_string();
 
-        if result.rows_affected() == 0 {
+        let rows_affected = self
+            .db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query("DELETE FROM user WHERE nostr_pubkey = ?")
+                    .bind(nostr_pubkey_owned)
+                    .execute(&pool)
+                    .await?;
+                Ok(result.rows_affected())
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => Error::DbError(e),
+                e => Error::BadRequest(e.to_string()),
+            })?;
+
+        if rows_affected == 0 {
             return Err(Error::NotFound(format!(
                 "User not found with pubkey: {}",
                 nostr_pubkey

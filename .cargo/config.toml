@@ -1,0 +1,6 @@
+[env]
+# Use offline mode for SQLx to use cached query metadata
+SQLX_OFFLINE = { value = "true", force = false }
+
+[registries.crates-io]
+protocol = "sparse"

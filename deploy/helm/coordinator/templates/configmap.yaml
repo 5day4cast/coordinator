@@ -87,17 +87,19 @@ metadata:
 data:
   litestream.yml: |
     dbs:
-      - path: {{ .Values.persistence.mountPath }}/coordinator.db
+      {{- range .Values.litestream.databases }}
+      - path: {{ .path }}
         replicas:
           - type: s3
-            bucket: {{ .Values.litestream.s3Bucket }}
-            path: {{ .Values.litestream.s3Path }}
-            region: {{ .Values.litestream.s3Region }}
-            {{- if .Values.litestream.s3Endpoint }}
-            endpoint: {{ .Values.litestream.s3Endpoint }}
-            force-path-style: {{ .Values.litestream.s3ForcePathStyle }}
+            bucket: {{ $.Values.litestream.s3Bucket }}
+            path: {{ .s3Path }}
+            region: {{ $.Values.litestream.s3Region }}
+            {{- if $.Values.litestream.s3Endpoint }}
+            endpoint: {{ $.Values.litestream.s3Endpoint }}
+            force-path-style: {{ $.Values.litestream.s3ForcePathStyle }}
             {{- end }}
-            sync-interval: {{ .Values.litestream.syncInterval }}
-            retention: {{ .Values.litestream.retention }}
-            snapshot-interval: {{ .Values.litestream.snapshotInterval }}
+            sync-interval: {{ $.Values.litestream.syncInterval }}
+            retention: {{ $.Values.litestream.retention }}
+            snapshot-interval: {{ $.Values.litestream.snapshotInterval }}
+      {{- end }}
 {{- end }}

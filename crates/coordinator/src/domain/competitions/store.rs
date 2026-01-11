@@ -43,15 +43,22 @@ impl CompetitionStore {
         name: String,
         pubkey: XOnlyPublicKey,
     ) -> Result<(), sqlx::Error> {
-        let pubkey_raw = pubkey.serialize();
+        let pubkey_raw = pubkey.serialize().to_vec();
 
-        sqlx::query("INSERT INTO coordinator_metadata (pubkey, name) VALUES (?, ?)")
-            .bind(&pubkey_raw[..])
-            .bind(&name)
-            .execute(self.db_connection.write())
-            .await?;
-
-        Ok(())
+        self.db_connection
+            .execute_write(move |pool| async move {
+                sqlx::query("INSERT INTO coordinator_metadata (pubkey, name) VALUES (?, ?)")
+                    .bind(&pubkey_raw[..])
+                    .bind(&name)
+                    .execute(&pool)
+                    .await?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
     }
 
     pub async fn add_entry(
@@ -64,30 +71,48 @@ impl CompetitionStore {
         let entry_submission = serde_json::to_string(&entry.entry_submission)
             .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
 
-        sqlx::query(
-            "INSERT INTO entries (
-                id,
-                ticket_id,
-                event_id,
-                pubkey,
-                ephemeral_pubkey,
-                ephemeral_privatekey_encrypted,
-                payout_preimage_encrypted,
-                payout_hash,
-                entry_submission
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(entry.id.to_string())
-        .bind(ticket_id.to_string())
-        .bind(entry.event_id.to_string())
-        .bind(&entry.pubkey)
-        .bind(&entry.ephemeral_pubkey)
-        .bind(&entry.ephemeral_privatekey_encrypted)
-        .bind(&entry.payout_preimage_encrypted)
-        .bind(&entry.payout_hash)
-        .bind(&entry_submission)
-        .execute(self.db_connection.write())
-        .await?;
+        let entry_id = entry.id.to_string();
+        let ticket_id_str = ticket_id.to_string();
+        let event_id = entry.event_id.to_string();
+        let pubkey = entry.pubkey.clone();
+        let ephemeral_pubkey = entry.ephemeral_pubkey.clone();
+        let ephemeral_privatekey_encrypted = entry.ephemeral_privatekey_encrypted.clone();
+        let payout_preimage_encrypted = entry.payout_preimage_encrypted.clone();
+        let payout_hash = entry.payout_hash.clone();
+
+        self.db_connection
+            .execute_write(move |pool| async move {
+                sqlx::query(
+                    "INSERT INTO entries (
+                        id,
+                        ticket_id,
+                        event_id,
+                        pubkey,
+                        ephemeral_pubkey,
+                        ephemeral_privatekey_encrypted,
+                        payout_preimage_encrypted,
+                        payout_hash,
+                        entry_submission
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(entry_id)
+                .bind(ticket_id_str)
+                .bind(event_id)
+                .bind(pubkey)
+                .bind(ephemeral_pubkey)
+                .bind(ephemeral_privatekey_encrypted)
+                .bind(payout_preimage_encrypted)
+                .bind(payout_hash)
+                .bind(entry_submission)
+                .execute(&pool)
+                .await?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })?;
 
         Ok(entry)
     }
@@ -100,20 +125,30 @@ impl CompetitionStore {
         let sigs_json = serde_json::to_string(&final_signatures.partial_signatures)
             .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
 
-        let result = sqlx::query(
-            "UPDATE entries
-            SET partial_signatures = ?,
-                funding_psbt_base64 = ?,
-                signed_at = datetime('now')
-            WHERE id = ?",
-        )
-        .bind(&sigs_json)
-        .bind(&final_signatures.funding_psbt_base64)
-        .bind(entry_id.to_string())
-        .execute(self.db_connection.write())
-        .await?;
+        let entry_id_str = entry_id.to_string();
+        let funding_psbt = final_signatures.funding_psbt_base64.clone();
 
-        Ok(result.rows_affected() > 0)
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE entries
+                    SET partial_signatures = ?,
+                        funding_psbt_base64 = ?,
+                        signed_at = datetime('now')
+                    WHERE id = ?",
+                )
+                .bind(sigs_json)
+                .bind(funding_psbt)
+                .bind(entry_id_str)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
     }
 
     pub async fn add_public_nonces(
@@ -124,17 +159,26 @@ impl CompetitionStore {
         let nonces_json =
             serde_json::to_string(&public_nonces).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
 
-        let result = sqlx::query(
-            "UPDATE entries
-            SET public_nonces = ?
-            WHERE id = ?",
-        )
-        .bind(&nonces_json)
-        .bind(entry_id.to_string())
-        .execute(self.db_connection.write())
-        .await?;
+        let entry_id_str = entry_id.to_string();
 
-        Ok(result.rows_affected() > 0)
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE entries
+                    SET public_nonces = ?
+                    WHERE id = ?",
+                )
+                .bind(nonces_json)
+                .bind(entry_id_str)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
     }
 
     pub async fn mark_entry_sellback_broadcast(
@@ -146,17 +190,26 @@ impl CompetitionStore {
             .format(&Rfc3339)
             .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
 
-        let result = sqlx::query(
-            "UPDATE entries
-            SET sellback_broadcasted_at = ?
-            WHERE id = ?",
-        )
-        .bind(&broadcast_time_str)
-        .bind(entry_id.to_string())
-        .execute(self.db_connection.write())
-        .await?;
+        let entry_id_str = entry_id.to_string();
 
-        Ok(result.rows_affected() > 0)
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE entries
+                    SET sellback_broadcasted_at = ?
+                    WHERE id = ?",
+                )
+                .bind(broadcast_time_str)
+                .bind(entry_id_str)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
     }
 
     pub async fn mark_entry_reclaim_broadcast(
@@ -168,17 +221,26 @@ impl CompetitionStore {
             .format(&Rfc3339)
             .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
 
-        let result = sqlx::query(
-            "UPDATE entries
-            SET reclaimed_broadcasted_at = ?
-            WHERE id = ?",
-        )
-        .bind(&broadcast_time_str)
-        .bind(entry_id.to_string())
-        .execute(self.db_connection.write())
-        .await?;
+        let entry_id_str = entry_id.to_string();
 
-        Ok(result.rows_affected() > 0)
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE entries
+                    SET reclaimed_broadcasted_at = ?
+                    WHERE id = ?",
+                )
+                .bind(broadcast_time_str)
+                .bind(entry_id_str)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
     }
 
     pub async fn store_payout_info_pending(
@@ -189,52 +251,61 @@ impl CompetitionStore {
         ln_invoice: String,
         payout_amount_sats: u64,
     ) -> Result<Uuid, sqlx::Error> {
-        let mut tx = self.db_connection.write().begin().await?;
-
         let payout_id = Uuid::now_v7();
         let initiated_at = OffsetDateTime::now_utc();
+        let entry_id_str = entry_id.to_string();
+        let payout_id_str = payout_id.to_string();
+        let initiated_at_str = initiated_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
 
-        sqlx::query(
-            "INSERT INTO payouts (
-                id,
-                entry_id,
-                payout_payment_request,
-                payout_amount_sats,
-                initiated_at,
-                succeed_at,
-                failed_at,
-                error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(payout_id.to_string())
-        .bind(entry_id.to_string())
-        .bind(&ln_invoice)
-        .bind(payout_amount_sats as i64)
-        .bind(
-            initiated_at
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap(),
-        )
-        .bind(None::<String>) // succeed_at
-        .bind(None::<String>) // failed_at
-        .bind(None::<String>)
-        .execute(&mut *tx)
-        .await?;
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let mut tx = pool.begin().await?;
 
-        sqlx::query(
-            "UPDATE entries
-            SET payout_preimage = ?,
-                ephemeral_privatekey = ?
-            WHERE id = ?",
-        )
-        .bind(&payout_preimage)
-        .bind(&ephemeral_private_key)
-        .bind(entry_id.to_string())
-        .execute(&mut *tx)
-        .await?;
+                sqlx::query(
+                    "INSERT INTO payouts (
+                        id,
+                        entry_id,
+                        payout_payment_request,
+                        payout_amount_sats,
+                        initiated_at,
+                        succeed_at,
+                        failed_at,
+                        error
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(&payout_id_str)
+                .bind(&entry_id_str)
+                .bind(&ln_invoice)
+                .bind(payout_amount_sats as i64)
+                .bind(&initiated_at_str)
+                .bind(None::<String>) // succeed_at
+                .bind(None::<String>) // failed_at
+                .bind(None::<String>)
+                .execute(&mut *tx)
+                .await?;
 
-        tx.commit().await?;
-        Ok(payout_id)
+                sqlx::query(
+                    "UPDATE entries
+                    SET payout_preimage = ?,
+                        ephemeral_privatekey = ?
+                    WHERE id = ?",
+                )
+                .bind(&payout_preimage)
+                .bind(&ephemeral_private_key)
+                .bind(&entry_id_str)
+                .execute(&mut *tx)
+                .await?;
+
+                tx.commit().await?;
+                Ok(payout_id)
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
     }
 
     pub async fn mark_payout_succeeded(
@@ -242,21 +313,29 @@ impl CompetitionStore {
         payout_id: Uuid,
         succeed_at: OffsetDateTime,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE payouts
-            SET succeed_at = ?
-            WHERE id = ?",
-        )
-        .bind(
-            succeed_at
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap(),
-        )
-        .bind(payout_id.to_string())
-        .execute(self.db_connection.write())
-        .await?;
+        let succeed_at_str = succeed_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let payout_id_str = payout_id.to_string();
 
-        Ok(())
+        self.db_connection
+            .execute_write(move |pool| async move {
+                sqlx::query(
+                    "UPDATE payouts
+                    SET succeed_at = ?
+                    WHERE id = ?",
+                )
+                .bind(succeed_at_str)
+                .bind(payout_id_str)
+                .execute(&pool)
+                .await?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
     }
 
     pub async fn mark_payout_failed(
@@ -267,23 +346,30 @@ impl CompetitionStore {
     ) -> Result<(), sqlx::Error> {
         let error_blob =
             serde_json::to_string(&error).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let failed_at_str = failed_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let payout_id_str = payout_id.to_string();
 
-        sqlx::query(
-            "UPDATE payouts
-            SET failed_at = ?, error = ?
-            WHERE id = ?",
-        )
-        .bind(
-            failed_at
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap(),
-        )
-        .bind(error_blob)
-        .bind(payout_id.to_string())
-        .execute(self.db_connection.write())
-        .await?;
-
-        Ok(())
+        self.db_connection
+            .execute_write(move |pool| async move {
+                sqlx::query(
+                    "UPDATE payouts
+                    SET failed_at = ?, error = ?
+                    WHERE id = ?",
+                )
+                .bind(failed_at_str)
+                .bind(error_blob)
+                .bind(payout_id_str)
+                .execute(&pool)
+                .await?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
     }
 
     pub async fn get_payout(&self, payout_id: Uuid) -> Result<Option<EntryPayout>, sqlx::Error> {
@@ -513,8 +599,6 @@ impl CompetitionStore {
         competition: Competition,
         tickets: Vec<Ticket>,
     ) -> Result<Competition, sqlx::Error> {
-        let mut tx = self.db_connection.write().begin().await?;
-
         let created_at = competition
             .created_at
             .format(&Rfc3339)
@@ -523,39 +607,67 @@ impl CompetitionStore {
         let event_submission = serde_json::to_string(&competition.event_submission)
             .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
 
-        sqlx::query(
-            "INSERT INTO competitions (
-                id,
-                created_at,
-                event_submission
-            ) VALUES (?, ?, ?)",
-        )
-        .bind(competition.id.to_string())
-        .bind(&created_at)
-        .bind(&event_submission)
-        .execute(&mut *tx)
-        .await?;
+        let competition_id_str = competition.id.to_string();
 
-        for ticket in &tickets {
-            sqlx::query(
-                "INSERT INTO tickets (
-                    id,
-                    event_id,
-                    encrypted_preimage,
-                    hash,
-                    payment_request
-                ) VALUES (?, ?, ?, ?, ?)",
-            )
-            .bind(ticket.id.to_string())
-            .bind(ticket.competition_id.to_string())
-            .bind(&ticket.encrypted_preimage)
-            .bind(&ticket.hash)
-            .bind(&ticket.payment_request)
-            .execute(&mut *tx)
-            .await?;
-        }
+        // Prepare ticket data for the closure
+        let ticket_data: Vec<(String, String, String, String, Option<String>)> = tickets
+            .iter()
+            .map(|t| {
+                (
+                    t.id.to_string(),
+                    t.competition_id.to_string(),
+                    t.encrypted_preimage.clone(),
+                    t.hash.clone(),
+                    t.payment_request.clone(),
+                )
+            })
+            .collect();
 
-        tx.commit().await?;
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let mut tx = pool.begin().await?;
+
+                sqlx::query(
+                    "INSERT INTO competitions (
+                        id,
+                        created_at,
+                        event_submission
+                    ) VALUES (?, ?, ?)",
+                )
+                .bind(&competition_id_str)
+                .bind(&created_at)
+                .bind(&event_submission)
+                .execute(&mut *tx)
+                .await?;
+
+                for (id, event_id, encrypted_preimage, hash, payment_request) in &ticket_data {
+                    sqlx::query(
+                        "INSERT INTO tickets (
+                            id,
+                            event_id,
+                            encrypted_preimage,
+                            hash,
+                            payment_request
+                        ) VALUES (?, ?, ?, ?, ?)",
+                    )
+                    .bind(id)
+                    .bind(event_id)
+                    .bind(encrypted_preimage)
+                    .bind(hash)
+                    .bind(payment_request)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+
+                tx.commit().await?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })?;
+
         Ok(competition)
     }
 
@@ -563,230 +675,281 @@ impl CompetitionStore {
         &self,
         competitions: Vec<Competition>,
     ) -> Result<(), sqlx::Error> {
-        for competition in competitions {
-            let query = "UPDATE competitions SET
-                event_announcement = ?,
-                outcome_transaction = ?,
-                funding_psbt_base64 = ?,
-                funding_transaction = ?,
-                funding_outpoint = ?,
-                contract_parameters = ?,
-                public_nonces = ?,
-                aggregated_nonces = ?,
-                partial_signatures = ?,
-                signed_contract = ?,
-                attestation = ?,
-                cancelled_at = ?,
-                contracted_at = ?,
-                signed_at = ?,
-                escrow_funds_confirmed_at = ?,
-                event_created_at = ?,
-                entries_submitted_at = ?,
-                funding_broadcasted_at = ?,
-                funding_confirmed_at = ?,
-                funding_settled_at = ?,
-                expiry_broadcasted_at = ?,
-                outcome_broadcasted_at = ?,
-                delta_broadcasted_at = ?,
-                completed_at = ?,
-                failed_at = ?,
-                errors = ?
-                WHERE id = ?";
+        // Prepare all competition data before moving into closure
+        let mut prepared_updates = Vec::with_capacity(competitions.len());
 
-            sqlx::query(query)
-                .bind(
-                    competition
-                        .event_announcement
-                        .as_ref()
-                        .map(serde_json::to_string)
-                        .transpose()
+        for competition in competitions {
+            let event_announcement = competition
+                .event_announcement
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let outcome_transaction = competition
+                .outcome_transaction
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let funding_psbt_base64 = competition.funding_psbt_base64.clone();
+            let funding_transaction = competition
+                .funding_transaction
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let funding_outpoint = competition
+                .funding_outpoint
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let contract_parameters = competition
+                .contract_parameters
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let public_nonces = competition
+                .public_nonces
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let aggregated_nonces = competition
+                .aggregated_nonces
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let partial_signatures = competition
+                .partial_signatures
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let signed_contract = competition
+                .signed_contract
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let attestation = competition
+                .attestation
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let cancelled_at = competition
+                .cancelled_at
+                .map(|ts| ts.format(&Rfc3339))
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let contracted_at = competition
+                .contracted_at
+                .map(|ts| ts.format(&Rfc3339))
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let signed_at = competition
+                .signed_at
+                .map(|ts| ts.format(&Rfc3339))
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let escrow_funds_confirmed_at = competition
+                .escrow_funds_confirmed_at
+                .map(|ts| ts.format(&Rfc3339))
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let event_created_at = competition
+                .event_created_at
+                .map(|ts| ts.format(&Rfc3339))
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let entries_submitted_at = competition
+                .entries_submitted_at
+                .map(|ts| ts.format(&Rfc3339))
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let funding_broadcasted_at = competition
+                .funding_broadcasted_at
+                .map(|ts| ts.format(&Rfc3339))
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let funding_confirmed_at = competition
+                .funding_confirmed_at
+                .map(|ts| ts.format(&Rfc3339))
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let funding_settled_at = competition
+                .funding_settled_at
+                .map(|ts| ts.format(&Rfc3339))
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let expiry_broadcasted_at = competition
+                .expiry_broadcasted_at
+                .map(|ts| ts.format(&Rfc3339))
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let outcome_broadcasted_at = competition
+                .outcome_broadcasted_at
+                .map(|ts| ts.format(&Rfc3339))
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let delta_broadcasted_at = competition
+                .delta_broadcasted_at
+                .map(|ts| ts.format(&Rfc3339))
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let completed_at = competition
+                .completed_at
+                .map(|ts| ts.format(&Rfc3339))
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let failed_at = competition
+                .failed_at
+                .map(|ts| ts.format(&Rfc3339))
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let errors = if !competition.errors.is_empty() {
+                Some(
+                    serde_json::to_string(&competition.errors)
                         .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
                 )
-                .bind(
-                    competition
-                        .outcome_transaction
-                        .as_ref()
-                        .map(serde_json::to_string)
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(competition.funding_psbt_base64.as_ref())
-                .bind(
-                    competition
-                        .funding_transaction
-                        .as_ref()
-                        .map(serde_json::to_string)
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .funding_outpoint
-                        .as_ref()
-                        .map(serde_json::to_string)
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .contract_parameters
-                        .as_ref()
-                        .map(serde_json::to_string)
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .public_nonces
-                        .as_ref()
-                        .map(serde_json::to_string)
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .aggregated_nonces
-                        .as_ref()
-                        .map(serde_json::to_string)
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .partial_signatures
-                        .as_ref()
-                        .map(serde_json::to_string)
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .signed_contract
-                        .as_ref()
-                        .map(serde_json::to_string)
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .attestation
-                        .as_ref()
-                        .map(serde_json::to_string)
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .cancelled_at
-                        .map(|ts| ts.format(&Rfc3339))
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .contracted_at
-                        .map(|ts| ts.format(&Rfc3339))
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .signed_at
-                        .map(|ts| ts.format(&Rfc3339))
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .escrow_funds_confirmed_at
-                        .map(|ts| ts.format(&Rfc3339))
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .event_created_at
-                        .map(|ts| ts.format(&Rfc3339))
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .entries_submitted_at
-                        .map(|ts| ts.format(&Rfc3339))
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .funding_broadcasted_at
-                        .map(|ts| ts.format(&Rfc3339))
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .funding_confirmed_at
-                        .map(|ts| ts.format(&Rfc3339))
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .funding_settled_at
-                        .map(|ts| ts.format(&Rfc3339))
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .expiry_broadcasted_at
-                        .map(|ts| ts.format(&Rfc3339))
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .outcome_broadcasted_at
-                        .map(|ts| ts.format(&Rfc3339))
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .delta_broadcasted_at
-                        .map(|ts| ts.format(&Rfc3339))
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .completed_at
-                        .map(|ts| ts.format(&Rfc3339))
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(
-                    competition
-                        .failed_at
-                        .map(|ts| ts.format(&Rfc3339))
-                        .transpose()
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-                .bind(if !competition.errors.is_empty() {
-                    Some(
-                        serde_json::to_string(&competition.errors)
-                            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                    )
-                } else {
-                    None
-                })
-                .bind(competition.id.to_string())
-                .execute(self.db_connection.write())
-                .await?;
+            } else {
+                None
+            };
+            let competition_id = competition.id.to_string();
+
+            prepared_updates.push((
+                event_announcement,
+                outcome_transaction,
+                funding_psbt_base64,
+                funding_transaction,
+                funding_outpoint,
+                contract_parameters,
+                public_nonces,
+                aggregated_nonces,
+                partial_signatures,
+                signed_contract,
+                attestation,
+                cancelled_at,
+                contracted_at,
+                signed_at,
+                escrow_funds_confirmed_at,
+                event_created_at,
+                entries_submitted_at,
+                funding_broadcasted_at,
+                funding_confirmed_at,
+                funding_settled_at,
+                expiry_broadcasted_at,
+                outcome_broadcasted_at,
+                delta_broadcasted_at,
+                completed_at,
+                failed_at,
+                errors,
+                competition_id,
+            ));
         }
 
-        Ok(())
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let query = "UPDATE competitions SET
+                    event_announcement = ?,
+                    outcome_transaction = ?,
+                    funding_psbt_base64 = ?,
+                    funding_transaction = ?,
+                    funding_outpoint = ?,
+                    contract_parameters = ?,
+                    public_nonces = ?,
+                    aggregated_nonces = ?,
+                    partial_signatures = ?,
+                    signed_contract = ?,
+                    attestation = ?,
+                    cancelled_at = ?,
+                    contracted_at = ?,
+                    signed_at = ?,
+                    escrow_funds_confirmed_at = ?,
+                    event_created_at = ?,
+                    entries_submitted_at = ?,
+                    funding_broadcasted_at = ?,
+                    funding_confirmed_at = ?,
+                    funding_settled_at = ?,
+                    expiry_broadcasted_at = ?,
+                    outcome_broadcasted_at = ?,
+                    delta_broadcasted_at = ?,
+                    completed_at = ?,
+                    failed_at = ?,
+                    errors = ?
+                    WHERE id = ?";
+
+                for (
+                    event_announcement,
+                    outcome_transaction,
+                    funding_psbt_base64,
+                    funding_transaction,
+                    funding_outpoint,
+                    contract_parameters,
+                    public_nonces,
+                    aggregated_nonces,
+                    partial_signatures,
+                    signed_contract,
+                    attestation,
+                    cancelled_at,
+                    contracted_at,
+                    signed_at,
+                    escrow_funds_confirmed_at,
+                    event_created_at,
+                    entries_submitted_at,
+                    funding_broadcasted_at,
+                    funding_confirmed_at,
+                    funding_settled_at,
+                    expiry_broadcasted_at,
+                    outcome_broadcasted_at,
+                    delta_broadcasted_at,
+                    completed_at,
+                    failed_at,
+                    errors,
+                    competition_id,
+                ) in prepared_updates
+                {
+                    sqlx::query(query)
+                        .bind(event_announcement)
+                        .bind(outcome_transaction)
+                        .bind(funding_psbt_base64)
+                        .bind(funding_transaction)
+                        .bind(funding_outpoint)
+                        .bind(contract_parameters)
+                        .bind(public_nonces)
+                        .bind(aggregated_nonces)
+                        .bind(partial_signatures)
+                        .bind(signed_contract)
+                        .bind(attestation)
+                        .bind(cancelled_at)
+                        .bind(contracted_at)
+                        .bind(signed_at)
+                        .bind(escrow_funds_confirmed_at)
+                        .bind(event_created_at)
+                        .bind(entries_submitted_at)
+                        .bind(funding_broadcasted_at)
+                        .bind(funding_confirmed_at)
+                        .bind(funding_settled_at)
+                        .bind(expiry_broadcasted_at)
+                        .bind(outcome_broadcasted_at)
+                        .bind(delta_broadcasted_at)
+                        .bind(completed_at)
+                        .bind(failed_at)
+                        .bind(errors)
+                        .bind(competition_id)
+                        .execute(&pool)
+                        .await?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
     }
 
     pub async fn get_competitions(
@@ -918,7 +1081,7 @@ impl CompetitionStore {
         };
 
         let pool = if use_write_pool {
-            self.db_connection.write()
+            self.db_connection.write_pool()
         } else {
             self.db_connection.read()
         };
@@ -1026,92 +1189,103 @@ impl CompetitionStore {
         competition_id: Uuid,
         pubkey: &str,
     ) -> Result<Ticket, sqlx::Error> {
-        let mut tx = self.db_connection.write().begin().await?;
+        let competition_id_str = competition_id.to_string();
+        let pubkey_owned = pubkey.to_string();
 
-        // First, find an available ticket
-        let ticket_id: Option<String> = sqlx::query_scalar(
-            r#"SELECT tickets.id
-               FROM tickets
-               LEFT JOIN entries ON tickets.id = entries.ticket_id
-               WHERE tickets.event_id = ?
-                 AND entries.id IS NULL
-                 AND (
-                     reserved_at IS NULL
-                     OR (
-                         reserved_at < datetime('now', '-10 minutes')
-                         AND paid_at IS NULL
-                     )
-                 )
-               ORDER BY
-                   reserved_at IS NULL DESC,
-                   reserved_at,
-                   tickets.id
-               LIMIT 1"#,
-        )
-        .bind(competition_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await?;
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let mut tx = pool.begin().await?;
 
-        let ticket_id = match ticket_id {
-            Some(id) => {
-                debug!("Found available ticket: {}", id);
-                id
-            }
-            None => {
-                debug!("No available tickets found");
-                tx.rollback().await?;
-                return Err(sqlx::Error::RowNotFound);
-            }
-        };
+                // First, find an available ticket
+                let ticket_id: Option<String> = sqlx::query_scalar(
+                    r#"SELECT tickets.id
+                       FROM tickets
+                       LEFT JOIN entries ON tickets.id = entries.ticket_id
+                       WHERE tickets.event_id = ?
+                         AND entries.id IS NULL
+                         AND (
+                             reserved_at IS NULL
+                             OR (
+                                 reserved_at < datetime('now', '-10 minutes')
+                                 AND paid_at IS NULL
+                             )
+                         )
+                       ORDER BY
+                           reserved_at IS NULL DESC,
+                           reserved_at,
+                           tickets.id
+                       LIMIT 1"#,
+                )
+                .bind(&competition_id_str)
+                .fetch_optional(&mut *tx)
+                .await?;
 
-        // Update the ticket to reserve it
-        let rows_affected = sqlx::query(
-            r#"UPDATE tickets
-               SET reserved_at = datetime('now'),
-                   reserved_by = ?
-               WHERE id = ?
-                 AND event_id = ?"#,
-        )
-        .bind(pubkey)
-        .bind(&ticket_id)
-        .bind(competition_id.to_string())
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+                let ticket_id = match ticket_id {
+                    Some(id) => {
+                        debug!("Found available ticket: {}", id);
+                        id
+                    }
+                    None => {
+                        debug!("No available tickets found");
+                        tx.rollback().await?;
+                        return Err(sqlx::Error::RowNotFound);
+                    }
+                };
 
-        if rows_affected == 0 {
-            debug!("Failed to reserve ticket {}", ticket_id);
-            tx.rollback().await?;
-            return Err(sqlx::Error::RowNotFound);
-        }
+                // Update the ticket to reserve it
+                let rows_affected = sqlx::query(
+                    r#"UPDATE tickets
+                       SET reserved_at = datetime('now'),
+                           reserved_by = ?
+                       WHERE id = ?
+                         AND event_id = ?"#,
+                )
+                .bind(&pubkey_owned)
+                .bind(&ticket_id)
+                .bind(&competition_id_str)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
 
-        // Get the updated ticket
-        let ticket = sqlx::query_as::<_, Ticket>(
-            r#"SELECT tickets.id as id,
-                      tickets.event_id as competition_id,
-                      entries.id as entry_id,
-                      tickets.ephemeral_pubkey as ephemeral_pubkey,
-                      encrypted_preimage,
-                      hash,
-                      payment_request,
-                      datetime('now', '+10 minutes') as expiry,
-                      reserved_by,
-                      reserved_at,
-                      paid_at,
-                      settled_at,
-                      escrow_transaction
-               FROM tickets
-               LEFT JOIN entries ON tickets.id = entries.ticket_id
-               WHERE tickets.id = ?"#,
-        )
-        .bind(&ticket_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        tx.commit().await?;
+                if rows_affected == 0 {
+                    debug!("Failed to reserve ticket {}", ticket_id);
+                    tx.rollback().await?;
+                    return Err(sqlx::Error::RowNotFound);
+                }
 
-        debug!("Successfully reserved ticket {}", ticket_id);
+                // Get the updated ticket
+                let ticket = sqlx::query_as::<_, Ticket>(
+                    r#"SELECT tickets.id as id,
+                              tickets.event_id as competition_id,
+                              entries.id as entry_id,
+                              tickets.ephemeral_pubkey as ephemeral_pubkey,
+                              encrypted_preimage,
+                              hash,
+                              payment_request,
+                              datetime('now', '+10 minutes') as expiry,
+                              reserved_by,
+                              reserved_at,
+                              paid_at,
+                              settled_at,
+                              escrow_transaction
+                       FROM tickets
+                       LEFT JOIN entries ON tickets.id = entries.ticket_id
+                       WHERE tickets.id = ?"#,
+                )
+                .bind(&ticket_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                tx.commit().await?;
 
-        Ok(ticket)
+                debug!("Successfully reserved ticket {}", ticket_id);
+
+                Ok(ticket)
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
     }
 
     pub async fn get_pending_tickets(&self) -> Result<Vec<Ticket>, sqlx::Error> {
@@ -1270,38 +1444,56 @@ impl CompetitionStore {
         competition_id: Uuid,
     ) -> Result<bool, sqlx::Error> {
         let interval = format!("-{} minutes", 10);
+        let ticket_hash_owned = ticket_hash.to_string();
+        let competition_id_str = competition_id.to_string();
 
-        let result = sqlx::query(
-            "UPDATE tickets
-            SET paid_at = datetime('now')
-            WHERE hash = ?
-            AND event_id = ?
-            AND paid_at IS NULL
-            AND settled_at IS NULL
-            AND reserved_at IS NOT NULL
-            AND reserved_at > datetime('now', ?)",
-        )
-        .bind(ticket_hash)
-        .bind(competition_id.to_string())
-        .bind(&interval)
-        .execute(self.db_connection.write())
-        .await?;
-
-        Ok(result.rows_affected() > 0)
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE tickets
+                    SET paid_at = datetime('now')
+                    WHERE hash = ?
+                    AND event_id = ?
+                    AND paid_at IS NULL
+                    AND settled_at IS NULL
+                    AND reserved_at IS NOT NULL
+                    AND reserved_at > datetime('now', ?)",
+                )
+                .bind(ticket_hash_owned)
+                .bind(competition_id_str)
+                .bind(interval)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
     }
 
     pub async fn mark_ticket_settled(&self, ticket_id: Uuid) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            "UPDATE tickets SET settled_at = datetime('now') WHERE id = ?
-            AND settled_at IS NULL
-            AND paid_at IS NOT NULL
-            AND reserved_at IS NOT NULL",
-        )
-        .bind(ticket_id.to_string())
-        .execute(self.db_connection.write())
-        .await?;
+        let ticket_id_str = ticket_id.to_string();
 
-        Ok(result.rows_affected() > 0)
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE tickets SET settled_at = datetime('now') WHERE id = ?
+                    AND settled_at IS NULL
+                    AND paid_at IS NOT NULL
+                    AND reserved_at IS NOT NULL",
+                )
+                .bind(ticket_id_str)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
     }
 
     pub async fn update_ticket_escrow(
@@ -1310,18 +1502,27 @@ impl CompetitionStore {
         ephemeral_pubkey: String,
         escrow_tx: String,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            "UPDATE tickets
-            SET escrow_transaction = ?, ephemeral_pubkey = ?
-            WHERE id = ?",
-        )
-        .bind(&escrow_tx)
-        .bind(&ephemeral_pubkey)
-        .bind(ticket_id.to_string())
-        .execute(self.db_connection.write())
-        .await?;
+        let ticket_id_str = ticket_id.to_string();
 
-        Ok(result.rows_affected() > 0)
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE tickets
+                    SET escrow_transaction = ?, ephemeral_pubkey = ?
+                    WHERE id = ?",
+                )
+                .bind(escrow_tx)
+                .bind(ephemeral_pubkey)
+                .bind(ticket_id_str)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
     }
 
     pub async fn update_ticket_payment_request(
@@ -1329,30 +1530,49 @@ impl CompetitionStore {
         ticket_id: Uuid,
         payment_request: &str,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query("UPDATE tickets SET payment_request = ? WHERE id = ?")
-            .bind(payment_request)
-            .bind(ticket_id.to_string())
-            .execute(self.db_connection.write())
-            .await?;
+        let ticket_id_str = ticket_id.to_string();
+        let payment_request_owned = payment_request.to_string();
 
-        Ok(result.rows_affected() > 0)
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query("UPDATE tickets SET payment_request = ? WHERE id = ?")
+                    .bind(payment_request_owned)
+                    .bind(ticket_id_str)
+                    .execute(&pool)
+                    .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
     }
 
     pub async fn clear_ticket_reservation(&self, ticket_id: Uuid) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            "UPDATE tickets
-            SET reserved_at = NULL,
-                reserved_by = NULL,
-                paid_at = NULL,
-                escrow_transaction = NULL
-            WHERE id = ?
-            AND settled_at IS NULL",
-        )
-        .bind(ticket_id.to_string())
-        .execute(self.db_connection.write())
-        .await?;
+        let ticket_id_str = ticket_id.to_string();
 
-        Ok(result.rows_affected() > 0)
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE tickets
+                    SET reserved_at = NULL,
+                        reserved_by = NULL,
+                        paid_at = NULL,
+                        escrow_transaction = NULL
+                    WHERE id = ?
+                    AND settled_at IS NULL",
+                )
+                .bind(ticket_id_str)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
     }
 
     pub async fn update_ticket_escrow_transaction(
@@ -1360,13 +1580,23 @@ impl CompetitionStore {
         ticket_id: uuid::Uuid,
         escrow_transaction: &str,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query("UPDATE tickets SET escrow_transaction = ? WHERE id = ?")
-            .bind(escrow_transaction)
-            .bind(ticket_id.to_string())
-            .execute(self.db_connection.write())
-            .await?;
+        let ticket_id_str = ticket_id.to_string();
+        let escrow_transaction_owned = escrow_transaction.to_string();
 
-        Ok(result.rows_affected() > 0)
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query("UPDATE tickets SET escrow_transaction = ? WHERE id = ?")
+                    .bind(escrow_transaction_owned)
+                    .bind(ticket_id_str)
+                    .execute(&pool)
+                    .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
     }
 
     pub async fn reset_ticket_after_failed_escrow(
@@ -1375,27 +1605,38 @@ impl CompetitionStore {
         new_encrypted_preimage: &str,
         new_hash: &str,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            "UPDATE tickets
-            SET
-                encrypted_preimage = ?,
-                hash = ?,
-                payment_request = NULL,
-                paid_at = NULL,
-                settled_at = NULL,
-                escrow_transaction = NULL,
-                ephemeral_pubkey = NULL,
-                reserved_by = NULL,
-                reserved_at = NULL
-                WHERE id = ?",
-        )
-        .bind(ticket_id.to_string())
-        .bind(new_encrypted_preimage)
-        .bind(new_hash)
-        .execute(self.db_connection.write())
-        .await?;
+        let ticket_id_str = ticket_id.to_string();
+        let new_encrypted_preimage_owned = new_encrypted_preimage.to_string();
+        let new_hash_owned = new_hash.to_string();
 
-        Ok(result.rows_affected() > 0)
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE tickets
+                    SET
+                        encrypted_preimage = ?,
+                        hash = ?,
+                        payment_request = NULL,
+                        paid_at = NULL,
+                        settled_at = NULL,
+                        escrow_transaction = NULL,
+                        ephemeral_pubkey = NULL,
+                        reserved_by = NULL,
+                        reserved_at = NULL
+                        WHERE id = ?",
+                )
+                .bind(new_encrypted_preimage_owned)
+                .bind(new_hash_owned)
+                .bind(ticket_id_str)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
     }
 
     /// Store a Keymeld session for a competition
@@ -1406,18 +1647,26 @@ impl CompetitionStore {
     ) -> Result<bool, sqlx::Error> {
         let session_json =
             serde_json::to_vec(session).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let competition_id_str = competition_id.to_string();
 
-        let result = sqlx::query(
-            "UPDATE competitions
-            SET keymeld_session = ?
-            WHERE id = ?",
-        )
-        .bind(&session_json)
-        .bind(competition_id.to_string())
-        .execute(self.db_connection.write())
-        .await?;
-
-        Ok(result.rows_affected() > 0)
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE competitions
+                    SET keymeld_session = ?
+                    WHERE id = ?",
+                )
+                .bind(session_json)
+                .bind(competition_id_str)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
     }
 
     /// Retrieve a Keymeld session for a competition
@@ -1443,15 +1692,24 @@ impl CompetitionStore {
 
     /// Clear a Keymeld session for a competition (e.g., on failure or completion)
     pub async fn clear_keymeld_session(&self, competition_id: Uuid) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            "UPDATE competitions
-            SET keymeld_session = NULL
-            WHERE id = ?",
-        )
-        .bind(competition_id.to_string())
-        .execute(self.db_connection.write())
-        .await?;
+        let competition_id_str = competition_id.to_string();
 
-        Ok(result.rows_affected() > 0)
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE competitions
+                    SET keymeld_session = NULL
+                    WHERE id = ?",
+                )
+                .bind(competition_id_str)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
     }
 }

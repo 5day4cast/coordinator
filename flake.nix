@@ -116,6 +116,15 @@
         keymeld-gateway = keymeld.packages.${system}.keymeld-gateway;
         keymeld-enclave = keymeld.packages.${system}.keymeld-enclave;
 
+        # Python environment with moto for AWS S3 mocking
+        moto-env = pkgs.python3.withPackages (ps: with ps; [
+          moto
+          flask
+          flask-cors
+          werkzeug
+          boto3
+        ]);
+
         # ============================================
         # Helper Scripts for Development Environment
         # ============================================
@@ -453,6 +462,136 @@
           echo "Keymeld stopped"
         '';
 
+        # Script: Run moto (AWS S3 mock) for local development
+        run-moto = pkgs.writeShellScriptBin "run-moto" ''
+          set -e
+          export MOTO_PORT=''${MOTO_PORT:-"4566"}
+          export DATA_DIR=''${DATA_DIR:-"$PWD/data"}
+          export AWS_DEFAULT_REGION=''${AWS_DEFAULT_REGION:-"us-west-2"}
+          export AWS_ACCESS_KEY_ID=''${AWS_ACCESS_KEY_ID:-"test"}
+          export AWS_SECRET_ACCESS_KEY=''${AWS_SECRET_ACCESS_KEY:-"test"}
+
+          MOTO_DIR="$DATA_DIR/moto"
+          mkdir -p "$MOTO_DIR"
+
+          # Check if already running
+          if pgrep -f "moto_server" > /dev/null; then
+            echo "Moto is already running"
+            exit 0
+          fi
+
+          echo "Starting Moto (AWS S3 mock server)..."
+          echo "  Port: $MOTO_PORT"
+          echo "  Region: $AWS_DEFAULT_REGION"
+          echo ""
+          echo "Endpoint: http://127.0.0.1:$MOTO_PORT"
+          echo "Use with AWS CLI: aws --endpoint-url=http://127.0.0.1:$MOTO_PORT s3 ..."
+
+          ${moto-env}/bin/moto_server -p $MOTO_PORT > "$DATA_DIR/moto.log" 2>&1 &
+          echo $! > "$MOTO_DIR/moto.pid"
+
+          # Wait for moto to be ready
+          for i in {1..30}; do
+            if ${pkgs.curl}/bin/curl -s http://127.0.0.1:$MOTO_PORT > /dev/null 2>&1; then
+              echo "Moto is ready!"
+              break
+            fi
+            sleep 1
+          done
+
+          # Create the backup bucket
+          AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+            ${pkgs.awscli2}/bin/aws --endpoint-url=http://127.0.0.1:$MOTO_PORT \
+            s3 mb s3://coordinator-db-backups 2>/dev/null || true
+
+          echo "Created S3 bucket: coordinator-db-backups"
+        '';
+
+        # Script: Stop moto
+        stop-moto = pkgs.writeShellScriptBin "stop-moto" ''
+          set -e
+          DATA_DIR="''${DATA_DIR:-$PWD/data}"
+          MOTO_DIR="$DATA_DIR/moto"
+
+          if [ -f "$MOTO_DIR/moto.pid" ]; then
+            pid=$(cat "$MOTO_DIR/moto.pid")
+            if kill -0 "$pid" 2>/dev/null; then
+              echo "Stopping Moto (pid $pid)..."
+              kill "$pid" || true
+            fi
+            rm -f "$MOTO_DIR/moto.pid"
+          fi
+
+          # Also try pkill as fallback
+          pkill -f "moto_server" 2>/dev/null || true
+
+          echo "Moto stopped"
+        '';
+
+        # Script: Run litestream replication
+        run-litestream = pkgs.writeShellScriptBin "run-litestream" ''
+          set -e
+          DATA_DIR="''${DATA_DIR:-$PWD/data}"
+          CONFIG_FILE="''${LITESTREAM_CONFIG:-$PWD/config/litestream.yml}"
+
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "Error: Litestream config not found at $CONFIG_FILE"
+            echo "Run from project root or set LITESTREAM_CONFIG"
+            exit 1
+          fi
+
+          # Check if moto is running for local dev
+          if ! pgrep -f "moto_server" > /dev/null; then
+            echo "Warning: Moto (S3 mock) is not running. Starting it..."
+            run-moto
+          fi
+
+          echo "Starting Litestream replication..."
+          echo "  Config: $CONFIG_FILE"
+          echo "  Database: $DATA_DIR/coordinator.db"
+
+          export AWS_ACCESS_KEY_ID=test
+          export AWS_SECRET_ACCESS_KEY=test
+
+          ${pkgs.litestream}/bin/litestream replicate -config "$CONFIG_FILE"
+        '';
+
+        # Script: Restore database from litestream backup
+        restore-litestream = pkgs.writeShellScriptBin "restore-litestream" ''
+          set -e
+          DATA_DIR="''${DATA_DIR:-$PWD/data}"
+          CONFIG_FILE="''${LITESTREAM_CONFIG:-$PWD/config/litestream.yml}"
+          DB_PATH="$DATA_DIR/coordinator.db"
+
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "Error: Litestream config not found at $CONFIG_FILE"
+            exit 1
+          fi
+
+          # Check if moto is running for local dev
+          if ! pgrep -f "moto_server" > /dev/null; then
+            echo "Warning: Moto (S3 mock) is not running. Starting it..."
+            run-moto
+          fi
+
+          echo "Restoring database from Litestream backup..."
+          echo "  Config: $CONFIG_FILE"
+          echo "  Target: $DB_PATH"
+
+          export AWS_ACCESS_KEY_ID=test
+          export AWS_SECRET_ACCESS_KEY=test
+
+          # Use timestamp if provided
+          if [ -n "$LITESTREAM_TIMESTAMP" ]; then
+            echo "  Timestamp: $LITESTREAM_TIMESTAMP"
+            ${pkgs.litestream}/bin/litestream restore -config "$CONFIG_FILE" -timestamp "$LITESTREAM_TIMESTAMP" "$DB_PATH"
+          else
+            ${pkgs.litestream}/bin/litestream restore -config "$CONFIG_FILE" -if-replica-exists "$DB_PATH"
+          fi
+
+          echo "Restore complete!"
+        '';
+
         # Script: Start all services
         start-all = pkgs.writeShellScriptBin "start-all" ''
           set -e
@@ -538,6 +677,11 @@
             pkgs.procps
             pkgs.netcat
 
+            # AWS tools for S3 mocking
+            moto-env
+            pkgs.awscli2
+            pkgs.litestream
+
             # Keymeld binaries for e2e testing
             keymeld-gateway
             keymeld-enclave
@@ -551,6 +695,10 @@
             stop-lnd
             run-keymeld
             stop-keymeld
+            run-moto
+            stop-moto
+            run-litestream
+            restore-litestream
             start-all
             stop-all
             clean-data
@@ -582,6 +730,11 @@
             echo "  setup-channels  - Create channels between LND nodes"
             echo "  run-keymeld     - Start keymeld gateway + enclaves"
             echo "  mine-blocks N   - Mine N blocks"
+            echo ""
+            echo "Litestream (database backup):"
+            echo "  run-moto        - Start Moto (S3 mock) server"
+            echo "  run-litestream  - Start database replication"
+            echo "  restore-litestream - Restore database from backup"
             echo ""
             echo "Use 'just help' to see all available commands"
             echo ""
@@ -623,6 +776,7 @@
           inherit start-regtest stop-regtest mine-blocks;
           inherit setup-lnd setup-channels stop-lnd;
           inherit run-keymeld stop-keymeld;
+          inherit run-moto stop-moto run-litestream restore-litestream;
           inherit start-all stop-all clean-data;
         };
 

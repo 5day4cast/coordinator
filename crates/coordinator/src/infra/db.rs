@@ -7,10 +7,144 @@ use sqlx::{
 };
 use std::{
     env,
+    future::Future,
     hash::{DefaultHasher, Hash, Hasher},
+    pin::Pin,
+    sync::Arc,
     time::Duration as StdDuration,
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use tokio::sync::{mpsc, oneshot};
+
+// ============================================================================
+// DatabaseWriter - Serializes all write operations through a single channel
+// ============================================================================
+//
+// This pattern ensures that all SQLite writes happen sequentially on a single
+// task, which is required for proper WAL mode operation with Litestream.
+// Without this, concurrent writes from multiple connections can cause issues
+// with WAL checkpointing and replication timing.
+
+/// Error type for database write operations
+#[derive(Debug, thiserror::Error)]
+pub enum DatabaseWriteError {
+    #[error("Database writer channel closed")]
+    ChannelClosed,
+
+    #[error("Failed to receive write result")]
+    ResultChannelClosed,
+
+    #[error("SQLx error: {0}")]
+    Sqlx(#[from] sqlx::Error),
+}
+
+/// A boxed future representing a write operation
+type WriteOperation = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Serializes all database write operations through a single channel.
+///
+/// This ensures that writes happen sequentially, which is important for:
+/// - WAL mode consistency with Litestream
+/// - Avoiding write conflicts
+/// - Predictable replication timing
+///
+/// # Example
+///
+/// ```ignore
+/// let writer = DatabaseWriter::new();
+/// let result = writer.execute(pool.clone(), |pool| async move {
+///     sqlx::query!("INSERT INTO users (name) VALUES (?)", name)
+///         .execute(&pool)
+///         .await?;
+///     Ok(())
+/// }).await?;
+/// ```
+#[derive(Debug)]
+pub struct DatabaseWriter {
+    write_tx: mpsc::UnboundedSender<WriteOperation>,
+    // Note: we use Arc to allow cloning while keeping the task alive
+    _handle: Arc<tokio::task::JoinHandle<()>>,
+}
+
+impl Clone for DatabaseWriter {
+    fn clone(&self) -> Self {
+        Self {
+            write_tx: self.write_tx.clone(),
+            _handle: self._handle.clone(),
+        }
+    }
+}
+
+impl Default for DatabaseWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DatabaseWriter {
+    /// Creates a new DatabaseWriter with a background task that processes writes.
+    pub fn new() -> Self {
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<WriteOperation>();
+
+        let handle = tokio::spawn(async move {
+            while let Some(future) = write_rx.recv().await {
+                future.await;
+            }
+        });
+
+        Self {
+            write_tx,
+            _handle: Arc::new(handle),
+        }
+    }
+
+    /// Executes a write operation through the serialized channel.
+    ///
+    /// The operation is sent to the background task and executed sequentially
+    /// with all other write operations. The result is returned via a oneshot channel.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `T` - The return type of the operation
+    /// * `F` - The closure type that produces the future
+    /// * `Fut` - The future type returned by the closure
+    ///
+    /// # Arguments
+    ///
+    /// * `pool` - The SQLite connection pool to use for the operation
+    /// * `operation` - A closure that takes the pool and returns a future
+    ///
+    /// # Returns
+    ///
+    /// The result of the operation, or a `DatabaseWriteError` if the operation failed.
+    pub async fn execute<T, F, Fut>(
+        &self,
+        pool: SqlitePool,
+        operation: F,
+    ) -> Result<T, DatabaseWriteError>
+    where
+        T: Send + 'static,
+        F: FnOnce(SqlitePool) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, sqlx::Error>> + Send + 'static,
+    {
+        let (result_tx, result_rx) = oneshot::channel::<Result<T, sqlx::Error>>();
+
+        let write_op: WriteOperation = Box::pin(async move {
+            let result = operation(pool).await;
+            // Ignore send errors - the receiver may have been dropped if the caller timed out
+            let _ = result_tx.send(result);
+        });
+
+        self.write_tx
+            .send(write_op)
+            .map_err(|_| DatabaseWriteError::ChannelClosed)?;
+
+        result_rx
+            .await
+            .map_err(|_| DatabaseWriteError::ResultChannelClosed)?
+            .map_err(DatabaseWriteError::Sqlx)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum SqliteMode {
@@ -398,12 +532,42 @@ pub enum DatabaseType {
     Users,
 }
 
+/// Database connection with serialized write support.
+///
+/// This struct provides access to both read and write pools, with writes
+/// being serialized through a `DatabaseWriter` to ensure WAL mode consistency
+/// and compatibility with Litestream replication.
+///
+/// # Write Operations
+///
+/// For write operations, use `execute_write()` which serializes all writes
+/// through a single channel:
+///
+/// ```ignore
+/// db.execute_write(|pool| async move {
+///     sqlx::query!("INSERT INTO users (name) VALUES (?)", name)
+///         .execute(&pool)
+///         .await?;
+///     Ok(())
+/// }).await?;
+/// ```
+///
+/// # Read Operations
+///
+/// For read operations, use `read()` to get direct access to the read pool:
+///
+/// ```ignore
+/// let users = sqlx::query_as!(User, "SELECT * FROM users")
+///     .fetch_all(db.read())
+///     .await?;
+/// ```
 #[derive(Clone, Debug)]
 pub struct DBConnection {
     pub database_name: String,
     pub database_path: String,
     read_pool: SqlitePool,
     write_pool: SqlitePool,
+    writer: DatabaseWriter,
 }
 
 impl DBConnection {
@@ -427,6 +591,9 @@ impl DBConnection {
         let (read_pool, write_pool) =
             Self::create_pools(&database_path, &database_pool_config).await?;
 
+        // Create the serialized writer for WAL-safe writes
+        let writer = DatabaseWriter::new();
+
         let migrator = match db_type {
             DatabaseType::Competitions => &COMPETITIONS_MIGRATOR,
             DatabaseType::Users => &USERS_MIGRATOR,
@@ -442,6 +609,7 @@ impl DBConnection {
             database_path: database_path.clone(),
             read_pool,
             write_pool,
+            writer,
         })
     }
 
@@ -457,6 +625,7 @@ impl DBConnection {
             database_path,
             read_pool,
             write_pool,
+            writer: DatabaseWriter::new(),
         }
     }
 
@@ -543,12 +712,83 @@ impl DBConnection {
         self.write_pool.close().await;
     }
 
+    /// Returns a reference to the read pool for read-only operations.
+    ///
+    /// Use this for SELECT queries and other read operations.
     pub fn read(&self) -> &SqlitePool {
         &self.read_pool
     }
 
+    /// Returns a reference to the write pool.
+    ///
+    /// **WARNING**: For new code, prefer using `execute_write()` instead, which
+    /// serializes writes through a single channel for WAL mode consistency and
+    /// Litestream compatibility.
+    ///
+    /// This method is kept for backwards compatibility during migration.
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use execute_write() for serialized writes compatible with Litestream"
+    )]
     pub fn write(&self) -> &SqlitePool {
         &self.write_pool
+    }
+
+    /// Returns a reference to the write pool for internal use.
+    ///
+    /// This is used by `execute_write()` and should not be called directly
+    /// for new code.
+    pub(crate) fn write_pool(&self) -> &SqlitePool {
+        &self.write_pool
+    }
+
+    /// Executes a write operation through the serialized channel.
+    ///
+    /// All writes go through a single background task to ensure:
+    /// - WAL mode consistency with Litestream
+    /// - No concurrent write conflicts
+    /// - Predictable replication timing
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// db.execute_write(|pool| async move {
+    ///     sqlx::query!("INSERT INTO users (name) VALUES (?)", name)
+    ///         .execute(&pool)
+    ///         .await?;
+    ///     Ok(())
+    /// }).await?;
+    /// ```
+    ///
+    /// # Type Parameters
+    ///
+    /// * `T` - The return type of the operation
+    /// * `F` - The closure type that produces the future
+    /// * `Fut` - The future type returned by the closure
+    ///
+    /// # Arguments
+    ///
+    /// * `operation` - A closure that takes the pool and returns a future
+    ///
+    /// # Returns
+    ///
+    /// The result of the operation, or a `DatabaseWriteError` if the operation failed.
+    pub async fn execute_write<T, F, Fut>(&self, operation: F) -> Result<T, DatabaseWriteError>
+    where
+        T: Send + 'static,
+        F: FnOnce(SqlitePool) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, sqlx::Error>> + Send + 'static,
+    {
+        self.writer
+            .execute(self.write_pool.clone(), operation)
+            .await
+    }
+
+    /// Returns the database writer for advanced use cases.
+    ///
+    /// Most code should use `execute_write()` instead.
+    pub fn writer(&self) -> &DatabaseWriter {
+        &self.writer
     }
 }
 
