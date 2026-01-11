@@ -757,35 +757,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b94f61472cee1439c0b966b47e3aca9ae07e45d070759512cd390ea2bebc6675"
 
 [[package]]
-name = "client_validator"
-version = "0.8.2"
-dependencies = [
- "aes-gcm",
- "async-trait",
- "bdk_wallet",
- "blake2",
- "dlctix",
- "getrandom 0.2.16",
- "hex",
- "js-sys",
- "log",
- "miniscript",
- "nostr-sdk",
- "rand 0.8.5",
- "rand_chacha 0.3.1",
- "secrecy",
- "serde",
- "serde-wasm-bindgen",
- "sha2",
- "thiserror 2.0.12",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-logger",
- "web-sys",
- "zeroize",
-]
-
-[[package]]
 name = "colorchoice"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -863,6 +834,98 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec182b0ca2f35d8fc196cf3404988fd8b8c739a4d270ff118a398feb0cbec1ca"
 dependencies = [
  "unicode-segmentation",
+]
+
+[[package]]
+name = "coordinator"
+version = "0.8.2"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bdk_esplora",
+ "bdk_wallet",
+ "blake2",
+ "clap",
+ "config",
+ "coordinator-core",
+ "dlctix",
+ "env_logger",
+ "fern",
+ "futures",
+ "h2 0.4.11",
+ "hex",
+ "hyper 1.6.0",
+ "itertools 0.14.0",
+ "lightning-invoice",
+ "log",
+ "maplit",
+ "mime",
+ "mockall",
+ "nostr-sdk",
+ "num_cpus",
+ "openssl",
+ "pem-rfc7468",
+ "rand 0.8.5",
+ "rand_chacha 0.3.1",
+ "reqwest-middleware",
+ "reqwest-retry",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tokio-test",
+ "tokio-util",
+ "toml",
+ "tower-http 0.5.2",
+ "uuid",
+]
+
+[[package]]
+name = "coordinator-core"
+version = "0.8.2"
+dependencies = [
+ "dlctix",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "time",
+ "uuid",
+]
+
+[[package]]
+name = "coordinator-wasm"
+version = "0.8.2"
+dependencies = [
+ "aes-gcm",
+ "async-trait",
+ "bdk_wallet",
+ "blake2",
+ "coordinator-core",
+ "dlctix",
+ "getrandom 0.2.16",
+ "hex",
+ "js-sys",
+ "log",
+ "miniscript",
+ "nostr-sdk",
+ "rand 0.8.5",
+ "rand_chacha 0.3.1",
+ "secrecy",
+ "serde",
+ "serde-wasm-bindgen",
+ "sha2",
+ "thiserror 1.0.69",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-logger",
+ "web-sys",
+ "zeroize",
 ]
 
 [[package]]
@@ -3586,56 +3649,6 @@ checksum = "f42f67da2385b51a5f9652db9c93d78aeaf7610bf5ec366080b6de810604af53"
 dependencies = [
  "base16ct",
  "serde",
-]
-
-[[package]]
-name = "server"
-version = "0.8.2"
-dependencies = [
- "anyhow",
- "async-channel",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "bdk_esplora",
- "bdk_wallet",
- "blake2",
- "clap",
- "client_validator",
- "config",
- "dlctix",
- "env_logger",
- "fern",
- "futures",
- "h2 0.4.11",
- "hex",
- "hyper 1.6.0",
- "itertools 0.14.0",
- "lightning-invoice",
- "log",
- "maplit",
- "mime",
- "mockall",
- "nostr-sdk",
- "num_cpus",
- "openssl",
- "pem-rfc7468",
- "rand 0.8.5",
- "rand_chacha 0.3.1",
- "reqwest-middleware",
- "reqwest-retry",
- "secrecy",
- "serde",
- "serde_json",
- "sqlx",
- "thiserror 1.0.69",
- "time",
- "tokio",
- "tokio-test",
- "tokio-util",
- "toml",
- "tower-http 0.5.2",
- "uuid",
 ]
 
 [[package]]

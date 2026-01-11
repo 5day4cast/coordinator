@@ -1,12 +1,110 @@
 [workspace]
+members = [
+    "crates/coordinator",
+    "crates/coordinator-core",
+    "crates/coordinator-wasm",
+]
 resolver = "2"
-members = ["crates/server"]
+
+[workspace.package]
+version = "0.8.2"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/5day4cast/coordinator"
+
+[workspace.metadata.crane]
+name = "coordinator"
+
+[workspace.dependencies]
+# Internal crates
+coordinator-core = { path = "crates/coordinator-core" }
+
+# Keymeld (will be enabled when available)
+# keymeld-sdk = { path = "../keymeld/crates/keymeld-sdk" }
+
+# Bitcoin
+bdk_esplora = { version = "0.20.1", features = ["async", "tokio"] }
+bdk_wallet = { version = "1.0.0", features = ["file_store", "keys-bip39"] }
+dlctix = "0.0.8"
+miniscript = "12.3.2"
+
+# Web
+axum = { version = "0.8.1", features = ["http1", "macros", "multipart", "tokio", "tracing", "original-uri"] }
+tower-http = { version = "0.5.2", features = ["cors", "fs"] }
+reqwest-middleware = { version = "0.3.3", features = ["json", "rustls-tls"] }
+reqwest-retry = "0.6.1"
+hyper = "1.4.0"
+h2 = "0.4.5"
+
+# Async
+tokio = { version = "1.39.2", features = ["macros", "rt-multi-thread", "signal"] }
+tokio-util = { version = "0.7.11", features = ["rt"] }
+futures = "0.3.28"
+async-trait = "0.1.85"
+async-channel = "2.3.1"
+
+# Serialization
+serde = { version = "1.0.188", features = ["derive"] }
+serde_json = "1.0.117"
+toml = "0.8.10"
+
+# Database
+sqlx = { version = "0.8.6", features = ["sqlite-unbundled", "uuid", "time", "json", "bigdecimal", "macros", "runtime-tokio", "migrate"] }
+
+# Nostr
+nostr-sdk = { version = "0.38.0", features = ["nip04", "nip44", "nip47", "nip49"] }
+
+# Logging
+log = "0.4.18"
+fern = { version = "0.6.2", features = ["colored"] }
+
+# Error handling
+anyhow = "1.0.72"
+thiserror = "1.0.62"
+
+# Crypto
+blake2 = "0.10.6"
+sha2 = "0.10"
+aes-gcm = "0.10"
+rand = "0.8.5"
+rand_chacha = "0.3"
+
+# Time
+time = { version = "0.3.36", features = ["formatting", "macros", "parsing", "serde"] }
+
+# Utilities
+uuid = { version = "1.4.1", features = ["serde", "v7"] }
+hex = "0.4.3"
+base64 = "0.22.1"
+itertools = "0.14.0"
+secrecy = { version = "0.10.3", features = ["serde"] }
+zeroize = { version = "1.6", features = ["zeroize_derive"] }
+
+# CLI
+clap = { version = "4.3.23", features = ["derive", "env"] }
+config = "0.14.0"
+
+# Lightning
+lightning-invoice = "0.33.2"
+
+# Misc
+num_cpus = "1.16.0"
+mime = "0.3.17"
+openssl = { version = "0.10", features = ["vendored"] }
+pem-rfc7468 = { version = "0.7.0", features = ["alloc"] }
+
+# WASM (for coordinator-wasm)
+wasm-bindgen = { version = "0.2.100", features = ["serde-serialize", "std"] }
+wasm-bindgen-futures = "0.4.43"
+wasm-logger = "0.2.0"
+serde-wasm-bindgen = "0.6.5"
+js-sys = "0.3.77"
+web-sys = { version = "0.3.77", features = ["Document", "Element", "HtmlElement", "Node", "Window", "CustomEventInit", "console"] }
+getrandom = { version = "0.2", features = ["js"] }
 
 [profile.release]
-# Tell `rustc` to optimize for small code size.
 opt-level = "s"
 
-# The profile that 'cargo dist' will build with
 [profile.dist]
 inherits = "release"
 lto = "thin"
