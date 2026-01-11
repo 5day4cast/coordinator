@@ -1,7 +1,90 @@
 # Refactor Status
 
 **Last Updated:** 2026-01-10
-**Current Phase:** Part 2 Complete, Ready for Part 2.5
+**Current Phase:** Part 4 In Progress - Keymeld SDK Integration (Server)
+
+---
+
+## In Progress: Part 4 - Keymeld SDK Integration (Server)
+
+### What Was Done
+
+1. **Added keymeld-sdk dependency:**
+   - Updated workspace `Cargo.toml` to use git dependency
+   - Enabled `client` and `dlctix` features
+   - Updated dlctix to `external-signing-api` branch for compatibility
+
+2. **Updated rand/rand_chacha to 0.9:**
+   - Required for dlctix compatibility
+   - Fixed deprecated `thread_rng()` calls to `rng()`
+   - Updated `secrets.rs` to use byte-based key generation
+
+3. **Added KeymeldSettings configuration:**
+   ```rust
+   pub struct KeymeldSettings {
+       pub gateway_url: String,
+       pub enabled: bool,
+       pub keygen_timeout_secs: u64,
+       pub signing_timeout_secs: u64,
+       pub max_polling_attempts: u32,
+       pub initial_polling_delay_ms: u64,
+       pub max_polling_delay_ms: u64,
+       pub polling_backoff_multiplier: f64,
+   }
+   ```
+
+4. **Created KeymeldService wrapper (`infra/keymeld.rs`):**
+   - `Keymeld` trait for abstracting signing operations
+   - `KeymeldService` production implementation
+   - `MockKeymeld` for testing without Keymeld server
+   - `DlcKeygenSession` struct for session state
+   - Integration with dlctix types via keymeld-sdk
+
+### Next Steps for Part 4
+
+1. **Wire KeymeldService into Coordinator struct:**
+   - Add `Arc<dyn Keymeld>` to `Coordinator`
+   - Pass keymeld service from startup.rs
+
+2. **Add keymeld session ID storage to database:**
+   - Add `keymeld_session_id` column to competitions table
+   - Add `keymeld_session_secret` for restoring sessions
+
+3. **Modify competition state machine:**
+   - Add `AwaitingKeygen` state (after escrow confirmed)
+   - Add `AwaitingSigning` state (after keygen complete)
+   - Update transitions to use keymeld when enabled
+
+4. **Replace MuSig2 code in coordinator.rs:**
+   - Remove `SigningSession::<NonceSharingRound>` usage
+   - Remove nonce collection/aggregation logic
+   - Use `KeymeldService.create_dlc_keygen_session()` and `sign_dlc_batch()`
+
+### Files Modified
+
+- `Cargo.toml` (workspace) - Added keymeld-sdk dependency
+- `crates/coordinator/Cargo.toml` - Added keymeld-sdk.workspace = true
+- `crates/coordinator/src/config.rs` - Added KeymeldSettings
+- `crates/coordinator/src/infra/mod.rs` - Added keymeld module
+- `crates/coordinator/src/infra/keymeld.rs` - NEW: Keymeld service wrapper
+- `crates/coordinator/src/infra/secrets.rs` - Updated for rand 0.9
+- `crates/coordinator/src/domain/competitions/mod.rs` - Fixed deprecated rng
+- `crates/coordinator/src/domain/invoices/invoice_watcher.rs` - Fixed deprecated rng
+- `crates/coordinator-wasm/src/wallet/core.rs` - Fixed deprecated rng
+
+---
+
+## Completed: Part 3 - Typestate Machine (Partial) ✅
+
+### What Was Done
+
+Created typestate module structure in `domain/competitions/states/`:
+- `mod.rs` - CompetitionStatus enum with 20 state variants
+- Individual state files for each state type
+- `HasCompetitionData` trait for extracting Competition from any state
+- Transition methods that consume self and return new states
+
+**Note:** Full integration with coordinator.rs is deferred until after Keymeld integration, as the keymeld states (AwaitingKeygen, AwaitingSigning) will replace MuSig-specific states.
 
 ---
 
@@ -31,46 +114,11 @@
    - `start-all` / `stop-all` - Manage entire stack
    - `mine-blocks N` - Mine N blocks
 
-4. **Created `justfile` with development commands:**
-   - `just build` / `just build-release`
-   - `just test` / `just test-verbose`
-   - `just clippy` / `just fmt`
-   - `just start` / `just stop` - Manage dev services
-   - `just e2e` - Run end-to-end tests
-   - `just status` - Show service status
+4. **Created `justfile` with development commands**
 
-5. **Created GitHub Actions CI workflow (`.github/workflows/ci.yml`):**
-   - Format check (`cargo fmt`)
-   - Clippy lint check
-   - Unit tests
-   - Build check with artifact upload
-   - E2E tests with full stack (Bitcoin, LND, Keymeld)
+5. **Created GitHub Actions CI workflow**
 
-6. **Removed `.doppler/` directory:**
-   - Replaced with Nix-based development environment
-
-7. **Updated `.gitignore`:**
-   - Added Nix artifacts (`result`, `result-*`, `.direnv/`)
-   - Added development data directories (`data/`, `logs/`)
-   - Added WASM build output (`pkg/`)
-   - Added SQLite databases
-
-### Build Status
-
-```bash
-$ nix build .#coordinator
-# Successfully builds coordinator binary
-
-$ cargo check
-# All 3 crates compile successfully
-```
-
-### New Files Created
-
-- `flake.nix` - Nix flake for reproducible builds
-- `flake.lock` - Lock file for flake inputs
-- `justfile` - Development command runner
-- `.github/workflows/ci.yml` - CI workflow
+6. **Removed `.doppler/` directory**
 
 ---
 
@@ -83,59 +131,17 @@ $ cargo check
    - `coordinator-core` - Shared types (server + WASM)
    - `coordinator-wasm` - Browser WASM module
 
-2. **Reorganized coordinator crate:**
-   ```
-   crates/coordinator/src/
-   ├── main.rs
-   ├── lib.rs
-   ├── config.rs
-   ├── startup.rs
-   ├── api/
-   │   ├── mod.rs
-   │   ├── extractors.rs
-   │   ├── routes/
-   │   └── views/
-   ├── domain/
-   │   ├── mod.rs
-   │   ├── competitions/
-   │   ├── invoices/
-   │   └── users/
-   ├── infra/
-   │   ├── mod.rs
-   │   ├── bitcoin.rs
-   │   ├── db.rs
-   │   ├── escrow.rs
-   │   ├── lightning.rs
-   │   ├── oracle.rs
-   │   └── secrets.rs
-   └── bin/
-       └── wallet_cli.rs
-   ```
+2. **Reorganized coordinator crate structure**
 
-3. **Moved frontend assets:**
-   - `crates/admin_ui/` → `crates/coordinator/frontend/admin/`
-   - `crates/public_ui/` → `crates/coordinator/frontend/public/`
+3. **Moved frontend assets**
 
-4. **Removed old structure:**
-   - Deleted `crates/server/`
-   - Deleted `crates/client_validator/`
-   - Deleted `crates/admin_ui/`
-   - Deleted `crates/public_ui/`
+4. **Removed old structure**
 
 ---
 
-## Next: Part 2.5 - Oracle Interface Abstraction & Mock
+## Skipped: Part 2.5 - Oracle Interface Abstraction & Mock
 
-### Goals
-- Create abstract `Oracle` trait for pluggable data sources
-- Implement `MockOracle` for deterministic e2e tests
-- Decouple from weather-specific types
-- Enable testing without real oracle dependency
-
-### Key Changes
-- Add `Oracle` trait in `coordinator/src/infra/oracle.rs`
-- Create `MockOracle` implementation
-- Update tests to use mock oracle
+**Status:** Deferred to later date per user request. Will be added when needed for testing.
 
 ---
 
@@ -145,9 +151,9 @@ $ cargo check
 |------|-------------|--------|
 | 1 | Project Structure Cleanup | ✅ Complete |
 | 2 | Nix Build System & CI | ✅ Complete |
-| 2.5 | Oracle Interface Abstraction & Mock | ⏳ Next |
-| 3 | Typestate Machine | Pending |
-| 4 | Keymeld SDK Integration (Server) | Pending |
+| 2.5 | Oracle Interface Abstraction & Mock | ⏸️ Skipped (deferred) |
+| 3 | Typestate Machine | ✅ Partial (states created, integration pending) |
+| 4 | Keymeld SDK Integration (Server) | 🔄 In Progress |
 | 5 | Keymeld SDK Integration (WASM) | Pending |
 | 6 | Database Migration System | Pending |
 | 7 | Escrow Simplification | Pending |
@@ -155,10 +161,21 @@ $ cargo check
 
 ---
 
+## Build Status
+
+```bash
+$ cargo check
+# All 3 crates compile successfully
+
+$ cargo check -p coordinator
+# Compiles with keymeld-sdk integration
+```
+
+---
+
 ## Notes for Next Session
 
-- First `nix develop` takes time to build keymeld from source - subsequent runs are cached
-- Dev shell requires keymeld gateway/enclave to be built (pulls from GitHub)
-- E2E tests in CI will use Nix to start all services
-- DataSourceType simplified to Weather only (other variants can be added later)
-- Frontend JS files still reference old `client_validator` WASM - will need updating in Part 5
+- KeymeldService wrapper is complete but not yet wired into Coordinator
+- Need to add database columns for keymeld session storage
+- The current MuSig2 code in coordinator.rs will be replaced when keymeld is wired in
+- Consider whether to keep backward compatibility (keymeld disabled mode) or fully replace
