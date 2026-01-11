@@ -69,9 +69,9 @@ pub struct DlcKeygenSession {
 pub struct StoredDlcKeygenSession {
     /// Session ID as string (UUID format)
     pub session_id: String,
-    /// Session secret bytes (hex encoded for safe storage)
-    #[serde(with = "hex_bytes")]
-    pub session_secret: [u8; 32],
+    /// Session secret encrypted with NIP-44 to coordinator's nostr pubkey
+    /// This ensures the secret is never stored in plaintext
+    pub encrypted_session_secret: String,
     /// Aggregate public key bytes (hex encoded)
     #[serde(with = "hex_vec")]
     pub aggregate_key: Vec<u8>,
@@ -79,48 +79,25 @@ pub struct StoredDlcKeygenSession {
     pub outcome_subset_ids: BTreeMap<usize, Uuid>,
 }
 
-impl From<DlcKeygenSession> for StoredDlcKeygenSession {
-    fn from(session: DlcKeygenSession) -> Self {
+impl StoredDlcKeygenSession {
+    /// Create a stored session by encrypting the session secret
+    pub fn from_session(session: DlcKeygenSession, encrypted_session_secret: String) -> Self {
         Self {
             session_id: session.session_id.to_string(),
-            session_secret: session.session_secret,
+            encrypted_session_secret,
             aggregate_key: session.aggregate_key,
             outcome_subset_ids: session.outcome_subset_ids,
         }
     }
-}
 
-impl From<StoredDlcKeygenSession> for DlcKeygenSession {
-    fn from(stored: StoredDlcKeygenSession) -> Self {
-        Self {
-            session_id: SessionId::new(stored.session_id),
-            session_secret: stored.session_secret,
-            aggregate_key: stored.aggregate_key,
-            outcome_subset_ids: stored.outcome_subset_ids,
+    /// Convert to DlcKeygenSession with the decrypted session secret
+    pub fn to_session(&self, session_secret: [u8; 32]) -> DlcKeygenSession {
+        DlcKeygenSession {
+            session_id: SessionId::new(&self.session_id),
+            session_secret,
+            aggregate_key: self.aggregate_key.clone(),
+            outcome_subset_ids: self.outcome_subset_ids.clone(),
         }
-    }
-}
-
-/// Hex serialization for fixed-size byte arrays
-mod hex_bytes {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&hex::encode(bytes))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        bytes
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("invalid byte length"))
     }
 }
 

@@ -180,16 +180,62 @@ impl Coordinator {
     }
 
     /// Store a Keymeld session for a competition (for use after keygen completes)
+    /// The session secret is encrypted to the coordinator's own nostr pubkey before storage
     pub async fn store_keymeld_session(
         &self,
         competition_id: Uuid,
-        session: StoredDlcKeygenSession,
+        session: DlcKeygenSession,
     ) -> Result<(), Error> {
+        use nostr_sdk::nips::nip44;
+        use nostr_sdk::prelude::{Keys, SecretKey};
+
+        // Encrypt session secret to our own pubkey for secure storage
+        let coordinator_secret_key = SecretKey::from_slice(&self.private_key.serialize())
+            .map_err(|e| Error::BadRequest(format!("Failed to create secret key: {}", e)))?;
+
+        let coordinator_keys = Keys::new(coordinator_secret_key);
+
+        let encrypted_session_secret = nip44::encrypt(
+            coordinator_keys.secret_key(),
+            &coordinator_keys.public_key(),
+            hex::encode(session.session_secret),
+            nip44::Version::V2,
+        )
+        .map_err(|e| Error::BadRequest(format!("NIP-44 encryption failed: {}", e)))?;
+
+        let stored_session =
+            StoredDlcKeygenSession::from_session(session, encrypted_session_secret);
+
         self.competition_store
-            .store_keymeld_session(competition_id, &session)
+            .store_keymeld_session(competition_id, &stored_session)
             .await
             .map_err(Error::DbError)?;
         Ok(())
+    }
+
+    /// Decrypt a stored keymeld session secret
+    fn decrypt_session_secret(&self, encrypted: &str) -> Result<[u8; 32], Error> {
+        use nostr_sdk::nips::nip44;
+        use nostr_sdk::prelude::{Keys, SecretKey};
+
+        let coordinator_secret_key = SecretKey::from_slice(&self.private_key.serialize())
+            .map_err(|e| Error::BadRequest(format!("Failed to create secret key: {}", e)))?;
+
+        let coordinator_keys = Keys::new(coordinator_secret_key);
+
+        let decrypted_hex = nip44::decrypt(
+            coordinator_keys.secret_key(),
+            &coordinator_keys.public_key(),
+            encrypted,
+        )
+        .map_err(|e| Error::BadRequest(format!("NIP-44 decryption failed: {}", e)))?;
+
+        let secret_bytes = hex::decode(&decrypted_hex)
+            .map_err(|e| Error::BadRequest(format!("Invalid session secret hex: {}", e)))?;
+
+        secret_bytes
+            .try_into()
+            .map_err(|_| Error::BadRequest("Session secret must be 32 bytes".to_string()))
     }
 
     pub fn public_key(&self) -> String {
@@ -1046,7 +1092,7 @@ impl Coordinator {
             );
 
             // Store the session for later signing
-            self.store_keymeld_session(competition.id, keygen_session.clone().into())
+            self.store_keymeld_session(competition.id, keygen_session.clone())
                 .await?;
 
             // For keymeld, we don't use local nonces - set a placeholder to indicate keymeld mode
@@ -1184,7 +1230,7 @@ impl Coordinator {
                 competition.id
             );
 
-            // Retrieve stored keygen session
+            // Retrieve stored keygen session and decrypt the session secret
             let stored_session = self
                 .competition_store
                 .get_keymeld_session(competition.id)
@@ -1197,7 +1243,11 @@ impl Coordinator {
                     )
                 })?;
 
-            let keygen_session: DlcKeygenSession = stored_session.into();
+            let session_secret = self
+                .decrypt_session_secret(&stored_session.encrypted_session_secret)
+                .map_err(|e| anyhow!("Failed to decrypt session secret: {}", e))?;
+
+            let keygen_session = stored_session.to_session(session_secret);
 
             // Get signing data from ticketed DLC
             let signing_data = ticketed_dlc.signing_data()?;
@@ -2470,6 +2520,7 @@ impl Coordinator {
     }
 
     /// Get keymeld signing info for a user's entry
+    /// Decrypts the stored session secret and re-encrypts it to the user's nostr pubkey
     async fn get_keymeld_signing_info(
         &self,
         competition_id: Uuid,
@@ -2479,7 +2530,7 @@ impl Coordinator {
         use nostr_sdk::nips::nip44;
         use nostr_sdk::prelude::{PublicKey, SecretKey};
 
-        let session = self
+        let stored_session = self
             .competition_store
             .get_keymeld_session(competition_id)
             .await
@@ -2496,6 +2547,11 @@ impl Coordinator {
             .clone()
             .ok_or_else(|| Error::BadRequest("Keymeld gateway URL not configured".to_string()))?;
 
+        // Decrypt the session secret from storage
+        let session_secret =
+            self.decrypt_session_secret(&stored_session.encrypted_session_secret)?;
+
+        // Re-encrypt to the user's pubkey
         let nostr_pubkey = PublicKey::from_hex(user_pubkey)
             .map_err(|e| Error::BadRequest(format!("Invalid user pubkey: {}", e)))?;
 
@@ -2505,7 +2561,7 @@ impl Coordinator {
         let encrypted_session_secret = nip44::encrypt(
             &coordinator_secret_key,
             &nostr_pubkey,
-            hex::encode(session.session_secret),
+            hex::encode(session_secret),
             nip44::Version::V2,
         )
         .map_err(|e| Error::BadRequest(format!("NIP-44 encryption failed: {}", e)))?;
@@ -2513,7 +2569,7 @@ impl Coordinator {
         Ok(KeymeldSigningInfo {
             enabled: true,
             gateway_url,
-            session_id: session.session_id,
+            session_id: stored_session.session_id,
             encrypted_session_secret,
             user_id: entry.id.to_string(),
         })
