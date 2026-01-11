@@ -4,4 +4,5 @@ pub mod escrow;
 pub mod file_utils;
 pub mod lightning;
 pub mod oracle;
+pub mod oracle_mock;
 pub mod secrets;
