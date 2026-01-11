@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "coordinator.fullname" . }}
+  labels:
+    {{- include "coordinator.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "coordinator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "coordinator.selectorLabels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.config.logLevel }}
+            - name: DATABASE_PATH
+              value: {{ .Values.config.dbPath }}
+            - name: KEYMELD_URL
+              value: {{ .Values.keymeld.url }}
+            - name: ORACLE_URL
+              value: {{ .Values.oracle.url }}
+            - name: BITCOIN_RPC_HOST
+              value: {{ .Values.bitcoin.rpcHost }}
+            - name: BITCOIN_RPC_PORT
+              value: "{{ .Values.bitcoin.rpcPort }}"
+            - name: BITCOIN_RPC_USER
+              value: {{ .Values.bitcoin.rpcUser }}
+            - name: BITCOIN_RPC_PASSWORD
+              value: {{ .Values.bitcoin.rpcPassword }}
+            - name: LND_HOST
+              value: {{ .Values.lnd.host }}
+            - name: LND_RPC_PORT
+              value: "{{ .Values.lnd.rpcPort }}"
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "coordinator.fullname" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}

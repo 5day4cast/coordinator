@@ -1,0 +1,56 @@
+# Coordinator Helm Chart Values
+replicaCount: 1
+
+image:
+  repository: coordinator
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8080
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts: []
+  tls: []
+
+resources:
+  requests:
+    memory: 128Mi
+    cpu: 50m
+  limits:
+    memory: 256Mi
+
+persistence:
+  enabled: true
+  size: 1Gi
+  mountPath: /data
+
+litestream:
+  enabled: false
+  s3Bucket: ""
+  s3Path: "db/coordinator.db"
+  s3Endpoint: ""
+
+keymeld:
+  url: "http://keymeld.keymeld.svc.cluster.local:8080"
+
+lnd:
+  host: "lnd1"
+  rpcPort: 10009
+
+bitcoin:
+  rpcHost: "bitcoind"
+  rpcPort: 18443
+  rpcUser: "bitcoin"
+  rpcPassword: "bitcoinpass"
+
+oracle:
+  url: "http://noaa-oracle.oracle.svc.cluster.local:9100"
+
+config:
+  logLevel: info
+  dbPath: /data/coordinator.db

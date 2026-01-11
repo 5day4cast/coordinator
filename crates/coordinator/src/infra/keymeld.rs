@@ -9,6 +9,7 @@ use keymeld_sdk::{
     PollingConfig,
 };
 use log::{debug, info};
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use uuid::Uuid;
 
@@ -61,6 +62,86 @@ pub struct DlcKeygenSession {
     pub aggregate_key: Vec<u8>,
     /// Mapping from outcome index to subset ID (for signing)
     pub outcome_subset_ids: BTreeMap<OutcomeIndex, Uuid>,
+}
+
+/// Serializable version of DlcKeygenSession for database storage
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredDlcKeygenSession {
+    /// Session ID as string (UUID format)
+    pub session_id: String,
+    /// Session secret bytes (hex encoded for safe storage)
+    #[serde(with = "hex_bytes")]
+    pub session_secret: [u8; 32],
+    /// Aggregate public key bytes (hex encoded)
+    #[serde(with = "hex_vec")]
+    pub aggregate_key: Vec<u8>,
+    /// Mapping from outcome index to subset ID
+    pub outcome_subset_ids: BTreeMap<usize, Uuid>,
+}
+
+impl From<DlcKeygenSession> for StoredDlcKeygenSession {
+    fn from(session: DlcKeygenSession) -> Self {
+        Self {
+            session_id: session.session_id.to_string(),
+            session_secret: session.session_secret,
+            aggregate_key: session.aggregate_key,
+            outcome_subset_ids: session.outcome_subset_ids,
+        }
+    }
+}
+
+impl From<StoredDlcKeygenSession> for DlcKeygenSession {
+    fn from(stored: StoredDlcKeygenSession) -> Self {
+        Self {
+            session_id: SessionId::new(stored.session_id),
+            session_secret: stored.session_secret,
+            aggregate_key: stored.aggregate_key,
+            outcome_subset_ids: stored.outcome_subset_ids,
+        }
+    }
+}
+
+/// Hex serialization for fixed-size byte arrays
+mod hex_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        bytes
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("invalid byte length"))
+    }
+}
+
+/// Hex serialization for variable-size byte vectors
+mod hex_vec {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        hex::decode(&s).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Production Keymeld service implementation

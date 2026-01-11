@@ -12,9 +12,10 @@ use crate::{
         UserStore,
     },
     infra::{
-        bitcoin::{BitcoinClient, BitcoinSyncWatcher},
+        bitcoin::{Bitcoin, BitcoinClient, BitcoinSyncWatcher},
         db::{DBConnection, DatabasePoolConfig, DatabaseType},
         file_utils::create_folder,
+        keymeld::create_keymeld_service,
         lightning::{Ln, LnClient},
         oracle::OracleClient,
     },
@@ -30,6 +31,7 @@ use axum::{
     serve::Serve,
     Router,
 };
+use dlctix::secp::Scalar;
 use hyper::{
     header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
     Method,
@@ -211,11 +213,39 @@ pub async fn build_app(
 
     let users_store = UserStore::new(users_db);
 
+    // Create Keymeld service
+    // Get the coordinator's private key for keymeld credentials
+    let coordinator_private_key: Scalar = bitcoin_client.get_derived_private_key().await?;
+    let private_key_bytes: [u8; 32] = coordinator_private_key.serialize();
+
+    // Generate a deterministic user ID from the private key bytes
+    // Use first 16 bytes of private key hash as UUID bytes
+    use bdk_wallet::bitcoin::hashes::{sha256, Hash};
+    let hash = sha256::Hash::hash(&private_key_bytes);
+    let hash_bytes = hash.to_byte_array();
+    let mut uuid_bytes = [0u8; 16];
+    uuid_bytes.copy_from_slice(&hash_bytes[..16]);
+    let coordinator_user_id = uuid::Uuid::from_bytes(uuid_bytes);
+
+    let keymeld_service = create_keymeld_service(
+        config.keymeld_settings.clone(),
+        coordinator_user_id,
+        &private_key_bytes,
+    )
+    .map_err(|e| anyhow!("Failed to create keymeld service: {}", e))?;
+
+    if config.keymeld_settings.enabled {
+        info!("Keymeld service configured (enabled)");
+    } else {
+        info!("Keymeld service configured (disabled - using local MuSig2)");
+    }
+
     let coordinator = Coordinator::new(
         Arc::new(oracle_client),
         competition_store,
         bitcoin_client.clone(),
         ln.clone(),
+        keymeld_service,
         config
             .coordinator_settings
             .relative_locktime_block_delta
