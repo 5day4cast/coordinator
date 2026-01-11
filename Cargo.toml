@@ -19,13 +19,13 @@ name = "coordinator"
 # Internal crates
 coordinator-core = { path = "crates/coordinator-core" }
 
-# Keymeld (will be enabled when available)
-# keymeld-sdk = { path = "../keymeld/crates/keymeld-sdk" }
+# Keymeld
+keymeld-sdk = { git = "https://github.com/tee8z/keymeld", features = ["client", "dlctix"] }
 
 # Bitcoin
 bdk_esplora = { version = "0.20.1", features = ["async", "tokio"] }
 bdk_wallet = { version = "1.0.0", features = ["file_store", "keys-bip39"] }
-dlctix = "0.0.8"
+dlctix = { git = "https://github.com/tee8z/dlctix", branch = "external-signing-api" }
 miniscript = "12.3.2"
 
 # Web
@@ -66,8 +66,8 @@ thiserror = "1.0.62"
 blake2 = "0.10.6"
 sha2 = "0.10"
 aes-gcm = "0.10"
-rand = "0.8.5"
-rand_chacha = "0.3"
+rand = "0.9"
+rand_chacha = "0.9"
 
 # Time
 time = { version = "0.3.36", features = ["formatting", "macros", "parsing", "serde"] }

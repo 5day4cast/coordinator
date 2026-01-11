@@ -189,7 +189,7 @@ impl InvoiceWatcher {
             }
         }
 
-        let ticket_preimage = hashlock::preimage_random(&mut rand::thread_rng());
+        let ticket_preimage = hashlock::preimage_random(&mut rand::rng());
         let payment_hash = sha256::Hash::hash(&ticket_preimage).to_byte_array();
 
         // Reset the ticket with new payment details
