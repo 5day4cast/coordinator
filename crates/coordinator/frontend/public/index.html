@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <base href=".">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>5day4cast</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
+    <link rel="stylesheet" href="/ui/styles.css">
+    <script src="/ui/bolt11.min.js"></script>
+    <script type="module"> import uuidv7 from 'https://cdn.jsdelivr.net/npm/uuidv7@1.0.1/+esm'; </script>
+    <script type="module" src="https://unpkg.com/bitcoin-qr@1.4.1/dist/bitcoin-qr/bitcoin-qr.esm.js"></script>
+</head>
+
+<body>
+    <script>
+        const API_BASE = "{SERVER_ADDRESS}";
+        const ORACLE_BASE = "{ORACLE_BASE}";
+        const NETWORK = "{NETWORK}";
+    </script>
+    <script type="module" src="/ui/main.js"></script>
+    <script type="module" src="/ui/navbar.js"></script>
+    <script type="module" src="/ui/router.js"></script>
+    <script type="module" src="/ui/authorized_client.js"></script>
+    <script type="module" src="/ui/auth_manager.js"></script>
+    <script type="module" src="/ui/weather_data.js"></script>
+    <script type="module" src="/ui/competitions.js"></script>
+    <script type="module" src="/ui/entries.js"></script>
+    <script type="module" src="/ui/leader_board.js"></script>
+    <script type="module" src="/ui/entry.js"></script>
+    <script type="module" src="/ui/utils.js"></script>
+    <script type="module" src="/ui/payouts.js"></script>
+    <script type="module" src="/ui/musig_session_manager.js"></script>
+    <script type="module" src="/ui/musig_session_registry.js"></script>
+    <script type="module" src="/ui/signing_progress_ui.js"></script>
+    <script type="module" src="/ui/dist/client_validator.js"></script>
+
+    <section class="section">
+        <div class="container">
+                <nav class="level">
+                    <div class="level-left">
+                        <a href="#"
+                           id="brandNavClick"
+                           data-route="/competitions"
+                           class="is-undecorated">
+                            <h1  class="title level-item">
+                                Fantasy Weather
+                            </h1>
+                        </a>
+                        <p class="level-item has-text-grey-light" style="margin-left: 20px;">
+                            Powered by&nbsp;<a href="https://www.4casttruth.win/" target="_blank">4cast Truth Oracle</a>
+                        </p>
+                    </div>
+                    <div class="level-right">
+                        <p class="level-item">
+                            <a href="https://github.com/5day4cast/coordinator" target="_blank" style="font-size: 0.7em; margin-left: 10px; color: #333;">
+                                <svg height="24" width="24" viewBox="0 0 16 16" version="1.1" aria-hidden="true" style="fill: currentColor; vertical-align: middle;">
+                                    <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path>
+                                </svg>
+                            </a>
+                        </p>
+                    </div>
+                </nav>
+        </div>
+        <div>
+            <div class="container">
+                <nav class="navbar is-light" role="navigation" aria-label="main navigation">
+                    <div class="container">
+                        <!-- Navbar Brand -->
+                        <div class="navbar-brand">
+
+                            <!-- Hamburger menu for mobile -->
+                            <a role="button"
+                               class="navbar-burger"
+                               aria-label="menu"
+                               aria-expanded="false"
+                               data-target="navMenu">
+                                <span aria-hidden="true"></span>
+                                <span aria-hidden="true"></span>
+                                <span aria-hidden="true"></span>
+                            </a>
+                        </div>
+
+                        <!-- Navbar Menu -->
+                        <div id="navMenu" class="navbar-menu">
+                            <!-- Left side of navbar -->
+                            <div class="navbar-start">
+                                <a href="#"
+                                   class="navbar-item"
+                                   id="allCompetitionsNavClick"
+                                   data-route="/competitions">
+                                    <span>Competitions</span>
+                                </a>
+
+                                <a href="#"
+                                   class="navbar-item"
+                                   id="allEntriesNavClick"
+                                   data-route="entries">
+                                    <span>Entries</span>
+                                </a>
+
+                                <a href="#"
+                                   class="navbar-item is-hidden"
+                                   id="signingStatusNavClick"
+                                   data-route="/signing">
+                                    <span>Signing Status</span>
+                                    <span class="tag is-info ml-2 is-hidden" id="activeSigningCount">0</span>
+                                </a>
+
+                                <a href="#"
+                                   class="navbar-item"
+                                   id="payoutsNavClick"
+                                   data-route="/payouts">
+                                    <span>Payouts</span>
+                                </a>
+                            </div>
+
+                            <!-- Right side of navbar -->
+                            <div class="navbar-end">
+                                <!-- Auth buttons for logged out state -->
+                                <div class="navbar-item" id="authButtons">
+                                    <div class="buttons">
+                                        <a class="button is-primary" id="loginNavClick">
+                                            <span>Log in</span>
+                                        </a>
+                                        <a class="button is-light" id="registerNavClick">
+                                            <span>Sign up</span>
+                                        </a>
+                                    </div>
+                                </div>
+
+                                <!-- Logout button for logged in state -->
+                                <div class="navbar-item is-hidden" id="logoutContainer">
+                                    <div class="buttons">
+                                        <a href="#" class="button is-light" id="logoutNavClick">
+                                            <span>Logout</span>
+                                        </a>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </nav>
+            </div>
+            <div id="signingStatus" class="container hidden">
+                <div class="signing-progress-content box">
+                    <div id="signingProgressContainer"></div>
+                </div>
+            </div>
+            <div id="allCompetitions" class="container hidden">
+                <div class="box">
+                    <div class="table-container">
+                        <table id="competitionsDataTable" class="table is-fullwidth is-striped is-hoverable">
+                            <thead>
+                                <tr>
+                                    <th>ID</th>
+                                    <th>Start Time</th>
+                                    <th>End Time</th>
+                                    <Th>Signing Time</Th>
+                                    <th>Status</th>
+                                    <th>Entry fee (sats)</th>
+                                    <th>Total Prize Pool Amt (sats)</th>
+                                    <th>Total Entries</th>
+                                    <th>Number Of Places 'In The Money'</th>
+                                    <th>Enter/View</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <!-- Populated dynamically -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            <div id="currentCompetition" class="hidden container">
+            </div>
+        </div>
+        <div id="entryContainer" class="container hidden">
+            <div class="box">
+                <div class="level">
+                    <div class="level-left">
+                        <h2 class="title is-4">Submit Entry</h2>
+                    </div>
+                    <div class="level-right">
+                        <button id="backToCompetitions" class="button is-light">
+                            Back to Competitions
+                        </button>
+                    </div>
+                </div>
+            <div id="entryContent"></div>
+            <div class="mt-4">
+                <button type="submit" id="submitEntry" class="button is-info">Submit</button>
+                <div id="successMessage" class="has-text-success-dark hidden">Successfully Submitted Entry!</div>
+                <div id="errorMessage" class="has-text-danger-dark hidden"></div>
+            </div>
+            </div>
+        </div>
+        <div id="competitionLeaderboard" class="container hidden">
+            <div class="box">
+                <h4 class="title is-4 mb-4">Leader Board</h4>
+                <div class="table-container">
+                    <table id="competitionLeaderboardData" class="table is-fullwidth is-striped is-hoverable">
+                        <thead>
+                            <tr>
+                                <th>Rank</th>
+                                <th>Entry ID</th>
+                                <th>Score</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <!-- Populated dynamically -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <div id="allEntries" class="container hidden">
+            <div class="box">
+                <div class="table-container">
+                    <table id="entriesDataTable" class="table is-fullwidth is-striped is-hoverable">
+                        <thead>
+                            <tr>
+                                <th>Competition ID</th>
+                                <th>Start Time</th>
+                                <th>End Time</th>
+                                <th>Status</th>
+                                <th>Entry ID</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <!-- Populated dynamically -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <div id="payouts" class="container hidden">
+            <div class="box">
+                <h3 class="title is-4 mb-4">Available Payouts</h3>
+                <div class="table-container">
+                    <table class="table is-fullwidth is-striped is-hoverable">
+                        <thead>
+                            <tr>
+                                <th>Competition ID</th>
+                                <th>Entry ID</th>
+                                <th>Status</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="payoutsTableBody">
+                            <!-- Populated dynamically -->
+                        </tbody>
+                    </table>
+                </div>
+                <div id="noPayoutsMessage" class="notification is-info hidden">
+                    No entries eligible for payout at this time.
+                </div>
+                <div id="payoutsError" class="notification is-danger hidden">
+                </div>
+            </div>
+        </div>
+
+        <!-- (optional) chat powered by nostr (cheap/open source communication) -->
+        </div>
+    </section>
+
+    <div id="payoutModal" class="modal">
+        <div class="modal-background"></div>
+        <div class="modal-content">
+            <div class="box">
+                <h3 class="title is-4">Submit Lightning Invoice</h3>
+                <div class="field">
+                    <label class="label">Lightning Invoice</label>
+                    <div class="control">
+                        <textarea class="textarea" id="lightningInvoice"
+                            placeholder="Enter your Lightning invoice here..."
+                        ></textarea>
+                    </div>
+                </div>
+                <div class="field is-grouped">
+                    <div class="control">
+                        <button class="button is-primary" id="submitPayoutInvoice">Submit</button>
+                    </div>
+                    <div class="control">
+                        <button class="button is-light" id="cancelPayoutModal">Cancel</button>
+                    </div>
+                </div>
+                <div id="payoutModalError" class="notification is-danger hidden"></div>
+            </div>
+        </div>
+        <button class="modal-close is-large" aria-label="close"></button>
+    </div>
+
+    <div id="ticketPaymentModal" class="modal">
+        <div class="modal-background"></div>
+        <div class="modal-content">
+            <div class="box">
+                <h3 class="title is-4">Entry Ticket Payment</h3>
+                <div class="content">
+                    <p>Please pay the lightning invoice to enter the competition:</p>
+
+                    <!-- QR Code centered in its own container -->
+                    <div id="qrContainer" class="has-text-centered mb-4"></div>
+
+                    <div class="field">
+                        <label class="label">Payment Request (click to copy)</label>
+                        <div class="control">
+                            <textarea class="textarea" id="paymentRequest" readonly></textarea>
+                        </div>
+                        <p class="help is-success is-hidden" id="copyFeedback">✓ Copied to clipboard</p>
+                    </div>
+
+                    <div id="paymentStatus" class="mt-4">
+                        <p>Waiting for payment...</p>
+                        <progress class="progress is-info" max="100"></progress>
+                    </div>
+                    <div id="ticketPaymentError" class="notification is-danger is-hidden"></div>
+                </div>
+            </div>
+        </div>
+        <button class="modal-close is-large" aria-label="close"></button>
+    </div>
+
+    <div id="entryScore" class="modal">
+        <div class="modal-background"></div>
+        <div class="modal-content">
+            <div class="box">
+                <div id="entryValues"></div>
+            </div>
+        </div>
+        <button class="modal-close is-large" aria-label="close"></button>
+    </div>
+
+    <!-- Login Modal -->
+    <div id="loginModal" class="modal">
+        <div class="modal-background"></div>
+        <div class="modal-card">
+            <header class="modal-card-head">
+                <p class="modal-card-title">Welcome Back</p>
+                <button id="closeLoginModal" class="delete" aria-label="close"></button>
+            </header>
+            <section class="modal-card-body">
+                <div class="tabs is-centered is-boxed">
+                    <ul>
+                        <li class="is-active" data-target="privateKeyLogin">
+                            <a>
+                                <span>Private Key</span>
+                            </a>
+                        </li>
+                        <li data-target="extensionLogin">
+                            <a>
+                                <span>Browser Extension</span>
+                            </a>
+                        </li>
+                    </ul>
+                </div>
+
+                <div id="privateKeyLogin">
+                    <div class="field">
+                        <div class="control">
+                            <input class="input is-medium" type="password" id="loginPrivateKey"
+                                   placeholder="Enter your private key">
+                        </div>
+
+                        <p class="help is-danger mt-2" id="privateKeyError"></p>
+                    </div>
+
+                    <div class="field mt-5">
+                        <div class="control">
+                            <button class="button is-info is-fullwidth" id="loginButton">
+                                Login
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="extensionLogin" class="is-hidden">
+                    <div class="field">
+                        <div class="control">
+                            <button class="button is-info is-fullwidth" id="extensionLoginButton">
+                                Connect with Extension
+                            </button>
+                        </div>
+
+                        <p class="help is-danger mt-2" id="extensionLoginError"></p>
+                    </div>
+                </div>
+
+                <p class="has-text-centered mt-5">
+                    <a href="#" id="showRegisterButton" class="has-text-info">
+                        Need an account? Sign up
+                    </a>
+                </p>
+            </section>
+        </div>
+    </div>
+
+    <!-- Registration Modal -->
+    <div id="registerModal" class="modal">
+        <div class="modal-background"></div>
+        <div class="modal-card">
+            <header class="modal-card-head">
+                <p class="modal-card-title">Create Account</p>
+                <button id="closeResisterModal"  class="delete" aria-label="close"></button>
+            </header>
+            <section class="modal-card-body">
+                <!-- Tabs at the top -->
+                <div class="tabs is-centered">
+                    <ul>
+                        <li class="is-active" data-target="registerPrivateKey">
+                            <a>Private Key</a>
+                        </li>
+                        <li data-target="registerExtension">
+                            <a>Browser Extension</a>
+                        </li>
+                    </ul>
+                </div>
+
+                <!-- Tab Contents -->
+                <!-- Private Key Registration -->
+                <div id="registerPrivateKey">
+                    <div id="registerStep1">
+                        <p>Copy and put this private key in a safe place. Nostr accounts do not have password reset. Without the private key, you will not be able to access your account.</p>
+                        <div class="field mt-4">
+                            <div class="control">
+                                <input class="input" type="text" id="privateKeyDisplay" readonly>
+                            </div>
+                        </div>
+                        <button class="button is-info is-fullwidth mt-4" id="copyPrivateKey">
+                            Copy to clipboard
+                        </button>
+                        <div class="field mt-4">
+                            <label class="checkbox">
+                                <input type="checkbox" id="privateKeySavedCheckbox">
+                                I have put my private key in a safe place
+                            </label>
+                        </div>
+                        <button class="button is-info is-fullwidth mt-4" id="registerStep1Button" disabled>
+                            Next
+                        </button>
+                    </div>
+                    <div id="registerStep2" class="is-hidden">
+                        <div class="has-text-centered">
+                            <h2 class="title">Welcome!</h2>
+                            <p class="subtitle">Your account has been created successfully.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Extension Registration -->
+                <div id="registerExtension" class="is-hidden">
+                    <p class="mb-4">
+                        Register a new account using your Nostr browser extension.
+                    </p>
+                    <div class="field">
+                        <div class="control">
+                            <button class="button is-info is-fullwidth" id="extensionRegisterButton">
+                                Register with Extension
+                            </button>
+                        </div>
+                        <p class="help is-danger mt-2" id="extensionRegisterError"></p>
+                    </div>
+                </div>
+
+                <p class="has-text-centered mt-5">
+                    <a href="#" id="goToLoginButton" class="has-text-info">
+                        Try Login?
+                    </a>
+                </p>
+            </section>
+        </div>
+    </div>
+</body>
+
+</html>

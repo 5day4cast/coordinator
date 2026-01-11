@@ -1,0 +1,228 @@
+.hidden {
+    display: none;
+}
+
+.parent {
+    width: 95vw;
+    height: 100vh;
+    position: relative;
+    z-index: 1;
+}
+
+.modal {
+    z-index: 9999 !important; /* Adjust the value as needed */
+}
+
+.steps {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 2rem;
+}
+
+.step-item {
+    flex: 1;
+    text-align: center;
+    position: relative;
+}
+
+.step-item:not(:last-child):after {
+    content: "";
+    position: absolute;
+    left: calc(50% + 1.5rem);
+    top: 1rem;
+    width: calc(100% - 3rem);
+    height: 2px;
+    background: #dbdbdb;
+}
+
+.step-marker {
+    width: 2rem;
+    height: 2rem;
+    border-radius: 50%;
+    background: #dbdbdb;
+    color: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0 auto 0.5rem;
+}
+
+.step-item.is-active .step-marker {
+    background: #3273dc;
+}
+
+.step-item.is-completed .step-marker {
+    background: #23d160;
+}
+
+.step-title {
+    font-size: 0.875rem;
+    color: #363636;
+}
+
+.modal-card {
+    background-color: #1a1a1a;
+    max-width: 480px;
+    margin: 0 20px;
+}
+
+.modal-card-head,
+.modal-card-foot {
+    background-color: #1a1a1a;
+    border-color: #363636;
+}
+
+.modal-card-body {
+    background-color: #1a1a1a;
+    color: white;
+}
+
+.modal-card-title {
+    color: white;
+}
+
+.private-key-box {
+    background-color: #1a1a1a;
+    border: 1px solid #363636;
+    padding: 1rem;
+    border-radius: 6px;
+    margin: 1rem 0;
+}
+
+.tabs li.is-active a {
+    border-color: #485fc7;
+    color: #485fc7;
+}
+
+.input {
+    background-color: #0d0d0d;
+    border-color: #363636;
+    color: white;
+}
+
+.input:focus {
+    border-color: #485fc7;
+    box-shadow: 0 0 0 0.125em rgba(72, 95, 199, 0.25);
+}
+
+.input::placeholder {
+    color: #666;
+}
+
+/* Container for all signing progress content */
+.signing-progress-content {
+    background: white;
+    border-radius: 6px;
+    padding: 1.5rem;
+    margin-top: 1rem;
+}
+
+#signingProgressContainer {
+    min-height: 100px;
+    padding: 1rem;
+}
+
+/* Individual session cards */
+.signing-session-card {
+    background: white;
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+    margin-bottom: 15px;
+    padding: 20px;
+    transition: box-shadow 0.3s ease;
+    border-left: 4px solid transparent; /* Default border */
+}
+
+.signing-session-card:hover {
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.2);
+}
+
+/* State-specific styling */
+.signing-session-card.initialized {
+    border-left-color: #3273dc;
+}
+
+.signing-session-card.completed {
+    border-left-color: #48c774;
+}
+
+.signing-session-card.error {
+    border-left-color: #f14668;
+}
+
+/* Card content styling */
+.competition-details {
+    font-size: 0.9em;
+    color: #666;
+    margin: 10px 0;
+}
+
+.session-status {
+    font-weight: 500;
+    color: #3273dc;
+    margin-top: 10px;
+}
+
+/* Progress indicators */
+.progress-steps {
+    margin-top: 15px;
+    position: relative;
+}
+
+.progress-line {
+    height: 2px;
+    background: #dbdbdb;
+    position: relative;
+    margin: 10px 0;
+}
+
+.progress-line-fill {
+    height: 100%;
+    background: #3273dc;
+    transition: width 0.3s ease;
+}
+
+tr.is-clickable {
+    cursor: pointer;
+}
+
+tr.is-clickable:hover {
+    background-color: #f5f5f5;
+}
+
+@media screen and (max-width: 768px) {
+    .table-container {
+        overflow-x: auto;
+    }
+
+    .table {
+        font-size: 0.875rem;
+    }
+}
+
+.navbar {
+    border-bottom: 1px solid #eee;
+    margin-bottom: 1rem;
+}
+
+.navbar-item.is-active {
+    color: #485fc7;
+    background-color: transparent !important;
+}
+
+.navbar-item:hover {
+    color: #485fc7 !important;
+    background-color: transparent !important;
+}
+
+@media screen and (max-width: 1023px) {
+    .navbar-menu {
+        box-shadow: none;
+    }
+}
+
+.is-undecorated {
+    text-decoration: none;
+    color: inherit;
+}

@@ -1,0 +1,90 @@
+[package]
+name = "coordinator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+coordinator-core.workspace = true
+
+# Web
+axum.workspace = true
+tower-http.workspace = true
+reqwest-middleware.workspace = true
+reqwest-retry.workspace = true
+hyper.workspace = true
+h2.workspace = true
+
+# Bitcoin
+bdk_esplora.workspace = true
+bdk_wallet.workspace = true
+dlctix.workspace = true
+
+# Async
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+async-channel.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+# Database
+sqlx.workspace = true
+
+# Nostr
+nostr-sdk.workspace = true
+
+# Logging
+log.workspace = true
+fern.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Crypto
+blake2.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+
+# Time
+time.workspace = true
+
+# Utilities
+uuid.workspace = true
+hex.workspace = true
+base64.workspace = true
+itertools.workspace = true
+secrecy.workspace = true
+
+# CLI
+clap.workspace = true
+config.workspace = true
+
+# Lightning
+lightning-invoice.workspace = true
+
+# Misc
+num_cpus.workspace = true
+mime.workspace = true
+openssl.workspace = true
+pem-rfc7468.workspace = true
+
+[dev-dependencies]
+maplit = "1.0.2"
+mockall = "0.11"
+tokio-test = "0.4"
+env_logger = "0.11.6"
+
+[[bin]]
+name = "coordinator"
+path = "src/main.rs"
+
+[[bin]]
+name = "wallet-cli"
+path = "src/bin/wallet_cli.rs"
