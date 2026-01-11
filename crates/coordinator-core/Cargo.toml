@@ -1,0 +1,22 @@
+[package]
+name = "coordinator-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared types for coordinator server and WASM client"
+
+[dependencies]
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Bitcoin types
+dlctix.workspace = true
+
+# Time
+time.workspace = true
+
+# Utilities
+uuid.workspace = true
+thiserror.workspace = true
