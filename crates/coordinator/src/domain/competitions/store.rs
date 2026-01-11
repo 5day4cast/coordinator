@@ -1397,4 +1397,61 @@ impl CompetitionStore {
 
         Ok(result.rows_affected() > 0)
     }
+
+    /// Store a Keymeld session for a competition
+    pub async fn store_keymeld_session(
+        &self,
+        competition_id: Uuid,
+        session: &crate::infra::keymeld::StoredDlcKeygenSession,
+    ) -> Result<bool, sqlx::Error> {
+        let session_json =
+            serde_json::to_vec(session).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+
+        let result = sqlx::query(
+            "UPDATE competitions
+            SET keymeld_session = ?
+            WHERE id = ?",
+        )
+        .bind(&session_json)
+        .bind(competition_id.to_string())
+        .execute(self.db_connection.write())
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Retrieve a Keymeld session for a competition
+    pub async fn get_keymeld_session(
+        &self,
+        competition_id: Uuid,
+    ) -> Result<Option<crate::infra::keymeld::StoredDlcKeygenSession>, sqlx::Error> {
+        let session_bytes: Option<Option<Vec<u8>>> =
+            sqlx::query_scalar("SELECT keymeld_session FROM competitions WHERE id = ?")
+                .bind(competition_id.to_string())
+                .fetch_optional(self.db_connection.read())
+                .await?;
+
+        match session_bytes {
+            Some(Some(bytes)) => {
+                let session =
+                    serde_json::from_slice(&bytes).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+                Ok(Some(session))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Clear a Keymeld session for a competition (e.g., on failure or completion)
+    pub async fn clear_keymeld_session(&self, competition_id: Uuid) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE competitions
+            SET keymeld_session = NULL
+            WHERE id = ?",
+        )
+        .bind(competition_id.to_string())
+        .execute(self.db_connection.write())
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
 }

@@ -8,6 +8,7 @@ use crate::{
     infra::{
         bitcoin::{Bitcoin, ForeignUtxo, REQUIRED_CONFIRMATIONS_FOR_TIME},
         escrow::{create_escrow_descriptor, generate_escrow_tx, get_escrow_outpoint},
+        keymeld::{Keymeld, StoredDlcKeygenSession},
         lightning::Ln,
         oracle::{AddEventEntries, AddEventEntry, Error as OracleError, Event, Oracle},
     },
@@ -67,6 +68,19 @@ pub struct TicketResponse {
     pub amount_sats: u64,
 }
 
+/// Response for Keymeld session info - used by clients to join remote MuSig2 signing
+#[derive(Debug, Clone, Serialize)]
+pub struct KeymeldSessionInfo {
+    /// Whether Keymeld signing is enabled for this coordinator
+    pub enabled: bool,
+    /// The Keymeld gateway URL (if enabled)
+    pub gateway_url: Option<String>,
+    /// Session ID for the keygen session (if active)
+    pub session_id: Option<String>,
+    /// Competition ID this session belongs to
+    pub competition_id: Uuid,
+}
+
 pub struct CompetitionWatcher {
     coordinator: Arc<Coordinator>,
     sync_interval: Duration,
@@ -122,6 +136,7 @@ pub struct Coordinator {
     pub competition_store: Arc<CompetitionStore>,
     pub bitcoin: Arc<dyn Bitcoin>,
     ln: Arc<dyn Ln>,
+    keymeld: Arc<dyn Keymeld>,
     private_key: Scalar,
     public_key: Point,
     relative_locktime_block_delta: u32,
@@ -135,6 +150,7 @@ impl Coordinator {
         competition_store: CompetitionStore,
         bitcoin: Arc<dyn Bitcoin>,
         ln: Arc<dyn Ln>,
+        keymeld: Arc<dyn Keymeld>,
         relative_locktime_block_delta: u32,
         required_confirmations: u32,
         name: String,
@@ -147,6 +163,7 @@ impl Coordinator {
             competition_store: Arc::new(competition_store),
             bitcoin,
             ln,
+            keymeld,
             private_key,
             public_key,
             relative_locktime_block_delta,
@@ -155,6 +172,49 @@ impl Coordinator {
         };
         coordinator.validate_coordinator_metadata().await?;
         Ok(coordinator)
+    }
+
+    /// Check if Keymeld signing is enabled
+    pub fn is_keymeld_enabled(&self) -> bool {
+        self.keymeld.is_enabled()
+    }
+
+    /// Get Keymeld session info for a competition
+    /// This allows clients to join the remote MuSig2 signing session
+    pub async fn get_keymeld_session_info(
+        &self,
+        competition_id: Uuid,
+    ) -> Result<KeymeldSessionInfo, Error> {
+        let session = self
+            .competition_store
+            .get_keymeld_session(competition_id)
+            .await
+            .map_err(Error::DbError)?;
+
+        Ok(KeymeldSessionInfo {
+            enabled: self.is_keymeld_enabled(),
+            gateway_url: if self.is_keymeld_enabled() {
+                // TODO: Expose gateway URL from keymeld service
+                None
+            } else {
+                None
+            },
+            session_id: session.map(|s| s.session_id),
+            competition_id,
+        })
+    }
+
+    /// Store a Keymeld session for a competition (for use after keygen completes)
+    pub async fn store_keymeld_session(
+        &self,
+        competition_id: Uuid,
+        session: StoredDlcKeygenSession,
+    ) -> Result<(), Error> {
+        self.competition_store
+            .store_keymeld_session(competition_id, &session)
+            .await
+            .map_err(Error::DbError)?;
+        Ok(())
     }
 
     pub fn public_key(&self) -> String {
@@ -872,9 +932,17 @@ impl Coordinator {
         }
 
         // Note: word of warning, the ticketed_dlc may be very large in memory depending on the contract params
-        let ticketed_dlc = TicketedDLC::new(contract_params, funding_outpoint)?;
+        let ticketed_dlc = TicketedDLC::new(contract_params.clone(), funding_outpoint)?;
         debug!("Built ticketed dlc");
 
+        // TODO(keymeld): When keymeld is enabled, create a keygen session instead of local nonces
+        // The flow would be:
+        // 1. Create keygen session via self.keymeld.create_dlc_keygen_session()
+        // 2. Store session in DB via self.store_keymeld_session()
+        // 3. Skip local nonce generation - clients will join the keymeld session
+        // 4. The aggregate key from keymeld becomes the funding key
+        //
+        // For now, we continue with local MuSig2 signing:
         let signing_session = {
             let mut rng = create_deterministic_rng(&funding_outpoint, self.private_key);
             SigningSession::<NonceSharingRound>::new(ticketed_dlc, &mut rng, self.private_key)?
@@ -883,11 +951,19 @@ impl Coordinator {
         if competition.public_nonces.is_none() {
             competition.public_nonces = Some(signing_session.our_public_nonces().to_owned());
         }
+        competition.contracted_at = Some(OffsetDateTime::now_utc());
         competition.errors = vec![];
 
         Ok(competition)
     }
 
+    /// Aggregate nonces from all participants and generate coordinator's partial signatures
+    ///
+    /// TODO(keymeld): When keymeld is enabled, this step is handled differently:
+    /// - The keymeld service coordinates nonce aggregation across all participants
+    /// - Participants join the keygen session via their keymeld SDK clients
+    /// - Once all participants have joined, keymeld returns the aggregate key
+    /// - This method would then just verify the keymeld session completed successfully
     pub async fn generate_aggregate_nonces_and_coord_partial_signatures<'a>(
         &self,
         competition: &'a mut Competition,
@@ -937,6 +1013,13 @@ impl Coordinator {
         Ok(competition)
     }
 
+    /// Sign the DLC contract by aggregating all partial signatures
+    ///
+    /// TODO(keymeld): When keymeld is enabled, signing is coordinated via the keymeld service:
+    /// - Use self.keymeld.sign_dlc_batch() to initiate signing
+    /// - The keymeld service coordinates with all participants via their SDK clients
+    /// - Participants sign their shares and keymeld aggregates the final signatures
+    /// - This method would verify the keymeld signing session completed and extract signatures
     pub async fn sign_dlc_contract<'a>(
         &self,
         competition: &'a mut Competition,
