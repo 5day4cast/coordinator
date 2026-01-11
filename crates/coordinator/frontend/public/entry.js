@@ -1,7 +1,7 @@
 import { WeatherData } from "./weather_data.js";
 import { uuidv7 } from "https://unpkg.com/uuidv7@^1";
 import { AuthorizedClient } from "./authorized_client.js";
-import { getMusigRegistry } from "./main.js";
+import { completeKeymeldRegistration } from "./keymeld_client.js";
 import { hideAllContainers, showContainer } from "./navbar.js";
 
 class Entry {
@@ -402,7 +402,33 @@ class Entry {
     try {
       // First handle the ticket payment
       await this.handleTicketPayment(this.entry.ephemeral_pubkey);
-      console.log("Ticket payment handled, creating entry submit");
+      console.log("Ticket payment handled, joining keymeld session");
+
+      // Get the ephemeral private key for keymeld registration
+      const ephemeralPrivateKey = await window.taprootWallet.getDlcPrivateKey(
+        this.entryIndex,
+      );
+
+      // Join keymeld session - this registers the user with keymeld for signing
+      const keymeldResult = await completeKeymeldRegistration(
+        this.client,
+        this.competition.id,
+        ephemeralPrivateKey,
+        window.nostrClient,
+      );
+
+      if (!keymeldResult.success) {
+        console.warn("Keymeld registration failed:", keymeldResult.error);
+        // Continue with entry submission - coordinator will handle signing
+      } else {
+        console.log(
+          "Keymeld registration successful:",
+          keymeldResult.sessionId,
+        );
+      }
+
+      // Now submit the entry
+      console.log("Creating entry submission");
       let submit = this.entry["submit"];
       let expected_observations = this.buildExpectedObservations(submit);
 
@@ -418,7 +444,6 @@ class Entry {
         expected_observations: expected_observations,
       };
 
-      //TODO(@tee8z): do validation on entry that it matches competition rules before submitting
       console.log("Sending entry:", entry_body);
 
       const response = await this.client.post(
@@ -431,17 +456,7 @@ class Entry {
       }
 
       const responseData = await response.json();
-
-      const registry = getMusigRegistry();
-      if (registry) {
-        await registry.createSession(
-          window.taprootWallet,
-          this.competition.id,
-          this.entry.id,
-          this.client,
-          this.entryIndex,
-        );
-      }
+      console.log("Entry submitted successfully:", responseData);
 
       $event.target.classList.remove("is-loading");
       this.showSuccess();
