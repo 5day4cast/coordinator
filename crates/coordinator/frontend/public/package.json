@@ -1,0 +1,25 @@
+{
+  "name": "client_validator",
+  "type": "module",
+  "version": "0.8.2",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tee8z/5day4cast"
+  },
+  "scripts": {
+    "build": "bash ../../build.sh"
+  },
+  "files": [
+    "client_validator_bg.wasm",
+    "client_validator.js",
+    "client_validator.d.ts"
+  ],
+  "main": "client_validator.js",
+  "types": "client_validator.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ],
+  "dependencies": {
+    "bolt11": "^1.4.1"
+  }
+}
