@@ -213,7 +213,7 @@ mod tests {
 
     fn test_config() -> CreateEvent {
         CreateEvent {
-            id: Uuid::new_v4(),
+            id: Uuid::now_v7(),
             signing_date: OffsetDateTime::now_utc() + time::Duration::days(1),
             start_observation_date: OffsetDateTime::now_utc(),
             end_observation_date: OffsetDateTime::now_utc() + time::Duration::hours(12),
