@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[package.metadata.cargo-machete]
+ignored = ["blake2", "coordinator-core", "h2", "openssl"]
+
 [dependencies]
 coordinator-core.workspace = true
 
@@ -26,7 +29,6 @@ tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true
 async-trait.workspace = true
-async-channel.workspace = true
 
 # Serialization
 serde.workspace = true
@@ -70,7 +72,6 @@ config.workspace = true
 lightning-invoice.workspace = true
 
 # Misc
-num_cpus.workspace = true
 mime.workspace = true
 openssl.workspace = true
 pem-rfc7468.workspace = true

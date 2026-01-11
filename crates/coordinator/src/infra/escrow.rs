@@ -81,10 +81,7 @@ pub fn create_escrow_descriptor(
     // Leaving out for now to avoid that complexity
     let descriptor_str = format!(
         "wsh(or_d(multi(2,{},{}),and_v(v:pk({}),and_v(v:sha256({}),older(144)))))",
-        coordinator_pubkey.to_string(),
-        user_pubkey.to_string(),
-        user_pubkey.to_string(),
-        payment_hash_hex
+        coordinator_pubkey, user_pubkey, user_pubkey, payment_hash_hex
     );
 
     Descriptor::from_str(&descriptor_str)

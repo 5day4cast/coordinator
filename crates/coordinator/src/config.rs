@@ -1,6 +1,6 @@
 use anyhow::anyhow;
 use bdk_wallet::bitcoin::Network;
-use clap::{command, Parser};
+use clap::Parser;
 use fern::colors::{Color, ColoredLevelConfig};
 use log::LevelFilter;
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,7 @@ pub struct Cli {
     pub level: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct Settings {
     pub config: Option<String>,
     pub level: Option<String>,
@@ -273,20 +273,6 @@ impl Default for APISettings {
     }
 }
 
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            config: None,
-            level: None,
-            db_settings: DBSettings::default(),
-            api_settings: APISettings::default(),
-            ui_settings: UISettings::default(),
-            coordinator_settings: CoordinatorSettings::default(),
-            bitcoin_settings: BitcoinSettings::default(),
-            ln_settings: LnSettings::default(),
-        }
-    }
-}
 pub fn get_settings() -> Result<Settings, anyhow::Error> {
     get_settings_with_cli(Cli::parse().into())
 }
@@ -412,8 +398,7 @@ pub fn setup_logger(
 }
 
 pub fn get_log_level(level: Option<String>) -> LevelFilter {
-    if level.is_some() {
-        let level = level.as_ref().unwrap();
+    if let Some(level) = &level {
         match level.as_ref() {
             "trace" => LevelFilter::Trace,
             "debug" => LevelFilter::Debug,

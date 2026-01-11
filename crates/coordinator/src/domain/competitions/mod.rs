@@ -205,11 +205,11 @@ impl FromRow<'_, SqliteRow> for UserEntry {
             public_nonces: parse_optional_blob_json(row, "public_nonces")?,
             funding_psbt_base64: row.get("funding_psbt_base64"),
             partial_signatures: parse_optional_blob_json(row, "partial_signatures")?,
-            signed_at: parse_optional_sqlite_datetime(&row, "signed_at")?,
-            paid_at: parse_optional_sqlite_datetime(&row, "paid_at")?,
-            sellback_broadcasted_at: parse_optional_datetime(&row, "sellback_broadcasted_at")?,
-            reclaimed_broadcasted_at: parse_optional_datetime(&row, "reclaimed_broadcasted_at")?,
-            paid_out_at: parse_optional_datetime(&row, "paid_out_at")?,
+            signed_at: parse_optional_sqlite_datetime(row, "signed_at")?,
+            paid_at: parse_optional_sqlite_datetime(row, "paid_at")?,
+            sellback_broadcasted_at: parse_optional_datetime(row, "sellback_broadcasted_at")?,
+            reclaimed_broadcasted_at: parse_optional_datetime(row, "reclaimed_broadcasted_at")?,
+            paid_out_at: parse_optional_datetime(row, "paid_out_at")?,
             payout_ln_invoice: row.get("payout_ln_invoice"),
         })
     }
@@ -319,9 +319,9 @@ impl FromRow<'_, SqliteRow> for Ticket {
                 .unwrap_or_else(|| OffsetDateTime::now_utc() + time::Duration::minutes(60)),
             ephemeral_pubkey: row.get("ephemeral_pubkey"),
             reserved_by: row.get("reserved_by"),
-            reserved_at: parse_optional_sqlite_datetime(&row, "reserved_at")?,
-            paid_at: parse_optional_sqlite_datetime(&row, "paid_at")?,
-            settled_at: parse_optional_sqlite_datetime(&row, "settled_at")?,
+            reserved_at: parse_optional_sqlite_datetime(row, "reserved_at")?,
+            paid_at: parse_optional_sqlite_datetime(row, "paid_at")?,
+            settled_at: parse_optional_sqlite_datetime(row, "settled_at")?,
             escrow_transaction: row.get("escrow_transaction"),
         })
     }

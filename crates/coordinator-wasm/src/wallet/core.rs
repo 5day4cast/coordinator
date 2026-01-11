@@ -52,7 +52,6 @@ impl From<Network> for NetworkKind {
             Network::Testnet | Network::Testnet4 | Network::Signet | Network::Regtest => {
                 NetworkKind::Test
             }
-            _ => NetworkKind::Test,
         }
     }
 }
@@ -75,6 +74,12 @@ pub struct TaprootWalletCoreBuilder {
     network: Option<String>,
     nostr_client: Option<NostrClientCore>,
     encrypted_key: Option<String>,
+}
+
+impl Default for TaprootWalletCoreBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TaprootWalletCoreBuilder {
@@ -369,14 +374,12 @@ impl TaprootWalletCore {
 
     fn generate_preimage_from_secret(&self, secret_bytes: [u8; 32]) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        hasher.update(&secret_bytes);
+        hasher.update(secret_bytes);
         hasher.finalize().into()
     }
 
     pub fn get_dlc_entry(&self, entry_index: u32) -> Option<DlcEntryData> {
-        let Some(entry) = self.dlc_contracts.get(&entry_index) else {
-            return None;
-        };
+        let entry = self.dlc_contracts.get(&entry_index)?;
         Some(entry.data.clone())
     }
 

@@ -13,6 +13,12 @@ pub struct NostrClientCore {
     pub signer: Option<CustomSigner>,
 }
 
+impl Default for NostrClientCore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NostrClientCore {
     pub fn new() -> Self {
         Self {
