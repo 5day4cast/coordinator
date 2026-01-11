@@ -2520,6 +2520,7 @@ impl Coordinator {
     }
 
     /// Get keymeld signing info for a user's entry
+    /// Only returns info if the user's ticket has been paid (HODL invoice accepted)
     /// Decrypts the stored session secret and re-encrypts it to the user's nostr pubkey
     async fn get_keymeld_signing_info(
         &self,
@@ -2529,6 +2530,19 @@ impl Coordinator {
     ) -> Result<KeymeldSigningInfo, Error> {
         use nostr_sdk::nips::nip44;
         use nostr_sdk::prelude::{PublicKey, SecretKey};
+
+        // Check that the user's ticket has been paid before revealing keymeld info
+        let ticket = self
+            .competition_store
+            .get_ticket(entry.ticket_id)
+            .await
+            .map_err(Error::DbError)?;
+
+        if ticket.paid_at.is_none() {
+            return Err(Error::BadRequest(
+                "Keymeld info not available until payment is received".to_string(),
+            ));
+        }
 
         let stored_session = self
             .competition_store
