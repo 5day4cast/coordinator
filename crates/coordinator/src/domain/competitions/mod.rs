@@ -786,7 +786,7 @@ impl Competition {
     // We add the fee for the coordinator's service at this point in the process,
     // A user can not enter into the competition without paying the fee
     async fn create_ticket(&self, expiry_time: OffsetDateTime) -> Result<Ticket, Error> {
-        let ticket_preimage = hashlock::preimage_random(&mut rand::thread_rng());
+        let ticket_preimage = hashlock::preimage_random(&mut rand::rng());
         let ticket_hash = hashlock::sha256(&ticket_preimage);
 
         Ok(Ticket {

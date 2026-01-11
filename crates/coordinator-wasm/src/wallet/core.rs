@@ -21,7 +21,7 @@ use dlctix::{
 };
 use log::debug;
 use nostr_sdk::{FromBech32, NostrSigner};
-use rand::{thread_rng, RngCore, SeedableRng};
+use rand::{rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -145,7 +145,7 @@ impl TaprootWalletCore {
         network: Network,
     ) -> Result<Self, WalletError> {
         let mut entropy = [0u8; 32];
-        thread_rng().fill_bytes(&mut entropy);
+        rng().fill_bytes(&mut entropy);
         let secret_key =
             SecretKey::from_slice(&entropy).map_err(|e| WalletError::KeyError(e.to_string()))?;
 
