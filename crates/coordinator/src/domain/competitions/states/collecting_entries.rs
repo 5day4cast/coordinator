@@ -46,14 +46,10 @@ impl CollectingEntries {
     /// This transition occurs when:
     /// - All entry slots are filled
     /// - All entries have been paid via Lightning HODL invoices
-    pub fn all_entries_collected(self) -> Result<CompetitionStatus, CompetitionStatus> {
-        if !self.has_all_entries() {
-            return Err(CompetitionStatus::CollectingEntries(self));
-        }
-
-        Ok(CompetitionStatus::AwaitingEscrow(
-            AwaitingEscrow::from_competition(self.competition),
-        ))
+    ///
+    /// Caller should check `has_all_entries()` before calling this.
+    pub fn into_awaiting_escrow(self) -> CompetitionStatus {
+        CompetitionStatus::AwaitingEscrow(AwaitingEscrow::from_competition(self.competition))
     }
 
     /// Check if competition is expired before all entries collected.

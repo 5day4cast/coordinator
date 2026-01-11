@@ -16,6 +16,7 @@ pub struct StateContext {
 }
 
 impl StateContext {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         oracle: Arc<dyn Oracle>,
         bitcoin: Arc<dyn Bitcoin>,
