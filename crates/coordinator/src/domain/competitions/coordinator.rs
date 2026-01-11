@@ -179,6 +179,43 @@ impl Coordinator {
         self.keymeld.is_enabled()
     }
 
+    /// Check if all participants have registered with keymeld for a competition
+    /// Returns true if all expected participants have registered, false otherwise
+    pub async fn check_keymeld_registrations(&self, competition_id: Uuid) -> Result<bool, Error> {
+        let stored_session = self
+            .competition_store
+            .get_keymeld_session(competition_id)
+            .await
+            .map_err(Error::DbError)?
+            .ok_or_else(|| {
+                Error::NotFound(format!(
+                    "Keymeld session not found for competition {}",
+                    competition_id
+                ))
+            })?;
+
+        // Decrypt the session secret to restore the session
+        let session_secret =
+            self.decrypt_session_secret(&stored_session.encrypted_session_secret)?;
+        let session = stored_session.to_session(session_secret);
+
+        let status = self
+            .keymeld
+            .get_keygen_status(&session)
+            .await
+            .map_err(|e| Error::BadRequest(format!("Failed to get keymeld status: {}", e)))?;
+
+        info!(
+            "Keymeld session {} status: {} ({}/{} participants)",
+            status.session_id,
+            status.status,
+            status.registered_participants,
+            status.expected_participants
+        );
+
+        Ok(status.is_completed)
+    }
+
     /// Store a Keymeld session for a competition (for use after keygen completes)
     /// The session secret is encrypted to the coordinator's own nostr pubkey before storage
     pub async fn store_keymeld_session(

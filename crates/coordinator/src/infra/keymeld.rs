@@ -32,6 +32,16 @@ pub enum KeymeldError {
     NotEnabled,
 }
 
+/// Status of a keygen session for polling
+#[derive(Debug, Clone)]
+pub struct KeygenSessionStatus {
+    pub session_id: String,
+    pub status: String,
+    pub registered_participants: usize,
+    pub expected_participants: usize,
+    pub is_completed: bool,
+}
+
 /// Trait for Keymeld signing operations
 #[async_trait]
 pub trait Keymeld: Send + Sync {
@@ -42,6 +52,12 @@ pub trait Keymeld: Send + Sync {
         contract_params: &ContractParameters,
         player_user_ids: Vec<UserId>,
     ) -> Result<DlcKeygenSession, KeymeldError>;
+
+    /// Get the status of a keygen session (for polling registrations)
+    async fn get_keygen_status(
+        &self,
+        session: &DlcKeygenSession,
+    ) -> Result<KeygenSessionStatus, KeymeldError>;
 
     /// Sign a DLC contract batch
     async fn sign_dlc_batch(
@@ -299,6 +315,43 @@ impl Keymeld for KeymeldService {
 
         Ok(dlc_signatures)
     }
+
+    async fn get_keygen_status(
+        &self,
+        session: &DlcKeygenSession,
+    ) -> Result<KeygenSessionStatus, KeymeldError> {
+        let client = self.get_client()?;
+
+        // Restore session credentials to make authenticated status request
+        let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
+
+        let restored_session = client
+            .keygen()
+            .restore_session(session.session_id.clone(), credentials)
+            .await?;
+
+        let status_kind = restored_session.status();
+        let is_completed = matches!(
+            status_kind,
+            keymeld_sdk::prelude::KeygenStatusKind::Completed
+        );
+
+        // Get available slots to count registrations
+        let slots = client
+            .keygen()
+            .get_available_slots(&session.session_id)
+            .await?;
+        let registered = slots.available_slots.iter().filter(|s| s.claimed).count();
+        let expected = slots.available_slots.len();
+
+        Ok(KeygenSessionStatus {
+            session_id: session.session_id.to_string(),
+            status: status_kind.as_ref().to_string(),
+            registered_participants: registered,
+            expected_participants: expected,
+            is_completed,
+        })
+    }
 }
 
 /// Mock implementation for testing without Keymeld
@@ -316,6 +369,13 @@ impl Keymeld for MockKeymeld {
         _contract_params: &ContractParameters,
         _player_user_ids: Vec<UserId>,
     ) -> Result<DlcKeygenSession, KeymeldError> {
+        Err(KeymeldError::NotEnabled)
+    }
+
+    async fn get_keygen_status(
+        &self,
+        _session: &DlcKeygenSession,
+    ) -> Result<KeygenSessionStatus, KeymeldError> {
         Err(KeymeldError::NotEnabled)
     }
 
