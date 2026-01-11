@@ -18,8 +18,8 @@ use uuid::Uuid;
 use crate::{
     api::extractors::NostrAuth,
     domain::{
-        AddEntry, Competition, CreateEvent, FundedContract, PayoutInfo, SearchBy, TicketResponse,
-        TicketStatus, UserEntry,
+        AddEntry, Competition, CreateEvent, FundedContract, KeymeldSessionInfo, PayoutInfo,
+        SearchBy, TicketResponse, TicketStatus, UserEntry,
     },
     startup::AppState,
 };
@@ -292,6 +292,32 @@ pub async fn submit_ticket_payout(
         .map(|_| StatusCode::OK)
         .map_err(|e| {
             error!("error submitting payout information: {:?}", e);
+            e.into()
+        })
+}
+
+/// Get Keymeld session info for a competition
+///
+/// Returns information needed for clients to join a Keymeld MuSig2 signing session.
+/// This includes:
+/// - Whether Keymeld is enabled on this coordinator
+/// - The gateway URL to connect to
+/// - The session ID (if a keygen session is active)
+/// - Encrypted session secret (NIP-44) for the requesting user
+pub async fn get_keymeld_session(
+    NostrAuth { pubkey, .. }: NostrAuth,
+    State(state): State<Arc<AppState>>,
+    Path(competition_id): Path<Uuid>,
+) -> Result<Json<KeymeldSessionInfo>, ErrorResponse> {
+    let pubkey_hex = pubkey.to_hex();
+
+    state
+        .coordinator
+        .get_keymeld_session_info(competition_id, &pubkey_hex)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            error!("error getting keymeld session info: {:?}", e);
             e.into()
         })
 }
