@@ -34,6 +34,7 @@ pub struct Settings {
     pub coordinator_settings: CoordinatorSettings,
     pub bitcoin_settings: BitcoinSettings,
     pub ln_settings: LnSettings,
+    pub keymeld_settings: KeymeldSettings,
 }
 
 impl ConfigurableSettings for Settings {
@@ -165,6 +166,41 @@ impl Default for LnSettings {
             tls_cert_path: Some(String::from("./creds/tls.cert")),
             invoice_watch_interval: 5,
             payout_watch_interval: 5,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KeymeldSettings {
+    /// URL of the Keymeld gateway server
+    pub gateway_url: String,
+    /// Whether Keymeld integration is enabled
+    pub enabled: bool,
+    /// Timeout in seconds for keygen sessions
+    pub keygen_timeout_secs: u64,
+    /// Timeout in seconds for signing sessions
+    pub signing_timeout_secs: u64,
+    /// Maximum polling attempts for session completion
+    pub max_polling_attempts: u32,
+    /// Initial polling delay in milliseconds
+    pub initial_polling_delay_ms: u64,
+    /// Maximum polling delay in milliseconds
+    pub max_polling_delay_ms: u64,
+    /// Polling backoff multiplier
+    pub polling_backoff_multiplier: f64,
+}
+
+impl Default for KeymeldSettings {
+    fn default() -> Self {
+        KeymeldSettings {
+            gateway_url: String::from("http://localhost:8080"),
+            enabled: false,
+            keygen_timeout_secs: 3600,
+            signing_timeout_secs: 300,
+            max_polling_attempts: 60,
+            initial_polling_delay_ms: 500,
+            max_polling_delay_ms: 5000,
+            polling_backoff_multiplier: 1.5,
         }
     }
 }

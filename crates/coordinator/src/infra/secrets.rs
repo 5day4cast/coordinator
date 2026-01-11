@@ -1,8 +1,8 @@
 use anyhow::anyhow;
 use bdk_wallet::bitcoin::secp256k1::SecretKey as BitcoinSecretKey;
-use dlctix::musig2::secp256k1::{rand, SecretKey as DlctixSecretKey};
+use dlctix::musig2::secp256k1::SecretKey as DlctixSecretKey;
 use pem_rfc7468::{decode_vec, encode_string};
-use rand::{rngs::ThreadRng, thread_rng};
+use rand::RngCore;
 use std::{
     fs::{metadata, File},
     io::{Read, Write},
@@ -10,14 +10,22 @@ use std::{
 };
 
 pub trait SecretKeyHandler: Sized {
-    fn new(rng: &mut ThreadRng) -> Self;
+    fn generate() -> Self;
     fn from_slice(data: &[u8]) -> Result<Self, anyhow::Error>;
     fn secret_bytes(&self) -> [u8; 32];
 }
 
 impl SecretKeyHandler for BitcoinSecretKey {
-    fn new(rng: &mut ThreadRng) -> Self {
-        BitcoinSecretKey::new(rng)
+    fn generate() -> Self {
+        let mut bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        // Loop until we get valid key bytes (extremely rare to fail)
+        loop {
+            if let Ok(key) = BitcoinSecretKey::from_slice(&bytes) {
+                return key;
+            }
+            rand::rng().fill_bytes(&mut bytes);
+        }
     }
 
     fn from_slice(data: &[u8]) -> Result<Self, anyhow::Error> {
@@ -30,13 +38,23 @@ impl SecretKeyHandler for BitcoinSecretKey {
 }
 
 impl SecretKeyHandler for DlctixSecretKey {
-    fn new(rng: &mut ThreadRng) -> Self {
-        // Since dlctix is using the newer secp256k1, we use the new API
-        DlctixSecretKey::new(rng)
+    fn generate() -> Self {
+        let mut bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        // Loop until we get valid key bytes (extremely rare to fail)
+        loop {
+            if let Ok(key) = DlctixSecretKey::from_byte_array(bytes) {
+                return key;
+            }
+            rand::rng().fill_bytes(&mut bytes);
+        }
     }
 
     fn from_slice(data: &[u8]) -> Result<Self, anyhow::Error> {
-        DlctixSecretKey::from_slice(data).map_err(|e| anyhow!(e))
+        let bytes: [u8; 32] = data
+            .try_into()
+            .map_err(|_| anyhow!("Invalid secret key length"))?;
+        DlctixSecretKey::from_byte_array(bytes).map_err(|e| anyhow!(e))
     }
 
     fn secret_bytes(&self) -> [u8; 32] {
@@ -59,7 +77,7 @@ pub fn get_key<T: SecretKeyHandler>(file_path: &str) -> Result<T, anyhow::Error>
 }
 
 fn generate_new_key<T: SecretKeyHandler>() -> T {
-    T::new(&mut thread_rng())
+    T::generate()
 }
 
 fn is_pem_file(file_path: &str) -> bool {

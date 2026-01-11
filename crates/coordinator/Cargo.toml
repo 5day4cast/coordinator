@@ -24,6 +24,9 @@ bdk_esplora.workspace = true
 bdk_wallet.workspace = true
 dlctix.workspace = true
 
+# Keymeld
+keymeld-sdk.workspace = true
+
 # Async
 tokio.workspace = true
 tokio-util.workspace = true
