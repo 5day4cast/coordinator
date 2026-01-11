@@ -1,4 +1,5 @@
 mod coordinator;
+pub mod states;
 mod store;
 use crate::infra::{
     db::{
