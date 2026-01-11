@@ -1,6 +1,6 @@
 use super::{
     states::CompetitionStatus, AddEntry, CompetitionError, CompetitionStore, FundedContract,
-    PayoutInfo, SearchBy, Ticket, TicketStatus, UserEntry,
+    KeymeldSigningInfo, PayoutInfo, SearchBy, Ticket, TicketStatus, UserEntry,
 };
 use crate::{
     api::routes::FinalSignatures,
@@ -67,24 +67,6 @@ pub struct TicketResponse {
     pub escrow_tx: Option<String>, // escrow transaction the coordinator broadcasts prior to settling the HODL invoice
     pub payment_hash: String,      // Hex-encoded payment hash for verification
     pub amount_sats: u64,
-}
-
-/// Response for Keymeld session info - used by clients to join remote MuSig2 signing
-#[derive(Debug, Clone, Serialize)]
-pub struct KeymeldSessionInfo {
-    /// Whether Keymeld signing is enabled for this coordinator
-    pub enabled: bool,
-    /// The Keymeld gateway URL (if enabled)
-    pub gateway_url: Option<String>,
-    /// Session ID for the keygen session (if active)
-    pub session_id: Option<String>,
-    /// Competition ID this session belongs to
-    pub competition_id: Uuid,
-    /// Session secret encrypted with NIP-44 for the requesting user (hex encoded)
-    /// Only present if the user has an entry in this competition
-    pub encrypted_session_secret: Option<String>,
-    /// User ID assigned to this participant in the keymeld session
-    pub user_id: Option<String>,
 }
 
 pub struct CompetitionWatcher {
@@ -187,67 +169,6 @@ impl Coordinator {
     /// Check if Keymeld signing is enabled
     pub fn is_keymeld_enabled(&self) -> bool {
         self.keymeld.is_enabled()
-    }
-
-    /// Get Keymeld session info for a competition
-    /// This allows clients to join the remote MuSig2 signing session
-    /// The session secret is encrypted with NIP-44 for the requesting user
-    pub async fn get_keymeld_session_info(
-        &self,
-        competition_id: Uuid,
-        user_pubkey: &str,
-    ) -> Result<KeymeldSessionInfo, Error> {
-        use nostr_sdk::nips::nip44;
-        use nostr_sdk::prelude::{PublicKey, SecretKey};
-
-        let session = self
-            .competition_store
-            .get_keymeld_session(competition_id)
-            .await
-            .map_err(Error::DbError)?;
-
-        // Check if user has an entry in this competition
-        let entries = self
-            .competition_store
-            .get_competition_entries(competition_id, vec![])
-            .await
-            .map_err(Error::DbError)?;
-
-        let user_entry = entries.iter().find(|e| e.pubkey == user_pubkey);
-
-        // Encrypt session secret for the user if they have an entry and session exists
-        let (encrypted_session_secret, user_id) = match (&session, user_entry) {
-            (Some(sess), Some(entry)) => {
-                let nostr_pubkey = PublicKey::from_hex(user_pubkey)
-                    .map_err(|e| Error::BadRequest(format!("Invalid user pubkey: {}", e)))?;
-
-                let coordinator_secret_key = SecretKey::from_slice(&self.private_key.serialize())
-                    .map_err(|e| {
-                    Error::BadRequest(format!("Failed to create secret key: {}", e))
-                })?;
-
-                let encrypted = nip44::encrypt(
-                    &coordinator_secret_key,
-                    &nostr_pubkey,
-                    hex::encode(sess.session_secret),
-                    nip44::Version::V2,
-                )
-                .map_err(|e| Error::BadRequest(format!("NIP-44 encryption failed: {}", e)))?;
-
-                // User ID is derived from entry ID for keymeld
-                (Some(encrypted), Some(entry.id.to_string()))
-            }
-            _ => (None, None),
-        };
-
-        Ok(KeymeldSessionInfo {
-            enabled: self.is_keymeld_enabled(),
-            gateway_url: self.keymeld_gateway_url.clone(),
-            session_id: session.map(|s| s.session_id),
-            competition_id,
-            encrypted_session_secret,
-            user_id,
-        })
     }
 
     /// Store a Keymeld session for a competition (for use after keygen completes)
@@ -2473,7 +2394,7 @@ impl Coordinator {
         let entries = self
             .competition_store
             .get_user_entries(
-                pubkey,
+                pubkey.clone(),
                 SearchBy {
                     event_ids: Some(vec![competition_id]),
                 },
@@ -2508,10 +2429,70 @@ impl Coordinator {
             ))
         })?;
 
+        // Get keymeld signing info if enabled
+        let keymeld = if self.is_keymeld_enabled() {
+            self.get_keymeld_signing_info(competition_id, &pubkey, &entries[0])
+                .await
+                .ok()
+        } else {
+            None
+        };
+
         Ok(FundedContract {
             contract_params: contract,
             funding_outpoint,
             funding_psbt_base64,
+            keymeld,
+        })
+    }
+
+    /// Get keymeld signing info for a user's entry
+    async fn get_keymeld_signing_info(
+        &self,
+        competition_id: Uuid,
+        user_pubkey: &str,
+        entry: &UserEntry,
+    ) -> Result<KeymeldSigningInfo, Error> {
+        use nostr_sdk::nips::nip44;
+        use nostr_sdk::prelude::{PublicKey, SecretKey};
+
+        let session = self
+            .competition_store
+            .get_keymeld_session(competition_id)
+            .await
+            .map_err(Error::DbError)?
+            .ok_or_else(|| {
+                Error::NotFound(format!(
+                    "Keymeld session not found for competition {}",
+                    competition_id
+                ))
+            })?;
+
+        let gateway_url = self
+            .keymeld_gateway_url
+            .clone()
+            .ok_or_else(|| Error::BadRequest("Keymeld gateway URL not configured".to_string()))?;
+
+        let nostr_pubkey = PublicKey::from_hex(user_pubkey)
+            .map_err(|e| Error::BadRequest(format!("Invalid user pubkey: {}", e)))?;
+
+        let coordinator_secret_key = SecretKey::from_slice(&self.private_key.serialize())
+            .map_err(|e| Error::BadRequest(format!("Failed to create secret key: {}", e)))?;
+
+        let encrypted_session_secret = nip44::encrypt(
+            &coordinator_secret_key,
+            &nostr_pubkey,
+            hex::encode(session.session_secret),
+            nip44::Version::V2,
+        )
+        .map_err(|e| Error::BadRequest(format!("NIP-44 encryption failed: {}", e)))?;
+
+        Ok(KeymeldSigningInfo {
+            enabled: true,
+            gateway_url,
+            session_id: session.session_id,
+            encrypted_session_secret,
+            user_id: entry.id.to_string(),
         })
     }
 

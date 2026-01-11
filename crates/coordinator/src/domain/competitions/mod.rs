@@ -812,6 +812,24 @@ pub struct FundedContract {
     pub contract_params: ContractParameters,
     pub funding_outpoint: OutPoint,
     pub funding_psbt_base64: String,
+    /// Keymeld signing info (present when keymeld is enabled and user has entry)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keymeld: Option<KeymeldSigningInfo>,
+}
+
+/// Keymeld signing information included in contract response
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeymeldSigningInfo {
+    /// Whether keymeld signing is enabled
+    pub enabled: bool,
+    /// Keymeld gateway URL
+    pub gateway_url: String,
+    /// Session ID for the keygen session
+    pub session_id: String,
+    /// Session secret encrypted with NIP-44 for the user (hex encoded)
+    pub encrypted_session_secret: String,
+    /// User ID assigned to this participant
+    pub user_id: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]

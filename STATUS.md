@@ -1,7 +1,7 @@
 # Refactor Status
 
 **Last Updated:** 2026-01-11
-**Current Phase:** Part 2.6 Complete (Litestream + DatabaseWriter)
+**Current Phase:** Part 6 Complete (Session Secret Sharing via NIP-44)
 
 ---
 
@@ -181,18 +181,155 @@ $ cargo check
 
 ---
 
-## Next: Part 2.5 - Oracle Interface Abstraction & Mock
+## Completed: Part 3 - Typestate Machine Architecture ✅
+
+### What Was Done
+
+1. **Created states module under domain/competitions:**
+   ```
+   domain/competitions/states/
+   ├── mod.rs                    # CompetitionStatus enum, HasCompetitionData trait
+   ├── processor.rs              # StateContext, StateProcessingError
+   ├── created.rs                # Initial state
+   ├── collecting_entries.rs     # Collecting participant entries
+   ├── awaiting_escrow.rs        # Waiting for escrow confirmation
+   ├── escrow_confirmed.rs       # Escrow transactions confirmed
+   ├── event_created.rs          # Oracle event created
+   ├── entries_submitted.rs      # Entries submitted to oracle
+   ├── contract_created.rs       # DLC contract created
+   ├── awaiting_signatures.rs    # Waiting for MuSig2 signatures (keymeld or legacy)
+   ├── funding.rs                # SigningComplete, FundingBroadcasted, FundingConfirmed, FundingSettled
+   ├── awaiting_attestation.rs   # Waiting for oracle attestation
+   ├── settling.rs               # Attested, ExpiryBroadcasted, OutcomeBroadcasted, DeltaBroadcasted
+   ├── completed.rs              # Terminal success state
+   └── failed.rs                 # Failed and Cancelled terminal states
+   ```
+
+2. **Implemented CompetitionStatus enum:**
+   - Wrapper enum for dynamic dispatch (20+ state variants)
+   - `competition_id()`, `state_name()`, `is_terminal()`, `is_immediate_transition()` methods
+   - `fail()` and `cancel()` methods for transitioning to terminal states
+   - `into_competition()` for extracting Competition data
+   - `From<Competition>` implementation for reconstructing state from DB
+
+3. **Implemented HasCompetitionData trait:**
+   - `competition()` - Get reference to underlying Competition
+   - `competition_mut()` - Get mutable reference
+   - `into_competition()` - Consume and extract Competition
+
+4. **Each state struct has:**
+   - `competition_id` field for quick access
+   - State-specific fields (timestamps, data relevant to that state)
+   - `from_competition()` constructor for DB reconstruction
+   - Transition methods that consume `self` and return `CompetitionStatus`
+   - State-specific query methods
+
+5. **Updated coordinator.rs:**
+   - `process_status()` method handles all state transitions
+   - Matches on `CompetitionStatus` enum for state-specific logic
+   - Immediate transitions handled in a loop for pass-through states
+   - Error handling pushes to `competition.errors` and can trigger `fail()` transition
+
+6. **Keymeld integration in AwaitingSignatures:**
+   - Checks `is_keymeld_enabled()` to select signing flow
+   - Keymeld mode: Uses remote MuSig2 via keymeld service
+   - Legacy mode: Local nonce collection and signature aggregation
+
+---
+
+## Completed: Part 4 - Server-Side Keymeld Integration ✅
+
+### What Was Done
+
+1. **Keymeld trait and service implementation (`infra/keymeld.rs`):**
+   - `Keymeld` trait with `create_dlc_keygen_session()` and `sign_dlc_batch()`
+   - `KeymeldService` production implementation with SDK client
+   - `MockKeymeld` for testing when keymeld is disabled
+   - `DlcKeygenSession` and `StoredDlcKeygenSession` with hex serialization
+
+2. **DLC-specific keygen and signing:**
+   - Uses `DlcSubsetBuilder` to create outcome-based subsets
+   - Uses `DlcBatchBuilder` to batch sign all DLC transactions
+   - Maps outcome indices to keymeld subset IDs
+   - Handles aggregate key generation and storage
+
+3. **Session secret sharing via NIP-44:**
+   - `get_keymeld_session_info()` in coordinator.rs
+   - Encrypts session secret with participant's nostr pubkey
+   - Returns `KeymeldSessionInfo` with gateway URL, session ID, encrypted secret
+
+4. **Integration in coordinator.rs:**
+   - `create_funding_psbt()` - Creates keygen session when keymeld enabled
+   - `sign_dlc_contract()` - Uses keymeld for batch signing or falls back to legacy
+   - `generate_aggregate_nonces_and_coord_partial_signatures()` - Skipped when keymeld enabled
+   - Stores keygen session for later signing retrieval
+
+5. **Database persistence:**
+   - `store_keymeld_session()` and `get_keymeld_session()` in store.rs
+   - Keymeld session stored with competition ID as key
+   - Session secret stored securely (hex encoded)
+
+---
+
+## Completed: Part 5 - WASM Keymeld Integration ✅
+
+### What Was Done
+
+1. **KeymeldParticipant WASM wrapper (`coordinator-wasm/src/keymeld/mod.rs`):**
+   - `KeymeldParticipant` struct with wasm-bindgen bindings
+   - `KeymeldClientConfig` for gateway URL and polling settings
+   - Uses keymeld-sdk with WASM-compatible async
+
+2. **Keygen session joining:**
+   - `join_keygen_session()` - Join existing session with session secret
+   - Registers participant and waits for completion
+   - Returns `KeygenResult` with session ID, secret, and aggregate key
+
+3. **Signing participation:**
+   - `participate_in_signing()` - Ready for signing with restored session
+   - `get_signing_status()` - Poll session status
+   - Returns `SigningResult` and `SessionStatus` types
+
+4. **Error handling:**
+   - `KeymeldClientError` with SDK, config, session, serialization variants
+   - Proper conversion to `JsValue` for JavaScript consumption
+
+---
+
+## Completed: Part 6 - Session Secret Sharing (NIP-44) ✅
+
+### What Was Done
+
+1. **Keymeld info integrated into FundedContract response:**
+   - No separate endpoint - keymeld info included in `GET /api/v1/competitions/{id}/contract`
+   - `KeymeldSigningInfo` struct added to `FundedContract.keymeld` field
+   - Only present when keymeld is enabled and user has an entry
+
+2. **NIP-44 encryption of session secrets:**
+   - Uses nostr-sdk NIP-44 v2 encryption
+   - Encrypts session secret with participant's nostr pubkey
+   - `get_keymeld_signing_info()` method in coordinator.rs
+
+3. **KeymeldSigningInfo fields:**
+   - `enabled` - Whether keymeld is enabled on coordinator
+   - `gateway_url` - Keymeld gateway URL
+   - `session_id` - Active keygen session ID
+   - `encrypted_session_secret` - NIP-44 encrypted secret (hex)
+   - `user_id` - Participant's keymeld user ID
+
+---
+
+## Next: Part 7 - Frontend Architecture (Maud + HTMX)
 
 ### Goals
-- Create abstract `Oracle` trait for pluggable data sources
-- Implement `MockOracle` for deterministic e2e tests
-- Decouple from weather-specific types
-- Enable testing without real oracle dependency
+- Add Maud templates for server-side rendering
+- Use HTMX for dynamic updates without full page reloads
+- Update frontend JS to use keymeld when enabled (fallback to legacy)
 
-### Key Changes
-- Add `Oracle` trait in `coordinator/src/infra/oracle.rs`
-- Create `MockOracle` implementation
-- Update tests to use mock oracle
+### Current Status
+- Frontend still uses legacy MuSig session manager
+- `musig_session_manager.js` polls for nonces and signatures locally
+- Needs to check keymeld endpoint and use WASM `KeymeldParticipant` when enabled
 
 ---
 
@@ -202,21 +339,21 @@ $ cargo check
 |------|-------------|--------|
 | 1 | Project Structure Cleanup | ✅ Complete |
 | 2 | Nix Build System & CI | ✅ Complete |
-| 2.5 | Oracle Interface Abstraction & Mock | Pending |
+| 2.5 | Oracle Interface Abstraction & Mock | Deferred |
 | 2.6 | Litestream & DatabaseWriter | ✅ Complete |
-| 3 | Typestate Machine | Pending |
-| 4 | Keymeld SDK Integration (Server) | Pending |
-| 5 | Keymeld SDK Integration (WASM) | Pending |
-| 6 | Database Migration System | Pending |
-| 7 | Escrow Simplification | Pending |
-| 8 | Testing & Documentation | Pending |
+| 3 | Typestate Machine | ✅ Complete |
+| 4 | Keymeld SDK Integration (Server) | ✅ Complete |
+| 5 | Keymeld SDK Integration (WASM) | ✅ Complete |
+| 6 | Session Secret Sharing (NIP-44) | ✅ Complete |
+| 7 | Frontend Architecture (Maud + HTMX) | Pending |
+| 8 | Admin UI (Maud + HTMX) | Pending |
 
 ---
 
-## Notes for Next Session
+## Notes
 
 - First `nix develop` takes time to build keymeld from source - subsequent runs are cached
 - Dev shell requires keymeld gateway/enclave to be built (pulls from GitHub)
 - E2E tests in CI will use Nix to start all services
 - DataSourceType simplified to Weather only (other variants can be added later)
-- Frontend JS files still reference old `client_validator` WASM - will need updating in Part 5
+- Frontend JS can use either keymeld or legacy MuSig based on coordinator config
