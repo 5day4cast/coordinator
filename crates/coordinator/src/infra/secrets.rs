@@ -63,10 +63,7 @@ fn generate_new_key<T: SecretKeyHandler>() -> T {
 }
 
 fn is_pem_file(file_path: &str) -> bool {
-    Path::new(file_path)
-        .extension()
-        .and_then(|s| s.to_str())
-        .map_or(false, |ext| ext == "pem")
+    Path::new(file_path).extension().and_then(|s| s.to_str()) == Some("pem")
 }
 
 fn read_key<T: SecretKeyHandler>(file_path: &str) -> Result<T, anyhow::Error> {

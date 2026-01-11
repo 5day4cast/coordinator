@@ -366,7 +366,7 @@ impl CompetitionStore {
 
         let query = query_builder.build();
 
-        let entry_payouts = sqlx::query_as::<_, EntryPayout>(&query.sql())
+        let entry_payouts = sqlx::query_as::<_, EntryPayout>(query.sql())
             .fetch_all(self.db_connection.read())
             .await?;
 
@@ -598,7 +598,7 @@ impl CompetitionStore {
                     competition
                         .event_announcement
                         .as_ref()
-                        .map(|v| serde_json::to_string(v))
+                        .map(serde_json::to_string)
                         .transpose()
                         .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
                 )
@@ -606,7 +606,7 @@ impl CompetitionStore {
                     competition
                         .outcome_transaction
                         .as_ref()
-                        .map(|v| serde_json::to_string(v))
+                        .map(serde_json::to_string)
                         .transpose()
                         .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
                 )
@@ -615,7 +615,7 @@ impl CompetitionStore {
                     competition
                         .funding_transaction
                         .as_ref()
-                        .map(|v| serde_json::to_string(v))
+                        .map(serde_json::to_string)
                         .transpose()
                         .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
                 )
@@ -623,7 +623,7 @@ impl CompetitionStore {
                     competition
                         .funding_outpoint
                         .as_ref()
-                        .map(|v| serde_json::to_string(v))
+                        .map(serde_json::to_string)
                         .transpose()
                         .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
                 )
@@ -631,7 +631,7 @@ impl CompetitionStore {
                     competition
                         .contract_parameters
                         .as_ref()
-                        .map(|v| serde_json::to_string(v))
+                        .map(serde_json::to_string)
                         .transpose()
                         .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
                 )
@@ -639,7 +639,7 @@ impl CompetitionStore {
                     competition
                         .public_nonces
                         .as_ref()
-                        .map(|v| serde_json::to_string(v))
+                        .map(serde_json::to_string)
                         .transpose()
                         .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
                 )
@@ -647,7 +647,7 @@ impl CompetitionStore {
                     competition
                         .aggregated_nonces
                         .as_ref()
-                        .map(|v| serde_json::to_string(v))
+                        .map(serde_json::to_string)
                         .transpose()
                         .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
                 )
@@ -655,7 +655,7 @@ impl CompetitionStore {
                     competition
                         .partial_signatures
                         .as_ref()
-                        .map(|v| serde_json::to_string(v))
+                        .map(serde_json::to_string)
                         .transpose()
                         .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
                 )
@@ -663,7 +663,7 @@ impl CompetitionStore {
                     competition
                         .signed_contract
                         .as_ref()
-                        .map(|v| serde_json::to_string(v))
+                        .map(serde_json::to_string)
                         .transpose()
                         .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
                 )
@@ -671,7 +671,7 @@ impl CompetitionStore {
                     competition
                         .attestation
                         .as_ref()
-                        .map(|v| serde_json::to_string(v))
+                        .map(serde_json::to_string)
                         .transpose()
                         .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
                 )

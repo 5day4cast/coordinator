@@ -704,7 +704,7 @@ impl Coordinator {
             );
         }
 
-        let outcome_payouts = generate_payouts(&competition, &mut entries, &players)?;
+        let outcome_payouts = generate_payouts(competition, &mut entries, &players)?;
         debug!("Generated outcome payouts:");
         for (outcome, weights) in &outcome_payouts {
             debug!("Outcome {:?}: weights={:?}", outcome, weights);
@@ -716,7 +716,7 @@ impl Coordinator {
 
         // TODO (@tee8z): make this configurable from the admin screen
         let rate_confirm_within_2_blocks = if fee_rates.is_empty() {
-            1 as u64
+            1_u64
         } else {
             fee_rates[&1_u16].ceil() as u64
         };
@@ -725,7 +725,7 @@ impl Coordinator {
 
         let contract_params = ContractParameters {
             market_maker: dlctix::MarketMaker {
-                pubkey: Point::from(self.public_key),
+                pubkey: self.public_key,
             },
             players,
             event: event_announcement.clone(),
@@ -747,8 +747,8 @@ impl Coordinator {
             .collect::<HashMap<_, _>>();
 
         let escrow_inputs: Vec<ForeignUtxo> = tickets
-            .iter()
-            .map(|(_, ticket)| {
+            .values()
+            .map(|ticket| {
                 let hex_data = ticket
                     .escrow_transaction
                     .clone()
@@ -798,11 +798,11 @@ impl Coordinator {
 
                 debug!(
                     "Payment hash from ticket.hash: {}",
-                    hex::encode(&payment_hash_from_ticket)
+                    hex::encode(payment_hash_from_ticket)
                 );
                 debug!(
                     "Payment hash from preimage: {}",
-                    hex::encode(&payment_hash_from_preimage)
+                    hex::encode(payment_hash_from_preimage)
                 );
 
                 if payment_hash_from_ticket != payment_hash_from_preimage {
@@ -906,7 +906,7 @@ impl Coordinator {
             TicketedDLC::new(contract_parameters.to_owned(), funding_outpoint.to_owned())?;
 
         let signing_session = {
-            let mut rng = create_deterministic_rng(&funding_outpoint, self.private_key);
+            let mut rng = create_deterministic_rng(funding_outpoint, self.private_key);
             SigningSession::<NonceSharingRound>::new(ticketed_dlc, &mut rng, self.private_key)?
         };
 
@@ -968,7 +968,7 @@ impl Coordinator {
             TicketedDLC::new(contract_parameters.to_owned(), funding_outpoint.to_owned())?;
 
         let signing_session = {
-            let mut rng = create_deterministic_rng(&funding_outpoint, self.private_key);
+            let mut rng = create_deterministic_rng(funding_outpoint, self.private_key);
             SigningSession::<NonceSharingRound>::new(ticketed_dlc, &mut rng, self.private_key)?
         };
 
@@ -996,10 +996,8 @@ impl Coordinator {
                 .verify_partial_signatures(*sender_pubkey, &final_signature.partial_signatures)
             {
                 Ok(_) => {
-                    partial_sigs_by_sender.insert(
-                        sender_pubkey.clone(),
-                        final_signature.partial_signatures.clone(),
-                    );
+                    partial_sigs_by_sender
+                        .insert(*sender_pubkey, final_signature.partial_signatures.clone());
 
                     debug!(
                         "✓ Signature verification succeeded for player {}",
@@ -1368,7 +1366,7 @@ impl Coordinator {
         // Get fee rate for transactions
         let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
         let rate_confirm_within_2_blocks = if fee_rates.is_empty() {
-            1 as u64
+            1_u64
         } else {
             fee_rates[&1_u16].ceil() as u64
         };
@@ -1384,9 +1382,7 @@ impl Coordinator {
                         let Ok(pubkey) = Point::from_hex(&entry.ephemeral_pubkey) else {
                             return false;
                         };
-                        if let Some(player) =
-                            signed_contract.params().players.get(player_index.clone())
-                        {
+                        if let Some(player) = signed_contract.params().players.get(player_index) {
                             player.pubkey == pubkey
                         } else {
                             false
@@ -1436,7 +1432,7 @@ impl Coordinator {
                 })
                 .collect();
 
-            let input_index = close_tx_input.previous_output.vout.clone() as usize;
+            let input_index = close_tx_input.previous_output.vout as usize;
 
             signed_contract.sign_outcome_close_tx_input(
                 &outcome,
@@ -1487,7 +1483,7 @@ impl Coordinator {
                 let winner_seckey = Scalar::from_hex(entry.ephemeral_privatekey.as_ref().unwrap())
                     .map_err(|e| anyhow!("Invalid winner secret key: {}", e))?;
 
-                let input_index = close_tx_input.previous_output.vout.clone() as usize;
+                let input_index = close_tx_input.previous_output.vout as usize;
 
                 signed_contract.sign_split_close_tx_input(
                     &win_condition,
@@ -1584,19 +1580,19 @@ impl Coordinator {
         // Get fee rate for transactions
         let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
         let rate_confirm_within_2_blocks = if fee_rates.is_empty() {
-            1 as u64
+            1_u64
         } else {
             fee_rates[&1_u16].ceil() as u64
         };
         let fee_rate = FeeRate::from_sat_per_vb_unchecked(rate_confirm_within_2_blocks);
 
         // Get unpaid winners that haven't been reclaimed
-        for (&player_index, _) in winners {
+        for &player_index in winners.keys() {
             if let Some(entry) = entries.iter().find(|entry| {
                 let Ok(pubkey) = Point::from_hex(&entry.ephemeral_pubkey) else {
                     return false;
                 };
-                if let Some(player) = signed_contract.params().players.get(player_index.clone()) {
+                if let Some(player) = signed_contract.params().players.get(player_index) {
                     player.pubkey == pubkey
                 } else {
                     false
@@ -1623,7 +1619,7 @@ impl Coordinator {
                     fee_rate,
                 );
 
-                let input_index = reclaim_tx_input.previous_output.vout.clone() as usize;
+                let input_index = reclaim_tx_input.previous_output.vout as usize;
 
                 signed_contract.sign_split_reclaim_tx_input(
                     &win_condition,
@@ -1756,7 +1752,7 @@ impl Coordinator {
             }
             Err(e) => return Err(anyhow!("error getting stored public key: {}", e)),
         };
-        let dlc_pubkey = Point::from(self.public_key);
+        let dlc_pubkey = self.public_key;
         let (xonly, _) = dlc_pubkey.into();
         let bitcoin_key = convert_xonly_key(xonly);
 
@@ -1771,7 +1767,7 @@ impl Coordinator {
     }
 
     async fn add_metadata(&self) -> Result<(), anyhow::Error> {
-        let dlc_pubkey = Point::from(self.public_key);
+        let dlc_pubkey = self.public_key;
         let (xonly, _) = dlc_pubkey.into();
         let bitcoin_key = convert_xonly_key(xonly);
 
@@ -2519,12 +2515,10 @@ impl Coordinator {
                     .inspect(|pay_out_id| info!("Payout initiated with ID: {}", pay_out_id))
                     .map(|_| ())
             }
-            Err(e) => {
-                return Err(Error::PaymentFailed(format!(
-                    "Failed to initiate lightning payment: {}",
-                    e
-                )));
-            }
+            Err(e) => Err(Error::PaymentFailed(format!(
+                "Failed to initiate lightning payment: {}",
+                e
+            ))),
         }
     }
 }
@@ -2576,8 +2570,8 @@ fn get_percentage_weights(num_winners: usize) -> Vec<u64> {
 
 fn generate_payouts(
     competition: &Competition,
-    entries: &mut Vec<UserEntry>,
-    players: &Vec<Player>,
+    entries: &mut [UserEntry],
+    players: &[Player],
 ) -> Result<BTreeMap<Outcome, PayoutWeights>, anyhow::Error> {
     debug!("Generating payouts for {} players", players.len());
 
@@ -2706,7 +2700,7 @@ pub fn generate_ranking_permutations(num_players: usize, rankings: usize) -> Vec
 }
 
 fn find_player_indices(
-    players: &Vec<Player>,
+    players: &[Player],
     entry_ticket_pubkeys: Vec<String>,
 ) -> Result<Vec<usize>, anyhow::Error> {
     entry_ticket_pubkeys
@@ -2722,7 +2716,7 @@ fn find_player_indices(
 }
 
 fn find_winning_entries_pubkeys(
-    entries: &Vec<UserEntry>,
+    entries: &[UserEntry],
     winning_entry_indices: Vec<usize>,
 ) -> Vec<String> {
     winning_entry_indices
@@ -2760,7 +2754,7 @@ async fn signed_funding_tx(
     for (i, input) in funding_tx.inputs.iter().enumerate() {
         if input.witness_script.is_some() {
             debug!("Input {} signature count: {}", i, input.partial_sigs.len());
-            for (pk, _) in &input.partial_sigs {
+            for pk in input.partial_sigs.keys() {
                 debug!("  - Signed by: {}", pk);
             }
         }
