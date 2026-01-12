@@ -6,6 +6,12 @@ image:
   tag: latest
   pullPolicy: IfNotPresent
 
+serviceAccount:
+  create: true
+  automount: true
+  annotations: {}
+  name: ""
+
 service:
   type: ClusterIP
   port: 8080
@@ -41,7 +47,6 @@ litestream:
   syncInterval: "10s"
   retention: "168h"
   snapshotInterval: "1h"
-  # Database paths to replicate
   databases:
     - name: bitcoin
       path: /data/bitcoin.db
@@ -55,13 +60,20 @@ litestream:
 
 keymeld:
   url: "http://keymeld.keymeld.svc.cluster.local:8080"
+  enabled: true
+  gatewayUrl: "http://keymeld.keymeld.svc.cluster.local:8080"
+  keygenTimeoutSecs: 30
+  signingTimeoutSecs: 30
+  maxPollingAttempts: 100
+  initialPollingDelayMs: 100
+  maxPollingDelayMs: 5000
+  pollingBackoffMultiplier: 1.5
 
 lnd:
   host: "lnd1"
   rpcPort: 10009
   macaroonPath: /lnd/admin.macaroon
   tlsCertPath: /lnd/tls.cert
-  # Init container copies creds from LND pod PVC (for regtest)
   initContainer:
     enabled: false
     image: busybox:1.36
@@ -72,6 +84,15 @@ bitcoin:
   rpcPort: 18443
   rpcUser: "bitcoin"
   rpcPassword: "bitcoinpass"
+  network: regtest
+  esploraUrl: "http://esplora.bitcoin.svc.cluster.local:3000"
+  refreshBlocksSecs: 10
+
+lightning:
+  baseUrl: "https://lnd1.bitcoin.svc.cluster.local:8080"
+  tlsCertPath: "/etc/coordinator/secrets/tls.cert"
+  invoiceWatchIntervalSecs: 5
+  payoutWatchIntervalSecs: 10
 
 oracle:
   url: "http://noaa-oracle.oracle.svc.cluster.local:8080"
@@ -79,23 +100,52 @@ oracle:
 config:
   logLevel: info
   dbPath: /data/coordinator.db
+  database:
+    dataFolder: /data
+    readMaxConnections: 5
+    readMinConnections: 1
+    writeMaxConnections: 1
+    writeMinConnections: 1
+    idleTimeoutSecs: 300
+    acquireTimeoutSecs: 30
+    sqlite:
+      mode: rwc
+      cache: shared
+      busyTimeoutMs: 5000
+      journalMode: WAL
+      synchronous: NORMAL
+      cacheSize: -2000
+      foreignKeys: true
+      walAutocheckpoint: 1000
+      tempStore: MEMORY
+      mmapSize: 268435456
+      pageSize: 4096
+  api:
+    domain: "0.0.0.0"
+    port: "8080"
+    origins:
+      - "*"
+  ui:
+    privateUrl: "http://localhost:8080"
+    remoteUrl: "http://localhost:8080"
+    uiDir: "/app/ui"
+    adminUiDir: "/app/admin-ui"
+  coordinator:
+    name: "local-coordinator"
+    relativeLockTimeBlockDelta: 144
+    requiredConfirmations: 1
+    syncIntervalSecs: 60
 
-# Secrets configuration
 secrets:
   privateKey:
     create: false
     value: ""
   lnd:
     create: false
-    # Base64-encoded macaroon and tls cert (for production)
     macaroon: ""
     tlsCert: ""
 
-# Dev mode configuration for fast local development
-# Uses locally-compiled cargo binaries instead of container images
 devMode:
   enabled: false
-  # Path to the binary inside the k3d node (mounted from host)
   hostPath: /mnt/coordinator/coordinator
-  # Base image for running the binary (must have libc, ssl, etc.)
   baseImage: debian:bookworm-slim
