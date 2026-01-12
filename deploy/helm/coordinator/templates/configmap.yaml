@@ -27,7 +27,7 @@ data:
     foreign_keys = {{ .Values.config.database.sqlite.foreignKeys }}
     wal_autocheckpoint = {{ .Values.config.database.sqlite.walAutocheckpoint }}
     temp_store = {{ .Values.config.database.sqlite.tempStore | quote }}
-    mmap_size = {{ .Values.config.database.sqlite.mmapSize }}
+    mmap_size = {{ .Values.config.database.sqlite.mmapSize | int64 }}
     page_size = {{ .Values.config.database.sqlite.pageSize }}
 
     [api_settings]
