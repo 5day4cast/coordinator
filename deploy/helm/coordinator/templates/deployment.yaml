@@ -64,8 +64,10 @@ spec:
           {{- if .Values.devMode.enabled }}
           image: {{ .Values.devMode.baseImage }}
           command: ["/app/coordinator"]
+          args: ["--config", "/etc/coordinator/config.toml"]
           {{- else }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          args: ["--config", "/etc/coordinator/config.toml"]
           {{- end }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
@@ -75,47 +77,24 @@ spec:
           env:
             - name: RUST_LOG
               value: {{ .Values.config.logLevel }}
-            - name: DATABASE_PATH
-              value: {{ .Values.config.dbPath }}
-            - name: KEYMELD_URL
-              value: {{ .Values.keymeld.url }}
-            - name: ORACLE_URL
-              value: {{ .Values.oracle.url }}
-            - name: BITCOIN_RPC_HOST
-              value: {{ .Values.bitcoin.rpcHost }}
-            - name: BITCOIN_RPC_PORT
-              value: "{{ .Values.bitcoin.rpcPort }}"
-            - name: BITCOIN_RPC_USER
-              value: {{ .Values.bitcoin.rpcUser }}
-            - name: BITCOIN_RPC_PASSWORD
-              value: {{ .Values.bitcoin.rpcPassword }}
-            - name: LND_HOST
-              value: {{ .Values.lnd.host }}
-            - name: LND_RPC_PORT
-              value: "{{ .Values.lnd.rpcPort }}"
-            - name: LND_MACAROON_PATH
-              value: {{ .Values.lnd.macaroonPath }}
-            - name: LND_TLS_CERT_PATH
-              value: {{ .Values.lnd.tlsCertPath }}
-            {{- if .Values.secrets.privateKey.create }}
-            - name: PRIVATE_KEY_PATH
-              value: /secrets/private-key.pem
-            {{- end }}
           volumeMounts:
             - name: data
               mountPath: {{ .Values.persistence.mountPath }}
+            - name: config
+              mountPath: /etc/coordinator
+              readOnly: true
             {{- if .Values.secrets.privateKey.create }}
             - name: private-key
-              mountPath: /secrets
+              mountPath: /etc/coordinator/secrets
               readOnly: true
             {{- end }}
             {{- if .Values.lnd.initContainer.enabled }}
             - name: lnd-creds
-              mountPath: /lnd
+              mountPath: /etc/coordinator/secrets
               readOnly: true
             {{- else if .Values.secrets.lnd.create }}
             - name: lnd-secret
-              mountPath: /lnd
+              mountPath: /etc/coordinator/secrets
               readOnly: true
             {{- end }}
             {{- if .Values.devMode.enabled }}
@@ -172,6 +151,9 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        - name: config
+          configMap:
+            name: {{ include "coordinator.fullname" . }}
         {{- if .Values.secrets.privateKey.create }}
         - name: private-key
           secret:
