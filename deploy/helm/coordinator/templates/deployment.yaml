@@ -14,6 +14,11 @@ spec:
       labels:
         {{- include "coordinator.selectorLabels" . | nindent 8 }}
     spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "coordinator.serviceAccountName" . }}
       initContainers:
         {{- if .Values.lnd.initContainer.enabled }}
         - name: lnd-creds
@@ -51,13 +56,24 @@ spec:
             - name: litestream-config
               mountPath: /etc/litestream.yml
               subPath: litestream.yml
-          {{- if .Values.litestream.s3Endpoint }}
           env:
+            {{- if .Values.litestream.s3Endpoint }}
             - name: AWS_ACCESS_KEY_ID
               value: "test"
             - name: AWS_SECRET_ACCESS_KEY
               value: "test"
-          {{- end }}
+            {{- else }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "coordinator.fullname" . }}-s3
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "coordinator.fullname" . }}-s3
+                  key: secret-access-key
+            {{- end }}
         {{- end }}
       containers:
         - name: {{ .Chart.Name }}
@@ -129,13 +145,24 @@ spec:
             - name: litestream-config
               mountPath: /etc/litestream.yml
               subPath: litestream.yml
-          {{- if .Values.litestream.s3Endpoint }}
           env:
+            {{- if .Values.litestream.s3Endpoint }}
             - name: AWS_ACCESS_KEY_ID
               value: "test"
             - name: AWS_SECRET_ACCESS_KEY
               value: "test"
-          {{- end }}
+            {{- else }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "coordinator.fullname" . }}-s3
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "coordinator.fullname" . }}-s3
+                  key: secret-access-key
+            {{- end }}
           resources:
             requests:
               memory: 32Mi
