@@ -758,11 +758,21 @@
 
 
         # Docker image for k8s deployment
+        # Symlinks for frontend directories at expected paths
+        frontend-links = pkgs.runCommand "coordinator-frontend-links" {} ''
+          mkdir -p $out/app
+          ln -s ${coordinator}/share/coordinator/frontend/public $out/app/ui
+          ln -s ${coordinator}/share/coordinator/frontend/admin $out/app/admin-ui
+        '';
+
+        # Docker image for k8s deployment
         docker-coordinator = pkgs.dockerTools.buildLayeredImage {
           name = "coordinator";
           tag = "latest";
           contents = [
             coordinator
+            wallet-cli
+            frontend-links
             pkgs.cacert
             pkgs.tzdata
           ];
@@ -781,6 +791,7 @@
             };
           };
         };
+
 
       in {
         packages = {
