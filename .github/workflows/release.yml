@@ -197,6 +197,11 @@ jobs:
         run: |
           cd crates/coordinator-wasm
           wasm-pack build --target web --release
+        env:
+          # Workaround for secp256k1-sys WASM build with clang 16+
+          # The wasm-sysroot in secp256k1-sys is missing memmove declaration in string.h
+          # Newer clang versions treat implicit function declarations as errors
+          CFLAGS_wasm32_unknown_unknown: "-Wno-error=implicit-function-declaration"
 
       - name: Create WASM package
         run: |
