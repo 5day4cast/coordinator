@@ -1,3 +1,4 @@
+#![allow(deprecated)] // SignOptions is deprecated but no replacement API exists yet in bdk_wallet 2.3
 use crate::{get_key, BitcoinSettings};
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -20,8 +21,8 @@ use bdk_wallet::{
     },
     coin_selection::DefaultCoinSelectionAlgorithm,
     descriptor::calc_checksum,
-    AddressInfo, Balance, KeychainKind, LocalOutput, PersistedWallet, SignOptions,
-    TxBuilder, Wallet,
+    AddressInfo, Balance, KeychainKind, LocalOutput, PersistedWallet, SignOptions, TxBuilder,
+    Wallet,
 };
 use dlctix::{
     bitcoin::{bip32::ChainCode, FeeRate},
@@ -91,7 +92,6 @@ pub struct BitcoinClient {
     client: AsyncClient,
     wallet_store: RwLock<Store>,
 }
-
 
 #[derive(Deserialize)]
 pub struct SendOptions {
@@ -567,7 +567,8 @@ impl BitcoinClient {
             .descriptor(KeychainKind::Internal, Some(internal_desc.clone()))
             .extract_keys()
             .check_network(settings.network)
-            .load_wallet_async(&mut db).await
+            .load_wallet_async(&mut db)
+            .await
             .map_err(|e| anyhow!("Failed to load bitcoin wallet store: {}", e))?;
         info!("Loaded wallet: {}", wallet_opt.is_some());
 
@@ -575,7 +576,8 @@ impl BitcoinClient {
             Some(wallet) => wallet,
             None => Wallet::create(external_desc, internal_desc)
                 .network(settings.network)
-                .create_wallet_async(&mut db).await
+                .create_wallet_async(&mut db)
+                .await
                 .map_err(|e| anyhow!("Failed to create bitcoin wallet from keys: {}", e))?,
         };
         info!(

@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use super::{
     states::CompetitionStatus, AddEntry, CompetitionError, CompetitionStore, FundedContract,
     KeymeldSigningInfo, PayoutInfo, SearchBy, Ticket, TicketStatus, UserEntry,
