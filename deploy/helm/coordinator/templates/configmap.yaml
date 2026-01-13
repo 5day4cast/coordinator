@@ -61,8 +61,6 @@ data:
     macaroon_file_path = "/etc/coordinator-secrets/admin.macaroon"
     {{- if .Values.lightning.tlsCertPath }}
     tls_cert_path = "/etc/coordinator-secrets/tls.cert"
-    {{- else }}
-    tls_cert_path = ""
     {{- end }}
     invoice_watch_interval = {{ .Values.lightning.invoiceWatchIntervalSecs }}
     payout_watch_interval = {{ .Values.lightning.payoutWatchIntervalSecs }}
