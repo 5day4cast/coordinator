@@ -5,6 +5,7 @@ use bdk_esplora::{
     esplora_client::{r#async::DefaultSleeper, AsyncClient, Builder},
     EsploraAsyncExt,
 };
+use bdk_sqlite::Store;
 use bdk_wallet::{
     bitcoin::{
         address::NetworkChecked,
@@ -19,8 +20,7 @@ use bdk_wallet::{
     },
     coin_selection::DefaultCoinSelectionAlgorithm,
     descriptor::calc_checksum,
-    file_store::Store,
-    AddressInfo, Balance, ChangeSet, KeychainKind, LocalOutput, PersistedWallet, SignOptions,
+    AddressInfo, Balance, KeychainKind, LocalOutput, PersistedWallet, SignOptions,
     TxBuilder, Wallet,
 };
 use dlctix::{
@@ -87,12 +87,11 @@ pub trait Bitcoin: Send + Sync {
 pub struct BitcoinClient {
     pub network: Network,
     seed_path: SecretString,
-    wallet: RwLock<PersistedWallet<Store<ChangeSet>>>,
+    wallet: RwLock<PersistedWallet<Store>>,
     client: AsyncClient,
-    wallet_store: RwLock<Store<bdk_wallet::ChangeSet>>,
+    wallet_store: RwLock<Store>,
 }
 
-const DB_MAGIC: &str = "coordinator_wallet_store";
 
 #[derive(Deserialize)]
 pub struct SendOptions {
@@ -459,7 +458,7 @@ impl Bitcoin for BitcoinClient {
         let (mut wallet, mut store) = tokio::join!(self.wallet.write(), self.wallet_store.write());
 
         let address = wallet.next_unused_address(KeychainKind::External);
-        wallet.persist(&mut store)?;
+        wallet.persist_async(&mut store).await?;
 
         Ok(address)
     }
@@ -528,7 +527,7 @@ impl Bitcoin for BitcoinClient {
 
         let (mut wallet, mut store) = tokio::join!(self.wallet.write(), self.wallet_store.write());
         wallet.apply_update(update)?;
-        wallet.persist(&mut store)?;
+        wallet.persist_async(&mut store).await?;
 
         info!("Sync completed successfully");
 
@@ -549,11 +548,9 @@ impl BitcoinClient {
             fs::create_dir_all(parent)?;
         }
 
-        let mut db = Store::<bdk_wallet::ChangeSet>::open_or_create_new(
-            DB_MAGIC.as_bytes(),
-            &settings.storage_file,
-        )
-        .map_err(|e| anyhow!("Failed to open or create bitcoin db: {}", e))?;
+        let mut db = Store::new(&settings.storage_file)
+            .await
+            .map_err(|e| anyhow!("Failed to open or create bitcoin db: {}", e))?;
         info!("Bitcoin db configured");
 
         let path = Path::new(&settings.seed_path);
@@ -570,7 +567,7 @@ impl BitcoinClient {
             .descriptor(KeychainKind::Internal, Some(internal_desc.clone()))
             .extract_keys()
             .check_network(settings.network)
-            .load_wallet(&mut db)
+            .load_wallet_async(&mut db).await
             .map_err(|e| anyhow!("Failed to load bitcoin wallet store: {}", e))?;
         info!("Loaded wallet: {}", wallet_opt.is_some());
 
@@ -578,7 +575,7 @@ impl BitcoinClient {
             Some(wallet) => wallet,
             None => Wallet::create(external_desc, internal_desc)
                 .network(settings.network)
-                .create_wallet(&mut db)
+                .create_wallet_async(&mut db).await
                 .map_err(|e| anyhow!("Failed to create bitcoin wallet from keys: {}", e))?,
         };
         info!(
@@ -622,7 +619,7 @@ impl BitcoinClient {
             .apply_update(update)
             .map_err(|e| anyhow!("Failed to load full blockchain scan into wallet: {}", e))?;
 
-        wallet.persist(&mut db).map_err(|e| {
+        wallet.persist_async(&mut db).await.map_err(|e| {
             anyhow!(
                 "Failed to load persist full blockchain scan into wallet: {}",
                 e
