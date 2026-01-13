@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use crate::infra::bitcoin::Bitcoin;
 use anyhow::anyhow;
 use bdk_wallet::{
