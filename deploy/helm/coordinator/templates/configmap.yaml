@@ -58,9 +58,9 @@ data:
 
     [ln_settings]
     base_url = {{ .Values.lightning.baseUrl | quote }}
-    macaroon_file_path = "/etc/coordinator-secrets/admin.macaroon"
+    macaroon_file_path = "/etc/lnd-secrets/admin.macaroon"
     {{- if .Values.lightning.tlsCertPath }}
-    tls_cert_path = "/etc/coordinator-secrets/tls.cert"
+    tls_cert_path = "/etc/lnd-secrets/tls.cert"
     {{- end }}
     invoice_watch_interval = {{ .Values.lightning.invoiceWatchIntervalSecs }}
     payout_watch_interval = {{ .Values.lightning.payoutWatchIntervalSecs }}

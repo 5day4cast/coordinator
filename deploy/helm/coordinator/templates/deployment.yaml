@@ -110,11 +110,11 @@ spec:
             {{- end }}
             {{- if .Values.lnd.initContainer.enabled }}
             - name: lnd-creds
-              mountPath: /etc/coordinator-secrets
+              mountPath: /etc/lnd-secrets
               readOnly: true
             {{- else if or .Values.secrets.lnd.create .Values.secrets.lnd.external }}
             - name: lnd-secret
-              mountPath: /etc/coordinator-secrets
+              mountPath: /etc/lnd-secrets
               readOnly: true
             {{- end }}
             {{- if .Values.devMode.enabled }}
