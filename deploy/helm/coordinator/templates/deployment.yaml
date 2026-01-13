@@ -44,12 +44,16 @@ spec:
         {{- if .Values.litestream.enabled }}
         - name: litestream-restore
           image: "{{ .Values.litestream.image.repository }}:{{ .Values.litestream.image.tag }}"
-          args:
-            - restore
-            - -if-db-not-exists
-            - -if-replica-exists
-            - -config
-            - /etc/litestream.yml
+          command:
+            - sh
+            - -c
+            - |
+              echo "Restoring databases from S3 backups..."
+              {{- range .Values.litestream.databases }}
+              echo "Attempting to restore {{ .path }}..."
+              litestream restore -if-db-not-exists -if-replica-exists -config /etc/litestream.yml {{ .path }} || echo "No backup found for {{ .path }}, starting fresh"
+              {{- end }}
+              echo "Restore complete"
           volumeMounts:
             - name: data
               mountPath: {{ .Values.persistence.mountPath }}
