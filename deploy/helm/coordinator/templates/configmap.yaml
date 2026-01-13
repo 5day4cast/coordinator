@@ -44,7 +44,7 @@ data:
     [coordinator_settings]
     name = {{ .Values.config.coordinator.name | quote }}
     oracle_url = {{ .Values.oracle.url | quote }}
-    private_key_file = "/etc/coordinator/secrets/private-key.pem"
+    private_key_file = "/etc/coordinator-secrets/private-key.pem"
     relative_locktime_block_delta = {{ .Values.config.coordinator.relativeLockTimeBlockDelta }}
     required_confirmations = {{ .Values.config.coordinator.requiredConfirmations }}
     sync_interval_secs = {{ .Values.config.coordinator.syncIntervalSecs }}
@@ -53,14 +53,14 @@ data:
     network = {{ .Values.bitcoin.network | quote }}
     esplora_url = {{ .Values.bitcoin.esploraUrl | quote }}
     storage_file = "{{ .Values.config.database.dataFolder }}/bitcoin.db"
-    seed_path = "/etc/coordinator/secrets/private-key.pem"
+    seed_path = "/etc/coordinator-secrets/private-key.pem"
     refresh_blocks_secs = {{ .Values.bitcoin.refreshBlocksSecs }}
 
     [ln_settings]
     base_url = {{ .Values.lightning.baseUrl | quote }}
-    macaroon_file_path = "/etc/coordinator/secrets/admin.macaroon"
+    macaroon_file_path = "/etc/coordinator-secrets/admin.macaroon"
     {{- if .Values.lightning.tlsCertPath }}
-    tls_cert_path = "/etc/coordinator/secrets/tls.cert"
+    tls_cert_path = "/etc/coordinator-secrets/tls.cert"
     {{- else }}
     tls_cert_path = ""
     {{- end }}

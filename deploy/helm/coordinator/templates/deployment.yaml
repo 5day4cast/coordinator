@@ -105,16 +105,16 @@ spec:
               readOnly: true
             {{- if .Values.secrets.privateKey.create }}
             - name: private-key
-              mountPath: /etc/coordinator/secrets
+              mountPath: /etc/coordinator-secrets
               readOnly: true
             {{- end }}
             {{- if .Values.lnd.initContainer.enabled }}
             - name: lnd-creds
-              mountPath: /etc/coordinator/secrets
+              mountPath: /etc/coordinator-secrets
               readOnly: true
             {{- else if .Values.secrets.lnd.create }}
             - name: lnd-secret
-              mountPath: /etc/coordinator/secrets
+              mountPath: /etc/coordinator-secrets
               readOnly: true
             {{- end }}
             {{- if .Values.devMode.enabled }}
