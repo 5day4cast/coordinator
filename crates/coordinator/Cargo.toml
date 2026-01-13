@@ -22,6 +22,7 @@ h2.workspace = true
 # Bitcoin
 bdk_esplora.workspace = true
 bdk_wallet.workspace = true
+bdk_sqlite.workspace = true
 dlctix.workspace = true
 
 # Keymeld

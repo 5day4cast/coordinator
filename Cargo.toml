@@ -23,8 +23,9 @@ coordinator-core = { path = "crates/coordinator-core" }
 keymeld-sdk = { git = "https://github.com/tee8z/keymeld", tag = "v0.1.8", features = ["client", "dlctix"] }
 
 # Bitcoin
-bdk_esplora = { version = "0.20.1", features = ["async", "tokio"] }
-bdk_wallet = { version = "1.0.0", features = ["file_store", "keys-bip39"] }
+bdk_esplora = { version = "0.22.1", features = ["async", "tokio"] }
+bdk_wallet = { version = "2.3.0", features = ["keys-bip39"] }
+bdk_sqlite = { version = "0.4.0" }
 dlctix = { git = "https://github.com/tee8z/dlctix", branch = "external-signing-api" }
 miniscript = "12.3.2"
 
