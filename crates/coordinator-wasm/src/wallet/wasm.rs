@@ -1,5 +1,5 @@
 use super::core::{TaprootWalletCore, TaprootWalletCoreBuilder};
-use crate::NostrClientWrapper;
+use crate::nostr::NostrClientWrapper;
 use bdk_wallet::bitcoin::Psbt;
 use dlctix::{
     bitcoin::OutPoint,

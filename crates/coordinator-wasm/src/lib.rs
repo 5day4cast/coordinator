@@ -3,10 +3,11 @@
 //! This crate provides browser-side functionality for:
 //! - Nostr authentication (NIP-98)
 //! - Escrow PSBT signing
-//! - Keymeld SDK integration for remote MuSig2 signing
+//! - Keymeld SDK integration for remote MuSig2 signing (requires `keymeld` feature)
 
 use wasm_bindgen::prelude::*;
 
+#[cfg(feature = "keymeld")]
 pub mod keymeld;
 pub mod nostr;
 pub mod wallet;
@@ -17,7 +18,8 @@ pub use coordinator_core::*;
 // Re-export nostr types for internal use
 pub use nostr::NostrClientCore;
 
-// Re-export keymeld types for WASM bindings
+// Re-export keymeld types for WASM bindings (when feature enabled)
+#[cfg(feature = "keymeld")]
 pub use keymeld::{KeymeldClientConfig, KeymeldParticipant};
 
 #[wasm_bindgen(start)]
