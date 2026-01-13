@@ -10,8 +10,10 @@ description = "WASM client for coordinator - Nostr auth, wallet signing, keymeld
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["keymeld"]
+default = []
 # Enable keymeld integration for remote MuSig2 signing
+# NOTE: Currently disabled by default because secp256k1-sys v0.11.0 (from keymeld)
+# has WASM compilation issues with memmove. Upstream fix needed in keymeld.
 keymeld = ["dep:keymeld-sdk"]
 
 [dependencies]
