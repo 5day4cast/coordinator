@@ -112,7 +112,7 @@ spec:
             - name: lnd-creds
               mountPath: /etc/coordinator-secrets
               readOnly: true
-            {{- else if .Values.secrets.lnd.create }}
+            {{- else if or .Values.secrets.lnd.create .Values.secrets.lnd.external }}
             - name: lnd-secret
               mountPath: /etc/coordinator-secrets
               readOnly: true
@@ -196,10 +196,10 @@ spec:
             claimName: {{ .Values.lnd.initContainer.sourcePvc }}
         - name: lnd-creds
           emptyDir: {}
-        {{- else if .Values.secrets.lnd.create }}
+        {{- else if or .Values.secrets.lnd.create .Values.secrets.lnd.external }}
         - name: lnd-secret
           secret:
-            secretName: {{ include "coordinator.fullname" . }}-lnd
+            secretName: {{- if .Values.secrets.lnd.external }} {{ .Values.secrets.lnd.secretName }}{{- else }} {{ include "coordinator.fullname" . }}-lnd{{- end }}
         {{- end }}
         {{- if .Values.devMode.enabled }}
         - name: dev-binary

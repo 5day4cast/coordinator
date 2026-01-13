@@ -137,11 +137,14 @@ config:
     syncIntervalSecs: 60
 
 secrets:
+  # Support for external secrets (managed outside Helm)
   privateKey:
     create: false
     value: ""
   lnd:
     create: false
+    external: false
+    secretName: "lnd-credentials"
     macaroon: ""
     tlsCert: ""
 
