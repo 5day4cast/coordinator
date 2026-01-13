@@ -66,7 +66,7 @@ spec:
               value: "test"
             - name: AWS_SECRET_ACCESS_KEY
               value: "test"
-            {{- else }}
+            {{- else if not .Values.litestream.useIAMRole }}
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
@@ -85,7 +85,7 @@ spec:
           image: {{ .Values.devMode.baseImage }}
           command: ["/app/coordinator"]
           args: ["--config", "/etc/coordinator/config.toml"]
-          {{- else }}
+          {{- else if not .Values.litestream.useIAMRole }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           args: ["--config", "/etc/coordinator/config.toml"]
           {{- end }}
@@ -155,7 +155,7 @@ spec:
               value: "test"
             - name: AWS_SECRET_ACCESS_KEY
               value: "test"
-            {{- else }}
+            {{- else if not .Values.litestream.useIAMRole }}
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
@@ -179,7 +179,7 @@ spec:
           {{- if .Values.persistence.enabled }}
           persistentVolumeClaim:
             claimName: {{ include "coordinator.fullname" . }}
-          {{- else }}
+          {{- else if not .Values.litestream.useIAMRole }}
           emptyDir: {}
           {{- end }}
         - name: config
@@ -199,7 +199,7 @@ spec:
         {{- else if or .Values.secrets.lnd.create .Values.secrets.lnd.external }}
         - name: lnd-secret
           secret:
-            secretName: {{- if .Values.secrets.lnd.external }} {{ .Values.secrets.lnd.secretName }}{{- else }} {{ include "coordinator.fullname" . }}-lnd{{- end }}
+            secretName: {{- if .Values.secrets.lnd.external }} {{ .Values.secrets.lnd.secretName }}{{- else if not .Values.litestream.useIAMRole }} {{ include "coordinator.fullname" . }}-lnd{{- end }}
         {{- end }}
         {{- if .Values.devMode.enabled }}
         - name: dev-binary
