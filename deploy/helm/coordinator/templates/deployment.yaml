@@ -84,11 +84,10 @@ spec:
           {{- if .Values.devMode.enabled }}
           image: {{ .Values.devMode.baseImage }}
           command: ["/app/coordinator"]
-          args: ["--config", "/etc/coordinator/config.toml"]
-          {{- else if not .Values.litestream.useIAMRole }}
+          {{- else }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-          args: ["--config", "/etc/coordinator/config.toml"]
           {{- end }}
+          args: ["--config", "/etc/coordinator/config.toml"]
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: http
@@ -179,7 +178,7 @@ spec:
           {{- if .Values.persistence.enabled }}
           persistentVolumeClaim:
             claimName: {{ include "coordinator.fullname" . }}
-          {{- else if not .Values.litestream.useIAMRole }}
+          {{- else }}
           emptyDir: {}
           {{- end }}
         - name: config
@@ -199,7 +198,7 @@ spec:
         {{- else if or .Values.secrets.lnd.create .Values.secrets.lnd.external }}
         - name: lnd-secret
           secret:
-            secretName: {{- if .Values.secrets.lnd.external }} {{ .Values.secrets.lnd.secretName }}{{- else if not .Values.litestream.useIAMRole }} {{ include "coordinator.fullname" . }}-lnd{{- end }}
+            secretName: {{- if .Values.secrets.lnd.external }} {{ .Values.secrets.lnd.secretName }}{{- else }} {{ include "coordinator.fullname" . }}-lnd{{- end }}
         {{- end }}
         {{- if .Values.devMode.enabled }}
         - name: dev-binary
