@@ -87,7 +87,6 @@ spec:
           {{- else }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           {{- end }}
-          args: ["--config", "/etc/coordinator/config.toml"]
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: http
@@ -100,7 +99,7 @@ spec:
             - name: data
               mountPath: {{ .Values.persistence.mountPath }}
             - name: config
-              mountPath: /etc/coordinator
+              mountPath: /data/config
               readOnly: true
             {{- if .Values.secrets.privateKey.create }}
             - name: private-key
