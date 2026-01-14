@@ -85,7 +85,6 @@ spec:
           image: {{ .Values.devMode.baseImage }}
           command: ["/app/coordinator"]
           {{- else }}
-          command: ["/coordinator"]
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           {{- end }}
           args: ["--config", "/etc/coordinator/config.toml"]
@@ -180,7 +179,6 @@ spec:
           persistentVolumeClaim:
             claimName: {{ include "coordinator.fullname" . }}
           {{- else }}
-          command: ["/coordinator"]
           emptyDir: {}
           {{- end }}
         - name: config
@@ -201,7 +199,7 @@ spec:
         - name: lnd-secret
           secret:
             secretName: {{- if .Values.secrets.lnd.external }} {{ .Values.secrets.lnd.secretName }}{{- else }}
-          command: ["/coordinator"] {{ include "coordinator.fullname" . }}-lnd{{- end }}
+ {{ include "coordinator.fullname" . }}-lnd{{- end }}
         {{- end }}
         {{- if .Values.devMode.enabled }}
         - name: dev-binary
