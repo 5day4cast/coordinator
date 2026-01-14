@@ -86,7 +86,6 @@ spec:
           command: ["/app/coordinator"]
           {{- else }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-          command: ["/bin/coordinator"]
           {{- end }}
           args: ["--config", "/etc/coordinator/config.toml"]
           imagePullPolicy: {{ .Values.image.pullPolicy }}
