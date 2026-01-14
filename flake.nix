@@ -764,6 +764,12 @@
           ln -s ${coordinator}/share/coordinator/frontend/public $out/app/ui
           ln -s ${coordinator}/share/coordinator/frontend/admin $out/app/admin-ui
         '';
+        # Symlinks for binaries at standard paths (for k8s helm charts)
+        bin-links = pkgs.runCommand "coordinator-bin-links" {} ''
+          mkdir -p $out/bin
+          ln -s ${coordinator}/bin/coordinator $out/bin/coordinator
+        '';
+
 
         # Docker image for k8s deployment
         docker-coordinator = pkgs.dockerTools.buildLayeredImage {
@@ -773,6 +779,7 @@
             coordinator
             wallet-cli
             frontend-links
+            bin-links
             pkgs.cacert
             pkgs.tzdata
           ];
