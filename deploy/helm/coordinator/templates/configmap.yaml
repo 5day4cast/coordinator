@@ -5,7 +5,7 @@ metadata:
   labels:
     {{- include "coordinator.labels" . | nindent 4 }}
 data:
-  settings.toml: |
+  local.toml: |
     level = {{ .Values.config.logLevel | quote }}
 
     [db_settings]
