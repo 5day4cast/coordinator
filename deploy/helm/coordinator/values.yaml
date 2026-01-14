@@ -47,6 +47,15 @@ litestream:
   syncInterval: "10s"
   retention: "168h"
   snapshotInterval: "1h"
+  # Encryption key for Litestream backups (age key format)
+  # Can be set directly or via encryptionKeySecret to reference a K8s secret
+  encryptionKey: ""
+  encryptionKeySecret:
+    enabled: false
+    name: ""
+    key: "encryption-key"
+  # Use IAM role for S3 access (recommended for EC2/EKS)
+  useIAMRole: false
   databases:
     - name: bitcoin
       path: /data/bitcoin.db
