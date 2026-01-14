@@ -188,6 +188,9 @@ pub struct KeymeldSettings {
     pub max_polling_delay_ms: u64,
     /// Polling backoff multiplier
     pub polling_backoff_multiplier: f64,
+    /// Enclave public key for encrypting participant private keys (hex-encoded)
+    /// Users encrypt their ephemeral private key to this key for server-side registration
+    pub enclave_public_key: Option<String>,
 }
 
 impl Default for KeymeldSettings {
@@ -201,6 +204,7 @@ impl Default for KeymeldSettings {
             initial_polling_delay_ms: 500,
             max_polling_delay_ms: 5000,
             polling_backoff_multiplier: 1.5,
+            enclave_public_key: None,
         }
     }
 }

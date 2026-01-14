@@ -3,6 +3,7 @@ pub mod config;
 pub mod domain;
 pub mod infra;
 pub mod startup;
+pub mod templates;
 
 // Re-exports for backward compatibility during migration
 pub use api::routes::*;

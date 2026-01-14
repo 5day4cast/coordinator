@@ -1,0 +1,107 @@
+use maud::{html, Markup, DOCTYPE};
+
+use crate::templates::components::{auth_modals, navbar};
+
+/// Configuration passed to the base template
+pub struct PageConfig<'a> {
+    pub title: &'a str,
+    pub api_base: &'a str,
+    pub oracle_base: &'a str,
+    pub network: &'a str,
+}
+
+/// Base layout for the public UI
+///
+/// Includes:
+/// - Bulma CSS
+/// - HTMX for interactivity
+/// - WASM module for crypto operations
+/// - Minimal JS bridge for auth header injection
+pub fn base(config: &PageConfig, content: Markup) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                base href=".";
+                meta charset="UTF-8";
+                meta name="viewport" content="width=device-width, initial-scale=1.0";
+                title { (config.title) }
+
+                // Bulma CSS
+                link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css";
+                link rel="stylesheet" href="/ui/styles.css";
+
+                // HTMX
+                script src="https://unpkg.com/htmx.org@1.9.10" {}
+
+                // External dependencies for entry flow
+                script src="/ui/bolt11.min.js" {}
+                script type="module" src="https://unpkg.com/bitcoin-qr@1.4.1/dist/bitcoin-qr/bitcoin-qr.esm.js" {}
+            }
+            body {
+                // Global config for JS
+                script {
+                    (format!(r#"
+                        const API_BASE = "{}";
+                        const ORACLE_BASE = "{}";
+                        const NETWORK = "{}";
+                    "#, config.api_base, config.oracle_base, config.network))
+                }
+
+                section class="section" {
+                    div class="container" {
+                        // Header with branding
+                        nav class="level" {
+                            div class="level-left" {
+                                a href="/" class="is-undecorated" {
+                                    h1 class="title level-item" { "Fantasy Weather" }
+                                }
+                                p class="level-item has-text-grey-light" style="margin-left: 20px;" {
+                                    "Powered by "
+                                    a href="https://www.4casttruth.win/" target="_blank" { "4cast Truth Oracle" }
+                                }
+                            }
+                            div class="level-right" {
+                                p class="level-item" {
+                                    a href="https://github.com/5day4cast/coordinator" target="_blank"
+                                      style="font-size: 0.7em; margin-left: 10px; color: #333;" {
+                                        // GitHub icon SVG
+                                        (github_icon())
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Navigation
+                    (navbar())
+
+                    // Main content area
+                    div id="main-content" {
+                        (content)
+                    }
+                }
+
+                // Auth modals
+                (auth_modals())
+
+                // Initialize app - load crypto bridge which handles WASM + HTMX auth
+                script type="module" {
+                    (maud::PreEscaped(r#"
+                        import { initApp } from '/ui/crypto_bridge.js';
+                        initApp();
+                    "#))
+                }
+            }
+        }
+    }
+}
+
+fn github_icon() -> Markup {
+    html! {
+        svg height="24" width="24" viewBox="0 0 16 16" version="1.1" aria-hidden="true"
+            style="fill: currentColor; vertical-align: middle;" {
+            path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z" {}
+        }
+    }
+}

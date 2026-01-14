@@ -2,10 +2,11 @@ use crate::config::KeymeldSettings;
 use async_trait::async_trait;
 use keymeld_sdk::{
     dlctix::{
-        dlctix::{ContractParameters, OutcomeIndex, SigningData},
+        dlctix::{ContractParameters, SigningData},
         DlcBatchBuilder, DlcSignatureResults, DlcSubsetBuilder,
     },
     prelude::*,
+    types::RegisterKeygenParticipantRequest,
     PollingConfig,
 };
 use log::{debug, info};
@@ -42,18 +43,41 @@ pub struct KeygenSessionStatus {
     pub is_completed: bool,
 }
 
+/// Data required to register a participant on their behalf
+/// The user generates this data client-side and submits it with their entry
+#[derive(Debug, Clone)]
+pub struct ParticipantRegistrationData {
+    /// User's ephemeral private key encrypted to the keymeld enclave's public key
+    pub encrypted_private_key: String,
+    /// User's ephemeral public key (hex-encoded, will be decoded to bytes)
+    pub public_key: String,
+    /// User's auth public key derived from their ephemeral private key (hex-encoded)
+    /// This is derived client-side using: derive_session_auth_pubkey(session_id)
+    pub auth_pubkey: String,
+}
+
 /// Trait for Keymeld signing operations
 #[async_trait]
 pub trait Keymeld: Send + Sync {
-    /// Initialize a keygen session without waiting for participants
-    /// This creates the session, registers the coordinator, and returns immediately
-    /// Users will register themselves via the WASM SDK after payment
+    /// Initialize a keygen session at competition creation time.
+    /// This creates the session with all participant user_ids (ticket_ids) and registers the coordinator.
+    /// Users will register themselves later after getting their ticket and deriving their auth_pubkey.
+    /// Note: This does NOT require contract_params - those are only needed for signing.
     async fn init_keygen_session(
         &self,
         competition_id: Uuid,
-        contract_params: &ContractParameters,
         player_user_ids: Vec<UserId>,
     ) -> Result<DlcKeygenSession, KeymeldError>;
+
+    /// Register a participant on their behalf using pre-computed registration data.
+    /// The user generates the crypto material client-side and submits it with their entry.
+    /// The coordinator forwards this data to keymeld to complete the registration.
+    async fn register_participant(
+        &self,
+        session: &DlcKeygenSession,
+        user_id: UserId,
+        registration_data: &ParticipantRegistrationData,
+    ) -> Result<(), KeymeldError>;
 
     /// Wait for keygen to complete and get the aggregate key
     /// Called after all participants have registered
@@ -68,15 +92,21 @@ pub trait Keymeld: Send + Sync {
         session: &DlcKeygenSession,
     ) -> Result<KeygenSessionStatus, KeymeldError>;
 
-    /// Sign a DLC contract batch
+    /// Sign a DLC contract batch.
+    /// This builds subset definitions from contract_params at signing time.
     async fn sign_dlc_batch(
         &self,
         keygen_session: &DlcKeygenSession,
         signing_data: &SigningData,
+        contract_params: &ContractParameters,
+        player_user_ids: Vec<UserId>,
     ) -> Result<DlcSignatureResults, KeymeldError>;
 
     /// Check if Keymeld is enabled
     fn is_enabled(&self) -> bool;
+
+    /// Get the enclave's public key for encrypting participant private keys
+    fn enclave_public_key(&self) -> Option<String>;
 }
 
 /// Holds the state of a DLC keygen session
@@ -85,8 +115,6 @@ pub struct DlcKeygenSession {
     pub session_id: SessionId,
     pub session_secret: [u8; 32],
     pub aggregate_key: Vec<u8>,
-    /// Mapping from outcome index to subset ID (for signing)
-    pub outcome_subset_ids: BTreeMap<OutcomeIndex, Uuid>,
 }
 
 /// Serializable version of DlcKeygenSession for database storage
@@ -100,8 +128,6 @@ pub struct StoredDlcKeygenSession {
     /// Aggregate public key bytes (hex encoded)
     #[serde(with = "hex_vec")]
     pub aggregate_key: Vec<u8>,
-    /// Mapping from outcome index to subset ID
-    pub outcome_subset_ids: BTreeMap<usize, Uuid>,
 }
 
 impl StoredDlcKeygenSession {
@@ -111,7 +137,6 @@ impl StoredDlcKeygenSession {
             session_id: session.session_id.to_string(),
             encrypted_session_secret,
             aggregate_key: session.aggregate_key,
-            outcome_subset_ids: session.outcome_subset_ids,
         }
     }
 
@@ -121,7 +146,6 @@ impl StoredDlcKeygenSession {
             session_id: SessionId::new(&self.session_id),
             session_secret,
             aggregate_key: self.aggregate_key.clone(),
-            outcome_subset_ids: self.outcome_subset_ids.clone(),
         }
     }
 }
@@ -206,7 +230,6 @@ impl Keymeld for KeymeldService {
     async fn init_keygen_session(
         &self,
         competition_id: Uuid,
-        contract_params: &ContractParameters,
         player_user_ids: Vec<UserId>,
     ) -> Result<DlcKeygenSession, KeymeldError> {
         let client = self.get_client()?;
@@ -217,15 +240,6 @@ impl Keymeld for KeymeldService {
             player_user_ids.len()
         );
 
-        // Build subset definitions for DLC outcomes
-        let subset_info = DlcSubsetBuilder::new(
-            contract_params,
-            self.coordinator_user_id.clone(),
-            player_user_ids.clone(),
-        )
-        .build()
-        .map_err(|e| KeymeldError::Session(format!("Failed to build subsets: {}", e)))?;
-
         // All participants: coordinator + all players
         let mut all_participants = vec![self.coordinator_user_id.clone()];
         all_participants.extend(player_user_ids);
@@ -234,10 +248,10 @@ impl Keymeld for KeymeldService {
             .timeout(self.settings.keygen_timeout_secs)
             .tweak(TaprootTweak::None);
 
-        // Create the keygen session with subset definitions
+        // Create the keygen session (without subset definitions - those are added at signing time)
         let mut keygen_session = client
             .keygen()
-            .create_session_with_subsets(all_participants, subset_info.definitions, keygen_options)
+            .create_session(all_participants, keygen_options)
             .await?;
 
         // Register ourselves (coordinator) as a participant
@@ -256,7 +270,6 @@ impl Keymeld for KeymeldService {
             session_id: keygen_session.session_id().clone(),
             session_secret: keygen_session.export_session_secret(),
             aggregate_key: vec![], // Will be populated when keygen completes
-            outcome_subset_ids: subset_info.outcome_subset_ids,
         })
     }
 
@@ -297,6 +310,8 @@ impl Keymeld for KeymeldService {
         &self,
         keygen_session: &DlcKeygenSession,
         signing_data: &SigningData,
+        contract_params: &ContractParameters,
+        player_user_ids: Vec<UserId>,
     ) -> Result<DlcSignatureResults, KeymeldError> {
         let client = self.get_client()?;
 
@@ -304,6 +319,15 @@ impl Keymeld for KeymeldService {
             "Creating DLC signing session for keygen {}",
             keygen_session.session_id
         );
+
+        // Build subset definitions for DLC outcomes at signing time
+        let subset_info = DlcSubsetBuilder::new(
+            contract_params,
+            self.coordinator_user_id.clone(),
+            player_user_ids,
+        )
+        .build()
+        .map_err(|e| KeymeldError::Signing(format!("Failed to build subsets: {}", e)))?;
 
         // Restore the keygen session from stored credentials
         let credentials = SessionCredentials::from_session_secret(&keygen_session.session_secret)?;
@@ -315,7 +339,7 @@ impl Keymeld for KeymeldService {
 
         // Build batch items for all DLC transactions
         let dlc_batch = DlcBatchBuilder::new(signing_data)
-            .with_outcome_subsets(&keygen_session.outcome_subset_ids)
+            .with_outcome_subsets(&subset_info.outcome_subset_ids)
             .build()
             .map_err(|e| KeymeldError::Signing(format!("Failed to build batch: {}", e)))?;
 
@@ -385,6 +409,122 @@ impl Keymeld for KeymeldService {
             is_completed,
         })
     }
+
+    async fn register_participant(
+        &self,
+        session: &DlcKeygenSession,
+        user_id: UserId,
+        registration_data: &ParticipantRegistrationData,
+    ) -> Result<(), KeymeldError> {
+        let client = self.get_client()?;
+
+        info!(
+            "Registering participant {} for keygen session {}",
+            user_id, session.session_id
+        );
+
+        // Restore session credentials to sign the request
+        let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
+
+        // Get the user's slot to find which enclave they're assigned to
+        let slots = client
+            .keygen()
+            .get_available_slots(&session.session_id)
+            .await?;
+
+        let user_slot = slots
+            .available_slots
+            .iter()
+            .find(|s| s.user_id == user_id && !s.claimed)
+            .ok_or_else(|| {
+                KeymeldError::Session(format!(
+                    "No available slot found for user {} in session {}",
+                    user_id, session.session_id
+                ))
+            })?;
+
+        // Get enclave public key for this user's slot
+        let enclave_info = client
+            .health()
+            .get_enclave_key(user_slot.enclave_id.as_u32())
+            .await
+            .map_err(|e| KeymeldError::Session(format!("Failed to get enclave info: {}", e)))?;
+
+        // Decode the user-provided public key and auth pubkey from hex
+        let public_key_bytes = hex::decode(&registration_data.public_key)
+            .map_err(|e| KeymeldError::Session(format!("Invalid public key hex: {}", e)))?;
+
+        let auth_pubkey_bytes = hex::decode(&registration_data.auth_pubkey)
+            .map_err(|e| KeymeldError::Session(format!("Invalid auth pubkey hex: {}", e)))?;
+
+        // Build the encrypted session data on behalf of the user
+        // This contains the participant's public key mapping
+        #[derive(Serialize)]
+        struct KeygenParticipantSessionData {
+            participant_public_keys: BTreeMap<UserId, Vec<u8>>,
+        }
+
+        let session_data = KeygenParticipantSessionData {
+            participant_public_keys: {
+                let mut map = BTreeMap::new();
+                map.insert(user_id.clone(), public_key_bytes.clone());
+                map
+            },
+        };
+
+        let session_data_json = serde_json::to_vec(&session_data).map_err(|e| {
+            KeymeldError::Session(format!("Failed to serialize session data: {}", e))
+        })?;
+
+        let encrypted_session_data = credentials
+            .encrypt(&session_data_json, "keygen_participant_session")
+            .map_err(|e| KeymeldError::Session(format!("Failed to encrypt session data: {}", e)))?;
+
+        // Sign the session request
+        let session_signature = credentials
+            .sign_session_request(&session.session_id.to_string())
+            .map_err(|e| KeymeldError::Session(format!("Failed to sign session request: {}", e)))?;
+
+        // Build the registration request
+        let register_request = RegisterKeygenParticipantRequest {
+            keygen_session_id: session.session_id.clone(),
+            user_id: user_id.clone(),
+            encrypted_private_key: registration_data.encrypted_private_key.clone(),
+            public_key: public_key_bytes,
+            encrypted_session_data,
+            enclave_public_key: enclave_info.public_key.clone(),
+            enclave_key_epoch: enclave_info.key_epoch,
+            require_signing_approval: false,
+            auth_pubkey: auth_pubkey_bytes,
+        };
+
+        // Make the HTTP request directly
+        let _response: keymeld_sdk::types::RegisterKeygenParticipantResponse = client
+            .http()
+            .post(
+                &format!(
+                    "{}/api/v1/keygen/{}/participants",
+                    self.settings.gateway_url, session.session_id
+                ),
+                &register_request,
+                &[("X-Session-Signature", &session_signature)],
+            )
+            .await
+            .map_err(|e| {
+                KeymeldError::Session(format!("Failed to register participant {}: {}", user_id, e))
+            })?;
+
+        info!(
+            "Participant {} registered for keygen session {}",
+            user_id, session.session_id
+        );
+
+        Ok(())
+    }
+
+    fn enclave_public_key(&self) -> Option<String> {
+        self.settings.enclave_public_key.clone()
+    }
 }
 
 /// Mock implementation for testing without Keymeld
@@ -399,7 +539,6 @@ impl Keymeld for MockKeymeld {
     async fn init_keygen_session(
         &self,
         _competition_id: Uuid,
-        _contract_params: &ContractParameters,
         _player_user_ids: Vec<UserId>,
     ) -> Result<DlcKeygenSession, KeymeldError> {
         Err(KeymeldError::NotEnabled)
@@ -423,8 +562,23 @@ impl Keymeld for MockKeymeld {
         &self,
         _keygen_session: &DlcKeygenSession,
         _signing_data: &SigningData,
+        _contract_params: &ContractParameters,
+        _player_user_ids: Vec<UserId>,
     ) -> Result<DlcSignatureResults, KeymeldError> {
         Err(KeymeldError::NotEnabled)
+    }
+
+    async fn register_participant(
+        &self,
+        _session: &DlcKeygenSession,
+        _user_id: UserId,
+        _registration_data: &ParticipantRegistrationData,
+    ) -> Result<(), KeymeldError> {
+        Err(KeymeldError::NotEnabled)
+    }
+
+    fn enclave_public_key(&self) -> Option<String> {
+        None
     }
 }
 

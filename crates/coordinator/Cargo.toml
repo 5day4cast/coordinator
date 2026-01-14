@@ -14,6 +14,7 @@ coordinator-core.workspace = true
 # Web
 axum.workspace = true
 tower-http.workspace = true
+maud.workspace = true
 reqwest-middleware.workspace = true
 reqwest-retry.workspace = true
 hyper.workspace = true

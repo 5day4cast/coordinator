@@ -47,6 +47,15 @@ pub struct AddEntry {
     pub payout_preimage_encrypted: String,
     pub event_id: Uuid,
     pub expected_observations: Vec<WeatherChoices>,
+    /// User's ephemeral private key encrypted to the keymeld enclave's public key.
+    /// Used for server-side keymeld registration. Optional for backwards compatibility.
+    #[serde(default)]
+    pub encrypted_keymeld_private_key: Option<String>,
+    /// User's auth public key derived from their ephemeral private key for keymeld session auth.
+    /// This is computed client-side as: derive_session_auth_pubkey(session_id)
+    /// Required when encrypted_keymeld_private_key is provided.
+    #[serde(default)]
+    pub keymeld_auth_pubkey: Option<String>,
 }
 
 pub enum EntryStatus {
@@ -156,6 +165,12 @@ pub struct UserEntry {
     pub ephemeral_privatekey: Option<String>,
     /// User provided preimage de-encrypted, only used during payout
     pub payout_preimage: Option<String>,
+    /// User's ephemeral private key encrypted to the keymeld enclave's public key.
+    /// Used for server-side keymeld registration.
+    pub encrypted_keymeld_private_key: Option<String>,
+    /// User's auth public key for keymeld session authentication.
+    /// Derived client-side from their ephemeral private key.
+    pub keymeld_auth_pubkey: Option<String>,
     pub public_nonces: Option<SigMap<PubNonce>>,
     /// User signed funding psbt
     pub funding_psbt_base64: Option<String>,
@@ -203,6 +218,8 @@ impl FromRow<'_, SqliteRow> for UserEntry {
             entry_submission: parse_required_blob_json(row, "entry_submission")?,
             ephemeral_privatekey: row.get("ephemeral_privatekey"),
             payout_preimage: row.get("payout_preimage"),
+            encrypted_keymeld_private_key: row.get("encrypted_keymeld_private_key"),
+            keymeld_auth_pubkey: row.get("keymeld_auth_pubkey"),
             public_nonces: parse_optional_blob_json(row, "public_nonces")?,
             funding_psbt_base64: row.get("funding_psbt_base64"),
             partial_signatures: parse_optional_blob_json(row, "partial_signatures")?,
@@ -235,6 +252,8 @@ impl AddEntry {
             public_nonces: None,
             ephemeral_privatekey: None,
             payout_preimage: None,
+            encrypted_keymeld_private_key: self.encrypted_keymeld_private_key,
+            keymeld_auth_pubkey: self.keymeld_auth_pubkey,
             paid_at: None,
             sellback_broadcasted_at: None,
             reclaimed_broadcasted_at: None,
@@ -830,6 +849,21 @@ pub struct KeymeldSigningInfo {
     pub encrypted_session_secret: String,
     /// User ID assigned to this participant
     pub user_id: String,
+}
+
+/// Keymeld registration info returned when requesting a ticket.
+/// This provides the information needed for users to derive their auth_pubkey
+/// before submitting their entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeymeldRegistrationInfo {
+    /// Keymeld gateway URL
+    pub gateway_url: String,
+    /// Session ID for the keygen session - used to derive auth_pubkey
+    pub session_id: String,
+    /// User ID (ticket_id) assigned to this participant
+    pub user_id: String,
+    /// Enclave public key for encrypting the user's private key
+    pub enclave_public_key: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]

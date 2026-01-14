@@ -9,7 +9,7 @@ use crate::{
     infra::{
         bitcoin::{Bitcoin, ForeignUtxo, REQUIRED_CONFIRMATIONS_FOR_TIME},
         escrow::{create_escrow_descriptor, generate_escrow_tx, get_escrow_outpoint},
-        keymeld::{DlcKeygenSession, Keymeld, StoredDlcKeygenSession},
+        keymeld::{DlcKeygenSession, Keymeld, ParticipantRegistrationData, StoredDlcKeygenSession},
         lightning::Ln,
         oracle::{AddEventEntries, AddEventEntry, Error as OracleError, Event, Oracle},
     },
@@ -68,6 +68,15 @@ pub struct TicketResponse {
     pub escrow_tx: Option<String>, // escrow transaction the coordinator broadcasts prior to settling the HODL invoice
     pub payment_hash: String,      // Hex-encoded payment hash for verification
     pub amount_sats: u64,
+    /// The user's keymeld user_id (same as ticket_id) - used for keymeld registration
+    pub keymeld_user_id: uuid::Uuid,
+    /// Keymeld gateway URL for client registration
+    pub keymeld_gateway_url: Option<String>,
+    /// Keymeld session ID - users need this to derive their auth_pubkey for server-side registration
+    pub keymeld_session_id: Option<String>,
+    /// Keymeld enclave public key (hex-encoded) for encrypting the user's ephemeral private key
+    /// Users encrypt their ephemeral private key to this key for server-side keymeld registration
+    pub keymeld_enclave_public_key: Option<String>,
 }
 
 pub struct CompetitionWatcher {
@@ -1195,34 +1204,78 @@ impl Coordinator {
         debug!("Built ticketed dlc");
 
         if self.is_keymeld_enabled() {
-            // Keymeld flow: Initialize keygen session, users register themselves
+            // Keymeld flow: Retrieve keygen session (created at competition creation) and register participants
             info!(
                 "Using Keymeld for MuSig2 signing for competition {}",
                 competition.id
             );
 
-            // Derive UserIds from player ephemeral pubkeys
-            let player_user_ids: Vec<UserId> = entries
-                .iter()
-                .map(|entry| user_id_from_pubkey(&entry.ephemeral_pubkey))
-                .collect();
-
-            // Initialize keygen session - coordinator registers, users register themselves later
-            let keygen_session = self
-                .keymeld
-                .init_keygen_session(competition.id, &contract_params, player_user_ids)
+            // Retrieve the keygen session created at competition creation time
+            let stored_session = self
+                .competition_store
+                .get_keymeld_session(competition.id)
                 .await
-                .map_err(|e| anyhow!("Failed to initialize keymeld keygen session: {}", e))?;
+                .map_err(|e| anyhow!("Failed to get keymeld session: {}", e))?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "No keymeld session found for competition {} - was keymeld enabled at competition creation?",
+                        competition.id
+                    )
+                })?;
+
+            let session_secret = self
+                .decrypt_session_secret(&stored_session.encrypted_session_secret)
+                .map_err(|e| anyhow!("Failed to decrypt session secret: {}", e))?;
+
+            let keygen_session = stored_session.to_session(session_secret);
 
             info!(
-                "Keymeld keygen session {} initialized for competition {}, waiting for user registrations",
+                "Retrieved keymeld keygen session {} for competition {}, registering participants",
                 keygen_session.session_id, competition.id
             );
 
-            // Store the session immediately - users will get keymeld info after payment
-            // The aggregate_key is empty until all users register and keygen completes
-            self.store_keymeld_session(competition.id, keygen_session.clone())
-                .await?;
+            // Use ticket_id as keymeld user_id for each player
+            let player_user_ids: Vec<UserId> = entries
+                .iter()
+                .map(|entry| UserId::from(entry.ticket_id))
+                .collect();
+
+            // Server-side keymeld registration for users who provided all required registration data
+            for (entry, user_id) in entries.iter().zip(player_user_ids.iter()) {
+                // Check if user provided all required keymeld registration data
+                if let (Some(encrypted_key), Some(auth_pubkey)) = (
+                    &entry.encrypted_keymeld_private_key,
+                    &entry.keymeld_auth_pubkey,
+                ) {
+                    info!(
+                        "Registering participant {} (ticket {}) for keygen session {}",
+                        user_id, entry.ticket_id, keygen_session.session_id
+                    );
+
+                    let registration_data = ParticipantRegistrationData {
+                        encrypted_private_key: encrypted_key.clone(),
+                        public_key: entry.ephemeral_pubkey.clone(),
+                        auth_pubkey: auth_pubkey.clone(),
+                    };
+
+                    if let Err(e) = self
+                        .keymeld
+                        .register_participant(&keygen_session, user_id.clone(), &registration_data)
+                        .await
+                    {
+                        error!(
+                            "Failed to register participant {} for competition {}: {}",
+                            user_id, competition.id, e
+                        );
+                        // Continue with other participants - they may register themselves later
+                    }
+                } else {
+                    debug!(
+                        "Entry {} missing keymeld registration data (encrypted_keymeld_private_key or keymeld_auth_pubkey), user must register manually",
+                        entry.id
+                    );
+                }
+            }
 
             // For keymeld, we don't use local nonces - set a placeholder to indicate keymeld mode
             // The actual aggregate key is stored in the keygen session after completion
@@ -1381,10 +1434,25 @@ impl Coordinator {
             // Get signing data from ticketed DLC
             let signing_data = ticketed_dlc.signing_data()?;
 
+            // Get entries to build player_user_ids for subset definitions
+            let entries = self
+                .competition_store
+                .get_competition_entries(competition.id, vec![EntryStatus::Paid])
+                .await?;
+            let player_user_ids: Vec<UserId> = entries
+                .iter()
+                .map(|entry| UserId::from(entry.ticket_id))
+                .collect();
+
             // Call keymeld to perform batch signing
             let dlc_signatures = self
                 .keymeld
-                .sign_dlc_batch(&keygen_session, &signing_data)
+                .sign_dlc_batch(
+                    &keygen_session,
+                    &signing_data,
+                    contract_parameters,
+                    player_user_ids,
+                )
                 .await
                 .map_err(|e| anyhow!("Keymeld signing failed: {}", e))?;
 
@@ -2267,6 +2335,54 @@ impl Coordinator {
             .generate_competition_tickets(create_event.total_allowed_entries)
             .await?;
         debug!("tickets: {:?}", tickets);
+
+        // If keymeld is enabled, create the keygen session now with all ticket_ids
+        // This allows users to derive their auth_pubkey before submitting their entry
+        if self.is_keymeld_enabled() {
+            let player_user_ids: Vec<UserId> = tickets
+                .iter()
+                .map(|ticket| UserId::from(ticket.id))
+                .collect();
+
+            info!(
+                "Creating keymeld keygen session for competition {} with {} potential participants",
+                competition.id,
+                player_user_ids.len()
+            );
+
+            match self
+                .keymeld
+                .init_keygen_session(competition.id, player_user_ids)
+                .await
+            {
+                Ok(keygen_session) => {
+                    info!(
+                        "Keymeld keygen session {} created for competition {}",
+                        keygen_session.session_id, competition.id
+                    );
+
+                    // Store the session - users will get session_id when requesting a ticket
+                    if let Err(e) = self
+                        .store_keymeld_session(competition.id, keygen_session)
+                        .await
+                    {
+                        error!(
+                            "Failed to store keymeld session for competition {}: {}",
+                            competition.id, e
+                        );
+                        // Continue without keymeld - competition can still work
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to create keymeld keygen session for competition {}: {}",
+                        competition.id, e
+                    );
+                    // Continue without keymeld - competition can still work
+                }
+            }
+        }
+
         let competition = self
             .competition_store
             .add_competition_with_tickets(competition, tickets)
@@ -2426,12 +2542,29 @@ impl Coordinator {
                 Error::DbError(e)
             })?;
 
+        // Get keymeld session_id if available (created at competition creation)
+        let keymeld_session_id = if self.is_keymeld_enabled() {
+            self.competition_store
+                .get_keymeld_session(competition.id)
+                .await
+                .ok()
+                .flatten()
+                .map(|s| s.session_id)
+        } else {
+            None
+        };
+
         Ok(TicketResponse {
             ticket_id: ticket.id,
             payment_request: invoice.payment_request,
             escrow_tx: escrow_tx_hex,
             payment_hash: hex::encode(payment_hash),
             amount_sats: full_fee,
+            // ticket_id is used as the keymeld user_id for consistency
+            keymeld_user_id: ticket.id,
+            keymeld_gateway_url: self.keymeld_gateway_url.clone(),
+            keymeld_session_id,
+            keymeld_enclave_public_key: self.keymeld.enclave_public_key(),
         })
     }
 
@@ -2714,7 +2847,8 @@ impl Coordinator {
             gateway_url,
             session_id: stored_session.session_id,
             encrypted_session_secret,
-            user_id: entry.id.to_string(),
+            // Use ticket_id as user_id for consistency with keygen session creation
+            user_id: entry.ticket_id.to_string(),
         })
     }
 
@@ -3117,17 +3251,6 @@ fn string_to_byte_array(hex_str: &str) -> [u8; 32] {
     let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     let bytes = hex::decode(hex_str).expect("valid hex string");
     bytes.try_into().expect("32 bytes")
-}
-
-/// Derive a Keymeld UserId from a player's ephemeral public key.
-/// Uses SHA256 hash of the pubkey to create a deterministic UUID.
-fn user_id_from_pubkey(pubkey_hex: &str) -> UserId {
-    let pubkey_bytes = hex::decode(pubkey_hex).unwrap_or_default();
-    let hash = sha256::Hash::hash(&pubkey_bytes);
-    let hash_bytes = hash.to_byte_array();
-    let mut uuid_bytes = [0u8; 16];
-    uuid_bytes.copy_from_slice(&hash_bytes[..16]);
-    UserId::from(Uuid::from_bytes(uuid_bytes))
 }
 
 fn get_percentage_weights(num_winners: usize) -> Vec<u64> {

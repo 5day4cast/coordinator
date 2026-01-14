@@ -1,8 +1,8 @@
 import { WeatherData } from "./weather_data.js";
 import { uuidv7 } from "https://unpkg.com/uuidv7@^1";
 import { AuthorizedClient } from "./authorized_client.js";
-import { completeKeymeldRegistration } from "./keymeld_client.js";
 import { hideAllContainers, showContainer } from "./navbar.js";
+import { deriveKeymeldAuthPubkey, encryptToEnclave } from "./keymeld_crypto.js";
 
 class Entry {
   constructor(
@@ -125,6 +125,10 @@ class Entry {
     this.ticket = {
       id: ticketData.ticket_id,
       payment_request: ticketData.payment_request,
+      // Keymeld registration info for server-side registration
+      keymeld_session_id: ticketData.keymeld_session_id,
+      keymeld_enclave_public_key: ticketData.keymeld_enclave_public_key,
+      keymeld_user_id: ticketData.keymeld_user_id,
     };
 
     return this.showPaymentModal();
@@ -400,31 +404,42 @@ class Entry {
 
   async submit($event) {
     try {
-      // First handle the ticket payment
+      // First handle the ticket payment - this also gets keymeld session info
       await this.handleTicketPayment(this.entry.ephemeral_pubkey);
-      console.log("Ticket payment handled, joining keymeld session");
+      console.log("Ticket payment handled");
 
-      // Get the ephemeral private key for keymeld registration
-      const ephemeralPrivateKey = await window.taprootWallet.getDlcPrivateKey(
-        this.entryIndex,
-      );
+      // Build keymeld registration data for server-side registration
+      let encrypted_keymeld_private_key = null;
+      let keymeld_auth_pubkey = null;
 
-      // Join keymeld session - this registers the user with keymeld for signing
-      const keymeldResult = await completeKeymeldRegistration(
-        this.client,
-        this.competition.id,
-        ephemeralPrivateKey,
-        window.nostrClient,
-      );
-
-      if (!keymeldResult.success) {
-        console.warn("Keymeld registration failed:", keymeldResult.error);
-        // Continue with entry submission - coordinator will handle signing
-      } else {
+      if (
+        this.ticket.keymeld_session_id &&
+        this.ticket.keymeld_enclave_public_key
+      ) {
         console.log(
-          "Keymeld registration successful:",
-          keymeldResult.sessionId,
+          "Preparing keymeld registration data for server-side registration",
         );
+
+        // Get the ephemeral private key
+        const ephemeralPrivateKey = await window.taprootWallet.getDlcPrivateKey(
+          this.entryIndex,
+        );
+
+        // Encrypt the private key to the enclave's public key
+        encrypted_keymeld_private_key = await encryptToEnclave(
+          ephemeralPrivateKey,
+          this.ticket.keymeld_enclave_public_key,
+        );
+
+        // Derive the auth pubkey from the private key and session ID
+        keymeld_auth_pubkey = await deriveKeymeldAuthPubkey(
+          ephemeralPrivateKey,
+          this.ticket.keymeld_session_id,
+        );
+
+        console.log("Keymeld registration data prepared");
+      } else {
+        console.log("Keymeld not enabled or session info not available");
       }
 
       // Now submit the entry
@@ -442,6 +457,9 @@ class Entry {
         event_id: this.competition.id,
         ticket_id: this.ticket.id,
         expected_observations: expected_observations,
+        // Keymeld registration data for server-side registration
+        encrypted_keymeld_private_key,
+        keymeld_auth_pubkey,
       };
 
       console.log("Sending entry:", entry_body);
