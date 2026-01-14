@@ -1,10 +1,45 @@
 use crate::{
     api::routes::{
-        add_event_entry, admin_index_handler, create_competition, get_aggregate_nonces,
-        get_balance, get_competitions, get_contract_parameters, get_entries,
-        get_estimated_fee_rates, get_next_address, get_outputs, get_ticket_status, health,
-        index_handler, login, register, request_competition_ticket, send_to_address,
-        submit_final_signatures, submit_public_nonces, submit_ticket_payout,
+        add_event_entry,
+        admin_competition_fragment,
+        admin_create_competition_handler,
+        admin_fee_estimates_fragment,
+        admin_index_handler,
+        // HTMX page handlers
+        admin_page_handler,
+        admin_send_bitcoin_handler,
+        admin_wallet_address_fragment,
+        admin_wallet_balance_fragment,
+        admin_wallet_fragment,
+        admin_wallet_outputs_fragment,
+        competitions_fragment,
+        competitions_rows_fragment,
+        create_competition,
+        entries_fragment,
+        entry_detail_fragment,
+        entry_form_fragment,
+        get_aggregate_nonces,
+        get_balance,
+        get_competitions,
+        get_contract_parameters,
+        get_entries,
+        get_estimated_fee_rates,
+        get_next_address,
+        get_outputs,
+        get_ticket_status,
+        health,
+        index_handler,
+        leaderboard_fragment,
+        leaderboard_rows_fragment,
+        login,
+        payouts_fragment,
+        public_page_handler,
+        register,
+        request_competition_ticket,
+        send_to_address,
+        submit_final_signatures,
+        submit_public_nonces,
+        submit_ticket_payout,
     },
     config::Settings,
     domain::{
@@ -418,10 +453,48 @@ pub fn app(
         .route("/login", post(login))
         .route("/register", post(register));
 
+    // HTMX admin routes (pure server-side rendering, no WASM)
+    let admin_htmx_routes = Router::new()
+        .route("/", get(admin_page_handler))
+        .route("/competition", get(admin_competition_fragment))
+        .route("/wallet", get(admin_wallet_fragment))
+        .route("/wallet/balance", get(admin_wallet_balance_fragment))
+        .route("/wallet/address", get(admin_wallet_address_fragment))
+        .route("/wallet/fees", get(admin_fee_estimates_fragment))
+        .route("/wallet/outputs", get(admin_wallet_outputs_fragment))
+        .route("/wallet/send", post(admin_send_bitcoin_handler))
+        .route("/api/competitions", post(admin_create_competition_handler));
+
+    // HTMX public routes (some require JS bridge for auth)
+    let htmx_routes = Router::new()
+        .route("/competitions", get(competitions_fragment))
+        .route("/competitions/rows", get(competitions_rows_fragment))
+        .route(
+            "/competitions/{competition_id}/entry-form",
+            get(entry_form_fragment),
+        )
+        .route(
+            "/competitions/{competition_id}/leaderboard",
+            get(leaderboard_fragment),
+        )
+        .route(
+            "/competitions/{competition_id}/leaderboard/rows",
+            get(leaderboard_rows_fragment),
+        )
+        .route("/entries", get(entries_fragment))
+        .route("/entries/{entry_id}/detail", get(entry_detail_fragment))
+        .route("/payouts", get(payouts_fragment));
+
     Router::new()
-        .route("/", get(index_handler))
-        .route("/admin", get(admin_index_handler))
-        .fallback(index_handler)
+        // Use new Maud-based handlers for main pages
+        .route("/", get(public_page_handler))
+        // Keep legacy handlers available during migration
+        .route("/legacy", get(index_handler))
+        .route("/legacy/admin", get(admin_index_handler))
+        // HTMX routes
+        .nest("/admin", admin_htmx_routes)
+        .merge(htmx_routes)
+        .fallback(public_page_handler)
         .route("/api/v1/health_check", get(health))
         .route("/api/v1/competitions", post(create_competition))
         .route("/api/v1/competitions", get(get_competitions))

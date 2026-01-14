@@ -79,6 +79,8 @@ impl CompetitionStore {
         let ephemeral_privatekey_encrypted = entry.ephemeral_privatekey_encrypted.clone();
         let payout_preimage_encrypted = entry.payout_preimage_encrypted.clone();
         let payout_hash = entry.payout_hash.clone();
+        let encrypted_keymeld_private_key = entry.encrypted_keymeld_private_key.clone();
+        let keymeld_auth_pubkey = entry.keymeld_auth_pubkey.clone();
 
         self.db_connection
             .execute_write(move |pool| async move {
@@ -92,8 +94,10 @@ impl CompetitionStore {
                         ephemeral_privatekey_encrypted,
                         payout_preimage_encrypted,
                         payout_hash,
-                        entry_submission
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        entry_submission,
+                        encrypted_keymeld_private_key,
+                        keymeld_auth_pubkey
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(entry_id)
                 .bind(ticket_id_str)
@@ -104,6 +108,8 @@ impl CompetitionStore {
                 .bind(payout_preimage_encrypted)
                 .bind(payout_hash)
                 .bind(entry_submission)
+                .bind(encrypted_keymeld_private_key)
+                .bind(keymeld_auth_pubkey)
                 .execute(&pool)
                 .await?;
                 Ok(())
@@ -231,6 +237,35 @@ impl CompetitionStore {
                     WHERE id = ?",
                 )
                 .bind(broadcast_time_str)
+                .bind(entry_id_str)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
+    }
+
+    /// Update the keymeld_auth_pubkey for an entry.
+    /// This is called after the keygen session is created and the user has derived their auth pubkey.
+    pub async fn update_keymeld_auth_pubkey(
+        &self,
+        entry_id: Uuid,
+        keymeld_auth_pubkey: String,
+    ) -> Result<bool, sqlx::Error> {
+        let entry_id_str = entry_id.to_string();
+
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE entries
+                    SET keymeld_auth_pubkey = ?
+                    WHERE id = ?",
+                )
+                .bind(keymeld_auth_pubkey)
                 .bind(entry_id_str)
                 .execute(&pool)
                 .await?;

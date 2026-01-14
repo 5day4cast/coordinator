@@ -1,5 +1,6 @@
 mod competitions;
 mod invoices;
+pub mod scoring;
 mod users;
 
 pub use competitions::*;

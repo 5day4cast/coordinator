@@ -1,5 +1,6 @@
 mod coordinator;
 mod home;
+mod pages;
 mod system;
 
 use axum::{
@@ -14,6 +15,7 @@ use crate::domain::Error;
 
 pub use coordinator::*;
 pub use home::*;
+pub use pages::*;
 pub use system::*;
 
 impl IntoResponse for Error {
