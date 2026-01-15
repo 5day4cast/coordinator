@@ -2,7 +2,6 @@ use maud::{html, Markup, DOCTYPE};
 
 use crate::templates::components::{auth_modals, navbar};
 
-/// Configuration passed to the base template
 pub struct PageConfig<'a> {
     pub title: &'a str,
     pub api_base: &'a str,
@@ -10,13 +9,6 @@ pub struct PageConfig<'a> {
     pub network: &'a str,
 }
 
-/// Base layout for the public UI
-///
-/// Includes:
-/// - Bulma CSS
-/// - HTMX for interactivity
-/// - WASM module for crypto operations
-/// - Minimal JS bridge for auth header injection
 pub fn base(config: &PageConfig, content: Markup) -> Markup {
     html! {
         (DOCTYPE)
@@ -27,30 +19,17 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                 meta name="viewport" content="width=device-width, initial-scale=1.0";
                 title { (config.title) }
 
-                // Bulma CSS
-                link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css";
+                link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@1.0.2/css/bulma.min.css";
                 link rel="stylesheet" href="/ui/styles.css";
 
-                // HTMX
                 script src="https://unpkg.com/htmx.org@1.9.10" {}
-
-                // External dependencies for entry flow
                 script src="/ui/bolt11.min.js" {}
                 script type="module" src="https://unpkg.com/bitcoin-qr@1.4.1/dist/bitcoin-qr/bitcoin-qr.esm.js" {}
             }
-            body {
-                // Global config for JS
-                script {
-                    (format!(r#"
-                        const API_BASE = "{}";
-                        const ORACLE_BASE = "{}";
-                        const NETWORK = "{}";
-                    "#, config.api_base, config.oracle_base, config.network))
-                }
+            body data-api-base=(config.api_base) data-oracle-base=(config.oracle_base) data-network=(config.network) {
 
                 section class="section" {
                     div class="container" {
-                        // Header with branding
                         nav class="level" {
                             div class="level-left" {
                                 a href="/" class="is-undecorated" {
@@ -65,7 +44,6 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                                 p class="level-item" {
                                     a href="https://github.com/5day4cast/coordinator" target="_blank"
                                       style="font-size: 0.7em; margin-left: 10px; color: #333;" {
-                                        // GitHub icon SVG
                                         (github_icon())
                                     }
                                 }
@@ -73,25 +51,17 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                         }
                     }
 
-                    // Navigation
                     (navbar())
 
-                    // Main content area
                     div id="main-content" {
                         (content)
                     }
                 }
 
-                // Auth modals
                 (auth_modals())
 
-                // Initialize app - load crypto bridge which handles WASM + HTMX auth
-                script type="module" {
-                    (maud::PreEscaped(r#"
-                        import { initApp } from '/ui/crypto_bridge.js';
-                        initApp();
-                    "#))
-                }
+                // loader.js handles WASM init and loads the bundled app
+                script type="module" src="/ui/loader.js" {}
             }
         }
     }

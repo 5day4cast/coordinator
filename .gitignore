@@ -34,6 +34,9 @@ logs/
 # WASM build output
 pkg/
 
+# Generated static assets
+crates/public_ui/
+
 # SQLite databases
 *.db
 *.db-journal

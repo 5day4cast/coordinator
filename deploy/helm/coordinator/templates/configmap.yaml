@@ -39,7 +39,6 @@ data:
     private_url = {{ .Values.config.ui.privateUrl | quote }}
     remote_url = {{ .Values.config.ui.remoteUrl | quote }}
     ui_dir = {{ .Values.config.ui.uiDir | quote }}
-    admin_ui_dir = {{ .Values.config.ui.adminUiDir | quote }}
 
     [coordinator_settings]
     name = {{ .Values.config.coordinator.name | quote }}

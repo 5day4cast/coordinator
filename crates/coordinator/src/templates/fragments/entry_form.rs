@@ -106,21 +106,21 @@ fn pick_row(station_id: &str, metric: &str, label: &str, value: &ForecastValue) 
             }
             div class="buttons has-addons" {
                 button type="button"
-                       class="button pick-button"
+                       class="button pick-button is-outlined"
                        data-field=(field_name)
                        data-value="over"
                        onclick="selectPick(this)" {
                     "Over"
                 }
                 button type="button"
-                       class="button pick-button"
+                       class="button pick-button is-outlined"
                        data-field=(field_name)
                        data-value="par"
                        onclick="selectPick(this)" {
                     "Par"
                 }
                 button type="button"
-                       class="button pick-button"
+                       class="button pick-button is-outlined"
                        data-field=(field_name)
                        data-value="under"
                        onclick="selectPick(this)" {
