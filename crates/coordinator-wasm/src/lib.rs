@@ -18,12 +18,11 @@ pub use coordinator_core::*;
 // Re-export nostr types for internal use
 pub use nostr::NostrClientCore;
 
-// Re-export keymeld types and functions for WASM bindings (when feature enabled)
+// Re-export keymeld crypto functions for WASM bindings (when feature enabled)
+// These are used for server-side keymeld registration - the coordinator
+// handles all keymeld communication, users just provide encrypted keys
 #[cfg(feature = "keymeld")]
-pub use keymeld::{
-    derive_keymeld_auth_pubkey, encrypt_private_key_for_enclave, KeymeldClientConfig,
-    KeymeldParticipant,
-};
+pub use keymeld::{derive_keymeld_auth_pubkey, encrypt_private_key_for_enclave};
 
 #[wasm_bindgen(start)]
 pub fn start() {

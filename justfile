@@ -252,6 +252,24 @@ logs service:
     fi
 
 # ============================================
+# Staging / Remote Testing
+# ============================================
+
+# Port-forward keymeld from staging cluster for local testing
+# Requires: kubectl access to staging cluster
+# Uses port 8090 to match local k3d setup
+keymeld-staging:
+    @echo "Port-forwarding keymeld from staging cluster..."
+    @echo "Keymeld will be available at http://localhost:8090"
+    @echo "Press Ctrl+C to stop"
+    kubectl port-forward -n keymeld svc/keymeld 8090:8080
+
+# Port-forward keymeld on a custom local port
+keymeld-staging-port port="8090":
+    @echo "Port-forwarding keymeld from staging to localhost:{{port}}..."
+    kubectl port-forward -n keymeld svc/keymeld {{port}}:8080
+
+# ============================================
 # CI Commands
 # ============================================
 
@@ -295,5 +313,9 @@ help:
     @echo "  just status    - Show status of all services"
     @echo "  just logs X    - Tail logs for service X (lnd1, lnd2, gateway, enclave-0, etc.)"
     @echo "  just mine N    - Mine N blocks"
+    @echo ""
+    @echo "Staging / Remote Testing:"
+    @echo "  just keymeld-staging      - Port-forward keymeld from staging cluster"
+    @echo "  just keymeld-staging-port - Port-forward on custom port"
     @echo ""
     @echo "Run 'just --list' to see all available commands"

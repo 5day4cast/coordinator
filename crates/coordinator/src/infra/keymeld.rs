@@ -105,8 +105,14 @@ pub trait Keymeld: Send + Sync {
     /// Check if Keymeld is enabled
     fn is_enabled(&self) -> bool;
 
-    /// Get the enclave's public key for encrypting participant private keys
-    fn enclave_public_key(&self) -> Option<String>;
+    /// Get a user's assigned enclave public key for a keygen session.
+    /// Users need this to encrypt their private keys for registration.
+    /// Each user is assigned to a specific enclave when the session is created.
+    async fn get_user_enclave_pubkey(
+        &self,
+        session: &DlcKeygenSession,
+        user_id: UserId,
+    ) -> Result<String, KeymeldError>;
 }
 
 /// Holds the state of a DLC keygen session
@@ -522,8 +528,38 @@ impl Keymeld for KeymeldService {
         Ok(())
     }
 
-    fn enclave_public_key(&self) -> Option<String> {
-        self.settings.enclave_public_key.clone()
+    async fn get_user_enclave_pubkey(
+        &self,
+        session: &DlcKeygenSession,
+        user_id: UserId,
+    ) -> Result<String, KeymeldError> {
+        let client = self.get_client()?;
+
+        // Get the user's slot to find which enclave they're assigned to
+        let slots = client
+            .keygen()
+            .get_available_slots(&session.session_id)
+            .await?;
+
+        let user_slot = slots
+            .available_slots
+            .iter()
+            .find(|s| s.user_id == user_id)
+            .ok_or_else(|| {
+                KeymeldError::Session(format!(
+                    "No slot found for user {} in session {}",
+                    user_id, session.session_id
+                ))
+            })?;
+
+        // Get enclave public key for this user's assigned enclave
+        let enclave_info = client
+            .health()
+            .get_enclave_key(user_slot.enclave_id.as_u32())
+            .await
+            .map_err(|e| KeymeldError::Session(format!("Failed to get enclave info: {}", e)))?;
+
+        Ok(enclave_info.public_key)
     }
 }
 
@@ -577,8 +613,12 @@ impl Keymeld for MockKeymeld {
         Err(KeymeldError::NotEnabled)
     }
 
-    fn enclave_public_key(&self) -> Option<String> {
-        None
+    async fn get_user_enclave_pubkey(
+        &self,
+        _session: &DlcKeygenSession,
+        _user_id: UserId,
+    ) -> Result<String, KeymeldError> {
+        Err(KeymeldError::NotEnabled)
     }
 }
 

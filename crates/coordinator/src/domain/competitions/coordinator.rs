@@ -2542,16 +2542,38 @@ impl Coordinator {
                 Error::DbError(e)
             })?;
 
-        // Get keymeld session_id if available (created at competition creation)
-        let keymeld_session_id = if self.is_keymeld_enabled() {
-            self.competition_store
+        // Get keymeld session info if available (created at competition creation)
+        let (keymeld_session_id, keymeld_enclave_public_key) = if self.is_keymeld_enabled() {
+            if let Some(stored_session) = self
+                .competition_store
                 .get_keymeld_session(competition.id)
                 .await
                 .ok()
                 .flatten()
-                .map(|s| s.session_id)
+            {
+                // Decrypt session secret to get the full session
+                let session_secret =
+                    self.decrypt_session_secret(&stored_session.encrypted_session_secret)?;
+                let session = stored_session.to_session(session_secret);
+
+                // Get the user's assigned enclave public key
+                // ticket_id is used as keymeld user_id
+                let user_id = UserId::from(ticket.id);
+                let enclave_pubkey = self
+                    .keymeld
+                    .get_user_enclave_pubkey(&session, user_id)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to get user enclave pubkey: {}", e);
+                        Error::BadRequest(format!("Failed to get enclave info: {}", e))
+                    })?;
+
+                (Some(stored_session.session_id), Some(enclave_pubkey))
+            } else {
+                (None, None)
+            }
         } else {
-            None
+            (None, None)
         };
 
         Ok(TicketResponse {
@@ -2564,7 +2586,7 @@ impl Coordinator {
             keymeld_user_id: ticket.id,
             keymeld_gateway_url: self.keymeld_gateway_url.clone(),
             keymeld_session_id,
-            keymeld_enclave_public_key: self.keymeld.enclave_public_key(),
+            keymeld_enclave_public_key,
         })
     }
 
