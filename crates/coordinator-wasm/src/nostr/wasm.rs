@@ -24,6 +24,12 @@ impl NostrClientWrapper {
         &self.inner
     }
 
+    /// Check if the signer has been initialized and is ready to sign
+    #[wasm_bindgen(js_name = "isSignerReady")]
+    pub fn is_signer_ready(&self) -> bool {
+        self.inner.signer.is_some()
+    }
+
     #[wasm_bindgen]
     pub async fn initialize(
         &mut self,

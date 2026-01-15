@@ -1,66 +1,42 @@
 use std::sync::Arc;
 
 use axum::{extract::State, response::Html};
-use log::info;
-use tokio::fs;
 
-use crate::startup::AppState;
+use crate::{
+    startup::AppState,
+    templates::{
+        layouts::base::{base, PageConfig},
+        pages::competitions::{competitions_page, CompetitionView},
+    },
+};
 
-//TODO: add pulling down wasm that holds the cryptograph needed for signing the dlc musig
-pub async fn index_handler(State(state): State<Arc<AppState>>) -> Html<String> {
-    Html(
-        public_index(
-            &state.remote_url,
-            &state.oracle_url,
-            &state.ui_dir,
-            &state.bitcoin.network.to_string(),
-        )
-        .await,
-    )
-}
+pub async fn public_page_handler(State(state): State<Arc<AppState>>) -> Html<String> {
+    let config = PageConfig {
+        title: "Fantasy Weather",
+        api_base: &state.remote_url,
+        oracle_base: &state.oracle_url,
+        network: &state.bitcoin.network.to_string(),
+    };
 
-pub async fn public_index(
-    remote_url: &str,
-    oracle_url: &str,
-    ui_dir: &str,
-    bitcoin_network: &str,
-) -> String {
-    let mut file_content = fs::read_to_string(&format!("{}/index.html", ui_dir))
-        .await
-        .expect("Unable to read index.html");
-    info!("remote_url: {}", remote_url);
-    info!("oracle_url: {}", oracle_url);
-    info!("bitcoin_network: {}", bitcoin_network);
-    file_content = file_content.replace("{SERVER_ADDRESS}", remote_url);
-    file_content = file_content.replace("{ORACLE_BASE}", oracle_url);
-    file_content.replace("{NETWORK}", bitcoin_network)
-}
+    let competitions = match state.coordinator.get_competitions().await {
+        Ok(comps) => comps
+            .into_iter()
+            .map(|c| CompetitionView {
+                id: c.id.to_string(),
+                start_time: c.event_submission.observation_date.to_string(),
+                end_time: c.event_submission.observation_date.to_string(),
+                signing_time: c.event_submission.signing_date.to_string(),
+                status: format!("{:?}", c.current_state),
+                entry_fee: c.event_submission.entry_fee,
+                total_pool: c.event_submission.total_competition_pool,
+                total_entries: c.event_submission.number_of_players_signed_up,
+                num_winners: c.event_submission.number_of_places_win as u64,
+                can_enter: c.can_enter(),
+            })
+            .collect(),
+        Err(_) => vec![],
+    };
 
-pub async fn admin_index_handler(State(state): State<Arc<AppState>>) -> Html<String> {
-    Html(
-        admin_index(
-            &state.private_url,
-            &state.oracle_url,
-            &state.admin_ui_dir,
-            &state.esplora_url,
-        )
-        .await,
-    )
-}
-
-pub async fn admin_index(
-    remote_url: &str,
-    oracle_url: &str,
-    admin_ui_dir: &str,
-    esplora_url: &str,
-) -> String {
-    let mut file_content = fs::read_to_string(&format!("{}/index.html", admin_ui_dir))
-        .await
-        .expect("Unable to read index.html");
-    info!("remote_url: {}", remote_url);
-    info!("oracle_url: {}", oracle_url);
-    info!("esplora_url: {}", esplora_url);
-    file_content = file_content.replace("{SERVER_ADDRESS}", remote_url);
-    file_content = file_content.replace("{ORACLE_BASE}", oracle_url);
-    file_content.replace("{ESPLORA_URL}", esplora_url)
+    let content = competitions_page(&competitions);
+    Html(base(&config, content).into_string())
 }

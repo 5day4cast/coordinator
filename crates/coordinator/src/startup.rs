@@ -1,45 +1,15 @@
 use crate::{
     api::routes::{
-        add_event_entry,
-        admin_competition_fragment,
-        admin_create_competition_handler,
-        admin_fee_estimates_fragment,
-        admin_index_handler,
-        // HTMX page handlers
-        admin_page_handler,
-        admin_send_bitcoin_handler,
-        admin_wallet_address_fragment,
-        admin_wallet_balance_fragment,
-        admin_wallet_fragment,
-        admin_wallet_outputs_fragment,
-        competitions_fragment,
-        competitions_rows_fragment,
-        create_competition,
-        entries_fragment,
-        entry_detail_fragment,
-        entry_form_fragment,
-        get_aggregate_nonces,
-        get_balance,
-        get_competitions,
-        get_contract_parameters,
-        get_entries,
-        get_estimated_fee_rates,
-        get_next_address,
-        get_outputs,
-        get_ticket_status,
-        health,
-        index_handler,
-        leaderboard_fragment,
-        leaderboard_rows_fragment,
-        login,
-        payouts_fragment,
-        public_page_handler,
-        register,
-        request_competition_ticket,
-        send_to_address,
-        submit_final_signatures,
-        submit_public_nonces,
-        submit_ticket_payout,
+        add_event_entry, admin_competition_fragment, admin_create_competition_handler,
+        admin_fee_estimates_fragment, admin_page_handler, admin_send_bitcoin_handler,
+        admin_wallet_address_fragment, admin_wallet_balance_fragment, admin_wallet_fragment,
+        admin_wallet_outputs_fragment, competitions_fragment, competitions_rows_fragment,
+        create_competition, entries_fragment, entry_detail_fragment, entry_form_fragment,
+        get_aggregate_nonces, get_balance, get_competitions, get_contract_parameters, get_entries,
+        get_estimated_fee_rates, get_next_address, get_outputs, get_ticket_status, health,
+        leaderboard_fragment, leaderboard_rows_fragment, login, payouts_fragment,
+        public_page_handler, register, request_competition_ticket, send_to_address,
+        submit_final_signatures, submit_public_nonces, submit_ticket_payout,
     },
     config::Settings,
     domain::{
@@ -84,8 +54,7 @@ use tokio::{net::TcpListener, select, task::JoinHandle};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
-    services::{ServeDir, ServeFile},
-    set_status::SetStatus,
+    services::ServeDir,
 };
 pub struct Application {
     server: Serve<
@@ -104,16 +73,10 @@ impl Application {
             config.api_settings.domain, config.api_settings.port
         );
         let listener = SocketAddr::from_str(&address)?;
-        let (app_state, serve_dir, serve_admin_dir, background_tasks, cancellation_token) =
+        let (app_state, serve_dir, background_tasks, cancellation_token) =
             build_app(config.clone()).await?;
-        let server = build_server(
-            listener,
-            app_state,
-            serve_dir,
-            serve_admin_dir,
-            config.api_settings.origins,
-        )
-        .await?;
+        let server =
+            build_server(listener, app_state, serve_dir, config.api_settings.origins).await?;
         Ok(Self {
             server,
             cancellation_token,
@@ -160,7 +123,6 @@ impl Application {
 #[derive(Clone)]
 pub struct AppState {
     pub ui_dir: String,
-    pub admin_ui_dir: String,
     pub private_url: String,
     pub remote_url: String,
     pub oracle_url: String,
@@ -177,28 +139,17 @@ pub async fn build_app(
     (
         AppState,
         ServeDir<ServeFile>,
-        ServeDir<SetStatus<ServeFile>>,
         TaskTracker,
         CancellationToken,
     ),
     anyhow::Error,
 > {
-    // The ui folder needs to be generated and have this relative path from where the binary is being run
-    let serve_dir = ServeDir::new(config.ui_settings.ui_dir.clone())
-        .not_found_service(ServeFile::new(format!(
-            "{}/index.html",
-            config.ui_settings.ui_dir
-        )))
-        .fallback(ServeFile::new(format!(
-            "{}/index.html",
-            config.ui_settings.ui_dir
-        )));
-    info!("Public UI configured");
-
-    // The admin_ui folder needs to be generated and have this relative path from where the binary is being run
-    let serve_admin_dir = ServeDir::new(config.ui_settings.admin_ui_dir.clone())
-        .not_found_service(ServeFile::new(config.ui_settings.admin_ui_dir.clone()));
-    info!("Admin UI configured");
+    // Static assets served from ui_dir (JS, CSS, WASM)
+    let serve_dir = ServeDir::new(config.ui_settings.ui_dir.clone());
+    info!(
+        "Static UI assets configured at {}",
+        config.ui_settings.ui_dir
+    );
 
     let bitcoin_client = BitcoinClient::new(&config.bitcoin_settings)
         .await
@@ -384,7 +335,6 @@ pub async fn build_app(
         ui_dir: config.ui_settings.ui_dir,
         private_url: config.ui_settings.private_url,
         remote_url: config.ui_settings.remote_url,
-        admin_ui_dir: config.ui_settings.admin_ui_dir,
         esplora_url: config.bitcoin_settings.esplora_url,
         oracle_url: config.coordinator_settings.oracle_url,
         coordinator,
@@ -392,14 +342,13 @@ pub async fn build_app(
         bitcoin: bitcoin_client,
         background_threads: Arc::new(threads),
     };
-    Ok((app_state, serve_dir, serve_admin_dir, tracker, cancel_token))
+    Ok((app_state, serve_dir, tracker, cancel_token))
 }
 
 pub async fn build_server(
     socket_addr: SocketAddr,
     app_state: AppState,
-    serve_dir: ServeDir<ServeFile>,
-    serve_admin_dir: ServeDir<SetStatus<ServeFile>>,
+    serve_dir: ServeDir,
     origins: Vec<String>,
 ) -> Result<
     Serve<
@@ -412,7 +361,7 @@ pub async fn build_server(
     let listener = TcpListener::bind(socket_addr).await?;
 
     info!("Setting up service");
-    let app = app(app_state, serve_dir, serve_admin_dir, origins);
+    let app = app(app_state, serve_dir, origins);
     let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -425,12 +374,7 @@ pub async fn build_server(
     Ok(server)
 }
 
-pub fn app(
-    app_state: AppState,
-    serve_dir: ServeDir<ServeFile>,
-    serve_admin_dir: ServeDir<SetStatus<ServeFile>>,
-    origins: Vec<String>,
-) -> Router {
+pub fn app(app_state: AppState, serve_dir: ServeDir, origins: Vec<String>) -> Router {
     let origins: Vec<HeaderValue> = origins
         .into_iter()
         .filter_map(|origin| origin.parse().ok())
@@ -486,12 +430,7 @@ pub fn app(
         .route("/payouts", get(payouts_fragment));
 
     Router::new()
-        // Use new Maud-based handlers for main pages
         .route("/", get(public_page_handler))
-        // Keep legacy handlers available during migration
-        .route("/legacy", get(index_handler))
-        .route("/legacy/admin", get(admin_index_handler))
-        // HTMX routes
         .nest("/admin", admin_htmx_routes)
         .merge(htmx_routes)
         .fallback(public_page_handler)
@@ -532,8 +471,7 @@ pub fn app(
         .nest("/api/v1/users", users_endpoints)
         .layer(middleware::from_fn(log_request))
         .with_state(Arc::new(app_state))
-        .nest_service("/ui", serve_dir.clone())
-        .nest_service("/admin_ui", serve_admin_dir.clone())
+        .nest_service("/ui", serve_dir)
         .layer(cors)
 }
 

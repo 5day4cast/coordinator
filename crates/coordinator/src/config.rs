@@ -286,7 +286,6 @@ pub struct UISettings {
     pub private_url: String,
     pub remote_url: String,
     pub ui_dir: String,
-    pub admin_ui_dir: String,
 }
 
 impl Default for UISettings {
@@ -295,7 +294,6 @@ impl Default for UISettings {
             private_url: String::from("http://127.0.0.1:9990"),
             remote_url: String::from("http://127.0.0.1:9990"),
             ui_dir: String::from("./crates/public_ui"),
-            admin_ui_dir: String::from("./crates/admin_ui"),
         }
     }
 }

@@ -27,7 +27,7 @@ pub use wasm_bindgen;
 
 #[derive(Error, Debug)]
 pub enum NostrError {
-    #[error("No signer initialized")]
+    #[error("NoSigner: {0}")]
     NoSigner(String),
     #[error("Key parsing error: {0}")]
     KeyParsing(#[from] nostr_sdk::key::Error),

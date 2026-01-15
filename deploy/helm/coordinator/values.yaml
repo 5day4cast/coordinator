@@ -139,7 +139,6 @@ config:
     privateUrl: "http://localhost:8080"
     remoteUrl: "http://localhost:8080"
     uiDir: "/app/ui"
-    adminUiDir: "/app/admin-ui"
   coordinator:
     name: "local-coordinator"
     relativeLockTimeBlockDelta: 144

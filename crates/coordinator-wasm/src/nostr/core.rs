@@ -149,7 +149,7 @@ impl NostrClientCore {
         url: &str,
         body: Option<&T>,
     ) -> Result<String, NostrError> {
-        let http_method = HttpMethod::from_str(method)
+        let http_method = HttpMethod::from_str(&method.to_uppercase())
             .map_err(|e| NostrError::NoSigner(format!("Invalid HTTP method: {}", e)))?;
         let http_url =
             Url::from_str(url).map_err(|e| NostrError::NoSigner(format!("Invalid URL: {}", e)))?;
