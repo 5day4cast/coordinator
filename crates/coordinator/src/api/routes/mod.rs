@@ -14,7 +14,6 @@ use std::borrow::Borrow;
 use crate::domain::Error;
 
 pub use coordinator::*;
-pub use home::*;
 pub use pages::*;
 pub use system::*;
 

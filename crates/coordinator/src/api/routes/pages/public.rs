@@ -98,7 +98,7 @@ pub async fn public_page_handler(State(state): State<Arc<AppState>>) -> Html<Str
         title: "Fantasy Weather",
         api_base: &state.remote_url,
         oracle_base: &state.oracle_url,
-        network: &state.bitcoin.network.to_string(),
+        network: &state.bitcoin.get_network().to_string(),
     };
 
     let competitions = fetch_competitions(&state).await;
@@ -352,28 +352,54 @@ async fn fetch_eligible_payouts(state: &AppState, pubkey: &str) -> Vec<PayoutVie
     payouts
 }
 
-async fn fetch_forecasts(
-    _state: &AppState,
-    _competition: &CompetitionView,
-) -> Vec<StationForecast> {
+async fn fetch_forecasts(state: &AppState, competition: &CompetitionView) -> Vec<StationForecast> {
+    // Get full competition to access locations
+    let competition_id = match Uuid::parse_str(&competition.id) {
+        Ok(id) => id,
+        Err(_) => return vec![],
+    };
+
+    let locations = match state.coordinator.get_competition(competition_id).await {
+        Ok(comp) => comp.event_submission.locations,
+        Err(_) => return vec![],
+    };
+
     // TODO: Fetch actual forecasts from oracle
-    // For now, return placeholder data
-    vec![StationForecast {
-        station_id: "KEWR".to_string(),
-        station_name: "Newark Liberty International".to_string(),
-        wind_speed: Some(ForecastValue {
-            value: 12.5,
-            unit: "mph".to_string(),
-        }),
-        temp_high: Some(ForecastValue {
-            value: 75.0,
-            unit: "°F".to_string(),
-        }),
-        temp_low: Some(ForecastValue {
-            value: 58.0,
-            unit: "°F".to_string(),
-        }),
-    }]
+    // For now, return stub data for each location
+    locations
+        .into_iter()
+        .map(|station_id| StationForecast {
+            station_id: station_id.clone(),
+            station_name: get_station_name(&station_id),
+            wind_speed: Some(ForecastValue {
+                value: 12.5,
+                unit: "mph".to_string(),
+            }),
+            temp_high: Some(ForecastValue {
+                value: 75.0,
+                unit: "°F".to_string(),
+            }),
+            temp_low: Some(ForecastValue {
+                value: 58.0,
+                unit: "°F".to_string(),
+            }),
+        })
+        .collect()
+}
+
+fn get_station_name(station_id: &str) -> String {
+    // Common airport codes to names
+    match station_id {
+        "KORD" => "Chicago O'Hare International".to_string(),
+        "KJFK" => "John F. Kennedy International".to_string(),
+        "KLAX" => "Los Angeles International".to_string(),
+        "KEWR" => "Newark Liberty International".to_string(),
+        "KATL" => "Hartsfield-Jackson Atlanta International".to_string(),
+        "KDFW" => "Dallas/Fort Worth International".to_string(),
+        "KDEN" => "Denver International".to_string(),
+        "KSFO" => "San Francisco International".to_string(),
+        _ => format!("Station {}", station_id),
+    }
 }
 
 async fn fetch_leaderboard_scores(state: &AppState, competition_id: Uuid) -> Vec<EntryScore> {

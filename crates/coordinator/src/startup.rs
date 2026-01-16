@@ -28,10 +28,10 @@ use crate::{
 use anyhow::anyhow;
 use axum::{
     body::Body,
-    extract::{connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, Request},
-    http::{Extensions, HeaderValue},
+    extract::{connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, Path, Request, State},
+    http::{header, Extensions, HeaderValue, StatusCode},
     middleware::{self, AddExtension, Next},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     serve::Serve,
     Router,
@@ -43,7 +43,7 @@ use hyper::{
 };
 use log::{error, info, warn};
 use reqwest_middleware::{
-    reqwest::{self, Client, Response, Url},
+    reqwest::{self, Client, Url},
     ClientBuilder, ClientWithMiddleware, Middleware,
 };
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
@@ -52,10 +52,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::{net::TcpListener, select, task::JoinHandle};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
-use tower_http::{
-    cors::{AllowOrigin, CorsLayer},
-    services::ServeDir,
-};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 pub struct Application {
     server: Serve<
         TcpListener,
@@ -73,10 +70,8 @@ impl Application {
             config.api_settings.domain, config.api_settings.port
         );
         let listener = SocketAddr::from_str(&address)?;
-        let (app_state, serve_dir, background_tasks, cancellation_token) =
-            build_app(config.clone()).await?;
-        let server =
-            build_server(listener, app_state, serve_dir, config.api_settings.origins).await?;
+        let (app_state, background_tasks, cancellation_token) = build_app(config.clone()).await?;
+        let server = build_server(listener, app_state, config.api_settings.origins).await?;
         Ok(Self {
             server,
             cancellation_token,
@@ -135,17 +130,7 @@ pub struct AppState {
 
 pub async fn build_app(
     config: Settings,
-) -> Result<
-    (
-        AppState,
-        ServeDir<ServeFile>,
-        TaskTracker,
-        CancellationToken,
-    ),
-    anyhow::Error,
-> {
-    // Static assets served from ui_dir (JS, CSS, WASM)
-    let serve_dir = ServeDir::new(config.ui_settings.ui_dir.clone());
+) -> Result<(AppState, TaskTracker, CancellationToken), anyhow::Error> {
     info!(
         "Static UI assets configured at {}",
         config.ui_settings.ui_dir
@@ -342,13 +327,12 @@ pub async fn build_app(
         bitcoin: bitcoin_client,
         background_threads: Arc::new(threads),
     };
-    Ok((app_state, serve_dir, tracker, cancel_token))
+    Ok((app_state, tracker, cancel_token))
 }
 
 pub async fn build_server(
     socket_addr: SocketAddr,
     app_state: AppState,
-    serve_dir: ServeDir,
     origins: Vec<String>,
 ) -> Result<
     Serve<
@@ -361,7 +345,7 @@ pub async fn build_server(
     let listener = TcpListener::bind(socket_addr).await?;
 
     info!("Setting up service");
-    let app = app(app_state, serve_dir, origins);
+    let app = app(app_state, origins);
     let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -374,7 +358,7 @@ pub async fn build_server(
     Ok(server)
 }
 
-pub fn app(app_state: AppState, serve_dir: ServeDir, origins: Vec<String>) -> Router {
+pub fn app(app_state: AppState, origins: Vec<String>) -> Router {
     let origins: Vec<HeaderValue> = origins
         .into_iter()
         .filter_map(|origin| origin.parse().ok())
@@ -469,9 +453,9 @@ pub fn app(app_state: AppState, serve_dir: ServeDir, origins: Vec<String>) -> Ro
         .route("/api/v1/entries", get(get_entries))
         .nest("/api/v1/wallet", wallet_endpoints)
         .nest("/api/v1/users", users_endpoints)
+        .route("/ui/{*path}", get(serve_static_file))
         .layer(middleware::from_fn(log_request))
         .with_state(Arc::new(app_state))
-        .nest_service("/ui", serve_dir)
         .layer(cors)
 }
 
@@ -489,6 +473,74 @@ async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {
     info!(target: "http_response", "response, code: {}, time: {}", response.status().as_str(), response_time);
 
     response
+}
+
+async fn serve_static_file(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<String>,
+) -> Response {
+    let file_path = std::path::Path::new(&state.ui_dir).join(&path);
+
+    // Security: prevent path traversal
+    let canonical = match file_path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::NOT_FOUND, "Not found").into_response(),
+    };
+
+    let ui_dir_canonical = match std::path::Path::new(&state.ui_dir).canonicalize() {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Server error").into_response(),
+    };
+
+    if !canonical.starts_with(&ui_dir_canonical) {
+        return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+    }
+
+    let content = match tokio::fs::read(&canonical).await {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::NOT_FOUND, "Not found").into_response(),
+    };
+
+    let mime_type = get_mime_type(&path);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime_type)
+        .body(Body::from(content))
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Server error").into_response())
+}
+
+fn get_mime_type(path: &str) -> &'static str {
+    let ext = path.rsplit('.').next().unwrap_or("");
+    match ext {
+        // JavaScript
+        "js" | "mjs" => "application/javascript; charset=utf-8",
+        // CSS
+        "css" => "text/css; charset=utf-8",
+        // HTML
+        "html" | "htm" => "text/html; charset=utf-8",
+        // JSON
+        "json" | "map" => "application/json",
+        // Images
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "webp" => "image/webp",
+        // Fonts
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "eot" => "application/vnd.ms-fontobject",
+        // Other
+        "txt" => "text/plain; charset=utf-8",
+        "xml" => "application/xml",
+        "wasm" => "application/wasm",
+        // Default
+        _ => "application/octet-stream",
+    }
 }
 
 pub fn build_reqwest_client() -> ClientWithMiddleware {
