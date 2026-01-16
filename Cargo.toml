@@ -31,6 +31,7 @@ miniscript = "12.3.2"
 
 # Web
 axum = { version = "0.8.1", features = ["http1", "macros", "multipart", "tokio", "tracing", "original-uri"] }
+axum-extra = { version = "0.10", features = ["form"] }
 tower-http = { version = "0.5.2", features = ["cors", "fs"] }
 maud = { version = "0.26", features = ["axum"] }
 reqwest-middleware = { version = "0.3.3", features = ["json", "rustls-tls"] }

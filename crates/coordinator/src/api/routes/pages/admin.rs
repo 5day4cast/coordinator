@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
-use axum::{extract::State, response::Html, Form};
+use axum::{extract::State, response::Html};
+use axum_extra::extract::Form;
 use serde::Deserialize;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    infra::bitcoin::{Bitcoin, SendOptions},
+    infra::bitcoin::SendOptions,
     startup::AppState,
     templates::{
         admin::{

@@ -6,13 +6,14 @@ license.workspace = true
 repository.workspace = true
 
 [package.metadata.cargo-machete]
-ignored = ["blake2", "coordinator-core", "h2", "openssl"]
+ignored = ["blake2", "coordinator-core", "h2", "hex", "minify-js", "openssl", "sha2", "walkdir"]
 
 [dependencies]
 coordinator-core.workspace = true
 
 # Web
 axum.workspace = true
+axum-extra.workspace = true
 tower-http.workspace = true
 maud.workspace = true
 reqwest-middleware.workspace = true
