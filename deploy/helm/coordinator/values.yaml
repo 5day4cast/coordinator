@@ -47,6 +47,7 @@ litestream:
   syncInterval: "10s"
   retention: "168h"
   snapshotInterval: "1h"
+  retentionCheckInterval: "1h"
   # Encryption key for Litestream backups (age key format)
   # Can be set directly or via encryptionKeySecret to reference a K8s secret
   encryptionKey: ""
