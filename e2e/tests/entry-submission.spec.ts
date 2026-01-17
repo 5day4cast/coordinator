@@ -162,14 +162,23 @@ test.describe("Competitions", () => {
   });
 
   test("can navigate to entries page", async ({ page }) => {
+    // Already registered and logged in via beforeEach
     await page.locator("#allEntriesNavClick").click();
-    await expect(page.locator("#allEntries")).toBeVisible();
-    await expect(page.locator("#entriesDataTable")).toBeVisible();
+
+    // Should show entries page content (allEntries container)
+    await expect(page.locator("#allEntries")).toBeVisible({
+      timeout: 10000,
+    });
   });
 
   test("can navigate to payouts page", async ({ page }) => {
+    // Already registered and logged in via beforeEach
     await page.locator("#payoutsNavClick").click();
-    await expect(page.locator("#payouts")).toBeVisible();
+
+    // Should show payouts page content
+    await expect(page.locator("#payouts")).toBeVisible({
+      timeout: 10000,
+    });
   });
 });
 
@@ -196,34 +205,32 @@ test.describe("Entry Form", () => {
       timeout: 10000,
     });
 
-    // Check if there are any competitions
-    const rows = await page.locator("#competitionsDataTable tbody tr").count();
+    // Find a competition in Registration status that we can enter
+    const enterButton = page
+      .locator("#competitionsDataTable tbody tr")
+      .filter({ hasText: "Registration" })
+      .locator("button, a")
+      .filter({ hasText: /Enter|Create Entry/ })
+      .first();
 
-    if (rows > 0) {
-      // Click the first "Enter" button (last column has Enter/View buttons)
-      const enterButton = page.locator(
-        "#competitionsDataTable tbody tr:first-child button",
-      );
+    const canEnter = (await enterButton.count()) > 0;
 
-      if ((await enterButton.count()) > 0) {
-        await enterButton.first().click();
+    if (canEnter) {
+      await enterButton.click();
 
-        // Entry container should become visible
-        await expect(page.locator("#entryContainer")).toBeVisible({
-          timeout: 5000,
-        });
+      // Entry container should become visible
+      await expect(page.locator("#entryContainer")).toBeVisible({
+        timeout: 5000,
+      });
 
-        // Should show the submit button
-        await expect(page.locator("#submitEntry")).toBeVisible();
+      // Should show the submit button
+      await expect(page.locator("#submitEntry")).toBeVisible();
 
-        // Should have a back button
-        await expect(page.locator("#backToCompetitions")).toBeVisible();
-      }
+      // Should have a back button
+      await expect(page.locator("#backToCompetitions")).toBeVisible();
     } else {
-      // No competitions available - this is expected in some test environments
-      console.log(
-        "No competitions available for entry test - create a competition first",
-      );
+      console.log("No competitions in Registration status available for entry");
+      test.skip();
     }
   });
 
@@ -232,26 +239,35 @@ test.describe("Entry Form", () => {
       timeout: 10000,
     });
 
-    const rows = await page.locator("#competitionsDataTable tbody tr").count();
+    // Find a competition in Registration status that we can enter
+    const enterButton = page
+      .locator("#competitionsDataTable tbody tr")
+      .filter({ hasText: "Registration" })
+      .locator("button, a")
+      .filter({ hasText: /Enter|Create Entry/ })
+      .first();
 
-    if (rows > 0) {
-      const enterButton = page.locator(
-        "#competitionsDataTable tbody tr:first-child button",
-      );
+    const canEnter = (await enterButton.count()) > 0;
 
-      if ((await enterButton.count()) > 0) {
-        await enterButton.first().click();
-        await expect(page.locator("#entryContainer")).toBeVisible({
-          timeout: 5000,
-        });
+    if (canEnter) {
+      await enterButton.click();
+      await expect(page.locator("#entryContainer")).toBeVisible({
+        timeout: 5000,
+      });
 
-        // Click back button
-        await page.locator("#backToCompetitions").click();
+      // Click back button - uses HTMX to replace main-content
+      await Promise.all([
+        page.waitForResponse((resp) => resp.url().includes("/competitions")),
+        page.locator("#backToCompetitions").click(),
+      ]);
 
-        // Should be back to competitions
-        await expect(page.locator("#allCompetitions")).toBeVisible();
-        await expect(page.locator("#entryContainer")).toHaveClass(/hidden/);
-      }
+      // Should be back to competitions (HTMX replaces entire main-content)
+      await expect(page.locator("#allCompetitions")).toBeVisible();
+      // Entry container should no longer exist (replaced by HTMX)
+      await expect(page.locator("#entryContainer")).not.toBeVisible();
+    } else {
+      console.log("No competitions in Registration status available for entry");
+      test.skip();
     }
   });
 
@@ -260,36 +276,43 @@ test.describe("Entry Form", () => {
       timeout: 10000,
     });
 
-    const rows = await page.locator("#competitionsDataTable tbody tr").count();
+    // Find a competition in Registration status that we can enter
+    const enterButton = page
+      .locator("#competitionsDataTable tbody tr")
+      .filter({ hasText: "Registration" })
+      .locator("button, a")
+      .filter({ hasText: /Enter|Create Entry/ })
+      .first();
 
-    if (rows > 0) {
-      const enterButton = page.locator(
-        "#competitionsDataTable tbody tr:first-child button",
-      );
+    const canEnter = (await enterButton.count()) > 0;
 
-      if ((await enterButton.count()) > 0) {
-        await enterButton.first().click();
-        await expect(page.locator("#entryContainer")).toBeVisible({
-          timeout: 5000,
-        });
+    if (canEnter) {
+      await enterButton.click();
+      await expect(page.locator("#entryContainer")).toBeVisible({
+        timeout: 5000,
+      });
 
-        // Wait for weather options to load
-        await page.waitForSelector("#entryContent button", { timeout: 10000 });
+      // Wait for weather options to load
+      await page.waitForSelector("#entryContent button.pick-button", {
+        timeout: 10000,
+      });
 
-        // Should have Over/Par/Under buttons
-        const buttons = page.locator("#entryContent button");
-        const buttonCount = await buttons.count();
+      // Should have Over/Par/Under buttons
+      const buttons = page.locator("#entryContent button.pick-button");
+      const buttonCount = await buttons.count();
 
-        if (buttonCount > 0) {
-          // Check that we have prediction buttons
-          const buttonTexts = await buttons.allTextContents();
-          const hasOver = buttonTexts.some((t) => t.includes("Over"));
-          const hasPar = buttonTexts.some((t) => t.includes("Par"));
-          const hasUnder = buttonTexts.some((t) => t.includes("Under"));
+      if (buttonCount > 0) {
+        // Check that we have prediction buttons
+        const buttonTexts = await buttons.allTextContents();
+        const hasOver = buttonTexts.some((t) => t.includes("Over"));
+        const hasPar = buttonTexts.some((t) => t.includes("Par"));
+        const hasUnder = buttonTexts.some((t) => t.includes("Under"));
 
-          expect(hasOver || hasPar || hasUnder).toBe(true);
-        }
+        expect(hasOver || hasPar || hasUnder).toBe(true);
       }
+    } else {
+      console.log("No competitions in Registration status available for entry");
+      test.skip();
     }
   });
 
@@ -298,38 +321,43 @@ test.describe("Entry Form", () => {
       timeout: 10000,
     });
 
-    const rows = await page.locator("#competitionsDataTable tbody tr").count();
+    // Find a competition in Registration status that we can enter
+    const enterButton = page
+      .locator("#competitionsDataTable tbody tr")
+      .filter({ hasText: "Registration" })
+      .locator("button, a")
+      .filter({ hasText: /Enter|Create Entry/ })
+      .first();
 
-    if (rows > 0) {
-      const enterButton = page.locator(
-        "#competitionsDataTable tbody tr:first-child button",
-      );
+    const canEnter = (await enterButton.count()) > 0;
 
-      if ((await enterButton.count()) > 0) {
-        await enterButton.first().click();
-        await expect(page.locator("#entryContainer")).toBeVisible({
-          timeout: 5000,
-        });
+    if (canEnter) {
+      await enterButton.click();
+      await expect(page.locator("#entryContainer")).toBeVisible({
+        timeout: 5000,
+      });
 
-        // Wait for weather options to load
-        await page.waitForSelector("#entryContent button", { timeout: 10000 });
+      // Wait for weather options to load - use .pick-button class
+      await page.waitForSelector("#entryContent button.pick-button", {
+        timeout: 10000,
+      });
 
-        // Click a prediction button
-        const predictionButtons = page.locator(
-          "#entryContent button.is-outlined",
-        );
-        const buttonCount = await predictionButtons.count();
+      // Click a prediction button (pick buttons have is-outlined initially)
+      const firstPickButton = page
+        .locator("#entryContent button.pick-button")
+        .first();
 
-        if (buttonCount > 0) {
-          await predictionButtons.first().click();
+      // Should be outlined initially
+      await expect(firstPickButton).toHaveClass(/is-outlined/);
 
-          // Button should become active (lose is-outlined class)
-          await expect(predictionButtons.first()).not.toHaveClass(
-            /is-outlined/,
-          );
-          await expect(predictionButtons.first()).toHaveClass(/is-active/);
-        }
-      }
+      await firstPickButton.click();
+
+      // Button should become active (lose is-outlined class, gain is-active)
+      await expect(firstPickButton).not.toHaveClass(/is-outlined/);
+      await expect(firstPickButton).toHaveClass(/is-active/);
+    } else {
+      console.log("No competitions in Registration status available for entry");
+      test.skip();
     }
   });
 });

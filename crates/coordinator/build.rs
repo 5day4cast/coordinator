@@ -29,7 +29,7 @@ fn main() {
         .filter(|e| {
             e.path()
                 .extension()
-                .map_or(false, |ext| ext == "js" || ext == "css")
+                .is_some_and(|ext| ext == "js" || ext == "css")
         })
     {
         println!("cargo:rerun-if-changed={}", entry.path().display());
@@ -80,6 +80,37 @@ fn main() {
         let manifest_json = serde_json_minimal(&manifest);
         let _ = fs::write(&manifest_path, manifest_json);
     }
+
+    // Copy static files (loader.js, etc.) to output directory
+    copy_static_files(&templates_dir, &output_dir);
+}
+
+fn copy_static_files(templates_dir: &Path, output_dir: &Path) {
+    let static_dir = templates_dir.join("static");
+    if !static_dir.exists() {
+        return;
+    }
+
+    for entry in WalkDir::new(&static_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+    {
+        let src_path = entry.path();
+        let relative_path = src_path.strip_prefix(&static_dir).unwrap();
+        let dest_path = output_dir.join(relative_path);
+
+        // Create parent directories if needed
+        if let Some(parent) = dest_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        if let Err(e) = fs::copy(src_path, &dest_path) {
+            println!("cargo:warning=Failed to copy {:?}: {}", src_path, e);
+        } else {
+            println!("cargo:warning=Copied static file: {:?}", relative_path);
+        }
+    }
 }
 
 fn build_css_bundle(
@@ -108,7 +139,7 @@ fn build_css_bundle(
         let mut css_files: Vec<_> = WalkDir::new(&dir_path)
             .into_iter()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "css"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "css"))
             .map(|e| e.path().to_path_buf())
             .collect();
 
@@ -161,7 +192,7 @@ fn build_css_bundle(
 }
 
 fn is_release_build() -> bool {
-    env::var("PROFILE").map_or(false, |p| p == "release")
+    env::var("PROFILE").is_ok_and(|p| p == "release")
 }
 
 fn clean_old_bundles(output_dir: &Path) {
@@ -221,16 +252,14 @@ fn build_bundle(
         let mut js_files: Vec<_> = WalkDir::new(&dir_path)
             .into_iter()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "js"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "js"))
             .map(|e| e.path().to_path_buf())
             .collect();
 
         // Sort for deterministic order, but put layout file last
         js_files.sort_by(|a, b| {
-            let a_is_layout =
-                layout_file.map_or(false, |lf| a.file_name().map_or(false, |n| n == lf));
-            let b_is_layout =
-                layout_file.map_or(false, |lf| b.file_name().map_or(false, |n| n == lf));
+            let a_is_layout = layout_file.is_some_and(|lf| a.file_name().is_some_and(|n| n == lf));
+            let b_is_layout = layout_file.is_some_and(|lf| b.file_name().is_some_and(|n| n == lf));
             match (a_is_layout, b_is_layout) {
                 (true, false) => std::cmp::Ordering::Greater,
                 (false, true) => std::cmp::Ordering::Less,

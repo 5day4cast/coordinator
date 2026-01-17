@@ -22,8 +22,14 @@ use crate::{
         file_utils::create_folder,
         keymeld::create_keymeld_service,
         lightning::{Ln, LnClient},
-        oracle::OracleClient,
+        oracle::{Oracle, OracleClient},
     },
+};
+
+// Mock implementations only available with e2e-testing feature or debug builds
+#[cfg(any(feature = "e2e-testing", debug_assertions))]
+use crate::infra::{
+    bitcoin_mock::MockBitcoinClient, lightning_mock::MockLnClient, oracle_mock::MockOracle,
 };
 use anyhow::anyhow;
 use axum::{
@@ -122,7 +128,7 @@ pub struct AppState {
     pub remote_url: String,
     pub oracle_url: String,
     pub esplora_url: String,
-    pub bitcoin: Arc<BitcoinClient>,
+    pub bitcoin: Arc<dyn Bitcoin>,
     pub coordinator: Arc<Coordinator>,
     pub users_info: Arc<UserInfo>,
     pub background_threads: Arc<HashMap<String, JoinHandle<()>>>,
@@ -136,28 +142,107 @@ pub async fn build_app(
         config.ui_settings.ui_dir
     );
 
-    let bitcoin_client = BitcoinClient::new(&config.bitcoin_settings)
-        .await
-        .map(Arc::new)?;
-    info!("Bitcoin service configured");
+    // Create Bitcoin client (real or mock based on config)
+    #[cfg(any(feature = "e2e-testing", debug_assertions))]
+    let bitcoin_client: Arc<dyn Bitcoin> = if config.bitcoin_settings.mock_enabled {
+        info!("Mock Bitcoin client configured");
+        Arc::new(MockBitcoinClient::new(config.bitcoin_settings.network))
+    } else {
+        let client = BitcoinClient::new(&config.bitcoin_settings)
+            .await
+            .map(Arc::new)?;
+        info!("Bitcoin service configured");
+        client
+    };
+
+    #[cfg(not(any(feature = "e2e-testing", debug_assertions)))]
+    let bitcoin_client: Arc<dyn Bitcoin> = {
+        if config.bitcoin_settings.mock_enabled {
+            return Err(anyhow!(
+                "Mock Bitcoin client requires e2e-testing feature or debug build"
+            ));
+        }
+        let client = BitcoinClient::new(&config.bitcoin_settings)
+            .await
+            .map(Arc::new)?;
+        info!("Bitcoin service configured");
+        client
+    };
 
     let reqwest_client = build_reqwest_client();
-    let ln = LnClient::new(reqwest_client.clone(), config.ln_settings.clone())
-        .await
-        .map(Arc::new)?;
 
-    // TODO: add background thread to monitor how lnd node is doing, alert if there is an issue
-    ln.ping().await?;
-    info!("Lnd client configured");
+    // Create LN client (real or mock based on config)
+    #[cfg(any(feature = "e2e-testing", debug_assertions))]
+    let ln: Arc<dyn Ln> = if config.ln_settings.mock_enabled {
+        let mock_ln = if let Some(auto_accept_secs) = config.ln_settings.mock_auto_accept_secs {
+            MockLnClient::with_auto_accept(Duration::from_secs(auto_accept_secs))
+        } else {
+            MockLnClient::new()
+        };
+        mock_ln.ping().await?;
+        info!(
+            "Mock LN client configured (auto_accept: {:?})",
+            config.ln_settings.mock_auto_accept_secs
+        );
+        Arc::new(mock_ln)
+    } else {
+        let ln_client = LnClient::new(reqwest_client.clone(), config.ln_settings.clone())
+            .await
+            .map(Arc::new)?;
+        ln_client.ping().await?;
+        info!("LND client configured");
+        ln_client
+    };
 
-    let orcale_url = Url::parse(&config.coordinator_settings.oracle_url)
-        .map_err(|e| anyhow!("Failed to parse oracle url: {}", e))?;
-    let oracle_client = OracleClient::new(
-        reqwest_client,
-        &orcale_url,
-        &config.coordinator_settings.private_key_file,
-    )?;
-    info!("Oracle client configured");
+    #[cfg(not(any(feature = "e2e-testing", debug_assertions)))]
+    let ln: Arc<dyn Ln> = {
+        if config.ln_settings.mock_enabled {
+            return Err(anyhow!(
+                "Mock LN client requires e2e-testing feature or debug build"
+            ));
+        }
+        let ln_client = LnClient::new(reqwest_client.clone(), config.ln_settings.clone())
+            .await
+            .map(Arc::new)?;
+        ln_client.ping().await?;
+        info!("LND client configured");
+        ln_client
+    };
+
+    // Create Oracle client (real or mock based on config)
+    #[cfg(any(feature = "e2e-testing", debug_assertions))]
+    let oracle_client: Arc<dyn Oracle> = if config.coordinator_settings.mock_oracle {
+        info!("Mock Oracle configured");
+        Arc::new(MockOracle::new([0u8; 32]))
+    } else {
+        let oracle_url = Url::parse(&config.coordinator_settings.oracle_url)
+            .map_err(|e| anyhow!("Failed to parse oracle url: {}", e))?;
+        let real_oracle = OracleClient::new(
+            reqwest_client,
+            &oracle_url,
+            &config.coordinator_settings.private_key_file,
+        )?;
+        info!("Oracle client configured");
+        Arc::new(real_oracle)
+    };
+
+    #[cfg(not(any(feature = "e2e-testing", debug_assertions)))]
+    let oracle_client: Arc<dyn Oracle> = {
+        if config.coordinator_settings.mock_oracle {
+            return Err(anyhow!(
+                "Mock Oracle requires e2e-testing feature or debug build"
+            ));
+        }
+        let oracle_url = Url::parse(&config.coordinator_settings.oracle_url)
+            .map_err(|e| anyhow!("Failed to parse oracle url: {}", e))?;
+        let real_oracle = OracleClient::new(
+            reqwest_client,
+            &oracle_url,
+            &config.coordinator_settings.private_key_file,
+        )?;
+        info!("Oracle client configured");
+        Arc::new(real_oracle)
+    };
     create_folder(&config.db_settings.data_folder.clone());
 
     let pool_config: DatabasePoolConfig = config.db_settings.clone().into();
@@ -218,7 +303,7 @@ pub async fn build_app(
     };
 
     let coordinator = Coordinator::new(
-        Arc::new(oracle_client),
+        oracle_client,
         competition_store,
         bitcoin_client.clone(),
         ln.clone(),
@@ -560,7 +645,7 @@ impl Middleware for LoggingMiddleware {
         req: reqwest::Request,
         extensions: &mut Extensions,
         next: reqwest_middleware::Next<'_>,
-    ) -> reqwest_middleware::Result<Response> {
+    ) -> reqwest_middleware::Result<reqwest::Response> {
         let method = req.method().clone();
         let url = req.url().clone();
 
