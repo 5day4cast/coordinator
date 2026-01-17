@@ -1,0 +1,790 @@
+/* ===========================================
+   Fantasy Weather - Custom Styles
+   Built for Bulma v1.0.2
+   Uses CSS variables for theming compatibility
+   Supports light/dark mode toggle
+   =========================================== */
+
+/* ===========================================
+   CSS Custom Properties - Light Theme (default)
+   =========================================== */
+:root,
+[data-theme="light"] {
+    /* App-specific colors for light mode */
+    --app-bg: #ffffff;
+    --app-bg-secondary: #fafafa;
+    --app-text: #363636;
+    --app-text-muted: #7a7a7a;
+    --app-border: #dbdbdb;
+    --app-card-bg: #ffffff;
+    --app-card-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+
+    /* Modal colors (always dark for contrast) */
+    --app-modal-bg: #1a1a1a;
+    --app-modal-border: #363636;
+    --app-modal-text: #ffffff;
+    --app-input-bg: #0d0d0d;
+}
+
+/* ===========================================
+   CSS Custom Properties - Dark Theme
+   =========================================== */
+[data-theme="dark"] {
+    /* App-specific colors for dark mode */
+    --app-bg: #1a1a2e;
+    --app-bg-secondary: #16213e;
+    --app-text: #eaeaea;
+    --app-text-muted: #a0a0a0;
+    --app-border: #3a3a5a;
+    --app-card-bg: #1f1f3a;
+    --app-card-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+
+    /* Modal colors stay dark */
+    --app-modal-bg: #0f0f1a;
+    --app-modal-border: #2a2a4a;
+    --app-modal-text: #ffffff;
+    --app-input-bg: #0a0a15;
+}
+
+/* ===========================================
+   Base Dark Mode Overrides
+   =========================================== */
+[data-theme="dark"] {
+    background-color: var(--app-bg);
+    color: var(--app-text);
+}
+
+[data-theme="dark"] body {
+    background-color: var(--app-bg);
+    color: var(--app-text);
+}
+
+[data-theme="dark"] .section {
+    background-color: var(--app-bg);
+}
+
+[data-theme="dark"] .box {
+    background-color: var(--app-card-bg);
+    color: var(--app-text);
+}
+
+[data-theme="dark"] .title,
+[data-theme="dark"] .subtitle {
+    color: var(--app-text);
+}
+
+[data-theme="dark"] .navbar {
+    background-color: var(--app-bg-secondary);
+    border-color: var(--app-border);
+}
+
+[data-theme="dark"] .navbar-item,
+[data-theme="dark"] .navbar-link {
+    color: var(--app-text);
+}
+
+[data-theme="dark"] .navbar-burger span {
+    background-color: var(--app-text);
+}
+
+[data-theme="dark"] .navbar-menu {
+    background-color: var(--app-bg-secondary);
+}
+
+[data-theme="dark"] .table {
+    background-color: var(--app-card-bg);
+    color: var(--app-text);
+}
+
+[data-theme="dark"] .table th {
+    color: var(--app-text);
+}
+
+[data-theme="dark"] .table td {
+    border-color: var(--app-border);
+}
+
+[data-theme="dark"] .table thead th {
+    border-color: var(--app-border);
+}
+
+[data-theme="dark"] .table.is-striped tbody tr:nth-child(even) {
+    background-color: var(--app-bg-secondary);
+}
+
+[data-theme="dark"] tr.is-clickable:hover {
+    background-color: var(--app-bg-secondary) !important;
+}
+
+[data-theme="dark"] .notification {
+    background-color: var(--app-bg-secondary);
+    color: var(--app-text);
+}
+
+[data-theme="dark"] .notification.is-info {
+    background-color: #1a3a5c;
+}
+
+[data-theme="dark"] a:not(.button):not(.navbar-item):not(.tag) {
+    color: #7aa2f7;
+}
+
+[data-theme="dark"] a:not(.button):not(.navbar-item):not(.tag):hover {
+    color: #9cb8ff;
+}
+
+/* ===========================================
+   Utility Classes
+   =========================================== */
+.hidden {
+    display: none;
+}
+
+.is-undecorated {
+    text-decoration: none;
+    color: inherit;
+}
+
+/* ===========================================
+   Theme Toggle Button
+   =========================================== */
+.theme-toggle {
+    background-color: transparent;
+    border: 1px solid var(--app-border);
+    cursor: pointer;
+    padding: 0.5rem;
+    border-radius: 50%;
+    width: 40px;
+    height: 40px;
+    min-height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition:
+        background-color 0.2s ease,
+        border-color 0.2s ease;
+}
+
+.theme-toggle:hover {
+    background-color: var(--app-bg-secondary);
+    border-color: var(--bulma-link, #485fc7);
+}
+
+.theme-toggle .icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+/* Light mode: show moon, hide sun */
+[data-theme="light"] .theme-icon-light,
+:root:not([data-theme]) .theme-icon-light {
+    display: none;
+}
+
+[data-theme="light"] .theme-icon-dark,
+:root:not([data-theme]) .theme-icon-dark {
+    display: inline-flex;
+}
+
+/* Dark mode: show sun, hide moon */
+[data-theme="dark"] .theme-icon-light {
+    display: inline-flex;
+}
+
+[data-theme="dark"] .theme-icon-dark {
+    display: none;
+}
+
+/* ===========================================
+   Layout
+   =========================================== */
+.parent {
+    width: 95vw;
+    height: 100vh;
+    position: relative;
+    z-index: 1;
+}
+
+/* ===========================================
+   Navbar Customizations
+   =========================================== */
+.navbar {
+    border-bottom: 1px solid var(--app-border, #dbdbdb);
+    margin-bottom: 1rem;
+}
+
+.navbar-item.is-active {
+    color: var(--bulma-link, #485fc7);
+    background-color: transparent !important;
+}
+
+.navbar-item:hover {
+    color: var(--bulma-link, #485fc7) !important;
+    background-color: transparent !important;
+}
+
+/* ===========================================
+   Modal Customizations (Always Dark Theme)
+   =========================================== */
+.modal {
+    z-index: 9999 !important;
+}
+
+.modal-card {
+    background-color: var(--app-modal-bg);
+    max-width: 480px;
+    margin: 0 auto;
+    border-radius: var(--bulma-radius-large, 8px);
+}
+
+.modal-card-head,
+.modal-card-foot {
+    background-color: var(--app-modal-bg);
+    border-color: var(--app-modal-border);
+}
+
+.modal-card-body {
+    background-color: var(--app-modal-bg);
+    color: var(--app-modal-text);
+}
+
+.modal-card-title {
+    color: var(--app-modal-text);
+}
+
+/* Dark-themed inputs inside modals */
+.modal .input,
+.modal .textarea {
+    background-color: var(--app-input-bg);
+    border-color: var(--app-modal-border);
+    color: var(--app-modal-text);
+}
+
+.modal .input:focus,
+.modal .textarea:focus {
+    border-color: var(--bulma-link, #485fc7);
+    box-shadow: 0 0 0 0.125em rgba(72, 95, 199, 0.25);
+}
+
+.modal .input::placeholder,
+.modal .textarea::placeholder {
+    color: #666;
+}
+
+/* Tabs in modals */
+.modal .tabs li.is-active a {
+    border-color: var(--bulma-link, #485fc7);
+    color: var(--bulma-link, #485fc7);
+}
+
+.modal .tabs a {
+    color: #999;
+    border-color: var(--app-modal-border);
+}
+
+.modal .tabs a:hover {
+    color: var(--app-modal-text);
+    border-color: #666;
+}
+
+.private-key-box {
+    background-color: var(--app-modal-bg);
+    border: 1px solid var(--app-modal-border);
+    padding: 1rem;
+    border-radius: var(--bulma-radius, 6px);
+    margin: 1rem 0;
+}
+
+/* ===========================================
+   Steps Progress Indicator
+   =========================================== */
+.steps {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 2rem;
+}
+
+.step-item {
+    flex: 1;
+    text-align: center;
+    position: relative;
+}
+
+.step-item:not(:last-child):after {
+    content: "";
+    position: absolute;
+    left: calc(50% + 1.5rem);
+    top: 1rem;
+    width: calc(100% - 3rem);
+    height: 2px;
+    background: var(--app-border, #dbdbdb);
+}
+
+.step-marker {
+    width: 2rem;
+    height: 2rem;
+    border-radius: 50%;
+    background: var(--app-border, #dbdbdb);
+    color: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0 auto 0.5rem;
+}
+
+.step-item.is-active .step-marker {
+    background: var(--bulma-link, #3273dc);
+}
+
+.step-item.is-completed .step-marker {
+    background: var(--bulma-success, #48c774);
+}
+
+.step-title {
+    font-size: 0.875rem;
+    color: var(--app-text, #363636);
+}
+
+/* ===========================================
+   Signing Session Cards
+   =========================================== */
+.signing-progress-content {
+    background: var(--app-card-bg, white);
+    border-radius: var(--bulma-radius, 6px);
+    padding: 1.5rem;
+    margin-top: 1rem;
+}
+
+#signingProgressContainer {
+    min-height: 100px;
+    padding: 1rem;
+}
+
+.signing-session-card {
+    background: var(--app-card-bg, white);
+    border-radius: var(--bulma-radius-large, 8px);
+    box-shadow: var(--app-card-shadow, 0 2px 8px rgba(0, 0, 0, 0.15));
+    margin-bottom: 15px;
+    padding: 20px;
+    transition: box-shadow 0.3s ease;
+    border-left: 4px solid transparent;
+}
+
+.signing-session-card:hover {
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+}
+
+.signing-session-card.initialized {
+    border-left-color: var(--bulma-link, #3273dc);
+}
+
+.signing-session-card.completed {
+    border-left-color: var(--bulma-success, #48c774);
+}
+
+.signing-session-card.error {
+    border-left-color: var(--bulma-danger, #f14668);
+}
+
+.competition-details {
+    font-size: 0.9em;
+    color: var(--app-text-muted);
+    margin: 10px 0;
+}
+
+.session-status {
+    font-weight: 500;
+    color: var(--bulma-link, #3273dc);
+    margin-top: 10px;
+}
+
+.progress-steps {
+    margin-top: 15px;
+    position: relative;
+}
+
+.progress-line {
+    height: 2px;
+    background: var(--app-border, #dbdbdb);
+    position: relative;
+    margin: 10px 0;
+}
+
+.progress-line-fill {
+    height: 100%;
+    background: var(--bulma-link, #3273dc);
+    transition: width 0.3s ease;
+}
+
+/* ===========================================
+   Table Enhancements
+   =========================================== */
+tr.is-clickable {
+    cursor: pointer;
+}
+
+tr.is-clickable:hover {
+    background-color: var(--app-bg-secondary, #fafafa);
+}
+
+/* ===========================================
+   Touch-Friendly Buttons
+   Ensures minimum 44px touch targets (WCAG)
+   =========================================== */
+.button {
+    min-height: 44px;
+}
+
+.button.is-small {
+    min-height: 36px;
+}
+
+/* ===========================================
+   RESPONSIVE: Tablet & Below (max-width: 1023px)
+   Bulma's tablet breakpoint
+   =========================================== */
+@media screen and (max-width: 1023px) {
+    /* Navbar mobile menu styling */
+    .navbar-menu {
+        background-color: var(--app-bg-secondary, #fafafa);
+        border-top: 1px solid var(--app-border, #dbdbdb);
+        padding: 0.5rem 0;
+        box-shadow: 0 8px 16px rgba(0, 0, 0, 0.1);
+    }
+
+    .navbar-item {
+        padding: 0.75rem 1rem;
+    }
+
+    .navbar-end .buttons {
+        justify-content: center;
+        padding: 0.5rem;
+        flex-wrap: wrap;
+    }
+
+    .navbar-end .button {
+        margin: 0.25rem;
+    }
+
+    /* Table adjustments */
+    .table {
+        font-size: 0.9rem;
+    }
+}
+
+/* ===========================================
+   RESPONSIVE: Mobile (max-width: 768px)
+   Bulma's mobile breakpoint
+   =========================================== */
+@media screen and (max-width: 768px) {
+    /* Reduce section padding */
+    .section {
+        padding: 1.5rem 1rem;
+    }
+
+    .container {
+        padding-left: 0.75rem;
+        padding-right: 0.75rem;
+    }
+
+    .box {
+        padding: 1rem;
+    }
+
+    /* Header/branding - stack vertically on mobile */
+    .level {
+        display: block;
+    }
+
+    .level-left,
+    .level-right {
+        display: block;
+        text-align: center;
+        margin-bottom: 0.75rem;
+    }
+
+    .level-left .title {
+        font-size: 1.5rem;
+        margin-bottom: 0.25rem;
+    }
+
+    .level-left p.level-item {
+        margin-left: 0 !important;
+        font-size: 0.8rem;
+    }
+
+    .level-right {
+        margin-top: 0.5rem;
+    }
+
+    /* Table responsive styles */
+    .table-container {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        margin: 0 -0.75rem;
+        padding: 0 0.75rem;
+    }
+
+    .table {
+        font-size: 0.8rem;
+    }
+
+    .table th,
+    .table td {
+        padding: 0.5em;
+        white-space: nowrap;
+    }
+
+    /* Utility class to hide columns on mobile */
+    .hide-mobile,
+    .is-hidden-mobile {
+        display: none !important;
+    }
+
+    /* Smaller buttons in tables */
+    .table .button.is-small {
+        font-size: 0.7rem;
+        padding: 0.4em 0.6em;
+        min-height: 32px;
+    }
+
+    /* Form inputs - prevent iOS zoom */
+    .input,
+    .textarea,
+    .select select {
+        font-size: 16px !important;
+        min-height: 44px;
+    }
+
+    /* Modal improvements for mobile */
+    .modal-card {
+        margin: 0.5rem;
+        max-width: calc(100vw - 1rem);
+        max-height: calc(100vh - 1rem);
+        border-radius: var(--bulma-radius, 6px);
+    }
+
+    .modal-card-body {
+        padding: 1rem;
+        max-height: 70vh;
+        overflow-y: auto;
+    }
+
+    .modal-content {
+        margin: 0.5rem;
+        max-width: calc(100vw - 1rem);
+    }
+
+    .modal-content .box {
+        padding: 1rem;
+    }
+
+    /* Tabs wrap on mobile */
+    .tabs ul {
+        flex-wrap: wrap;
+    }
+
+    .tabs li {
+        flex-grow: 1;
+    }
+
+    .tabs a {
+        padding: 0.5em 0.75em;
+        font-size: 0.875rem;
+        justify-content: center;
+    }
+
+    /* Notification sizing */
+    .notification {
+        padding: 1rem;
+        font-size: 0.9rem;
+    }
+
+    /* Tag sizing */
+    .tag {
+        font-size: 0.7rem;
+    }
+
+    /* Steps - vertical layout on mobile */
+    .steps {
+        flex-direction: column;
+        align-items: center;
+        gap: 0.5rem;
+    }
+
+    .step-item {
+        width: 100%;
+        margin-bottom: 0.5rem;
+    }
+
+    .step-item:not(:last-child):after {
+        display: none;
+    }
+
+    /* Signing cards */
+    .signing-session-card {
+        padding: 1rem;
+    }
+
+    /* QR code container */
+    #qrContainer {
+        max-width: 100%;
+        overflow: hidden;
+    }
+
+    #qrContainer bitcoin-qr {
+        max-width: 280px;
+        margin: 0 auto;
+        display: block;
+    }
+
+    /* Payment request textarea */
+    #paymentRequest {
+        font-size: 0.75rem;
+        word-break: break-all;
+    }
+
+    /* Checkbox improvements */
+    .checkbox {
+        display: flex;
+        align-items: flex-start;
+        gap: 0.5rem;
+    }
+
+    .checkbox input[type="checkbox"] {
+        margin-top: 0.2rem;
+        min-width: 20px;
+        min-height: 20px;
+        flex-shrink: 0;
+    }
+
+    /* Button full-width on mobile where appropriate */
+    .field .button.is-fullwidth {
+        margin-top: 0.5rem;
+    }
+}
+
+/* ===========================================
+   RESPONSIVE: Small Mobile (max-width: 480px)
+   Extra small screens
+   =========================================== */
+@media screen and (max-width: 480px) {
+    .section {
+        padding: 1rem 0.5rem;
+    }
+
+    .level-left .title {
+        font-size: 1.25rem;
+    }
+
+    .box {
+        padding: 0.75rem;
+        border-radius: var(--bulma-radius-small, 4px);
+    }
+
+    /* Even smaller table text */
+    .table {
+        font-size: 0.75rem;
+    }
+
+    .table th,
+    .table td {
+        padding: 0.4em;
+    }
+
+    /* Modal nearly full-screen */
+    .modal-card {
+        margin: 0.25rem;
+        max-width: calc(100vw - 0.5rem);
+        max-height: calc(100vh - 0.5rem);
+    }
+
+    .modal-card-head {
+        padding: 0.75rem 1rem;
+    }
+
+    .modal-card-title {
+        font-size: 1.1rem;
+    }
+
+    /* QR code smaller */
+    #qrContainer bitcoin-qr {
+        max-width: 240px;
+    }
+}
+
+/* ===========================================
+   Utility: Show only on tablet and up
+   =========================================== */
+@media screen and (min-width: 769px) {
+    .is-hidden-tablet-up {
+        display: none !important;
+    }
+}
+
+/* ===========================================
+   Accessibility
+   =========================================== */
+
+/* Reduced motion preference */
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+}
+
+/* Focus visible for keyboard navigation */
+.button:focus-visible,
+.input:focus-visible,
+.textarea:focus-visible,
+.select select:focus-visible,
+a:focus-visible {
+    outline: 2px solid var(--bulma-link, #485fc7);
+    outline-offset: 2px;
+}
+
+/* High contrast mode */
+@media (prefers-contrast: high) {
+    .button {
+        border-width: 2px;
+    }
+
+    .input,
+    .textarea,
+    .select select {
+        border-width: 2px;
+    }
+
+    .signing-session-card {
+        border-left-width: 6px;
+    }
+}
+
+/* ===========================================
+   Smooth theme transitions
+   =========================================== */
+html {
+    transition:
+        background-color 0.3s ease,
+        color 0.3s ease;
+}
+
+body,
+.section,
+.box,
+.navbar,
+.navbar-menu,
+.table,
+.notification {
+    transition:
+        background-color 0.3s ease,
+        color 0.3s ease,
+        border-color 0.3s ease;
+}
