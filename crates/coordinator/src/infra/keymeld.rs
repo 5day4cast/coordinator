@@ -563,65 +563,6 @@ impl Keymeld for KeymeldService {
     }
 }
 
-/// Mock implementation for testing without Keymeld
-pub struct MockKeymeld;
-
-#[async_trait]
-impl Keymeld for MockKeymeld {
-    fn is_enabled(&self) -> bool {
-        false
-    }
-
-    async fn init_keygen_session(
-        &self,
-        _competition_id: Uuid,
-        _player_user_ids: Vec<UserId>,
-    ) -> Result<DlcKeygenSession, KeymeldError> {
-        Err(KeymeldError::NotEnabled)
-    }
-
-    async fn wait_for_keygen_completion(
-        &self,
-        _session: &DlcKeygenSession,
-    ) -> Result<Vec<u8>, KeymeldError> {
-        Err(KeymeldError::NotEnabled)
-    }
-
-    async fn get_keygen_status(
-        &self,
-        _session: &DlcKeygenSession,
-    ) -> Result<KeygenSessionStatus, KeymeldError> {
-        Err(KeymeldError::NotEnabled)
-    }
-
-    async fn sign_dlc_batch(
-        &self,
-        _keygen_session: &DlcKeygenSession,
-        _signing_data: &SigningData,
-        _contract_params: &ContractParameters,
-        _player_user_ids: Vec<UserId>,
-    ) -> Result<DlcSignatureResults, KeymeldError> {
-        Err(KeymeldError::NotEnabled)
-    }
-
-    async fn register_participant(
-        &self,
-        _session: &DlcKeygenSession,
-        _user_id: UserId,
-        _registration_data: &ParticipantRegistrationData,
-    ) -> Result<(), KeymeldError> {
-        Err(KeymeldError::NotEnabled)
-    }
-
-    async fn get_user_enclave_pubkey(
-        &self,
-        _session: &DlcKeygenSession,
-        _user_id: UserId,
-    ) -> Result<String, KeymeldError> {
-        Err(KeymeldError::NotEnabled)
-    }
-}
-
 /// Create a Keymeld service based on settings
 pub fn create_keymeld_service(
     settings: KeymeldSettings,
@@ -635,6 +576,6 @@ pub fn create_keymeld_service(
             coordinator_private_key,
         )?))
     } else {
-        Ok(Arc::new(MockKeymeld))
+        Ok(Arc::new(super::keymeld_mock::MockKeymeld))
     }
 }
