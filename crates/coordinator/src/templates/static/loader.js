@@ -12,10 +12,22 @@ window.TaprootWallet = TaprootWallet;
 window.TaprootWalletBuilder = TaprootWalletBuilder;
 window.SignerType = SignerType;
 
+// Track WASM initialization state
+window.wasmInitialized = false;
+window.wasmError = null;
+
 // Initialize WASM and create default client
 window.initWasm = async function () {
-  await init();
-  window.nostrClient = new NostrClientWrapper();
+  try {
+    await init();
+    window.nostrClient = new NostrClientWrapper();
+    window.wasmInitialized = true;
+    console.log("WASM initialized successfully");
+  } catch (error) {
+    window.wasmError = error;
+    console.error("WASM initialization failed:", error);
+    throw error;
+  }
 };
 
 // Load app bundle

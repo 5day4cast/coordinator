@@ -4,6 +4,33 @@ import { request } from "@playwright/test";
 export default async function globalSetup() {
   const baseURL = process.env.COORDINATOR_URL || "http://localhost:9990";
 
+  // Wait for server to be ready
+  const maxRetries = 10;
+  let serverReady = false;
+
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      const context = await request.newContext({ baseURL });
+      const healthResponse = await context.get("/api/v1/health_check", {
+        timeout: 2000,
+      });
+      await context.dispose();
+      if (healthResponse.ok()) {
+        serverReady = true;
+        console.log("Server is ready");
+        break;
+      }
+    } catch {
+      console.log(`Waiting for server... (attempt ${i + 1}/${maxRetries})`);
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+
+  if (!serverReady) {
+    console.error("Server failed to start");
+    return;
+  }
+
   const context = await request.newContext({ baseURL });
 
   // Create a test competition via admin API
@@ -26,18 +53,24 @@ export default async function globalSetup() {
   formData.append("locations", "KJFK");
   formData.append("locations", "KLAX");
 
-  const response = await context.post("/admin/api/competitions", {
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    data: formData.toString(),
-  });
+  try {
+    const response = await context.post("/admin/api/competitions", {
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      data: formData.toString(),
+      timeout: 10000,
+    });
 
-  const responseText = await response.text();
-  if (responseText.includes("error") || responseText.includes("Error")) {
-    console.error("Competition creation error:", responseText);
-  } else {
-    console.log("Seeded test competition successfully");
+    const responseText = await response.text();
+    if (responseText.includes("error") || responseText.includes("Error")) {
+      console.error("Competition creation error:", responseText);
+    } else {
+      console.log("Seeded test competition successfully");
+    }
+  } catch (error) {
+    console.error("Failed to seed competition (non-fatal):", error);
+    // Don't throw - tests can still run with existing data or without a competition
   }
 
   await context.dispose();
