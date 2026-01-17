@@ -95,8 +95,11 @@
           postInstall = ''
             mkdir -p $out/share/coordinator
             cp -r crates/coordinator/migrations $out/share/coordinator/
-            if [ -d crates/coordinator/frontend ]; then
-              cp -r crates/coordinator/frontend $out/share/coordinator/
+
+            # Copy frontend assets from public_ui (where build.rs outputs them)
+            if [ -d crates/public_ui ]; then
+              mkdir -p $out/share/coordinator/frontend/public
+              cp -r crates/public_ui/* $out/share/coordinator/frontend/public/
             fi
           '';
         } // commonEnvs);
