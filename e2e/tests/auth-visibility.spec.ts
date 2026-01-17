@@ -16,7 +16,9 @@ test.describe("Public vs Authenticated Views", () => {
   test("unauthenticated user can see competitions table", async ({ page }) => {
     await page.goto("/");
 
-    await expect(page.locator("h1")).toContainText("Fantasy Weather");
+    await expect(page.locator(".navbar-brand strong")).toContainText(
+      "Fantasy Weather",
+    );
     await expect(page.locator("#competitionsDataTable")).toBeVisible();
     await expect(page.locator("#loginNavClick")).toBeVisible();
     await expect(page.locator("#registerNavClick")).toBeVisible();

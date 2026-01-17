@@ -21,7 +21,9 @@ test.describe("Basic UI", () => {
     await page.goto("/");
 
     // Wait for the main content to load
-    await expect(page.locator("h1")).toContainText("Fantasy Weather");
+    await expect(page.locator(".navbar-brand strong")).toContainText(
+      "Fantasy Weather",
+    );
 
     // The competitions table should be present
     await expect(page.locator("#competitionsDataTable")).toBeVisible();
