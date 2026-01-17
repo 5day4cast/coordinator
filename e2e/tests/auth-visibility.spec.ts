@@ -1,6 +1,18 @@
 import { test, expect } from "@playwright/test";
 
 test.describe("Public vs Authenticated Views", () => {
+  // Capture console logs for debugging
+  test.beforeEach(async ({ page }) => {
+    page.on("console", (msg) => {
+      if (msg.type() === "error" || msg.text().includes("WASM")) {
+        console.log(`Browser ${msg.type()}: ${msg.text()}`);
+      }
+    });
+    page.on("pageerror", (error) => {
+      console.log(`Page error: ${error.message}`);
+    });
+  });
+
   test("unauthenticated user can see competitions table", async ({ page }) => {
     await page.goto("/");
 
@@ -20,6 +32,11 @@ test.describe("Public vs Authenticated Views", () => {
 
   test("user can register and login", async ({ page }) => {
     await page.goto("/");
+
+    // Wait for WASM to initialize
+    await page.waitForFunction(() => window.wasmInitialized === true, {
+      timeout: 15000,
+    });
 
     // Open register modal
     await page.locator("#registerNavClick").click();
@@ -45,6 +62,11 @@ test.describe("Public vs Authenticated Views", () => {
 
   test("logout returns user to unauthenticated state", async ({ page }) => {
     await page.goto("/");
+
+    // Wait for WASM to initialize
+    await page.waitForFunction(() => window.wasmInitialized === true, {
+      timeout: 15000,
+    });
 
     // Register and login
     await page.locator("#registerNavClick").click();

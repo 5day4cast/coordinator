@@ -1,4 +1,9 @@
 async function initApp() {
+  // Setup non-WASM dependent features first (UI interactions, theme, navigation)
+  window.setupModalCloseHandlers?.();
+  window.setupNavbarBurger?.();
+  window.setupThemeToggle?.();
+
   try {
     await window.initWasm();
 
@@ -9,14 +14,12 @@ async function initApp() {
     const authManager = new window.AuthManager(API_BASE, NETWORK);
     window.authManager = authManager;
 
-    window.setupModalCloseHandlers();
     window.setupAuthModals(authManager);
     authManager.attachEventListeners();
-    window.setupHtmxAuth();
-    window.setupNavbarBurger();
-    window.setupThemeToggle();
+    window.setupHtmxAuth?.();
   } catch (error) {
-    console.error("Failed to initialize app:", error);
+    console.error("Failed to initialize WASM:", error);
+    // Auth features won't work, but basic UI will still function
   }
 }
 
