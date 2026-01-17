@@ -59,7 +59,7 @@ pub trait Ln: Send + Sync {
     ) -> Result<(), anyhow::Error>;
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum InvoiceState {
     Open,

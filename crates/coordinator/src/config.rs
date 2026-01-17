@@ -156,6 +156,13 @@ pub struct LnSettings {
     pub invoice_watch_interval: u64,
     /// Interval in seconds to check for new payouts
     pub payout_watch_interval: u64,
+    /// Enable mock LN client for E2E testing (no real LND required)
+    #[serde(default)]
+    pub mock_enabled: bool,
+    /// Auto-accept invoices after this many seconds (only when mock_enabled=true)
+    /// If not set, invoices must be manually accepted via test endpoints
+    #[serde(default)]
+    pub mock_auto_accept_secs: Option<u64>,
 }
 
 impl Default for LnSettings {
@@ -166,6 +173,8 @@ impl Default for LnSettings {
             tls_cert_path: Some(String::from("./creds/tls.cert")),
             invoice_watch_interval: 5,
             payout_watch_interval: 5,
+            mock_enabled: false,
+            mock_auto_accept_secs: None,
         }
     }
 }
@@ -220,6 +229,9 @@ pub struct BitcoinSettings {
     /// Frequency in seconds for how often to refresh block data with on-chain
     /// (usually want to set to half as often as a block on average will come in, 10min block time -> refresh every 5min)
     pub refresh_blocks_secs: u64,
+    /// Enable mock Bitcoin client for E2E testing (no real Bitcoin infrastructure required)
+    #[serde(default)]
+    pub mock_enabled: bool,
 }
 
 impl Default for BitcoinSettings {
@@ -230,6 +242,7 @@ impl Default for BitcoinSettings {
             storage_file: String::from("./data/bitcoin.db"),
             seed_path: String::from("./creds/coordinator_private_key.pem"),
             refresh_blocks_secs: 15,
+            mock_enabled: false,
         }
     }
 }
@@ -265,6 +278,10 @@ pub struct CoordinatorSettings {
     /// Enable this as a safety net if HODL invoice timing becomes an issue.
     #[serde(default)]
     pub escrow_enabled: bool,
+
+    /// Enable mock oracle for E2E testing (no real oracle server required)
+    #[serde(default)]
+    pub mock_oracle: bool,
 }
 
 impl Default for CoordinatorSettings {
@@ -277,6 +294,7 @@ impl Default for CoordinatorSettings {
             required_confirmations: 1,
             sync_interval_secs: 15,
             escrow_enabled: false,
+            mock_oracle: false,
         }
     }
 }

@@ -202,7 +202,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - run: cargo build --workspace --release --locked
+      - name: Build with e2e-testing feature
+        run: cargo build --workspace --release --features e2e-testing --locked
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked
+
+      - name: Build WASM module
+        run: wasm-pack build crates/coordinator-wasm --target web --release --out-dir ../../crates/public_ui/pkg
+        env:
+          # Workaround for secp256k1-sys WASM build with clang 16+
+          CFLAGS_wasm32_unknown_unknown: "-Wno-error=implicit-function-declaration"
 
       - name: Upload coordinator binary
         uses: actions/upload-artifact@v4
@@ -211,17 +221,85 @@ jobs:
           path: target/release/coordinator
           retention-days: 1
 
-  # E2E tests - disabled until keymeld integration is complete
-  # e2e:
-  #   name: E2E Tests
-  #   runs-on: ubuntu-latest
-  #   needs: [fmt, clippy, test, build]
-  #   timeout-minutes: 30
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Install Nix
-  #       uses: DeterminateSystems/nix-installer-action@main
-  #     - name: Setup Nix cache
-  #       uses: DeterminateSystems/magic-nix-cache-action@main
-  #     - name: Run E2E tests
-  #       run: nix develop --command just e2e
+      - name: Upload UI assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-assets
+          path: crates/public_ui/
+          retention-days: 1
+
+  # E2E tests using Playwright with mock services
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, test, build]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download coordinator binary
+        uses: actions/download-artifact@v4
+        with:
+          name: coordinator-binary
+          path: ./target/release
+
+      - name: Download UI assets
+        uses: actions/download-artifact@v4
+        with:
+          name: ui-assets
+          path: ./crates/public_ui
+
+      - name: Make binary executable
+        run: chmod +x ./target/release/coordinator
+
+      - name: Create test credentials
+        run: |
+          mkdir -p creds data/e2e
+          openssl ecparam -name secp256k1 -genkey -noout -out creds/coordinator_private_key.pem
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Get Playwright version
+        id: playwright-version
+        working-directory: e2e
+        run: echo "version=$(npm ls @playwright/test --json | jq -r '.dependencies["@playwright/test"].version')" >> $GITHUB_OUTPUT
+
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright-version.outputs.version }}
+
+      - name: Install npm dependencies
+        working-directory: e2e
+        run: npm ci
+
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        working-directory: e2e
+        run: npx playwright install chromium --with-deps
+
+      - name: Install Playwright system dependencies
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        working-directory: e2e
+        run: npx playwright install-deps chromium
+
+      - name: Run Playwright tests
+        working-directory: e2e
+        run: npm test
+        env:
+          CI: true
+
+      - name: Upload Playwright report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: e2e/playwright-report/
+          retention-days: 7

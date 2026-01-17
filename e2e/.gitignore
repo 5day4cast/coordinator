@@ -1,0 +1,4 @@
+-e 
+# Test artifacts
+playwright-report/
+test-results/

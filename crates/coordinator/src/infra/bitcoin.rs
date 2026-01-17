@@ -83,6 +83,13 @@ pub trait Bitcoin: Send + Sync {
     ) -> Result<bool, anyhow::Error>;
     async fn list_utxos(&self) -> Vec<LocalOutput>;
     async fn sync(&self) -> Result<(), anyhow::Error>;
+    async fn get_balance(&self) -> Result<Balance, anyhow::Error>;
+    async fn get_outputs(&self) -> Result<Vec<LocalOutput>, anyhow::Error>;
+    async fn send_to_address(
+        &self,
+        send_options: SendOptions,
+        selected_utxos: Vec<OutPoint>,
+    ) -> Result<Txid, anyhow::Error>;
 }
 
 pub struct BitcoinClient {
@@ -533,6 +540,72 @@ impl Bitcoin for BitcoinClient {
 
         Ok(())
     }
+
+    async fn get_balance(&self) -> Result<Balance, anyhow::Error> {
+        let balance = self.wallet.read().await.balance();
+        Ok(balance)
+    }
+
+    async fn get_outputs(&self) -> Result<Vec<LocalOutput>, anyhow::Error> {
+        let outputs = self.wallet.read().await.list_output().collect();
+        Ok(outputs)
+    }
+
+    async fn send_to_address(
+        &self,
+        send_options: SendOptions,
+        selected_utxos: Vec<OutPoint>,
+    ) -> Result<Txid, anyhow::Error> {
+        // Get wallet read lock first to check addresses and UTXOs
+        let wallet = self.wallet.read().await;
+
+        // Validate destination address and find source UTXOs
+        let dest_addr = send_options.get_destination_address(wallet.network())?;
+        let source_utxos = if selected_utxos.is_empty() {
+            send_options.find_source_utxos(&wallet)?
+        } else {
+            // Convert OutPoint to LocalOutput
+            let mut utxos = Vec::new();
+            for outpoint in selected_utxos {
+                if let Some(utxo) = wallet.get_utxo(outpoint) {
+                    utxos.push(utxo);
+                } else {
+                    return Err(anyhow::anyhow!("UTXO not found: {}", outpoint));
+                }
+            }
+            utxos
+        };
+
+        // Switch to write lock for transaction building
+        drop(wallet);
+        let mut wallet = self.wallet.write().await;
+
+        let mut builder = wallet.build_tx();
+
+        for utxo in source_utxos {
+            builder.add_utxo(utxo.outpoint)?;
+        }
+
+        send_options.configure_tx_builder(&mut builder, dest_addr)?;
+
+        let mut psbt = builder.finish()?;
+
+        send_options.validate_fee(&psbt)?;
+
+        // Sign and finalize
+        info!("PSBT before signing: {}", psbt);
+        let finalized = wallet.sign(&mut psbt, SignOptions::default())?;
+        info!("PSBT after signing: {}", psbt);
+        if !finalized {
+            return Err(anyhow!("Failed to sign transaction"));
+        }
+
+        // Extract and broadcast
+        let tx = psbt.extract_tx()?;
+        self.client.broadcast(&tx).await?;
+
+        Ok(tx.compute_txid())
+    }
 }
 
 impl BitcoinClient {
@@ -658,72 +731,6 @@ impl BitcoinClient {
         }
 
         Ok(())
-    }
-
-    pub async fn get_balance(&self) -> Result<Balance, anyhow::Error> {
-        let balance = self.wallet.read().await.balance();
-        Ok(balance)
-    }
-
-    pub async fn get_outputs(&self) -> Result<Vec<LocalOutput>, anyhow::Error> {
-        let outputs = self.wallet.read().await.list_output().collect();
-        Ok(outputs)
-    }
-
-    pub async fn send_to_address(
-        &self,
-        send_options: SendOptions,
-        selected_utxos: Vec<OutPoint>,
-    ) -> Result<Txid, anyhow::Error> {
-        // Get wallet read lock first to check addresses and UTXOs
-        let wallet = self.wallet.read().await;
-
-        // Validate destination address and find source UTXOs
-        let dest_addr = send_options.get_destination_address(wallet.network())?;
-        let source_utxos = if selected_utxos.is_empty() {
-            send_options.find_source_utxos(&wallet)?
-        } else {
-            // Convert OutPoint to LocalOutput
-            let mut utxos = Vec::new();
-            for outpoint in selected_utxos {
-                if let Some(utxo) = wallet.get_utxo(outpoint) {
-                    utxos.push(utxo);
-                } else {
-                    return Err(anyhow::anyhow!("UTXO not found: {}", outpoint));
-                }
-            }
-            utxos
-        };
-
-        // Switch to write lock for transaction building
-        drop(wallet);
-        let mut wallet = self.wallet.write().await;
-
-        let mut builder = wallet.build_tx();
-
-        for utxo in source_utxos {
-            builder.add_utxo(utxo.outpoint)?;
-        }
-
-        send_options.configure_tx_builder(&mut builder, dest_addr)?;
-
-        let mut psbt = builder.finish()?;
-
-        send_options.validate_fee(&psbt)?;
-
-        // Sign and finalize
-        info!("PSBT before signing: {}", psbt);
-        let finalized = wallet.sign(&mut psbt, SignOptions::default())?;
-        info!("PSBT after signing: {}", psbt);
-        if !finalized {
-            return Err(anyhow!("Failed to sign transaction"));
-        }
-
-        // Extract and broadcast
-        let tx = psbt.extract_tx()?;
-        self.client.broadcast(&tx).await?;
-
-        Ok(tx.compute_txid())
     }
 
     async fn sign_escrow_inputs(&self, psbt: &mut Psbt) -> Result<usize, anyhow::Error> {
@@ -910,14 +917,14 @@ fn derive_wallet_key(seed_path: &str, network: NetworkKind) -> Result<Xpriv, any
 }
 
 pub struct BitcoinSyncWatcher {
-    bitcoin: Arc<BitcoinClient>,
+    bitcoin: Arc<dyn Bitcoin>,
     cancel_token: CancellationToken,
     sync_interval: Duration,
 }
 
 impl BitcoinSyncWatcher {
     pub fn new(
-        bitcoin: Arc<BitcoinClient>,
+        bitcoin: Arc<dyn Bitcoin>,
         cancel_token: CancellationToken,
         sync_interval: Duration,
     ) -> Self {

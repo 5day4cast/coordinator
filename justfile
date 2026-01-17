@@ -213,6 +213,31 @@ playwright-codegen:
     cd e2e && npm run codegen http://localhost:9990
 
 # ============================================
+# E2E Mock Testing (for CI - no external services)
+# ============================================
+
+# Run Playwright E2E tests with mocked services (for CI)
+# Uses internal mock implementations - no LND, keymeld, or oracle needed
+e2e-mock:
+    cd e2e && npm test
+
+# Run mock E2E tests with visible browser (for debugging)
+e2e-mock-headed:
+    cd e2e && npm run test:headed
+
+# Run mock E2E tests with interactive UI
+e2e-mock-ui:
+    cd e2e && npm run test:ui
+
+# Run coordinator with e2e mock config (for manual testing)
+run-e2e-mock:
+    cargo run --bin coordinator -- --config ./config/e2e.toml
+
+# Run coordinator with e2e mock config and debug logging
+run-e2e-mock-debug:
+    RUST_LOG=debug cargo run --bin coordinator -- --config ./config/e2e.toml
+
+# ============================================
 # Utility Commands
 # ============================================
 
@@ -308,6 +333,11 @@ help:
     @echo "  just playwright         - Run Playwright tests"
     @echo "  just playwright-headed  - Run with visible browser"
     @echo "  just playwright-ui      - Run with interactive UI"
+    @echo ""
+    @echo "E2E Mock Testing (CI - no external services):"
+    @echo "  just e2e-mock           - Run Playwright with mocked services"
+    @echo "  just e2e-mock-headed    - Run with visible browser"
+    @echo "  just run-e2e-mock       - Run coordinator with mock config"
     @echo ""
     @echo "Services:"
     @echo "  just status    - Show status of all services"

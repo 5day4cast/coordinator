@@ -19,7 +19,8 @@ server/target/
 # Project-specific
 duckdb_lib/
 coordinator_private_key.pem
-config/
+config/*
+!config/e2e.toml
 crates/*/src/bin/settings.toml
 
 # Nix
@@ -55,3 +56,5 @@ crates/public_ui/
 *.profraw
 coverage/
 e2e/node_modules/
+e2e/test-results
+e2e/playwright-report
