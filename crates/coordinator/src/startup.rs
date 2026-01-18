@@ -564,24 +564,14 @@ async fn serve_static_file(
     State(state): State<Arc<AppState>>,
     Path(path): Path<String>,
 ) -> Response {
-    let file_path = std::path::Path::new(&state.ui_dir).join(&path);
-
-    // Security: prevent path traversal
-    let canonical = match file_path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => return (StatusCode::NOT_FOUND, "Not found").into_response(),
-    };
-
-    let ui_dir_canonical = match std::path::Path::new(&state.ui_dir).canonicalize() {
-        Ok(p) => p,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Server error").into_response(),
-    };
-
-    if !canonical.starts_with(&ui_dir_canonical) {
-        return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+    // Prevent directory traversal attacks
+    if path.contains("..") {
+        return (StatusCode::BAD_REQUEST, "Bad request").into_response();
     }
 
-    let content = match tokio::fs::read(&canonical).await {
+    let file_path = std::path::Path::new(&state.ui_dir).join(&path);
+
+    let content = match tokio::fs::read(&file_path).await {
         Ok(c) => c,
         Err(_) => return (StatusCode::NOT_FOUND, "Not found").into_response(),
     };
