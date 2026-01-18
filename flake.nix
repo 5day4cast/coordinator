@@ -832,19 +832,36 @@
 
         # Docker image for k8s deployment
         # Combine frontend assets with WASM module
-        frontend-assets = pkgs.runCommand "coordinator-frontend-assets" {} ''
+        # Frontend assets - copy actual files (not symlinks) to ensure they're in the Docker image
+        frontend-assets = pkgs.runCommand "coordinator-frontend-assets" {
+          # Force rebuild when coordinator or wasm changes
+          inherit coordinator coordinator-wasm;
+        } ''
           mkdir -p $out/app/ui/pkg
 
-          # Copy bundled JS/CSS assets from coordinator build
+          # Copy bundled JS/CSS assets from coordinator build (actual files, not symlinks)
           if [ -d ${coordinator}/share/coordinator/frontend/public ]; then
-            cp -r ${coordinator}/share/coordinator/frontend/public/* $out/app/ui/
+            cp -rL ${coordinator}/share/coordinator/frontend/public/* $out/app/ui/
           fi
 
-          # Copy WASM module
-          cp -r ${coordinator-wasm}/pkg/* $out/app/ui/pkg/
+          # Copy WASM module (actual files, not symlinks)
+          cp -rL ${coordinator-wasm}/pkg/* $out/app/ui/pkg/
+
+          # Verify critical files exist
+          for f in loader.js styles.css bolt11.min.js app.min.js styles.min.css; do
+            if [ ! -f "$out/app/ui/$f" ]; then
+              echo "ERROR: Missing required file: $f"
+              echo "Contents of $out/app/ui/:"
+              ls -la $out/app/ui/
+              exit 1
+            fi
+          done
+          echo "Frontend assets verified successfully"
         '';
         # Symlinks for binaries at standard paths (for k8s helm charts)
-        bin-links = pkgs.runCommand "coordinator-bin-links" {} ''
+        bin-links = pkgs.runCommand "coordinator-bin-links" {
+          inherit coordinator;
+        } ''
           mkdir -p $out/bin
           ln -s ${coordinator}/bin/coordinator $out/bin/coordinator
         '';
