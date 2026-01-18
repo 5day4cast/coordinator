@@ -82,32 +82,68 @@
           nativeBuildInputs = commonNativeBuildInputs;
         } // commonEnvs);
 
-        # WASM build for coordinator-wasm crate
+        # WASM build for coordinator-wasm crate using craneLib
+        # This properly pre-fetches dependencies to work in Nix's sandboxed build
+        wasmTarget = "wasm32-unknown-unknown";
+
+        # Build WASM dependencies first (fetches from network during eval, not build)
+        wasmDeps = craneLib.buildDepsOnly ({
+          pname = "coordinator-wasm-deps";
+          version = "0.1.0";
+          inherit src;
+          buildInputs = commonBuildInputs;
+          nativeBuildInputs = commonNativeBuildInputs ++ [ pkgs.llvmPackages.clang-unwrapped pkgs.llvmPackages.lld ];
+          CARGO_BUILD_TARGET = wasmTarget;
+          cargoExtraArgs = "-p coordinator-wasm";
+          # Workaround for secp256k1-sys WASM build with clang 16+
+          # The wasm-sysroot in secp256k1-sys is missing memmove declaration
+          CFLAGS_wasm32_unknown_unknown = "-Wno-error=implicit-function-declaration";
+          # Use unwrapped clang for WASM target to avoid Nix hardening flags that don't work with WASM
+          CC_wasm32_unknown_unknown = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";
+          AR_wasm32_unknown_unknown = "${pkgs.llvmPackages.llvm}/bin/llvm-ar";
+        } // commonEnvs);
+
+        # Build the WASM crate with cargo, then run wasm-bindgen
         coordinator-wasm = pkgs.stdenv.mkDerivation {
           pname = "coordinator-wasm";
           version = "0.1.0";
-          inherit src;
+
+          # Use the cargo artifacts from craneLib which has pre-fetched deps
+          src = craneLib.buildPackage ({
+            pname = "coordinator-wasm-cargo";
+            version = "0.1.0";
+            inherit src;
+            cargoArtifacts = wasmDeps;
+            buildInputs = commonBuildInputs;
+            nativeBuildInputs = commonNativeBuildInputs;
+            CARGO_BUILD_TARGET = wasmTarget;
+            cargoExtraArgs = "-p coordinator-wasm";
+            # Workaround for secp256k1-sys WASM build with clang 16+
+            CFLAGS_wasm32_unknown_unknown = "-Wno-error=implicit-function-declaration";
+
+            # Don't run tests for WASM target
+            doCheck = false;
+
+            installPhase = ''
+              mkdir -p $out
+              cp -r target/${wasmTarget}/release/*.wasm $out/ || true
+              cp -r target/${wasmTarget}/release/coordinator_wasm.wasm $out/ || true
+              # Also copy the Cargo.toml for wasm-bindgen to read metadata
+              cp crates/coordinator-wasm/Cargo.toml $out/
+            '';
+          } // commonEnvs);
 
           nativeBuildInputs = with pkgs; [
-            rustToolchain
-            wasm-pack
             wasm-bindgen-cli
-            pkg-config
-            llvmPackages.clang
-            llvmPackages.libclang
           ];
 
-          buildInputs = commonBuildInputs;
-
-          # Environment for WASM build
-          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-          # Workaround for secp256k1-sys WASM build with clang 16+
-          CFLAGS_wasm32_unknown_unknown = "-Wno-error=implicit-function-declaration";
-
           buildPhase = ''
-            export HOME=$TMPDIR
-            cd crates/coordinator-wasm
-            wasm-pack build --target web --release
+            # Run wasm-bindgen to generate JS bindings
+            wasm-bindgen \
+              --target web \
+              --out-dir pkg \
+              --out-name coordinator_wasm \
+              $src/coordinator_wasm.wasm
           '';
 
           installPhase = ''
