@@ -27,7 +27,7 @@ wasm-bindgen-futures.workspace = true
 nostr-sdk = { version = "0.38", default-features = false, features = ["indexeddb", "nip07", "nip04", "nip44"] }
 
 # Bitcoin - use without network features for WASM
-bdk_wallet = { version = "1.0.0", default-features = false, features = ["std", "keys-bip39"] }
+bdk_wallet = { version = "2.3.0", default-features = false, features = ["std", "keys-bip39"] }
 dlctix = { git = "https://github.com/tee8z/dlctix", branch = "external-signing-api", default-features = false }
 
 # Keymeld SDK - for remote MuSig2 signing (WASM-compatible with v0.1.8+)

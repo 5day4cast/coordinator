@@ -40,16 +40,23 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        # wasm-bindgen-cli must match the version in Cargo.lock exactly
-        # nixpkgs has 0.2.104, but we need 0.2.106
+        # Parse Cargo.lock to get the exact wasm-bindgen version
+        # This ensures wasm-bindgen-cli always matches what cargo is using
+        cargoLock = builtins.fromTOML (builtins.readFile ./Cargo.lock);
+        wasmBindgenVersion = (pkgs.lib.findFirst
+          (pkg: pkg.name == "wasm-bindgen")
+          (throw "wasm-bindgen not found in Cargo.lock")
+          cargoLock.package).version;
+
+        # wasm-bindgen-cli version is derived from Cargo.lock automatically
         wasm-bindgen-cli = pkgs.rustPlatform.buildRustPackage rec {
           pname = "wasm-bindgen-cli";
-          version = "0.2.106";
+          version = wasmBindgenVersion;
           src = pkgs.fetchCrate {
             inherit pname version;
-            hash = "sha256-M6WuGl7EruNopHZbqBpucu4RWz44/MSdv6f0zkYw+44=";
+            hash = "sha256-UsuxILm1G6PkmVw0I/JF12CRltAfCJQFOaT4hFwvR8E=";
           };
-          cargoHash = "sha256-ElDatyOwdKwHg3bNH/1pcxKI7LXkhsotlDPQjiLHBwA=";
+          cargoHash = "sha256-iqQiWbsKlLBiJFeqIYiXo3cqxGLSjNM8SOWXGM9u43E=";
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [ pkgs.openssl ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
             pkgs.curl
@@ -107,18 +114,35 @@
         # This properly pre-fetches dependencies to work in Nix's sandboxed build
         wasmTarget = "wasm32-unknown-unknown";
 
+        # Use unwrapped clang 18 for wasm32 C compilation.
+        # The wrapped version adds flags like -fzero-call-used-regs which aren't
+        # supported for wasm32 targets.
+        clang18-unwrapped = pkgs.llvmPackages_18.clang-unwrapped;
+        clang18-lib = pkgs.llvmPackages_18.libclang.lib;
+
+        # Create a wrapper script that calls clang with the correct include paths
+        # and suppresses the memmove implicit declaration error (secp256k1-sys's
+        # wasm-sysroot is missing this declaration - fixed in secp256k1-sys 0.12.0+
+        # but bitcoin 0.32.x still uses older versions)
+        wasm32-clang = pkgs.writeShellScriptBin "wasm32-clang" ''
+          exec ${clang18-unwrapped}/bin/clang \
+            -isystem ${clang18-lib}/lib/clang/18/include \
+            -Wno-error=implicit-function-declaration \
+            "$@"
+        '';
+
         # Build WASM dependencies first (fetches from network during eval, not build)
         wasmDeps = craneLib.buildDepsOnly ({
           pname = "coordinator-wasm-deps";
           version = "0.1.0";
           inherit src;
           buildInputs = commonBuildInputs;
-          nativeBuildInputs = commonNativeBuildInputs;
+          nativeBuildInputs = commonNativeBuildInputs ++ [ wasm32-clang ];
           CARGO_BUILD_TARGET = wasmTarget;
           cargoExtraArgs = "-p coordinator-wasm";
-          # secp256k1-sys's wasm-sysroot is missing memmove declaration which newer
-          # clang versions treat as an error. Downgrade to warning to allow build.
-          CFLAGS_wasm32_unknown_unknown = "-Wno-error=implicit-function-declaration";
+          # Use our wrapper clang for wasm32 target to work around secp256k1-sys
+          # missing memmove declaration in wasm-sysroot (fixed in 0.12.0+)
+          CC_wasm32_unknown_unknown = "${wasm32-clang}/bin/wasm32-clang";
         } // commonEnvs);
 
         # Build the WASM crate with cargo, then run wasm-bindgen
@@ -136,9 +160,8 @@
             nativeBuildInputs = commonNativeBuildInputs;
             CARGO_BUILD_TARGET = wasmTarget;
             cargoExtraArgs = "-p coordinator-wasm";
-            # secp256k1-sys's wasm-sysroot is missing memmove declaration which newer
-            # clang versions treat as an error. Downgrade to warning to allow build.
-            CFLAGS_wasm32_unknown_unknown = "-Wno-error=implicit-function-declaration";
+            # Use our wrapper clang for wasm32 target
+            CC_wasm32_unknown_unknown = "${wasm32-clang}/bin/wasm32-clang";
 
             # Don't run tests for WASM target
             doCheck = false;
