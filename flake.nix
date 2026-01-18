@@ -32,12 +32,33 @@
         };
 
         # Use Rust 1.92.0 to match current toolchain
-        rustToolchain = pkgs.rust-bin.stable."1.85.0".default.override {
+        # Use latest stable Rust - older versions have issues with secp256k1-sys WASM builds
+        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "rust-analyzer" ];
           targets = [ "wasm32-unknown-unknown" ];
         };
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+
+        # wasm-bindgen-cli must match the version in Cargo.lock exactly
+        # nixpkgs has 0.2.104, but we need 0.2.106
+        wasm-bindgen-cli = pkgs.rustPlatform.buildRustPackage rec {
+          pname = "wasm-bindgen-cli";
+          version = "0.2.106";
+          src = pkgs.fetchCrate {
+            inherit pname version;
+            hash = "sha256-M6WuGl7EruNopHZbqBpucu4RWz44/MSdv6f0zkYw+44=";
+          };
+          cargoHash = "sha256-ElDatyOwdKwHg3bNH/1pcxKI7LXkhsotlDPQjiLHBwA=";
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.openssl ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.curl
+            pkgs.darwin.apple_sdk.frameworks.Security
+          ];
+          # Only build the CLI binary
+          cargoBuildFlags = [ "--bin" "wasm-bindgen" "--bin" "wasm-bindgen-test-runner" ];
+          doCheck = false;
+        };
 
         # Common environment variables
         commonEnvs = {
@@ -92,15 +113,12 @@
           version = "0.1.0";
           inherit src;
           buildInputs = commonBuildInputs;
-          nativeBuildInputs = commonNativeBuildInputs ++ [ pkgs.llvmPackages.clang-unwrapped pkgs.llvmPackages.lld ];
+          nativeBuildInputs = commonNativeBuildInputs;
           CARGO_BUILD_TARGET = wasmTarget;
           cargoExtraArgs = "-p coordinator-wasm";
-          # Workaround for secp256k1-sys WASM build with clang 16+
-          # The wasm-sysroot in secp256k1-sys is missing memmove declaration
+          # secp256k1-sys's wasm-sysroot is missing memmove declaration which newer
+          # clang versions treat as an error. Downgrade to warning to allow build.
           CFLAGS_wasm32_unknown_unknown = "-Wno-error=implicit-function-declaration";
-          # Use unwrapped clang for WASM target to avoid Nix hardening flags that don't work with WASM
-          CC_wasm32_unknown_unknown = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";
-          AR_wasm32_unknown_unknown = "${pkgs.llvmPackages.llvm}/bin/llvm-ar";
         } // commonEnvs);
 
         # Build the WASM crate with cargo, then run wasm-bindgen
@@ -118,7 +136,8 @@
             nativeBuildInputs = commonNativeBuildInputs;
             CARGO_BUILD_TARGET = wasmTarget;
             cargoExtraArgs = "-p coordinator-wasm";
-            # Workaround for secp256k1-sys WASM build with clang 16+
+            # secp256k1-sys's wasm-sysroot is missing memmove declaration which newer
+            # clang versions treat as an error. Downgrade to warning to allow build.
             CFLAGS_wasm32_unknown_unknown = "-Wno-error=implicit-function-declaration";
 
             # Don't run tests for WASM target
@@ -133,7 +152,7 @@
             '';
           } // commonEnvs);
 
-          nativeBuildInputs = with pkgs; [
+          nativeBuildInputs = [
             wasm-bindgen-cli
           ];
 
@@ -736,7 +755,7 @@
 
             # WASM
             pkgs.wasm-pack
-            pkgs.wasm-bindgen-cli
+            wasm-bindgen-cli
 
             # Bitcoin stack
             pkgs.bitcoind
