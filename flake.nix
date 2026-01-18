@@ -82,6 +82,40 @@
           nativeBuildInputs = commonNativeBuildInputs;
         } // commonEnvs);
 
+        # WASM build for coordinator-wasm crate
+        coordinator-wasm = pkgs.stdenv.mkDerivation {
+          pname = "coordinator-wasm";
+          version = "0.1.0";
+          inherit src;
+
+          nativeBuildInputs = with pkgs; [
+            rustToolchain
+            wasm-pack
+            wasm-bindgen-cli
+            pkg-config
+            llvmPackages.clang
+            llvmPackages.libclang
+          ];
+
+          buildInputs = commonBuildInputs;
+
+          # Environment for WASM build
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+          # Workaround for secp256k1-sys WASM build with clang 16+
+          CFLAGS_wasm32_unknown_unknown = "-Wno-error=implicit-function-declaration";
+
+          buildPhase = ''
+            export HOME=$TMPDIR
+            cd crates/coordinator-wasm
+            wasm-pack build --target web --release
+          '';
+
+          installPhase = ''
+            mkdir -p $out/pkg
+            cp -r pkg/* $out/pkg/
+          '';
+        };
+
         # Main coordinator binary
         coordinator = craneLib.buildPackage ({
           pname = "coordinator";
@@ -761,11 +795,17 @@
 
 
         # Docker image for k8s deployment
-        # Symlinks for frontend directories at expected paths
-        frontend-links = pkgs.runCommand "coordinator-frontend-links" {} ''
-          mkdir -p $out/app
-          ln -s ${coordinator}/share/coordinator/frontend/public $out/app/ui
-          ln -s ${coordinator}/share/coordinator/frontend/admin $out/app/admin-ui
+        # Combine frontend assets with WASM module
+        frontend-assets = pkgs.runCommand "coordinator-frontend-assets" {} ''
+          mkdir -p $out/app/ui/pkg
+
+          # Copy bundled JS/CSS assets from coordinator build
+          if [ -d ${coordinator}/share/coordinator/frontend/public ]; then
+            cp -r ${coordinator}/share/coordinator/frontend/public/* $out/app/ui/
+          fi
+
+          # Copy WASM module
+          cp -r ${coordinator-wasm}/pkg/* $out/app/ui/pkg/
         '';
         # Symlinks for binaries at standard paths (for k8s helm charts)
         bin-links = pkgs.runCommand "coordinator-bin-links" {} ''
@@ -781,7 +821,7 @@
           contents = [
             coordinator
             wallet-cli
-            frontend-links
+            frontend-assets
             bin-links
             pkgs.cacert
             pkgs.tzdata
@@ -806,7 +846,7 @@
       in {
         packages = {
           default = coordinator;
-          inherit coordinator wallet-cli docker-coordinator;
+          inherit coordinator coordinator-wasm wallet-cli docker-coordinator;
           inherit start-regtest stop-regtest mine-blocks;
           inherit setup-lnd setup-channels stop-lnd;
           inherit run-keymeld stop-keymeld;
