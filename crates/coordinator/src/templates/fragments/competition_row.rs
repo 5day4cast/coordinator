@@ -5,15 +5,20 @@ use crate::templates::pages::competitions::CompetitionView;
 /// Single competition row for the table
 pub fn competition_row(comp: &CompetitionView) -> Markup {
     html! {
-        tr {
-            td { (comp.id) }
-            td { (comp.start_time) }
-            td { (comp.end_time) }
-            td { (comp.signing_time) }
+        tr data-competition-id=(comp.id) {
             td {
                 span class=(status_class(&comp.status)) {
                     (comp.status)
                 }
+            }
+            td {
+                span class="utc-time" data-utc=(comp.start_time) { (comp.start_time) }
+            }
+            td {
+                span class="utc-time" data-utc=(comp.end_time) { (comp.end_time) }
+            }
+            td {
+                span class="utc-time" data-utc=(comp.signing_time) { (comp.signing_time) }
             }
             td { (comp.entry_fee) }
             td { (comp.total_pool) }
@@ -26,7 +31,7 @@ pub fn competition_row(comp: &CompetitionView) -> Markup {
                            hx-get=(format!("/competitions/{}/entry-form", comp.id))
                            hx-target="#main-content"
                            hx-push-url="true" {
-                        "Create Entry"
+                        "Enter"
                     }
                 } @else {
                     button class="button is-info is-small"

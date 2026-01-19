@@ -144,6 +144,8 @@ config:
     relativeLockTimeBlockDelta: 144
     requiredConfirmations: 1
     syncIntervalSecs: 60
+    escrowEnabled: false
+    invoiceSettlementConfirmations: 0
 
 secrets:
   # Support for external secrets (managed outside Helm)

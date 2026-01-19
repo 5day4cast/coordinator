@@ -10,6 +10,23 @@ pub struct StationForecast {
     pub wind_speed: Option<ForecastValue>,
     pub temp_high: Option<ForecastValue>,
     pub temp_low: Option<ForecastValue>,
+    /// Weather context for user reference
+    pub weather_context: Option<WeatherContext>,
+}
+
+/// Current and forecast weather context for reference
+#[derive(Debug, Clone)]
+pub struct WeatherContext {
+    /// Current actual temperature (if available)
+    pub current_temp: Option<f64>,
+    /// Today's forecast high
+    pub today_forecast_high: Option<f64>,
+    /// Today's forecast low
+    pub today_forecast_low: Option<f64>,
+    /// Today's actual high (if observation available)
+    pub today_actual_high: Option<f64>,
+    /// Today's actual low (if observation available)
+    pub today_actual_low: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,15 +62,42 @@ pub fn entry_form(competition: &CompetitionView, forecasts: &[StationForecast]) 
                     div class="notification is-light mb-4" {
                         p { strong { "Competition: " } (competition.id) }
                         p { strong { "Entry Fee: " } (competition.entry_fee) " sats" }
-                        p { strong { "Observation Period: " } (competition.start_time) " - " (competition.end_time) }
+                        p {
+                            strong { "Observation Period: " }
+                            span class="utc-time" data-utc=(competition.start_time) { (competition.start_time) }
+                            " - "
+                            span class="utc-time" data-utc=(competition.end_time) { (competition.end_time) }
+                        }
                     }
 
                     // Station forecast picks
-                    form id="entryForm" data-competition-id=(competition.id) {
+                    form id="entryForm" data-competition-id=(competition.id)
+                         data-max-values=(competition.number_of_values_per_entry) {
                         @for forecast in forecasts {
                             (station_picks(forecast))
                         }
                     }
+                }
+
+                // JavaScript to convert UTC times to local timezone
+                script {
+                    (maud::PreEscaped(r#"
+                    (function() {
+                        document.querySelectorAll('.utc-time').forEach(function(el) {
+                            const utc = el.dataset.utc;
+                            if (utc) {
+                                const date = new Date(utc);
+                                el.textContent = date.toLocaleString(undefined, {
+                                    month: 'short',
+                                    day: 'numeric',
+                                    hour: 'numeric',
+                                    minute: '2-digit'
+                                });
+                                el.title = date.toLocaleString();
+                            }
+                        });
+                    })();
+                    "#))
                 }
 
                 div class="mt-4" {
@@ -62,10 +106,10 @@ pub fn entry_form(competition: &CompetitionView, forecasts: &[StationForecast]) 
                            onclick="submitEntry()" {
                         "Submit Entry"
                     }
-                    div id="successMessage" class="has-text-success-dark hidden" {
+                    div id="successMessage" class="notification is-success hidden" {
                         "Successfully Submitted Entry!"
                     }
-                    div id="errorMessage" class="has-text-danger-dark hidden" {}
+                    div id="errorMessage" class="notification is-danger hidden" {}
                 }
             }
         }
@@ -78,6 +122,28 @@ fn station_picks(forecast: &StationForecast) -> Markup {
         div class="box mb-4" data-station=(forecast.station_id) {
             h5 class="title is-5" {
                 (forecast.station_id) " - " (forecast.station_name)
+            }
+
+            // Weather context for reference
+            @if let Some(ctx) = &forecast.weather_context {
+                div class="weather-context" {
+                    @if let (Some(actual_high), Some(actual_low)) = (ctx.today_actual_high, ctx.today_actual_low) {
+                        div class="weather-row" {
+                            span class="weather-label" { "Today's Actual:" }
+                            span class="weather-value" {
+                                (format!("{:.0}°F", actual_high)) " / " (format!("{:.0}°F", actual_low))
+                            }
+                        }
+                    }
+                    @if let (Some(fc_high), Some(fc_low)) = (ctx.today_forecast_high, ctx.today_forecast_low) {
+                        div class="weather-row" {
+                            span class="weather-label" { "Today's Forecast:" }
+                            span class="weather-value forecast-value" {
+                                (format!("{:.0}°F", fc_high)) " / " (format!("{:.0}°F", fc_low))
+                            }
+                        }
+                    }
+                }
             }
 
             @if let Some(wind) = &forecast.wind_speed {

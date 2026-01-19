@@ -1,4 +1,4 @@
-const AUTH_REQUIRED_ROUTES = ["/entries", "/payouts"];
+const AUTH_REQUIRED_ROUTES = ["/entries", "/payouts", "/entry-form"];
 
 function requiresAuth(url) {
   return AUTH_REQUIRED_ROUTES.some((route) => url.includes(route));

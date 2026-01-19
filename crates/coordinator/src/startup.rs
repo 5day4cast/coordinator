@@ -274,14 +274,11 @@ pub async fn build_app(
     let coordinator_private_key: Scalar = bitcoin_client.get_derived_private_key().await?;
     let private_key_bytes: [u8; 32] = coordinator_private_key.serialize();
 
-    // Generate a deterministic user ID from the private key bytes
-    // Use first 16 bytes of private key hash as UUID bytes
-    use bdk_wallet::bitcoin::hashes::{sha256, Hash};
-    let hash = sha256::Hash::hash(&private_key_bytes);
-    let hash_bytes = hash.to_byte_array();
-    let mut uuid_bytes = [0u8; 16];
-    uuid_bytes.copy_from_slice(&hash_bytes[..16]);
-    let coordinator_user_id = uuid::Uuid::from_bytes(uuid_bytes);
+    // Generate a UUID v7 for the coordinator user ID
+    // UUID v7 is time-based, which ensures consistent ordering with ticket IDs (also UUID v7).
+    // This is critical because participant ordering must be deterministic - tickets are created
+    // after the coordinator starts, so the coordinator's UUID v7 will always sort before tickets.
+    let coordinator_user_id = uuid::Uuid::now_v7();
 
     let keymeld_service = create_keymeld_service(
         config.keymeld_settings.clone(),
@@ -316,6 +313,7 @@ pub async fn build_app(
         config.coordinator_settings.required_confirmations,
         config.coordinator_settings.name,
         config.coordinator_settings.escrow_enabled,
+        config.coordinator_settings.invoice_settlement_confirmations,
     )
     .await
     .map(Arc::new)?;

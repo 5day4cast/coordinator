@@ -32,17 +32,9 @@ class Entry {
   }
 
   async getCompetitionLastForecast() {
-    // If oracle URL is a mock placeholder, extract forecasts from the rendered form
-    if (!this.oracle_url || this.oracle_url.startsWith("mock://")) {
-      return this.getForecastsFromForm();
-    }
-
-    const response = await fetch(
-      `${this.oracle_url}/oracle/events/${this.competition.id}/forecasts/latest`,
-    );
-    if (!response.ok)
-      throw new Error(`Failed to fetch forecasts: ${response.status}`);
-    return response.json();
+    // Forecasts are already rendered server-side in the form, extract them from there
+    // This avoids needing a separate API call and keeps the data consistent
+    return this.getForecastsFromForm();
   }
 
   // Extract forecast data from the rendered entry form (for mock/test mode)
@@ -211,17 +203,66 @@ class Entry {
     $modal.classList.add("is-active");
 
     return new Promise((resolve, reject) => {
-      const handleClose = () => {
-        cleanup();
-        reject(new Error("Payment cancelled by user"));
+      let currentStatus = "Reserved";
+      let closeHandlersRemoved = false;
+      let backgroundPollingInterval = null;
+
+      // Background polling function to check payment status after modal is closed
+      const startBackgroundPolling = () => {
+        backgroundPollingInterval = setInterval(async () => {
+          try {
+            const response = await this.client.get(
+              `${this.coordinator_url}/api/v1/competitions/${this.competition.id}/tickets/${this.ticket.id}/status`,
+            );
+            if (response.ok) {
+              const status = await response.json();
+              if (status === "Settled" || status === "Paid") {
+                clearInterval(backgroundPollingInterval);
+                resolve(true);
+              }
+            }
+          } catch (e) {
+            // Ignore errors during background polling
+          }
+        }, 2000);
       };
 
-      $modal
-        .querySelector(".modal-background")
-        .addEventListener("click", handleClose, { once: true });
-      $modal
-        .querySelector(".modal-close")
-        .addEventListener("click", handleClose, { once: true });
+      const handleClose = () => {
+        // Only allow cancellation if payment hasn't been received yet
+        if (currentStatus === "Paid" || currentStatus === "Settled") {
+          // Payment already received, don't cancel - just close modal and resolve
+          cleanup();
+          resolve(true);
+          return;
+        }
+        // Modal closed but payment might still be in-flight
+        // Start background polling to detect if payment completes
+        cleanup();
+        startBackgroundPolling();
+        // Don't reject yet - let background polling resolve if payment comes through
+        // Set a timeout to eventually reject if no payment after 5 minutes
+        setTimeout(
+          () => {
+            if (backgroundPollingInterval) {
+              clearInterval(backgroundPollingInterval);
+              reject(new Error("Payment cancelled by user"));
+            }
+          },
+          5 * 60 * 1000,
+        );
+      };
+
+      const $modalClose = $modal.querySelector(".modal-close");
+
+      // Only allow closing via the X button, not by clicking the background
+      // This prevents accidental closure while payment is in-flight
+      $modalClose.addEventListener("click", handleClose, { once: true });
+
+      const removeCloseHandlers = () => {
+        if (closeHandlersRemoved) return;
+        closeHandlersRemoved = true;
+        $modalClose.removeEventListener("click", handleClose);
+      };
 
       $qrCode.callback = async () => {
         try {
@@ -235,8 +276,14 @@ class Entry {
             );
 
           const status = await response.json();
+          currentStatus = status;
 
           if (status === "Settled" || status === "Paid") {
+            // Payment received - remove close handlers to prevent accidental cancel
+            removeCloseHandlers();
+            if (backgroundPollingInterval) {
+              clearInterval(backgroundPollingInterval);
+            }
             updateStatus("Payment received!", "success");
             cleanup();
             resolve(true);
@@ -277,17 +324,14 @@ class Entry {
         this.ticket.keymeld_session_id &&
         this.ticket.keymeld_enclave_public_key
       ) {
-        const ephemeralPrivateKey = await window.taprootWallet.getDlcPrivateKey(
+        // Use the secure WASM method that keeps private key inside WASM
+        const keymeldData = window.taprootWallet.prepareKeymeldRegistration(
           this.entryIndex,
-        );
-        encrypted_keymeld_private_key = await window.encryptToEnclave(
-          ephemeralPrivateKey,
           this.ticket.keymeld_enclave_public_key,
-        );
-        keymeld_auth_pubkey = await window.deriveKeymeldAuthPubkey(
-          ephemeralPrivateKey,
           this.ticket.keymeld_session_id,
         );
+        encrypted_keymeld_private_key = keymeldData.encrypted_private_key;
+        keymeld_auth_pubkey = keymeldData.auth_pubkey;
       }
 
       const entry_body = {
@@ -365,39 +409,64 @@ let currentEntry = null;
 /**
  * Handle pick button selection (Over/Par/Under)
  * Called when user clicks a prediction button
+ * Clicking an already-selected button will deselect it (toggle behavior)
  */
 function selectPick(button) {
   const field = button.dataset.field;
   const value = button.dataset.value;
+  const wasActive = button.classList.contains("is-active");
 
   // Find all buttons in this group and deselect them
   const group = button.closest(".buttons");
   group.querySelectorAll(".pick-button").forEach((btn) => {
-    btn.classList.remove("is-info", "is-active");
+    btn.classList.remove("is-active");
     btn.classList.add("is-outlined");
   });
 
-  // Select clicked button
-  button.classList.remove("is-outlined");
-  button.classList.add("is-info", "is-active");
-
-  // Update hidden input
+  // Update hidden input and entry state
   const hiddenInput = document.getElementById(field);
-  if (hiddenInput) {
-    hiddenInput.value = value;
-  }
 
-  // Update current entry if exists
-  if (currentEntry) {
-    // Parse field name: stationId_metric (e.g., "KEWR_wind_speed")
-    const parts = field.split("_");
-    const stationId = parts[0];
-    const metric = parts.slice(1).join("_");
-
-    if (!currentEntry.entry.submit[stationId]) {
-      currentEntry.entry.submit[stationId] = {};
+  if (wasActive) {
+    // Button was already selected - deselect it (toggle off)
+    if (hiddenInput) {
+      hiddenInput.value = "";
     }
-    currentEntry.entry.submit[stationId][metric] = value;
+
+    // Remove from current entry if exists
+    if (currentEntry) {
+      const parts = field.split("_");
+      const stationId = parts[0];
+      const metric = parts.slice(1).join("_");
+
+      if (currentEntry.entry.submit[stationId]) {
+        delete currentEntry.entry.submit[stationId][metric];
+        // Clean up empty station objects
+        if (Object.keys(currentEntry.entry.submit[stationId]).length === 0) {
+          delete currentEntry.entry.submit[stationId];
+        }
+      }
+    }
+  } else {
+    // Select clicked button - color is determined by CSS based on data-value
+    button.classList.remove("is-outlined");
+    button.classList.add("is-active");
+
+    if (hiddenInput) {
+      hiddenInput.value = value;
+    }
+
+    // Update current entry if exists
+    if (currentEntry) {
+      // Parse field name: stationId_metric (e.g., "KEWR_wind_speed")
+      const parts = field.split("_");
+      const stationId = parts[0];
+      const metric = parts.slice(1).join("_");
+
+      if (!currentEntry.entry.submit[stationId]) {
+        currentEntry.entry.submit[stationId] = {};
+      }
+      currentEntry.entry.submit[stationId][metric] = value;
+    }
   }
 }
 
@@ -418,6 +487,41 @@ async function submitEntry() {
   errorMsg.classList.add("hidden");
   errorMsg.textContent = "";
   successMsg.classList.add("hidden");
+
+  // Check if user is logged in
+  if (typeof window.isLoggedIn === "function" && !window.isLoggedIn()) {
+    // Show login modal
+    const loginModal = document.getElementById("loginModal");
+    if (loginModal) {
+      loginModal.classList.add("is-active");
+    }
+    return;
+  }
+
+  // Double-check that required WASM objects are ready
+  if (!window.nostrClient || !window.taprootWallet) {
+    errorMsg.textContent = "Please log in to submit an entry";
+    errorMsg.classList.remove("hidden");
+    const loginModal = document.getElementById("loginModal");
+    if (loginModal) {
+      loginModal.classList.add("is-active");
+    }
+    return;
+  }
+
+  // Verify the signer is actually ready
+  if (
+    typeof window.nostrClient.isSignerReady === "function" &&
+    !window.nostrClient.isSignerReady()
+  ) {
+    errorMsg.textContent = "Session expired. Please log in again.";
+    errorMsg.classList.remove("hidden");
+    const loginModal = document.getElementById("loginModal");
+    if (loginModal) {
+      loginModal.classList.add("is-active");
+    }
+    return;
+  }
 
   // Disable button during submission
   submitBtn.disabled = true;
@@ -441,9 +545,23 @@ async function submitEntry() {
       }
     });
 
+    // Count total value choices
+    let choiceCount = 0;
+    for (const stationPicks of Object.values(picks)) {
+      choiceCount += Object.keys(stationPicks).length;
+    }
+
     // Validate we have picks
-    if (Object.keys(picks).length === 0) {
+    if (choiceCount === 0) {
       throw new Error("Please make at least one prediction");
+    }
+
+    // Validate we don't have too many picks
+    const maxValues = parseInt(form.dataset.maxValues, 10) || 1;
+    if (choiceCount > maxValues) {
+      throw new Error(
+        `Too many predictions selected. Maximum allowed: ${maxValues}, but you selected: ${choiceCount}`,
+      );
     }
 
     // Get API config from body data attributes
@@ -475,7 +593,21 @@ async function submitEntry() {
     submitBtn.classList.add("is-success");
   } catch (error) {
     console.error("Entry submission failed:", error);
-    errorMsg.textContent = error.message || "Failed to submit entry";
+
+    // Provide user-friendly error messages
+    let userMessage = error.message || "Failed to submit entry";
+    if (error.message && error.message.includes("No signer initialized")) {
+      userMessage = "Session expired. Please log in again.";
+      const loginModal = document.getElementById("loginModal");
+      if (loginModal) {
+        loginModal.classList.add("is-active");
+      }
+    } else if (error.message && error.message.includes("NetworkError")) {
+      userMessage =
+        "Network error. Please check your connection and try again.";
+    }
+
+    errorMsg.textContent = userMessage;
     errorMsg.classList.remove("hidden");
     submitBtn.disabled = false;
     submitBtn.classList.remove("is-loading");

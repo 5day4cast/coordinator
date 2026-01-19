@@ -1,4 +1,4 @@
-use super::{DlcEntryData, WalletError};
+use super::{DlcEntryData, KeymeldRegistrationData, WalletError};
 use crate::NostrClientCore;
 use bdk_wallet::{
     bitcoin::{
@@ -294,6 +294,42 @@ impl TaprootWalletCore {
         let child_key = hex::encode(secret_bytes);
         self.encrypt_key(&SecretString::from(child_key), nostr_pubkey)
             .await
+    }
+
+    /// Prepare keymeld registration data for an entry.
+    /// Returns the encrypted private key (for enclave) and the derived auth pubkey.
+    /// This keeps the raw private key inside WASM and never exposes it to JavaScript.
+    pub fn prepare_keymeld_registration(
+        &self,
+        entry_index: u32,
+        enclave_pubkey_hex: &str,
+        session_id: &str,
+    ) -> Result<KeymeldRegistrationData, WalletError> {
+        use keymeld_sdk::prelude::UserCredentials;
+
+        let child_xpriv = self.derive_dlc_key(entry_index)?;
+        let secret_bytes = child_xpriv.private_key.secret_bytes();
+
+        let credentials = UserCredentials::from_private_key(&secret_bytes).map_err(|e| {
+            WalletError::KeyDerivation(format!("Failed to create credentials: {}", e))
+        })?;
+
+        let encrypted_private_key = credentials
+            .encrypt_private_key_for_enclave(enclave_pubkey_hex)
+            .map_err(|e| {
+                WalletError::KeyDerivation(format!("Failed to encrypt for enclave: {}", e))
+            })?;
+
+        let auth_pubkey = credentials
+            .derive_session_auth_pubkey(session_id)
+            .map_err(|e| {
+                WalletError::KeyDerivation(format!("Failed to derive auth pubkey: {}", e))
+            })?;
+
+        Ok(KeymeldRegistrationData {
+            encrypted_private_key,
+            auth_pubkey: hex::encode(auth_pubkey),
+        })
     }
 
     pub async fn get_encrypted_dlc_payout_preimage(

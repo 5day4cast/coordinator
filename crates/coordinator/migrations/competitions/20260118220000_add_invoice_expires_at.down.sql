@@ -1,0 +1,2 @@
+-- Remove invoice_expires_at column (SQLite doesn't support DROP COLUMN easily, this is a no-op)
+-- In practice, for SQLite you would recreate the table without the column

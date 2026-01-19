@@ -286,15 +286,9 @@ impl From<Competition> for CompetitionStatus {
             super::CompetitionState::ContractCreated => {
                 CompetitionStatus::ContractCreated(ContractCreated::from_competition(competition))
             }
-            super::CompetitionState::NoncesCollected
-            | super::CompetitionState::AggregateNoncesGenerated
-            | super::CompetitionState::PartialSignaturesCollected => {
-                // All MuSig-related states map to AwaitingSignatures
-                // (Keymeld handles this internally)
-                CompetitionStatus::AwaitingSignatures(AwaitingSignatures::from_competition(
-                    competition,
-                ))
-            }
+            super::CompetitionState::AwaitingSignatures => CompetitionStatus::AwaitingSignatures(
+                AwaitingSignatures::from_competition(competition),
+            ),
             super::CompetitionState::SigningComplete => {
                 CompetitionStatus::SigningComplete(SigningComplete::from_competition(competition))
             }

@@ -295,6 +295,7 @@ pub struct Ticket {
     pub encrypted_preimage: String,
     pub hash: String,
     pub payment_request: Option<String>,
+    pub invoice_expires_at: Option<OffsetDateTime>,
     pub expiry: OffsetDateTime,
     /// Pubkey created for this entry for the user
     pub ephemeral_pubkey: Option<String>,
@@ -331,6 +332,7 @@ impl FromRow<'_, SqliteRow> for Ticket {
             encrypted_preimage: row.get("encrypted_preimage"),
             hash: row.get("hash"),
             payment_request: row.get("payment_request"),
+            invoice_expires_at: parse_optional_sqlite_datetime(row, "invoice_expires_at")?,
             expiry: row
                 .get::<Option<String>, _>("expiry")
                 .and_then(|s| {
@@ -502,6 +504,9 @@ pub struct Competition {
     /// Funding transaction is considered settled after 1 confirmation by default
     #[serde(with = "time::serde::rfc3339::option")]
     pub funding_confirmed_at: Option<OffsetDateTime>,
+    /// When hold invoices were settled (funds released to coordinator)
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub invoices_settled_at: Option<OffsetDateTime>,
     /// Funding transaction is considered settled after all hold invoices have been closed
     #[serde(with = "time::serde::rfc3339::option")]
     pub funding_settled_at: Option<OffsetDateTime>,
@@ -519,6 +524,9 @@ pub struct Competition {
     pub completed_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub failed_at: Option<OffsetDateTime>,
+    /// When keymeld keygen completed (aggregate key generated)
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub keymeld_keygen_completed_at: Option<OffsetDateTime>,
     pub errors: Vec<CompetitionError>,
 }
 
@@ -581,6 +589,8 @@ pub struct ExtendCompetition {
     pub completed_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub failed_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub keymeld_keygen_completed_at: Option<OffsetDateTime>,
     pub errors: Vec<CompetitionError>,
     pub state: String,
 }
@@ -622,6 +632,7 @@ impl From<Competition> for ExtendCompetition {
             delta_broadcasted_at: competition.delta_broadcasted_at,
             completed_at: competition.completed_at,
             failed_at: competition.failed_at,
+            keymeld_keygen_completed_at: competition.keymeld_keygen_completed_at,
             errors: competition.errors,
             state,
         }
@@ -816,6 +827,7 @@ impl Competition {
             encrypted_preimage: ticket_preimage.to_lower_hex_string(), // TODO: encrypt this
             hash: ticket_hash.to_lower_hex_string(),
             payment_request: None,
+            invoice_expires_at: None,
             expiry: expiry_time,
             reserved_by: None,
             reserved_at: None,
@@ -875,9 +887,8 @@ pub enum CompetitionState {
     EventCreated,
     EntriesSubmitted,
     ContractCreated,
-    NoncesCollected,
-    AggregateNoncesGenerated,
-    PartialSignaturesCollected,
+    /// Keymeld keygen completed, awaiting signing
+    AwaitingSignatures,
     SigningComplete,
     FundingBroadcasted,
     /// Once funding transaction has been confirmed at least once (default)
@@ -907,11 +918,7 @@ impl fmt::Display for CompetitionState {
             CompetitionState::EscrowFundsConfirmed => write!(f, "escrow_funds_confirmed"),
             CompetitionState::EntriesCollected => write!(f, "entries_collected"),
             CompetitionState::ContractCreated => write!(f, "contract_created"),
-            CompetitionState::NoncesCollected => write!(f, "nonces_collected"),
-            CompetitionState::AggregateNoncesGenerated => write!(f, "aggregate_nonces_generated"),
-            CompetitionState::PartialSignaturesCollected => {
-                write!(f, "partial_signatures_collected")
-            }
+            CompetitionState::AwaitingSignatures => write!(f, "awaiting_signatures"),
             CompetitionState::SigningComplete => write!(f, "signing_complete"),
             CompetitionState::FundingBroadcasted => write!(f, "funding_broadcasted"),
             CompetitionState::FundingConfirmed => write!(f, "funding_confirmed"),
@@ -957,12 +964,14 @@ impl Competition {
             escrow_funds_confirmed_at: None,
             funding_broadcasted_at: None,
             funding_confirmed_at: None,
+            invoices_settled_at: None,
             funding_settled_at: None,
             expiry_broadcasted_at: None,
             outcome_broadcasted_at: None,
             delta_broadcasted_at: None,
             completed_at: None,
             failed_at: None,
+            keymeld_keygen_completed_at: None,
             errors: vec![],
         }
     }
@@ -1074,19 +1083,11 @@ impl Competition {
 
         // Add timeouts for different stages
         match self.get_state() {
-            CompetitionState::ContractCreated => {
-                // Give users 1 hour to submit nonces after contract creation
+            CompetitionState::ContractCreated | CompetitionState::AwaitingSignatures => {
+                // Give 2 hours for keymeld keygen and signing after contract creation
                 self.contracted_at
-                    .map(|t| now - t > Duration::hours(1))
+                    .map(|t| now - t > Duration::hours(2))
                     .unwrap_or(false)
-            }
-            CompetitionState::AggregateNoncesGenerated => {
-                // Give users 1 hour to submit partial signatures
-                self.aggregated_nonces.is_some()
-                    && self
-                        .contracted_at
-                        .map(|t| now - t > Duration::hours(2))
-                        .unwrap_or(false)
             }
             _ => false,
         }
@@ -1126,22 +1127,9 @@ impl Competition {
         if self.is_signed() {
             return CompetitionState::SigningComplete;
         }
-        if self.has_all_entry_partial_signatures() {
-            debug!(
-                "All signatures collected: {}/{}",
-                self.total_signed_entries, self.total_entries
-            );
-            return CompetitionState::PartialSignaturesCollected;
-        }
-        if self.aggregated_nonces.is_some() {
-            return CompetitionState::AggregateNoncesGenerated;
-        }
-        if self.has_all_entry_nonces() {
-            debug!(
-                "All nonces collected: {}/{}",
-                self.total_entry_nonces, self.total_entries
-            );
-            return CompetitionState::NoncesCollected;
+        // Keymeld flow: keygen completed means we're awaiting signatures
+        if self.keymeld_keygen_completed_at.is_some() {
+            return CompetitionState::AwaitingSignatures;
         }
         if self.contract_parameters.is_some() {
             return CompetitionState::ContractCreated;
@@ -1197,12 +1185,17 @@ impl FromRow<'_, SqliteRow> for Competition {
             entries_submitted_at: parse_optional_datetime(row, "entries_submitted_at")?,
             funding_broadcasted_at: parse_optional_datetime(row, "funding_broadcasted_at")?,
             funding_confirmed_at: parse_optional_datetime(row, "funding_confirmed_at")?,
+            invoices_settled_at: parse_optional_datetime(row, "invoices_settled_at")?,
             funding_settled_at: parse_optional_datetime(row, "funding_settled_at")?,
             expiry_broadcasted_at: parse_optional_datetime(row, "expiry_broadcasted_at")?,
             outcome_broadcasted_at: parse_optional_datetime(row, "outcome_broadcasted_at")?,
             delta_broadcasted_at: parse_optional_datetime(row, "delta_broadcasted_at")?,
             completed_at: parse_optional_datetime(row, "completed_at")?,
             failed_at: parse_optional_datetime(row, "failed_at")?,
+            keymeld_keygen_completed_at: parse_optional_datetime(
+                row,
+                "keymeld_keygen_completed_at",
+            )?,
             errors: parse_optional_blob_json(row, "errors")?.unwrap_or_default(),
         })
     }

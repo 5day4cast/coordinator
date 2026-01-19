@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
 };
 use maud::html;
@@ -14,7 +14,7 @@ use crate::{
     startup::AppState,
     templates::{
         fragments::{
-            entry_form::{entry_form, ForecastValue, StationForecast},
+            entry_form::{entry_form, ForecastValue, StationForecast, WeatherContext},
             leaderboard::{leaderboard, leaderboard_row, EntryScore},
         },
         layouts::base::{base, PageConfig},
@@ -149,17 +149,22 @@ pub async fn payouts_fragment(
 }
 
 /// Entry form for a competition
+/// Returns full page if accessed directly, or fragment if via HTMX
 pub async fn entry_form_fragment(
     State(state): State<Arc<AppState>>,
     Path(competition_id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> Html<String> {
+    // Check if this is an HTMX request
+    let is_htmx = headers.get("HX-Request").is_some();
+
     // Get competition details
     let competitions = fetch_competitions(&state).await;
     let competition = competitions
         .iter()
         .find(|c| c.id == competition_id.to_string());
 
-    let markup = match competition {
+    let content = match competition {
         Some(comp) => {
             // Fetch forecasts from oracle
             let forecasts = fetch_forecasts(&state, comp).await;
@@ -173,7 +178,19 @@ pub async fn entry_form_fragment(
             }
         }
     };
-    Html(markup.into_string())
+
+    // If direct navigation (not HTMX), wrap in base layout
+    if is_htmx {
+        Html(content.into_string())
+    } else {
+        let config = PageConfig {
+            title: "Submit Entry - Fantasy Weather",
+            api_base: &state.remote_url,
+            oracle_base: &state.oracle_url,
+            network: &state.bitcoin.get_network().to_string(),
+        };
+        Html(base(&config, content).into_string())
+    }
 }
 
 /// Leaderboard for a competition
@@ -253,6 +270,7 @@ async fn fetch_competitions(state: &AppState) -> Vec<CompetitionView> {
                     total_entries: c.total_entries,
                     num_winners: c.event_submission.number_of_places_win as u64,
                     can_enter,
+                    number_of_values_per_entry: c.event_submission.number_of_values_per_entry,
                 }
             })
             .collect(),
@@ -364,27 +382,178 @@ async fn fetch_forecasts(state: &AppState, competition: &CompetitionView) -> Vec
         Err(_) => return vec![],
     };
 
-    // TODO: Fetch actual forecasts from oracle
-    // For now, return stub data for each location
+    if locations.is_empty() {
+        return vec![];
+    }
+
+    // Fetch forecasts and observations from oracle
+    let station_ids: Vec<&str> = locations.iter().map(|s| s.as_str()).collect();
+    let (forecasts, observations) = tokio::join!(
+        fetch_oracle_forecasts(&state.oracle_url, &station_ids),
+        fetch_oracle_observations(&state.oracle_url, &station_ids)
+    );
+
+    let forecasts = forecasts.unwrap_or_default();
+    let observations = observations.unwrap_or_default();
+
+    // Build weather context maps
+    use std::collections::HashMap;
+    let today = time::OffsetDateTime::now_utc();
+    let today_str = today.date().to_string();
+
+    // Index forecasts by station_id for today
+    let mut forecast_map: HashMap<&str, &OracleForecast> = HashMap::new();
+    for forecast in &forecasts {
+        let date_part = forecast.date.split('T').next().unwrap_or(&forecast.date);
+        if date_part == today_str {
+            forecast_map.insert(forecast.station_id.as_str(), forecast);
+        }
+    }
+
+    // Index observations by station_id
+    let mut observation_map: HashMap<&str, &OracleObservation> = HashMap::new();
+    for obs in &observations {
+        observation_map.insert(obs.station_id.as_str(), obs);
+    }
+
     locations
         .into_iter()
-        .map(|station_id| StationForecast {
-            station_id: station_id.clone(),
-            station_name: get_station_name(&station_id),
-            wind_speed: Some(ForecastValue {
-                value: 12.5,
-                unit: "mph".to_string(),
-            }),
-            temp_high: Some(ForecastValue {
-                value: 75.0,
-                unit: "°F".to_string(),
-            }),
-            temp_low: Some(ForecastValue {
-                value: 58.0,
-                unit: "°F".to_string(),
-            }),
+        .map(|station_id| {
+            // Build weather context from oracle data
+            let weather_context = {
+                let forecast = forecast_map.get(station_id.as_str());
+                let observation = observation_map.get(station_id.as_str());
+
+                if forecast.is_some() || observation.is_some() {
+                    Some(WeatherContext {
+                        current_temp: None, // Current temp not available from observation endpoint
+                        today_forecast_high: forecast.map(|f| f.temp_high as f64),
+                        today_forecast_low: forecast.map(|f| f.temp_low as f64),
+                        today_actual_high: observation.map(|o| o.temp_high),
+                        today_actual_low: observation.map(|o| o.temp_low),
+                    })
+                } else {
+                    None
+                }
+            };
+
+            // Use forecast values for the competition picks (these are the "par" values)
+            let forecast = forecast_map.get(station_id.as_str());
+
+            StationForecast {
+                station_id: station_id.clone(),
+                station_name: get_station_name(&station_id),
+                wind_speed: Some(ForecastValue {
+                    value: 12.5, // Wind speed not in current forecast data
+                    unit: "mph".to_string(),
+                }),
+                temp_high: Some(ForecastValue {
+                    value: forecast.map(|f| f.temp_high as f64).unwrap_or(75.0),
+                    unit: "°F".to_string(),
+                }),
+                temp_low: Some(ForecastValue {
+                    value: forecast.map(|f| f.temp_low as f64).unwrap_or(58.0),
+                    unit: "°F".to_string(),
+                }),
+                weather_context,
+            }
         })
         .collect()
+}
+
+/// Oracle forecast response
+#[derive(Debug, Clone, serde::Deserialize)]
+struct OracleForecast {
+    station_id: String,
+    date: String,
+    temp_high: i64,
+    temp_low: i64,
+}
+
+/// Oracle observation response
+#[derive(Debug, Clone, serde::Deserialize)]
+struct OracleObservation {
+    station_id: String,
+    temp_high: f64,
+    temp_low: f64,
+}
+
+async fn fetch_oracle_forecasts(
+    oracle_url: &str,
+    station_ids: &[&str],
+) -> Result<Vec<OracleForecast>, anyhow::Error> {
+    if station_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let client = reqwest_middleware::reqwest::Client::new();
+
+    // Fetch forecasts for today and tomorrow
+    let today = time::OffsetDateTime::now_utc();
+    let end_date = today + time::Duration::days(2);
+
+    let start = today
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    let end = end_date
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+
+    let station_ids_param = station_ids.join(",");
+
+    let response = client
+        .get(format!(
+            "{}/stations/forecasts?station_ids={}&start={}&end={}",
+            oracle_url, station_ids_param, start, end
+        ))
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+        let forecasts: Vec<OracleForecast> = response.json().await?;
+        Ok(forecasts)
+    } else {
+        Ok(vec![])
+    }
+}
+
+async fn fetch_oracle_observations(
+    oracle_url: &str,
+    station_ids: &[&str],
+) -> Result<Vec<OracleObservation>, anyhow::Error> {
+    if station_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let client = reqwest_middleware::reqwest::Client::new();
+
+    // Fetch observations for today
+    let today = time::OffsetDateTime::now_utc();
+    let tomorrow = today + time::Duration::days(1);
+
+    let start = today
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    let end = tomorrow
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+
+    let station_ids_param = station_ids.join(",");
+
+    let response = client
+        .get(format!(
+            "{}/stations/observations?station_ids={}&start={}&end={}",
+            oracle_url, station_ids_param, start, end
+        ))
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+        let observations: Vec<OracleObservation> = response.json().await?;
+        Ok(observations)
+    } else {
+        Ok(vec![])
+    }
 }
 
 fn get_station_name(station_id: &str) -> String {

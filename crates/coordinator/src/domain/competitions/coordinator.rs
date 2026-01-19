@@ -9,7 +9,10 @@ use crate::{
     infra::{
         bitcoin::{Bitcoin, ForeignUtxo, REQUIRED_CONFIRMATIONS_FOR_TIME},
         escrow::{create_escrow_descriptor, generate_escrow_tx, get_escrow_outpoint},
-        keymeld::{DlcKeygenSession, Keymeld, ParticipantRegistrationData, StoredDlcKeygenSession},
+        keymeld::{
+            DlcKeygenSession, DlcSubsetInfo, Keymeld, ParticipantRegistrationData,
+            StoredDlcKeygenSession, SubsetDefinition,
+        },
         lightning::Ln,
         oracle::{AddEventEntries, AddEventEntry, Error as OracleError, Event, Oracle},
     },
@@ -142,6 +145,7 @@ pub struct Coordinator {
     required_confirmations: u32,
     name: String,
     escrow_enabled: bool,
+    invoice_settlement_confirmations: u32,
 }
 
 impl Coordinator {
@@ -157,6 +161,7 @@ impl Coordinator {
         required_confirmations: u32,
         name: String,
         escrow_enabled: bool,
+        invoice_settlement_confirmations: u32,
     ) -> Result<Self, anyhow::Error> {
         let private_key = bitcoin.get_derived_private_key().await?;
         let public_key = private_key.base_point_mul();
@@ -174,6 +179,7 @@ impl Coordinator {
             required_confirmations,
             name,
             escrow_enabled,
+            invoice_settlement_confirmations,
         };
         coordinator.validate_coordinator_metadata().await?;
         Ok(coordinator)
@@ -187,6 +193,57 @@ impl Coordinator {
     /// Check if Keymeld signing is enabled
     pub fn is_keymeld_enabled(&self) -> bool {
         self.keymeld.is_enabled()
+    }
+
+    /// Settle all hold invoices for a competition.
+    /// This releases the held funds to the coordinator.
+    pub async fn settle_competition_invoices(
+        &self,
+        competition_id: Uuid,
+    ) -> Result<(), anyhow::Error> {
+        let tickets = self.competition_store.get_tickets(competition_id).await?;
+
+        info!(
+            "Settling {} hold invoices for competition {}",
+            tickets.len(),
+            competition_id
+        );
+
+        for (_ticket_id, ticket) in tickets {
+            // Only settle tickets that have been paid (invoice accepted)
+            if ticket.paid_at.is_none() {
+                debug!("Skipping ticket {} - not paid yet", ticket.id);
+                continue;
+            }
+
+            // Skip already settled tickets
+            if ticket.settled_at.is_some() {
+                debug!("Skipping ticket {} - already settled", ticket.id);
+                continue;
+            }
+
+            match self
+                .ln
+                .settle_hold_invoice(ticket.encrypted_preimage.clone())
+                .await
+            {
+                Ok(_) => {
+                    info!("Settled hold invoice for ticket {}", ticket.id);
+                    // Mark ticket as settled
+                    if let Err(e) = self.competition_store.mark_ticket_settled(ticket.id).await {
+                        error!("Failed to mark ticket {} as settled: {}", ticket.id, e);
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to settle hold invoice for ticket {}: {}",
+                        ticket.id, e
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Check if all participants have registered with keymeld for a competition
@@ -216,11 +273,8 @@ impl Coordinator {
             .map_err(|e| Error::BadRequest(format!("Failed to get keymeld status: {}", e)))?;
 
         info!(
-            "Keymeld session {} status: {} ({}/{} participants)",
-            status.session_id,
-            status.status,
-            status.registered_participants,
-            status.expected_participants
+            "Keymeld session {} status: {}",
+            status.session_id, status.status
         );
 
         Ok(status.is_completed)
@@ -269,6 +323,9 @@ impl Coordinator {
 
         self.store_keymeld_session(competition.id, updated_session)
             .await?;
+
+        // Mark keygen as completed on the competition
+        competition.keymeld_keygen_completed_at = Some(time::OffsetDateTime::now_utc());
 
         Ok(())
     }
@@ -443,7 +500,13 @@ impl Coordinator {
                     state.competition.total_entries,
                     state.competition.event_submission.total_allowed_entries
                 );
-                CompetitionStatus::Created(state)
+                // Check if we have entries and should transition
+                if state.competition.total_entries > 0 {
+                    // Transition to CollectingEntries
+                    state.first_entry_added()
+                } else {
+                    CompetitionStatus::Created(state)
+                }
             }
 
             CompetitionStatus::CollectingEntries(state) => {
@@ -567,9 +630,29 @@ impl Coordinator {
                                 state.competition().id
                             );
                             match self.complete_keymeld_keygen(state.competition_mut()).await {
-                                Ok(_) => CompetitionStatus::AwaitingSignatures(
-                                    AwaitingSignatures::from_competition(state.into_competition()),
-                                ),
+                                Ok(_) => {
+                                    // Chain immediately to AwaitingSignatures processing
+                                    let awaiting_sigs = CompetitionStatus::AwaitingSignatures(
+                                        AwaitingSignatures::from_competition(
+                                            state.into_competition(),
+                                        ),
+                                    );
+                                    // Persist state before chaining to ensure we don't lose progress
+                                    if let Err(e) = self
+                                        .competition_store
+                                        .update_competitions(vec![awaiting_sigs
+                                            .clone()
+                                            .into_competition()])
+                                        .await
+                                    {
+                                        error!(
+                                            "Failed to save competition {} before chaining to AwaitingSignatures: {}",
+                                            competition_id, e
+                                        );
+                                    }
+                                    // Use Box::pin to allow recursive async call
+                                    return Box::pin(self.process_status(awaiting_sigs)).await;
+                                }
                                 Err(e) => {
                                     error!(
                                         "Competition {} keymeld keygen completion failed: {}",
@@ -693,6 +776,45 @@ impl Coordinator {
             }
 
             CompetitionStatus::FundingBroadcasted(mut state) => {
+                // Settle hold invoices based on configured confirmation requirement
+                // If invoice_settlement_confirmations is 0, settle immediately at broadcast
+                // Otherwise, wait for the required confirmations before settling
+                let should_settle = if self.invoice_settlement_confirmations == 0 {
+                    // Settle immediately at broadcast time
+                    state.competition().invoices_settled_at.is_none()
+                } else {
+                    // Check if we have enough confirmations to settle
+                    if let Some(funding_tx) = &state.competition().funding_transaction {
+                        let txid = funding_tx.compute_txid();
+                        match self.bitcoin.get_tx_confirmation_height(&txid).await {
+                            Ok(Some(confirmations)) => {
+                                confirmations >= self.invoice_settlement_confirmations
+                                    && state.competition().invoices_settled_at.is_none()
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    }
+                };
+
+                if should_settle {
+                    info!(
+                        "Settling hold invoices for competition {} (required confirmations: {})",
+                        competition_id, self.invoice_settlement_confirmations
+                    );
+                    if let Err(e) = self.settle_competition_invoices(competition_id).await {
+                        error!(
+                            "Competition {} failed to settle invoices: {}",
+                            competition_id, e
+                        );
+                    } else {
+                        state.competition_mut().invoices_settled_at =
+                            Some(OffsetDateTime::now_utc());
+                    }
+                }
+
+                // Continue checking for funding confirmation
                 match self
                     .check_funding_confirmation(state.competition_mut())
                     .await
@@ -1019,6 +1141,9 @@ impl Coordinator {
             .competition_store
             .get_competition_entries(competition.id, vec![EntryStatus::Paid])
             .await?;
+        // Sort entries by ticket_id to ensure player indices match the ticket order
+        // used when creating keymeld subset definitions at competition creation time
+        entries.sort_by_key(|entry| entry.ticket_id);
         debug!("Competition entries {:?}", entries);
         let tickets = self.competition_store.get_tickets(competition.id).await?;
 
@@ -1074,96 +1199,110 @@ impl Coordinator {
             .map(|user_entry| (user_entry.id, user_entry))
             .collect::<HashMap<_, _>>();
 
-        let escrow_inputs: Vec<ForeignUtxo> = tickets
-            .values()
-            .map(|ticket| {
-                let hex_data = ticket
-                    .escrow_transaction
-                    .clone()
-                    .ok_or_else(|| anyhow!("Missing escrow transaction"))?;
+        // When escrow is disabled, the coordinator funds the contract directly from its wallet
+        // When escrow is enabled, we use the escrow transactions from each ticket
+        let escrow_inputs: Vec<ForeignUtxo> = if self.escrow_enabled {
+            tickets
+                .values()
+                .map(|ticket| {
+                    let hex_data = ticket
+                        .escrow_transaction
+                        .clone()
+                        .ok_or_else(|| anyhow!("Missing escrow transaction"))?;
 
-                let bytes = hex::decode(&hex_data)
-                    .map_err(|e| anyhow!("Failed to decode escrow transaction: {}", e))?;
+                    let bytes = hex::decode(&hex_data)
+                        .map_err(|e| anyhow!("Failed to decode escrow transaction: {}", e))?;
 
-                let transaction: Transaction = deserialize(&bytes)
-                    .map_err(|e| anyhow!("Failed to deserialize escrow transaction: {}", e))?;
-                debug!("Escrow transaction: {:?}", transaction);
-                let outpoint = get_escrow_outpoint(
-                    &transaction,
-                    Amount::from_sat(competition.event_submission.entry_fee as u64),
-                )?;
+                    let transaction: Transaction = deserialize(&bytes)
+                        .map_err(|e| anyhow!("Failed to deserialize escrow transaction: {}", e))?;
+                    debug!("Escrow transaction: {:?}", transaction);
+                    let outpoint = get_escrow_outpoint(
+                        &transaction,
+                        Amount::from_sat(competition.event_submission.entry_fee as u64),
+                    )?;
 
-                let escrow_output = transaction
-                    .output
-                    .get(outpoint.vout as usize)
-                    .ok_or_else(|| anyhow!("Escrow output not found at index {}", outpoint.vout))?
-                    .clone();
+                    let escrow_output = transaction
+                        .output
+                        .get(outpoint.vout as usize)
+                        .ok_or_else(|| {
+                            anyhow!("Escrow output not found at index {}", outpoint.vout)
+                        })?
+                        .clone();
 
-                let user_pubkey = &entries_lookup
-                    .get(&ticket.entry_id.unwrap())
-                    .ok_or_else(|| anyhow!("Missing entry for ticket {}", ticket.id))?
-                    .ephemeral_pubkey;
+                    let user_pubkey = &entries_lookup
+                        .get(&ticket.entry_id.unwrap())
+                        .ok_or_else(|| anyhow!("Missing entry for ticket {}", ticket.id))?
+                        .ephemeral_pubkey;
 
-                let btc_pubkey = ticket
-                    .ephemeral_pubkey
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("Missing btc_pubkey for ticket {}", ticket.id))?;
+                    let btc_pubkey = ticket
+                        .ephemeral_pubkey
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("Missing btc_pubkey for ticket {}", ticket.id))?;
 
-                if btc_pubkey != user_pubkey {
-                    return Err(anyhow!(
-                        "Entry public key {} must match ticket escrow public key {}",
-                        user_pubkey,
-                        btc_pubkey
-                    ));
-                }
+                    if btc_pubkey != user_pubkey {
+                        return Err(anyhow!(
+                            "Entry public key {} must match ticket escrow public key {}",
+                            user_pubkey,
+                            btc_pubkey
+                        ));
+                    }
 
-                let user_pubkey = BdkPublicKey::from_str(user_pubkey)
-                    .map_err(|e| anyhow!("Failed to parse user public key: {}", e))?;
-                let payment_hash_from_ticket = string_to_byte_array(&ticket.hash);
-                let preimage = hex::decode(&ticket.encrypted_preimage)
-                    .map_err(|e| anyhow!("Failed to decode preimage: {}", e))?;
-                let payment_hash_from_preimage = sha256::Hash::hash(&preimage).to_byte_array();
+                    let user_pubkey = BdkPublicKey::from_str(user_pubkey)
+                        .map_err(|e| anyhow!("Failed to parse user public key: {}", e))?;
+                    let payment_hash_from_ticket = string_to_byte_array(&ticket.hash);
+                    let preimage = hex::decode(&ticket.encrypted_preimage)
+                        .map_err(|e| anyhow!("Failed to decode preimage: {}", e))?;
+                    let payment_hash_from_preimage = sha256::Hash::hash(&preimage).to_byte_array();
 
-                debug!(
-                    "Payment hash from ticket.hash: {}",
-                    hex::encode(payment_hash_from_ticket)
-                );
-                debug!(
-                    "Payment hash from preimage: {}",
-                    hex::encode(payment_hash_from_preimage)
-                );
+                    debug!(
+                        "Payment hash from ticket.hash: {}",
+                        hex::encode(payment_hash_from_ticket)
+                    );
+                    debug!(
+                        "Payment hash from preimage: {}",
+                        hex::encode(payment_hash_from_preimage)
+                    );
 
-                if payment_hash_from_ticket != payment_hash_from_preimage {
-                    return Err(anyhow!("Payment hash mismatch for ticket {}", ticket.id));
-                }
+                    if payment_hash_from_ticket != payment_hash_from_preimage {
+                        return Err(anyhow!("Payment hash mismatch for ticket {}", ticket.id));
+                    }
 
-                // Use the hash that was used when creating the escrow
-                let payment_hash = payment_hash_from_preimage;
+                    // Use the hash that was used when creating the escrow
+                    let payment_hash = payment_hash_from_preimage;
 
-                let escrow_descriptor =
-                    create_escrow_descriptor(&coordinator_pubkey, &user_pubkey, &payment_hash)?;
+                    let escrow_descriptor =
+                        create_escrow_descriptor(&coordinator_pubkey, &user_pubkey, &payment_hash)?;
 
-                let witness_script = escrow_descriptor.explicit_script().map_err(|e| {
-                    anyhow!("Failed to extract witness script from descriptor: {}", e)
-                })?;
+                    let witness_script = escrow_descriptor.explicit_script().map_err(|e| {
+                        anyhow!("Failed to extract witness script from descriptor: {}", e)
+                    })?;
 
-                Ok(ForeignUtxo {
-                    outpoint,
-                    psbt: Input {
-                        witness_utxo: Some(escrow_output.clone()),
-                        non_witness_utxo: Some(transaction),
-                        witness_script: Some(witness_script),
-                        ..Default::default()
-                    },
-                    satisfaction_weight: escrow_descriptor
-                        .max_weight_to_satisfy()
-                        .map_err(|e| anyhow!("Failed to get satisfactory weight: {}", e))?,
+                    Ok(ForeignUtxo {
+                        outpoint,
+                        psbt: Input {
+                            witness_utxo: Some(escrow_output.clone()),
+                            non_witness_utxo: Some(transaction),
+                            witness_script: Some(witness_script),
+                            ..Default::default()
+                        },
+                        satisfaction_weight: escrow_descriptor
+                            .max_weight_to_satisfy()
+                            .map_err(|e| anyhow!("Failed to get satisfactory weight: {}", e))?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, anyhow::Error>>()?;
+                .collect::<Result<Vec<_>, anyhow::Error>>()?
+        } else {
+            // Escrow disabled - coordinator wallet funds the contract directly
+            debug!("Escrow disabled - using coordinator wallet UTXOs for funding");
+            vec![]
+        };
 
         debug!("Contract amount: {}", contract_amount_sats);
-        debug!("Escrow inputs: {:?}", escrow_inputs);
+        debug!(
+            "Escrow inputs: {} (escrow_enabled={})",
+            escrow_inputs.len(),
+            self.escrow_enabled
+        );
 
         let psbt = self
             .bitcoin
@@ -1435,10 +1574,12 @@ impl Coordinator {
             let signing_data = ticketed_dlc.signing_data()?;
 
             // Get entries to build player_user_ids for subset definitions
-            let entries = self
+            // Sort by ticket_id to match the order used in keymeld subset definitions
+            let mut entries = self
                 .competition_store
                 .get_competition_entries(competition.id, vec![EntryStatus::Paid])
                 .await?;
+            entries.sort_by_key(|entry| entry.ticket_id);
             let player_user_ids: Vec<UserId> = entries
                 .iter()
                 .map(|entry| UserId::from(entry.ticket_id))
@@ -1586,37 +1727,45 @@ impl Coordinator {
 
         let mut funding_psbt = Psbt::from_str(&funding_psbt_base64)?;
 
-        let final_signatures_by_sender: BTreeMap<Point, FinalSignatures> =
-            self.get_final_sigs_by_sender(competition.id).await?;
+        // When escrow is enabled, users sign their own funding PSBTs which need to be merged.
+        // When escrow is disabled (hold invoice flow), the coordinator funds the DLC directly.
+        if self.is_escrow_enabled() {
+            let final_signatures_by_sender: BTreeMap<Point, FinalSignatures> =
+                self.get_final_sigs_by_sender(competition.id).await?;
 
-        if (final_signatures_by_sender.len() as u64) < competition.total_entries {
-            return Err(anyhow!(
-                "Not enough final signatures for competition {}",
-                competition.id
-            ));
-        }
+            if (final_signatures_by_sender.len() as u64) < competition.total_entries {
+                return Err(anyhow!(
+                    "Not enough final signatures for competition {}",
+                    competition.id
+                ));
+            }
 
-        debug!("Merging all funding psbts");
+            debug!("Merging all funding psbts");
 
-        for (sender_pubkey, final_signature) in &final_signatures_by_sender {
-            let sender_funding_psbt = Psbt::from_str(&final_signature.funding_psbt_base64)?;
-            match funding_psbt.combine(sender_funding_psbt) {
-                Ok(_) => {
-                    debug!(
-                        "✓ Funding PSBT combination succeeded for player {}",
-                        sender_pubkey
-                    );
-                }
-                Err(err) => {
-                    error!(
-                        "✗ Funding PSBT combination failed for player {}: {}",
-                        sender_pubkey, err
-                    );
+            for (sender_pubkey, final_signature) in &final_signatures_by_sender {
+                let sender_funding_psbt = Psbt::from_str(&final_signature.funding_psbt_base64)?;
+                match funding_psbt.combine(sender_funding_psbt) {
+                    Ok(_) => {
+                        debug!(
+                            "✓ Funding PSBT combination succeeded for player {}",
+                            sender_pubkey
+                        );
+                    }
+                    Err(err) => {
+                        error!(
+                            "✗ Funding PSBT combination failed for player {}: {}",
+                            sender_pubkey, err
+                        );
+                    }
                 }
             }
-        }
 
-        debug!("Combined all psbts");
+            debug!("Combined all psbts");
+        } else {
+            debug!(
+                "Escrow disabled: coordinator signs funding PSBT directly (no user PSBTs to merge)"
+            );
+        }
 
         let funding_transaction = signed_funding_tx(self.bitcoin.clone(), funding_psbt).await?;
 
@@ -2336,29 +2485,53 @@ impl Coordinator {
             .await?;
         debug!("tickets: {:?}", tickets);
 
+        // First insert the competition into the database
+        let competition = self
+            .competition_store
+            .add_competition_with_tickets(competition, tickets.clone())
+            .map_err(|e| {
+                error!(
+                    "competition added to oracle, but failed to be saved with tickets: competition_id {} {:?}",
+                    create_event.id, e
+                );
+                Error::DbError(e)
+            })
+            .await?;
+
         // If keymeld is enabled, create the keygen session now with all ticket_ids
         // This allows users to derive their auth_pubkey before submitting their entry
+        // NOTE: This must happen AFTER add_competition_with_tickets since store_keymeld_session
+        // does an UPDATE on the competitions table
         if self.is_keymeld_enabled() {
             let player_user_ids: Vec<UserId> = tickets
                 .iter()
                 .map(|ticket| UserId::from(ticket.id))
                 .collect();
 
+            // Pre-compute subset definitions for all possible outcomes
+            // This is required because keymeld needs to know all subsets at keygen time
+            let subset_info = compute_dlc_subset_definitions(
+                self.keymeld.coordinator_user_id(),
+                &player_user_ids,
+                competition.event_submission.number_of_places_win,
+            );
+
             info!(
-                "Creating keymeld keygen session for competition {} with {} potential participants",
+                "Creating keymeld keygen session for competition {} with {} potential participants and {} subset definitions",
                 competition.id,
-                player_user_ids.len()
+                player_user_ids.len(),
+                subset_info.definitions.len()
             );
 
             match self
                 .keymeld
-                .init_keygen_session(competition.id, player_user_ids)
+                .init_keygen_session(competition.id, player_user_ids, subset_info)
                 .await
             {
                 Ok(keygen_session) => {
                     info!(
-                        "Keymeld keygen session {} created for competition {}",
-                        keygen_session.session_id, competition.id
+                        "Keymeld keygen session {} created for competition {} with {} outcome subsets",
+                        keygen_session.session_id, competition.id, keygen_session.outcome_subset_ids.len()
                     );
 
                     // Store the session - users will get session_id when requesting a ticket
@@ -2382,18 +2555,6 @@ impl Coordinator {
                 }
             }
         }
-
-        let competition = self
-            .competition_store
-            .add_competition_with_tickets(competition, tickets)
-            .map_err(|e| {
-                error!(
-                    "competition added to oracle, but failed to be saved with tickets: competition_id {} {:?}",
-                    create_event.id, e
-                );
-                Error::DbError(e)
-            })
-            .await?;
 
         Ok(competition)
     }
@@ -2516,31 +2677,99 @@ impl Coordinator {
 
         let full_fee = (competition.event_submission.entry_fee as u64) + coordinator_fee;
 
-        // Create the HODL invoice
-        // Note: escrow_tx_hex is empty string when escrow disabled
-        let invoice = self
-            .ln
-            .add_hold_invoice(
-                full_fee,
-                300, // 5 minute timeout
-                hex::encode(payment_hash),
-                ticket.competition_id,
-                escrow_tx_hex.clone().unwrap_or_default(),
-            )
-            .await
-            .map_err(|e| {
-                error!("Failed to create HODL invoice: {}", e);
-                Error::BadRequest(format!("Failed to create invoice: {}", e))
-            })?;
+        // Check if ticket already has a payment request (reuse existing invoice if not expired)
+        // Invoice needs to stay active through:
+        // 1. Registration period (until start_observation_date when entries close)
+        // 2. Keymeld signing (~5 min buffer)
+        // 3. Funding transaction broadcast (~5 min buffer)
+        let now = time::OffsetDateTime::now_utc();
+        let time_until_entries_close =
+            (competition.event_submission.start_observation_date - now).whole_seconds();
+        let buffer_seconds = 600i64; // 10 minutes buffer for signing + broadcast
+        let invoice_expiry_seconds = (time_until_entries_close + buffer_seconds).max(900); // minimum 15 min
+        let payment_request = if let Some(existing_payment_request) = &ticket.payment_request {
+            // Check if the existing invoice has expired
+            let is_expired = ticket
+                .invoice_expires_at
+                .map(|expires_at| expires_at < time::OffsetDateTime::now_utc())
+                .unwrap_or(true); // If no expiry stored, treat as expired to be safe
 
-        // Update ticket with payment request
-        self.competition_store
-            .update_ticket_payment_request(ticket.id, &invoice.payment_request)
-            .await
-            .map_err(|e| {
-                error!("Failed to update ticket with payment request: {}", e);
-                Error::DbError(e)
-            })?;
+            if is_expired {
+                debug!(
+                    "Existing invoice for ticket {} has expired, creating new one",
+                    ticket.id
+                );
+                // Cancel the old invoice before creating a new one
+                if let Err(e) = self.ln.cancel_hold_invoice(hex::encode(payment_hash)).await {
+                    // Log but don't fail - the invoice might already be cancelled or not exist
+                    debug!("Failed to cancel expired invoice: {}", e);
+                }
+
+                // Create new HODL invoice
+                let invoice = self
+                    .ln
+                    .add_hold_invoice(
+                        full_fee,
+                        invoice_expiry_seconds as u64,
+                        hex::encode(payment_hash),
+                        ticket.competition_id,
+                        escrow_tx_hex.clone().unwrap_or_default(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to create HODL invoice: {}", e);
+                        Error::BadRequest(format!("Failed to create invoice: {}", e))
+                    })?;
+
+                let expires_at = time::OffsetDateTime::now_utc()
+                    + time::Duration::seconds(invoice_expiry_seconds);
+
+                // Update ticket with new payment request and expiry
+                self.competition_store
+                    .update_ticket_payment_request(ticket.id, &invoice.payment_request, expires_at)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to update ticket with payment request: {}", e);
+                        Error::DbError(e)
+                    })?;
+
+                invoice.payment_request
+            } else {
+                debug!("Reusing existing payment request for ticket {}", ticket.id);
+                existing_payment_request.clone()
+            }
+        } else {
+            // Create new HODL invoice
+            // Note: escrow_tx_hex is empty string when escrow disabled
+            let invoice = self
+                .ln
+                .add_hold_invoice(
+                    full_fee,
+                    invoice_expiry_seconds as u64,
+                    hex::encode(payment_hash),
+                    ticket.competition_id,
+                    escrow_tx_hex.clone().unwrap_or_default(),
+                )
+                .await
+                .map_err(|e| {
+                    error!("Failed to create HODL invoice: {}", e);
+                    Error::BadRequest(format!("Failed to create invoice: {}", e))
+                })?;
+
+            let expires_at =
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(invoice_expiry_seconds);
+
+            // Update ticket with payment request and expiry
+            self.competition_store
+                .update_ticket_payment_request(ticket.id, &invoice.payment_request, expires_at)
+                .await
+                .map_err(|e| {
+                    error!("Failed to update ticket with payment request: {}", e);
+                    Error::DbError(e)
+                })?;
+
+            invoice.payment_request
+        };
 
         // Get keymeld session info if available (created at competition creation)
         let (keymeld_session_id, keymeld_enclave_public_key) = if self.is_keymeld_enabled() {
@@ -2578,7 +2807,7 @@ impl Coordinator {
 
         Ok(TicketResponse {
             ticket_id: ticket.id,
-            payment_request: invoice.payment_request,
+            payment_request,
             escrow_tx: escrow_tx_hex,
             payment_hash: hex::encode(payment_hash),
             amount_sats: full_fee,
@@ -3293,8 +3522,10 @@ fn generate_payouts(
 ) -> Result<BTreeMap<Outcome, PayoutWeights>, anyhow::Error> {
     debug!("Generating payouts for {} players", players.len());
 
-    // Sort entries by ID for consistent indexing
-    entries.sort_by_key(|entry| entry.id);
+    // Sort entries by ticket_id for consistent indexing
+    // This ensures player indices match the ticket order used when creating
+    // keymeld subset definitions at competition creation time
+    entries.sort_by_key(|entry| entry.ticket_id);
     let mut payouts: BTreeMap<Outcome, PayoutWeights> = BTreeMap::new();
 
     let possible_rankings = generate_ranking_permutations(
@@ -3415,6 +3646,66 @@ pub fn generate_ranking_permutations(num_players: usize, rankings: usize) -> Vec
     permutations.push((0..num_players).collect());
 
     permutations
+}
+
+/// Pre-compute DLC subset definitions for keygen session creation.
+///
+/// This generates subset definitions based on the competition parameters (number of entries
+/// and number of winners). Each outcome has a subset containing the coordinator plus all
+/// winning players for that outcome.
+///
+/// The player_user_ids must be ordered to match the player indices (0, 1, 2, ...).
+/// At competition creation time, tickets are generated in order, so ticket_ids map
+/// directly to player indices.
+///
+/// Returns DlcSubsetInfo containing:
+/// - definitions: SubsetDefinition list for keygen session creation
+/// - outcome_subset_ids: Mapping from outcome index to subset UUID for signing
+pub fn compute_dlc_subset_definitions(
+    coordinator_user_id: UserId,
+    player_user_ids: &[UserId],
+    number_of_places_win: usize,
+) -> DlcSubsetInfo {
+    let num_players = player_user_ids.len();
+    let possible_rankings = generate_ranking_permutations(num_players, number_of_places_win);
+
+    let mut definitions = Vec::new();
+    let mut outcome_subset_ids = BTreeMap::new();
+
+    for (outcome_index, winner_indices) in possible_rankings.iter().enumerate() {
+        let subset_id = Uuid::now_v7();
+        outcome_subset_ids.insert(outcome_index, subset_id);
+
+        // Subset includes: coordinator + all winners for this outcome
+        let mut participants = vec![coordinator_user_id.clone()];
+        for &winner_idx in winner_indices {
+            if winner_idx < player_user_ids.len() {
+                participants.push(player_user_ids[winner_idx].clone());
+            }
+        }
+
+        debug!(
+            "Outcome {}: subset {} with {} participants (winners: {:?})",
+            outcome_index,
+            subset_id,
+            participants.len(),
+            winner_indices
+        );
+
+        definitions.push(SubsetDefinition::with_id(subset_id, participants));
+    }
+
+    info!(
+        "Pre-computed {} subset definitions for {} players with {} winners per outcome",
+        definitions.len(),
+        num_players,
+        number_of_places_win
+    );
+
+    DlcSubsetInfo {
+        definitions,
+        outcome_subset_ids,
+    }
 }
 
 fn find_player_indices(

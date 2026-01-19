@@ -61,6 +61,18 @@ pub enum WalletError {
     InvalidInvoice(String),
     #[error("No matching outcome found for attestation")]
     NoMatchingOutcome,
+    #[error("Key derivation error: {0}")]
+    KeyDerivation(String),
+}
+
+/// Data returned from keymeld registration preparation.
+/// Contains the encrypted private key and derived auth pubkey.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeymeldRegistrationData {
+    /// The private key encrypted to the keymeld enclave's public key
+    pub encrypted_private_key: String,
+    /// The derived auth pubkey for keymeld session authentication (hex encoded)
+    pub auth_pubkey: String,
 }
 
 #[cfg(target_arch = "wasm32")]

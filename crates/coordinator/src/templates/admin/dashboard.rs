@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use super::location_selector::location_selector;
+
 /// Station data from the oracle
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Station {
@@ -10,6 +12,55 @@ pub struct Station {
     pub station_name: String,
     pub latitude: f64,
     pub longitude: f64,
+}
+
+/// Station with weather data for display
+#[derive(Debug, Clone)]
+pub struct StationWithWeather {
+    pub station: Station,
+    /// Today's actual observed high temperature
+    pub today_actual_high: Option<f64>,
+    /// Today's actual observed low temperature
+    pub today_actual_low: Option<f64>,
+    /// Today's forecasted high temperature
+    pub today_forecast_high: Option<i64>,
+    /// Today's forecasted low temperature
+    pub today_forecast_low: Option<i64>,
+    /// Tomorrow's forecasted high temperature
+    pub tomorrow_forecast_high: Option<i64>,
+    /// Tomorrow's forecasted low temperature
+    pub tomorrow_forecast_low: Option<i64>,
+}
+
+impl From<Station> for StationWithWeather {
+    fn from(station: Station) -> Self {
+        Self {
+            station,
+            today_actual_high: None,
+            today_actual_low: None,
+            today_forecast_high: None,
+            today_forecast_low: None,
+            tomorrow_forecast_high: None,
+            tomorrow_forecast_low: None,
+        }
+    }
+}
+
+/// Forecast data from the oracle
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Forecast {
+    pub station_id: String,
+    pub date: String,
+    pub temp_high: i64,
+    pub temp_low: i64,
+}
+
+/// Observation data from the oracle
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Observation {
+    pub station_id: String,
+    pub temp_high: f64,
+    pub temp_low: f64,
 }
 
 /// Default values for competition creation form
@@ -37,7 +88,7 @@ impl Default for CompetitionDefaults {
 }
 
 /// Admin dashboard page - competition creation
-pub fn admin_dashboard(stations: &[Station], defaults: &CompetitionDefaults) -> Markup {
+pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDefaults) -> Markup {
     html! {
         section class="section" {
             div class="container" {
@@ -48,7 +99,8 @@ pub fn admin_dashboard(stations: &[Station], defaults: &CompetitionDefaults) -> 
                 h6 class="subtitle" { "Create Competition" }
 
                 // Competition form using HTMX
-                form hx-post="/admin/api/competitions"
+                form id="competition-form"
+                     hx-post="/admin/api/competitions"
                      hx-target="#competition-notification"
                      hx-swap="innerHTML"
                      hx-indicator="#submit-indicator" {
@@ -62,117 +114,76 @@ pub fn admin_dashboard(stations: &[Station], defaults: &CompetitionDefaults) -> 
                     input type="hidden" name="end_observation_date"
                           value=(defaults.end_observation_date.format(&time::format_description::well_known::Rfc3339).unwrap_or_default());
 
-                    div class="columns" {
-                        div class="column is-half" {
-                            div class="field" {
-                                label class="label" { "Number of Values Per Entry" }
-                                div class="control" {
-                                    input class="input" type="number" name="number_of_values_per_entry"
-                                          value="1" min="1";
-                                }
-                            }
-
-                            div class="field" {
-                                label class="label" { "Total Allowed Entries" }
-                                div class="control" {
-                                    input class="input" type="number" name="total_allowed_entries"
-                                          value="3" min="1";
-                                }
-                            }
-
-                            div class="field" {
-                                label class="label" { "Entry Fee (sats)" }
-                                div class="control" {
-                                    input class="input" type="number" name="entry_fee"
-                                          value="5000" min="1";
-                                }
-                            }
-
-                            div class="field" {
-                                label class="label" { "Coordinator Fee (%)" }
-                                div class="control" {
-                                    input class="input" type="number" name="coordinator_fee_percentage"
-                                          value="5" min="0" max="100";
-                                }
-                            }
-
-                            div class="field" {
-                                label class="label" { "Number of Places Win" }
-                                div class="control" {
-                                    input class="input" type="number" name="number_of_places_win"
-                                          value="1" min="1";
-                                }
-                            }
-                        }
-
-                        div class="column is-half" {
-                            div class="field" {
-                                label class="label" { "Locations (select multiple)" }
-                                div class="control" {
-                                    div class="select is-multiple is-fullwidth" {
-                                        select name="locations" multiple size="10" {
-                                            @for station in stations {
-                                                option value=(station.station_id) {
-                                                    (station.station_id) " - " (station.station_name)
-                                                }
-                                            }
-                                        }
+                    // Competition parameters
+                    div class="box" {
+                        h3 class="subtitle is-5" { "Competition Parameters" }
+                        div class="columns" {
+                            div class="column" {
+                                div class="field" {
+                                    label class="label" { "Number of Values Per Entry" }
+                                    div class="control" {
+                                        input class="input" type="number" name="number_of_values_per_entry"
+                                              value="1" min="1";
                                     }
                                 }
-                                p class="help" { "Hold Ctrl/Cmd to select multiple stations" }
                             }
-                        }
-                    }
 
-                    div class="field" {
-                        div class="control" {
-                            button class="button is-primary" type="submit" {
-                                span class="icon is-small" id="submit-indicator" {
-                                    // Loading spinner shown during submission
-                                }
-                                span { "Create Competition" }
-                            }
-                        }
-                    }
-                }
-
-                // Notification area for success/error messages
-                div id="competition-notification" class="mt-4" {}
-            }
-        }
-
-        // Stations reference table
-        section class="section" {
-            div class="container" {
-                h6 class="subtitle" { "Available Stations" }
-                div class="columns is-centered is-mobile" {
-                    div class="column" {
-                        div class="table-container" {
-                            table id="stations_container" class="table is-striped is-bordered is-narrow is-fullwidth" {
-                                thead {
-                                    tr {
-                                        th { "Station ID" }
-                                        th { "Station Name" }
-                                        th { "Latitude" }
-                                        th { "Longitude" }
+                            div class="column" {
+                                div class="field" {
+                                    label class="label" { "Total Allowed Entries" }
+                                    div class="control" {
+                                        input class="input" type="number" name="total_allowed_entries"
+                                              value="3" min="1";
                                     }
                                 }
-                                tbody {
-                                    @for station in stations {
-                                        tr {
-                                            td { (station.station_id) }
-                                            td { (station.station_name) }
-                                            td { (format!("{:.4}", station.latitude)) }
-                                            td { (format!("{:.4}", station.longitude)) }
-                                        }
+                            }
+
+                            div class="column" {
+                                div class="field" {
+                                    label class="label" { "Entry Fee (sats)" }
+                                    div class="control" {
+                                        input class="input" type="number" name="entry_fee"
+                                              value="5000" min="1";
                                     }
                                 }
                             }
                         }
+
+                        div class="columns" {
+                            div class="column" {
+                                div class="field" {
+                                    label class="label" { "Coordinator Fee (%)" }
+                                    div class="control" {
+                                        input class="input" type="number" name="coordinator_fee_percentage"
+                                              value="5" min="0" max="100";
+                                    }
+                                }
+                            }
+
+                            div class="column" {
+                                div class="field" {
+                                    label class="label" { "Number of Places Win" }
+                                    div class="control" {
+                                        input class="input" type="number" name="number_of_places_win"
+                                              value="1" min="1";
+                                    }
+                                }
+                            }
+
+                            div class="column" {
+                                // Empty column for layout balance
+                            }
+                        }
                     }
+
+                    // Location selector with map, table, and Create Competition button
+                    (location_selector(stations))
                 }
             }
         }
+
+        // Include location selector JavaScript
+        script src="/ui/location_selector.js" {}
     }
 }
 
