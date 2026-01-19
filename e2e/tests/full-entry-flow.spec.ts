@@ -284,7 +284,7 @@ test.describe("Competition Status Display", () => {
         .locator("#competitionsDataTable tbody tr")
         .first()
         .locator("td")
-        .nth(4); // Status is typically 5th column (0-indexed: 4)
+        .nth(0); // Status is 1st column (0-indexed: 0)
 
       await expect(firstRowStatus).toBeVisible();
 
@@ -324,7 +324,7 @@ test.describe("Competition Status Display", () => {
 
     for (let i = 0; i < rowCount; i++) {
       const row = rows.nth(i);
-      const statusCell = row.locator("td").nth(4);
+      const statusCell = row.locator("td").nth(0);
       const statusText = await statusCell.textContent();
 
       const enterButton = row
