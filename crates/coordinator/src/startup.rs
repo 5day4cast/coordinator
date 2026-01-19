@@ -3,12 +3,13 @@ use crate::{
         add_event_entry, admin_competition_fragment, admin_create_competition_handler,
         admin_fee_estimates_fragment, admin_page_handler, admin_send_bitcoin_handler,
         admin_wallet_address_fragment, admin_wallet_balance_fragment, admin_wallet_fragment,
-        admin_wallet_outputs_fragment, competitions_fragment, competitions_rows_fragment,
-        create_competition, entries_fragment, entry_detail_fragment, entry_form_fragment,
+        admin_wallet_outputs_fragment, change_password, competitions_fragment,
+        competitions_rows_fragment, create_competition, entries_fragment, entry_detail_fragment,
+        entry_form_fragment, forgot_password_challenge, forgot_password_reset,
         get_aggregate_nonces, get_balance, get_competitions, get_contract_parameters, get_entries,
         get_estimated_fee_rates, get_next_address, get_outputs, get_ticket_status, health,
-        leaderboard_fragment, leaderboard_rows_fragment, login, payouts_fragment,
-        public_page_handler, register, request_competition_ticket, send_to_address,
+        leaderboard_fragment, leaderboard_rows_fragment, login, login_email, payouts_fragment,
+        public_page_handler, register, register_email, request_competition_ticket, send_to_address,
         submit_final_signatures, submit_public_nonces, submit_ticket_payout,
     },
     config::Settings,
@@ -56,6 +57,7 @@ use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 use std::{collections::HashMap, net::SocketAddr, str::FromStr};
 use std::{sync::Arc, time::Duration};
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::RwLock;
 use tokio::{net::TcpListener, select, task::JoinHandle};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -132,6 +134,8 @@ pub struct AppState {
     pub coordinator: Arc<Coordinator>,
     pub users_info: Arc<UserInfo>,
     pub background_threads: Arc<HashMap<String, JoinHandle<()>>>,
+    /// Temporary storage for forgot password challenges (email -> (challenge, created_at))
+    pub forgot_password_challenges: Arc<RwLock<HashMap<String, (String, std::time::Instant)>>>,
 }
 
 pub async fn build_app(
@@ -409,6 +413,7 @@ pub async fn build_app(
         users_info: Arc::new(UserInfo::new(users_store)),
         bitcoin: bitcoin_client,
         background_threads: Arc::new(threads),
+        forgot_password_challenges: Arc::new(RwLock::new(HashMap::new())),
     };
     Ok((app_state, tracker, cancel_token))
 }
@@ -462,7 +467,13 @@ pub fn app(app_state: AppState, origins: Vec<String>) -> Router {
 
     let users_endpoints = Router::new()
         .route("/login", post(login))
-        .route("/register", post(register));
+        .route("/register", post(register))
+        // Email auth routes
+        .route("/email/register", post(register_email))
+        .route("/email/login", post(login_email))
+        .route("/email/change-password", post(change_password))
+        .route("/email/forgot-password", post(forgot_password_challenge))
+        .route("/email/reset-password", post(forgot_password_reset));
 
     // HTMX admin routes (pure server-side rendering, no WASM)
     let admin_htmx_routes = Router::new()

@@ -1,10 +1,12 @@
 mod core;
+mod password_crypto;
 mod types;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm;
 
 pub use core::NostrClientCore;
+pub use password_crypto::*;
 pub use types::{CustomSigner, SignerType};
 
 use thiserror::Error;

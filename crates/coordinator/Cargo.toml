@@ -65,6 +65,7 @@ thiserror.workspace = true
 blake2.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
+argon2 = "0.5"
 
 # Time
 time.workspace = true

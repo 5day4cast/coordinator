@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, Page } from "@playwright/test";
 
 /**
  * E2E tests for the coordinator frontend UI.
@@ -15,6 +15,54 @@ import { test, expect } from "@playwright/test";
  * Payment and keymeld integration tests should be done in a
  * larger harness that includes LND, Bitcoin, and Keymeld services.
  */
+
+// Helper to generate unique email for each test
+function uniqueEmail(): string {
+  return `test-${Date.now()}-${Math.random().toString(36).slice(2)}@example.com`;
+}
+
+// Helper to register with email
+async function registerWithEmail(
+  page: Page,
+  email: string,
+  password: string,
+): Promise<void> {
+  // Wait for WASM to initialize
+  await page.waitForFunction(() => window.wasmInitialized === true, {
+    timeout: 15000,
+  });
+
+  // Open register modal
+  await page.locator("#registerNavClick").click();
+  await expect(page.locator("#registerModal")).toHaveClass(/is-active/);
+
+  // Click email tab (should be default)
+  await page.locator(".tabs li[data-target='registerEmail']").click();
+
+  // Fill email registration form
+  await page.locator("#registerEmailInput").fill(email);
+  await page.locator("#registerPassword").fill(password);
+  await page.locator("#registerPasswordConfirm").fill(password);
+
+  // Click step 1 button to generate keys
+  await page.locator("#emailRegisterStep1Button").click();
+
+  // Wait for nsec to be displayed (WASM generates it)
+  await expect(page.locator("#emailNsecDisplay")).toHaveValue(/^nsec1/, {
+    timeout: 15000,
+  });
+
+  // Check the "I saved my key" checkbox
+  await page.locator("#emailNsecSavedCheckbox").check();
+
+  // Complete registration
+  await page.locator("#emailRegisterStep2Button").click();
+
+  // Should be logged in - logout container visible
+  await expect(page.locator("#logoutContainer")).toBeVisible({
+    timeout: 10000,
+  });
+}
 
 test.describe("Basic UI", () => {
   test("homepage loads and shows competitions table", async ({ page }) => {
@@ -51,16 +99,16 @@ test.describe("Basic UI", () => {
     // Modal should be visible
     await expect(page.locator("#loginModal")).toHaveClass(/is-active/);
 
-    // Should have private key and extension tabs
+    // Should have email and extension tabs
     await expect(
-      page.locator("#loginModal .tabs li[data-target='privateKeyLogin']"),
+      page.locator("#loginModal .tabs li[data-target='emailLogin']"),
     ).toBeVisible();
     await expect(
       page.locator("#loginModal .tabs li[data-target='extensionLogin']"),
     ).toBeVisible();
   });
 
-  test("register modal opens and shows private key", async ({ page }) => {
+  test("register modal opens and has email form", async ({ page }) => {
     await page.goto("/");
 
     // Click register button
@@ -69,68 +117,54 @@ test.describe("Basic UI", () => {
     // Modal should be visible
     await expect(page.locator("#registerModal")).toHaveClass(/is-active/);
 
-    // Private key display should eventually have a value (WASM generates it)
-    await expect(page.locator("#privateKeyDisplay")).toBeVisible();
+    // Should have email and extension tabs
+    await expect(
+      page.locator("#registerModal .tabs li[data-target='registerEmail']"),
+    ).toBeVisible();
+    await expect(
+      page.locator("#registerModal .tabs li[data-target='registerExtension']"),
+    ).toBeVisible();
 
-    // Wait for WASM to initialize and generate key
-    await expect(page.locator("#privateKeyDisplay")).toHaveValue(/^nsec1/, {
-      timeout: 10000,
-    });
+    // Email form should be visible by default
+    await expect(page.locator("#registerEmail")).toBeVisible();
+    await expect(page.locator("#registerEmailInput")).toBeVisible();
+    await expect(page.locator("#registerPassword")).toBeVisible();
+    await expect(page.locator("#registerPasswordConfirm")).toBeVisible();
   });
 });
 
 test.describe("Authentication", () => {
-  test("can register a new account", async ({ page }) => {
+  test("can register a new account with email", async ({ page }) => {
     await page.goto("/");
 
-    // Click register
-    await page.locator("#registerNavClick").click();
-    await expect(page.locator("#registerModal")).toHaveClass(/is-active/);
+    const email = uniqueEmail();
+    const password = "testPassword123!";
 
-    // Wait for private key to be generated
-    await expect(page.locator("#privateKeyDisplay")).toHaveValue(/^nsec1/, {
-      timeout: 10000,
-    });
+    await registerWithEmail(page, email, password);
 
-    // Copy the private key for later
-    const privateKey = await page.locator("#privateKeyDisplay").inputValue();
-    expect(privateKey).toMatch(/^nsec1/);
-
-    // Check the "I saved my key" checkbox
-    await page.locator("#privateKeySavedCheckbox").check();
-
-    // Click next button
-    await page.locator("#registerStep1Button").click();
-
-    // Should show success message or close modal
-    await expect(page.locator("#logoutContainer")).toBeVisible({
-      timeout: 10000,
-    });
+    // Should show success - logout container visible
+    await expect(page.locator("#logoutContainer")).toBeVisible();
     await expect(page.locator("#authButtons")).toHaveClass(/is-hidden/);
   });
 
-  test("can login with private key", async ({ page }) => {
+  test("can login with email after registration", async ({ page }) => {
     // First register to create an account
     await page.goto("/");
-    await page.locator("#registerNavClick").click();
-    await expect(page.locator("#privateKeyDisplay")).toHaveValue(/^nsec1/, {
-      timeout: 10000,
-    });
-    const privateKey = await page.locator("#privateKeyDisplay").inputValue();
-    await page.locator("#privateKeySavedCheckbox").check();
-    await page.locator("#registerStep1Button").click();
-    await expect(page.locator("#logoutContainer")).toBeVisible({
-      timeout: 10000,
-    });
+    const email = uniqueEmail();
+    const password = "testPassword123!";
+
+    await registerWithEmail(page, email, password);
 
     // Logout
     await page.locator("#logoutNavClick").click();
     await expect(page.locator("#authButtons")).toBeVisible();
 
-    // Now login with the private key
+    // Now login with email
     await page.locator("#loginNavClick").click();
-    await page.locator("#loginPrivateKey").fill(privateKey);
-    await page.locator("#loginButton").click();
+    await page.locator(".tabs li[data-target='emailLogin']").click();
+    await page.locator("#loginEmail").fill(email);
+    await page.locator("#loginPassword").fill(password);
+    await page.locator("#emailLoginButton").click();
 
     // Should be logged in
     await expect(page.locator("#logoutContainer")).toBeVisible({
@@ -143,15 +177,9 @@ test.describe("Competitions", () => {
   test.beforeEach(async ({ page }) => {
     // Register and login before each test
     await page.goto("/");
-    await page.locator("#registerNavClick").click();
-    await expect(page.locator("#privateKeyDisplay")).toHaveValue(/^nsec1/, {
-      timeout: 10000,
-    });
-    await page.locator("#privateKeySavedCheckbox").check();
-    await page.locator("#registerStep1Button").click();
-    await expect(page.locator("#logoutContainer")).toBeVisible({
-      timeout: 10000,
-    });
+    const email = uniqueEmail();
+    const password = "testPassword123!";
+    await registerWithEmail(page, email, password);
   });
 
   test("competitions table shows headers", async ({ page }) => {
@@ -188,15 +216,9 @@ test.describe("Entry Form", () => {
   test.beforeEach(async ({ page }) => {
     // Register and login
     await page.goto("/");
-    await page.locator("#registerNavClick").click();
-    await expect(page.locator("#privateKeyDisplay")).toHaveValue(/^nsec1/, {
-      timeout: 10000,
-    });
-    await page.locator("#privateKeySavedCheckbox").check();
-    await page.locator("#registerStep1Button").click();
-    await expect(page.locator("#logoutContainer")).toBeVisible({
-      timeout: 10000,
-    });
+    const email = uniqueEmail();
+    const password = "testPassword123!";
+    await registerWithEmail(page, email, password);
   });
 
   test("entry container shows when clicking enter on a competition", async ({

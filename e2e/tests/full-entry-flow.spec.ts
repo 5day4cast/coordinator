@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, Page } from "@playwright/test";
 
 /**
  * Full Entry Submission Flow E2E Tests
@@ -16,33 +16,56 @@ import { test, expect } from "@playwright/test";
  * - At least one competition in "Registration" status
  */
 
+// Helper to generate unique email for each test
+function uniqueEmail(): string {
+  return `test-${Date.now()}-${Math.random().toString(36).slice(2)}@example.com`;
+}
+
+// Helper to register and login with email
+async function registerAndLogin(page: Page): Promise<void> {
+  await page.goto("/");
+
+  // Wait for WASM to initialize
+  await page.waitForFunction(() => window.wasmInitialized === true, {
+    timeout: 15000,
+  });
+
+  const email = uniqueEmail();
+  const password = "testPassword123!";
+
+  // Open register modal
+  await page.locator("#registerNavClick").click();
+  await expect(page.locator("#registerModal")).toHaveClass(/is-active/);
+
+  // Click email tab (should be default)
+  await page.locator(".tabs li[data-target='registerEmail']").click();
+
+  // Fill email registration form
+  await page.locator("#registerEmailInput").fill(email);
+  await page.locator("#registerPassword").fill(password);
+  await page.locator("#registerPasswordConfirm").fill(password);
+
+  // Click step 1 button to generate keys
+  await page.locator("#emailRegisterStep1Button").click();
+
+  // Wait for nsec to be displayed (WASM generates it)
+  await expect(page.locator("#emailNsecDisplay")).toHaveValue(/^nsec1/, {
+    timeout: 15000,
+  });
+
+  // Check the "I saved my key" checkbox
+  await page.locator("#emailNsecSavedCheckbox").check();
+
+  // Complete registration
+  await page.locator("#emailRegisterStep2Button").click();
+
+  // Verify logged in
+  await expect(page.locator("#logoutContainer")).toBeVisible({
+    timeout: 10000,
+  });
+}
+
 test.describe("Full Entry Submission Flow", () => {
-  // Helper to register and login
-  async function registerAndLogin(page: any) {
-    await page.goto("/");
-    await page.locator("#registerNavClick").click();
-    await expect(page.locator("#registerModal")).toHaveClass(/is-active/);
-
-    // Wait for WASM to generate private key
-    await expect(page.locator("#privateKeyDisplay")).toHaveValue(/^nsec1/, {
-      timeout: 15000,
-    });
-
-    // Save the private key for potential re-login
-    const privateKey = await page.locator("#privateKeyDisplay").inputValue();
-
-    // Complete registration
-    await page.locator("#privateKeySavedCheckbox").check();
-    await page.locator("#registerStep1Button").click();
-
-    // Verify logged in
-    await expect(page.locator("#logoutContainer")).toBeVisible({
-      timeout: 10000,
-    });
-
-    return privateKey;
-  }
-
   test("complete entry flow: login → competition → picks → payment → submission", async ({
     page,
   }) => {
@@ -301,18 +324,8 @@ test.describe("Competition Status Display", () => {
   test("only Registration status competitions have Enter button", async ({
     page,
   }) => {
-    await page.goto("/");
-
     // Register to see Enter buttons
-    await page.locator("#registerNavClick").click();
-    await expect(page.locator("#privateKeyDisplay")).toHaveValue(/^nsec1/, {
-      timeout: 10000,
-    });
-    await page.locator("#privateKeySavedCheckbox").check();
-    await page.locator("#registerStep1Button").click();
-    await expect(page.locator("#logoutContainer")).toBeVisible({
-      timeout: 10000,
-    });
+    await registerAndLogin(page);
 
     await page.waitForSelector("#competitionsDataTable tbody tr", {
       timeout: 15000,

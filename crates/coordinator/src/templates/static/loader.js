@@ -4,6 +4,9 @@ import init, {
   TaprootWallet,
   TaprootWalletBuilder,
   SignerType,
+  encryptNsecWithPassword,
+  decryptNsecWithPassword,
+  signForgotPasswordChallenge,
 } from "/ui/pkg/coordinator_wasm.js";
 
 // Expose WASM types globally
@@ -11,6 +14,11 @@ window.NostrClientWrapper = NostrClientWrapper;
 window.TaprootWallet = TaprootWallet;
 window.TaprootWalletBuilder = TaprootWalletBuilder;
 window.SignerType = SignerType;
+
+// Expose password crypto functions globally
+window.encryptNsecWithPassword = encryptNsecWithPassword;
+window.decryptNsecWithPassword = decryptNsecWithPassword;
+window.signForgotPasswordChallenge = signForgotPasswordChallenge;
 
 // Track WASM initialization state
 window.wasmInitialized = false;

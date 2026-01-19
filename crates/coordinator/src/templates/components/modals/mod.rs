@@ -12,6 +12,9 @@ pub fn auth_modals() -> Markup {
         // Registration Modal
         (register_modal())
 
+        // Forgot Password Modal
+        (forgot_password_modal())
+
         // Payment Modal (for entry ticket payments)
         (payment_modal())
 
@@ -33,11 +36,11 @@ fn login_modal() -> Markup {
                     button id="closeLoginModal" class="delete" aria-label="close" {}
                 }
                 section class="modal-card-body" {
-                    // Tabs for login method
+                    // Tabs for login method - Email (default) and Browser Extension
                     div class="tabs is-centered is-boxed" {
                         ul {
-                            li class="is-active" data-target="privateKeyLogin" {
-                                a { span { "Private Key" } }
+                            li class="is-active" data-target="emailLogin" {
+                                a { span { "Email" } }
                             }
                             li data-target="extensionLogin" {
                                 a { span { "Browser Extension" } }
@@ -45,21 +48,33 @@ fn login_modal() -> Markup {
                         }
                     }
 
-                    // Private Key Login
-                    div id="privateKeyLogin" {
+                    // Email Login (default)
+                    div id="emailLogin" {
                         div class="field" {
+                            label class="label" { "Email" }
                             div class="control" {
-                                input class="input is-medium" type="password"
-                                      id="loginPrivateKey"
-                                      placeholder="Enter your private key";
+                                input class="input" type="email" id="loginEmail"
+                                      placeholder="you@example.com";
                             }
-                            p class="help is-danger mt-2" id="privateKeyError" {}
                         }
-                        div class="field mt-5" {
+                        div class="field" {
+                            label class="label" { "Password" }
                             div class="control" {
-                                button class="button is-info is-fullwidth" id="loginButton" {
+                                input class="input" type="password" id="loginPassword"
+                                      placeholder="Enter your password";
+                            }
+                        }
+                        p class="help is-danger mt-2" id="emailLoginError" {}
+                        div class="field mt-4" {
+                            div class="control" {
+                                button class="button is-info is-fullwidth" id="emailLoginButton" {
                                     "Login"
                                 }
+                            }
+                        }
+                        p class="has-text-centered mt-3" {
+                            a href="#" id="forgotPasswordLink" class="has-text-grey" {
+                                "Forgot password?"
                             }
                         }
                     }
@@ -97,11 +112,11 @@ fn register_modal() -> Markup {
                     button id="closeResisterModal" class="delete" aria-label="close" {}
                 }
                 section class="modal-card-body" {
-                    // Tabs for registration method
+                    // Tabs for registration method - Email (default) and Browser Extension
                     div class="tabs is-centered" {
                         ul {
-                            li class="is-active" data-target="registerPrivateKey" {
-                                a { "Private Key" }
+                            li class="is-active" data-target="registerEmail" {
+                                a { "Email" }
                             }
                             li data-target="registerExtension" {
                                 a { "Browser Extension" }
@@ -109,34 +124,70 @@ fn register_modal() -> Markup {
                         }
                     }
 
-                    // Private Key Registration
-                    div id="registerPrivateKey" {
-                        div id="registerStep1" {
-                            p {
-                                "Copy and put this private key in a safe place. "
-                                "Nostr accounts do not have password reset. "
-                                "Without the private key, you will not be able to access your account."
-                            }
-                            div class="field mt-4" {
+                    // Email Registration
+                    div id="registerEmail" {
+                        // Step 1: Email & Password
+                        div id="emailRegisterStep1" {
+                            div class="field" {
+                                label class="label" { "Email" }
                                 div class="control" {
-                                    input class="input" type="text" id="privateKeyDisplay" readonly;
+                                    input class="input" type="email" id="registerEmailInput"
+                                          placeholder="you@example.com";
                                 }
                             }
-                            button class="button is-info is-fullwidth mt-4" id="copyPrivateKey" {
+                            div class="field" {
+                                label class="label" { "Password" }
+                                div class="control" {
+                                    input class="input" type="password" id="registerPassword"
+                                          placeholder="Choose a strong password (min 8 characters)";
+                                }
+                            }
+                            div class="field" {
+                                label class="label" { "Confirm Password" }
+                                div class="control" {
+                                    input class="input" type="password" id="registerPasswordConfirm"
+                                          placeholder="Confirm your password";
+                                }
+                            }
+                            p class="help is-danger mt-2" id="emailRegisterError" {}
+                            button class="button is-info is-fullwidth mt-4" id="emailRegisterStep1Button" {
+                                "Continue"
+                            }
+                        }
+
+                        // Step 2: Backup nsec (CRITICAL)
+                        div id="emailRegisterStep2" class="is-hidden" {
+                            div class="notification is-warning" {
+                                strong { "Important: Save Your Recovery Key" }
+                                p {
+                                    "This key is the ONLY way to recover your account if you forget your password. "
+                                    "Without it, your funds will be permanently lost."
+                                }
+                            }
+                            div class="field mt-4" {
+                                label class="label" { "Your Recovery Key (nsec)" }
+                                div class="control" {
+                                    input class="input" type="text" id="emailNsecDisplay" readonly;
+                                }
+                            }
+                            button class="button is-info is-fullwidth mt-2" id="copyEmailNsec" {
                                 "Copy to clipboard"
                             }
                             div class="field mt-4" {
                                 label class="checkbox" {
-                                    input type="checkbox" id="privateKeySavedCheckbox";
-                                    " I have put my private key in a safe place"
+                                    input type="checkbox" id="emailNsecSavedCheckbox";
+                                    " I have saved my recovery key in a safe place"
                                 }
                             }
-                            button class="button is-info is-fullwidth mt-4"
-                                   id="registerStep1Button" disabled {
-                                "Next"
+                            p class="help is-danger mt-2" id="emailRegisterStep2Error" {}
+                            button class="button is-success is-fullwidth mt-4"
+                                   id="emailRegisterStep2Button" disabled {
+                                "Complete Registration"
                             }
                         }
-                        div id="registerStep2" class="is-hidden" {
+
+                        // Step 3: Success
+                        div id="emailRegisterStep3" class="is-hidden" {
                             div class="has-text-centered" {
                                 h2 class="title" { "Welcome!" }
                                 p class="subtitle" { "Your account has been created successfully." }
@@ -161,7 +212,88 @@ fn register_modal() -> Markup {
 
                     p class="has-text-centered mt-5" {
                         a href="#" id="goToLoginButton" class="has-text-info" {
-                            "Try Login?"
+                            "Already have an account? Login"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn forgot_password_modal() -> Markup {
+    html! {
+        div id="forgotPasswordModal" class="modal" {
+            div class="modal-background" {}
+            div class="modal-card" {
+                header class="modal-card-head" {
+                    p class="modal-card-title" { "Reset Password" }
+                    button class="delete" aria-label="close" id="closeForgotPasswordModal" {}
+                }
+                section class="modal-card-body" {
+                    // Step 1: Enter email
+                    div id="forgotStep1" {
+                        p { "Enter your email to receive a password reset challenge." }
+                        div class="field mt-4" {
+                            label class="label" { "Email" }
+                            div class="control" {
+                                input class="input" type="email" id="forgotEmail"
+                                      placeholder="you@example.com";
+                            }
+                        }
+                        p class="help is-danger mt-2" id="forgotStep1Error" {}
+                        button class="button is-info is-fullwidth mt-4" id="forgotStep1Button" {
+                            "Continue"
+                        }
+                    }
+
+                    // Step 2: Enter nsec and sign challenge
+                    div id="forgotStep2" class="is-hidden" {
+                        div class="notification is-info is-light" {
+                            p { "Enter your recovery key (nsec) to prove account ownership." }
+                        }
+                        div class="field mt-4" {
+                            label class="label" { "Your Recovery Key (nsec)" }
+                            div class="control" {
+                                input class="input" type="password" id="forgotNsec"
+                                      placeholder="nsec1...";
+                            }
+                        }
+                        p class="help is-danger mt-2" id="forgotStep2Error" {}
+                        button class="button is-info is-fullwidth mt-4" id="forgotStep2Button" {
+                            "Verify Ownership"
+                        }
+                    }
+
+                    // Step 3: Set new password
+                    div id="forgotStep3" class="is-hidden" {
+                        div class="notification is-success is-light" {
+                            p { "Ownership verified! Set your new password." }
+                        }
+                        div class="field mt-4" {
+                            label class="label" { "New Password" }
+                            div class="control" {
+                                input class="input" type="password" id="forgotNewPassword"
+                                      placeholder="Choose a new password (min 8 characters)";
+                            }
+                        }
+                        div class="field" {
+                            label class="label" { "Confirm New Password" }
+                            div class="control" {
+                                input class="input" type="password" id="forgotNewPasswordConfirm"
+                                      placeholder="Confirm your new password";
+                            }
+                        }
+                        p class="help is-danger mt-2" id="forgotStep3Error" {}
+                        button class="button is-success is-fullwidth mt-4" id="forgotStep3Button" {
+                            "Reset Password"
+                        }
+                    }
+
+                    // Back to login link
+                    p class="has-text-centered mt-5" {
+                        a href="#" id="backToLoginFromForgot" class="has-text-info" {
+                            "Back to Login"
                         }
                     }
                 }
