@@ -98,7 +98,8 @@
             || (builtins.match ".*migrations.*" path != null)
             || (builtins.match ".*\\.html$" path != null)
             || (builtins.match ".*\\.js$" path != null)
-            || (builtins.match ".*\\.css$" path != null);
+            || (builtins.match ".*\\.css$" path != null)
+            || (builtins.match ".*\\.svg$" path != null);
         };
 
         # Build workspace dependencies once (for caching)
