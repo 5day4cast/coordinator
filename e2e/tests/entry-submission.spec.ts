@@ -157,10 +157,10 @@ test.describe("Competitions", () => {
   test("competitions table shows headers", async ({ page }) => {
     // Check table headers
     const headers = page.locator("#competitionsDataTable thead th");
-    await expect(headers.nth(0)).toContainText("ID");
-    await expect(headers.nth(1)).toContainText("Start Time");
-    await expect(headers.nth(4)).toContainText("Status");
-    await expect(headers.nth(5)).toContainText("Entry fee");
+    await expect(headers.nth(0)).toContainText("Status");
+    await expect(headers.nth(1)).toContainText("Start");
+    await expect(headers.nth(4)).toContainText("Fee");
+    await expect(headers.nth(5)).toContainText("Pool");
   });
 
   test("can navigate to entries page", async ({ page }) => {
