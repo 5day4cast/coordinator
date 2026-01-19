@@ -114,7 +114,7 @@ fn validate_username(username: &str) -> Result<(), String> {
     if !username
         .chars()
         .next()
-        .map_or(false, |c| c.is_ascii_alphabetic())
+        .is_some_and(|c| c.is_ascii_alphabetic())
     {
         return Err("Username must start with a letter".to_string());
     }
@@ -191,10 +191,18 @@ pub async fn login_username(
 ) -> Result<impl IntoResponse, ErrorResponse> {
     debug!("username login attempt for: {}", body.username);
 
-    let user = match state.users_info.get_user_by_username(&body.username).await {
-        Ok(user) => user,
+    let user_result = state.users_info.get_user_by_username(&body.username).await;
+
+    // Always verify against something to prevent timing attacks
+    let (password_hash, user) = match user_result {
+        Ok(user) => {
+            let hash = user.password_hash.clone().unwrap_or_default();
+            (hash, Some(user))
+        }
         Err(domain::Error::NotFound(_)) => {
-            return Err(ErrorResponse::from(AuthError::InvalidLogin));
+            // Use a dummy hash so we still spend time on verification
+            let dummy_hash = "$argon2id$v=19$m=19456,t=2,p=1$dummysalt1234567$dummyhash123456789012345678901234567890".to_string();
+            (dummy_hash, None)
         }
         Err(e) => {
             error!("Failed to get user by username: {}", e);
@@ -202,19 +210,12 @@ pub async fn login_username(
         }
     };
 
-    let password_hash = user.password_hash.as_ref().ok_or_else(|| {
-        error!("User {} has no password hash", body.username);
-        AuthError::InvalidLogin
-    })?;
+    let valid = verify_password(&body.password, &password_hash).unwrap_or(false);
 
-    let valid = verify_password(&body.password, password_hash).map_err(|e| {
-        error!("Password verification error: {}", e);
-        AuthError::InvalidLogin
-    })?;
-
-    if !valid {
-        return Err(ErrorResponse::from(AuthError::InvalidLogin));
-    }
+    let user = match user {
+        Some(u) if valid && u.password_hash.is_some() => u,
+        _ => return Err(ErrorResponse::from(AuthError::InvalidLogin)),
+    };
 
     let encrypted_nsec = user.encrypted_nsec.ok_or_else(|| {
         error!("User {} has no encrypted nsec", body.username);
