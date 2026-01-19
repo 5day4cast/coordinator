@@ -20,9 +20,9 @@ const SALT_LEN: usize = 32;
 const NONCE_LEN: usize = 24; // XChaCha20 uses 192-bit nonce
 const KEY_LEN: usize = 32;
 
-// scrypt params: N=2^17, r=8, p=1 (moderate memory usage for browser)
-// This is less than the plan's 2^17 to be more browser-friendly
-const SCRYPT_LOG_N: u8 = 15; // 2^15 = 32768 (browser-friendly)
+// scrypt params: N=2^17, r=8, p=1 (128 MB memory, ~1-2 sec on modern devices)
+// Provides strong protection against GPU-based brute force attacks
+const SCRYPT_LOG_N: u8 = 17; // 2^17 = 131072
 const SCRYPT_R: u32 = 8;
 const SCRYPT_P: u32 = 1;
 
