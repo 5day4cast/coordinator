@@ -34,6 +34,7 @@ axum = { version = "0.8.1", features = ["http1", "macros", "multipart", "tokio",
 axum-extra = { version = "0.10", features = ["form"] }
 tower-http = { version = "0.5.2", features = ["cors", "fs"] }
 maud = { version = "0.26", features = ["axum"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] }
 reqwest-middleware = { version = "0.3.3", features = ["json", "rustls-tls"] }
 reqwest-retry = "0.6.1"
 hyper = "1.4.0"
