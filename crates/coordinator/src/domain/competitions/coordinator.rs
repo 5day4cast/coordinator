@@ -2966,6 +2966,14 @@ impl Coordinator {
             .await
     }
 
+    /// Get a single entry by ID (public, for leaderboard entry details)
+    pub async fn get_entry_by_id(&self, entry_id: Uuid) -> Result<Option<UserEntry>, Error> {
+        self.competition_store
+            .get_entry_by_id(entry_id)
+            .map_err(Error::DbError)
+            .await
+    }
+
     pub async fn get_contract_parameters(
         &self,
         pubkey: String,

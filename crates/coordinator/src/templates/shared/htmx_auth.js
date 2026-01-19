@@ -1,6 +1,11 @@
 const AUTH_REQUIRED_ROUTES = ["/entries", "/payouts", "/entry-form"];
+const PUBLIC_ROUTES = ["/entries/", "/detail"]; // Entry detail pages are public (leaderboard)
 
 function requiresAuth(url) {
+  // Entry detail routes are public (accessed from leaderboard)
+  if (url.includes("/entries/") && url.includes("/detail")) {
+    return false;
+  }
   return AUTH_REQUIRED_ROUTES.some((route) => url.includes(route));
 }
 

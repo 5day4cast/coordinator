@@ -1831,4 +1831,52 @@ impl CompetitionStore {
                 e => sqlx::Error::Protocol(e.to_string()),
             })
     }
+
+    /// Get a single entry by its ID
+    pub async fn get_entry_by_id(&self, entry_id: Uuid) -> Result<Option<UserEntry>, sqlx::Error> {
+        let query = "WITH latest_payouts AS (
+              SELECT
+                  entry_id,
+                  payout_payment_request,
+                  ROW_NUMBER() OVER (
+                      PARTITION BY entry_id
+                      ORDER BY COALESCE(succeed_at, initiated_at) DESC
+                  ) as rn,
+                  COALESCE(succeed_at, initiated_at) as latest_payout_time
+              FROM payouts
+              WHERE failed_at IS NULL
+          )
+          SELECT
+              entries.id as id,
+              ticket_id,
+              entries.event_id as event_id,
+              pubkey,
+              entries.ephemeral_pubkey as ephemeral_pubkey,
+              ephemeral_privatekey_encrypted,
+              ephemeral_privatekey,
+              encrypted_keymeld_private_key,
+              keymeld_auth_pubkey,
+              public_nonces,
+              partial_signatures,
+              funding_psbt_base64,
+              entry_submission,
+              payout_preimage_encrypted,
+              payout_hash,
+              payout_preimage,
+              signed_at,
+              tickets.paid_at AS paid_at,
+              sellback_broadcasted_at,
+              reclaimed_broadcasted_at,
+              latest_payouts.latest_payout_time as paid_out_at,
+              latest_payouts.payout_payment_request as payout_ln_invoice
+          FROM entries
+          LEFT JOIN tickets ON entries.ticket_id = tickets.id
+          LEFT JOIN latest_payouts ON entries.id = latest_payouts.entry_id AND latest_payouts.rn = 1
+          WHERE entries.id = ?";
+
+        sqlx::query_as::<_, UserEntry>(query)
+            .bind(entry_id.to_string())
+            .fetch_optional(self.db_connection.read())
+            .await
+    }
 }

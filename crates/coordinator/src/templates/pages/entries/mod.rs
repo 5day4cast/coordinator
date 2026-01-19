@@ -29,7 +29,12 @@ pub fn entries_page(entries: &[EntryView]) -> Markup {
                         }
                         tbody {
                             @for entry in entries {
-                                tr {
+                                tr hx-get=(format!("/entries/{}/detail", entry.entry_id))
+                                   hx-target="#entryScore .modal-content .box"
+                                   hx-swap="innerHTML"
+                                   onclick="document.getElementById('entryScore').classList.add('is-active')"
+                                   style="cursor: pointer;"
+                                   title="Click to view entry details" {
                                     td { (entry.competition_id) }
                                     td { (entry.start_time) }
                                     td { (entry.end_time) }
