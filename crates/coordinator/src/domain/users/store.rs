@@ -13,8 +13,7 @@ pub struct User {
     pub nostr_pubkey: String,
     pub encrypted_bitcoin_private_key: String,
     pub network: String,
-    // Email auth fields (nullable - only set for email/password users)
-    pub email: Option<String>,
+    pub username: Option<String>,
     pub password_hash: Option<String>,
     pub encrypted_nsec: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
@@ -29,7 +28,7 @@ impl FromRow<'_, SqliteRow> for User {
             nostr_pubkey: row.get("nostr_pubkey"),
             encrypted_bitcoin_private_key: row.get("encrypted_bitcoin_private_key"),
             network: row.get("network"),
-            email: row.get("email"),
+            username: row.get("username"),
             password_hash: row.get("password_hash"),
             encrypted_nsec: row.get("encrypted_nsec"),
             created_at: parse_required_datetime(row, "created_at")?,
@@ -72,7 +71,7 @@ impl UserStore {
                         created_at,
                         updated_at
                     ) VALUES (?, ?, ?, ?, ?)
-                    RETURNING nostr_pubkey, encrypted_bitcoin_private_key, network, email, password_hash, encrypted_nsec, created_at, updated_at",
+                    RETURNING nostr_pubkey, encrypted_bitcoin_private_key, network, username, password_hash, encrypted_nsec, created_at, updated_at",
                 )
                 .bind(nostr_pubkey)
                 .bind(encrypted_key)
@@ -97,7 +96,7 @@ impl UserStore {
                 nostr_pubkey,
                 encrypted_bitcoin_private_key,
                 network,
-                email,
+                username,
                 password_hash,
                 encrypted_nsec,
                 created_at,
@@ -191,7 +190,7 @@ impl UserStore {
                 nostr_pubkey,
                 encrypted_bitcoin_private_key,
                 network,
-                email,
+                username,
                 password_hash,
                 encrypted_nsec,
                 created_at,
@@ -229,7 +228,7 @@ impl UserStore {
                 nostr_pubkey,
                 encrypted_bitcoin_private_key,
                 network,
-                email,
+                username,
                 password_hash,
                 encrypted_nsec,
                 created_at,
@@ -251,7 +250,7 @@ impl UserStore {
                 nostr_pubkey,
                 encrypted_bitcoin_private_key,
                 network,
-                email,
+                username,
                 password_hash,
                 encrypted_nsec,
                 created_at,
@@ -267,13 +266,10 @@ impl UserStore {
         Ok(users)
     }
 
-    // ==================== Email Auth Methods ====================
-
-    /// Register a new user with email/password authentication
-    pub async fn register_email_user(
+    pub async fn register_username_user(
         &self,
         nostr_pubkey: String,
-        email: String,
+        username: String,
         password_hash: String,
         encrypted_nsec: String,
         encrypted_bitcoin_private_key: String,
@@ -289,18 +285,18 @@ impl UserStore {
                         nostr_pubkey,
                         encrypted_bitcoin_private_key,
                         network,
-                        email,
+                        username,
                         password_hash,
                         encrypted_nsec,
                         created_at,
                         updated_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    RETURNING nostr_pubkey, encrypted_bitcoin_private_key, network, email, password_hash, encrypted_nsec, created_at, updated_at",
+                    RETURNING nostr_pubkey, encrypted_bitcoin_private_key, network, username, password_hash, encrypted_nsec, created_at, updated_at",
                 )
                 .bind(nostr_pubkey)
                 .bind(encrypted_bitcoin_private_key)
                 .bind(network)
-                .bind(email)
+                .bind(username)
                 .bind(password_hash)
                 .bind(encrypted_nsec)
                 .bind(now)
@@ -317,39 +313,37 @@ impl UserStore {
         Ok(user)
     }
 
-    /// Get user by email address
-    pub async fn get_user_by_email(&self, email: &str) -> Result<User, Error> {
+    pub async fn get_user_by_username(&self, username: &str) -> Result<User, Error> {
         let user = sqlx::query_as::<_, User>(
             "SELECT
                 nostr_pubkey,
                 encrypted_bitcoin_private_key,
                 network,
-                email,
+                username,
                 password_hash,
                 encrypted_nsec,
                 created_at,
                 updated_at
             FROM user
-            WHERE email = ?",
+            WHERE username = ?",
         )
-        .bind(email)
+        .bind(username)
         .fetch_optional(self.db_connection.read())
         .await?;
 
-        user.ok_or_else(|| Error::NotFound(format!("User not found with email: {}", email)))
+        user.ok_or_else(|| Error::NotFound(format!("User not found with username: {}", username)))
     }
 
-    /// Check if an email is already registered
-    pub async fn email_exists(&self, email: &str) -> Result<bool, Error> {
-        let result: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user WHERE email = ?)")
-            .bind(email)
-            .fetch_one(self.db_connection.read())
-            .await?;
+    pub async fn username_exists(&self, username: &str) -> Result<bool, Error> {
+        let result: i64 =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user WHERE username = ?)")
+                .bind(username)
+                .fetch_one(self.db_connection.read())
+                .await?;
 
         Ok(result == 1)
     }
 
-    /// Update password hash and encrypted nsec (for password change or reset)
     pub async fn update_password(
         &self,
         nostr_pubkey: &str,
@@ -393,15 +387,50 @@ impl UserStore {
         Ok(())
     }
 
-    /// Get user's pubkey by email (for forgot password challenge)
-    pub async fn get_pubkey_by_email(&self, email: &str) -> Result<String, Error> {
+    pub async fn get_pubkey_by_username(&self, username: &str) -> Result<String, Error> {
         let pubkey: Option<String> =
-            sqlx::query_scalar("SELECT nostr_pubkey FROM user WHERE email = ?")
-                .bind(email)
+            sqlx::query_scalar("SELECT nostr_pubkey FROM user WHERE username = ?")
+                .bind(username)
                 .fetch_optional(self.db_connection.read())
                 .await?;
 
-        pubkey.ok_or_else(|| Error::NotFound(format!("User not found with email: {}", email)))
+        pubkey.ok_or_else(|| Error::NotFound(format!("User not found with username: {}", username)))
+    }
+
+    pub async fn update_username(&self, nostr_pubkey: &str, username: String) -> Result<(), Error> {
+        let now = OffsetDateTime::now_utc();
+        let nostr_pubkey_owned = nostr_pubkey.to_string();
+
+        let rows_affected = self
+            .db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE user
+                     SET username = ?,
+                         updated_at = ?
+                     WHERE nostr_pubkey = ?",
+                )
+                .bind(username)
+                .bind(now)
+                .bind(nostr_pubkey_owned)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected())
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => Error::DbError(e),
+                e => Error::BadRequest(e.to_string()),
+            })?;
+
+        if rows_affected == 0 {
+            return Err(Error::NotFound(format!(
+                "User not found with pubkey: {}",
+                nostr_pubkey
+            )));
+        }
+
+        Ok(())
     }
 }
 

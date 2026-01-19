@@ -8,9 +8,9 @@ use crate::{
         entry_form_fragment, forgot_password_challenge, forgot_password_reset,
         get_aggregate_nonces, get_balance, get_competitions, get_contract_parameters, get_entries,
         get_estimated_fee_rates, get_next_address, get_outputs, get_ticket_status, health,
-        leaderboard_fragment, leaderboard_rows_fragment, login, login_email, payouts_fragment,
-        public_page_handler, register, register_email, request_competition_ticket, send_to_address,
-        submit_final_signatures, submit_public_nonces, submit_ticket_payout,
+        leaderboard_fragment, leaderboard_rows_fragment, login, login_username, payouts_fragment,
+        public_page_handler, register, register_username, request_competition_ticket,
+        send_to_address, submit_final_signatures, submit_public_nonces, submit_ticket_payout,
     },
     config::Settings,
     domain::{
@@ -134,7 +134,6 @@ pub struct AppState {
     pub coordinator: Arc<Coordinator>,
     pub users_info: Arc<UserInfo>,
     pub background_threads: Arc<HashMap<String, JoinHandle<()>>>,
-    /// Temporary storage for forgot password challenges (email -> (challenge, created_at))
     pub forgot_password_challenges: Arc<RwLock<HashMap<String, (String, std::time::Instant)>>>,
 }
 
@@ -468,12 +467,11 @@ pub fn app(app_state: AppState, origins: Vec<String>) -> Router {
     let users_endpoints = Router::new()
         .route("/login", post(login))
         .route("/register", post(register))
-        // Email auth routes
-        .route("/email/register", post(register_email))
-        .route("/email/login", post(login_email))
-        .route("/email/change-password", post(change_password))
-        .route("/email/forgot-password", post(forgot_password_challenge))
-        .route("/email/reset-password", post(forgot_password_reset));
+        .route("/username/register", post(register_username))
+        .route("/username/login", post(login_username))
+        .route("/username/change-password", post(change_password))
+        .route("/username/forgot-password", post(forgot_password_challenge))
+        .route("/username/reset-password", post(forgot_password_reset));
 
     // HTMX admin routes (pure server-side rendering, no WASM)
     let admin_htmx_routes = Router::new()
