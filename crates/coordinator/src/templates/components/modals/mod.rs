@@ -48,14 +48,14 @@ fn login_modal() -> Markup {
                             label class="label" { "Username" }
                             div class="control" {
                                 input class="input" type="text" id="loginUsername"
-                                      placeholder="your_username";
+                                      placeholder="username";
                             }
                         }
                         div class="field" {
                             label class="label" { "Password" }
                             div class="control" {
                                 input class="input" type="password" id="loginPassword"
-                                      placeholder="Enter your password";
+                                      placeholder="password";
                             }
                         }
                         p class="help is-danger mt-2" id="usernameLoginError" {}
@@ -122,7 +122,7 @@ fn register_modal() -> Markup {
                                 label class="label" { "Username" }
                                 div class="control" {
                                     input class="input" type="text" id="registerUsernameInput"
-                                          placeholder="your_username";
+                                          placeholder="username";
                                 }
                                 p class="help" { "3-32 characters, letters, numbers, underscores, hyphens" }
                             }
@@ -225,7 +225,7 @@ fn forgot_password_modal() -> Markup {
                             label class="label" { "Username" }
                             div class="control" {
                                 input class="input" type="text" id="forgotUsername"
-                                      placeholder="your_username";
+                                      placeholder="username";
                             }
                         }
                         p class="help is-danger mt-2" id="forgotStep1Error" {}

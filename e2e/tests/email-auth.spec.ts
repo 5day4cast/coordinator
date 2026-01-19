@@ -305,6 +305,56 @@ test.describe("Username/Password Authentication", () => {
     await expect(page.locator("#extensionLoginButton")).toBeVisible();
   });
 
+  test("username-registered user can login with same nsec (extension upgrade)", async ({
+    page,
+  }) => {
+    const username = uniqueUsername();
+    const password = "testPassword123!";
+
+    const nsec = await registerWithUsername(page, username, password);
+    expect(nsec).toMatch(/^nsec1/);
+
+    await logout(page);
+
+    await page.goto("/");
+    await page.waitForFunction(() => window.wasmInitialized === true, {
+      timeout: 15000,
+    });
+
+    const loginSuccess = await page.evaluate(async (nsec) => {
+      try {
+        await window.nostrClient.initialize(window.SignerType.PrivateKey, nsec);
+
+        const apiBase = document.body.dataset.apiBase;
+        const authorizedClient = new window.AuthorizedClient(
+          window.nostrClient,
+          apiBase,
+        );
+
+        const response = await authorizedClient.post(
+          `${apiBase}/api/v1/users/login`,
+        );
+
+        if (!response.ok) {
+          return { success: false, status: response.status };
+        }
+
+        const data = await response.json();
+        return {
+          success: true,
+          hasEncryptedKey: !!data.encrypted_bitcoin_private_key,
+          hasNetwork: !!data.network,
+        };
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    }, nsec);
+
+    expect(loginSuccess.success).toBe(true);
+    expect(loginSuccess.hasEncryptedKey).toBe(true);
+    expect(loginSuccess.hasNetwork).toBe(true);
+  });
+
   test("password validation rejects weak passwords", async ({ page }) => {
     const username = uniqueUsername();
     const weakPassword = "short";
