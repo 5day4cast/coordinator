@@ -1,9 +1,5 @@
 use maud::{html, Markup};
 
-/// Authentication modals (login and registration)
-///
-/// These modals are controlled by JS (crypto_bridge.js) since they involve
-/// WASM operations for Nostr key generation and wallet initialization.
 pub fn auth_modals() -> Markup {
     html! {
         // Login Modal
@@ -36,11 +32,10 @@ fn login_modal() -> Markup {
                     button id="closeLoginModal" class="delete" aria-label="close" {}
                 }
                 section class="modal-card-body" {
-                    // Tabs for login method - Email (default) and Browser Extension
                     div class="tabs is-centered is-boxed" {
                         ul {
-                            li class="is-active" data-target="emailLogin" {
-                                a { span { "Email" } }
+                            li class="is-active" data-target="usernameLogin" {
+                                a { span { "Username" } }
                             }
                             li data-target="extensionLogin" {
                                 a { span { "Browser Extension" } }
@@ -48,13 +43,12 @@ fn login_modal() -> Markup {
                         }
                     }
 
-                    // Email Login (default)
-                    div id="emailLogin" {
+                    div id="usernameLogin" {
                         div class="field" {
-                            label class="label" { "Email" }
+                            label class="label" { "Username" }
                             div class="control" {
-                                input class="input" type="email" id="loginEmail"
-                                      placeholder="you@example.com";
+                                input class="input" type="text" id="loginUsername"
+                                      placeholder="your_username";
                             }
                         }
                         div class="field" {
@@ -64,10 +58,10 @@ fn login_modal() -> Markup {
                                       placeholder="Enter your password";
                             }
                         }
-                        p class="help is-danger mt-2" id="emailLoginError" {}
+                        p class="help is-danger mt-2" id="usernameLoginError" {}
                         div class="field mt-4" {
                             div class="control" {
-                                button class="button is-info is-fullwidth" id="emailLoginButton" {
+                                button class="button is-info is-fullwidth" id="usernameLoginButton" {
                                     "Login"
                                 }
                             }
@@ -79,7 +73,6 @@ fn login_modal() -> Markup {
                         }
                     }
 
-                    // Extension Login
                     div id="extensionLogin" class="is-hidden" {
                         div class="field" {
                             div class="control" {
@@ -112,11 +105,10 @@ fn register_modal() -> Markup {
                     button id="closeResisterModal" class="delete" aria-label="close" {}
                 }
                 section class="modal-card-body" {
-                    // Tabs for registration method - Email (default) and Browser Extension
                     div class="tabs is-centered" {
                         ul {
-                            li class="is-active" data-target="registerEmail" {
-                                a { "Email" }
+                            li class="is-active" data-target="registerUsername" {
+                                a { "Username" }
                             }
                             li data-target="registerExtension" {
                                 a { "Browser Extension" }
@@ -124,22 +116,21 @@ fn register_modal() -> Markup {
                         }
                     }
 
-                    // Email Registration
-                    div id="registerEmail" {
-                        // Step 1: Email & Password
-                        div id="emailRegisterStep1" {
+                    div id="registerUsername" {
+                        div id="usernameRegisterStep1" {
                             div class="field" {
-                                label class="label" { "Email" }
+                                label class="label" { "Username" }
                                 div class="control" {
-                                    input class="input" type="email" id="registerEmailInput"
-                                          placeholder="you@example.com";
+                                    input class="input" type="text" id="registerUsernameInput"
+                                          placeholder="your_username";
                                 }
+                                p class="help" { "3-32 characters, letters, numbers, underscores, hyphens" }
                             }
                             div class="field" {
                                 label class="label" { "Password" }
                                 div class="control" {
                                     input class="input" type="password" id="registerPassword"
-                                          placeholder="Choose a strong password (min 8 characters)";
+                                          placeholder="Choose a strong password (min 10 characters)";
                                 }
                             }
                             div class="field" {
@@ -149,14 +140,13 @@ fn register_modal() -> Markup {
                                           placeholder="Confirm your password";
                                 }
                             }
-                            p class="help is-danger mt-2" id="emailRegisterError" {}
-                            button class="button is-info is-fullwidth mt-4" id="emailRegisterStep1Button" {
+                            p class="help is-danger mt-2" id="usernameRegisterError" {}
+                            button class="button is-info is-fullwidth mt-4" id="usernameRegisterStep1Button" {
                                 "Continue"
                             }
                         }
 
-                        // Step 2: Backup nsec (CRITICAL)
-                        div id="emailRegisterStep2" class="is-hidden" {
+                        div id="usernameRegisterStep2" class="is-hidden" {
                             div class="notification is-warning" {
                                 strong { "Important: Save Your Recovery Key" }
                                 p {
@@ -167,27 +157,26 @@ fn register_modal() -> Markup {
                             div class="field mt-4" {
                                 label class="label" { "Your Recovery Key (nsec)" }
                                 div class="control" {
-                                    input class="input" type="text" id="emailNsecDisplay" readonly;
+                                    input class="input" type="text" id="usernameNsecDisplay" readonly;
                                 }
                             }
-                            button class="button is-info is-fullwidth mt-2" id="copyEmailNsec" {
+                            button class="button is-info is-fullwidth mt-2" id="copyUsernameNsec" {
                                 "Copy to clipboard"
                             }
                             div class="field mt-4" {
                                 label class="checkbox" {
-                                    input type="checkbox" id="emailNsecSavedCheckbox";
+                                    input type="checkbox" id="usernameNsecSavedCheckbox";
                                     " I have saved my recovery key in a safe place"
                                 }
                             }
-                            p class="help is-danger mt-2" id="emailRegisterStep2Error" {}
+                            p class="help is-danger mt-2" id="usernameRegisterStep2Error" {}
                             button class="button is-success is-fullwidth mt-4"
-                                   id="emailRegisterStep2Button" disabled {
+                                   id="usernameRegisterStep2Button" disabled {
                                 "Complete Registration"
                             }
                         }
 
-                        // Step 3: Success
-                        div id="emailRegisterStep3" class="is-hidden" {
+                        div id="usernameRegisterStep3" class="is-hidden" {
                             div class="has-text-centered" {
                                 h2 class="title" { "Welcome!" }
                                 p class="subtitle" { "Your account has been created successfully." }
@@ -195,7 +184,6 @@ fn register_modal() -> Markup {
                         }
                     }
 
-                    // Extension Registration
                     div id="registerExtension" class="is-hidden" {
                         p class="mb-4" {
                             "Register a new account using your Nostr browser extension."
@@ -231,14 +219,13 @@ fn forgot_password_modal() -> Markup {
                     button class="delete" aria-label="close" id="closeForgotPasswordModal" {}
                 }
                 section class="modal-card-body" {
-                    // Step 1: Enter email
                     div id="forgotStep1" {
-                        p { "Enter your email to receive a password reset challenge." }
+                        p { "Enter your username to start the password reset process." }
                         div class="field mt-4" {
-                            label class="label" { "Email" }
+                            label class="label" { "Username" }
                             div class="control" {
-                                input class="input" type="email" id="forgotEmail"
-                                      placeholder="you@example.com";
+                                input class="input" type="text" id="forgotUsername"
+                                      placeholder="your_username";
                             }
                         }
                         p class="help is-danger mt-2" id="forgotStep1Error" {}
@@ -247,7 +234,6 @@ fn forgot_password_modal() -> Markup {
                         }
                     }
 
-                    // Step 2: Enter nsec and sign challenge
                     div id="forgotStep2" class="is-hidden" {
                         div class="notification is-info is-light" {
                             p { "Enter your recovery key (nsec) to prove account ownership." }
@@ -265,7 +251,6 @@ fn forgot_password_modal() -> Markup {
                         }
                     }
 
-                    // Step 3: Set new password
                     div id="forgotStep3" class="is-hidden" {
                         div class="notification is-success is-light" {
                             p { "Ownership verified! Set your new password." }
@@ -274,7 +259,7 @@ fn forgot_password_modal() -> Markup {
                             label class="label" { "New Password" }
                             div class="control" {
                                 input class="input" type="password" id="forgotNewPassword"
-                                      placeholder="Choose a new password (min 8 characters)";
+                                      placeholder="Choose a new password (min 10 characters)";
                             }
                         }
                         div class="field" {
@@ -290,7 +275,6 @@ fn forgot_password_modal() -> Markup {
                         }
                     }
 
-                    // Back to login link
                     p class="has-text-centered mt-5" {
                         a href="#" id="backToLoginFromForgot" class="has-text-info" {
                             "Back to Login"

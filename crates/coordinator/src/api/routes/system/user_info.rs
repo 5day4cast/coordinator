@@ -18,12 +18,6 @@ use crate::{
     startup::AppState,
 };
 
-/// Validates password strength requirements:
-/// - At least 10 characters
-/// - Contains lowercase letter
-/// - Contains uppercase letter
-/// - Contains number
-/// - Contains special character
 fn validate_password_strength(password: &str) -> Result<(), String> {
     if password.len() < 10 {
         return Err("Password must be at least 10 characters".to_string());
@@ -86,11 +80,9 @@ pub async fn register(
     }
 }
 
-// ==================== Email Auth Endpoints ====================
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmailRegisterPayload {
-    pub email: String,
+pub struct UsernameRegisterPayload {
+    pub username: String,
     pub password: String,
     pub encrypted_nsec: String,
     pub nostr_pubkey: String,
@@ -99,48 +91,70 @@ pub struct EmailRegisterPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmailRegisterResponse {
+pub struct UsernameRegisterResponse {
     pub nostr_pubkey: String,
-    pub email: String,
+    pub username: String,
 }
 
-pub async fn register_email(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<EmailRegisterPayload>,
-) -> Result<impl IntoResponse, ErrorResponse> {
-    debug!("registering user with email: {}", body.email);
+fn validate_username(username: &str) -> Result<(), String> {
+    if username.len() < 3 {
+        return Err("Username must be at least 3 characters".to_string());
+    }
+    if username.len() > 32 {
+        return Err("Username must be at most 32 characters".to_string());
+    }
+    if !username
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(
+            "Username can only contain letters, numbers, underscores, and hyphens".to_string(),
+        );
+    }
+    if !username
+        .chars()
+        .next()
+        .map_or(false, |c| c.is_ascii_alphabetic())
+    {
+        return Err("Username must start with a letter".to_string());
+    }
+    Ok(())
+}
 
-    // Validate email format (basic check)
-    if !body.email.contains('@') || body.email.len() < 5 {
-        return Err(ErrorResponse::from(domain::Error::BadRequest(
-            "Invalid email format".to_string(),
-        )));
+pub async fn register_username(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<UsernameRegisterPayload>,
+) -> Result<impl IntoResponse, ErrorResponse> {
+    debug!("registering user with username: {}", body.username);
+
+    if let Err(e) = validate_username(&body.username) {
+        return Err(ErrorResponse::from(domain::Error::BadRequest(e)));
     }
 
-    // Validate password strength
     if let Err(e) = validate_password_strength(&body.password) {
         return Err(ErrorResponse::from(domain::Error::BadRequest(e)));
     }
 
-    // Check if email already exists
-    if state.users_info.email_exists(&body.email).await? {
-        return Err(ErrorResponse::from(domain::Error::BadRequest(
-            "Email already registered".to_string(),
-        )));
+    if state.users_info.username_exists(&body.username).await? {
+        return Ok((
+            StatusCode::CREATED,
+            Json(UsernameRegisterResponse {
+                nostr_pubkey: body.nostr_pubkey,
+                username: body.username,
+            }),
+        ));
     }
 
-    // Hash the password
     let password_hash = hash_password(&body.password).map_err(|e| {
         error!("Failed to hash password: {}", e);
         domain::Error::BadRequest("Failed to process password".to_string())
     })?;
 
-    // Register the user
     let user = state
         .users_info
-        .register_email_user(
+        .register_username_user(
             body.nostr_pubkey.clone(),
-            body.email.clone(),
+            body.username.clone(),
             password_hash,
             body.encrypted_nsec,
             body.encrypted_bitcoin_private_key,
@@ -150,48 +164,46 @@ pub async fn register_email(
 
     Ok((
         StatusCode::CREATED,
-        Json(EmailRegisterResponse {
+        Json(UsernameRegisterResponse {
             nostr_pubkey: user.nostr_pubkey,
-            email: user.email.unwrap_or_default(),
+            username: user.username.unwrap_or_default(),
         }),
     ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmailLoginPayload {
-    pub email: String,
+pub struct UsernameLoginPayload {
+    pub username: String,
     pub password: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmailLoginResponse {
+pub struct UsernameLoginResponse {
     pub encrypted_nsec: String,
     pub encrypted_bitcoin_private_key: String,
     pub network: String,
     pub nostr_pubkey: String,
 }
 
-pub async fn login_email(
+pub async fn login_username(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<EmailLoginPayload>,
+    Json(body): Json<UsernameLoginPayload>,
 ) -> Result<impl IntoResponse, ErrorResponse> {
-    debug!("email login attempt for: {}", body.email);
+    debug!("username login attempt for: {}", body.username);
 
-    // Get user by email
-    let user = match state.users_info.get_user_by_email(&body.email).await {
+    let user = match state.users_info.get_user_by_username(&body.username).await {
         Ok(user) => user,
         Err(domain::Error::NotFound(_)) => {
             return Err(ErrorResponse::from(AuthError::InvalidLogin));
         }
         Err(e) => {
-            error!("Failed to get user by email: {}", e);
+            error!("Failed to get user by username: {}", e);
             return Err(ErrorResponse::from(e));
         }
     };
 
-    // Verify password
     let password_hash = user.password_hash.as_ref().ok_or_else(|| {
-        error!("User {} has no password hash", body.email);
+        error!("User {} has no password hash", body.username);
         AuthError::InvalidLogin
     })?;
 
@@ -204,15 +216,14 @@ pub async fn login_email(
         return Err(ErrorResponse::from(AuthError::InvalidLogin));
     }
 
-    // Return encrypted data for client-side decryption
     let encrypted_nsec = user.encrypted_nsec.ok_or_else(|| {
-        error!("User {} has no encrypted nsec", body.email);
+        error!("User {} has no encrypted nsec", body.username);
         AuthError::InvalidLogin
     })?;
 
     Ok((
         StatusCode::OK,
-        Json(EmailLoginResponse {
+        Json(UsernameLoginResponse {
             encrypted_nsec,
             encrypted_bitcoin_private_key: user.encrypted_bitcoin_private_key,
             network: user.network,
@@ -236,19 +247,16 @@ pub async fn change_password(
     let pubkey_str = pubkey.to_bech32().expect("public bech32 format");
     debug!("password change for user: {}", pubkey_str);
 
-    // Validate new password strength
     if let Err(e) = validate_password_strength(&body.new_password) {
         return Err(ErrorResponse::from(domain::Error::BadRequest(e)));
     }
 
-    // Get user to verify current password
     let user = state.users_info.login(pubkey_str.clone()).await?;
 
     let password_hash = user.password_hash.as_ref().ok_or_else(|| {
         domain::Error::BadRequest("User does not have password authentication".to_string())
     })?;
 
-    // Verify current password
     let valid = verify_password(&body.current_password, password_hash).map_err(|e| {
         error!("Password verification error: {}", e);
         domain::Error::BadRequest("Invalid current password".to_string())
@@ -260,13 +268,11 @@ pub async fn change_password(
         )));
     }
 
-    // Hash new password
     let new_password_hash = hash_password(&body.new_password).map_err(|e| {
         error!("Failed to hash password: {}", e);
         domain::Error::BadRequest("Failed to process password".to_string())
     })?;
 
-    // Update password
     state
         .users_info
         .update_password(&pubkey_str, new_password_hash, body.new_encrypted_nsec)
@@ -277,7 +283,7 @@ pub async fn change_password(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForgotPasswordRequest {
-    pub email: String,
+    pub username: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,24 +296,8 @@ pub async fn forgot_password_challenge(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ForgotPasswordRequest>,
 ) -> Result<impl IntoResponse, ErrorResponse> {
-    debug!("forgot password request for: {}", body.email);
+    debug!("forgot password request for: {}", body.username);
 
-    // Get user's pubkey by email
-    let nostr_pubkey = match state.users_info.get_pubkey_by_email(&body.email).await {
-        Ok(pubkey) => pubkey,
-        Err(domain::Error::NotFound(_)) => {
-            // Don't reveal whether email exists - return generic error
-            return Err(ErrorResponse::from(domain::Error::BadRequest(
-                "If this email is registered, a challenge has been generated".to_string(),
-            )));
-        }
-        Err(e) => {
-            error!("Failed to get pubkey by email: {}", e);
-            return Err(ErrorResponse::from(e));
-        }
-    };
-
-    // Generate random challenge
     let challenge = {
         use rand::Rng;
         let mut bytes = [0u8; 32];
@@ -315,14 +305,33 @@ pub async fn forgot_password_challenge(
         hex::encode(bytes)
     };
 
-    // Store challenge with expiry (5 minutes)
+    let nostr_pubkey = match state
+        .users_info
+        .get_pubkey_by_username(&body.username)
+        .await
     {
-        let mut challenges = state.forgot_password_challenges.write().await;
-        challenges.insert(
-            body.email.clone(),
-            (challenge.clone(), std::time::Instant::now()),
-        );
-    }
+        Ok(pubkey) => {
+            let mut challenges = state.forgot_password_challenges.write().await;
+            challenges.insert(
+                body.username.clone(),
+                (challenge.clone(), std::time::Instant::now()),
+            );
+            pubkey
+        }
+        Err(domain::Error::NotFound(_)) => {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            body.username.hash(&mut hasher);
+            format!(
+                "npub1fake{:016x}0000000000000000000000000000",
+                hasher.finish()
+            )
+        }
+        Err(e) => {
+            error!("Failed to get pubkey by username: {}", e);
+            return Err(ErrorResponse::from(e));
+        }
+    };
 
     Ok((
         StatusCode::OK,
@@ -335,7 +344,7 @@ pub async fn forgot_password_challenge(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForgotPasswordReset {
-    pub email: String,
+    pub username: String,
     pub challenge: String,
     pub signed_event: String,
     pub new_password: String,
@@ -346,17 +355,15 @@ pub async fn forgot_password_reset(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ForgotPasswordReset>,
 ) -> Result<impl IntoResponse, ErrorResponse> {
-    debug!("forgot password reset for: {}", body.email);
+    debug!("forgot password reset for: {}", body.username);
 
-    // Validate new password strength
     if let Err(e) = validate_password_strength(&body.new_password) {
         return Err(ErrorResponse::from(domain::Error::BadRequest(e)));
     }
 
-    // Verify challenge exists and hasn't expired (5 min timeout)
     let challenge_valid = {
         let challenges = state.forgot_password_challenges.read().await;
-        if let Some((stored_challenge, created_at)) = challenges.get(&body.email) {
+        if let Some((stored_challenge, created_at)) = challenges.get(&body.username) {
             stored_challenge == &body.challenge
                 && created_at.elapsed() < std::time::Duration::from_secs(300)
         } else {
@@ -370,22 +377,30 @@ pub async fn forgot_password_reset(
         )));
     }
 
-    // Get user's pubkey
-    let nostr_pubkey = state.users_info.get_pubkey_by_email(&body.email).await?;
+    let nostr_pubkey = match state
+        .users_info
+        .get_pubkey_by_username(&body.username)
+        .await
+    {
+        Ok(pubkey) => pubkey,
+        Err(domain::Error::NotFound(_)) => {
+            return Err(ErrorResponse::from(domain::Error::BadRequest(
+                "Invalid or expired challenge".to_string(),
+            )));
+        }
+        Err(e) => return Err(ErrorResponse::from(e)),
+    };
 
-    // Parse and verify the signed event
     let event: Event = serde_json::from_str(&body.signed_event).map_err(|e| {
         error!("Failed to parse signed event: {}", e);
         domain::Error::BadRequest("Invalid signed event format".to_string())
     })?;
 
-    // Verify signature
     event.verify().map_err(|e| {
         error!("Invalid event signature: {}", e);
         domain::Error::BadRequest("Invalid event signature".to_string())
     })?;
 
-    // Verify pubkey matches
     let event_pubkey = event.pubkey.to_bech32().expect("public bech32 format");
     if event_pubkey != nostr_pubkey {
         return Err(ErrorResponse::from(domain::Error::BadRequest(
@@ -393,29 +408,25 @@ pub async fn forgot_password_reset(
         )));
     }
 
-    // Verify challenge is in event content
     if event.content != body.challenge {
         return Err(ErrorResponse::from(domain::Error::BadRequest(
             "Challenge mismatch in signed event".to_string(),
         )));
     }
 
-    // Hash new password
     let new_password_hash = hash_password(&body.new_password).map_err(|e| {
         error!("Failed to hash password: {}", e);
         domain::Error::BadRequest("Failed to process password".to_string())
     })?;
 
-    // Update password
     state
         .users_info
         .update_password(&nostr_pubkey, new_password_hash, body.new_encrypted_nsec)
         .await?;
 
-    // Remove used challenge
     {
         let mut challenges = state.forgot_password_challenges.write().await;
-        challenges.remove(&body.email);
+        challenges.remove(&body.username);
     }
 
     Ok(StatusCode::OK)

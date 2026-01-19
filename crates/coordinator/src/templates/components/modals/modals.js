@@ -1,30 +1,30 @@
 function resetLoginModal() {
-  const emailError = document.querySelector("#emailLoginError");
-  if (emailError) emailError.textContent = "";
+  const usernameError = document.querySelector("#usernameLoginError");
+  if (usernameError) usernameError.textContent = "";
 
   const extensionError = document.querySelector("#extensionLoginError");
   if (extensionError) extensionError.textContent = "";
 
-  const emailInput = document.getElementById("loginEmail");
-  if (emailInput) emailInput.value = "";
+  const usernameInput = document.getElementById("loginUsername");
+  if (usernameInput) usernameInput.value = "";
 
   const passwordInput = document.getElementById("loginPassword");
   if (passwordInput) passwordInput.value = "";
 
   document
-    .querySelector("#loginModal .tabs li[data-target='emailLogin']")
+    .querySelector("#loginModal .tabs li[data-target='usernameLogin']")
     ?.click();
 }
 
 function resetRegisterModal() {
-  const emailError = document.querySelector("#emailRegisterError");
-  if (emailError) emailError.textContent = "";
+  const usernameError = document.querySelector("#usernameRegisterError");
+  if (usernameError) usernameError.textContent = "";
 
   const extensionError = document.querySelector("#extensionRegisterError");
   if (extensionError) extensionError.textContent = "";
 
-  const emailInput = document.getElementById("registerEmailInput");
-  if (emailInput) emailInput.value = "";
+  const usernameInput = document.getElementById("registerUsernameInput");
+  if (usernameInput) usernameInput.value = "";
 
   const passwordInput = document.getElementById("registerPassword");
   if (passwordInput) passwordInput.value = "";
@@ -32,30 +32,32 @@ function resetRegisterModal() {
   const confirmInput = document.getElementById("registerPasswordConfirm");
   if (confirmInput) confirmInput.value = "";
 
-  const display = document.getElementById("emailNsecDisplay");
+  const display = document.getElementById("usernameNsecDisplay");
   if (display) display.value = "";
 
-  const checkbox = document.getElementById("emailNsecSavedCheckbox");
+  const checkbox = document.getElementById("usernameNsecSavedCheckbox");
   if (checkbox) checkbox.checked = false;
 
-  const step2Button = document.getElementById("emailRegisterStep2Button");
+  const step2Button = document.getElementById("usernameRegisterStep2Button");
   if (step2Button) step2Button.disabled = true;
 
-  document.getElementById("emailRegisterStep1")?.classList.remove("is-hidden");
-  document.getElementById("emailRegisterStep2")?.classList.add("is-hidden");
-  document.getElementById("emailRegisterStep3")?.classList.add("is-hidden");
+  document
+    .getElementById("usernameRegisterStep1")
+    ?.classList.remove("is-hidden");
+  document.getElementById("usernameRegisterStep2")?.classList.add("is-hidden");
+  document.getElementById("usernameRegisterStep3")?.classList.add("is-hidden");
 
   document
-    .querySelector("#registerModal .tabs li[data-target='registerEmail']")
+    .querySelector("#registerModal .tabs li[data-target='registerUsername']")
     ?.click();
 }
 
 function resetForgotPasswordModal() {
-  const error = document.querySelector("#forgotPasswordError");
+  const error = document.querySelector("#forgotStep1Error");
   if (error) error.textContent = "";
 
-  const emailInput = document.getElementById("forgotEmail");
-  if (emailInput) emailInput.value = "";
+  const usernameInput = document.getElementById("forgotUsername");
+  if (usernameInput) usernameInput.value = "";
 
   const nsecInput = document.getElementById("forgotNsec");
   if (nsecInput) nsecInput.value = "";
@@ -121,6 +123,15 @@ function setupAuthModals(authManager) {
       resetForgotPasswordModal();
       window.openModal(document.getElementById("forgotPasswordModal"));
     });
+
+  document
+    .getElementById("backToLoginFromForgot")
+    ?.addEventListener("click", (e) => {
+      e.preventDefault();
+      window.closeModal(document.getElementById("forgotPasswordModal"));
+      resetLoginModal();
+      window.openModal(document.getElementById("loginModal"));
+    });
 }
 
 window.resetLoginModal = resetLoginModal;
@@ -140,48 +151,40 @@ class AuthManager {
   }
 
   attachEventListeners() {
-    // Email login
     document
-      .getElementById("emailLoginButton")
-      ?.addEventListener("click", () => this.handleEmailLogin());
+      .getElementById("usernameLoginButton")
+      ?.addEventListener("click", () => this.handleUsernameLogin());
 
-    // Extension login
     document
       .getElementById("extensionLoginButton")
       ?.addEventListener("click", () => this.handleExtensionLogin());
 
-    // Email registration steps
     document
-      .getElementById("emailRegisterStep1Button")
-      ?.addEventListener("click", () => this.handleEmailRegisterStep1());
+      .getElementById("usernameRegisterStep1Button")
+      ?.addEventListener("click", () => this.handleUsernameRegisterStep1());
     document
-      .getElementById("emailRegisterStep2Button")
-      ?.addEventListener("click", () => this.handleEmailRegisterStep2());
+      .getElementById("usernameRegisterStep2Button")
+      ?.addEventListener("click", () => this.handleUsernameRegisterStep2());
 
-    // Extension registration
     document
       .getElementById("extensionRegisterButton")
       ?.addEventListener("click", () => this.handleExtensionRegistration());
 
-    // Copy nsec button
     document
-      .getElementById("copyEmailNsec")
+      .getElementById("copyUsernameNsec")
       ?.addEventListener("click", () => this.handleCopyNsec());
 
-    // Logout
     document
       .getElementById("logoutContainer")
       ?.addEventListener("click", () => this.handleLogout());
 
-    // nsec saved checkbox enables step 2 button
     document
-      .getElementById("emailNsecSavedCheckbox")
+      .getElementById("usernameNsecSavedCheckbox")
       ?.addEventListener("change", (e) => {
-        const btn = document.getElementById("emailRegisterStep2Button");
+        const btn = document.getElementById("usernameRegisterStep2Button");
         if (btn) btn.disabled = !e.target.checked;
       });
 
-    // Forgot password steps
     document
       .getElementById("forgotStep1Button")
       ?.addEventListener("click", () => this.handleForgotStep1());
@@ -192,7 +195,6 @@ class AuthManager {
       .getElementById("forgotStep3Button")
       ?.addEventListener("click", () => this.handleForgotStep3());
 
-    // Tab switching
     document.querySelectorAll(".tabs li").forEach((tab) => {
       tab.addEventListener("click", () => {
         const modal = tab.closest(".modal");
@@ -205,30 +207,32 @@ class AuthManager {
     });
   }
 
-  async handleEmailLogin() {
-    const errorElement = document.querySelector("#emailLoginError");
+  async handleUsernameLogin() {
+    const errorElement = document.querySelector("#usernameLoginError");
     if (errorElement) errorElement.textContent = "";
 
-    const email = document.getElementById("loginEmail")?.value?.trim();
+    const username = document.getElementById("loginUsername")?.value?.trim();
     const password = document.getElementById("loginPassword")?.value;
 
-    if (!email || !password) {
+    if (!username || !password) {
       if (errorElement)
-        errorElement.textContent = "Please enter email and password";
+        errorElement.textContent = "Please enter username and password";
       return;
     }
 
     try {
-      // Call login endpoint to get encrypted nsec
-      const response = await fetch(`${this.apiBase}/api/v1/users/email/login`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password }),
-      });
+      const response = await fetch(
+        `${this.apiBase}/api/v1/users/username/login`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, password }),
+        },
+      );
 
       if (response.status === 401) {
         if (errorElement)
-          errorElement.textContent = "Invalid email or password";
+          errorElement.textContent = "Invalid username or password";
         return;
       }
 
@@ -245,20 +249,17 @@ class AuthManager {
         );
       }
 
-      // Decrypt nsec with password (client-side WASM)
       const nsec = await window.decryptNsecWithPassword(
         encrypted_nsec,
         password,
       );
 
-      // Initialize NostrClient with decrypted nsec
       await window.nostrClient.initialize(window.SignerType.PrivateKey, nsec);
       this.authorizedClient = new window.AuthorizedClient(
         window.nostrClient,
         this.apiBase,
       );
 
-      // Build taproot wallet
       window.taprootWallet = await new window.TaprootWalletBuilder()
         .network(network)
         .nostr_client(window.nostrClient)
@@ -267,7 +268,7 @@ class AuthManager {
 
       this.onLoginSuccess();
     } catch (error) {
-      console.error("Email login failed:", error);
+      console.error("Username login failed:", error);
       if (errorElement) {
         errorElement.textContent =
           error.message.includes("decrypt") ||
@@ -305,18 +306,26 @@ class AuthManager {
     }
   }
 
-  async handleEmailRegisterStep1() {
-    const errorElement = document.querySelector("#emailRegisterError");
+  async handleUsernameRegisterStep1() {
+    const errorElement = document.querySelector("#usernameRegisterError");
     if (errorElement) errorElement.textContent = "";
 
-    const email = document.getElementById("registerEmailInput")?.value?.trim();
+    const username = document
+      .getElementById("registerUsernameInput")
+      ?.value?.trim();
     const password = document.getElementById("registerPassword")?.value;
     const confirmPassword = document.getElementById(
       "registerPasswordConfirm",
     )?.value;
 
-    if (!email || !password || !confirmPassword) {
+    if (!username || !password || !confirmPassword) {
       if (errorElement) errorElement.textContent = "Please fill in all fields";
+      return;
+    }
+
+    const usernameError = this.validateUsername(username);
+    if (usernameError) {
+      if (errorElement) errorElement.textContent = usernameError;
       return;
     }
 
@@ -332,30 +341,27 @@ class AuthManager {
     }
 
     try {
-      // Generate new nsec (client-side WASM)
       await window.nostrClient.initialize(window.SignerType.PrivateKey, null);
       const nsec = await window.nostrClient.getPrivateKey();
 
-      // Encrypt nsec with password (client-side WASM)
       const encryptedNsec = await window.encryptNsecWithPassword(
         nsec,
         password,
       );
 
-      // Store for step 2
       this.pendingNsec = nsec;
       this.pendingEncryptedNsec = encryptedNsec;
-      this.pendingEmail = email;
+      this.pendingUsername = username;
       this.pendingPassword = password;
 
-      // Show nsec to user
-      const display = document.getElementById("emailNsecDisplay");
+      const display = document.getElementById("usernameNsecDisplay");
       if (display) display.value = nsec;
 
-      // Move to step 2
-      document.getElementById("emailRegisterStep1")?.classList.add("is-hidden");
       document
-        .getElementById("emailRegisterStep2")
+        .getElementById("usernameRegisterStep1")
+        ?.classList.add("is-hidden");
+      document
+        .getElementById("usernameRegisterStep2")
         ?.classList.remove("is-hidden");
     } catch (error) {
       console.error("Registration step 1 failed:", error);
@@ -364,14 +370,14 @@ class AuthManager {
     }
   }
 
-  async handleEmailRegisterStep2() {
-    const errorElement = document.querySelector("#emailRegisterError");
+  async handleUsernameRegisterStep2() {
+    const errorElement = document.querySelector("#usernameRegisterStep2Error");
     if (errorElement) errorElement.textContent = "";
 
     if (
       !this.pendingNsec ||
       !this.pendingEncryptedNsec ||
-      !this.pendingEmail ||
+      !this.pendingUsername ||
       !this.pendingPassword
     ) {
       if (errorElement)
@@ -381,13 +387,11 @@ class AuthManager {
     }
 
     try {
-      // Create authorized client for registration
       this.authorizedClient = new window.AuthorizedClient(
         window.nostrClient,
         this.apiBase,
       );
 
-      // Create wallet and get encrypted bitcoin key
       const pubkey = await window.nostrClient.getPublicKey();
       const wallet = await new window.TaprootWalletBuilder()
         .network(this.network)
@@ -397,14 +401,13 @@ class AuthManager {
       const { encrypted_bitcoin_private_key } =
         await wallet.getEncryptedMasterKey(pubkey);
 
-      // Register with server
       const response = await fetch(
-        `${this.apiBase}/api/v1/users/email/register`,
+        `${this.apiBase}/api/v1/users/username/register`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            email: this.pendingEmail,
+            username: this.pendingUsername,
             password: this.pendingPassword,
             encrypted_nsec: this.pendingEncryptedNsec,
             nostr_pubkey: pubkey,
@@ -416,37 +419,26 @@ class AuthManager {
 
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));
-        if (
-          response.status === 400 &&
-          data.error?.includes("already registered")
-        ) {
-          if (errorElement)
-            errorElement.textContent =
-              "Email already registered. Please log in.";
-        } else {
-          if (errorElement)
-            errorElement.textContent =
-              data.error || "Registration failed. Please try again.";
-        }
+        if (errorElement)
+          errorElement.textContent =
+            data.error || "Registration failed. Please try again.";
         return;
       }
 
-      // Set up taproot wallet
       window.taprootWallet = wallet;
 
-      // Clear pending state
       this.pendingNsec = null;
       this.pendingEncryptedNsec = null;
-      this.pendingEmail = null;
+      this.pendingUsername = null;
       this.pendingPassword = null;
 
-      // Show success step
-      document.getElementById("emailRegisterStep2")?.classList.add("is-hidden");
       document
-        .getElementById("emailRegisterStep3")
+        .getElementById("usernameRegisterStep2")
+        ?.classList.add("is-hidden");
+      document
+        .getElementById("usernameRegisterStep3")
         ?.classList.remove("is-hidden");
 
-      // Auto-close after delay
       setTimeout(() => {
         this.onLoginSuccess();
       }, 2000);
@@ -480,10 +472,23 @@ class AuthManager {
   }
 
   handleCopyNsec() {
-    const nsec = document.getElementById("emailNsecDisplay")?.value;
+    const nsec = document.getElementById("usernameNsecDisplay")?.value;
     if (nsec) {
       navigator.clipboard.writeText(nsec);
     }
+  }
+
+  validateUsername(username) {
+    if (username.length < 3) {
+      return "Username must be at least 3 characters";
+    }
+    if (username.length > 32) {
+      return "Username must be at most 32 characters";
+    }
+    if (!/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(username)) {
+      return "Username must start with a letter and contain only letters, numbers, underscores, and hyphens";
+    }
+    return null;
   }
 
   validatePasswordStrength(password) {
@@ -506,30 +511,24 @@ class AuthManager {
   }
 
   async handleForgotStep1() {
-    const errorElement = document.querySelector("#forgotPasswordError");
+    const errorElement = document.querySelector("#forgotStep1Error");
     if (errorElement) errorElement.textContent = "";
 
-    const email = document.getElementById("forgotEmail")?.value?.trim();
-    if (!email) {
-      if (errorElement) errorElement.textContent = "Please enter your email";
+    const username = document.getElementById("forgotUsername")?.value?.trim();
+    if (!username) {
+      if (errorElement) errorElement.textContent = "Please enter your username";
       return;
     }
 
     try {
       const response = await fetch(
-        `${this.apiBase}/api/v1/users/email/forgot-password`,
+        `${this.apiBase}/api/v1/users/username/forgot-password`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email }),
+          body: JSON.stringify({ username }),
         },
       );
-
-      if (response.status === 404) {
-        if (errorElement)
-          errorElement.textContent = "No account found with that email";
-        return;
-      }
 
       if (!response.ok) {
         throw new Error("Failed to initiate password reset");
@@ -538,9 +537,8 @@ class AuthManager {
       const { challenge, nostr_pubkey } = await response.json();
       this.forgotChallenge = challenge;
       this.forgotNpub = nostr_pubkey;
-      this.forgotEmail = email;
+      this.forgotUsername = username;
 
-      // Move to step 2
       document.getElementById("forgotStep1")?.classList.add("is-hidden");
       document.getElementById("forgotStep2")?.classList.remove("is-hidden");
     } catch (error) {
@@ -551,7 +549,7 @@ class AuthManager {
   }
 
   async handleForgotStep2() {
-    const errorElement = document.querySelector("#forgotPasswordError");
+    const errorElement = document.querySelector("#forgotStep2Error");
     if (errorElement) errorElement.textContent = "";
 
     const nsec = document.getElementById("forgotNsec")?.value?.trim();
@@ -569,7 +567,6 @@ class AuthManager {
     }
 
     try {
-      // Verify nsec matches the account's npub
       await window.nostrClient.initialize(window.SignerType.PrivateKey, nsec);
       const derivedNpub = await window.nostrClient.getPublicKey();
 
@@ -580,14 +577,12 @@ class AuthManager {
         return;
       }
 
-      // Sign challenge to prove ownership
       this.forgotSignedChallenge = await window.signForgotPasswordChallenge(
         nsec,
         this.forgotChallenge,
       );
       this.forgotNsec = nsec;
 
-      // Move to step 3
       document.getElementById("forgotStep2")?.classList.add("is-hidden");
       document.getElementById("forgotStep3")?.classList.remove("is-hidden");
     } catch (error) {
@@ -598,7 +593,7 @@ class AuthManager {
   }
 
   async handleForgotStep3() {
-    const errorElement = document.querySelector("#forgotPasswordError");
+    const errorElement = document.querySelector("#forgotStep3Error");
     if (errorElement) errorElement.textContent = "";
 
     const newPassword = document.getElementById("forgotNewPassword")?.value;
@@ -622,7 +617,11 @@ class AuthManager {
       return;
     }
 
-    if (!this.forgotSignedChallenge || !this.forgotNsec || !this.forgotEmail) {
+    if (
+      !this.forgotSignedChallenge ||
+      !this.forgotNsec ||
+      !this.forgotUsername
+    ) {
       if (errorElement)
         errorElement.textContent = "Session expired. Please start over.";
       resetForgotPasswordModal();
@@ -630,20 +629,18 @@ class AuthManager {
     }
 
     try {
-      // Re-encrypt nsec with new password
       const newEncryptedNsec = await window.encryptNsecWithPassword(
         this.forgotNsec,
         newPassword,
       );
 
-      // Send reset request
       const response = await fetch(
-        `${this.apiBase}/api/v1/users/email/reset-password`,
+        `${this.apiBase}/api/v1/users/username/reset-password`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            email: this.forgotEmail,
+            username: this.forgotUsername,
             challenge: this.forgotChallenge,
             signed_event: this.forgotSignedChallenge,
             new_password: newPassword,
@@ -657,24 +654,21 @@ class AuthManager {
         throw new Error(data.error || "Password reset failed");
       }
 
-      // Clear forgot state
       this.forgotChallenge = null;
       this.forgotNpub = null;
-      this.forgotEmail = null;
+      this.forgotUsername = null;
       this.forgotSignedChallenge = null;
       this.forgotNsec = null;
 
-      // Close modal and show login
       window.closeModal(document.getElementById("forgotPasswordModal"));
       resetLoginModal();
       window.openModal(document.getElementById("loginModal"));
 
-      // Show success message in login modal
-      const loginError = document.querySelector("#emailLoginError");
+      const loginError = document.querySelector("#usernameLoginError");
       if (loginError) {
         loginError.textContent = "Password reset successful. Please log in.";
-        loginError.classList.remove("has-text-danger");
-        loginError.classList.add("has-text-success");
+        loginError.classList.remove("is-danger");
+        loginError.classList.add("is-success");
       }
     } catch (error) {
       console.error("Forgot password step 3 failed:", error);
@@ -732,11 +726,10 @@ class AuthManager {
     document.getElementById("authButtons")?.classList.remove("is-hidden");
     document.getElementById("logoutContainer")?.classList.add("is-hidden");
 
-    // Clear any sensitive inputs
-    document.getElementById("loginEmail")?.value &&
-      (document.getElementById("loginEmail").value = "");
-    document.getElementById("loginPassword")?.value &&
-      (document.getElementById("loginPassword").value = "");
+    const usernameInput = document.getElementById("loginUsername");
+    if (usernameInput) usernameInput.value = "";
+    const passwordInput = document.getElementById("loginPassword");
+    if (passwordInput) passwordInput.value = "";
 
     document.querySelector('[hx-get="/competitions"]')?.click();
   }
@@ -755,8 +748,8 @@ class AuthManager {
 
     const target = tab.dataset.target;
     document
-      .getElementById("emailLogin")
-      ?.classList.toggle("is-hidden", target !== "emailLogin");
+      .getElementById("usernameLogin")
+      ?.classList.toggle("is-hidden", target !== "usernameLogin");
     document
       .getElementById("extensionLogin")
       ?.classList.toggle("is-hidden", target !== "extensionLogin");
@@ -770,8 +763,8 @@ class AuthManager {
 
     const target = tab.dataset.target;
     document
-      .getElementById("registerEmail")
-      ?.classList.toggle("is-hidden", target !== "registerEmail");
+      .getElementById("registerUsername")
+      ?.classList.toggle("is-hidden", target !== "registerUsername");
     document
       .getElementById("registerExtension")
       ?.classList.toggle("is-hidden", target !== "registerExtension");

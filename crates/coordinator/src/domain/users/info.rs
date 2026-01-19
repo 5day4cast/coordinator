@@ -22,21 +22,19 @@ impl UserInfo {
         self.user_store.login(pubkey).await
     }
 
-    // ==================== Email Auth Methods ====================
-
-    pub async fn register_email_user(
+    pub async fn register_username_user(
         &self,
         nostr_pubkey: String,
-        email: String,
+        username: String,
         password_hash: String,
         encrypted_nsec: String,
         encrypted_bitcoin_private_key: String,
         network: String,
     ) -> Result<User, Error> {
         self.user_store
-            .register_email_user(
+            .register_username_user(
                 nostr_pubkey,
-                email,
+                username,
                 password_hash,
                 encrypted_nsec,
                 encrypted_bitcoin_private_key,
@@ -45,12 +43,12 @@ impl UserInfo {
             .await
     }
 
-    pub async fn get_user_by_email(&self, email: &str) -> Result<User, Error> {
-        self.user_store.get_user_by_email(email).await
+    pub async fn get_user_by_username(&self, username: &str) -> Result<User, Error> {
+        self.user_store.get_user_by_username(username).await
     }
 
-    pub async fn email_exists(&self, email: &str) -> Result<bool, Error> {
-        self.user_store.email_exists(email).await
+    pub async fn username_exists(&self, username: &str) -> Result<bool, Error> {
+        self.user_store.username_exists(username).await
     }
 
     pub async fn update_password(
@@ -64,7 +62,13 @@ impl UserInfo {
             .await
     }
 
-    pub async fn get_pubkey_by_email(&self, email: &str) -> Result<String, Error> {
-        self.user_store.get_pubkey_by_email(email).await
+    pub async fn get_pubkey_by_username(&self, username: &str) -> Result<String, Error> {
+        self.user_store.get_pubkey_by_username(username).await
+    }
+
+    pub async fn update_username(&self, nostr_pubkey: &str, username: String) -> Result<(), Error> {
+        self.user_store
+            .update_username(nostr_pubkey, username)
+            .await
     }
 }
