@@ -447,8 +447,6 @@ impl CompetitionStore {
         Ok(entry_payouts)
     }
 
-    /// Get a pending payout by its payment hash (used for subscription-based payment updates)
-    /// Since we store the full payment_request, we need to extract and compare hashes
     pub async fn get_payout_by_payment_hash(
         &self,
         payment_hash: &str,
@@ -1529,7 +1527,6 @@ impl CompetitionStore {
         Ok(ticket)
     }
 
-    /// Get a ticket by its payment hash (used for subscription-based invoice updates)
     pub async fn get_ticket_by_hash(&self, hash: &str) -> Result<Option<Ticket>, sqlx::Error> {
         let ticket = sqlx::query_as::<_, Ticket>(
             r#"SELECT tickets.id as id,
