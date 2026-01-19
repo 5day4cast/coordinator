@@ -368,9 +368,9 @@ test.describe("Email/Password Authentication", () => {
     // This test just verifies the UI is present
   });
 
-  test("password validation rejects short passwords", async ({ page }) => {
+  test("password validation rejects weak passwords", async ({ page }) => {
     const email = uniqueEmail();
-    const shortPassword = "short"; // Less than 8 characters
+    const weakPassword = "short"; // Too short, missing requirements
 
     await page.goto("/");
     await page.waitForFunction(() => window.wasmInitialized === true, {
@@ -381,13 +381,13 @@ test.describe("Email/Password Authentication", () => {
     await page.locator(".tabs li[data-target='registerEmail']").click();
 
     await page.locator("#registerEmailInput").fill(email);
-    await page.locator("#registerPassword").fill(shortPassword);
-    await page.locator("#registerPasswordConfirm").fill(shortPassword);
+    await page.locator("#registerPassword").fill(weakPassword);
+    await page.locator("#registerPasswordConfirm").fill(weakPassword);
     await page.locator("#emailRegisterStep1Button").click();
 
-    // Should show error about password length
+    // Should show error about password requirements
     await expect(page.locator("#emailRegisterError")).toContainText(
-      /8 characters/i,
+      /10 characters/i,
       { timeout: 5000 },
     );
 

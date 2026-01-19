@@ -18,6 +18,31 @@ use crate::{
     startup::AppState,
 };
 
+/// Validates password strength requirements:
+/// - At least 10 characters
+/// - Contains lowercase letter
+/// - Contains uppercase letter
+/// - Contains number
+/// - Contains special character
+fn validate_password_strength(password: &str) -> Result<(), String> {
+    if password.len() < 10 {
+        return Err("Password must be at least 10 characters".to_string());
+    }
+    if !password.chars().any(|c| c.is_ascii_lowercase()) {
+        return Err("Password must contain a lowercase letter".to_string());
+    }
+    if !password.chars().any(|c| c.is_ascii_uppercase()) {
+        return Err("Password must contain an uppercase letter".to_string());
+    }
+    if !password.chars().any(|c| c.is_ascii_digit()) {
+        return Err("Password must contain a number".to_string());
+    }
+    if !password.chars().any(|c| !c.is_ascii_alphanumeric()) {
+        return Err("Password must contain a special character".to_string());
+    }
+    Ok(())
+}
+
 pub async fn login(
     NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
@@ -92,11 +117,9 @@ pub async fn register_email(
         )));
     }
 
-    // Validate password length
-    if body.password.len() < 8 {
-        return Err(ErrorResponse::from(domain::Error::BadRequest(
-            "Password must be at least 8 characters".to_string(),
-        )));
+    // Validate password strength
+    if let Err(e) = validate_password_strength(&body.password) {
+        return Err(ErrorResponse::from(domain::Error::BadRequest(e)));
     }
 
     // Check if email already exists
@@ -213,11 +236,9 @@ pub async fn change_password(
     let pubkey_str = pubkey.to_bech32().expect("public bech32 format");
     debug!("password change for user: {}", pubkey_str);
 
-    // Validate new password length
-    if body.new_password.len() < 8 {
-        return Err(ErrorResponse::from(domain::Error::BadRequest(
-            "New password must be at least 8 characters".to_string(),
-        )));
+    // Validate new password strength
+    if let Err(e) = validate_password_strength(&body.new_password) {
+        return Err(ErrorResponse::from(domain::Error::BadRequest(e)));
     }
 
     // Get user to verify current password
@@ -327,11 +348,9 @@ pub async fn forgot_password_reset(
 ) -> Result<impl IntoResponse, ErrorResponse> {
     debug!("forgot password reset for: {}", body.email);
 
-    // Validate new password length
-    if body.new_password.len() < 8 {
-        return Err(ErrorResponse::from(domain::Error::BadRequest(
-            "New password must be at least 8 characters".to_string(),
-        )));
+    // Validate new password strength
+    if let Err(e) = validate_password_strength(&body.new_password) {
+        return Err(ErrorResponse::from(domain::Error::BadRequest(e)));
     }
 
     // Verify challenge exists and hasn't expired (5 min timeout)

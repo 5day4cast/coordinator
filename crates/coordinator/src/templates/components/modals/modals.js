@@ -325,9 +325,9 @@ class AuthManager {
       return;
     }
 
-    if (password.length < 8) {
-      if (errorElement)
-        errorElement.textContent = "Password must be at least 8 characters";
+    const passwordError = this.validatePasswordStrength(password);
+    if (passwordError) {
+      if (errorElement) errorElement.textContent = passwordError;
       return;
     }
 
@@ -486,6 +486,25 @@ class AuthManager {
     }
   }
 
+  validatePasswordStrength(password) {
+    if (password.length < 10) {
+      return "Password must be at least 10 characters";
+    }
+    if (!/[a-z]/.test(password)) {
+      return "Password must contain a lowercase letter";
+    }
+    if (!/[A-Z]/.test(password)) {
+      return "Password must contain an uppercase letter";
+    }
+    if (!/[0-9]/.test(password)) {
+      return "Password must contain a number";
+    }
+    if (!/[^a-zA-Z0-9]/.test(password)) {
+      return "Password must contain a special character";
+    }
+    return null;
+  }
+
   async handleForgotStep1() {
     const errorElement = document.querySelector("#forgotPasswordError");
     if (errorElement) errorElement.textContent = "";
@@ -597,9 +616,9 @@ class AuthManager {
       return;
     }
 
-    if (newPassword.length < 8) {
-      if (errorElement)
-        errorElement.textContent = "Password must be at least 8 characters";
+    const passwordError = this.validatePasswordStrength(newPassword);
+    if (passwordError) {
+      if (errorElement) errorElement.textContent = passwordError;
       return;
     }
 
