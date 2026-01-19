@@ -83,6 +83,23 @@
     color: var(--app-text);
 }
 
+[data-theme="dark"] .navbar-item:hover,
+[data-theme="dark"] .navbar-link:hover {
+    background-color: transparent !important;
+    color: var(--bulma-link, #485fc7) !important;
+}
+
+[data-theme="dark"] .navbar-item.is-active,
+[data-theme="dark"] .navbar-item:focus,
+[data-theme="dark"] .navbar-item:focus-within {
+    background-color: transparent !important;
+    color: var(--bulma-link, #485fc7) !important;
+}
+
+[data-theme="dark"] .navbar-item {
+    background-color: transparent !important;
+}
+
 [data-theme="dark"] .navbar-burger span {
     background-color: var(--app-text);
 }
@@ -787,4 +804,476 @@ body,
         background-color 0.3s ease,
         color 0.3s ease,
         border-color 0.3s ease;
+}
+
+/* ===========================================
+   Location Selector - Map & Table
+   =========================================== */
+
+.location-map-container {
+    position: relative;
+    width: 100%;
+}
+
+.map-wrapper {
+    position: relative;
+    width: 100%;
+    overflow: hidden;
+    border-radius: 6px;
+    background: var(--app-bg-secondary, #fafafa);
+}
+
+.map-wrapper.is-panning {
+    cursor: grabbing;
+}
+
+.map-zoomable {
+    position: relative;
+    width: 100%;
+    transform-origin: center center;
+    transition: transform 0.1s ease-out;
+    cursor: grab;
+}
+
+.map-zoomable:active {
+    cursor: grabbing;
+}
+
+.usa-map {
+    width: 100%;
+    height: auto;
+    display: block;
+    user-select: none;
+    -webkit-user-drag: none;
+}
+
+/* Station markers overlay */
+.station-markers {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+}
+
+.station-marker {
+    cursor: pointer;
+    pointer-events: auto;
+    transition: transform 0.15s ease;
+    stroke: #fff;
+    stroke-width: 1.5;
+    transform-origin: center;
+    transform-box: fill-box;
+}
+
+.station-marker:hover {
+    transform: scale(1.5);
+}
+
+.station-marker.selected {
+    stroke: #ffdd57;
+    stroke-width: 3;
+    transform: scale(1.25);
+}
+
+/* Region colors for markers */
+.station-marker.region-alaska-hawaii {
+    fill: #8b5cf6; /* Purple */
+}
+
+.station-marker.region-pacific {
+    fill: #a855f7; /* Purple */
+}
+
+.station-marker.region-mountain {
+    fill: #10b981; /* Green */
+}
+
+.station-marker.region-central {
+    fill: #f59e0b; /* Amber */
+}
+
+.station-marker.region-eastern {
+    fill: #06b6d4; /* Cyan */
+}
+
+/* Zoom controls */
+.map-zoom-controls {
+    position: absolute;
+    bottom: 10px;
+    right: 10px;
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    background: var(--bulma-scheme-main, #fff);
+    border-radius: 6px;
+    padding: 0.25rem;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+    z-index: 50;
+}
+
+.map-zoom-controls .button {
+    min-height: 32px;
+    width: 32px;
+    padding: 0;
+}
+
+.zoom-level {
+    font-size: 0.75rem;
+    min-width: 40px;
+    text-align: center;
+    color: var(--bulma-text-weak, #7a7a7a);
+}
+
+/* Station tooltip - enhanced with weather */
+.station-tooltip {
+    position: absolute;
+    z-index: 100;
+    background: var(--bulma-scheme-main, #fff);
+    border: 1px solid var(--bulma-border, #dbdbdb);
+    border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+    padding: 0.75rem;
+    pointer-events: none;
+    font-size: 0.875rem;
+    min-width: 200px;
+    max-width: 280px;
+}
+
+.tooltip-station-id {
+    display: block;
+    font-size: 1rem;
+    margin-bottom: 0.25rem;
+}
+
+.tooltip-name {
+    color: var(--bulma-text-weak, #7a7a7a);
+    font-size: 0.8rem;
+    margin-bottom: 0.5rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--app-border, #dbdbdb);
+}
+
+.tooltip-weather {
+    display: flex;
+    gap: 1rem;
+}
+
+.tooltip-weather-day {
+    flex: 1;
+    text-align: center;
+}
+
+.tooltip-weather-day strong {
+    display: block;
+    font-size: 0.7rem;
+    color: var(--bulma-text-weak, #7a7a7a);
+    text-transform: uppercase;
+    margin-bottom: 0.25rem;
+}
+
+.weather-temp {
+    font-size: 0.9rem;
+    font-weight: 500;
+}
+
+.weather-forecast {
+    font-size: 0.8rem;
+    color: var(--bulma-text-weak, #7a7a7a);
+    margin-top: 0.15rem;
+}
+
+.forecast-label {
+    font-size: 0.65rem;
+    color: var(--bulma-text-weak, #7a7a7a);
+}
+
+.tooltip-loading {
+    text-align: center;
+    color: var(--bulma-text-weak, #7a7a7a);
+    font-size: 0.8rem;
+    padding: 0.5rem 0;
+}
+
+.tooltip-error {
+    text-align: center;
+    color: var(--bulma-danger, #f14668);
+    font-size: 0.8rem;
+}
+
+/* Region legend */
+.region-legend {
+    display: flex;
+    justify-content: center;
+    gap: 1.5rem;
+    flex-wrap: wrap;
+    font-size: 0.875rem;
+}
+
+.legend-item {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+}
+
+.legend-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: 2px solid #fff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+.legend-dot.region-alaska-hawaii {
+    background: #8b5cf6;
+}
+
+.legend-dot.region-pacific {
+    background: #a855f7;
+}
+
+.legend-dot.region-mountain {
+    background: #10b981;
+}
+
+.legend-dot.region-central {
+    background: #f59e0b;
+}
+
+.legend-dot.region-eastern {
+    background: #06b6d4;
+}
+
+/* Location table styles */
+.location-table-container {
+    max-height: 500px;
+    overflow-y: auto;
+}
+
+.region-section {
+    margin-bottom: 1rem;
+    padding: 0.75rem;
+    border-radius: 6px;
+    background: var(--app-bg-secondary, #fafafa);
+}
+
+.region-section .region-header {
+    padding-bottom: 0.5rem;
+    margin-bottom: 0.5rem;
+    border-bottom: 1px solid var(--app-border, #dbdbdb);
+}
+
+.region-section.region-eastern {
+    border-left: 4px solid #06b6d4;
+}
+
+.region-section.region-central {
+    border-left: 4px solid #f59e0b;
+}
+
+.region-section.region-mountain {
+    border-left: 4px solid #10b981;
+}
+
+.region-section.region-pacific {
+    border-left: 4px solid #a855f7;
+}
+
+.region-section.region-alaska-hawaii {
+    border-left: 4px solid #8b5cf6;
+}
+
+.station-checkbox-label {
+    display: block;
+    padding: 0.5rem;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background-color 0.15s ease;
+}
+
+.station-checkbox-label:hover {
+    background-color: var(--app-bg, #fff);
+}
+
+.station-checkbox-label input:checked + strong {
+    color: var(--bulma-link, #485fc7);
+}
+
+/* Dark mode adjustments */
+[data-theme="dark"] .map-wrapper {
+    background: var(--app-bg-secondary);
+}
+
+[data-theme="dark"] .usa-map {
+    filter: invert(1) brightness(0.55) contrast(1.1);
+}
+
+[data-theme="dark"] .map-zoom-controls {
+    background: var(--app-card-bg);
+    border: 1px solid var(--app-border);
+}
+
+[data-theme="dark"] .region-section {
+    background: var(--app-bg-secondary);
+}
+
+[data-theme="dark"] .station-checkbox-label:hover {
+    background-color: var(--app-card-bg);
+}
+
+[data-theme="dark"] .station-tooltip {
+    background: var(--app-card-bg);
+    border-color: var(--app-border);
+}
+
+/* Mobile responsive */
+@media screen and (max-width: 768px) {
+    .region-legend {
+        gap: 1rem;
+        font-size: 0.8rem;
+    }
+
+    .legend-dot {
+        width: 10px;
+        height: 10px;
+    }
+
+    .location-table-container {
+        max-height: 400px;
+    }
+
+    .region-stations .column {
+        padding: 0.25rem;
+    }
+
+    .station-checkbox-label {
+        padding: 0.35rem;
+        font-size: 0.875rem;
+    }
+}
+
+/* ===========================================
+   Entry Form - Over/Par/Under Pick Buttons
+   =========================================== */
+.pick-button {
+    min-width: 70px;
+    font-weight: 500;
+}
+
+/* Over button - purple */
+.pick-button[data-value="over"].is-active {
+    background-color: #9b59b6 !important;
+    border-color: #9b59b6 !important;
+    color: white !important;
+}
+
+.pick-button[data-value="over"]:not(.is-active):hover {
+    background-color: rgba(155, 89, 182, 0.1);
+    border-color: #9b59b6;
+    color: #9b59b6;
+}
+
+/* Par button - teal/cyan */
+.pick-button[data-value="par"].is-active {
+    background-color: #16a085 !important;
+    border-color: #16a085 !important;
+    color: white !important;
+}
+
+.pick-button[data-value="par"]:not(.is-active):hover {
+    background-color: rgba(22, 160, 133, 0.1);
+    border-color: #16a085;
+    color: #16a085;
+}
+
+/* Under button - cool blue */
+.pick-button[data-value="under"].is-active {
+    background-color: #3498db !important;
+    border-color: #3498db !important;
+    color: white !important;
+}
+
+.pick-button[data-value="under"]:not(.is-active):hover {
+    background-color: rgba(52, 152, 219, 0.1);
+    border-color: #3498db;
+    color: #3498db;
+}
+
+/* Weather context display in entry form */
+.weather-context {
+    font-size: 0.85rem;
+    color: var(--bulma-text-weak, #7a7a7a);
+    margin-bottom: 0.5rem;
+    padding: 0.5rem;
+    background: var(--app-bg-secondary, #fafafa);
+    border-radius: 4px;
+}
+
+.weather-context .weather-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 0.25rem 0;
+}
+
+.weather-context .weather-label {
+    font-weight: 500;
+}
+
+.weather-context .weather-value {
+    font-family: monospace;
+}
+
+.weather-context .forecast-value {
+    color: var(--bulma-info, #3e8ed0);
+    font-weight: 600;
+}
+
+[data-theme="dark"] .weather-context {
+    background: var(--app-bg-secondary);
+}
+
+/* Competitions table - compact layout */
+.competitions-table {
+    font-size: 0.9rem;
+}
+
+.competitions-table th,
+.competitions-table td {
+    white-space: nowrap;
+    padding: 0.5em 0.75em;
+}
+
+.competitions-table .utc-time {
+    font-family: inherit;
+}
+
+/* Fix table hover/selected states in dark mode - keep text readable */
+[data-theme="dark"] .table.is-hoverable tbody tr:not(.is-selected):hover {
+    background-color: var(--app-bg-secondary) !important;
+    color: inherit;
+}
+
+[data-theme="dark"] .table.is-hoverable tbody tr:not(.is-selected):hover td {
+    color: var(--bulma-text, #f5f5f5);
+}
+
+[data-theme="dark"] .table tbody tr.is-selected {
+    background-color: var(--bulma-link, #485fc7) !important;
+    color: white;
+}
+
+[data-theme="dark"] .table tbody tr.is-selected td {
+    color: white;
+}
+
+/* Dark mode - pick buttons should have white text/border when not selected */
+[data-theme="dark"] .pick-button.is-outlined {
+    border-color: rgba(255, 255, 255, 0.6);
+    color: rgba(255, 255, 255, 0.9);
+}
+
+[data-theme="dark"] .pick-button.is-outlined:hover {
+    border-color: white;
+    color: white;
 }

@@ -47,6 +47,8 @@ data:
     relative_locktime_block_delta = {{ .Values.config.coordinator.relativeLockTimeBlockDelta }}
     required_confirmations = {{ .Values.config.coordinator.requiredConfirmations }}
     sync_interval_secs = {{ .Values.config.coordinator.syncIntervalSecs }}
+    escrow_enabled = {{ .Values.config.coordinator.escrowEnabled }}
+    invoice_settlement_confirmations = {{ .Values.config.coordinator.invoiceSettlementConfirmations }}
 
     [bitcoin_settings]
     network = {{ .Values.bitcoin.network | quote }}

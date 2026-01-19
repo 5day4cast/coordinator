@@ -15,6 +15,7 @@ pub struct CompetitionView {
     pub total_entries: u64,
     pub num_winners: u64,
     pub can_enter: bool,
+    pub number_of_values_per_entry: usize,
 }
 
 /// Competitions page content
@@ -24,19 +25,18 @@ pub fn competitions_page(competitions: &[CompetitionView]) -> Markup {
             div class="box" {
                 div class="table-container" {
                     table id="competitionsDataTable"
-                          class="table is-fullwidth is-striped is-hoverable" {
+                          class="table is-fullwidth is-striped is-hoverable competitions-table" {
                         thead {
                             tr {
-                                th { "ID" }
-                                th { "Start Time" }
-                                th { "End Time" }
-                                th { "Signing Time" }
                                 th { "Status" }
-                                th { "Entry fee (sats)" }
-                                th { "Total Prize Pool (sats)" }
-                                th { "Total Entries" }
-                                th { "Places 'In The Money'" }
-                                th { "Enter/View" }
+                                th { "Start" }
+                                th { "End" }
+                                th { "Signing" }
+                                th { "Fee" }
+                                th { "Pool" }
+                                th { "Entries" }
+                                th { "Winners" }
+                                th { "" }
                             }
                         }
                         tbody hx-get="/competitions/rows"
@@ -49,6 +49,33 @@ pub fn competitions_page(competitions: &[CompetitionView]) -> Markup {
                     }
                 }
             }
+        }
+
+        // JavaScript to convert UTC times to local timezone
+        script {
+            (maud::PreEscaped(r#"
+            document.addEventListener('DOMContentLoaded', function() {
+                formatLocalTimes();
+            });
+            document.body.addEventListener('htmx:afterSwap', function() {
+                formatLocalTimes();
+            });
+            function formatLocalTimes() {
+                document.querySelectorAll('.utc-time').forEach(function(el) {
+                    const utc = el.dataset.utc;
+                    if (utc) {
+                        const date = new Date(utc);
+                        el.textContent = date.toLocaleString(undefined, {
+                            month: 'short',
+                            day: 'numeric',
+                            hour: 'numeric',
+                            minute: '2-digit'
+                        });
+                        el.title = date.toLocaleString();
+                    }
+                });
+            }
+            "#))
         }
     }
 }

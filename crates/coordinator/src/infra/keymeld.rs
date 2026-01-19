@@ -1,9 +1,11 @@
 use crate::config::KeymeldSettings;
 use async_trait::async_trait;
+use dlctix::OutcomeIndex;
+pub use keymeld_sdk::types::SubsetDefinition;
 use keymeld_sdk::{
     dlctix::{
         dlctix::{ContractParameters, SigningData},
-        DlcBatchBuilder, DlcSignatureResults, DlcSubsetBuilder,
+        DlcBatchBuilder, DlcSignatureResults,
     },
     prelude::*,
     types::RegisterKeygenParticipantRequest,
@@ -38,8 +40,6 @@ pub enum KeymeldError {
 pub struct KeygenSessionStatus {
     pub session_id: String,
     pub status: String,
-    pub registered_participants: usize,
-    pub expected_participants: usize,
     pub is_completed: bool,
 }
 
@@ -56,17 +56,30 @@ pub struct ParticipantRegistrationData {
     pub auth_pubkey: String,
 }
 
+/// Pre-computed DLC subset definitions for keygen session creation.
+/// Generated at competition creation time based on ranking permutations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DlcSubsetInfo {
+    /// Subset definitions to pass to keygen session creation
+    pub definitions: Vec<SubsetDefinition>,
+    /// Mapping from outcome index to subset ID (needed for signing)
+    pub outcome_subset_ids: BTreeMap<OutcomeIndex, Uuid>,
+}
+
 /// Trait for Keymeld signing operations
 #[async_trait]
 pub trait Keymeld: Send + Sync {
-    /// Initialize a keygen session at competition creation time.
-    /// This creates the session with all participant user_ids (ticket_ids) and registers the coordinator.
-    /// Users will register themselves later after getting their ticket and deriving their auth_pubkey.
-    /// Note: This does NOT require contract_params - those are only needed for signing.
+    /// Initialize a keygen session at competition creation time with subset definitions.
+    /// This creates the session with all participant user_ids (ticket_ids), subset definitions,
+    /// and registers the coordinator.
+    ///
+    /// The subset_info contains pre-computed subset definitions based on ranking permutations.
+    /// These MUST be provided at keygen time - they cannot be added later.
     async fn init_keygen_session(
         &self,
         competition_id: Uuid,
         player_user_ids: Vec<UserId>,
+        subset_info: DlcSubsetInfo,
     ) -> Result<DlcKeygenSession, KeymeldError>;
 
     /// Register a participant on their behalf using pre-computed registration data.
@@ -105,6 +118,9 @@ pub trait Keymeld: Send + Sync {
     /// Check if Keymeld is enabled
     fn is_enabled(&self) -> bool;
 
+    /// Get the coordinator's user ID for subset definitions
+    fn coordinator_user_id(&self) -> UserId;
+
     /// Get a user's assigned enclave public key for a keygen session.
     /// Users need this to encrypt their private keys for registration.
     /// Each user is assigned to a specific enclave when the session is created.
@@ -121,6 +137,9 @@ pub struct DlcKeygenSession {
     pub session_id: SessionId,
     pub session_secret: [u8; 32],
     pub aggregate_key: Vec<u8>,
+    /// Mapping from outcome index to subset ID - needed for signing.
+    /// Set at keygen creation time from DlcSubsetInfo.
+    pub outcome_subset_ids: BTreeMap<OutcomeIndex, Uuid>,
 }
 
 /// Serializable version of DlcKeygenSession for database storage
@@ -134,6 +153,9 @@ pub struct StoredDlcKeygenSession {
     /// Aggregate public key bytes (hex encoded)
     #[serde(with = "hex_vec")]
     pub aggregate_key: Vec<u8>,
+    /// Mapping from outcome index to subset ID - needed for signing
+    #[serde(default)]
+    pub outcome_subset_ids: BTreeMap<OutcomeIndex, Uuid>,
 }
 
 impl StoredDlcKeygenSession {
@@ -143,6 +165,7 @@ impl StoredDlcKeygenSession {
             session_id: session.session_id.to_string(),
             encrypted_session_secret,
             aggregate_key: session.aggregate_key,
+            outcome_subset_ids: session.outcome_subset_ids,
         }
     }
 
@@ -152,6 +175,7 @@ impl StoredDlcKeygenSession {
             session_id: SessionId::new(&self.session_id),
             session_secret,
             aggregate_key: self.aggregate_key.clone(),
+            outcome_subset_ids: self.outcome_subset_ids.clone(),
         }
     }
 }
@@ -233,17 +257,23 @@ impl Keymeld for KeymeldService {
         self.settings.enabled && self.client.is_some()
     }
 
+    fn coordinator_user_id(&self) -> UserId {
+        self.coordinator_user_id.clone()
+    }
+
     async fn init_keygen_session(
         &self,
         competition_id: Uuid,
         player_user_ids: Vec<UserId>,
+        subset_info: DlcSubsetInfo,
     ) -> Result<DlcKeygenSession, KeymeldError> {
         let client = self.get_client()?;
 
         info!(
-            "Initializing keygen session for competition {} with {} players",
+            "Initializing keygen session for competition {} with {} players and {} subset definitions",
             competition_id,
-            player_user_ids.len()
+            player_user_ids.len(),
+            subset_info.definitions.len()
         );
 
         // All participants: coordinator + all players
@@ -254,10 +284,11 @@ impl Keymeld for KeymeldService {
             .timeout(self.settings.keygen_timeout_secs)
             .tweak(TaprootTweak::None);
 
-        // Create the keygen session (without subset definitions - those are added at signing time)
+        // Create the keygen session WITH subset definitions
+        // These subsets define which participants sign each outcome's split transactions
         let mut keygen_session = client
             .keygen()
-            .create_session(all_participants, keygen_options)
+            .create_session_with_subsets(all_participants, subset_info.definitions, keygen_options)
             .await?;
 
         // Register ourselves (coordinator) as a participant
@@ -266,8 +297,9 @@ impl Keymeld for KeymeldService {
             .await?;
 
         info!(
-            "Keygen session {} initialized, waiting for user registrations",
-            keygen_session.session_id()
+            "Keygen session {} initialized with {} subsets, waiting for user registrations",
+            keygen_session.session_id(),
+            subset_info.outcome_subset_ids.len()
         );
 
         // Return immediately without waiting for other participants
@@ -276,6 +308,7 @@ impl Keymeld for KeymeldService {
             session_id: keygen_session.session_id().clone(),
             session_secret: keygen_session.export_session_secret(),
             aggregate_key: vec![], // Will be populated when keygen completes
+            outcome_subset_ids: subset_info.outcome_subset_ids,
         })
     }
 
@@ -316,24 +349,16 @@ impl Keymeld for KeymeldService {
         &self,
         keygen_session: &DlcKeygenSession,
         signing_data: &SigningData,
-        contract_params: &ContractParameters,
-        player_user_ids: Vec<UserId>,
+        _contract_params: &ContractParameters,
+        _player_user_ids: Vec<UserId>,
     ) -> Result<DlcSignatureResults, KeymeldError> {
         let client = self.get_client()?;
 
         info!(
-            "Creating DLC signing session for keygen {}",
-            keygen_session.session_id
+            "Creating DLC signing session for keygen {} with {} outcome subsets",
+            keygen_session.session_id,
+            keygen_session.outcome_subset_ids.len()
         );
-
-        // Build subset definitions for DLC outcomes at signing time
-        let subset_info = DlcSubsetBuilder::new(
-            contract_params,
-            self.coordinator_user_id.clone(),
-            player_user_ids,
-        )
-        .build()
-        .map_err(|e| KeymeldError::Signing(format!("Failed to build subsets: {}", e)))?;
 
         // Restore the keygen session from stored credentials
         let credentials = SessionCredentials::from_session_secret(&keygen_session.session_secret)?;
@@ -343,9 +368,10 @@ impl Keymeld for KeymeldService {
             .restore_session(keygen_session.session_id.clone(), credentials)
             .await?;
 
-        // Build batch items for all DLC transactions
+        // Build batch items for all DLC transactions using the pre-registered subset IDs
+        // The outcome_subset_ids were created at keygen time and map outcome indices to subset UUIDs
         let dlc_batch = DlcBatchBuilder::new(signing_data)
-            .with_outcome_subsets(&subset_info.outcome_subset_ids)
+            .with_outcome_subsets(&keygen_session.outcome_subset_ids)
             .build()
             .map_err(|e| KeymeldError::Signing(format!("Failed to build batch: {}", e)))?;
 
@@ -386,6 +412,7 @@ impl Keymeld for KeymeldService {
         let client = self.get_client()?;
 
         // Restore session credentials to make authenticated status request
+        // This calls /api/v1/keygen/{session_id}/status which returns the current status
         let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
 
         let restored_session = client
@@ -399,19 +426,9 @@ impl Keymeld for KeymeldService {
             keymeld_sdk::prelude::KeygenStatusKind::Completed
         );
 
-        // Get available slots to count registrations
-        let slots = client
-            .keygen()
-            .get_available_slots(&session.session_id)
-            .await?;
-        let registered = slots.available_slots.iter().filter(|s| s.claimed).count();
-        let expected = slots.available_slots.len();
-
         Ok(KeygenSessionStatus {
             session_id: session.session_id.to_string(),
             status: status_kind.as_ref().to_string(),
-            registered_participants: registered,
-            expected_participants: expected,
             is_completed,
         })
     }

@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use axum::{extract::State, response::Html};
+use axum::{extract::State, http::HeaderMap, response::Html};
 use axum_extra::extract::Form;
+use log::error;
 use serde::Deserialize;
-use time::OffsetDateTime;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::{
@@ -13,8 +14,9 @@ use crate::{
         admin::{
             dashboard::{
                 admin_dashboard, competition_error, competition_success, CompetitionDefaults,
-                Station,
+                Forecast, Observation, Station, StationWithWeather,
             },
+            is_allowed_station,
             wallet::{
                 fee_estimates_rows, send_error, send_success, wallet_balance_section,
                 wallet_outputs_rows, wallet_page, WalletBalance, WalletOutput,
@@ -33,44 +35,114 @@ pub async fn admin_page_handler(State(state): State<Arc<AppState>>) -> Html<Stri
         esplora_url: &state.esplora_url,
     };
 
-    // Fetch stations from oracle
-    let stations = fetch_stations(&state.oracle_url).await.unwrap_or_default();
+    // Fetch stations from oracle and filter to top 200 cities
+    let stations: Vec<Station> = fetch_stations(&state.oracle_url)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| is_allowed_station(&s.station_id))
+        .collect();
+
+    // Fetch weather data (forecasts and observations) for all stations
+    let station_ids: Vec<&str> = stations.iter().map(|s| s.station_id.as_str()).collect();
+    let (forecasts, observations) = tokio::join!(
+        fetch_forecasts(&state.oracle_url, &station_ids),
+        fetch_observations(&state.oracle_url, &station_ids)
+    );
+
+    // Merge stations with weather data
+    let stations_with_weather = merge_stations_with_weather(
+        stations,
+        forecasts.unwrap_or_default(),
+        observations.unwrap_or_default(),
+    );
+
     let defaults = CompetitionDefaults::default();
 
-    let content = admin_dashboard(&stations, &defaults);
+    let content = admin_dashboard(&stations_with_weather, &defaults);
     Html(admin_base(&config, content).into_string())
 }
 
 /// Admin competition tab fragment (for HTMX tab switching)
 pub async fn admin_competition_fragment(State(state): State<Arc<AppState>>) -> Html<String> {
-    let stations = fetch_stations(&state.oracle_url).await.unwrap_or_default();
+    // Fetch stations from oracle and filter to top 200 cities
+    let stations: Vec<Station> = fetch_stations(&state.oracle_url)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| is_allowed_station(&s.station_id))
+        .collect();
+
+    // Fetch weather data (forecasts and observations) for all stations
+    let station_ids: Vec<&str> = stations.iter().map(|s| s.station_id.as_str()).collect();
+    let (forecasts, observations) = tokio::join!(
+        fetch_forecasts(&state.oracle_url, &station_ids),
+        fetch_observations(&state.oracle_url, &station_ids)
+    );
+
+    // Merge stations with weather data
+    let stations_with_weather = merge_stations_with_weather(
+        stations,
+        forecasts.unwrap_or_default(),
+        observations.unwrap_or_default(),
+    );
+
     let defaults = CompetitionDefaults::default();
-    Html(admin_dashboard(&stations, &defaults).into_string())
+    Html(admin_dashboard(&stations_with_weather, &defaults).into_string())
 }
 
-/// Admin wallet page fragment (for HTMX tab switching)
-pub async fn admin_wallet_fragment(State(state): State<Arc<AppState>>) -> Html<String> {
-    let balance = fetch_balance(&state).await.unwrap_or(WalletBalance {
-        confirmed: 0,
-        unconfirmed: 0,
-    });
-    let address = fetch_address(&state).await.unwrap_or_default();
+/// Admin wallet page (full page for direct navigation, fragment for HTMX)
+pub async fn admin_wallet_fragment(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Html<String> {
+    let balance = fetch_balance(&state)
+        .await
+        .inspect_err(|e| error!("Failed to fetch wallet balance: {e}"))
+        .unwrap_or(WalletBalance {
+            confirmed: 0,
+            unconfirmed: 0,
+        });
+    let address = fetch_address(&state)
+        .await
+        .inspect_err(|e| error!("Failed to fetch wallet address: {e}"))
+        .unwrap_or_default();
 
-    Html(wallet_page(&state.esplora_url, &balance, &address).into_string())
+    let content = wallet_page(&state.esplora_url, &balance, &address);
+
+    // Check if this is an HTMX request
+    if headers.get("HX-Request").is_some() {
+        Html(content.into_string())
+    } else {
+        // Full page load - wrap in admin_base
+        let config = AdminPageConfig {
+            title: "5day4cast Admin - Wallet",
+            api_base: &state.private_url,
+            oracle_base: &state.oracle_url,
+            esplora_url: &state.esplora_url,
+        };
+        Html(admin_base(&config, content).into_string())
+    }
 }
 
 /// Wallet balance fragment (for HTMX refresh)
 pub async fn admin_wallet_balance_fragment(State(state): State<Arc<AppState>>) -> Html<String> {
-    let balance = fetch_balance(&state).await.unwrap_or(WalletBalance {
-        confirmed: 0,
-        unconfirmed: 0,
-    });
+    let balance = fetch_balance(&state)
+        .await
+        .inspect_err(|e| error!("Failed to fetch wallet balance: {e}"))
+        .unwrap_or(WalletBalance {
+            confirmed: 0,
+            unconfirmed: 0,
+        });
     Html(wallet_balance_section(&balance).into_string())
 }
 
 /// Wallet address fragment (returns just the new address text)
 pub async fn admin_wallet_address_fragment(State(state): State<Arc<AppState>>) -> String {
-    fetch_address(&state).await.unwrap_or_default()
+    fetch_address(&state)
+        .await
+        .inspect_err(|e| error!("Failed to fetch wallet address: {e}"))
+        .unwrap_or_default()
 }
 
 /// Fee estimates table rows fragment
@@ -79,13 +151,17 @@ pub async fn admin_fee_estimates_fragment(State(state): State<Arc<AppState>>) ->
         .bitcoin
         .get_estimated_fee_rates()
         .await
+        .inspect_err(|e| error!("Failed to fetch fee estimates: {e}"))
         .unwrap_or_default();
     Html(fee_estimates_rows(&estimates).into_string())
 }
 
 /// Wallet outputs table rows fragment
 pub async fn admin_wallet_outputs_fragment(State(state): State<Arc<AppState>>) -> Html<String> {
-    let outputs = fetch_outputs(&state).await.unwrap_or_default();
+    let outputs = fetch_outputs(&state)
+        .await
+        .inspect_err(|e| error!("Failed to fetch wallet outputs: {e}"))
+        .unwrap_or_default();
     Html(wallet_outputs_rows(&outputs).into_string())
 }
 
@@ -206,6 +282,126 @@ async fn fetch_stations(oracle_url: &str) -> Result<Vec<Station>, anyhow::Error>
     } else {
         Ok(vec![])
     }
+}
+
+async fn fetch_forecasts(
+    oracle_url: &str,
+    station_ids: &[&str],
+) -> Result<Vec<Forecast>, anyhow::Error> {
+    if station_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let client = reqwest_middleware::reqwest::Client::new();
+
+    // Fetch forecasts for today and tomorrow (end date is exclusive, so +2 days)
+    let today = time::OffsetDateTime::now_utc();
+    let end_date = today + time::Duration::days(2);
+
+    let start = today.format(&Rfc3339).unwrap_or_default();
+    let end = end_date.format(&Rfc3339).unwrap_or_default();
+
+    let station_ids_param = station_ids.join(",");
+
+    let response = client
+        .get(format!(
+            "{}/stations/forecasts?station_ids={}&start={}&end={}",
+            oracle_url, station_ids_param, start, end
+        ))
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+        let forecasts: Vec<Forecast> = response.json().await?;
+        Ok(forecasts)
+    } else {
+        Ok(vec![])
+    }
+}
+
+async fn fetch_observations(
+    oracle_url: &str,
+    station_ids: &[&str],
+) -> Result<Vec<Observation>, anyhow::Error> {
+    if station_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let client = reqwest_middleware::reqwest::Client::new();
+
+    // Fetch observations for today only
+    let today = time::OffsetDateTime::now_utc();
+    let tomorrow = today + time::Duration::days(1);
+
+    let start = today.format(&Rfc3339).unwrap_or_default();
+    let end = tomorrow.format(&Rfc3339).unwrap_or_default();
+
+    let station_ids_param = station_ids.join(",");
+
+    let response = client
+        .get(format!(
+            "{}/stations/observations?station_ids={}&start={}&end={}",
+            oracle_url, station_ids_param, start, end
+        ))
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+        let observations: Vec<Observation> = response.json().await?;
+        Ok(observations)
+    } else {
+        Ok(vec![])
+    }
+}
+
+fn merge_stations_with_weather(
+    stations: Vec<Station>,
+    forecasts: Vec<Forecast>,
+    observations: Vec<Observation>,
+) -> Vec<StationWithWeather> {
+    use std::collections::HashMap;
+
+    // Get today and tomorrow date strings
+    let today = time::OffsetDateTime::now_utc();
+    let tomorrow = today + time::Duration::days(1);
+
+    let today_str = today.date().to_string();
+    let tomorrow_str = tomorrow.date().to_string();
+
+    // Index forecasts by station_id and date
+    let mut forecast_map: HashMap<(&str, &str), &Forecast> = HashMap::new();
+    for forecast in &forecasts {
+        // The date field format is "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM:SS..."
+        let date_part = forecast.date.split('T').next().unwrap_or(&forecast.date);
+        forecast_map.insert((forecast.station_id.as_str(), date_part), forecast);
+    }
+
+    // Index observations by station_id (we only fetch today's)
+    let mut observation_map: HashMap<&str, &Observation> = HashMap::new();
+    for observation in &observations {
+        observation_map.insert(observation.station_id.as_str(), observation);
+    }
+
+    stations
+        .into_iter()
+        .map(|station| {
+            let today_forecast =
+                forecast_map.get(&(station.station_id.as_str(), today_str.as_str()));
+            let tomorrow_forecast =
+                forecast_map.get(&(station.station_id.as_str(), tomorrow_str.as_str()));
+            let today_observation = observation_map.get(station.station_id.as_str());
+
+            StationWithWeather {
+                today_actual_high: today_observation.map(|o| o.temp_high),
+                today_actual_low: today_observation.map(|o| o.temp_low),
+                today_forecast_high: today_forecast.map(|f| f.temp_high),
+                today_forecast_low: today_forecast.map(|f| f.temp_low),
+                tomorrow_forecast_high: tomorrow_forecast.map(|f| f.temp_high),
+                tomorrow_forecast_low: tomorrow_forecast.map(|f| f.temp_low),
+                station,
+            }
+        })
+        .collect()
 }
 
 async fn fetch_balance(state: &AppState) -> Result<WalletBalance, anyhow::Error> {

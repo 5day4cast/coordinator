@@ -520,6 +520,8 @@ impl CompetitionStore {
                 entries.ephemeral_pubkey as ephemeral_pubkey,
                 ephemeral_privatekey_encrypted,
                 ephemeral_privatekey,
+                encrypted_keymeld_private_key,
+                keymeld_auth_pubkey,
                 public_nonces,
                 partial_signatures,
                 funding_psbt_base64,
@@ -586,6 +588,8 @@ impl CompetitionStore {
               entries.ephemeral_pubkey as ephemeral_pubkey,
               ephemeral_privatekey_encrypted,
               ephemeral_privatekey,
+              encrypted_keymeld_private_key,
+              keymeld_auth_pubkey,
               public_nonces,
               partial_signatures,
               funding_psbt_base64,
@@ -845,6 +849,16 @@ impl CompetitionStore {
                 .map(|ts| ts.format(&Rfc3339))
                 .transpose()
                 .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let keymeld_keygen_completed_at = competition
+                .keymeld_keygen_completed_at
+                .map(|ts| ts.format(&Rfc3339))
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let invoices_settled_at = competition
+                .invoices_settled_at
+                .map(|ts| ts.format(&Rfc3339))
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
             let errors = if !competition.errors.is_empty() {
                 Some(
                     serde_json::to_string(&competition.errors)
@@ -881,6 +895,8 @@ impl CompetitionStore {
                 delta_broadcasted_at,
                 completed_at,
                 failed_at,
+                keymeld_keygen_completed_at,
+                invoices_settled_at,
                 errors,
                 competition_id,
             ));
@@ -914,6 +930,8 @@ impl CompetitionStore {
                     delta_broadcasted_at = ?,
                     completed_at = ?,
                     failed_at = ?,
+                    keymeld_keygen_completed_at = ?,
+                    invoices_settled_at = ?,
                     errors = ?
                     WHERE id = ?";
 
@@ -943,6 +961,8 @@ impl CompetitionStore {
                     delta_broadcasted_at,
                     completed_at,
                     failed_at,
+                    keymeld_keygen_completed_at,
+                    invoices_settled_at,
                     errors,
                     competition_id,
                 ) in prepared_updates
@@ -973,6 +993,8 @@ impl CompetitionStore {
                         .bind(delta_broadcasted_at)
                         .bind(completed_at)
                         .bind(failed_at)
+                        .bind(keymeld_keygen_completed_at)
+                        .bind(invoices_settled_at)
                         .bind(errors)
                         .bind(competition_id)
                         .execute(&pool)
@@ -1009,7 +1031,7 @@ impl CompetitionStore {
                 COUNT(entries.id) as total_entries,
                 COUNT(CASE WHEN entries.public_nonces IS NOT NULL THEN entries.id END) as total_entry_nonces,
                 COUNT(CASE WHEN entries.signed_at IS NOT NULL THEN entries.id END) as total_signed_entries,
-                COUNT(tickets.settled_at) as total_paid_entries,
+                COUNT(tickets.paid_at) as total_paid_entries,
                 COALESCE(payout_stats.total_paid_out_entries, 0) as total_paid_out_entries,
                 outcome_transaction,
                 competitions.funding_psbt_base64 as funding_psbt_base64,
@@ -1030,11 +1052,13 @@ impl CompetitionStore {
                 funding_broadcasted_at as funding_broadcasted_at,
                 funding_confirmed_at as funding_confirmed_at,
                 funding_settled_at as funding_settled_at,
+                invoices_settled_at as invoices_settled_at,
                 expiry_broadcasted_at as expiry_broadcasted_at,
                 outcome_broadcasted_at as outcome_broadcasted_at,
                 delta_broadcasted_at as delta_broadcasted_at,
                 completed_at as completed_at,
                 failed_at as failed_at,
+                keymeld_keygen_completed_at as keymeld_keygen_completed_at,
                 errors
             FROM competitions
             LEFT JOIN payout_stats ON competitions.id = payout_stats.event_id
@@ -1068,11 +1092,13 @@ impl CompetitionStore {
                     funding_broadcasted_at,
                     funding_confirmed_at,
                     funding_settled_at,
+                    invoices_settled_at,
                     expiry_broadcasted_at,
                     outcome_broadcasted_at,
                     delta_broadcasted_at,
                     completed_at,
                     failed_at,
+                    keymeld_keygen_completed_at,
                     errors,
                     payout_stats.total_paid_out_entries",
                 base_query
@@ -1104,11 +1130,13 @@ impl CompetitionStore {
                     funding_broadcasted_at,
                     funding_confirmed_at,
                     funding_settled_at,
+                    invoices_settled_at,
                     expiry_broadcasted_at,
                     outcome_broadcasted_at,
                     delta_broadcasted_at,
                     completed_at,
                     failed_at,
+                    keymeld_keygen_completed_at,
                     errors,
                     payout_stats.total_paid_out_entries",
                 base_query
@@ -1147,7 +1175,7 @@ impl CompetitionStore {
                 COUNT(entries.id) as total_entries,
                 COUNT(CASE WHEN entries.public_nonces IS NOT NULL THEN entries.id END) as total_entry_nonces,
                 COUNT(CASE WHEN entries.signed_at IS NOT NULL THEN entries.id END) as total_signed_entries,
-                COUNT(tickets.settled_at) as total_paid_entries,
+                COUNT(tickets.paid_at) as total_paid_entries,
                 COALESCE(payout_stats.total_paid_out_entries, 0) as total_paid_out_entries,
                 outcome_transaction,
                 competitions.funding_psbt_base64 as funding_psbt_base64,
@@ -1168,11 +1196,13 @@ impl CompetitionStore {
                 funding_broadcasted_at as funding_broadcasted_at,
                 funding_confirmed_at as funding_confirmed_at,
                 funding_settled_at as funding_settled_at,
+                invoices_settled_at as invoices_settled_at,
                 expiry_broadcasted_at as expiry_broadcasted_at,
                 outcome_broadcasted_at as outcome_broadcasted_at,
                 delta_broadcasted_at as delta_broadcasted_at,
                 completed_at as completed_at,
                 failed_at as failed_at,
+                keymeld_keygen_completed_at as keymeld_keygen_completed_at,
                 errors
             FROM competitions
             LEFT JOIN payout_stats ON competitions.id = payout_stats.event_id
@@ -1203,11 +1233,13 @@ impl CompetitionStore {
                 funding_broadcasted_at,
                 funding_confirmed_at,
                 funding_settled_at,
+                invoices_settled_at,
                 expiry_broadcasted_at,
                 outcome_broadcasted_at,
                 delta_broadcasted_at,
                 completed_at,
                 failed_at,
+                keymeld_keygen_completed_at,
                 errors"#;
 
         let competition = sqlx::query_as::<_, Competition>(query_str)
@@ -1231,7 +1263,42 @@ impl CompetitionStore {
             .execute_write(move |pool| async move {
                 let mut tx = pool.begin().await?;
 
-                // First, find an available ticket
+                // First, check if this user already has a reserved ticket for this competition
+                // (that hasn't been used for an entry yet)
+                let existing_ticket: Option<Ticket> = sqlx::query_as::<_, Ticket>(
+                    r#"SELECT tickets.id as id,
+                              tickets.event_id as competition_id,
+                              entries.id as entry_id,
+                              tickets.ephemeral_pubkey as ephemeral_pubkey,
+                              encrypted_preimage,
+                              hash,
+                              payment_request,
+                              invoice_expires_at,
+                              datetime('now', '+10 minutes') as expiry,
+                              reserved_by,
+                              reserved_at,
+                              paid_at,
+                              settled_at,
+                              escrow_transaction
+                       FROM tickets
+                       LEFT JOIN entries ON tickets.id = entries.ticket_id
+                       WHERE tickets.event_id = ?
+                         AND tickets.reserved_by = ?
+                         AND entries.id IS NULL
+                       LIMIT 1"#,
+                )
+                .bind(&competition_id_str)
+                .bind(&pubkey_owned)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+                if let Some(ticket) = existing_ticket {
+                    debug!("Found existing reserved ticket {} for user", ticket.id);
+                    tx.commit().await?;
+                    return Ok(ticket);
+                }
+
+                // No existing ticket, find an available one
                 let ticket_id: Option<String> = sqlx::query_scalar(
                     r#"SELECT tickets.id
                        FROM tickets
@@ -1297,6 +1364,7 @@ impl CompetitionStore {
                               encrypted_preimage,
                               hash,
                               payment_request,
+                              invoice_expires_at,
                               datetime('now', '+10 minutes') as expiry,
                               reserved_by,
                               reserved_at,
@@ -1332,6 +1400,7 @@ impl CompetitionStore {
                       encrypted_preimage,
                       hash,
                       payment_request,
+                      invoice_expires_at,
                       datetime('now', '+10 minutes') as expiry,
                       reserved_by,
                       reserved_at,
@@ -1360,6 +1429,7 @@ impl CompetitionStore {
                       encrypted_preimage,
                       hash,
                       payment_request,
+                      invoice_expires_at,
                       datetime('now', '+10 minutes') as expiry,
                       reserved_by,
                       reserved_at,
@@ -1390,6 +1460,7 @@ impl CompetitionStore {
                       encrypted_preimage,
                       hash,
                       payment_request,
+                      invoice_expires_at,
                       datetime('now', '+10 minutes') as expiry,
                       reserved_by,
                       reserved_at,
@@ -1419,6 +1490,7 @@ impl CompetitionStore {
                       encrypted_preimage,
                       hash,
                       payment_request,
+                      invoice_expires_at,
                       datetime('now', '+10 minutes') as expiry,
                       reserved_by,
                       reserved_at,
@@ -1449,6 +1521,7 @@ impl CompetitionStore {
                 t.encrypted_preimage,
                 t.hash,
                 t.payment_request,
+                t.invoice_expires_at,
                 datetime('now', '+10 minutes') as expiry,
                 t.reserved_by,
                 t.reserved_at,
@@ -1564,17 +1637,26 @@ impl CompetitionStore {
         &self,
         ticket_id: Uuid,
         payment_request: &str,
+        invoice_expires_at: time::OffsetDateTime,
     ) -> Result<bool, sqlx::Error> {
         let ticket_id_str = ticket_id.to_string();
         let payment_request_owned = payment_request.to_string();
+        // Use SQLite datetime format: YYYY-MM-DD HH:MM:SS
+        let format =
+            time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]")
+                .expect("valid format");
+        let expires_at_str = invoice_expires_at.format(&format).unwrap_or_default();
 
         self.db_connection
             .execute_write(move |pool| async move {
-                let result = sqlx::query("UPDATE tickets SET payment_request = ? WHERE id = ?")
-                    .bind(payment_request_owned)
-                    .bind(ticket_id_str)
-                    .execute(&pool)
-                    .await?;
+                let result = sqlx::query(
+                    "UPDATE tickets SET payment_request = ?, invoice_expires_at = ? WHERE id = ?",
+                )
+                .bind(payment_request_owned)
+                .bind(expires_at_str)
+                .bind(ticket_id_str)
+                .execute(&pool)
+                .await?;
                 Ok(result.rows_affected() > 0)
             })
             .await
@@ -1594,7 +1676,9 @@ impl CompetitionStore {
                     SET reserved_at = NULL,
                         reserved_by = NULL,
                         paid_at = NULL,
-                        escrow_transaction = NULL
+                        escrow_transaction = NULL,
+                        payment_request = NULL,
+                        invoice_expires_at = NULL
                     WHERE id = ?
                     AND settled_at IS NULL",
                 )

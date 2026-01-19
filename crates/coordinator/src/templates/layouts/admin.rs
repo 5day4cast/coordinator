@@ -1,4 +1,4 @@
-use maud::{html, Markup, DOCTYPE};
+use maud::{html, Markup, PreEscaped, DOCTYPE};
 
 pub struct AdminPageConfig<'a> {
     pub title: &'a str,
@@ -12,12 +12,11 @@ pub fn admin_base(config: &AdminPageConfig, content: Markup) -> Markup {
         (DOCTYPE)
         html lang="en" {
             head {
-                base href=".";
                 meta charset="UTF-8";
                 meta name="viewport" content="width=device-width, initial-scale=1.0";
                 title { (config.title) }
 
-                link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css";
+                link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@1.0.2/css/bulma.min.css";
                 link rel="stylesheet" href="/ui/styles.css";
 
                 script src="https://unpkg.com/htmx.org@1.9.10" {}
@@ -33,13 +32,13 @@ pub fn admin_base(config: &AdminPageConfig, content: Markup) -> Markup {
                     "#
                 }
             }
-            body {
+            body data-api-base=(config.api_base)
+                 data-oracle-base=(config.oracle_base)
+                 data-esplora-url=(config.esplora_url) {
                 script {
-                    (format!(r#"
-                        const API_BASE = "{}";
-                        const ORACLE_BASE = "{}";
-                        const ESPLORA_URL = "{}";
-                    "#, config.api_base, config.oracle_base, config.esplora_url))
+                    "const API_BASE = document.body.dataset.apiBase;
+                     const ORACLE_BASE = document.body.dataset.oracleBase;
+                     const ESPLORA_URL = document.body.dataset.esploraUrl;"
                 }
 
                 div class="tabs is-centered" {
@@ -58,14 +57,14 @@ pub fn admin_base(config: &AdminPageConfig, content: Markup) -> Markup {
                 }
 
                 script {
-                    r#"
+                    (PreEscaped(r#"
                         document.querySelectorAll('.tabs li').forEach(tab => {
                             tab.addEventListener('htmx:afterRequest', function() {
                                 document.querySelectorAll('.tabs li').forEach(t => t.classList.remove('is-active'));
                                 this.classList.add('is-active');
                             });
                         });
-                    "#
+                    "#))
                 }
             }
         }

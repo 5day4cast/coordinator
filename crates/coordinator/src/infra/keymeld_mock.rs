@@ -9,7 +9,8 @@ use keymeld_sdk::{
 use uuid::Uuid;
 
 use super::keymeld::{
-    DlcKeygenSession, KeygenSessionStatus, Keymeld, KeymeldError, ParticipantRegistrationData,
+    DlcKeygenSession, DlcSubsetInfo, KeygenSessionStatus, Keymeld, KeymeldError,
+    ParticipantRegistrationData,
 };
 
 /// Mock implementation for testing without Keymeld
@@ -23,10 +24,16 @@ impl Keymeld for MockKeymeld {
         true
     }
 
+    fn coordinator_user_id(&self) -> UserId {
+        // Return a deterministic mock coordinator user ID
+        UserId::from(Uuid::nil())
+    }
+
     async fn init_keygen_session(
         &self,
         competition_id: Uuid,
         _player_user_ids: Vec<UserId>,
+        subset_info: DlcSubsetInfo,
     ) -> Result<DlcKeygenSession, KeymeldError> {
         // Return a mock session with deterministic values
         let session_id = SessionId::from(competition_id);
@@ -42,6 +49,7 @@ impl Keymeld for MockKeymeld {
             session_id,
             session_secret,
             aggregate_key,
+            outcome_subset_ids: subset_info.outcome_subset_ids,
         })
     }
 
@@ -61,8 +69,6 @@ impl Keymeld for MockKeymeld {
         Ok(KeygenSessionStatus {
             session_id: session.session_id.to_string(),
             status: "completed".to_string(),
-            registered_participants: 1,
-            expected_participants: 1,
             is_completed: true,
         })
     }

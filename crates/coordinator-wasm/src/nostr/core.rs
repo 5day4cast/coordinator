@@ -52,14 +52,18 @@ impl NostrClientCore {
 
         let client = Client::new(signer.clone());
 
-        //TODO: make these relays configurable from the client
-        self.add_relay(&client, "wss://relay.damus.io").await?;
-        self.add_relay(&client, "wss://relay.nostr.band").await?;
-        self.add_relay(&client, "wss://relay.primal.net").await?;
-
-        client.connect().await;
         self.signer = Some(signer);
-        self.inner = Some(client);
+        self.inner = Some(client.clone());
+
+        // Connect to relays in background - don't block initialization
+        // Relay connections are only needed for publishing/subscribing to Nostr events,
+        // not for HTTP authentication which only requires local signing
+        wasm_bindgen_futures::spawn_local(async move {
+            // Add relays (ignore errors - best effort)
+            let _ = client.add_relay("wss://relay.damus.io").await;
+            let _ = client.add_relay("wss://relay.primal.net").await;
+            client.connect().await;
+        });
 
         Ok(())
     }

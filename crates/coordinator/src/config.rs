@@ -282,6 +282,13 @@ pub struct CoordinatorSettings {
     /// Enable mock oracle for E2E testing (no real oracle server required)
     #[serde(default)]
     pub mock_oracle: bool,
+
+    /// Number of confirmations to wait before settling hold invoices after funding broadcast.
+    /// Set to 0 to settle immediately at broadcast time (riskier but faster).
+    /// Set to 1+ for more safety (wait for confirmations before settling).
+    /// Default is 0 (settle immediately at broadcast).
+    #[serde(default)]
+    pub invoice_settlement_confirmations: u32,
 }
 
 impl Default for CoordinatorSettings {
@@ -295,6 +302,7 @@ impl Default for CoordinatorSettings {
             sync_interval_secs: 15,
             escrow_enabled: false,
             mock_oracle: false,
+            invoice_settlement_confirmations: 0,
         }
     }
 }

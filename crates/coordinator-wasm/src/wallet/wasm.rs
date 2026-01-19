@@ -102,6 +102,24 @@ impl TaprootWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    /// Prepare keymeld registration data for an entry.
+    /// Returns an object with encrypted_private_key and auth_pubkey.
+    /// The raw private key never leaves WASM.
+    #[wasm_bindgen(js_name = "prepareKeymeldRegistration")]
+    pub fn prepare_keymeld_registration(
+        &self,
+        entry_index: u32,
+        enclave_pubkey_hex: &str,
+        session_id: &str,
+    ) -> Result<JsValue, JsValue> {
+        let data = self
+            .inner
+            .prepare_keymeld_registration(entry_index, enclave_pubkey_hex, session_id)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        serde_wasm_bindgen::to_value(&data).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     #[wasm_bindgen(js_name = "getEncryptedDlcPayoutPreimage")]
     pub async fn get_encrypted_dlc_payout_preimage(
         &self,
