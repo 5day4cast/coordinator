@@ -206,10 +206,76 @@ class Entry {
       let currentStatus = "Reserved";
       let closeHandlersRemoved = false;
       let backgroundPollingInterval = null;
+      let fallbackPollingInterval = null;
+      let resolved = false;
+
+      const checkPaymentStatus = async () => {
+        if (resolved) return;
+        try {
+          const response = await this.client.get(
+            `${this.coordinator_url}/api/v1/competitions/${this.competition.id}/tickets/${this.ticket.id}/status`,
+          );
+
+          if (!response.ok)
+            throw new Error(
+              `Failed to check ticket status: ${response.status}`,
+            );
+
+          const status = await response.json();
+          currentStatus = status;
+
+          if (status === "Settled" || status === "Paid") {
+            resolved = true;
+            removeCloseHandlers();
+            if (backgroundPollingInterval) {
+              clearInterval(backgroundPollingInterval);
+            }
+            if (fallbackPollingInterval) {
+              clearInterval(fallbackPollingInterval);
+            }
+            updateStatus("Payment received!", "success");
+            cleanup();
+            resolve(true);
+            return true;
+          } else if (status === "Reserved") {
+            return false;
+          }
+
+          const errorMessages = {
+            Expired: "Ticket payment expired. Please request a new ticket.",
+            Used: "Ticket has already been used.",
+            Cancelled: "Competition has been cancelled.",
+          };
+
+          throw new Error(
+            errorMessages[status] || `Unexpected ticket status: ${status}`,
+          );
+        } catch (error) {
+          if (!resolved) {
+            resolved = true;
+            if (fallbackPollingInterval) {
+              clearInterval(fallbackPollingInterval);
+            }
+            $error.textContent = error.message;
+            $error.classList.remove("is-hidden");
+            updateStatus("Payment failed", "danger");
+            cleanup();
+            reject(error);
+          }
+          return false;
+        }
+      };
+
+      // Fallback polling in case the QR component's callback doesn't fire
+      fallbackPollingInterval = setInterval(checkPaymentStatus, 2000);
 
       // Background polling function to check payment status after modal is closed
       const startBackgroundPolling = () => {
         backgroundPollingInterval = setInterval(async () => {
+          if (resolved) {
+            clearInterval(backgroundPollingInterval);
+            return;
+          }
           try {
             const response = await this.client.get(
               `${this.coordinator_url}/api/v1/competitions/${this.competition.id}/tickets/${this.ticket.id}/status`,
@@ -217,6 +283,7 @@ class Entry {
             if (response.ok) {
               const status = await response.json();
               if (status === "Settled" || status === "Paid") {
+                resolved = true;
                 clearInterval(backgroundPollingInterval);
                 resolve(true);
               }
@@ -232,18 +299,24 @@ class Entry {
         if (currentStatus === "Paid" || currentStatus === "Settled") {
           // Payment already received, don't cancel - just close modal and resolve
           cleanup();
-          resolve(true);
+          if (!resolved) {
+            resolved = true;
+            resolve(true);
+          }
           return;
         }
         // Modal closed but payment might still be in-flight
         // Start background polling to detect if payment completes
+        if (fallbackPollingInterval) {
+          clearInterval(fallbackPollingInterval);
+        }
         cleanup();
         startBackgroundPolling();
         // Don't reject yet - let background polling resolve if payment comes through
         // Set a timeout to eventually reject if no payment after 5 minutes
         setTimeout(
           () => {
-            if (backgroundPollingInterval) {
+            if (backgroundPollingInterval && !resolved) {
               clearInterval(backgroundPollingInterval);
               reject(new Error("Payment cancelled by user"));
             }
@@ -264,52 +337,8 @@ class Entry {
         $modalClose.removeEventListener("click", handleClose);
       };
 
-      $qrCode.callback = async () => {
-        try {
-          const response = await this.client.get(
-            `${this.coordinator_url}/api/v1/competitions/${this.competition.id}/tickets/${this.ticket.id}/status`,
-          );
-
-          if (!response.ok)
-            throw new Error(
-              `Failed to check ticket status: ${response.status}`,
-            );
-
-          const status = await response.json();
-          currentStatus = status;
-
-          if (status === "Settled" || status === "Paid") {
-            // Payment received - remove close handlers to prevent accidental cancel
-            removeCloseHandlers();
-            if (backgroundPollingInterval) {
-              clearInterval(backgroundPollingInterval);
-            }
-            updateStatus("Payment received!", "success");
-            cleanup();
-            resolve(true);
-            return true;
-          } else if (status === "Reserved") {
-            return false;
-          }
-
-          const errorMessages = {
-            Expired: "Ticket payment expired. Please request a new ticket.",
-            Used: "Ticket has already been used.",
-            Cancelled: "Competition has been cancelled.",
-          };
-
-          throw new Error(
-            errorMessages[status] || `Unexpected ticket status: ${status}`,
-          );
-        } catch (error) {
-          $error.textContent = error.message;
-          $error.classList.remove("is-hidden");
-          updateStatus("Payment failed", "danger");
-          cleanup();
-          reject(error);
-          return false;
-        }
-      };
+      // Also set QR code callback for when the component supports it
+      $qrCode.callback = checkPaymentStatus;
     });
   }
 
