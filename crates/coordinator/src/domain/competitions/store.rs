@@ -447,6 +447,27 @@ impl CompetitionStore {
         Ok(entry_payouts)
     }
 
+    /// Get a pending payout by its payment hash (used for subscription-based payment updates)
+    /// Since we store the full payment_request, we need to extract and compare hashes
+    pub async fn get_payout_by_payment_hash(
+        &self,
+        payment_hash: &str,
+    ) -> Result<Option<EntryPayout>, sqlx::Error> {
+        use crate::infra::lightning::extract_payment_hash_from_invoice;
+
+        let pending_payouts = self.get_all_pending_payouts().await?;
+
+        for payout in pending_payouts {
+            if let Ok(hash) = extract_payment_hash_from_invoice(&payout.payout_payment_request) {
+                if hash == payment_hash {
+                    return Ok(Some(payout));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     pub async fn get_entry_payouts(
         &self,
         entry_id: Uuid,
@@ -1503,6 +1524,35 @@ impl CompetitionStore {
         )
         .bind(ticket_id.to_string())
         .fetch_one(self.db_connection.read())
+        .await?;
+
+        Ok(ticket)
+    }
+
+    /// Get a ticket by its payment hash (used for subscription-based invoice updates)
+    pub async fn get_ticket_by_hash(&self, hash: &str) -> Result<Option<Ticket>, sqlx::Error> {
+        let ticket = sqlx::query_as::<_, Ticket>(
+            r#"SELECT tickets.id as id,
+                      tickets.event_id as competition_id,
+                      entries.id as entry_id,
+                      tickets.ephemeral_pubkey as ephemeral_pubkey,
+                      encrypted_preimage,
+                      hash,
+                      payment_request,
+                      invoice_expires_at,
+                      datetime('now', '+10 minutes') as expiry,
+                      reserved_by,
+                      reserved_at,
+                      paid_at,
+                      settled_at,
+                      escrow_transaction
+               FROM tickets
+               LEFT JOIN entries ON tickets.id = entries.ticket_id
+               WHERE tickets.hash = ?
+               AND tickets.paid_at IS NULL"#,
+        )
+        .bind(hash)
+        .fetch_optional(self.db_connection.read())
         .await?;
 
         Ok(ticket)

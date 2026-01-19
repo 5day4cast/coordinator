@@ -22,6 +22,7 @@ axum.workspace = true
 axum-extra.workspace = true
 tower-http.workspace = true
 maud.workspace = true
+reqwest.workspace = true
 reqwest-middleware.workspace = true
 reqwest-retry.workspace = true
 hyper.workspace = true

@@ -14,8 +14,8 @@ use crate::{
     },
     config::Settings,
     domain::{
-        CompetitionStore, CompetitionWatcher, Coordinator, InvoiceWatcher, PayoutWatcher, UserInfo,
-        UserStore,
+        CompetitionStore, CompetitionWatcher, Coordinator, InvoiceSubscriber, InvoiceWatcher,
+        PaymentSubscriber, PayoutWatcher, UserInfo, UserStore,
     },
     infra::{
         bitcoin::{Bitcoin, BitcoinClient, BitcoinSyncWatcher},
@@ -401,6 +401,31 @@ pub async fn build_app(
     });
 
     threads.insert("payout_watcher".to_string(), payout_watcher_handle);
+
+    // Subscription-based watchers for faster payment detection
+    // These run alongside the polling watchers as the primary mechanism,
+    // with polling serving as a fallback
+    let invoice_subscriber =
+        InvoiceSubscriber::new(coordinator.clone(), ln.clone(), cancel_token.clone());
+
+    let invoice_subscriber_handle = tokio::spawn(async move {
+        if let Err(e) = invoice_subscriber.subscribe().await {
+            error!("Invoice subscriber error: {}", e);
+        }
+    });
+
+    threads.insert("invoice_subscriber".to_string(), invoice_subscriber_handle);
+
+    let payment_subscriber =
+        PaymentSubscriber::new(coordinator.clone(), ln.clone(), cancel_token.clone());
+
+    let payment_subscriber_handle = tokio::spawn(async move {
+        if let Err(e) = payment_subscriber.subscribe().await {
+            error!("Payment subscriber error: {}", e);
+        }
+    });
+
+    threads.insert("payment_subscriber".to_string(), payment_subscriber_handle);
 
     let app_state = AppState {
         ui_dir: config.ui_settings.ui_dir,

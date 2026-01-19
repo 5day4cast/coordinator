@@ -2,12 +2,11 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use base64::Engine;
 use bdk_wallet::bitcoin::hashes::{sha256, Hash};
+use futures::StreamExt;
 use lightning_invoice::Bolt11Invoice;
-use log::{debug, info};
-use reqwest_middleware::{
-    reqwest::{Certificate, Client, Url},
-    ClientBuilder, ClientWithMiddleware,
-};
+use log::{debug, info, warn};
+use reqwest::{Certificate, Client, Url};
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -19,9 +18,27 @@ use std::{
     time::Duration,
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{domain::PaymentStatus, LnSettings};
+
+/// Event emitted when an invoice state changes
+#[derive(Debug, Clone)]
+pub struct InvoiceUpdate {
+    pub payment_hash: String,
+    pub state: InvoiceState,
+    pub amt_paid_sat: Option<u64>,
+}
+
+/// Event emitted when a payment state changes
+#[derive(Debug, Clone)]
+pub struct PaymentUpdate {
+    pub payment_hash: String,
+    pub status: PaymentStatus,
+    pub failure_reason: Option<String>,
+    pub preimage: Option<String>,
+}
 
 #[async_trait]
 pub trait Ln: Send + Sync {
@@ -57,6 +74,15 @@ pub trait Ln: Send + Sync {
         timeout_seconds: u64,
         fee_limit_sat: u64,
     ) -> Result<(), anyhow::Error>;
+
+    /// Subscribe to all invoice updates via streaming.
+    /// Returns a channel receiver that emits InvoiceUpdate events.
+    /// The subscription runs until the sender is dropped or an error occurs.
+    async fn subscribe_invoices(&self) -> Result<mpsc::Receiver<InvoiceUpdate>, anyhow::Error>;
+
+    /// Subscribe to all payment updates via streaming.
+    /// Returns a channel receiver that emits PaymentUpdate events.
+    async fn subscribe_payments(&self) -> Result<mpsc::Receiver<PaymentUpdate>, anyhow::Error>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -226,6 +252,31 @@ pub struct InvoiceRequest {
     pub value: String,  // Amount in satoshis
     pub expiry: String, // Expiry time in seconds
     pub memo: String,   // Memo field (description)
+}
+
+/// Response from LND's SubscribeInvoices streaming endpoint
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubscribeInvoiceResponse {
+    pub r_hash: Option<String>,
+    pub state: Option<InvoiceState>,
+    pub amt_paid_sat: Option<String>,
+    #[serde(default)]
+    pub settled: bool,
+}
+
+/// Response wrapper for LND's TrackPayments streaming endpoint
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TrackPaymentResponse {
+    pub result: Option<PaymentTrackResult>,
+}
+
+/// Payment tracking result from LND streaming
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PaymentTrackResult {
+    pub payment_hash: Option<String>,
+    pub status: Option<PaymentStatus>,
+    pub failure_reason: Option<String>,
+    pub payment_preimage: Option<String>,
 }
 
 #[async_trait]
@@ -564,6 +615,250 @@ impl Ln for LnClient {
             }
             Err(e) => Err(anyhow::anyhow!("Failed to send payment: {}", e)),
         }
+    }
+
+    async fn subscribe_invoices(&self) -> Result<mpsc::Receiver<InvoiceUpdate>, anyhow::Error> {
+        let (tx, rx) = mpsc::channel(100);
+        let base_url = self.base_url.clone();
+        let macaroon = self.macaroon.clone();
+
+        // Build a raw reqwest client for streaming (reqwest-middleware doesn't support streaming well)
+        let client = Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()?;
+
+        tokio::spawn(async move {
+            let url = format!("{}v1/invoices/subscribe", base_url);
+            info!("Starting invoice subscription at {}", url);
+
+            loop {
+                let response = match client
+                    .get(&url)
+                    .header(MACAROON_HEADER, macaroon.expose_secret())
+                    .send()
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        warn!("Invoice subscription connection error: {}", e);
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+
+                if !response.status().is_success() {
+                    warn!(
+                        "Invoice subscription failed with status: {}",
+                        response.status()
+                    );
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+
+                let mut stream = response.bytes_stream();
+
+                while let Some(chunk_result) = stream.next().await {
+                    match chunk_result {
+                        Ok(chunk) => {
+                            // LND returns newline-delimited JSON
+                            let text = match String::from_utf8(chunk.to_vec()) {
+                                Ok(t) => t,
+                                Err(_) => continue,
+                            };
+
+                            for line in text.lines() {
+                                if line.trim().is_empty() {
+                                    continue;
+                                }
+
+                                match serde_json::from_str::<SubscribeInvoiceResponse>(line) {
+                                    Ok(invoice_resp) => {
+                                        if let (Some(r_hash_b64), Some(state)) =
+                                            (&invoice_resp.r_hash, &invoice_resp.state)
+                                        {
+                                            // Decode base64 r_hash to hex
+                                            let payment_hash =
+                                                match base64::engine::general_purpose::STANDARD
+                                                    .decode(r_hash_b64)
+                                                {
+                                                    Ok(bytes) => hex::encode(bytes),
+                                                    Err(_) => {
+                                                        // Try URL-safe base64
+                                                        match base64::engine::general_purpose::URL_SAFE
+                                                        .decode(r_hash_b64)
+                                                    {
+                                                        Ok(bytes) => hex::encode(bytes),
+                                                        Err(_) => continue,
+                                                    }
+                                                    }
+                                                };
+
+                                            let amt_paid_sat = invoice_resp
+                                                .amt_paid_sat
+                                                .as_ref()
+                                                .and_then(|s| s.parse().ok());
+
+                                            let update = InvoiceUpdate {
+                                                payment_hash,
+                                                state: state.clone(),
+                                                amt_paid_sat,
+                                            };
+
+                                            debug!("Invoice update received: {:?}", update);
+
+                                            if tx.send(update).await.is_err() {
+                                                info!("Invoice subscription channel closed");
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        debug!("Failed to parse invoice update: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Invoice subscription stream error: {}", e);
+                            break;
+                        }
+                    }
+                }
+
+                // Stream ended, reconnect after delay
+                info!("Invoice subscription stream ended, reconnecting...");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+
+        Ok(rx)
+    }
+
+    async fn subscribe_payments(&self) -> Result<mpsc::Receiver<PaymentUpdate>, anyhow::Error> {
+        let (tx, rx) = mpsc::channel(100);
+        let base_url = self.base_url.clone();
+        let macaroon = self.macaroon.clone();
+
+        // Build a raw reqwest client for streaming
+        let client = Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()?;
+
+        tokio::spawn(async move {
+            let url = format!("{}v2/router/trackpayments", base_url);
+            info!("Starting payment subscription at {}", url);
+
+            loop {
+                let body = json!({
+                    "no_inflight_updates": false
+                });
+
+                let response = match client
+                    .post(&url)
+                    .json(&body)
+                    .header(MACAROON_HEADER, macaroon.expose_secret())
+                    .send()
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        warn!("Payment subscription connection error: {}", e);
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+
+                if !response.status().is_success() {
+                    warn!(
+                        "Payment subscription failed with status: {}",
+                        response.status()
+                    );
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+
+                let mut stream = response.bytes_stream();
+
+                while let Some(chunk_result) = stream.next().await {
+                    match chunk_result {
+                        Ok(chunk) => {
+                            let text = match String::from_utf8(chunk.to_vec()) {
+                                Ok(t) => t,
+                                Err(_) => continue,
+                            };
+
+                            for line in text.lines() {
+                                if line.trim().is_empty() {
+                                    continue;
+                                }
+
+                                match serde_json::from_str::<TrackPaymentResponse>(line) {
+                                    Ok(track_resp) => {
+                                        if let Some(result) = track_resp.result {
+                                            if let (Some(hash_b64), Some(status)) =
+                                                (&result.payment_hash, &result.status)
+                                            {
+                                                // Decode base64 payment_hash to hex
+                                                let payment_hash = match base64::engine::general_purpose::STANDARD
+                                                    .decode(hash_b64)
+                                                {
+                                                    Ok(bytes) => hex::encode(bytes),
+                                                    Err(_) => {
+                                                        match base64::engine::general_purpose::URL_SAFE
+                                                            .decode(hash_b64)
+                                                        {
+                                                            Ok(bytes) => hex::encode(bytes),
+                                                            Err(_) => continue,
+                                                        }
+                                                    }
+                                                };
+
+                                                let preimage = result
+                                                    .payment_preimage
+                                                    .as_ref()
+                                                    .and_then(|p| {
+                                                        base64::engine::general_purpose::STANDARD
+                                                            .decode(p)
+                                                            .ok()
+                                                            .map(|bytes| hex::encode(bytes))
+                                                    });
+
+                                                let update = PaymentUpdate {
+                                                    payment_hash,
+                                                    status: status.clone(),
+                                                    failure_reason: result.failure_reason.clone(),
+                                                    preimage,
+                                                };
+
+                                                debug!("Payment update received: {:?}", update);
+
+                                                if tx.send(update).await.is_err() {
+                                                    info!("Payment subscription channel closed");
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        debug!("Failed to parse payment update: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Payment subscription stream error: {}", e);
+                            break;
+                        }
+                    }
+                }
+
+                // Stream ended, reconnect after delay
+                info!("Payment subscription stream ended, reconnecting...");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+
+        Ok(rx)
     }
 }
 
