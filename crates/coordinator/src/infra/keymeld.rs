@@ -11,7 +11,7 @@ use keymeld_sdk::{
     types::RegisterKeygenParticipantRequest,
     PollingConfig,
 };
-use log::{debug, info};
+use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use uuid::Uuid;
@@ -296,17 +296,41 @@ impl Keymeld for KeymeldService {
             .register_self(RegisterOptions::default())
             .await?;
 
+        let session_id = keygen_session.session_id().clone();
+        let session_secret = keygen_session.export_session_secret();
+
         info!(
             "Keygen session {} initialized with {} subsets, waiting for user registrations",
-            keygen_session.session_id(),
+            session_id,
             subset_info.outcome_subset_ids.len()
+        );
+
+        // Verify the session exists on the server before returning
+        // This catches cases where the SDK returns success but the server didn't persist
+        let credentials = SessionCredentials::from_session_secret(&session_secret)?;
+        let restored = client
+            .keygen()
+            .restore_session(session_id.clone(), credentials)
+            .await
+            .map_err(|e| {
+                error!(
+                    "Failed to verify keygen session {} exists on server: {}",
+                    session_id, e
+                );
+                e
+            })?;
+
+        info!(
+            "Verified keygen session {} exists on server with status: {}",
+            session_id,
+            restored.status().as_ref()
         );
 
         // Return immediately without waiting for other participants
         // The aggregate_key will be empty until completion - it's set when wait_for_keygen_completion is called
         Ok(DlcKeygenSession {
-            session_id: keygen_session.session_id().clone(),
-            session_secret: keygen_session.export_session_secret(),
+            session_id,
+            session_secret,
             aggregate_key: vec![], // Will be populated when keygen completes
             outcome_subset_ids: subset_info.outcome_subset_ids,
         })

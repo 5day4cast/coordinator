@@ -741,10 +741,8 @@ async fn process_payment_stream(
     macaroon: &SecretString,
     tx: &mpsc::Sender<PaymentUpdate>,
 ) -> Result<(), anyhow::Error> {
-    let body = json!({ "no_inflight_updates": false });
     let response = client
-        .post(url)
-        .json(&body)
+        .get(format!("{}?no_inflight_updates=false", url))
         .header(MACAROON_HEADER, macaroon.expose_secret())
         .send()
         .await?;
