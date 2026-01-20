@@ -185,10 +185,10 @@ pub struct KeymeldSettings {
     pub gateway_url: String,
     /// Whether Keymeld integration is enabled
     pub enabled: bool,
-    /// Timeout in seconds for keygen sessions
-    pub keygen_timeout_secs: u64,
-    /// Timeout in seconds for signing sessions
-    pub signing_timeout_secs: u64,
+    /// Expiration time in seconds for keygen sessions
+    pub keygen_session_expiry_secs: u64,
+    /// Expiration time in seconds for signing sessions
+    pub signing_session_expiry_secs: u64,
     /// Maximum polling attempts for session completion
     pub max_polling_attempts: u32,
     /// Initial polling delay in milliseconds
@@ -204,8 +204,8 @@ impl Default for KeymeldSettings {
         KeymeldSettings {
             gateway_url: String::from("http://localhost:8080"),
             enabled: false,
-            keygen_timeout_secs: 3600,
-            signing_timeout_secs: 300,
+            keygen_session_expiry_secs: 3600,
+            signing_session_expiry_secs: 300,
             max_polling_attempts: 60,
             initial_polling_delay_ms: 500,
             max_polling_delay_ms: 5000,

@@ -69,8 +69,8 @@ data:
     [keymeld_settings]
     enabled = {{ .Values.keymeld.enabled }}
     gateway_url = {{ .Values.keymeld.gatewayUrl | quote }}
-    keygen_timeout_secs = {{ .Values.keymeld.keygenTimeoutSecs }}
-    signing_timeout_secs = {{ .Values.keymeld.signingTimeoutSecs }}
+    keygen_session_expiry_secs = {{ .Values.keymeld.keygenSessionExpirySecs }}
+    signing_session_expiry_secs = {{ .Values.keymeld.signingSessionExpirySecs }}
     max_polling_attempts = {{ .Values.keymeld.maxPollingAttempts }}
     initial_polling_delay_ms = {{ .Values.keymeld.initialPollingDelayMs }}
     max_polling_delay_ms = {{ .Values.keymeld.maxPollingDelayMs }}

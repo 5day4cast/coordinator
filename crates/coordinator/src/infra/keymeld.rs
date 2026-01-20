@@ -281,7 +281,7 @@ impl Keymeld for KeymeldService {
         all_participants.extend(player_user_ids);
 
         let keygen_options = KeygenOptions::default()
-            .timeout(self.settings.keygen_timeout_secs)
+            .timeout(self.settings.keygen_session_expiry_secs)
             .tweak(TaprootTweak::None);
 
         // Create the keygen session WITH subset definitions
@@ -399,7 +399,8 @@ impl Keymeld for KeymeldService {
             .build()
             .map_err(|e| KeymeldError::Signing(format!("Failed to build batch: {}", e)))?;
 
-        let signing_options = SigningOptions::default().timeout(self.settings.signing_timeout_secs);
+        let signing_options =
+            SigningOptions::default().timeout(self.settings.signing_session_expiry_secs);
 
         // Create signing session - need to clone items since sign_batch consumes them
         let batch_items = dlc_batch.items.clone();

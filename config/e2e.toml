@@ -61,8 +61,8 @@ mock_auto_accept_secs = 2  # Auto-accept invoices after 2 seconds
 [keymeld_settings]
 gateway_url = "http://localhost:8090"
 enabled = false  # Disable keymeld for E2E tests - use local signing
-keygen_timeout_secs = 60
-signing_timeout_secs = 30
+keygen_session_expiry_secs = 60
+signing_session_expiry_secs = 30
 max_polling_attempts = 10
 initial_polling_delay_ms = 100
 max_polling_delay_ms = 1000
