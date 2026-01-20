@@ -641,7 +641,7 @@ impl Ln for LnClient {
             .build()?;
 
         tokio::spawn(async move {
-            let url = format!("{}v2/router/trackpayments", base_url);
+            let url = format!("{}v2/router/payments", base_url);
             info!("Starting payment subscription at {}", url);
 
             loop {
