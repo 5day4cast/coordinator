@@ -87,6 +87,35 @@ impl InvoiceWatcher {
             match self.ln.lookup_invoice(&ticket.hash).await {
                 Ok(invoice) => {
                     debug!("Ticket {}: invoice state: {:?}", ticket.id, invoice.state);
+
+                    // Handle expired/canceled invoices - clear reservation so ticket can be reused
+                    if invoice.state == InvoiceState::Canceled {
+                        info!(
+                            "Invoice expired/canceled for ticket {}, clearing reservation",
+                            ticket.id
+                        );
+                        match self
+                            .coordinator
+                            .competition_store
+                            .clear_ticket_reservation(ticket.id)
+                            .await
+                        {
+                            Ok(_) => {
+                                info!(
+                                    "Successfully cleared reservation for expired ticket {}",
+                                    ticket.id
+                                );
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Failed to clear reservation for expired ticket {}: {}",
+                                    ticket.id, e
+                                );
+                            }
+                        }
+                        continue;
+                    }
+
                     if invoice.state == InvoiceState::Accepted {
                         info!("Invoice accepted for ticket {}", ticket.id);
 
