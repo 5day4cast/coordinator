@@ -492,7 +492,7 @@ fn simple_minify(source: &str) -> String {
                 chars.next();
                 in_multi_comment = true;
                 continue;
-            } else if last_token_char.map_or(true, |tc| {
+            } else if last_token_char.is_none_or(|tc| {
                 matches!(
                     tc,
                     '=' | '(' | ',' | '[' | '!' | '&' | '|' | ':' | ';' | '{' | '}' | '\n'
@@ -528,7 +528,7 @@ fn simple_minify(source: &str) -> String {
             if !last_was_space && !result.is_empty() {
                 // Keep one space between tokens that need it
                 let last_char = result.chars().last();
-                if last_char.map_or(false, |lc| lc.is_alphanumeric() || lc == '_' || lc == '$') {
+                if last_char.is_some_and(|lc| lc.is_alphanumeric() || lc == '_' || lc == '$') {
                     result.push(' ');
                     last_was_space = true;
                 }
