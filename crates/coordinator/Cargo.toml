@@ -12,7 +12,7 @@ default = []
 e2e-testing = []
 
 [package.metadata.cargo-machete]
-ignored = ["blake2", "coordinator-core", "h2", "hex", "minify-js", "openssl", "sha2", "walkdir"]
+ignored = ["blake2", "coordinator-core", "h2", "hex", "better-minify-js", "openssl", "sha2", "walkdir"]
 
 [dependencies]
 coordinator-core.workspace = true
@@ -97,7 +97,7 @@ tokio-test = "0.4"
 env_logger = "0.11.6"
 
 [build-dependencies]
-minify-js = "0.6"
+better-minify-js = "0.7"
 walkdir = "2.5"
 sha2 = "0.10"
 hex = "0.4"

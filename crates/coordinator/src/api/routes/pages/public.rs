@@ -5,7 +5,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
 };
-use maud::html;
+use maud::{html, Markup};
 use uuid::Uuid;
 
 use crate::{
@@ -19,7 +19,7 @@ use crate::{
     templates::{
         fragments::{
             entry_form::{entry_form, ForecastValue, StationForecast, WeatherContext},
-            leaderboard::{leaderboard, leaderboard_row, EntryScore},
+            leaderboard::{leaderboard, leaderboard_row, EntryScore, LeaderboardInfo},
         },
         layouts::base::{base, PageConfig},
         pages::{
@@ -29,6 +29,29 @@ use crate::{
         },
     },
 };
+
+/// Helper to render a fragment or wrap it in the base layout for direct navigation.
+/// Returns just the fragment for HTMX requests, or a full page for direct URL access.
+fn render_fragment(
+    headers: &HeaderMap,
+    state: &AppState,
+    title: &str,
+    content: Markup,
+) -> Html<String> {
+    let is_htmx = headers.get("HX-Request").is_some();
+
+    if is_htmx {
+        Html(content.into_string())
+    } else {
+        let config = PageConfig {
+            title,
+            api_base: &state.remote_url,
+            oracle_base: &state.oracle_url,
+            network: &state.bitcoin.get_network().to_string(),
+        };
+        Html(base(&config, content).into_string())
+    }
+}
 
 /// HTML error response for HTMX routes
 pub struct HtmlAuthError(pub AuthError);
@@ -111,9 +134,13 @@ pub async fn public_page_handler(State(state): State<Arc<AppState>>) -> Html<Str
 }
 
 /// Competitions page fragment (for HTMX navigation)
-pub async fn competitions_fragment(State(state): State<Arc<AppState>>) -> Html<String> {
+pub async fn competitions_fragment(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Html<String> {
     let competitions = fetch_competitions(&state).await;
-    Html(competitions_page(&competitions).into_string())
+    let content = competitions_page(&competitions);
+    render_fragment(&headers, &state, "Competitions - Fantasy Weather", content)
 }
 
 /// Competition rows fragment (for HTMX auto-refresh)
@@ -132,24 +159,27 @@ pub async fn competitions_rows_fragment(State(state): State<Arc<AppState>>) -> H
 /// Entries page fragment (requires auth, returns HTML error on auth failure)
 pub async fn entries_fragment(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     HtmlNostrAuth(NostrAuth { pubkey, .. }): HtmlNostrAuth,
 ) -> Html<String> {
     let entries = fetch_user_entries(&state, &pubkey.to_hex()).await;
-    let markup = if entries.is_empty() {
+    let content = if entries.is_empty() {
         no_entries()
     } else {
         entries_page(&entries)
     };
-    Html(markup.into_string())
+    render_fragment(&headers, &state, "My Entries - Fantasy Weather", content)
 }
 
 /// Payouts page fragment (requires auth, returns HTML error on auth failure)
 pub async fn payouts_fragment(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     HtmlNostrAuth(NostrAuth { pubkey, .. }): HtmlNostrAuth,
 ) -> Html<String> {
     let payouts = fetch_eligible_payouts(&state, &pubkey.to_hex()).await;
-    Html(payouts_page(&payouts).into_string())
+    let content = payouts_page(&payouts);
+    render_fragment(&headers, &state, "Payouts - Fantasy Weather", content)
 }
 
 /// Entry form for a competition
@@ -159,9 +189,6 @@ pub async fn entry_form_fragment(
     Path(competition_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Html<String> {
-    // Check if this is an HTMX request
-    let is_htmx = headers.get("HX-Request").is_some();
-
     // Get competition details
     let competitions = fetch_competitions(&state).await;
     let competition = competitions
@@ -183,27 +210,47 @@ pub async fn entry_form_fragment(
         }
     };
 
-    // If direct navigation (not HTMX), wrap in base layout
-    if is_htmx {
-        Html(content.into_string())
-    } else {
-        let config = PageConfig {
-            title: "Submit Entry - Fantasy Weather",
-            api_base: &state.remote_url,
-            oracle_base: &state.oracle_url,
-            network: &state.bitcoin.get_network().to_string(),
-        };
-        Html(base(&config, content).into_string())
-    }
+    render_fragment(&headers, &state, "Submit Entry - Fantasy Weather", content)
 }
 
 /// Leaderboard for a competition
+/// Returns full page if accessed directly, or fragment if via HTMX
 pub async fn leaderboard_fragment(
     State(state): State<Arc<AppState>>,
     Path(competition_id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> Html<String> {
     let scores = fetch_leaderboard_scores(&state, competition_id).await;
-    Html(leaderboard(&competition_id.to_string(), &scores).into_string())
+
+    // Fetch competition details for observation period
+    let info = match state.coordinator.get_competition(competition_id).await {
+        Ok(comp) => {
+            let status = determine_competition_status(&comp);
+            LeaderboardInfo {
+                competition_id: competition_id.to_string(),
+                start_time: comp
+                    .event_submission
+                    .start_observation_date
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+                end_time: comp
+                    .event_submission
+                    .end_observation_date
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+                status,
+            }
+        }
+        Err(_) => LeaderboardInfo {
+            competition_id: competition_id.to_string(),
+            start_time: String::new(),
+            end_time: String::new(),
+            status: "Unknown".to_string(),
+        },
+    };
+
+    let content = leaderboard(&info, &scores);
+    render_fragment(&headers, &state, "Leaderboard - Fantasy Weather", content)
 }
 
 /// Leaderboard rows fragment (for auto-refresh)
@@ -235,9 +282,9 @@ pub async fn entry_detail_fragment(
         .ok()
         .flatten();
 
-    // If we have an entry, fetch forecast and observation data for score breakdown
-    let score_data = if let Some(ref entry) = entry {
-        fetch_entry_score_data(&state, entry).await
+    // If we have an entry, fetch forecast and observation data
+    let weather_data = if let Some(ref entry) = entry {
+        fetch_entry_weather_data(&state, entry).await
     } else {
         None
     };
@@ -252,94 +299,107 @@ pub async fn entry_detail_fragment(
                     h5 class="title is-5 mt-4" { "Picks & Score Breakdown" }
                     @if entry.entry_submission.expected_observations.is_empty() {
                         p class="has-text-grey" { "No picks recorded" }
-                    } @else {
-                        @if let Some((forecasts, observations, total_score)) = score_data {
+                    } @else if let Some(ref data) = weather_data {
+                        // Show total score if competition is complete
+                        @if let Some(total_score) = data.total_score {
                             p class="mb-3" {
                                 strong { "Total Score: " }
                                 span class="tag is-info is-medium" { (total_score) }
                             }
-                            table class="table is-fullwidth is-striped" {
-                                thead {
-                                    tr {
-                                        th { "Station" }
-                                        th { "Metric" }
-                                        th { "Forecast" }
-                                        th { "Actual" }
-                                        th { "Pick" }
+                        } @else {
+                            p class="mb-3 has-text-grey-light" {
+                                "Final scores will be available after observations are recorded"
+                            }
+                        }
+                        table class="table is-fullwidth is-striped" {
+                            thead {
+                                tr {
+                                    th { "Station" }
+                                    th { "Metric" }
+                                    th { "Forecast" }
+                                    th { "Actual" }
+                                    th { "Pick" }
+                                    @if data.is_complete {
                                         th { "Points" }
                                     }
                                 }
-                                tbody {
-                                    @for obs in &entry.entry_submission.expected_observations {
-                                        @let forecast = forecasts.get(&obs.stations);
-                                        @let observation = observations.get(&obs.stations);
-                                        // Temp High row
-                                        @if let Some(pick) = &obs.temp_high {
-                                            @let forecast_val = forecast.and_then(|f| f.temp_high);
-                                            @let obs_val = observation.and_then(|o| o.temp_high);
-                                            @let points = calculate_option_score(forecast_val, obs_val, pick);
-                                            tr {
-                                                td { (get_station_name(&obs.stations)) }
-                                                td { "Temp High" }
-                                                td { (format_value(forecast_val, "°F")) }
-                                                td { (format_value(obs_val, "°F")) }
-                                                td { (format_pick(&Some(pick.clone()))) }
-                                                td class=(score_class(points)) { (points) }
-                                            }
-                                        }
-                                        // Temp Low row
-                                        @if let Some(pick) = &obs.temp_low {
-                                            @let forecast_val = forecast.and_then(|f| f.temp_low);
-                                            @let obs_val = observation.and_then(|o| o.temp_low);
-                                            @let points = calculate_option_score(forecast_val, obs_val, pick);
-                                            tr {
-                                                td { (get_station_name(&obs.stations)) }
-                                                td { "Temp Low" }
-                                                td { (format_value(forecast_val, "°F")) }
-                                                td { (format_value(obs_val, "°F")) }
-                                                td { (format_pick(&Some(pick.clone()))) }
-                                                td class=(score_class(points)) { (points) }
-                                            }
-                                        }
-                                        // Wind Speed row
-                                        @if let Some(pick) = &obs.wind_speed {
-                                            @let forecast_val = forecast.and_then(|f| f.wind_speed);
-                                            @let obs_val = observation.and_then(|o| o.wind_speed);
-                                            @let points = calculate_option_score(forecast_val, obs_val, pick);
-                                            tr {
-                                                td { (get_station_name(&obs.stations)) }
-                                                td { "Wind Speed" }
-                                                td { (format_value(forecast_val, " mph")) }
-                                                td { (format_value(obs_val, " mph")) }
-                                                td { (format_pick(&Some(pick.clone()))) }
-                                                td class=(score_class(points)) { (points) }
-                                            }
-                                        }
-                                    }
-                                }
                             }
-                        } @else {
-                            // No observation data yet - show picks only
-                            p class="mb-3 has-text-grey-light" {
-                                "Score breakdown will be available after observations are recorded"
-                            }
-                            table class="table is-fullwidth is-striped" {
-                                thead {
-                                    tr {
-                                        th { "Station" }
-                                        th { "Temp High" }
-                                        th { "Temp Low" }
-                                        th { "Wind Speed" }
-                                    }
-                                }
-                                tbody {
-                                    @for obs in &entry.entry_submission.expected_observations {
+                            tbody {
+                                @for obs in &entry.entry_submission.expected_observations {
+                                    @let forecast = data.forecasts.get(&obs.stations);
+                                    @let observation = data.observations.get(&obs.stations);
+                                    // Temp High row
+                                    @if let Some(pick) = &obs.temp_high {
+                                        @let forecast_val = forecast.and_then(|f| f.temp_high);
+                                        @let obs_val = observation.and_then(|o| o.temp_high);
                                         tr {
                                             td { (get_station_name(&obs.stations)) }
-                                            td { (format_pick(&obs.temp_high)) }
-                                            td { (format_pick(&obs.temp_low)) }
-                                            td { (format_pick(&obs.wind_speed)) }
+                                            td { "Temp High" }
+                                            td { (format_value(forecast_val, "°F")) }
+                                            td { (format_value(obs_val, "°F")) }
+                                            td { (format_pick(&Some(pick.clone()))) }
+                                            @if data.is_complete {
+                                                @let points = calculate_option_score(forecast_val, obs_val, pick);
+                                                td class=(score_class(points)) { (points) }
+                                            }
                                         }
+                                    }
+                                    // Temp Low row
+                                    @if let Some(pick) = &obs.temp_low {
+                                        @let forecast_val = forecast.and_then(|f| f.temp_low);
+                                        @let obs_val = observation.and_then(|o| o.temp_low);
+                                        tr {
+                                            td { (get_station_name(&obs.stations)) }
+                                            td { "Temp Low" }
+                                            td { (format_value(forecast_val, "°F")) }
+                                            td { (format_value(obs_val, "°F")) }
+                                            td { (format_pick(&Some(pick.clone()))) }
+                                            @if data.is_complete {
+                                                @let points = calculate_option_score(forecast_val, obs_val, pick);
+                                                td class=(score_class(points)) { (points) }
+                                            }
+                                        }
+                                    }
+                                    // Wind Speed row
+                                    @if let Some(pick) = &obs.wind_speed {
+                                        @let forecast_val = forecast.and_then(|f| f.wind_speed);
+                                        @let obs_val = observation.and_then(|o| o.wind_speed);
+                                        tr {
+                                            td { (get_station_name(&obs.stations)) }
+                                            td { "Wind Speed" }
+                                            td { (format_value(forecast_val, " mph")) }
+                                            td { (format_value(obs_val, " mph")) }
+                                            td { (format_pick(&Some(pick.clone()))) }
+                                            @if data.is_complete {
+                                                @let points = calculate_option_score(forecast_val, obs_val, pick);
+                                                td class=(score_class(points)) { (points) }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } @else {
+                        // No weather data available - show picks only
+                        p class="mb-3 has-text-grey-light" {
+                            "Weather data unavailable"
+                        }
+                        table class="table is-fullwidth is-striped" {
+                            thead {
+                                tr {
+                                    th { "Station" }
+                                    th { "Temp High" }
+                                    th { "Temp Low" }
+                                    th { "Wind Speed" }
+                                }
+                            }
+                            tbody {
+                                @for obs in &entry.entry_submission.expected_observations {
+                                    tr {
+                                        td { (get_station_name(&obs.stations)) }
+                                        td { (format_pick(&obs.temp_high)) }
+                                        td { (format_pick(&obs.temp_low)) }
+                                        td { (format_pick(&obs.wind_speed)) }
                                     }
                                 }
                             }
@@ -383,15 +443,19 @@ fn score_class(points: i32) -> &'static str {
     }
 }
 
-/// Fetch forecast and observation data for an entry's score breakdown
-async fn fetch_entry_score_data(
+/// Entry weather data for display
+struct EntryWeatherData {
+    forecasts: std::collections::HashMap<String, Forecast>,
+    observations: std::collections::HashMap<String, Observation>,
+    total_score: Option<i32>,
+    is_complete: bool,
+}
+
+/// Fetch forecast and observation data for an entry's display
+async fn fetch_entry_weather_data(
     state: &AppState,
     entry: &crate::domain::UserEntry,
-) -> Option<(
-    std::collections::HashMap<String, Forecast>,
-    std::collections::HashMap<String, Observation>,
-    i32,
-)> {
+) -> Option<EntryWeatherData> {
     use std::collections::HashMap;
 
     // Get the competition to find observation dates
@@ -400,12 +464,6 @@ async fn fetch_entry_score_data(
         .get_competition(entry.event_id)
         .await
         .ok()?;
-
-    // Only show score breakdown if we're past the observation end date
-    let now = time::OffsetDateTime::now_utc();
-    if now < competition.event_submission.end_observation_date {
-        return None;
-    }
 
     // Get station IDs from the entry's picks
     let station_ids: Vec<&str> = entry
@@ -435,13 +493,8 @@ async fn fetch_entry_score_data(
         )
     );
 
-    let forecasts = forecasts.ok()?;
-    let observations = observations.ok()?;
-
-    // If we don't have observations yet, don't show the breakdown
-    if observations.is_empty() {
-        return None;
-    }
+    let forecasts = forecasts.ok().unwrap_or_default();
+    let observations = observations.ok().unwrap_or_default();
 
     // Index by station ID
     let mut forecast_map: HashMap<String, Forecast> = HashMap::new();
@@ -454,36 +507,51 @@ async fn fetch_entry_score_data(
         observation_map.insert(o.station_id.clone(), o);
     }
 
-    // Calculate total score
-    let mut total_score = 0i32;
-    for obs in &entry.entry_submission.expected_observations {
-        let forecast = forecast_map.get(&obs.stations);
-        let observation = observation_map.get(&obs.stations);
+    // Check if observations are complete (past end date and have observation data)
+    let now = time::OffsetDateTime::now_utc();
+    let is_complete =
+        now >= competition.event_submission.end_observation_date && !observation_map.is_empty();
 
-        if let Some(pick) = &obs.temp_high {
-            total_score += calculate_option_score(
-                forecast.and_then(|f| f.temp_high),
-                observation.and_then(|o| o.temp_high),
-                pick,
-            );
-        }
-        if let Some(pick) = &obs.temp_low {
-            total_score += calculate_option_score(
-                forecast.and_then(|f| f.temp_low),
-                observation.and_then(|o| o.temp_low),
-                pick,
-            );
-        }
-        if let Some(pick) = &obs.wind_speed {
-            total_score += calculate_option_score(
-                forecast.and_then(|f| f.wind_speed),
-                observation.and_then(|o| o.wind_speed),
-                pick,
-            );
-        }
-    }
+    // Calculate total score only if observations are complete
+    let total_score = if is_complete {
+        let mut score = 0i32;
+        for obs in &entry.entry_submission.expected_observations {
+            let forecast = forecast_map.get(&obs.stations);
+            let observation = observation_map.get(&obs.stations);
 
-    Some((forecast_map, observation_map, total_score))
+            if let Some(pick) = &obs.temp_high {
+                score += calculate_option_score(
+                    forecast.and_then(|f| f.temp_high),
+                    observation.and_then(|o| o.temp_high),
+                    pick,
+                );
+            }
+            if let Some(pick) = &obs.temp_low {
+                score += calculate_option_score(
+                    forecast.and_then(|f| f.temp_low),
+                    observation.and_then(|o| o.temp_low),
+                    pick,
+                );
+            }
+            if let Some(pick) = &obs.wind_speed {
+                score += calculate_option_score(
+                    forecast.and_then(|f| f.wind_speed),
+                    observation.and_then(|o| o.wind_speed),
+                    pick,
+                );
+            }
+        }
+        Some(score)
+    } else {
+        None
+    };
+
+    Some(EntryWeatherData {
+        forecasts: forecast_map,
+        observations: observation_map,
+        total_score,
+        is_complete,
+    })
 }
 
 /// Fetch forecasts for entry score calculation

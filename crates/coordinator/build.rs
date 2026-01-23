@@ -1,4 +1,4 @@
-use minify_js::{minify, Session, TopLevelMode};
+use better_minify_js::{minify, Session, TopLevelMode};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
@@ -378,6 +378,11 @@ fn generate_source_map(entries: &[SourceMapEntry]) -> String {
 fn try_minify(source: &str) -> Result<String, String> {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
+    // In debug builds, skip minification for faster builds
+    if !is_release_build() {
+        return Ok(simple_minify(source));
+    }
+
     let source_owned = source.to_string();
     let result = catch_unwind(AssertUnwindSafe(|| {
         let session = Session::new();
@@ -398,6 +403,148 @@ fn try_minify(source: &str) -> Result<String, String> {
         Ok(Err(e)) => Err(e),
         Err(_) => Err("minifier panicked".to_string()),
     }
+}
+
+/// Simple minification: remove comments and excess whitespace
+/// Used as fallback when full minification fails or in debug builds
+fn simple_minify(source: &str) -> String {
+    let mut result = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    let mut in_string = None; // None, Some('"'), or Some('\'')
+    let mut in_template = false;
+    let mut in_single_comment = false;
+    let mut in_multi_comment = false;
+    let mut last_was_space = false;
+    let mut in_regex = false;
+    let mut last_token_char: Option<char> = None;
+
+    while let Some(c) = chars.next() {
+        // Handle single-line comments
+        if in_single_comment {
+            if c == '\n' {
+                in_single_comment = false;
+                if !last_was_space && !result.is_empty() {
+                    result.push(' ');
+                    last_was_space = true;
+                }
+            }
+            continue;
+        }
+
+        // Handle multi-line comments
+        if in_multi_comment {
+            if c == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                in_multi_comment = false;
+            }
+            continue;
+        }
+
+        // Handle strings
+        if let Some(quote) = in_string {
+            result.push(c);
+            if c == quote {
+                in_string = None;
+            } else if c == '\\' {
+                if let Some(&next) = chars.peek() {
+                    result.push(next);
+                    chars.next();
+                }
+            }
+            continue;
+        }
+
+        // Handle template literals
+        if in_template {
+            result.push(c);
+            if c == '`' {
+                in_template = false;
+            } else if c == '\\' {
+                if let Some(&next) = chars.peek() {
+                    result.push(next);
+                    chars.next();
+                }
+            }
+            continue;
+        }
+
+        // Handle regex literals (simplified detection)
+        if in_regex {
+            result.push(c);
+            if c == '/' {
+                in_regex = false;
+            } else if c == '\\' {
+                if let Some(&next) = chars.peek() {
+                    result.push(next);
+                    chars.next();
+                }
+            }
+            continue;
+        }
+
+        // Check for comment start
+        if c == '/' {
+            if chars.peek() == Some(&'/') {
+                chars.next();
+                in_single_comment = true;
+                continue;
+            } else if chars.peek() == Some(&'*') {
+                chars.next();
+                in_multi_comment = true;
+                continue;
+            } else if last_token_char.map_or(true, |tc| {
+                matches!(
+                    tc,
+                    '=' | '(' | ',' | '[' | '!' | '&' | '|' | ':' | ';' | '{' | '}' | '\n'
+                )
+            }) {
+                // Likely a regex
+                in_regex = true;
+                result.push(c);
+                last_was_space = false;
+                last_token_char = Some(c);
+                continue;
+            }
+        }
+
+        // Check for string/template start
+        if c == '"' || c == '\'' {
+            in_string = Some(c);
+            result.push(c);
+            last_was_space = false;
+            last_token_char = Some(c);
+            continue;
+        }
+        if c == '`' {
+            in_template = true;
+            result.push(c);
+            last_was_space = false;
+            last_token_char = Some(c);
+            continue;
+        }
+
+        // Handle whitespace
+        if c.is_whitespace() {
+            if !last_was_space && !result.is_empty() {
+                // Keep one space between tokens that need it
+                let last_char = result.chars().last();
+                if last_char.map_or(false, |lc| lc.is_alphanumeric() || lc == '_' || lc == '$') {
+                    result.push(' ');
+                    last_was_space = true;
+                }
+            }
+            continue;
+        }
+
+        // Regular character
+        result.push(c);
+        last_was_space = false;
+        if !c.is_whitespace() {
+            last_token_char = Some(c);
+        }
+    }
+
+    result
 }
 
 fn hash_content(content: &str) -> String {

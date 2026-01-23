@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::{extract::State, http::HeaderMap, response::Html};
 use axum_extra::extract::Form;
 use log::error;
+use maud::Markup;
 use serde::Deserialize;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
@@ -25,6 +26,28 @@ use crate::{
         layouts::admin::{admin_base, AdminPageConfig},
     },
 };
+
+/// Helper to render a fragment or wrap it in the admin base layout for direct navigation.
+fn render_admin_fragment(
+    headers: &HeaderMap,
+    state: &AppState,
+    title: &str,
+    content: Markup,
+) -> Html<String> {
+    let is_htmx = headers.get("HX-Request").is_some();
+
+    if is_htmx {
+        Html(content.into_string())
+    } else {
+        let config = AdminPageConfig {
+            title,
+            api_base: &state.private_url,
+            oracle_base: &state.oracle_url,
+            esplora_url: &state.esplora_url,
+        };
+        Html(admin_base(&config, content).into_string())
+    }
+}
 
 /// Admin dashboard page (competition tab)
 pub async fn admin_page_handler(State(state): State<Arc<AppState>>) -> Html<String> {
@@ -64,7 +87,10 @@ pub async fn admin_page_handler(State(state): State<Arc<AppState>>) -> Html<Stri
 }
 
 /// Admin competition tab fragment (for HTMX tab switching)
-pub async fn admin_competition_fragment(State(state): State<Arc<AppState>>) -> Html<String> {
+pub async fn admin_competition_fragment(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Html<String> {
     // Fetch stations from oracle and filter to top 200 cities
     let stations: Vec<Station> = fetch_stations(&state.oracle_url)
         .await
@@ -88,13 +114,14 @@ pub async fn admin_competition_fragment(State(state): State<Arc<AppState>>) -> H
     );
 
     let defaults = CompetitionDefaults::default();
-    Html(admin_dashboard(&stations_with_weather, &defaults).into_string())
+    let content = admin_dashboard(&stations_with_weather, &defaults);
+    render_admin_fragment(&headers, &state, "5day4cast Admin - Competition", content)
 }
 
 /// Admin wallet page (full page for direct navigation, fragment for HTMX)
 pub async fn admin_wallet_fragment(
-    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> Html<String> {
     let balance = fetch_balance(&state)
         .await
@@ -109,20 +136,7 @@ pub async fn admin_wallet_fragment(
         .unwrap_or_default();
 
     let content = wallet_page(&state.esplora_url, &balance, &address);
-
-    // Check if this is an HTMX request
-    if headers.get("HX-Request").is_some() {
-        Html(content.into_string())
-    } else {
-        // Full page load - wrap in admin_base
-        let config = AdminPageConfig {
-            title: "5day4cast Admin - Wallet",
-            api_base: &state.private_url,
-            oracle_base: &state.oracle_url,
-            esplora_url: &state.esplora_url,
-        };
-        Html(admin_base(&config, content).into_string())
-    }
+    render_admin_fragment(&headers, &state, "5day4cast Admin - Wallet", content)
 }
 
 /// Wallet balance fragment (for HTMX refresh)

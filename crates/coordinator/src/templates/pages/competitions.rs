@@ -54,27 +54,27 @@ pub fn competitions_page(competitions: &[CompetitionView]) -> Markup {
         // JavaScript to convert UTC times to local timezone
         script {
             (maud::PreEscaped(r#"
-            document.addEventListener('DOMContentLoaded', function() {
+            (function() {
+                function formatLocalTimes() {
+                    document.querySelectorAll('.utc-time').forEach(function(el) {
+                        const utc = el.dataset.utc;
+                        if (utc) {
+                            const date = new Date(utc);
+                            el.textContent = date.toLocaleString(undefined, {
+                                month: 'short',
+                                day: 'numeric',
+                                hour: 'numeric',
+                                minute: '2-digit'
+                            });
+                            el.title = date.toLocaleString();
+                        }
+                    });
+                }
+                // Run immediately for this fragment
                 formatLocalTimes();
-            });
-            document.body.addEventListener('htmx:afterSwap', function() {
-                formatLocalTimes();
-            });
-            function formatLocalTimes() {
-                document.querySelectorAll('.utc-time').forEach(function(el) {
-                    const utc = el.dataset.utc;
-                    if (utc) {
-                        const date = new Date(utc);
-                        el.textContent = date.toLocaleString(undefined, {
-                            month: 'short',
-                            day: 'numeric',
-                            hour: 'numeric',
-                            minute: '2-digit'
-                        });
-                        el.title = date.toLocaleString();
-                    }
-                });
-            }
+                // Also run after HTMX swaps (for auto-refresh of rows)
+                document.body.addEventListener('htmx:afterSwap', formatLocalTimes);
+            })();
             "#))
         }
     }

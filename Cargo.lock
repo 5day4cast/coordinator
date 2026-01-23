@@ -486,6 +486,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 
 [[package]]
+name = "better-minify-js"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a79f646ae2c733203944224b9c1277d5a8653f4ab42ab28ed2bbd7d618a895e8"
+dependencies = [
+ "aho-corasick 1.1.4",
+ "lazy_static",
+ "parse-js",
+]
+
+[[package]]
 name = "bigdecimal"
 version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -876,6 +887,7 @@ dependencies = [
  "bdk_esplora",
  "bdk_sqlite",
  "bdk_wallet",
+ "better-minify-js",
  "blake2",
  "clap",
  "config",
@@ -894,7 +906,6 @@ dependencies = [
  "maplit",
  "maud",
  "mime",
- "minify-js",
  "mockall",
  "nostr-sdk",
  "openssl",
@@ -2449,17 +2460,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "minify-js"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1fa5546ee8bd66024113e506cabe4230e76635a094c06ea2051b66021dda92e"
-dependencies = [
- "aho-corasick 0.7.20",
- "lazy_static",
- "parse-js",
-]
-
-[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2922,9 +2922,9 @@ dependencies = [
 
 [[package]]
 name = "parse-js"
-version = "0.20.1"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2742b5e32dcb5930447ed9f9e401a7dfd883867fc079c4fac44ae8ba3593710e"
+checksum = "26f2abaec4434c4c5ec8bb3abfa112c9779f774b54ef3d9a6321e022cfcced5f"
 dependencies = [
  "aho-corasick 0.7.20",
  "bumpalo",

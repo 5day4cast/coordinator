@@ -20,8 +20,17 @@ impl EntryScore {
     }
 }
 
+/// Competition info for the leaderboard header
+#[derive(Debug, Clone)]
+pub struct LeaderboardInfo {
+    pub competition_id: String,
+    pub start_time: String,
+    pub end_time: String,
+    pub status: String,
+}
+
 /// Leaderboard content fragment
-pub fn leaderboard(competition_id: &str, scores: &[EntryScore]) -> Markup {
+pub fn leaderboard(info: &LeaderboardInfo, scores: &[EntryScore]) -> Markup {
     html! {
         div id="competitionLeaderboard" class="container" {
             div class="box" {
@@ -39,6 +48,50 @@ pub fn leaderboard(competition_id: &str, scores: &[EntryScore]) -> Markup {
                     }
                 }
 
+                // Observation period info
+                div class="notification is-info is-light mb-4" {
+                    div class="columns is-mobile" {
+                        div class="column" {
+                            p {
+                                strong { "Observation Period" }
+                            }
+                            p class="is-size-7" {
+                                span class="has-text-weight-semibold" { "Start: " }
+                                span class="utc-time" data-utc=(info.start_time) { (info.start_time) }
+                            }
+                            p class="is-size-7" {
+                                span class="has-text-weight-semibold" { "End: " }
+                                span class="utc-time" data-utc=(info.end_time) { (info.end_time) }
+                            }
+                        }
+                        div class="column is-narrow" {
+                            span class=(format!("tag {}", status_class(&info.status))) {
+                                (info.status)
+                            }
+                        }
+                    }
+                }
+                // Script to convert UTC times to local - runs on fragment load
+                script {
+                    (maud::PreEscaped(r#"
+                    (function() {
+                        document.querySelectorAll('.utc-time').forEach(function(el) {
+                            const utc = el.dataset.utc;
+                            if (utc) {
+                                const date = new Date(utc);
+                                el.textContent = date.toLocaleString(undefined, {
+                                    month: 'short',
+                                    day: 'numeric',
+                                    hour: 'numeric',
+                                    minute: '2-digit'
+                                });
+                                el.title = date.toLocaleString();
+                            }
+                        });
+                    })();
+                    "#))
+                }
+
                 div class="table-container" {
                     table id="competitionLeaderboardData"
                           class="table is-fullwidth is-striped is-hoverable" {
@@ -49,7 +102,7 @@ pub fn leaderboard(competition_id: &str, scores: &[EntryScore]) -> Markup {
                                 th { "Score" }
                             }
                         }
-                        tbody hx-get=(format!("/competitions/{}/leaderboard/rows", competition_id))
+                        tbody hx-get=(format!("/competitions/{}/leaderboard/rows", info.competition_id))
                               hx-trigger="every 30s"
                               hx-swap="innerHTML" {
                             @for score in scores {
@@ -63,11 +116,20 @@ pub fn leaderboard(competition_id: &str, scores: &[EntryScore]) -> Markup {
     }
 }
 
+fn status_class(status: &str) -> &'static str {
+    match status {
+        "Registration" => "is-success",
+        "Live" => "is-warning",
+        "Completed" => "is-info",
+        _ => "is-light",
+    }
+}
+
 /// Single leaderboard row
 pub fn leaderboard_row(score: &EntryScore) -> Markup {
     html! {
         tr hx-get=(format!("/entries/{}/detail", score.entry_id))
-           hx-target="#entryScore .modal-content .box"
+           hx-target="#entryValues"
            hx-swap="innerHTML"
            onclick="document.getElementById('entryScore').classList.add('is-active')"
            style="cursor: pointer;" {
