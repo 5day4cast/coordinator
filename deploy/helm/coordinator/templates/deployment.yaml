@@ -148,6 +148,12 @@ spec:
             - replicate
             - -config
             - /etc/litestream.yml
+          {{- if .Values.litestream.httpServer.enabled }}
+          ports:
+            - name: litestream-http
+              containerPort: {{ .Values.litestream.httpServer.port }}
+              protocol: TCP
+          {{- end }}
           volumeMounts:
             - name: data
               mountPath: {{ .Values.persistence.mountPath }}
