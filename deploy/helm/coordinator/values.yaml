@@ -57,10 +57,6 @@ litestream:
     key: "encryption-key"
   # Use IAM role for S3 access (recommended for EC2/EKS)
   useIAMRole: false
-  # HTTP server for live read replicas (used by Grafana for real-time SQLite access)
-  httpServer:
-    enabled: false
-    port: 9090
   databases:
     - name: bitcoin
       path: /data/bitcoin.db
