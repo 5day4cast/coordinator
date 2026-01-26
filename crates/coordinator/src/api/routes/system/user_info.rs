@@ -150,7 +150,7 @@ pub async fn register_username(
         domain::Error::BadRequest("Failed to process password".to_string())
     })?;
 
-    let user = state
+    let user = match state
         .users_info
         .register_username_user(
             body.nostr_pubkey.clone(),
@@ -160,7 +160,14 @@ pub async fn register_username(
             body.encrypted_bitcoin_private_key,
             body.network,
         )
-        .await?;
+        .await
+    {
+        Ok(user) => user,
+        Err(e) => {
+            error!("failed to register username user {}: {}", body.username, e);
+            return Err(ErrorResponse::from(e));
+        }
+    };
 
     Ok((
         StatusCode::CREATED,

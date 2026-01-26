@@ -72,8 +72,8 @@ keymeld:
   url: "http://keymeld.keymeld.svc.cluster.local:8080"
   enabled: true
   gatewayUrl: "http://keymeld.keymeld.svc.cluster.local:8080"
-  keygenSessionExpirySecs: 172800  # 48 hours
-  signingSessionExpirySecs: 172800  # 48 hours
+  keygenSessionExpirySecs: 86400  # 24 hours (max allowed by keymeld)
+  signingSessionExpirySecs: 86400  # 24 hours (max allowed by keymeld)
   maxPollingAttempts: 100
   initialPollingDelayMs: 100
   maxPollingDelayMs: 5000
