@@ -824,26 +824,21 @@ async fn fetch_eligible_payouts(state: &AppState, pubkey: &str) -> Vec<PayoutVie
             );
 
             if competition.attestation.is_some() && competition.outcome_broadcasted_at.is_some() {
-                let payout_amount = calculate_entry_payout(competition, &entry.ephemeral_pubkey);
-                match payout_amount {
-                    Some(amount) if amount > 0 => {
-                        debug!(
-                            "Entry {} is eligible for payout of {} sats",
-                            entry.id, amount
-                        );
-                        payouts.push(PayoutView {
-                            competition_id: competition.id.to_string(),
-                            entry_id: entry.id.to_string(),
-                            status: "Eligible".to_string(),
-                            payout_amount: amount,
-                        });
-                    }
-                    Some(_) => {
-                        debug!("Entry {} has zero payout (not a winner)", entry.id);
-                    }
-                    None => {
-                        debug!("Entry {} could not calculate payout amount", entry.id);
-                    }
+                if let Some(payout_amount) =
+                    calculate_entry_payout(competition, &entry.ephemeral_pubkey)
+                {
+                    debug!(
+                        "Entry {} is eligible for payout of {} sats",
+                        entry.id, payout_amount
+                    );
+                    payouts.push(PayoutView {
+                        competition_id: competition.id.to_string(),
+                        entry_id: entry.id.to_string(),
+                        status: "Eligible".to_string(),
+                        payout_amount,
+                    });
+                } else {
+                    debug!("Entry {} is not eligible for payout", entry.id);
                 }
             }
         } else {
@@ -863,37 +858,27 @@ async fn fetch_eligible_payouts(state: &AppState, pubkey: &str) -> Vec<PayoutVie
 }
 
 /// Calculate the payout amount in sats for an entry based on the competition outcome.
-/// Returns None if the calculation cannot be performed, or Some(0) if the entry is not a winner.
+/// Returns None if the entry is not a winner or the calculation cannot be performed.
 fn calculate_entry_payout(
     competition: &crate::domain::Competition,
     ephemeral_pubkey_hex: &str,
 ) -> Option<u64> {
     let contract_params = competition.contract_parameters.as_ref()?;
     let outcome = competition.get_current_outcome().ok()?;
-
     let outcome_weights = contract_params.outcome_payouts.get(&outcome)?;
-
     let ephemeral_pubkey = Point::from_hex(ephemeral_pubkey_hex).ok()?;
 
-    let player_weight = outcome_weights
-        .iter()
-        .find_map(|(player_index, weight)| {
-            let player = contract_params.players.get(*player_index)?;
-            if player.pubkey == ephemeral_pubkey {
-                Some(*weight)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
-
-    if player_weight == 0 {
-        return Some(0);
-    }
+    let player_weight = outcome_weights.iter().find_map(|(player_index, weight)| {
+        let player = contract_params.players.get(*player_index)?;
+        if player.pubkey == ephemeral_pubkey {
+            Some(*weight)
+        } else {
+            None
+        }
+    })?;
 
     let total_pool_sats = contract_params.funding_value.to_sat();
-    let payout_amount_sats = (total_pool_sats * player_weight) / 100;
-    Some(payout_amount_sats)
+    Some((total_pool_sats * player_weight) / 100)
 }
 
 async fn fetch_forecasts(state: &AppState, competition: &CompetitionView) -> Vec<StationForecast> {
