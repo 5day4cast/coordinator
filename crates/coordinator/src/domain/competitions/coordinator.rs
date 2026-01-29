@@ -1895,6 +1895,15 @@ impl Coordinator {
         &self,
         competition: &'a mut Competition,
     ) -> Result<&'a mut Competition, anyhow::Error> {
+        if competition.outcome_broadcasted_at.is_some() && competition.outcome_transaction.is_some()
+        {
+            info!(
+                "Outcome transaction already published for competition {}, skipping",
+                competition.id
+            );
+            return Ok(competition);
+        }
+
         let Some(attestation) = competition.attestation else {
             return Err(anyhow!(
                 "No attestation found for competition {}",
@@ -1939,6 +1948,9 @@ impl Coordinator {
         if competition.outcome_broadcasted_at.is_none() {
             self.bitcoin.broadcast(&outcome_tx).await?;
             competition.outcome_broadcasted_at = Some(OffsetDateTime::now_utc());
+            competition.errors = vec![];
+
+            return Ok(competition);
         }
 
         if let Some(expiry) = event_announcement.expiry {
@@ -1970,8 +1982,8 @@ impl Coordinator {
                 return Ok(competition);
             }
         }
-        competition.errors = vec![];
 
+        competition.errors = vec![];
         Ok(competition)
     }
 
