@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use dlctix::secp::Point;
+use log::{debug, error};
+
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -770,47 +773,127 @@ async fn fetch_user_entries(state: &AppState, pubkey: &str) -> Vec<EntryView> {
 }
 
 async fn fetch_eligible_payouts(state: &AppState, pubkey: &str) -> Vec<PayoutView> {
-    // Get user entries that are signed and have attestation but not paid out
+    debug!("Fetching eligible payouts for pubkey: {}", pubkey);
+
     let entries = match state
         .coordinator
         .get_entries(pubkey.to_string(), SearchBy { event_ids: None })
         .await
     {
-        Ok(e) => e,
-        Err(_) => return vec![],
+        Ok(e) => {
+            debug!("Found {} entries for pubkey {}", e.len(), pubkey);
+            e
+        }
+        Err(e) => {
+            error!("Failed to fetch entries for payouts: {:?}", e);
+            return vec![];
+        }
     };
 
     let competitions = match state.coordinator.get_competitions().await {
-        Ok(c) => c,
-        Err(_) => return vec![],
+        Ok(c) => {
+            debug!("Found {} competitions", c.len());
+            c
+        }
+        Err(e) => {
+            error!("Failed to fetch competitions for payouts: {:?}", e);
+            return vec![];
+        }
     };
 
     let mut payouts = Vec::new();
 
-    for entry in entries {
-        // Skip entries already paid out
+    for entry in &entries {
+        debug!(
+            "Checking entry {} (event_id: {}, paid_out_at: {:?})",
+            entry.id, entry.event_id, entry.paid_out_at
+        );
+
         if entry.paid_out_at.is_some() {
+            debug!("Skipping entry {} - already paid out", entry.id);
             continue;
         }
 
-        // Find competition and check if it has been attested (results are in)
         if let Some(competition) = competitions.iter().find(|c| c.id == entry.event_id) {
-            if competition.attestation.is_some() && competition.outcome_broadcasted_at.is_some() {
-                // Calculate payout amount based on outcome
-                // For now, just show that it's eligible
-                let payout_amount = competition.event_submission.entry_fee as u64; // Placeholder
+            debug!(
+                "Found competition {} for entry {} - attestation: {}, outcome_broadcasted_at: {:?}",
+                competition.id,
+                entry.id,
+                competition.attestation.is_some(),
+                competition.outcome_broadcasted_at
+            );
 
-                payouts.push(PayoutView {
-                    competition_id: competition.id.to_string(),
-                    entry_id: entry.id.to_string(),
-                    status: "Eligible".to_string(),
-                    payout_amount,
-                });
+            if competition.attestation.is_some() && competition.outcome_broadcasted_at.is_some() {
+                let payout_amount = calculate_entry_payout(competition, &entry.ephemeral_pubkey);
+                match payout_amount {
+                    Some(amount) if amount > 0 => {
+                        debug!(
+                            "Entry {} is eligible for payout of {} sats",
+                            entry.id, amount
+                        );
+                        payouts.push(PayoutView {
+                            competition_id: competition.id.to_string(),
+                            entry_id: entry.id.to_string(),
+                            status: "Eligible".to_string(),
+                            payout_amount: amount,
+                        });
+                    }
+                    Some(_) => {
+                        debug!("Entry {} has zero payout (not a winner)", entry.id);
+                    }
+                    None => {
+                        debug!("Entry {} could not calculate payout amount", entry.id);
+                    }
+                }
             }
+        } else {
+            debug!(
+                "No matching competition found for entry {} (event_id: {})",
+                entry.id, entry.event_id
+            );
         }
     }
 
+    debug!(
+        "Returning {} eligible payouts for pubkey {}",
+        payouts.len(),
+        pubkey
+    );
     payouts
+}
+
+/// Calculate the payout amount in sats for an entry based on the competition outcome.
+/// Returns None if the calculation cannot be performed, or Some(0) if the entry is not a winner.
+fn calculate_entry_payout(
+    competition: &crate::domain::Competition,
+    ephemeral_pubkey_hex: &str,
+) -> Option<u64> {
+    let contract_params = competition.contract_parameters.as_ref()?;
+    let outcome = competition.get_current_outcome().ok()?;
+
+    let outcome_weights = contract_params.outcome_payouts.get(&outcome)?;
+
+    let ephemeral_pubkey = Point::from_hex(ephemeral_pubkey_hex).ok()?;
+
+    let player_weight = outcome_weights
+        .iter()
+        .find_map(|(player_index, weight)| {
+            let player = contract_params.players.get(*player_index)?;
+            if player.pubkey == ephemeral_pubkey {
+                Some(*weight)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
+    if player_weight == 0 {
+        return Some(0);
+    }
+
+    let total_pool_sats = contract_params.funding_value.to_sat();
+    let payout_amount_sats = (total_pool_sats * player_weight) / 100;
+    Some(payout_amount_sats)
 }
 
 async fn fetch_forecasts(state: &AppState, competition: &CompetitionView) -> Vec<StationForecast> {

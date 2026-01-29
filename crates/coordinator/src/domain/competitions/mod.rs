@@ -692,7 +692,7 @@ impl Competition {
         Ok(latest_signing_end)
     }
 
-    fn get_current_outcome(&self) -> Result<Outcome, anyhow::Error> {
+    pub(crate) fn get_current_outcome(&self) -> Result<Outcome, anyhow::Error> {
         let Some(attestation) = self.attestation else {
             return Err(anyhow!("No attestation found for competition {}", self.id));
         };
