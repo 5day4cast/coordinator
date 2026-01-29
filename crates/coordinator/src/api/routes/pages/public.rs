@@ -788,8 +788,8 @@ async fn fetch_eligible_payouts(state: &AppState, pubkey: &str) -> Vec<PayoutVie
     let mut payouts = Vec::new();
 
     for entry in entries {
-        // Must be signed but not paid out
-        if entry.signed_at.is_none() || entry.paid_at.is_some() {
+        // Must be signed but not yet paid out winnings
+        if entry.signed_at.is_none() || entry.paid_out_at.is_some() {
             continue;
         }
 
