@@ -1919,6 +1919,28 @@ impl Coordinator {
             ));
         };
 
+        let outcome = competition.get_current_outcome()?;
+
+        let outcome_index = match outcome {
+            Outcome::Attestation(i) => i,
+            Outcome::Expiry => return Err(anyhow!("Unexpected expiry outcome")),
+        };
+
+        if !event_announcement.is_valid_outcome(&outcome) {
+            return Err(anyhow!("Invalid outcome for this contract"));
+        }
+
+        let outcome_tx = signed_contract.signed_outcome_tx(outcome_index, attestation)?;
+
+        let tx_hex = consensus::encode::serialize_hex(&outcome_tx);
+        debug!("Raw transaction hex: {}", tx_hex);
+        debug!("Transaction ID: {}", outcome_tx.compute_txid());
+        competition.outcome_transaction = Some(outcome_tx.clone());
+        if competition.outcome_broadcasted_at.is_none() {
+            self.bitcoin.broadcast(&outcome_tx).await?;
+            competition.outcome_broadcasted_at = Some(OffsetDateTime::now_utc());
+        }
+
         if let Some(expiry) = event_announcement.expiry {
             let current_time = self
                 .bitcoin
@@ -1947,28 +1969,6 @@ impl Coordinator {
 
                 return Ok(competition);
             }
-        }
-
-        let outcome = competition.get_current_outcome()?;
-
-        let outcome_index = match outcome {
-            Outcome::Attestation(i) => i,
-            Outcome::Expiry => return Err(anyhow!("Unexpected expiry outcome")),
-        };
-
-        if !event_announcement.is_valid_outcome(&outcome) {
-            return Err(anyhow!("Invalid outcome for this contract"));
-        }
-
-        let outcome_tx = signed_contract.signed_outcome_tx(outcome_index, attestation)?;
-
-        let tx_hex = consensus::encode::serialize_hex(&outcome_tx);
-        debug!("Raw transaction hex: {}", tx_hex);
-        debug!("Transaction ID: {}", outcome_tx.compute_txid());
-        competition.outcome_transaction = Some(outcome_tx.clone());
-        if competition.outcome_broadcasted_at.is_none() {
-            self.bitcoin.broadcast(&outcome_tx).await?;
-            competition.outcome_broadcasted_at = Some(OffsetDateTime::now_utc());
         }
         competition.errors = vec![];
 
