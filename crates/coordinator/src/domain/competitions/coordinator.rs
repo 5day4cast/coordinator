@@ -1604,23 +1604,8 @@ impl Coordinator {
                 dlc_signatures.split_signatures.len()
             );
 
-            // Build ContractSignatures from keymeld results
-            // Note: expiry_tx_signature would come from keymeld if the contract has an expiry outcome
-            // For now we check if there's an expiry outcome in the signing data
-            let signing_data = ticketed_dlc.signing_data()?;
-            let expiry_tx_signature = if signing_data
-                .outcome_sighashes
-                .contains_key(&Outcome::Expiry)
-            {
-                // TODO: Keymeld should return expiry signature separately
-                // For now, this is None - expiry transactions aren't adaptor-signed
-                None
-            } else {
-                None
-            };
-
             let contract_signatures = ContractSignatures {
-                expiry_tx_signature,
+                expiry_tx_signature: dlc_signatures.expiry_signature,
                 outcome_tx_signatures: dlc_signatures.outcome_signatures,
                 split_tx_signatures: dlc_signatures.split_signatures,
             };
@@ -1839,42 +1824,41 @@ impl Coordinator {
             ));
         };
 
-        if let Some(expiry) = signed_contract.dlc().params().event.expiry {
-            let current_time = self
-                .bitcoin
-                .get_confirmed_blockchain_time(REQUIRED_CONFIRMATIONS_FOR_TIME)
-                .await?;
-
-            if current_time > expiry as u64 {
-                // Get the expiry transaction
-                let Some(expiry_tx) = signed_contract.expiry_tx() else {
-                    return Err(anyhow!(
-                        "No expiry transaction found for competition {}",
-                        competition.id
-                    ));
-                };
-
-                debug!(
-                    "Broadcasting expiry transaction, current time {} expiry_tx lock time {} : {:?}",
-                    current_time, expiry_tx.lock_time, expiry_tx
-                );
-
-                if competition.expiry_broadcasted_at.is_none() {
-                    debug!("expiry_tx: {:?}", expiry_tx);
-                    self.bitcoin.broadcast(&expiry_tx).await?;
-                    competition.expiry_broadcasted_at = Some(OffsetDateTime::now_utc())
-                };
-
-                return Ok(competition);
-            }
-        }
-
         let event = self.oracle_client.get_event(&competition.id).await?;
         let Some(attestation) = event.attestation else {
             info!(
                 "No oracle attestation found for competition {} yet, skipping add",
                 competition.id
             );
+            if let Some(expiry) = signed_contract.dlc().params().event.expiry {
+                let current_time = self
+                    .bitcoin
+                    .get_confirmed_blockchain_time(REQUIRED_CONFIRMATIONS_FOR_TIME)
+                    .await?;
+
+                if current_time > expiry as u64 {
+                    // Get the expiry transaction
+                    let Some(expiry_tx) = signed_contract.expiry_tx() else {
+                        return Err(anyhow!(
+                            "No expiry transaction found for competition {}",
+                            competition.id
+                        ));
+                    };
+
+                    debug!(
+                        "Broadcasting expiry transaction, current time {} expiry_tx lock time {} : {:?}",
+                        current_time, expiry_tx.lock_time, expiry_tx
+                    );
+
+                    if competition.expiry_broadcasted_at.is_none() {
+                        debug!("expiry_tx: {:?}", expiry_tx);
+                        self.bitcoin.broadcast(&expiry_tx).await?;
+                        competition.expiry_broadcasted_at = Some(OffsetDateTime::now_utc())
+                    };
+
+                    return Ok(competition);
+                }
+            }
             return Ok(competition);
         };
         debug!("attestation above verification: {:?}", attestation);
