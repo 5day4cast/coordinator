@@ -191,10 +191,11 @@ impl CompetitionStatus {
     pub fn fail(self, error: CompetitionError) -> CompetitionStatus {
         let competition_id = self.competition_id();
         let previous_state = self.state_name().to_string();
-        let competition = self.into_competition();
+        let mut competition = self.into_competition();
+        competition.failed_at = Some(OffsetDateTime::now_utc());
         CompetitionStatus::Failed(Failed {
             competition_id,
-            failed_at: OffsetDateTime::now_utc(),
+            failed_at: competition.failed_at.unwrap(),
             error,
             previous_state,
             competition: Some(competition),
@@ -205,10 +206,11 @@ impl CompetitionStatus {
     pub fn cancel(self, reason: String) -> CompetitionStatus {
         let competition_id = self.competition_id();
         let previous_state = self.state_name().to_string();
-        let competition = self.into_competition();
+        let mut competition = self.into_competition();
+        competition.cancelled_at = Some(OffsetDateTime::now_utc());
         CompetitionStatus::Cancelled(Cancelled {
             competition_id,
-            cancelled_at: OffsetDateTime::now_utc(),
+            cancelled_at: competition.cancelled_at.unwrap(),
             reason,
             previous_state,
             competition: Some(competition),

@@ -724,22 +724,18 @@ fn determine_competition_status(competition: &crate::domain::Competition) -> Str
         | CompetitionState::OutcomeBroadcasted
         | CompetitionState::DeltaBroadcasted
         | CompetitionState::ExpiryBroadcasted => "Completed".to_string(),
-        CompetitionState::AwaitingAttestation => "Signing".to_string(),
-        // For earlier states, use time-based labels for user-friendliness
+        // For all other states, use time-based labels for user-friendliness
         _ => {
             let now = OffsetDateTime::now_utc();
             let start = competition.event_submission.start_observation_date;
             let end = competition.event_submission.end_observation_date;
-            let signing = competition.event_submission.signing_date;
 
             if now < start {
                 "Registration".to_string()
             } else if now < end {
                 "Live".to_string()
-            } else if now < signing {
-                "Setup".to_string()
             } else {
-                "Signing".to_string()
+                "Awaiting Results".to_string()
             }
         }
     }

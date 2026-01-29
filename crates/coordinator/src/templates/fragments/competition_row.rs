@@ -51,6 +51,7 @@ fn status_class(status: &str) -> &'static str {
         "registration" => "tag is-success",
         "setup" | "live" => "tag is-warning",
         "signing" => "tag is-warning",
+        "awaiting results" => "tag is-info is-light",
         "completed" => "tag is-info",
         "failed" | "cancelled" => "tag is-danger",
         _ => "tag",

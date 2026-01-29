@@ -6,6 +6,8 @@ metadata:
     {{- include "coordinator.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "coordinator.selectorLabels" . | nindent 6 }}
