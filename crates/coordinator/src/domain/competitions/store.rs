@@ -843,6 +843,11 @@ impl CompetitionStore {
                 .map(|ts| ts.format(&Rfc3339))
                 .transpose()
                 .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+            let awaiting_attestation_at = competition
+                .awaiting_attestation_at
+                .map(|ts| ts.format(&Rfc3339))
+                .transpose()
+                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
             let expiry_broadcasted_at = competition
                 .expiry_broadcasted_at
                 .map(|ts| ts.format(&Rfc3339))
@@ -909,6 +914,7 @@ impl CompetitionStore {
                 funding_broadcasted_at,
                 funding_confirmed_at,
                 funding_settled_at,
+                awaiting_attestation_at,
                 expiry_broadcasted_at,
                 outcome_broadcasted_at,
                 delta_broadcasted_at,
@@ -944,6 +950,7 @@ impl CompetitionStore {
                     funding_broadcasted_at = ?,
                     funding_confirmed_at = ?,
                     funding_settled_at = ?,
+                    awaiting_attestation_at = ?,
                     expiry_broadcasted_at = ?,
                     outcome_broadcasted_at = ?,
                     delta_broadcasted_at = ?,
@@ -975,6 +982,7 @@ impl CompetitionStore {
                     funding_broadcasted_at,
                     funding_confirmed_at,
                     funding_settled_at,
+                    awaiting_attestation_at,
                     expiry_broadcasted_at,
                     outcome_broadcasted_at,
                     delta_broadcasted_at,
@@ -1007,6 +1015,7 @@ impl CompetitionStore {
                         .bind(funding_broadcasted_at)
                         .bind(funding_confirmed_at)
                         .bind(funding_settled_at)
+                        .bind(awaiting_attestation_at)
                         .bind(expiry_broadcasted_at)
                         .bind(outcome_broadcasted_at)
                         .bind(delta_broadcasted_at)
@@ -1071,6 +1080,7 @@ impl CompetitionStore {
                 funding_broadcasted_at as funding_broadcasted_at,
                 funding_confirmed_at as funding_confirmed_at,
                 funding_settled_at as funding_settled_at,
+                awaiting_attestation_at as awaiting_attestation_at,
                 invoices_settled_at as invoices_settled_at,
                 expiry_broadcasted_at as expiry_broadcasted_at,
                 outcome_broadcasted_at as outcome_broadcasted_at,
@@ -1111,6 +1121,7 @@ impl CompetitionStore {
                     funding_broadcasted_at,
                     funding_confirmed_at,
                     funding_settled_at,
+                    awaiting_attestation_at,
                     invoices_settled_at,
                     expiry_broadcasted_at,
                     outcome_broadcasted_at,
@@ -1149,6 +1160,7 @@ impl CompetitionStore {
                     funding_broadcasted_at,
                     funding_confirmed_at,
                     funding_settled_at,
+                    awaiting_attestation_at,
                     invoices_settled_at,
                     expiry_broadcasted_at,
                     outcome_broadcasted_at,
@@ -1215,6 +1227,7 @@ impl CompetitionStore {
                 funding_broadcasted_at as funding_broadcasted_at,
                 funding_confirmed_at as funding_confirmed_at,
                 funding_settled_at as funding_settled_at,
+                awaiting_attestation_at as awaiting_attestation_at,
                 invoices_settled_at as invoices_settled_at,
                 expiry_broadcasted_at as expiry_broadcasted_at,
                 outcome_broadcasted_at as outcome_broadcasted_at,
@@ -1252,6 +1265,7 @@ impl CompetitionStore {
                 funding_broadcasted_at,
                 funding_confirmed_at,
                 funding_settled_at,
+                awaiting_attestation_at,
                 invoices_settled_at,
                 expiry_broadcasted_at,
                 outcome_broadcasted_at,

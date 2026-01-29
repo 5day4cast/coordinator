@@ -301,6 +301,9 @@ impl From<Competition> for CompetitionStatus {
             super::CompetitionState::FundingSettled => {
                 CompetitionStatus::FundingSettled(FundingSettled::from_competition(competition))
             }
+            super::CompetitionState::AwaitingAttestation => CompetitionStatus::AwaitingAttestation(
+                AwaitingAttestation::from_competition(competition),
+            ),
             super::CompetitionState::Attested => {
                 CompetitionStatus::Attested(Attested::from_competition(competition))
             }

@@ -170,7 +170,8 @@ impl FundingSettled {
     }
 
     /// Transition to AwaitingAttestation.
-    pub fn await_attestation(self) -> CompetitionStatus {
+    pub fn await_attestation(mut self) -> CompetitionStatus {
+        self.competition.awaiting_attestation_at = Some(OffsetDateTime::now_utc());
         CompetitionStatus::AwaitingAttestation(AwaitingAttestation::from_competition(
             self.competition,
         ))
