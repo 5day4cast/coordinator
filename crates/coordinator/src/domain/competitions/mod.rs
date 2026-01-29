@@ -510,6 +510,9 @@ pub struct Competition {
     /// Funding transaction is considered settled after all hold invoices have been closed
     #[serde(with = "time::serde::rfc3339::option")]
     pub funding_settled_at: Option<OffsetDateTime>,
+    /// When the competition started waiting for oracle attestation
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub awaiting_attestation_at: Option<OffsetDateTime>,
     /// Expiry transaction is broadcasted after event has expired
     #[serde(with = "time::serde::rfc3339::option")]
     pub expiry_broadcasted_at: Option<OffsetDateTime>,
@@ -575,6 +578,9 @@ pub struct ExtendCompetition {
     /// Funding transaction is considered settled after all hold invoices have been closed
     #[serde(with = "time::serde::rfc3339::option")]
     pub funding_settled_at: Option<OffsetDateTime>,
+    /// When the competition started waiting for oracle attestation
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub awaiting_attestation_at: Option<OffsetDateTime>,
     /// Expiry transaction is broadcasted after event has expired
     #[serde(with = "time::serde::rfc3339::option")]
     pub expiry_broadcasted_at: Option<OffsetDateTime>,
@@ -627,6 +633,7 @@ impl From<Competition> for ExtendCompetition {
             funding_broadcasted_at: competition.funding_broadcasted_at,
             funding_confirmed_at: competition.funding_confirmed_at,
             funding_settled_at: competition.funding_settled_at,
+            awaiting_attestation_at: competition.awaiting_attestation_at,
             expiry_broadcasted_at: competition.expiry_broadcasted_at,
             outcome_broadcasted_at: competition.outcome_broadcasted_at,
             delta_broadcasted_at: competition.delta_broadcasted_at,
@@ -895,6 +902,8 @@ pub enum CompetitionState {
     FundingConfirmed,
     /// Once all hold invoices have settled/tickets have been paid
     FundingSettled,
+    /// Waiting for oracle to attest to the results
+    AwaitingAttestation,
     /// Oracle has attested to the results
     Attested,
     /// Oracle event has expired & players refunded before an attestation was provided
@@ -923,6 +932,7 @@ impl fmt::Display for CompetitionState {
             CompetitionState::FundingBroadcasted => write!(f, "funding_broadcasted"),
             CompetitionState::FundingConfirmed => write!(f, "funding_confirmed"),
             CompetitionState::FundingSettled => write!(f, "funding_settled"),
+            CompetitionState::AwaitingAttestation => write!(f, "awaiting_attestation"),
             CompetitionState::Attested => write!(f, "attested"),
             CompetitionState::ExpiryBroadcasted => write!(f, "expiry_broadcasted"),
             CompetitionState::OutcomeBroadcasted => write!(f, "outcome_broadcasted"),
@@ -966,6 +976,7 @@ impl Competition {
             funding_confirmed_at: None,
             invoices_settled_at: None,
             funding_settled_at: None,
+            awaiting_attestation_at: None,
             expiry_broadcasted_at: None,
             outcome_broadcasted_at: None,
             delta_broadcasted_at: None,
@@ -1115,6 +1126,9 @@ impl Competition {
         if self.is_attested() {
             return CompetitionState::Attested;
         }
+        if self.awaiting_attestation_at.is_some() {
+            return CompetitionState::AwaitingAttestation;
+        }
         if self.is_funding_settled() {
             return CompetitionState::FundingSettled;
         }
@@ -1187,6 +1201,7 @@ impl FromRow<'_, SqliteRow> for Competition {
             funding_confirmed_at: parse_optional_datetime(row, "funding_confirmed_at")?,
             invoices_settled_at: parse_optional_datetime(row, "invoices_settled_at")?,
             funding_settled_at: parse_optional_datetime(row, "funding_settled_at")?,
+            awaiting_attestation_at: parse_optional_datetime(row, "awaiting_attestation_at")?,
             expiry_broadcasted_at: parse_optional_datetime(row, "expiry_broadcasted_at")?,
             outcome_broadcasted_at: parse_optional_datetime(row, "outcome_broadcasted_at")?,
             delta_broadcasted_at: parse_optional_datetime(row, "delta_broadcasted_at")?,

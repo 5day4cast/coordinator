@@ -708,23 +708,37 @@ async fn fetch_competitions(state: &AppState) -> Vec<CompetitionView> {
 }
 
 fn determine_competition_status(competition: &crate::domain::Competition) -> String {
+    use crate::domain::CompetitionState;
     use time::OffsetDateTime;
 
-    let now = OffsetDateTime::now_utc();
-    let start = competition.event_submission.start_observation_date;
-    let end = competition.event_submission.end_observation_date;
-    let signing = competition.event_submission.signing_date;
+    let state = competition.get_state();
 
-    if competition.attestation.is_some() {
-        "Completed".to_string()
-    } else if now < start {
-        "Registration".to_string()
-    } else if now < end {
-        "Live".to_string()
-    } else if now < signing {
-        "Setup".to_string()
-    } else {
-        "Signing".to_string()
+    match state {
+        CompetitionState::Failed => "Failed".to_string(),
+        CompetitionState::Cancelled => "Cancelled".to_string(),
+        CompetitionState::Completed => "Completed".to_string(),
+        CompetitionState::Attested
+        | CompetitionState::OutcomeBroadcasted
+        | CompetitionState::DeltaBroadcasted
+        | CompetitionState::ExpiryBroadcasted => "Completed".to_string(),
+        CompetitionState::AwaitingAttestation => "Signing".to_string(),
+        // For earlier states, use time-based labels for user-friendliness
+        _ => {
+            let now = OffsetDateTime::now_utc();
+            let start = competition.event_submission.start_observation_date;
+            let end = competition.event_submission.end_observation_date;
+            let signing = competition.event_submission.signing_date;
+
+            if now < start {
+                "Registration".to_string()
+            } else if now < end {
+                "Live".to_string()
+            } else if now < signing {
+                "Setup".to_string()
+            } else {
+                "Signing".to_string()
+            }
+        }
     }
 }
 
