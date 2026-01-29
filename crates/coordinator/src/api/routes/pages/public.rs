@@ -788,14 +788,14 @@ async fn fetch_eligible_payouts(state: &AppState, pubkey: &str) -> Vec<PayoutVie
     let mut payouts = Vec::new();
 
     for entry in entries {
-        // Must be signed but not yet paid out winnings
-        if entry.signed_at.is_none() || entry.paid_out_at.is_some() {
+        // Skip entries already paid out
+        if entry.paid_out_at.is_some() {
             continue;
         }
 
-        // Find competition and check if it has attestation
+        // Find competition and check if it has been attested (results are in)
         if let Some(competition) = competitions.iter().find(|c| c.id == entry.event_id) {
-            if competition.attestation.is_some() {
+            if competition.attestation.is_some() && competition.outcome_broadcasted_at.is_some() {
                 // Calculate payout amount based on outcome
                 // For now, just show that it's eligible
                 let payout_amount = competition.event_submission.entry_fee as u64; // Placeholder
