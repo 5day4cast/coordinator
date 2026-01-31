@@ -1,15 +1,33 @@
-use maud::{html, Markup};
+use maud::{html, Markup, PreEscaped};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::location_selector::location_selector;
 
+/// Format an OffsetDateTime as a datetime-local input value (YYYY-MM-DDTHH:MM)
+fn format_datetime_local(dt: &OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}",
+        dt.year(),
+        dt.month() as u8,
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+    )
+}
+
 /// Station data from the oracle
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Station {
     pub station_id: String,
     pub station_name: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub iata_id: String,
+    #[serde(default)]
+    pub elevation_m: Option<f64>,
     pub latitude: f64,
     pub longitude: f64,
 }
@@ -105,14 +123,56 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
                      hx-swap="innerHTML"
                      hx-indicator="#submit-indicator" {
 
-                    // Hidden fields with auto-generated defaults
+                    // Hidden field for auto-generated competition ID
                     input type="hidden" name="id" value=(defaults.id);
-                    input type="hidden" name="signing_date"
-                          value=(defaults.signing_date.format(&time::format_description::well_known::Rfc3339).unwrap_or_default());
-                    input type="hidden" name="start_observation_date"
+
+                    // Hidden fields synced from datetime-local inputs
+                    input type="hidden" name="start_observation_date" id="start_observation_date_hidden"
                           value=(defaults.start_observation_date.format(&time::format_description::well_known::Rfc3339).unwrap_or_default());
-                    input type="hidden" name="end_observation_date"
+                    input type="hidden" name="end_observation_date" id="end_observation_date_hidden"
                           value=(defaults.end_observation_date.format(&time::format_description::well_known::Rfc3339).unwrap_or_default());
+                    input type="hidden" name="signing_date" id="signing_date_hidden"
+                          value=(defaults.signing_date.format(&time::format_description::well_known::Rfc3339).unwrap_or_default());
+
+                    // Timing parameters
+                    div class="box" {
+                        h3 class="subtitle is-5" { "Timing (UTC)" }
+                        div class="columns" {
+                            div class="column" {
+                                div class="field" {
+                                    label class="label" { "Observation Start" }
+                                    div class="control" {
+                                        input class="input" type="datetime-local"
+                                              id="start_observation_date_input"
+                                              value=(format_datetime_local(&defaults.start_observation_date))
+                                              onchange="syncDateField('start_observation_date')";
+                                    }
+                                }
+                            }
+                            div class="column" {
+                                div class="field" {
+                                    label class="label" { "Observation End" }
+                                    div class="control" {
+                                        input class="input" type="datetime-local"
+                                              id="end_observation_date_input"
+                                              value=(format_datetime_local(&defaults.end_observation_date))
+                                              onchange="syncDateField('end_observation_date')";
+                                    }
+                                }
+                            }
+                            div class="column" {
+                                div class="field" {
+                                    label class="label" { "Signing Date" }
+                                    div class="control" {
+                                        input class="input" type="datetime-local"
+                                              id="signing_date_input"
+                                              value=(format_datetime_local(&defaults.signing_date))
+                                              onchange="syncDateField('signing_date')";
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     // Competition parameters
                     div class="box" {
@@ -184,6 +244,19 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
 
         // Include location selector JavaScript
         script src="/ui/location_selector.js" {}
+
+        // Sync datetime-local inputs to hidden RFC3339 fields
+        script {
+            (PreEscaped(r#"
+            function syncDateField(name) {
+                var input = document.getElementById(name + '_input');
+                var hidden = document.getElementById(name + '_hidden');
+                if (input && hidden && input.value) {
+                    hidden.value = input.value + ':00Z';
+                }
+            }
+            "#))
+        }
     }
 }
 

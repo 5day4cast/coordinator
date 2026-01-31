@@ -926,80 +926,90 @@ body,
     color: var(--bulma-text-weak, #7a7a7a);
 }
 
-/* Station tooltip - enhanced with weather */
-.station-tooltip {
+/* IATA airport code badge */
+.tag.is-iata {
+    background-color: #6b7280;
+    color: #fff;
+}
+
+/* Station popup (oracle-style forecast grid) */
+.station-popup {
     position: absolute;
     z-index: 100;
     background: var(--bulma-scheme-main, #fff);
     border: 1px solid var(--bulma-border, #dbdbdb);
     border-radius: 6px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
     padding: 0.75rem;
-    pointer-events: none;
-    font-size: 0.875rem;
-    min-width: 200px;
-    max-width: 280px;
+    min-width: 300px;
+    max-width: 360px;
 }
 
-.tooltip-station-id {
-    display: block;
-    font-size: 1rem;
-    margin-bottom: 0.25rem;
-}
-
-.tooltip-name {
-    color: var(--bulma-text-weak, #7a7a7a);
-    font-size: 0.8rem;
-    margin-bottom: 0.5rem;
-    padding-bottom: 0.5rem;
-    border-bottom: 1px solid var(--app-border, #dbdbdb);
-}
-
-.tooltip-weather {
+.popup-header {
     display: flex;
-    gap: 1rem;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
 }
 
-.tooltip-weather-day {
-    flex: 1;
-    text-align: center;
+.popup-station-id {
+    font-size: 1rem;
 }
 
-.tooltip-weather-day strong {
-    display: block;
+.popup-name {
+    font-size: 0.875rem;
+    color: var(--bulma-text-weak, #7a7a7a);
+    margin-bottom: 0.75rem;
+}
+
+/* Popup forecast grid */
+.popup-forecast-grid {
+    font-size: 0.75rem;
+}
+
+.forecast-header-row,
+.forecast-data-row {
+    display: grid;
+    grid-template-columns: 70px repeat(3, 1fr);
+    gap: 0.25rem;
+    align-items: center;
+}
+
+.forecast-header-row {
+    font-weight: 600;
+    color: var(--bulma-text-weak, #7a7a7a);
+    margin-bottom: 0.25rem;
+    padding-bottom: 0.25rem;
+    border-bottom: 1px solid var(--bulma-border, #dbdbdb);
+}
+
+.forecast-data-row {
+    padding: 0.2rem 0;
+}
+
+.forecast-data-row:not(:last-child) {
+    border-bottom: 1px dotted var(--bulma-border-weak, #e8e8e8);
+}
+
+.forecast-col-label {
     font-size: 0.7rem;
     color: var(--bulma-text-weak, #7a7a7a);
-    text-transform: uppercase;
-    margin-bottom: 0.25rem;
+    white-space: nowrap;
 }
 
-.weather-temp {
-    font-size: 0.9rem;
-    font-weight: 500;
-}
-
-.weather-forecast {
-    font-size: 0.8rem;
-    color: var(--bulma-text-weak, #7a7a7a);
-    margin-top: 0.15rem;
-}
-
-.forecast-label {
-    font-size: 0.65rem;
-    color: var(--bulma-text-weak, #7a7a7a);
-}
-
-.tooltip-loading {
+.forecast-col {
     text-align: center;
-    color: var(--bulma-text-weak, #7a7a7a);
-    font-size: 0.8rem;
-    padding: 0.5rem 0;
+    font-family: monospace;
 }
 
-.tooltip-error {
+.forecast-col.forecast-na {
+    color: var(--bulma-text-weak, #7a7a7a);
+}
+
+.popup-loading {
     text-align: center;
-    color: var(--bulma-danger, #f14668);
-    font-size: 0.8rem;
+    padding: 0.5rem;
+    color: var(--bulma-text-weak, #7a7a7a);
 }
 
 /* Region legend */
@@ -1122,7 +1132,7 @@ body,
     background-color: var(--app-card-bg);
 }
 
-[data-theme="dark"] .station-tooltip {
+[data-theme="dark"] .station-popup {
     background: var(--app-card-bg);
     border-color: var(--app-border);
 }
@@ -1150,6 +1160,26 @@ body,
     .station-checkbox-label {
         padding: 0.35rem;
         font-size: 0.875rem;
+    }
+
+    .station-popup {
+        min-width: 260px;
+        max-width: 300px;
+        font-size: 0.75rem;
+    }
+
+    .forecast-header-row,
+    .forecast-data-row {
+        grid-template-columns: 55px repeat(3, 1fr);
+        gap: 0.15rem;
+    }
+
+    .forecast-col-label {
+        font-size: 0.65rem;
+    }
+
+    .popup-forecast-grid {
+        font-size: 0.7rem;
     }
 }
 

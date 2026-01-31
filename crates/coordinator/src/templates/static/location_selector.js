@@ -370,118 +370,315 @@ function updateZoomDisplay() {
 }
 
 // ============================================
-// Tooltip with Weather Data (SSR - read from data attributes)
+// Station Popup with Forecast Grid (fetched from Oracle API)
 // ============================================
+
+// Cache fetched forecast data per station to avoid re-fetching on every hover
+const forecastCache = {};
+let popupHideTimer = null;
+let currentPopupMarker = null;
 
 document.addEventListener("mouseover", function (e) {
   if (e.target.classList.contains("station-marker")) {
-    showTooltip(e.target);
+    clearTimeout(popupHideTimer);
+    showStationPopup(e.target);
+  }
+  // Keep popup visible when hovering the popup itself
+  const popup = document.getElementById("station-popup");
+  if (popup && popup.contains(e.target)) {
+    clearTimeout(popupHideTimer);
   }
 });
 
 document.addEventListener("mouseout", function (e) {
   if (e.target.classList.contains("station-marker")) {
-    hideTooltip();
+    popupHideTimer = setTimeout(hideStationPopup, 200);
+  }
+  const popup = document.getElementById("station-popup");
+  if (popup && popup.contains(e.target)) {
+    popupHideTimer = setTimeout(hideStationPopup, 200);
   }
 });
 
-function showTooltip(marker) {
-  const tooltip = document.getElementById("station-tooltip");
-  if (!tooltip) return;
+function showStationPopup(marker) {
+  const popup = document.getElementById("station-popup");
+  if (!popup) return;
+
+  currentPopupMarker = marker;
 
   const stationId = marker.dataset.stationId;
   const stationName = marker.dataset.stationName;
+  const state = marker.dataset.state || "";
+  const iata = marker.dataset.iata || "";
 
-  // Read weather data from data attributes (SSR)
-  const todayActualHigh = marker.dataset.todayActualHigh;
-  const todayActualLow = marker.dataset.todayActualLow;
-  const todayForecastHigh = marker.dataset.todayForecastHigh;
-  const todayForecastLow = marker.dataset.todayForecastLow;
-  const tomorrowForecastHigh = marker.dataset.tomorrowForecastHigh;
-  const tomorrowForecastLow = marker.dataset.tomorrowForecastLow;
-
-  // Update basic info
-  tooltip.querySelector(".tooltip-station-id").textContent = stationId;
-  tooltip.querySelector(".tooltip-name").textContent = stationName;
-
-  // Build weather HTML from SSR data
-  const weatherSection = tooltip.querySelector(".tooltip-weather");
-  if (weatherSection) {
-    let html = "";
-
-    // Today's weather - actual and forecast
-    html += '<div class="tooltip-weather-day">';
-    html += "<strong>Today</strong>";
-
-    // Actual (current) weather
-    if (todayActualHigh || todayActualLow) {
-      const high = todayActualHigh ? `${todayActualHigh}°` : "-";
-      const low = todayActualLow ? `${todayActualLow}°` : "-";
-      html += `<div class="weather-temp">${high} / ${low}</div>`;
-    } else {
-      html += '<div class="weather-temp has-text-grey">-</div>';
-    }
-
-    // Forecast for today
-    if (todayForecastHigh || todayForecastLow) {
-      const high = todayForecastHigh ? `${todayForecastHigh}°` : "-";
-      const low = todayForecastLow ? `${todayForecastLow}°` : "-";
-      html += `<div class="weather-forecast">${high} / ${low} <span class="forecast-label">fcst</span></div>`;
-    }
-    html += "</div>";
-
-    // Tomorrow's forecast
-    html += '<div class="tooltip-weather-day">';
-    html += "<strong>Tomorrow</strong>";
-    if (tomorrowForecastHigh || tomorrowForecastLow) {
-      const high = tomorrowForecastHigh ? `${tomorrowForecastHigh}°` : "-";
-      const low = tomorrowForecastLow ? `${tomorrowForecastLow}°` : "-";
-      html += `<div class="weather-temp">${high} / ${low}</div>`;
-    } else {
-      html += '<div class="weather-temp has-text-grey">No forecast</div>';
-    }
-    html += "</div>";
-
-    weatherSection.innerHTML = html;
+  // Populate popup header
+  popup.querySelector(".popup-station-id").textContent = stationId;
+  const iataEl = popup.querySelector(".popup-iata");
+  if (iata) {
+    iataEl.textContent = iata;
+    iataEl.style.display = "inline-block";
+  } else {
+    iataEl.style.display = "none";
   }
 
-  // Position tooltip to the right of the marker
+  const nameText = [stationName, state].filter(Boolean).join(", ");
+  popup.querySelector(".popup-name").textContent = nameText;
+
+  // Position popup near marker
   const mapWrapper = document.querySelector(".map-wrapper");
   const mapRect = mapWrapper.getBoundingClientRect();
   const markerRect = marker.getBoundingClientRect();
 
-  const tooltipWidth = 220;
-  const tooltipHeight = 120;
-  const offset = 15; // gap between marker and tooltip
+  const popupWidth = 360;
+  const popupHeight = 280;
 
-  let left = markerRect.right - mapRect.left + offset;
-  let top =
-    markerRect.top - mapRect.top + markerRect.height / 2 - tooltipHeight / 2;
+  let left = markerRect.left - mapRect.left + markerRect.width / 2;
+  let top = markerRect.top - mapRect.top - 10;
 
-  // If tooltip would go off the right edge, position to the left of marker instead
-  if (left + tooltipWidth > mapRect.width) {
-    left = markerRect.left - mapRect.left - tooltipWidth - offset;
+  // Adjust horizontal to stay in bounds
+  if (left + popupWidth / 2 > mapRect.width) {
+    left = mapRect.width - popupWidth / 2 - 10;
+  }
+  if (left - popupWidth / 2 < 0) {
+    left = popupWidth / 2 + 10;
   }
 
-  // Keep tooltip within vertical bounds
-  if (top < 10) {
-    top = 10;
-  }
-  if (top + tooltipHeight > mapRect.height - 10) {
-    top = mapRect.height - tooltipHeight - 10;
+  // Position above marker, or below if too close to top
+  if (top < popupHeight) {
+    top = markerRect.top - mapRect.top + markerRect.height + 10;
+  } else {
+    top = top - popupHeight;
   }
 
-  tooltip.style.left = `${left}px`;
-  tooltip.style.top = `${top}px`;
-  tooltip.style.transform = "none";
-  tooltip.style.display = "block";
+  popup.style.left = `${left}px`;
+  popup.style.top = `${top}px`;
+  popup.style.transform = "translateX(-50%)";
+  popup.style.display = "block";
+
+  // Use cached data or fetch from oracle
+  if (forecastCache[stationId]) {
+    applyForecastData(popup, forecastCache[stationId]);
+  } else {
+    // Reset values to loading state
+    popup.querySelectorAll("[data-field]").forEach((el) => {
+      el.textContent = "-";
+    });
+    fetchStationForecast(stationId, popup);
+  }
 }
 
-function hideTooltip() {
-  const tooltip = document.getElementById("station-tooltip");
-  if (tooltip) {
-    tooltip.style.display = "none";
+function hideStationPopup() {
+  const popup = document.getElementById("station-popup");
+  if (popup) {
+    popup.style.display = "none";
   }
+  currentPopupMarker = null;
+}
+
+// Fetch forecast data from oracle API
+async function fetchStationForecast(stationId, popup) {
+  const loadingEl = popup.querySelector(".popup-loading");
+  if (loadingEl) loadingEl.style.display = "block";
+
+  try {
+    const oracleBase = typeof ORACLE_BASE !== "undefined" ? ORACLE_BASE : "";
+
+    const today = new Date();
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const dayAfterTomorrow = new Date(today);
+    dayAfterTomorrow.setDate(dayAfterTomorrow.getDate() + 2);
+
+    const startDate = yesterday.toISOString();
+    const endDate = dayAfterTomorrow.toISOString();
+
+    const [forecastRes, obsRes] = await Promise.all([
+      fetch(
+        `${oracleBase}/stations/forecasts?station_ids=${stationId}&start=${encodeURIComponent(startDate)}&end=${encodeURIComponent(endDate)}`,
+      ),
+      fetch(
+        `${oracleBase}/stations/observations?station_ids=${stationId}&start=${encodeURIComponent(startDate)}&end=${encodeURIComponent(endDate)}`,
+      ),
+    ]);
+
+    const forecasts = forecastRes.ok ? await forecastRes.json() : [];
+    const observations = obsRes.ok ? await obsRes.json() : [];
+
+    const data = { forecasts, observations };
+    forecastCache[stationId] = data;
+    applyForecastData(popup, data);
+  } catch (err) {
+    console.error("Error fetching forecast:", err);
+    popup.querySelectorAll("[data-field]").forEach((el) => {
+      el.textContent = "?";
+    });
+  } finally {
+    if (loadingEl) loadingEl.style.display = "none";
+  }
+}
+
+// Apply cached or freshly fetched forecast data to the popup
+function applyForecastData(popup, data) {
+  const { forecasts, observations } = data;
+
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  const tomorrow = new Date(today);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+
+  const formatDateKey = (d) => d.toISOString().split("T")[0];
+  const yesterdayKey = formatDateKey(yesterday);
+  const todayKey = formatDateKey(today);
+  const tomorrowKey = formatDateKey(tomorrow);
+
+  // Index by date
+  const forecastByDate = {};
+  forecasts.forEach((f) => {
+    forecastByDate[f.date] = f;
+  });
+
+  const obsByDate = {};
+  observations.forEach((o) => {
+    const date = o.date || (o.start_time ? o.start_time.split("T")[0] : null);
+    if (date) obsByDate[date] = o;
+  });
+
+  // Formatters
+  const formatTemp = (high, low) => {
+    if (high != null && low != null)
+      return `${Math.round(high)}° / ${Math.round(low)}°`;
+    if (high != null) return `${Math.round(high)}°`;
+    if (low != null) return `${Math.round(low)}°`;
+    return null;
+  };
+  const formatWind = (speed) =>
+    speed != null ? `${Math.round(speed)} mph` : null;
+  const formatPrecip = (chance) => (chance != null ? `${chance}%` : null);
+  const formatAmount = (amount) =>
+    amount != null && amount > 0 ? `${amount.toFixed(2)}"` : null;
+  const formatHumidity = (max, min) => {
+    if (max != null && min != null) return `${min}-${max}%`;
+    if (max != null) return `${max}%`;
+    if (min != null) return `${min}%`;
+    return null;
+  };
+
+  const setValue = (field, value) => {
+    const el = popup.querySelector(`[data-field="${field}"]`);
+    if (el) el.textContent = value || "-";
+  };
+
+  // Yesterday
+  const yObs = obsByDate[yesterdayKey];
+  const yFc = forecastByDate[yesterdayKey];
+  setValue(
+    "yesterday-temp-actual",
+    yObs ? formatTemp(yObs.temp_high, yObs.temp_low) : null,
+  );
+  setValue(
+    "yesterday-temp-forecast",
+    yFc ? formatTemp(yFc.temp_high, yFc.temp_low) : null,
+  );
+  setValue(
+    "yesterday-wind",
+    yObs
+      ? formatWind(yObs.wind_speed)
+      : yFc
+        ? formatWind(yFc.wind_speed)
+        : null,
+  );
+  setValue(
+    "yesterday-precip-chance",
+    yFc ? formatPrecip(yFc.precip_chance) : null,
+  );
+  setValue(
+    "yesterday-rain",
+    yObs
+      ? formatAmount(yObs.rain_amt)
+      : yFc
+        ? formatAmount(yFc.rain_amt)
+        : null,
+  );
+  setValue(
+    "yesterday-snow",
+    yObs
+      ? formatAmount(yObs.snow_amt)
+      : yFc
+        ? formatAmount(yFc.snow_amt)
+        : null,
+  );
+  setValue(
+    "yesterday-humidity",
+    yObs
+      ? formatHumidity(yObs.humidity, yObs.humidity)
+      : yFc
+        ? formatHumidity(yFc.humidity_max, yFc.humidity_min)
+        : null,
+  );
+
+  // Today
+  const tObs = obsByDate[todayKey];
+  const tFc = forecastByDate[todayKey];
+  setValue(
+    "today-temp-actual",
+    tObs ? formatTemp(tObs.temp_high, tObs.temp_low) : null,
+  );
+  setValue(
+    "today-temp-forecast",
+    tFc ? formatTemp(tFc.temp_high, tFc.temp_low) : null,
+  );
+  setValue(
+    "today-wind",
+    tObs
+      ? formatWind(tObs.wind_speed)
+      : tFc
+        ? formatWind(tFc.wind_speed)
+        : null,
+  );
+  setValue("today-precip-chance", tFc ? formatPrecip(tFc.precip_chance) : null);
+  setValue(
+    "today-rain",
+    tObs
+      ? formatAmount(tObs.rain_amt)
+      : tFc
+        ? formatAmount(tFc.rain_amt)
+        : null,
+  );
+  setValue(
+    "today-snow",
+    tObs
+      ? formatAmount(tObs.snow_amt)
+      : tFc
+        ? formatAmount(tFc.snow_amt)
+        : null,
+  );
+  setValue(
+    "today-humidity",
+    tObs
+      ? formatHumidity(tObs.humidity, tObs.humidity)
+      : tFc
+        ? formatHumidity(tFc.humidity_max, tFc.humidity_min)
+        : null,
+  );
+
+  // Tomorrow
+  const tmFc = forecastByDate[tomorrowKey];
+  setValue(
+    "tomorrow-temp-forecast",
+    tmFc ? formatTemp(tmFc.temp_high, tmFc.temp_low) : null,
+  );
+  setValue("tomorrow-wind", tmFc ? formatWind(tmFc.wind_speed) : null);
+  setValue(
+    "tomorrow-precip-chance",
+    tmFc ? formatPrecip(tmFc.precip_chance) : null,
+  );
+  setValue("tomorrow-rain", tmFc ? formatAmount(tmFc.rain_amt) : null);
+  setValue("tomorrow-snow", tmFc ? formatAmount(tmFc.snow_amt) : null);
+  setValue(
+    "tomorrow-humidity",
+    tmFc ? formatHumidity(tmFc.humidity_max, tmFc.humidity_min) : null,
+  );
 }
 
 // ============================================

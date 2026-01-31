@@ -167,6 +167,8 @@ fn location_map(stations: &[StationWithWeather]) -> Markup {
                                     r="4"
                                     data-station-id=(sw.station.station_id)
                                     data-station-name=(sw.station.station_name)
+                                    data-state=(sw.station.state)
+                                    data-iata=(sw.station.iata_id)
                                     data-today-actual-high=(sw.today_actual_high.map(|t| format!("{:.0}", t)).unwrap_or_default())
                                     data-today-actual-low=(sw.today_actual_low.map(|t| format!("{:.0}", t)).unwrap_or_default())
                                     data-today-forecast-high=(sw.today_forecast_high.map(|t| t.to_string()).unwrap_or_default())
@@ -179,11 +181,76 @@ fn location_map(stations: &[StationWithWeather]) -> Markup {
                     }
                 }
 
-                // Tooltip for hovering (enhanced with weather)
-                div id="station-tooltip" class="station-tooltip" style="display: none;" {
-                    strong class="tooltip-station-id" {}
-                    div class="tooltip-name" {}
-                    div class="tooltip-weather" {}
+                // Station popup (oracle-style forecast grid)
+                div id="station-popup" class="station-popup" style="display: none;" {
+                    div class="popup-header" {
+                        strong class="popup-station-id" {}
+                        span class="popup-iata tag is-iata is-small" {}
+                    }
+                    div class="popup-name" {}
+
+                    // 3-day compact forecast grid
+                    div class="popup-forecast-grid" {
+                        // Header row
+                        div class="forecast-header-row" {
+                            div class="forecast-col-label" {}
+                            div class="forecast-col" { "Yesterday" }
+                            div class="forecast-col" { "Today" }
+                            div class="forecast-col" { "Tomorrow" }
+                        }
+                        // Temp row - Actual
+                        div class="forecast-data-row" {
+                            div class="forecast-col-label" { "Actual" }
+                            div class="forecast-col" data-field="yesterday-temp-actual" { "-" }
+                            div class="forecast-col" data-field="today-temp-actual" { "-" }
+                            div class="forecast-col forecast-na" { "-" }
+                        }
+                        // Temp row - Forecast
+                        div class="forecast-data-row" {
+                            div class="forecast-col-label" { "Forecast" }
+                            div class="forecast-col" data-field="yesterday-temp-forecast" { "-" }
+                            div class="forecast-col" data-field="today-temp-forecast" { "-" }
+                            div class="forecast-col" data-field="tomorrow-temp-forecast" { "-" }
+                        }
+                        // Wind row
+                        div class="forecast-data-row" {
+                            div class="forecast-col-label" { "Wind" }
+                            div class="forecast-col" data-field="yesterday-wind" { "-" }
+                            div class="forecast-col" data-field="today-wind" { "-" }
+                            div class="forecast-col" data-field="tomorrow-wind" { "-" }
+                        }
+                        // Precipitation chance row
+                        div class="forecast-data-row" {
+                            div class="forecast-col-label" { "Chance" }
+                            div class="forecast-col" data-field="yesterday-precip-chance" { "-" }
+                            div class="forecast-col" data-field="today-precip-chance" { "-" }
+                            div class="forecast-col" data-field="tomorrow-precip-chance" { "-" }
+                        }
+                        // Precipitation row
+                        div class="forecast-data-row" {
+                            div class="forecast-col-label" { "Precip" }
+                            div class="forecast-col" data-field="yesterday-rain" { "-" }
+                            div class="forecast-col" data-field="today-rain" { "-" }
+                            div class="forecast-col" data-field="tomorrow-rain" { "-" }
+                        }
+                        // Snow row
+                        div class="forecast-data-row" {
+                            div class="forecast-col-label" { "Snow" }
+                            div class="forecast-col" data-field="yesterday-snow" { "-" }
+                            div class="forecast-col" data-field="today-snow" { "-" }
+                            div class="forecast-col" data-field="tomorrow-snow" { "-" }
+                        }
+                        // Humidity row
+                        div class="forecast-data-row" {
+                            div class="forecast-col-label" { "Humidity" }
+                            div class="forecast-col" data-field="yesterday-humidity" { "-" }
+                            div class="forecast-col" data-field="today-humidity" { "-" }
+                            div class="forecast-col" data-field="tomorrow-humidity" { "-" }
+                        }
+                    }
+
+                    // Loading indicator
+                    div class="popup-loading" style="display: none;" { "Loading..." }
                 }
 
                 // Zoom controls
@@ -285,6 +352,9 @@ fn location_table(stations: &[StationWithWeather]) -> Markup {
                                           onchange="updateStationSelection(this)";
                                     " "
                                     strong { (sw.station.station_id.clone()) }
+                                    @if !sw.station.state.is_empty() {
+                                        span class="is-size-7 has-text-grey ml-1" { "(" (sw.station.state.clone()) ")" }
+                                    }
                                     br;
                                     span class="is-size-7 has-text-grey" {
                                         (sw.station.station_name.clone())
