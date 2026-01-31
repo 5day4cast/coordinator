@@ -20,7 +20,7 @@ pub fn payouts_page(payouts: &[PayoutView]) -> Markup {
                     (no_payouts())
                 } @else {
                     div class="table-container" {
-                        table class="table is-fullwidth is-striped is-hoverable" {
+                        table class="table is-fullwidth is-striped is-hoverable is-card-mobile" {
                             thead {
                                 tr {
                                     th { "Competition ID" }
@@ -33,11 +33,11 @@ pub fn payouts_page(payouts: &[PayoutView]) -> Markup {
                             tbody {
                                 @for payout in payouts {
                                     tr {
-                                        td title=(payout.competition_id) { (&payout.competition_id[..8]) }
-                                        td title=(payout.entry_id) { (&payout.entry_id[..8]) }
-                                        td { (payout.payout_amount) }
-                                        td { (payout.status) }
-                                        td {
+                                        td data-label="Competition" title=(payout.competition_id) { (&payout.competition_id[..8]) }
+                                        td data-label="Entry ID" title=(payout.entry_id) { (&payout.entry_id[..8]) }
+                                        td data-label="Amount" { (payout.payout_amount) " sats" }
+                                        td data-label="Status" { (payout.status) }
+                                        td data-label="Action" {
                                             button class="button is-primary is-small"
                                                    data-entry-id=(payout.entry_id)
                                                    data-competition-id=(payout.competition_id)

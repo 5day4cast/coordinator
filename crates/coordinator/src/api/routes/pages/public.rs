@@ -21,6 +21,7 @@ use crate::{
     infra::oracle::ValueOptions,
     startup::AppState,
     templates::{
+        admin::dashboard::Station,
         fragments::{
             entry_form::{entry_form, ForecastValue, StationForecast, WeatherContext},
             leaderboard::{leaderboard, leaderboard_row, EntryScore, LeaderboardInfo},
@@ -31,6 +32,7 @@ use crate::{
             entries::{entries_page, no_entries, EntryView},
             payouts::{payouts_page, PayoutView},
         },
+        shared_map::StationMarker,
     },
 };
 
@@ -166,17 +168,7 @@ pub async fn entries_fragment(
     headers: HeaderMap,
     HtmlNostrAuth(NostrAuth { pubkey, .. }): HtmlNostrAuth,
 ) -> Html<String> {
-    let username = match pubkey.to_bech32() {
-        Ok(npub) => match state.users_info.login(npub.clone()).await {
-            Ok(user) => user.username.unwrap_or(npub),
-            Err(e) => {
-                warn!("Could not look up user for entries page: {}", e);
-                npub
-            }
-        },
-        Err(_) => pubkey.to_hex(),
-    };
-    let entries = fetch_user_entries(&state, &pubkey.to_hex(), username).await;
+    let entries = fetch_user_entries(&state, &pubkey.to_hex()).await;
     let content = if entries.is_empty() {
         no_entries()
     } else {
@@ -211,9 +203,34 @@ pub async fn entry_form_fragment(
 
     let content = match competition {
         Some(comp) => {
-            // Fetch forecasts from oracle
-            let forecasts = fetch_forecasts(&state, comp).await;
-            entry_form(comp, &forecasts)
+            // Fetch forecasts and station locations in parallel
+            let (forecasts, mut markers) = tokio::join!(
+                fetch_forecasts(&state, comp),
+                fetch_station_markers(&state, competition_id)
+            );
+
+            // Enrich markers with weather data from forecasts
+            for marker in markers.iter_mut() {
+                if let Some(forecast) = forecasts.iter().find(|f| f.station_id == marker.station_id)
+                {
+                    use crate::templates::shared_map::StationWeather;
+                    marker.weather = Some(StationWeather {
+                        forecast_high: forecast.temp_high.as_ref().map(|v| v.value),
+                        forecast_low: forecast.temp_low.as_ref().map(|v| v.value),
+                        actual_high: forecast
+                            .weather_context
+                            .as_ref()
+                            .and_then(|ctx| ctx.today_actual_high),
+                        actual_low: forecast
+                            .weather_context
+                            .as_ref()
+                            .and_then(|ctx| ctx.today_actual_low),
+                        wind_speed: forecast.wind_speed.as_ref().map(|v| v.value),
+                    });
+                }
+            }
+
+            entry_form(comp, &forecasts, &markers)
         }
         None => {
             html! {
@@ -752,7 +769,7 @@ fn determine_competition_status(competition: &crate::domain::Competition) -> Str
     }
 }
 
-async fn fetch_user_entries(state: &AppState, pubkey: &str, username: String) -> Vec<EntryView> {
+async fn fetch_user_entries(state: &AppState, pubkey: &str) -> Vec<EntryView> {
     match state
         .coordinator
         .get_entries(pubkey.to_string(), SearchBy { event_ids: None })
@@ -761,6 +778,7 @@ async fn fetch_user_entries(state: &AppState, pubkey: &str, username: String) ->
         Ok(entries) => entries
             .into_iter()
             .map(|e| EntryView {
+                entry_id: e.id.to_string(),
                 competition_id: e.event_id.to_string(),
                 start_time: String::new(), // Would need to fetch competition for this
                 end_time: String::new(),
@@ -772,8 +790,6 @@ async fn fetch_user_entries(state: &AppState, pubkey: &str, username: String) ->
                     "Pending"
                 }
                 .to_string(),
-                entry_id: e.id.to_string(),
-                username: username.clone(),
             })
             .collect(),
         Err(_) => vec![],
@@ -887,6 +903,59 @@ fn calculate_entry_payout(
 
     let total_pool_sats = contract_params.funding_value.to_sat();
     Some((total_pool_sats * player_weight) / 100)
+}
+
+/// Fetch station locations from the Oracle and build map markers for a competition's stations
+async fn fetch_station_markers(state: &AppState, competition_id: Uuid) -> Vec<StationMarker> {
+    let locations = match state.coordinator.get_competition(competition_id).await {
+        Ok(comp) => comp.event_submission.locations,
+        Err(_) => return vec![],
+    };
+
+    if locations.is_empty() {
+        return vec![];
+    }
+
+    let all_stations = match fetch_all_stations(&state.oracle_url).await {
+        Ok(stations) => stations,
+        Err(e) => {
+            warn!("Failed to fetch stations for map: {}", e);
+            return vec![];
+        }
+    };
+
+    let location_set: std::collections::HashSet<&str> =
+        locations.iter().map(|s| s.as_str()).collect();
+
+    all_stations
+        .into_iter()
+        .filter(|s| location_set.contains(s.station_id.as_str()))
+        .filter_map(|s| {
+            StationMarker::new(
+                s.station_id,
+                s.station_name,
+                s.state,
+                s.latitude,
+                s.longitude,
+            )
+        })
+        .collect()
+}
+
+/// Fetch all stations from the Oracle API
+async fn fetch_all_stations(oracle_url: &str) -> Result<Vec<Station>, anyhow::Error> {
+    let client = reqwest_middleware::reqwest::Client::new();
+    let response = client
+        .get(format!("{}/stations", oracle_url))
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+        let stations: Vec<Station> = response.json().await?;
+        Ok(stations)
+    } else {
+        Ok(vec![])
+    }
 }
 
 async fn fetch_forecasts(state: &AppState, competition: &CompetitionView) -> Vec<StationForecast> {
@@ -1117,9 +1186,30 @@ async fn fetch_leaderboard_scores(state: &AppState, competition_id: Uuid) -> Vec
         .map(|entry| EntryScore {
             rank: 0, // Will be assigned after sorting
             entry_id: entry.id.to_string(),
+            username: String::new(),
             score: entry.score.unwrap_or(0) as i32,
         })
         .collect();
+
+    // Look up usernames for each entry
+    for score in scores.iter_mut() {
+        if let Ok(entry_id) = Uuid::parse_str(&score.entry_id) {
+            if let Ok(Some(entry)) = state.coordinator.get_entry_by_id(entry_id).await {
+                // Convert hex pubkey to bech32 for user table lookup
+                if let Ok(pubkey) = nostr_sdk::PublicKey::from_hex(&entry.pubkey) {
+                    if let Ok(bech32) = pubkey.to_bech32() {
+                        if let Ok(Some(name)) =
+                            state.users_info.get_username_by_pubkey(&bech32).await
+                        {
+                            score.username = name;
+                        } else {
+                            score.username = entry.pubkey[..8].to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Sort by score descending, then by entry_id ascending (earlier entries win ties)
     scores.sort_by(|a, b| {

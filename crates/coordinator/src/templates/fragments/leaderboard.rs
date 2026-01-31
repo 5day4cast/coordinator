@@ -7,6 +7,7 @@ use crate::domain::scoring::ScoredEntry;
 pub struct EntryScore {
     pub rank: usize,
     pub entry_id: String,
+    pub username: String,
     pub score: i32,
 }
 
@@ -15,6 +16,7 @@ impl EntryScore {
         Self {
             rank,
             entry_id: entry.entry_id.clone(),
+            username: String::new(),
             score: entry.raw_score,
         }
     }
@@ -94,10 +96,11 @@ pub fn leaderboard(info: &LeaderboardInfo, scores: &[EntryScore]) -> Markup {
 
                 div class="table-container" {
                     table id="competitionLeaderboardData"
-                          class="table is-fullwidth is-striped is-hoverable" {
+                          class="table is-fullwidth is-striped is-hoverable is-card-mobile" {
                         thead {
                             tr {
                                 th { "Rank" }
+                                th { "User" }
                                 th { "Entry ID" }
                                 th { "Score" }
                             }
@@ -133,9 +136,10 @@ pub fn leaderboard_row(score: &EntryScore) -> Markup {
            hx-swap="innerHTML"
            onclick="document.getElementById('entryScore').classList.add('is-active')"
            style="cursor: pointer;" {
-            td { (score.rank) }
-            td title=(score.entry_id) { (&score.entry_id[..8]) }
-            td { (score.score) }
+            td data-label="Rank" { (score.rank) }
+            td data-label="User" { (score.username) }
+            td data-label="Entry ID" title=(score.entry_id) { (&score.entry_id[..8]) }
+            td data-label="Score" { (score.score) }
         }
     }
 }

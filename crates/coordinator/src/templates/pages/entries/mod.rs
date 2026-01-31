@@ -3,12 +3,11 @@ use maud::{html, Markup};
 /// View data for a user entry
 #[derive(Debug, Clone)]
 pub struct EntryView {
+    pub entry_id: String,
     pub competition_id: String,
     pub start_time: String,
     pub end_time: String,
     pub status: String,
-    pub entry_id: String,
-    pub username: String,
 }
 
 /// Entries page content (requires auth)
@@ -18,15 +17,14 @@ pub fn entries_page(entries: &[EntryView]) -> Markup {
             div class="box" {
                 div class="table-container" {
                     table id="entriesDataTable"
-                          class="table is-fullwidth is-striped is-hoverable" {
+                          class="table is-fullwidth is-striped is-hoverable is-card-mobile" {
                         thead {
                             tr {
-                                th { "Username" }
-                                th { "Competition ID" }
+                                th { "Entry ID" }
+                                th { "Competition" }
                                 th { "Start Time" }
                                 th { "End Time" }
                                 th { "Status" }
-                                th { "Entry ID" }
                             }
                         }
                         tbody {
@@ -37,12 +35,11 @@ pub fn entries_page(entries: &[EntryView]) -> Markup {
                                    onclick="document.getElementById('entryScore').classList.add('is-active')"
                                    style="cursor: pointer;"
                                    title="Click to view entry details" {
-                                    td { (entry.username) }
-                                    td title=(entry.competition_id) { (&entry.competition_id[..8]) }
-                                    td { (entry.start_time) }
-                                    td { (entry.end_time) }
-                                    td { (entry.status) }
-                                    td title=(entry.entry_id) { (&entry.entry_id[..8]) }
+                                    td data-label="Entry ID" title=(entry.entry_id) { (&entry.entry_id[..8]) }
+                                    td data-label="Competition" title=(entry.competition_id) { (&entry.competition_id[..8]) }
+                                    td data-label="Start" { (entry.start_time) }
+                                    td data-label="End" { (entry.end_time) }
+                                    td data-label="Status" { (entry.status) }
                                 }
                             }
                         }

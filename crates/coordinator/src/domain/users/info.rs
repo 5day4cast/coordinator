@@ -43,6 +43,13 @@ impl UserInfo {
             .await
     }
 
+    pub async fn get_username_by_pubkey(
+        &self,
+        nostr_pubkey: &str,
+    ) -> Result<Option<String>, Error> {
+        self.user_store.get_username_by_pubkey(nostr_pubkey).await
+    }
+
     pub async fn get_user_by_username(&self, username: &str) -> Result<User, Error> {
         self.user_store.get_user_by_username(username).await
     }

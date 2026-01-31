@@ -39,6 +39,35 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
 
                 (auth_modals())
 
+                // Inline burger setup so it works even if WASM/app bundle fails to load
+                script {
+                    (maud::PreEscaped(r#"
+                    document.addEventListener('DOMContentLoaded', function() {
+                        var burgers = document.querySelectorAll('.navbar-burger');
+                        burgers.forEach(function(el) {
+                            el.addEventListener('click', function() {
+                                var target = document.getElementById(el.dataset.target);
+                                if (!target) return;
+                                el.classList.toggle('is-active');
+                                target.classList.toggle('is-active');
+                                el.setAttribute('aria-expanded', el.classList.contains('is-active'));
+                            });
+                        });
+                        document.addEventListener('click', function(e) {
+                            if (!e.target.closest('.navbar')) {
+                                var menu = document.querySelector('.navbar-menu.is-active');
+                                var burger = document.querySelector('.navbar-burger.is-active');
+                                if (menu) menu.classList.remove('is-active');
+                                if (burger) {
+                                    burger.classList.remove('is-active');
+                                    burger.setAttribute('aria-expanded', 'false');
+                                }
+                            }
+                        });
+                    });
+                    "#))
+                }
+
                 // loader.js handles WASM init and loads the bundled app
                 script type="module" src="/ui/loader.js" {}
             }

@@ -1,8 +1,29 @@
 {{- if .Values.persistence.enabled }}
+{{- if .Values.blueGreen.enabled }}
+{{- range $slot := list "blue" "green" }}
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "coordinator.pvcName" . }}
+  name: {{ include "coordinator.fullname" $ }}-{{ $slot }}
+  labels:
+    {{- include "coordinator.labels" $ | nindent 4 }}
+    app.kubernetes.io/slot: {{ $slot }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if $.Values.persistence.storageClassName }}
+  storageClassName: {{ $.Values.persistence.storageClassName }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $.Values.persistence.size }}
+{{- end }}
+{{- else }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "coordinator.fullname" . }}
   labels:
     {{- include "coordinator.labels" . | nindent 4 }}
 spec:
@@ -14,4 +35,5 @@ spec:
   resources:
     requests:
       storage: {{ .Values.persistence.size }}
+{{- end }}
 {{- end }}

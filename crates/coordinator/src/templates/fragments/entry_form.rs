@@ -1,6 +1,7 @@
 use maud::{html, Markup};
 
 use crate::templates::pages::competitions::CompetitionView;
+use crate::templates::shared_map::{station_map, StationMarker};
 
 /// Weather forecast data for a station
 #[derive(Debug, Clone)]
@@ -39,7 +40,11 @@ pub struct ForecastValue {
 ///
 /// This renders the form shell - the actual submission is handled by JS
 /// because it requires WASM for key generation and keymeld registration.
-pub fn entry_form(competition: &CompetitionView, forecasts: &[StationForecast]) -> Markup {
+pub fn entry_form(
+    competition: &CompetitionView,
+    forecasts: &[StationForecast],
+    markers: &[StationMarker],
+) -> Markup {
     html! {
         div id="entryContainer" class="container" {
             div class="box" {
@@ -67,6 +72,13 @@ pub fn entry_form(competition: &CompetitionView, forecasts: &[StationForecast]) 
                             span class="utc-time" data-utc=(competition.start_time) { (competition.start_time) }
                             " - "
                             span class="utc-time" data-utc=(competition.end_time) { (competition.end_time) }
+                        }
+                    }
+
+                    // Station map
+                    @if !markers.is_empty() {
+                        div class="mb-4" {
+                            (station_map(markers))
                         }
                     }
 

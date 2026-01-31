@@ -1,7 +1,244 @@
+{{- if .Values.blueGreen.enabled }}
+{{- range $slot := list "blue" "green" }}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "coordinator.deploymentName" . }}
+  name: {{ include "coordinator.fullname" $ }}-{{ $slot }}
+  labels:
+    {{- include "coordinator.labels" $ | nindent 4 }}
+    app.kubernetes.io/slot: {{ $slot }}
+spec:
+  replicas: {{ $.Values.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "coordinator.selectorLabels" $ | nindent 6 }}
+      app.kubernetes.io/slot: {{ $slot }}
+  template:
+    metadata:
+      labels:
+        {{- include "coordinator.selectorLabels" $ | nindent 8 }}
+        app.kubernetes.io/slot: {{ $slot }}
+    spec:
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "coordinator.serviceAccountName" $ }}
+      initContainers:
+        {{- if $.Values.lnd.initContainer.enabled }}
+        - name: lnd-creds
+          image: {{ $.Values.lnd.initContainer.image }}
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for LND credentials..."
+              until [ -f /lnd-source/data/chain/bitcoin/regtest/admin.macaroon ]; do
+                sleep 2
+              done
+              cp /lnd-source/data/chain/bitcoin/regtest/admin.macaroon /lnd-creds/admin.macaroon
+              cp /lnd-source/tls.cert /lnd-creds/tls.cert
+              echo "LND credentials copied"
+          volumeMounts:
+            - name: lnd-source
+              mountPath: /lnd-source
+              readOnly: true
+            - name: lnd-creds
+              mountPath: /lnd-creds
+        {{- end }}
+        {{- if $.Values.litestream.enabled }}
+        - name: litestream-restore
+          image: "{{ $.Values.litestream.image.repository }}:{{ $.Values.litestream.image.tag }}"
+          command:
+            - sh
+            - -c
+            - |
+              echo "Restoring databases from S3 backups..."
+              {{- range $.Values.litestream.databases }}
+              echo "Attempting to restore {{ .path }}..."
+              litestream restore -if-db-not-exists -if-replica-exists -config /etc/litestream.yml {{ .path }} || echo "No backup found for {{ .path }}, starting fresh"
+              {{- end }}
+              echo "Restore complete"
+          volumeMounts:
+            - name: data
+              mountPath: {{ $.Values.persistence.mountPath }}
+            - name: litestream-config
+              mountPath: /etc/litestream.yml
+              subPath: litestream.yml
+          env:
+            {{- if $.Values.litestream.s3Endpoint }}
+            - name: AWS_ACCESS_KEY_ID
+              value: "test"
+            - name: AWS_SECRET_ACCESS_KEY
+              value: "test"
+            {{- else if not $.Values.litestream.useIAMRole }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "coordinator.fullname" $ }}-s3
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "coordinator.fullname" $ }}-s3
+                  key: secret-access-key
+            {{- end }}
+            {{- if $.Values.litestream.encryptionKeySecret.enabled }}
+            - name: LITESTREAM_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.litestream.encryptionKeySecret.name }}
+                  key: {{ $.Values.litestream.encryptionKeySecret.key }}
+            {{- end }}
+        {{- end }}
+      containers:
+        - name: {{ $.Chart.Name }}
+          {{- if $.Values.devMode.enabled }}
+          image: {{ $.Values.devMode.baseImage }}
+          command: ["/app/coordinator"]
+          {{- else }}
+          image: "{{ $.Values.image.repository }}:{{ $.Values.image.tag }}"
+          {{- end }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: {{ $.Values.config.logLevel }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ $.Values.persistence.mountPath }}
+            - name: config
+              mountPath: /data/config
+              readOnly: true
+            {{- if $.Values.secrets.privateKey.create }}
+            - name: private-key
+              mountPath: /etc/coordinator-secrets
+              readOnly: true
+            {{- end }}
+            {{- if $.Values.lnd.initContainer.enabled }}
+            - name: lnd-creds
+              mountPath: /etc/lnd-secrets
+              readOnly: true
+            {{- else if or $.Values.secrets.lnd.create $.Values.secrets.lnd.external }}
+            - name: lnd-secret
+              mountPath: /etc/lnd-secrets
+              readOnly: true
+            {{- end }}
+            {{- if $.Values.devMode.enabled }}
+            - name: dev-binary
+              mountPath: /app
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml $.Values.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+        {{- if $.Values.litestream.enabled }}
+        - name: litestream
+          image: "{{ $.Values.litestream.image.repository }}:{{ $.Values.litestream.image.tag }}"
+          args:
+            - replicate
+            - -config
+            - /etc/litestream.yml
+          volumeMounts:
+            - name: data
+              mountPath: {{ $.Values.persistence.mountPath }}
+            - name: litestream-config
+              mountPath: /etc/litestream.yml
+              subPath: litestream.yml
+          env:
+            {{- if $.Values.litestream.s3Endpoint }}
+            - name: AWS_ACCESS_KEY_ID
+              value: "test"
+            - name: AWS_SECRET_ACCESS_KEY
+              value: "test"
+            {{- else if not $.Values.litestream.useIAMRole }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "coordinator.fullname" $ }}-s3
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "coordinator.fullname" $ }}-s3
+                  key: secret-access-key
+            {{- end }}
+            {{- if $.Values.litestream.encryptionKeySecret.enabled }}
+            - name: LITESTREAM_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.litestream.encryptionKeySecret.name }}
+                  key: {{ $.Values.litestream.encryptionKeySecret.key }}
+            {{- end }}
+          resources:
+            requests:
+              memory: 32Mi
+              cpu: 10m
+            limits:
+              memory: 128Mi
+        {{- end }}
+      volumes:
+        - name: data
+          {{- if $.Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "coordinator.fullname" $ }}-{{ $slot }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: config
+          configMap:
+            name: {{ include "coordinator.fullname" $ }}
+        {{- if $.Values.secrets.privateKey.create }}
+        - name: private-key
+          secret:
+            secretName: {{ include "coordinator.fullname" $ }}-private-key
+        {{- end }}
+        {{- if $.Values.lnd.initContainer.enabled }}
+        - name: lnd-source
+          persistentVolumeClaim:
+            claimName: {{ $.Values.lnd.initContainer.sourcePvc }}
+        - name: lnd-creds
+          emptyDir: {}
+        {{- else if or $.Values.secrets.lnd.create $.Values.secrets.lnd.external }}
+        - name: lnd-secret
+          secret:
+            secretName: {{- if $.Values.secrets.lnd.external }} {{ $.Values.secrets.lnd.secretName }}{{- else }}
+ {{ include "coordinator.fullname" $ }}-lnd{{- end }}
+        {{- end }}
+        {{- if $.Values.devMode.enabled }}
+        - name: dev-binary
+          hostPath:
+            path: {{ $.Values.devMode.hostPath | dir }}
+            type: Directory
+        {{- end }}
+        {{- if $.Values.litestream.enabled }}
+        - name: litestream-config
+          configMap:
+            name: {{ include "coordinator.fullname" $ }}-litestream
+        {{- end }}
+{{- end }}
+{{- else }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "coordinator.fullname" . }}
   labels:
     {{- include "coordinator.labels" . | nindent 4 }}
 spec:
@@ -10,11 +247,11 @@ spec:
     type: Recreate
   selector:
     matchLabels:
-      {{- include "coordinator.deploymentSelectorLabels" . | nindent 6 }}
+      {{- include "coordinator.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "coordinator.deploymentSelectorLabels" . | nindent 8 }}
+        {{- include "coordinator.selectorLabels" . | nindent 8 }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -192,7 +429,7 @@ spec:
         - name: data
           {{- if .Values.persistence.enabled }}
           persistentVolumeClaim:
-            claimName: {{ include "coordinator.pvcName" . }}
+            claimName: {{ include "coordinator.fullname" . }}
           {{- else }}
           emptyDir: {}
           {{- end }}
@@ -227,3 +464,4 @@ spec:
           configMap:
             name: {{ include "coordinator.fullname" . }}-litestream
         {{- end }}
+{{- end }}

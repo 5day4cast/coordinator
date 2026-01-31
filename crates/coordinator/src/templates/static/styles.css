@@ -536,22 +536,73 @@ tr.is-clickable:hover {
         margin-top: 0.5rem;
     }
 
-    /* Table responsive styles */
+    /* ---- Card-based table layout on mobile ---- */
     .table-container {
-        overflow-x: auto;
-        -webkit-overflow-scrolling: touch;
-        margin: 0 -0.75rem;
-        padding: 0 0.75rem;
+        overflow-x: visible;
+        margin: 0;
+        padding: 0;
     }
 
-    .table {
-        font-size: 0.8rem;
+    .table.is-card-mobile,
+    .table.is-card-mobile thead,
+    .table.is-card-mobile tbody,
+    .table.is-card-mobile tr,
+    .table.is-card-mobile th,
+    .table.is-card-mobile td {
+        display: block;
+        width: 100%;
     }
 
-    .table th,
-    .table td {
-        padding: 0.5em;
-        white-space: nowrap;
+    .table.is-card-mobile thead {
+        display: none;
+    }
+
+    .table.is-card-mobile tr {
+        background: var(--app-bg-secondary, #fafafa);
+        border: 1px solid var(--app-border, #dbdbdb);
+        border-radius: 8px;
+        margin-bottom: 0.75rem;
+        padding: 0.75rem;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+    }
+
+    .table.is-card-mobile tr:hover {
+        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
+    }
+
+    .table.is-card-mobile td {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 0.35rem 0;
+        border: none;
+        white-space: normal;
+        font-size: 0.875rem;
+    }
+
+    .table.is-card-mobile td:not(:last-child) {
+        border-bottom: 1px dotted var(--app-border, #e8e8e8);
+    }
+
+    .table.is-card-mobile td::before {
+        content: attr(data-label);
+        font-weight: 600;
+        font-size: 0.75rem;
+        color: var(--bulma-text-weak, #7a7a7a);
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+        flex-shrink: 0;
+        margin-right: 1rem;
+    }
+
+    .table.is-card-mobile td .button {
+        width: 100%;
+        margin-top: 0.25rem;
+    }
+
+    [data-theme="dark"] .table.is-card-mobile tr {
+        background: var(--app-card-bg, #1e1e3a);
+        border-color: var(--app-border, #3a3a5a);
     }
 
     /* Utility class to hide columns on mobile */
@@ -560,8 +611,8 @@ tr.is-clickable:hover {
         display: none !important;
     }
 
-    /* Smaller buttons in tables */
-    .table .button.is-small {
+    /* Smaller buttons in tables (fallback for non-card tables) */
+    .table:not(.is-card-mobile) .button.is-small {
         font-size: 0.7rem;
         padding: 0.4em 0.6em;
         min-height: 32px;
@@ -1010,6 +1061,50 @@ body,
     text-align: center;
     padding: 0.5rem;
     color: var(--bulma-text-weak, #7a7a7a);
+}
+
+/* Entries map weather popup grid */
+.popup-weather-grid {
+    font-size: 0.8rem;
+    margin-top: 0.5rem;
+}
+
+.weather-grid-row {
+    display: grid;
+    grid-template-columns: 70px 1fr 1fr;
+    gap: 0.25rem;
+    padding: 0.25rem 0;
+    align-items: center;
+}
+
+.weather-grid-row:not(:last-child) {
+    border-bottom: 1px dotted var(--bulma-border-weak, #e8e8e8);
+}
+
+.weather-grid-header {
+    font-weight: 600;
+    color: var(--bulma-text-weak, #7a7a7a);
+    border-bottom: 1px solid var(--bulma-border, #dbdbdb) !important;
+    padding-bottom: 0.3rem;
+    margin-bottom: 0.1rem;
+}
+
+.weather-grid-label {
+    font-size: 0.75rem;
+    color: var(--bulma-text-weak, #7a7a7a);
+}
+
+.weather-grid-value {
+    text-align: center;
+    font-family: monospace;
+}
+
+.popup-action {
+    text-align: center;
+}
+
+.popup-close {
+    margin-left: auto;
 }
 
 /* Region legend */

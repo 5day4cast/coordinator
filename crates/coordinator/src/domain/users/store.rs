@@ -212,6 +212,20 @@ impl UserStore {
         Ok(result)
     }
 
+    pub async fn get_username_by_pubkey(
+        &self,
+        nostr_pubkey: &str,
+    ) -> Result<Option<String>, Error> {
+        let username: Option<String> =
+            sqlx::query_scalar("SELECT username FROM user WHERE nostr_pubkey = ?")
+                .bind(nostr_pubkey)
+                .fetch_optional(self.db_connection.read())
+                .await?
+                .flatten();
+
+        Ok(username)
+    }
+
     pub async fn user_exists(&self, nostr_pubkey: &str) -> Result<bool, Error> {
         let result: i64 =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user WHERE nostr_pubkey = ?)")
