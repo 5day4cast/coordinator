@@ -33,8 +33,8 @@ pub fn payouts_page(payouts: &[PayoutView]) -> Markup {
                             tbody {
                                 @for payout in payouts {
                                     tr {
-                                        td { (payout.competition_id) }
-                                        td { (payout.entry_id) }
+                                        td title=(payout.competition_id) { (&payout.competition_id[..8]) }
+                                        td title=(payout.entry_id) { (&payout.entry_id[..8]) }
                                         td { (payout.payout_amount) }
                                         td { (payout.status) }
                                         td {

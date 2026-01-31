@@ -134,7 +134,7 @@ pub fn leaderboard_row(score: &EntryScore) -> Markup {
            onclick="document.getElementById('entryScore').classList.add('is-active')"
            style="cursor: pointer;" {
             td { (score.rank) }
-            td { (score.entry_id) }
+            td title=(score.entry_id) { (&score.entry_id[..8]) }
             td { (score.score) }
         }
     }

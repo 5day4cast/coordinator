@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use dlctix::secp::Point;
-use log::{debug, error};
+use log::{debug, error, warn};
+use nostr_sdk::ToBech32;
 
 use axum::{
     extract::{Path, State},
@@ -165,7 +166,17 @@ pub async fn entries_fragment(
     headers: HeaderMap,
     HtmlNostrAuth(NostrAuth { pubkey, .. }): HtmlNostrAuth,
 ) -> Html<String> {
-    let entries = fetch_user_entries(&state, &pubkey.to_hex()).await;
+    let username = match pubkey.to_bech32() {
+        Ok(npub) => match state.users_info.login(npub.clone()).await {
+            Ok(user) => user.username.unwrap_or(npub),
+            Err(e) => {
+                warn!("Could not look up user for entries page: {}", e);
+                npub
+            }
+        },
+        Err(_) => pubkey.to_hex(),
+    };
+    let entries = fetch_user_entries(&state, &pubkey.to_hex(), username).await;
     let content = if entries.is_empty() {
         no_entries()
     } else {
@@ -741,7 +752,7 @@ fn determine_competition_status(competition: &crate::domain::Competition) -> Str
     }
 }
 
-async fn fetch_user_entries(state: &AppState, pubkey: &str) -> Vec<EntryView> {
+async fn fetch_user_entries(state: &AppState, pubkey: &str, username: String) -> Vec<EntryView> {
     match state
         .coordinator
         .get_entries(pubkey.to_string(), SearchBy { event_ids: None })
@@ -762,6 +773,7 @@ async fn fetch_user_entries(state: &AppState, pubkey: &str) -> Vec<EntryView> {
                 }
                 .to_string(),
                 entry_id: e.id.to_string(),
+                username: username.clone(),
             })
             .collect(),
         Err(_) => vec![],

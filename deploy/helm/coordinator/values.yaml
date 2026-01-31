@@ -1,3 +1,11 @@
+# Blue/Green deployment support
+# When enabled, deployments and PVCs are suffixed with the slot name (blue/green)
+# The Service selector uses activeSlot to route traffic to the active deployment
+blueGreen:
+  enabled: false
+  slot: blue          # Which slot this deployment represents: "blue" or "green"
+  activeSlot: blue    # Which slot the Service routes traffic to
+
 # Coordinator Helm Chart Values
 replicaCount: 1
 

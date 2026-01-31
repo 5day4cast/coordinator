@@ -2,7 +2,7 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "coordinator.fullname" . }}
+  name: {{ include "coordinator.pvcName" . }}
   labels:
     {{- include "coordinator.labels" . | nindent 4 }}
 spec:

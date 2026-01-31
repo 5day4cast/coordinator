@@ -37,3 +37,45 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- include "coordinator.fullname" . }}
 {{- end }}
 {{- end }}
+
+{{/*
+Deployment name - includes slot suffix when blue/green is enabled
+*/}}
+{{- define "coordinator.deploymentName" -}}
+{{- if .Values.blueGreen.enabled }}
+{{- printf "%s-%s" (include "coordinator.fullname" .) .Values.blueGreen.slot }}
+{{- else }}
+{{- include "coordinator.fullname" . }}
+{{- end }}
+{{- end }}
+
+{{/*
+PVC name - includes slot suffix when blue/green is enabled
+*/}}
+{{- define "coordinator.pvcName" -}}
+{{- if .Values.blueGreen.enabled }}
+{{- printf "%s-%s" (include "coordinator.fullname" .) .Values.blueGreen.slot }}
+{{- else }}
+{{- include "coordinator.fullname" . }}
+{{- end }}
+{{- end }}
+
+{{/*
+Deployment selector labels - includes slot when blue/green is enabled
+*/}}
+{{- define "coordinator.deploymentSelectorLabels" -}}
+{{ include "coordinator.selectorLabels" . }}
+{{- if .Values.blueGreen.enabled }}
+app.kubernetes.io/slot: {{ .Values.blueGreen.slot }}
+{{- end }}
+{{- end }}
+
+{{/*
+Service selector labels - uses activeSlot when blue/green is enabled
+*/}}
+{{- define "coordinator.serviceSelectorLabels" -}}
+{{ include "coordinator.selectorLabels" . }}
+{{- if .Values.blueGreen.enabled }}
+app.kubernetes.io/slot: {{ .Values.blueGreen.activeSlot }}
+{{- end }}
+{{- end }}

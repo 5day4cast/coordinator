@@ -8,6 +8,7 @@ pub struct EntryView {
     pub end_time: String,
     pub status: String,
     pub entry_id: String,
+    pub username: String,
 }
 
 /// Entries page content (requires auth)
@@ -20,6 +21,7 @@ pub fn entries_page(entries: &[EntryView]) -> Markup {
                           class="table is-fullwidth is-striped is-hoverable" {
                         thead {
                             tr {
+                                th { "Username" }
                                 th { "Competition ID" }
                                 th { "Start Time" }
                                 th { "End Time" }
@@ -35,11 +37,12 @@ pub fn entries_page(entries: &[EntryView]) -> Markup {
                                    onclick="document.getElementById('entryScore').classList.add('is-active')"
                                    style="cursor: pointer;"
                                    title="Click to view entry details" {
-                                    td { (entry.competition_id) }
+                                    td { (entry.username) }
+                                    td title=(entry.competition_id) { (&entry.competition_id[..8]) }
                                     td { (entry.start_time) }
                                     td { (entry.end_time) }
                                     td { (entry.status) }
-                                    td { (entry.entry_id) }
+                                    td title=(entry.entry_id) { (&entry.entry_id[..8]) }
                                 }
                             }
                         }
