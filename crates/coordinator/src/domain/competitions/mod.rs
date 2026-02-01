@@ -233,6 +233,46 @@ impl FromRow<'_, SqliteRow> for UserEntry {
     }
 }
 
+/// Lightweight view of a user's entry joined with competition dates.
+/// Used for the entries list page to avoid fetching full Competition objects.
+#[derive(Debug, Clone)]
+pub struct UserEntryView {
+    pub entry_id: String,
+    pub competition_id: String,
+    pub start_time: String,
+    pub end_time: String,
+    pub status: String,
+}
+
+impl FromRow<'_, SqliteRow> for UserEntryView {
+    fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
+        let signed_at: Option<String> = row.get("signed_at");
+        let paid_at: Option<String> = row.get("paid_at");
+        let paid_out_at: Option<String> = row.get("paid_out_at");
+
+        let status = if paid_out_at.is_some() {
+            "Paid Out"
+        } else if paid_at.is_some() {
+            "Entry Paid"
+        } else if signed_at.is_some() {
+            "Signed"
+        } else {
+            "Pending"
+        }
+        .to_string();
+
+        Ok(UserEntryView {
+            entry_id: row.get("entry_id"),
+            competition_id: row.get("competition_id"),
+            start_time: row
+                .get::<Option<String>, _>("start_time")
+                .unwrap_or_default(),
+            end_time: row.get::<Option<String>, _>("end_time").unwrap_or_default(),
+            status,
+        })
+    }
+}
+
 impl AddEntry {
     fn into_user_entry(self, pubkey: String) -> UserEntry {
         let entry_submission = self.clone().into();

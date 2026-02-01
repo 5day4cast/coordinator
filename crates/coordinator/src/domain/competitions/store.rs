@@ -652,6 +652,48 @@ impl CompetitionStore {
         Ok(user_entries)
     }
 
+    /// Lightweight query for the entries list page.
+    /// Joins entries with competitions to get observation dates and payout status
+    /// in a single query, avoiding N+1 competition fetches.
+    pub async fn get_user_entry_views(
+        &self,
+        pubkey: String,
+    ) -> Result<Vec<super::UserEntryView>, sqlx::Error> {
+        let query = "
+            WITH latest_payouts AS (
+                SELECT
+                    entry_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY entry_id
+                        ORDER BY COALESCE(succeed_at, initiated_at) DESC
+                    ) as rn,
+                    COALESCE(succeed_at, initiated_at) as latest_payout_time
+                FROM payouts
+                WHERE failed_at IS NULL
+            )
+            SELECT
+                entries.id as entry_id,
+                entries.event_id as competition_id,
+                json_extract(competitions.event_submission, '$.start_observation_date') as start_time,
+                json_extract(competitions.event_submission, '$.end_observation_date') as end_time,
+                entries.signed_at as signed_at,
+                tickets.paid_at as paid_at,
+                latest_payouts.latest_payout_time as paid_out_at
+            FROM entries
+            JOIN competitions ON entries.event_id = competitions.id
+            LEFT JOIN tickets ON entries.ticket_id = tickets.id
+            LEFT JOIN latest_payouts ON entries.id = latest_payouts.entry_id AND latest_payouts.rn = 1
+            WHERE entries.pubkey = ?
+            ORDER BY json_extract(competitions.event_submission, '$.start_observation_date') DESC";
+
+        let views = sqlx::query_as::<_, super::UserEntryView>(query)
+            .bind(pubkey)
+            .fetch_all(self.db_connection.read())
+            .await?;
+
+        Ok(views)
+    }
+
     pub async fn add_competition_with_tickets(
         &self,
         competition: Competition,

@@ -29,7 +29,7 @@ use crate::{
         layouts::base::{base, PageConfig},
         pages::{
             competitions::{competitions_page, CompetitionView},
-            entries::{entries_page, no_entries, EntryView},
+            entries::{entries_page, no_entries},
             payouts::{payouts_page, PayoutView},
         },
         shared_map::StationMarker,
@@ -168,7 +168,11 @@ pub async fn entries_fragment(
     headers: HeaderMap,
     HtmlNostrAuth(NostrAuth { pubkey, .. }): HtmlNostrAuth,
 ) -> Html<String> {
-    let entries = fetch_user_entries(&state, &pubkey.to_hex()).await;
+    let entries = state
+        .coordinator
+        .get_user_entry_views(pubkey.to_hex())
+        .await
+        .unwrap_or_default();
     let content = if entries.is_empty() {
         no_entries()
     } else {
@@ -416,18 +420,24 @@ fn pick_card(data: &PickCardData) -> Markup {
     } else {
         None
     };
-    let has_values = data.forecast_val.is_some() || data.obs_val.is_some();
 
     html! {
         div class="entry-pick-card" {
             span class="entry-pick-icon" { (data.icon) }
             div class="entry-pick-info" {
                 div class="entry-pick-label" { (data.label) " · " (data.station_id) }
-                @if has_values {
+                @if data.forecast_val.is_some() || data.obs_val.is_some() {
                     div class="entry-pick-values" {
-                        (format_value(data.forecast_val, data.unit))
-                        " → "
-                        (format_value(data.obs_val, data.unit))
+                        span class="entry-pick-forecast" {
+                            "Forecast: "
+                            strong { (format_value(data.forecast_val, data.unit)) }
+                        }
+                        @if data.obs_val.is_some() {
+                            span class="entry-pick-observed" {
+                                "Observed: "
+                                strong { (format_value(data.obs_val, data.unit)) }
+                            }
+                        }
                     }
                 }
             }
@@ -767,33 +777,6 @@ fn determine_competition_status(competition: &crate::domain::Competition) -> Str
                 "Awaiting Results".to_string()
             }
         }
-    }
-}
-
-async fn fetch_user_entries(state: &AppState, pubkey: &str) -> Vec<EntryView> {
-    match state
-        .coordinator
-        .get_entries(pubkey.to_string(), SearchBy { event_ids: None })
-        .await
-    {
-        Ok(entries) => entries
-            .into_iter()
-            .map(|e| EntryView {
-                entry_id: e.id.to_string(),
-                competition_id: e.event_id.to_string(),
-                start_time: String::new(), // Would need to fetch competition for this
-                end_time: String::new(),
-                status: if e.paid_at.is_some() {
-                    "Paid"
-                } else if e.signed_at.is_some() {
-                    "Signed"
-                } else {
-                    "Pending"
-                }
-                .to_string(),
-            })
-            .collect(),
-        Err(_) => vec![],
     }
 }
 

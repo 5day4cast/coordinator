@@ -1,7 +1,7 @@
 #![allow(deprecated)]
 use super::{
     states::CompetitionStatus, AddEntry, CompetitionError, CompetitionStore, FundedContract,
-    KeymeldSigningInfo, PayoutInfo, SearchBy, Ticket, TicketStatus, UserEntry,
+    KeymeldSigningInfo, PayoutInfo, SearchBy, Ticket, TicketStatus, UserEntry, UserEntryView,
 };
 use crate::{
     api::routes::FinalSignatures,
@@ -2967,6 +2967,15 @@ impl Coordinator {
     ) -> Result<Vec<UserEntry>, Error> {
         self.competition_store
             .get_user_entries(pubkey, filter)
+            .map_err(Error::DbError)
+            .await
+    }
+
+    /// Get lightweight entry views for the entries list page.
+    /// Single query that joins entries with competitions for dates and payout status.
+    pub async fn get_user_entry_views(&self, pubkey: String) -> Result<Vec<UserEntryView>, Error> {
+        self.competition_store
+            .get_user_entry_views(pubkey)
             .map_err(Error::DbError)
             .await
     }
