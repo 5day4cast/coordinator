@@ -429,7 +429,7 @@ fn pick_card(data: &PickCardData) -> Markup {
                 @if data.forecast_val.is_some() || data.obs_val.is_some() {
                     div class="entry-pick-values" {
                         span class="entry-pick-forecast" {
-                            "Forecast: "
+                            "Forecasted: "
                             strong { (format_value(data.forecast_val, data.unit)) }
                         }
                         @if data.obs_val.is_some() {
