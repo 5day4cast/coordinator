@@ -25,7 +25,7 @@ pub fn competitions_page(competitions: &[CompetitionView]) -> Markup {
             div class="box" {
                 div class="table-container" {
                     table id="competitionsDataTable"
-                          class="table is-fullwidth is-striped is-hoverable competitions-table" {
+                          class="table is-fullwidth is-striped is-hoverable competitions-table is-card-mobile" {
                         thead {
                             tr {
                                 th { "Status" }

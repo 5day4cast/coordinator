@@ -106,6 +106,7 @@
 
 [data-theme="dark"] .navbar-menu {
     background-color: var(--app-bg-secondary);
+    border-color: var(--app-border);
 }
 
 [data-theme="dark"] .table {
@@ -463,12 +464,26 @@ tr.is-clickable:hover {
    Bulma's tablet breakpoint
    =========================================== */
 @media screen and (max-width: 1023px) {
-    /* Navbar mobile menu styling */
+    /* Navbar mobile menu - hidden by default, shown when burger is active */
     .navbar-menu {
+        display: none;
         background-color: var(--app-bg-secondary, #fafafa);
         border-top: 1px solid var(--app-border, #dbdbdb);
         padding: 0.5rem 0;
         box-shadow: 0 8px 16px rgba(0, 0, 0, 0.1);
+        position: absolute;
+        top: 100%;
+        left: 0;
+        right: 0;
+        z-index: 100;
+    }
+
+    .navbar-menu.is-active {
+        display: block;
+    }
+
+    .navbar {
+        position: relative;
     }
 
     .navbar-item {
@@ -1367,6 +1382,13 @@ body,
 .competitions-table td {
     white-space: nowrap;
     padding: 0.5em 0.75em;
+}
+
+/* Competitions table card layout on mobile */
+@media screen and (max-width: 768px) {
+    .competitions-table td {
+        white-space: normal;
+    }
 }
 
 .competitions-table .utc-time {
