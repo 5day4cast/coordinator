@@ -9,7 +9,7 @@ metadata:
     {{- include "coordinator.labels" $ | nindent 4 }}
     app.kubernetes.io/slot: {{ $slot }}
 spec:
-  replicas: {{ $.Values.replicaCount }}
+  replicas: {{ if eq $slot $.Values.blueGreen.activeSlot }}{{ $.Values.replicaCount }}{{ else }}0{{ end }}
   strategy:
     type: Recreate
   selector:
