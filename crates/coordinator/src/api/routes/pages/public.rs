@@ -354,19 +354,19 @@ pub async fn entry_detail_fragment(
                             @if let Some(pick) = &obs.temp_high {
                                 @let forecast_val = forecast.and_then(|f| f.temp_high);
                                 @let obs_val = observation.and_then(|o| o.temp_high);
-                                (pick_card("🟡", "High", &obs.stations, forecast_val, obs_val, "°F", pick, data.is_complete))
+                                (pick_card(&PickCardData { icon: "🟡", label: "High", station_id: &obs.stations, forecast_val, obs_val, unit: "°F", pick, is_complete: data.is_complete }))
                             }
                             // Temp Low card
                             @if let Some(pick) = &obs.temp_low {
                                 @let forecast_val = forecast.and_then(|f| f.temp_low);
                                 @let obs_val = observation.and_then(|o| o.temp_low);
-                                (pick_card("🔵", "Low", &obs.stations, forecast_val, obs_val, "°F", pick, data.is_complete))
+                                (pick_card(&PickCardData { icon: "🔵", label: "Low", station_id: &obs.stations, forecast_val, obs_val, unit: "°F", pick, is_complete: data.is_complete }))
                             }
                             // Wind Speed card
                             @if let Some(pick) = &obs.wind_speed {
                                 @let forecast_val = forecast.and_then(|f| f.wind_speed);
                                 @let obs_val = observation.and_then(|o| o.wind_speed);
-                                (pick_card("💨", "Wind", &obs.stations, forecast_val, obs_val, " mph", pick, data.is_complete))
+                                (pick_card(&PickCardData { icon: "💨", label: "Wind", station_id: &obs.stations, forecast_val, obs_val, unit: " mph", pick, is_complete: data.is_complete }))
                             }
                         }
                     } @else {
@@ -374,13 +374,13 @@ pub async fn entry_detail_fragment(
                         p class="entry-pending-msg mb-3" { "Weather data unavailable" }
                         @for obs in &entry.entry_submission.expected_observations {
                             @if let Some(pick) = &obs.temp_high {
-                                (pick_card_simple("🟡", "High", &obs.stations, pick))
+                                (pick_card(&PickCardData { icon: "🟡", label: "High", station_id: &obs.stations, forecast_val: None, obs_val: None, unit: "°F", pick, is_complete: false }))
                             }
                             @if let Some(pick) = &obs.temp_low {
-                                (pick_card_simple("🔵", "Low", &obs.stations, pick))
+                                (pick_card(&PickCardData { icon: "🔵", label: "Low", station_id: &obs.stations, forecast_val: None, obs_val: None, unit: "°F", pick, is_complete: false }))
                             }
                             @if let Some(pick) = &obs.wind_speed {
-                                (pick_card_simple("💨", "Wind", &obs.stations, pick))
+                                (pick_card(&PickCardData { icon: "💨", label: "Wind", station_id: &obs.stations, forecast_val: None, obs_val: None, unit: " mph", pick, is_complete: false }))
                             }
                         }
                     }
@@ -393,54 +393,49 @@ pub async fn entry_detail_fragment(
     )
 }
 
-/// Render a compact pick card with weather data
-fn pick_card(
-    icon: &str,
-    label: &str,
-    station_id: &str,
+/// Data for rendering a pick card
+struct PickCardData<'a> {
+    icon: &'a str,
+    label: &'a str,
+    station_id: &'a str,
     forecast_val: Option<f64>,
     obs_val: Option<f64>,
-    unit: &str,
-    pick: &ValueOptions,
+    unit: &'a str,
+    pick: &'a ValueOptions,
     is_complete: bool,
-) -> Markup {
-    let points = if is_complete {
-        Some(calculate_option_score(forecast_val, obs_val, pick))
+}
+
+/// Render a compact pick card
+fn pick_card(data: &PickCardData) -> Markup {
+    let points = if data.is_complete {
+        Some(calculate_option_score(
+            data.forecast_val,
+            data.obs_val,
+            data.pick,
+        ))
     } else {
         None
     };
+    let has_values = data.forecast_val.is_some() || data.obs_val.is_some();
 
     html! {
         div class="entry-pick-card" {
-            span class="entry-pick-icon" { (icon) }
+            span class="entry-pick-icon" { (data.icon) }
             div class="entry-pick-info" {
-                div class="entry-pick-label" { (label) " · " (station_id) }
-                div class="entry-pick-values" {
-                    (format_value(forecast_val, unit))
-                    " → "
-                    (format_value(obs_val, unit))
+                div class="entry-pick-label" { (data.label) " · " (data.station_id) }
+                @if has_values {
+                    div class="entry-pick-values" {
+                        (format_value(data.forecast_val, data.unit))
+                        " → "
+                        (format_value(data.obs_val, data.unit))
+                    }
                 }
             }
             div class="entry-pick-result" {
-                span class=(pick_choice_class(pick)) { (format_pick_short(pick)) }
+                span class=(pick_choice_class(data.pick)) { (format_pick_short(data.pick)) }
                 @if let Some(pts) = points {
                     div class=(points_class(pts)) { (pts) " pts" }
                 }
-            }
-        }
-    }
-}
-
-/// Render a compact pick card without weather data (picks only)
-fn pick_card_simple(icon: &str, label: &str, station_id: &str, pick: &ValueOptions) -> Markup {
-    html! {
-        div class="entry-pick-card" {
-            span class="entry-pick-icon" { (icon) }
-            div class="entry-pick-info" {
-                div class="entry-pick-label" { (label) " · " (station_id) }
-            }
-            div class="entry-pick-result" {
-                span class=(pick_choice_class(pick)) { (format_pick_short(pick)) }
             }
         }
     }
