@@ -1490,9 +1490,21 @@ body,
 }
 
 .entry-pick-values {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
     font-size: 0.75rem;
     color: var(--app-text-muted, #7a7a7a);
     font-family: monospace;
+}
+
+.entry-pick-forecast,
+.entry-pick-observed {
+    display: block;
+}
+
+.entry-pick-observed strong {
+    color: var(--bulma-link, #485fc7);
 }
 
 .entry-pick-result {
