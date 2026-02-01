@@ -118,8 +118,8 @@ spec:
                     \"containers\": [{
                       \"name\": \"cleanup\",
                       \"image\": \"alpine:latest\",
-                      \"command\": [\"sh\", \"-c\", \"rm -fv /data/*.db /data/*.db-shm /data/*.db-wal && rm -rfv /data/.*-litestream && echo PVC cleaned\"],
-                      \"volumeMounts\": [{\"name\": \"data\", \"mountPath\": \"/data\"}]
+                      \"command\": [\"sh\", \"-c\", \"find {{ .Values.persistence.mountPath }} -type f -name '*.db' -exec rm -fv {} + ; find {{ .Values.persistence.mountPath }} -type f -name '*.db-shm' -exec rm -fv {} + ; find {{ .Values.persistence.mountPath }} -type f -name '*.db-wal' -exec rm -fv {} + ; find {{ .Values.persistence.mountPath }} -type d -name '*-litestream' -exec rm -rfv {} + 2>/dev/null; echo PVC cleaned\"],
+                      \"volumeMounts\": [{\"name\": \"data\", \"mountPath\": \"{{ .Values.persistence.mountPath }}\"}]
                     }],
                     \"volumes\": [{\"name\": \"data\", \"persistentVolumeClaim\": {\"claimName\": \"${DEPLOY_PREFIX}-${STANDBY}\"}}]
                   }
