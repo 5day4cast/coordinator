@@ -89,39 +89,47 @@ spec:
               echo "=== Starting switchover: $ACTIVE -> $STANDBY ==="
 
               # Step 1: Update standby image
-              echo "Step 1/5: Setting $STANDBY_DEPLOY image to $NEW_IMAGE"
+              echo "Step 1/6: Setting $STANDBY_DEPLOY image to $NEW_IMAGE"
               kubectl -n "$NAMESPACE" set image "deployment/$STANDBY_DEPLOY" "$CONTAINER=$NEW_IMAGE"
 
-              # Step 2: Scale up standby
-              echo "Step 2/5: Scaling up $STANDBY_DEPLOY"
-              kubectl -n "$NAMESPACE" scale deployment "$STANDBY_DEPLOY" --replicas=1
-
-              # Step 3: Wait for readiness
-              echo "Step 3/5: Waiting for $STANDBY_DEPLOY to be ready..."
-              if ! kubectl -n "$NAMESPACE" rollout status deployment "$STANDBY_DEPLOY" --timeout=300s; then
-                echo "ERROR: Standby deployment failed readiness check"
-                echo "Rolling back: scaling down standby"
-                kubectl -n "$NAMESPACE" scale deployment "$STANDBY_DEPLOY" --replicas=0
-                exit 1
-              fi
-
-              # Step 4: Flip Service selector (503 window starts and ends here)
-              echo "Step 4/5: Flipping Service selector to $STANDBY"
+              # Step 2: Scale down active so Litestream flushes WAL to S3 on SIGTERM.
+              # This must happen BEFORE the standby starts, otherwise the standby
+              # restores stale data from S3 (the active's latest writes haven't
+              # been synced yet).
+              echo "Step 2/6: Scaling down $ACTIVE_DEPLOY (Litestream will flush WAL to S3)"
               kubectl -n "$NAMESPACE" scale deployment "$ACTIVE_DEPLOY" --replicas=0
-              sleep 2
-              kubectl -n "$NAMESPACE" patch svc "$SERVICE" --type=json \
-                -p "[{\"op\": \"replace\", \"path\": \"/spec/selector/app.kubernetes.io~1slot\", \"value\": \"$STANDBY\"}]"
 
-              # Step 5: Verify
-              echo "Step 5/5: Verifying switchover"
-              NEW_ACTIVE=$(kubectl -n "$NAMESPACE" get svc "$SERVICE" \
-                -o jsonpath='{.spec.selector.app\.kubernetes\.io/slot}')
-              echo "Service now pointing to: $NEW_ACTIVE"
-
-              # Wait for old active to fully terminate
+              # Step 3: Wait for active pods to fully terminate so Litestream
+              # completes its S3 sync on shutdown.
+              echo "Step 3/6: Waiting for $ACTIVE_DEPLOY pods to terminate"
               kubectl -n "$NAMESPACE" wait --for=delete pod \
                 -l "app.kubernetes.io/slot=$ACTIVE,app.kubernetes.io/name={{ include "coordinator.name" . }}" \
                 --timeout=60s 2>/dev/null || true
+              echo "$ACTIVE_DEPLOY terminated, S3 backups should be up to date"
+
+              # Step 4: Scale up standby (triggers Litestream restore from fresh S3 data)
+              echo "Step 4/6: Scaling up $STANDBY_DEPLOY (will restore DB from S3)"
+              kubectl -n "$NAMESPACE" scale deployment "$STANDBY_DEPLOY" --replicas=1
+
+              # Step 5: Wait for readiness
+              echo "Step 5/6: Waiting for $STANDBY_DEPLOY to be ready..."
+              if ! kubectl -n "$NAMESPACE" rollout status deployment "$STANDBY_DEPLOY" --timeout=300s; then
+                echo "ERROR: Standby deployment failed readiness check"
+                echo "Rolling back: scaling down standby, scaling up previous active"
+                kubectl -n "$NAMESPACE" scale deployment "$STANDBY_DEPLOY" --replicas=0
+                kubectl -n "$NAMESPACE" scale deployment "$ACTIVE_DEPLOY" --replicas=1
+                exit 1
+              fi
+
+              # Step 6: Flip Service selector (503 window ends)
+              echo "Step 6/6: Flipping Service selector to $STANDBY"
+              kubectl -n "$NAMESPACE" patch svc "$SERVICE" --type=json \
+                -p "[{\"op\": \"replace\", \"path\": \"/spec/selector/app.kubernetes.io~1slot\", \"value\": \"$STANDBY\"}]"
+
+              # Verify
+              NEW_ACTIVE=$(kubectl -n "$NAMESPACE" get svc "$SERVICE" \
+                -o jsonpath='{.spec.selector.app\.kubernetes\.io/slot}')
+              echo "Service now pointing to: $NEW_ACTIVE"
 
               echo ""
               echo "=== Switchover complete ==="
