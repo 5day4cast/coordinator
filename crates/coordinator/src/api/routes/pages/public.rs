@@ -323,116 +323,64 @@ pub async fn entry_detail_fragment(
     Html(
         html! {
             div {
-                h4 class="title is-4" { "Entry Details" }
-                p class="mb-4" { "Entry ID: " (entry_id) }
+                // Compact header with entry ID and total score
+                div class="entry-detail-header" {
+                    div {
+                        h5 class="title is-5 mb-1" { "Picks & Score" }
+                        span class="entry-id" { (format!("#{}", &entry_id.to_string()[..8])) }
+                    }
+                    @if entry.is_some() {
+                        @if let Some(ref data) = weather_data {
+                            @if let Some(total_score) = data.total_score {
+                                span class="entry-detail-score" { "🏆 " (total_score) " pts" }
+                            }
+                        }
+                    }
+                }
 
                 @if let Some(entry) = entry {
-                    h5 class="title is-5 mt-4" { "Picks & Score Breakdown" }
                     @if entry.entry_submission.expected_observations.is_empty() {
                         p class="has-text-grey" { "No picks recorded" }
                     } @else if let Some(ref data) = weather_data {
-                        // Show total score if competition is complete
-                        @if let Some(total_score) = data.total_score {
-                            p class="mb-3" {
-                                strong { "Total Score: " }
-                                span class="tag is-info is-medium" { (total_score) }
-                            }
-                        } @else {
-                            p class="mb-3 has-text-grey-light" {
-                                "Final scores will be available after observations are recorded"
+                        @if data.total_score.is_none() {
+                            p class="entry-pending-msg mb-3" {
+                                "Scores available after observations are recorded"
                             }
                         }
-                        table class="table is-fullwidth is-striped" {
-                            thead {
-                                tr {
-                                    th { "Station" }
-                                    th { "Metric" }
-                                    th { "Forecast" }
-                                    th { "Actual" }
-                                    th { "Pick" }
-                                    @if data.is_complete {
-                                        th { "Points" }
-                                    }
-                                }
+                        @for obs in &entry.entry_submission.expected_observations {
+                            @let forecast = data.forecasts.get(&obs.stations);
+                            @let observation = data.observations.get(&obs.stations);
+                            // Temp High card
+                            @if let Some(pick) = &obs.temp_high {
+                                @let forecast_val = forecast.and_then(|f| f.temp_high);
+                                @let obs_val = observation.and_then(|o| o.temp_high);
+                                (pick_card("🟡", "High", &obs.stations, forecast_val, obs_val, "°F", pick, data.is_complete))
                             }
-                            tbody {
-                                @for obs in &entry.entry_submission.expected_observations {
-                                    @let forecast = data.forecasts.get(&obs.stations);
-                                    @let observation = data.observations.get(&obs.stations);
-                                    // Temp High row
-                                    @if let Some(pick) = &obs.temp_high {
-                                        @let forecast_val = forecast.and_then(|f| f.temp_high);
-                                        @let obs_val = observation.and_then(|o| o.temp_high);
-                                        tr {
-                                            td { (get_station_name(&obs.stations)) }
-                                            td { "Temp High" }
-                                            td { (format_value(forecast_val, "°F")) }
-                                            td { (format_value(obs_val, "°F")) }
-                                            td { (format_pick(&Some(pick.clone()))) }
-                                            @if data.is_complete {
-                                                @let points = calculate_option_score(forecast_val, obs_val, pick);
-                                                td class=(score_class(points)) { (points) }
-                                            }
-                                        }
-                                    }
-                                    // Temp Low row
-                                    @if let Some(pick) = &obs.temp_low {
-                                        @let forecast_val = forecast.and_then(|f| f.temp_low);
-                                        @let obs_val = observation.and_then(|o| o.temp_low);
-                                        tr {
-                                            td { (get_station_name(&obs.stations)) }
-                                            td { "Temp Low" }
-                                            td { (format_value(forecast_val, "°F")) }
-                                            td { (format_value(obs_val, "°F")) }
-                                            td { (format_pick(&Some(pick.clone()))) }
-                                            @if data.is_complete {
-                                                @let points = calculate_option_score(forecast_val, obs_val, pick);
-                                                td class=(score_class(points)) { (points) }
-                                            }
-                                        }
-                                    }
-                                    // Wind Speed row
-                                    @if let Some(pick) = &obs.wind_speed {
-                                        @let forecast_val = forecast.and_then(|f| f.wind_speed);
-                                        @let obs_val = observation.and_then(|o| o.wind_speed);
-                                        tr {
-                                            td { (get_station_name(&obs.stations)) }
-                                            td { "Wind Speed" }
-                                            td { (format_value(forecast_val, " mph")) }
-                                            td { (format_value(obs_val, " mph")) }
-                                            td { (format_pick(&Some(pick.clone()))) }
-                                            @if data.is_complete {
-                                                @let points = calculate_option_score(forecast_val, obs_val, pick);
-                                                td class=(score_class(points)) { (points) }
-                                            }
-                                        }
-                                    }
-                                }
+                            // Temp Low card
+                            @if let Some(pick) = &obs.temp_low {
+                                @let forecast_val = forecast.and_then(|f| f.temp_low);
+                                @let obs_val = observation.and_then(|o| o.temp_low);
+                                (pick_card("🔵", "Low", &obs.stations, forecast_val, obs_val, "°F", pick, data.is_complete))
+                            }
+                            // Wind Speed card
+                            @if let Some(pick) = &obs.wind_speed {
+                                @let forecast_val = forecast.and_then(|f| f.wind_speed);
+                                @let obs_val = observation.and_then(|o| o.wind_speed);
+                                (pick_card("💨", "Wind", &obs.stations, forecast_val, obs_val, " mph", pick, data.is_complete))
                             }
                         }
                     } @else {
-                        // No weather data available - show picks only
-                        p class="mb-3 has-text-grey-light" {
-                            "Weather data unavailable"
-                        }
-                        table class="table is-fullwidth is-striped" {
-                            thead {
-                                tr {
-                                    th { "Station" }
-                                    th { "Temp High" }
-                                    th { "Temp Low" }
-                                    th { "Wind Speed" }
-                                }
+                        // No weather data - show picks only
+                        p class="entry-pending-msg mb-3" { "Weather data unavailable" }
+                        @for obs in &entry.entry_submission.expected_observations {
+                            @if let Some(pick) = &obs.temp_high {
+                                (pick_card_simple("🟡", "High", &obs.stations, pick))
                             }
-                            tbody {
-                                @for obs in &entry.entry_submission.expected_observations {
-                                    tr {
-                                        td { (get_station_name(&obs.stations)) }
-                                        td { (format_pick(&obs.temp_high)) }
-                                        td { (format_pick(&obs.temp_low)) }
-                                        td { (format_pick(&obs.wind_speed)) }
-                                    }
-                                }
+                            @if let Some(pick) = &obs.temp_low {
+                                (pick_card_simple("🔵", "Low", &obs.stations, pick))
+                            }
+                            @if let Some(pick) = &obs.wind_speed {
+                                (pick_card_simple("💨", "Wind", &obs.stations, pick))
                             }
                         }
                     }
@@ -445,13 +393,59 @@ pub async fn entry_detail_fragment(
     )
 }
 
-/// Format a pick value for display
-fn format_pick(pick: &Option<ValueOptions>) -> String {
-    match pick {
-        Some(ValueOptions::Over) => "Over ↑".to_string(),
-        Some(ValueOptions::Par) => "Par →".to_string(),
-        Some(ValueOptions::Under) => "Under ↓".to_string(),
-        None => "-".to_string(),
+/// Render a compact pick card with weather data
+fn pick_card(
+    icon: &str,
+    label: &str,
+    station_id: &str,
+    forecast_val: Option<f64>,
+    obs_val: Option<f64>,
+    unit: &str,
+    pick: &ValueOptions,
+    is_complete: bool,
+) -> Markup {
+    let points = if is_complete {
+        Some(calculate_option_score(forecast_val, obs_val, pick))
+    } else {
+        None
+    };
+
+    html! {
+        div class="entry-pick-card" {
+            span class="entry-pick-icon" { (icon) }
+            div class="entry-pick-info" {
+                div class="entry-pick-label" { (label) " · " (station_id) }
+                div class="entry-pick-values" {
+                    (format_value(forecast_val, unit))
+                    " → "
+                    (format_value(obs_val, unit))
+                }
+            }
+            div class="entry-pick-result" {
+                span class=(pick_choice_class(pick)) { (format_pick_short(pick)) }
+                @if let Some(pts) = points {
+                    div class=(points_class(pts)) {
+                        @if pts > 0 { "✅ " } @else { "❌ " }
+                        (pts) " pts"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render a compact pick card without weather data (picks only)
+fn pick_card_simple(icon: &str, label: &str, station_id: &str, pick: &ValueOptions) -> Markup {
+    html! {
+        div class="entry-pick-card" {
+            span class="entry-pick-icon" { (icon) }
+            div class="entry-pick-info" {
+                div class="entry-pick-label" { (label) " · " (station_id) }
+            }
+            div class="entry-pick-result" {
+                span class=(pick_choice_class(pick)) { (format_pick_short(pick)) }
+            }
+        }
     }
 }
 
@@ -463,14 +457,32 @@ fn format_value(value: Option<f64>, unit: &str) -> String {
     }
 }
 
-/// Get CSS class for score display
-fn score_class(points: i32) -> &'static str {
+/// Format a pick as short text
+fn format_pick_short(pick: &ValueOptions) -> &'static str {
+    match pick {
+        ValueOptions::Over => "Over ↑",
+        ValueOptions::Par => "Par →",
+        ValueOptions::Under => "Under ↓",
+    }
+}
+
+/// Get CSS class for pick choice display
+fn pick_choice_class(pick: &ValueOptions) -> &'static str {
+    match pick {
+        ValueOptions::Over => "entry-pick-choice pick-over",
+        ValueOptions::Par => "entry-pick-choice pick-par",
+        ValueOptions::Under => "entry-pick-choice pick-under",
+    }
+}
+
+/// Get CSS class for points display
+fn points_class(points: i32) -> &'static str {
     if points >= 20 {
-        "has-text-success has-text-weight-bold"
+        "entry-pick-points points-high"
     } else if points > 0 {
-        "has-text-info"
+        "entry-pick-points points-mid"
     } else {
-        "has-text-grey"
+        "entry-pick-points points-zero"
     }
 }
 
@@ -1173,48 +1185,133 @@ struct OracleEntry {
 }
 
 async fn fetch_leaderboard_scores(state: &AppState, competition_id: Uuid) -> Vec<EntryScore> {
-    // Fetch event from oracle to get entries with scores
+    // Fetch event from oracle to get entries with scores (used for sort order via final_score)
     let oracle_entries = fetch_oracle_event_entries(&state.oracle_url, competition_id).await;
 
     if oracle_entries.is_empty() {
         return vec![];
     }
 
-    // Convert to EntryScore and sort by score (highest first), then by entry_id for ties
-    let mut scores: Vec<EntryScore> = oracle_entries
+    // Fetch competition weather data once for raw score calculation
+    let competition = state.coordinator.get_competition(competition_id).await.ok();
+    let weather = if let Some(ref comp) = competition {
+        let station_ids: Vec<&str> = comp
+            .event_submission
+            .locations
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        if !station_ids.is_empty() {
+            let (forecasts, observations) = tokio::join!(
+                fetch_entry_forecasts(
+                    &state.oracle_url,
+                    &station_ids,
+                    comp.event_submission.start_observation_date,
+                    comp.event_submission.end_observation_date
+                ),
+                fetch_entry_observations(
+                    &state.oracle_url,
+                    &station_ids,
+                    comp.event_submission.start_observation_date,
+                    comp.event_submission.end_observation_date
+                )
+            );
+            let forecast_map: std::collections::HashMap<String, Forecast> = forecasts
+                .ok()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|f| (f.station_id.clone(), f))
+                .collect();
+            let observation_map: std::collections::HashMap<String, Observation> = observations
+                .ok()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|o| (o.station_id.clone(), o))
+                .collect();
+            Some((forecast_map, observation_map))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Build index of oracle scores for sort order (final_score with tiebreaker)
+    let oracle_score_map: std::collections::HashMap<Uuid, i64> = oracle_entries
         .iter()
-        .map(|entry| EntryScore {
-            rank: 0, // Will be assigned after sorting
-            entry_id: entry.id.to_string(),
-            username: String::new(),
-            score: entry.score.unwrap_or(0) as i32,
-        })
+        .map(|e| (e.id, e.score.unwrap_or(0)))
         .collect();
 
-    // Look up usernames for each entry
-    for score in scores.iter_mut() {
-        if let Ok(entry_id) = Uuid::parse_str(&score.entry_id) {
-            if let Ok(Some(entry)) = state.coordinator.get_entry_by_id(entry_id).await {
-                // Convert hex pubkey to bech32 for user table lookup
-                if let Ok(pubkey) = nostr_sdk::PublicKey::from_hex(&entry.pubkey) {
-                    if let Ok(bech32) = pubkey.to_bech32() {
-                        if let Ok(Some(name)) =
-                            state.users_info.get_username_by_pubkey(&bech32).await
-                        {
-                            score.username = name;
-                        } else {
-                            score.username = entry.pubkey[..8].to_string();
-                        }
+    // Convert to EntryScore, computing raw scores from picks + weather data
+    let mut scores: Vec<EntryScore> = Vec::with_capacity(oracle_entries.len());
+
+    for oracle_entry in &oracle_entries {
+        let mut entry_score = EntryScore {
+            rank: 0,
+            entry_id: oracle_entry.id.to_string(),
+            username: String::new(),
+            score: 0,
+        };
+
+        // Fetch entry details for username and raw score calculation
+        if let Ok(Some(entry)) = state.coordinator.get_entry_by_id(oracle_entry.id).await {
+            // Look up username
+            if let Ok(pubkey) = nostr_sdk::PublicKey::from_hex(&entry.pubkey) {
+                if let Ok(bech32) = pubkey.to_bech32() {
+                    if let Ok(Some(name)) = state.users_info.get_username_by_pubkey(&bech32).await {
+                        entry_score.username = name;
+                    } else {
+                        entry_score.username = entry.pubkey[..8].to_string();
                     }
                 }
             }
+
+            // Compute raw score from picks + weather data
+            if let Some((ref forecast_map, ref observation_map)) = weather {
+                let mut raw_score = 0i32;
+                for obs in &entry.entry_submission.expected_observations {
+                    let forecast = forecast_map.get(&obs.stations);
+                    let observation = observation_map.get(&obs.stations);
+
+                    if let Some(pick) = &obs.temp_high {
+                        raw_score += calculate_option_score(
+                            forecast.and_then(|f| f.temp_high),
+                            observation.and_then(|o| o.temp_high),
+                            pick,
+                        );
+                    }
+                    if let Some(pick) = &obs.temp_low {
+                        raw_score += calculate_option_score(
+                            forecast.and_then(|f| f.temp_low),
+                            observation.and_then(|o| o.temp_low),
+                            pick,
+                        );
+                    }
+                    if let Some(pick) = &obs.wind_speed {
+                        raw_score += calculate_option_score(
+                            forecast.and_then(|f| f.wind_speed),
+                            observation.and_then(|o| o.wind_speed),
+                            pick,
+                        );
+                    }
+                }
+                entry_score.score = raw_score;
+            }
         }
+
+        scores.push(entry_score);
     }
 
-    // Sort by score descending, then by entry_id ascending (earlier entries win ties)
+    // Sort by oracle final_score (handles tiebreaking), but display raw_score
     scores.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
+        let a_oracle = oracle_score_map
+            .get(&Uuid::parse_str(&a.entry_id).unwrap_or_default())
+            .unwrap_or(&0);
+        let b_oracle = oracle_score_map
+            .get(&Uuid::parse_str(&b.entry_id).unwrap_or_default())
+            .unwrap_or(&0);
+        b_oracle
+            .cmp(a_oracle)
             .then_with(|| a.entry_id.cmp(&b.entry_id))
     });
 

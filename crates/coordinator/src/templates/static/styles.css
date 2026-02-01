@@ -1424,3 +1424,120 @@ body,
     border-color: white;
     color: white;
 }
+
+/* ===========================================
+   Entry Detail Cards (modal)
+   =========================================== */
+.entry-detail-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+}
+
+.entry-detail-header .entry-id {
+    font-size: 0.8rem;
+    color: var(--app-text-muted, #7a7a7a);
+    font-family: monospace;
+}
+
+.entry-detail-score {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 1.1rem;
+    font-weight: 700;
+    padding: 0.3rem 0.75rem;
+    border-radius: 6px;
+    background: rgba(72, 95, 199, 0.15);
+    color: var(--bulma-link, #485fc7);
+}
+
+.entry-pick-card {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    gap: 0.5rem;
+    align-items: center;
+    padding: 0.6rem 0.75rem;
+    border-radius: 6px;
+    background: var(--app-bg-secondary, #fafafa);
+    margin-bottom: 0.5rem;
+    font-size: 0.875rem;
+}
+
+[data-theme="dark"] .entry-pick-card {
+    background: var(--app-bg-secondary, #16213e);
+}
+
+.entry-pick-icon {
+    font-size: 1.3rem;
+    line-height: 1;
+}
+
+.entry-pick-info {
+    min-width: 0;
+}
+
+.entry-pick-label {
+    font-weight: 600;
+    font-size: 0.8rem;
+    margin-bottom: 0.15rem;
+}
+
+.entry-pick-station {
+    font-size: 0.7rem;
+    color: var(--app-text-muted, #7a7a7a);
+}
+
+.entry-pick-values {
+    font-size: 0.75rem;
+    color: var(--app-text-muted, #7a7a7a);
+    font-family: monospace;
+}
+
+.entry-pick-result {
+    text-align: right;
+    white-space: nowrap;
+}
+
+.entry-pick-choice {
+    font-size: 0.75rem;
+    font-weight: 600;
+}
+
+.entry-pick-choice.pick-over {
+    color: #9b59b6;
+}
+
+.entry-pick-choice.pick-par {
+    color: #16a085;
+}
+
+.entry-pick-choice.pick-under {
+    color: #3498db;
+}
+
+.entry-pick-points {
+    font-size: 0.8rem;
+    font-weight: 700;
+    margin-top: 0.1rem;
+}
+
+.entry-pick-points.points-high {
+    color: var(--bulma-success, #48c774);
+}
+
+.entry-pick-points.points-mid {
+    color: var(--bulma-info, #3e8ed0);
+}
+
+.entry-pick-points.points-zero {
+    color: var(--app-text-muted, #7a7a7a);
+}
+
+.entry-pending-msg {
+    font-size: 0.8rem;
+    color: var(--app-text-muted, #7a7a7a);
+    text-align: center;
+    padding: 0.5rem;
+}
