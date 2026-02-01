@@ -172,7 +172,8 @@ pub async fn build_app(
         client
     };
 
-    let reqwest_client = build_reqwest_client();
+    let http_client = Client::new();
+    let reqwest_client = build_reqwest_client(http_client.clone());
 
     // Create LN client (real or mock based on config)
     #[cfg(any(feature = "e2e-testing", debug_assertions))]
@@ -221,7 +222,7 @@ pub async fn build_app(
         let oracle_url = Url::parse(&config.coordinator_settings.oracle_url)
             .map_err(|e| anyhow!("Failed to parse oracle url: {}", e))?;
         let real_oracle = OracleClient::new(
-            reqwest_client,
+            build_oracle_reqwest_client(http_client.clone()),
             &oracle_url,
             &config.coordinator_settings.private_key_file,
         )?;
@@ -239,7 +240,7 @@ pub async fn build_app(
         let oracle_url = Url::parse(&config.coordinator_settings.oracle_url)
             .map_err(|e| anyhow!("Failed to parse oracle url: {}", e))?;
         let real_oracle = OracleClient::new(
-            reqwest_client,
+            build_oracle_reqwest_client(http_client.clone()),
             &oracle_url,
             &config.coordinator_settings.private_key_file,
         )?;
@@ -650,9 +651,22 @@ fn get_mime_type(path: &str) -> &'static str {
     }
 }
 
-pub fn build_reqwest_client() -> ClientWithMiddleware {
+pub fn build_reqwest_client(client: Client) -> ClientWithMiddleware {
     let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
-    ClientBuilder::new(Client::new())
+    ClientBuilder::new(client)
+        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+        .with(LoggingMiddleware)
+        .build()
+}
+
+/// Build a reqwest client for the oracle with more forgiving retry policy.
+/// The oracle may be temporarily unavailable during blue/green deployments,
+/// so we retry for up to 10 minutes with exponential backoff (5s to 60s).
+pub fn build_oracle_reqwest_client(client: Client) -> ClientWithMiddleware {
+    let retry_policy = ExponentialBackoff::builder()
+        .retry_bounds(Duration::from_secs(5), Duration::from_secs(60))
+        .build_with_total_retry_duration(Duration::from_secs(10 * 60));
+    ClientBuilder::new(client)
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
         .with(LoggingMiddleware)
         .build()

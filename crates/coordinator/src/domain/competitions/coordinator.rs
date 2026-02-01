@@ -48,7 +48,7 @@ use dlctix::{
 use futures::TryFutureExt;
 use itertools::Itertools;
 use keymeld_sdk::prelude::UserId;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use serde::Serialize;
@@ -866,20 +866,29 @@ impl Coordinator {
                         }
                     }
                     Err(e) => {
-                        error!(
-                            "Competition {} attestation check failed: {}",
-                            competition_id, e
-                        );
-                        state
-                            .competition_mut()
-                            .errors
-                            .push(CompetitionError::FailedCheckingAttestation(e.to_string()));
-                        if state.competition().should_abort() {
-                            CompetitionStatus::AwaitingAttestation(state)
-                                .fail(CompetitionError::FailedCheckingAttestation(e.to_string()))
+                        if e.downcast_ref::<OracleError>()
+                            .is_some_and(|oe| oe.is_transient())
+                        {
+                            warn!(
+                                "Competition {} attestation check hit transient error, will retry: {}",
+                                competition_id, e
+                            );
                         } else {
-                            CompetitionStatus::AwaitingAttestation(state)
+                            error!(
+                                "Competition {} attestation check failed: {}",
+                                competition_id, e
+                            );
+                            state
+                                .competition_mut()
+                                .errors
+                                .push(CompetitionError::FailedCheckingAttestation(e.to_string()));
+                            if state.competition().should_abort() {
+                                return CompetitionStatus::AwaitingAttestation(state).fail(
+                                    CompetitionError::FailedCheckingAttestation(e.to_string()),
+                                );
+                            }
                         }
+                        CompetitionStatus::AwaitingAttestation(state)
                     }
                 }
             }

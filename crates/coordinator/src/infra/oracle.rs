@@ -49,6 +49,14 @@ pub enum Error {
     Request(String),
     #[error("{0}")]
     BadRequest(String),
+    #[error("oracle temporarily unavailable: {0}")]
+    Transient(String),
+}
+
+impl Error {
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Error::Transient(_))
+    }
 }
 
 #[derive(Clone)]
@@ -224,6 +232,17 @@ impl OracleClient {
                     .await
                     .unwrap_or(String::from("bad request to oracle")),
             ))
+        } else if response.status() == StatusCode::SERVICE_UNAVAILABLE
+            || response.status() == StatusCode::BAD_GATEWAY
+            || response.status() == StatusCode::GATEWAY_TIMEOUT
+            || response.status() == StatusCode::TOO_MANY_REQUESTS
+        {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            Err(Error::Transient(format!(
+                "error response from oracle with status {}: {:?}",
+                status, body
+            )))
         } else {
             let status = response.status();
             let body = response.text().await?;
