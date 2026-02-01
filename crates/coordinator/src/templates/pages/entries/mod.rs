@@ -29,14 +29,37 @@ pub fn entries_page(entries: &[UserEntryView]) -> Markup {
                                    title="Click to view entry details" {
                                     td data-label="Entry ID" title=(entry.entry_id) { (&entry.entry_id[..8]) }
                                     td data-label="Competition" title=(entry.competition_id) { (&entry.competition_id[..8]) }
-                                    td data-label="Start" { (entry.start_time) }
-                                    td data-label="End" { (entry.end_time) }
+                                    td data-label="Start" {
+                                        span class="utc-time" data-utc=(entry.start_time) { (entry.start_time) }
+                                    }
+                                    td data-label="End" {
+                                        span class="utc-time" data-utc=(entry.end_time) { (entry.end_time) }
+                                    }
                                     td data-label="Status" { (entry.status) }
                                 }
                             }
                         }
                     }
                 }
+            }
+            script {
+                (maud::PreEscaped(r#"
+                (function() {
+                    document.querySelectorAll('#allEntries .utc-time').forEach(function(el) {
+                        var utc = el.dataset.utc;
+                        if (utc) {
+                            var date = new Date(utc);
+                            el.textContent = date.toLocaleString(undefined, {
+                                month: 'short',
+                                day: 'numeric',
+                                hour: 'numeric',
+                                minute: '2-digit'
+                            });
+                            el.title = date.toLocaleString();
+                        }
+                    });
+                })();
+                "#))
             }
         }
     }
