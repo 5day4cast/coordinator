@@ -424,10 +424,7 @@ fn pick_card(
             div class="entry-pick-result" {
                 span class=(pick_choice_class(pick)) { (format_pick_short(pick)) }
                 @if let Some(pts) = points {
-                    div class=(points_class(pts)) {
-                        @if pts > 0 { "✅ " } @else { "❌ " }
-                        (pts) " pts"
-                    }
+                    div class=(points_class(pts)) { (pts) " pts" }
                 }
             }
         }
