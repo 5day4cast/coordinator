@@ -354,19 +354,19 @@ pub async fn entry_detail_fragment(
                             @if let Some(pick) = &obs.temp_high {
                                 @let forecast_val = forecast.and_then(|f| f.temp_high);
                                 @let obs_val = observation.and_then(|o| o.temp_high);
-                                (pick_card(&PickCardData { icon: "🟡", label: "High", station_id: &obs.stations, forecast_val, obs_val, unit: "°F", pick, is_complete: data.is_complete }))
+                                (pick_card(&PickCardData { icon: "🟡", label: "High", station_id: &obs.stations, forecast_val, obs_val, unit: "°F", pick, show_points: data.has_observations }))
                             }
                             // Temp Low card
                             @if let Some(pick) = &obs.temp_low {
                                 @let forecast_val = forecast.and_then(|f| f.temp_low);
                                 @let obs_val = observation.and_then(|o| o.temp_low);
-                                (pick_card(&PickCardData { icon: "🔵", label: "Low", station_id: &obs.stations, forecast_val, obs_val, unit: "°F", pick, is_complete: data.is_complete }))
+                                (pick_card(&PickCardData { icon: "🔵", label: "Low", station_id: &obs.stations, forecast_val, obs_val, unit: "°F", pick, show_points: data.has_observations }))
                             }
                             // Wind Speed card
                             @if let Some(pick) = &obs.wind_speed {
                                 @let forecast_val = forecast.and_then(|f| f.wind_speed);
                                 @let obs_val = observation.and_then(|o| o.wind_speed);
-                                (pick_card(&PickCardData { icon: "💨", label: "Wind", station_id: &obs.stations, forecast_val, obs_val, unit: " mph", pick, is_complete: data.is_complete }))
+                                (pick_card(&PickCardData { icon: "💨", label: "Wind", station_id: &obs.stations, forecast_val, obs_val, unit: " mph", pick, show_points: data.has_observations }))
                             }
                         }
                     } @else {
@@ -374,13 +374,13 @@ pub async fn entry_detail_fragment(
                         p class="entry-pending-msg mb-3" { "Weather data unavailable" }
                         @for obs in &entry.entry_submission.expected_observations {
                             @if let Some(pick) = &obs.temp_high {
-                                (pick_card(&PickCardData { icon: "🟡", label: "High", station_id: &obs.stations, forecast_val: None, obs_val: None, unit: "°F", pick, is_complete: false }))
+                                (pick_card(&PickCardData { icon: "🟡", label: "High", station_id: &obs.stations, forecast_val: None, obs_val: None, unit: "°F", pick, show_points: false }))
                             }
                             @if let Some(pick) = &obs.temp_low {
-                                (pick_card(&PickCardData { icon: "🔵", label: "Low", station_id: &obs.stations, forecast_val: None, obs_val: None, unit: "°F", pick, is_complete: false }))
+                                (pick_card(&PickCardData { icon: "🔵", label: "Low", station_id: &obs.stations, forecast_val: None, obs_val: None, unit: "°F", pick, show_points: false }))
                             }
                             @if let Some(pick) = &obs.wind_speed {
-                                (pick_card(&PickCardData { icon: "💨", label: "Wind", station_id: &obs.stations, forecast_val: None, obs_val: None, unit: " mph", pick, is_complete: false }))
+                                (pick_card(&PickCardData { icon: "💨", label: "Wind", station_id: &obs.stations, forecast_val: None, obs_val: None, unit: " mph", pick, show_points: false }))
                             }
                         }
                     }
@@ -402,12 +402,12 @@ struct PickCardData<'a> {
     obs_val: Option<f64>,
     unit: &'a str,
     pick: &'a ValueOptions,
-    is_complete: bool,
+    show_points: bool,
 }
 
 /// Render a compact pick card
 fn pick_card(data: &PickCardData) -> Markup {
-    let points = if data.is_complete {
+    let points = if data.show_points {
         Some(calculate_option_score(
             data.forecast_val,
             data.obs_val,
@@ -483,7 +483,7 @@ struct EntryWeatherData {
     forecasts: std::collections::HashMap<String, Forecast>,
     observations: std::collections::HashMap<String, Observation>,
     total_score: Option<i32>,
-    is_complete: bool,
+    has_observations: bool,
 }
 
 /// Fetch forecast and observation data for an entry's display
@@ -542,13 +542,10 @@ async fn fetch_entry_weather_data(
         observation_map.insert(o.station_id.clone(), o);
     }
 
-    // Check if observations are complete (past end date and have observation data)
-    let now = time::OffsetDateTime::now_utc();
-    let is_complete =
-        now >= competition.event_submission.end_observation_date && !observation_map.is_empty();
+    let has_observations = !observation_map.is_empty();
 
-    // Calculate total score only if observations are complete
-    let total_score = if is_complete {
+    // Calculate total score whenever observations exist (live or complete)
+    let total_score = if has_observations {
         let mut score = 0i32;
         for obs in &entry.entry_submission.expected_observations {
             let forecast = forecast_map.get(&obs.stations);
@@ -585,7 +582,7 @@ async fn fetch_entry_weather_data(
         forecasts: forecast_map,
         observations: observation_map,
         total_score,
-        is_complete,
+        has_observations,
     })
 }
 
