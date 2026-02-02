@@ -1,5 +1,5 @@
 use crate::SqliteConfigSerde;
-use log::debug;
+use log::{debug, error, info};
 use sqlx::{
     migrate::MigrateDatabase,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow},
@@ -707,9 +707,38 @@ impl DBConnection {
         Ok(())
     }
 
+    /// Run PRAGMA quick_check to verify database page structure integrity.
+    /// Returns Ok(()) if healthy, Err if corruption is detected.
+    pub async fn quick_check(&self) -> Result<(), sqlx::Error> {
+        let result: String = sqlx::query_scalar("PRAGMA quick_check;")
+            .fetch_one(&self.read_pool)
+            .await?;
+        if result != "ok" {
+            error!("{}: PRAGMA quick_check failed: {}", self.database_name, result);
+            return Err(sqlx::Error::Protocol(format!(
+                "Database integrity check failed: {}",
+                result
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn close(self) {
         self.read_pool.close().await;
         self.write_pool.close().await;
+    }
+
+    /// Checkpoint WAL to main database file before shutdown.
+    /// This ensures all pending writes are flushed so Litestream
+    /// can replicate a complete database to S3.
+    pub async fn checkpoint(&self) {
+        match sqlx::query("PRAGMA wal_checkpoint(TRUNCATE);")
+            .execute(&self.write_pool)
+            .await
+        {
+            Ok(_) => info!("{}: WAL checkpoint completed successfully", self.database_name),
+            Err(e) => error!("{}: WAL checkpoint failed: {}", self.database_name, e),
+        }
     }
 
     /// Returns a reference to the read pool for read-only operations.

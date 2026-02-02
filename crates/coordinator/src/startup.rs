@@ -69,6 +69,7 @@ pub struct Application {
     >,
     cancellation_token: CancellationToken,
     background_tasks: TaskTracker,
+    db_connections: Vec<DBConnection>,
 }
 
 impl Application {
@@ -78,12 +79,13 @@ impl Application {
             config.api_settings.domain, config.api_settings.port
         );
         let listener = SocketAddr::from_str(&address)?;
-        let (app_state, background_tasks, cancellation_token) = build_app(config.clone()).await?;
+        let (app_state, background_tasks, cancellation_token, db_connections) = build_app(config.clone()).await?;
         let server = build_server(listener, app_state, config.api_settings.origins).await?;
         Ok(Self {
             server,
             cancellation_token,
             background_tasks,
+            db_connections,
         })
     }
 
@@ -102,6 +104,12 @@ impl Application {
                     _ = timeout => {
                         warn!("Background tasks timed out during shutdown");
                     }
+                }
+
+                // Checkpoint WAL before exit so Litestream replicates complete databases
+                info!("Checkpointing WAL before shutdown...");
+                for db in &self.db_connections {
+                    db.checkpoint().await;
                 }
 
                 info!("Shutdown complete");
@@ -140,7 +148,7 @@ pub struct AppState {
 
 pub async fn build_app(
     config: Settings,
-) -> Result<(AppState, TaskTracker, CancellationToken), anyhow::Error> {
+) -> Result<(AppState, TaskTracker, CancellationToken, Vec<DBConnection>), anyhow::Error> {
     info!(
         "Static UI assets configured at {}",
         config.ui_settings.ui_dir
@@ -261,6 +269,7 @@ pub async fn build_app(
     .await
     .map_err(|e| anyhow!("Error setting up competition db: {}", e))?;
 
+    let competition_db_clone = competition_db.clone();
     let competition_store = CompetitionStore::new(competition_db);
 
     let users_db = DBConnection::new(
@@ -272,6 +281,7 @@ pub async fn build_app(
     .await
     .map_err(|e| anyhow!("Error setting up users db: {}", e))?;
 
+    let users_db_clone = users_db.clone();
     let users_store = UserStore::new(users_db);
 
     // Create Keymeld service
@@ -442,7 +452,7 @@ pub async fn build_app(
         background_threads: Arc::new(threads),
         forgot_password_challenges: Arc::new(RwLock::new(HashMap::new())),
     };
-    Ok((app_state, tracker, cancel_token))
+    Ok((app_state, tracker, cancel_token, vec![competition_db_clone, users_db_clone]))
 }
 
 pub async fn build_server(

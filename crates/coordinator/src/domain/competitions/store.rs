@@ -27,6 +27,10 @@ impl CompetitionStore {
         self.db_connection.ping().await
     }
 
+    pub async fn quick_check(&self) -> Result<(), sqlx::Error> {
+        self.db_connection.quick_check().await
+    }
+
     pub async fn get_stored_public_key(&self) -> Result<XOnlyPublicKey, sqlx::Error> {
         let key_bytes: Vec<u8> = sqlx::query_scalar("SELECT pubkey FROM coordinator_metadata")
             .fetch_one(self.db_connection.read())

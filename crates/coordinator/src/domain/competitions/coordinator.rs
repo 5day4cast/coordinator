@@ -398,6 +398,10 @@ impl Coordinator {
         self.competition_store.ping().await.map_err(Error::DbError)
     }
 
+    pub async fn quick_check(&self) -> Result<(), Error> {
+        self.competition_store.quick_check().await.map_err(Error::DbError)
+    }
+
     pub async fn competition_handler(&self) -> Result<(), anyhow::Error> {
         let competitions: Vec<Competition> =
             self.competition_store.get_competitions(true, true).await?;

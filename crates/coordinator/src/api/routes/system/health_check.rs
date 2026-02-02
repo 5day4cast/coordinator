@@ -12,6 +12,12 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Result<StatusCode, Er
         e
     })?;
 
+    // Verify database integrity (PRAGMA quick_check)
+    state.coordinator.quick_check().await.map_err(|e| {
+        error!("Database integrity check failed: {}", e);
+        e
+    })?;
+
     // Verify the background threads are still running
     for (thread_name, thread) in state.background_threads.clone().iter() {
         if thread.is_finished() {
