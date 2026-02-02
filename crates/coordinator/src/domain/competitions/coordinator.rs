@@ -399,7 +399,10 @@ impl Coordinator {
     }
 
     pub async fn quick_check(&self) -> Result<(), Error> {
-        self.competition_store.quick_check().await.map_err(Error::DbError)
+        self.competition_store
+            .quick_check()
+            .await
+            .map_err(Error::DbError)
     }
 
     pub async fn competition_handler(&self) -> Result<(), anyhow::Error> {

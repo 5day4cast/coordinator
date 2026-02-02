@@ -79,7 +79,8 @@ impl Application {
             config.api_settings.domain, config.api_settings.port
         );
         let listener = SocketAddr::from_str(&address)?;
-        let (app_state, background_tasks, cancellation_token, db_connections) = build_app(config.clone()).await?;
+        let (app_state, background_tasks, cancellation_token, db_connections) =
+            build_app(config.clone()).await?;
         let server = build_server(listener, app_state, config.api_settings.origins).await?;
         Ok(Self {
             server,
@@ -452,7 +453,12 @@ pub async fn build_app(
         background_threads: Arc::new(threads),
         forgot_password_challenges: Arc::new(RwLock::new(HashMap::new())),
     };
-    Ok((app_state, tracker, cancel_token, vec![competition_db_clone, users_db_clone]))
+    Ok((
+        app_state,
+        tracker,
+        cancel_token,
+        vec![competition_db_clone, users_db_clone],
+    ))
 }
 
 pub async fn build_server(

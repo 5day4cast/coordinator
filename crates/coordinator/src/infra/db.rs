@@ -714,7 +714,10 @@ impl DBConnection {
             .fetch_one(&self.read_pool)
             .await?;
         if result != "ok" {
-            error!("{}: PRAGMA quick_check failed: {}", self.database_name, result);
+            error!(
+                "{}: PRAGMA quick_check failed: {}",
+                self.database_name, result
+            );
             return Err(sqlx::Error::Protocol(format!(
                 "Database integrity check failed: {}",
                 result
@@ -736,7 +739,10 @@ impl DBConnection {
             .execute(&self.write_pool)
             .await
         {
-            Ok(_) => info!("{}: WAL checkpoint completed successfully", self.database_name),
+            Ok(_) => info!(
+                "{}: WAL checkpoint completed successfully",
+                self.database_name
+            ),
             Err(e) => error!("{}: WAL checkpoint failed: {}", self.database_name, e),
         }
     }
