@@ -491,6 +491,11 @@ pub struct CreateEvent {
     pub coordinator_fee_percentage: usize,
     /// Total sats in competition pool to be won
     pub total_competition_pool: usize,
+    /// Relative locktime block delta for this competition.
+    /// Controls how many blocks to wait between outcome and delta transactions.
+    /// If not set, uses the coordinator-level default from config.
+    #[serde(default)]
+    pub relative_locktime_block_delta: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -44,6 +44,7 @@ fn render_admin_fragment(
             api_base: &state.private_url,
             oracle_base: &state.oracle_url,
             esplora_url: &state.esplora_url,
+            network: &state.network,
         };
         Html(admin_base(&config, content).into_string())
     }
@@ -56,6 +57,7 @@ pub async fn admin_page_handler(State(state): State<Arc<AppState>>) -> Html<Stri
         api_base: &state.private_url,
         oracle_base: &state.oracle_url,
         esplora_url: &state.esplora_url,
+        network: &state.network,
     };
 
     // Fetch stations from oracle and filter to top 200 cities
@@ -193,6 +195,8 @@ pub struct CreateCompetitionForm {
     pub number_of_places_win: usize,
     #[serde(default)]
     pub locations: Vec<String>,
+    #[serde(default)]
+    pub relative_locktime_block_delta: Option<u16>,
 }
 
 /// Handle competition creation from HTMX form
@@ -247,6 +251,7 @@ pub async fn admin_create_competition_handler(
         entry_fee: form.entry_fee,
         coordinator_fee_percentage: form.coordinator_fee_percentage,
         total_competition_pool,
+        relative_locktime_block_delta: form.relative_locktime_block_delta,
     };
 
     match state.coordinator.create_competition(create_event).await {

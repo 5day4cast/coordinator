@@ -231,7 +231,18 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
                             }
 
                             div class="column" {
-                                // Empty column for layout balance
+                                div class="field" {
+                                    label class="label" { "Block Delta" }
+                                    div class="control" {
+                                        input class="input" type="number"
+                                              name="relative_locktime_block_delta"
+                                              id="block_delta_input"
+                                              value="" min="1";
+                                    }
+                                    p class="help" id="block_delta_help" {
+                                        "Blocks between tx stages"
+                                    }
+                                }
                             }
                         }
                     }
@@ -255,6 +266,47 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
                     hidden.value = input.value + ':00Z';
                 }
             }
+            "#))
+        }
+
+        // Set network-aware defaults for block delta
+        script {
+            (PreEscaped(r#"
+            (function() {
+                var network = (document.body.dataset.network || '').toLowerCase();
+                var input = document.getElementById('block_delta_input');
+                var help = document.getElementById('block_delta_help');
+                if (!input) return;
+
+                var config;
+                if (network === 'signet') {
+                    // Mutinynet/Signet: ~30s blocks
+                    config = { min: 2, max: 40320, def: 2880, blockSecs: 30, label: 'signet ~30s blocks' };
+                } else if (network === 'bitcoin') {
+                    // Mainnet: ~10min blocks
+                    config = { min: 6, max: 2016, def: 144, blockSecs: 600, label: 'mainnet ~10min blocks' };
+                } else {
+                    // Regtest/Testnet: ~10min blocks (but often instant in regtest)
+                    config = { min: 1, max: 2016, def: 6, blockSecs: 600, label: network + ' ~10min blocks' };
+                }
+
+                input.min = config.min;
+                input.max = config.max;
+                input.value = config.def;
+                input.placeholder = config.def;
+
+                function updateHelp() {
+                    var val = parseInt(input.value) || config.def;
+                    var totalSecs = val * config.blockSecs;
+                    var hours = Math.floor(totalSecs / 3600);
+                    var mins = Math.floor((totalSecs % 3600) / 60);
+                    var timeStr = hours > 0 ? hours + 'h ' + mins + 'm' : mins + 'm';
+                    help.textContent = '~' + timeStr + ' (' + config.label + ', range: ' + config.min + '-' + config.max + ')';
+                }
+
+                input.addEventListener('input', updateHelp);
+                updateHelp();
+            })();
             "#))
         }
     }

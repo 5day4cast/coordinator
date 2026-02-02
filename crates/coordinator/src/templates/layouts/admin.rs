@@ -5,6 +5,7 @@ pub struct AdminPageConfig<'a> {
     pub api_base: &'a str,
     pub oracle_base: &'a str,
     pub esplora_url: &'a str,
+    pub network: &'a str,
 }
 
 pub fn admin_base(config: &AdminPageConfig, content: Markup) -> Markup {
@@ -34,7 +35,8 @@ pub fn admin_base(config: &AdminPageConfig, content: Markup) -> Markup {
             }
             body data-api-base=(config.api_base)
                  data-oracle-base=(config.oracle_base)
-                 data-esplora-url=(config.esplora_url) {
+                 data-esplora-url=(config.esplora_url)
+                 data-network=(config.network) {
                 script {
                     "const API_BASE = document.body.dataset.apiBase;
                      const ORACLE_BASE = document.body.dataset.oracleBase;

@@ -1194,7 +1194,10 @@ impl Coordinator {
             outcome_payouts,
             fee_rate,
             funding_value: Amount::from_sat(contract_amount_sats as u64),
-            relative_locktime_block_delta: self.relative_locktime_block_delta as u16,
+            relative_locktime_block_delta: competition
+                .event_submission
+                .relative_locktime_block_delta
+                .unwrap_or(self.relative_locktime_block_delta as u16),
         };
         competition.contract_parameters = Some(contract_params.clone());
 
@@ -1769,6 +1772,11 @@ impl Coordinator {
         );
 
         self.bitcoin.broadcast(&funding_transaction).await?;
+        info!(
+            "Competition {} funding tx broadcast: txid={}",
+            competition.id,
+            funding_transaction.compute_txid()
+        );
 
         if competition.funding_broadcasted_at.is_none() {
             competition.funding_broadcasted_at = Some(OffsetDateTime::now_utc());
@@ -1956,6 +1964,11 @@ impl Coordinator {
         competition.outcome_transaction = Some(outcome_tx.clone());
         if competition.outcome_broadcasted_at.is_none() {
             self.bitcoin.broadcast(&outcome_tx).await?;
+            info!(
+                "Competition {} outcome tx broadcast: txid={}",
+                competition.id,
+                outcome_tx.compute_txid()
+            );
             competition.outcome_broadcasted_at = Some(OffsetDateTime::now_utc());
             competition.errors = vec![];
 
@@ -1985,6 +1998,11 @@ impl Coordinator {
                 if competition.expiry_broadcasted_at.is_none() {
                     debug!("expiry_tx: {:?}", expiry_tx);
                     self.bitcoin.broadcast(&expiry_tx).await?;
+                    info!(
+                        "Competition {} expiry tx broadcast: txid={}",
+                        competition.id,
+                        expiry_tx.compute_txid()
+                    );
                     competition.expiry_broadcasted_at = Some(OffsetDateTime::now_utc())
                 };
 
@@ -2137,9 +2155,13 @@ impl Coordinator {
                 &winner_seckeys,
             )?;
 
-            debug!("Broadcasting unified close transaction");
             if competition.delta_broadcasted_at.is_none() {
                 self.bitcoin.broadcast(&close_tx).await?;
+                info!(
+                    "Competition {} unified close tx broadcast: txid={}",
+                    competition.id,
+                    close_tx.compute_txid()
+                );
                 competition.delta_broadcasted_at = Some(OffsetDateTime::now_utc());
             }
 
@@ -2151,6 +2173,77 @@ impl Coordinator {
                     .await?;
             }
         } else {
+            // Not all winners have been paid via lightning.
+            // We need the split TX so each winner has their own output to
+            // claim from (on-chain via split-win, or off-chain via lightning
+            // leading to split-close/split-sellback). Delta2 will later do
+            // split-reclaim for any winners still unpaid after 2*delta blocks.
+
+            // Broadcast the split TX if not already done.
+            // Use a paid winner's ticket preimage when available - easier to
+            // reason about which preimage was used. Fall back to any winner's
+            // preimage if no one has been paid yet.
+            if competition.delta_broadcasted_at.is_none() {
+                let (split_player_index, split_entry) = if !paid_winners.is_empty() {
+                    let &(idx, entry) = &paid_winners[0];
+                    (idx, entry)
+                } else {
+                    // No paid winners yet - find any winner's entry for the preimage
+                    winners
+                        .keys()
+                        .find_map(|&player_index| {
+                            entries
+                                .iter()
+                                .find(|entry| {
+                                    let Ok(pubkey) = Point::from_hex(&entry.ephemeral_pubkey)
+                                    else {
+                                        return false;
+                                    };
+                                    signed_contract
+                                        .params()
+                                        .players
+                                        .get(player_index)
+                                        .map(|player| player.pubkey == pubkey)
+                                        .unwrap_or(false)
+                                })
+                                .map(|entry| (player_index, entry))
+                        })
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "Competition {} has no winner entries to build split TX",
+                                competition.id
+                            )
+                        })?
+                };
+
+                let ticket = self
+                    .competition_store
+                    .get_ticket(split_entry.ticket_id)
+                    .await
+                    .map_err(|e| anyhow!("Failed to get ticket for split TX: {}", e))?;
+
+                let ticket_preimage =
+                    dlctix::hashlock::preimage_from_hex(&ticket.encrypted_preimage)
+                        .map_err(|e| anyhow!("Failed to decode ticket preimage: {}", e))?;
+
+                let win_cond = WinCondition {
+                    outcome,
+                    player_index: split_player_index,
+                };
+
+                let split_tx = signed_contract
+                    .signed_split_tx(&win_cond, ticket_preimage)
+                    .map_err(|e| anyhow!("Failed to build signed split TX: {}", e))?;
+
+                self.bitcoin.broadcast(&split_tx).await?;
+                info!(
+                    "Competition {} split tx broadcast: txid={}",
+                    competition.id,
+                    split_tx.compute_txid()
+                );
+                competition.delta_broadcasted_at = Some(OffsetDateTime::now_utc());
+            }
+
             // Handle individual cooperative closes for paid winners
             for (player_index, entry) in paid_winners {
                 // Skip if already processed
@@ -2188,21 +2281,19 @@ impl Coordinator {
                     winner_seckey,
                 )?;
 
-                debug!(
-                    "Broadcasting individual close transaction for player {}",
-                    player_index
+                self.bitcoin.broadcast(&close_tx).await?;
+                info!(
+                    "Competition {} split-close tx broadcast for player {}: txid={}",
+                    competition.id,
+                    player_index,
+                    close_tx.compute_txid()
                 );
-
-                if competition.delta_broadcasted_at.is_none() {
-                    self.bitcoin.broadcast(&close_tx).await?;
-                }
 
                 // Mark entry as closed
                 self.competition_store
                     .mark_entry_sellback_broadcast(entry.id, OffsetDateTime::now_utc())
                     .await?;
             }
-            competition.delta_broadcasted_at = Some(OffsetDateTime::now_utc());
         }
         competition.errors = vec![];
 
@@ -2280,7 +2371,9 @@ impl Coordinator {
         };
         let fee_rate = FeeRate::from_sat_per_vb_unchecked(rate_confirm_within_2_blocks);
 
-        // Get unpaid winners that haven't been reclaimed
+        // The split TX was broadcast during delta, so each winner has their
+        // own output. Use split-reclaim for unpaid winners who haven't been
+        // closed or reclaimed yet.
         for &player_index in winners.keys() {
             if let Some(entry) = entries.iter().find(|entry| {
                 let Ok(pubkey) = Point::from_hex(&entry.ephemeral_pubkey) else {
@@ -2292,8 +2385,11 @@ impl Coordinator {
                     false
                 }
             }) {
-                // Skip if already processed or if paid out
-                if entry.reclaimed_broadcasted_at.is_some() || entry.paid_out_at.is_some() {
+                // Skip if already processed, paid out, or already closed via delta
+                if entry.reclaimed_broadcasted_at.is_some()
+                    || entry.paid_out_at.is_some()
+                    || entry.sellback_broadcasted_at.is_some()
+                {
                     continue;
                 }
 
@@ -2323,20 +2419,20 @@ impl Coordinator {
                     self.private_key,
                 )?;
 
-                debug!(
-                    "Broadcasting reclaim transaction for player {}",
-                    player_index
+                self.bitcoin.broadcast(&reclaim_tx).await?;
+                info!(
+                    "Competition {} split-reclaim tx broadcast for player {}: txid={}",
+                    competition.id,
+                    player_index,
+                    reclaim_tx.compute_txid()
                 );
 
-                if competition.completed_at.is_none() {
-                    self.bitcoin.broadcast(&reclaim_tx).await?;
-                }
-                // Mark entry as reclaimed
                 self.competition_store
                     .mark_entry_reclaim_broadcast(entry.id, OffsetDateTime::now_utc())
                     .await?;
             }
         }
+
         competition.completed_at = Some(OffsetDateTime::now_utc());
         competition.errors = vec![];
 
