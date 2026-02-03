@@ -1986,4 +1986,45 @@ impl CompetitionStore {
             .fetch_optional(self.db_connection.read())
             .await
     }
+
+    /// Delete a competition and all related data (tickets, entries, payouts)
+    /// This should only be used for competitions that have not started (no paid entries)
+    pub async fn delete_competition(&self, competition_id: Uuid) -> Result<(), sqlx::Error> {
+        let id_str = competition_id.to_string();
+        self.db_connection
+            .execute_write(move |pool| async move {
+                // Delete payouts for entries in this competition
+                sqlx::query(
+                    "DELETE FROM payouts WHERE entry_id IN (SELECT id FROM entries WHERE event_id = ?)"
+                )
+                .bind(&id_str)
+                .execute(&pool)
+                .await?;
+
+                // Delete entries for this competition
+                sqlx::query("DELETE FROM entries WHERE event_id = ?")
+                    .bind(&id_str)
+                    .execute(&pool)
+                    .await?;
+
+                // Delete tickets for this competition
+                sqlx::query("DELETE FROM tickets WHERE event_id = ?")
+                    .bind(&id_str)
+                    .execute(&pool)
+                    .await?;
+
+                // Delete the competition itself
+                sqlx::query("DELETE FROM competitions WHERE id = ?")
+                    .bind(&id_str)
+                    .execute(&pool)
+                    .await?;
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
+    }
 }

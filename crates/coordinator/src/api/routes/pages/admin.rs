@@ -235,6 +235,18 @@ pub async fn admin_create_competition_handler(
         }
     };
 
+    // Validate at least 1 location is selected
+    if form.locations.is_empty() {
+        return Html(competition_error("At least 1 location must be selected").into_string());
+    }
+
+    // Validate number_of_values_per_entry is at least 1
+    if form.number_of_values_per_entry < 1 {
+        return Html(
+            competition_error("Number of values per entry must be at least 1").into_string(),
+        );
+    }
+
     // Calculate total pool
     let total_competition_pool = form.entry_fee * form.total_allowed_entries;
 
@@ -449,4 +461,43 @@ async fn fetch_outputs(state: &AppState) -> Result<Vec<WalletOutput>, anyhow::Er
             is_spent: o.is_spent,
         })
         .collect())
+}
+
+/// Form data for deleting a competition
+#[derive(Debug, Deserialize)]
+pub struct DeleteCompetitionForm {
+    pub competition_id: String,
+}
+
+/// Handle competition deletion from admin panel
+pub async fn admin_delete_competition_handler(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<DeleteCompetitionForm>,
+) -> Html<String> {
+    // Parse UUID
+    let competition_id = match uuid::Uuid::parse_str(&form.competition_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return Html(
+                crate::templates::admin::dashboard::competition_error(&format!(
+                    "Invalid competition ID: {}",
+                    e
+                ))
+                .into_string(),
+            )
+        }
+    };
+
+    match state.coordinator.delete_competition(competition_id).await {
+        Ok(()) => Html(
+            crate::templates::admin::dashboard::competition_success_message(&format!(
+                "Competition {} deleted successfully",
+                competition_id
+            ))
+            .into_string(),
+        ),
+        Err(e) => Html(
+            crate::templates::admin::dashboard::competition_error(&e.to_string()).into_string(),
+        ),
+    }
 }

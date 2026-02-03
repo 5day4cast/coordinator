@@ -253,6 +253,34 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
             }
         }
 
+            // Delete Competition section
+            div class="container mt-5" {
+                h6 class="subtitle" { "Delete Competition" }
+
+                div class="box" {
+                    form id="delete-competition-form"
+                         hx-post="/admin/api/competitions/delete"
+                         hx-target="#delete-notification"
+                         hx-swap="innerHTML"
+                         hx-confirm="Are you sure you want to delete this competition? This action cannot be undone." {
+
+                        div class="field has-addons" {
+                            div class="control is-expanded" {
+                                input class="input" type="text" name="competition_id"
+                                      placeholder="Competition ID (e.g., 019c21de-e786-7992-853e-c27238a61925)";
+                            }
+                            div class="control" {
+                                button class="button is-danger" type="submit" {
+                                    "Delete"
+                                }
+                            }
+                        }
+                        p class="help" { "Only competitions with no paid entries can be deleted." }
+                    }
+                    div id="delete-notification" class="mt-3" {}
+                }
+            }
+
         // Include location selector JavaScript
         script src="/ui/location_selector.js" {}
 
@@ -353,6 +381,17 @@ pub fn competition_error(message: &str) -> Markup {
             button class="delete"
                    onclick="this.parentElement.remove()" {}
             "Failed to create competition: " (message)
+        }
+    }
+}
+
+/// Success message notification fragment (generic)
+pub fn competition_success_message(message: &str) -> Markup {
+    html! {
+        div class="notification is-success" {
+            button class="delete"
+                   onclick="this.parentElement.remove()" {}
+            (message)
         }
     }
 }

@@ -1,16 +1,17 @@
 use crate::{
     api::routes::{
         add_event_entry, admin_competition_fragment, admin_create_competition_handler,
-        admin_fee_estimates_fragment, admin_page_handler, admin_send_bitcoin_handler,
-        admin_wallet_address_fragment, admin_wallet_balance_fragment, admin_wallet_fragment,
-        admin_wallet_outputs_fragment, change_password, competitions_fragment,
-        competitions_rows_fragment, create_competition, entries_fragment, entry_detail_fragment,
-        entry_form_fragment, forgot_password_challenge, forgot_password_reset,
-        get_aggregate_nonces, get_balance, get_competitions, get_contract_parameters, get_entries,
-        get_estimated_fee_rates, get_next_address, get_outputs, get_ticket_status, health,
-        leaderboard_fragment, leaderboard_rows_fragment, login, login_username, payouts_fragment,
-        public_page_handler, register, register_username, request_competition_ticket,
-        send_to_address, submit_final_signatures, submit_public_nonces, submit_ticket_payout,
+        admin_delete_competition_handler, admin_fee_estimates_fragment, admin_page_handler,
+        admin_send_bitcoin_handler, admin_wallet_address_fragment, admin_wallet_balance_fragment,
+        admin_wallet_fragment, admin_wallet_outputs_fragment, change_password,
+        competitions_fragment, competitions_rows_fragment, create_competition, entries_fragment,
+        entry_detail_fragment, entry_form_fragment, forgot_password_challenge,
+        forgot_password_reset, get_aggregate_nonces, get_balance, get_competitions,
+        get_contract_parameters, get_entries, get_estimated_fee_rates, get_next_address,
+        get_outputs, get_ticket_status, health, leaderboard_fragment, leaderboard_rows_fragment,
+        login, login_username, payouts_fragment, public_page_handler, register, register_username,
+        request_competition_ticket, send_to_address, submit_final_signatures, submit_public_nonces,
+        submit_ticket_payout,
     },
     config::Settings,
     domain::{
@@ -527,7 +528,11 @@ pub fn app(app_state: AppState, origins: Vec<String>) -> Router {
         .route("/wallet/fees", get(admin_fee_estimates_fragment))
         .route("/wallet/outputs", get(admin_wallet_outputs_fragment))
         .route("/wallet/send", post(admin_send_bitcoin_handler))
-        .route("/api/competitions", post(admin_create_competition_handler));
+        .route("/api/competitions", post(admin_create_competition_handler))
+        .route(
+            "/api/competitions/delete",
+            post(admin_delete_competition_handler),
+        );
 
     // HTMX public routes (some require JS bridge for auth)
     let htmx_routes = Router::new()

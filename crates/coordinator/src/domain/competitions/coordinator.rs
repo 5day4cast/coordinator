@@ -2973,6 +2973,33 @@ impl Coordinator {
             .await
     }
 
+    /// Delete a competition by ID. Only allowed if no entries have been paid.
+    pub async fn delete_competition(&self, competition_id: Uuid) -> Result<(), Error> {
+        // First check if competition exists and has no paid entries
+        let competition = self.get_competition(competition_id).await?;
+
+        if competition.total_paid_entries > 0 {
+            return Err(Error::BadRequest(format!(
+                "Cannot delete competition {} - it has {} paid entries",
+                competition_id, competition.total_paid_entries
+            )));
+        }
+
+        self.competition_store
+            .delete_competition(competition_id)
+            .await
+            .map_err(|e| {
+                error!(
+                    "failed to delete competition: competition_id {} {:?}",
+                    competition_id, e
+                );
+                Error::DbError(e)
+            })?;
+
+        info!("Deleted competition: {}", competition_id);
+        Ok(())
+    }
+
     pub async fn handle_invoice_accepted(
         &self,
         competition_id: Uuid,
