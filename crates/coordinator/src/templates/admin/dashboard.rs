@@ -136,7 +136,7 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
 
                     // Timing parameters
                     div class="box" {
-                        h3 class="subtitle is-5" { "Timing (UTC)" }
+                        h3 class="subtitle is-5" { "Timing (local)" }
                         div class="columns" {
                             div class="column" {
                                 div class="field" {
@@ -263,7 +263,9 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
                 var input = document.getElementById(name + '_input');
                 var hidden = document.getElementById(name + '_hidden');
                 if (input && hidden && input.value) {
-                    hidden.value = input.value + ':00Z';
+                    // datetime-local gives local time; convert to UTC via Date object
+                    var date = new Date(input.value);
+                    hidden.value = date.toISOString();
                 }
             }
             "#))
@@ -306,6 +308,27 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
 
                 input.addEventListener('input', updateHelp);
                 updateHelp();
+            })();
+            "#))
+        }
+
+        // Convert UTC default values in datetime-local inputs to browser local time
+        script {
+            (PreEscaped(r#"
+            (function() {
+                ['start_observation_date', 'end_observation_date', 'signing_date'].forEach(function(name) {
+                    var hidden = document.getElementById(name + '_hidden');
+                    var input = document.getElementById(name + '_input');
+                    if (hidden && input && hidden.value) {
+                        var date = new Date(hidden.value);
+                        var year = date.getFullYear();
+                        var month = String(date.getMonth() + 1).padStart(2, '0');
+                        var day = String(date.getDate()).padStart(2, '0');
+                        var hours = String(date.getHours()).padStart(2, '0');
+                        var minutes = String(date.getMinutes()).padStart(2, '0');
+                        input.value = year + '-' + month + '-' + day + 'T' + hours + ':' + minutes;
+                    }
+                });
             })();
             "#))
         }
