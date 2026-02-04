@@ -3,12 +3,14 @@ async function initApp() {
   window.setupModalCloseHandlers?.();
   window.setupNavbarBurger?.();
   window.setupThemeToggle?.();
+  window.setupPayoutModal?.();
 
   try {
     await window.initWasm();
 
     const body = document.body;
     const API_BASE = body.dataset.apiBase;
+    const ORACLE_BASE = body.dataset.oracleBase;
     const NETWORK = body.dataset.network;
 
     const authManager = new window.AuthManager(API_BASE, NETWORK);
@@ -17,6 +19,9 @@ async function initApp() {
     window.setupAuthModals(authManager);
     authManager.attachEventListeners();
     window.setupHtmxAuth?.();
+
+    // Initialize payouts functionality
+    window.initPayouts?.(API_BASE, ORACLE_BASE);
   } catch (error) {
     console.error("Failed to initialize WASM:", error);
     // Auth features won't work, but basic UI will still function

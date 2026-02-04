@@ -189,3 +189,127 @@ class Payouts {
 }
 
 window.Payouts = Payouts;
+
+// Global payout state for the modal
+let currentPayoutData = null;
+let payoutsInstance = null;
+
+/**
+ * Initialize payouts instance
+ */
+function initPayouts(coordinatorUrl, oracleUrl) {
+  payoutsInstance = new Payouts(coordinatorUrl, oracleUrl);
+}
+
+/**
+ * Open the payout modal when user clicks "Submit Invoice" button
+ */
+function openPayoutModal(button) {
+  const entryId = button.dataset.entryId;
+  const competitionId = button.dataset.competitionId;
+  const payoutAmount = parseInt(button.dataset.payoutAmount, 10);
+
+  currentPayoutData = {
+    entryId,
+    competitionId,
+    payoutAmount,
+  };
+
+  // Clear previous state
+  const invoiceInput = document.getElementById("lightningInvoice");
+  const errorDiv = document.getElementById("payoutModalError");
+  if (invoiceInput) invoiceInput.value = "";
+  if (errorDiv) {
+    errorDiv.textContent = "";
+    errorDiv.classList.add("hidden");
+  }
+
+  // Open modal
+  const modal = document.getElementById("payoutModal");
+  window.openModal(modal);
+}
+
+/**
+ * Handle payout invoice submission
+ */
+async function submitPayoutInvoice() {
+  const errorDiv = document.getElementById("payoutModalError");
+  const submitBtn = document.getElementById("submitPayoutInvoice");
+  const invoice = document.getElementById("lightningInvoice")?.value?.trim();
+
+  if (!invoice) {
+    errorDiv.textContent = "Please enter a Lightning invoice";
+    errorDiv.classList.remove("hidden");
+    return;
+  }
+
+  if (!currentPayoutData || !payoutsInstance) {
+    errorDiv.textContent = "Payout data not available. Please try again.";
+    errorDiv.classList.remove("hidden");
+    return;
+  }
+
+  submitBtn.disabled = true;
+  submitBtn.classList.add("is-loading");
+  errorDiv.classList.add("hidden");
+
+  try {
+    // Get payable entries to find the entry details
+    const payableEntries = await payoutsInstance.getPayableEntries();
+    const payableEntry = payableEntries.find(
+      (p) => p.entry.id === currentPayoutData.entryId,
+    );
+
+    if (!payableEntry) {
+      throw new Error("Entry not found or no longer eligible for payout");
+    }
+
+    await payoutsInstance.submitPayout(
+      currentPayoutData.competitionId,
+      currentPayoutData.entryId,
+      payableEntry.entry.ticket_id,
+      payableEntry.entryIndex,
+      payableEntry.entry.payout_preimage_encrypted,
+      invoice,
+      currentPayoutData.payoutAmount,
+    );
+
+    // Success - close modal and refresh the page
+    window.closeModal(document.getElementById("payoutModal"));
+
+    // Reload the payouts page to reflect the updated status
+    const payoutsLink = document.querySelector('[hx-get="/payouts"]');
+    if (payoutsLink) {
+      payoutsLink.click();
+    } else {
+      window.location.reload();
+    }
+  } catch (error) {
+    console.error("Payout submission failed:", error);
+    errorDiv.textContent = error.message || "Failed to submit payout";
+    errorDiv.classList.remove("hidden");
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.classList.remove("is-loading");
+  }
+}
+
+/**
+ * Set up payout modal event listeners
+ */
+function setupPayoutModal() {
+  document
+    .getElementById("submitPayoutInvoice")
+    ?.addEventListener("click", submitPayoutInvoice);
+
+  document
+    .getElementById("cancelPayoutModal")
+    ?.addEventListener("click", () => {
+      window.closeModal(document.getElementById("payoutModal"));
+    });
+}
+
+window.initPayouts = initPayouts;
+window.openPayoutModal = openPayoutModal;
+window.submitPayoutInvoice = submitPayoutInvoice;
+window.setupPayoutModal = setupPayoutModal;
