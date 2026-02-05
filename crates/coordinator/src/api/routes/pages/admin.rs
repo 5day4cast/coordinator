@@ -5,7 +5,7 @@ use axum_extra::extract::Form;
 use log::error;
 use maud::Markup;
 use serde::Deserialize;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
 use uuid::Uuid;
 
 use crate::{
@@ -209,7 +209,7 @@ pub async fn admin_create_competition_handler(
         &form.signing_date,
         &time::format_description::well_known::Rfc3339,
     ) {
-        Ok(dt) => dt,
+        Ok(dt) => dt.to_offset(UtcOffset::UTC),
         Err(e) => {
             return Html(competition_error(&format!("Invalid signing date: {}", e)).into_string())
         }
@@ -219,7 +219,7 @@ pub async fn admin_create_competition_handler(
         &form.start_observation_date,
         &time::format_description::well_known::Rfc3339,
     ) {
-        Ok(dt) => dt,
+        Ok(dt) => dt.to_offset(UtcOffset::UTC),
         Err(e) => {
             return Html(competition_error(&format!("Invalid start date: {}", e)).into_string())
         }
@@ -229,7 +229,7 @@ pub async fn admin_create_competition_handler(
         &form.end_observation_date,
         &time::format_description::well_known::Rfc3339,
     ) {
-        Ok(dt) => dt,
+        Ok(dt) => dt.to_offset(UtcOffset::UTC),
         Err(e) => {
             return Html(competition_error(&format!("Invalid end date: {}", e)).into_string())
         }

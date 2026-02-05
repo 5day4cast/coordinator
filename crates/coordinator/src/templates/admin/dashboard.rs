@@ -5,17 +5,6 @@ use uuid::Uuid;
 
 use super::location_selector::location_selector;
 
-/// Format an OffsetDateTime as a datetime-local input value (YYYY-MM-DDTHH:MM)
-fn format_datetime_local(dt: &OffsetDateTime) -> String {
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}",
-        dt.year(),
-        dt.month() as u8,
-        dt.day(),
-        dt.hour(),
-        dt.minute(),
-    )
-}
 
 /// Station data from the oracle
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,7 +133,7 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
                                     div class="control" {
                                         input class="input" type="datetime-local"
                                               id="start_observation_date_input"
-                                              value=(format_datetime_local(&defaults.start_observation_date))
+                                              
                                               onchange="syncDateField('start_observation_date')";
                                     }
                                 }
@@ -155,7 +144,7 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
                                     div class="control" {
                                         input class="input" type="datetime-local"
                                               id="end_observation_date_input"
-                                              value=(format_datetime_local(&defaults.end_observation_date))
+                                              
                                               onchange="syncDateField('end_observation_date')";
                                     }
                                 }
@@ -166,7 +155,7 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
                                     div class="control" {
                                         input class="input" type="datetime-local"
                                               id="signing_date_input"
-                                              value=(format_datetime_local(&defaults.signing_date))
+                                              
                                               onchange="syncDateField('signing_date')";
                                     }
                                 }
