@@ -4,5 +4,5 @@ helm:
     value: ghcr.io/5day4cast/coordinator
     forcestring: true
   - name: image.tag
-    value: 1.18.22
+    value: 1.18.23
     forcestring: true
