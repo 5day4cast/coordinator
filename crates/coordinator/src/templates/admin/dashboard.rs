@@ -5,7 +5,6 @@ use uuid::Uuid;
 
 use super::location_selector::location_selector;
 
-
 /// Station data from the oracle
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Station {
@@ -133,7 +132,7 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
                                     div class="control" {
                                         input class="input" type="datetime-local"
                                               id="start_observation_date_input"
-                                              
+
                                               onchange="syncDateField('start_observation_date')";
                                     }
                                 }
@@ -144,7 +143,7 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
                                     div class="control" {
                                         input class="input" type="datetime-local"
                                               id="end_observation_date_input"
-                                              
+
                                               onchange="syncDateField('end_observation_date')";
                                     }
                                 }
@@ -155,7 +154,7 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
                                     div class="control" {
                                         input class="input" type="datetime-local"
                                               id="signing_date_input"
-                                              
+
                                               onchange="syncDateField('signing_date')";
                                     }
                                 }
