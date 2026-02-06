@@ -2116,7 +2116,67 @@ impl Coordinator {
             })
             .collect();
 
+        info!(
+            "Competition {} delta check: outcome={:?}, winners={}, paid_winners={}, entries={}",
+            competition.id,
+            outcome,
+            winners.len(),
+            paid_winners.len(),
+            entries.len()
+        );
+        for (player_index, entry) in &paid_winners {
+            info!(
+                "Competition {} paid_winner: player_index={}, entry_id={}, paid_out_at={:?}, ephemeral_privatekey={}, sellback_broadcasted_at={:?}",
+                competition.id,
+                player_index,
+                entry.id,
+                entry.paid_out_at,
+                entry.ephemeral_privatekey.is_some(),
+                entry.sellback_broadcasted_at
+            );
+        }
+
         if paid_winners.len() != winners.len() {
+            info!(
+                "Competition {} not all winners paid: paid_winners={}, winners={}, blocks_since_outcome={}, required_2x_delta={}",
+                competition.id,
+                paid_winners.len(),
+                winners.len(),
+                blocks_since_outcome,
+                2 * required_delta
+            );
+            // Log which winners are missing
+            for (&player_index, _) in winners.iter() {
+                let found_entry = entries.iter().find(|entry| {
+                    let Ok(pubkey) = Point::from_hex(&entry.ephemeral_pubkey) else {
+                        return false;
+                    };
+                    signed_contract
+                        .params()
+                        .players
+                        .get(player_index)
+                        .map(|player| player.pubkey == pubkey)
+                        .unwrap_or(false)
+                });
+                if let Some(entry) = found_entry {
+                    let is_paid_winner = paid_winners.iter().any(|(idx, _)| *idx == player_index);
+                    info!(
+                        "Competition {} winner player_index={}: entry_id={}, paid_out_at={:?}, ephemeral_privatekey={}, sellback_broadcasted_at={:?}, in_paid_winners={}",
+                        competition.id,
+                        player_index,
+                        entry.id,
+                        entry.paid_out_at,
+                        entry.ephemeral_privatekey.is_some(),
+                        entry.sellback_broadcasted_at,
+                        is_paid_winner
+                    );
+                } else {
+                    info!(
+                        "Competition {} winner player_index={}: NO MATCHING ENTRY FOUND",
+                        competition.id, player_index
+                    );
+                }
+            }
             // Technically we are good to broadcast the first delta transaction
             // once blocks_since_outcome < required_delta, we add this wait to
             // give users more time to be paid out via lightning
@@ -2130,6 +2190,11 @@ impl Coordinator {
         }
 
         if paid_winners.len() == winners.len() {
+            info!(
+                "Competition {} taking UNIFIED CLOSE path: all {} winners paid",
+                competition.id,
+                paid_winners.len()
+            );
             // All winners have paid out and none have had sellback broadcast - do unified close
             let (close_tx_input, close_tx_prevout) =
                 signed_contract.outcome_close_tx_input_and_prevout(&outcome)?;
@@ -2151,6 +2216,13 @@ impl Coordinator {
                 })
                 .collect();
 
+            info!(
+                "Competition {} unified close: winner_seckeys_count={}, close_tx_prevout_value={}",
+                competition.id,
+                winner_seckeys.len(),
+                close_tx_prevout.value
+            );
+
             let input_index = close_tx_input.previous_output.vout as usize;
 
             signed_contract.sign_outcome_close_tx_input(
@@ -2163,6 +2235,10 @@ impl Coordinator {
             )?;
 
             if competition.delta_broadcasted_at.is_none() {
+                info!(
+                    "Competition {} broadcasting unified close tx",
+                    competition.id
+                );
                 self.bitcoin.broadcast(&close_tx).await?;
                 info!(
                     "Competition {} unified close tx broadcast: txid={}",
@@ -2170,6 +2246,11 @@ impl Coordinator {
                     close_tx.compute_txid()
                 );
                 competition.delta_broadcasted_at = Some(OffsetDateTime::now_utc());
+            } else {
+                info!(
+                    "Competition {} unified close already broadcast, skipping",
+                    competition.id
+                );
             }
 
             // Mark all entries as closed
@@ -2180,6 +2261,12 @@ impl Coordinator {
                     .await?;
             }
         } else {
+            info!(
+                "Competition {} taking SPLIT TX path: paid_winners={}, winners={}",
+                competition.id,
+                paid_winners.len(),
+                winners.len()
+            );
             // Not all winners have been paid via lightning.
             // We need the split TX so each winner has their own output to
             // claim from (on-chain via split-win, or off-chain via lightning
@@ -2192,9 +2279,17 @@ impl Coordinator {
             // preimage if no one has been paid yet.
             if competition.delta_broadcasted_at.is_none() {
                 let (split_player_index, split_entry) = if !paid_winners.is_empty() {
+                    info!(
+                        "Competition {} using paid winner for split TX preimage",
+                        competition.id
+                    );
                     let &(idx, entry) = &paid_winners[0];
                     (idx, entry)
                 } else {
+                    info!(
+                        "Competition {} no paid winners, finding any winner entry for split TX preimage",
+                        competition.id
+                    );
                     // No paid winners yet - find any winner's entry for the preimage
                     winners
                         .keys()
@@ -2223,6 +2318,14 @@ impl Coordinator {
                         })?
                 };
 
+                info!(
+                    "Competition {} building split TX: split_player_index={}, split_entry_id={}, ticket_id={}",
+                    competition.id,
+                    split_player_index,
+                    split_entry.id,
+                    split_entry.ticket_id
+                );
+
                 let ticket = self
                     .competition_store
                     .get_ticket(split_entry.ticket_id)
@@ -2238,6 +2341,11 @@ impl Coordinator {
                     player_index: split_player_index,
                 };
 
+                info!(
+                    "Competition {} signing split TX: outcome={:?}, player_index={}",
+                    competition.id, win_cond.outcome, win_cond.player_index
+                );
+
                 let split_tx = signed_contract
                     .signed_split_tx(&win_cond, ticket_preimage)
                     .map_err(|e| anyhow!("Failed to build signed split TX: {}", e))?;
@@ -2249,14 +2357,28 @@ impl Coordinator {
                     split_tx.compute_txid()
                 );
                 competition.delta_broadcasted_at = Some(OffsetDateTime::now_utc());
+            } else {
+                info!(
+                    "Competition {} split TX already broadcast, processing individual closes",
+                    competition.id
+                );
             }
 
             // Handle individual cooperative closes for paid winners
             for (player_index, entry) in paid_winners {
                 // Skip if already processed
                 if entry.sellback_broadcasted_at.is_some() {
+                    info!(
+                        "Competition {} skipping already-closed entry {} for player {}",
+                        competition.id, entry.id, player_index
+                    );
                     continue;
                 }
+
+                info!(
+                    "Competition {} broadcasting split-close for player {}, entry {}",
+                    competition.id, player_index, entry.id
+                );
 
                 let win_condition = WinCondition {
                     outcome,
