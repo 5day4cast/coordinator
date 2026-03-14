@@ -49,3 +49,8 @@ config:
       - "KORD"
     entryFee: 1000
     observationWindowSecs: 300
+
+# Metrics - ServiceMonitor requires CRD on target cluster
+metrics:
+  serviceMonitor:
+    enabled: false
