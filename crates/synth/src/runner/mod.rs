@@ -91,13 +91,17 @@ impl Runner {
     }
 
     /// Start the scheduled runner loop
-    pub async fn run_scheduled(&self, interval_secs: u64, scenario: &str) {
+    pub async fn run_scheduled(
+        &self,
+        interval_secs: u64,
+        scenario: &str,
+        config: ScenarioConfig,
+    ) {
         info!(
             "Starting scheduled runner: '{}' every {}s",
             scenario, interval_secs
         );
 
-        let config = ScenarioConfig::default();
         loop {
             if let Err(e) = self.run_scenario(scenario, config.clone()).await {
                 error!("Scheduled run failed: {:?}", e);

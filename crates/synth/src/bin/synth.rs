@@ -2,6 +2,7 @@ use coordinator_synth::client::CoordinatorClient;
 use coordinator_synth::config::load_config;
 use coordinator_synth::db::SynthDb;
 use coordinator_synth::runner::Runner;
+use coordinator_synth::scenarios::ScenarioConfig;
 use coordinator_synth::server;
 use log::info;
 
@@ -28,8 +29,17 @@ async fn main() -> anyhow::Result<()> {
         let scheduler_runner = runner.clone();
         let interval = config.scheduler.interval_secs;
         let scenario = config.scheduler.scenario.clone();
+        let scenario_config = ScenarioConfig {
+            users: config.defaults.users,
+            stations: config.defaults.stations.clone(),
+            entry_fee: config.defaults.entry_fee,
+            observation_window_secs: config.defaults.observation_window_secs,
+            ..ScenarioConfig::default()
+        };
         tokio::spawn(async move {
-            scheduler_runner.run_scheduled(interval, &scenario).await;
+            scheduler_runner
+                .run_scheduled(interval, &scenario, scenario_config)
+                .await;
         });
     }
 

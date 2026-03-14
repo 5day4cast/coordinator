@@ -137,11 +137,14 @@ async fn create_competition(client: &CoordinatorClient, config: &ScenarioConfig)
     let now = OffsetDateTime::now_utc();
     let observation_window = time::Duration::seconds(config.observation_window_secs as i64);
 
+    // start_observation_date must be far enough in the future for ticket purchases
+    // (coordinator requires start_observation_date - 1min > now for ticket expiry)
+    let entry_window = time::Duration::seconds(120);
     let competition = CreateCompetition {
         id: Uuid::now_v7(),
-        signing_date: now + observation_window + time::Duration::seconds(60),
-        start_observation_date: now,
-        end_observation_date: now + observation_window,
+        signing_date: now + entry_window + observation_window + time::Duration::seconds(60),
+        start_observation_date: now + entry_window,
+        end_observation_date: now + entry_window + observation_window,
         locations: config.stations.clone(),
         number_of_values_per_entry: config.stations.len() * 3,
         number_of_places_win: 1.min(config.users),
