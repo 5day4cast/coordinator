@@ -359,7 +359,7 @@ where
         }
         Err(e) => {
             let duration = start.elapsed().as_millis() as i64;
-            error!("Step '{}' failed: {}", name, e);
+            error!("Step '{}' failed: {:?}", name, e);
             Err(StepResult {
                 name: name.to_string(),
                 status: StepStatus::Failed,

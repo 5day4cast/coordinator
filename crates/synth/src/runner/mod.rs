@@ -100,7 +100,7 @@ impl Runner {
         let config = ScenarioConfig::default();
         loop {
             if let Err(e) = self.run_scenario(scenario, config.clone()).await {
-                error!("Scheduled run failed: {}", e);
+                error!("Scheduled run failed: {:?}", e);
             }
             tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
         }
