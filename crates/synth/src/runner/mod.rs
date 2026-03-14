@@ -91,12 +91,7 @@ impl Runner {
     }
 
     /// Start the scheduled runner loop
-    pub async fn run_scheduled(
-        &self,
-        interval_secs: u64,
-        scenario: &str,
-        config: ScenarioConfig,
-    ) {
+    pub async fn run_scheduled(&self, interval_secs: u64, scenario: &str, config: ScenarioConfig) {
         info!(
             "Starting scheduled runner: '{}' every {}s",
             scenario, interval_secs
