@@ -208,6 +208,27 @@ async fn enter_competition(
 
     info!("  {} invoice settled", user.name);
 
+    // Wait for ticket payment to propagate (SQLite WAL read/write pool sync)
+    let mut retries = 0;
+    loop {
+        let status = client
+            .check_ticket_status(&user.nostr_keys, competition_id, &ticket.ticket_id)
+            .await
+            .context("Failed to check ticket status")?;
+        if status.status == "Paid" || status.status == "Settled" {
+            break;
+        }
+        retries += 1;
+        if retries > 10 {
+            anyhow::bail!(
+                "Ticket {} still not paid after settle (status: {})",
+                ticket.ticket_id,
+                status.status
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
     // Generate payout preimage/hash
     let (payout_preimage, payout_hash) =
         crypto::payout::generate_payout_pair(&ephemeral.secret_bytes);
