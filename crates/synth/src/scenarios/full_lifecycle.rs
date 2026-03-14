@@ -1,5 +1,5 @@
 use crate::client::competitions::CreateCompetition;
-use crate::client::entries::{AddEntry, ValueOption, WeatherChoices};
+use crate::client::entries::{AddEntry, TicketStatus, ValueOption, WeatherChoices};
 use crate::client::CoordinatorClient;
 use crate::crypto;
 use crate::crypto::keys::SynthUser;
@@ -215,15 +215,15 @@ async fn enter_competition(
             .check_ticket_status(&user.nostr_keys, competition_id, &ticket.ticket_id)
             .await
             .context("Failed to check ticket status")?;
-        if status.status == "Paid" || status.status == "Settled" {
+        if status == TicketStatus::Paid || status == TicketStatus::Settled {
             break;
         }
         retries += 1;
         if retries > 10 {
             anyhow::bail!(
-                "Ticket {} still not paid after settle (status: {})",
+                "Ticket {} still not paid after settle (status: {:?})",
                 ticket.ticket_id,
-                status.status
+                status
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;

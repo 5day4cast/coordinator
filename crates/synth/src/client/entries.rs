@@ -78,10 +78,16 @@ pub struct EntryResponse {
     pub paid_out_at: Option<OffsetDateTime>,
 }
 
-/// Ticket status check response
-#[derive(Debug, Clone)]
-pub struct TicketStatusResponse {
-    pub status: String,
+/// Ticket status from the coordinator API
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub enum TicketStatus {
+    Created,
+    Reserved,
+    Paid,
+    Settled,
+    Used,
+    Expired,
+    Cancelled,
 }
 
 impl CoordinatorClient {
@@ -128,7 +134,7 @@ impl CoordinatorClient {
         keys: &Keys,
         competition_id: &Uuid,
         ticket_id: &Uuid,
-    ) -> Result<TicketStatusResponse> {
+    ) -> Result<TicketStatus> {
         let url = format!(
             "{}/api/v1/competitions/{}/tickets/{}/status",
             self.base_url(),
@@ -152,11 +158,9 @@ impl CoordinatorClient {
             anyhow::bail!("Check ticket status failed ({}): {}", status, body);
         }
 
-        let status: String = resp
-            .json()
+        resp.json()
             .await
-            .context("Failed to parse ticket status response")?;
-        Ok(TicketStatusResponse { status })
+            .context("Failed to parse ticket status response")
     }
 
     /// Submit an entry (requires Nostr auth)
