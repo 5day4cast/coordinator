@@ -1,5 +1,7 @@
 use axum::{response::IntoResponse, routing::get, Router};
-use prometheus::{Encoder, TextEncoder, register_counter_vec, register_gauge, register_histogram_vec};
+use prometheus::{
+    register_counter_vec, register_gauge, register_histogram_vec, Encoder, TextEncoder,
+};
 
 lazy_static::lazy_static! {
     pub static ref SCENARIO_RUNS: prometheus::CounterVec = register_counter_vec!(
@@ -56,9 +58,7 @@ pub fn record_scenario(
     steps: &[(String, i64)], // (step_name, duration_ms)
 ) {
     let status = if passed { "passed" } else { "failed" };
-    SCENARIO_RUNS
-        .with_label_values(&[scenario, status])
-        .inc();
+    SCENARIO_RUNS.with_label_values(&[scenario, status]).inc();
     SCENARIO_DURATION
         .with_label_values(&[scenario])
         .observe(duration_ms as f64 / 1000.0);

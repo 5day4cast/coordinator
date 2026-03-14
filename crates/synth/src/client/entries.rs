@@ -1,5 +1,5 @@
-use super::CoordinatorClient;
 use super::auth::create_auth_header;
+use super::CoordinatorClient;
 use anyhow::{Context, Result};
 use nostr_sdk::Keys;
 use serde::{Deserialize, Serialize};
@@ -158,11 +158,7 @@ impl CoordinatorClient {
     }
 
     /// Submit an entry (requires Nostr auth)
-    pub async fn submit_entry(
-        &self,
-        keys: &Keys,
-        entry: &AddEntry,
-    ) -> Result<EntryResponse> {
+    pub async fn submit_entry(&self, keys: &Keys, entry: &AddEntry) -> Result<EntryResponse> {
         let url = format!("{}/api/v1/entries", self.base_url());
 
         let auth = create_auth_header(keys, "POST", &url, Some(entry)).await?;
@@ -212,6 +208,8 @@ impl CoordinatorClient {
             anyhow::bail!("List entries failed ({}): {}", status, body);
         }
 
-        resp.json().await.context("Failed to parse entries response")
+        resp.json()
+            .await
+            .context("Failed to parse entries response")
     }
 }

@@ -1,6 +1,6 @@
+use crate::client::competitions::CreateCompetition;
 use crate::client::entries::{AddEntry, ValueOption, WeatherChoices};
 use crate::client::CoordinatorClient;
-use crate::client::competitions::CreateCompetition;
 use crate::crypto;
 use crate::crypto::keys::SynthUser;
 use crate::db::SynthDb;
@@ -133,10 +133,7 @@ pub async fn run_full_lifecycle(
     finish_result("full_lifecycle", started_at, scenario_start, steps, false)
 }
 
-async fn create_competition(
-    client: &CoordinatorClient,
-    config: &ScenarioConfig,
-) -> Result<Uuid> {
+async fn create_competition(client: &CoordinatorClient, config: &ScenarioConfig) -> Result<Uuid> {
     let now = OffsetDateTime::now_utc();
     let observation_window = time::Duration::seconds(config.observation_window_secs as i64);
 
@@ -159,7 +156,9 @@ async fn create_competition(
 }
 
 async fn load_users(db: &SynthDb, count: usize) -> Result<Vec<SynthUser>> {
-    let names = ["alice", "bob", "charlie", "dave", "eve", "frank", "grace", "heidi"];
+    let names = [
+        "alice", "bob", "charlie", "dave", "eve", "frank", "grace", "heidi",
+    ];
     let mut users = Vec::new();
 
     for i in 0..count {
@@ -207,19 +206,25 @@ async fn enter_competition(
     info!("  {} invoice settled", user.name);
 
     // Generate payout preimage/hash
-    let (payout_preimage, payout_hash) = crypto::payout::generate_payout_pair(&ephemeral.secret_bytes);
+    let (payout_preimage, payout_hash) =
+        crypto::payout::generate_payout_pair(&ephemeral.secret_bytes);
 
     // Encrypt ephemeral private key and payout preimage to user's nostr key
-    let ephemeral_encrypted = user.nip44_encrypt_to_self(&ephemeral.private_key_hex).await?;
+    let ephemeral_encrypted = user
+        .nip44_encrypt_to_self(&ephemeral.private_key_hex)
+        .await?;
     let preimage_encrypted = user.nip44_encrypt_to_self(&payout_preimage).await?;
 
     // Prepare keymeld data if session info is available
     let (encrypted_keymeld_key, keymeld_auth_pubkey) =
-        if let (Some(session_id), Some(enclave_pubkey)) =
-            (&ticket.keymeld_session_id, &ticket.keymeld_enclave_public_key)
-        {
-            let encrypted = crypto::keymeld::encrypt_for_enclave(&ephemeral.private_key_hex, enclave_pubkey)?;
-            let auth_pubkey = crypto::keymeld::derive_auth_pubkey(&ephemeral.private_key_hex, session_id)?;
+        if let (Some(session_id), Some(enclave_pubkey)) = (
+            &ticket.keymeld_session_id,
+            &ticket.keymeld_enclave_public_key,
+        ) {
+            let encrypted =
+                crypto::keymeld::encrypt_for_enclave(&ephemeral.private_key_hex, enclave_pubkey)?;
+            let auth_pubkey =
+                crypto::keymeld::derive_auth_pubkey(&ephemeral.private_key_hex, session_id)?;
             (Some(encrypted), Some(auth_pubkey))
         } else {
             (None, None)

@@ -109,8 +109,14 @@ pub fn load_config(path: Option<&str>) -> anyhow::Result<SynthConfig> {
 
     let builder = builder
         .add_source(config::Environment::with_prefix("SYNTH").separator("__"))
-        .set_default("coordinator.url", "http://coordinator.coordinator.svc.cluster.local:9990")?
-        .set_default("oracle.url", "http://noaa-oracle.noaa-oracle.svc.cluster.local:9800")?
+        .set_default(
+            "coordinator.url",
+            "http://coordinator.coordinator.svc.cluster.local:9990",
+        )?
+        .set_default(
+            "oracle.url",
+            "http://noaa-oracle.noaa-oracle.svc.cluster.local:9800",
+        )?
         .set_default("server.host", "0.0.0.0")?
         .set_default("server.port", 9980)?
         .set_default("db.path", "./data/synth.db")?

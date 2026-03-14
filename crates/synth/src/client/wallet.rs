@@ -32,7 +32,9 @@ impl CoordinatorClient {
             anyhow::bail!("Get wallet balance failed ({}): {}", status, body);
         }
 
-        resp.json().await.context("Failed to parse balance response")
+        resp.json()
+            .await
+            .context("Failed to parse balance response")
     }
 
     /// Get a new wallet address
@@ -51,6 +53,8 @@ impl CoordinatorClient {
             anyhow::bail!("Get wallet address failed ({}): {}", status, body);
         }
 
-        resp.json().await.context("Failed to parse address response")
+        resp.json()
+            .await
+            .context("Failed to parse address response")
     }
 }

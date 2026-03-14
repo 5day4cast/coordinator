@@ -44,8 +44,7 @@ impl SynthDb {
     pub async fn new(path: &str) -> Result<Self> {
         // Ensure parent directory exists
         if let Some(parent) = std::path::Path::new(path).parent() {
-            std::fs::create_dir_all(parent)
-                .context("Failed to create database directory")?;
+            std::fs::create_dir_all(parent).context("Failed to create database directory")?;
         }
 
         let url = format!("sqlite:{}?mode=rwc", path);
@@ -115,8 +114,8 @@ impl SynthDb {
 
     pub async fn create_run(&self, scenario: &str, config_json: Option<&str>) -> Result<String> {
         let id = Uuid::now_v7().to_string();
-        let now = OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)?;
+        let now =
+            OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
 
         sqlx::query(
             "INSERT INTO test_runs (id, scenario, status, started_at, config_json) VALUES (?, ?, 'running', ?, ?)",
@@ -132,8 +131,8 @@ impl SynthDb {
     }
 
     pub async fn complete_run(&self, id: &str, error: Option<&str>) -> Result<()> {
-        let now = OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)?;
+        let now =
+            OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
         let status = if error.is_some() { "failed" } else { "passed" };
 
         sqlx::query(
@@ -173,8 +172,8 @@ impl SynthDb {
 
     pub async fn create_step(&self, run_id: &str, step_name: &str) -> Result<String> {
         let id = Uuid::now_v7().to_string();
-        let now = OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)?;
+        let now =
+            OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
 
         sqlx::query(
             "INSERT INTO test_steps (id, run_id, step_name, status, started_at) VALUES (?, ?, ?, 'running', ?)",
@@ -196,8 +195,8 @@ impl SynthDb {
         error: Option<&str>,
         details_json: Option<&str>,
     ) -> Result<()> {
-        let now = OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)?;
+        let now =
+            OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
         let status = if error.is_some() { "failed" } else { "passed" };
 
         sqlx::query(
@@ -227,17 +226,13 @@ impl SynthDb {
 
     // --- Synth Users ---
 
-    pub async fn get_or_create_user(
-        &self,
-        name: &str,
-    ) -> Result<SynthUserRecord> {
+    pub async fn get_or_create_user(&self, name: &str) -> Result<SynthUserRecord> {
         // Try to find existing user
-        if let Some(user) = sqlx::query_as::<_, SynthUserRecord>(
-            "SELECT * FROM synth_users WHERE name = ?",
-        )
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?
+        if let Some(user) =
+            sqlx::query_as::<_, SynthUserRecord>("SELECT * FROM synth_users WHERE name = ?")
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?
         {
             return Ok(user);
         }
@@ -245,16 +240,16 @@ impl SynthDb {
         // Create new user
         let user = crate::crypto::keys::SynthUser::new_random(name)?;
         let id = Uuid::now_v7().to_string();
-        let now = OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)?;
+        let now =
+            OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
 
         sqlx::query(
             "INSERT INTO synth_users (id, name, nostr_secret_key, nostr_pubkey, created_at) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(name)
-        .bind(&user.nostr_secret_key_hex())
-        .bind(&user.nostr_pubkey_hex())
+        .bind(user.nostr_secret_key_hex())
+        .bind(user.nostr_pubkey_hex())
         .bind(&now)
         .execute(&self.pool)
         .await?;
@@ -269,10 +264,9 @@ impl SynthDb {
     }
 
     pub async fn list_users(&self) -> Result<Vec<SynthUserRecord>> {
-        let users =
-            sqlx::query_as::<_, SynthUserRecord>("SELECT * FROM synth_users ORDER BY name")
-                .fetch_all(&self.pool)
-                .await?;
+        let users = sqlx::query_as::<_, SynthUserRecord>("SELECT * FROM synth_users ORDER BY name")
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok(users)
     }

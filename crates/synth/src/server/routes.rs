@@ -119,7 +119,9 @@ async fn trigger_run(
     State(runner): State<Runner>,
     Query(params): Query<RunParams>,
 ) -> impl IntoResponse {
-    let scenario = params.scenario.unwrap_or_else(|| "full_lifecycle".to_string());
+    let scenario = params
+        .scenario
+        .unwrap_or_else(|| "full_lifecycle".to_string());
     let mut config = ScenarioConfig::default();
     if let Some(users) = params.users {
         config.users = users;

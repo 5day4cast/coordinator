@@ -1,7 +1,9 @@
+#![allow(clippy::print_literal)]
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use coordinator_synth::client::CoordinatorClient;
 use coordinator_synth::client::competitions::CreateCompetition;
+use coordinator_synth::client::CoordinatorClient;
 use coordinator_synth::db::SynthDb;
 use coordinator_synth::runner::Runner;
 use coordinator_synth::scenarios::ScenarioConfig;
@@ -121,7 +123,10 @@ async fn main() -> Result<()> {
                     println!("No competitions found");
                     return Ok(());
                 }
-                println!("{:<38} {:<22} {:<8} {:<8}", "ID", "STATUS", "ENTRIES", "PAID");
+                println!(
+                    "{:<38} {:<22} {:<8} {:<8}",
+                    "ID", "STATUS", "ENTRIES", "PAID"
+                );
                 println!("{}", "-".repeat(80));
                 for comp in &competitions {
                     println!(
@@ -137,7 +142,7 @@ async fn main() -> Result<()> {
                 let comp = client.get_competition(&id).await?;
                 println!("Competition: {}", comp.id);
                 println!("Status:      {}", comp.inferred_status());
-                println!("Entries:     {}/{}", comp.total_entries, "?");
+                println!("Entries:     {}/unknown", comp.total_entries);
                 println!("Paid:        {}", comp.total_paid_entries);
                 println!("Paid Out:    {}", comp.total_paid_out_entries);
                 println!("Created:     {}", comp.created_at);
@@ -210,10 +215,7 @@ async fn main() -> Result<()> {
 
                     println!("Running scenario: {}", scenario);
                     println!("  Users: {}", users);
-                    println!(
-                        "  Observation window: {} min",
-                        observation_window
-                    );
+                    println!("  Observation window: {} min", observation_window);
                     println!();
 
                     let result = runner.run_scenario(&scenario, config).await?;
@@ -222,7 +224,10 @@ async fn main() -> Result<()> {
                     println!("Result: {:?}", result.status);
                     println!("Duration: {}ms", result.total_duration_ms);
                     println!();
-                    println!("{:<30} {:<10} {:<12} {}", "STEP", "STATUS", "DURATION", "ERROR");
+                    println!(
+                        "{:<30} {:<10} {:<12} {}",
+                        "STEP", "STATUS", "DURATION", "ERROR"
+                    );
                     println!("{}", "-".repeat(80));
                     for step in &result.steps {
                         println!(
@@ -292,7 +297,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-        },
+        }
     }
 
     Ok(())

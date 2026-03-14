@@ -128,7 +128,9 @@ impl CoordinatorClient {
             anyhow::bail!("Create competition failed ({}): {}", status, body);
         }
 
-        resp.json().await.context("Failed to parse competition response")
+        resp.json()
+            .await
+            .context("Failed to parse competition response")
     }
 
     /// List all competitions
@@ -147,7 +149,9 @@ impl CoordinatorClient {
             anyhow::bail!("List competitions failed ({}): {}", status, body);
         }
 
-        resp.json().await.context("Failed to parse competitions response")
+        resp.json()
+            .await
+            .context("Failed to parse competitions response")
     }
 
     /// Get a specific competition by ID
@@ -166,6 +170,8 @@ impl CoordinatorClient {
             anyhow::bail!("Get competition failed ({}): {}", status, body);
         }
 
-        resp.json().await.context("Failed to parse competition response")
+        resp.json()
+            .await
+            .context("Failed to parse competition response")
     }
 }

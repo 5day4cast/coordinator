@@ -15,8 +15,7 @@ pub async fn create_auth_header<T: serde::Serialize>(
 ) -> Result<String> {
     let http_method = HttpMethod::from_str(&method.to_uppercase())
         .map_err(|e| anyhow::anyhow!("Invalid HTTP method: {}", e))?;
-    let http_url =
-        Url::from_str(url).map_err(|e| anyhow::anyhow!("Invalid URL: {}", e))?;
+    let http_url = Url::from_str(url).map_err(|e| anyhow::anyhow!("Invalid URL: {}", e))?;
 
     let mut http_data = HttpData::new(http_url, http_method);
 
