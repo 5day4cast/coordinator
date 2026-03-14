@@ -747,6 +747,15 @@ impl DBConnection {
         }
     }
 
+    /// Non-blocking WAL checkpoint that flushes committed WAL frames to the
+    /// main database file without blocking writers. Use this after writes that
+    /// must be immediately visible to the read pool (e.g. test-settle).
+    pub async fn passive_checkpoint(&self) {
+        let _ = sqlx::query("PRAGMA wal_checkpoint(PASSIVE);")
+            .execute(&self.write_pool)
+            .await;
+    }
+
     /// Returns a reference to the read pool for read-only operations.
     ///
     /// Use this for SELECT queries and other read operations.

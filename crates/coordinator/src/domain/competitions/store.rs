@@ -1716,7 +1716,8 @@ impl CompetitionStore {
     pub async fn test_settle_ticket(&self, ticket_id: Uuid) -> Result<bool, sqlx::Error> {
         let ticket_id_str = ticket_id.to_string();
 
-        self.db_connection
+        let result = self
+            .db_connection
             .execute_write(move |pool| async move {
                 let result = sqlx::query(
                     "UPDATE tickets
@@ -1734,7 +1735,15 @@ impl CompetitionStore {
             .map_err(|e| match e {
                 crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
                 e => sqlx::Error::Protocol(e.to_string()),
-            })
+            })?;
+
+        // Force WAL checkpoint so read pool connections can see the update.
+        // The read pool uses shared_cache which can pin WAL snapshots.
+        if result {
+            self.db_connection.passive_checkpoint().await;
+        }
+
+        Ok(result)
     }
 
     pub async fn update_ticket_escrow(

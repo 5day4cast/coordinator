@@ -219,7 +219,7 @@ async fn enter_competition(
             break;
         }
         retries += 1;
-        if retries > 10 {
+        if retries > 30 {
             anyhow::bail!(
                 "Ticket {} still not paid after settle (status: {:?})",
                 ticket.ticket_id,
