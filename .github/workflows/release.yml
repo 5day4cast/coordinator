@@ -294,15 +294,27 @@ jobs:
 
       - name: Build and push x86_64 image
         run: |
+          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          ORG_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          VERSION="${{ needs.prepare-release.outputs.version }}"
+
+          # Build and push coordinator image
           nix build .#docker-coordinator --print-build-logs
           docker load < result
-          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          docker tag coordinator:latest ghcr.io/${REPO_LOWER}:${{ needs.prepare-release.outputs.version }}-amd64
+          docker tag coordinator:latest ghcr.io/${REPO_LOWER}:${VERSION}-amd64
           docker tag coordinator:latest ghcr.io/${REPO_LOWER}:latest-amd64
 
+          # Build and push synth image
+          nix build .#docker-synth --print-build-logs
+          docker load < result
+          docker tag synth:latest ghcr.io/${ORG_LOWER}/synth:${VERSION}-amd64
+          docker tag synth:latest ghcr.io/${ORG_LOWER}/synth:latest-amd64
+
           if [ "${{ needs.prepare-release.outputs.dry_run }}" != "true" ]; then
-            docker push ghcr.io/${REPO_LOWER}:${{ needs.prepare-release.outputs.version }}-amd64
+            docker push ghcr.io/${REPO_LOWER}:${VERSION}-amd64
             docker push ghcr.io/${REPO_LOWER}:latest-amd64
+            docker push ghcr.io/${ORG_LOWER}/synth:${VERSION}-amd64
+            docker push ghcr.io/${ORG_LOWER}/synth:latest-amd64
           fi
 
   build-docker-arm64:
@@ -342,15 +354,27 @@ jobs:
 
       - name: Build and push ARM64 image
         run: |
+          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          ORG_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          VERSION="${{ needs.prepare-release.outputs.version }}"
+
+          # Build and push coordinator image
           nix build .#docker-coordinator --print-build-logs
           docker load < result
-          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          docker tag coordinator:latest ghcr.io/${REPO_LOWER}:${{ needs.prepare-release.outputs.version }}-arm64
+          docker tag coordinator:latest ghcr.io/${REPO_LOWER}:${VERSION}-arm64
           docker tag coordinator:latest ghcr.io/${REPO_LOWER}:latest-arm64
 
+          # Build and push synth image
+          nix build .#docker-synth --print-build-logs
+          docker load < result
+          docker tag synth:latest ghcr.io/${ORG_LOWER}/synth:${VERSION}-arm64
+          docker tag synth:latest ghcr.io/${ORG_LOWER}/synth:latest-arm64
+
           if [ "${{ needs.prepare-release.outputs.dry_run }}" != "true" ]; then
-            docker push ghcr.io/${REPO_LOWER}:${{ needs.prepare-release.outputs.version }}-arm64
+            docker push ghcr.io/${REPO_LOWER}:${VERSION}-arm64
             docker push ghcr.io/${REPO_LOWER}:latest-arm64
+            docker push ghcr.io/${ORG_LOWER}/synth:${VERSION}-arm64
+            docker push ghcr.io/${ORG_LOWER}/synth:latest-arm64
           fi
 
   create-docker-manifest:
@@ -373,9 +397,11 @@ jobs:
         run: |
           VERSION="${{ needs.prepare-release.outputs.version }}"
           REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          ORG_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           IMAGE="ghcr.io/${REPO_LOWER}"
+          SYNTH_IMAGE="ghcr.io/${ORG_LOWER}/synth"
 
-          # Create and push multi-arch manifests
+          # Coordinator multi-arch manifests
           docker manifest create ${IMAGE}:${VERSION} \
             ${IMAGE}:${VERSION}-amd64 \
             ${IMAGE}:${VERSION}-arm64
@@ -387,3 +413,16 @@ jobs:
           docker manifest push ${IMAGE}:latest
 
           echo "Pushed multi-arch image: ${IMAGE}:${VERSION}"
+
+          # Synth multi-arch manifests
+          docker manifest create ${SYNTH_IMAGE}:${VERSION} \
+            ${SYNTH_IMAGE}:${VERSION}-amd64 \
+            ${SYNTH_IMAGE}:${VERSION}-arm64
+          docker manifest push ${SYNTH_IMAGE}:${VERSION}
+
+          docker manifest create ${SYNTH_IMAGE}:latest \
+            ${SYNTH_IMAGE}:latest-amd64 \
+            ${SYNTH_IMAGE}:latest-arm64
+          docker manifest push ${SYNTH_IMAGE}:latest
+
+          echo "Pushed multi-arch image: ${SYNTH_IMAGE}:${VERSION}"

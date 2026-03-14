@@ -1,0 +1,74 @@
+[package]
+name = "coordinator-synth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Synthetic testing tool and CLI for coordinator"
+
+[[bin]]
+name = "synth"
+path = "src/bin/synth.rs"
+
+[[bin]]
+name = "coord"
+path = "src/bin/coord.rs"
+
+[dependencies]
+coordinator-core.workspace = true
+
+# Keymeld SDK for auth pubkey derivation and enclave encryption
+keymeld-sdk = { workspace = true, default-features = false }
+
+# Web
+axum.workspace = true
+tower-http.workspace = true
+maud.workspace = true
+reqwest.workspace = true
+
+# Async
+tokio.workspace = true
+futures.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+# Database
+sqlx.workspace = true
+
+# Nostr
+nostr-sdk = { version = "0.38.0", features = ["nip04", "nip44"] }
+
+# Logging
+log.workspace = true
+fern.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Crypto
+sha2.workspace = true
+blake2.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+
+# Bitcoin (for key derivation)
+dlctix = { git = "https://github.com/tee8z/dlctix", branch = "external-signing-api", default-features = false }
+
+# Time
+time.workspace = true
+
+# Utilities
+uuid.workspace = true
+hex.workspace = true
+base64.workspace = true
+secrecy.workspace = true
+clap.workspace = true
+config.workspace = true
+
+# Metrics
+prometheus.workspace = true
+lazy_static.workspace = true

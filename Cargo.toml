@@ -3,6 +3,7 @@ members = [
     "crates/coordinator",
     "crates/coordinator-core",
     "crates/coordinator-wasm",
+    "crates/synth",
 ]
 resolver = "2"
 
@@ -90,6 +91,10 @@ config = "0.14.0"
 
 # Lightning
 lightning-invoice = "0.33.2"
+
+# Metrics
+prometheus = "0.13"
+lazy_static = "1.4"
 
 # Misc
 num_cpus = "1.16.0"

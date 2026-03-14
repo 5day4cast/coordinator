@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: synth-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "synth.labels" . | nindent 4 }}
+data:
+  synth.toml: |
+    [coordinator]
+    url = "{{ .Values.config.coordinator.url }}"
+    {{- if .Values.config.coordinator.adminUrl }}
+    admin_url = "{{ .Values.config.coordinator.adminUrl }}"
+    {{- end }}
+
+    [oracle]
+    url = "{{ .Values.config.oracle.url }}"
+
+    [server]
+    host = "{{ .Values.config.server.host }}"
+    port = {{ .Values.config.server.port }}
+
+    [db]
+    path = "/data/synth.db"
+
+    [scheduler]
+    enabled = {{ .Values.config.scheduler.enabled }}
+    interval_secs = {{ .Values.config.scheduler.intervalSecs }}
+    scenario = "{{ .Values.config.scheduler.scenario }}"
+
+    [defaults]
+    users = {{ .Values.config.defaults.users }}
+    stations = [{{ range $i, $s := .Values.config.defaults.stations }}{{ if $i }}, {{ end }}"{{ $s }}"{{ end }}]
+    entry_fee = {{ .Values.config.defaults.entryFee }}
+    observation_window_secs = {{ .Values.config.defaults.observationWindowSecs }}

@@ -1,7 +1,7 @@
 use crate::{
     api::routes::{
         add_event_entry, admin_competition_fragment, admin_create_competition_handler,
-        admin_delete_competition_handler, admin_fee_estimates_fragment, admin_page_handler,
+        admin_delete_competition_handler, admin_fee_estimates_fragment, admin_page_handler, admin_settle_test_invoice_handler,
         admin_send_bitcoin_handler, admin_wallet_address_fragment, admin_wallet_balance_fragment,
         admin_wallet_fragment, admin_wallet_outputs_fragment, change_password,
         competitions_fragment, competitions_rows_fragment, create_competition, entries_fragment,
@@ -532,6 +532,10 @@ pub fn app(app_state: AppState, origins: Vec<String>) -> Router {
         .route(
             "/api/competitions/delete",
             post(admin_delete_competition_handler),
+        )
+        .route(
+            "/api/test/settle-invoice/{ticket_id}",
+            post(admin_settle_test_invoice_handler),
         );
 
     // HTMX public routes (some require JS bridge for auth)

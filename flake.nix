@@ -228,6 +228,17 @@
           cargoExtraArgs = "--bin wallet-cli";
         } // commonEnvs);
 
+        # Synth binary (synthetic testing service)
+        synth = craneLib.buildPackage ({
+          pname = "synth";
+          version = "0.1.0";
+          inherit src;
+          cargoArtifacts = workspaceDeps;
+          buildInputs = commonBuildInputs;
+          nativeBuildInputs = commonNativeBuildInputs;
+          cargoExtraArgs = "--bin synth --bin coord";
+        } // commonEnvs);
+
         # Get keymeld binaries from the keymeld flake
         keymeld-gateway = keymeld.packages.${system}.keymeld-gateway;
         keymeld-enclave = keymeld.packages.${system}.keymeld-enclave;
@@ -939,10 +950,35 @@
         };
 
 
+        # Docker image for synth service
+        docker-synth = pkgs.dockerTools.buildLayeredImage {
+          name = "synth";
+          tag = "latest";
+          contents = [
+            synth
+            pkgs.cacert
+            pkgs.tzdata
+          ];
+          config = {
+            Cmd = [ "${synth}/bin/synth" ];
+            Env = [
+              "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+              "RUST_LOG=info"
+            ];
+            ExposedPorts = {
+              "9980/tcp" = {};
+            };
+            WorkingDir = "/data";
+            Volumes = {
+              "/data" = {};
+            };
+          };
+        };
+
       in {
         packages = {
           default = coordinator;
-          inherit coordinator coordinator-wasm wallet-cli docker-coordinator;
+          inherit coordinator coordinator-wasm wallet-cli synth docker-coordinator docker-synth;
           inherit start-regtest stop-regtest mine-blocks;
           inherit setup-lnd setup-channels stop-lnd;
           inherit run-keymeld stop-keymeld;

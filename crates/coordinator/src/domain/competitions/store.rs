@@ -1711,6 +1711,32 @@ impl CompetitionStore {
             })
     }
 
+    /// Test-only: Mark a ticket as both paid and settled, bypassing Lightning.
+    /// Used by the synthetic testing tool to simulate invoice payment.
+    pub async fn test_settle_ticket(&self, ticket_id: Uuid) -> Result<bool, sqlx::Error> {
+        let ticket_id_str = ticket_id.to_string();
+
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE tickets
+                    SET paid_at = COALESCE(paid_at, datetime('now')),
+                        settled_at = COALESCE(settled_at, datetime('now'))
+                    WHERE id = ?
+                    AND reserved_at IS NOT NULL",
+                )
+                .bind(ticket_id_str)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+            .map_err(|e| match e {
+                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
+                e => sqlx::Error::Protocol(e.to_string()),
+            })
+    }
+
     pub async fn update_ticket_escrow(
         &self,
         ticket_id: Uuid,

@@ -1,8 +1,13 @@
 use std::sync::Arc;
 
-use axum::{extract::State, http::HeaderMap, response::Html};
+use axum::{
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    response::{Html, IntoResponse},
+    Json,
+};
 use axum_extra::extract::Form;
-use log::error;
+use log::{error, info};
 use maud::Markup;
 use serde::Deserialize;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
@@ -499,5 +504,38 @@ pub async fn admin_delete_competition_handler(
         Err(e) => Html(
             crate::templates::admin::dashboard::competition_error(&e.to_string()).into_string(),
         ),
+    }
+}
+
+/// Test-only: Settle a ticket's HODL invoice without real Lightning payment.
+/// Used by the synthetic testing tool. Marks the ticket as both paid and settled.
+pub async fn admin_settle_test_invoice_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ticket_id): Path<Uuid>,
+) -> impl IntoResponse {
+    match state
+        .coordinator
+        .competition_store
+        .test_settle_ticket(ticket_id)
+        .await
+    {
+        Ok(true) => {
+            info!("Test-settled ticket {}", ticket_id);
+            (StatusCode::OK, Json(serde_json::json!({ "settled": true })))
+        }
+        Ok(false) => {
+            error!("Ticket {} not found or not in settleable state", ticket_id);
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Ticket not found or not reserved" })),
+            )
+        }
+        Err(e) => {
+            error!("Failed to test-settle ticket {}: {}", ticket_id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        }
     }
 }

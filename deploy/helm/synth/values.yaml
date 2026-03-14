@@ -1,0 +1,51 @@
+# Synth Helm Chart Values
+replicaCount: 1
+
+image:
+  repository: ghcr.io/5day4cast/synth
+  tag: latest
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  automount: true
+  name: ""
+
+service:
+  type: ClusterIP
+  port: 9980
+
+resources:
+  requests:
+    memory: 64Mi
+    cpu: 10m
+  limits:
+    memory: 256Mi
+
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClassName: longhorn
+
+# Synth configuration
+config:
+  coordinator:
+    url: "http://coordinator.coordinator.svc.cluster.local:9990"
+    adminUrl: ""
+  oracle:
+    url: "http://noaa-oracle.noaa-oracle.svc.cluster.local:9800"
+  server:
+    host: "0.0.0.0"
+    port: 9980
+  scheduler:
+    enabled: false
+    intervalSecs: 3600
+    scenario: "full_lifecycle"
+  defaults:
+    users: 3
+    stations:
+      - "KDEN"
+      - "KJFK"
+      - "KORD"
+    entryFee: 1000
+    observationWindowSecs: 300
