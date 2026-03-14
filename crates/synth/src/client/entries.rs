@@ -79,7 +79,7 @@ pub struct EntryResponse {
 }
 
 /// Ticket status check response
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct TicketStatusResponse {
     pub status: String,
 }
@@ -152,9 +152,11 @@ impl CoordinatorClient {
             anyhow::bail!("Check ticket status failed ({}): {}", status, body);
         }
 
-        resp.json()
+        let status: String = resp
+            .json()
             .await
-            .context("Failed to parse ticket status response")
+            .context("Failed to parse ticket status response")?;
+        Ok(TicketStatusResponse { status })
     }
 
     /// Submit an entry (requires Nostr auth)
