@@ -7,11 +7,12 @@ use crate::{
         admin_wallet_outputs_fragment, change_password, competitions_fragment,
         competitions_rows_fragment, create_competition, entries_fragment, entry_detail_fragment,
         entry_form_fragment, forgot_password_challenge, forgot_password_reset,
-        get_aggregate_nonces, get_balance, get_competitions, get_contract_parameters, get_entries,
-        get_estimated_fee_rates, get_next_address, get_outputs, get_ticket_status, health,
-        leaderboard_fragment, leaderboard_rows_fragment, login, login_username, payouts_fragment,
-        public_page_handler, register, register_username, request_competition_ticket,
-        send_to_address, submit_final_signatures, submit_public_nonces, submit_ticket_payout,
+        get_aggregate_nonces, get_balance, get_competition, get_competitions,
+        get_contract_parameters, get_entries, get_estimated_fee_rates, get_next_address,
+        get_outputs, get_ticket_status, health, leaderboard_fragment, leaderboard_rows_fragment,
+        login, login_username, payouts_fragment, public_page_handler, register, register_username,
+        request_competition_ticket, send_to_address, submit_final_signatures, submit_public_nonces,
+        submit_ticket_payout,
     },
     config::Settings,
     domain::{
@@ -566,6 +567,10 @@ pub fn app(app_state: AppState, origins: Vec<String>) -> Router {
         .route("/api/v1/health_check", get(health))
         .route("/api/v1/competitions", post(create_competition))
         .route("/api/v1/competitions", get(get_competitions))
+        .route(
+            "/api/v1/competitions/{competition_id}",
+            get(get_competition),
+        )
         .route(
             "/api/v1/competitions/{competition_id}/ticket",
             post(request_competition_ticket),
