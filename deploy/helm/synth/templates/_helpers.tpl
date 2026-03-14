@@ -20,9 +20,9 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 Service account name
 */}}
 {{- define "synth.serviceAccountName" -}}
-{{- if .Values.serviceAccount.name }}
-{{- .Values.serviceAccount.name }}
-{{- else }}
+{{- if .Values.serviceAccount.name -}}
+{{- .Values.serviceAccount.name -}}
+{{- else -}}
 synth
-{{- end }}
+{{- end -}}
 {{- end }}
