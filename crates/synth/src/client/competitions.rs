@@ -30,41 +30,43 @@ pub struct CompetitionResponse {
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     pub event_submission: serde_json::Value,
+    #[serde(default)]
     pub total_entries: u64,
+    #[serde(default)]
     pub total_paid_entries: u64,
+    #[serde(default)]
     pub total_paid_out_entries: u64,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub completed_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub failed_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub cancelled_at: Option<OffsetDateTime>,
-    // Lifecycle timestamps
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub escrow_funds_confirmed_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub event_created_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub entries_submitted_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub contracted_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub signed_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub funding_broadcasted_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub funding_confirmed_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub invoices_settled_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub funding_settled_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub awaiting_attestation_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub outcome_broadcasted_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub delta_broadcasted_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub keymeld_keygen_completed_at: Option<OffsetDateTime>,
 }
 
