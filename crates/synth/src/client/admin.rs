@@ -34,7 +34,7 @@ impl CoordinatorClient {
 
     /// Health check
     pub async fn health_check(&self) -> Result<()> {
-        let url = format!("{}/health_check", self.base_url());
+        let url = format!("{}/api/v1/health_check", self.base_url());
         let resp = self
             .http()
             .get(&url)
