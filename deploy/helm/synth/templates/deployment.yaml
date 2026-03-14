@@ -24,8 +24,8 @@ spec:
         - name: synth
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args:
-            - /config/synth.toml
+          command: ["synth"]
+          args: ["/config/synth.toml"]
           ports:
             - name: http
               containerPort: {{ .Values.config.server.port }}
