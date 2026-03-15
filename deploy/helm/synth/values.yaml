@@ -50,6 +50,26 @@ config:
     entryFee: 1000
     observationWindowSecs: 300
 
+litestream:
+  enabled: false
+  image:
+    repository: litestream/litestream
+    tag: "0.5.6"
+  s3Bucket: ""
+  s3Region: "us-west-2"
+  s3Path: "synth.db"
+  s3Endpoint: ""
+  s3ForcePathStyle: false
+  syncInterval: "60s"
+  retention: "168h"
+  snapshotInterval: "1h"
+  retentionCheckInterval: "1h"
+  encryptionKeySecret:
+    enabled: false
+    name: ""
+    key: "encryption-key"
+  useIAMRole: false
+
 # Metrics - ServiceMonitor requires CRD on target cluster
 metrics:
   serviceMonitor:

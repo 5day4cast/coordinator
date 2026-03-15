@@ -20,6 +20,49 @@ spec:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ include "synth.serviceAccountName" . }}
+      {{- if .Values.litestream.enabled }}
+      initContainers:
+        - name: litestream-restore
+          image: "{{ .Values.litestream.image.repository }}:{{ .Values.litestream.image.tag }}"
+          command:
+            - sh
+            - -c
+            - |
+              echo "Restoring database from S3 backup..."
+              litestream restore -if-db-not-exists -if-replica-exists -config /etc/litestream.yml /data/synth.db || echo "No backup found, starting fresh"
+              echo "Restore complete"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: litestream-config
+              mountPath: /etc/litestream.yml
+              subPath: litestream.yml
+          env:
+            {{- if .Values.litestream.s3Endpoint }}
+            - name: AWS_ACCESS_KEY_ID
+              value: "test"
+            - name: AWS_SECRET_ACCESS_KEY
+              value: "test"
+            {{- else if not .Values.litestream.useIAMRole }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: synth-s3
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: synth-s3
+                  key: secret-access-key
+            {{- end }}
+            {{- if .Values.litestream.encryptionKeySecret.enabled }}
+            - name: LITESTREAM_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.litestream.encryptionKeySecret.name }}
+                  key: {{ .Values.litestream.encryptionKeySecret.key }}
+            {{- end }}
+      {{- end }}
       containers:
         - name: synth
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -52,6 +95,51 @@ spec:
             {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+        {{- if .Values.litestream.enabled }}
+        - name: litestream
+          image: "{{ .Values.litestream.image.repository }}:{{ .Values.litestream.image.tag }}"
+          args:
+            - replicate
+            - -config
+            - /etc/litestream.yml
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: litestream-config
+              mountPath: /etc/litestream.yml
+              subPath: litestream.yml
+          env:
+            {{- if .Values.litestream.s3Endpoint }}
+            - name: AWS_ACCESS_KEY_ID
+              value: "test"
+            - name: AWS_SECRET_ACCESS_KEY
+              value: "test"
+            {{- else if not .Values.litestream.useIAMRole }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: synth-s3
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: synth-s3
+                  key: secret-access-key
+            {{- end }}
+            {{- if .Values.litestream.encryptionKeySecret.enabled }}
+            - name: LITESTREAM_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.litestream.encryptionKeySecret.name }}
+                  key: {{ .Values.litestream.encryptionKeySecret.key }}
+            {{- end }}
+          resources:
+            requests:
+              memory: 32Mi
+              cpu: 10m
+            limits:
+              memory: 128Mi
+        {{- end }}
       volumes:
         - name: config
           configMap:
@@ -60,4 +148,9 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: synth-data
+        {{- end }}
+        {{- if .Values.litestream.enabled }}
+        - name: litestream-config
+          configMap:
+            name: synth-litestream
         {{- end }}

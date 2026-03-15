@@ -33,3 +33,33 @@ data:
     stations = [{{ range $i, $s := .Values.config.defaults.stations }}{{ if $i }}, {{ end }}"{{ $s }}"{{ end }}]
     entry_fee = {{ .Values.config.defaults.entryFee }}
     observation_window_secs = {{ .Values.config.defaults.observationWindowSecs }}
+---
+{{- if .Values.litestream.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: synth-litestream
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "synth.labels" . | nindent 4 }}
+data:
+  litestream.yml: |
+    dbs:
+      - path: /data/synth.db
+        replicas:
+          - type: s3
+            bucket: {{ .Values.litestream.s3Bucket }}
+            path: {{ .Values.litestream.s3Path }}
+            region: {{ .Values.litestream.s3Region }}
+            {{- if .Values.litestream.s3Endpoint }}
+            endpoint: {{ .Values.litestream.s3Endpoint }}
+            force-path-style: {{ .Values.litestream.s3ForcePathStyle }}
+            {{- end }}
+            {{- if .Values.litestream.encryptionKeySecret.enabled }}
+            encryption-key: $LITESTREAM_ENCRYPTION_KEY
+            {{- end }}
+            sync-interval: {{ .Values.litestream.syncInterval }}
+            retention: {{ .Values.litestream.retention }}
+            snapshot-interval: {{ .Values.litestream.snapshotInterval }}
+            retention-check-interval: {{ .Values.litestream.retentionCheckInterval }}
+{{- end }}
