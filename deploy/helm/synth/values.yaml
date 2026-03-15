@@ -48,6 +48,7 @@ config:
       - "KJFK"
       - "KORD"
     entryFee: 1000
+    entryWindowSecs: 120
     observationWindowSecs: 300
 
 litestream:

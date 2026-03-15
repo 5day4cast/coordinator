@@ -9,6 +9,8 @@ pub struct ScenarioConfig {
     pub stations: Vec<String>,
     /// Entry fee in sats
     pub entry_fee: usize,
+    /// Time before observation starts (entry window) in seconds
+    pub entry_window_secs: u64,
     /// Observation window duration in seconds
     pub observation_window_secs: u64,
     /// Max time to wait for each state transition (seconds)
@@ -23,6 +25,7 @@ impl Default for ScenarioConfig {
             users: 3,
             stations: vec!["KDEN".to_string(), "KJFK".to_string(), "KORD".to_string()],
             entry_fee: 1000,
+            entry_window_secs: 120,
             observation_window_secs: 300,
             state_timeout_secs: 600,
             poll_interval_secs: 5,

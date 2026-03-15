@@ -127,7 +127,7 @@ async fn create_competition(client: &CoordinatorClient, config: &ScenarioConfig)
 
     // start_observation_date must be far enough in the future for ticket purchases
     // (coordinator requires start_observation_date - 1min > now for ticket expiry)
-    let entry_window = time::Duration::seconds(120);
+    let entry_window = time::Duration::seconds(config.entry_window_secs as i64);
     let competition = CreateCompetition {
         id: Uuid::now_v7(),
         signing_date: now + entry_window + observation_window + time::Duration::seconds(60),

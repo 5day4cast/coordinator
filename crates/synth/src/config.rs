@@ -62,6 +62,8 @@ pub struct DefaultsConfig {
     pub stations: Vec<String>,
     /// Entry fee in sats
     pub entry_fee: usize,
+    /// Time before observation starts (entry window) in seconds
+    pub entry_window_secs: u64,
     /// Observation window duration in seconds
     pub observation_window_secs: u64,
 }
@@ -92,6 +94,7 @@ impl Default for SynthConfig {
                 users: 3,
                 stations: vec!["KDEN".to_string(), "KJFK".to_string(), "KORD".to_string()],
                 entry_fee: 1000,
+                entry_window_secs: 120,
                 observation_window_secs: 300,
             },
         }
@@ -125,6 +128,7 @@ pub fn load_config(path: Option<&str>) -> anyhow::Result<SynthConfig> {
         .set_default("scheduler.scenario", "full_lifecycle")?
         .set_default("defaults.users", 3)?
         .set_default("defaults.entry_fee", 1000)?
+        .set_default("defaults.entry_window_secs", 120)?
         .set_default("defaults.observation_window_secs", 300)?;
 
     let config = builder.build()?;

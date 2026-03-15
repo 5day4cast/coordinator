@@ -32,6 +32,7 @@ data:
     users = {{ .Values.config.defaults.users }}
     stations = [{{ range $i, $s := .Values.config.defaults.stations }}{{ if $i }}, {{ end }}"{{ $s }}"{{ end }}]
     entry_fee = {{ .Values.config.defaults.entryFee }}
+    entry_window_secs = {{ .Values.config.defaults.entryWindowSecs }}
     observation_window_secs = {{ .Values.config.defaults.observationWindowSecs }}
 ---
 {{- if .Values.litestream.enabled }}

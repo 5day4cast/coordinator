@@ -33,6 +33,7 @@ async fn main() -> anyhow::Result<()> {
             users: config.defaults.users,
             stations: config.defaults.stations.clone(),
             entry_fee: config.defaults.entry_fee,
+            entry_window_secs: config.defaults.entry_window_secs,
             observation_window_secs: config.defaults.observation_window_secs,
             ..ScenarioConfig::default()
         };
