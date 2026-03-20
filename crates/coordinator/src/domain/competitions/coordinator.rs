@@ -414,7 +414,35 @@ impl Coordinator {
             const MAX_CONSECUTIVE_STATES: usize = 10;
 
             if competition.skip_competition() {
-                info!(
+                // Auto-expire failed competitions after 1 hour so they stop
+                // polluting every tick's log output and DB query results.
+                const FAILED_EXPIRY_HOURS: i64 = 1;
+                if competition.is_failed() && competition.cancelled_at.is_none() {
+                    if let Some(failed_at) = competition.failed_at {
+                        let age = OffsetDateTime::now_utc() - failed_at;
+                        if age.whole_hours() >= FAILED_EXPIRY_HOURS {
+                            competition.cancelled_at = Some(OffsetDateTime::now_utc());
+                            if let Err(e) = self
+                                .competition_store
+                                .update_competitions(vec![competition.clone()])
+                                .await
+                            {
+                                error!(
+                                    "Failed to cancel expired-failed competition {}: {}",
+                                    competition.id, e
+                                );
+                            } else {
+                                info!(
+                                    "Auto-cancelled failed competition {} (failed {}h ago)",
+                                    competition.id,
+                                    age.whole_hours()
+                                );
+                            }
+                            continue;
+                        }
+                    }
+                }
+                debug!(
                     "Skipping competition {} in state {}",
                     competition.id,
                     competition.get_state()
