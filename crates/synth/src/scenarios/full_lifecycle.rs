@@ -130,7 +130,7 @@ async fn create_competition(client: &CoordinatorClient, config: &ScenarioConfig)
     let entry_window = time::Duration::seconds(config.entry_window_secs as i64);
     let competition = CreateCompetition {
         id: Uuid::now_v7(),
-        signing_date: now + entry_window + observation_window + time::Duration::seconds(60),
+        signing_date: now + entry_window + observation_window + time::Duration::seconds(config.signing_delay_secs as i64),
         start_observation_date: now + entry_window,
         end_observation_date: now + entry_window + observation_window,
         locations: config.stations.clone(),

@@ -34,6 +34,7 @@ data:
     entry_fee = {{ .Values.config.defaults.entryFee }}
     entry_window_secs = {{ .Values.config.defaults.entryWindowSecs }}
     observation_window_secs = {{ .Values.config.defaults.observationWindowSecs }}
+    signing_delay_secs = {{ .Values.config.defaults.signingDelaySecs }}
 ---
 {{- if .Values.litestream.enabled }}
 apiVersion: v1

@@ -66,6 +66,8 @@ pub struct DefaultsConfig {
     pub entry_window_secs: u64,
     /// Observation window duration in seconds
     pub observation_window_secs: u64,
+    /// Delay after observation ends before signing deadline, in seconds
+    pub signing_delay_secs: u64,
 }
 
 impl Default for SynthConfig {
@@ -96,6 +98,7 @@ impl Default for SynthConfig {
                 entry_fee: 1000,
                 entry_window_secs: 120,
                 observation_window_secs: 300,
+                signing_delay_secs: 60,
             },
         }
     }
@@ -129,7 +132,8 @@ pub fn load_config(path: Option<&str>) -> anyhow::Result<SynthConfig> {
         .set_default("defaults.users", 3)?
         .set_default("defaults.entry_fee", 1000)?
         .set_default("defaults.entry_window_secs", 120)?
-        .set_default("defaults.observation_window_secs", 300)?;
+        .set_default("defaults.observation_window_secs", 300)?
+        .set_default("defaults.signing_delay_secs", 60)?;
 
     let config = builder.build()?;
     Ok(config.try_deserialize()?)

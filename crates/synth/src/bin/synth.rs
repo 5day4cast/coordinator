@@ -35,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
             entry_fee: config.defaults.entry_fee,
             entry_window_secs: config.defaults.entry_window_secs,
             observation_window_secs: config.defaults.observation_window_secs,
+            signing_delay_secs: config.defaults.signing_delay_secs,
             ..ScenarioConfig::default()
         };
         tokio::spawn(async move {

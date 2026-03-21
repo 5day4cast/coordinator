@@ -50,6 +50,7 @@ config:
     entryFee: 1000
     entryWindowSecs: 120
     observationWindowSecs: 300
+    signingDelaySecs: 60
 
 litestream:
   enabled: false

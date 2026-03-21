@@ -13,6 +13,8 @@ pub struct ScenarioConfig {
     pub entry_window_secs: u64,
     /// Observation window duration in seconds
     pub observation_window_secs: u64,
+    /// Delay after observation ends before signing deadline, in seconds
+    pub signing_delay_secs: u64,
     /// Max time to wait for each state transition (seconds)
     pub state_timeout_secs: u64,
     /// Poll interval for state transitions (seconds)
@@ -27,6 +29,7 @@ impl Default for ScenarioConfig {
             entry_fee: 1000,
             entry_window_secs: 120,
             observation_window_secs: 300,
+            signing_delay_secs: 60,
             state_timeout_secs: 600,
             poll_interval_secs: 5,
         }
