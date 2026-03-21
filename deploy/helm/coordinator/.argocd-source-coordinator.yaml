@@ -1,8 +1,0 @@
-helm:
-  parameters:
-  - name: image.repository
-    value: ghcr.io/5day4cast/coordinator
-    forcestring: true
-  - name: image.tag
-    value: 1.18.32
-    forcestring: true
