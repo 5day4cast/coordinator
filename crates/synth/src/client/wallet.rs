@@ -5,9 +5,9 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 pub struct BalanceResponse {
     pub confirmed: u64,
-    pub immature: u64,
-    pub trusted_pending: u64,
-    pub untrusted_pending: u64,
+    pub unconfirmed: u64,
+    #[serde(default)]
+    pub locked: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

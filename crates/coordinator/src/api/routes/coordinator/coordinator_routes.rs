@@ -4,7 +4,7 @@ use axum::{
     response::ErrorResponse,
     Json,
 };
-use bdk_wallet::bitcoin::PublicKey;
+use bitcoin::PublicKey;
 use dlctix::{
     musig2::{AggNonce, PartialSignature, PubNonce},
     SigMap,

@@ -1,5 +1,5 @@
 use anyhow::anyhow;
-use bdk_wallet::bitcoin::Network;
+use bitcoin::Network;
 use clap::Parser;
 use fern::colors::{Color, ColoredLevelConfig};
 use log::LevelFilter;
@@ -218,14 +218,15 @@ impl Default for KeymeldSettings {
 pub struct BitcoinSettings {
     /// On-chain network to use
     pub network: Network,
-    /// Url to grab on-chain data from as an esplora client
-    pub esplora_url: String,
-    /// Path to the raw seed to use for the wallet (can be the same as the nostr private key file)
-    /// The service will generate a private the bitcoin wallet if one is not provided
-    /// By default this key will also be used to sign nostr events/auth
+    /// Electrum server (electrs) used for chain lookups LND cannot answer,
+    /// such as escrow and outcome transactions: "tcp://host:50001" or "ssl://host:50002"
+    pub electrum_url: String,
+    /// Optional block explorer linked from the admin wallet page
+    #[serde(default)]
+    pub explorer_url: Option<String>,
+    /// Path to the coordinator's private key (can be the same as the nostr private key file).
+    /// It signs DLC escrow inputs and nostr events; the on-chain wallet itself lives in LND.
     pub seed_path: String,
-    /// Path to sqlite file that will store the onchain data related to the wallet
-    pub storage_file: String,
     /// Frequency in seconds for how often to refresh block data with on-chain
     /// (usually want to set to half as often as a block on average will come in, 10min block time -> refresh every 5min)
     pub refresh_blocks_secs: u64,
@@ -238,8 +239,8 @@ impl Default for BitcoinSettings {
     fn default() -> Self {
         BitcoinSettings {
             network: Network::Regtest,
-            esplora_url: String::from("http://localhost:9102"),
-            storage_file: String::from("./data/bitcoin.db"),
+            electrum_url: String::from("tcp://127.0.0.1:50001"),
+            explorer_url: None,
             seed_path: String::from("./creds/coordinator_private_key.pem"),
             refresh_blocks_secs: 15,
             mock_enabled: false,

@@ -48,7 +48,7 @@ fn render_admin_fragment(
             title,
             api_base: &state.private_url,
             oracle_base: &state.oracle_url,
-            esplora_url: &state.esplora_url,
+            explorer_url: &state.explorer_url,
             network: &state.network,
         };
         Html(admin_base(&config, content).into_string())
@@ -61,7 +61,7 @@ pub async fn admin_page_handler(State(state): State<Arc<AppState>>) -> Html<Stri
         title: "5day4cast Admin",
         api_base: &state.private_url,
         oracle_base: &state.oracle_url,
-        esplora_url: &state.esplora_url,
+        explorer_url: &state.explorer_url,
         network: &state.network,
     };
 
@@ -142,7 +142,7 @@ pub async fn admin_wallet_fragment(
         .inspect_err(|e| error!("Failed to fetch wallet address: {e}"))
         .unwrap_or_default();
 
-    let content = wallet_page(&state.esplora_url, &balance, &address);
+    let content = wallet_page(&state.explorer_url, &balance, &address);
     render_admin_fragment(&headers, &state, "5day4cast Admin - Wallet", content)
 }
 
@@ -444,7 +444,7 @@ async fn fetch_balance(state: &AppState) -> Result<WalletBalance, anyhow::Error>
     let balance = state.bitcoin.get_balance().await?;
     Ok(WalletBalance {
         confirmed: balance.confirmed.to_sat(),
-        unconfirmed: balance.untrusted_pending.to_sat() + balance.trusted_pending.to_sat(),
+        unconfirmed: balance.unconfirmed.to_sat(),
     })
 }
 
@@ -463,7 +463,7 @@ async fn fetch_outputs(state: &AppState) -> Result<Vec<WalletOutput>, anyhow::Er
                 value: o.txout.value.to_sat(),
                 script_pubkey: Some(o.txout.script_pubkey.to_string()),
             },
-            is_spent: o.is_spent,
+            is_spent: false,
         })
         .collect())
 }

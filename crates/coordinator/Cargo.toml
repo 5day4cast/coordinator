@@ -28,10 +28,10 @@ reqwest-retry.workspace = true
 hyper.workspace = true
 h2.workspace = true
 
-# Bitcoin
-bdk_esplora.workspace = true
-bdk_wallet.workspace = true
-bdk_sqlite.workspace = true
+# Bitcoin: the wallet lives in LND; electrs answers chain lookups
+bitcoin.workspace = true
+miniscript.workspace = true
+electrum-client.workspace = true
 dlctix.workspace = true
 
 # Keymeld

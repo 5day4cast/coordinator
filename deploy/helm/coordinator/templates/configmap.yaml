@@ -52,8 +52,10 @@ data:
 
     [bitcoin_settings]
     network = {{ .Values.bitcoin.network | quote }}
-    esplora_url = {{ .Values.bitcoin.esploraUrl | quote }}
-    storage_file = "{{ .Values.config.database.dataFolder }}/bitcoin.db"
+    electrum_url = {{ .Values.bitcoin.electrumUrl | quote }}
+    {{- if .Values.bitcoin.explorerUrl }}
+    explorer_url = {{ .Values.bitcoin.explorerUrl | quote }}
+    {{- end }}
     seed_path = "/etc/coordinator-secrets/private-key.pem"
     refresh_blocks_secs = {{ .Values.bitcoin.refreshBlocksSecs }}
 

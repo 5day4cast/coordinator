@@ -106,7 +106,10 @@ The coordinator reads from `./config/local.toml` by default. Key settings:
 ```toml
 [bitcoin_settings]
 network = "Regtest"
-esplora_url = "http://localhost:9102"
+# electrs, for chain lookups LND cannot answer (escrow and outcome transactions)
+electrum_url = "tcp://localhost:60401"
+# Optional block explorer linked from the admin wallet page
+explorer_url = "http://localhost:9102"
 
 [ln_settings]
 base_url = "https://localhost:8080"
@@ -159,7 +162,7 @@ JavaScript is bundled at compile time via `build.rs` into `crates/public_ui/`.
 
 ## External Services
 
-- **LND** - Lightning payments (HODL invoices)
-- **Esplora** - Bitcoin blockchain data
+- **LND** - Lightning payments (HODL invoices) and the on-chain wallet (addresses, funding, signing, publishing)
+- **electrs** - Chain lookups for transactions the LND wallet does not own (Electrum protocol)
 - **Oracle** - Weather data and DLC attestations (4casttruth.win)
 - **Keymeld** - Threshold signing for DLC contracts

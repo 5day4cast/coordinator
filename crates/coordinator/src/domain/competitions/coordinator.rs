@@ -18,16 +18,13 @@ use crate::{
     },
 };
 use anyhow::anyhow;
-use bdk_wallet::{
-    bitcoin::{
-        absolute::LockTime,
-        consensus::encode::deserialize,
-        hashes::{sha256, Hash},
-        transaction::Version,
-        Amount, FeeRate, OutPoint, Psbt, PublicKey as BitcoinPublicKey, ScriptBuf, Transaction,
-        TxIn, TxOut,
-    },
-    SignOptions,
+use bitcoin::{
+    absolute::LockTime,
+    consensus::encode::deserialize,
+    hashes::{sha256, Hash},
+    transaction::Version,
+    Amount, FeeRate, OutPoint, Psbt, PublicKey as BitcoinPublicKey, ScriptBuf, Transaction, TxIn,
+    TxOut,
 };
 use dlctix::{
     bitcoin::{
@@ -4044,16 +4041,7 @@ async fn signed_funding_tx(
 
     // Sign the PSBT (including escrow inputs)
     let fully_signed = bitcoin_client
-        .sign_psbt_with_escrow_support(
-            &mut funding_tx,
-            SignOptions {
-                trust_witness_utxo: true,
-                sign_with_tap_internal_key: true,
-                allow_all_sighashes: true,
-                allow_grinding: true,
-                ..Default::default()
-            },
-        )
+        .sign_psbt_with_escrow_support(&mut funding_tx)
         .await?;
 
     debug!(
@@ -4090,7 +4078,7 @@ async fn signed_funding_tx(
                     input.partial_sigs.len()
                 ));
             }
-        } else if input.partial_sigs.is_empty() {
+        } else if input.partial_sigs.is_empty() && input.tap_key_sig.is_none() {
             validation_errors.push(format!("Input {}: No signatures present", i));
         }
     }

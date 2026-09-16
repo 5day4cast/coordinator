@@ -2,7 +2,7 @@
 
 use super::{CompetitionStatus, ContractCreated, HasCompetitionData};
 use crate::domain::competitions::Competition;
-use bdk_wallet::bitcoin::OutPoint;
+use bitcoin::OutPoint;
 use dlctix::ContractParameters;
 use time::OffsetDateTime;
 use uuid::Uuid;

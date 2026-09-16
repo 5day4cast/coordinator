@@ -24,9 +24,10 @@ coordinator-core = { path = "crates/coordinator-core" }
 keymeld-sdk = { git = "https://github.com/tee8z/keymeld", tag = "v0.3.2", features = ["client", "dlctix"] }
 
 # Bitcoin
-bdk_esplora = { version = "0.22.1", features = ["async", "tokio"] }
+bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }
+electrum-client = "0.21"
+# The browser wallet (coordinator-wasm) still builds on BDK.
 bdk_wallet = { version = "2.3.0", features = ["keys-bip39"] }
-bdk_sqlite = { version = "0.4.0" }
 dlctix = { git = "https://github.com/tee8z/dlctix", branch = "external-signing-api" }
 miniscript = "12.3.2"
 

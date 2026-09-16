@@ -1,5 +1,5 @@
 use anyhow::anyhow;
-use bdk_wallet::bitcoin::{
+use bitcoin::{
     consensus::encode::deserialize,
     hashes::{sha256, Hash},
     PublicKey, Transaction,
@@ -356,7 +356,7 @@ impl InvoiceWatcher {
 
                             // Update the ticket with the new escrow transaction
                             let new_escrow_hex = hex::encode(
-                                bdk_wallet::bitcoin::consensus::encode::serialize(&new_transaction),
+                                bitcoin::consensus::encode::serialize(&new_transaction),
                             );
                             if let Err(e) = self
                                 .coordinator
