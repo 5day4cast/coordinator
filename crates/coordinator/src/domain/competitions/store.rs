@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::{
     api::routes::FinalSignatures,
     domain::{EntryPayout, PayoutError, PayoutStatus},
-    infra::db::DBConnection,
+    infra::db::{DBConnection, DatabaseWriteError},
 };
 
 use super::{Competition, EntryStatus, SearchBy, Ticket, UserEntry};
@@ -46,7 +46,7 @@ impl CompetitionStore {
         &self,
         name: String,
         pubkey: XOnlyPublicKey,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), DatabaseWriteError> {
         let pubkey_raw = pubkey.serialize().to_vec();
 
         self.db_connection
@@ -59,17 +59,13 @@ impl CompetitionStore {
                 Ok(())
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 
     pub async fn add_entry(
         &self,
         entry: UserEntry,
         ticket_id: Uuid,
-    ) -> Result<UserEntry, sqlx::Error> {
+    ) -> Result<UserEntry, DatabaseWriteError> {
         info!("entry: {:?}", entry);
 
         let entry_submission = serde_json::to_string(&entry.entry_submission)
@@ -85,6 +81,12 @@ impl CompetitionStore {
         let payout_hash = entry.payout_hash.clone();
         let encrypted_keymeld_private_key = entry.encrypted_keymeld_private_key.clone();
         let keymeld_auth_pubkey = entry.keymeld_auth_pubkey.clone();
+        let keymeld_registration_context = entry
+            .keymeld_registration_context
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
 
         self.db_connection
             .execute_write(move |pool| async move {
@@ -100,8 +102,9 @@ impl CompetitionStore {
                         payout_hash,
                         entry_submission,
                         encrypted_keymeld_private_key,
-                        keymeld_auth_pubkey
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        keymeld_auth_pubkey,
+                        keymeld_registration_context
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(entry_id)
                 .bind(ticket_id_str)
@@ -114,15 +117,12 @@ impl CompetitionStore {
                 .bind(entry_submission)
                 .bind(encrypted_keymeld_private_key)
                 .bind(keymeld_auth_pubkey)
+                .bind(keymeld_registration_context)
                 .execute(&pool)
                 .await?;
                 Ok(())
             })
-            .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })?;
+            .await?;
 
         Ok(entry)
     }
@@ -131,7 +131,7 @@ impl CompetitionStore {
         &self,
         entry_id: Uuid,
         final_signatures: FinalSignatures,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<bool, DatabaseWriteError> {
         let sigs_json = serde_json::to_string(&final_signatures.partial_signatures)
             .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
 
@@ -155,17 +155,13 @@ impl CompetitionStore {
                 Ok(result.rows_affected() > 0)
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 
     pub async fn add_public_nonces(
         &self,
         entry_id: Uuid,
         public_nonces: SigMap<PubNonce>,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<bool, DatabaseWriteError> {
         let nonces_json =
             serde_json::to_string(&public_nonces).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
 
@@ -185,17 +181,13 @@ impl CompetitionStore {
                 Ok(result.rows_affected() > 0)
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 
     pub async fn mark_entry_sellback_broadcast(
         &self,
         entry_id: Uuid,
         broadcast_time: OffsetDateTime,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<bool, DatabaseWriteError> {
         let broadcast_time_str = broadcast_time
             .format(&Rfc3339)
             .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
@@ -216,17 +208,13 @@ impl CompetitionStore {
                 Ok(result.rows_affected() > 0)
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 
     pub async fn mark_entry_reclaim_broadcast(
         &self,
         entry_id: Uuid,
         broadcast_time: OffsetDateTime,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<bool, DatabaseWriteError> {
         let broadcast_time_str = broadcast_time
             .format(&Rfc3339)
             .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
@@ -247,10 +235,6 @@ impl CompetitionStore {
                 Ok(result.rows_affected() > 0)
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 
     /// Update the keymeld_auth_pubkey for an entry.
@@ -259,7 +243,7 @@ impl CompetitionStore {
         &self,
         entry_id: Uuid,
         keymeld_auth_pubkey: String,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<bool, DatabaseWriteError> {
         let entry_id_str = entry_id.to_string();
 
         self.db_connection
@@ -276,10 +260,6 @@ impl CompetitionStore {
                 Ok(result.rows_affected() > 0)
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 
     pub async fn store_payout_info_pending(
@@ -289,7 +269,7 @@ impl CompetitionStore {
         ephemeral_private_key: String,
         ln_invoice: String,
         payout_amount_sats: u64,
-    ) -> Result<Uuid, sqlx::Error> {
+    ) -> Result<Uuid, DatabaseWriteError> {
         let payout_id = Uuid::now_v7();
         let initiated_at = OffsetDateTime::now_utc();
         let entry_id_str = entry_id.to_string();
@@ -341,17 +321,13 @@ impl CompetitionStore {
                 Ok(payout_id)
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 
     pub async fn mark_payout_succeeded(
         &self,
         payout_id: Uuid,
         succeed_at: OffsetDateTime,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), DatabaseWriteError> {
         let succeed_at_str = succeed_at
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
@@ -371,10 +347,6 @@ impl CompetitionStore {
                 Ok(())
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 
     pub async fn mark_payout_failed(
@@ -382,7 +354,7 @@ impl CompetitionStore {
         payout_id: Uuid,
         failed_at: OffsetDateTime,
         error: PayoutError,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), DatabaseWriteError> {
         let error_blob =
             serde_json::to_string(&error).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
         let failed_at_str = failed_at
@@ -405,10 +377,6 @@ impl CompetitionStore {
                 Ok(())
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 
     pub async fn get_payout(&self, payout_id: Uuid) -> Result<Option<EntryPayout>, sqlx::Error> {
@@ -545,6 +513,7 @@ impl CompetitionStore {
                 ephemeral_privatekey,
                 encrypted_keymeld_private_key,
                 keymeld_auth_pubkey,
+                keymeld_registration_context,
                 public_nonces,
                 partial_signatures,
                 funding_psbt_base64,
@@ -613,6 +582,7 @@ impl CompetitionStore {
               ephemeral_privatekey,
               encrypted_keymeld_private_key,
               keymeld_auth_pubkey,
+              keymeld_registration_context,
               public_nonces,
               partial_signatures,
               funding_psbt_base64,
@@ -702,7 +672,7 @@ impl CompetitionStore {
         &self,
         competition: Competition,
         tickets: Vec<Ticket>,
-    ) -> Result<Competition, sqlx::Error> {
+    ) -> Result<Competition, DatabaseWriteError> {
         let created_at = competition
             .created_at
             .format(&Rfc3339)
@@ -766,11 +736,7 @@ impl CompetitionStore {
                 tx.commit().await?;
                 Ok(())
             })
-            .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })?;
+            .await?;
 
         Ok(competition)
     }
@@ -778,7 +744,7 @@ impl CompetitionStore {
     pub async fn update_competitions(
         &self,
         competitions: Vec<Competition>,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), DatabaseWriteError> {
         // Prepare all competition data before moving into closure
         let mut prepared_updates = Vec::with_capacity(competitions.len());
 
@@ -1077,16 +1043,11 @@ impl CompetitionStore {
                 Ok(())
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 
     pub async fn get_competitions(
         &self,
         active_only: bool,
-        use_write_pool: bool,
     ) -> Result<Vec<Competition>, sqlx::Error> {
         let base_query = r#"
             WITH payout_stats AS (
@@ -1220,14 +1181,8 @@ impl CompetitionStore {
             )
         };
 
-        let pool = if use_write_pool {
-            self.db_connection.write_pool()
-        } else {
-            self.db_connection.read()
-        };
-
         let competitions = sqlx::query_as::<_, Competition>(&final_query)
-            .fetch_all(pool)
+            .fetch_all(self.db_connection.read())
             .await?;
 
         Ok(competitions)
@@ -1334,7 +1289,7 @@ impl CompetitionStore {
         &self,
         competition_id: Uuid,
         pubkey: &str,
-    ) -> Result<Ticket, sqlx::Error> {
+    ) -> Result<Ticket, DatabaseWriteError> {
         let competition_id_str = competition_id.to_string();
         let pubkey_owned = pubkey.to_string();
 
@@ -1464,10 +1419,6 @@ impl CompetitionStore {
                 Ok(ticket)
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 
     pub async fn get_pending_tickets(&self) -> Result<Vec<Ticket>, sqlx::Error> {
@@ -1657,7 +1608,7 @@ impl CompetitionStore {
         &self,
         ticket_hash: &str,
         competition_id: Uuid,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<bool, DatabaseWriteError> {
         let interval = format!("-{} minutes", 10);
         let ticket_hash_owned = ticket_hash.to_string();
         let competition_id_str = competition_id.to_string();
@@ -1682,13 +1633,9 @@ impl CompetitionStore {
                 Ok(result.rows_affected() > 0)
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 
-    pub async fn mark_ticket_settled(&self, ticket_id: Uuid) -> Result<bool, sqlx::Error> {
+    pub async fn mark_ticket_settled(&self, ticket_id: Uuid) -> Result<bool, DatabaseWriteError> {
         let ticket_id_str = ticket_id.to_string();
 
         self.db_connection
@@ -1705,15 +1652,11 @@ impl CompetitionStore {
                 Ok(result.rows_affected() > 0)
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 
     /// Test-only: Mark a ticket as both paid and settled, bypassing Lightning.
     /// Used by the synthetic testing tool to simulate invoice payment.
-    pub async fn test_settle_ticket(&self, ticket_id: Uuid) -> Result<bool, sqlx::Error> {
+    pub async fn test_settle_ticket(&self, ticket_id: Uuid) -> Result<bool, DatabaseWriteError> {
         let ticket_id_str = ticket_id.to_string();
 
         let result = self
@@ -1731,17 +1674,7 @@ impl CompetitionStore {
                 .await?;
                 Ok(result.rows_affected() > 0)
             })
-            .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })?;
-
-        // Force WAL checkpoint so read pool connections can see the update.
-        // The read pool uses shared_cache which can pin WAL snapshots.
-        if result {
-            self.db_connection.passive_checkpoint().await;
-        }
+            .await?;
 
         Ok(result)
     }
@@ -1751,7 +1684,7 @@ impl CompetitionStore {
         ticket_id: Uuid,
         ephemeral_pubkey: String,
         escrow_tx: String,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<bool, DatabaseWriteError> {
         let ticket_id_str = ticket_id.to_string();
 
         self.db_connection
@@ -1769,10 +1702,6 @@ impl CompetitionStore {
                 Ok(result.rows_affected() > 0)
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 
     pub async fn update_ticket_payment_request(
@@ -1780,7 +1709,7 @@ impl CompetitionStore {
         ticket_id: Uuid,
         payment_request: &str,
         invoice_expires_at: time::OffsetDateTime,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<bool, DatabaseWriteError> {
         let ticket_id_str = ticket_id.to_string();
         let payment_request_owned = payment_request.to_string();
         // Use SQLite datetime format: YYYY-MM-DD HH:MM:SS
@@ -1802,13 +1731,12 @@ impl CompetitionStore {
                 Ok(result.rows_affected() > 0)
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 
-    pub async fn clear_ticket_reservation(&self, ticket_id: Uuid) -> Result<bool, sqlx::Error> {
+    pub async fn clear_ticket_reservation(
+        &self,
+        ticket_id: Uuid,
+    ) -> Result<bool, DatabaseWriteError> {
         let ticket_id_str = ticket_id.to_string();
 
         self.db_connection
@@ -1830,17 +1758,13 @@ impl CompetitionStore {
                 Ok(result.rows_affected() > 0)
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 
     pub async fn update_ticket_escrow_transaction(
         &self,
         ticket_id: uuid::Uuid,
         escrow_transaction: &str,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<bool, DatabaseWriteError> {
         let ticket_id_str = ticket_id.to_string();
         let escrow_transaction_owned = escrow_transaction.to_string();
 
@@ -1854,10 +1778,6 @@ impl CompetitionStore {
                 Ok(result.rows_affected() > 0)
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 
     pub async fn reset_ticket_after_failed_escrow(
@@ -1865,7 +1785,7 @@ impl CompetitionStore {
         ticket_id: uuid::Uuid,
         new_encrypted_preimage: &str,
         new_hash: &str,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<bool, DatabaseWriteError> {
         let ticket_id_str = ticket_id.to_string();
         let new_encrypted_preimage_owned = new_encrypted_preimage.to_string();
         let new_hash_owned = new_hash.to_string();
@@ -1894,10 +1814,6 @@ impl CompetitionStore {
                 Ok(result.rows_affected() > 0)
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 
     /// Store a Keymeld session for a competition
@@ -1905,7 +1821,7 @@ impl CompetitionStore {
         &self,
         competition_id: Uuid,
         session: &crate::infra::keymeld::StoredDlcKeygenSession,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<bool, DatabaseWriteError> {
         let session_json =
             serde_json::to_vec(session).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
         let competition_id_str = competition_id.to_string();
@@ -1924,10 +1840,6 @@ impl CompetitionStore {
                 Ok(result.rows_affected() > 0)
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 
     /// Retrieve a Keymeld session for a competition
@@ -1952,7 +1864,10 @@ impl CompetitionStore {
     }
 
     /// Clear a Keymeld session for a competition (e.g., on failure or completion)
-    pub async fn clear_keymeld_session(&self, competition_id: Uuid) -> Result<bool, sqlx::Error> {
+    pub async fn clear_keymeld_session(
+        &self,
+        competition_id: Uuid,
+    ) -> Result<bool, DatabaseWriteError> {
         let competition_id_str = competition_id.to_string();
 
         self.db_connection
@@ -1968,10 +1883,6 @@ impl CompetitionStore {
                 Ok(result.rows_affected() > 0)
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 
     /// Get a single entry by its ID
@@ -1998,6 +1909,7 @@ impl CompetitionStore {
               ephemeral_privatekey,
               encrypted_keymeld_private_key,
               keymeld_auth_pubkey,
+              keymeld_registration_context,
               public_nonces,
               partial_signatures,
               funding_psbt_base64,
@@ -2024,42 +1936,40 @@ impl CompetitionStore {
 
     /// Delete a competition and all related data (tickets, entries, payouts)
     /// This should only be used for competitions that have not started (no paid entries)
-    pub async fn delete_competition(&self, competition_id: Uuid) -> Result<(), sqlx::Error> {
+    pub async fn delete_competition(&self, competition_id: Uuid) -> Result<(), DatabaseWriteError> {
         let id_str = competition_id.to_string();
         self.db_connection
             .execute_write(move |pool| async move {
+                let mut transaction = pool.begin().await?;
                 // Delete payouts for entries in this competition
                 sqlx::query(
                     "DELETE FROM payouts WHERE entry_id IN (SELECT id FROM entries WHERE event_id = ?)"
                 )
                 .bind(&id_str)
-                .execute(&pool)
+                .execute(&mut *transaction)
                 .await?;
 
                 // Delete entries for this competition
                 sqlx::query("DELETE FROM entries WHERE event_id = ?")
                     .bind(&id_str)
-                    .execute(&pool)
+                    .execute(&mut *transaction)
                     .await?;
 
                 // Delete tickets for this competition
                 sqlx::query("DELETE FROM tickets WHERE event_id = ?")
                     .bind(&id_str)
-                    .execute(&pool)
+                    .execute(&mut *transaction)
                     .await?;
 
                 // Delete the competition itself
                 sqlx::query("DELETE FROM competitions WHERE id = ?")
                     .bind(&id_str)
-                    .execute(&pool)
+                    .execute(&mut *transaction)
                     .await?;
 
+                transaction.commit().await?;
                 Ok(())
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => e,
-                e => sqlx::Error::Protocol(e.to_string()),
-            })
     }
 }

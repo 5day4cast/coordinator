@@ -1,5 +1,5 @@
 use crate::SqliteConfigSerde;
-use log::{debug, error, info};
+use log::{debug, error, warn};
 use sqlx::{
     migrate::MigrateDatabase,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow},
@@ -14,24 +14,29 @@ use std::{
     time::Duration as StdDuration,
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio_util::sync::CancellationToken;
 
 // ============================================================================
 // DatabaseWriter - Serializes all write operations through a single channel
 // ============================================================================
 //
-// This pattern ensures that all SQLite writes happen sequentially on a single
-// task, which is required for proper WAL mode operation with Litestream.
-// Without this, concurrent writes from multiple connections can cause issues
-// with WAL checkpointing and replication timing.
+// One worker serializes writes to avoid competing SQLite writers. WAL permits
+// concurrent readers; replication remains asynchronous after a local commit.
+
+const WRITE_QUEUE_CAPACITY: usize = 64;
+const DATABASE_CLOSE_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 
 /// Error type for database write operations
 #[derive(Debug, thiserror::Error)]
 pub enum DatabaseWriteError {
+    #[error("Database write queue full; operation was not accepted")]
+    QueueFull,
+
     #[error("Database writer channel closed")]
     ChannelClosed,
 
-    #[error("Failed to receive write result")]
+    #[error("Database write result lost; operation outcome is unknown")]
     ResultChannelClosed,
 
     #[error("SQLx error: {0}")]
@@ -43,10 +48,7 @@ type WriteOperation = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// Serializes all database write operations through a single channel.
 ///
-/// This ensures that writes happen sequentially, which is important for:
-/// - WAL mode consistency with Litestream
-/// - Avoiding write conflicts
-/// - Predictable replication timing
+/// Admission is bounded. Accepted operations continue when callers disconnect.
 ///
 /// # Example
 ///
@@ -59,20 +61,11 @@ type WriteOperation = Pin<Box<dyn Future<Output = ()> + Send>>;
 ///     Ok(())
 /// }).await?;
 /// ```
-#[derive(Debug)]
-pub struct DatabaseWriter {
-    write_tx: mpsc::UnboundedSender<WriteOperation>,
-    // Note: we use Arc to allow cloning while keeping the task alive
-    _handle: Arc<tokio::task::JoinHandle<()>>,
-}
-
-impl Clone for DatabaseWriter {
-    fn clone(&self) -> Self {
-        Self {
-            write_tx: self.write_tx.clone(),
-            _handle: self._handle.clone(),
-        }
-    }
+#[derive(Clone, Debug)]
+struct DatabaseWriter {
+    write_tx: mpsc::Sender<WriteOperation>,
+    shutdown: CancellationToken,
+    handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl Default for DatabaseWriter {
@@ -83,10 +76,27 @@ impl Default for DatabaseWriter {
 
 impl DatabaseWriter {
     /// Creates a new DatabaseWriter with a background task that processes writes.
-    pub fn new() -> Self {
-        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<WriteOperation>();
+    fn new() -> Self {
+        let (write_tx, mut write_rx) = mpsc::channel::<WriteOperation>(WRITE_QUEUE_CAPACITY);
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
 
         let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = stop.cancelled() => {
+                        write_rx.close();
+                        break;
+                    }
+                    operation = write_rx.recv() => {
+                        let Some(operation) = operation else { return };
+                        operation.await;
+                    }
+                }
+            }
+            // Closing admission preserves accepted commands, including commands
+            // whose callers no longer wait for their replies.
             while let Some(future) = write_rx.recv().await {
                 future.await;
             }
@@ -94,8 +104,31 @@ impl DatabaseWriter {
 
         Self {
             write_tx,
-            _handle: Arc::new(handle),
+            shutdown,
+            handle: Arc::new(Mutex::new(Some(handle))),
         }
+    }
+
+    async fn close(&self) -> Result<(), anyhow::Error> {
+        self.shutdown.cancel();
+        let mut handle = self.handle.lock().await;
+        if let Some(task) = handle.as_mut() {
+            match tokio::time::timeout(DATABASE_CLOSE_TIMEOUT, &mut *task).await {
+                Ok(result) => {
+                    handle.take();
+                    result?;
+                }
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                    handle.take();
+                    return Err(anyhow::anyhow!(
+                        "Database writer did not drain before shutdown timeout"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Executes a write operation through the serialized channel.
@@ -117,7 +150,7 @@ impl DatabaseWriter {
     /// # Returns
     ///
     /// The result of the operation, or a `DatabaseWriteError` if the operation failed.
-    pub async fn execute<T, F, Fut>(
+    async fn execute<T, F, Fut>(
         &self,
         pool: SqlitePool,
         operation: F,
@@ -127,6 +160,9 @@ impl DatabaseWriter {
         F: FnOnce(SqlitePool) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, sqlx::Error>> + Send + 'static,
     {
+        if self.shutdown.is_cancelled() {
+            return Err(DatabaseWriteError::ChannelClosed);
+        }
         let (result_tx, result_rx) = oneshot::channel::<Result<T, sqlx::Error>>();
 
         let write_op: WriteOperation = Box::pin(async move {
@@ -136,8 +172,11 @@ impl DatabaseWriter {
         });
 
         self.write_tx
-            .send(write_op)
-            .map_err(|_| DatabaseWriteError::ChannelClosed)?;
+            .try_send(write_op)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => DatabaseWriteError::QueueFull,
+                mpsc::error::TrySendError::Closed(_) => DatabaseWriteError::ChannelClosed,
+            })?;
 
         result_rx
             .await
@@ -262,7 +301,7 @@ impl SqliteConfig {
     pub fn read_only() -> Self {
         Self {
             mode: SqliteMode::ReadOnly,
-            cache: SqliteCache::Shared,
+            cache: SqliteCache::Private,
             journal_mode: JournalMode::WAL, // Can still read WAL files
             synchronous: SynchronousMode::OFF, // No writes, so sync doesn't matter
             foreign_keys: false,            // Read-only doesn't need FK checks
@@ -391,7 +430,7 @@ impl Default for SqliteConfig {
     fn default() -> Self {
         Self {
             mode: SqliteMode::ReadWriteCreate,
-            cache: SqliteCache::Shared,
+            cache: SqliteCache::Private,
             busy_timeout_ms: 5000,
             journal_mode: JournalMode::WAL,
             synchronous: SynchronousMode::NORMAL,
@@ -421,7 +460,7 @@ impl Default for DatabasePoolConfig {
         Self {
             read_max_connections: 12, // More readers
             read_min_connections: 2,
-            write_max_connections: 5, // Fewer writers
+            write_max_connections: 1,
             write_min_connections: 1,
             idle_timeout_secs: 600,   // 10 minutes
             acquire_timeout_secs: 15, // 15 seconds
@@ -434,7 +473,7 @@ impl DatabasePoolConfig {
     pub fn development() -> Self {
         Self {
             read_max_connections: 5,
-            write_max_connections: 3,
+            write_max_connections: 1,
             sqlite_config: SqliteConfig::development(),
             ..Default::default()
         }
@@ -444,8 +483,8 @@ impl DatabasePoolConfig {
         Self {
             read_max_connections: 20,
             read_min_connections: 5,
-            write_max_connections: 8,
-            write_min_connections: 2,
+            write_max_connections: 1,
+            write_min_connections: 1,
             acquire_timeout_secs: 30,
             sqlite_config: SqliteConfig::production(),
             ..Default::default()
@@ -534,9 +573,8 @@ pub enum DatabaseType {
 
 /// Database connection with serialized write support.
 ///
-/// This struct provides access to both read and write pools, with writes
-/// being serialized through a `DatabaseWriter` to ensure WAL mode consistency
-/// and compatibility with Litestream replication.
+/// Reads use a query-only pool. A bounded worker serializes writes through a
+/// pool with one retained connection.
 ///
 /// # Write Operations
 ///
@@ -591,9 +629,6 @@ impl DBConnection {
         let (read_pool, write_pool) =
             Self::create_pools(&database_path, &database_pool_config).await?;
 
-        // Create the serialized writer for WAL-safe writes
-        let writer = DatabaseWriter::new();
-
         let migrator = match db_type {
             DatabaseType::Competitions => &COMPETITIONS_MIGRATOR,
             DatabaseType::Users => &USERS_MIGRATOR,
@@ -609,7 +644,7 @@ impl DBConnection {
             database_path: database_path.clone(),
             read_pool,
             write_pool,
-            writer,
+            writer: DatabaseWriter::new(),
         })
     }
 
@@ -633,12 +668,27 @@ impl DBConnection {
         database_path: &str,
         database_pool_config: &DatabasePoolConfig,
     ) -> Result<(SqlitePool, SqlitePool), sqlx::Error> {
+        if database_pool_config.read_max_connections == 0
+            || database_pool_config.read_min_connections > database_pool_config.read_max_connections
+            || database_pool_config.acquire_timeout_secs == 0
+        {
+            return Err(sqlx::Error::Configuration(
+                "Reader pool bounds and acquisition timeout must be positive and consistent".into(),
+            ));
+        }
+        if database_pool_config.write_max_connections != 1
+            || database_pool_config.write_min_connections != 1
+        {
+            warn!(
+                "SQLite uses one writable connection; legacy write pool size settings are ignored"
+            );
+        }
         let (read_config, write_config) =
             if matches!(database_pool_config.sqlite_config.mode, SqliteMode::Memory) {
                 // For memory mode, both pools use memory but can be separate instances
                 let read_config = SqliteConfig {
                     mode: SqliteMode::Memory,
-                    cache_size: database_pool_config.sqlite_config.cache_size * 2, // Larger cache for reads
+                    cache_size: database_pool_config.sqlite_config.cache_size,
                     synchronous: SynchronousMode::OFF, // No writes = no sync needed
                     ..database_pool_config.sqlite_config.clone()
                 };
@@ -652,11 +702,13 @@ impl DBConnection {
             } else {
                 // For file mode, create separate read-only and read-write pools
                 let mut read_config = SqliteConfig::read_only();
-                read_config.cache_size = database_pool_config.sqlite_config.cache_size * 2; // Larger cache for reads
+                read_config.cache_size = database_pool_config.sqlite_config.cache_size;
+                read_config.cache = SqliteCache::Private;
                 read_config.busy_timeout_ms = database_pool_config.sqlite_config.busy_timeout_ms;
 
                 let write_config = SqliteConfig {
                     mode: SqliteMode::ReadWrite,
+                    cache: SqliteCache::Private,
                     ..database_pool_config.sqlite_config.clone()
                 };
 
@@ -667,18 +719,19 @@ impl DBConnection {
         debug!("Write connection: {:?}", write_connection);
 
         let write_pool = SqlitePoolOptions::new()
-            .max_connections(database_pool_config.write_max_connections)
-            .min_connections(database_pool_config.write_min_connections)
+            .max_connections(1)
+            .min_connections(1)
             .acquire_timeout(StdDuration::from_secs(
                 database_pool_config.acquire_timeout_secs,
             ))
-            .idle_timeout(StdDuration::from_secs(
-                database_pool_config.idle_timeout_secs,
-            ))
+            .idle_timeout(None)
+            .max_lifetime(None)
             .connect_with(write_connection)
             .await?;
 
-        let read_connection = read_config.build_connect_options(database_path);
+        let read_connection = read_config
+            .build_connect_options(database_path)
+            .pragma("query_only", "ON");
         debug!("Read connection: {:?}", read_connection);
 
         let read_pool = SqlitePoolOptions::new()
@@ -697,6 +750,9 @@ impl DBConnection {
     }
 
     pub async fn ping(&self) -> Result<(), sqlx::Error> {
+        if self.writer.write_tx.is_closed() || self.writer.shutdown.is_cancelled() {
+            return Err(sqlx::Error::PoolClosed);
+        }
         let _: i32 = sqlx::query_scalar("SELECT 1")
             .fetch_one(&self.read_pool)
             .await?;
@@ -705,6 +761,10 @@ impl DBConnection {
             .await?;
 
         Ok(())
+    }
+
+    pub(crate) async fn writer_stopped(&self) {
+        self.writer.write_tx.closed().await;
     }
 
     /// Run PRAGMA quick_check to verify database page structure integrity.
@@ -726,34 +786,19 @@ impl DBConnection {
         Ok(())
     }
 
-    pub async fn close(self) {
-        self.read_pool.close().await;
-        self.write_pool.close().await;
-    }
-
-    /// Checkpoint WAL to main database file before shutdown.
-    /// This ensures all pending writes are flushed so Litestream
-    /// can replicate a complete database to S3.
-    pub async fn checkpoint(&self) {
-        match sqlx::query("PRAGMA wal_checkpoint(TRUNCATE);")
-            .execute(&self.write_pool)
-            .await
-        {
-            Ok(_) => info!(
-                "{}: WAL checkpoint completed successfully",
-                self.database_name
-            ),
-            Err(e) => error!("{}: WAL checkpoint failed: {}", self.database_name, e),
-        }
-    }
-
-    /// Non-blocking WAL checkpoint that flushes committed WAL frames to the
-    /// main database file without blocking writers. Use this after writes that
-    /// must be immediately visible to the read pool (e.g. test-settle).
-    pub async fn passive_checkpoint(&self) {
-        let _ = sqlx::query("PRAGMA wal_checkpoint(PASSIVE);")
-            .execute(&self.write_pool)
-            .await;
+    pub async fn close(self) -> Result<(), anyhow::Error> {
+        let writer_result = self.writer.close().await;
+        // Accepted commands finish before either pool closes. This also closes
+        // handles retained by application state after HTTP has drained.
+        tokio::time::timeout(DATABASE_CLOSE_TIMEOUT, async {
+            self.read_pool.close().await;
+            self.write_pool.close().await;
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("Database connections did not close before shutdown timeout")
+        })?;
+        writer_result
     }
 
     /// Returns a reference to the read pool for read-only operations.
@@ -763,35 +808,11 @@ impl DBConnection {
         &self.read_pool
     }
 
-    /// Returns a reference to the write pool.
-    ///
-    /// **WARNING**: For new code, prefer using `execute_write()` instead, which
-    /// serializes writes through a single channel for WAL mode consistency and
-    /// Litestream compatibility.
-    ///
-    /// This method is kept for backwards compatibility during migration.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Use execute_write() for serialized writes compatible with Litestream"
-    )]
-    pub fn write(&self) -> &SqlitePool {
-        &self.write_pool
-    }
-
-    /// Returns a reference to the write pool for internal use.
-    ///
-    /// This is used by `execute_write()` and should not be called directly
-    /// for new code.
-    pub(crate) fn write_pool(&self) -> &SqlitePool {
-        &self.write_pool
-    }
-
     /// Executes a write operation through the serialized channel.
     ///
-    /// All writes go through a single background task to ensure:
-    /// - WAL mode consistency with Litestream
-    /// - No concurrent write conflicts
-    /// - Predictable replication timing
+    /// Commands run sequentially and retain ownership after callers disconnect.
+    /// Return success only after SQL completes or an explicit transaction commits.
+    /// Closures must contain only bounded database work.
     ///
     /// # Example
     ///
@@ -826,13 +847,6 @@ impl DBConnection {
         self.writer
             .execute(self.write_pool.clone(), operation)
             .await
-    }
-
-    /// Returns the database writer for advanced use cases.
-    ///
-    /// Most code should use `execute_write()` instead.
-    pub fn writer(&self) -> &DatabaseWriter {
-        &self.writer
     }
 }
 
@@ -914,3 +928,6 @@ where
         source: Box::new(e),
     })
 }
+
+#[cfg(test)]
+mod tests;

@@ -12,7 +12,7 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["keymeld"]
 # Enable keymeld integration for remote MuSig2 signing
-keymeld = ["dep:keymeld-sdk"]
+keymeld = ["dep:keymeld-sdk", "coordinator-core/keymeld"]
 
 [dependencies]
 coordinator-core = { path = "../coordinator-core", default-features = false }
@@ -31,7 +31,7 @@ bdk_wallet = { version = "2.3.0", default-features = false, features = ["std", "
 dlctix = { git = "https://github.com/tee8z/dlctix", branch = "external-signing-api", default-features = false }
 
 # Keymeld SDK - for remote MuSig2 signing
-keymeld-sdk = { workspace = true, default-features = false, optional = true }
+keymeld-sdk = { workspace = true, optional = true }
 
 # Crypto
 blake2.workspace = true

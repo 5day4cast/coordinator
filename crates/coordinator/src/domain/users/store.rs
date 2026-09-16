@@ -82,10 +82,7 @@ impl UserStore {
                 .await
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => Error::DbError(e),
-                e => Error::BadRequest(e.to_string()),
-            })?;
+            .map_err(Error::from)?;
 
         Ok(user)
     }
@@ -140,10 +137,7 @@ impl UserStore {
                 Ok(result.rows_affected())
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => Error::DbError(e),
-                e => Error::BadRequest(e.to_string()),
-            })?;
+            .map_err(Error::from)?;
 
         if rows_affected == 0 {
             return Err(Error::NotFound(format!(
@@ -169,10 +163,7 @@ impl UserStore {
                 Ok(result.rows_affected())
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => Error::DbError(e),
-                e => Error::BadRequest(e.to_string()),
-            })?;
+            .map_err(Error::from)?;
 
         if rows_affected == 0 {
             return Err(Error::NotFound(format!(
@@ -319,10 +310,7 @@ impl UserStore {
                 .await
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => Error::DbError(e),
-                e => Error::BadRequest(e.to_string()),
-            })?;
+            .map_err(Error::from)?;
 
         Ok(user)
     }
@@ -386,10 +374,7 @@ impl UserStore {
                 Ok(result.rows_affected())
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => Error::DbError(e),
-                e => Error::BadRequest(e.to_string()),
-            })?;
+            .map_err(Error::from)?;
 
         if rows_affected == 0 {
             return Err(Error::NotFound(format!(
@@ -432,10 +417,7 @@ impl UserStore {
                 Ok(result.rows_affected())
             })
             .await
-            .map_err(|e| match e {
-                crate::infra::db::DatabaseWriteError::Sqlx(e) => Error::DbError(e),
-                e => Error::BadRequest(e.to_string()),
-            })?;
+            .map_err(Error::from)?;
 
         if rows_affected == 0 {
             return Err(Error::NotFound(format!(

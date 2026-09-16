@@ -17,6 +17,7 @@ use dlctix::{
     secp::MaybeScalar,
     ContractParameters, EventLockingConditions, Outcome, SigMap, SignedContract,
 };
+use keymeld_sdk::types::{RegistrationContext, SignedSessionManifest};
 use log::{debug, error};
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, FromRow, Row};
@@ -48,7 +49,7 @@ pub struct AddEntry {
     pub event_id: Uuid,
     pub expected_observations: Vec<WeatherChoices>,
     /// User's ephemeral private key encrypted to the keymeld enclave's public key.
-    /// Used for server-side keymeld registration. Optional for backwards compatibility.
+    /// Required for authorized server-side registration when Keymeld is enabled.
     #[serde(default)]
     pub encrypted_keymeld_private_key: Option<String>,
     /// User's auth public key derived from their ephemeral private key for keymeld session auth.
@@ -56,6 +57,9 @@ pub struct AddEntry {
     /// Required when encrypted_keymeld_private_key is provided.
     #[serde(default)]
     pub keymeld_auth_pubkey: Option<String>,
+    /// Exact context bound to the participant possession proof.
+    #[serde(default)]
+    pub keymeld_registration_context: Option<RegistrationContext>,
 }
 
 pub enum EntryStatus {
@@ -171,6 +175,9 @@ pub struct UserEntry {
     /// User's auth public key for keymeld session authentication.
     /// Derived client-side from their ephemeral private key.
     pub keymeld_auth_pubkey: Option<String>,
+    /// Exact context bound to the participant possession proof.
+    #[serde(default)]
+    pub keymeld_registration_context: Option<RegistrationContext>,
     pub public_nonces: Option<SigMap<PubNonce>>,
     /// User signed funding psbt
     pub funding_psbt_base64: Option<String>,
@@ -220,6 +227,15 @@ impl FromRow<'_, SqliteRow> for UserEntry {
             payout_preimage: row.get("payout_preimage"),
             encrypted_keymeld_private_key: row.get("encrypted_keymeld_private_key"),
             keymeld_auth_pubkey: row.get("keymeld_auth_pubkey"),
+            keymeld_registration_context: row
+                .try_get::<Option<String>, _>("keymeld_registration_context")?
+                .map(|json| {
+                    serde_json::from_str(&json).map_err(|error| sqlx::Error::ColumnDecode {
+                        index: "keymeld_registration_context".into(),
+                        source: Box::new(error),
+                    })
+                })
+                .transpose()?,
             public_nonces: parse_optional_blob_json(row, "public_nonces")?,
             funding_psbt_base64: row.get("funding_psbt_base64"),
             partial_signatures: parse_optional_blob_json(row, "partial_signatures")?,
@@ -294,6 +310,7 @@ impl AddEntry {
             payout_preimage: None,
             encrypted_keymeld_private_key: self.encrypted_keymeld_private_key,
             keymeld_auth_pubkey: self.keymeld_auth_pubkey,
+            keymeld_registration_context: self.keymeld_registration_context,
             paid_at: None,
             sellback_broadcasted_at: None,
             reclaimed_broadcasted_at: None,
@@ -890,7 +907,7 @@ impl Competition {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FundedContract {
     pub contract_params: ContractParameters,
     pub funding_outpoint: OutPoint,
@@ -901,7 +918,7 @@ pub struct FundedContract {
 }
 
 /// Keymeld signing information included in contract response
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeymeldSigningInfo {
     /// Whether keymeld signing is enabled
     pub enabled: bool,
@@ -911,6 +928,8 @@ pub struct KeymeldSigningInfo {
     pub session_id: String,
     /// Session secret encrypted with NIP-44 for the user (hex encoded)
     pub encrypted_session_secret: String,
+    /// Pinned manifest for participant session reads; private authority credentials are never shared.
+    pub authorization_manifest: SignedSessionManifest,
     /// User ID assigned to this participant
     pub user_id: String,
 }

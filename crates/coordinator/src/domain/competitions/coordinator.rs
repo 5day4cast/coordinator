@@ -8,6 +8,7 @@ use crate::{
     domain::{Competition, CreateEvent, EntryStatus, Error},
     infra::{
         bitcoin::{Bitcoin, ForeignUtxo, REQUIRED_CONFIRMATIONS_FOR_TIME},
+        db::DatabaseWriteError,
         escrow::{create_escrow_descriptor, generate_escrow_tx, get_escrow_outpoint},
         keymeld::{
             DlcKeygenSession, DlcSubsetInfo, Keymeld, ParticipantRegistrationData,
@@ -24,8 +25,9 @@ use bitcoin::{
     hashes::{sha256, Hash},
     transaction::Version,
     Amount, FeeRate, OutPoint, Psbt, PublicKey as BitcoinPublicKey, ScriptBuf, Transaction, TxIn,
-    TxOut,
+    TxOut, Txid,
 };
+use coordinator_core::RegistrationAssignment;
 use dlctix::{
     bitcoin::{
         consensus,
@@ -45,7 +47,9 @@ use dlctix::{
 use futures::TryFutureExt;
 use itertools::Itertools;
 use keymeld_sdk::prelude::UserId;
+use keymeld_sdk::types::{RegistrationContext, SignedRoster};
 use log::{debug, error, info, warn};
+use nostr_sdk::{nips::nip44, Keys, PublicKey as NostrPublicKey, SecretKey};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use serde::Serialize;
@@ -59,6 +63,37 @@ use time::OffsetDateTime;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+fn confirmation_depth(tip: u32, inclusion_height: u32) -> u32 {
+    tip.checked_sub(inclusion_height)
+        .and_then(|blocks| blocks.checked_add(1))
+        .unwrap_or(0)
+}
+
+impl Competition {
+    pub(crate) fn funding_reservation_deadline(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<u64, anyhow::Error> {
+        let deadline = self
+            .event_submission
+            .signing_date
+            .unix_timestamp()
+            .max(self.event_submission.end_observation_date.unix_timestamp())
+            .max(
+                self.event_announcement
+                    .as_ref()
+                    .and_then(|event| event.expiry)
+                    .map(i64::from)
+                    .unwrap_or(0),
+            )
+            .max(now.unix_timestamp())
+            .checked_add(24 * 60 * 60)
+            .ok_or_else(|| anyhow!("Funding reservation deadline overflow"))?;
+        u64::try_from(deadline)
+            .map_err(|error| anyhow!("Invalid funding reservation deadline: {error}"))
+    }
+}
 
 /// Response for ticket request containing both payment info and safety mechanisms
 #[derive(Debug, Serialize)]
@@ -77,6 +112,7 @@ pub struct TicketResponse {
     /// Keymeld enclave public key (hex-encoded) for encrypting the user's ephemeral private key
     /// Users encrypt their ephemeral private key to this key for server-side keymeld registration
     pub keymeld_enclave_public_key: Option<String>,
+    pub keymeld_registration: Option<RegistrationAssignment>,
 }
 
 pub struct CompetitionWatcher {
@@ -198,48 +234,32 @@ impl Coordinator {
         &self,
         competition_id: Uuid,
     ) -> Result<(), anyhow::Error> {
-        let tickets = self.competition_store.get_tickets(competition_id).await?;
-
-        info!(
-            "Settling {} hold invoices for competition {}",
-            tickets.len(),
-            competition_id
-        );
-
-        for (_ticket_id, ticket) in tickets {
-            // Only settle tickets that have been paid (invoice accepted)
-            if ticket.paid_at.is_none() {
-                debug!("Skipping ticket {} - not paid yet", ticket.id);
-                continue;
-            }
-
-            // Skip already settled tickets
-            if ticket.settled_at.is_some() {
-                debug!("Skipping ticket {} - already settled", ticket.id);
-                continue;
-            }
-
-            match self
-                .ln
-                .settle_hold_invoice(ticket.encrypted_preimage.clone())
-                .await
-            {
-                Ok(_) => {
-                    info!("Settled hold invoice for ticket {}", ticket.id);
-                    // Mark ticket as settled
-                    if let Err(e) = self.competition_store.mark_ticket_settled(ticket.id).await {
-                        error!("Failed to mark ticket {} as settled: {}", ticket.id, e);
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to settle hold invoice for ticket {}: {}",
-                        ticket.id, e
-                    );
-                }
-            }
+        if self.is_keymeld_enabled() {
+            let competition = self
+                .competition_store
+                .get_competition(competition_id)
+                .await?;
+            let stored = self
+                .competition_store
+                .get_keymeld_session(competition_id)
+                .await?
+                .ok_or_else(|| anyhow!("Competition has no authorized Keymeld session"))?;
+            let session = self.restore_keymeld_session(&stored)?;
+            self.verify_keymeld_competition(&competition, &session)
+                .await?;
         }
-
+        let tickets = self.competition_store.get_tickets(competition_id).await?;
+        for ticket in tickets.values() {
+            if ticket.paid_at.is_none() || ticket.settled_at.is_some() {
+                continue;
+            }
+            self.ln
+                .settle_hold_invoice(ticket.encrypted_preimage.clone())
+                .await?;
+            self.competition_store
+                .mark_ticket_settled(ticket.id)
+                .await?;
+        }
         Ok(())
     }
 
@@ -250,7 +270,7 @@ impl Coordinator {
             .competition_store
             .get_keymeld_session(competition_id)
             .await
-            .map_err(Error::DbError)?
+            .map_err(Error::from)?
             .ok_or_else(|| {
                 Error::NotFound(format!(
                     "Keymeld session not found for competition {}",
@@ -258,10 +278,7 @@ impl Coordinator {
                 ))
             })?;
 
-        // Decrypt the session secret to restore the session
-        let session_secret =
-            self.decrypt_session_secret(&stored_session.encrypted_session_secret)?;
-        let session = stored_session.to_session(session_secret);
+        let session = self.restore_keymeld_session(&stored_session)?;
 
         let status = self
             .keymeld
@@ -287,7 +304,7 @@ impl Coordinator {
             .competition_store
             .get_keymeld_session(competition.id)
             .await
-            .map_err(Error::DbError)?
+            .map_err(Error::from)?
             .ok_or_else(|| {
                 Error::NotFound(format!(
                     "Keymeld session not found for competition {}",
@@ -295,17 +312,12 @@ impl Coordinator {
                 ))
             })?;
 
-        // Decrypt session secret to restore session
-        let session_secret =
-            self.decrypt_session_secret(&stored_session.encrypted_session_secret)?;
-        let session = stored_session.to_session(session_secret);
+        let session = self.restore_keymeld_session(&stored_session)?;
 
-        // Wait for keygen to complete and get aggregate key
-        let aggregate_key = self
-            .keymeld
-            .wait_for_keygen_completion(&session)
-            .await
-            .map_err(|e| Error::BadRequest(format!("Failed to complete keymeld keygen: {}", e)))?;
+        let roster = self
+            .verify_keymeld_competition(competition, &session)
+            .await?;
+        let aggregate_key = roster.roster.aggregate_public_key;
 
         info!(
             "Keymeld keygen session {} completed for competition {}",
@@ -327,63 +339,88 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Store a Keymeld session for a competition (for use after keygen completes)
-    /// The session secret is encrypted to the coordinator's own nostr pubkey before storage
+    /// Encrypt shared and independent authority credentials before persisting the pinned session.
     pub async fn store_keymeld_session(
         &self,
         competition_id: Uuid,
         session: DlcKeygenSession,
     ) -> Result<(), Error> {
-        use nostr_sdk::nips::nip44;
-        use nostr_sdk::prelude::{Keys, SecretKey};
-
-        // Encrypt session secret to our own pubkey for secure storage
-        let coordinator_secret_key = SecretKey::from_slice(&self.private_key.serialize())
-            .map_err(|e| Error::BadRequest(format!("Failed to create secret key: {}", e)))?;
-
-        let coordinator_keys = Keys::new(coordinator_secret_key);
-
-        let encrypted_session_secret = nip44::encrypt(
-            coordinator_keys.secret_key(),
-            &coordinator_keys.public_key(),
-            hex::encode(session.session_secret),
-            nip44::Version::V2,
-        )
-        .map_err(|e| Error::BadRequest(format!("NIP-44 encryption failed: {}", e)))?;
-
-        let stored_session =
-            StoredDlcKeygenSession::from_session(session, encrypted_session_secret);
-
+        let keys = self.keymeld_storage_keys()?;
+        let stored_session = StoredDlcKeygenSession::from_session(&session, &keys)
+            .map_err(|error| Error::Bitcoin(anyhow!(error)))?;
         self.competition_store
             .store_keymeld_session(competition_id, &stored_session)
             .await
-            .map_err(Error::DbError)?;
+            .map_err(Error::from)?;
         Ok(())
     }
 
-    /// Decrypt a stored keymeld session secret
-    fn decrypt_session_secret(&self, encrypted: &str) -> Result<[u8; 32], Error> {
-        use nostr_sdk::nips::nip44;
-        use nostr_sdk::prelude::{Keys, SecretKey};
+    fn keymeld_storage_keys(&self) -> Result<Keys, Error> {
+        SecretKey::from_slice(&self.private_key.serialize())
+            .map(Keys::new)
+            .map_err(|error| Error::Bitcoin(anyhow!(error)))
+    }
 
-        let coordinator_secret_key = SecretKey::from_slice(&self.private_key.serialize())
-            .map_err(|e| Error::BadRequest(format!("Failed to create secret key: {}", e)))?;
+    fn restore_keymeld_session(
+        &self,
+        stored: &StoredDlcKeygenSession,
+    ) -> Result<DlcKeygenSession, Error> {
+        stored
+            .to_session(&self.keymeld_storage_keys()?)
+            .map_err(|error| Error::Bitcoin(anyhow!(error)))
+    }
 
-        let coordinator_keys = Keys::new(coordinator_secret_key);
-
-        let decrypted_hex = nip44::decrypt(
-            coordinator_keys.secret_key(),
-            &coordinator_keys.public_key(),
-            encrypted,
+    /// Verify the complete accepted roster before signatures, funding, or invoice settlement.
+    async fn verify_keymeld_competition(
+        &self,
+        competition: &Competition,
+        session: &DlcKeygenSession,
+    ) -> Result<SignedRoster, Error> {
+        let mut entries = self
+            .competition_store
+            .get_competition_entries(competition.id, vec![EntryStatus::Paid])
+            .await
+            .map_err(Error::from)?;
+        entries.sort_by_key(|entry| entry.ticket_id);
+        let roster = self
+            .keymeld
+            .wait_for_keygen_completion(session)
+            .await
+            .map_err(|error| Error::Bitcoin(anyhow!(error)))?;
+        let coordinator_id = session
+            .authorization_manifest
+            .manifest
+            .coordinator_user_id
+            .clone();
+        let mut expected_keys = BTreeMap::new();
+        let mut expected_contexts = BTreeMap::new();
+        expected_keys.insert(coordinator_id.clone(), self.public_key.serialize().to_vec());
+        for entry in &entries {
+            let user = UserId::from(entry.ticket_id);
+            expected_keys.insert(
+                user.clone(),
+                hex::decode(&entry.ephemeral_pubkey)
+                    .map_err(|error| Error::Bitcoin(anyhow!(error)))?,
+            );
+            expected_contexts.insert(
+                user,
+                entry.keymeld_registration_context.clone().ok_or_else(|| {
+                    Error::BadRequest(
+                        "Accepted entry is missing authorized registration context".into(),
+                    )
+                })?,
+            );
+        }
+        verify_accepted_keymeld_roster(
+            session,
+            &roster,
+            &expected_keys,
+            &expected_contexts,
+            coordinator_id,
+            competition.event_submission.number_of_places_win,
         )
-        .map_err(|e| Error::BadRequest(format!("NIP-44 decryption failed: {}", e)))?;
-
-        let secret_bytes = hex::decode(&decrypted_hex)
-            .map_err(|e| Error::BadRequest(format!("Invalid session secret hex: {}", e)))?;
-
-        secret_bytes
-            .try_into()
-            .map_err(|_| Error::BadRequest("Session secret must be 32 bytes".to_string()))
+        .map_err(Error::Bitcoin)?;
+        Ok(roster)
     }
 
     pub fn public_key(&self) -> String {
@@ -392,19 +429,18 @@ impl Coordinator {
     }
 
     pub async fn ping(&self) -> Result<(), Error> {
-        self.competition_store.ping().await.map_err(Error::DbError)
+        self.competition_store.ping().await.map_err(Error::from)
     }
 
     pub async fn quick_check(&self) -> Result<(), Error> {
         self.competition_store
             .quick_check()
             .await
-            .map_err(Error::DbError)
+            .map_err(Error::from)
     }
 
     pub async fn competition_handler(&self) -> Result<(), anyhow::Error> {
-        let competitions: Vec<Competition> =
-            self.competition_store.get_competitions(true, true).await?;
+        let competitions: Vec<Competition> = self.competition_store.get_competitions(true).await?;
 
         for mut competition in competitions {
             let mut processed_states = 0;
@@ -424,10 +460,11 @@ impl Coordinator {
                                 .update_competitions(vec![competition.clone()])
                                 .await
                             {
-                                error!(
+                                return Err(anyhow!(
                                     "Failed to cancel expired-failed competition {}: {}",
-                                    competition.id, e
-                                );
+                                    competition.id,
+                                    e
+                                ));
                             } else {
                                 info!(
                                     "Auto-cancelled failed competition {} (failed {}h ago)",
@@ -454,12 +491,21 @@ impl Coordinator {
                     .update_competitions(vec![competition.clone()])
                     .await
                 {
-                    error!(
+                    return Err(anyhow!(
                         "Failed to save competition {} after cancellation: {}",
-                        competition.id, e
-                    );
+                        competition.id,
+                        e
+                    ));
                 }
                 info!("Cancelled expired competition {}", competition.id);
+                continue;
+            }
+
+            if let Err(error) = self.renew_funding_reservation(&competition).await {
+                error!(
+                    "Cannot reserve funding inputs for competition {}: {}",
+                    competition.id, error
+                );
                 continue;
             }
 
@@ -487,10 +533,12 @@ impl Coordinator {
                             .update_competitions(vec![updated_competition.clone()])
                             .await
                         {
-                            error!(
+                            return Err(anyhow!(
                                 "Failed to save competition {} in state {}: {}",
-                                competition.id, new_state_name, e
-                            );
+                                competition.id,
+                                new_state_name,
+                                e
+                            ));
                         }
                         competition = updated_competition;
                         continue;
@@ -502,10 +550,12 @@ impl Coordinator {
                     .update_competitions(vec![updated_competition])
                     .await
                 {
-                    error!(
+                    return Err(anyhow!(
                         "Failed to save competition {} in state {}: {}",
-                        competition.id, new_state_name, e
-                    );
+                        competition.id,
+                        new_state_name,
+                        e
+                    ));
                 }
                 break;
             }
@@ -663,27 +713,13 @@ impl Coordinator {
                             );
                             match self.complete_keymeld_keygen(state.competition_mut()).await {
                                 Ok(_) => {
-                                    // Chain immediately to AwaitingSignatures processing
-                                    let awaiting_sigs = CompetitionStatus::AwaitingSignatures(
+                                    // The outer lifecycle loop commits this state before
+                                    // another tick can start unattended signing.
+                                    CompetitionStatus::AwaitingSignatures(
                                         AwaitingSignatures::from_competition(
                                             state.into_competition(),
                                         ),
-                                    );
-                                    // Persist state before chaining to ensure we don't lose progress
-                                    if let Err(e) = self
-                                        .competition_store
-                                        .update_competitions(vec![awaiting_sigs
-                                            .clone()
-                                            .into_competition()])
-                                        .await
-                                    {
-                                        error!(
-                                            "Failed to save competition {} before chaining to AwaitingSignatures: {}",
-                                            competition_id, e
-                                        );
-                                    }
-                                    // Use Box::pin to allow recursive async call
-                                    return Box::pin(self.process_status(awaiting_sigs)).await;
+                                    )
                                 }
                                 Err(e) => {
                                     error!(
@@ -818,7 +854,7 @@ impl Coordinator {
                     // Check if we have enough confirmations to settle
                     if let Some(funding_tx) = &state.competition().funding_transaction {
                         let txid = funding_tx.compute_txid();
-                        match self.bitcoin.get_tx_confirmation_height(&txid).await {
+                        match self.transaction_confirmations(&txid).await {
                             Ok(Some(confirmations)) => {
                                 confirmations >= self.invoice_settlement_confirmations
                                     && state.competition().invoices_settled_at.is_none()
@@ -1002,6 +1038,32 @@ impl Coordinator {
         }
     }
 
+    async fn transaction_confirmations(&self, txid: &Txid) -> Result<Option<u32>, anyhow::Error> {
+        let Some(height) = self.bitcoin.get_tx_confirmation_height(txid).await? else {
+            return Ok(None);
+        };
+        let tip = self.bitcoin.get_current_height().await?;
+        Ok(Some(confirmation_depth(tip, height)))
+    }
+
+    async fn renew_funding_reservation(
+        &self,
+        competition: &Competition,
+    ) -> Result<(), anyhow::Error> {
+        if competition.funding_broadcasted_at.is_none() {
+            if let Some(encoded) = &competition.funding_psbt_base64 {
+                let psbt = Psbt::from_str(encoded)?;
+                self.bitcoin
+                    .reserve_psbt_inputs_until(
+                        &psbt,
+                        competition.funding_reservation_deadline(OffsetDateTime::now_utc())?,
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn check_escrow_confirmations<'a>(
         &self,
         competition: &'a mut Competition,
@@ -1022,7 +1084,7 @@ impl Coordinator {
                 let txid = escrow_tx.compute_txid();
 
                 // Check if transaction has required confirmations
-                match self.bitcoin.get_tx_confirmation_height(&txid).await? {
+                match self.transaction_confirmations(&txid).await? {
                     Some(confirmations) if confirmations >= self.required_confirmations => {
                         debug!(
                             "Escrow transaction {} has {} confirmations for ticket {}",
@@ -1209,31 +1271,36 @@ impl Coordinator {
         info!("Fee rates: {:?}", fee_rates);
 
         // TODO (@tee8z): make this configurable from the admin screen
-        let rate_confirm_within_2_blocks = if fee_rates.is_empty() {
-            1_u64
-        } else {
-            fee_rates[&1_u16].ceil() as u64
-        };
+        let rate_confirm_within_2_blocks = fee_rates
+            .get(&1_u16)
+            .ok_or_else(|| {
+                anyhow!("LND returned no fee estimate for the funding confirmation target")
+            })?
+            .ceil() as u64;
 
         let fee_rate = FeeRate::from_sat_per_vb_unchecked(rate_confirm_within_2_blocks);
 
-        let contract_params = ContractParameters {
-            market_maker: dlctix::MarketMaker {
-                pubkey: self.public_key,
-            },
-            players,
-            event: event_announcement.clone(),
-            outcome_payouts,
-            fee_rate,
-            funding_value: Amount::from_sat(contract_amount_sats as u64),
-            relative_locktime_block_delta: competition
-                .event_submission
-                .relative_locktime_block_delta
-                .unwrap_or(self.relative_locktime_block_delta as u16),
-        };
+        let contract_params =
+            competition
+                .contract_parameters
+                .clone()
+                .unwrap_or(ContractParameters {
+                    market_maker: dlctix::MarketMaker {
+                        pubkey: self.public_key,
+                    },
+                    players,
+                    event: event_announcement.clone(),
+                    outcome_payouts,
+                    fee_rate,
+                    funding_value: Amount::from_sat(contract_amount_sats as u64),
+                    relative_locktime_block_delta: competition
+                        .event_submission
+                        .relative_locktime_block_delta
+                        .unwrap_or(self.relative_locktime_block_delta as u16),
+                });
         competition.contract_parameters = Some(contract_params.clone());
 
-        let funding_output = contract_params.funding_output().unwrap();
+        let funding_output = contract_params.funding_output()?;
 
         let funding_script = funding_output.script_pubkey.clone();
         debug!("Contract params have been built");
@@ -1348,16 +1415,35 @@ impl Coordinator {
             self.escrow_enabled
         );
 
-        let psbt = self
+        let psbt = match &competition.funding_psbt_base64 {
+            Some(encoded) => Psbt::from_str(encoded)?,
+            None => {
+                self.bitcoin
+                    .build_psbt(
+                        funding_script.clone(),
+                        Amount::from_sat(contract_amount_sats as u64),
+                        contract_params.fee_rate,
+                        vec![],
+                        escrow_inputs,
+                    )
+                    .await?
+            }
+        };
+        if let Err(error) = self
             .bitcoin
-            .build_psbt(
-                funding_script.clone(),
-                Amount::from_sat(contract_amount_sats as u64),
-                fee_rate,
-                vec![],
-                escrow_inputs,
+            .reserve_psbt_inputs_until(
+                &psbt,
+                competition.funding_reservation_deadline(OffsetDateTime::now_utc())?,
             )
-            .await?;
+            .await
+        {
+            if competition.funding_psbt_base64.is_none() {
+                if let Err(release_error) = self.bitcoin.release_psbt_inputs(&psbt).await {
+                    warn!("Failed to release new funding inputs: {}", release_error);
+                }
+            }
+            return Err(error);
+        }
 
         let funding_txid = psbt.unsigned_tx.compute_txid();
         debug!("unsigned funding txid: {:?}", funding_txid);
@@ -1406,11 +1492,7 @@ impl Coordinator {
                     )
                 })?;
 
-            let session_secret = self
-                .decrypt_session_secret(&stored_session.encrypted_session_secret)
-                .map_err(|e| anyhow!("Failed to decrypt session secret: {}", e))?;
-
-            let keygen_session = stored_session.to_session(session_secret);
+            let keygen_session = self.restore_keymeld_session(&stored_session)?;
 
             info!(
                 "Retrieved keymeld keygen session {} for competition {}, registering participants",
@@ -1423,41 +1505,30 @@ impl Coordinator {
                 .map(|entry| UserId::from(entry.ticket_id))
                 .collect();
 
-            // Server-side keymeld registration for users who provided all required registration data
             for (entry, user_id) in entries.iter().zip(player_user_ids.iter()) {
-                // Check if user provided all required keymeld registration data
-                if let (Some(encrypted_key), Some(auth_pubkey)) = (
-                    &entry.encrypted_keymeld_private_key,
-                    &entry.keymeld_auth_pubkey,
-                ) {
-                    info!(
-                        "Registering participant {} (ticket {}) for keygen session {}",
-                        user_id, entry.ticket_id, keygen_session.session_id
-                    );
-
-                    let registration_data = ParticipantRegistrationData {
-                        encrypted_private_key: encrypted_key.clone(),
-                        public_key: entry.ephemeral_pubkey.clone(),
-                        auth_pubkey: auth_pubkey.clone(),
-                    };
-
-                    if let Err(e) = self
-                        .keymeld
-                        .register_participant(&keygen_session, user_id.clone(), &registration_data)
-                        .await
-                    {
-                        error!(
-                            "Failed to register participant {} for competition {}: {}",
-                            user_id, competition.id, e
-                        );
-                        // Continue with other participants - they may register themselves later
-                    }
-                } else {
-                    debug!(
-                        "Entry {} missing keymeld registration data (encrypted_keymeld_private_key or keymeld_auth_pubkey), user must register manually",
-                        entry.id
-                    );
-                }
+                let registration_data = ParticipantRegistrationData {
+                    encrypted_private_key: entry.encrypted_keymeld_private_key.clone().ok_or_else(
+                        || {
+                            anyhow!(
+                                "Entry {} is missing its authorized registration envelope",
+                                entry.id
+                            )
+                        },
+                    )?,
+                    public_key: entry.ephemeral_pubkey.clone(),
+                    auth_pubkey: entry.keymeld_auth_pubkey.clone().ok_or_else(|| {
+                        anyhow!("Entry {} is missing its authentication key", entry.id)
+                    })?,
+                    context: entry.keymeld_registration_context.clone().ok_or_else(|| {
+                        anyhow!("Entry {} is missing its registration context", entry.id)
+                    })?,
+                };
+                self.keymeld
+                    .register_participant(&keygen_session, user_id.clone(), &registration_data)
+                    .await
+                    .map_err(|error| {
+                        anyhow!("Participant {user_id} registration failed: {error}")
+                    })?;
             }
 
             // For keymeld, we don't use local nonces - set a placeholder to indicate keymeld mode
@@ -1608,11 +1679,7 @@ impl Coordinator {
                     )
                 })?;
 
-            let session_secret = self
-                .decrypt_session_secret(&stored_session.encrypted_session_secret)
-                .map_err(|e| anyhow!("Failed to decrypt session secret: {}", e))?;
-
-            let keygen_session = stored_session.to_session(session_secret);
+            let keygen_session = self.restore_keymeld_session(&stored_session)?;
 
             // Get signing data from ticketed DLC
             let signing_data = ticketed_dlc.signing_data()?;
@@ -1628,6 +1695,9 @@ impl Coordinator {
                 .iter()
                 .map(|entry| UserId::from(entry.ticket_id))
                 .collect();
+
+            self.verify_keymeld_competition(competition, &keygen_session)
+                .await?;
 
             // Call keymeld to perform batch signing
             let dlc_signatures = self
@@ -1747,6 +1817,16 @@ impl Coordinator {
         &self,
         competition: &'a mut Competition,
     ) -> Result<&'a mut Competition, anyhow::Error> {
+        if self.is_keymeld_enabled() {
+            let stored = self
+                .competition_store
+                .get_keymeld_session(competition.id)
+                .await?
+                .ok_or_else(|| anyhow!("Competition has no authorized Keymeld session"))?;
+            let session = self.restore_keymeld_session(&stored)?;
+            self.verify_keymeld_competition(competition, &session)
+                .await?;
+        }
         let Some(funding_psbt_base64) = competition.funding_psbt_base64.clone() else {
             return Err(anyhow!(
                         "Unsigned funding psbt doesn't exists, failed publishing competition {} funding transaction",
@@ -1754,6 +1834,7 @@ impl Coordinator {
                     ));
         };
 
+        self.renew_funding_reservation(competition).await?;
         let mut funding_psbt = Psbt::from_str(&funding_psbt_base64)?;
 
         // When escrow is enabled, users sign their own funding PSBTs which need to be merged.
@@ -1830,7 +1911,7 @@ impl Coordinator {
         })?;
 
         let txid = funding_tx.compute_txid();
-        match self.bitcoin.get_tx_confirmation_height(&txid).await? {
+        match self.transaction_confirmations(&txid).await? {
             Some(confirmations) if confirmations >= self.required_confirmations => {
                 info!(
                     "Funding transaction {} confirmed with {} confirmations for competition {}",
@@ -2082,7 +2163,9 @@ impl Coordinator {
             return Ok(competition);
         };
 
-        let blocks_since_outcome = current_height - outcome_height;
+        let blocks_since_outcome = current_height
+            .checked_sub(outcome_height)
+            .ok_or_else(|| anyhow!("LND chain tip is behind the outcome confirmation height"))?;
         let required_delta = signed_contract.params().relative_locktime_block_delta as u32;
 
         if blocks_since_outcome < required_delta {
@@ -2109,11 +2192,12 @@ impl Coordinator {
 
         // Get fee rate for transactions
         let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
-        let rate_confirm_within_2_blocks = if fee_rates.is_empty() {
-            1_u64
-        } else {
-            fee_rates[&1_u16].ceil() as u64
-        };
+        let rate_confirm_within_2_blocks = fee_rates
+            .get(&1_u16)
+            .ok_or_else(|| {
+                anyhow!("LND returned no fee estimate for the funding confirmation target")
+            })?
+            .ceil() as u64;
         let fee_rate = FeeRate::from_sat_per_vb_unchecked(rate_confirm_within_2_blocks);
 
         // Check if we can do a unified close
@@ -2171,7 +2255,7 @@ impl Coordinator {
                 2 * required_delta
             );
             // Log which winners are missing
-            for (&player_index, _) in winners.iter() {
+            for &player_index in winners.keys() {
                 let found_entry = entries.iter().find(|entry| {
                     let Ok(pubkey) = Point::from_hex(&entry.ephemeral_pubkey) else {
                         return false;
@@ -2492,7 +2576,9 @@ impl Coordinator {
             return Ok(competition);
         };
 
-        let blocks_since_outcome = current_height - outcome_height;
+        let blocks_since_outcome = current_height
+            .checked_sub(outcome_height)
+            .ok_or_else(|| anyhow!("LND chain tip is behind the outcome confirmation height"))?;
         let required_delta = signed_contract.params().relative_locktime_block_delta as u32;
 
         if blocks_since_outcome < (2 * required_delta) {
@@ -2518,11 +2604,12 @@ impl Coordinator {
 
         // Get fee rate for transactions
         let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
-        let rate_confirm_within_2_blocks = if fee_rates.is_empty() {
-            1_u64
-        } else {
-            fee_rates[&1_u16].ceil() as u64
-        };
+        let rate_confirm_within_2_blocks = fee_rates
+            .get(&1_u16)
+            .ok_or_else(|| {
+                anyhow!("LND returned no fee estimate for the funding confirmation target")
+            })?
+            .ceil() as u64;
         let fee_rate = FeeRate::from_sat_per_vb_unchecked(rate_confirm_within_2_blocks);
 
         // The split TX was broadcast during delta, so each winner has their
@@ -2749,7 +2836,7 @@ impl Coordinator {
                     "competition added to oracle, but failed to be saved with tickets: competition_id {} {:?}",
                     create_event.id, e
                 );
-                Error::DbError(e)
+                Error::from(e)
             })
             .await?;
 
@@ -2778,37 +2865,15 @@ impl Coordinator {
                 subset_info.definitions.len()
             );
 
-            match self
+            let keygen_session = self
                 .keymeld
                 .init_keygen_session(competition.id, player_user_ids, subset_info)
                 .await
-            {
-                Ok(keygen_session) => {
-                    info!(
-                        "Keymeld keygen session {} created for competition {} with {} outcome subsets",
-                        keygen_session.session_id, competition.id, keygen_session.outcome_subset_ids.len()
-                    );
-
-                    // Store the session - users will get session_id when requesting a ticket
-                    if let Err(e) = self
-                        .store_keymeld_session(competition.id, keygen_session)
-                        .await
-                    {
-                        error!(
-                            "Failed to store keymeld session for competition {}: {}",
-                            competition.id, e
-                        );
-                        // Continue without keymeld - competition can still work
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to create keymeld keygen session for competition {}: {}",
-                        competition.id, e
-                    );
-                    // Continue without keymeld - competition can still work
-                }
-            }
+                .map_err(|error| {
+                    Error::Bitcoin(anyhow!("Keymeld session creation failed: {error}"))
+                })?;
+            self.store_keymeld_session(competition.id, keygen_session)
+                .await?;
         }
 
         Ok(competition)
@@ -2816,10 +2881,10 @@ impl Coordinator {
 
     pub async fn get_competitions(&self) -> Result<Vec<Competition>, Error> {
         self.competition_store
-            .get_competitions(false, false)
+            .get_competitions(false)
             .map_err(|e| {
                 error!("failed to get competitions: {:?}", e);
-                Error::DbError(e)
+                Error::from(e)
             })
             .await
     }
@@ -2846,8 +2911,8 @@ impl Coordinator {
             .get_and_reserve_ticket(competition_id, &pubkey)
             .await
             .map_err(|e| match e {
-                sqlx::Error::RowNotFound => Error::NoAvailableTickets,
-                e => Error::DbError(e),
+                DatabaseWriteError::Sqlx(sqlx::Error::RowNotFound) => Error::NoAvailableTickets,
+                e => Error::from(e),
             })?;
         match self
             .create_ticket_response(ticket.clone(), btc_pubkey, competition)
@@ -2891,6 +2956,9 @@ impl Coordinator {
                 btc_pubkey,
                 payment_hash,
                 competition.event_submission.entry_fee as u64,
+                competition
+                    .funding_reservation_deadline(OffsetDateTime::now_utc())
+                    .map_err(Error::Bitcoin)?,
             )
             .await
             .map_err(|e| {
@@ -2908,7 +2976,7 @@ impl Coordinator {
                 .await
                 .map_err(|e| {
                     error!("Failed to update ticket with escrow transaction: {}", e);
-                    Error::DbError(e)
+                    Error::from(e)
                 })?;
 
             debug!(
@@ -2985,7 +3053,7 @@ impl Coordinator {
                     .await
                     .map_err(|e| {
                         error!("Failed to update ticket with payment request: {}", e);
-                        Error::DbError(e)
+                        Error::from(e)
                     })?;
 
                 invoice.payment_request
@@ -3020,45 +3088,37 @@ impl Coordinator {
                 .await
                 .map_err(|e| {
                     error!("Failed to update ticket with payment request: {}", e);
-                    Error::DbError(e)
+                    Error::from(e)
                 })?;
 
             invoice.payment_request
         };
 
-        // Get keymeld session info if available (created at competition creation)
-        let (keymeld_session_id, keymeld_enclave_public_key) = if self.is_keymeld_enabled() {
-            if let Some(stored_session) = self
+        let keymeld_registration = if self.is_keymeld_enabled() {
+            let stored = self
                 .competition_store
                 .get_keymeld_session(competition.id)
                 .await
-                .ok()
-                .flatten()
-            {
-                // Decrypt session secret to get the full session
-                let session_secret =
-                    self.decrypt_session_secret(&stored_session.encrypted_session_secret)?;
-                let session = stored_session.to_session(session_secret);
-
-                // Get the user's assigned enclave public key
-                // ticket_id is used as keymeld user_id
-                let user_id = UserId::from(ticket.id);
-                let enclave_pubkey = self
-                    .keymeld
-                    .get_user_enclave_pubkey(&session, user_id)
+                .map_err(Error::from)?
+                .ok_or_else(|| {
+                    Error::BadRequest("Competition has no authorized Keymeld session".into())
+                })?;
+            let session = self.restore_keymeld_session(&stored)?;
+            Some(
+                self.keymeld
+                    .get_registration_assignment(&session, UserId::from(ticket.id))
                     .await
-                    .map_err(|e| {
-                        error!("Failed to get user enclave pubkey: {}", e);
-                        Error::BadRequest(format!("Failed to get enclave info: {}", e))
-                    })?;
-
-                (Some(stored_session.session_id), Some(enclave_pubkey))
-            } else {
-                (None, None)
-            }
+                    .map_err(|error| Error::Bitcoin(anyhow!(error)))?,
+            )
         } else {
-            (None, None)
+            None
         };
+        let keymeld_session_id = keymeld_registration
+            .as_ref()
+            .map(|assignment| assignment.session_id.clone());
+        let keymeld_enclave_public_key = keymeld_registration
+            .as_ref()
+            .map(|assignment| assignment.enclave_public_key.clone());
 
         Ok(TicketResponse {
             ticket_id: ticket.id,
@@ -3071,6 +3131,7 @@ impl Coordinator {
             keymeld_gateway_url: self.keymeld_gateway_url.clone(),
             keymeld_session_id,
             keymeld_enclave_public_key,
+            keymeld_registration,
         })
     }
 
@@ -3088,7 +3149,7 @@ impl Coordinator {
                 debug!("error: {:?}", e);
                 match e {
                     sqlx::Error::RowNotFound => Error::NotFound("Ticket not found".into()),
-                    e => Error::DbError(e),
+                    e => Error::from(e),
                 }
             })?;
 
@@ -3115,7 +3176,7 @@ impl Coordinator {
                     "failed to get competition: competition_id {} {:?}",
                     competition_id, e
                 );
-                Error::DbError(e)
+                Error::from(e)
             })
             .await
     }
@@ -3140,7 +3201,7 @@ impl Coordinator {
                     "failed to delete competition: competition_id {} {:?}",
                     competition_id, e
                 );
-                Error::DbError(e)
+                Error::from(e)
             })?;
 
         info!("Deleted competition: {}", competition_id);
@@ -3156,10 +3217,10 @@ impl Coordinator {
             .mark_ticket_paid(ticket_hash, competition_id)
             .await
             .map_err(|e| match e {
-                sqlx::Error::RowNotFound => {
+                DatabaseWriteError::Sqlx(sqlx::Error::RowNotFound) => {
                     Error::BadRequest("Invalid ticket or competition".into())
                 }
-                e => Error::DbError(e),
+                e => Error::from(e),
             })?;
 
         Ok(())
@@ -3174,7 +3235,7 @@ impl Coordinator {
                 error!("error {:?}", e);
                 match e {
                     sqlx::Error::RowNotFound => Error::BadRequest("Competition not found".into()),
-                    e => Error::DbError(e),
+                    e => Error::from(e),
                 }
             })?;
 
@@ -3189,7 +3250,7 @@ impl Coordinator {
                 error!("error {:?}", e);
                 match e {
                     sqlx::Error::RowNotFound => Error::BadRequest("Ticket not found".into()),
-                    e => Error::DbError(e),
+                    e => Error::from(e),
                 }
             })?;
 
@@ -3214,12 +3275,39 @@ impl Coordinator {
             }
         }
 
+        if self.is_keymeld_enabled() {
+            let stored = self
+                .competition_store
+                .get_keymeld_session(entry.event_id)
+                .await
+                .map_err(Error::from)?
+                .ok_or_else(|| {
+                    Error::BadRequest("Competition has no authorized Keymeld session".into())
+                })?;
+            let session = self.restore_keymeld_session(&stored)?;
+            let data = ParticipantRegistrationData {
+                encrypted_private_key: entry.encrypted_keymeld_private_key.clone().ok_or_else(
+                    || Error::BadRequest("Missing authorized Keymeld registration envelope".into()),
+                )?,
+                public_key: entry.ephemeral_pubkey.clone(),
+                auth_pubkey: entry.keymeld_auth_pubkey.clone().ok_or_else(|| {
+                    Error::BadRequest("Missing Keymeld authentication key".into())
+                })?,
+                context: entry.keymeld_registration_context.clone().ok_or_else(|| {
+                    Error::BadRequest("Missing Keymeld registration context".into())
+                })?,
+            };
+            session
+                .validate_registration(&UserId::from(ticket.id), &data)
+                .map_err(|_| Error::BadRequest("Invalid Keymeld registration context".into()))?;
+        }
+
         let user_entry = self
             .competition_store
             .add_entry(entry.clone().into_user_entry(pubkey), ticket.id)
             .await
             .map_err(|e| match e {
-                sqlx::Error::RowNotFound => {
+                DatabaseWriteError::Sqlx(sqlx::Error::RowNotFound) => {
                     Error::BadRequest(
                         "Failed to claim ticket - may have expired or been claimed by another entry"
                             .into(),
@@ -3230,7 +3318,7 @@ impl Coordinator {
                         "entry added to oracle, but failed to be saved: entry_id {}, event_id {} {:?}",
                         entry.id, entry.event_id, e
                     );
-                    Error::DbError(e)
+                    Error::from(e)
                 }
             })?;
 
@@ -3244,7 +3332,7 @@ impl Coordinator {
     ) -> Result<Vec<UserEntry>, Error> {
         self.competition_store
             .get_user_entries(pubkey, filter)
-            .map_err(Error::DbError)
+            .map_err(Error::from)
             .await
     }
 
@@ -3253,7 +3341,7 @@ impl Coordinator {
     pub async fn get_user_entry_views(&self, pubkey: String) -> Result<Vec<UserEntryView>, Error> {
         self.competition_store
             .get_user_entry_views(pubkey)
-            .map_err(Error::DbError)
+            .map_err(Error::from)
             .await
     }
 
@@ -3261,7 +3349,7 @@ impl Coordinator {
     pub async fn get_entry_by_id(&self, entry_id: Uuid) -> Result<Option<UserEntry>, Error> {
         self.competition_store
             .get_entry_by_id(entry_id)
-            .map_err(Error::DbError)
+            .map_err(Error::from)
             .await
     }
 
@@ -3340,15 +3428,12 @@ impl Coordinator {
         user_pubkey: &str,
         entry: &UserEntry,
     ) -> Result<KeymeldSigningInfo, Error> {
-        use nostr_sdk::nips::nip44;
-        use nostr_sdk::prelude::{PublicKey, SecretKey};
-
         // Check that the user's ticket has been paid before revealing keymeld info
         let ticket = self
             .competition_store
             .get_ticket(entry.ticket_id)
             .await
-            .map_err(Error::DbError)?;
+            .map_err(Error::from)?;
 
         if ticket.paid_at.is_none() {
             return Err(Error::BadRequest(
@@ -3360,7 +3445,7 @@ impl Coordinator {
             .competition_store
             .get_keymeld_session(competition_id)
             .await
-            .map_err(Error::DbError)?
+            .map_err(Error::from)?
             .ok_or_else(|| {
                 Error::NotFound(format!(
                     "Keymeld session not found for competition {}",
@@ -3374,11 +3459,11 @@ impl Coordinator {
             .ok_or_else(|| Error::BadRequest("Keymeld gateway URL not configured".to_string()))?;
 
         // Decrypt the session secret from storage
-        let session_secret =
-            self.decrypt_session_secret(&stored_session.encrypted_session_secret)?;
+        let session = self.restore_keymeld_session(&stored_session)?;
+        let session_secret = session.session_secret;
 
         // Re-encrypt to the user's pubkey
-        let nostr_pubkey = PublicKey::from_hex(user_pubkey)
+        let nostr_pubkey = NostrPublicKey::from_hex(user_pubkey)
             .map_err(|e| Error::BadRequest(format!("Invalid user pubkey: {}", e)))?;
 
         let coordinator_secret_key = SecretKey::from_slice(&self.private_key.serialize())
@@ -3397,6 +3482,7 @@ impl Coordinator {
             gateway_url,
             session_id: stored_session.session_id,
             encrypted_session_secret,
+            authorization_manifest: stored_session.authorization_manifest,
             // Use ticket_id as user_id for consistency with keygen session creation
             user_id: entry.ticket_id.to_string(),
         })
@@ -3460,7 +3546,7 @@ impl Coordinator {
                     "failed save entry public nonces: entry_id {}, event_id {} {:?}",
                     entry_id, competition_id, e
                 );
-                Error::DbError(e)
+                Error::from(e)
             })?;
 
         Ok(())
@@ -3558,7 +3644,7 @@ impl Coordinator {
                     "failed save entry signatures: entry_id {}, event_id {} {:?}",
                     entry_id, competition_id, e
                 );
-                Error::DbError(e)
+                Error::from(e)
             })?;
 
         Ok(())
@@ -3757,7 +3843,7 @@ impl Coordinator {
                         payout_amount_sats,
                     )
                     .await
-                    .map_err(Error::DbError)
+                    .map_err(Error::from)
                     .inspect(|pay_out_id| info!("Payout initiated with ID: {}", pay_out_id))
                     .map(|_| ())
             }
@@ -4007,6 +4093,80 @@ pub fn compute_dlc_subset_definitions(
     }
 }
 
+fn verify_accepted_keymeld_roster(
+    session: &DlcKeygenSession,
+    signed: &SignedRoster,
+    expected_keys: &BTreeMap<UserId, Vec<u8>>,
+    expected_contexts: &BTreeMap<UserId, RegistrationContext>,
+    coordinator_id: UserId,
+    number_of_places_win: usize,
+) -> Result<(), anyhow::Error> {
+    let roster = &signed.roster;
+    let recipients = &session.recipient_authorization;
+    let enclave = recipients
+        .user_enclave_assignments
+        .get(&coordinator_id)
+        .ok_or_else(|| anyhow!("Coordinator enclave is absent from pinned recipients"))?;
+    let key = recipients
+        .recipient_public_keys
+        .get(enclave)
+        .ok_or_else(|| anyhow!("Coordinator enclave key is absent from pinned recipients"))?;
+    signed.verify(key)?;
+    signed.verify_registrations(&session.authorization_manifest)?;
+    roster.verify_aggregates()?;
+    if roster.participants != *expected_keys
+        || !matches!(roster.taproot_tweak, keymeld_sdk::TaprootTweak::None)
+    {
+        return Err(anyhow!(
+            "Keymeld roster does not match accepted participant keys or funding tweak"
+        ));
+    }
+    for (user, authorization) in &roster.registrations {
+        if recipients.user_enclave_assignments.get(user) != Some(&authorization.context.enclave_id)
+            || authorization.context.require_signing_approval
+            || (user != &coordinator_id
+                && expected_contexts.get(user) != Some(&authorization.context))
+        {
+            return Err(anyhow!("Keymeld roster registration differs from accepted entry or delegated signing policy"));
+        }
+    }
+    let players = expected_keys
+        .keys()
+        .filter(|user| *user != &coordinator_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let rankings = generate_ranking_permutations(players.len(), number_of_places_win);
+    if rankings.len() != session.outcome_subset_ids.len()
+        || roster.subset_definitions.len() != session.outcome_subset_ids.len()
+    {
+        return Err(anyhow!("Keymeld subsets do not match competition outcomes"));
+    }
+    for (outcome, winners) in rankings.into_iter().enumerate() {
+        let subset_id = session
+            .outcome_subset_ids
+            .get(&outcome)
+            .ok_or_else(|| anyhow!("Missing Keymeld outcome subset"))?;
+        let subset = roster
+            .subset_definitions
+            .iter()
+            .find(|subset| &subset.subset_id == subset_id)
+            .ok_or_else(|| anyhow!("Missing authorized outcome subset"))?;
+        let mut participants = vec![coordinator_id.clone()];
+        participants.extend(winners.into_iter().map(|winner| players[winner].clone()));
+        if subset.participants != participants {
+            return Err(anyhow!(
+                "Keymeld subset participants differ from competition payout recipients"
+            ));
+        }
+    }
+    if !session.aggregate_key.is_empty() && session.aggregate_key != roster.aggregate_public_key {
+        return Err(anyhow!(
+            "Keymeld aggregate key differs from the completed session"
+        ));
+    }
+    Ok(())
+}
+
 fn find_player_indices(
     players: &[Player],
     entry_ticket_pubkeys: Vec<String>,
@@ -4214,4 +4374,291 @@ async fn validate_entry(entry: AddEventEntry, competition: Competition) -> Resul
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod funding_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn confirmation_requirements_count_blocks_since_inclusion() {
+        assert_eq!(confirmation_depth(900_000, 900_000), 1);
+        assert_eq!(confirmation_depth(900_004, 900_000), 5);
+        assert_eq!(confirmation_depth(900_005, 900_000), 6);
+        assert_eq!(confirmation_depth(899_999, 900_000), 0);
+    }
+
+    #[test]
+    fn funding_reservations_cover_future_competitions_and_extend_overdue_sessions() {
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let signing_date = now + time::Duration::days(30);
+        let competition = Competition::new(&CreateEvent {
+            id: Uuid::now_v7(),
+            signing_date,
+            start_observation_date: now + time::Duration::days(28),
+            end_observation_date: now + time::Duration::days(29),
+            locations: vec![],
+            number_of_values_per_entry: 1,
+            number_of_places_win: 1,
+            total_allowed_entries: 1,
+            entry_fee: 1_000,
+            coordinator_fee_percentage: 10,
+            total_competition_pool: 900,
+            relative_locktime_block_delta: None,
+        });
+        assert_eq!(
+            competition.funding_reservation_deadline(now).unwrap(),
+            (signing_date + time::Duration::days(1)).unix_timestamp() as u64,
+        );
+        let restarted_at = signing_date + time::Duration::days(2);
+        assert_eq!(
+            competition
+                .funding_reservation_deadline(restarted_at)
+                .unwrap(),
+            (restarted_at + time::Duration::days(1)).unix_timestamp() as u64,
+        );
+    }
+}
+
+#[cfg(test)]
+mod keymeld_authorization_tests {
+    use super::*;
+    use keymeld_core::{authorization::EnclaveRecipientAuthorization, KeyAggContext, PublicKey};
+    use keymeld_sdk::{
+        types::{ParticipantRoster, RegistrationAuthorization, SessionAuthorizationManifest},
+        AuthorizationCredentials, EnclaveId, SessionCredentials, SessionId, UserCredentials,
+    };
+
+    struct Fixture {
+        session: DlcKeygenSession,
+        roster: SignedRoster,
+        keys: BTreeMap<UserId, Vec<u8>>,
+        contexts: BTreeMap<UserId, RegistrationContext>,
+        coordinator: UserId,
+        player: UserId,
+    }
+
+    fn fixture() -> Fixture {
+        let coordinator = UserId::new_v7();
+        let player = UserId::new_v7();
+        let session_id = SessionId::new_v7();
+        let creator = AuthorizationCredentials::from_secret(&[9; 32]).unwrap();
+        let authority = AuthorizationCredentials::from_secret(&[2; 32]).unwrap();
+        let credentials = SessionCredentials::from_session_secret(&[3; 32]).unwrap();
+        let registrations = BTreeMap::from([
+            (
+                coordinator.clone(),
+                AuthorizationCredentials::from_secret(&[4; 32]).unwrap(),
+            ),
+            (
+                player.clone(),
+                AuthorizationCredentials::from_secret(&[5; 32]).unwrap(),
+            ),
+        ]);
+        let participant_keys = BTreeMap::from([
+            (
+                coordinator.clone(),
+                UserCredentials::from_private_key(&[1; 32]).unwrap(),
+            ),
+            (
+                player.clone(),
+                UserCredentials::from_private_key(&[7; 32]).unwrap(),
+            ),
+        ]);
+        let keys: BTreeMap<_, _> = participant_keys
+            .iter()
+            .map(|(id, key)| (id.clone(), key.public_key_bytes()))
+            .collect();
+        let subsets =
+            compute_dlc_subset_definitions(coordinator.clone(), std::slice::from_ref(&player), 1);
+        let manifest = keymeld_sdk::SignedSessionManifest::sign(
+            SessionAuthorizationManifest {
+                keygen_session_id: session_id.clone(),
+                coordinator_user_id: coordinator.clone(),
+                creator_pubkey: creator.public_key_bytes(),
+                signing_pubkey: authority.public_key_bytes(),
+                session_public_key: credentials.public_key_bytes(),
+                participant_verifiers: registrations
+                    .iter()
+                    .map(|(id, credential)| (id.clone(), credential.public_key_bytes()))
+                    .collect(),
+                timeout_secs: 300,
+                max_signing_sessions: None,
+                encrypted_taproot_tweak: "unused-in-roster-test".into(),
+                subset_definitions: subsets
+                    .definitions
+                    .iter()
+                    .map(|subset| keymeld_core::protocol::SubsetDefinition {
+                        subset_id: subset.subset_id,
+                        participants: subset.participants.clone(),
+                    })
+                    .collect(),
+            },
+            &creator.export_secret(),
+        )
+        .unwrap();
+        let enclave = EnclaveId::new(1);
+        let enclave_key = AuthorizationCredentials::from_secret(&[8; 32])
+            .unwrap()
+            .public_key_bytes();
+        let recipients = EnclaveRecipientAuthorization::sign(
+            &manifest,
+            BTreeMap::from([(coordinator.clone(), enclave), (player.clone(), enclave)]),
+            BTreeMap::from([(enclave, enclave_key.clone())]),
+            &creator.export_secret(),
+        )
+        .unwrap();
+        let contexts: BTreeMap<_, _> = participant_keys
+            .iter()
+            .map(|(id, key)| {
+                (
+                    id.clone(),
+                    RegistrationContext {
+                        keygen_session_id: session_id.clone(),
+                        user_id: id.clone(),
+                        manifest_hash: manifest.digest().unwrap(),
+                        enclave_id: enclave,
+                        enclave_key_epoch: 1,
+                        public_key: key.public_key_bytes(),
+                        auth_pubkey: key
+                            .derive_session_auth_pubkey(&session_id.to_string())
+                            .unwrap(),
+                        require_signing_approval: false,
+                    },
+                )
+            })
+            .collect();
+        let authorized = contexts
+            .iter()
+            .map(|(id, context)| {
+                let envelope = participant_keys[id]
+                    .prepare_registration(context.clone(), &hex::encode(&enclave_key))
+                    .unwrap();
+                (
+                    id.clone(),
+                    RegistrationAuthorization::sign(
+                        &registrations[id].export_secret(),
+                        context.clone(),
+                        &envelope,
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        let mut public_keys = keys
+            .values()
+            .map(|key| PublicKey::from_slice(key).unwrap())
+            .collect::<Vec<_>>();
+        public_keys.sort_by_key(|key| key.serialize());
+        let aggregate: PublicKey = KeyAggContext::new(public_keys).unwrap().aggregated_pubkey();
+        let aggregate = aggregate.serialize().to_vec();
+        let roster = SignedRoster::sign(
+            ParticipantRoster {
+                keygen_session_id: session_id.clone(),
+                manifest_hash: manifest.digest().unwrap(),
+                participants: keys.clone(),
+                registrations: authorized,
+                aggregate_public_key: aggregate.clone(),
+                subset_aggregate_keys: subsets
+                    .definitions
+                    .iter()
+                    .map(|subset| (subset.subset_id, aggregate.clone()))
+                    .collect(),
+                subset_definitions: manifest.manifest.subset_definitions.clone(),
+                taproot_tweak: keymeld_sdk::TaprootTweak::None,
+            },
+            &[8; 32],
+        )
+        .unwrap();
+        Fixture {
+            session: DlcKeygenSession {
+                session_id,
+                session_secret: [3; 32],
+                authorization_manifest: manifest,
+                recipient_authorization: recipients,
+                signing_authority: authority,
+                registration_authorities: registrations,
+                aggregate_key: aggregate,
+                outcome_subset_ids: subsets.outcome_subset_ids,
+            },
+            roster,
+            keys,
+            contexts,
+            coordinator,
+            player,
+        }
+    }
+
+    #[test]
+    fn funding_roster_accepts_only_the_paid_entry_keys_and_contexts() {
+        let mut fixture = fixture();
+        verify_accepted_keymeld_roster(
+            &fixture.session,
+            &fixture.roster,
+            &fixture.keys,
+            &fixture.contexts,
+            fixture.coordinator.clone(),
+            1,
+        )
+        .unwrap();
+        fixture.keys.insert(
+            fixture.player.clone(),
+            UserCredentials::from_private_key(&[10; 32])
+                .unwrap()
+                .public_key_bytes(),
+        );
+        assert!(verify_accepted_keymeld_roster(
+            &fixture.session,
+            &fixture.roster,
+            &fixture.keys,
+            &fixture.contexts,
+            fixture.coordinator.clone(),
+            1
+        )
+        .is_err());
+        fixture.keys = fixture.roster.roster.participants.clone();
+        fixture
+            .contexts
+            .get_mut(&fixture.player)
+            .unwrap()
+            .enclave_key_epoch += 1;
+        assert!(verify_accepted_keymeld_roster(
+            &fixture.session,
+            &fixture.roster,
+            &fixture.keys,
+            &fixture.contexts,
+            fixture.coordinator,
+            1
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn funding_roster_rejects_substituted_aggregates_and_outcome_assignments() {
+        let mut fixture = fixture();
+        fixture.roster.roster.aggregate_public_key = UserCredentials::from_private_key(&[10; 32])
+            .unwrap()
+            .public_key_bytes();
+        fixture.roster = SignedRoster::sign(fixture.roster.roster, &[8; 32]).unwrap();
+        assert!(verify_accepted_keymeld_roster(
+            &fixture.session,
+            &fixture.roster,
+            &fixture.keys,
+            &fixture.contexts,
+            fixture.coordinator,
+            1
+        )
+        .is_err());
+        let mut fixture = self::fixture();
+        fixture.session.outcome_subset_ids.insert(0, Uuid::now_v7());
+        assert!(verify_accepted_keymeld_roster(
+            &fixture.session,
+            &fixture.roster,
+            &fixture.keys,
+            &fixture.contexts,
+            fixture.coordinator,
+            1
+        )
+        .is_err());
+    }
 }

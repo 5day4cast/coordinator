@@ -35,7 +35,8 @@ electrum-client.workspace = true
 dlctix.workspace = true
 
 # Keymeld
-keymeld-sdk.workspace = true
+keymeld-sdk = { workspace = true, features = ["client", "dlctix"] }
+keymeld-core.workspace = true
 
 # Async
 tokio.workspace = true
@@ -91,6 +92,9 @@ openssl.workspace = true
 pem-rfc7468.workspace = true
 
 [dev-dependencies]
+tempfile = "3"
+# Synthetic gateways must strip the SDK's gzip request bodies like the real gateway.
+tower-http = { workspace = true, features = ["decompression-gzip"] }
 maplit = "1.0.2"
 mockall = "0.11"
 tokio-test = "0.4"

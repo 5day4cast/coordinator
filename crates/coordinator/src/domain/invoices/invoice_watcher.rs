@@ -7,6 +7,7 @@ use bitcoin::{
 use dlctix::{bitcoin::hex::DisplayHex, hashlock};
 use log::{debug, error, info, warn};
 use std::{str::FromStr, sync::Arc, time::Duration};
+use time::OffsetDateTime;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
@@ -337,6 +338,7 @@ impl InvoiceWatcher {
                 user_pubkey,
                 payment_hash,
                 entry_fee,
+                competition.funding_reservation_deadline(OffsetDateTime::now_utc())?,
             )
             .await
             {

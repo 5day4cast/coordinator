@@ -60,7 +60,11 @@ use std::{collections::HashMap, net::SocketAddr, str::FromStr};
 use std::{sync::Arc, time::Duration};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::RwLock;
-use tokio::{net::TcpListener, select, task::JoinHandle};
+use tokio::{
+    net::TcpListener,
+    select,
+    task::{AbortHandle, JoinHandle},
+};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 pub struct Application {
@@ -71,6 +75,7 @@ pub struct Application {
     >,
     cancellation_token: CancellationToken,
     background_tasks: TaskTracker,
+    background_abort_handles: Vec<AbortHandle>,
     db_connections: Vec<DBConnection>,
 }
 
@@ -83,52 +88,121 @@ impl Application {
         let listener = SocketAddr::from_str(&address)?;
         let (app_state, background_tasks, cancellation_token, db_connections) =
             build_app(config.clone()).await?;
-        let server = build_server(listener, app_state, config.api_settings.origins).await?;
+        let background_abort_handles: Vec<_> = app_state
+            .background_threads
+            .values()
+            .map(JoinHandle::abort_handle)
+            .collect();
+        let server = match build_server(listener, app_state, config.api_settings.origins).await {
+            Ok(server) => server,
+            Err(error) => {
+                cancellation_token.cancel();
+                for handle in background_abort_handles {
+                    handle.abort();
+                }
+                let _ = tokio::time::timeout(Duration::from_secs(5), background_tasks.wait()).await;
+                for database in db_connections {
+                    if let Err(close_error) = database.close().await {
+                        error!("Database cleanup after HTTP bind failure failed: {close_error}");
+                    }
+                }
+                return Err(error);
+            }
+        };
         Ok(Self {
             server,
             cancellation_token,
             background_tasks,
+            background_abort_handles,
             db_connections,
         })
     }
 
     pub async fn run_until_stopped(self) -> Result<(), anyhow::Error> {
         info!("Starting server...");
-        match self.server.with_graceful_shutdown(shutdown_signal()).await {
-            Ok(_) => {
-                info!("Server shutdown initiated");
-                self.cancellation_token.cancel();
-
-                let timeout = tokio::time::sleep(std::time::Duration::from_secs(10));
-                select! {
-                    _ = self.background_tasks.wait() => {
-                        info!("Background tasks completed gracefully");
-                    }
-                    _ = timeout => {
-                        warn!("Background tasks timed out during shutdown");
-                    }
+        let Application {
+            server,
+            cancellation_token,
+            background_tasks,
+            background_abort_handles,
+            db_connections,
+        } = self;
+        let stop_http = CancellationToken::new();
+        let http_shutdown = stop_http.clone();
+        let mut http = tokio::spawn(async move {
+            server
+                .with_graceful_shutdown(http_shutdown.cancelled_owned())
+                .await
+        });
+        let mut http_finished = false;
+        let mut shutdown_error = None;
+        let writer_stopped = async {
+            let waiters: Vec<_> = db_connections
+                .iter()
+                .map(|database| Box::pin(database.writer_stopped()))
+                .collect();
+            if waiters.is_empty() {
+                std::future::pending::<()>().await;
+            }
+            futures::future::select_all(waiters).await;
+        };
+        select! {
+            result = &mut http => {
+                http_finished = true;
+                shutdown_error = Some(anyhow!("HTTP server stopped unexpectedly: {result:?}"));
+            }
+            () = shutdown_signal() => {}
+            () = writer_stopped => {
+                shutdown_error = Some(anyhow!("Database writer stopped unexpectedly"));
+            }
+        }
+        stop_http.cancel();
+        if !http_finished {
+            match tokio::time::timeout(Duration::from_secs(10), &mut http).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(result) => {
+                    shutdown_error
+                        .get_or_insert_with(|| anyhow!("HTTP server shutdown failed: {result:?}"));
                 }
-
-                // Checkpoint WAL before exit so Litestream replicates complete databases
-                info!("Checkpointing WAL before shutdown...");
-                for db in &self.db_connections {
-                    db.checkpoint().await;
+                Err(_) => {
+                    http.abort();
+                    let _ = http.await;
+                    shutdown_error.get_or_insert_with(|| anyhow!("HTTP server drain timed out"));
                 }
+            }
+        }
+        cancellation_token.cancel();
+        if tokio::time::timeout(Duration::from_secs(10), background_tasks.wait())
+            .await
+            .is_err()
+        {
+            shutdown_error
+                .get_or_insert_with(|| anyhow!("Background tasks timed out during shutdown"));
+            for handle in background_abort_handles {
+                handle.abort();
+            }
+            if tokio::time::timeout(Duration::from_secs(5), background_tasks.wait())
+                .await
+                .is_err()
+            {
+                error!("Aborted background tasks did not finish before timeout");
+            }
+        }
 
+        // Close admission, drain accepted writes, then close SQLite. A local
+        // commit does not guarantee that Litestream has replicated it remotely.
+        for db in db_connections {
+            if let Err(error) = db.close().await {
+                error!("Database shutdown failed: {error}");
+                shutdown_error.get_or_insert(error);
+            }
+        }
+
+        match shutdown_error {
+            Some(error) => Err(error),
+            None => {
                 info!("Shutdown complete");
                 Ok(())
-            }
-            Err(e) => {
-                error!("Server shutdown error: {}", e);
-                self.cancellation_token.cancel();
-
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    self.background_tasks.wait(),
-                )
-                .await;
-
-                Err(anyhow!("Error during server shutdown: {}", e))
             }
         }
     }
@@ -380,7 +454,6 @@ pub async fn build_app(
         }
     });
 
-    tracker.close();
     threads.insert(
         String::from("competition_watcher"),
         competition_watcher_task,
@@ -394,7 +467,7 @@ pub async fn build_app(
         Duration::from_secs(config.ln_settings.invoice_watch_interval),
     );
 
-    let invoice_watcher_handle = tokio::spawn(async move {
+    let invoice_watcher_handle = tracker.spawn(async move {
         if let Err(e) = invoice_watcher.watch().await {
             error!("Invoice watcher error: {}", e);
         }
@@ -409,7 +482,7 @@ pub async fn build_app(
         Duration::from_secs(config.ln_settings.payout_watch_interval),
     );
 
-    let payout_watcher_handle = tokio::spawn(async move {
+    let payout_watcher_handle = tracker.spawn(async move {
         if let Err(e) = payout_watcher.watch().await {
             error!("Payout watcher error: {}", e);
         }
@@ -423,7 +496,7 @@ pub async fn build_app(
     let invoice_subscriber =
         InvoiceSubscriber::new(coordinator.clone(), ln.clone(), cancel_token.clone());
 
-    let invoice_subscriber_handle = tokio::spawn(async move {
+    let invoice_subscriber_handle = tracker.spawn(async move {
         if let Err(e) = invoice_subscriber.subscribe().await {
             error!("Invoice subscriber error: {}", e);
         }
@@ -434,13 +507,14 @@ pub async fn build_app(
     let payment_subscriber =
         PaymentSubscriber::new(coordinator.clone(), ln.clone(), cancel_token.clone());
 
-    let payment_subscriber_handle = tokio::spawn(async move {
+    let payment_subscriber_handle = tracker.spawn(async move {
         if let Err(e) = payment_subscriber.subscribe().await {
             error!("Payment subscriber error: {}", e);
         }
     });
 
     threads.insert("payment_subscriber".to_string(), payment_subscriber_handle);
+    tracker.close();
 
     let app_state = AppState {
         ui_dir: config.ui_settings.ui_dir,

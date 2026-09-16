@@ -130,6 +130,7 @@ class Entry {
       keymeld_session_id: ticketData.keymeld_session_id,
       keymeld_enclave_public_key: ticketData.keymeld_enclave_public_key,
       keymeld_user_id: ticketData.keymeld_user_id,
+      keymeld_registration: ticketData.keymeld_registration,
     };
 
     return this.showPaymentModal();
@@ -348,19 +349,20 @@ class Entry {
 
       let encrypted_keymeld_private_key = null;
       let keymeld_auth_pubkey = null;
+      let keymeld_registration_context = null;
 
-      if (
-        this.ticket.keymeld_session_id &&
-        this.ticket.keymeld_enclave_public_key
-      ) {
+      if (this.ticket.keymeld_session_id && !this.ticket.keymeld_registration) {
+        throw new Error("The ticket is missing its authorized Keymeld registration context");
+      }
+      if (this.ticket.keymeld_registration) {
         // Use the secure WASM method that keeps private key inside WASM
-        const keymeldData = window.taprootWallet.prepareKeymeldRegistration(
+        const keymeldData = await window.taprootWallet.prepareKeymeldRegistration(
           this.entryIndex,
-          this.ticket.keymeld_enclave_public_key,
-          this.ticket.keymeld_session_id,
+          JSON.stringify(this.ticket.keymeld_registration),
         );
         encrypted_keymeld_private_key = keymeldData.encrypted_private_key;
         keymeld_auth_pubkey = keymeldData.auth_pubkey;
+        keymeld_registration_context = keymeldData.context;
       }
 
       const entry_body = {
@@ -375,6 +377,7 @@ class Entry {
         expected_observations: expectedObservations,
         encrypted_keymeld_private_key,
         keymeld_auth_pubkey,
+        keymeld_registration_context,
       };
 
       const response = await this.client.post(
@@ -411,26 +414,6 @@ class Entry {
 }
 
 window.Entry = Entry;
-
-async function deriveKeymeldAuthPubkey(privateKeyHex, sessionId) {
-  if (typeof window.derive_keymeld_auth_pubkey === "function") {
-    return window.derive_keymeld_auth_pubkey(privateKeyHex, sessionId);
-  }
-  throw new Error("Keymeld WASM not loaded");
-}
-
-async function encryptToEnclave(privateKeyHex, enclavePubkeyHex) {
-  if (typeof window.encrypt_private_key_for_enclave === "function") {
-    return window.encrypt_private_key_for_enclave(
-      privateKeyHex,
-      enclavePubkeyHex,
-    );
-  }
-  throw new Error("Keymeld WASM not loaded");
-}
-
-window.deriveKeymeldAuthPubkey = deriveKeymeldAuthPubkey;
-window.encryptToEnclave = encryptToEnclave;
 
 // Current entry instance for the form
 let currentEntry = null;

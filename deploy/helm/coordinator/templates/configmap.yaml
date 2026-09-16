@@ -71,12 +71,19 @@ data:
     [keymeld_settings]
     enabled = {{ .Values.keymeld.enabled }}
     gateway_url = {{ .Values.keymeld.gatewayUrl | quote }}
+    {{- if .Values.keymeld.publicGatewayUrl }}
+    public_gateway_url = {{ .Values.keymeld.publicGatewayUrl | quote }}
+    {{- end }}
     keygen_session_expiry_secs = {{ .Values.keymeld.keygenSessionExpirySecs }}
     signing_session_expiry_secs = {{ .Values.keymeld.signingSessionExpirySecs }}
     max_polling_attempts = {{ .Values.keymeld.maxPollingAttempts }}
     initial_polling_delay_ms = {{ .Values.keymeld.initialPollingDelayMs }}
     max_polling_delay_ms = {{ .Values.keymeld.maxPollingDelayMs }}
     polling_backoff_multiplier = {{ .Values.keymeld.pollingBackoffMultiplier }}
+    [keymeld_settings.trusted_pcrs]
+    {{- range $index, $measurement := .Values.keymeld.trustedPcrs }}
+    {{ $index | quote }} = {{ $measurement | quote }}
+    {{- end }}
 ---
 {{- if .Values.litestream.enabled }}
 apiVersion: v1

@@ -6,7 +6,7 @@ DLC-based fantasy weather prediction market coordinator with keymeld signing.
 
 - [dlctix](https://github.com/conduition/dlctix) - DLC cryptography and protocol implementation
 - [keymeld](https://github.com/tee8z/keymeld) - Threshold signing for DLC contracts
-- [bdk_wallet](https://github.com/bitcoindevkit/bdk) - Bitcoin wallet functionality
+- [bdk_wallet](https://github.com/bitcoindevkit/bdk) - Browser wallet functionality
 - [nostr-sdk](https://github.com/rust-nostr/nostr) - Nostr protocol for user auth
 - [maud](https://maud.lambda.xyz/) - Compile-time HTML templates
 - [sqlite](https://sqlite.org/) - Database with Litestream replication
@@ -17,6 +17,10 @@ DLC-based fantasy weather prediction market coordinator with keymeld signing.
 
 - [Nix](https://nixos.org/download.html) with flakes enabled
 - Docker (for k3d-based bitcoin stack)
+- An electrs server on the same Bitcoin network as LND, reachable through `bitcoin_settings.electrum_url`
+
+The local service helpers start Bitcoin, LND, and Keymeld.
+Start electrs separately before starting the coordinator; `start-all` does not provide an Electrum server.
 
 ### Development Setup
 
@@ -105,7 +109,7 @@ The coordinator reads from `./config/local.toml` by default. Key settings:
 
 ```toml
 [bitcoin_settings]
-network = "Regtest"
+network = "regtest"
 # electrs, for chain lookups LND cannot answer (escrow and outcome transactions)
 electrum_url = "tcp://localhost:60401"
 # Optional block explorer linked from the admin wallet page
@@ -123,6 +127,80 @@ enabled = true
 [coordinator_settings]
 oracle_url = "http://localhost:9800"
 ```
+
+### Keymeld authorization upgrade
+
+The SDK is pinned to Keymeld security revision `a974207819f24fbfe40c33542f8f19d28e7c4f09` (protocol 0.4).
+Deploy matching gateway, enclave, coordinator, and browser artifacts together.
+Complete active competitions before upgrading and archive their session state.
+Legacy session records lack authorization credentials and cannot resume under this protocol.
+
+Configure `keymeld_settings.trusted_pcrs` with PCR0 or PCR8 from the reviewed enclave build.
+Use hexadecimal, nonzero SHA-384 measurements; never copy trust pins from the gateway being verified.
+Set `keymeld_settings.public_gateway_url` to the browser-reachable gateway address.
+Allow the coordinator's exact browser origin in Keymeld's `server.cors_allowed_origins`.
+For Helm, use `keymeld.trustedPcrs` and `keymeld.publicGatewayUrl`.
+An enabled coordinator rejects missing or invalid trust pins.
+
+The browser verifies fresh enclave attestation before encrypting its participant key.
+Coordinator retains encrypted slot credentials and a separate signing credential with the pinned manifest and recipient proof.
+Ticket responses contain registration context, never those private authority credentials.
+Coordinator checks the completed roster against accepted entries before funding and signing.
+Entry submission delegates unattended signing for that competition; participants do not approve each batch.
+
+See [Keymeld security operations](https://github.com/tee8z/keymeld/blob/a974207819f24fbfe40c33542f8f19d28e7c4f09/docs/SECURITY_OPERATIONS.md) for enclave provisioning and hardware acceptance checks.
+See [the authorization design](docs/KEYMELD_AUTHORIZATION_MIGRATION.md) for the credentials the coordinator holds and the checks it enforces.
+Local mock tests do not establish Nitro attestation or live signing compatibility.
+
+### Upgrade from the coordinator-managed wallet
+
+The coordinator now uses the wallet in the configured LND node for on-chain funds.
+Existing BDK wallet funds do not move automatically.
+
+Before upgrading, complete active competitions with the previous version.
+Use the previous version to transfer remaining BDK wallet funds to an address owned by LND.
+Keep the old wallet database and key backups until you verify the transfer.
+
+Keep the existing `bitcoin_settings.seed_path` key.
+The coordinator still uses this key to sign DLC escrow inputs and Nostr events.
+Back up LND wallet data through your LND deployment's backup procedure.
+The chart no longer replicates `bitcoin.db` with Litestream.
+
+Update configuration before starting the new version:
+
+- Replace `bitcoin_settings.esplora_url` with `bitcoin_settings.electrum_url`.
+  Use an Electrum endpoint on the same network as LND.
+- Remove `bitcoin_settings.storage_file`.
+- Set `bitcoin_settings.explorer_url` only when an HTTP block explorer is available.
+- Verify `ln_settings` connects to the funded LND node with its TLS certificate and macaroon.
+
+For Helm, replace `bitcoin.esploraUrl` with `bitcoin.electrumUrl` and optionally set `bitcoin.explorerUrl`.
+For `wallet-cli`, use the equivalent `[bitcoin]` and `[ln]` sections in its configuration file.
+
+The wallet balance API now returns `confirmed`, `unconfirmed`, and `locked` amounts in satoshis.
+Update clients that read `immature`, `trusted_pending`, or `untrusted_pending`.
+The wallet outputs API returns `outpoint`, `txout`, and `confirmations` for each unspent output.
+
+### SQLite ownership and shutdown
+
+Each database has one writable connection and a separate pool of query-only readers.
+File databases use private connection caches with write-ahead logging (WAL).
+Readers see committed changes without a manual checkpoint.
+Legacy `write_max_connections` and `write_min_connections` settings are ignored; use `1` for both.
+
+Each writer accepts up to 64 queued commands, plus its active command.
+A full or closed queue rejects new commands before admission.
+Accepted commands finish even when their callers disconnect.
+A lost reply after admission means the outcome is unknown; do not retry the write automatically.
+
+An unexpected writer exit stops HTTP and makes the process fail.
+Shutdown drains HTTP, stops background producers, drains accepted writes, and then closes SQLite.
+HTTP and background producer drains each have a 10-second timeout.
+The writer drain and pool close each have a 15-second timeout.
+Shutdown reports an error when a drain exceeds its timeout.
+Successful writes confirm local commits; Litestream replication remains asynchronous.
+The Helm chart allows 120 seconds for shutdown through `terminationGracePeriodSeconds`.
+Its Litestream container does not guarantee a final remote sync after coordinator shutdown.
 
 ## Architecture
 

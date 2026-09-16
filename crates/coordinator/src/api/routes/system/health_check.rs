@@ -1,11 +1,11 @@
-use axum::{extract::State, response::ErrorResponse};
+use axum::extract::State;
 use hyper::StatusCode;
 use log::{debug, error};
 use std::sync::Arc;
 
-use crate::{domain::Error, startup::AppState};
+use crate::{api::routes::ApiError, domain::Error, startup::AppState};
 
-pub async fn health(State(state): State<Arc<AppState>>) -> Result<StatusCode, ErrorResponse> {
+pub async fn health(State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiError> {
     // Ping the database
     state.coordinator.ping().await.map_err(|e| {
         error!("{}", e);

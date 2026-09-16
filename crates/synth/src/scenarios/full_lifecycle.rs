@@ -37,7 +37,7 @@ pub async fn run_full_lifecycle(
             comp_id
         }
         Err(step) => {
-            steps.push(step);
+            steps.push(*step);
             return finish_result("full_lifecycle", started_at, scenario_start, steps, true);
         }
     };
@@ -54,7 +54,7 @@ pub async fn run_full_lifecycle(
             users
         }
         Err(step) => {
-            steps.push(step);
+            steps.push(*step);
             return finish_result("full_lifecycle", started_at, scenario_start, steps, true);
         }
     };
@@ -71,7 +71,7 @@ pub async fn run_full_lifecycle(
         {
             Ok((step, _)) => steps.push(step),
             Err(step) => {
-                steps.push(step);
+                steps.push(*step);
                 return finish_result("full_lifecycle", started_at, scenario_start, steps, true);
             }
         }
@@ -103,7 +103,7 @@ pub async fn run_full_lifecycle(
                 info!("Competition reached state: {}", target_state);
             }
             Err(step) => {
-                steps.push(step);
+                steps.push(*step);
                 warn!(
                     "Competition did not reach state: {} - stopping at current state",
                     target_state
@@ -230,19 +230,23 @@ async fn enter_competition(
         .await?;
     let preimage_encrypted = user.nip44_encrypt_to_self(&payout_preimage).await?;
 
-    // Prepare keymeld data if session info is available
-    let (encrypted_keymeld_key, keymeld_auth_pubkey) =
-        if let (Some(session_id), Some(enclave_pubkey)) = (
-            &ticket.keymeld_session_id,
-            &ticket.keymeld_enclave_public_key,
-        ) {
-            let encrypted =
-                crypto::keymeld::encrypt_for_enclave(&ephemeral.private_key_hex, enclave_pubkey)?;
-            let auth_pubkey =
-                crypto::keymeld::derive_auth_pubkey(&ephemeral.private_key_hex, session_id)?;
-            (Some(encrypted), Some(auth_pubkey))
-        } else {
-            (None, None)
+    if ticket.keymeld_session_id.is_some() && ticket.keymeld_registration.is_none() {
+        anyhow::bail!("Ticket is missing authorized Keymeld registration context");
+    }
+    let registration = match &ticket.keymeld_registration {
+        Some(assignment) => {
+            Some(crypto::keymeld::prepare_for_ticket(&ephemeral.private_key_hex, assignment).await?)
+        }
+        None => None,
+    };
+    let (encrypted_keymeld_key, keymeld_auth_pubkey, keymeld_registration_context) =
+        match registration {
+            Some(data) => (
+                Some(data.encrypted_private_key),
+                Some(data.auth_pubkey),
+                Some(data.context),
+            ),
+            None => (None, None, None),
         };
 
     // Generate random weather predictions
@@ -260,6 +264,7 @@ async fn enter_competition(
         expected_observations: predictions,
         encrypted_keymeld_private_key: encrypted_keymeld_key,
         keymeld_auth_pubkey,
+        keymeld_registration_context,
     };
 
     client
@@ -352,7 +357,10 @@ fn is_past_state(current: &str, target: &str) -> bool {
 }
 
 /// Helper to run a step with timing
-async fn run_step<F, Fut, T>(name: &str, f: F) -> std::result::Result<(StepResult, T), StepResult>
+async fn run_step<F, Fut, T>(
+    name: &str,
+    f: F,
+) -> std::result::Result<(StepResult, T), Box<StepResult>>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
@@ -375,13 +383,13 @@ where
         Err(e) => {
             let duration = start.elapsed().as_millis() as i64;
             error!("Step '{}' failed: {:?}", name, e);
-            Err(StepResult {
+            Err(Box::new(StepResult {
                 name: name.to_string(),
                 status: StepStatus::Failed,
                 duration_ms: duration,
                 details: None,
                 error: Some(e.to_string()),
-            })
+            }))
         }
     }
 }

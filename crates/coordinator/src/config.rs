@@ -5,6 +5,7 @@ use fern::colors::{Color, ColoredLevelConfig};
 use log::LevelFilter;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     env,
     fs::{self, File},
     io::{Read, Write},
@@ -82,7 +83,7 @@ impl Default for DBSettings {
             data_folder: String::from("./data"),
             read_max_connections: 12,
             read_min_connections: 2,
-            write_max_connections: 5,
+            write_max_connections: 1,
             write_min_connections: 1,
             idle_timeout_secs: 600,   // 10 minutes
             acquire_timeout_secs: 15, // 15 seconds
@@ -95,7 +96,7 @@ impl Default for SqliteConfigSerde {
     fn default() -> Self {
         Self {
             mode: "ReadWriteCreate".to_string(),
-            cache: "Shared".to_string(),
+            cache: "Private".to_string(),
             busy_timeout_ms: 5000,
             journal_mode: "WAL".to_string(),
             synchronous: "NORMAL".to_string(),
@@ -181,8 +182,14 @@ impl Default for LnSettings {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KeymeldSettings {
+    /// Trusted Nitro PCR measurements from the reviewed enclave build; PCR0 or PCR8 is required when enabled.
+    #[serde(default, with = "pcr_measurements")]
+    pub trusted_pcrs: BTreeMap<u16, String>,
     /// URL of the Keymeld gateway server
     pub gateway_url: String,
+    /// Gateway URL reachable by browsers for fresh enclave attestation.
+    #[serde(default)]
+    pub public_gateway_url: Option<String>,
     /// Whether Keymeld integration is enabled
     pub enabled: bool,
     /// Expiration time in seconds for keygen sessions
@@ -202,7 +209,9 @@ pub struct KeymeldSettings {
 impl Default for KeymeldSettings {
     fn default() -> Self {
         KeymeldSettings {
+            trusted_pcrs: BTreeMap::new(),
             gateway_url: String::from("http://localhost:8080"),
+            public_gateway_url: None,
             enabled: false,
             keygen_session_expiry_secs: 3600,
             signing_session_expiry_secs: 300,
@@ -211,6 +220,55 @@ impl Default for KeymeldSettings {
             max_polling_delay_ms: 5000,
             polling_backoff_multiplier: 1.5,
         }
+    }
+}
+
+mod pcr_measurements {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S>(values: &BTreeMap<u16, String>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        values
+            .iter()
+            .map(|(index, value)| (index.to_string(), value))
+            .collect::<BTreeMap<_, _>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<u16, String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        BTreeMap::<String, String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|(index, value)| {
+                index
+                    .parse()
+                    .map(|index| (index, value))
+                    .map_err(serde::de::Error::custom)
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod keymeld_config_tests {
+    use super::*;
+
+    #[test]
+    fn trusted_measurements_round_trip_through_operator_toml() {
+        let settings = KeymeldSettings {
+            trusted_pcrs: BTreeMap::from([(0, "ab".repeat(48)), (8, "cd".repeat(48))]),
+            public_gateway_url: Some("https://keymeld.example.com".into()),
+            ..KeymeldSettings::default()
+        };
+        let text = toml::to_string(&settings).unwrap();
+        let parsed: KeymeldSettings = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.trusted_pcrs, settings.trusted_pcrs);
+        assert_eq!(parsed.public_gateway_url, settings.public_gateway_url);
     }
 }
 

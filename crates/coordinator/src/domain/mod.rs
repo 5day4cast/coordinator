@@ -9,7 +9,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 pub use users::*;
 
-use crate::infra::oracle::Error as OracleError;
+use crate::infra::{db::DatabaseWriteError, oracle::Error as OracleError};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -19,6 +19,8 @@ pub enum Error {
     BadRequest(String),
     #[error("problem querying db: {0}")]
     DbError(#[from] sqlx::Error),
+    #[error("database write failed: {0}")]
+    DatabaseWrite(#[from] DatabaseWriteError),
     #[error("{0}")]
     OracleFailed(#[from] OracleError),
     #[error("invalid signature for request")]

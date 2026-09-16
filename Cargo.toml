@@ -21,7 +21,8 @@ name = "coordinator"
 coordinator-core = { path = "crates/coordinator-core" }
 
 # Keymeld
-keymeld-sdk = { git = "https://github.com/tee8z/keymeld", tag = "v0.3.2", features = ["client", "dlctix"] }
+keymeld-sdk = { git = "https://github.com/tee8z/keymeld", rev = "a974207819f24fbfe40c33542f8f19d28e7c4f09", default-features = false }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "a974207819f24fbfe40c33542f8f19d28e7c4f09", default-features = false }
 
 # Bitcoin
 bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }

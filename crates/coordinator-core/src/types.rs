@@ -1,6 +1,22 @@
 //! Shared types between coordinator server and WASM client
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use uuid::Uuid;
+
+/// Ticket assignment supplied by the coordinator, separate from the Keymeld gateway.
+/// Trusted PCR measurements come from the operator's reviewed enclave build.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistrationAssignment {
+    pub session_id: String,
+    pub user_id: Uuid,
+    pub manifest_hash: Vec<u8>,
+    pub enclave_id: u32,
+    pub enclave_key_epoch: u64,
+    pub enclave_public_key: String,
+    pub gateway_url: String,
+    pub trusted_pcrs: BTreeMap<u16, String>,
+}
 
 /// Comparison type for predictions
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

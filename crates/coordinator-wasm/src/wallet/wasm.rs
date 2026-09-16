@@ -1,6 +1,8 @@
 use super::core::{TaprootWalletCore, TaprootWalletCoreBuilder};
 use crate::nostr::NostrClientWrapper;
 use bdk_wallet::bitcoin::Psbt;
+#[cfg(feature = "keymeld")]
+use coordinator_core::RegistrationAssignment;
 use dlctix::{
     bitcoin::OutPoint,
     musig2::AggNonce,
@@ -8,6 +10,8 @@ use dlctix::{
     ContractParameters, EventLockingConditions, SigMap,
 };
 use log::{debug, info};
+#[cfg(feature = "keymeld")]
+use serde::Serialize;
 use std::str::FromStr;
 use wasm_bindgen::prelude::*;
 
@@ -106,18 +110,22 @@ impl TaprootWallet {
     /// Returns an object with encrypted_private_key and auth_pubkey.
     /// The raw private key never leaves WASM.
     #[wasm_bindgen(js_name = "prepareKeymeldRegistration")]
-    pub fn prepare_keymeld_registration(
+    #[cfg(feature = "keymeld")]
+    pub async fn prepare_keymeld_registration(
         &self,
         entry_index: u32,
-        enclave_pubkey_hex: &str,
-        session_id: &str,
+        assignment_json: &str,
     ) -> Result<JsValue, JsValue> {
+        let assignment: RegistrationAssignment =
+            serde_json::from_str(assignment_json).map_err(|e| JsValue::from_str(&e.to_string()))?;
         let data = self
             .inner
-            .prepare_keymeld_registration(entry_index, enclave_pubkey_hex, session_id)
+            .prepare_keymeld_registration(entry_index, &assignment)
+            .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-        serde_wasm_bindgen::to_value(&data).map_err(|e| JsValue::from_str(&e.to_string()))
+        data.serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     #[wasm_bindgen(js_name = "getEncryptedDlcPayoutPreimage")]
