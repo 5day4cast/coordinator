@@ -6,6 +6,9 @@ pub mod errors;
 pub mod types;
 pub mod validation;
 
+#[cfg(feature = "keymeld")]
+pub mod keymeld;
+
 pub use errors::*;
 pub use types::*;
 pub use validation::*;

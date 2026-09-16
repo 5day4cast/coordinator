@@ -13,6 +13,7 @@ pub async fn generate_escrow_tx(
     user_pubkey: PublicKey,
     payment_hash: [u8; 32],
     amount_sats: u64,
+    lease_deadline: u64,
 ) -> Result<Transaction, anyhow::Error> {
     let fee_rates = bitcoin.get_estimated_fee_rates().await?;
 
@@ -51,9 +52,28 @@ pub async fn generate_escrow_tx(
     let proprietary_value = ticket_id.as_bytes().to_vec();
     psbt.proprietary.insert(proprietary_key, proprietary_value);
 
-    bitcoin.sign_psbt(&mut psbt).await?;
-
-    let final_tx = psbt.extract_tx()?;
+    let transaction = async {
+        bitcoin
+            .reserve_psbt_inputs_until(&psbt, lease_deadline)
+            .await?;
+        if !bitcoin.sign_psbt(&mut psbt).await? {
+            return Err(anyhow!("LND did not finalize the escrow transaction"));
+        }
+        psbt.clone().extract_tx().map_err(anyhow::Error::from)
+    }
+    .await;
+    let final_tx = match transaction {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            if let Err(release_error) = bitcoin.release_psbt_inputs(&psbt).await {
+                log::warn!(
+                    "Failed to release inputs after escrow preparation failed: {}",
+                    release_error
+                );
+            }
+            return Err(error);
+        }
+    };
 
     debug!(
         "Generated escrow transaction with ID: {} for ticket: {}",

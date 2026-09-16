@@ -6,14 +6,14 @@
 data_folder = "./data/e2e"
 read_max_connections = 5
 read_min_connections = 1
-write_max_connections = 3
+write_max_connections = 1
 write_min_connections = 1
 idle_timeout_secs = 300
 acquire_timeout_secs = 10
 
 [db_settings.sqlite_config]
 mode = "ReadWriteCreate"
-cache = "Shared"
+cache = "Private"
 busy_timeout_ms = 5000
 journal_mode = "WAL"
 synchronous = "NORMAL"

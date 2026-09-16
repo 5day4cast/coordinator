@@ -65,16 +65,6 @@ pub enum WalletError {
     KeyDerivation(String),
 }
 
-/// Data returned from keymeld registration preparation.
-/// Contains the encrypted private key and derived auth pubkey.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KeymeldRegistrationData {
-    /// The private key encrypted to the keymeld enclave's public key
-    pub encrypted_private_key: String,
-    /// The derived auth pubkey for keymeld session authentication (hex encoded)
-    pub auth_pubkey: String,
-}
-
 #[cfg(target_arch = "wasm32")]
 impl From<WalletError> for wasm_bindgen::JsValue {
     fn from(error: WalletError) -> Self {

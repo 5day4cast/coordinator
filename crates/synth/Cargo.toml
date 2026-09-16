@@ -15,10 +15,10 @@ name = "coord"
 path = "src/bin/coord.rs"
 
 [dependencies]
-coordinator-core.workspace = true
+coordinator-core = { workspace = true, features = ["keymeld"] }
 
 # Keymeld SDK for auth pubkey derivation and enclave encryption
-keymeld-sdk = { workspace = true, default-features = false }
+keymeld-sdk.workspace = true
 
 # Web
 axum.workspace = true

@@ -1,6 +1,8 @@
 use super::auth::create_auth_header;
 use super::CoordinatorClient;
 use anyhow::{Context, Result};
+use coordinator_core::RegistrationAssignment;
+use keymeld_sdk::types::RegistrationContext;
 use nostr_sdk::Keys;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -24,6 +26,7 @@ pub struct TicketResponse {
     pub keymeld_gateway_url: Option<String>,
     pub keymeld_session_id: Option<String>,
     pub keymeld_enclave_public_key: Option<String>,
+    pub keymeld_registration: Option<RegistrationAssignment>,
 }
 
 /// Weather prediction choices for an entry
@@ -60,6 +63,8 @@ pub struct AddEntry {
     pub encrypted_keymeld_private_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keymeld_auth_pubkey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keymeld_registration_context: Option<RegistrationContext>,
 }
 
 /// Entry response from the API

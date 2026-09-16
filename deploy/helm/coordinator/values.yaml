@@ -7,6 +7,8 @@ blueGreen:
 
 # Coordinator Helm Chart Values
 replicaCount: 1
+# Covers bounded HTTP, producer, and database drain before Kubernetes sends SIGKILL.
+terminationGracePeriodSeconds: 120
 
 image:
   repository: coordinator
@@ -76,6 +78,10 @@ keymeld:
   url: "http://keymeld.keymeld.svc.cluster.local:8080"
   enabled: true
   gatewayUrl: "http://keymeld.keymeld.svc.cluster.local:8080"
+  # Browser-reachable gateway with the coordinator origin allowed by Keymeld CORS.
+  publicGatewayUrl: ""
+  # Pin PCR0 or PCR8 from the reviewed enclave build. Required when enabled.
+  trustedPcrs: {}
   keygenSessionExpirySecs: 86400  # 24 hours (max allowed by keymeld)
   signingSessionExpirySecs: 86400  # 24 hours (max allowed by keymeld)
   maxPollingAttempts: 100
@@ -125,7 +131,7 @@ config:
     acquireTimeoutSecs: 30
     sqlite:
       mode: rwc
-      cache: shared
+      cache: Private
       busyTimeoutMs: 5000
       journalMode: WAL
       synchronous: NORMAL

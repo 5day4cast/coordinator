@@ -164,6 +164,18 @@ impl Bitcoin for MockBitcoinClient {
         Ok(true)
     }
 
+    async fn reserve_psbt_inputs_until(
+        &self,
+        _psbt: &Psbt,
+        _deadline: u64,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    async fn release_psbt_inputs(&self, _psbt: &Psbt) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
     async fn list_utxos(&self) -> Vec<WalletUtxo> {
         // Mock: no UTXOs
         Vec::new()

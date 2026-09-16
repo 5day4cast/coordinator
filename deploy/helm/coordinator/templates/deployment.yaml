@@ -22,6 +22,7 @@ spec:
         {{- include "coordinator.selectorLabels" $ | nindent 8 }}
         app.kubernetes.io/slot: {{ $slot }}
     spec:
+      terminationGracePeriodSeconds: {{ $.Values.terminationGracePeriodSeconds }}
       {{- with $.Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -257,6 +258,7 @@ spec:
       labels:
         {{- include "coordinator.selectorLabels" . | nindent 8 }}
     spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

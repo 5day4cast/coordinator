@@ -1,16 +1,14 @@
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::{ErrorResponse, IntoResponse},
-    Json,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use log::{debug, error};
 use nostr_sdk::{Event, ToBech32};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::{
-    api::extractors::{AuthError, NostrAuth},
+    api::{
+        extractors::{AuthError, NostrAuth},
+        routes::ApiError,
+    },
     domain::{
         self,
         users::{hash_password, verify_password},
@@ -40,7 +38,7 @@ fn validate_password_strength(password: &str) -> Result<(), String> {
 pub async fn login(
     NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, ErrorResponse> {
+) -> Result<impl IntoResponse, ApiError> {
     let pubkey = pubkey.to_bech32().expect("public bech32 format");
     debug!("login with pubkey: {}", pubkey);
 
@@ -48,11 +46,11 @@ pub async fn login(
         Ok(user_info) => Ok((StatusCode::CREATED, Json(user_info))),
         Err(domain::Error::NotFound(e)) => {
             error!("Failed to login: {}", e);
-            Err(ErrorResponse::from(AuthError::InvalidLogin))
+            Err(ApiError::from(AuthError::InvalidLogin))
         }
         Err(e) => {
             error!("Failed to login: {}", e);
-            Err(ErrorResponse::from(e))
+            Err(ApiError::from(e))
         }
     }
 }
@@ -67,7 +65,7 @@ pub async fn register(
     NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
     Json(body): Json<RegisterPayload>,
-) -> Result<impl IntoResponse, ErrorResponse> {
+) -> Result<impl IntoResponse, ApiError> {
     let pubkey = pubkey.to_bech32().expect("public bech32 format");
 
     debug!("registering user: {}", pubkey);
@@ -75,7 +73,7 @@ pub async fn register(
         Ok(user_info) => Ok((StatusCode::CREATED, Json(user_info))),
         Err(e) => {
             error!("failed to register: {}", e);
-            Err(ErrorResponse::from(e))
+            Err(ApiError::from(e))
         }
     }
 }
@@ -124,15 +122,15 @@ fn validate_username(username: &str) -> Result<(), String> {
 pub async fn register_username(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UsernameRegisterPayload>,
-) -> Result<impl IntoResponse, ErrorResponse> {
+) -> Result<impl IntoResponse, ApiError> {
     debug!("registering user with username: {}", body.username);
 
     if let Err(e) = validate_username(&body.username) {
-        return Err(ErrorResponse::from(domain::Error::BadRequest(e)));
+        return Err(ApiError::from(domain::Error::BadRequest(e)));
     }
 
     if let Err(e) = validate_password_strength(&body.password) {
-        return Err(ErrorResponse::from(domain::Error::BadRequest(e)));
+        return Err(ApiError::from(domain::Error::BadRequest(e)));
     }
 
     if state.users_info.username_exists(&body.username).await? {
@@ -165,7 +163,7 @@ pub async fn register_username(
         Ok(user) => user,
         Err(e) => {
             error!("failed to register username user {}: {}", body.username, e);
-            return Err(ErrorResponse::from(e));
+            return Err(ApiError::from(e));
         }
     };
 
@@ -195,7 +193,7 @@ pub struct UsernameLoginResponse {
 pub async fn login_username(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UsernameLoginPayload>,
-) -> Result<impl IntoResponse, ErrorResponse> {
+) -> Result<impl IntoResponse, ApiError> {
     debug!("username login attempt for: {}", body.username);
 
     let user_result = state.users_info.get_user_by_username(&body.username).await;
@@ -213,7 +211,7 @@ pub async fn login_username(
         }
         Err(e) => {
             error!("Failed to get user by username: {}", e);
-            return Err(ErrorResponse::from(e));
+            return Err(ApiError::from(e));
         }
     };
 
@@ -221,7 +219,7 @@ pub async fn login_username(
 
     let user = match user {
         Some(u) if valid && u.password_hash.is_some() => u,
-        _ => return Err(ErrorResponse::from(AuthError::InvalidLogin)),
+        _ => return Err(ApiError::from(AuthError::InvalidLogin)),
     };
 
     let encrypted_nsec = user.encrypted_nsec.ok_or_else(|| {
@@ -251,12 +249,12 @@ pub async fn change_password(
     NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
     Json(body): Json<PasswordChangePayload>,
-) -> Result<impl IntoResponse, ErrorResponse> {
+) -> Result<impl IntoResponse, ApiError> {
     let pubkey_str = pubkey.to_bech32().expect("public bech32 format");
     debug!("password change for user: {}", pubkey_str);
 
     if let Err(e) = validate_password_strength(&body.new_password) {
-        return Err(ErrorResponse::from(domain::Error::BadRequest(e)));
+        return Err(ApiError::from(domain::Error::BadRequest(e)));
     }
 
     let user = state.users_info.login(pubkey_str.clone()).await?;
@@ -271,7 +269,7 @@ pub async fn change_password(
     })?;
 
     if !valid {
-        return Err(ErrorResponse::from(domain::Error::BadRequest(
+        return Err(ApiError::from(domain::Error::BadRequest(
             "Invalid current password".to_string(),
         )));
     }
@@ -303,7 +301,7 @@ pub struct ForgotPasswordChallenge {
 pub async fn forgot_password_challenge(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ForgotPasswordRequest>,
-) -> Result<impl IntoResponse, ErrorResponse> {
+) -> Result<impl IntoResponse, ApiError> {
     debug!("forgot password request for: {}", body.username);
 
     let challenge = {
@@ -337,7 +335,7 @@ pub async fn forgot_password_challenge(
         }
         Err(e) => {
             error!("Failed to get pubkey by username: {}", e);
-            return Err(ErrorResponse::from(e));
+            return Err(ApiError::from(e));
         }
     };
 
@@ -362,11 +360,11 @@ pub struct ForgotPasswordReset {
 pub async fn forgot_password_reset(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ForgotPasswordReset>,
-) -> Result<impl IntoResponse, ErrorResponse> {
+) -> Result<impl IntoResponse, ApiError> {
     debug!("forgot password reset for: {}", body.username);
 
     if let Err(e) = validate_password_strength(&body.new_password) {
-        return Err(ErrorResponse::from(domain::Error::BadRequest(e)));
+        return Err(ApiError::from(domain::Error::BadRequest(e)));
     }
 
     let challenge_valid = {
@@ -380,7 +378,7 @@ pub async fn forgot_password_reset(
     };
 
     if !challenge_valid {
-        return Err(ErrorResponse::from(domain::Error::BadRequest(
+        return Err(ApiError::from(domain::Error::BadRequest(
             "Invalid or expired challenge".to_string(),
         )));
     }
@@ -392,11 +390,11 @@ pub async fn forgot_password_reset(
     {
         Ok(pubkey) => pubkey,
         Err(domain::Error::NotFound(_)) => {
-            return Err(ErrorResponse::from(domain::Error::BadRequest(
+            return Err(ApiError::from(domain::Error::BadRequest(
                 "Invalid or expired challenge".to_string(),
             )));
         }
-        Err(e) => return Err(ErrorResponse::from(e)),
+        Err(e) => return Err(ApiError::from(e)),
     };
 
     let event: Event = serde_json::from_str(&body.signed_event).map_err(|e| {
@@ -411,13 +409,13 @@ pub async fn forgot_password_reset(
 
     let event_pubkey = event.pubkey.to_bech32().expect("public bech32 format");
     if event_pubkey != nostr_pubkey {
-        return Err(ErrorResponse::from(domain::Error::BadRequest(
+        return Err(ApiError::from(domain::Error::BadRequest(
             "Event pubkey does not match account".to_string(),
         )));
     }
 
     if event.content != body.challenge {
-        return Err(ErrorResponse::from(domain::Error::BadRequest(
+        return Err(ApiError::from(domain::Error::BadRequest(
             "Challenge mismatch in signed event".to_string(),
         )));
     }

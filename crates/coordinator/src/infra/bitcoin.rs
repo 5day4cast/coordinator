@@ -1,8 +1,9 @@
 //! On-chain access for the coordinator.
 //!
-//! The wallet lives in LND: addresses, UTXOs, transaction funding, signing,
-//! finalizing and publishing all go through LND's REST API (walletkit), so
-//! the coordinator keeps no on-chain wallet state of its own. Chain lookups
+//! The wallet lives in LND: addresses, UTXOs, wallet coin selection, signing,
+//! finalizing and publishing use LND's REST API (walletkit). The coordinator
+//! assembles external escrow inputs and accounts for their witness fees, while
+//! preserving LND's input leases in the funding PSBT. Chain lookups
 //! that LND cannot answer for transactions it does not own (escrow and
 //! outcome transactions) go to an electrs server over the Electrum protocol.
 //! The coordinator's own key (the seed file) is still used for DLC escrow
@@ -29,14 +30,14 @@ use electrum_client::{Client as ElectrumClient, ConfigBuilder, ElectrumApi};
 use futures::future::join_all;
 use log::{debug, error, info, warn};
 use reqwest::{Certificate, Client, Url};
-use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
-use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, fs, path::Path, str::FromStr, sync::Arc, time::Duration};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
+
+mod funding;
 
 // Needs to be over half of the last 10 blocks block time passed
 // the expiry time for a block to be considered final and able to broadcast
@@ -94,6 +95,15 @@ pub trait Bitcoin: Send + Sync {
         selected_utxos: Vec<OutPoint>,
         foreign_utxos: Vec<ForeignUtxo>,
     ) -> Result<Psbt, anyhow::Error>;
+    /// Keep the wallet inputs owned by this packet reserved until the given
+    /// Unix timestamp. Persist the packet before giving it to other signers.
+    async fn reserve_psbt_inputs_until(
+        &self,
+        psbt: &Psbt,
+        deadline: u64,
+    ) -> Result<(), anyhow::Error>;
+    /// Release this packet's wallet inputs after a definite pre-publication failure.
+    async fn release_psbt_inputs(&self, psbt: &Psbt) -> Result<(), anyhow::Error>;
     async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<WalletUtxo, anyhow::Error>;
     async fn get_current_height(&self) -> Result<u32, anyhow::Error>;
     async fn get_confirmed_blockchain_time(&self, blocks: usize) -> Result<u64, anyhow::Error>;
@@ -137,7 +147,9 @@ impl SendOptions {
 
     pub fn validate_fee(&self, psbt: &Psbt) -> Result<(), anyhow::Error> {
         if let Some(max_fee_sats) = self.max_fee {
-            let fee = psbt.fee().unwrap_or_default();
+            let fee = psbt
+                .fee()
+                .map_err(|error| anyhow!("Cannot validate transaction fee: {}", error))?;
             if fee > Amount::from_sat(max_fee_sats) {
                 return Err(anyhow!(
                     "Transaction fee {} sats exceeds maximum specified fee {} sats",
@@ -168,22 +180,38 @@ fn json_u64(value: &Value) -> Result<u64, anyhow::Error> {
             .parse::<u64>()
             .map_err(|e| anyhow!("bad integer {s}: {e}")),
         Value::Number(n) => n.as_u64().ok_or_else(|| anyhow!("bad integer {n}")),
-        Value::Null => Ok(0),
         other => Err(anyhow!("unexpected integer value {other}")),
     }
 }
 
 struct LndWallet {
     base_url: Url,
-    client: ClientWithMiddleware,
+    client: Client,
     macaroon: SecretString,
 }
 
 impl LndWallet {
     fn new(settings: &LnSettings) -> Result<Self, anyhow::Error> {
         let macaroon = read_macaroon_hex(&settings.macaroon_file_path)?;
-        let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
-        let mut builder = Client::builder().tls_built_in_root_certs(true);
+        let base_url = Url::parse(&settings.base_url)?;
+        if !matches!(base_url.scheme(), "http" | "https")
+            || base_url.host_str().is_none()
+            || !base_url.username().is_empty()
+            || base_url.password().is_some()
+            || base_url.query().is_some()
+            || base_url.fragment().is_some()
+        {
+            return Err(anyhow!(
+                "LND base URL must be an HTTP(S) URL without credentials, query or fragment"
+            ));
+        }
+        // Wallet mutations are never retried: a failed response can follow a
+        // successful spend, address allocation, or input lease.
+        let mut builder = Client::builder()
+            .tls_built_in_root_certs(true)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none());
         if let Some(tls_cert_path) = &settings.tls_cert_path {
             let cert_bytes = fs::read(tls_cert_path)
                 .map_err(|e| anyhow!("Failed to read LND tls cert {}: {}", tls_cert_path, e))?;
@@ -191,11 +219,9 @@ impl LndWallet {
                 .map_err(|e| anyhow!("Failed to parse LND tls cert: {}", e))?;
             builder = builder.add_root_certificate(cert);
         }
-        let client = ClientBuilder::new(builder.build()?)
-            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-            .build();
+        let client = builder.build()?;
         Ok(Self {
-            base_url: Url::parse(&settings.base_url)?,
+            base_url,
             client,
             macaroon,
         })
@@ -249,7 +275,7 @@ impl LndWallet {
 
     async fn block_height(&self) -> Result<u32, anyhow::Error> {
         let info: Value = self.get("v1/getinfo").await?;
-        Ok(json_u64(info.get("block_height").unwrap_or(&Value::Null))? as u32)
+        u32::try_from(json_u64(&info["block_height"])?).map_err(Into::into)
     }
 
     async fn list_unspent(&self) -> Result<Vec<WalletUtxo>, anyhow::Error> {
@@ -268,7 +294,7 @@ impl LndWallet {
         {
             let outpoint = &utxo["outpoint"];
             let txid = Txid::from_str(outpoint["txid_str"].as_str().unwrap_or_default())?;
-            let vout = json_u64(&outpoint["output_index"])? as u32;
+            let vout = u32::try_from(json_u64(&outpoint["output_index"])?)?;
             let script = ScriptBuf::from_hex(utxo["pk_script"].as_str().unwrap_or_default())?;
             utxos.push(WalletUtxo {
                 outpoint: OutPoint { txid, vout },
@@ -307,26 +333,6 @@ impl LndWallet {
             .map_err(|e| anyhow!("LND address is not for {}: {}", network, e))
     }
 
-    /// Adds wallet inputs and a change output to a template PSBT so that its
-    /// outputs (and any foreign inputs already present) are funded at the fee
-    /// rate. LND leases the selected inputs for ten minutes.
-    async fn fund_psbt(&self, template: &Psbt, fee_rate: FeeRate) -> Result<Psbt, anyhow::Error> {
-        let sat_per_vbyte = fee_rate.to_sat_per_vb_ceil().max(1);
-        let response: Value = self
-            .post(
-                "v2/wallet/psbt/fund",
-                json!({
-                    "coin_select": { "psbt": BASE64.encode(template.serialize()), "add": true },
-                    "sat_per_vbyte": sat_per_vbyte.to_string(),
-                    "min_confs": 1,
-                    "spend_unconfirmed": false,
-                    "change_type": "CHANGE_ADDRESS_TYPE_P2TR",
-                }),
-            )
-            .await?;
-        decode_psbt(&response["funded_psbt"])
-    }
-
     /// Signs the wallet's inputs; other inputs pass through untouched.
     async fn sign_psbt(&self, psbt: &Psbt) -> Result<Psbt, anyhow::Error> {
         let response: Value = self
@@ -357,8 +363,11 @@ impl LndWallet {
             )
             .await?;
         match response["publish_error"].as_str() {
-            Some("") | None => Ok(()),
+            Some("") => Ok(()),
             Some(err) => Err(anyhow!("LND refused to publish: {}", err)),
+            None => Err(anyhow!(
+                "LND returned no publication result; publication outcome is unknown"
+            )),
         }
     }
 
@@ -473,6 +482,35 @@ impl BitcoinClient {
         };
 
         let info: Value = client.lnd.get("v1/getinfo").await?;
+        let expected_network = match settings.network {
+            Network::Bitcoin => "mainnet",
+            Network::Testnet => "testnet",
+            Network::Testnet4 => "testnet4",
+            Network::Signet => "signet",
+            Network::Regtest => "regtest",
+        };
+        let correct_chain = info["chains"].as_array().is_some_and(|chains| {
+            chains
+                .iter()
+                .any(|chain| chain["chain"] == "bitcoin" && chain["network"] == expected_network)
+        });
+        if !correct_chain {
+            return Err(anyhow!(
+                "LND chain does not match configured Bitcoin network {}",
+                settings.network
+            ));
+        }
+        let genesis = client
+            .with_electrum(|electrum| electrum.block_header(0))
+            .await?;
+        if genesis.block_hash()
+            != bitcoin::blockdata::constants::genesis_block(settings.network).block_hash()
+        {
+            return Err(anyhow!(
+                "Electrum chain does not match configured Bitcoin network {}",
+                settings.network
+            ));
+        }
         let synced = info["synced_to_chain"].as_bool().unwrap_or(false);
         info!(
             "LND wallet reachable: height {}, synced_to_chain {}",
@@ -572,7 +610,7 @@ impl BitcoinClient {
                 let expected_hash = &script_bytes[2..34];
                 let actual_hash = sha256::Hash::hash(witness_script.as_bytes()).to_byte_array();
                 if expected_hash != actual_hash.as_slice() {
-                    debug!("Witness script hash mismatch for input {}", idx);
+                    return Err(anyhow!("Witness script hash mismatch for input {}", idx));
                 }
             }
 
@@ -747,10 +785,7 @@ impl Bitcoin for BitcoinClient {
             .iter()
             .any(|input| input.witness_script.is_none());
         if has_wallet_inputs {
-            match self.lnd.sign_psbt(psbt).await {
-                Ok(signed) => *psbt = signed,
-                Err(e) => warn!("LND signed no inputs: {}", e),
-            }
+            *psbt = self.lnd.sign_psbt(psbt).await?;
         }
 
         Ok(Self::is_psbt_fully_signed(psbt))
@@ -791,15 +826,18 @@ impl Bitcoin for BitcoinClient {
         foreign_utxos: Vec<ForeignUtxo>,
     ) -> Result<Psbt, anyhow::Error> {
         self.print_balance_info().await?;
-        let template = Self::template_psbt(
-            vec![TxOut {
-                value: amount,
-                script_pubkey,
-            }],
-            &selected_utxos,
-            foreign_utxos,
-        )?;
-        self.lnd.fund_psbt(&template, fee_rate).await
+        self.lnd
+            .fund_with_foreign(
+                self.network,
+                TxOut {
+                    value: amount,
+                    script_pubkey,
+                },
+                fee_rate,
+                selected_utxos,
+                foreign_utxos,
+            )
+            .await
     }
 
     async fn sign_psbt(&self, psbt: &mut Psbt) -> Result<bool, anyhow::Error> {
@@ -808,6 +846,18 @@ impl Bitcoin for BitcoinClient {
             .inputs
             .iter()
             .all(|input| input.final_script_witness.is_some() || input.final_script_sig.is_some()))
+    }
+
+    async fn reserve_psbt_inputs_until(
+        &self,
+        psbt: &Psbt,
+        deadline: u64,
+    ) -> Result<(), anyhow::Error> {
+        self.lnd.reserve_psbt_inputs_until(psbt, deadline).await
+    }
+
+    async fn release_psbt_inputs(&self, psbt: &Psbt) -> Result<(), anyhow::Error> {
+        self.lnd.release_psbt_inputs(psbt).await
     }
 
     async fn get_tx_confirmation_height(&self, txid: &Txid) -> Result<Option<u32>, anyhow::Error> {
@@ -851,8 +901,13 @@ impl Bitcoin for BitcoinClient {
     }
 
     async fn get_confirmed_blockchain_time(&self, blocks: usize) -> Result<u64, anyhow::Error> {
+        if blocks == 0 || blocks > 2016 {
+            return Err(anyhow!(
+                "Block time window must be between 1 and 2016 blocks"
+            ));
+        }
         let tip = self.get_current_height().await? as usize;
-        let count = blocks.max(1);
+        let count = blocks;
         let start = tip.saturating_sub(count - 1);
         let mut times = self
             .with_electrum(move |client| client.block_headers(start, count))
@@ -861,12 +916,17 @@ impl Bitcoin for BitcoinClient {
             .iter()
             .map(|header| header.time as u64)
             .collect::<Vec<_>>();
-        if times.is_empty() {
-            return Err(anyhow!("No blocks available to calculate median time"));
+        if times.len() != count {
+            return Err(anyhow!(
+                "Insufficient blocks available to calculate confirmed time"
+            ));
         }
         // Oldest of the most recent `blocks` headers, as before.
         times.sort_unstable_by(|a, b| b.cmp(a));
-        Ok(times.get(blocks - 1).copied().unwrap_or_default())
+        times
+            .get(blocks - 1)
+            .copied()
+            .ok_or_else(|| anyhow!("Missing confirmed block time"))
     }
 
     /// Fee rates in sat/vB keyed by confirmation target in blocks.
@@ -928,6 +988,9 @@ impl Bitcoin for BitcoinClient {
         selected_utxos: Vec<OutPoint>,
     ) -> Result<Txid, anyhow::Error> {
         let dest_addr = send_options.get_destination_address(self.network)?;
+        if send_options.amount.is_none() && send_options.max_fee.is_some() {
+            return Err(anyhow!("A maximum fee requires an explicit send amount; LND sweeps publish before the fee can be checked"));
+        }
 
         // Inputs: the explicit selection, or every UTXO of the source address.
         let mut inputs = selected_utxos;
@@ -955,9 +1018,6 @@ impl Bitcoin for BitcoinClient {
         let sat_per_vbyte = fee_rates.get(&6).copied().unwrap_or(1.0).ceil() as u64;
 
         let Some(amount_sats) = send_options.amount else {
-            if send_options.max_fee.is_some() {
-                warn!("max_fee is not enforced when sweeping the whole wallet");
-            }
             return self
                 .lnd
                 .send_all(&dest_addr, sat_per_vbyte.max(1), &inputs)
@@ -972,17 +1032,31 @@ impl Bitcoin for BitcoinClient {
             &inputs,
             vec![],
         )?;
-        let mut psbt = self
+        let psbt = self
             .lnd
             .fund_psbt(
                 &template,
                 FeeRate::from_sat_per_vb_unchecked(sat_per_vbyte.max(1)),
             )
             .await?;
-        send_options.validate_fee(&psbt)?;
-
-        psbt = self.lnd.finalize_psbt(&psbt).await?;
-        let tx = psbt.extract_tx()?;
+        let transaction = async {
+            send_options.validate_fee(&psbt)?;
+            let finalized = self.lnd.finalize_psbt(&psbt).await?;
+            finalized.extract_tx().map_err(anyhow::Error::from)
+        }
+        .await;
+        let tx = match transaction {
+            Ok(tx) => tx,
+            Err(error) => {
+                if let Err(release_error) = self.lnd.release_psbt_inputs(&psbt).await {
+                    warn!(
+                        "Failed to release inputs after send preparation failed: {}",
+                        release_error
+                    );
+                }
+                return Err(error);
+            }
+        };
         self.lnd.publish(&tx, "coordinator send").await?;
         Ok(tx.compute_txid())
     }

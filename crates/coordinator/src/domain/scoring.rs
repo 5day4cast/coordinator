@@ -3,6 +3,7 @@
 //! Ported from frontend/public/leader_board.js
 
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 
 use crate::infra::oracle::{ValueOptions, WeatherChoices};
 
@@ -178,7 +179,7 @@ pub fn calculate_scores(
         .collect();
 
     // Sort by final score (highest first)
-    scored_entries.sort_by(|a, b| b.final_score.cmp(&a.final_score));
+    scored_entries.sort_by_key(|entry| Reverse(entry.final_score));
 
     scored_entries
 }

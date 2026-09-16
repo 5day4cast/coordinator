@@ -113,6 +113,10 @@ pub fn entry_form(
                 }
 
                 div class="mt-4" {
+                    p class="help mb-3" {
+                        "Submitting an entry authorizes automatic signing for this competition. "
+                        "You do not need to stay online or approve each signing request."
+                    }
                     // Submit button - triggers JS handler
                     button type="button" id="submitEntry" class="button is-info"
                            onclick="submitEntry()" {

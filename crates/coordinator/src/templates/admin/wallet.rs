@@ -35,11 +35,13 @@ pub fn wallet_page(explorer_url: &str, balance: &WalletBalance, address: &str) -
                             h1 class="title" { "Bitcoin Wallet" }
                         }
                     }
-                    div class="level-right" {
-                        div class="level-item" {
-                            a href=(explorer_url) target="_blank"
-                              class="button is-small is-info is-light" {
-                                span { "Open Explorer" }
+                    @if !explorer_url.is_empty() {
+                        div class="level-right" {
+                            div class="level-item" {
+                                a href=(explorer_url) target="_blank"
+                                  class="button is-small is-info is-light" {
+                                    span { "Open Explorer" }
+                                }
                             }
                         }
                     }
