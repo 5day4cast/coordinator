@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use bdk_wallet::bitcoin::hashes::{sha256, Hash};
+use bitcoin::hashes::{sha256, Hash};
 use log::{debug, info};
 use std::{
     collections::HashMap,

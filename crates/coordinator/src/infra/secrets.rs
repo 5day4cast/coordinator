@@ -1,5 +1,5 @@
 use anyhow::anyhow;
-use bdk_wallet::bitcoin::secp256k1::SecretKey as BitcoinSecretKey;
+use bitcoin::secp256k1::SecretKey as BitcoinSecretKey;
 use dlctix::musig2::secp256k1::SecretKey as DlctixSecretKey;
 use pem_rfc7468::{decode_vec, encode_string};
 use rand::RngCore;

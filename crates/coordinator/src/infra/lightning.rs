@@ -1,7 +1,7 @@
 use anyhow::anyhow;
 use async_trait::async_trait;
 use base64::Engine;
-use bdk_wallet::bitcoin::hashes::{sha256, Hash};
+use bitcoin::hashes::{sha256, Hash};
 use futures::StreamExt;
 use lightning_invoice::Bolt11Invoice;
 use log::{debug, info, warn};

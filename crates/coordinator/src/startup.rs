@@ -140,7 +140,7 @@ pub struct AppState {
     pub private_url: String,
     pub remote_url: String,
     pub oracle_url: String,
-    pub esplora_url: String,
+    pub explorer_url: String,
     pub network: String,
     pub bitcoin: Arc<dyn Bitcoin>,
     pub coordinator: Arc<Coordinator>,
@@ -163,7 +163,7 @@ pub async fn build_app(
         info!("Mock Bitcoin client configured");
         Arc::new(MockBitcoinClient::new(config.bitcoin_settings.network))
     } else {
-        let client = BitcoinClient::new(&config.bitcoin_settings)
+        let client = BitcoinClient::new(&config.bitcoin_settings, &config.ln_settings)
             .await
             .map(Arc::new)?;
         info!("Bitcoin service configured");
@@ -177,7 +177,7 @@ pub async fn build_app(
                 "Mock Bitcoin client requires e2e-testing feature or debug build"
             ));
         }
-        let client = BitcoinClient::new(&config.bitcoin_settings)
+        let client = BitcoinClient::new(&config.bitcoin_settings, &config.ln_settings)
             .await
             .map(Arc::new)?;
         info!("Bitcoin service configured");
@@ -446,7 +446,11 @@ pub async fn build_app(
         ui_dir: config.ui_settings.ui_dir,
         private_url: config.ui_settings.private_url,
         remote_url: config.ui_settings.remote_url,
-        esplora_url: config.bitcoin_settings.esplora_url,
+        explorer_url: config
+            .bitcoin_settings
+            .explorer_url
+            .clone()
+            .unwrap_or_default(),
         oracle_url: config.coordinator_settings.oracle_url,
         network: config.bitcoin_settings.network.to_string(),
         coordinator,

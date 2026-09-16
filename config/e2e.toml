@@ -44,9 +44,8 @@ mock_oracle = true  # Use MockOracle instead of real Oracle server
 
 [bitcoin_settings]
 network = "regtest"
-esplora_url = "http://localhost:9102"
+electrum_url = "tcp://localhost:60401"
 seed_path = "./creds/coordinator_private_key.pem"
-storage_file = "./data/e2e/bitcoin.db"
 refresh_blocks_secs = 30
 mock_enabled = true  # Use MockBitcoinClient - no real Bitcoin infrastructure needed
 

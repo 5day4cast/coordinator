@@ -2,16 +2,10 @@
 //!
 //! Provides a minimal Bitcoin trait implementation that doesn't require
 //! any real Bitcoin infrastructure. Used for Playwright E2E tests.
-#![allow(deprecated)] // SignOptions is deprecated but no replacement API exists yet in bdk_wallet 2.3
 
 use async_trait::async_trait;
-use bdk_wallet::{
-    bitcoin::{
-        Address, Amount, FeeRate, Network, OutPoint, Psbt, PublicKey, ScriptBuf, Transaction, Txid,
-    },
-    AddressInfo, Balance, KeychainKind, LocalOutput, SignOptions,
-};
-use dlctix::secp::Scalar;
+use bitcoin::{Address, Amount, Network, OutPoint, Psbt, PublicKey, ScriptBuf, Transaction, Txid};
+use dlctix::{bitcoin::FeeRate, secp::Scalar};
 use log::info;
 use std::{
     collections::HashMap,
@@ -20,7 +14,7 @@ use std::{
 };
 use time::OffsetDateTime;
 
-use super::bitcoin::{Bitcoin, ForeignUtxo, SendOptions};
+use super::bitcoin::{Bitcoin, ForeignUtxo, SendOptions, WalletBalance, WalletUtxo};
 
 /// Mock Bitcoin client for E2E testing
 pub struct MockBitcoinClient {
@@ -58,11 +52,7 @@ impl Bitcoin for MockBitcoinClient {
         self.network
     }
 
-    async fn sign_psbt_with_escrow_support(
-        &self,
-        _psbt: &mut Psbt,
-        _options: SignOptions,
-    ) -> Result<bool, anyhow::Error> {
+    async fn sign_psbt_with_escrow_support(&self, _psbt: &mut Psbt) -> Result<bool, anyhow::Error> {
         // Mock: pretend signing succeeded
         Ok(true)
     }
@@ -83,14 +73,13 @@ impl Bitcoin for MockBitcoinClient {
         _selected_utxos: Vec<OutPoint>,
         _foreign_utxos: Vec<ForeignUtxo>,
     ) -> Result<Psbt, anyhow::Error> {
-        // Return a minimal empty PSBT for testing
         // In real E2E tests, we won't actually need to build transactions
         Err(anyhow::anyhow!(
             "MockBitcoinClient: build_psbt not implemented for E2E tests"
         ))
     }
 
-    async fn get_spendable_utxo(&self, _amount_sats: u64) -> Result<LocalOutput, anyhow::Error> {
+    async fn get_spendable_utxo(&self, _amount_sats: u64) -> Result<WalletUtxo, anyhow::Error> {
         Err(anyhow::anyhow!(
             "MockBitcoinClient: no UTXOs available in mock mode"
         ))
@@ -128,32 +117,22 @@ impl Bitcoin for MockBitcoinClient {
         Ok(())
     }
 
-    async fn get_next_address(&self) -> Result<AddressInfo, anyhow::Error> {
-        let index = self.address_counter.fetch_add(1, Ordering::SeqCst);
+    async fn get_next_address(&self) -> Result<Address, anyhow::Error> {
+        self.address_counter.fetch_add(1, Ordering::SeqCst);
 
-        // Use a well-known regtest address format
-        // bcrt1q prefix for regtest bech32 addresses
+        // Use a well-known address for the network
         let address_str = match self.network {
-            Network::Regtest => {
-                // Use a valid bech32 regtest address
-                "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"
-            }
+            Network::Regtest => "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
             Network::Testnet | Network::Testnet4 | Network::Signet => {
                 "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"
             }
             _ => "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
         };
 
-        let address = Address::from_str(address_str)
+        Address::from_str(address_str)
             .map_err(|e| anyhow::anyhow!("Failed to parse mock address: {}", e))?
             .require_network(self.network)
-            .map_err(|e| anyhow::anyhow!("Address network mismatch: {}", e))?;
-
-        Ok(AddressInfo {
-            index,
-            address,
-            keychain: KeychainKind::External,
-        })
+            .map_err(|e| anyhow::anyhow!("Address network mismatch: {}", e))
     }
 
     async fn get_public_key(&self) -> Result<PublicKey, anyhow::Error> {
@@ -180,16 +159,12 @@ impl Bitcoin for MockBitcoinClient {
         ))
     }
 
-    async fn sign_psbt(
-        &self,
-        _psbt: &mut Psbt,
-        _sign_options: SignOptions,
-    ) -> Result<bool, anyhow::Error> {
+    async fn sign_psbt(&self, _psbt: &mut Psbt) -> Result<bool, anyhow::Error> {
         // Mock: pretend signing succeeded
         Ok(true)
     }
 
-    async fn list_utxos(&self) -> Vec<LocalOutput> {
+    async fn list_utxos(&self) -> Vec<WalletUtxo> {
         // Mock: no UTXOs
         Vec::new()
     }
@@ -200,12 +175,12 @@ impl Bitcoin for MockBitcoinClient {
         Ok(())
     }
 
-    async fn get_balance(&self) -> Result<Balance, anyhow::Error> {
+    async fn get_balance(&self) -> Result<WalletBalance, anyhow::Error> {
         // Mock: return zero balance
-        Ok(Balance::default())
+        Ok(WalletBalance::default())
     }
 
-    async fn get_outputs(&self) -> Result<Vec<LocalOutput>, anyhow::Error> {
+    async fn get_outputs(&self) -> Result<Vec<WalletUtxo>, anyhow::Error> {
         // Mock: no outputs
         Ok(Vec::new())
     }

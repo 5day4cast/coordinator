@@ -187,10 +187,9 @@ async fn main() -> Result<()> {
             WalletCommands::Balance => {
                 let balance = client.wallet_balance().await?;
                 println!("Wallet Balance:");
-                println!("  Confirmed:         {} sats", balance.confirmed);
-                println!("  Trusted Pending:   {} sats", balance.trusted_pending);
-                println!("  Untrusted Pending: {} sats", balance.untrusted_pending);
-                println!("  Immature:          {} sats", balance.immature);
+                println!("  Confirmed:   {} sats", balance.confirmed);
+                println!("  Unconfirmed: {} sats", balance.unconfirmed);
+                println!("  Locked:      {} sats", balance.locked);
             }
             WalletCommands::Address => {
                 let addr = client.wallet_address().await?;

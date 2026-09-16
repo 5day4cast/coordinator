@@ -65,9 +65,6 @@ litestream:
   # Use IAM role for S3 access (recommended for EC2/EKS)
   useIAMRole: false
   databases:
-    - name: bitcoin
-      path: /data/bitcoin.db
-      s3Path: bitcoin.db
     - name: competitions
       path: /data/competitions.db
       s3Path: competitions.db
@@ -102,7 +99,8 @@ bitcoin:
   rpcUser: "bitcoin"
   rpcPassword: "bitcoinpass"
   network: regtest
-  esploraUrl: "http://esplora.bitcoin.svc.cluster.local:3000"
+  electrumUrl: "tcp://electrs.bitcoin.svc.cluster.local:60401"
+  explorerUrl: "http://esplora.bitcoin.svc.cluster.local:3000"
   refreshBlocksSecs: 10
 
 lightning:

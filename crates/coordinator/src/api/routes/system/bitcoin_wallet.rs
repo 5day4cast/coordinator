@@ -4,12 +4,15 @@ use axum::{
     response::{ErrorResponse, IntoResponse},
     Json,
 };
-use bdk_wallet::{Balance, LocalOutput};
 use log::{debug, error};
 use serde::Serialize;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::{domain::Error, infra::bitcoin::SendOptions, startup::AppState};
+use crate::{
+    domain::Error,
+    infra::bitcoin::{SendOptions, WalletBalance, WalletUtxo},
+    startup::AppState,
+};
 
 #[derive(Debug, Serialize)]
 pub struct AddressResponse {
@@ -18,7 +21,7 @@ pub struct AddressResponse {
 
 #[derive(Debug, Serialize)]
 pub struct OutputsResponse {
-    outputs: Vec<LocalOutput>,
+    outputs: Vec<WalletUtxo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -33,7 +36,7 @@ pub struct FeeEstimatesResponse {
 
 pub async fn get_balance(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Balance>, ErrorResponse> {
+) -> Result<Json<WalletBalance>, ErrorResponse> {
     debug!("Getting wallet balance");
 
     match state.bitcoin.get_balance().await {

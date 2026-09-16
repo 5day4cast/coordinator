@@ -1,59 +1,87 @@
-#![allow(deprecated)] // SignOptions is deprecated but no replacement API exists yet in bdk_wallet 2.3
-use crate::{get_key, BitcoinSettings};
+//! On-chain access for the coordinator.
+//!
+//! The wallet lives in LND: addresses, UTXOs, transaction funding, signing,
+//! finalizing and publishing all go through LND's REST API (walletkit), so
+//! the coordinator keeps no on-chain wallet state of its own. Chain lookups
+//! that LND cannot answer for transactions it does not own (escrow and
+//! outcome transactions) go to an electrs server over the Electrum protocol.
+//! The coordinator's own key (the seed file) is still used for DLC escrow
+//! signatures, which no wallet can produce on its behalf.
+use crate::{get_key, BitcoinSettings, LnSettings};
 use anyhow::anyhow;
 use async_trait::async_trait;
-use bdk_esplora::{
-    esplora_client::{r#async::DefaultSleeper, AsyncClient, Builder},
-    EsploraAsyncExt,
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use bitcoin::{
+    absolute::LockTime,
+    address::NetworkChecked,
+    consensus::encode::serialize,
+    ecdsa,
+    hashes::{sha256, Hash},
+    psbt::Input,
+    secp256k1::{Message, Secp256k1, SecretKey},
+    sighash::{EcdsaSighashType, SighashCache},
+    transaction::Version,
+    Address, Amount, Network, NetworkKind, OutPoint, Psbt, PublicKey, ScriptBuf, Sequence,
+    Transaction, TxIn, TxOut, Txid, Weight, Witness,
 };
-use bdk_sqlite::Store;
-use bdk_wallet::{
-    bitcoin::{
-        address::NetworkChecked,
-        bip32::{ChildNumber, Xpriv},
-        ecdsa,
-        hashes::{sha256, Hash},
-        psbt::Input,
-        secp256k1::{Message, Secp256k1, SecretKey as BdkSecretKey},
-        sighash::{EcdsaSighashType, SighashCache},
-        Address, Amount, Network, NetworkKind, OutPoint, Psbt, PublicKey, ScriptBuf, Transaction,
-        Txid, Weight, Witness,
-    },
-    coin_selection::DefaultCoinSelectionAlgorithm,
-    descriptor::calc_checksum,
-    AddressInfo, Balance, KeychainKind, LocalOutput, PersistedWallet, SignOptions, TxBuilder,
-    Wallet,
-};
-use dlctix::{
-    bitcoin::{bip32::ChainCode, FeeRate},
-    secp::Scalar,
-};
-use log::{debug, error, info};
+use dlctix::{bitcoin::FeeRate, secp::Scalar};
+use electrum_client::{Client as ElectrumClient, ConfigBuilder, ElectrumApi};
+use futures::future::join_all;
+use log::{debug, error, info, warn};
+use reqwest::{Certificate, Client, Url};
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
-use std::{
-    collections::{BTreeSet, HashMap},
-    fs,
-    path::Path,
-    str::FromStr,
-    sync::Arc,
-    time::Duration,
-};
-use tokio::{sync::RwLock, time::sleep};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::{collections::HashMap, fs, path::Path, str::FromStr, sync::Arc, time::Duration};
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 // Needs to be over half of the last 10 blocks block time passed
 // the expiry time for a block to be considered final and able to broadcast
 pub const REQUIRED_CONFIRMATIONS_FOR_TIME: usize = 6;
 
+/// Confirmation targets (in blocks) offered by `get_estimated_fee_rates`.
+const FEE_TARGETS: [u16; 12] = [1, 2, 3, 4, 5, 6, 10, 12, 24, 144, 504, 1008];
+
+/// An unspent output of the LND wallet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletUtxo {
+    pub outpoint: OutPoint,
+    pub txout: TxOut,
+    pub address: String,
+    pub confirmations: u64,
+}
+
+impl WalletUtxo {
+    pub fn is_confirmed(&self) -> bool {
+        self.confirmations > 0
+    }
+}
+
+/// The LND wallet's on-chain balance.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WalletBalance {
+    pub confirmed: Amount,
+    pub unconfirmed: Amount,
+    pub locked: Amount,
+}
+
+impl WalletBalance {
+    pub fn total(&self) -> Amount {
+        self.confirmed + self.unconfirmed
+    }
+}
+
 #[async_trait]
 pub trait Bitcoin: Send + Sync {
     fn get_network(&self) -> Network;
-    async fn sign_psbt_with_escrow_support(
-        &self,
-        psbt: &mut Psbt,
-        options: SignOptions,
-    ) -> Result<bool, anyhow::Error>;
+    /// Signs the wallet's inputs through LND and the escrow inputs with the
+    /// coordinator's key. Returns whether every input carries a signature.
+    async fn sign_psbt_with_escrow_support(&self, psbt: &mut Psbt) -> Result<bool, anyhow::Error>;
+    /// Finalizes escrow inputs from their signatures, then lets LND sign and
+    /// finalize its own inputs. Returns whether every input is final.
     async fn finalize_psbt_with_escrow_support(
         &self,
         psbt: &mut Psbt,
@@ -66,38 +94,27 @@ pub trait Bitcoin: Send + Sync {
         selected_utxos: Vec<OutPoint>,
         foreign_utxos: Vec<ForeignUtxo>,
     ) -> Result<Psbt, anyhow::Error>;
-    async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<LocalOutput, anyhow::Error>;
+    async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<WalletUtxo, anyhow::Error>;
     async fn get_current_height(&self) -> Result<u32, anyhow::Error>;
     async fn get_confirmed_blockchain_time(&self, blocks: usize) -> Result<u64, anyhow::Error>;
     async fn get_estimated_fee_rates(&self) -> Result<HashMap<u16, f64>, anyhow::Error>;
     async fn get_tx_confirmation_height(&self, txid: &Txid) -> Result<Option<u32>, anyhow::Error>;
     async fn broadcast(&self, transaction: &Transaction) -> Result<(), anyhow::Error>;
-    async fn get_next_address(&self) -> Result<AddressInfo, anyhow::Error>;
-    async fn get_public_key(&self) -> Result<bdk_wallet::bitcoin::PublicKey, anyhow::Error>;
+    async fn get_next_address(&self) -> Result<Address, anyhow::Error>;
+    async fn get_public_key(&self) -> Result<PublicKey, anyhow::Error>;
     async fn get_derived_private_key(&self) -> Result<Scalar, anyhow::Error>;
     async fn get_raw_transaction(&self, txid: &Txid) -> Result<Transaction, anyhow::Error>;
-    async fn sign_psbt(
-        &self,
-        psbt: &mut Psbt,
-        sign_options: SignOptions,
-    ) -> Result<bool, anyhow::Error>;
-    async fn list_utxos(&self) -> Vec<LocalOutput>;
+    /// Signs and finalizes every wallet input through LND.
+    async fn sign_psbt(&self, psbt: &mut Psbt) -> Result<bool, anyhow::Error>;
+    async fn list_utxos(&self) -> Vec<WalletUtxo>;
     async fn sync(&self) -> Result<(), anyhow::Error>;
-    async fn get_balance(&self) -> Result<Balance, anyhow::Error>;
-    async fn get_outputs(&self) -> Result<Vec<LocalOutput>, anyhow::Error>;
+    async fn get_balance(&self) -> Result<WalletBalance, anyhow::Error>;
+    async fn get_outputs(&self) -> Result<Vec<WalletUtxo>, anyhow::Error>;
     async fn send_to_address(
         &self,
         send_options: SendOptions,
         selected_utxos: Vec<OutPoint>,
     ) -> Result<Txid, anyhow::Error>;
-}
-
-pub struct BitcoinClient {
-    pub network: Network,
-    seed_path: SecretString,
-    wallet: RwLock<PersistedWallet<Store>>,
-    client: AsyncClient,
-    wallet_store: RwLock<Store>,
 }
 
 #[derive(Deserialize)]
@@ -116,50 +133,6 @@ impl SendOptions {
         Address::from_str(&self.address_to)?
             .require_network(network)
             .map_err(|e| anyhow!("Invalid destination address: {}", e))
-    }
-
-    pub fn find_source_utxos(
-        &self,
-        wallet: &bdk_wallet::Wallet,
-    ) -> Result<Vec<LocalOutput>, anyhow::Error> {
-        match &self.address_from {
-            Some(addr) => {
-                let source_addr = Address::from_str(addr)?.require_network(wallet.network())?;
-
-                let utxos = wallet
-                    .list_unspent()
-                    .filter(|utxo| {
-                        Address::from_script(&utxo.txout.script_pubkey, wallet.network())
-                            .ok()
-                            .is_some_and(|addr| {
-                                addr == source_addr
-                                    && !utxo.is_spent
-                                    && utxo.chain_position.is_confirmed()
-                            })
-                    })
-                    .collect::<Vec<_>>();
-
-                if utxos.is_empty() {
-                    Err(anyhow!("No spendable UTXOs found for address: {}", addr))
-                } else {
-                    Ok(utxos)
-                }
-            }
-            None => Ok(vec![]),
-        }
-    }
-
-    pub fn configure_tx_builder(
-        &self,
-        builder: &mut TxBuilder<DefaultCoinSelectionAlgorithm>,
-        dest_addr: Address<NetworkChecked>,
-    ) -> Result<(), anyhow::Error> {
-        if let Some(amount_sats) = self.amount {
-            builder.add_recipient(dest_addr.script_pubkey(), Amount::from_sat(amount_sats));
-        } else {
-            builder.drain_wallet().drain_to(dest_addr.script_pubkey());
-        }
-        Ok(())
     }
 
     pub fn validate_fee(&self, psbt: &Psbt) -> Result<(), anyhow::Error> {
@@ -184,573 +157,375 @@ pub struct ForeignUtxo {
     pub satisfaction_weight: Weight,
 }
 
-#[async_trait]
-impl Bitcoin for BitcoinClient {
-    fn get_network(&self) -> Network {
-        self.network
-    }
-
-    async fn get_public_key(&self) -> Result<bdk_wallet::bitcoin::PublicKey, anyhow::Error> {
-        let secret_key = get_key::<BdkSecretKey>(self.seed_path.expose_secret())?;
-        let private_key = bdk_wallet::bitcoin::PrivateKey {
-            compressed: true,
-            network: NetworkKind::from(self.network),
-            inner: secret_key,
-        };
-        let secp = bdk_wallet::bitcoin::secp256k1::Secp256k1::new();
-
-        let public_key = bdk_wallet::bitcoin::PublicKey::from_private_key(&secp, &private_key);
-        Ok(public_key)
-    }
-
-    async fn get_derived_private_key(&self) -> Result<Scalar, anyhow::Error> {
-        let secret_key = get_key::<BdkSecretKey>(self.seed_path.expose_secret())?;
-        let dlc_key = Scalar::from_hex(&hex::encode(secret_key.secret_bytes()))
-            .map_err(|e| anyhow!("Failed to convert private key to scalar: {}", e))?;
-
-        Ok(dlc_key)
-    }
-
-    async fn get_raw_transaction(&self, txid: &Txid) -> Result<Transaction, anyhow::Error> {
-        let Some(transaction) = self.client.get_tx(txid).await? else {
-            return Err(anyhow!("Transaction not found: {}", txid));
-        };
-        Ok(transaction)
-    }
-
-    async fn sign_psbt_with_escrow_support(
-        &self,
-        psbt: &mut Psbt,
-        options: SignOptions,
-    ) -> Result<bool, anyhow::Error> {
-        // First, let BDK sign what it can (non-escrow inputs)
-        let wallet = self.wallet.write().await;
-        let bdk_finalized = wallet.sign(psbt, options.clone())?;
-
-        debug!("BDK signing complete. Finalized: {}", bdk_finalized);
-
-        if bdk_finalized {
-            return Ok(true);
-        }
-
-        // Now manually sign any escrow inputs that BDK couldn't handle
-        let escrow_signed = self.sign_escrow_inputs(psbt).await?;
-
-        if escrow_signed > 0 {
-            debug!("Manually signed {} escrow inputs", escrow_signed);
-        }
-
-        // Return whether the PSBT is fully signed (but not finalized)
-        Ok(self.is_psbt_fully_signed(psbt))
-    }
-
-    async fn finalize_psbt_with_escrow_support(
-        &self,
-        psbt: &mut Psbt,
-    ) -> Result<bool, anyhow::Error> {
-        let wallet = self.wallet.write().await;
-        let finalized = wallet.finalize_psbt(
-            psbt,
-            SignOptions {
-                trust_witness_utxo: true,
-                allow_all_sighashes: true,
-                try_finalize: true,
-                sign_with_tap_internal_key: true,
-                allow_grinding: true,
-                ..Default::default()
-            },
-        )?;
-
-        if finalized {
-            return Ok(true);
-        }
-
-        debug!("BDK finalization incomplete, finalizing escrow inputs manually");
-
-        // Manually finalize each escrow input
-        for (index, input) in psbt.inputs.iter_mut().enumerate() {
-            // Skip already finalized inputs
-            if input.final_script_witness.is_some() {
-                debug!("Input {} is already finalized", index);
-                continue;
-            }
-
-            // Only process escrow inputs (those with witness_script)
-            if let Some(witness_script) = input.witness_script.clone() {
-                debug!("Finalizing escrow input {}", index);
-
-                // For escrow miniscript: wsh(or_d(multi(2,A,B),and_v(v:pk(B),and_v(v:sha256(H),older(144)))))
-                // We're using the 2-of-2 multisig path, so we need:
-                // - Empty byte vector (for OP_FALSE to select the first branch)
-                // - Signature from first key in the multisig
-                // - Signature from second key in the multisig
-                // - The witness script itself
-
-                let mut witness = Witness::new();
-
-                // Add empty byte vector for OP_FALSE (selects the multisig branch in or_d)
-                witness.push([]);
-
-                // Extract public keys from the witness script to get the correct order
-                // The multisig format is: OP_PUSHNUM_2 <pubkey1> <pubkey2> OP_PUSHNUM_2 OP_CHECKMULTISIG
-                let script_bytes = witness_script.as_bytes();
-                let mut pubkeys_in_script = Vec::new();
-
-                // Find 33-byte pubkeys in the script (they start after OP_PUSHBYTES_33 = 0x21)
-                let mut i = 0;
-                while i < script_bytes.len() {
-                    if script_bytes[i] == 0x21 && i + 33 < script_bytes.len() {
-                        if let Ok(pk) = PublicKey::from_slice(&script_bytes[i + 1..i + 34]) {
-                            pubkeys_in_script.push(pk);
-                            if pubkeys_in_script.len() == 2 {
-                                break; // We found both pubkeys
-                            }
-                        }
-                        i += 34;
-                    } else {
-                        i += 1;
-                    }
-                }
-
-                if pubkeys_in_script.len() != 2 {
-                    return Err(anyhow!(
-                        "Failed to extract 2 public keys from witness script for input {}",
-                        index
-                    ));
-                }
-
-                debug!(
-                    "Multisig pubkey order in script: {} then {}",
-                    pubkeys_in_script[0], pubkeys_in_script[1]
-                );
-
-                // Add signatures in the order they appear in the script
-                for pubkey in &pubkeys_in_script {
-                    if let Some(sig) = input.partial_sigs.get(pubkey) {
-                        witness.push_ecdsa_signature(sig);
-                    } else {
-                        return Err(anyhow!(
-                            "Missing signature for pubkey {} in input {}",
-                            pubkey,
-                            index
-                        ));
-                    }
-                }
-
-                // Add the witness script
-                witness.push(witness_script.as_bytes());
-
-                // Set the final witness
-                input.final_script_witness = Some(witness);
-
-                // Clear the partial signatures and witness script as they're now in the final witness
-                input.partial_sigs.clear();
-                input.witness_script = None;
-
-                debug!(
-                    "Finalized escrow input {} with {} witness elements",
-                    index,
-                    input.final_script_witness.as_ref().unwrap().len()
-                );
-            } else if input.tap_internal_key.is_some() {
-                // This is a taproot input, let BDK handle it
-                debug!(
-                    "Input {} is taproot, should have been finalized by BDK",
-                    index
-                );
-            }
-        }
-
-        // Check if all inputs are now finalized
-        let all_finalized = psbt.inputs.iter().enumerate().all(|(idx, input)| {
-            let finalized =
-                input.final_script_witness.is_some() || input.final_script_sig.is_some();
-            if !finalized {
-                debug!("Input {} is still not finalized", idx);
-            }
-            finalized
-        });
-
-        Ok(all_finalized)
-    }
-
-    async fn build_psbt(
-        &self,
-        script_pubkey: ScriptBuf,
-        amount: Amount,
-        fee_rate: FeeRate,
-        selected_utxos: Vec<OutPoint>,
-        foreign_utxos: Vec<ForeignUtxo>,
-    ) -> Result<Psbt, anyhow::Error> {
-        self.print_balance_info().await?;
-
-        let mut wallet = self.wallet.write().await;
-        let mut tx_builder = wallet.build_tx();
-
-        for utxo in selected_utxos {
-            tx_builder
-                .add_utxo(utxo)
-                .map_err(|e| anyhow!("Failed to add utxo: {}", e))?;
-        }
-
-        for foreign_utxo in foreign_utxos {
-            tx_builder
-                .add_foreign_utxo(
-                    foreign_utxo.outpoint,
-                    foreign_utxo.psbt,
-                    foreign_utxo.satisfaction_weight,
-                )
-                .map_err(|e| anyhow!("Failed to add foreign utxo: {}", e))?;
-        }
-
-        tx_builder
-            .add_recipient(script_pubkey, amount)
-            .fee_rate(fee_rate);
-
-        // This ensures the txid won't change after signing
-        tx_builder.only_witness_utxo();
-
-        let psbt = tx_builder.finish()?;
-
-        Ok(psbt)
-    }
-
-    async fn sign_psbt(
-        &self,
-        psbt: &mut Psbt,
-        sign_options: SignOptions,
-    ) -> Result<bool, anyhow::Error> {
-        let wallet = self.wallet.write().await;
-        let finalized = wallet.sign(psbt, sign_options)?;
-        Ok(finalized)
-    }
-
-    async fn get_tx_confirmation_height(&self, txid: &Txid) -> Result<Option<u32>, anyhow::Error> {
-        let tx_status = self.client.get_tx_status(txid).await?;
-        debug!("Transaction status: {:?}", tx_status);
-        Ok(tx_status.block_height)
-    }
-
-    async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<LocalOutput, anyhow::Error> {
-        let amount = Amount::from_sat(amount_sats);
-        let current_height = self.get_current_height().await?;
-        let utxo = self.wallet.read().await.list_unspent().find(|utxo| {
-            // If this is a coinbase-derived UTXO, check maturity
-            if let Some(conf_height) = utxo.chain_position.confirmation_height_upper_bound() {
-                if utxo.outpoint.vout == 0 {
-                    debug!("Coinbase UTXO found at height {}", conf_height);
-                    if current_height < conf_height + 100 {
-                        debug!(
-                            "Coinbase UTXO not mature yet. Current height: {}, Need: {}",
-                            current_height,
-                            conf_height + 100
-                        );
-                        return false;
-                    }
-                }
-            }
-
-            // Check if UTXO is confirmed, not spent, bigger than amount, and not locked
-            utxo.txout.value >= amount && !utxo.is_spent && utxo.chain_position.is_confirmed()
-        });
-
-        if let Some(utxo) = utxo {
-            Ok(utxo)
-        } else {
-            Err(anyhow!("No utxos with the request amount available"))
-        }
-    }
-
-    async fn get_next_address(&self) -> Result<AddressInfo, anyhow::Error> {
-        let (mut wallet, mut store) = tokio::join!(self.wallet.write(), self.wallet_store.write());
-
-        let address = wallet.next_unused_address(KeychainKind::External);
-        wallet.persist_async(&mut store).await?;
-
-        Ok(address)
-    }
-
-    async fn get_current_height(&self) -> Result<u32, anyhow::Error> {
-        self.client
-            .get_height()
-            .await
-            .map_err(|e| anyhow!("Failed to get block height: {}", e))
-    }
-
-    async fn get_confirmed_blockchain_time(&self, blocks: usize) -> Result<u64, anyhow::Error> {
-        let mut last_blocks = self
-            .client
-            .get_blocks(None)
-            .await
-            .map_err(|e| anyhow!("Failed to get block height: {}", e))?;
-        last_blocks.sort_by_key(|block| std::cmp::Reverse(block.time.height));
-
-        if last_blocks.is_empty() {
-            return Err(anyhow!("No blocks available to calculate median time"));
-        }
-
-        let lastest_time = last_blocks
-            .get(blocks - 1)
-            .map(|val| val.time.timestamp)
-            .unwrap_or_default();
-
-        Ok(lastest_time)
-    }
-
-    /// Get an object where the key is the confirmation target (in number of blocks) and the value is the estimated feerate (in sat/vB).
-    /// The available confirmation targets are 1-25, 144, 504 and 1008 blocks.
-    /// For example: { "1": 87.882, "2": 87.882, "3": 87.882, "4": 87.882, "5": 81.129, "6": 68.285, ..., "144": 1.027, "504": 1.027, "1008": 1.027 }
-    async fn get_estimated_fee_rates(&self) -> Result<HashMap<u16, f64>, anyhow::Error> {
-        let fee_estimates = self.client.get_fee_estimates().await?;
-        Ok(fee_estimates)
-    }
-
-    async fn broadcast(&self, transaction: &Transaction) -> Result<(), anyhow::Error> {
-        //TODO: add child-pays-for-parent if fees are too low
-
-        self.client
-            .broadcast(transaction)
-            .await
-            .map_err(|e| anyhow!("error broadcasting: {}", e))
-    }
-
-    async fn list_utxos(&self) -> Vec<LocalOutput> {
-        let wallet = self.wallet.read().await;
-        wallet.list_unspent().collect()
-    }
-
-    async fn sync(&self) -> Result<(), anyhow::Error> {
-        let wallet = self.wallet.read().await;
-        let request = wallet
-            .start_sync_with_revealed_spks()
-            .inspect(|item, progress| {
-                let pc = (100 * progress.consumed()) as f32 / progress.total() as f32;
-                info!("[ SCANNING {:03.0}% ] {}", pc, item);
-            })
-            .build();
-
-        let update = self.client.sync(request, 5).await?; // parallel_requests: 5
-        drop(wallet);
-
-        let (mut wallet, mut store) = tokio::join!(self.wallet.write(), self.wallet_store.write());
-        wallet.apply_update(update)?;
-        wallet.persist_async(&mut store).await?;
-
-        info!("Sync completed successfully");
-
-        Ok(())
-    }
-
-    async fn get_balance(&self) -> Result<Balance, anyhow::Error> {
-        let balance = self.wallet.read().await.balance();
-        Ok(balance)
-    }
-
-    async fn get_outputs(&self) -> Result<Vec<LocalOutput>, anyhow::Error> {
-        let outputs = self.wallet.read().await.list_output().collect();
-        Ok(outputs)
-    }
-
-    async fn send_to_address(
-        &self,
-        send_options: SendOptions,
-        selected_utxos: Vec<OutPoint>,
-    ) -> Result<Txid, anyhow::Error> {
-        // Get wallet read lock first to check addresses and UTXOs
-        let wallet = self.wallet.read().await;
-
-        // Validate destination address and find source UTXOs
-        let dest_addr = send_options.get_destination_address(wallet.network())?;
-        let source_utxos = if selected_utxos.is_empty() {
-            send_options.find_source_utxos(&wallet)?
-        } else {
-            // Convert OutPoint to LocalOutput
-            let mut utxos = Vec::new();
-            for outpoint in selected_utxos {
-                if let Some(utxo) = wallet.get_utxo(outpoint) {
-                    utxos.push(utxo);
-                } else {
-                    return Err(anyhow::anyhow!("UTXO not found: {}", outpoint));
-                }
-            }
-            utxos
-        };
-
-        // Switch to write lock for transaction building
-        drop(wallet);
-        let mut wallet = self.wallet.write().await;
-
-        let mut builder = wallet.build_tx();
-
-        for utxo in source_utxos {
-            builder.add_utxo(utxo.outpoint)?;
-        }
-
-        send_options.configure_tx_builder(&mut builder, dest_addr)?;
-
-        let mut psbt = builder.finish()?;
-
-        send_options.validate_fee(&psbt)?;
-
-        // Sign and finalize
-        info!("PSBT before signing: {}", psbt);
-        let finalized = wallet.sign(&mut psbt, SignOptions::default())?;
-        info!("PSBT after signing: {}", psbt);
-        if !finalized {
-            return Err(anyhow!("Failed to sign transaction"));
-        }
-
-        // Extract and broadcast
-        let tx = psbt.extract_tx()?;
-        self.client.broadcast(&tx).await?;
-
-        Ok(tx.compute_txid())
+// ---------------------------------------------------------------------------
+// LND REST (walletkit) client
+// ---------------------------------------------------------------------------
+
+/// LND encodes 64-bit integers as JSON strings; accept both forms.
+fn json_u64(value: &Value) -> Result<u64, anyhow::Error> {
+    match value {
+        Value::String(s) => s
+            .parse::<u64>()
+            .map_err(|e| anyhow!("bad integer {s}: {e}")),
+        Value::Number(n) => n.as_u64().ok_or_else(|| anyhow!("bad integer {n}")),
+        Value::Null => Ok(0),
+        other => Err(anyhow!("unexpected integer value {other}")),
     }
 }
 
-impl BitcoinClient {
-    pub async fn new(settings: &BitcoinSettings) -> Result<BitcoinClient, anyhow::Error> {
-        info!("Creating Bitcoin client with settings:");
-        info!("  Storage file: {}", settings.storage_file);
-        info!("  Seed path: {}", settings.seed_path);
-        info!("  Network: {}", settings.network);
-        info!("  Esplora URL: {}", settings.esplora_url);
+struct LndWallet {
+    base_url: Url,
+    client: ClientWithMiddleware,
+    macaroon: SecretString,
+}
 
-        let path = Path::new(&settings.storage_file);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+impl LndWallet {
+    fn new(settings: &LnSettings) -> Result<Self, anyhow::Error> {
+        let macaroon = read_macaroon_hex(&settings.macaroon_file_path)?;
+        let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
+        let mut builder = Client::builder().tls_built_in_root_certs(true);
+        if let Some(tls_cert_path) = &settings.tls_cert_path {
+            let cert_bytes = fs::read(tls_cert_path)
+                .map_err(|e| anyhow!("Failed to read LND tls cert {}: {}", tls_cert_path, e))?;
+            let cert = Certificate::from_pem(&cert_bytes)
+                .map_err(|e| anyhow!("Failed to parse LND tls cert: {}", e))?;
+            builder = builder.add_root_certificate(cert);
         }
-
-        let mut db = Store::new(&settings.storage_file)
-            .await
-            .map_err(|e| anyhow!("Failed to open or create bitcoin db: {}", e))?;
-        info!("Bitcoin db configured");
-
-        let path = Path::new(&settings.seed_path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        // Set up wallet with EC private key
-        let (external_desc, internal_desc) =
-            setup_wallet_descriptors(&settings.seed_path, settings.network.into())
-                .map_err(|e| anyhow!("Failed to load bitcoin private key: {}", e))?;
-
-        let wallet_opt = Wallet::load()
-            .descriptor(KeychainKind::External, Some(external_desc.clone()))
-            .descriptor(KeychainKind::Internal, Some(internal_desc.clone()))
-            .extract_keys()
-            .check_network(settings.network)
-            .load_wallet_async(&mut db)
-            .await
-            .map_err(|e| anyhow!("Failed to load bitcoin wallet store: {}", e))?;
-        info!("Loaded wallet: {}", wallet_opt.is_some());
-
-        let mut wallet = match wallet_opt {
-            Some(wallet) => wallet,
-            None => Wallet::create(external_desc, internal_desc)
-                .network(settings.network)
-                .create_wallet_async(&mut db)
-                .await
-                .map_err(|e| anyhow!("Failed to create bitcoin wallet from keys: {}", e))?,
-        };
-        info!(
-            "Wallet ready. Has {} UTXOs",
-            wallet.list_unspent().collect::<Vec<_>>().len()
-        );
-
-        let esplora_api =
-            if settings.network == Network::Regtest || settings.network == Network::Testnet {
-                format!("{}/{}/api", settings.esplora_url, settings.network)
-            } else {
-                // For mutinynet and mainnet network is not needed in the path
-                format!("{}/api", settings.esplora_url)
-            };
-
-        let client = Builder::new(&esplora_api)
-            .build_async_with_sleeper::<DefaultSleeper>()
-            .map_err(|e| anyhow!("Failed to create esplora client: {}", e))?;
-
-        // Perform initial full scan
-        info!("Starting initial full scan...");
-        let request = wallet
-            .start_full_scan()
-            .inspect({
-                let mut once = BTreeSet::<KeychainKind>::new();
-                move |keychain, spk_i, _| {
-                    if once.insert(keychain) {
-                        info!("Scanning keychain [{:?}]", keychain);
-                    }
-                    info!(" {:<3}", spk_i);
-                }
-            })
+        let client = ClientBuilder::new(builder.build()?)
+            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
             .build();
-
-        let update = client
-            .full_scan(request, 20, 5) // stop_gap: 20, parallel_requests: 5
-            .await
-            .map_err(|e| anyhow!("Failed to complete full blockchain scan: {}", e))?;
-
-        wallet
-            .apply_update(update)
-            .map_err(|e| anyhow!("Failed to load full blockchain scan into wallet: {}", e))?;
-
-        wallet.persist_async(&mut db).await.map_err(|e| {
-            anyhow!(
-                "Failed to load persist full blockchain scan into wallet: {}",
-                e
-            )
-        })?;
-        info!("Initial scan completed");
-
-        let balance = wallet.balance();
-        info!("Wallet balance after scan: {} sats", balance.total());
-        info!("Confirmed balance: {} sats", balance.confirmed);
-        info!("Unconfirmed balance: {} sats", balance.untrusted_pending);
-
-        Ok(BitcoinClient {
-            network: settings.network,
-            wallet: RwLock::new(wallet),
-            seed_path: SecretString::from(settings.seed_path.clone()),
+        Ok(Self {
+            base_url: Url::parse(&settings.base_url)?,
             client,
-            wallet_store: RwLock::new(db),
+            macaroon,
         })
     }
 
+    fn url(&self, path: &str) -> Result<Url, anyhow::Error> {
+        self.base_url
+            .join(path)
+            .map_err(|e| anyhow!("Bad LND url for {}: {}", path, e))
+    }
+
+    async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, anyhow::Error> {
+        let response = self
+            .client
+            .get(self.url(path)?)
+            .header("Grpc-Metadata-macaroon", self.macaroon.expose_secret())
+            .send()
+            .await
+            .map_err(|e| anyhow!("LND request {} failed: {}", path, e))?;
+        Self::decode(path, response).await
+    }
+
+    async fn post<T: DeserializeOwned>(&self, path: &str, body: Value) -> Result<T, anyhow::Error> {
+        let response = self
+            .client
+            .post(self.url(path)?)
+            .header("Grpc-Metadata-macaroon", self.macaroon.expose_secret())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow!("LND request {} failed: {}", path, e))?;
+        Self::decode(path, response).await
+    }
+
+    async fn decode<T: DeserializeOwned>(
+        path: &str,
+        response: reqwest::Response,
+    ) -> Result<T, anyhow::Error> {
+        let status = response.status();
+        let text = response.text().await?;
+        if !status.is_success() {
+            let message = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_owned))
+                .unwrap_or(text);
+            return Err(anyhow!("LND {} returned {}: {}", path, status, message));
+        }
+        serde_json::from_str::<T>(&text)
+            .map_err(|e| anyhow!("LND {} returned unexpected JSON ({}): {}", path, e, text))
+    }
+
+    async fn block_height(&self) -> Result<u32, anyhow::Error> {
+        let info: Value = self.get("v1/getinfo").await?;
+        Ok(json_u64(info.get("block_height").unwrap_or(&Value::Null))? as u32)
+    }
+
+    async fn list_unspent(&self) -> Result<Vec<WalletUtxo>, anyhow::Error> {
+        let response: Value = self
+            .post(
+                "v2/wallet/utxos",
+                json!({ "min_confs": 0, "max_confs": i32::MAX }),
+            )
+            .await?;
+        let mut utxos = Vec::new();
+        for utxo in response
+            .get("utxos")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+        {
+            let outpoint = &utxo["outpoint"];
+            let txid = Txid::from_str(outpoint["txid_str"].as_str().unwrap_or_default())?;
+            let vout = json_u64(&outpoint["output_index"])? as u32;
+            let script = ScriptBuf::from_hex(utxo["pk_script"].as_str().unwrap_or_default())?;
+            utxos.push(WalletUtxo {
+                outpoint: OutPoint { txid, vout },
+                txout: TxOut {
+                    value: Amount::from_sat(json_u64(&utxo["amount_sat"])?),
+                    script_pubkey: script,
+                },
+                address: utxo["address"].as_str().unwrap_or_default().to_owned(),
+                confirmations: json_u64(&utxo["confirmations"])?,
+            });
+        }
+        Ok(utxos)
+    }
+
+    async fn balance(&self) -> Result<WalletBalance, anyhow::Error> {
+        let response: Value = self.get("v1/balance/blockchain").await?;
+        Ok(WalletBalance {
+            confirmed: Amount::from_sat(json_u64(&response["confirmed_balance"])?),
+            unconfirmed: Amount::from_sat(json_u64(&response["unconfirmed_balance"])?),
+            locked: Amount::from_sat(json_u64(&response["locked_balance"])?),
+        })
+    }
+
+    async fn next_address(&self, network: Network) -> Result<Address, anyhow::Error> {
+        let response: Value = self
+            .post(
+                "v2/wallet/address/next",
+                json!({ "type": "TAPROOT_PUBKEY", "change": false }),
+            )
+            .await?;
+        let addr = response["addr"]
+            .as_str()
+            .ok_or_else(|| anyhow!("LND returned no address"))?;
+        Address::from_str(addr)?
+            .require_network(network)
+            .map_err(|e| anyhow!("LND address is not for {}: {}", network, e))
+    }
+
+    /// Adds wallet inputs and a change output to a template PSBT so that its
+    /// outputs (and any foreign inputs already present) are funded at the fee
+    /// rate. LND leases the selected inputs for ten minutes.
+    async fn fund_psbt(&self, template: &Psbt, fee_rate: FeeRate) -> Result<Psbt, anyhow::Error> {
+        let sat_per_vbyte = fee_rate.to_sat_per_vb_ceil().max(1);
+        let response: Value = self
+            .post(
+                "v2/wallet/psbt/fund",
+                json!({
+                    "coin_select": { "psbt": BASE64.encode(template.serialize()), "add": true },
+                    "sat_per_vbyte": sat_per_vbyte.to_string(),
+                    "min_confs": 1,
+                    "spend_unconfirmed": false,
+                    "change_type": "CHANGE_ADDRESS_TYPE_P2TR",
+                }),
+            )
+            .await?;
+        decode_psbt(&response["funded_psbt"])
+    }
+
+    /// Signs the wallet's inputs; other inputs pass through untouched.
+    async fn sign_psbt(&self, psbt: &Psbt) -> Result<Psbt, anyhow::Error> {
+        let response: Value = self
+            .post(
+                "v2/wallet/psbt/sign",
+                json!({ "funded_psbt": BASE64.encode(psbt.serialize()) }),
+            )
+            .await?;
+        decode_psbt(&response["signed_psbt"])
+    }
+
+    /// Signs and finalizes the wallet's inputs; every other input must already be final.
+    async fn finalize_psbt(&self, psbt: &Psbt) -> Result<Psbt, anyhow::Error> {
+        let response: Value = self
+            .post(
+                "v2/wallet/psbt/finalize",
+                json!({ "funded_psbt": BASE64.encode(psbt.serialize()) }),
+            )
+            .await?;
+        decode_psbt(&response["signed_psbt"])
+    }
+
+    async fn publish(&self, transaction: &Transaction, label: &str) -> Result<(), anyhow::Error> {
+        let response: Value = self
+            .post(
+                "v2/wallet/tx",
+                json!({ "tx_hex": BASE64.encode(serialize(transaction)), "label": label }),
+            )
+            .await?;
+        match response["publish_error"].as_str() {
+            Some("") | None => Ok(()),
+            Some(err) => Err(anyhow!("LND refused to publish: {}", err)),
+        }
+    }
+
+    async fn send_all(
+        &self,
+        address: &Address,
+        sat_per_vbyte: u64,
+        outpoints: &[OutPoint],
+    ) -> Result<Txid, anyhow::Error> {
+        let outpoints: Vec<Value> = outpoints
+            .iter()
+            .map(|o| json!({ "txid_str": o.txid.to_string(), "output_index": o.vout }))
+            .collect();
+        let response: Value = self
+            .post(
+                "v1/transactions",
+                json!({
+                    "addr": address.to_string(),
+                    "send_all": true,
+                    "sat_per_vbyte": sat_per_vbyte.to_string(),
+                    "min_confs": 1,
+                    "spend_unconfirmed": false,
+                    "outpoints": outpoints,
+                    "label": "coordinator sweep",
+                }),
+            )
+            .await?;
+        Txid::from_str(response["txid"].as_str().unwrap_or_default())
+            .map_err(|e| anyhow!("LND returned no txid: {}", e))
+    }
+
+    /// Fee rate in sat/vB for a confirmation target.
+    async fn estimate_fee(&self, conf_target: u16) -> Result<f64, anyhow::Error> {
+        let response: Value = self
+            .get(&format!("v2/wallet/estimatefee/{}", conf_target))
+            .await?;
+        let sat_per_kw = json_u64(&response["sat_per_kw"])? as f64;
+        Ok(sat_per_kw * 4.0 / 1000.0)
+    }
+}
+
+fn decode_psbt(value: &Value) -> Result<Psbt, anyhow::Error> {
+    let encoded = value
+        .as_str()
+        .ok_or_else(|| anyhow!("LND returned no PSBT"))?;
+    let bytes = BASE64
+        .decode(encoded)
+        .map_err(|e| anyhow!("LND returned an undecodable PSBT: {}", e))?;
+    Psbt::deserialize(&bytes).map_err(|e| anyhow!("LND returned an invalid PSBT: {}", e))
+}
+
+fn read_macaroon_hex(file_path: &str) -> Result<SecretString, anyhow::Error> {
+    if Path::new(file_path).extension().and_then(|s| s.to_str()) != Some("macaroon") {
+        return Err(anyhow!("Not a '.macaroon' file extension"));
+    }
+    let contents =
+        fs::read(file_path).map_err(|e| anyhow!("Failed to read macaroon file: {}", e))?;
+    Ok(SecretString::from(hex::encode(contents)))
+}
+
+// ---------------------------------------------------------------------------
+// The client
+// ---------------------------------------------------------------------------
+
+pub struct BitcoinClient {
+    pub network: Network,
+    seed_path: SecretString,
+    lnd: LndWallet,
+    electrum: Arc<ElectrumClient>,
+}
+
+impl BitcoinClient {
+    pub async fn new(
+        settings: &BitcoinSettings,
+        ln_settings: &LnSettings,
+    ) -> Result<BitcoinClient, anyhow::Error> {
+        info!("Creating Bitcoin client with settings:");
+        info!("  Seed path: {}", settings.seed_path);
+        info!("  Network: {}", settings.network);
+        info!("  LND: {}", ln_settings.base_url);
+        info!("  Electrum: {}", settings.electrum_url);
+
+        if let Some(parent) = Path::new(&settings.seed_path).parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // Creates the key on first start, as before.
+        get_key::<SecretKey>(&settings.seed_path)
+            .map_err(|e| anyhow!("Failed to load bitcoin private key: {}", e))?;
+
+        let lnd = LndWallet::new(ln_settings)?;
+        let electrum_url = settings.electrum_url.clone();
+        let electrum = tokio::task::spawn_blocking(move || {
+            ElectrumClient::from_config(
+                &electrum_url,
+                ConfigBuilder::new().timeout(Some(15)).retry(3).build(),
+            )
+        })
+        .await?
+        .map_err(|e| {
+            anyhow!(
+                "Failed to connect to electrs at {}: {}",
+                settings.electrum_url,
+                e
+            )
+        })?;
+
+        let client = BitcoinClient {
+            network: settings.network,
+            seed_path: SecretString::from(settings.seed_path.clone()),
+            lnd,
+            electrum: Arc::new(electrum),
+        };
+
+        let info: Value = client.lnd.get("v1/getinfo").await?;
+        let synced = info["synced_to_chain"].as_bool().unwrap_or(false);
+        info!(
+            "LND wallet reachable: height {}, synced_to_chain {}",
+            json_u64(&info["block_height"])?,
+            synced
+        );
+        if !synced {
+            warn!("LND is not synced to chain yet; on-chain operations may lag");
+        }
+        client.print_balance_info().await?;
+        Ok(client)
+    }
+
     pub async fn print_balance_info(&self) -> Result<(), anyhow::Error> {
-        let balance = self.wallet.read().await.balance();
-        info!("Wallet balance: {} sats", balance.total());
-
-        let all_utxos = self.list_utxos().await;
-        info!("Available UTXOs: {}", all_utxos.len());
-
-        for utxo in &all_utxos {
+        let balance = self.lnd.balance().await?;
+        info!(
+            "Wallet balance: {} sats confirmed, {} sats unconfirmed",
+            balance.confirmed.to_sat(),
+            balance.unconfirmed.to_sat()
+        );
+        let utxos = self.list_utxos().await;
+        info!("Available UTXOs: {}", utxos.len());
+        for utxo in &utxos {
             info!(
-                "UTXO: {} - Amount: {} sats, Keychain: {:?}",
-                utxo.outpoint, utxo.txout.value, utxo.keychain
+                "UTXO: {} - Amount: {} sats, confirmations: {}",
+                utxo.outpoint, utxo.txout.value, utxo.confirmations
             );
         }
-
         Ok(())
     }
 
-    async fn sign_escrow_inputs(&self, psbt: &mut Psbt) -> Result<usize, anyhow::Error> {
-        // Load the private key from the seed file
-        let secret_key = get_key::<BdkSecretKey>(self.seed_path.expose_secret())?;
-        let coordinator_privkey = bdk_wallet::bitcoin::PrivateKey {
+    async fn with_electrum<T, F>(&self, operation: F) -> Result<T, anyhow::Error>
+    where
+        T: Send + 'static,
+        F: FnOnce(&ElectrumClient) -> Result<T, electrum_client::Error> + Send + 'static,
+    {
+        let electrum = Arc::clone(&self.electrum);
+        tokio::task::spawn_blocking(move || operation(&electrum))
+            .await?
+            .map_err(|e| anyhow!("electrs request failed: {}", e))
+    }
+
+    fn coordinator_private_key(&self) -> Result<bitcoin::PrivateKey, anyhow::Error> {
+        let secret_key = get_key::<SecretKey>(self.seed_path.expose_secret())?;
+        Ok(bitcoin::PrivateKey {
             compressed: true,
             network: NetworkKind::from(self.network),
             inner: secret_key,
-        };
+        })
+    }
 
-        // Verify network
-        if coordinator_privkey.network != self.network.into() {
-            return Err(anyhow!(
-                "Private key network {:?} doesn't match wallet network {}",
-                coordinator_privkey.network,
-                self.network
-            ));
-        }
-
+    async fn sign_escrow_inputs(&self, psbt: &mut Psbt) -> Result<usize, anyhow::Error> {
+        let coordinator_privkey = self.coordinator_private_key()?;
         let secp = Secp256k1::new();
         let coordinator_pubkey = PublicKey::from_private_key(&secp, &coordinator_privkey);
 
@@ -763,26 +538,20 @@ impl BitcoinClient {
         let mut escrow_inputs_signed = 0;
 
         for (idx, input) in psbt.inputs.iter_mut().enumerate() {
-            // Skip if already has our signature
             if input.partial_sigs.contains_key(&coordinator_pubkey) {
                 debug!("Input {} already has coordinator signature", idx);
                 continue;
             }
 
-            // Check if this is an escrow input by looking for witness_script
+            // Escrow inputs are the ones carrying a witness script.
             let witness_script = match &input.witness_script {
                 Some(ws) => ws,
-                None => {
-                    debug!("Input {} is not an escrow input (no witness_script)", idx);
-                    continue;
-                }
+                None => continue,
             };
 
-            // Verify this witness script contains our pubkey
-            let script_bytes = witness_script.as_bytes();
             let pubkey_bytes = coordinator_pubkey.to_bytes();
-
-            if !script_bytes
+            if !witness_script
+                .as_bytes()
                 .windows(pubkey_bytes.len())
                 .any(|window| window == pubkey_bytes)
             {
@@ -793,35 +562,20 @@ impl BitcoinClient {
                 continue;
             }
 
-            // Get witness UTXO for signing
             let witness_utxo = input
                 .witness_utxo
                 .as_ref()
                 .ok_or_else(|| anyhow!("Missing witness_utxo for escrow input {}", idx))?;
 
-            debug!(
-                "Signing escrow input {} (value: {} sats)",
-                idx, witness_utxo.value
-            );
             let script_bytes = witness_utxo.script_pubkey.as_bytes();
             if script_bytes.len() >= 34 && script_bytes[0] == 0x00 && script_bytes[1] == 0x20 {
-                // This is a P2WSH script
                 let expected_hash = &script_bytes[2..34];
-
-                // Calculate the hash of the witness script
                 let actual_hash = sha256::Hash::hash(witness_script.as_bytes()).to_byte_array();
-
-                debug!("Expected witness hash: {}", hex::encode(expected_hash));
-                debug!("Actual witness hash: {}", hex::encode(actual_hash));
-
                 if expected_hash != actual_hash.as_slice() {
-                    debug!("HASH MISMATCH for input {}", idx);
-                } else {
-                    debug!("Hash verification OK for input {}", idx);
+                    debug!("Witness script hash mismatch for input {}", idx);
                 }
             }
 
-            // Create sighash
             let mut cache = SighashCache::new(&tx);
             let sighash = cache.p2wsh_signature_hash(
                 idx,
@@ -829,12 +583,8 @@ impl BitcoinClient {
                 witness_utxo.value,
                 EcdsaSighashType::All,
             )?;
-
-            // Sign
             let message = Message::from_digest(sighash.to_byte_array());
             let sig = secp.sign_ecdsa(&message, &coordinator_privkey.inner);
-
-            // Add signature to PSBT
             input.partial_sigs.insert(
                 coordinator_pubkey,
                 ecdsa::Signature {
@@ -842,7 +592,6 @@ impl BitcoinClient {
                     sighash_type: EcdsaSighashType::All,
                 },
             );
-
             escrow_inputs_signed += 1;
             debug!("Added coordinator signature to escrow input {}", idx);
         }
@@ -850,70 +599,393 @@ impl BitcoinClient {
         Ok(escrow_inputs_signed)
     }
 
-    fn is_psbt_fully_signed(&self, psbt: &Psbt) -> bool {
-        for (i, input) in psbt.inputs.iter().enumerate() {
-            // Skip already finalized inputs
+    /// Builds the final witness of every escrow input that has both signatures.
+    fn finalize_escrow_inputs(psbt: &mut Psbt) -> Result<(), anyhow::Error> {
+        for (index, input) in psbt.inputs.iter_mut().enumerate() {
             if input.final_script_witness.is_some() {
                 continue;
             }
+            let Some(witness_script) = input.witness_script.clone() else {
+                continue;
+            };
+            debug!("Finalizing escrow input {}", index);
 
-            // Check escrow inputs
-            if input.witness_script.is_some() {
-                // For 2-of-2 multisig escrow, we need exactly 2 signatures
-                if input.partial_sigs.len() < 2 {
-                    debug!(
-                        "Input {} needs more signatures ({}/2)",
-                        i,
-                        input.partial_sigs.len()
-                    );
-                    return false;
+            // For escrow miniscript: wsh(or_d(multi(2,A,B),and_v(v:pk(B),and_v(v:sha256(H),older(144)))))
+            // The 2-of-2 multisig path needs: an empty element (OP_FALSE selects
+            // the first branch), both signatures in script order, the script.
+            let mut witness = Witness::new();
+            witness.push([]);
+
+            let script_bytes = witness_script.as_bytes();
+            let mut pubkeys_in_script = Vec::new();
+            let mut i = 0;
+            while i < script_bytes.len() {
+                if script_bytes[i] == 0x21 && i + 33 < script_bytes.len() {
+                    if let Ok(pk) = PublicKey::from_slice(&script_bytes[i + 1..i + 34]) {
+                        pubkeys_in_script.push(pk);
+                        if pubkeys_in_script.len() == 2 {
+                            break;
+                        }
+                    }
+                    i += 34;
+                } else {
+                    i += 1;
                 }
-            } else if input.partial_sigs.is_empty() {
-                // Non-escrow inputs should have at least one signature
-                debug!("Input {} has no signatures", i);
-                return false;
             }
-        }
+            if pubkeys_in_script.len() != 2 {
+                return Err(anyhow!(
+                    "Failed to extract 2 public keys from witness script for input {}",
+                    index
+                ));
+            }
+            for pubkey in &pubkeys_in_script {
+                let sig = input.partial_sigs.get(pubkey).ok_or_else(|| {
+                    anyhow!("Missing signature for pubkey {} in input {}", pubkey, index)
+                })?;
+                witness.push_ecdsa_signature(sig);
+            }
+            witness.push(witness_script.as_bytes());
 
-        true
+            input.final_script_witness = Some(witness);
+            input.partial_sigs.clear();
+            input.witness_script = None;
+        }
+        Ok(())
+    }
+
+    fn is_psbt_fully_signed(psbt: &Psbt) -> bool {
+        psbt.inputs.iter().enumerate().all(|(i, input)| {
+            if input.final_script_witness.is_some() || input.final_script_sig.is_some() {
+                return true;
+            }
+            let signed = if input.witness_script.is_some() {
+                // 2-of-2 escrow input
+                input.partial_sigs.len() >= 2
+            } else {
+                !input.partial_sigs.is_empty() || input.tap_key_sig.is_some()
+            };
+            if !signed {
+                debug!("Input {} is not fully signed yet", i);
+            }
+            signed
+        })
+    }
+
+    fn template_psbt(
+        outputs: Vec<TxOut>,
+        selected_utxos: &[OutPoint],
+        foreign_utxos: Vec<ForeignUtxo>,
+    ) -> Result<Psbt, anyhow::Error> {
+        let mut inputs = Vec::new();
+        let mut psbt_inputs = Vec::new();
+        for outpoint in selected_utxos {
+            inputs.push(TxIn {
+                previous_output: *outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            });
+            psbt_inputs.push(Input::default());
+        }
+        for foreign in foreign_utxos {
+            inputs.push(TxIn {
+                previous_output: foreign.outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            });
+            psbt_inputs.push(foreign.psbt);
+        }
+        let unsigned_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: inputs,
+            output: outputs,
+        };
+        let mut psbt = Psbt::from_unsigned_tx(unsigned_tx)?;
+        psbt.inputs = psbt_inputs;
+        Ok(psbt)
     }
 }
 
-fn setup_wallet_descriptors(
-    seed_path: &str,
-    network: NetworkKind,
-) -> Result<(String, String), anyhow::Error> {
-    let xpriv = derive_wallet_key(seed_path, network)?;
+#[async_trait]
+impl Bitcoin for BitcoinClient {
+    fn get_network(&self) -> Network {
+        self.network
+    }
 
-    // Use standard tr descriptor
-    let external_base = format!("tr({}/0/*)", xpriv);
-    let internal_base = format!("tr({}/1/*)", xpriv);
+    async fn get_public_key(&self) -> Result<PublicKey, anyhow::Error> {
+        let private_key = self.coordinator_private_key()?;
+        let secp = Secp256k1::new();
+        Ok(PublicKey::from_private_key(&secp, &private_key))
+    }
 
-    let external_checksum = calc_checksum(&external_base)?;
-    let internal_checksum = calc_checksum(&internal_base)?;
+    async fn get_derived_private_key(&self) -> Result<Scalar, anyhow::Error> {
+        let secret_key = get_key::<SecretKey>(self.seed_path.expose_secret())?;
+        Scalar::from_hex(&hex::encode(secret_key.secret_bytes()))
+            .map_err(|e| anyhow!("Failed to convert private key to scalar: {}", e))
+    }
 
-    let external_descriptor = format!("{}#{}", external_base, external_checksum);
-    let internal_descriptor = format!("{}#{}", internal_base, internal_checksum);
+    async fn get_raw_transaction(&self, txid: &Txid) -> Result<Transaction, anyhow::Error> {
+        let txid = *txid;
+        self.with_electrum(move |client| client.transaction_get(&txid))
+            .await
+            .map_err(|e| anyhow!("Transaction {} not found: {}", txid, e))
+    }
 
-    Ok((external_descriptor, internal_descriptor))
-}
+    async fn sign_psbt_with_escrow_support(&self, psbt: &mut Psbt) -> Result<bool, anyhow::Error> {
+        let escrow_signed = self.sign_escrow_inputs(psbt).await?;
+        if escrow_signed > 0 {
+            debug!(
+                "Signed {} escrow inputs with the coordinator key",
+                escrow_signed
+            );
+        }
 
-fn derive_wallet_key(seed_path: &str, network: NetworkKind) -> Result<Xpriv, anyhow::Error> {
-    // Get the secret key from the provided path
-    let secret_key: BdkSecretKey = get_key(seed_path)?;
-    let chain_code = ChainCode::from(secret_key.secret_bytes());
+        let has_wallet_inputs = psbt
+            .inputs
+            .iter()
+            .any(|input| input.witness_script.is_none());
+        if has_wallet_inputs {
+            match self.lnd.sign_psbt(psbt).await {
+                Ok(signed) => *psbt = signed,
+                Err(e) => warn!("LND signed no inputs: {}", e),
+            }
+        }
 
-    // Create extended private key with network support
-    let xpriv = Xpriv {
-        network,
-        depth: 0,
-        parent_fingerprint: Default::default(),
-        chain_code,
-        child_number: ChildNumber::from_normal_idx(0)?,
-        private_key: secret_key,
-    };
+        Ok(Self::is_psbt_fully_signed(psbt))
+    }
 
-    Ok(xpriv)
+    async fn finalize_psbt_with_escrow_support(
+        &self,
+        psbt: &mut Psbt,
+    ) -> Result<bool, anyhow::Error> {
+        Self::finalize_escrow_inputs(psbt)?;
+
+        let has_open_inputs = psbt
+            .inputs
+            .iter()
+            .any(|input| input.final_script_witness.is_none() && input.final_script_sig.is_none());
+        if has_open_inputs {
+            // LND must be the last signer: escrow inputs are final by now.
+            *psbt = self.lnd.finalize_psbt(psbt).await?;
+        }
+
+        let all_finalized = psbt.inputs.iter().enumerate().all(|(idx, input)| {
+            let finalized =
+                input.final_script_witness.is_some() || input.final_script_sig.is_some();
+            if !finalized {
+                debug!("Input {} is still not finalized", idx);
+            }
+            finalized
+        });
+        Ok(all_finalized)
+    }
+
+    async fn build_psbt(
+        &self,
+        script_pubkey: ScriptBuf,
+        amount: Amount,
+        fee_rate: FeeRate,
+        selected_utxos: Vec<OutPoint>,
+        foreign_utxos: Vec<ForeignUtxo>,
+    ) -> Result<Psbt, anyhow::Error> {
+        self.print_balance_info().await?;
+        let template = Self::template_psbt(
+            vec![TxOut {
+                value: amount,
+                script_pubkey,
+            }],
+            &selected_utxos,
+            foreign_utxos,
+        )?;
+        self.lnd.fund_psbt(&template, fee_rate).await
+    }
+
+    async fn sign_psbt(&self, psbt: &mut Psbt) -> Result<bool, anyhow::Error> {
+        *psbt = self.lnd.finalize_psbt(psbt).await?;
+        Ok(psbt
+            .inputs
+            .iter()
+            .all(|input| input.final_script_witness.is_some() || input.final_script_sig.is_some()))
+    }
+
+    async fn get_tx_confirmation_height(&self, txid: &Txid) -> Result<Option<u32>, anyhow::Error> {
+        let txid = *txid;
+        let result = self
+            .with_electrum(move |client| {
+                let tx = match client.transaction_get(&txid) {
+                    Ok(tx) => tx,
+                    Err(electrum_client::Error::Protocol(_)) => return Ok(None),
+                    Err(e) => return Err(e),
+                };
+                // Any output script's history lists this transaction with its height.
+                for output in &tx.output {
+                    let history = client.script_get_history(&output.script_pubkey)?;
+                    if let Some(entry) = history.iter().find(|entry| entry.tx_hash == txid) {
+                        return Ok(Some(entry.height));
+                    }
+                }
+                Ok(None)
+            })
+            .await?;
+        debug!("Transaction {} confirmation height: {:?}", txid, result);
+        Ok(result.and_then(|height| (height > 0).then_some(height as u32)))
+    }
+
+    async fn get_spendable_utxo(&self, amount_sats: u64) -> Result<WalletUtxo, anyhow::Error> {
+        let amount = Amount::from_sat(amount_sats);
+        self.list_utxos()
+            .await
+            .into_iter()
+            .find(|utxo| utxo.is_confirmed() && utxo.txout.value >= amount)
+            .ok_or_else(|| anyhow!("No utxos with the request amount available"))
+    }
+
+    async fn get_next_address(&self) -> Result<Address, anyhow::Error> {
+        self.lnd.next_address(self.network).await
+    }
+
+    async fn get_current_height(&self) -> Result<u32, anyhow::Error> {
+        self.lnd.block_height().await
+    }
+
+    async fn get_confirmed_blockchain_time(&self, blocks: usize) -> Result<u64, anyhow::Error> {
+        let tip = self.get_current_height().await? as usize;
+        let count = blocks.max(1);
+        let start = tip.saturating_sub(count - 1);
+        let mut times = self
+            .with_electrum(move |client| client.block_headers(start, count))
+            .await?
+            .headers
+            .iter()
+            .map(|header| header.time as u64)
+            .collect::<Vec<_>>();
+        if times.is_empty() {
+            return Err(anyhow!("No blocks available to calculate median time"));
+        }
+        // Oldest of the most recent `blocks` headers, as before.
+        times.sort_unstable_by(|a, b| b.cmp(a));
+        Ok(times.get(blocks - 1).copied().unwrap_or_default())
+    }
+
+    /// Fee rates in sat/vB keyed by confirmation target in blocks.
+    async fn get_estimated_fee_rates(&self) -> Result<HashMap<u16, f64>, anyhow::Error> {
+        let estimates = join_all(
+            FEE_TARGETS
+                .iter()
+                .map(|target| async move { (*target, self.lnd.estimate_fee(*target).await) }),
+        )
+        .await;
+        let mut rates = HashMap::new();
+        for (target, estimate) in estimates {
+            match estimate {
+                Ok(rate) => {
+                    rates.insert(target, rate.max(1.0));
+                }
+                Err(e) => warn!("No fee estimate for {} blocks: {}", target, e),
+            }
+        }
+        if rates.is_empty() {
+            return Err(anyhow!("LND returned no fee estimates"));
+        }
+        Ok(rates)
+    }
+
+    async fn broadcast(&self, transaction: &Transaction) -> Result<(), anyhow::Error> {
+        //TODO: add child-pays-for-parent if fees are too low
+        self.lnd.publish(transaction, "coordinator").await
+    }
+
+    async fn list_utxos(&self) -> Vec<WalletUtxo> {
+        match self.lnd.list_unspent().await {
+            Ok(utxos) => utxos,
+            Err(e) => {
+                error!("Failed to list LND utxos: {}", e);
+                Vec::new()
+            }
+        }
+    }
+
+    async fn sync(&self) -> Result<(), anyhow::Error> {
+        // LND keeps its own wallet in sync; report its view for the logs.
+        let height = self.lnd.block_height().await?;
+        debug!("LND wallet at height {}", height);
+        Ok(())
+    }
+
+    async fn get_balance(&self) -> Result<WalletBalance, anyhow::Error> {
+        self.lnd.balance().await
+    }
+
+    async fn get_outputs(&self) -> Result<Vec<WalletUtxo>, anyhow::Error> {
+        self.lnd.list_unspent().await
+    }
+
+    async fn send_to_address(
+        &self,
+        send_options: SendOptions,
+        selected_utxos: Vec<OutPoint>,
+    ) -> Result<Txid, anyhow::Error> {
+        let dest_addr = send_options.get_destination_address(self.network)?;
+
+        // Inputs: the explicit selection, or every UTXO of the source address.
+        let mut inputs = selected_utxos;
+        if inputs.is_empty() {
+            if let Some(from) = &send_options.address_from {
+                let source = Address::from_str(from)?.require_network(self.network)?;
+                inputs = self
+                    .list_utxos()
+                    .await
+                    .into_iter()
+                    .filter(|utxo| {
+                        utxo.is_confirmed()
+                            && Address::from_script(&utxo.txout.script_pubkey, self.network)
+                                .is_ok_and(|address| address == source)
+                    })
+                    .map(|utxo| utxo.outpoint)
+                    .collect();
+                if inputs.is_empty() {
+                    return Err(anyhow!("No spendable UTXOs found for address: {}", from));
+                }
+            }
+        }
+
+        let fee_rates = self.get_estimated_fee_rates().await?;
+        let sat_per_vbyte = fee_rates.get(&6).copied().unwrap_or(1.0).ceil() as u64;
+
+        let Some(amount_sats) = send_options.amount else {
+            if send_options.max_fee.is_some() {
+                warn!("max_fee is not enforced when sweeping the whole wallet");
+            }
+            return self
+                .lnd
+                .send_all(&dest_addr, sat_per_vbyte.max(1), &inputs)
+                .await;
+        };
+
+        let template = Self::template_psbt(
+            vec![TxOut {
+                value: Amount::from_sat(amount_sats),
+                script_pubkey: dest_addr.script_pubkey(),
+            }],
+            &inputs,
+            vec![],
+        )?;
+        let mut psbt = self
+            .lnd
+            .fund_psbt(
+                &template,
+                FeeRate::from_sat_per_vb_unchecked(sat_per_vbyte.max(1)),
+            )
+            .await?;
+        send_options.validate_fee(&psbt)?;
+
+        psbt = self.lnd.finalize_psbt(&psbt).await?;
+        let tx = psbt.extract_tx()?;
+        self.lnd.publish(&tx, "coordinator send").await?;
+        Ok(tx.compute_txid())
+    }
 }
 
 pub struct BitcoinSyncWatcher {
@@ -945,12 +1017,8 @@ impl BitcoinSyncWatcher {
             }
 
             match self.bitcoin.sync().await {
-                Ok(_) => {
-                    info!("Bitcoin wallet sync completed successfully");
-                }
-                Err(e) => {
-                    error!("Bitcoin wallet sync error: {}", e);
-                }
+                Ok(_) => debug!("Bitcoin wallet sync completed successfully"),
+                Err(e) => error!("Bitcoin wallet sync error: {}", e),
             }
 
             tokio::select! {

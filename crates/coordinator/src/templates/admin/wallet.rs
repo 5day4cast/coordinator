@@ -24,7 +24,7 @@ pub struct TxOut {
 }
 
 /// Admin wallet management page
-pub fn wallet_page(esplora_url: &str, balance: &WalletBalance, address: &str) -> Markup {
+pub fn wallet_page(explorer_url: &str, balance: &WalletBalance, address: &str) -> Markup {
     html! {
         section class="section" {
             div class="container" {
@@ -37,7 +37,7 @@ pub fn wallet_page(esplora_url: &str, balance: &WalletBalance, address: &str) ->
                     }
                     div class="level-right" {
                         div class="level-item" {
-                            a href=(esplora_url) target="_blank"
+                            a href=(explorer_url) target="_blank"
                               class="button is-small is-info is-light" {
                                 span { "Open Explorer" }
                             }

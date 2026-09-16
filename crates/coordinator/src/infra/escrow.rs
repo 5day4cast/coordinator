@@ -1,13 +1,9 @@
-#![allow(deprecated)]
 use crate::infra::bitcoin::Bitcoin;
 use anyhow::anyhow;
-use bdk_wallet::{
-    bitcoin::{psbt::raw::ProprietaryKey, Amount, OutPoint, PublicKey, Transaction},
-    miniscript::Descriptor,
-    SignOptions,
-};
+use bitcoin::{psbt::raw::ProprietaryKey, Amount, OutPoint, PublicKey, Transaction};
 use dlctix::bitcoin::FeeRate;
 use log::debug;
+use miniscript::Descriptor;
 use std::{str::FromStr, sync::Arc};
 use uuid::Uuid;
 
@@ -22,10 +18,10 @@ pub async fn generate_escrow_tx(
 
     // Choose the fee rate for 2-block confirmation
     // TODO(@tee8z): Make this configurable
-    let esplora_fee_rate = fee_rates.get(&1u16).cloned().unwrap_or(1.0);
-    debug!("Esplora fee rate: {} sats/vB", esplora_fee_rate);
+    let estimated_fee_rate = fee_rates.get(&1u16).cloned().unwrap_or(1.0);
+    debug!("Estimated fee rate: {} sats/vB", estimated_fee_rate);
 
-    let fee_rate_sat_vb = esplora_fee_rate.ceil() as u64;
+    let fee_rate_sat_vb = estimated_fee_rate.ceil() as u64;
     debug!("Transaction fee rate: {} sats/vB", fee_rate_sat_vb);
 
     let coordinator_pubkey = bitcoin.get_public_key().await?;
@@ -55,7 +51,7 @@ pub async fn generate_escrow_tx(
     let proprietary_value = ticket_id.as_bytes().to_vec();
     psbt.proprietary.insert(proprietary_key, proprietary_value);
 
-    bitcoin.sign_psbt(&mut psbt, SignOptions::default()).await?;
+    bitcoin.sign_psbt(&mut psbt).await?;
 
     let final_tx = psbt.extract_tx()?;
 
@@ -69,7 +65,7 @@ pub async fn generate_escrow_tx(
 }
 
 pub fn create_escrow_descriptor(
-    coordinator_pubkey: &bdk_wallet::bitcoin::PublicKey,
+    coordinator_pubkey: &PublicKey,
     user_pubkey: &PublicKey,
     payment_hash: &[u8; 32],
 ) -> Result<Descriptor<PublicKey>, anyhow::Error> {
@@ -112,7 +108,7 @@ pub fn get_escrow_outpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bdk_wallet::bitcoin::{Network, PublicKey};
+    use bitcoin::{Network, PublicKey};
     use std::str::FromStr;
 
     #[test]

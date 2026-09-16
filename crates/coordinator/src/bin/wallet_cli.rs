@@ -1,10 +1,10 @@
 use anyhow::Result;
-use bdk_wallet::bitcoin::{OutPoint, Txid};
+use bitcoin::{OutPoint, Txid};
 use clap::{Parser, Subcommand};
 use coordinator::SendOptions;
 use coordinator::{
     get_settings_with_cli, setup_logger, Bitcoin, BitcoinClient, BitcoinSettings, CliSettings,
-    ConfigurableSettings,
+    ConfigurableSettings, LnSettings,
 };
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
@@ -89,6 +89,8 @@ impl From<Cli> for CliSettings {
 pub struct WalletSettings {
     pub level: Option<String>,
     pub bitcoin: BitcoinSettings,
+    /// The LND node whose wallet is used on-chain
+    pub ln: LnSettings,
 }
 
 impl ConfigurableSettings for WalletSettings {
@@ -117,12 +119,12 @@ async fn main() -> Result<()> {
 
     debug!("Settings: {:?}", settings);
 
-    let client = BitcoinClient::new(&settings.bitcoin).await?;
+    let client = BitcoinClient::new(&settings.bitcoin, &settings.ln).await?;
 
     match cli.command {
         Commands::Address => {
             let address = client.get_next_address().await?;
-            info!("New address: {}", address.address);
+            info!("New address: {}", address);
         }
         Commands::Balance => {
             let balance = client.get_balance().await?;
