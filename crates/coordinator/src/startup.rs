@@ -81,6 +81,7 @@ pub struct Application {
 
 impl Application {
     pub async fn build(config: Settings) -> Result<Self, anyhow::Error> {
+        config.validate()?;
         let address = format!(
             "{}:{}",
             config.api_settings.domain, config.api_settings.port
@@ -381,6 +382,11 @@ pub async fn build_app(
 
     if config.keymeld_settings.enabled {
         info!("Keymeld service configured (enabled)");
+        if config.keymeld_settings.dangerous_trust_unattested_enclaves {
+            log::warn!(
+                "Keymeld attestation is disabled: trusting unattested simulated enclaves. Never use this on mainnet."
+            );
+        }
     } else {
         info!("Keymeld service configured (disabled - using local MuSig2)");
     }

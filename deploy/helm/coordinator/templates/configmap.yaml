@@ -70,6 +70,7 @@ data:
 
     [keymeld_settings]
     enabled = {{ .Values.keymeld.enabled }}
+    dangerous_trust_unattested_enclaves = {{ .Values.keymeld.dangerousTrustUnattestedEnclaves }}
     gateway_url = {{ .Values.keymeld.gatewayUrl | quote }}
     {{- if .Values.keymeld.publicGatewayUrl }}
     public_gateway_url = {{ .Values.keymeld.publicGatewayUrl | quote }}

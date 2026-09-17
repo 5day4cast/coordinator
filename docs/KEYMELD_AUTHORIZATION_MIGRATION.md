@@ -219,6 +219,7 @@ Coordinator unit tests cover these application boundaries:
 - Preserve legacy entries while adding the registration context column.
 
 Local mock tests do not establish Nitro attestation or live signing compatibility; run the Keymeld transport tests for that.
+`run-keymeld` provides a simulated gateway for the ignored `live_simulated_gateway_accepts_unattested_registration_envelopes` test and for end-to-end competitions.
 
 Deploy matching gateway, enclave, SDK, and browser artifacts together.
 Stop Keymeld services and archive their legacy database and enclave state before the upgrade.
@@ -244,7 +245,9 @@ A parsed PCR map or an enclave public key returned by the gateway is insufficien
 
 The browser uses the SDK's verified enclave-key lookup before `UserCredentials::prepare_registration`.
 The browser performs verification itself before encrypting its private key; the coordinator does not proxy attestation.
-The SDK's development attestation bypass is used only inside a synthetic transport test and is not exposed through any coordinator option.
+The SDK's development attestation bypass is reachable only through `keymeld_settings.dangerous_trust_unattested_enclaves`.
+The coordinator refuses that setting on mainnet or together with pinned measurements, warns at startup, and forwards it to browsers in the ticket response.
+It exists so local simulation and Moto-backed staging can exercise the full funding, signing, and invoice flow against Keymeld without Nitro hardware.
 
 Session creation signs an `EnclaveRecipientAuthorization` after verifying every assigned enclave.
 That proof is stored with the manifest and compared during every restoration.

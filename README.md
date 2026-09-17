@@ -19,8 +19,12 @@ DLC-based fantasy weather prediction market coordinator with keymeld signing.
 - Docker (for k3d-based bitcoin stack)
 - An electrs server on the same Bitcoin network as LND, reachable through `bitcoin_settings.electrum_url`
 
-The local service helpers start Bitcoin, LND, and Keymeld.
+The local service helpers start Bitcoin, LND, Moto, and Keymeld.
 Start electrs separately before starting the coordinator; `start-all` does not provide an Electrum server.
+
+`run-keymeld` runs Keymeld the way its own local launcher does: Moto stands in for AWS KMS, three enclaves listen on local TCP ports, and the gateway runs in Keymeld's development environment with a generated channel credential under `data/keymeld`.
+Simulated enclaves produce no Nitro attestation, so `config/local.toml` sets `keymeld_settings.dangerous_trust_unattested_enclaves = true`.
+This exercises the coordinator's full funding, signing, and invoice flow without enclave hardware.
 
 ### Development Setup
 
@@ -28,14 +32,14 @@ Start electrs separately before starting the coordinator; `start-all` does not p
 # Enter nix development shell
 nix develop
 
-# Start all local services (bitcoin, lnd, keymeld)
+# Start all local services (bitcoin, lnd, moto, keymeld)
 start-all
 
 # Or start individual services
 start-regtest      # Bitcoin regtest
 setup-lnd          # LND nodes
 setup-channels     # Open channels
-run-keymeld        # Keymeld gateway + enclaves
+run-keymeld        # Moto KMS + simulated Keymeld enclaves + gateway
 
 # Run the coordinator
 cargo run --bin coordinator -- --config ./config/local.toml
@@ -140,7 +144,10 @@ Use hexadecimal, nonzero SHA-384 measurements; never copy trust pins from the ga
 Set `keymeld_settings.public_gateway_url` to the browser-reachable gateway address.
 Allow the coordinator's exact browser origin in Keymeld's `server.cors_allowed_origins`.
 For Helm, use `keymeld.trustedPcrs` and `keymeld.publicGatewayUrl`.
-An enabled coordinator rejects missing or invalid trust pins.
+An enabled coordinator rejects missing or invalid trust pins unless `keymeld_settings.dangerous_trust_unattested_enclaves` is set.
+That setting exists for local simulation and for staging where Keymeld runs simulated enclaves with Moto KMS instead of Nitro hardware.
+The coordinator refuses it on mainnet or together with trust pins, warns at startup, and forwards it to browsers in the ticket response so they skip attestation for that gateway only.
+For Helm, use `keymeld.dangerousTrustUnattestedEnclaves`.
 
 The browser verifies fresh enclave attestation before encrypting its participant key.
 Coordinator retains encrypted slot credentials and a separate signing credential with the pinned manifest and recipient proof.

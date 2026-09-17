@@ -27,20 +27,30 @@ pub async fn prepare_registration(
             "Invalid session manifest digest".into(),
         ));
     }
-    let measurements = assignment
-        .trusted_pcrs
-        .iter()
-        .map(|(index, value)| {
-            hex::decode(value)
-                .map(|bytes| (*index, bytes))
-                .map_err(|_| SdkError::InvalidInput("Invalid trusted PCR measurement".into()))
-        })
-        .collect::<Result<_, _>>()?;
-    let policy = AttestationPolicy::new(measurements)?;
     let user_id = UserId::from(assignment.user_id);
-    let client = KeyMeldClient::builder(&assignment.gateway_url, user_id.clone())
-        .attestation_policy(policy)
-        .build()?;
+    let builder = KeyMeldClient::builder(&assignment.gateway_url, user_id.clone());
+    let client = if assignment.dangerous_trust_unattested_enclaves {
+        if !assignment.trusted_pcrs.is_empty() {
+            return Err(SdkError::InvalidInput(
+                "Trusted PCR measurements and unattested trust are mutually exclusive".into(),
+            ));
+        }
+        // Simulated enclaves return no Nitro evidence. The coordinator sets this
+        // only from its own development configuration and refuses it on mainnet.
+        builder.dangerous_trust_unattested_enclaves()
+    } else {
+        let measurements = assignment
+            .trusted_pcrs
+            .iter()
+            .map(|(index, value)| {
+                hex::decode(value)
+                    .map(|bytes| (*index, bytes))
+                    .map_err(|_| SdkError::InvalidInput("Invalid trusted PCR measurement".into()))
+            })
+            .collect::<Result<_, _>>()?;
+        builder.attestation_policy(AttestationPolicy::new(measurements)?)
+    }
+    .build()?;
     // The SDK generates the nonce locally and verifies the original COSE bytes.
     let enclave = client
         .health()
@@ -98,7 +108,95 @@ mod tests {
                 "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
             gateway_url,
             trusted_pcrs: BTreeMap::new(),
+            dangerous_trust_unattested_enclaves: false,
         }
+    }
+
+    fn simulated_enclave(public_key: String) -> Router {
+        Router::new().route(
+            "/api/v1/enclaves/1/public-key",
+            get(move || {
+                let public_key = public_key.clone();
+                async move {
+                    Json(json!({
+                        "enclave_id": 1, "public_key": public_key,
+                        "attestation_document": "", "pcr_measurements": {},
+                        "timestamp": 0, "healthy": true, "key_epoch": 1,
+                    }))
+                }
+            }),
+        )
+    }
+
+    async fn prepare(
+        assignment: &RegistrationAssignment,
+    ) -> Result<PreparedRegistration, SdkError> {
+        timeout(
+            Duration::from_secs(5),
+            prepare_registration(&[1; 32], assignment),
+        )
+        .await
+        .expect("registration preparation timed out")
+    }
+
+    #[tokio::test]
+    async fn simulated_enclaves_need_explicit_unattested_trust_without_pins() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut assignment = assignment(format!("http://{}", listener.local_addr().unwrap()));
+        let app = simulated_enclave(assignment.enclave_public_key.clone());
+        let (shutdown, stopped) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+        });
+
+        assignment.trusted_pcrs.insert(0, hex::encode([1; 48]));
+        assert!(prepare(&assignment).await.is_err());
+
+        assignment.trusted_pcrs.clear();
+        assignment.dangerous_trust_unattested_enclaves = true;
+        let prepared = prepare(&assignment).await.unwrap();
+        assert_eq!(prepared.context.user_id, UserId::from(assignment.user_id));
+        assert_eq!(prepared.context.enclave_key_epoch, 1);
+        assert!(!prepared.context.require_signing_approval);
+        assert!(!prepared.encrypted_private_key.is_empty());
+
+        assignment.trusted_pcrs.insert(0, hex::encode([1; 48]));
+        assert!(prepare(&assignment).await.is_err());
+
+        shutdown.send(()).unwrap();
+        timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Exercises a real simulated keymeld gateway started by `run-keymeld`.
+    #[tokio::test]
+    #[ignore = "requires COORDINATOR_TEST_KEYMELD_URL pointing at a simulated keymeld gateway"]
+    async fn live_simulated_gateway_accepts_unattested_registration_envelopes() {
+        let gateway_url = std::env::var("COORDINATOR_TEST_KEYMELD_URL").unwrap();
+        let client = KeyMeldClient::builder(&gateway_url, UserId::new_v7())
+            .dangerous_trust_unattested_enclaves()
+            .build()
+            .unwrap();
+        let enclave = client.health().get_enclave_key(0).await.unwrap();
+        let mut assignment = assignment(gateway_url);
+        assignment.enclave_id = 0;
+        assignment.enclave_public_key = enclave.public_key;
+        assignment.enclave_key_epoch = enclave.key_epoch;
+        assert!(prepare_registration(&[1; 32], &assignment).await.is_err());
+        assignment.dangerous_trust_unattested_enclaves = true;
+        let prepared = prepare_registration(&[1; 32], &assignment).await.unwrap();
+        assert_eq!(
+            prepared.context.enclave_key_epoch,
+            assignment.enclave_key_epoch
+        );
+        assert!(!prepared.encrypted_private_key.is_empty());
     }
 
     #[tokio::test]

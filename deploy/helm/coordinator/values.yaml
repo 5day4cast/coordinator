@@ -82,6 +82,9 @@ keymeld:
   publicGatewayUrl: ""
   # Pin PCR0 or PCR8 from the reviewed enclave build. Required when enabled.
   trustedPcrs: {}
+  # Trust simulated enclaves without Nitro attestation (Moto-backed staging only).
+  # Refused on mainnet and together with trustedPcrs.
+  dangerousTrustUnattestedEnclaves: false
   keygenSessionExpirySecs: 86400  # 24 hours (max allowed by keymeld)
   signingSessionExpirySecs: 86400  # 24 hours (max allowed by keymeld)
   maxPollingAttempts: 100
