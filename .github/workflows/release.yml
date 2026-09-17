@@ -142,6 +142,11 @@ jobs:
           # Copy migrations
           cp -r crates/coordinator/migrations/* "${PKG_NAME}/migrations/"
 
+          # Copy the UI assets that build.rs bundled (served from ui_dir);
+          # the WASM module ships separately as coordinator-wasm-<version>.
+          mkdir -p "${PKG_NAME}/ui"
+          cp -r crates/public_ui/* "${PKG_NAME}/ui/"
+
           # Create README
           cat > "${PKG_NAME}/README.txt" << EOF
           Coordinator v${VERSION}
@@ -155,6 +160,10 @@ jobs:
           Migrations:
             The migrations/ directory contains database migrations.
             These are applied automatically on startup.
+
+          UI:
+            Point [ui_settings].ui_dir at the ui/ directory and unpack the
+            coordinator-wasm package into ui/pkg/.
 
           For more info: https://github.com/5day4cast/coordinator
           EOF
