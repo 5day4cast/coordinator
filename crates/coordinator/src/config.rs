@@ -190,6 +190,11 @@ pub struct KeymeldSettings {
     /// Gateway URL reachable by browsers for fresh enclave attestation.
     #[serde(default)]
     pub public_gateway_url: Option<String>,
+    /// Trust simulated enclaves that produce no Nitro attestation, as in local
+    /// development and Moto-backed staging. Refused on mainnet and alongside
+    /// pinned measurements; forwarded to browsers in the ticket response.
+    #[serde(default)]
+    pub dangerous_trust_unattested_enclaves: bool,
     /// Whether Keymeld integration is enabled
     pub enabled: bool,
     /// Expiration time in seconds for keygen sessions
@@ -212,6 +217,7 @@ impl Default for KeymeldSettings {
             trusted_pcrs: BTreeMap::new(),
             gateway_url: String::from("http://localhost:8080"),
             public_gateway_url: None,
+            dangerous_trust_unattested_enclaves: false,
             enabled: false,
             keygen_session_expiry_secs: 3600,
             signing_session_expiry_secs: 300,
@@ -220,6 +226,39 @@ impl Default for KeymeldSettings {
             max_polling_delay_ms: 5000,
             polling_backoff_multiplier: 1.5,
         }
+    }
+}
+
+impl Settings {
+    /// Reject configurations that would hand participant keys to unverified enclaves.
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        self.keymeld_settings
+            .validate(self.bitcoin_settings.network)
+    }
+}
+
+impl KeymeldSettings {
+    pub fn validate(&self, network: Network) -> Result<(), anyhow::Error> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.dangerous_trust_unattested_enclaves {
+            if network == Network::Bitcoin {
+                return Err(anyhow::anyhow!(
+                    "keymeld_settings.dangerous_trust_unattested_enclaves is refused on mainnet"
+                ));
+            }
+            if !self.trusted_pcrs.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "keymeld_settings.trusted_pcrs must be empty when trusting unattested enclaves"
+                ));
+            }
+        } else if self.trusted_pcrs.is_empty() {
+            return Err(anyhow::anyhow!(
+                "keymeld_settings.trusted_pcrs must pin PCR0 or PCR8; set dangerous_trust_unattested_enclaves only for simulated enclaves"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -269,6 +308,54 @@ mod keymeld_config_tests {
         let parsed: KeymeldSettings = toml::from_str(&text).unwrap();
         assert_eq!(parsed.trusted_pcrs, settings.trusted_pcrs);
         assert_eq!(parsed.public_gateway_url, settings.public_gateway_url);
+    }
+
+    #[test]
+    fn simulation_trust_is_explicit_and_refused_on_mainnet_or_with_pins() {
+        let simulation = KeymeldSettings {
+            enabled: true,
+            dangerous_trust_unattested_enclaves: true,
+            ..KeymeldSettings::default()
+        };
+        let parsed: KeymeldSettings =
+            toml::from_str(&toml::to_string(&simulation).unwrap()).unwrap();
+        assert!(parsed.dangerous_trust_unattested_enclaves);
+        let mut without_flag = toml::to_string(&simulation).unwrap();
+        without_flag = without_flag
+            .lines()
+            .filter(|line| !line.starts_with("dangerous_trust_unattested_enclaves"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let legacy: KeymeldSettings = toml::from_str(&without_flag).unwrap();
+        assert!(!legacy.dangerous_trust_unattested_enclaves);
+
+        assert!(simulation.validate(Network::Regtest).is_ok());
+        assert!(simulation.validate(Network::Signet).is_ok());
+        assert!(simulation.validate(Network::Bitcoin).is_err());
+        let pinned_and_unattested = KeymeldSettings {
+            trusted_pcrs: BTreeMap::from([(0, "ab".repeat(48))]),
+            ..simulation.clone()
+        };
+        assert!(pinned_and_unattested.validate(Network::Regtest).is_err());
+
+        let unpinned = KeymeldSettings {
+            enabled: true,
+            ..KeymeldSettings::default()
+        };
+        assert!(unpinned.validate(Network::Regtest).is_err());
+        let pinned = KeymeldSettings {
+            trusted_pcrs: BTreeMap::from([(0, "ab".repeat(48))]),
+            ..unpinned
+        };
+        assert!(pinned.validate(Network::Bitcoin).is_ok());
+        assert!(KeymeldSettings::default()
+            .validate(Network::Bitcoin)
+            .is_ok());
+        let settings = Settings {
+            keymeld_settings: simulation,
+            ..Settings::default()
+        };
+        assert!(settings.validate().is_ok());
     }
 }
 

@@ -11,8 +11,9 @@
     crane.url = "github:ipetkov/crane";
 
     # Keymeld for e2e testing
+    # Pinned to the same revision as the keymeld-sdk dependency in Cargo.toml.
     keymeld = {
-      url = "github:tee8z/keymeld";
+      url = "github:tee8z/keymeld/a974207819f24fbfe40c33542f8f19d28e7c4f09";
     };
   };
 
@@ -510,63 +511,129 @@
           echo "LND nodes stopped"
         '';
 
-        # Script: Run keymeld for e2e tests
+        # Script: Run keymeld the way its own local launcher does: Moto stands in
+        # for AWS KMS, enclaves listen on local TCP ports, and the gateway runs in
+        # keymeld's development environment with a generated channel credential.
+        # Simulated enclaves produce no Nitro attestation; config/local.toml sets
+        # keymeld_settings.dangerous_trust_unattested_enclaves for this stack.
         run-keymeld = pkgs.writeShellScriptBin "run-keymeld" ''
-          set -e
+          set -euo pipefail
           DATA_DIR="''${DATA_DIR:-$PWD/data}"
           LOGS_DIR="''${LOGS_DIR:-$PWD/logs}"
           KEYMELD_DIR="$DATA_DIR/keymeld"
+          KEYMELD_PORT="''${KEYMELD_PORT:-8090}"
+          MOTO_PORT="''${MOTO_PORT:-4566}"
+          # Browser origins allowed to fetch enclave keys directly from the gateway.
+          COORDINATOR_ORIGINS="''${COORDINATOR_ORIGINS:-http://localhost:9990,http://127.0.0.1:9990}"
+          KMS_ALIAS="alias/keymeld-enclave-master-key"
+          KMS_ENDPOINT="http://127.0.0.1:$MOTO_PORT"
+          AWS="${pkgs.awscli2}/bin/aws --endpoint-url $KMS_ENDPOINT"
 
           mkdir -p "$KEYMELD_DIR" "$LOGS_DIR"
 
-          echo "Starting keymeld enclaves (simulated)..."
+          export KEYMELD_ENVIRONMENT=development
+          export KEYMELD_DANGEROUS_TRUST_UNATTESTED_ENCLAVES=true
+          export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test
+          export AWS_DEFAULT_REGION=us-west-2 AWS_REGION=us-west-2 AWS_EC2_METADATA_DISABLED=true
 
-          # Start 3 enclaves on different ports
+          run-moto
+          if ! $AWS kms describe-key --key-id "$KMS_ALIAS" > /dev/null 2>&1; then
+            echo "Creating Moto KMS key $KMS_ALIAS..."
+            KMS_KEY_ID=$($AWS kms create-key \
+              --description "Keymeld enclave master key (local simulation)" \
+              --query KeyMetadata.KeyId --output text)
+            $AWS kms create-alias --alias-name "$KMS_ALIAS" --target-key-id "$KMS_KEY_ID"
+          fi
+
+          # The gateway authenticates every enclave command with this credential.
+          export KEYMELD_GATEWAY_SIGNING_KEY_FILE="$KEYMELD_DIR/development-channel.key"
+          if [ ! -f "$KEYMELD_GATEWAY_SIGNING_KEY_FILE" ]; then
+            ${keymeld-gateway}/bin/keymeld-gateway --generate-channel-key "$KEYMELD_GATEWAY_SIGNING_KEY_FILE" > /dev/null
+          fi
+          chmod 600 "$KEYMELD_GATEWAY_SIGNING_KEY_FILE"
+          ENCLAVE_GATEWAY_PUBLIC_KEY=$(${keymeld-gateway}/bin/keymeld-gateway --channel-public-key "$KEYMELD_GATEWAY_SIGNING_KEY_FILE")
+          export ENCLAVE_GATEWAY_PUBLIC_KEY
+          export ENCLAVE_KMS_KEY_ID="$KMS_ALIAS"
+          export ENCLAVE_KMS_ENDPOINT="$KMS_ENDPOINT"
+
+          echo "Starting keymeld enclaves (simulated, TCP)..."
           for i in 0 1 2; do
             port=$((5000 + i))
-            VSOCK_PORT=$port \
-            ENCLAVE_ID=$i \
-            TEST_MODE=true \
-              ${keymeld-enclave}/bin/keymeld-enclave \
-              > "$LOGS_DIR/enclave-$i.log" 2>&1 &
+            ENCLAVE_ID=$i VSOCK_PORT=$port TRANSPORT_MODE=tcp TCP_HOST=127.0.0.1 \
+              ${keymeld-enclave}/bin/keymeld-enclave > "$LOGS_DIR/enclave-$i.log" 2>&1 &
             echo $! > "$KEYMELD_DIR/enclave-$i.pid"
-            echo "  Enclave $i started on port $port"
+            echo "  Enclave $i started on 127.0.0.1:$port"
           done
 
-          # Wait for enclaves to be ready
-          sleep 2
+          GATEWAY_CONFIG="$KEYMELD_DIR/gateway.yaml"
+          ORIGINS_YAML=$(printf '%s' "$COORDINATOR_ORIGINS" | sed 's/[^,]*/"&"/g')
+          cat > "$GATEWAY_CONFIG" <<EOF
+          environment: development
+          server:
+            host: "127.0.0.1"
+            port: $KEYMELD_PORT
+            enable_cors: true
+            cors_allowed_origins: [$ORIGINS_YAML]
+            enable_compression: true
+          kms:
+            enabled: true
+            endpoint_url: "$KMS_ENDPOINT"
+            key_id: "$KMS_ALIAS"
+          database:
+            path: "$KEYMELD_DIR/keymeld.db"
+            max_connections: 10
+            connection_timeout_secs: 30
+            idle_timeout_secs: 60
+            enable_wal_mode: true
+          enclaves:
+            enclaves:
+              - { id: 0, cid: 2, port: 5000, transport: tcp, tcp_host: "127.0.0.1" }
+              - { id: 1, cid: 2, port: 5001, transport: tcp, tcp_host: "127.0.0.1" }
+              - { id: 2, cid: 2, port: 5002, transport: tcp, tcp_host: "127.0.0.1" }
+          logging:
+            level: info
+            format: pretty
+            enable_json: false
+            enable_file_output: false
+            file_path: null
+          security:
+            enable_attestation: false
+            strict_validation: false
+            allow_insecure_connections: true
+            require_tls: false
+          development:
+            enable_test_endpoints: false
+            disable_enclave_verification: true
+            extended_logging: false
+          EOF
 
           echo "Starting keymeld gateway..."
-
-          # Start gateway
-          KEYMELD_HOST=127.0.0.1 \
-          KEYMELD_PORT=8090 \
-          KEYMELD_DATABASE_PATH="$KEYMELD_DIR/keymeld.db" \
-          TEST_MODE=true \
-          ENCLAVE_0_HOST=127.0.0.1 \
-          ENCLAVE_0_PORT=5000 \
-          ENCLAVE_1_HOST=127.0.0.1 \
-          ENCLAVE_1_PORT=5001 \
-          ENCLAVE_2_HOST=127.0.0.1 \
-          ENCLAVE_2_PORT=5002 \
-            ${keymeld-gateway}/bin/keymeld-gateway \
-            > "$LOGS_DIR/gateway.log" 2>&1 &
+          sleep 1
+          CONFIG_PATH="$GATEWAY_CONFIG" RUST_LOG="''${RUST_LOG:-info}" \
+            ${keymeld-gateway}/bin/keymeld-gateway > "$LOGS_DIR/gateway.log" 2>&1 &
           echo $! > "$KEYMELD_DIR/gateway.pid"
 
-          # Wait for gateway to be ready
           echo "Waiting for keymeld gateway..."
-          for i in {1..30}; do
-            if ${pkgs.curl}/bin/curl -s http://127.0.0.1:8090/health > /dev/null 2>&1; then
-              echo "Keymeld gateway ready on http://127.0.0.1:8090"
+          for i in $(seq 1 60); do
+            if ${pkgs.curl}/bin/curl -fsS --max-time 2 "http://127.0.0.1:$KEYMELD_PORT/api/v1/health" > /dev/null 2>&1; then
               break
+            fi
+            if ! kill -0 "$(cat "$KEYMELD_DIR/gateway.pid")" 2>/dev/null; then
+              echo "Keymeld gateway exited; see $LOGS_DIR/gateway.log" >&2
+              exit 1
             fi
             sleep 1
           done
+          for i in 0 1 2; do
+            ${pkgs.curl}/bin/curl -fsS --max-time 2 "http://127.0.0.1:$KEYMELD_PORT/api/v1/enclaves/$i/public-key" > /dev/null \
+              || { echo "Enclave $i is not reachable through the gateway; see $LOGS_DIR" >&2; exit 1; }
+          done
 
           echo ""
-          echo "Keymeld stack running!"
-          echo "  Gateway: http://127.0.0.1:8090"
-          echo "  Enclaves: ports 5000, 5001, 5002"
+          echo "Keymeld stack running (simulated enclaves, attestation disabled)"
+          echo "  Gateway: http://127.0.0.1:$KEYMELD_PORT"
+          echo "  Enclaves: 127.0.0.1:5000-5002 (TCP)"
+          echo "  KMS: Moto at $KMS_ENDPOINT"
         '';
 
         # Script: Stop keymeld
@@ -757,6 +824,7 @@
           stop-keymeld || true
           stop-lnd || true
           stop-regtest || true
+          stop-moto || true
 
           echo "All services stopped"
         '';

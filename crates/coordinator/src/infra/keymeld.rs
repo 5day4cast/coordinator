@@ -361,18 +361,32 @@ impl KeymeldService {
             jitter: 0.25,
         };
 
-        let measurements = settings
-            .trusted_pcrs
-            .iter()
-            .map(|(pcr, value)| (pcr.to_string(), value.clone()))
-            .collect();
-        let attestation = AttestationPolicy::from_hex_measurements(&measurements).map_err(|e| {
-            KeymeldError::Config(format!("Invalid trusted enclave measurements: {e}"))
-        })?;
-        let client = KeyMeldClient::builder(&settings.gateway_url, user_id.clone())
+        let builder = KeyMeldClient::builder(&settings.gateway_url, user_id.clone())
             .credentials(credentials)
-            .attestation_policy(attestation)
-            .polling_config(polling_config)
+            .polling_config(polling_config);
+        let builder = if settings.dangerous_trust_unattested_enclaves {
+            if !settings.trusted_pcrs.is_empty() {
+                return Err(KeymeldError::Config(
+                    "Trusted enclave measurements and unattested trust are mutually exclusive"
+                        .into(),
+                ));
+            }
+            // Simulated enclaves produce no Nitro evidence. Settings validation
+            // refuses this on mainnet before the service is built.
+            builder.dangerous_trust_unattested_enclaves()
+        } else {
+            let measurements = settings
+                .trusted_pcrs
+                .iter()
+                .map(|(pcr, value)| (pcr.to_string(), value.clone()))
+                .collect();
+            let attestation =
+                AttestationPolicy::from_hex_measurements(&measurements).map_err(|e| {
+                    KeymeldError::Config(format!("Invalid trusted enclave measurements: {e}"))
+                })?;
+            builder.attestation_policy(attestation)
+        };
+        let client = builder
             .build()
             .map_err(|e| KeymeldError::Config(format!("Failed to build client: {}", e)))?;
 
@@ -854,6 +868,7 @@ impl Keymeld for KeymeldService {
                 .clone()
                 .unwrap_or_else(|| self.settings.gateway_url.clone()),
             trusted_pcrs: self.settings.trusted_pcrs.clone(),
+            dangerous_trust_unattested_enclaves: self.settings.dangerous_trust_unattested_enclaves,
         })
     }
 }
@@ -1039,7 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn enabled_service_requires_trusted_measurements() {
+    fn enabled_service_requires_trusted_measurements_or_explicit_simulation() {
         let settings = KeymeldSettings {
             enabled: true,
             ..KeymeldSettings::default()
@@ -1048,6 +1063,28 @@ mod tests {
         let disabled =
             KeymeldService::new(KeymeldSettings::default(), Uuid::now_v7(), &[1; 32]).unwrap();
         assert!(!disabled.is_enabled());
+        let simulation = KeymeldService::new(
+            KeymeldSettings {
+                enabled: true,
+                dangerous_trust_unattested_enclaves: true,
+                ..KeymeldSettings::default()
+            },
+            Uuid::now_v7(),
+            &[1; 32],
+        )
+        .unwrap();
+        assert!(simulation.is_enabled());
+        assert!(KeymeldService::new(
+            KeymeldSettings {
+                enabled: true,
+                dangerous_trust_unattested_enclaves: true,
+                trusted_pcrs: BTreeMap::from([(0, "ab".repeat(48))]),
+                ..KeymeldSettings::default()
+            },
+            Uuid::now_v7(),
+            &[1; 32],
+        )
+        .is_err());
     }
     struct GatewayFixture {
         session_id: SessionId,

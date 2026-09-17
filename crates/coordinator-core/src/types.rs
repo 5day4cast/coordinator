@@ -16,6 +16,10 @@ pub struct RegistrationAssignment {
     pub enclave_public_key: String,
     pub gateway_url: String,
     pub trusted_pcrs: BTreeMap<u16, String>,
+    /// Skip Nitro attestation for simulated enclaves. The coordinator sets this
+    /// only from its own development configuration and never on mainnet.
+    #[serde(default)]
+    pub dangerous_trust_unattested_enclaves: bool,
 }
 
 /// Comparison type for predictions
