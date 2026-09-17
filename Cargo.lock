@@ -2292,7 +2292,7 @@ dependencies = [
 [[package]]
 name = "keymeld-core"
 version = "0.4.0"
-source = "git+https://github.com/tee8z/keymeld?rev=a974207819f24fbfe40c33542f8f19d28e7c4f09#a974207819f24fbfe40c33542f8f19d28e7c4f09"
+source = "git+https://github.com/tee8z/keymeld?tag=v0.4.0#a1b37b8f42097e8be9fc576cff2ceb1be42c0cdd"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2328,7 +2328,7 @@ dependencies = [
 [[package]]
 name = "keymeld-sdk"
 version = "0.4.0"
-source = "git+https://github.com/tee8z/keymeld?rev=a974207819f24fbfe40c33542f8f19d28e7c4f09#a974207819f24fbfe40c33542f8f19d28e7c4f09"
+source = "git+https://github.com/tee8z/keymeld?tag=v0.4.0#a1b37b8f42097e8be9fc576cff2ceb1be42c0cdd"
 dependencies = [
  "dlctix",
  "flate2",
