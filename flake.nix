@@ -527,7 +527,12 @@
           COORDINATOR_ORIGINS="''${COORDINATOR_ORIGINS:-http://localhost:9990,http://127.0.0.1:9990}"
           KMS_ALIAS="alias/keymeld-enclave-master-key"
           KMS_ENDPOINT="http://127.0.0.1:$MOTO_PORT"
-          AWS="${pkgs.awscli2}/bin/aws --endpoint-url $KMS_ENDPOINT"
+          # LD_LIBRARY_PATH from the dev shell must not leak into Python or the
+          # nix-built keymeld binaries; see run-moto.
+          AWS="env -u LD_LIBRARY_PATH ${pkgs.awscli2}/bin/aws --endpoint-url $KMS_ENDPOINT"
+          KEYMELD_GATEWAY="env -u LD_LIBRARY_PATH ${keymeld-gateway}/bin/keymeld-gateway"
+          KEYMELD_ENCLAVE="env -u LD_LIBRARY_PATH ${keymeld-enclave}/bin/keymeld-enclave"
+          CURL="env -u LD_LIBRARY_PATH ${pkgs.curl}/bin/curl -fsS --max-time 2"
 
           mkdir -p "$KEYMELD_DIR" "$LOGS_DIR"
 
@@ -548,10 +553,10 @@
           # The gateway authenticates every enclave command with this credential.
           export KEYMELD_GATEWAY_SIGNING_KEY_FILE="$KEYMELD_DIR/development-channel.key"
           if [ ! -f "$KEYMELD_GATEWAY_SIGNING_KEY_FILE" ]; then
-            ${keymeld-gateway}/bin/keymeld-gateway --generate-channel-key "$KEYMELD_GATEWAY_SIGNING_KEY_FILE" > /dev/null
+            $KEYMELD_GATEWAY --generate-channel-key "$KEYMELD_GATEWAY_SIGNING_KEY_FILE" > /dev/null
           fi
           chmod 600 "$KEYMELD_GATEWAY_SIGNING_KEY_FILE"
-          ENCLAVE_GATEWAY_PUBLIC_KEY=$(${keymeld-gateway}/bin/keymeld-gateway --channel-public-key "$KEYMELD_GATEWAY_SIGNING_KEY_FILE")
+          ENCLAVE_GATEWAY_PUBLIC_KEY=$($KEYMELD_GATEWAY --channel-public-key "$KEYMELD_GATEWAY_SIGNING_KEY_FILE")
           export ENCLAVE_GATEWAY_PUBLIC_KEY
           export ENCLAVE_KMS_KEY_ID="$KMS_ALIAS"
           export ENCLAVE_KMS_ENDPOINT="$KMS_ENDPOINT"
@@ -560,7 +565,7 @@
           for i in 0 1 2; do
             port=$((5000 + i))
             ENCLAVE_ID=$i VSOCK_PORT=$port TRANSPORT_MODE=tcp TCP_HOST=127.0.0.1 \
-              ${keymeld-enclave}/bin/keymeld-enclave > "$LOGS_DIR/enclave-$i.log" 2>&1 &
+              $KEYMELD_ENCLAVE > "$LOGS_DIR/enclave-$i.log" 2>&1 &
             echo $! > "$KEYMELD_DIR/enclave-$i.pid"
             echo "  Enclave $i started on 127.0.0.1:$port"
           done
@@ -590,6 +595,9 @@
               - { id: 0, cid: 2, port: 5000, transport: tcp, tcp_host: "127.0.0.1" }
               - { id: 1, cid: 2, port: 5001, transport: tcp, tcp_host: "127.0.0.1" }
               - { id: 2, cid: 2, port: 5002, transport: tcp, tcp_host: "127.0.0.1" }
+          coordinator:
+            processing_interval_ms: 100
+            health_check_interval_secs: 5
           logging:
             level: info
             format: pretty
@@ -610,12 +618,12 @@
           echo "Starting keymeld gateway..."
           sleep 1
           CONFIG_PATH="$GATEWAY_CONFIG" RUST_LOG="''${RUST_LOG:-info}" \
-            ${keymeld-gateway}/bin/keymeld-gateway > "$LOGS_DIR/gateway.log" 2>&1 &
+            $KEYMELD_GATEWAY > "$LOGS_DIR/gateway.log" 2>&1 &
           echo $! > "$KEYMELD_DIR/gateway.pid"
 
           echo "Waiting for keymeld gateway..."
-          for i in $(seq 1 60); do
-            if ${pkgs.curl}/bin/curl -fsS --max-time 2 "http://127.0.0.1:$KEYMELD_PORT/api/v1/health" > /dev/null 2>&1; then
+          for i in $(seq 1 120); do
+            if $CURL "http://127.0.0.1:$KEYMELD_PORT/api/v1/health" > /dev/null 2>&1; then
               break
             fi
             if ! kill -0 "$(cat "$KEYMELD_DIR/gateway.pid")" 2>/dev/null; then
@@ -625,7 +633,7 @@
             sleep 1
           done
           for i in 0 1 2; do
-            ${pkgs.curl}/bin/curl -fsS --max-time 2 "http://127.0.0.1:$KEYMELD_PORT/api/v1/enclaves/$i/public-key" > /dev/null \
+            $CURL "http://127.0.0.1:$KEYMELD_PORT/api/v1/enclaves/$i/public-key" > /dev/null \
               || { echo "Enclave $i is not reachable through the gateway; see $LOGS_DIR" >&2; exit 1; }
           done
 
@@ -681,24 +689,37 @@
           echo "Endpoint: http://127.0.0.1:$MOTO_PORT"
           echo "Use with AWS CLI: aws --endpoint-url=http://127.0.0.1:$MOTO_PORT s3 ..."
 
-          ${moto-env}/bin/moto_server -p $MOTO_PORT > "$DATA_DIR/moto.log" 2>&1 &
+          # The dev shell exports LD_LIBRARY_PATH for cargo's OpenSSL build. That
+          # path breaks Python's ssl module, so Moto and the AWS CLI run without it.
+          env -u LD_LIBRARY_PATH ${moto-env}/bin/moto_server -p $MOTO_PORT > "$DATA_DIR/moto.log" 2>&1 &
           echo $! > "$MOTO_DIR/moto.pid"
 
-          # Wait for moto to be ready
-          for i in {1..30}; do
-            if ${pkgs.curl}/bin/curl -s http://127.0.0.1:$MOTO_PORT > /dev/null 2>&1; then
-              echo "Moto is ready!"
+          # A cold start compiles Moto's Python modules and can exceed a minute.
+          ready=false
+          for i in {1..120}; do
+            if env -u LD_LIBRARY_PATH ${pkgs.curl}/bin/curl -s http://127.0.0.1:$MOTO_PORT > /dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            if ! kill -0 "$(cat "$MOTO_DIR/moto.pid")" 2>/dev/null; then
               break
             fi
             sleep 1
           done
+          if [ "$ready" != true ]; then
+            echo "Moto did not start; see $DATA_DIR/moto.log" >&2
+            exit 1
+          fi
+          echo "Moto is ready!"
 
-          # Create the backup bucket
-          AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+          # Create the backup bucket used by local Litestream replication
+          if env -u LD_LIBRARY_PATH AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
             ${pkgs.awscli2}/bin/aws --endpoint-url=http://127.0.0.1:$MOTO_PORT \
-            s3 mb s3://coordinator-db-backups 2>/dev/null || true
-
-          echo "Created S3 bucket: coordinator-db-backups"
+            s3 mb s3://coordinator-db-backups > /dev/null 2>&1; then
+            echo "Created S3 bucket: coordinator-db-backups"
+          else
+            echo "S3 bucket coordinator-db-backups already exists or could not be created"
+          fi
         '';
 
         # Script: Stop moto
