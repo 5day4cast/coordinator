@@ -29,7 +29,7 @@ bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }
 electrum-client = "0.21"
 # The browser wallet (coordinator-wasm) still builds on BDK.
 bdk_wallet = { version = "2.3.0", features = ["keys-bip39"] }
-dlctix = { git = "https://github.com/tee8z/dlctix", branch = "external-signing-api" }
+dlctix = { git = "https://github.com/tee8z/dlctix-fork", rev = "d6f103c7508b6380b5ebf41e6af26a5b5a4fe64d" }
 miniscript = "12.3.2"
 
 # Web
@@ -121,8 +121,11 @@ inherits = "release"
 lto = "thin"
 
 # dlctix's external-signing-api branch was squashed into tee8z/dlctix PR 4,
-# whose head lives in the archived tee8z/dlctix-fork repository. Resolve every
-# dlctix dependency, including keymeld-sdk's, from that PR commit until dlctix
-# merges and releases it. Cargo requires the patch to use a different URL.
+# whose head lives in the archived tee8z/dlctix-fork repository, and the branch
+# no longer exists upstream. This workspace depends on the fork commit directly
+# (see the dlctix entries above and in coordinator-wasm and synth). keymeld-sdk
+# still names the deleted branch, so this patch redirects that transitive
+# dependency to the same commit until keymeld and dlctix move on. Cargo requires
+# the patch to use a different URL than the one it replaces.
 [patch."https://github.com/tee8z/dlctix"]
 dlctix = { git = "https://github.com/tee8z/dlctix-fork", rev = "d6f103c7508b6380b5ebf41e6af26a5b5a4fe64d" }

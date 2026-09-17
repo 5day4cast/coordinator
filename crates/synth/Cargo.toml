@@ -56,7 +56,7 @@ rand.workspace = true
 rand_chacha.workspace = true
 
 # Bitcoin (for key derivation)
-dlctix = { git = "https://github.com/tee8z/dlctix", branch = "external-signing-api", default-features = false }
+dlctix = { git = "https://github.com/tee8z/dlctix-fork", rev = "d6f103c7508b6380b5ebf41e6af26a5b5a4fe64d", default-features = false }
 
 # Time
 time.workspace = true

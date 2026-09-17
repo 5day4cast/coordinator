@@ -28,7 +28,7 @@ nostr-sdk = { version = "0.38", default-features = false, features = ["indexeddb
 
 # Bitcoin - use without network features for WASM
 bdk_wallet = { version = "2.3.0", default-features = false, features = ["std", "keys-bip39"] }
-dlctix = { git = "https://github.com/tee8z/dlctix", branch = "external-signing-api", default-features = false }
+dlctix = { git = "https://github.com/tee8z/dlctix-fork", rev = "d6f103c7508b6380b5ebf41e6af26a5b5a4fe64d", default-features = false }
 
 # Keymeld SDK - for remote MuSig2 signing
 keymeld-sdk = { workspace = true, optional = true }
