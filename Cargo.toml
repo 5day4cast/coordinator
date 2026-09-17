@@ -119,3 +119,10 @@ opt-level = "s"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# dlctix's external-signing-api branch was squashed into tee8z/dlctix PR 4,
+# whose head lives in the archived tee8z/dlctix-fork repository. Resolve every
+# dlctix dependency, including keymeld-sdk's, from that PR commit until dlctix
+# merges and releases it. Cargo requires the patch to use a different URL.
+[patch."https://github.com/tee8z/dlctix"]
+dlctix = { git = "https://github.com/tee8z/dlctix-fork", rev = "d6f103c7508b6380b5ebf41e6af26a5b5a4fe64d" }
