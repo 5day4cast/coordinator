@@ -134,7 +134,7 @@ oracle_url = "http://localhost:9800"
 
 ### Keymeld authorization upgrade
 
-The SDK is pinned to Keymeld security revision `a974207819f24fbfe40c33542f8f19d28e7c4f09` (protocol 0.4).
+The SDK and the flake's keymeld input are pinned to the Keymeld `v0.4.0` release (protocol 0.4).
 Deploy matching gateway, enclave, coordinator, and browser artifacts together.
 Complete active competitions before upgrading and archive their session state.
 Legacy session records lack authorization credentials and cannot resume under this protocol.
@@ -155,7 +155,7 @@ Ticket responses contain registration context, never those private authority cre
 Coordinator checks the completed roster against accepted entries before funding and signing.
 Entry submission delegates unattended signing for that competition; participants do not approve each batch.
 
-See [Keymeld security operations](https://github.com/tee8z/keymeld/blob/a974207819f24fbfe40c33542f8f19d28e7c4f09/docs/SECURITY_OPERATIONS.md) for enclave provisioning and hardware acceptance checks.
+See [Keymeld security operations](https://github.com/tee8z/keymeld/blob/v0.4.0/docs/SECURITY_OPERATIONS.md) for enclave provisioning and hardware acceptance checks.
 See [the authorization design](docs/KEYMELD_AUTHORIZATION_MIGRATION.md) for the credentials the coordinator holds and the checks it enforces.
 Local mock tests do not establish Nitro attestation or live signing compatibility.
 

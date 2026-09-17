@@ -11,9 +11,9 @@
     crane.url = "github:ipetkov/crane";
 
     # Keymeld for e2e testing
-    # Pinned to the same revision as the keymeld-sdk dependency in Cargo.toml.
+    # Pinned to the same release as the keymeld-sdk dependency in Cargo.toml.
     keymeld = {
-      url = "github:tee8z/keymeld/a974207819f24fbfe40c33542f8f19d28e7c4f09";
+      url = "github:tee8z/keymeld/v0.4.0";
     };
   };
 
