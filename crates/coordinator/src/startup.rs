@@ -1,4 +1,5 @@
 use crate::{
+    api::nip98_replay::{Nip98ReplayGuard, DEFAULT_REPLAY_CAPACITY},
     api::routes::{
         add_event_entry, admin_competition_fragment, admin_create_competition_handler,
         admin_delete_competition_handler, admin_fee_estimates_fragment, admin_page_handler,
@@ -43,7 +44,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
     serve::Serve,
-    Router,
+    Extension, Router,
 };
 use dlctix::secp::Scalar;
 use hyper::{
@@ -688,6 +689,9 @@ pub fn app(app_state: AppState, origins: Vec<String>) -> Router {
         .nest("/api/v1/wallet", wallet_endpoints)
         .nest("/api/v1/users", users_endpoints)
         .route("/ui/{*path}", get(serve_static_file))
+        .layer(Extension(Arc::new(Nip98ReplayGuard::new(
+            DEFAULT_REPLAY_CAPACITY,
+        ))))
         .layer(middleware::from_fn(log_request))
         .with_state(Arc::new(app_state))
         .layer(cors)
@@ -713,19 +717,28 @@ async fn serve_static_file(
     State(state): State<Arc<AppState>>,
     Path(path): Path<String>,
 ) -> Response {
-    // Prevent directory traversal attacks
-    if path.contains("..") {
+    static_file_response(&state.ui_dir, &path).await
+}
+
+async fn static_file_response(ui_dir: &str, path: &str) -> Response {
+    // Axum percent-decodes the wildcard before extraction. An encoded leading
+    // slash would make Path::join discard ui_dir, even without any '..'.
+    if path.is_empty()
+        || !std::path::Path::new(path)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
         return (StatusCode::BAD_REQUEST, "Bad request").into_response();
     }
 
-    let file_path = std::path::Path::new(&state.ui_dir).join(&path);
+    let file_path = std::path::Path::new(ui_dir).join(path);
 
     let content = match tokio::fs::read(&file_path).await {
         Ok(c) => c,
         Err(_) => return (StatusCode::NOT_FOUND, "Not found").into_response(),
     };
 
-    let mime_type = get_mime_type(&path);
+    let mime_type = get_mime_type(path);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -825,5 +838,60 @@ async fn shutdown_signal() {
     select! {
         _ = sigint.recv() => info!("Received SIGINT signal"),
         _ = sigterm.recv() => info!("Received SIGTERM signal"),
+    }
+}
+
+#[cfg(test)]
+mod static_file_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn static_routes_reject_percent_encoded_absolute_paths_and_parent_components() {
+        let directory = tempfile::tempdir().unwrap();
+        let ui_dir = directory.path().join("ui");
+        std::fs::create_dir_all(ui_dir.join("pkg")).unwrap();
+        std::fs::write(ui_dir.join("pkg/app.js"), "browser code").unwrap();
+        let secret_path = directory.path().join("secret.txt");
+        std::fs::write(&secret_path, "private data").unwrap();
+
+        let router = Router::new()
+            .route(
+                "/ui/{*path}",
+                get(
+                    |State(ui_dir): State<String>, Path(path): Path<String>| async move {
+                        static_file_response(&ui_dir, &path).await
+                    },
+                ),
+            )
+            .with_state(ui_dir.to_str().unwrap().to_owned());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let valid = client
+            .get(format!("http://{address}/ui/pkg/app.js"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(valid.status(), StatusCode::OK);
+        assert_eq!(valid.text().await.unwrap(), "browser code");
+
+        for path in [
+            format!(
+                "%2F{}",
+                secret_path.to_str().unwrap().trim_start_matches('/')
+            ),
+            "pkg%2F..%2F..%2Fsecret.txt".to_owned(),
+        ] {
+            let response = client
+                .get(format!("http://{address}/ui/{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            assert!(!response.text().await.unwrap().contains("private data"));
+        }
+        server.abort();
     }
 }

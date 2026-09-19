@@ -259,12 +259,18 @@ async fn registration_migration_preserves_legacy_entries_and_new_context_roundtr
     let old_ticket = Uuid::now_v7();
     let new_ticket = Uuid::now_v7();
     let old_entry = Uuid::now_v7();
+    let duplicate_tickets = [Uuid::now_v7(), Uuid::now_v7()];
     sqlx::query("INSERT INTO competitions (id, created_at, event_submission) VALUES (?, datetime('now'), '{}')")
         .bind(event_id.to_string())
         .execute(&legacy)
         .await
         .unwrap();
-    for ticket in [old_ticket, new_ticket] {
+    for ticket in [
+        old_ticket,
+        new_ticket,
+        duplicate_tickets[0],
+        duplicate_tickets[1],
+    ] {
         sqlx::query("INSERT INTO tickets (id, event_id, encrypted_preimage, hash) VALUES (?, ?, 'encrypted', 'hash')")
             .bind(ticket.to_string())
             .bind(event_id.to_string())
@@ -316,10 +322,29 @@ async fn registration_migration_preserves_legacy_entries_and_new_context_roundtr
     new_entry.id = Uuid::now_v7();
     new_entry.ticket_id = new_ticket;
     new_entry.entry_submission.id = new_entry.id;
+    new_entry.ephemeral_pubkey = "ephemeral-2".into();
+    new_entry.payout_hash = "hash-2".into();
     new_entry.keymeld_registration_context = Some(context.clone());
     bounded(store.add_entry(new_entry.clone(), new_ticket))
         .await
         .unwrap();
+
+    // Every entry needs its own DLC key and payout hash.
+    for (ticket, (ephemeral_pubkey, payout_hash)) in duplicate_tickets
+        .into_iter()
+        .zip([("ephemeral", "hash-3"), ("ephemeral-3", "hash")])
+    {
+        let mut duplicate = new_entry.clone();
+        duplicate.id = Uuid::now_v7();
+        duplicate.ticket_id = ticket;
+        duplicate.entry_submission.id = duplicate.id;
+        duplicate.ephemeral_pubkey = ephemeral_pubkey.into();
+        duplicate.payout_hash = payout_hash.into();
+        assert!(
+            bounded(store.add_entry(duplicate, ticket)).await.is_err(),
+            "duplicate ephemeral pubkey or payout hash must be rejected"
+        );
+    }
     let loaded = bounded(store.get_entry_by_id(new_entry.id))
         .await
         .unwrap()

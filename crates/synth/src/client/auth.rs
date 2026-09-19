@@ -7,11 +7,12 @@ use nostr_sdk::{
 use std::str::FromStr;
 
 /// Create a NIP-98 HTTP Auth header for authenticated coordinator API requests.
-pub async fn create_auth_header<T: serde::Serialize>(
+/// `body` must be the exact bytes sent; the coordinator checks its hash.
+pub async fn create_auth_header(
     keys: &Keys,
     method: &str,
     url: &str,
-    body: Option<&T>,
+    body: Option<&[u8]>,
 ) -> Result<String> {
     let http_method = HttpMethod::from_str(&method.to_uppercase())
         .map_err(|e| anyhow::anyhow!("Invalid HTTP method: {}", e))?;
@@ -19,13 +20,39 @@ pub async fn create_auth_header<T: serde::Serialize>(
 
     let mut http_data = HttpData::new(http_url, http_method);
 
-    if let Some(content) = body {
-        let content_str = serde_json::to_string(content)?;
-        let hash = Sha256Hash::hash(content_str.as_bytes());
-        http_data = http_data.payload(hash);
+    if let Some(body) = body {
+        http_data = http_data.payload(Sha256Hash::hash(body));
     }
 
-    let event = EventBuilder::http_auth(http_data).sign_with_keys(keys)?;
+    // A new signature alone does not change the event ID used by replay guards.
+    let event = EventBuilder::http_auth(http_data)
+        .tag(Tag::custom(
+            TagKind::Custom("request-id".into()),
+            [hex::encode(rand::random::<[u8; 16]>())],
+        ))
+        .sign_with_keys(keys)?;
 
     Ok(format!("Nostr {}", BASE64.encode(event.as_json())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn repeated_requests_have_unique_event_ids() {
+        let keys = Keys::generate();
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..16 {
+            let header = create_auth_header(&keys, "GET", "http://localhost/entries", None)
+                .await
+                .unwrap();
+            let bytes = BASE64
+                .decode(header.strip_prefix("Nostr ").unwrap())
+                .unwrap();
+            let event: Event = serde_json::from_slice(&bytes).unwrap();
+            event.verify().unwrap();
+            assert!(ids.insert(event.id));
+        }
+    }
 }

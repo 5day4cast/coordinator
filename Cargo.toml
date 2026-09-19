@@ -20,16 +20,15 @@ name = "coordinator"
 # Internal crates
 coordinator-core = { path = "crates/coordinator-core" }
 
-# Keymeld
-keymeld-sdk = { git = "https://github.com/tee8z/keymeld", tag = "v0.4.0", default-features = false }
-keymeld-core = { git = "https://github.com/tee8z/keymeld", tag = "v0.4.0", default-features = false }
+# Keymeld: released SDK and services on the published dlctix crate.
+# keymeld-sdk and the coordinator must resolve dlctix from the same source.
+keymeld-sdk = { git = "https://github.com/tee8z/keymeld", tag = "v0.4.1", default-features = false }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", tag = "v0.4.1", default-features = false }
 
 # Bitcoin
 bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }
 electrum-client = "0.21"
-# The browser wallet (coordinator-wasm) still builds on BDK.
-bdk_wallet = { version = "2.3.0", features = ["keys-bip39"] }
-dlctix = { git = "https://github.com/tee8z/dlctix", branch = "external-signing-api" }
+dlctix = "0.1.0"
 miniscript = "12.3.2"
 
 # Web
@@ -119,10 +118,3 @@ opt-level = "s"
 [profile.dist]
 inherits = "release"
 lto = "thin"
-
-# dlctix's external-signing-api branch was squashed into tee8z/dlctix PR 4,
-# whose head lives in the archived tee8z/dlctix-fork repository. Resolve every
-# dlctix dependency, including keymeld-sdk's, from that PR commit until dlctix
-# merges and releases it. Cargo requires the patch to use a different URL.
-[patch."https://github.com/tee8z/dlctix"]
-dlctix = { git = "https://github.com/tee8z/dlctix-fork", rev = "d6f103c7508b6380b5ebf41e6af26a5b5a4fe64d" }

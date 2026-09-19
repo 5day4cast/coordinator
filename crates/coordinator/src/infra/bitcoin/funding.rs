@@ -422,7 +422,7 @@ mod tests {
     fn escrow_surplus_funds_without_wallet_inputs_and_pays_witness_fee() {
         let foreign = foreign(22_000);
         let (value, weight) = foreign_totals(&[], std::slice::from_ref(&foreign)).unwrap();
-        let rate = FeeRate::from_sat_per_vb_unchecked(3);
+        let rate = FeeRate::from_sat_per_vb_u32(3);
         let funded = fund_foreign_only(
             &target(20_000, 4),
             &target(0, 5).script_pubkey,
@@ -460,7 +460,7 @@ mod tests {
             &[foreign],
             value,
             weight,
-            FeeRate::from_sat_per_vb_unchecked(3),
+            FeeRate::from_sat_per_vb_u32(3),
         )
         .unwrap()
         .is_none());
@@ -582,7 +582,7 @@ mod tests {
                 .unwrap()
         });
         let funded = wallet
-            .fund_psbt(&template, FeeRate::from_sat_per_vb_unchecked(2))
+            .fund_psbt(&template, FeeRate::from_sat_per_vb_u32(2))
             .await
             .unwrap();
         assert!(wallet.reserve_psbt_inputs_until(&funded, 0).await.is_err());
@@ -692,7 +692,7 @@ mod tests {
             value: Amount::from_sat(20_000),
             script_pubkey: destination.script_pubkey(),
         };
-        let rate = FeeRate::from_sat_per_vb_unchecked(2);
+        let rate = FeeRate::from_sat_per_vb_u32(2);
 
         // Explicit selections use LND's legacy PSBT mode, which must accept
         // an unlocked output and return the lease that we then release.

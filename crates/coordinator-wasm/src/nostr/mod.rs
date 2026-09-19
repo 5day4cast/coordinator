@@ -1,46 +1,39 @@
 mod core;
-mod password_crypto;
+mod login;
 mod types;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm;
 
 pub use core::NostrClientCore;
-pub use password_crypto::*;
+pub use login::{LoginError, LoginKeys};
 pub use types::{CustomSigner, SignerType};
+
+#[cfg(target_arch = "wasm32")]
+pub use wasm::{LoginCredentials, NostrClientWrapper};
 
 use thiserror::Error;
 
-#[cfg(target_arch = "wasm32")]
-pub use wasm::{Nip04Methods, Nip44Methods, NostrClientWrapper};
-
-#[cfg(not(target_arch = "wasm32"))]
-pub type NostrClientWrapper = NostrClientCore;
-
-// Re-export common traits and types that are used in public interfaces
-pub use nostr_sdk::{
-    nips::nip04,
-    signer::{NostrSigner, SignerBackend, SignerError},
-    Relay, RelayUrl,
-};
-
-#[cfg(target_arch = "wasm32")]
-pub use wasm_bindgen;
-
 #[derive(Error, Debug)]
 pub enum NostrError {
-    #[error("NoSigner: {0}")]
-    NoSigner(String),
+    #[error("No signer initialized")]
+    NoSigner,
+    #[error("The extension signer does not expose a local key")]
+    NoLocalKey,
+    #[error("Invalid {0}")]
+    InvalidRequest(&'static str),
+    #[error(transparent)]
+    Login(#[from] LoginError),
     #[error("Key parsing error: {0}")]
     KeyParsing(#[from] nostr_sdk::key::Error),
-    #[error("Relay connection error: {0}")]
-    RelayConnection(#[from] nostr_sdk::client::Error),
+    #[error("Key encoding error: {0}")]
+    KeyEncoding(#[from] nostr_sdk::nips::nip19::Error),
     #[error("Signer error: {0}")]
-    SignerError(#[from] nostr_sdk::signer::SignerError),
+    Signer(#[from] nostr_sdk::signer::SignerError),
     #[error("Event builder error: {0}")]
-    EventBuilderError(#[from] nostr_sdk::event::builder::Error),
-    #[error("Browser signer error: {0}")]
+    EventBuilder(#[from] nostr_sdk::event::builder::Error),
     #[cfg(target_arch = "wasm32")]
+    #[error("Browser signer error: {0}")]
     BrowserSigner(#[from] nostr_sdk::nips::nip07::Error),
 }
 

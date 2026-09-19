@@ -221,14 +221,8 @@ async fn enter_competition(
     }
 
     // Generate payout preimage/hash
-    let (payout_preimage, payout_hash) =
+    let (_payout_preimage, payout_hash) =
         crypto::payout::generate_payout_pair(&ephemeral.secret_bytes);
-
-    // Encrypt ephemeral private key and payout preimage to user's nostr key
-    let ephemeral_encrypted = user
-        .nip44_encrypt_to_self(&ephemeral.private_key_hex)
-        .await?;
-    let preimage_encrypted = user.nip44_encrypt_to_self(&payout_preimage).await?;
 
     if ticket.keymeld_session_id.is_some() && ticket.keymeld_registration.is_none() {
         anyhow::bail!("Ticket is missing authorized Keymeld registration context");
@@ -257,9 +251,7 @@ async fn enter_competition(
         id: Uuid::now_v7(),
         ticket_id: ticket.ticket_id,
         ephemeral_pubkey: ephemeral.public_key,
-        ephemeral_privatekey_encrypted: ephemeral_encrypted,
         payout_hash,
-        payout_preimage_encrypted: preimage_encrypted,
         event_id: *competition_id,
         expected_observations: predictions,
         encrypted_keymeld_private_key: encrypted_keymeld_key,

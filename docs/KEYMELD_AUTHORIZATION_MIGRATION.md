@@ -4,7 +4,7 @@ The coordinator uses participant-scoped registration and a separate signing auth
 This document records the design behind that integration and the invariants the code enforces.
 The [README](../README.md#keymeld-authorization-upgrade) covers operator configuration and the upgrade procedure.
 
-The workspace pins the Keymeld `v0.4.0` release in [Cargo.toml](../Cargo.toml) and in the flake's keymeld input.
+The workspace pins the Keymeld `v0.4.1` release in [Cargo.toml](../Cargo.toml) and in the flake's keymeld input.
 Deploy the gateway and enclaves at the same version.
 Complete Keymeld's hardware acceptance checks before using the Nitro deployment.
 

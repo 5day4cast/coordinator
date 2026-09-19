@@ -4,7 +4,6 @@ on:
   push:
     branches: [master]
   pull_request:
-    branches: [master]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -279,6 +278,10 @@ jobs:
       - name: Install npm dependencies
         working-directory: e2e
         run: npm ci
+
+      - name: Run browser unit tests
+        working-directory: e2e
+        run: npm run test:unit
 
       - name: Install Playwright browsers
         if: steps.playwright-cache.outputs.cache-hit != 'true'

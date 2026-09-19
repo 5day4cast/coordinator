@@ -13,7 +13,7 @@
     # Keymeld for e2e testing
     # Pinned to the same release as the keymeld-sdk dependency in Cargo.toml.
     keymeld = {
-      url = "github:tee8z/keymeld/v0.4.0";
+      url = "github:tee8z/keymeld/v0.4.1";
     };
   };
 
@@ -100,7 +100,9 @@
             || (builtins.match ".*\\.html$" path != null)
             || (builtins.match ".*\\.js$" path != null)
             || (builtins.match ".*\\.css$" path != null)
-            || (builtins.match ".*\\.svg$" path != null);
+            || (builtins.match ".*\\.svg$" path != null)
+            # Keymeld enclave measurements compiled into the browser WASM.
+            || (builtins.match ".*/keymeld-trusted-pcrs\\.json$" path != null);
         };
 
         # Build workspace dependencies once (for caching)
@@ -925,6 +927,8 @@
           ];
 
           nativeBuildInputs = commonNativeBuildInputs;
+          # Cross-compile secp256k1 without host glibc headers from cc-wrapper.
+          CC_wasm32_unknown_unknown = "${wasm32-clang}/bin/wasm32-clang";
 
           shellHook = ''
             export DATA_DIR="$PWD/data"

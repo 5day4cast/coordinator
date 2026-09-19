@@ -35,17 +35,11 @@ pub struct AddEntry {
     /// ID that matches a ticket in this competition that the user paid
     pub ticket_id: Uuid,
     pub ephemeral_pubkey: String,
-    /// User provided private encrypted to their nostr key, only stored for easier UX,
-    /// backed up via dm to user
-    pub ephemeral_privatekey_encrypted: String,
     /// A hash used for unlocking the split TX output early. To allow winning
     /// players to receive off-chain payouts, they must provide this `payout_hash`,
     /// for which they know the preimage. By selling the preimage to the market maker,
     /// they allow the market maker to reclaim the on-chain funds. Expects the hash in hex.
     pub payout_hash: String,
-    /// User provided preimage encrypted to their nostr key, only stored for easier UX,
-    /// backed up via dm to user
-    pub payout_preimage_encrypted: String,
     pub event_id: Uuid,
     pub expected_observations: Vec<WeatherChoices>,
     /// User's ephemeral private key encrypted to the keymeld enclave's public key.
@@ -152,17 +146,11 @@ pub struct UserEntry {
     pub pubkey: String,
     /// Pubkey created for this entry for the user
     pub ephemeral_pubkey: String,
-    /// User provided private encrypted to their nostr key, only stored for easier UX,
-    /// backed up via dm to user
-    pub ephemeral_privatekey_encrypted: String,
     /// A hash used for unlocking the split TX output early. To allow winning
     /// players to receive off-chain payouts, they must provide this `payout_hash`,
     /// for which they know the preimage. By selling the preimage to the market maker,
     /// they allow the market maker to reclaim the on-chain funds. Expects the hash in hex.
     pub payout_hash: String,
-    /// User provided preimage encrypted to their nostr key, only stored for easier UX,
-    /// backed up via dm to user
-    pub payout_preimage_encrypted: String,
     /// User's entry submission data (should be able to update until all entries have been collected)
     pub entry_submission: AddEventEntry,
     /// User provided private de-encrypted, only used during payout
@@ -219,9 +207,7 @@ impl FromRow<'_, SqliteRow> for UserEntry {
             })?,
             pubkey: row.get("pubkey"),
             ephemeral_pubkey: row.get("ephemeral_pubkey"),
-            ephemeral_privatekey_encrypted: row.get("ephemeral_privatekey_encrypted"),
             payout_hash: row.get("payout_hash"),
-            payout_preimage_encrypted: row.get("payout_preimage_encrypted"),
             entry_submission: parse_required_blob_json(row, "entry_submission")?,
             ephemeral_privatekey: row.get("ephemeral_privatekey"),
             payout_preimage: row.get("payout_preimage"),
@@ -298,9 +284,7 @@ impl AddEntry {
             ticket_id: self.ticket_id,
             pubkey,
             ephemeral_pubkey: self.ephemeral_pubkey,
-            ephemeral_privatekey_encrypted: self.ephemeral_privatekey_encrypted,
             payout_hash: self.payout_hash,
-            payout_preimage_encrypted: self.payout_preimage_encrypted,
             entry_submission,
             signed_at: None,
             funding_psbt_base64: None,
@@ -320,7 +304,10 @@ impl AddEntry {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Not `Clone`/`Serialize`, and `Debug` is redacted: the body carries the
+/// entry's private key and payout preimage.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PayoutInfo {
     pub ticket_id: Uuid,
     /// We are providing the payout preimage & ephemeral private key before being paid,
@@ -342,6 +329,15 @@ pub struct PayoutInfo {
     pub payout_preimage: String,
     pub ephemeral_private_key: String,
     pub ln_invoice: String,
+}
+
+impl std::fmt::Debug for PayoutInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PayoutInfo")
+            .field("ticket_id", &self.ticket_id)
+            .field("ln_invoice", &self.ln_invoice)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
