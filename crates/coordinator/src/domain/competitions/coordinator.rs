@@ -1263,7 +1263,7 @@ impl Coordinator {
             );
         }
 
-        let outcome_payouts = generate_payouts(competition, &mut entries, &players)?;
+        let outcome_payouts = generate_payouts(competition, &entries, &players)?;
         debug!("Generated outcome payouts:");
         for (outcome, weights) in &outcome_payouts {
             debug!("Outcome {:?}: weights={:?}", outcome, weights);
@@ -3936,15 +3936,15 @@ fn get_percentage_weights(num_winners: usize) -> Vec<u64> {
 
 fn generate_payouts(
     competition: &Competition,
-    entries: &mut [UserEntry],
+    entries: &[UserEntry],
     players: &[Player],
 ) -> Result<BTreeMap<Outcome, PayoutWeights>, anyhow::Error> {
     debug!("Generating payouts for {} players", players.len());
 
-    // Sort entries by ticket_id for consistent indexing
-    // This ensures player indices match the ticket order used when creating
-    // keymeld subset definitions at competition creation time
-    entries.sort_by_key(|entry| entry.ticket_id);
+    // NOAA outcome indices refer to entries sorted by their submitted entry IDs.
+    // Contract players keep ticket order, so map each winner back by public key.
+    let mut oracle_entries: Vec<_> = entries.iter().collect();
+    oracle_entries.sort_by_key(|entry| entry.entry_submission.id);
     let mut payouts: BTreeMap<Outcome, PayoutWeights> = BTreeMap::new();
 
     let possible_rankings = generate_ranking_permutations(
@@ -3991,7 +3991,10 @@ fn generate_payouts(
         }
 
         // Normal outcome processing
-        let entry_pubkeys = find_winning_entries_pubkeys(entries, winner_indices.to_owned());
+        let entry_pubkeys = winner_indices
+            .iter()
+            .map(|&index| oracle_entries[index].ephemeral_pubkey.clone())
+            .collect();
         debug!("Winner pubkeys: {:?}", entry_pubkeys);
 
         let player_indices = find_player_indices(players, entry_pubkeys)?;
@@ -4217,16 +4220,6 @@ fn find_player_indices(
         .collect()
 }
 
-fn find_winning_entries_pubkeys(
-    entries: &[UserEntry],
-    winning_entry_indices: Vec<usize>,
-) -> Vec<String> {
-    winning_entry_indices
-        .into_iter()
-        .map(|idx| entries[idx].ephemeral_pubkey.clone())
-        .collect()
-}
-
 async fn signed_funding_tx(
     bitcoin_client: Arc<dyn Bitcoin>,
     mut funding_tx: Psbt,
@@ -4424,6 +4417,74 @@ async fn validate_entry(entry: AddEventEntry, competition: Competition) -> Resul
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod oracle_payout_order_tests {
+    use super::*;
+
+    #[test]
+    fn oracle_entry_order_maps_to_ticket_order_players_for_every_ranking() {
+        let now = OffsetDateTime::now_utc();
+        let competition = Competition::new(&CreateEvent {
+            id: Uuid::now_v7(),
+            signing_date: now + time::Duration::days(2),
+            start_observation_date: now,
+            end_observation_date: now + time::Duration::days(1),
+            locations: vec!["KORD".into()],
+            number_of_values_per_entry: 1,
+            number_of_places_win: 2,
+            total_allowed_entries: 3,
+            entry_fee: 1_000,
+            coordinator_fee_percentage: 10,
+            total_competition_pool: 2_700,
+            relative_locktime_block_delta: None,
+        });
+        let entry_ids = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
+        let tickets = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
+        let players: Vec<Player> = (1..=3)
+            .map(|index| Player {
+                pubkey: Scalar::from_slice(&[index; 32]).unwrap().base_point_mul(),
+                ticket_hash: [index; 32],
+                payout_hash: [index + 3; 32],
+            })
+            .collect();
+        // Tickets 1 and 2 submit before ticket 0. Oracle order is players [1, 2, 0].
+        let entries: Vec<_> = [2, 0, 1]
+            .iter()
+            .enumerate()
+            .map(|(player, &entry)| {
+                AddEntry {
+                    id: entry_ids[entry],
+                    ticket_id: tickets[player],
+                    event_id: competition.id,
+                    ephemeral_pubkey: hex::encode(players[player].pubkey.serialize()),
+                    payout_hash: hex::encode(players[player].payout_hash),
+                    expected_observations: vec![],
+                    encrypted_keymeld_private_key: None,
+                    keymeld_auth_pubkey: None,
+                    keymeld_registration_context: None,
+                }
+                .into_user_entry(String::new())
+            })
+            .collect();
+
+        let payouts = generate_payouts(&competition, &entries, &players).unwrap();
+        for (outcome, winners) in [[1, 2], [1, 0], [2, 1], [2, 0], [0, 1], [0, 2]]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                payouts[&Outcome::Attestation(outcome)],
+                BTreeMap::from([(winners[0], 60), (winners[1], 40)]),
+            );
+        }
+        assert_eq!(
+            payouts[&Outcome::Attestation(6)],
+            BTreeMap::from([(0, 34), (1, 33), (2, 33)]),
+        );
+        assert_eq!(entries[0].ticket_id, tickets[0]);
+    }
 }
 
 #[cfg(test)]

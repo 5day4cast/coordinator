@@ -328,8 +328,6 @@ async fn fetch_forecasts(
         return Ok(vec![]);
     }
 
-    let client = reqwest_middleware::reqwest::Client::new();
-
     // Fetch forecasts for today and tomorrow (end date is exclusive, so +2 days)
     let today = time::OffsetDateTime::now_utc();
     let end_date = today + time::Duration::days(2);
@@ -337,22 +335,7 @@ async fn fetch_forecasts(
     let start = today.format(&Rfc3339).unwrap_or_default();
     let end = end_date.format(&Rfc3339).unwrap_or_default();
 
-    let station_ids_param = station_ids.join(",");
-
-    let response = client
-        .get(format!(
-            "{}/stations/forecasts?station_ids={}&start={}&end={}",
-            oracle_url, station_ids_param, start, end
-        ))
-        .send()
-        .await?;
-
-    if response.status().is_success() {
-        let forecasts: Vec<Forecast> = response.json().await?;
-        Ok(forecasts)
-    } else {
-        Ok(vec![])
-    }
+    fetch_station_weather(oracle_url, "forecasts", station_ids, &start, &end).await
 }
 
 async fn fetch_observations(
@@ -363,8 +346,6 @@ async fn fetch_observations(
         return Ok(vec![]);
     }
 
-    let client = reqwest_middleware::reqwest::Client::new();
-
     // Fetch observations for today only
     let today = time::OffsetDateTime::now_utc();
     let tomorrow = today + time::Duration::days(1);
@@ -372,22 +353,40 @@ async fn fetch_observations(
     let start = today.format(&Rfc3339).unwrap_or_default();
     let end = tomorrow.format(&Rfc3339).unwrap_or_default();
 
-    let station_ids_param = station_ids.join(",");
+    fetch_station_weather(oracle_url, "observations", station_ids, &start, &end).await
+}
 
-    let response = client
-        .get(format!(
-            "{}/stations/observations?station_ids={}&start={}&end={}",
-            oracle_url, station_ids_param, start, end
-        ))
-        .send()
-        .await?;
-
-    if response.status().is_success() {
-        let observations: Vec<Observation> = response.json().await?;
-        Ok(observations)
-    } else {
-        Ok(vec![])
+async fn fetch_station_weather<T: serde::de::DeserializeOwned>(
+    oracle_url: &str,
+    kind: &str,
+    station_ids: &[&str],
+    start: &str,
+    end: &str,
+) -> Result<Vec<T>, anyhow::Error> {
+    // NOAA Oracle 2.0 accepts at most 100 stations per weather query. The admin
+    // selector can contain 200 stations, so retain all of them across bounded requests.
+    let client = reqwest_middleware::reqwest::Client::new();
+    let mut weather = Vec::new();
+    for stations in station_ids.chunks(100) {
+        let station_ids = stations.join(",");
+        let mut batch = client
+            .get(format!(
+                "{}/stations/{kind}",
+                oracle_url.trim_end_matches('/')
+            ))
+            .query(&[
+                ("station_ids", station_ids.as_str()),
+                ("start", start),
+                ("end", end),
+            ])
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Vec<T>>()
+            .await?;
+        weather.append(&mut batch);
     }
+    Ok(weather)
 }
 
 fn merge_stations_with_weather(
@@ -438,6 +437,57 @@ fn merge_stations_with_weather(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod oracle_weather_tests {
+    use super::*;
+    use axum::{extract::Query, routing::get, Router};
+    use std::{collections::HashMap, sync::Mutex};
+
+    #[tokio::test]
+    async fn weather_queries_respect_the_oracle_station_limit_without_dropping_stations() {
+        let counts = Arc::new(Mutex::new(Vec::new()));
+        let requests = counts.clone();
+        let app = Router::new().route(
+            "/stations/{kind}",
+            get(move |Query(query): Query<HashMap<String, String>>| {
+                let requests = requests.clone();
+                async move {
+                    let stations: Vec<_> = query["station_ids"].split(',').collect();
+                    assert!(stations.len() <= 100);
+                    requests.lock().unwrap().push(stations.len());
+                    Json(
+                        stations
+                            .into_iter()
+                            .map(|station| {
+                                serde_json::json!({
+                                    "station_id": station,
+                                    "date": "2030-01-01",
+                                    "temp_high": 25,
+                                    "temp_low": 10,
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let stations: Vec<String> = (0..201).map(|index| format!("S{index:03}")).collect();
+        let station_ids: Vec<_> = stations.iter().map(String::as_str).collect();
+        let forecasts = fetch_forecasts(&url, &station_ids).await.unwrap();
+        let observations = fetch_observations(&url, &station_ids).await.unwrap();
+        assert_eq!(forecasts.len(), stations.len());
+        assert_eq!(observations.len(), stations.len());
+        assert_eq!(forecasts.last().unwrap().station_id, "S200");
+        assert_eq!(observations.last().unwrap().station_id, "S200");
+        assert_eq!(*counts.lock().unwrap(), vec![100, 100, 1, 100, 100, 1]);
+        server.abort();
+        let _ = server.await;
+    }
 }
 
 async fn fetch_balance(state: &AppState) -> Result<WalletBalance, anyhow::Error> {
