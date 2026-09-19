@@ -622,25 +622,19 @@ class AuthManager {
       newPassword,
     );
     try {
-      const response = await fetch(
+      // Bind the replacement credentials to the recovered account key. The
+      // challenge signature alone does not authenticate the replacement body.
+      const resetClient = new window.AuthorizedClient(window.nostrClient, this.apiBase);
+      await resetClient.post(
         `${this.apiBase}/api/v1/users/username/reset-password`,
         {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            username: this.forgotUsername,
-            challenge: this.forgotChallenge,
-            signed_event: this.forgotSignedChallenge,
-            new_auth_key: credentials.authKey,
-            new_encrypted_nsec: window.nostrClient.sealForLogin(credentials),
-          }),
+          username: this.forgotUsername,
+          challenge: this.forgotChallenge,
+          signed_event: this.forgotSignedChallenge,
+          new_auth_key: credentials.authKey,
+          new_encrypted_nsec: window.nostrClient.sealForLogin(credentials),
         },
       );
-
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        throw new Error(data.error || "Password reset failed");
-      }
 
       this.forgotChallenge = null;
       this.forgotNpub = null;

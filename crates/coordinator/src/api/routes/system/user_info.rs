@@ -331,7 +331,10 @@ pub struct ForgotPasswordReset {
 
 pub async fn forgot_password_reset(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<ForgotPasswordReset>,
+    AuthedJson {
+        auth: NostrAuth { pubkey, .. },
+        body,
+    }: AuthedJson<ForgotPasswordReset>,
 ) -> Result<impl IntoResponse, ApiError> {
     debug!("forgot password reset for: {}", body.username);
 
@@ -376,7 +379,9 @@ pub async fn forgot_password_reset(
     })?;
 
     let event_pubkey = event.pubkey.to_bech32().expect("public bech32 format");
-    if event_pubkey != nostr_pubkey {
+    if event_pubkey != nostr_pubkey
+        || pubkey.to_bech32().expect("public bech32 format") != nostr_pubkey
+    {
         return Err(ApiError::from(domain::Error::BadRequest(
             "Event pubkey does not match account".to_string(),
         )));
@@ -388,6 +393,20 @@ pub async fn forgot_password_reset(
         )));
     }
 
+    // Verify the account proof and body-bound authorization before consuming the
+    // challenge. Claim it atomically so concurrent requests cannot reset twice.
+    if !claim_reset_challenge(
+        &state.forgot_password_challenges,
+        &body.username,
+        &body.challenge,
+    )
+    .await
+    {
+        return Err(ApiError::from(domain::Error::BadRequest(
+            "Invalid or expired challenge".to_string(),
+        )));
+    }
+
     let new_password_hash = hash_auth_key(&body.new_auth_key).map_err(credential_error)?;
 
     state
@@ -395,10 +414,61 @@ pub async fn forgot_password_reset(
         .update_password(&nostr_pubkey, new_password_hash, body.new_encrypted_nsec)
         .await?;
 
-    {
-        let mut challenges = state.forgot_password_challenges.write().await;
-        challenges.remove(&body.username);
+    Ok(StatusCode::OK)
+}
+
+async fn claim_reset_challenge(
+    challenges: &tokio::sync::RwLock<
+        std::collections::HashMap<String, (String, std::time::Instant)>,
+    >,
+    username: &str,
+    challenge: &str,
+) -> bool {
+    let mut challenges = challenges.write().await;
+    let valid = challenges.get(username).is_some_and(|(stored, created)| {
+        stored == challenge && created.elapsed() < std::time::Duration::from_secs(300)
+    });
+    if valid {
+        challenges.remove(username);
+    }
+    valid
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::*;
+    use std::{
+        collections::HashMap,
+        time::{Duration, Instant},
+    };
+    use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn concurrent_password_resets_can_claim_a_challenge_only_once() {
+        let challenges = RwLock::new(HashMap::from([(
+            "alice".into(),
+            ("challenge".into(), Instant::now()),
+        )]));
+        let (first, second) = tokio::join!(
+            claim_reset_challenge(&challenges, "alice", "challenge"),
+            claim_reset_challenge(&challenges, "alice", "challenge"),
+        );
+        assert_ne!(first, second);
+        assert!(!claim_reset_challenge(&challenges, "alice", "challenge").await);
     }
 
-    Ok(StatusCode::OK)
+    #[tokio::test]
+    async fn invalid_challenges_cannot_consume_a_live_challenge() {
+        let challenges = RwLock::new(HashMap::from([
+            ("alice".into(), ("challenge".into(), Instant::now())),
+            (
+                "expired".into(),
+                ("old".into(), Instant::now() - Duration::from_secs(301)),
+            ),
+        ]));
+        assert!(!claim_reset_challenge(&challenges, "alice", "wrong").await);
+        assert!(!claim_reset_challenge(&challenges, "missing", "challenge").await);
+        assert!(!claim_reset_challenge(&challenges, "expired", "old").await);
+        assert!(claim_reset_challenge(&challenges, "alice", "challenge").await);
+    }
 }
