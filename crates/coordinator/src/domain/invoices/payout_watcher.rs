@@ -6,11 +6,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     domain::{competitions::PayoutError, CompetitionStore, Coordinator, PaymentStatus},
-    infra::lightning::{extract_payment_hash_from_invoice, Ln, PaymentNotFound},
+    infra::lightning::{
+        extract_payment_hash_from_invoice, invoice_is_expired, Ln, PaymentNotFound,
+    },
 };
 
 pub struct PayoutWatcher {
-    competition_store: CompetitionStore,
+    competition_store: Arc<CompetitionStore>,
     ln: Arc<dyn Ln>,
     sync_interval: Duration,
     cancel_token: CancellationToken,
@@ -160,8 +162,11 @@ impl PayoutWatcher {
                     // LND confirms that no payment exists before we release it.
                     let invoice = payout
                         .payout_payment_request
-                        .parse::<lightning_invoice::Bolt11Invoice>()?;
-                    if invoice.is_expired() {
+                        .parse::<lightning_invoice::Bolt11Invoice>()
+                        .map_err(|error| {
+                            anyhow::anyhow!("Invalid stored payout invoice: {error}")
+                        })?;
+                    if invoice_is_expired(&invoice) {
                         self.competition_store
                             .mark_payout_failed(
                                 payout.id,
@@ -303,7 +308,7 @@ mod tests {
             axum::serve(listener, router).await.unwrap();
         });
         let watcher = PayoutWatcher {
-            competition_store: store.clone(),
+            competition_store: Arc::new(store.clone()),
             ln: Arc::new(LnClient {
                 base_url: reqwest::Url::parse(&format!("http://{address}/")).unwrap(),
                 client: reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build(),

@@ -899,11 +899,18 @@ pub fn extract_payment_hash_from_invoice(payment_request: &str) -> Result<String
     Ok(hex::encode(payment_hash.as_byte_array()))
 }
 
+pub(crate) fn invoice_is_expired(invoice: &Bolt11Invoice) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    invoice.would_expire(now)
+}
+
 pub fn extract_amount_from_invoice(payment_request: &str) -> Result<Option<u64>, anyhow::Error> {
     let invoice = Bolt11Invoice::from_str(payment_request)
         .map_err(|e| anyhow::anyhow!("Failed to parse BOLT11 invoice: {}", e))?;
 
-    if invoice.is_expired() {
+    if invoice_is_expired(&invoice) {
         return Err(anyhow!("Lightning invoice has expired"));
     }
 
