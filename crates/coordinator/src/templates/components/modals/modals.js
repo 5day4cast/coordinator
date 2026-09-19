@@ -415,7 +415,10 @@ class AuthManager {
         return;
       }
 
-      window.dlcWallet = wallet;
+      // Registration is idempotent: a retry may have kept an earlier seed.
+      // Always use the persisted backup before deriving any entry keys.
+      wallet.free();
+      await this.loadWallet();
       this.pendingRegistration = null;
 
       const display = document.getElementById("usernameNsecDisplay");
@@ -682,6 +685,11 @@ class AuthManager {
   }
 
   async performLogin() {
+    await this.loadWallet();
+    this.onLoginSuccess();
+  }
+
+  async loadWallet() {
     const response = await this.authorizedClient.post(
       `${this.apiBase}/api/v1/users/login`,
     );
@@ -702,8 +710,6 @@ class AuthManager {
       network,
       encrypted_bitcoin_private_key,
     );
-
-    this.onLoginSuccess();
   }
 
   handleLogout() {

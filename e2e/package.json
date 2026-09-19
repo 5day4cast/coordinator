@@ -4,6 +4,7 @@
   "description": "E2E tests for the coordinator frontend",
   "scripts": {
     "test": "playwright test",
+    "test:unit": "node --test unit/*.test.cjs",
     "test:headed": "playwright test --headed",
     "test:ui": "playwright test --ui",
     "test:debug": "playwright test --debug",
