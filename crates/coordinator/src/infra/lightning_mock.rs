@@ -11,8 +11,8 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::lightning::{
-    InvoiceAddResponse, InvoiceLookupResponse, InvoiceState, InvoiceUpdate, Ln,
-    PaymentLookupResponse, PaymentUpdate,
+    extract_payment_hash_from_invoice, InvoiceAddResponse, InvoiceLookupResponse, InvoiceState,
+    InvoiceUpdate, Ln, PaymentLookupResponse, PaymentUpdate,
 };
 use crate::domain::PaymentStatus;
 
@@ -501,10 +501,13 @@ impl Ln for MockLnClient {
             amount_sats, payout_payment_request
         );
 
-        // Extract or generate a payment hash for tracking
-        let hash_input = format!("payment:{}:{}", payout_payment_request, amount_sats);
-        let payment_hash = sha256::Hash::hash(hash_input.as_bytes());
-        let payment_hash_hex = hex::encode(payment_hash.to_byte_array());
+        // A real invoice settles under its own payment hash so the payout
+        // watchers can match it; mock invoices get a synthetic one.
+        let payment_hash_hex = extract_payment_hash_from_invoice(&payout_payment_request)
+            .unwrap_or_else(|_| {
+                let hash_input = format!("payment:{}:{}", payout_payment_request, amount_sats);
+                hex::encode(sha256::Hash::hash(hash_input.as_bytes()).to_byte_array())
+            });
 
         {
             let mut payments = self

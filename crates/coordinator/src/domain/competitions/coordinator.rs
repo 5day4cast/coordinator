@@ -1,7 +1,9 @@
 use super::{
-    states::CompetitionStatus, store::ReservedTicket, AddEntry, CompetitionError, CompetitionState,
-    CompetitionStore, FundedContract, KeymeldSigningInfo, PayoutError, PayoutInfo, SearchBy,
-    Ticket, TicketStatus, UserEntry, UserEntryView,
+    parse_invoice, states::CompetitionStatus, store::ReservedTicket, verify_entry_key,
+    verify_payout_preimage, winner_payout_sats, AddEntry, CompetitionError, CompetitionState,
+    CompetitionStore, FundedContract, KeymeldSigningInfo, PayoutClaimInfo, PayoutClaimReceipt,
+    PayoutError, PayoutInfo, PayoutRejection, SearchBy, Ticket, TicketStatus, UserEntry,
+    UserEntryView,
 };
 use crate::{
     api::routes::FinalSignatures,
@@ -14,7 +16,8 @@ use crate::{
             DlcKeygenSession, DlcSubsetInfo, Keymeld, ParticipantRegistrationData,
             StoredDlcKeygenSession, SubsetDefinition,
         },
-        lightning::{extract_amount_from_invoice, Ln},
+        lightning::Ln,
+        lnurl::{LightningAddress, LnurlError, LnurlPay},
         oracle::{AddEventEntries, AddEventEntry, Error as OracleError, Event, Oracle},
     },
 };
@@ -31,7 +34,6 @@ use coordinator_core::RegistrationAssignment;
 use dlctix::{
     bitcoin::{
         consensus,
-        hex::DisplayHex as _,
         key::TweakedPublicKey,
         psbt::Input,
         sighash::Prevouts,
@@ -170,6 +172,7 @@ pub struct Coordinator {
     pub competition_store: Arc<CompetitionStore>,
     pub bitcoin: Arc<dyn Bitcoin>,
     ln: Arc<dyn Ln>,
+    lnurl: Arc<dyn LnurlPay>,
     keymeld: Arc<dyn Keymeld>,
     keymeld_gateway_url: Option<String>,
     private_key: Scalar,
@@ -191,6 +194,7 @@ impl Coordinator {
         competition_store: CompetitionStore,
         bitcoin: Arc<dyn Bitcoin>,
         ln: Arc<dyn Ln>,
+        lnurl: Arc<dyn LnurlPay>,
         keymeld: Arc<dyn Keymeld>,
         keymeld_gateway_url: Option<String>,
         relative_locktime_block_delta: u32,
@@ -207,6 +211,7 @@ impl Coordinator {
             competition_store: Arc::new(competition_store),
             bitcoin,
             ln,
+            lnurl,
             keymeld,
             keymeld_gateway_url,
             private_key,
@@ -3702,33 +3707,28 @@ impl Coordinator {
         Ok(())
     }
 
-    pub async fn submit_ticket_payout(
+    /// The checks every payout path shares: the caller owns the entry, the
+    /// competition is attested and still open for sellbacks, the entry won,
+    /// and the key and preimage handed over are the entry's own. Returns the
+    /// winnings in sats.
+    async fn verify_payout_release(
         &self,
-        pubkey: String,
+        pubkey: &str,
         competition_id: Uuid,
         entry_id: Uuid,
-        payout_info: PayoutInfo,
-    ) -> Result<(), Error> {
-        if payout_info.ln_invoice.is_empty() {
-            return Err(Error::BadRequest("Invalid lightning invoice".into()));
-        }
-
-        // Get the competition and verify it's in a valid state for payouts
+        ticket_id: Uuid,
+        ephemeral_private_key: &str,
+        payout_preimage: &str,
+    ) -> Result<u64, Error> {
         let competition = self
             .competition_store
             .get_competition(competition_id)
             .await?;
-
         if !competition.is_attested() {
             return Err(Error::BadRequest(
                 "Competition results not yet attested".into(),
             ));
         }
-
-        if let Some(ref event_announcement) = competition.event_announcement {
-            debug!("Locking points: {:?}", event_announcement.locking_points);
-        }
-
         if competition.is_delta_broadcasted()
             || competition.is_expiry_broadcasted()
             || competition.is_completed()
@@ -3738,34 +3738,26 @@ impl Coordinator {
             ));
         }
 
-        // Get the entry and verify ownership
         let entries = self
             .competition_store
             .get_user_entries(
-                pubkey.clone(),
+                pubkey.to_string(),
                 SearchBy {
                     event_ids: Some(vec![competition_id]),
                 },
             )
             .await?;
-
         let entry = entries
             .iter()
             .find(|e| e.id == entry_id)
             .ok_or_else(|| Error::NotFound(format!("Entry {} not found", entry_id)))?;
-
-        // Verify the ticket matches
-        if entry.ticket_id != payout_info.ticket_id {
+        if entry.ticket_id != ticket_id {
             return Err(Error::BadRequest("Invalid ticket for this entry".into()));
         }
-
-        // Get competition tickets to verify against stored data
         let tickets = self.competition_store.get_tickets(competition_id).await?;
-        _ = tickets
-            .get(&entry.id)
-            .ok_or_else(|| Error::NotFound("Ticket not found".into()))?;
-
-        // Verify the entry hasn't already been paid out or pending a payout
+        if !tickets.contains_key(&entry.id) {
+            return Err(Error::NotFound("Ticket not found".into()));
+        }
         if let Some(paid_out_at) = entry.paid_out_at {
             return Err(Error::BadRequest(format!(
                 "Entry {} already paid out at {}",
@@ -3773,116 +3765,139 @@ impl Coordinator {
             )));
         }
 
-        // Get the current outcome
         let outcome = competition.get_current_outcome()?;
-        debug!("Current outcome: {:?}", outcome);
-
-        // Get the signed contract to verify winner
         let signed_contract = competition
             .signed_contract
             .as_ref()
             .ok_or_else(|| Error::BadRequest("Competition contract not yet signed".into()))?;
-
-        // Verify this entry is a winner
-        let winner_weights = signed_contract
-            .params()
-            .outcome_payouts
-            .get(&outcome)
-            .ok_or_else(|| Error::BadRequest("No payout mapping for outcome".into()))?;
-
         let ephemeral_pubkey = Point::from_hex(&entry.ephemeral_pubkey)
             .map_err(|e| Error::BadRequest(format!("Invalid ephemeral pubkey: {}", e)))?;
-
-        debug!("Ephemeral pubkey: {:?}", ephemeral_pubkey);
-        debug!("Winner weights: {:?}", winner_weights);
-        debug!("Players: {:?}", signed_contract.params().players);
-
-        let is_winner = winner_weights.iter().any(|(player_index, _)| {
-            if let Some(player) = signed_contract.params().players.get(*player_index) {
-                player.pubkey == ephemeral_pubkey
-            } else {
-                false
-            }
-        });
-
-        if !is_winner {
-            return Err(Error::BadRequest("Entry is not a winner".into()));
-        }
-
-        // Verify the private key matches the public key
-        let provided_private_key = Scalar::from_hex(&payout_info.ephemeral_private_key)
-            .map_err(|e| Error::BadRequest(format!("Invalid private key: {}", e)))?;
-
-        let derived_public_key = provided_private_key.base_point_mul();
-        if derived_public_key != ephemeral_pubkey {
-            return Err(Error::BadRequest(
-                "Invalid private key for this entry".into(),
-            ));
-        }
-
-        // Verify the payout preimage matches the hash
-        let provided_preimage =
-            dlctix::hashlock::preimage_from_hex(&payout_info.payout_preimage)
-                .map_err(|e| Error::BadRequest(format!("Invalid payout preimage: {}", e)))?;
-
-        let derived_hash = dlctix::hashlock::sha256(&provided_preimage);
-        if derived_hash.to_hex_string(dlctix::bitcoin::hex::Case::Lower) != entry.payout_hash {
-            return Err(Error::BadRequest(
-                "Invalid payout preimage for this entry".into(),
-            ));
-        }
-
-        if payout_info.ln_invoice.is_empty() {
-            return Err(Error::BadRequest("Invalid lightning invoice".into()));
-        }
-
-        // Calculate the payout amount based on winner's weight
-        let total_pool_sats = signed_contract.params().funding_value.to_sat();
-        let winner_weight = winner_weights
-            .iter()
-            .find_map(|(player_index, weight)| {
-                if let Some(player) = signed_contract.params().players.get(*player_index) {
-                    if player.pubkey == ephemeral_pubkey {
-                        Some(*weight)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| Error::BadRequest("Unable to determine winner weight".into()))?;
-
-        let payout_amount_sats = (total_pool_sats * winner_weight) / 100;
-
+        let rejected = |e: PayoutRejection| Error::BadRequest(e.to_string());
+        let payout_amount_sats =
+            winner_payout_sats(signed_contract.params(), &outcome, &ephemeral_pubkey)
+                .map_err(rejected)?;
+        verify_entry_key(ephemeral_private_key, &ephemeral_pubkey).map_err(rejected)?;
+        verify_payout_preimage(payout_preimage, &entry.payout_hash).map_err(rejected)?;
         debug!(
-            "Total pool: {} sats, Winner weight: {}%, Payout amount: {} sats",
-            total_pool_sats, winner_weight, payout_amount_sats
+            "Entry {} wins {} sats for outcome {:?}",
+            entry.id, payout_amount_sats, outcome
         );
+        Ok(payout_amount_sats)
+    }
 
-        let invoice_amount_sats = extract_amount_from_invoice(&payout_info.ln_invoice)
-            .map_err(|e| Error::BadRequest(format!("Invalid lightning invoice: {}", e)))?;
-
-        if let Some(invoice_amount_sats) = invoice_amount_sats {
-            if invoice_amount_sats != payout_amount_sats {
+    /// Pay a winner the invoice they pasted. The key and preimage arrive
+    /// before the payment, so the winner trusts the coordinator to pay; see
+    /// `PayoutInfo`.
+    pub async fn submit_ticket_payout(
+        &self,
+        pubkey: String,
+        competition_id: Uuid,
+        entry_id: Uuid,
+        payout_info: PayoutInfo,
+    ) -> Result<(), Error> {
+        let invoice =
+            parse_invoice(&payout_info.ln_invoice).map_err(|e| Error::BadRequest(e.to_string()))?;
+        let payout_amount_sats = self
+            .verify_payout_release(
+                &pubkey,
+                competition_id,
+                entry_id,
+                payout_info.ticket_id,
+                &payout_info.ephemeral_private_key,
+                &payout_info.payout_preimage,
+            )
+            .await?;
+        // An amountless invoice is paid the winnings; a stated amount must be
+        // exactly the winnings.
+        if let Some(invoice_msat) = invoice.amount_milli_satoshis() {
+            if invoice_msat != payout_amount_sats.saturating_mul(1000) {
                 return Err(Error::BadRequest(format!(
                     "Invoice amount {} sats does not match expected payout {} sats",
-                    invoice_amount_sats, payout_amount_sats
+                    invoice_msat / 1000,
+                    payout_amount_sats
                 )));
             }
         }
+        self.pay_payout(
+            entry_id,
+            payout_info.payout_preimage,
+            payout_info.ephemeral_private_key,
+            payout_info.ln_invoice,
+            payout_amount_sats,
+        )
+        .await?;
+        Ok(())
+    }
 
-        // The pending payout is recorded before anything is sent, and the
-        // database allows one live payout per entry, so a concurrent or
-        // repeated request cannot pay twice. The PayoutWatcher marks it paid
-        // once the payment settles.
+    /// One-click payout to the account's Lightning Address: resolve it, fetch
+    /// an invoice for exactly the winnings, and pay it. Not atomic, like the
+    /// pasted-invoice path; the enclave-escrowed preimage release is the
+    /// planned fix.
+    pub async fn claim_ticket_payout(
+        &self,
+        pubkey: String,
+        competition_id: Uuid,
+        entry_id: Uuid,
+        claim: PayoutClaimInfo,
+        address: &LightningAddress,
+    ) -> Result<PayoutClaimReceipt, Error> {
+        let payout_amount_sats = self
+            .verify_payout_release(
+                &pubkey,
+                competition_id,
+                entry_id,
+                claim.ticket_id,
+                &claim.ephemeral_private_key,
+                &claim.payout_preimage,
+            )
+            .await?;
+        let amount_msat = payout_amount_sats
+            .checked_mul(1000)
+            .ok_or_else(|| Error::BadRequest("Payout amount is out of range".into()))?;
+        let request = self
+            .lnurl
+            .resolve(address)
+            .await
+            .map_err(payout_unavailable)?;
+        let invoice = self
+            .lnurl
+            .request_invoice(&request, amount_msat)
+            .await
+            .map_err(payout_unavailable)?;
+        let payout_id = self
+            .pay_payout(
+                entry_id,
+                claim.payout_preimage,
+                claim.ephemeral_private_key,
+                invoice.to_string(),
+                payout_amount_sats,
+            )
+            .await?;
+        Ok(PayoutClaimReceipt {
+            payout_id,
+            lightning_address: address.to_string(),
+            amount_sats: payout_amount_sats,
+        })
+    }
+
+    /// Record the pending payout, then send the payment. The database allows
+    /// one live payout per entry, so a concurrent or repeated request cannot
+    /// pay twice; the PayoutWatcher marks it paid once the payment settles.
+    async fn pay_payout(
+        &self,
+        entry_id: Uuid,
+        payout_preimage: String,
+        ephemeral_private_key: String,
+        ln_invoice: String,
+        payout_amount_sats: u64,
+    ) -> Result<Uuid, Error> {
         let payout_id = self
             .competition_store
             .store_payout_info_pending(
                 entry_id,
-                payout_info.payout_preimage,
-                payout_info.ephemeral_private_key,
-                payout_info.ln_invoice.clone(),
+                payout_preimage,
+                ephemeral_private_key,
+                ln_invoice.clone(),
                 payout_amount_sats,
             )
             .await
@@ -3897,7 +3912,7 @@ impl Coordinator {
         if let Err(e) = self
             .ln
             .send_payment(
-                payout_info.ln_invoice,
+                ln_invoice,
                 payout_amount_sats,
                 60,   // TODO(@tee8z): make this timeout configurable, 60 second timeout
                 1000, // TODO(@tee8z): make this fee configurable, 1000 sat fee limit
@@ -3923,8 +3938,14 @@ impl Coordinator {
                 "Failed to initiate lightning payment".into(),
             ));
         }
-        Ok(())
+        Ok(payout_id)
     }
+}
+
+/// Resolution or invoice errors are the provider's or the address's; the
+/// winner can fix the address or paste an invoice instead.
+fn payout_unavailable(error: LnurlError) -> Error {
+    Error::BadRequest(format!("Lightning Address payout failed: {error}"))
 }
 
 fn generate_players(

@@ -22,6 +22,7 @@ async function registerAndLogin(page: Page): Promise<void> {
   await page.locator("#registerUsernameInput").fill(username);
   await page.locator("#registerPassword").fill(password);
   await page.locator("#registerPasswordConfirm").fill(password);
+  await page.locator("#registerLightningAddress").fill(`${username}@mock-wallet.dev`);
 
   await page.locator("#usernameRegisterStep1Button").click();
 

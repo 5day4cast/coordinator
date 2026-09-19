@@ -8,15 +8,15 @@ use crate::{
         admin_delete_competition_handler, admin_fee_estimates_fragment, admin_page_handler,
         admin_send_bitcoin_handler, admin_settle_test_invoice_handler,
         admin_wallet_address_fragment, admin_wallet_balance_fragment, admin_wallet_fragment,
-        admin_wallet_outputs_fragment, change_password, competitions_fragment,
+        admin_wallet_outputs_fragment, change_password, claim_ticket_payout, competitions_fragment,
         competitions_rows_fragment, create_competition, entries_fragment, entry_detail_fragment,
         entry_form_fragment, forgot_password_challenge, forgot_password_reset,
         get_aggregate_nonces, get_balance, get_competition, get_competitions,
         get_contract_parameters, get_entries, get_estimated_fee_rates, get_next_address,
         get_outputs, get_ticket_status, health, leaderboard_fragment, leaderboard_rows_fragment,
         login, login_username, payouts_fragment, public_page_handler, register, register_username,
-        request_competition_ticket, send_to_address, submit_final_signatures, submit_public_nonces,
-        submit_ticket_payout,
+        request_competition_ticket, send_to_address, set_lightning_address,
+        submit_final_signatures, submit_public_nonces, submit_ticket_payout,
     },
     config::Settings,
     domain::{
@@ -29,6 +29,7 @@ use crate::{
         file_utils::create_folder,
         keymeld::create_keymeld_service,
         lightning::{Ln, LnClient},
+        lnurl::{HttpsLnurlPay, LnurlPay},
         oracle::{Oracle, OracleClient},
     },
 };
@@ -36,7 +37,8 @@ use crate::{
 // Mock implementations only available with e2e-testing feature or debug builds
 #[cfg(any(feature = "e2e-testing", debug_assertions))]
 use crate::infra::{
-    bitcoin_mock::MockBitcoinClient, lightning_mock::MockLnClient, oracle_mock::MockOracle,
+    bitcoin_mock::MockBitcoinClient, lightning_mock::MockLnClient, lnurl_mock::MockLnurlPay,
+    oracle_mock::MockOracle,
 };
 use anyhow::anyhow;
 use axum::{
@@ -268,6 +270,7 @@ pub struct AppState {
     pub bitcoin: Arc<dyn Bitcoin>,
     pub coordinator: Arc<Coordinator>,
     pub users_info: Arc<UserInfo>,
+    pub lnurl: Arc<dyn LnurlPay>,
     pub background_threads: Arc<HashMap<String, JoinHandle<()>>>,
     pub forgot_password_challenges: Arc<RwLock<HashMap<String, (String, std::time::Instant)>>>,
 }
@@ -445,11 +448,19 @@ pub async fn build_app(
         None
     };
 
+    // Lightning Address resolution follows the Lightning client: mocked
+    // together, real together.
+    let lnurl = lnurl_resolver(
+        config.ln_settings.mock_enabled,
+        config.bitcoin_settings.network,
+    );
+
     let coordinator = Coordinator::new(
         oracle_client,
         competition_store,
         bitcoin_client.clone(),
         ln.clone(),
+        lnurl.clone(),
         keymeld_service,
         keymeld_gateway_url,
         config
@@ -583,6 +594,7 @@ pub async fn build_app(
         network: config.bitcoin_settings.network.to_string(),
         coordinator,
         users_info: Arc::new(UserInfo::new(users_store)),
+        lnurl,
         bitcoin: bitcoin_client,
         background_threads: Arc::new(threads),
         forgot_password_challenges: Arc::new(RwLock::new(HashMap::new())),
@@ -627,6 +639,7 @@ pub fn app(app_state: Arc<AppState>, origins: Vec<String>) -> Router {
         .route("/login", post(login))
         .route("/register", post(register))
         .route("/username/register", post(register_username))
+        .route("/lightning-address", post(set_lightning_address))
         .route("/username/login", post(login_username))
         .route("/username/change-password", post(change_password))
         .route("/username/forgot-password", post(forgot_password_challenge))
@@ -689,6 +702,10 @@ pub fn app(app_state: Arc<AppState>, origins: Vec<String>) -> Router {
         .route(
             "/api/v1/competitions/{competitionId}/entries/{entryId}/payout",
             post(submit_ticket_payout),
+        )
+        .route(
+            "/api/v1/competitions/{competitionId}/entries/{entryId}/claim",
+            post(claim_ticket_payout),
         )
         .route("/api/v1/entries", post(add_event_entry))
         .route("/api/v1/entries", get(get_entries))
@@ -844,6 +861,21 @@ fn get_mime_type(path: &str) -> &'static str {
         // Default
         _ => "application/octet-stream",
     }
+}
+
+#[cfg(any(feature = "e2e-testing", debug_assertions))]
+fn lnurl_resolver(mock: bool, network: Network) -> Arc<dyn LnurlPay> {
+    if mock {
+        Arc::new(MockLnurlPay::new(network))
+    } else {
+        Arc::new(HttpsLnurlPay::new(network))
+    }
+}
+
+/// Release builds refuse mocked Lightning before this is reached.
+#[cfg(not(any(feature = "e2e-testing", debug_assertions)))]
+fn lnurl_resolver(_mock: bool, network: Network) -> Arc<dyn LnurlPay> {
+    Arc::new(HttpsLnurlPay::new(network))
 }
 
 pub fn build_reqwest_client(client: Client) -> ClientWithMiddleware {

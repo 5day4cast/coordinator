@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use super::{User, UserStore};
+use super::{NewUsernameUser, User, UserStore};
 use crate::{api::routes::RegisterPayload, domain::Error};
 
 pub struct UserInfo {
@@ -22,24 +22,17 @@ impl UserInfo {
         self.user_store.login(pubkey).await
     }
 
-    pub async fn register_username_user(
+    pub async fn register_username_user(&self, user: NewUsernameUser) -> Result<User, Error> {
+        self.user_store.register_username_user(user).await
+    }
+
+    pub async fn update_lightning_address(
         &self,
-        nostr_pubkey: String,
-        username: String,
-        password_hash: String,
-        encrypted_nsec: String,
-        encrypted_bitcoin_private_key: String,
-        network: String,
-    ) -> Result<User, Error> {
+        nostr_pubkey: &str,
+        lightning_address: String,
+    ) -> Result<(), Error> {
         self.user_store
-            .register_username_user(
-                nostr_pubkey,
-                username,
-                password_hash,
-                encrypted_nsec,
-                encrypted_bitcoin_private_key,
-                network,
-            )
+            .update_lightning_address(nostr_pubkey, lightning_address)
             .await
     }
 

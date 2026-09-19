@@ -91,7 +91,7 @@ clap = { version = "4.3.23", features = ["derive", "env"] }
 config = "0.14.0"
 
 # Lightning
-lightning-invoice = "0.33.2"
+lightning-invoice = { version = "0.33.2", features = ["std"] }
 
 # Metrics
 prometheus = "0.13"

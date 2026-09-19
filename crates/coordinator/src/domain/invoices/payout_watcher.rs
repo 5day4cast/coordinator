@@ -111,7 +111,11 @@ impl PayoutWatcher {
                             match self
                                 .coordinator
                                 .competition_store
-                                .mark_payout_succeeded(payout.id, OffsetDateTime::now_utc())
+                                .mark_payout_succeeded(
+                                    payout.id,
+                                    OffsetDateTime::now_utc(),
+                                    payment.payment_preimage.clone(),
+                                )
                                 .await
                             {
                                 Ok(_) => {

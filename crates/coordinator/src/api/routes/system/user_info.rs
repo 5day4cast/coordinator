@@ -11,8 +11,9 @@ use crate::{
     },
     domain::{
         self,
-        users::{hash_auth_key, verify_auth_key, AuthKey, PasswordError},
+        users::{hash_auth_key, verify_auth_key, AuthKey, NewUsernameUser, PasswordError},
     },
+    infra::lnurl::LightningAddress,
     startup::AppState,
 };
 
@@ -70,6 +71,24 @@ pub async fn login(
 pub struct RegisterPayload {
     pub encrypted_bitcoin_private_key: String,
     pub network: String,
+    /// LUD-16 address winnings are paid to.
+    pub lightning_address: String,
+}
+
+/// Parse and resolve a Lightning Address before it is stored, so a typo or a
+/// dead provider fails at signup instead of at payout time.
+async fn checked_lightning_address(
+    state: &AppState,
+    raw: &str,
+) -> Result<LightningAddress, ApiError> {
+    let address = LightningAddress::parse(raw)
+        .map_err(|e| ApiError::from(domain::Error::BadRequest(e.to_string())))?;
+    state.lnurl.resolve(&address).await.map_err(|e| {
+        ApiError::from(domain::Error::BadRequest(format!(
+            "Could not resolve Lightning Address {address}: {e}"
+        )))
+    })?;
+    Ok(address)
 }
 
 pub async fn register(
@@ -82,6 +101,11 @@ pub async fn register(
     let pubkey = pubkey.to_bech32().expect("public bech32 format");
 
     debug!("registering user: {}", pubkey);
+    let address = checked_lightning_address(&state, &body.lightning_address).await?;
+    let body = RegisterPayload {
+        lightning_address: address.to_string(),
+        ..body
+    };
     match state.users_info.register(pubkey, body).await {
         Ok(user_info) => Ok((StatusCode::CREATED, Json(user_info))),
         Err(e) => {
@@ -100,12 +124,14 @@ pub struct UsernameRegisterPayload {
     pub encrypted_nsec: String,
     pub encrypted_bitcoin_private_key: String,
     pub network: String,
+    pub lightning_address: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsernameRegisterResponse {
     pub nostr_pubkey: String,
     pub username: String,
+    pub lightning_address: String,
 }
 
 fn validate_username(username: &str) -> Result<(), String> {
@@ -148,6 +174,9 @@ pub async fn register_username(
     if let Err(e) = validate_username(&body.username) {
         return Err(ApiError::from(domain::Error::BadRequest(e)));
     }
+    let lightning_address = checked_lightning_address(&state, &body.lightning_address)
+        .await?
+        .to_string();
 
     match state
         .users_info
@@ -161,6 +190,7 @@ pub async fn register_username(
                 Json(UsernameRegisterResponse {
                     nostr_pubkey,
                     username: body.username,
+                    lightning_address,
                 }),
             ));
         }
@@ -177,14 +207,15 @@ pub async fn register_username(
 
     let user = match state
         .users_info
-        .register_username_user(
+        .register_username_user(NewUsernameUser {
             nostr_pubkey,
-            body.username.clone(),
+            username: body.username.clone(),
             password_hash,
-            body.encrypted_nsec,
-            body.encrypted_bitcoin_private_key,
-            body.network,
-        )
+            encrypted_nsec: body.encrypted_nsec,
+            encrypted_bitcoin_private_key: body.encrypted_bitcoin_private_key,
+            network: body.network,
+            lightning_address,
+        })
         .await
     {
         Ok(user) => user,
@@ -199,6 +230,7 @@ pub async fn register_username(
         Json(UsernameRegisterResponse {
             nostr_pubkey: user.nostr_pubkey,
             username: user.username.unwrap_or_default(),
+            lightning_address: user.lightning_address.unwrap_or_default(),
         }),
     ))
 }
@@ -216,6 +248,7 @@ pub struct UsernameLoginResponse {
     pub encrypted_bitcoin_private_key: String,
     pub network: String,
     pub nostr_pubkey: String,
+    pub lightning_address: Option<String>,
 }
 
 pub async fn login_username(
@@ -257,6 +290,40 @@ pub async fn login_username(
             encrypted_bitcoin_private_key: user.encrypted_bitcoin_private_key,
             network: user.network,
             nostr_pubkey: user.nostr_pubkey,
+            lightning_address: user.lightning_address,
+        }),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightningAddressPayload {
+    pub lightning_address: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LightningAddressResponse {
+    pub lightning_address: String,
+}
+
+/// Change where winnings are paid. Signed with the account's Nostr key.
+pub async fn set_lightning_address(
+    State(state): State<Arc<AppState>>,
+    AuthedJson {
+        auth: NostrAuth { pubkey, .. },
+        body,
+    }: AuthedJson<LightningAddressPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    let nostr_pubkey = pubkey.to_bech32().expect("public bech32 format");
+    let address = checked_lightning_address(&state, &body.lightning_address).await?;
+    state
+        .users_info
+        .update_lightning_address(&nostr_pubkey, address.to_string())
+        .await?;
+    Ok((
+        StatusCode::OK,
+        Json(LightningAddressResponse {
+            lightning_address: address.to_string(),
         }),
     ))
 }

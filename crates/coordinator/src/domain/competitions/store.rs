@@ -331,10 +331,13 @@ impl CompetitionStore {
             .await
     }
 
+    /// `payment_preimage` is the proof of payment LND reports on settlement;
+    /// a later report never erases one already stored.
     pub async fn mark_payout_succeeded(
         &self,
         payout_id: Uuid,
         succeed_at: OffsetDateTime,
+        payment_preimage: Option<String>,
     ) -> Result<(), DatabaseWriteError> {
         let succeed_at_str = succeed_at
             .format(&time::format_description::well_known::Rfc3339)
@@ -345,10 +348,12 @@ impl CompetitionStore {
             .execute_write(move |pool| async move {
                 sqlx::query(
                     "UPDATE payouts
-                    SET succeed_at = ?
+                    SET succeed_at = ?,
+                        payment_preimage = COALESCE(payment_preimage, ?)
                     WHERE id = ?",
                 )
                 .bind(succeed_at_str)
+                .bind(payment_preimage)
                 .bind(payout_id_str)
                 .execute(&pool)
                 .await?;
@@ -397,7 +402,8 @@ impl CompetitionStore {
                 initiated_at,
                 succeed_at,
                 failed_at,
-                error
+                error,
+                payment_preimage
             FROM payouts
             WHERE id = ?",
         )
@@ -416,7 +422,8 @@ impl CompetitionStore {
                 initiated_at,
                 succeed_at,
                 failed_at,
-                error
+                error,
+                payment_preimage
             FROM payouts
             WHERE succeed_at IS NULL AND failed_at IS NULL
             ORDER BY initiated_at ASC",
@@ -460,7 +467,8 @@ impl CompetitionStore {
                 initiated_at,
                 succeed_at,
                 failed_at,
-                error
+                error,
+                payment_preimage
             FROM payouts
             WHERE entry_id = ",
         );

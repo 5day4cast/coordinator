@@ -119,12 +119,15 @@ that module, and the pins it was built from are in the tagged source.
 ## Known gaps
 
 - **The sellback is not atomic.** The payout preimage and entry key are sent
-  before the Lightning payout is made (see `PayoutInfo`). A Lightning Address
-  can automate payouts but cannot make them atomic, because its invoices use
-  the payee's own preimage. The planned fix is an NWC hold invoice whose
-  payment hash is `payout_hash`, settled by the browser; Lightning Address
-  payouts stay as the automated, trust-the-coordinator option. Until then,
-  the database allows one live payout per entry, and the payout row is
+  before the Lightning payout is made, both for a pasted invoice
+  (`PayoutInfo`) and for the one-click claim to the account's Lightning
+  Address (`PayoutClaimInfo`). Every account registers a Lightning Address;
+  the coordinator resolves it over LNURL-pay with an HTTPS-only,
+  redirect-free, public-hosts-only client (`infra/lnurl.rs`) and pays an
+  invoice for exactly the winnings. The planned fix keeps the address but
+  escrows the payout preimage in the Keymeld enclave, which releases it only
+  against the settled invoice's preimage and the LNURL metadata hash. Until
+  then, the database allows one live payout per entry, and the payout row is
   written before the payment is sent.
 - **Sold payout secrets are stored in plaintext.** After a sellback the
   coordinator keeps the entry key and preimage it bought, unencrypted, to sign

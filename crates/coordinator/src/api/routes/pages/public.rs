@@ -189,7 +189,16 @@ pub async fn payouts_fragment(
     HtmlNostrAuth(NostrAuth { pubkey, .. }): HtmlNostrAuth,
 ) -> Html<String> {
     let payouts = fetch_eligible_payouts(&state, &pubkey.to_hex()).await;
-    let content = payouts_page(&payouts);
+    let lightning_address = match pubkey.to_bech32() {
+        Ok(npub) => state
+            .users_info
+            .login(npub)
+            .await
+            .ok()
+            .and_then(|user| user.lightning_address),
+        Err(_) => None,
+    };
+    let content = payouts_page(&payouts, lightning_address.as_deref());
     render_fragment(&headers, &state, "Payouts - Fantasy Weather", content)
 }
 

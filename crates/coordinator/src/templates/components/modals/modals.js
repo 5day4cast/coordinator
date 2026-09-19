@@ -32,6 +32,11 @@ function resetRegisterModal() {
   const confirmInput = document.getElementById("registerPasswordConfirm");
   if (confirmInput) confirmInput.value = "";
 
+  for (const id of ["registerLightningAddress", "extensionLightningAddress"]) {
+    const input = document.getElementById(id);
+    if (input) input.value = "";
+  }
+
   const display = document.getElementById("usernameNsecDisplay");
   if (display) display.value = "";
 
@@ -339,6 +344,15 @@ class AuthManager {
       return;
     }
 
+    const lightningAddress = window.normalizeLightningAddress(
+      document.getElementById("registerLightningAddress")?.value,
+    );
+    const addressError = window.validateLightningAddress(lightningAddress);
+    if (addressError) {
+      if (errorElement) errorElement.textContent = addressError;
+      return;
+    }
+
     let credentials = null;
     try {
       window.nostrClient.initialize(window.SignerType.PrivateKey, null);
@@ -346,6 +360,7 @@ class AuthManager {
 
       this.pendingRegistration = {
         username,
+        lightningAddress,
         authKey: credentials.authKey,
         sealedNsec: window.nostrClient.sealForLogin(credentials),
       };
@@ -400,6 +415,7 @@ class AuthManager {
             encrypted_nsec: pending.sealedNsec,
             encrypted_bitcoin_private_key,
             network: this.network,
+            lightning_address: pending.lightningAddress,
           },
         );
       } catch (error) {
@@ -438,13 +454,22 @@ class AuthManager {
     const errorElement = document.querySelector("#extensionRegisterError");
     if (errorElement) errorElement.textContent = "";
 
+    const lightningAddress = window.normalizeLightningAddress(
+      document.getElementById("extensionLightningAddress")?.value,
+    );
+    const addressError = window.validateLightningAddress(lightningAddress);
+    if (addressError) {
+      if (errorElement) errorElement.textContent = addressError;
+      return;
+    }
+
     try {
       await window.nostrClient.initialize(window.SignerType.NIP07, null);
       this.authorizedClient = new window.AuthorizedClient(
         window.nostrClient,
         this.apiBase,
       );
-      await this.performRegistration();
+      await this.performRegistration(lightningAddress);
       await this.performLogin();
     } catch (error) {
       console.error("Extension registration failed:", error);
@@ -662,13 +687,13 @@ class AuthManager {
     }
   }
 
-  async performRegistration() {
+  async performRegistration(lightningAddress) {
     const wallet = window.DlcWallet.create(window.nostrClient, this.network);
     try {
       const payload = await wallet.encryptedBackup();
       const response = await this.authorizedClient.post(
         `${this.apiBase}/api/v1/users/register`,
-        payload,
+        { ...payload, lightning_address: lightningAddress },
       );
       if (!response.ok) throw new Error("Registration failed");
     } finally {
@@ -758,3 +783,27 @@ class AuthManager {
 }
 
 window.AuthManager = AuthManager;
+
+/**
+ * Lightning Addresses are case-insensitive; the server stores them lowercase.
+ */
+function normalizeLightningAddress(value) {
+  return (value ?? "").trim().toLowerCase();
+}
+
+/**
+ * Client-side shape check for a LUD-16 address (user@domain). The server
+ * also resolves the address, so this only catches obvious typos early.
+ */
+function validateLightningAddress(address) {
+  if (!address) {
+    return "Please enter the Lightning Address your winnings should be paid to";
+  }
+  if (!/^[a-z0-9._-]{1,64}@([a-z0-9-]{1,63}\.)+[a-z]{2,63}$/.test(address)) {
+    return "Lightning Address must look like you@wallet.com";
+  }
+  return null;
+}
+
+window.normalizeLightningAddress = normalizeLightningAddress;
+window.validateLightningAddress = validateLightningAddress;

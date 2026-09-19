@@ -9,6 +9,7 @@ use dlctix::{
     SigMap,
 };
 use log::{debug, error};
+use nostr_sdk::ToBech32;
 use serde::Deserialize;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -20,9 +21,10 @@ use crate::{
         routes::ApiError,
     },
     domain::{
-        AddEntry, Competition, CreateEvent, FundedContract, PayoutInfo, SearchBy, TicketResponse,
-        TicketStatus, UserEntry,
+        AddEntry, Competition, CreateEvent, Error as DomainError, FundedContract, PayoutClaimInfo,
+        PayoutClaimReceipt, PayoutInfo, SearchBy, TicketResponse, TicketStatus, UserEntry,
     },
+    infra::lnurl::LightningAddress,
     startup::AppState,
 };
 
@@ -304,6 +306,42 @@ pub async fn submit_ticket_payout(
         .map(|_| StatusCode::OK)
         .map_err(|e| {
             error!("error submitting payout information: {:?}", e);
+            e.into()
+        })
+}
+
+/// One-click payout to the Lightning Address on the account.
+pub async fn claim_ticket_payout(
+    State(state): State<Arc<AppState>>,
+    Path((competition_id, entry_id)): Path<(Uuid, Uuid)>,
+    AuthedJson {
+        auth: NostrAuth { pubkey, .. },
+        body: claim,
+    }: AuthedJson<PayoutClaimInfo>,
+) -> Result<Json<PayoutClaimReceipt>, ApiError> {
+    let npub = pubkey.to_bech32().expect("public bech32 format");
+    let user = state.users_info.login(npub).await?;
+    let address = user
+        .lightning_address
+        .as_deref()
+        .map(LightningAddress::parse)
+        .transpose()
+        .map_err(|e| ApiError::from(DomainError::BadRequest(e.to_string())))?
+        .ok_or_else(|| {
+            ApiError::from(DomainError::BadRequest(
+                "Add a Lightning Address on the payouts page first".into(),
+            ))
+        })?;
+    let pubkey = pubkey.to_hex();
+    debug!("payout claim by: {} for entry {}", pubkey, entry_id);
+
+    state
+        .coordinator
+        .claim_ticket_payout(pubkey, competition_id, entry_id, claim, &address)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            error!("error claiming payout: {:?}", e);
             e.into()
         })
 }
