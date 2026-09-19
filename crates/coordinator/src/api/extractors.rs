@@ -11,7 +11,7 @@ use log::{info, warn};
 use nostr_sdk::{
     hashes::{sha256::Hash as Sha256Hash, Hash},
     nips::nip98::{HttpData, HttpMethod},
-    Event, EventBuilder, Keys, Kind, PublicKey, Url,
+    Event, EventBuilder, Keys, Kind, PublicKey, Tag, TagKind, Url,
 };
 use serde::{de::DeserializeOwned, ser::SerializeStruct, Serialize, Serializer};
 use serde_json::json;
@@ -35,6 +35,10 @@ pub async fn create_auth_event(
     }
 
     EventBuilder::http_auth(http_data)
+        .tag(Tag::custom(
+            TagKind::Custom("request-id".into()),
+            [hex::encode(rand::random::<[u8; 16]>())],
+        ))
         .sign_with_keys(keys)
         .expect("Failed to sign event")
 }
@@ -398,6 +402,34 @@ mod tests {
             NostrAuth::from_request_parts(&mut attempt(), &AppState).await,
             Err(AuthError::Replayed)
         ));
+    }
+
+    #[tokio::test]
+    async fn repeated_requests_get_distinct_auth_events() {
+        let keys = Keys::generate();
+        let guard = Arc::new(Nip98ReplayGuard::new(16));
+        for _ in 0..16 {
+            let event = create_auth_event("GET", "http://localhost/test", None, &keys).await;
+            let mut parts = Request::builder()
+                .method("GET")
+                .uri("/test")
+                .header("host", "localhost")
+                .header(
+                    AUTHORIZATION,
+                    format!(
+                        "Nostr {}",
+                        BASE64.encode(serde_json::to_vec(&event).unwrap())
+                    ),
+                )
+                .extension(guard.clone())
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0;
+            assert!(NostrAuth::from_request_parts(&mut parts, &AppState)
+                .await
+                .is_ok());
+        }
     }
 
     #[tokio::test]

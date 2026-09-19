@@ -73,15 +73,7 @@ impl NostrClientCore {
         url: &str,
         body: Option<&[u8]>,
     ) -> Result<String, NostrError> {
-        let method = HttpMethod::from_str(&method.to_uppercase())
-            .map_err(|_| NostrError::InvalidRequest("HTTP method"))?;
-        let url = Url::from_str(url).map_err(|_| NostrError::InvalidRequest("URL"))?;
-
-        let mut http_data = HttpData::new(url, method);
-        if let Some(body) = body {
-            http_data = http_data.payload(Sha256Hash::hash(body));
-        }
-        let event = EventBuilder::http_auth(http_data)
+        let event = auth_event_builder(method, url, body)?
             .sign(self.signer()?)
             .await?;
         Ok(format!("Nostr {}", BASE64.encode(event.as_json())))
@@ -92,5 +84,55 @@ impl NostrClientCore {
         Ok(EventBuilder::new(Kind::HttpAuth, challenge)
             .sign(self.signer()?)
             .await?)
+    }
+}
+
+fn auth_event_builder(
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+) -> Result<EventBuilder, NostrError> {
+    let method = HttpMethod::from_str(&method.to_uppercase())
+        .map_err(|_| NostrError::InvalidRequest("HTTP method"))?;
+    let url = Url::from_str(url).map_err(|_| NostrError::InvalidRequest("URL"))?;
+    let mut http_data = HttpData::new(url, method);
+    if let Some(body) = body {
+        http_data = http_data.payload(Sha256Hash::hash(body));
+    }
+
+    // Event IDs exclude the signature and timestamps have one-second precision.
+    // Distinguish legitimate requests for the same resource within one second.
+    Ok(EventBuilder::http_auth(http_data).tag(Tag::custom(
+        TagKind::Custom("request-id".into()),
+        [hex::encode(rand::random::<[u8; 16]>())],
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_requests_in_the_same_second_have_unique_event_ids() {
+        let keys = Keys::generate();
+        let timestamp = Timestamp::from(1_000);
+        for (method, body) in [("GET", None), ("POST", Some(b"{}".as_slice()))] {
+            let make_event = || {
+                auth_event_builder(method, "https://coordinator.example/entries", body)
+                    .unwrap()
+                    .custom_created_at(timestamp)
+                    .sign_with_keys(&keys)
+                    .unwrap()
+            };
+            let first = make_event();
+            let second = make_event();
+            assert_ne!(first.id, second.id);
+            for event in [first, second] {
+                event.verify().unwrap();
+                assert!(event.content.is_empty());
+                let data = HttpData::try_from(event.tags.to_vec()).unwrap();
+                assert_eq!(data.payload, body.map(Sha256Hash::hash));
+            }
+        }
     }
 }

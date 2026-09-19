@@ -24,7 +24,35 @@ pub async fn create_auth_header(
         http_data = http_data.payload(Sha256Hash::hash(body));
     }
 
-    let event = EventBuilder::http_auth(http_data).sign_with_keys(keys)?;
+    // A new signature alone does not change the event ID used by replay guards.
+    let event = EventBuilder::http_auth(http_data)
+        .tag(Tag::custom(
+            TagKind::Custom("request-id".into()),
+            [hex::encode(rand::random::<[u8; 16]>())],
+        ))
+        .sign_with_keys(keys)?;
 
     Ok(format!("Nostr {}", BASE64.encode(event.as_json())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn repeated_requests_have_unique_event_ids() {
+        let keys = Keys::generate();
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..16 {
+            let header = create_auth_header(&keys, "GET", "http://localhost/entries", None)
+                .await
+                .unwrap();
+            let bytes = BASE64
+                .decode(header.strip_prefix("Nostr ").unwrap())
+                .unwrap();
+            let event: Event = serde_json::from_slice(&bytes).unwrap();
+            event.verify().unwrap();
+            assert!(ids.insert(event.id));
+        }
+    }
 }

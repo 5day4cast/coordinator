@@ -35,6 +35,8 @@ pub struct DlcWalletCore {
     nostr_client: NostrClientCore,
     secp: Secp256k1<All>,
     contracts: HashMap<Uuid, EntryContract>,
+    /// Remember every signed nonce context, even if an entry's contract is replaced.
+    signed_aggregates: HashMap<(Uuid, OutPoint, [u8; 32]), [u8; 32]>,
 }
 
 /// A contract the user has checked and agreed to sign for one entry.
@@ -42,8 +44,6 @@ struct EntryContract {
     dlc: TicketedDLC,
     /// Digest of the accepted `ContractParameters`; part of the nonce seed.
     params_digest: [u8; 32],
-    /// Digest of the aggregate nonces already signed in this page session.
-    signed_aggregate: Option<[u8; 32]>,
 }
 
 impl DlcWalletCore {
@@ -76,6 +76,7 @@ impl DlcWalletCore {
             nostr_client: nostr_client.clone(),
             secp: Secp256k1::new(),
             contracts: HashMap::new(),
+            signed_aggregates: HashMap::new(),
         }
     }
 
@@ -168,14 +169,8 @@ impl DlcWalletCore {
         let params_digest = json_digest(&params)?;
         let dlc = TicketedDLC::new(params, funding_outpoint)
             .map_err(|e| WalletError::Contract(e.to_string()))?;
-        self.contracts.insert(
-            entry_id,
-            EntryContract {
-                dlc,
-                params_digest,
-                signed_aggregate: None,
-            },
-        );
+        self.contracts
+            .insert(entry_id, EntryContract { dlc, params_digest });
         Ok(())
     }
 
@@ -240,9 +235,15 @@ impl DlcWalletCore {
             .contracts
             .get(&entry_id)
             .ok_or(WalletError::NoContract(entry_id))?;
-        if contract
-            .signed_aggregate
-            .is_some_and(|signed| signed != digest)
+        let nonce_context = (
+            entry_id,
+            contract.dlc.funding_outpoint(),
+            contract.params_digest,
+        );
+        if self
+            .signed_aggregates
+            .get(&nonce_context)
+            .is_some_and(|signed| *signed != digest)
         {
             return Err(WalletError::ConflictingAggregateNonces(entry_id));
         }
@@ -251,9 +252,7 @@ impl DlcWalletCore {
             .signing_session(entry_id, contract)?
             .compute_partial_signatures(aggregate_nonces)
             .map_err(|e| WalletError::Signing(e.to_string()))?;
-        if let Some(contract) = self.contracts.get_mut(&entry_id) {
-            contract.signed_aggregate = Some(digest);
-        }
+        self.signed_aggregates.insert(nonce_context, digest);
         Ok(signed.our_partial_signatures().clone())
     }
 
@@ -607,6 +606,49 @@ mod tests {
             signed,
             "re-signing the same aggregate is idempotent"
         );
+        assert!(matches!(
+            f.wallet.sign_aggregate_nonces(second, id),
+            Err(WalletError::ConflictingAggregateNonces(_))
+        ));
+    }
+
+    #[test]
+    fn replacing_a_contract_does_not_forget_signed_nonce_contexts() {
+        let f = fixture();
+        let psbt = funding_psbt(&f, our_key(&f));
+        let mut f = accepted(f, &psbt);
+        let id = f.entry_id;
+        let outpoint = OutPoint::new(psbt.unsigned_tx.compute_txid(), 0);
+        let nonces = f.wallet.generate_public_nonces(id).unwrap();
+        let first = nonces
+            .clone()
+            .map_values(|nonce| AggNonce::sum([nonce.clone()]));
+        let second = nonces.map_values(|nonce| AggNonce::sum([nonce.clone(), nonce.clone()]));
+        let signed = f.wallet.sign_aggregate_nonces(first.clone(), id).unwrap();
+
+        // Re-accepting the same contract must preserve the signing decision.
+        f.wallet
+            .add_contract(id, f.params.clone(), outpoint)
+            .unwrap();
+        assert!(matches!(
+            f.wallet.sign_aggregate_nonces(second.clone(), id),
+            Err(WalletError::ConflictingAggregateNonces(_))
+        ));
+
+        // Nor may replacing it and then returning to it reset that decision.
+        let mut changed = f.params.clone();
+        changed.fee_rate = FeeRate::from_sat_per_vb_u32(2);
+        f.wallet.add_contract(id, changed, outpoint).unwrap();
+        let changed_nonces = f
+            .wallet
+            .generate_public_nonces(id)
+            .unwrap()
+            .map_values(|nonce| AggNonce::sum([nonce.clone()]));
+        f.wallet.sign_aggregate_nonces(changed_nonces, id).unwrap();
+        f.wallet
+            .add_contract(id, f.params.clone(), outpoint)
+            .unwrap();
+        assert_eq!(f.wallet.sign_aggregate_nonces(first, id).unwrap(), signed);
         assert!(matches!(
             f.wallet.sign_aggregate_nonces(second, id),
             Err(WalletError::ConflictingAggregateNonces(_))
