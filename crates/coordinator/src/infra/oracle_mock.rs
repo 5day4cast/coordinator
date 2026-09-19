@@ -149,7 +149,7 @@ impl MockOracle {
         attestation_secret(
             self.generate_oracle_key(),
             self.generate_nonce(event_id),
-            &outcome.to_bytes(),
+            outcome.to_bytes(),
         )
     }
 }
