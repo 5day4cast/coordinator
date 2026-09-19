@@ -174,9 +174,11 @@ test.describe("Username/Password Authentication", () => {
     await expect(page.locator("#logoutContainer")).not.toBeVisible();
   });
 
-  test("duplicate username registration silently fails to prevent enumeration", async ({
+  test("duplicate username registration is rejected without replacing the account", async ({
     page,
   }) => {
+    // Registration and both login attempts each derive a key in the browser.
+    test.setTimeout(120_000);
     const username = uniqueUsername();
     const password = "testPassword123!";
     const differentPassword = "DifferentPass456!";
@@ -198,9 +200,11 @@ test.describe("Username/Password Authentication", () => {
     await page.locator("#usernameNsecSavedCheckbox").check();
     await page.locator("#usernameRegisterStep2Button").click();
 
-    await expect(page.locator("#usernameRegisterStep3")).toBeVisible({
-      timeout: 10000,
-    });
+    await expect(page.locator("#usernameRegisterStep2Error")).toBeVisible();
+    await expect(page.locator("#usernameRegisterStep2Error")).not.toBeEmpty();
+    await expect(page.locator("#usernameRegisterStep2")).toBeVisible();
+    await expect(page.locator("#usernameRegisterStep3")).toBeHidden();
+    await expect(page.locator("#logoutContainer")).toBeHidden();
 
     await page.locator("#closeResisterModal").click();
 
