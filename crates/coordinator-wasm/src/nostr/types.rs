@@ -1,13 +1,12 @@
-use async_trait::async_trait;
-use nostr_sdk::{
-    nips::nip04,
+use ::nostr::{
     signer::{SignerBackend, SignerError},
+    util::BoxedFuture,
     Event, Keys, PublicKey, UnsignedEvent,
 };
 use std::fmt;
 
 #[cfg(target_arch = "wasm32")]
-use nostr_sdk::nips::nip07::Nip07Signer;
+use nostr_browser_signer::BrowserSigner;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
@@ -22,7 +21,7 @@ pub enum SignerType {
 pub enum CustomSigner {
     Keys(Keys),
     #[cfg(target_arch = "wasm32")]
-    BrowserSigner(Nip07Signer),
+    BrowserSigner(BrowserSigner),
 }
 
 impl fmt::Debug for CustomSigner {
@@ -31,7 +30,7 @@ impl fmt::Debug for CustomSigner {
             CustomSigner::Keys(keys) => f.debug_tuple("Keys").field(keys).finish(),
             #[cfg(target_arch = "wasm32")]
             CustomSigner::BrowserSigner(signer) => {
-                f.debug_tuple("Nip07Signer").field(signer).finish()
+                f.debug_tuple("BrowserSigner").field(signer).finish()
             }
         }
     }
@@ -47,9 +46,7 @@ impl Clone for CustomSigner {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-impl nostr_sdk::NostrSigner for CustomSigner {
+impl ::nostr::NostrSigner for CustomSigner {
     fn backend(&self) -> SignerBackend<'_> {
         match self {
             CustomSigner::Keys(_) => SignerBackend::Keys,
@@ -58,80 +55,74 @@ impl nostr_sdk::NostrSigner for CustomSigner {
         }
     }
 
-    async fn get_public_key(&self) -> Result<PublicKey, SignerError> {
+    fn get_public_key(&self) -> BoxedFuture<'_, Result<PublicKey, SignerError>> {
         match self {
-            CustomSigner::Keys(keys) => Ok(keys.public_key()),
+            CustomSigner::Keys(keys) => keys.get_public_key(),
             #[cfg(target_arch = "wasm32")]
-            CustomSigner::BrowserSigner(signer) => signer.get_public_key().await,
+            CustomSigner::BrowserSigner(signer) => Box::pin(async move {
+                let public_key = signer.get_public_key().await?;
+                // PublicKey parsing is byte-only in nostr 0.44; preserve the
+                // previous curve validation at the extension boundary.
+                public_key.xonly().map_err(SignerError::backend)?;
+                Ok(public_key)
+            }),
         }
     }
 
-    async fn sign_event(&self, unsigned: UnsignedEvent) -> Result<Event, SignerError> {
+    fn sign_event(&self, unsigned: UnsignedEvent) -> BoxedFuture<'_, Result<Event, SignerError>> {
         match self {
-            CustomSigner::Keys(keys) => unsigned.sign_with_keys(keys).map_err(SignerError::backend),
+            CustomSigner::Keys(keys) => keys.sign_event(unsigned),
             #[cfg(target_arch = "wasm32")]
-            CustomSigner::BrowserSigner(signer) => signer.sign_event(unsigned).await,
+            CustomSigner::BrowserSigner(signer) => signer.sign_event(unsigned),
         }
     }
 
-    async fn nip44_encrypt(
-        &self,
-        public_key: &PublicKey,
-        content: &str,
-    ) -> Result<String, SignerError> {
+    fn nip44_encrypt<'a>(
+        &'a self,
+        public_key: &'a PublicKey,
+        content: &'a str,
+    ) -> BoxedFuture<'a, Result<String, SignerError>> {
         match self {
-            CustomSigner::Keys(keys) => {
-                use nostr_sdk::nips::nip44::{self, Version};
-                nip44::encrypt(keys.secret_key(), public_key, content, Version::default())
-                    .map_err(SignerError::backend)
-            }
+            CustomSigner::Keys(keys) => keys.nip44_encrypt(public_key, content),
             #[cfg(target_arch = "wasm32")]
-            CustomSigner::BrowserSigner(signer) => signer.nip44_encrypt(public_key, content).await,
+            CustomSigner::BrowserSigner(signer) => signer.nip44_encrypt(public_key, content),
         }
     }
 
-    async fn nip44_decrypt(
-        &self,
-        public_key: &PublicKey,
-        content: &str,
-    ) -> Result<String, SignerError> {
+    fn nip44_decrypt<'a>(
+        &'a self,
+        public_key: &'a PublicKey,
+        content: &'a str,
+    ) -> BoxedFuture<'a, Result<String, SignerError>> {
         match self {
-            CustomSigner::Keys(keys) => {
-                use nostr_sdk::nips::nip44;
-                nip44::decrypt(keys.secret_key(), public_key, content).map_err(SignerError::backend)
-            }
+            CustomSigner::Keys(keys) => keys.nip44_decrypt(public_key, content),
             #[cfg(target_arch = "wasm32")]
-            CustomSigner::BrowserSigner(signer) => signer.nip44_decrypt(public_key, content).await,
+            CustomSigner::BrowserSigner(signer) => signer.nip44_decrypt(public_key, content),
         }
     }
 
-    async fn nip04_encrypt(
-        &self,
-        public_key: &PublicKey,
-        content: &str,
-    ) -> Result<String, SignerError> {
+    fn nip04_encrypt<'a>(
+        &'a self,
+        public_key: &'a PublicKey,
+        content: &'a str,
+    ) -> BoxedFuture<'a, Result<String, SignerError>> {
         match self {
-            CustomSigner::Keys(keys) => {
-                nip04::encrypt(keys.secret_key(), public_key, content).map_err(SignerError::backend)
-            }
+            CustomSigner::Keys(keys) => keys.nip04_encrypt(public_key, content),
             #[cfg(target_arch = "wasm32")]
-            CustomSigner::BrowserSigner(signer) => signer.nip04_encrypt(public_key, content).await,
+            CustomSigner::BrowserSigner(signer) => signer.nip04_encrypt(public_key, content),
         }
     }
 
-    async fn nip04_decrypt(
-        &self,
-        public_key: &PublicKey,
-        encrypted_content: &str,
-    ) -> Result<String, SignerError> {
+    fn nip04_decrypt<'a>(
+        &'a self,
+        public_key: &'a PublicKey,
+        encrypted_content: &'a str,
+    ) -> BoxedFuture<'a, Result<String, SignerError>> {
         match self {
-            CustomSigner::Keys(keys) => {
-                nip04::decrypt(keys.secret_key(), public_key, encrypted_content)
-                    .map_err(SignerError::backend)
-            }
+            CustomSigner::Keys(keys) => keys.nip04_decrypt(public_key, encrypted_content),
             #[cfg(target_arch = "wasm32")]
             CustomSigner::BrowserSigner(signer) => {
-                signer.nip04_decrypt(public_key, encrypted_content).await
+                signer.nip04_decrypt(public_key, encrypted_content)
             }
         }
     }

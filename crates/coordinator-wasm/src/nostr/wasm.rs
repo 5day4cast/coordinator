@@ -1,5 +1,5 @@
 use super::{core::NostrClientCore, LoginKeys, NostrError, SignerType};
-use nostr_sdk::{JsonUtil, ToBech32};
+use ::nostr::{JsonUtil, ToBech32};
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 

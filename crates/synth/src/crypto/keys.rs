@@ -4,7 +4,7 @@ use dlctix::{
     bitcoin::bip32::{ChainCode, ChildNumber, DerivationPath, Xpriv},
     secp::Scalar,
 };
-use nostr_sdk::{Keys, SecretKey};
+use nostr::{Keys, SecretKey};
 use rand::RngCore;
 use sha2::Sha256;
 use std::str::FromStr;

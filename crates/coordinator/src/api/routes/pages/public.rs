@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use dlctix::secp::Point;
 use log::{debug, error, warn};
-use nostr_sdk::ToBech32;
+use nostr::ToBech32;
 
 use axum::{
     extract::{Path, State},
@@ -1223,7 +1223,7 @@ async fn fetch_leaderboard_scores(state: &AppState, competition_id: Uuid) -> Vec
         // Fetch entry details for username and raw score calculation
         if let Ok(Some(entry)) = state.coordinator.get_entry_by_id(oracle_entry.id).await {
             // Look up username
-            if let Ok(pubkey) = nostr_sdk::PublicKey::from_hex(&entry.pubkey) {
+            if let Ok(pubkey) = nostr::PublicKey::from_hex(&entry.pubkey) {
                 if let Ok(bech32) = pubkey.to_bech32() {
                     if let Ok(Some(name)) = state.users_info.get_username_by_pubkey(&bech32).await {
                         entry_score.username = name;

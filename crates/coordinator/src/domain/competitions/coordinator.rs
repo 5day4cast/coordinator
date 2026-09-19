@@ -49,7 +49,7 @@ use itertools::Itertools;
 use keymeld_sdk::prelude::UserId;
 use keymeld_sdk::types::{RegistrationContext, SignedRoster};
 use log::{debug, error, info, warn};
-use nostr_sdk::{nips::nip44, Keys, PublicKey as NostrPublicKey, SecretKey};
+use nostr::{nips::nip44, Keys, PublicKey as NostrPublicKey, SecretKey};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use serde::Serialize;

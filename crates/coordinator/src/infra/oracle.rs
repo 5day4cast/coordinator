@@ -10,7 +10,7 @@ use hyper::{
 };
 use log::{debug, error};
 use mime::APPLICATION_JSON;
-use nostr_sdk::{
+use nostr::{
     hashes::Hash as Sha256Hash, secp256k1::SecretKey as Secp256k1SecretKey, Keys,
     SecretKey as NostrSecretKey, ToBech32,
 };
@@ -619,7 +619,7 @@ mod tests {
         routing::{get, post},
         Json, Router,
     };
-    use nostr_sdk::nips::nip98::HttpData;
+    use nostr::nips::nip98::HttpData;
     use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
     use std::{
         collections::HashSet,
@@ -681,8 +681,8 @@ mod tests {
     struct RetryServer {
         url: String,
         body: Vec<u8>,
-        signer: nostr_sdk::PublicKey,
-        seen: Arc<Mutex<HashSet<nostr_sdk::EventId>>>,
+        signer: nostr::PublicKey,
+        seen: Arc<Mutex<HashSet<nostr::EventId>>>,
         response: serde_json::Value,
     }
 
@@ -692,7 +692,7 @@ mod tests {
         body: Bytes,
     ) -> (StatusCode, Json<serde_json::Value>) {
         let header = headers.get(AUTHORIZATION).unwrap().to_str().unwrap();
-        let auth: nostr_sdk::Event = serde_json::from_slice(
+        let auth: nostr::Event = serde_json::from_slice(
             &BASE64
                 .decode(header.strip_prefix("Nostr ").unwrap())
                 .unwrap(),

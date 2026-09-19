@@ -8,7 +8,7 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use hyper::{header::AUTHORIZATION, StatusCode};
 use log::{info, warn};
-use nostr_sdk::{
+use nostr::{
     hashes::{sha256::Hash as Sha256Hash, Hash},
     nips::nip98::{HttpData, HttpMethod},
     Event, EventBuilder, Keys, Kind, PublicKey, Tag, TagKind, Url,
@@ -19,6 +19,11 @@ use std::{str::FromStr, sync::Arc};
 use time::OffsetDateTime;
 
 use super::nip98_replay::{Nip98ReplayGuard, ReplayRejection, MAX_EVENT_SKEW_SECS};
+
+// Match the protocol crate's bounded NIP-98 parser. This extractor parses its
+// own event so it can also enforce replay protection and exact-body hashes.
+const MAX_AUTH_EVENT_BYTES: usize = 64 * 1024;
+const MAX_ENCODED_AUTH_EVENT_BYTES: usize = MAX_AUTH_EVENT_BYTES.div_ceil(3) * 4;
 
 pub async fn create_auth_event(
     method: &str,
@@ -73,9 +78,15 @@ where
             .strip_prefix("Nostr ")
             .ok_or(AuthError::InvalidAuthFormat)?;
 
+        if event_json.len() > MAX_ENCODED_AUTH_EVENT_BYTES {
+            return Err(AuthError::AuthEventTooLarge);
+        }
         let event_bytes = BASE64
             .decode(event_json)
             .map_err(|e| AuthError::InvalidBase64(e.to_string()))?;
+        if event_bytes.len() > MAX_AUTH_EVENT_BYTES {
+            return Err(AuthError::AuthEventTooLarge);
+        }
 
         let event: Event = serde_json::from_slice(&event_bytes)
             .map_err(|e| AuthError::InvalidEventJson(e.to_string()))?;
@@ -85,7 +96,7 @@ where
         }
 
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        let created_at = i64::try_from(event.created_at.as_u64()).unwrap_or(i64::MAX);
+        let created_at = i64::try_from(event.created_at.as_secs()).unwrap_or(i64::MAX);
         if (now - created_at).abs() > MAX_EVENT_SKEW_SECS {
             return Err(AuthError::ExpiredTimestamp);
         }
@@ -196,6 +207,8 @@ pub enum AuthError {
     InvalidLogin,
     #[error("Invalid authorization format")]
     InvalidAuthFormat,
+    #[error("Authorization event too large")]
+    AuthEventTooLarge,
     #[error("Invalid base64 encoding: {0}")]
     InvalidBase64(String),
     #[error("Invalid event JSON: {0}")]
@@ -230,8 +243,8 @@ pub enum AuthError {
     ReplayGuardMissing,
 }
 
-impl From<nostr_sdk::types::ParseError> for AuthError {
-    fn from(err: nostr_sdk::types::ParseError) -> Self {
+impl From<nostr::types::ParseError> for AuthError {
+    fn from(err: nostr::types::ParseError) -> Self {
         AuthError::InvalidUrl(err.to_string())
     }
 }
@@ -247,6 +260,7 @@ impl Serialize for AuthError {
             Self::NoAuthHeader => "no_auth_header",
             Self::InvalidLogin => "invalid_login",
             Self::InvalidAuthFormat => "invalid_auth_format",
+            Self::AuthEventTooLarge => "auth_event_too_large",
             Self::InvalidBase64(_) => "invalid_base_64",
             Self::InvalidEventJson(_) => "invalid_event_json",
             Self::InvalidEventKind => "invalid_event_kind",
@@ -312,7 +326,7 @@ impl IntoResponse for AuthError {
 mod tests {
     use super::*;
     use axum::http::Request;
-    use nostr_sdk::{
+    use nostr::{
         hashes::{sha256::Hash as Sha256Hash, Hash},
         Alphabet, EventBuilder, Keys, SingleLetterTag, Tag, TagKind, Timestamp,
     };
@@ -402,6 +416,68 @@ mod tests {
             NostrAuth::from_request_parts(&mut attempt(), &AppState).await,
             Err(AuthError::Replayed)
         ));
+    }
+
+    #[tokio::test]
+    async fn authorization_event_size_is_bounded_before_decoding_and_parsing() {
+        let encoded_too_large = "A".repeat(MAX_ENCODED_AUTH_EVENT_BYTES + 4);
+        // Base64 rounds to a four-byte boundary. This fits the encoded limit
+        // but exceeds the decoded limit and must be rejected before JSON parsing.
+        let decoded_too_large = BASE64.encode(vec![b' '; MAX_AUTH_EVENT_BYTES + 1]);
+        assert!(decoded_too_large.len() <= MAX_ENCODED_AUTH_EVENT_BYTES);
+        for encoded in [encoded_too_large, decoded_too_large] {
+            let mut parts = Request::builder()
+                .method("GET")
+                .uri("/test")
+                .header("host", "localhost")
+                .header(AUTHORIZATION, format!("Nostr {encoded}"))
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0;
+            assert!(matches!(
+                NostrAuth::from_request_parts(&mut parts, &AppState).await,
+                Err(AuthError::AuthEventTooLarge)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn forged_event_does_not_claim_a_valid_auth_event_id() {
+        let keys = Keys::generate();
+        let event = create_auth_event("GET", "http://localhost/test", None, &keys).await;
+        let mut forged = event.clone();
+        forged.sig = create_auth_event("GET", "http://localhost/test", None, &Keys::generate())
+            .await
+            .sig;
+        let guard = Arc::new(Nip98ReplayGuard::new(16));
+        let request = |event: &Event| {
+            Request::builder()
+                .extension(guard.clone())
+                .method("GET")
+                .uri("/test")
+                .header("host", "localhost")
+                .header(
+                    AUTHORIZATION,
+                    format!(
+                        "Nostr {}",
+                        BASE64.encode(serde_json::to_vec(event).unwrap())
+                    ),
+                )
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0
+        };
+        assert!(matches!(
+            NostrAuth::from_request_parts(&mut request(&forged), &AppState).await,
+            Err(AuthError::InvalidSignature(_))
+        ));
+        assert!(
+            NostrAuth::from_request_parts(&mut request(&event), &AppState)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

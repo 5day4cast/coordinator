@@ -7,7 +7,7 @@ DLC-based fantasy weather prediction market coordinator with keymeld signing.
 - [dlctix](https://github.com/tee8z/dlctix) - Ticketed DLC transactions, MuSig2 signing and validation (crates.io `dlctix`)
 - [keymeld](https://github.com/tee8z/keymeld) - Threshold signing for DLC contracts
 - [bdk_wallet](https://github.com/bitcoindevkit/bdk) - Browser wallet functionality
-- [nostr-sdk](https://github.com/rust-nostr/nostr) - Nostr protocol for user auth
+- [nostr](https://github.com/rust-nostr/nostr) - Nostr protocol for user auth
 - [maud](https://maud.lambda.xyz/) - Compile-time HTML templates
 - [sqlite](https://sqlite.org/) - Database with Litestream replication
 

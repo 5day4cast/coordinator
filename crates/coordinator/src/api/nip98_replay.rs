@@ -10,7 +10,7 @@
 //! deployment; running replicas behind a load balancer would need a shared
 //! store.
 
-use nostr_sdk::EventId;
+use nostr::EventId;
 use std::{
     collections::HashMap,
     sync::{Mutex, PoisonError},

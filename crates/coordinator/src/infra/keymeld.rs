@@ -17,7 +17,7 @@ use keymeld_sdk::{
     PollingConfig,
 };
 use log::{debug, error, info};
-use nostr_sdk::{nips::nip44, Keys};
+use nostr::{nips::nip44, Keys};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use uuid::Uuid;

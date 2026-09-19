@@ -1,6 +1,6 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use log::{debug, error};
-use nostr_sdk::{Event, ToBech32};
+use nostr::{Event, ToBech32};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 

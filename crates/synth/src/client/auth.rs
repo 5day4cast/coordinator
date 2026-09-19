@@ -1,6 +1,6 @@
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use nostr_sdk::{
+use nostr::{
     hashes::{sha256::Hash as Sha256Hash, Hash},
     prelude::*,
 };
