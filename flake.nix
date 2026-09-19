@@ -927,6 +927,8 @@
           ];
 
           nativeBuildInputs = commonNativeBuildInputs;
+          # Cross-compile secp256k1 without host glibc headers from cc-wrapper.
+          CC_wasm32_unknown_unknown = "${wasm32-clang}/bin/wasm32-clang";
 
           shellHook = ''
             export DATA_DIR="$PWD/data"
