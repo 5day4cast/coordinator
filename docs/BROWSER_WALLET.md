@@ -68,7 +68,9 @@ three are enough to recover it.
   fields, and on accepting each entry's nonces only once.
 
 In production, Keymeld runs MuSig2 inside the enclave and the browser rounds
-are not used.
+are not used. Either way the coordinator, as market maker, verifies the
+complete aggregated signature set (`TicketedDLC::into_signed_contract`) before
+it accepts the signed contract and funds it.
 
 ## Funding PSBT (escrow mode)
 
@@ -127,3 +129,9 @@ that module, and the pins it was built from are in the tagged source.
 - **Sold payout secrets are stored in plaintext.** After a sellback the
   coordinator keeps the entry key and preimage it bought, unencrypted, to sign
   the reclaim.
+- **Players do not verify contract signatures before buying a ticket.** The
+  browser only receives `ContractParameters`; the aggregated
+  `ContractSignatures` stay with the coordinator, so a player cannot run
+  `TicketedDLC::verify_signatures` for the outcomes they can win before paying
+  the ticket invoice. Publishing the pruned signature set per entry would close
+  this.

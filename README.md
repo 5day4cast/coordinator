@@ -4,7 +4,7 @@ DLC-based fantasy weather prediction market coordinator with keymeld signing.
 
 ## Built With
 
-- [dlctix](https://github.com/conduition/dlctix) - DLC cryptography and protocol implementation
+- [dlctix](https://github.com/tee8z/dlctix) - Ticketed DLC transactions, MuSig2 signing and validation (crates.io `dlctix`)
 - [keymeld](https://github.com/tee8z/keymeld) - Threshold signing for DLC contracts
 - [bdk_wallet](https://github.com/bitcoindevkit/bdk) - Browser wallet functionality
 - [nostr-sdk](https://github.com/rust-nostr/nostr) - Nostr protocol for user auth
