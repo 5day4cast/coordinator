@@ -1224,12 +1224,11 @@ async fn fetch_leaderboard_scores(state: &AppState, competition_id: Uuid) -> Vec
         if let Ok(Some(entry)) = state.coordinator.get_entry_by_id(oracle_entry.id).await {
             // Look up username
             if let Ok(pubkey) = nostr::PublicKey::from_hex(&entry.pubkey) {
-                if let Ok(bech32) = pubkey.to_bech32() {
-                    if let Ok(Some(name)) = state.users_info.get_username_by_pubkey(&bech32).await {
-                        entry_score.username = name;
-                    } else {
-                        entry_score.username = entry.pubkey[..8].to_string();
-                    }
+                let bech32 = pubkey.to_bech32().unwrap_or_else(|never| match never {});
+                if let Ok(Some(name)) = state.users_info.get_username_by_pubkey(&bech32).await {
+                    entry_score.username = name;
+                } else {
+                    entry_score.username = entry.pubkey[..8].to_string();
                 }
             }
 

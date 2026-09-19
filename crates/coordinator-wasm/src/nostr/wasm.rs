@@ -61,7 +61,9 @@ impl NostrClientWrapper {
     #[wasm_bindgen(js_name = "getPublicKey")]
     pub async fn get_public_key(&self) -> Result<String, JsValue> {
         let public_key = self.inner.public_key().await?;
-        Ok(public_key.to_bech32().map_err(NostrError::from)?)
+        Ok(public_key
+            .to_bech32()
+            .unwrap_or_else(|never| match never {}))
     }
 
     /// NIP-98 header. Pass the exact request body string (or null) that will be sent.

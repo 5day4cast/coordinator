@@ -252,7 +252,7 @@ impl OracleAuth {
             .0
             .public_key()
             .to_bech32()
-            .map_err(|error| reqwest_middleware::Error::Middleware(error.into()))?;
+            .unwrap_or_else(|never| match never {});
         if stored.event.id != write.event_id() || stored.coordinator_pubkey != owner {
             return Err(reqwest_middleware::Error::Middleware(anyhow!(
                 "oracle event belongs to a different coordinator or event"

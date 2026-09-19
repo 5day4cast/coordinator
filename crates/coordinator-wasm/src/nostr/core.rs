@@ -57,7 +57,11 @@ impl NostrClientCore {
 
     /// The local key as `nsec`, shown once at registration as the recovery key.
     pub fn nsec(&self) -> Result<Zeroizing<String>, NostrError> {
-        Ok(Zeroizing::new(self.local_secret_key()?.to_bech32()?))
+        let encoded = self
+            .local_secret_key()?
+            .to_bech32()
+            .unwrap_or_else(|never| match never {});
+        Ok(Zeroizing::new(encoded))
     }
 
     fn signer(&self) -> Result<&CustomSigner, NostrError> {

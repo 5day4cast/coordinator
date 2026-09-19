@@ -50,7 +50,7 @@ pub async fn login(
     NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let pubkey = pubkey.to_bech32().expect("public bech32 format");
+    let pubkey = pubkey.to_bech32().unwrap_or_else(|never| match never {});
     debug!("login with pubkey: {}", pubkey);
 
     match state.users_info.login(pubkey).await {
@@ -79,7 +79,7 @@ pub async fn register(
         body,
     }: AuthedJson<RegisterPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let pubkey = pubkey.to_bech32().expect("public bech32 format");
+    let pubkey = pubkey.to_bech32().unwrap_or_else(|never| match never {});
 
     debug!("registering user: {}", pubkey);
     match state.users_info.register(pubkey, body).await {
@@ -142,7 +142,7 @@ pub async fn register_username(
         body,
     }: AuthedJson<UsernameRegisterPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let nostr_pubkey = pubkey.to_bech32().expect("public bech32 format");
+    let nostr_pubkey = pubkey.to_bech32().unwrap_or_else(|never| match never {});
     debug!("registering user with username: {}", body.username);
 
     if let Err(e) = validate_username(&body.username) {
@@ -276,7 +276,7 @@ pub async fn change_password(
         body,
     }: AuthedJson<PasswordChangePayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let pubkey_str = pubkey.to_bech32().expect("public bech32 format");
+    let pubkey_str = pubkey.to_bech32().unwrap_or_else(|never| match never {});
     debug!("password change for user: {}", pubkey_str);
 
     let user = state.users_info.login(pubkey_str.clone()).await?;
@@ -421,9 +421,12 @@ pub async fn forgot_password_reset(
         domain::Error::BadRequest("Invalid event signature".to_string())
     })?;
 
-    let event_pubkey = event.pubkey.to_bech32().expect("public bech32 format");
+    let event_pubkey = event
+        .pubkey
+        .to_bech32()
+        .unwrap_or_else(|never| match never {});
     if event_pubkey != nostr_pubkey
-        || pubkey.to_bech32().expect("public bech32 format") != nostr_pubkey
+        || pubkey.to_bech32().unwrap_or_else(|never| match never {}) != nostr_pubkey
     {
         return Err(ApiError::from(domain::Error::BadRequest(
             "Event pubkey does not match account".to_string(),
