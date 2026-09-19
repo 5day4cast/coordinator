@@ -31,11 +31,6 @@ impl CollectingEntries {
         self.competition.has_full_entries() && self.competition.has_all_entries_paid()
     }
 
-    /// Get current entry count.
-    pub fn entry_count(&self) -> u64 {
-        self.competition.total_entries
-    }
-
     /// Get total allowed entries.
     pub fn total_allowed(&self) -> usize {
         self.competition.event_submission.total_allowed_entries

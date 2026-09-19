@@ -213,22 +213,10 @@ Its Litestream container does not guarantee a final remote sync after coordinato
 
 ### Competition State Machine
 
-1. **Created** → Competition created
-2. **EntriesCollected** → All entries paid
-3. **EscrowFundsConfirmed** → Escrow transactions confirmed
-4. **EventCreated** → Oracle event created
-5. **EntriesSubmitted** → Entries submitted to oracle
-6. **ContractCreated** → DLC contract parameters generated
-7. **NoncesCollected** → User nonces collected
-8. **AggregateNoncesGenerated** → Nonces aggregated
-9. **PartialSignaturesCollected** → User signatures collected
-10. **SigningComplete** → Signatures aggregated (via keymeld)
-11. **FundingBroadcasted** → Funding tx broadcast
-12. **FundingConfirmed** → Funding confirmed
-13. **Attested** → Oracle attestation received
-14. **OutcomeBroadcasted** → Outcome tx broadcast
-15. **DeltaBroadcasted** → Cooperative close txs broadcast
-16. **Completed** → All reclaim txs broadcast
+Competitions move through a typestate machine; the current state flow is
+documented in
+[`crates/coordinator/src/domain/competitions/states/mod.rs`](crates/coordinator/src/domain/competitions/states/mod.rs),
+next to the transition code. Any state can move to `Failed` or `Cancelled`.
 
 ### Frontend
 

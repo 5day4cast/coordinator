@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     domain::{competitions::PayoutError, Coordinator, PaymentStatus},
-    infra::lightning::Ln,
+    infra::lightning::{extract_payment_hash_from_invoice, Ln},
 };
 
 pub struct PayoutWatcher {
@@ -71,32 +71,31 @@ impl PayoutWatcher {
         debug!("Checking {} pending payouts", pending_payouts.len());
 
         for payout in pending_payouts {
-            let payment_hash = match crate::infra::lightning::extract_payment_hash_from_invoice(
-                &payout.payout_payment_request,
-            ) {
-                Ok(hash) => hash,
-                Err(e) => {
-                    error!("Invalid lightning invoice for payout {}: {}", payout.id, e);
+            let payment_hash =
+                match extract_payment_hash_from_invoice(&payout.payout_payment_request) {
+                    Ok(hash) => hash,
+                    Err(e) => {
+                        error!("Invalid lightning invoice for payout {}: {}", payout.id, e);
 
-                    // Mark payout as failed due to invalid invoice
-                    if let Err(mark_err) = self
-                        .coordinator
-                        .competition_store
-                        .mark_payout_failed(
-                            payout.id,
-                            OffsetDateTime::now_utc(),
-                            PayoutError::FailedToPayOut(e.to_string()),
-                        )
-                        .await
-                    {
-                        error!(
-                            "Failed to mark payout {} as failed: {}",
-                            payout.id, mark_err
-                        );
+                        // Mark payout as failed due to invalid invoice
+                        if let Err(mark_err) = self
+                            .coordinator
+                            .competition_store
+                            .mark_payout_failed(
+                                payout.id,
+                                OffsetDateTime::now_utc(),
+                                PayoutError::FailedToPayOut(e.to_string()),
+                            )
+                            .await
+                        {
+                            error!(
+                                "Failed to mark payout {} as failed: {}",
+                                payout.id, mark_err
+                            );
+                        }
+                        continue;
                     }
-                    continue;
-                }
-            };
+                };
 
             match self.ln.lookup_payment(&payment_hash).await {
                 Ok(payment) => {

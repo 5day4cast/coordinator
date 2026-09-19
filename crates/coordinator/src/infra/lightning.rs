@@ -130,14 +130,17 @@ impl LnClient {
         settings: LnSettings,
     ) -> Result<Self, anyhow::Error> {
         let macaroon = get_macaroon(&settings.macaroon_file_path)?;
-        let client = if let Some(tls_cert_path) = settings.tls_cert_path {
-            info!("Found tls.crt file, using for lnd client");
-            let cert = get_tls_cert(&tls_cert_path)?;
-
-            build_reqwest_tls_client(cert)?
-        } else {
-            info!("No tls.crt file found, skipping for lnd client");
-            client
+        let tls_cert = settings
+            .tls_cert_path
+            .as_deref()
+            .map(get_tls_cert)
+            .transpose()?;
+        let client = match (tls_cert, settings.dangerous_accept_invalid_tls) {
+            (None, false) => {
+                info!("No LND tls cert configured; verifying against the system roots");
+                client
+            }
+            (tls_cert, dangerous) => build_reqwest_tls_client(tls_cert, dangerous)?,
         };
         Ok(Self {
             base_url: Url::parse(&settings.base_url)?,
@@ -147,16 +150,25 @@ impl LnClient {
     }
 }
 
+/// Every LND request carries the admin macaroon, so the connection must be
+/// verified: against the pinned `tls.cert` when one is configured, otherwise
+/// the system roots. `dangerous_accept_invalid_certs` exists for local
+/// development against a self-signed cert without matching SANs; config
+/// refuses it on mainnet.
 pub fn build_reqwest_tls_client(
-    tls_cert: Certificate,
+    tls_cert: Option<Certificate>,
+    dangerous_accept_invalid_certs: bool,
 ) -> Result<ClientWithMiddleware, anyhow::Error> {
     let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
-    let client = Client::builder()
-        .add_root_certificate(tls_cert)
-        .danger_accept_invalid_certs(true) // only use this for development locally or for self signed certs
-        .tls_built_in_root_certs(true)
-        .build()?;
-    let client = ClientBuilder::new(client)
+    let mut builder = Client::builder().tls_built_in_root_certs(true);
+    if let Some(tls_cert) = tls_cert {
+        builder = builder.add_root_certificate(tls_cert);
+    }
+    if dangerous_accept_invalid_certs {
+        warn!("ln_settings.dangerous_accept_invalid_tls is set: LND certificate verification is disabled");
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    let client = ClientBuilder::new(builder.build()?)
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
         .build();
     Ok(client)
@@ -593,16 +605,30 @@ impl Ln for LnClient {
             .send()
             .await;
 
+        // `/v2/router/send` streams updates until the payment resolves. A slow
+        // payment hits the request timeout while still in flight; the payout
+        // stays pending and the payment subscriber records how it ends.
         match response {
             Ok(response) => {
-                info!("Payment: {}", response.text().await.unwrap());
-                Ok(())
+                let status = response.status();
+                match response.text().await {
+                    Ok(body) if status.is_success() => {
+                        info!("Payment: {}", body);
+                        Ok(())
+                    }
+                    Ok(body) => Err(anyhow!("Payment request failed with {}: {}", status, body)),
+                    Err(e) if e.is_timeout() => {
+                        debug!("Payment stream timed out with the payment in flight: {}", e);
+                        Ok(())
+                    }
+                    Err(e) => Err(anyhow!("Failed to read payment response: {}", e)),
+                }
             }
             Err(e) if e.is_timeout() => {
                 debug!("Payment request timed out (expected): {}", e);
                 Ok(())
             }
-            Err(e) => Err(anyhow::anyhow!("Failed to send payment: {}", e)),
+            Err(e) => Err(anyhow!("Failed to send payment: {}", e)),
         }
     }
 
@@ -610,22 +636,27 @@ impl Ln for LnClient {
         let (tx, rx) = mpsc::channel(100);
         let base_url = self.base_url.clone();
         let macaroon = self.macaroon.clone();
-
-        let client = Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()?;
+        // The same verified client as every other LND call.
+        let client = self.client.clone();
 
         tokio::spawn(async move {
             let url = format!("{}v1/invoices/subscribe", base_url);
             info!("Starting invoice subscription at {}", url);
 
-            loop {
+            // Ends when the subscriber drops its receiver, which shutdown does;
+            // until then, reconnect after a short pause.
+            while !tx.is_closed() {
                 if let Err(e) = process_invoice_stream(&client, &url, &macaroon, &tx).await {
                     warn!("Invoice subscription error: {}", e);
                 }
-                info!("Invoice subscription reconnecting...");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        info!("Invoice subscription reconnecting...");
+                    }
+                    _ = tx.closed() => {}
+                }
             }
+            info!("Invoice subscription stopped");
         });
 
         Ok(rx)
@@ -635,22 +666,27 @@ impl Ln for LnClient {
         let (tx, rx) = mpsc::channel(100);
         let base_url = self.base_url.clone();
         let macaroon = self.macaroon.clone();
-
-        let client = Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()?;
+        // The same verified client as every other LND call.
+        let client = self.client.clone();
 
         tokio::spawn(async move {
             let url = format!("{}v2/router/payments", base_url);
             info!("Starting payment subscription at {}", url);
 
-            loop {
+            // Ends when the subscriber drops its receiver, which shutdown does;
+            // until then, reconnect after a short pause.
+            while !tx.is_closed() {
                 if let Err(e) = process_payment_stream(&client, &url, &macaroon, &tx).await {
                     warn!("Payment subscription error: {}", e);
                 }
-                info!("Payment subscription reconnecting...");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        info!("Payment subscription reconnecting...");
+                    }
+                    _ = tx.closed() => {}
+                }
             }
+            info!("Payment subscription stopped");
         });
 
         Ok(rx)
@@ -699,7 +735,7 @@ fn parse_payment_update(line: &str) -> Option<PaymentUpdate> {
 }
 
 async fn process_invoice_stream(
-    client: &Client,
+    client: &ClientWithMiddleware,
     url: &str,
     macaroon: &SecretString,
     tx: &mpsc::Sender<InvoiceUpdate>,
@@ -736,7 +772,7 @@ async fn process_invoice_stream(
 }
 
 async fn process_payment_stream(
-    client: &Client,
+    client: &ClientWithMiddleware,
     url: &str,
     macaroon: &SecretString,
     tx: &mpsc::Sender<PaymentUpdate>,

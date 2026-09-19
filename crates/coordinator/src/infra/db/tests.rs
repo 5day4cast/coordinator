@@ -406,3 +406,80 @@ async fn failed_competition_delete_preserves_related_tickets() {
     assert_eq!(count, 1);
     bounded(database.close()).await.unwrap();
 }
+
+#[tokio::test]
+async fn taking_over_a_stale_reservation_rotates_the_ticket_and_reports_the_old_invoice() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = bounded(DBConnection::new(
+        directory.path().to_str().unwrap(),
+        "competitions",
+        DatabasePoolConfig::default(),
+        DatabaseType::Competitions,
+    ))
+    .await
+    .unwrap();
+    let store = CompetitionStore::new(database.clone());
+    let event_id = Uuid::now_v7();
+    let ticket_id = Uuid::now_v7();
+    bounded(database.execute_write(move |pool| async move {
+        sqlx::query("INSERT INTO competitions (id, created_at, event_submission) VALUES (?, datetime('now'), '{}')")
+            .bind(event_id.to_string())
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO tickets (id, event_id, encrypted_preimage, hash) VALUES (?, ?, 'old-preimage', 'old-hash')")
+            .bind(ticket_id.to_string())
+            .bind(event_id.to_string())
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }))
+    .await
+    .unwrap();
+
+    // Alice reserves the ticket, receives an invoice, then goes quiet past the window.
+    let alice = bounded(store.get_and_reserve_ticket(event_id, "alice"))
+        .await
+        .unwrap();
+    assert!(alice.superseded_payment_hash.is_none());
+    bounded(store.update_ticket_payment_request(
+        ticket_id,
+        "lnbc-alice",
+        OffsetDateTime::now_utc() + time::Duration::hours(1),
+    ))
+    .await
+    .unwrap();
+    bounded(database.execute_write(move |pool| async move {
+        sqlx::query("UPDATE tickets SET reserved_at = datetime('now', '-11 minutes') WHERE id = ?")
+            .bind(ticket_id.to_string())
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }))
+    .await
+    .unwrap();
+
+    // Bob takes it over: fresh hash and preimage, no invoice, Alice's hash reported.
+    let bob = bounded(store.get_and_reserve_ticket(event_id, "bob"))
+        .await
+        .unwrap();
+    assert_eq!(bob.superseded_payment_hash.as_deref(), Some("old-hash"));
+    assert_eq!(bob.ticket.id, ticket_id);
+    assert_eq!(bob.ticket.reserved_by.as_deref(), Some("bob"));
+    assert_ne!(bob.ticket.hash, "old-hash");
+    assert_ne!(bob.ticket.encrypted_preimage, "old-preimage");
+    assert!(bob.ticket.payment_request.is_none());
+
+    // A late payment on Alice's invoice can never be credited to Bob's ticket.
+    assert!(!bounded(store.mark_ticket_paid("old-hash", event_id))
+        .await
+        .unwrap());
+    assert!(bounded(store.mark_ticket_paid(&bob.ticket.hash, event_id))
+        .await
+        .unwrap());
+
+    // A paid ticket is never released, even if a later request fails.
+    assert!(!bounded(store.clear_ticket_reservation(ticket_id))
+        .await
+        .unwrap());
+    bounded(database.close()).await.unwrap();
+}
