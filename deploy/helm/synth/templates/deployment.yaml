@@ -89,6 +89,11 @@ spec:
             - name: config
               mountPath: /config
               readOnly: true
+            {{- if .Values.config.coordinator.adminTokenSecret.enabled }}
+            - name: admin-token
+              mountPath: /etc/synth-secrets
+              readOnly: true
+            {{- end }}
             {{- if .Values.persistence.enabled }}
             - name: data
               mountPath: /data
@@ -144,6 +149,14 @@ spec:
         - name: config
           configMap:
             name: synth-config
+        {{- if .Values.config.coordinator.adminTokenSecret.enabled }}
+        - name: admin-token
+          secret:
+            secretName: {{ .Values.config.coordinator.adminTokenSecret.name }}
+            items:
+              - key: {{ .Values.config.coordinator.adminTokenSecret.key }}
+                path: admin-token
+        {{- end }}
         {{- if .Values.persistence.enabled }}
         - name: data
           persistentVolumeClaim:

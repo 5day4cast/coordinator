@@ -68,6 +68,10 @@ data:
     invoice_watch_interval = {{ .Values.lightning.invoiceWatchIntervalSecs }}
     payout_watch_interval = {{ .Values.lightning.payoutWatchIntervalSecs }}
 
+    [admin_settings]
+    listen_addr = "0.0.0.0:{{ .Values.service.adminPort }}"
+    token_file = "/etc/coordinator-admin/token"
+
     [keymeld_settings]
     enabled = {{ .Values.keymeld.enabled }}
     dangerous_trust_unattested_enclaves = {{ .Values.keymeld.dangerousTrustUnattestedEnclaves }}

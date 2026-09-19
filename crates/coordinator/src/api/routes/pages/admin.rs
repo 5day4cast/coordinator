@@ -4,7 +4,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse},
-    Json,
+    Extension, Json,
 };
 use axum_extra::extract::Form;
 use log::{error, info};
@@ -14,6 +14,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
 use uuid::Uuid;
 
 use crate::{
+    api::admin_auth::AdminCsrf,
     infra::bitcoin::SendOptions,
     startup::AppState,
     templates::{
@@ -36,6 +37,7 @@ use crate::{
 fn render_admin_fragment(
     headers: &HeaderMap,
     state: &AppState,
+    csrf: &AdminCsrf,
     title: &str,
     content: Markup,
 ) -> Html<String> {
@@ -50,19 +52,24 @@ fn render_admin_fragment(
             oracle_base: &state.oracle_url,
             explorer_url: &state.explorer_url,
             network: &state.network,
+            csrf_token: csrf.0.as_deref(),
         };
         Html(admin_base(&config, content).into_string())
     }
 }
 
 /// Admin dashboard page (competition tab)
-pub async fn admin_page_handler(State(state): State<Arc<AppState>>) -> Html<String> {
+pub async fn admin_page_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(csrf): Extension<AdminCsrf>,
+) -> Html<String> {
     let config = AdminPageConfig {
         title: "5day4cast Admin",
         api_base: &state.private_url,
         oracle_base: &state.oracle_url,
         explorer_url: &state.explorer_url,
         network: &state.network,
+        csrf_token: csrf.0.as_deref(),
     };
 
     // Fetch stations from oracle and filter to top 200 cities
@@ -96,6 +103,7 @@ pub async fn admin_page_handler(State(state): State<Arc<AppState>>) -> Html<Stri
 /// Admin competition tab fragment (for HTMX tab switching)
 pub async fn admin_competition_fragment(
     State(state): State<Arc<AppState>>,
+    Extension(csrf): Extension<AdminCsrf>,
     headers: HeaderMap,
 ) -> Html<String> {
     // Fetch stations from oracle and filter to top 200 cities
@@ -122,12 +130,19 @@ pub async fn admin_competition_fragment(
 
     let defaults = CompetitionDefaults::default();
     let content = admin_dashboard(&stations_with_weather, &defaults);
-    render_admin_fragment(&headers, &state, "5day4cast Admin - Competition", content)
+    render_admin_fragment(
+        &headers,
+        &state,
+        &csrf,
+        "5day4cast Admin - Competition",
+        content,
+    )
 }
 
 /// Admin wallet page (full page for direct navigation, fragment for HTMX)
 pub async fn admin_wallet_fragment(
     State(state): State<Arc<AppState>>,
+    Extension(csrf): Extension<AdminCsrf>,
     headers: HeaderMap,
 ) -> Html<String> {
     let balance = fetch_balance(&state)
@@ -143,7 +158,7 @@ pub async fn admin_wallet_fragment(
         .unwrap_or_default();
 
     let content = wallet_page(&state.explorer_url, &balance, &address);
-    render_admin_fragment(&headers, &state, "5day4cast Admin - Wallet", content)
+    render_admin_fragment(&headers, &state, &csrf, "5day4cast Admin - Wallet", content)
 }
 
 /// Wallet balance fragment (for HTMX refresh)
@@ -509,6 +524,7 @@ pub async fn admin_delete_competition_handler(
 
 /// Test-only: Settle a ticket's HODL invoice without real Lightning payment.
 /// Used by the synthetic testing tool. Marks the ticket as both paid and settled.
+/// The admin router never registers this route on mainnet.
 pub async fn admin_settle_test_invoice_handler(
     State(state): State<Arc<AppState>>,
     Path(ticket_id): Path<Uuid>,
