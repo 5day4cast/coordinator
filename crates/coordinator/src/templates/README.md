@@ -43,16 +43,16 @@ At compile time, `build.rs`:
 1. Finds all `.js` files in `templates/`
 2. Concatenates them (shared first, base.js last)
 3. Minifies and hashes for cache busting
-4. Outputs to `crates/public_ui/`
+4. Outputs to `crates/public_ui/` (generated; gitignored)
 
 **CSS:**
-1. Starts with `crates/public_ui/styles.css` (base/global styles)
+1. Starts with `templates/static/styles.css` (base/global styles)
 2. Appends any `.css` files found in `templates/`
 3. Minifies into `styles.min.css`
 
 ## Loader Pattern
 
-External dependencies (WASM, large libraries) go in `crates/public_ui/loader.js`:
+External dependencies (WASM, large libraries) go in `templates/static/loader.js`:
 
 ```javascript
 // loader.js - not bundled, loaded directly
@@ -85,7 +85,7 @@ const client = new window.NostrClientWrapper();
 
 ## Adding CSS
 
-**Global styles:** Edit `crates/public_ui/styles.css`
+**Global styles:** Edit `templates/static/styles.css`
 
 **Component styles:** Add `mycomponent.css` next to `mod.rs`:
 ```
@@ -106,10 +106,10 @@ link rel="stylesheet" href="/ui/styles.min.css";
 | File | Purpose |
 |------|---------|
 | `build.rs` | Bundles JS/CSS at compile time |
-| `crates/public_ui/loader.js` | WASM/external deps, loads app bundle |
-| `crates/public_ui/styles.css` | Base/global styles (manual) |
-| `crates/public_ui/app.min.js` | Generated JS bundle |
-| `crates/public_ui/styles.min.css` | Generated CSS bundle |
+| `templates/static/loader.js` | WASM/external deps, loads app bundle |
+| `templates/static/styles.css` | Base/global styles (manual) |
+| `crates/public_ui/app.<hash>.min.js` | Generated JS bundle (do not edit) |
+| `crates/public_ui/styles.<hash>.min.css` | Generated CSS bundle (do not edit) |
 | `shared/*.js` | Utilities for all templates |
 | `layouts/base/base.js` | App init (runs last) |
 

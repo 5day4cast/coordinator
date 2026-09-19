@@ -83,11 +83,6 @@ impl FundingBroadcasted {
         self.competition.funding_confirmed_at = Some(OffsetDateTime::now_utc());
         CompetitionStatus::FundingConfirmed(FundingConfirmed::from_competition(self.competition))
     }
-
-    /// Get the funding transaction for confirmation checking.
-    pub fn funding_transaction(&self) -> Option<&Transaction> {
-        self.competition.funding_transaction.as_ref()
-    }
 }
 
 impl HasCompetitionData for FundingBroadcasted {
