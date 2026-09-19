@@ -12,6 +12,9 @@ data:
     {{- if .Values.config.coordinator.adminUrl }}
     admin_url = "{{ .Values.config.coordinator.adminUrl }}"
     {{- end }}
+    {{- if .Values.config.coordinator.adminTokenSecret.enabled }}
+    admin_token_file = "/etc/synth-secrets/admin-token"
+    {{- end }}
 
     [oracle]
     url = "{{ .Values.config.oracle.url }}"

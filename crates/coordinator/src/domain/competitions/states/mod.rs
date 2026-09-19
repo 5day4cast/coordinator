@@ -56,7 +56,6 @@ mod escrow_confirmed;
 mod event_created;
 mod failed;
 mod funding;
-pub mod processor;
 mod settling;
 
 pub use awaiting_attestation::*;
@@ -71,7 +70,6 @@ pub use escrow_confirmed::*;
 pub use event_created::*;
 pub use failed::*;
 pub use funding::*;
-pub use processor::*;
 pub use settling::*;
 
 use super::{Competition, CompetitionError};
@@ -192,13 +190,14 @@ impl CompetitionStatus {
         let competition_id = self.competition_id();
         let previous_state = self.state_name().to_string();
         let mut competition = self.into_competition();
-        competition.failed_at = Some(OffsetDateTime::now_utc());
+        let failed_at = OffsetDateTime::now_utc();
+        competition.failed_at = Some(failed_at);
         CompetitionStatus::Failed(Failed {
             competition_id,
-            failed_at: competition.failed_at.unwrap(),
+            failed_at,
             error,
             previous_state,
-            competition: Some(competition),
+            competition,
         })
     }
 
@@ -207,13 +206,14 @@ impl CompetitionStatus {
         let competition_id = self.competition_id();
         let previous_state = self.state_name().to_string();
         let mut competition = self.into_competition();
-        competition.cancelled_at = Some(OffsetDateTime::now_utc());
+        let cancelled_at = OffsetDateTime::now_utc();
+        competition.cancelled_at = Some(cancelled_at);
         CompetitionStatus::Cancelled(Cancelled {
             competition_id,
-            cancelled_at: competition.cancelled_at.unwrap(),
+            cancelled_at,
             reason,
             previous_state,
-            competition: Some(competition),
+            competition,
         })
     }
 

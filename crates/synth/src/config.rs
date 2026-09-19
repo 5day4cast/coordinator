@@ -14,8 +14,14 @@ pub struct SynthConfig {
 pub struct CoordinatorConfig {
     /// Coordinator API URL (e.g. http://coordinator.coordinator.svc.cluster.local:9990)
     pub url: String,
-    /// Coordinator admin URL (defaults to same as url)
+    /// Coordinator operator listener URL (competition creation, test settlement).
+    /// Set this separately from the participant API, including for local development.
     pub admin_url: Option<String>,
+    /// File holding the coordinator's operator token, sent as a bearer token to
+    /// `admin_url`. Required unless the coordinator allows unauthenticated
+    /// operator access.
+    #[serde(default)]
+    pub admin_token_file: Option<String>,
 }
 
 impl CoordinatorConfig {
@@ -75,7 +81,10 @@ impl Default for SynthConfig {
         Self {
             coordinator: CoordinatorConfig {
                 url: "http://coordinator.coordinator.svc.cluster.local:9990".to_string(),
-                admin_url: None,
+                admin_url: Some(
+                    "http://coordinator-admin.coordinator.svc.cluster.local:9991".to_string(),
+                ),
+                admin_token_file: None,
             },
             oracle: OracleConfig {
                 url: "http://noaa-oracle.noaa-oracle.svc.cluster.local:9800".to_string(),
@@ -118,6 +127,10 @@ pub fn load_config(path: Option<&str>) -> anyhow::Result<SynthConfig> {
         .set_default(
             "coordinator.url",
             "http://coordinator.coordinator.svc.cluster.local:9990",
+        )?
+        .set_default(
+            "coordinator.admin_url",
+            "http://coordinator-admin.coordinator.svc.cluster.local:9991",
         )?
         .set_default(
             "oracle.url",

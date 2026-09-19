@@ -17,9 +17,17 @@ struct Cli {
     #[arg(long, env = "COORDINATOR_URL", default_value = "http://localhost:9990")]
     url: String,
 
-    /// Coordinator admin URL (defaults to same as url)
-    #[arg(long, env = "COORDINATOR_ADMIN_URL")]
+    /// Coordinator operator listener URL
+    #[arg(
+        long,
+        env = "COORDINATOR_ADMIN_URL",
+        default_value = "http://localhost:9991"
+    )]
     admin_url: Option<String>,
+
+    /// File holding the coordinator's operator token, sent as a bearer token
+    #[arg(long, env = "COORDINATOR_ADMIN_TOKEN_FILE")]
+    admin_token_file: Option<String>,
 
     /// SQLite database path for synth data
     #[arg(long, env = "SYNTH_DB_PATH", default_value = "./data/synth.db")]
@@ -113,7 +121,10 @@ async fn main() -> Result<()> {
     setup_logging();
 
     let cli = Cli::parse();
-    let client = CoordinatorClient::new(&cli.url, cli.admin_url.as_deref());
+    let mut client = CoordinatorClient::new(&cli.url, cli.admin_url.as_deref());
+    if let Some(path) = &cli.admin_token_file {
+        client = client.with_admin_token_file(path)?;
+    }
 
     match cli.command {
         Commands::Competitions { action } => match action {

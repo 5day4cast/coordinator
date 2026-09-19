@@ -1,4 +1,4 @@
-use crate::SqliteConfigSerde;
+use crate::config::{DBSettings, SqliteConfigSerde};
 use log::{debug, error, warn};
 use sqlx::{
     migrate::MigrateDatabase,
@@ -549,8 +549,8 @@ impl From<SqliteConfigSerde> for SqliteConfig {
     }
 }
 
-impl From<crate::config::DBSettings> for DatabasePoolConfig {
-    fn from(config: crate::config::DBSettings) -> Self {
+impl From<DBSettings> for DatabasePoolConfig {
+    fn from(config: DBSettings) -> Self {
         Self {
             read_max_connections: config.read_max_connections,
             read_min_connections: config.read_min_connections,
@@ -882,12 +882,13 @@ pub fn parse_optional_sqlite_datetime(
         .map(|s| {
             // SQLite datetime format: "YYYY-MM-DD HH:MM:SS"
             // Parse as UTC since SQLite doesn't include timezone info
-            let format =
-                time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]")
-                    .map_err(|e| sqlx::Error::ColumnDecode {
-                        index: column.to_string(),
-                        source: Box::new(e),
-                    })?;
+            let format = time::format_description::parse_borrowed::<1>(
+                "[year]-[month]-[day] [hour]:[minute]:[second]",
+            )
+            .map_err(|e| sqlx::Error::ColumnDecode {
+                index: column.to_string(),
+                source: Box::new(e),
+            })?;
 
             let pdt = time::PrimitiveDateTime::parse(&s, &format).map_err(|e| {
                 sqlx::Error::ColumnDecode {

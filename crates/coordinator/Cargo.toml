@@ -53,7 +53,7 @@ toml.workspace = true
 sqlx.workspace = true
 
 # Nostr
-nostr-sdk.workspace = true
+nostr.workspace = true
 
 # Logging
 log.workspace = true
@@ -94,6 +94,8 @@ pem-rfc7468.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# Drives routers directly in route-isolation tests.
+tower = { version = "0.5", features = ["util"] }
 # Synthetic gateways must strip the SDK's gzip request bodies like the real gateway.
 tower-http = { workspace = true, features = ["decompression-gzip"] }
 maplit = "1.0.2"

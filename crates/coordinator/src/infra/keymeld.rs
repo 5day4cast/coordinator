@@ -1,7 +1,7 @@
 use crate::config::KeymeldSettings;
 use async_trait::async_trait;
 use coordinator_core::RegistrationAssignment;
-use dlctix::OutcomeIndex;
+use dlctix::{Outcome, OutcomeIndex, PayoutWeights};
 use keymeld_core::authorization::EnclaveRecipientAuthorization;
 pub use keymeld_sdk::types::SubsetDefinition;
 use keymeld_sdk::{
@@ -17,7 +17,7 @@ use keymeld_sdk::{
     PollingConfig,
 };
 use log::{debug, error, info};
-use nostr_sdk::{nips::nip44, Keys};
+use nostr::{nips::nip44, Keys};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use uuid::Uuid;
@@ -71,6 +71,49 @@ pub struct DlcSubsetInfo {
     pub definitions: Vec<SubsetDefinition>,
     /// Mapping from outcome index to subset ID (needed for signing)
     pub outcome_subset_ids: BTreeMap<OutcomeIndex, Uuid>,
+}
+
+/// Select an authorized subset by its actual payout recipients. Oracle outcomes
+/// use entry-ID order, while participant slots were allocated earlier in ticket order.
+fn outcome_subsets_for_payouts(
+    payouts: &BTreeMap<Outcome, PayoutWeights>,
+    player_user_ids: &[UserId],
+    coordinator: &UserId,
+    definitions: &[keymeld_core::protocol::SubsetDefinition],
+) -> Result<BTreeMap<OutcomeIndex, Uuid>, KeymeldError> {
+    let mut authorized = BTreeMap::new();
+    for definition in definitions {
+        let mut participants = definition.participants.clone();
+        participants.sort();
+        authorized
+            .entry(participants)
+            .or_insert(definition.subset_id);
+    }
+    let mut subsets = BTreeMap::new();
+    for (outcome, weights) in payouts {
+        let Outcome::Attestation(index) = outcome else {
+            continue;
+        };
+        let mut participants = vec![coordinator.clone()];
+        for (&player, &weight) in weights {
+            if weight > 0 {
+                participants.push(
+                    player_user_ids
+                        .get(player)
+                        .ok_or_else(|| KeymeldError::Signing("Invalid payout player index".into()))?
+                        .clone(),
+                );
+            }
+        }
+        participants.sort();
+        let subset = authorized.get(&participants).ok_or_else(|| {
+            KeymeldError::Signing(format!(
+                "No authorized subset for outcome {index} recipients"
+            ))
+        })?;
+        subsets.insert(*index, *subset);
+    }
+    Ok(subsets)
 }
 
 /// Trait for Keymeld signing operations
@@ -567,8 +610,8 @@ impl Keymeld for KeymeldService {
         &self,
         keygen_session: &DlcKeygenSession,
         signing_data: &SigningData,
-        _contract_params: &ContractParameters,
-        _player_user_ids: Vec<UserId>,
+        contract_params: &ContractParameters,
+        player_user_ids: Vec<UserId>,
     ) -> Result<DlcSignatureResults, KeymeldError> {
         let client = self.get_client()?;
 
@@ -594,10 +637,22 @@ impl Keymeld for KeymeldService {
         keygen_session.verify_restored_recipients(&restored_keygen)?;
         restored_keygen.verify_roster()?;
 
-        // Build batch items for all DLC transactions using the pre-registered subset IDs
-        // The outcome_subset_ids were created at keygen time and map outcome indices to subset UUIDs
+        // Reuse the authorized participant subsets with the contract's actual winners.
+        // Entries can be submitted in a different order than their ticket allocation.
+        let outcome_subsets = outcome_subsets_for_payouts(
+            &contract_params.outcome_payouts,
+            &player_user_ids,
+            &keygen_session
+                .authorization_manifest
+                .manifest
+                .coordinator_user_id,
+            &keygen_session
+                .authorization_manifest
+                .manifest
+                .subset_definitions,
+        )?;
         let dlc_batch = DlcBatchBuilder::new(signing_data)
-            .with_outcome_subsets(&keygen_session.outcome_subset_ids)
+            .with_outcome_subsets(&outcome_subsets)
             .build()
             .map_err(|e| KeymeldError::Signing(format!("Failed to build batch: {}", e)))?;
 
@@ -884,6 +939,53 @@ pub fn create_keymeld_service(
         coordinator_user_id,
         coordinator_private_key,
     )?))
+}
+
+#[cfg(test)]
+mod payout_subset_tests {
+    use super::*;
+
+    #[test]
+    fn signing_subsets_follow_reordered_winners_and_keep_the_authorized_ids() {
+        let coordinator = UserId::new_v7();
+        let players = vec![UserId::new_v7(), UserId::new_v7(), UserId::new_v7()];
+        let definitions: Vec<_> = [vec![0, 1], vec![0, 2], vec![1, 2], vec![0, 1, 2]]
+            .into_iter()
+            .map(|winners| keymeld_core::protocol::SubsetDefinition {
+                subset_id: Uuid::now_v7(),
+                participants: std::iter::once(coordinator.clone())
+                    .chain(winners.into_iter().map(|index| players[index].clone()))
+                    .collect(),
+            })
+            .collect();
+        let payouts = BTreeMap::from([
+            (Outcome::Attestation(0), BTreeMap::from([(1, 60), (2, 40)])),
+            (Outcome::Attestation(1), BTreeMap::from([(0, 40), (2, 60)])),
+            (
+                Outcome::Attestation(2),
+                BTreeMap::from([(0, 34), (1, 33), (2, 33)]),
+            ),
+            (Outcome::Expiry, BTreeMap::from([(0, 1), (1, 1), (2, 1)])),
+        ]);
+        let mapped =
+            outcome_subsets_for_payouts(&payouts, &players, &coordinator, &definitions).unwrap();
+        assert_eq!(
+            mapped,
+            BTreeMap::from([
+                (0, definitions[2].subset_id),
+                (1, definitions[1].subset_id),
+                (2, definitions[3].subset_id),
+            ])
+        );
+        assert!(
+            outcome_subsets_for_payouts(&payouts, &players, &coordinator, &definitions[..2])
+                .is_err()
+        );
+        let invalid = BTreeMap::from([(Outcome::Attestation(0), BTreeMap::from([(3, 100)]))]);
+        assert!(
+            outcome_subsets_for_payouts(&invalid, &players, &coordinator, &definitions).is_err()
+        );
+    }
 }
 
 #[cfg(test)]

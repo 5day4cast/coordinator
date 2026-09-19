@@ -1,12 +1,15 @@
 use super::{login::LoginKeys, CustomSigner, NostrError, SignerType};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use nostr_sdk::{
+use ::nostr::{
     hashes::{sha256::Hash as Sha256Hash, Hash},
     prelude::*,
     Event, EventBuilder, Keys, Kind, PublicKey, SecretKey,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use std::str::FromStr;
 use zeroize::Zeroizing;
+
+#[cfg(target_arch = "wasm32")]
+use nostr_browser_signer::BrowserSigner;
 
 /// The user's Nostr identity: signs NIP-98 HTTP auth and encrypts wallet
 /// backups to itself. It makes no relay connections.
@@ -27,7 +30,7 @@ impl NostrClientCore {
                 None => Keys::generate(),
             }),
             #[cfg(target_arch = "wasm32")]
-            SignerType::NIP07 => CustomSigner::BrowserSigner(Nip07Signer::new()?),
+            SignerType::NIP07 => CustomSigner::BrowserSigner(BrowserSigner::new()?),
         });
         Ok(())
     }
@@ -54,7 +57,11 @@ impl NostrClientCore {
 
     /// The local key as `nsec`, shown once at registration as the recovery key.
     pub fn nsec(&self) -> Result<Zeroizing<String>, NostrError> {
-        Ok(Zeroizing::new(self.local_secret_key()?.to_bech32()?))
+        let encoded = self
+            .local_secret_key()?
+            .to_bech32()
+            .unwrap_or_else(|never| match never {});
+        Ok(Zeroizing::new(encoded))
     }
 
     fn signer(&self) -> Result<&CustomSigner, NostrError> {
@@ -111,6 +118,50 @@ fn auth_event_builder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+
+    #[test]
+    fn local_signer_binds_the_http_auth_body() {
+        let keys = Keys::parse("0000000000000000000000000000000000000000000000000000000000000001")
+            .unwrap();
+        let pubkey = keys.public_key();
+        let client = NostrClientCore {
+            signer: Some(CustomSigner::Keys(keys)),
+        };
+        let body = br#"{"invoice":"ln-test"}"#;
+        let mut signing = std::pin::pin!(client.auth_header(
+            "POST",
+            "https://coordinator.example/payout",
+            Some(body),
+        ));
+        // The local signer performs no I/O; exercise the boxed-future trait
+        // through the same path used by the browser's private-key signer.
+        let Poll::Ready(header) = signing
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("local signing unexpectedly waited for I/O");
+        };
+        let bytes = BASE64
+            .decode(header.unwrap().strip_prefix("Nostr ").unwrap())
+            .unwrap();
+        let event: Event = serde_json::from_slice(&bytes).unwrap();
+        event.verify().unwrap();
+        assert_eq!(event.pubkey, pubkey);
+        assert_eq!(event.kind, Kind::HttpAuth);
+        assert!(event.content.is_empty());
+        let http = HttpData::try_from(event.tags.to_vec()).unwrap();
+        assert_eq!(http.url.as_str(), "https://coordinator.example/payout");
+        assert_eq!(http.method, HttpMethod::POST);
+        assert_eq!(http.payload, Some(Sha256Hash::hash(body)));
+        assert_ne!(
+            http.payload,
+            Some(Sha256Hash::hash(br#"{"invoice":"changed"}"#))
+        );
+    }
 
     #[test]
     fn repeated_requests_in_the_same_second_have_unique_event_ids() {

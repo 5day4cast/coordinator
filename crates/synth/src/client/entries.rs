@@ -3,7 +3,7 @@ use super::CoordinatorClient;
 use anyhow::{Context, Result};
 use coordinator_core::RegistrationAssignment;
 use keymeld_sdk::types::RegistrationContext;
-use nostr_sdk::Keys;
+use nostr::Keys;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;

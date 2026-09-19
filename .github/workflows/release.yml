@@ -7,439 +7,328 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release (e.g., 0.8.3)"
+        description: "Committed release version without v (e.g., 2.0.0)"
         required: true
         type: string
       dry_run:
-        description: "Dry run (build only, no release)"
+        description: "Build review artifacts without publishing a release or container images"
         required: false
         type: boolean
         default: true
 
+# Serialize publication, including updates to the latest container manifests.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  SQLX_OFFLINE: "true"
 
 jobs:
   prepare-release:
-    name: Prepare Release
+    name: Validate Release Source
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.get_version.outputs.version }}
-      version_name: ${{ steps.get_version.outputs.version_name }}
-      dry_run: ${{ steps.get_version.outputs.dry_run }}
-    steps:
-      - name: Get version from tag or input
-        id: get_version
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-            DRY_RUN="${{ github.event.inputs.dry_run }}"
-          else
-            VERSION=${GITHUB_REF#refs/tags/v}
-            DRY_RUN="false"
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "version_name=v$VERSION" >> $GITHUB_OUTPUT
-          echo "dry_run=$DRY_RUN" >> $GITHUB_OUTPUT
-          echo "Release version: $VERSION (dry_run: $DRY_RUN)"
-
-  update-versions:
-    name: Update Crate Versions
-    runs-on: ubuntu-latest
-    needs: prepare-release
-    if: needs.prepare-release.outputs.dry_run != 'true'
+      version: ${{ steps.release.outputs.version }}
+      version_name: ${{ steps.release.outputs.version_name }}
+      source: ${{ steps.release.outputs.source }}
+      dry_run: ${{ steps.release.outputs.dry_run }}
     steps:
       - uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-edit and update versions
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check release helper regressions
+        run: python3 -m unittest discover -s scripts -p 'test_release.py' -v
+      - name: Validate committed versions and release tag
+        id: release
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          VERSION="${{ needs.prepare-release.outputs.version }}"
-          echo "Updating all crates to version $VERSION"
-          cargo install cargo-edit --locked
-          cargo set-version --workspace $VERSION
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
+            DRY_RUN="$INPUT_DRY_RUN"
+          else
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            DRY_RUN=false
+          fi
+          SOURCE=$(python3 scripts/release.py validate --version "$VERSION" \
+            --event "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF" --dry-run "$DRY_RUN")
+          {
+            echo "version=$VERSION"
+            echo "version_name=v$VERSION"
+            echo "source=$SOURCE"
+            echo "dry_run=$DRY_RUN"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release v$VERSION from $SOURCE (dry_run=$DRY_RUN)" >> "$GITHUB_STEP_SUMMARY"
 
-          echo "Updated versions:"
-          grep "^version" Cargo.toml
-          grep "^version" crates/*/Cargo.toml
-
-      - name: Commit version updates
+  build-wasm:
+    name: Build Browser WASM
+    runs-on: ubuntu-latest
+    needs: prepare-release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.source }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install matching WASM bindings generator
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock crates/*/Cargo.toml
-          git commit -m "chore: bump version to ${{ needs.prepare-release.outputs.version }}" || echo "No changes to commit"
-          git push origin HEAD:master || echo "No changes to push"
+          BINDGEN_VERSION=$(python3 -c 'import tomllib; print(next(p["version"] for p in tomllib.load(open("Cargo.lock", "rb"))["package"] if p["name"] == "wasm-bindgen"))')
+          cargo install wasm-bindgen-cli --version "$BINDGEN_VERSION" --locked
+      - name: Build locked browser module
+        run: |
+          cargo build --locked --release --target wasm32-unknown-unknown -p coordinator-wasm
+          wasm-bindgen --target web --out-dir wasm-pkg --out-name coordinator_wasm \
+            target/wasm32-unknown-unknown/release/coordinator_wasm.wasm
+        env:
+          CC_wasm32_unknown_unknown: clang
+          CFLAGS_wasm32_unknown_unknown: "-Wno-error=implicit-function-declaration"
+      - name: Package WASM and source manifest
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          SOURCE: ${{ needs.prepare-release.outputs.source }}
+        run: python3 scripts/release.py wasm --version "$VERSION" --source "$SOURCE" --wasm wasm-pkg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-wasm
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
 
   build-release:
-    name: Build Release (${{ matrix.target }})
+    name: Build Native Package (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
-    needs: prepare-release
-    if: always() && needs.prepare-release.result == 'success'
+    needs: [prepare-release, build-wasm]
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: coordinator
-            asset_name: coordinator-x86_64-linux
+            asset: coordinator-x86_64-linux
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact_name: coordinator
-            asset_name: coordinator-x86_64-macos
+            asset: coordinator-x86_64-macos
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: coordinator
-            asset_name: coordinator-aarch64-macos
-
+            asset: coordinator-aarch64-macos
     steps:
       - uses: actions/checkout@v4
-
-      - name: Free up disk space (Linux)
+        with:
+          ref: ${{ needs.prepare-release.outputs.source }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Free disk space (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force || true
           sudo apt-get clean || true
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Install dependencies (Linux)
+      - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config
-
-      - name: Build release binary
-        run: |
-          cargo build --release --locked --target ${{ matrix.target }} -p coordinator
+      - name: Build locked native binaries and UI
         env:
-          SQLX_OFFLINE: "true"
-
-      - name: Create release package
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --target "$TARGET" -p coordinator
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-wasm
+          path: wasm-release
+      - name: Assemble complete package and verify required UI assets
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          SOURCE: ${{ needs.prepare-release.outputs.source }}
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
         run: |
-          VERSION="${{ needs.prepare-release.outputs.version }}"
-          PKG_NAME="${{ matrix.asset_name }}-${VERSION}"
-
-          mkdir -p "${PKG_NAME}/bin"
-          mkdir -p "${PKG_NAME}/migrations"
-
-          # Copy binary
-          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} "${PKG_NAME}/bin/"
-
-          # Copy migrations
-          cp -r crates/coordinator/migrations/* "${PKG_NAME}/migrations/"
-
-          # Copy the UI assets that build.rs bundled (served from ui_dir);
-          # the WASM module ships separately as coordinator-wasm-<version>.
-          mkdir -p "${PKG_NAME}/ui"
-          cp -r crates/public_ui/* "${PKG_NAME}/ui/"
-
-          # Create README
-          cat > "${PKG_NAME}/README.txt" << EOF
-          Coordinator v${VERSION}
-          =======================
-
-          A DLC competition coordination server.
-
-          Usage:
-            ./bin/coordinator --help
-
-          Migrations:
-            The migrations/ directory contains database migrations.
-            These are applied automatically on startup.
-
-          UI:
-            Point [ui_settings].ui_dir at the ui/ directory and unpack the
-            coordinator-wasm package into ui/pkg/.
-
-          For more info: https://github.com/5day4cast/coordinator
-          EOF
-
-          # Create archive
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a "${PKG_NAME}.zip" "${PKG_NAME}"
-          else
-            tar czf "${PKG_NAME}.tar.gz" "${PKG_NAME}"
-          fi
-
-          mkdir -p release
-          mv ${PKG_NAME}.* release/
-          ls -lh release/
-
-      - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
+          python3 scripts/release.py native --version "$VERSION" --source "$SOURCE" \
+            --target "$TARGET" --asset "$ASSET" --wasm "wasm-release/coordinator-wasm-$VERSION.tar.gz"
+      - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}
           path: release/*
-          retention-days: 7
+          if-no-files-found: error
+          retention-days: 14
 
-  build-wasm:
-    name: Build WASM Package
+  package-charts:
+    name: Package Helm Charts
     runs-on: ubuntu-latest
     needs: prepare-release
-    if: always() && needs.prepare-release.result == 'success'
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
-
-      - name: Install wasm-pack
-        run: cargo install wasm-pack
-
-      - name: Build WASM
+          ref: ${{ needs.prepare-release.outputs.source }}
+          persist-credentials: false
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.20.2
+      - name: Lint and package charts
         run: |
-          cd crates/coordinator-wasm
-          wasm-pack build --target web --release
-        env:
-          # Workaround for secp256k1-sys WASM build with clang 16+
-          # The wasm-sysroot in secp256k1-sys is missing memmove declaration in string.h
-          # Newer clang versions treat implicit function declarations as errors
-          CFLAGS_wasm32_unknown_unknown: "-Wno-error=implicit-function-declaration"
-
-      - name: Create WASM package
-        run: |
-          VERSION="${{ needs.prepare-release.outputs.version }}"
-          PKG_NAME="coordinator-wasm-${VERSION}"
-
-          mkdir -p "${PKG_NAME}"
-          cp -r crates/coordinator-wasm/pkg/* "${PKG_NAME}/"
-
-          tar czf "${PKG_NAME}.tar.gz" "${PKG_NAME}"
-
-          # Publish the hash of the module browsers actually load, so users can
-          # check the coordinator serves the release build (whose pinned keymeld
-          # enclave measurements they can audit in source).
-          sha256sum "${PKG_NAME}/coordinator_wasm_bg.wasm" "${PKG_NAME}.tar.gz" \
-            > "${PKG_NAME}.sha256"
-
           mkdir -p release
-          mv "${PKG_NAME}.tar.gz" "${PKG_NAME}.sha256" release/
-          ls -lh release/
-          cat "release/${PKG_NAME}.sha256"
-
-      - name: Upload WASM artifacts
-        uses: actions/upload-artifact@v4
+          helm lint deploy/helm/coordinator
+          helm lint deploy/helm/synth
+          helm package deploy/helm/coordinator --destination release
+          helm package deploy/helm/synth --destination release
+          python3 scripts/release.py checksums --output release
+      - uses: actions/upload-artifact@v4
         with:
-          name: release-wasm
+          name: release-charts
           path: release/*
-          retention-days: 7
+          if-no-files-found: error
+          retention-days: 14
+
+  build-docker:
+    name: Build Docker Images (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    needs: prepare-release
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.source }}
+          persist-credentials: false
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-gha-cache: false
+          use-flakehub: false
+      - name: Build images from the committed flake lock
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          REPO_LOWER="${GITHUB_REPOSITORY,,}"
+          ORG_LOWER="${GITHUB_REPOSITORY_OWNER,,}"
+          nix build .#docker-coordinator --no-update-lock-file --print-build-logs --out-link coordinator-image
+          docker load < coordinator-image
+          docker tag coordinator:latest "ghcr.io/$REPO_LOWER:$VERSION-$ARCH"
+          nix build .#docker-synth --no-update-lock-file --print-build-logs --out-link synth-image
+          docker load < synth-image
+          docker tag synth:latest "ghcr.io/$ORG_LOWER/synth:$VERSION-$ARCH"
+      - name: Save review images
+        if: needs.prepare-release.outputs.dry_run == 'true'
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p release
+          docker save "ghcr.io/${GITHUB_REPOSITORY,,}:$VERSION-$ARCH" \
+            "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/synth:$VERSION-$ARCH" | gzip -n > "release/docker-$VERSION-$ARCH.tar.gz"
+          python3 scripts/release.py checksums --output release
+      - uses: actions/upload-artifact@v4
+        if: needs.prepare-release.outputs.dry_run == 'true'
+        with:
+          name: review-docker-${{ matrix.arch }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      - name: Log in to GHCR
+        if: needs.prepare-release.outputs.dry_run != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push versioned architecture images
+        if: needs.prepare-release.outputs.dry_run != 'true'
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          docker push "ghcr.io/${GITHUB_REPOSITORY,,}:$VERSION-$ARCH"
+          docker push "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/synth:$VERSION-$ARCH"
+
+  publish-images:
+    name: Publish Container Manifests
+    runs-on: ubuntu-latest
+    needs: [prepare-release, build-release, build-wasm, package-charts, build-docker]
+    if: needs.prepare-release.outputs.dry_run != 'true'
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish version and latest from the same architecture images
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          for IMAGE in "ghcr.io/${GITHUB_REPOSITORY,,}" "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/synth"; do
+            for TAG in "$VERSION" latest; do
+              docker manifest create "$IMAGE:$TAG" "$IMAGE:$VERSION-amd64" "$IMAGE:$VERSION-arm64"
+              docker manifest push "$IMAGE:$TAG"
+            done
+          done
 
   create-release:
-    name: Create GitHub Release
+    name: Publish GitHub Release
     runs-on: ubuntu-latest
-    needs: [prepare-release, build-release, build-wasm]
+    needs: [prepare-release, build-release, build-wasm, package-charts, publish-images]
     if: needs.prepare-release.outputs.dry_run != 'true'
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
         with:
+          ref: ${{ needs.prepare-release.outputs.source }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
           path: artifacts
-
-      - name: Display structure of downloaded files
-        run: ls -R artifacts
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+      - name: Create release at the verified source commit
+        uses: softprops/action-gh-release@v2
         with:
           name: Release ${{ needs.prepare-release.outputs.version_name }}
           tag_name: ${{ needs.prepare-release.outputs.version_name }}
+          target_commitish: ${{ needs.prepare-release.outputs.source }}
           draft: false
           prerelease: false
+          body_path: docs/releases/${{ needs.prepare-release.outputs.version_name }}.md
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
             artifacts/**/*.tar.gz
-            artifacts/**/*.zip
+            artifacts/**/*.tgz
             artifacts/**/*.sha256
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # Build and push Docker images to GHCR
-  build-docker-amd64:
-    name: Build Docker Image (amd64)
-    runs-on: ubuntu-latest
-    needs: [prepare-release]
-    if: always() && needs.prepare-release.result == 'success'
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Free up disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force || true
-
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
-
-      - name: Setup Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
-        with:
-          use-gha-cache: false
-          use-flakehub: false
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push x86_64 image
-        run: |
-          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          ORG_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          VERSION="${{ needs.prepare-release.outputs.version }}"
-
-          # Build and push coordinator image
-          nix build .#docker-coordinator --print-build-logs
-          docker load < result
-          docker tag coordinator:latest ghcr.io/${REPO_LOWER}:${VERSION}-amd64
-          docker tag coordinator:latest ghcr.io/${REPO_LOWER}:latest-amd64
-
-          # Build and push synth image
-          nix build .#docker-synth --print-build-logs
-          docker load < result
-          docker tag synth:latest ghcr.io/${ORG_LOWER}/synth:${VERSION}-amd64
-          docker tag synth:latest ghcr.io/${ORG_LOWER}/synth:latest-amd64
-
-          if [ "${{ needs.prepare-release.outputs.dry_run }}" != "true" ]; then
-            docker push ghcr.io/${REPO_LOWER}:${VERSION}-amd64
-            docker push ghcr.io/${REPO_LOWER}:latest-amd64
-            docker push ghcr.io/${ORG_LOWER}/synth:${VERSION}-amd64
-            docker push ghcr.io/${ORG_LOWER}/synth:latest-amd64
-          fi
-
-  build-docker-arm64:
-    name: Build Docker Image (arm64)
-    runs-on: ubuntu-24.04-arm
-    needs: [prepare-release]
-    if: always() && needs.prepare-release.result == 'success'
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Free up disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force || true
-
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
-
-      - name: Setup Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
-        with:
-          use-gha-cache: false
-          use-flakehub: false
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push ARM64 image
-        run: |
-          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          ORG_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          VERSION="${{ needs.prepare-release.outputs.version }}"
-
-          # Build and push coordinator image
-          nix build .#docker-coordinator --print-build-logs
-          docker load < result
-          docker tag coordinator:latest ghcr.io/${REPO_LOWER}:${VERSION}-arm64
-          docker tag coordinator:latest ghcr.io/${REPO_LOWER}:latest-arm64
-
-          # Build and push synth image
-          nix build .#docker-synth --print-build-logs
-          docker load < result
-          docker tag synth:latest ghcr.io/${ORG_LOWER}/synth:${VERSION}-arm64
-          docker tag synth:latest ghcr.io/${ORG_LOWER}/synth:latest-arm64
-
-          if [ "${{ needs.prepare-release.outputs.dry_run }}" != "true" ]; then
-            docker push ghcr.io/${REPO_LOWER}:${VERSION}-arm64
-            docker push ghcr.io/${REPO_LOWER}:latest-arm64
-            docker push ghcr.io/${ORG_LOWER}/synth:${VERSION}-arm64
-            docker push ghcr.io/${ORG_LOWER}/synth:latest-arm64
-          fi
-
-  create-docker-manifest:
-    name: Create Docker Manifest
-    runs-on: ubuntu-latest
-    needs: [prepare-release, build-docker-amd64, build-docker-arm64]
-    if: needs.prepare-release.outputs.dry_run != 'true'
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create and push multi-arch manifest
-        run: |
-          VERSION="${{ needs.prepare-release.outputs.version }}"
-          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          ORG_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          IMAGE="ghcr.io/${REPO_LOWER}"
-          SYNTH_IMAGE="ghcr.io/${ORG_LOWER}/synth"
-
-          # Coordinator multi-arch manifests
-          docker manifest create ${IMAGE}:${VERSION} \
-            ${IMAGE}:${VERSION}-amd64 \
-            ${IMAGE}:${VERSION}-arm64
-          docker manifest push ${IMAGE}:${VERSION}
-
-          docker manifest create ${IMAGE}:latest \
-            ${IMAGE}:latest-amd64 \
-            ${IMAGE}:latest-arm64
-          docker manifest push ${IMAGE}:latest
-
-          echo "Pushed multi-arch image: ${IMAGE}:${VERSION}"
-
-          # Synth multi-arch manifests
-          docker manifest create ${SYNTH_IMAGE}:${VERSION} \
-            ${SYNTH_IMAGE}:${VERSION}-amd64 \
-            ${SYNTH_IMAGE}:${VERSION}-arm64
-          docker manifest push ${SYNTH_IMAGE}:${VERSION}
-
-          docker manifest create ${SYNTH_IMAGE}:latest \
-            ${SYNTH_IMAGE}:latest-amd64 \
-            ${SYNTH_IMAGE}:latest-arm64
-          docker manifest push ${SYNTH_IMAGE}:latest
-
-          echo "Pushed multi-arch image: ${SYNTH_IMAGE}:${VERSION}"
+            artifacts/**/SHA256SUMS

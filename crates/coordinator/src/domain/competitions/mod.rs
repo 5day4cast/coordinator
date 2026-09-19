@@ -112,7 +112,7 @@ impl FromRow<'_, SqliteRow> for EntryPayout {
             })?,
             payout_status,
             payout_payment_request: row.try_get("payout_payment_request")?,
-            payout_amount_sats: row.try_get("payout_amount_sats").unwrap_or(0) as u64,
+            payout_amount_sats: parse_required_u64(row, "payout_amount_sats")?,
             initiated_at: parse_required_datetime(row, "initiated_at")?,
             succeed_at,
             failed_at,
@@ -135,7 +135,9 @@ pub enum PayoutError {
     FailedToPayOut(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Debug` omits the sold payout secrets and they are never serialized: the
+/// browser re-derives them, and no client needs them back.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct UserEntry {
     pub id: Uuid,
     /// The id used by the oracle to assoicate the event with this entry
@@ -153,9 +155,11 @@ pub struct UserEntry {
     pub payout_hash: String,
     /// User's entry submission data (should be able to update until all entries have been collected)
     pub entry_submission: AddEventEntry,
-    /// User provided private de-encrypted, only used during payout
+    /// Sold to the coordinator at payout, plaintext; used to sign the reclaim.
+    #[serde(default, skip_serializing)]
     pub ephemeral_privatekey: Option<String>,
-    /// User provided preimage de-encrypted, only used during payout
+    /// Sold to the coordinator at payout, plaintext; opens the payout hash.
+    #[serde(default, skip_serializing)]
     pub payout_preimage: Option<String>,
     /// User's ephemeral private key encrypted to the keymeld enclave's public key.
     /// Used for server-side keymeld registration.
@@ -182,6 +186,22 @@ pub struct UserEntry {
     #[serde(with = "time::serde::rfc3339::option")]
     pub paid_out_at: Option<OffsetDateTime>,
     pub payout_ln_invoice: Option<String>,
+}
+
+impl std::fmt::Debug for UserEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserEntry")
+            .field("id", &self.id)
+            .field("event_id", &self.event_id)
+            .field("ticket_id", &self.ticket_id)
+            .field("pubkey", &self.pubkey)
+            .field("ephemeral_pubkey", &self.ephemeral_pubkey)
+            .field("payout_hash", &self.payout_hash)
+            .field("signed_at", &self.signed_at)
+            .field("paid_at", &self.paid_at)
+            .field("paid_out_at", &self.paid_out_at)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FromRow<'_, SqliteRow> for UserEntry {
@@ -340,11 +360,14 @@ impl std::fmt::Debug for PayoutInfo {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Debug` omits the preimage; `Ticket` is never serialized to clients.
+#[derive(Clone)]
 pub struct Ticket {
     pub id: Uuid,
     pub competition_id: Uuid,
     pub entry_id: Option<Uuid>,
+    /// Plaintext hex despite the name. Settles the ticket's HODL invoice, so it
+    /// must not reach logs or responses.
     pub encrypted_preimage: String,
     pub hash: String,
     pub payment_request: Option<String>,
@@ -357,6 +380,21 @@ pub struct Ticket {
     pub paid_at: Option<OffsetDateTime>,
     pub settled_at: Option<OffsetDateTime>,
     pub escrow_transaction: Option<String>, // Hex-encoded escrow transaction
+}
+
+impl std::fmt::Debug for Ticket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ticket")
+            .field("id", &self.id)
+            .field("competition_id", &self.competition_id)
+            .field("entry_id", &self.entry_id)
+            .field("hash", &self.hash)
+            .field("reserved_by", &self.reserved_by)
+            .field("reserved_at", &self.reserved_at)
+            .field("paid_at", &self.paid_at)
+            .field("settled_at", &self.settled_at)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FromRow<'_, SqliteRow> for Ticket {
@@ -509,6 +547,178 @@ pub struct CreateEvent {
     /// If not set, uses the coordinator-level default from config.
     #[serde(default)]
     pub relative_locktime_block_delta: Option<u16>,
+}
+
+impl CreateEvent {
+    /// Mirror NOAA Oracle 2.0's event bounds before allocating tickets, signer
+    /// subsets, or funds. The coordinator uses NOAA's three default weather metrics.
+    pub(crate) fn validate_oracle_settings(&self) -> Result<(), &'static str> {
+        if self.id.get_version_num() != 7 {
+            return Err("event id must be a UUIDv7");
+        }
+        if self.start_observation_date >= self.end_observation_date
+            || self.end_observation_date > self.signing_date
+        {
+            return Err(
+                "observation start must precede its end, and the end must not follow signing",
+            );
+        }
+        if self
+            .signing_date
+            .checked_add(Duration::DAY)
+            .and_then(|expiry| u32::try_from(expiry.unix_timestamp()).ok())
+            .is_none()
+        {
+            return Err("signing date is outside the oracle's DLC expiry range");
+        }
+        let entries = self.total_allowed_entries;
+        let places = self.number_of_places_win;
+        if !(2..=25).contains(&entries) {
+            return Err("total_allowed_entries must be between 2 and 25");
+        }
+        if !(1..=5).contains(&places) || places >= entries {
+            return Err("number_of_places_win must be between 1 and 5 and fewer than entries");
+        }
+        let outcomes = (entries - places + 1..=entries)
+            .try_fold(1usize, |count, factor| count.checked_mul(factor))
+            .and_then(|count| count.checked_add(1));
+        if !outcomes.is_some_and(|count| count <= 20_000) {
+            return Err("entries and winning places must produce at most 20,000 oracle outcomes");
+        }
+        if !(1..=50).contains(&self.locations.len()) {
+            return Err("an event must contain between 1 and 50 locations");
+        }
+        let mut distinct = std::collections::HashSet::new();
+        for location in &self.locations {
+            if location.is_empty()
+                || location.len() > 16
+                || !location
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            {
+                return Err(
+                    "station IDs must contain 1–16 ASCII letters, digits, hyphens, or underscores",
+                );
+            }
+            if !distinct.insert(location) {
+                return Err("event locations must be distinct");
+            }
+        }
+        if !(1..=self.locations.len() * 3).contains(&self.number_of_values_per_entry) {
+            return Err(
+                "number_of_values_per_entry must be between 1 and three times the location count",
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod oracle_event_validation_tests {
+    use super::*;
+
+    fn event() -> CreateEvent {
+        let start = OffsetDateTime::from_unix_timestamp(1_900_000_000).unwrap();
+        CreateEvent {
+            id: Uuid::now_v7(),
+            signing_date: start + Duration::days(2),
+            start_observation_date: start,
+            end_observation_date: start + Duration::DAY,
+            locations: vec!["KORD".into()],
+            number_of_values_per_entry: 3,
+            number_of_places_win: 1,
+            total_allowed_entries: 2,
+            entry_fee: 1_000,
+            coordinator_fee_percentage: 10,
+            total_competition_pool: 1_800,
+            relative_locktime_block_delta: None,
+        }
+    }
+
+    #[test]
+    fn rejects_oracle_incompatible_events_before_resource_allocation() {
+        type InvalidCase = (&'static str, fn(&mut CreateEvent));
+        let cases: &[InvalidCase] = &[
+            ("non-v7 id", |event| event.id = Uuid::nil()),
+            ("zero entries", |event| event.total_allowed_entries = 0),
+            ("one entry", |event| event.total_allowed_entries = 1),
+            ("too many entries", |event| event.total_allowed_entries = 26),
+            ("unbounded entries", |event| {
+                event.total_allowed_entries = usize::MAX
+            }),
+            ("zero places", |event| event.number_of_places_win = 0),
+            ("all entries win", |event| event.number_of_places_win = 2),
+            ("too many places", |event| {
+                event.total_allowed_entries = 10;
+                event.number_of_places_win = 6;
+            }),
+            ("too many outcomes", |event| {
+                event.total_allowed_entries = 25;
+                event.number_of_places_win = 4;
+            }),
+            ("empty window", |event| {
+                event.start_observation_date = event.end_observation_date
+            }),
+            ("signing before end", |event| {
+                event.signing_date = event.start_observation_date
+            }),
+            ("expiry overflow", |event| {
+                event.signing_date =
+                    OffsetDateTime::from_unix_timestamp(i64::from(u32::MAX)).unwrap()
+            }),
+            ("no locations", |event| event.locations.clear()),
+            ("too many locations", |event| {
+                event.locations = (0..51).map(|index| format!("S{index}")).collect()
+            }),
+            ("duplicate location", |event| {
+                event.locations.push("KORD".into())
+            }),
+            ("no picks", |event| event.number_of_values_per_entry = 0),
+            ("too many picks", |event| {
+                event.number_of_values_per_entry = 4
+            }),
+        ];
+        for (name, invalidate) in cases {
+            let mut candidate = event();
+            invalidate(&mut candidate);
+            assert!(candidate.validate_oracle_settings().is_err(), "{name}");
+        }
+        for station in [
+            "",
+            "ABCDEFGHIJKLMNOPQ",
+            "K ORD",
+            "KORD'",
+            "é",
+            "K/ORD",
+            "K;ORD",
+        ] {
+            let mut candidate = event();
+            candidate.locations = vec![station.into()];
+            assert!(candidate.validate_oracle_settings().is_err(), "{station:?}");
+        }
+    }
+
+    #[test]
+    fn accepts_oracle_boundary_configurations() {
+        for (entries, places) in [(2, 1), (25, 3), (9, 5)] {
+            let mut candidate = event();
+            candidate.total_allowed_entries = entries;
+            candidate.number_of_places_win = places;
+            candidate.signing_date = candidate.end_observation_date;
+            assert_eq!(candidate.validate_oracle_settings(), Ok(()));
+        }
+        let mut candidate = event();
+        candidate.locations = (0..50)
+            .map(|index| format!("station-{index}_test"))
+            .collect();
+        candidate.number_of_values_per_entry = 150;
+        assert_eq!(candidate.validate_oracle_settings(), Ok(()));
+        candidate.locations = vec!["ABCDEFGHIJKLMNOP".into()];
+        candidate.number_of_values_per_entry = 1;
+        candidate.signing_date =
+            OffsetDateTime::from_unix_timestamp(i64::from(u32::MAX) - 86_400).unwrap();
+        assert_eq!(candidate.validate_oracle_settings(), Ok(()));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1235,11 +1445,11 @@ impl FromRow<'_, SqliteRow> for Competition {
             })?,
             created_at: parse_required_datetime(row, "created_at")?,
             event_submission: parse_required_blob_json(row, "event_submission")?,
-            total_entries: row.try_get("total_entries").unwrap_or(0) as u64,
-            total_entry_nonces: row.try_get("total_entry_nonces").unwrap_or(0) as u64,
-            total_signed_entries: row.try_get("total_signed_entries").unwrap_or(0) as u64,
-            total_paid_entries: row.try_get("total_paid_entries").unwrap_or(0) as u64,
-            total_paid_out_entries: row.try_get("total_paid_out_entries").unwrap_or(0) as u64,
+            total_entries: parse_required_u64(row, "total_entries")?,
+            total_entry_nonces: parse_required_u64(row, "total_entry_nonces")?,
+            total_signed_entries: parse_required_u64(row, "total_signed_entries")?,
+            total_paid_entries: parse_required_u64(row, "total_paid_entries")?,
+            total_paid_out_entries: parse_required_u64(row, "total_paid_out_entries")?,
             event_announcement: parse_optional_blob_json(row, "event_announcement")?,
             funding_outpoint: parse_optional_blob_json(row, "funding_outpoint")?,
             funding_psbt_base64: row.get("funding_psbt_base64"),
@@ -1300,4 +1510,14 @@ pub enum CompetitionError {
     Expired(String),
     #[error("Invalid state transition: {0}")]
     InvalidStateTransition(String),
+}
+
+/// A NOT NULL integer or COUNT column as `u64`, failing closed on NULL or a
+/// negative value instead of silently reading zero.
+fn parse_required_u64(row: &SqliteRow, column: &str) -> Result<u64, sqlx::Error> {
+    let value: i64 = row.try_get(column)?;
+    u64::try_from(value).map_err(|e| sqlx::Error::ColumnDecode {
+        index: column.to_string(),
+        source: Box::new(e),
+    })
 }

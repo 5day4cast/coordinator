@@ -32,7 +32,6 @@
           inherit system overlays;
         };
 
-        # Use Rust 1.92.0 to match current toolchain
         # Use latest stable Rust - older versions have issues with secp256k1-sys WASM builds
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "rust-analyzer" ];
@@ -40,6 +39,7 @@
         };
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+        workspaceVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
         # Parse Cargo.lock to get the exact wasm-bindgen version
         # This ensures wasm-bindgen-cli always matches what cargo is using
@@ -108,7 +108,7 @@
         # Build workspace dependencies once (for caching)
         workspaceDeps = craneLib.buildDepsOnly ({
           pname = "coordinator-workspace-deps";
-          version = "0.1.0";
+          version = workspaceVersion;
           inherit src;
           buildInputs = commonBuildInputs;
           nativeBuildInputs = commonNativeBuildInputs;
@@ -138,7 +138,7 @@
         # Build WASM dependencies first (fetches from network during eval, not build)
         wasmDeps = craneLib.buildDepsOnly ({
           pname = "coordinator-wasm-deps";
-          version = "0.1.0";
+          version = workspaceVersion;
           inherit src;
           buildInputs = commonBuildInputs;
           nativeBuildInputs = commonNativeBuildInputs ++ [ wasm32-clang ];
@@ -152,12 +152,12 @@
         # Build the WASM crate with cargo, then run wasm-bindgen
         coordinator-wasm = pkgs.stdenv.mkDerivation {
           pname = "coordinator-wasm";
-          version = "0.1.0";
+          version = workspaceVersion;
 
           # Use the cargo artifacts from craneLib which has pre-fetched deps
           src = craneLib.buildPackage ({
             pname = "coordinator-wasm-cargo";
-            version = "0.1.0";
+            version = workspaceVersion;
             inherit src;
             cargoArtifacts = wasmDeps;
             buildInputs = commonBuildInputs;
@@ -201,7 +201,7 @@
         # Main coordinator binary
         coordinator = craneLib.buildPackage ({
           pname = "coordinator";
-          version = "0.1.0";
+          version = workspaceVersion;
           inherit src;
           cargoArtifacts = workspaceDeps;
           buildInputs = commonBuildInputs;
@@ -223,7 +223,7 @@
         # Wallet CLI binary
         wallet-cli = craneLib.buildPackage ({
           pname = "wallet-cli";
-          version = "0.1.0";
+          version = workspaceVersion;
           inherit src;
           cargoArtifacts = workspaceDeps;
           buildInputs = commonBuildInputs;
@@ -234,7 +234,7 @@
         # Synth binary (synthetic testing service)
         synth = craneLib.buildPackage ({
           pname = "synth";
-          version = "0.1.0";
+          version = workspaceVersion;
           inherit src;
           cargoArtifacts = workspaceDeps;
           buildInputs = commonBuildInputs;

@@ -25,16 +25,16 @@ pub enum NostrError {
     #[error(transparent)]
     Login(#[from] LoginError),
     #[error("Key parsing error: {0}")]
-    KeyParsing(#[from] nostr_sdk::key::Error),
+    KeyParsing(#[from] ::nostr::key::Error),
     #[error("Key encoding error: {0}")]
-    KeyEncoding(#[from] nostr_sdk::nips::nip19::Error),
+    KeyEncoding(#[from] ::nostr::nips::nip19::Error),
     #[error("Signer error: {0}")]
-    Signer(#[from] nostr_sdk::signer::SignerError),
+    Signer(#[from] ::nostr::signer::SignerError),
     #[error("Event builder error: {0}")]
-    EventBuilder(#[from] nostr_sdk::event::builder::Error),
+    EventBuilder(#[from] ::nostr::event::builder::Error),
     #[cfg(target_arch = "wasm32")]
     #[error("Browser signer error: {0}")]
-    BrowserSigner(#[from] nostr_sdk::nips::nip07::Error),
+    BrowserSigner(#[from] nostr_browser_signer::Error),
 }
 
 #[cfg(target_arch = "wasm32")]

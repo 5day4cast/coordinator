@@ -1,4 +1,4 @@
-{{- if .Values.blueGreen.enabled }}
+{{- if and .Values.blueGreen.enabled .Values.blueGreen.switchoverEnabled }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -42,6 +42,8 @@ spec:
               value: "{{ .Release.Namespace }}"
             - name: SERVICE
               value: "{{ include "coordinator.fullname" . }}"
+            - name: ADMIN_SERVICE
+              value: "{{ include "coordinator.fullname" . }}-admin"
             - name: DEPLOY_PREFIX
               value: "{{ include "coordinator.fullname" . }}"
             - name: CONTAINER

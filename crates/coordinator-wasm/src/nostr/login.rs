@@ -12,12 +12,12 @@
 //! The server can verify a login but holds nothing that decrypts the nsec,
 //! so it cannot reach the wallet seed, which is encrypted to the Nostr key.
 
+use ::nostr::{Keys, SecretKey};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
 };
-use nostr_sdk::{Keys, SecretKey};
 use rand::RngCore;
 use scrypt::{scrypt, Params};
 use sha2::{Digest, Sha256};
@@ -145,6 +145,27 @@ mod tests {
 
     fn keys(username: &str, password: &str) -> LoginKeys {
         LoginKeys::derive_with(username, password, TEST_LOG_N).unwrap()
+    }
+
+    #[test]
+    fn frozen_v1_login_restores_original_identity() {
+        // Independent v1 vector: scrypt logN=4, r=8, p=1; nonce bytes 0..23;
+        // raw Nostr secret scalar 1. Keep the ciphertext fixed across SDK upgrades.
+        const SEALED: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXOq6VCBZ1XrPgjqhWb1+Z5JU5pTVYThyjHiP20osNioNqNotpMCMeLwUCKp1SEMLy";
+        let login = keys("Alice", "pw");
+        assert_eq!(
+            login.auth_key_hex(),
+            "6be6c5aef8ae3cf29c773e1878fa11594d40ed207086b5e25b3efe45b053464d"
+        );
+
+        let opened = login.open(SEALED).unwrap();
+        let mut expected_secret = [0u8; 32];
+        expected_secret[31] = 1;
+        assert_eq!(opened.secret_key().to_secret_bytes(), expected_secret);
+        assert_eq!(
+            opened.public_key().to_hex(),
+            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        );
     }
 
     #[test]

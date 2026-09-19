@@ -1,6 +1,7 @@
 use super::{
-    states::CompetitionStatus, AddEntry, CompetitionError, CompetitionStore, FundedContract,
-    KeymeldSigningInfo, PayoutInfo, SearchBy, Ticket, TicketStatus, UserEntry, UserEntryView,
+    states::CompetitionStatus, store::ReservedTicket, AddEntry, CompetitionError, CompetitionState,
+    CompetitionStore, FundedContract, KeymeldSigningInfo, PayoutInfo, SearchBy, Ticket,
+    TicketStatus, UserEntry, UserEntryView,
 };
 use crate::{
     api::routes::FinalSignatures,
@@ -13,7 +14,7 @@ use crate::{
             DlcKeygenSession, DlcSubsetInfo, Keymeld, ParticipantRegistrationData,
             StoredDlcKeygenSession, SubsetDefinition,
         },
-        lightning::Ln,
+        lightning::{extract_amount_from_invoice, Ln},
         oracle::{AddEventEntries, AddEventEntry, Error as OracleError, Event, Oracle},
     },
 };
@@ -48,7 +49,7 @@ use itertools::Itertools;
 use keymeld_sdk::prelude::UserId;
 use keymeld_sdk::types::{RegistrationContext, SignedRoster};
 use log::{debug, error, info, warn};
-use nostr_sdk::{nips::nip44, Keys, PublicKey as NostrPublicKey, SecretKey};
+use nostr::{nips::nip44, Keys, PublicKey as NostrPublicKey, SecretKey};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use serde::Serialize;
@@ -142,13 +143,13 @@ impl CompetitionWatcher {
                 break;
             }
 
-            match self.coordinator.competition_handler().await {
-                Ok(_) => {
-                    info!("Competition sync completed successfully");
-                }
-                Err(e) => {
-                    error!("Competition sync error: {}", e);
-                }
+            // Run each sync on its own task: a panic while handling one
+            // competition must not take the watcher down for all of them.
+            let coordinator = self.coordinator.clone();
+            match tokio::spawn(async move { coordinator.competition_handler().await }).await {
+                Ok(Ok(_)) => info!("Competition sync completed successfully"),
+                Ok(Err(e)) => error!("Competition sync error: {}", e),
+                Err(e) => error!("Competition sync task failed: {}", e),
             }
 
             tokio::select! {
@@ -181,7 +182,10 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "wires every runtime dependency once at startup"
+    )]
     pub async fn new(
         oracle_client: Arc<dyn Oracle>,
         competition_store: CompetitionStore,
@@ -1259,7 +1263,7 @@ impl Coordinator {
             );
         }
 
-        let outcome_payouts = generate_payouts(competition, &mut entries, &players)?;
+        let outcome_payouts = generate_payouts(competition, &entries, &players)?;
         debug!("Generated outcome payouts:");
         for (outcome, weights) in &outcome_payouts {
             debug!("Outcome {:?}: weights={:?}", outcome, weights);
@@ -1352,7 +1356,7 @@ impl Coordinator {
 
                     let user_pubkey = BdkPublicKey::from_str(user_pubkey)
                         .map_err(|e| anyhow!("Failed to parse user public key: {}", e))?;
-                    let payment_hash_from_ticket = string_to_byte_array(&ticket.hash);
+                    let payment_hash_from_ticket = parse_hash32(&ticket.hash)?;
                     let preimage = hex::decode(&ticket.encrypted_preimage)
                         .map_err(|e| anyhow!("Failed to decode preimage: {}", e))?;
                     let payment_hash_from_preimage = sha256::Hash::hash(&preimage).to_byte_array();
@@ -2806,14 +2810,10 @@ impl Coordinator {
         &self,
         create_event: CreateEvent,
     ) -> Result<Competition, Error> {
+        create_event
+            .validate_oracle_settings()
+            .map_err(|reason| Error::BadRequest(reason.into()))?;
         let competition = Competition::new(&create_event);
-
-        if competition.event_submission.number_of_places_win > 5 {
-            return Err(Error::BadRequest(format!(
-                "Number of winners exceeds maximum allowed 5 {}",
-                competition.event_submission.number_of_places_win
-            )));
-        }
 
         debug!("created competition");
         let tickets = competition
@@ -2893,6 +2893,11 @@ impl Coordinator {
             .competition_store
             .get_competition(competition_id)
             .await?;
+        if !matches!(competition.get_state(), CompetitionState::Created) {
+            return Err(Error::BadRequest(
+                "Competition is no longer accepting entries".into(),
+            ));
+        }
         if competition.total_entries as usize >= competition.event_submission.total_allowed_entries
         {
             return Err(Error::CompetitionFull);
@@ -2900,7 +2905,10 @@ impl Coordinator {
         debug!("got competition: {:?}", competition);
 
         // Get ticket
-        let ticket = self
+        let ReservedTicket {
+            ticket,
+            superseded_payment_hash,
+        } = self
             .competition_store
             .get_and_reserve_ticket(competition_id, &pubkey)
             .await
@@ -2908,6 +2916,9 @@ impl Coordinator {
                 DatabaseWriteError::Sqlx(sqlx::Error::RowNotFound) => Error::NoAvailableTickets,
                 e => Error::from(e),
             })?;
+        if let Some(old_hash) = superseded_payment_hash {
+            self.cancel_superseded_invoice(ticket.id, old_hash).await;
+        }
         match self
             .create_ticket_response(ticket.clone(), btc_pubkey, competition)
             .await
@@ -2916,7 +2927,7 @@ impl Coordinator {
             Err(e) => {
                 if let Err(clear_err) = self
                     .competition_store
-                    .clear_ticket_reservation(ticket.id)
+                    .clear_ticket_reservation(&ticket)
                     .await
                 {
                     error!(
@@ -2926,6 +2937,19 @@ impl Coordinator {
                 }
                 Err(e)
             }
+        }
+    }
+
+    /// A stale reservation was taken over and the ticket already carries a
+    /// fresh hash, so nothing the previous holder still has can pay for it.
+    /// Their invoice is cancelled to refund any late payment promptly; if LND
+    /// cannot be reached, LND itself cancels a held HTLC before it times out.
+    async fn cancel_superseded_invoice(&self, ticket_id: Uuid, old_hash: String) {
+        if let Err(e) = self.ln.cancel_hold_invoice(old_hash).await {
+            warn!(
+                "Failed to cancel the superseded invoice of ticket {}: {}",
+                ticket_id, e
+            );
         }
     }
 
@@ -2957,7 +2981,7 @@ impl Coordinator {
             .await
             .map_err(|e| {
                 error!("Failed to generate escrow transaction: {}", e);
-                Error::BadRequest(format!("Failed to generate refund transaction: {}", e))
+                Error::BadRequest("Failed to generate refund transaction".to_string())
             })?;
 
             debug!("escrow_tx: {:?}", escrow_tx);
@@ -2965,13 +2989,20 @@ impl Coordinator {
             let escrow_hex = hex::encode(dlctix::bitcoin::consensus::encode::serialize(&escrow_tx));
 
             // Store the escrow transaction in the database
-            self.competition_store
-                .update_ticket_escrow(ticket.id, btc_pubkey.to_string(), escrow_hex.clone())
+            let stored = self
+                .competition_store
+                .update_ticket_escrow(&ticket, btc_pubkey.to_string(), escrow_hex.clone())
                 .await
                 .map_err(|e| {
                     error!("Failed to update ticket with escrow transaction: {}", e);
                     Error::from(e)
                 })?;
+
+            if !stored {
+                return Err(Error::BadRequest(
+                    "Ticket reservation changed; request a new ticket".into(),
+                ));
+            }
 
             debug!(
                 "Created ticket {} with escrow tx {}",
@@ -3005,56 +3036,9 @@ impl Coordinator {
         let buffer_seconds = 600i64; // 10 minutes buffer for signing + broadcast
         let invoice_expiry_seconds = (time_until_entries_close + buffer_seconds).max(900); // minimum 15 min
         let payment_request = if let Some(existing_payment_request) = &ticket.payment_request {
-            // Check if the existing invoice has expired
-            let is_expired = ticket
-                .invoice_expires_at
-                .map(|expires_at| expires_at < time::OffsetDateTime::now_utc())
-                .unwrap_or(true); // If no expiry stored, treat as expired to be safe
-
-            if is_expired {
-                debug!(
-                    "Existing invoice for ticket {} has expired, creating new one",
-                    ticket.id
-                );
-                // Cancel the old invoice before creating a new one
-                if let Err(e) = self.ln.cancel_hold_invoice(hex::encode(payment_hash)).await {
-                    // Log but don't fail - the invoice might already be cancelled or not exist
-                    debug!("Failed to cancel expired invoice: {}", e);
-                }
-
-                // Create new HODL invoice
-                let invoice = self
-                    .ln
-                    .add_hold_invoice(
-                        full_fee,
-                        invoice_expiry_seconds as u64,
-                        hex::encode(payment_hash),
-                        ticket.competition_id,
-                        escrow_tx_hex.clone().unwrap_or_default(),
-                    )
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to create HODL invoice: {}", e);
-                        Error::BadRequest(format!("Failed to create invoice: {}", e))
-                    })?;
-
-                let expires_at = time::OffsetDateTime::now_utc()
-                    + time::Duration::seconds(invoice_expiry_seconds);
-
-                // Update ticket with new payment request and expiry
-                self.competition_store
-                    .update_ticket_payment_request(ticket.id, &invoice.payment_request, expires_at)
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to update ticket with payment request: {}", e);
-                        Error::from(e)
-                    })?;
-
-                invoice.payment_request
-            } else {
-                debug!("Reusing existing payment request for ticket {}", ticket.id);
-                existing_payment_request.clone()
-            }
+            // Expired unpaid invoices are rotated atomically by the ticket
+            // store. LND does not permit reusing a cancelled payment hash.
+            existing_payment_request.clone()
         } else {
             // Create new HODL invoice
             // Note: escrow_tx_hex is empty string when escrow disabled
@@ -3070,21 +3054,29 @@ impl Coordinator {
                 .await
                 .map_err(|e| {
                     error!("Failed to create HODL invoice: {}", e);
-                    Error::BadRequest(format!("Failed to create invoice: {}", e))
+                    Error::BadRequest("Failed to create invoice".to_string())
                 })?;
 
             let expires_at =
                 time::OffsetDateTime::now_utc() + time::Duration::seconds(invoice_expiry_seconds);
 
             // Update ticket with payment request and expiry
-            self.competition_store
-                .update_ticket_payment_request(ticket.id, &invoice.payment_request, expires_at)
+            let stored = self
+                .competition_store
+                .update_ticket_payment_request(&ticket, &invoice.payment_request, expires_at)
                 .await
                 .map_err(|e| {
                     error!("Failed to update ticket with payment request: {}", e);
                     Error::from(e)
                 })?;
 
+            if !stored {
+                self.cancel_superseded_invoice(ticket.id, ticket.hash.clone())
+                    .await;
+                return Err(Error::BadRequest(
+                    "Ticket reservation changed; request a new ticket".into(),
+                ));
+            }
             invoice.payment_request
         };
 
@@ -3220,7 +3212,7 @@ impl Coordinator {
         Ok(())
     }
 
-    pub async fn add_entry(&self, pubkey: String, entry: AddEntry) -> Result<UserEntry, Error> {
+    pub async fn add_entry(&self, pubkey: String, mut entry: AddEntry) -> Result<UserEntry, Error> {
         let competition = self
             .competition_store
             .get_competition(entry.event_id)
@@ -3233,6 +3225,12 @@ impl Coordinator {
                 }
             })?;
 
+        if !matches!(competition.get_state(), CompetitionState::Created) {
+            return Err(Error::BadRequest(
+                "Competition is no longer accepting entries".into(),
+            ));
+        }
+        validate_entry_keys(&mut entry)?;
         validate_entry(entry.clone().into(), competition).await?;
 
         debug!("entry: {:?}", entry);
@@ -3258,6 +3256,12 @@ impl Coordinator {
 
         if ticket.entry_id.is_some() {
             return Err(Error::BadRequest("Ticket has already been used".into()));
+        }
+
+        if ticket.competition_id != entry.event_id {
+            return Err(Error::BadRequest(
+                "Ticket belongs to a different competition".into(),
+            ));
         }
 
         if let Some(btc_pubkey) = &ticket.ephemeral_pubkey {
@@ -3504,7 +3508,13 @@ impl Coordinator {
             ));
         }
 
-        if public_nonces.is_mirror(&competition.public_nonces.unwrap()) {
+        let Some(coordinator_nonces) = competition.public_nonces.as_ref() else {
+            return Err(Error::BadRequest(
+                "Coordinator nonces not yet available".to_string(),
+            ));
+        };
+
+        if public_nonces.is_mirror(coordinator_nonces) {
             return Err(Error::BadRequest(format!(
                 "public nonces do not match competitions: {}",
                 entry_id
@@ -3532,7 +3542,8 @@ impl Coordinator {
             ));
         }
 
-        self.competition_store
+        let stored = self
+            .competition_store
             .add_public_nonces(entry_id, public_nonces)
             .await
             .map_err(|e| {
@@ -3542,6 +3553,11 @@ impl Coordinator {
                 );
                 Error::from(e)
             })?;
+        if !stored {
+            return Err(Error::BadRequest(
+                "Public nonces already submitted for this entry".to_string(),
+            ));
+        }
 
         Ok(())
     }
@@ -3630,7 +3646,8 @@ impl Coordinator {
             .find(|e| e.id == entry_id)
             .ok_or_else(|| Error::NotFound(format!("Entry {} not found", entry_id)))?;
 
-        self.competition_store
+        let stored = self
+            .competition_store
             .add_final_signatures(entry_id, final_signatures)
             .await
             .map_err(|e| {
@@ -3640,6 +3657,11 @@ impl Coordinator {
                 );
                 Error::from(e)
             })?;
+        if !stored {
+            return Err(Error::BadRequest(
+                "Signatures already submitted for this entry".to_string(),
+            ));
+        }
 
         Ok(())
     }
@@ -3802,9 +3824,8 @@ impl Coordinator {
             total_pool_sats, winner_weight, payout_amount_sats
         );
 
-        let invoice_amount_sats =
-            crate::infra::lightning::extract_amount_from_invoice(&payout_info.ln_invoice)
-                .map_err(|e| Error::BadRequest(format!("Invalid lightning invoice: {}", e)))?;
+        let invoice_amount_sats = extract_amount_from_invoice(&payout_info.ln_invoice)
+            .map_err(|e| Error::BadRequest(format!("Invalid lightning invoice: {}", e)))?;
 
         if let Some(invoice_amount_sats) = invoice_amount_sats {
             if invoice_amount_sats != payout_amount_sats {
@@ -3815,37 +3836,32 @@ impl Coordinator {
             }
         }
 
-        match self
-            .ln
-            .send_payment(
+        // The pending payout is recorded before anything is sent, and the
+        // database allows one live payout per entry, so a concurrent or
+        // repeated request cannot pay twice. The PayoutWatcher marks it paid
+        // once the payment settles.
+        let payout_id = self
+            .competition_store
+            .store_payout_info_pending(
+                entry_id,
+                payout_info.payout_preimage,
+                payout_info.ephemeral_private_key,
                 payout_info.ln_invoice.clone(),
                 payout_amount_sats,
-                60,   // TODO(@tee8z): make this timeout configurable, 60 second timeout
-                1000, // TODO(@tee8z): make this fee configurable, 1000 sat fee limit
             )
             .await
-        {
-            Ok(_) => {
-                // Store payout info but DON'T mark as paid out yet
-                // The PayoutWatcher will monitor the payment and mark as paid when it settles
-                self.competition_store
-                    .store_payout_info_pending(
-                        entry_id,
-                        payout_info.payout_preimage,
-                        payout_info.ephemeral_private_key,
-                        payout_info.ln_invoice,
-                        payout_amount_sats,
-                    )
-                    .await
-                    .map_err(Error::from)
-                    .inspect(|pay_out_id| info!("Payout initiated with ID: {}", pay_out_id))
-                    .map(|_| ())
-            }
-            Err(e) => Err(Error::PaymentFailed(format!(
-                "Failed to initiate lightning payment: {}",
-                e
-            ))),
-        }
+            .map_err(|e| match e {
+                DatabaseWriteError::Sqlx(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+                    Error::BadRequest("A payout for this entry is already in progress".into())
+                }
+                e => Error::from(e),
+            })?;
+        info!("Payout {} initiated for entry {}", payout_id, entry_id);
+
+        // The payout watcher is the sole sender. Persisting this outbox item
+        // before acknowledging the request also survives shutdown before the
+        // first RPC. Ambiguous RPC errors never release the entry's payout lock.
+        Ok(())
     }
 }
 
@@ -3868,19 +3884,39 @@ fn generate_players(
         let player = Player {
             pubkey,
             // coordinator generates this preimage and only shares after player has paid for a ticket
-            ticket_hash: string_to_byte_array(&ticket.hash),
+            ticket_hash: parse_hash32(&ticket.hash)?,
             // players generate this preimage and only share after winning with the coordinator
-            payout_hash: string_to_byte_array(payout_hash),
+            payout_hash: parse_hash32(payout_hash)?,
         };
         players.push(player);
     }
 
     Ok(players)
 }
-fn string_to_byte_array(hex_str: &str) -> [u8; 32] {
+/// A 32-byte hash from hex. Entry and ticket hashes are validated on the way
+/// in; a bad row must still fail the competition rather than panic the watcher.
+fn parse_hash32(hex_str: &str) -> Result<[u8; 32], anyhow::Error> {
     let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-    let bytes = hex::decode(hex_str).expect("valid hex string");
-    bytes.try_into().expect("32 bytes")
+    let bytes = hex::decode(hex_str).map_err(|e| anyhow!("invalid hash hex: {}", e))?;
+    bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| anyhow!("hash must be 32 bytes, got {}", bytes.len()))
+}
+
+/// Entry keys are used verbatim when the contract is built; reject anything
+/// the contract builder could not parse so one entry cannot poison a
+/// competition.
+fn validate_entry_keys(entry: &mut AddEntry) -> Result<(), Error> {
+    let pubkey = Point::from_hex(&entry.ephemeral_pubkey).map_err(|_| {
+        Error::BadRequest("ephemeral_pubkey must be a compressed secp256k1 point in hex".into())
+    })?;
+    let payout_hash = parse_hash32(&entry.payout_hash)
+        .map_err(|_| Error::BadRequest("payout_hash must be 32 bytes in hex".into()))?;
+    // The database's per-competition uniqueness constraints compare strings.
+    // Store a single encoding so case/prefix aliases cannot bypass them.
+    entry.ephemeral_pubkey = hex::encode(pubkey.serialize());
+    entry.payout_hash = hex::encode(payout_hash);
+    Ok(())
 }
 
 fn get_percentage_weights(num_winners: usize) -> Vec<u64> {
@@ -3896,15 +3932,15 @@ fn get_percentage_weights(num_winners: usize) -> Vec<u64> {
 
 fn generate_payouts(
     competition: &Competition,
-    entries: &mut [UserEntry],
+    entries: &[UserEntry],
     players: &[Player],
 ) -> Result<BTreeMap<Outcome, PayoutWeights>, anyhow::Error> {
     debug!("Generating payouts for {} players", players.len());
 
-    // Sort entries by ticket_id for consistent indexing
-    // This ensures player indices match the ticket order used when creating
-    // keymeld subset definitions at competition creation time
-    entries.sort_by_key(|entry| entry.ticket_id);
+    // NOAA outcome indices refer to entries sorted by their submitted entry IDs.
+    // Contract players keep ticket order, so map each winner back by public key.
+    let mut oracle_entries: Vec<_> = entries.iter().collect();
+    oracle_entries.sort_by_key(|entry| entry.entry_submission.id);
     let mut payouts: BTreeMap<Outcome, PayoutWeights> = BTreeMap::new();
 
     let possible_rankings = generate_ranking_permutations(
@@ -3951,7 +3987,10 @@ fn generate_payouts(
         }
 
         // Normal outcome processing
-        let entry_pubkeys = find_winning_entries_pubkeys(entries, winner_indices.to_owned());
+        let entry_pubkeys = winner_indices
+            .iter()
+            .map(|&index| oracle_entries[index].ephemeral_pubkey.clone())
+            .collect();
         debug!("Winner pubkeys: {:?}", entry_pubkeys);
 
         let player_indices = find_player_indices(players, entry_pubkeys)?;
@@ -4177,16 +4216,6 @@ fn find_player_indices(
         .collect()
 }
 
-fn find_winning_entries_pubkeys(
-    entries: &[UserEntry],
-    winning_entry_indices: Vec<usize>,
-) -> Vec<String> {
-    winning_entry_indices
-        .into_iter()
-        .map(|idx| entries[idx].ephemeral_pubkey.clone())
-        .collect()
-}
-
 async fn signed_funding_tx(
     bitcoin_client: Arc<dyn Bitcoin>,
     mut funding_tx: Psbt,
@@ -4384,6 +4413,74 @@ async fn validate_entry(entry: AddEventEntry, competition: Competition) -> Resul
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod oracle_payout_order_tests {
+    use super::*;
+
+    #[test]
+    fn oracle_entry_order_maps_to_ticket_order_players_for_every_ranking() {
+        let now = OffsetDateTime::now_utc();
+        let competition = Competition::new(&CreateEvent {
+            id: Uuid::now_v7(),
+            signing_date: now + time::Duration::days(2),
+            start_observation_date: now,
+            end_observation_date: now + time::Duration::days(1),
+            locations: vec!["KORD".into()],
+            number_of_values_per_entry: 1,
+            number_of_places_win: 2,
+            total_allowed_entries: 3,
+            entry_fee: 1_000,
+            coordinator_fee_percentage: 10,
+            total_competition_pool: 2_700,
+            relative_locktime_block_delta: None,
+        });
+        let entry_ids = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
+        let tickets = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
+        let players: Vec<Player> = (1..=3)
+            .map(|index| Player {
+                pubkey: Scalar::from_slice(&[index; 32]).unwrap().base_point_mul(),
+                ticket_hash: [index; 32],
+                payout_hash: [index + 3; 32],
+            })
+            .collect();
+        // Tickets 1 and 2 submit before ticket 0. Oracle order is players [1, 2, 0].
+        let entries: Vec<_> = [2, 0, 1]
+            .iter()
+            .enumerate()
+            .map(|(player, &entry)| {
+                AddEntry {
+                    id: entry_ids[entry],
+                    ticket_id: tickets[player],
+                    event_id: competition.id,
+                    ephemeral_pubkey: hex::encode(players[player].pubkey.serialize()),
+                    payout_hash: hex::encode(players[player].payout_hash),
+                    expected_observations: vec![],
+                    encrypted_keymeld_private_key: None,
+                    keymeld_auth_pubkey: None,
+                    keymeld_registration_context: None,
+                }
+                .into_user_entry(String::new())
+            })
+            .collect();
+
+        let payouts = generate_payouts(&competition, &entries, &players).unwrap();
+        for (outcome, winners) in [[1, 2], [1, 0], [2, 1], [2, 0], [0, 1], [0, 2]]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                payouts[&Outcome::Attestation(outcome)],
+                BTreeMap::from([(winners[0], 60), (winners[1], 40)]),
+            );
+        }
+        assert_eq!(
+            payouts[&Outcome::Attestation(6)],
+            BTreeMap::from([(0, 34), (1, 33), (2, 33)]),
+        );
+        assert_eq!(entries[0].ticket_id, tickets[0]);
+    }
 }
 
 #[cfg(test)]
@@ -4678,6 +4775,27 @@ mod tests {
     use super::*;
     use dlctix::{attestation_locking_point, hashlock, MarketMaker};
     use rand::RngCore;
+
+    #[test]
+    fn entry_key_validation_normalizes_aliases_before_uniqueness_checks() {
+        let key = Scalar::from_slice(&[1; 32]).unwrap().base_point_mul();
+        let mut entry = AddEntry {
+            id: Uuid::now_v7(),
+            ticket_id: Uuid::now_v7(),
+            event_id: Uuid::now_v7(),
+            ephemeral_pubkey: hex::encode(key.serialize()).to_uppercase(),
+            payout_hash: format!("0x{}", hex::encode([0xab; 32]).to_uppercase()),
+            expected_observations: vec![],
+            encrypted_keymeld_private_key: None,
+            keymeld_auth_pubkey: None,
+            keymeld_registration_context: None,
+        };
+        validate_entry_keys(&mut entry).unwrap();
+        assert_eq!(entry.ephemeral_pubkey, hex::encode(key.serialize()));
+        assert_eq!(entry.payout_hash, hex::encode([0xab; 32]));
+        entry.payout_hash = "00".into();
+        assert!(validate_entry_keys(&mut entry).is_err());
+    }
 
     fn params() -> ContractParameters {
         let mut rng = rand::rng();

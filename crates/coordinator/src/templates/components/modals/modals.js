@@ -386,32 +386,28 @@ class AuthManager {
         this.apiBase,
       );
 
-      const pubkey = await window.nostrClient.getPublicKey();
       const wallet = window.DlcWallet.create(window.nostrClient, this.network);
       const { encrypted_bitcoin_private_key } = await wallet.encryptedBackup();
 
-      const response = await fetch(
-        `${this.apiBase}/api/v1/users/username/register`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
+      // Signed with the new Nostr key: the server takes the account pubkey
+      // from the NIP-98 header, never from the body.
+      try {
+        await this.authorizedClient.post(
+          `${this.apiBase}/api/v1/users/username/register`,
+          {
             username: pending.username,
             auth_key: pending.authKey,
             encrypted_nsec: pending.sealedNsec,
-            nostr_pubkey: pubkey,
             encrypted_bitcoin_private_key,
             network: this.network,
-          }),
-        },
-      );
-
-      if (!response.ok) {
+          },
+        );
+      } catch (error) {
         wallet.free();
-        const data = await response.json().catch(() => ({}));
+        const data = await error.response?.json().catch(() => ({}));
         if (errorElement)
           errorElement.textContent =
-            data.error || "Registration failed. Please try again.";
+            data?.error || "Registration failed. Please try again.";
         return;
       }
 

@@ -39,7 +39,7 @@ toml.workspace = true
 sqlx.workspace = true
 
 # Nostr
-nostr-sdk = { version = "0.38.0", features = ["nip04", "nip44"] }
+nostr.workspace = true
 
 # Logging
 log.workspace = true
@@ -47,6 +47,7 @@ fern.workspace = true
 
 # Error handling
 anyhow.workspace = true
+zeroize.workspace = true
 thiserror.workspace = true
 
 # Crypto

@@ -21,6 +21,7 @@ duckdb_lib/
 coordinator_private_key.pem
 config/*
 !config/e2e.toml
+!config/e2e_admin_token
 crates/*/src/bin/settings.toml
 
 # Nix
@@ -53,6 +54,7 @@ crates/public_ui/
 .DS_Store
 
 # Test artifacts
+__pycache__/
 *.profraw
 coverage/
 e2e/node_modules/

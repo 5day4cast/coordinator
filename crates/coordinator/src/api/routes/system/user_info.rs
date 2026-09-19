@@ -1,6 +1,6 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use log::{debug, error};
-use nostr_sdk::{Event, ToBech32};
+use nostr::{Event, ToBech32};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -22,11 +22,35 @@ fn credential_error(e: PasswordError) -> domain::Error {
     domain::Error::BadRequest("Failed to process credentials".to_string())
 }
 
+fn credential_task_error(e: tokio::task::JoinError) -> ApiError {
+    error!("Credential task failed: {}", e);
+    ApiError::Status(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Argon2 takes tens of milliseconds; keep it off the async workers so a burst
+/// of login attempts cannot stall every other request.
+async fn hash_auth_key_blocking(key: AuthKey) -> Result<String, ApiError> {
+    tokio::task::spawn_blocking(move || hash_auth_key(&key))
+        .await
+        .map_err(credential_task_error)?
+        .map_err(|e| ApiError::from(credential_error(e)))
+}
+
+async fn verify_auth_key_blocking(
+    key: AuthKey,
+    stored_hash: Option<String>,
+) -> Result<bool, ApiError> {
+    tokio::task::spawn_blocking(move || verify_auth_key(&key, stored_hash.as_deref()))
+        .await
+        .map_err(credential_task_error)?
+        .map_err(|e| ApiError::from(credential_error(e)))
+}
+
 pub async fn login(
     NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let pubkey = pubkey.to_bech32().expect("public bech32 format");
+    let pubkey = pubkey.to_bech32().unwrap_or_else(|never| match never {});
     debug!("login with pubkey: {}", pubkey);
 
     match state.users_info.login(pubkey).await {
@@ -55,7 +79,7 @@ pub async fn register(
         body,
     }: AuthedJson<RegisterPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let pubkey = pubkey.to_bech32().expect("public bech32 format");
+    let pubkey = pubkey.to_bech32().unwrap_or_else(|never| match never {});
 
     debug!("registering user: {}", pubkey);
     match state.users_info.register(pubkey, body).await {
@@ -74,7 +98,6 @@ pub struct UsernameRegisterPayload {
     pub username: String,
     pub auth_key: AuthKey,
     pub encrypted_nsec: String,
-    pub nostr_pubkey: String,
     pub encrypted_bitcoin_private_key: String,
     pub network: String,
 }
@@ -110,32 +133,52 @@ fn validate_username(username: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Signed with the account's Nostr key, so a username can only ever be bound
+/// to a pubkey whose owner asked for it.
 pub async fn register_username(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<UsernameRegisterPayload>,
+    AuthedJson {
+        auth: NostrAuth { pubkey, .. },
+        body,
+    }: AuthedJson<UsernameRegisterPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let nostr_pubkey = pubkey.to_bech32().unwrap_or_else(|never| match never {});
     debug!("registering user with username: {}", body.username);
 
     if let Err(e) = validate_username(&body.username) {
         return Err(ApiError::from(domain::Error::BadRequest(e)));
     }
 
-    if state.users_info.username_exists(&body.username).await? {
-        return Ok((
-            StatusCode::CREATED,
-            Json(UsernameRegisterResponse {
-                nostr_pubkey: body.nostr_pubkey,
-                username: body.username,
-            }),
-        ));
+    match state
+        .users_info
+        .get_pubkey_by_username(&body.username)
+        .await
+    {
+        // A retry by the same account is idempotent.
+        Ok(owner) if owner == nostr_pubkey => {
+            return Ok((
+                StatusCode::CREATED,
+                Json(UsernameRegisterResponse {
+                    nostr_pubkey,
+                    username: body.username,
+                }),
+            ));
+        }
+        Ok(_) => {
+            return Err(ApiError::from(domain::Error::BadRequest(
+                "Username is already taken".to_string(),
+            )));
+        }
+        Err(domain::Error::NotFound(_)) => {}
+        Err(e) => return Err(ApiError::from(e)),
     }
 
-    let password_hash = hash_auth_key(&body.auth_key).map_err(credential_error)?;
+    let password_hash = hash_auth_key_blocking(body.auth_key).await?;
 
     let user = match state
         .users_info
         .register_username_user(
-            body.nostr_pubkey.clone(),
+            nostr_pubkey,
             body.username.clone(),
             password_hash,
             body.encrypted_nsec,
@@ -194,8 +237,8 @@ pub async fn login_username(
 
     // Unknown users are checked against a dummy hash so timing does not
     // reveal whether the username exists.
-    let stored_hash = user.as_ref().and_then(|u| u.password_hash.as_deref());
-    let valid = verify_auth_key(&body.auth_key, stored_hash).map_err(credential_error)?;
+    let stored_hash = user.as_ref().and_then(|u| u.password_hash.clone());
+    let valid = verify_auth_key_blocking(body.auth_key, stored_hash).await?;
 
     let user = match user {
         Some(u) if valid => u,
@@ -233,7 +276,7 @@ pub async fn change_password(
         body,
     }: AuthedJson<PasswordChangePayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let pubkey_str = pubkey.to_bech32().expect("public bech32 format");
+    let pubkey_str = pubkey.to_bech32().unwrap_or_else(|never| match never {});
     debug!("password change for user: {}", pubkey_str);
 
     let user = state.users_info.login(pubkey_str.clone()).await?;
@@ -242,13 +285,13 @@ pub async fn change_password(
         domain::Error::BadRequest("User does not have password authentication".to_string())
     })?;
 
-    if !verify_auth_key(&body.current_auth_key, Some(password_hash)).map_err(credential_error)? {
+    if !verify_auth_key_blocking(body.current_auth_key, Some(password_hash.clone())).await? {
         return Err(ApiError::from(domain::Error::BadRequest(
             "Invalid current password".to_string(),
         )));
     }
 
-    let new_password_hash = hash_auth_key(&body.new_auth_key).map_err(credential_error)?;
+    let new_password_hash = hash_auth_key_blocking(body.new_auth_key).await?;
 
     state
         .users_info
@@ -378,9 +421,12 @@ pub async fn forgot_password_reset(
         domain::Error::BadRequest("Invalid event signature".to_string())
     })?;
 
-    let event_pubkey = event.pubkey.to_bech32().expect("public bech32 format");
+    let event_pubkey = event
+        .pubkey
+        .to_bech32()
+        .unwrap_or_else(|never| match never {});
     if event_pubkey != nostr_pubkey
-        || pubkey.to_bech32().expect("public bech32 format") != nostr_pubkey
+        || pubkey.to_bech32().unwrap_or_else(|never| match never {}) != nostr_pubkey
     {
         return Err(ApiError::from(domain::Error::BadRequest(
             "Event pubkey does not match account".to_string(),
@@ -407,7 +453,7 @@ pub async fn forgot_password_reset(
         )));
     }
 
-    let new_password_hash = hash_auth_key(&body.new_auth_key).map_err(credential_error)?;
+    let new_password_hash = hash_auth_key_blocking(body.new_auth_key).await?;
 
     state
         .users_info

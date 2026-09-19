@@ -4,6 +4,9 @@
 blueGreen:
   enabled: false
   activeSlot: blue    # Which slot the Service routes traffic to
+  # Disable only the PreSync switchover during a maintenance upgrade.
+  # Keep enabled=true to preserve the slot Deployments and PVCs.
+  switchoverEnabled: true
 
 # Coordinator Helm Chart Values
 replicaCount: 1
@@ -11,8 +14,8 @@ replicaCount: 1
 terminationGracePeriodSeconds: 120
 
 image:
-  repository: coordinator
-  tag: latest
+  repository: ghcr.io/5day4cast/coordinator
+  tag: "2.0.0"
   pullPolicy: IfNotPresent
 
 serviceAccount:
@@ -24,6 +27,9 @@ serviceAccount:
 service:
   type: ClusterIP
   port: 8080
+  # Operator port on the separate <release>-admin ClusterIP Service.
+  # Reach it through an operator tunnel or port-forward, never through the ingress.
+  adminPort: 9991
 
 ingress:
   enabled: false
@@ -150,7 +156,8 @@ config:
     origins:
       - "*"
   ui:
-    privateUrl: "http://localhost:8080"
+    # Origin the operator's browser uses to reach the operator listener (tunnel name).
+    privateUrl: "http://localhost:9991"
     remoteUrl: "http://localhost:8080"
     uiDir: "/app/ui"
   coordinator:
@@ -166,6 +173,13 @@ secrets:
   privateKey:
     create: false
     value: ""
+  # Operator bearer token for the admin listener (at least 32 characters, e.g.
+  # `openssl rand -hex 32`). The coordinator refuses to start without it.
+  adminToken:
+    create: false
+    value: ""
+    external: false
+    secretName: "coordinator-admin-token"
   lnd:
     create: false
     external: false

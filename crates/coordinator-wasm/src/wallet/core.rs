@@ -4,6 +4,7 @@ use super::{
     EncryptedWalletBackup, EntryRegistration, PayoutRelease, WalletError,
 };
 use crate::nostr::{CustomSigner, NostrClientCore};
+use ::nostr::NostrSigner;
 use coordinator_core::{
     keymeld::{prepare_registration, PreparedRegistration},
     RegistrationAssignment,
@@ -22,7 +23,6 @@ use dlctix::{
     ContractParameters, EventLockingConditions, NonceSharingRound, Outcome, SigMap, SigningSession,
     TicketedDLC,
 };
-use nostr_sdk::NostrSigner;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -404,6 +404,50 @@ mod tests {
         MarketMaker, PayoutWeights, Player,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn frozen_nip44_v2_backup_restores_original_entry_keys() {
+        use std::{future::Future, task::Context, task::Poll, task::Waker};
+
+        // Independent NIP-44 v2 vector: identity scalar 1, nonce bytes 0..31,
+        // and plaintext coordinator-wallet-v1: followed by seed bytes 0..31 in hex.
+        // Its generator was checked against the published NIP-44 encryption vectors.
+        const BACKUP: &str = "AgABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fbs/OmfRMUk7F+0uJ2f7fKhZzIQpO4B+r3cNO0C6SgEL2ltBxC/qEHHZ4nsOzZHscm6bC9zD4bRyH0tNZv8rKjkBrpdjATRlh//6eva50xVC4WNnCop8zKjiciNTn40sGxIjnzKRhhIrHaScdFwNpNvBR2FY5E6gg5Yf/pNGLgrY+SA==";
+        let keys = ::nostr::Keys::parse(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        let client = NostrClientCore {
+            signer: Some(CustomSigner::Keys(keys)),
+        };
+        // A local key signer completes synchronously and needs no async runtime.
+        let mut load = std::pin::pin!(DlcWalletCore::load(&client, BACKUP, Network::Signet));
+        let wallet = match load.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(wallet) => wallet.unwrap(),
+            Poll::Pending => panic!("local key signer unexpectedly requires I/O"),
+        };
+        let entry_id = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        let registration = wallet.entry_registration(entry_id).unwrap();
+        assert_eq!(
+            registration.ephemeral_pubkey,
+            "02db32ae6adf4d575228bc8de8a99d3f856855bbe2d8d9ff84e9a1c81d9ea73a03"
+        );
+        assert_eq!(
+            registration.payout_hash,
+            "33ed8f79efa5a15b4c513b3ed5a22122a7d7eb2663687e3f555561fe13641977"
+        );
+        let release = wallet
+            .payout_release(entry_id, &registration.ephemeral_pubkey)
+            .unwrap();
+        assert_eq!(
+            release.ephemeral_private_key,
+            "f53d104768bda153f481882115a011185c917998b2073bb45d6694eb0f9f1aed"
+        );
+        assert_eq!(
+            release.payout_preimage,
+            "f0856215fa2ee82c74c788deba04dfb38d068058617409973a5f007ee1327299"
+        );
+    }
 
     struct Fixture {
         wallet: DlcWalletCore,

@@ -6,6 +6,7 @@
 # Required env vars (set by Helm template in bg-hook-job.yaml):
 #   NAMESPACE      - Kubernetes namespace
 #   SERVICE        - Service name to patch selector on
+#   ADMIN_SERVICE  - Operator Service name to patch with the public Service
 #   DEPLOY_PREFIX  - Deployment name prefix (e.g. "keymeld", deployments are PREFIX-blue/PREFIX-green)
 #   CONTAINER      - Container name in deployment spec
 #   NEW_IMAGE      - Full image:tag to deploy
@@ -23,6 +24,7 @@ set -euo pipefail
 # Validate required env vars
 : "${NAMESPACE:?NAMESPACE is required}"
 : "${SERVICE:?SERVICE is required}"
+: "${ADMIN_SERVICE:?ADMIN_SERVICE is required}"
 : "${DEPLOY_PREFIX:?DEPLOY_PREFIX is required}"
 : "${CONTAINER:?CONTAINER is required}"
 : "${NEW_IMAGE:?NEW_IMAGE is required}"
@@ -39,6 +41,16 @@ else
 fi
 STEP=0
 step() { STEP=$((STEP + 1)); echo "Step ${STEP}/${TOTAL_STEPS}: $1"; }
+
+patch_admin_slot() {
+  if kubectl -n "$NAMESPACE" get svc "$ADMIN_SERVICE" >/dev/null 2>&1; then
+    kubectl -n "$NAMESPACE" patch svc "$ADMIN_SERVICE" --type=merge \
+      -p "{\"spec\":{\"selector\":{\"app.kubernetes.io/slot\":\"$1\"}}}"
+  else
+    # A first installation creates Services during Sync, after this PreSync hook.
+    echo "Operator Service $ADMIN_SERVICE is absent; Sync will create it."
+  fi
+}
 
 echo "=== Blue/Green PreSync Switchover ==="
 echo "Namespace: $NAMESPACE"
@@ -58,6 +70,7 @@ if [[ -z "$ACTIVE" ]]; then
   echo "Patching Service selector to blue..."
   kubectl -n "$NAMESPACE" patch svc "$SERVICE" --type=json \
     -p '[{"op": "add", "path": "/spec/selector/app.kubernetes.io~1slot", "value": "blue"}]' || true
+  patch_admin_slot blue
   echo "Scaling down ${DEPLOY_PREFIX}-green..."
   kubectl -n "$NAMESPACE" scale deployment "${DEPLOY_PREFIX}-green" --replicas=0 || true
   echo "First deploy initialization complete."
@@ -79,6 +92,7 @@ echo "Current active image: $CURRENT_IMAGE"
 
 if [[ "$CURRENT_IMAGE" == "$NEW_IMAGE" ]]; then
   echo "Active deployment already running $NEW_IMAGE. No switchover needed."
+  patch_admin_slot "$ACTIVE"
   kubectl -n "$NAMESPACE" scale deployment "$STANDBY_DEPLOY" --replicas=0 2>/dev/null || true
   exit 0
 fi
@@ -292,8 +306,10 @@ if [[ "$WEATHER_RESTORE_ENABLED" == "true" ]]; then
   fi
 fi
 
-# Flip Service selector (503 window ends)
+# Flip both Service selectors (503 window ends).
+# Patch the operator Service first; failure leaves public traffic on the old slot.
 step "Flipping Service selector to $STANDBY"
+patch_admin_slot "$STANDBY"
 kubectl -n "$NAMESPACE" patch svc "$SERVICE" --type=json \
   -p "[{\"op\": \"replace\", \"path\": \"/spec/selector/app.kubernetes.io~1slot\", \"value\": \"$STANDBY\"}]"
 

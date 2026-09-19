@@ -200,8 +200,9 @@ test.describe("Username/Password Authentication", () => {
     await page.locator("#usernameNsecSavedCheckbox").check();
     await page.locator("#usernameRegisterStep2Button").click();
 
-    await expect(page.locator("#usernameRegisterStep2Error")).toBeVisible();
-    await expect(page.locator("#usernameRegisterStep2Error")).not.toBeEmpty();
+    await expect(page.locator("#usernameRegisterStep2Error")).toHaveText(
+      "Username is already taken",
+    );
     await expect(page.locator("#usernameRegisterStep2")).toBeVisible();
     await expect(page.locator("#usernameRegisterStep3")).toBeHidden();
     await expect(page.locator("#logoutContainer")).toBeHidden();

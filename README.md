@@ -7,7 +7,7 @@ DLC-based fantasy weather prediction market coordinator with keymeld signing.
 - [dlctix](https://github.com/tee8z/dlctix) - Ticketed DLC transactions, MuSig2 signing and validation (crates.io `dlctix`)
 - [keymeld](https://github.com/tee8z/keymeld) - Threshold signing for DLC contracts
 - [bdk_wallet](https://github.com/bitcoindevkit/bdk) - Browser wallet functionality
-- [nostr-sdk](https://github.com/rust-nostr/nostr) - Nostr protocol for user auth
+- [nostr](https://github.com/rust-nostr/nostr) - Nostr protocol for user auth
 - [maud](https://maud.lambda.xyz/) - Compile-time HTML templates
 - [sqlite](https://sqlite.org/) - Database with Litestream replication
 
@@ -42,6 +42,7 @@ setup-channels     # Open channels
 run-keymeld        # Moto KMS + simulated Keymeld enclaves + gateway
 
 # Run the coordinator
+just admin-token
 cargo run --bin coordinator -- --config ./config/local.toml
 
 # Stop services
@@ -59,6 +60,7 @@ just bitcoin-dev-creds  # Export LND creds to coordinator/creds/
 
 # Then run coordinator
 cd ~/repos/coordinator
+just admin-token
 cargo run --bin coordinator -- --config ./config/local.toml
 ```
 
@@ -130,7 +132,72 @@ enabled = true
 
 [coordinator_settings]
 oracle_url = "http://localhost:9800"
+
+[admin_settings]
+# Operator listener: /admin pages, /api/v1/wallet/*, POST /api/v1/competitions.
+# Never exposed on the public listener; keep it on loopback or a private network.
+listen_addr = "127.0.0.1:9991"
+# Bearer token for operators and tooling (synth); at least 32 characters.
+token_file = "./creds/admin_token"
 ```
+
+### Operator access
+
+Operator routes are served only by the admin listener and require the token in
+`admin_settings.token_file` (`just admin-token` generates one). Scripts send it
+as `Authorization: Bearer <token>`; the browser signs in at `/admin/login`,
+which sets a session cookie. The coordinator refuses to start without the
+token file. `admin_settings.dangerous_allow_unauthenticated = true` disables
+this for local development only; it is refused on mainnet and off loopback.
+Set `ui_settings.private_url` to the origin the operator's browser uses to
+reach the admin listener (a tunnel name in production).
+
+Browser sessions use a Secure cookie. Use HTTPS for remote operator access or
+`http://localhost:9991/admin/login` through a local port-forward.
+Set `COORDINATOR_ADMIN_URL` and `COORDINATOR_ADMIN_TOKEN_FILE` when using `coord` against a remote coordinator.
+The local CLI defaults to `http://localhost:9991` for operator requests.
+
+The Helm chart exposes operator traffic on the separate `<release>-admin` ClusterIP Service.
+The public Service and ingress expose only participant traffic.
+Configure `secrets.adminToken.create` and `secrets.adminToken.value`, or use
+`secrets.adminToken.external` with `secrets.adminToken.secretName`.
+The existing Secret must contain a `token` key.
+For synth, configure `config.coordinator.adminUrl` and `config.coordinator.adminTokenSecret`.
+The synth Secret must exist in the synth namespace and contain the same operator token.
+Restart the coordinator after rotating the token; credentials load only during startup.
+
+For an existing Argo CD blue/green deployment, use a maintenance upgrade for v2.
+The PreSync hook changes only the image; it cannot install the new token mount, admin port, or configuration.
+Creating the admin Service alone does not prepare the old Deployment for v2.
+
+1. After active competitions complete, pause automatic synchronization and participant traffic; back up databases and recovery material.
+2. Record the public Service's active slot:
+
+```bash
+kubectl -n <namespace> get service <release> -o jsonpath='{.spec.selector.app\.kubernetes\.io/slot}{"\n"}'
+```
+
+Use the chart's full Service name when `fullnameOverride` or `nameOverride` is configured.
+The result must be `blue` or `green`.
+
+3. Keep `blueGreen.enabled=true` and set `blueGreen.activeSlot` to the recorded slot.
+4. Set `blueGreen.switchoverEnabled=false`; retain the existing release name and PVC names.
+5. Configure the operator token, admin origin, and remaining v2 settings described above and below.
+6. Sync the full v2 chart, including its ConfigMap, token Secret, admin Service, and both Deployment specifications.
+   For an external token Secret, provision that Secret before synchronization.
+   The active Deployment restarts on its existing PVC; the standby remains stopped.
+7. Verify active Deployment readiness, public health, and authenticated admin access before resuming traffic.
+8. Verify that both Service selectors match the recorded slot.
+9. Preserve the Argo CD ignore rules for both Deployments' `/spec/replicas` fields.
+   Ignore `/spec/selector/app.kubernetes.io~1slot` for both the public and admin Services.
+   Set `RespectIgnoreDifferences=true` in the Application's `spec.syncPolicy.syncOptions` before re-enabling the hook.
+   Without this option, ignore rules affect comparisons only; Sync can revert the hook's changes.
+   See [Argo CD's sync option documentation](https://argo-cd.readthedocs.io/en/stable/user-guide/sync-options/#respect-ignore-differences-configs).
+10. Re-enable `blueGreen.switchoverEnabled` and resume automatic synchronization after verification.
+
+Do not disable `blueGreen.enabled` during this procedure; doing so changes the Deployment and PVC names.
+Subsequent image-only upgrades can use the PreSync hook, which switches both Service selectors.
+Argo CD Sync must preserve those selector changes.
 
 ### Keymeld authorization upgrade
 
@@ -159,6 +226,34 @@ Entry submission delegates unattended signing for that competition; participants
 See [Keymeld security operations](https://github.com/tee8z/keymeld/blob/v0.4.1/docs/SECURITY_OPERATIONS.md) for enclave provisioning and hardware acceptance checks.
 See [the authorization design](docs/KEYMELD_AUTHORIZATION_MIGRATION.md) for the credentials the coordinator holds and the checks it enforces.
 Local mock tests do not establish Nitro attestation or live signing compatibility.
+
+### NOAA Oracle 2.0 compatibility
+
+Use the [NOAA Oracle 2.0 API](https://github.com/tee8z/noaa-oracle/blob/master/docs/attestation.md) with dlctix `0.1.0`.
+The event response supplies `nonce_point`, the public nonce commitment.
+The coordinator signs the exact JSON body with a fresh NIP-98 event for each HTTP attempt, including retries.
+
+Set `coordinator_settings.oracle_url` to the oracle's configured `remote_url` origin.
+For Helm, set `oracle.url` to that same origin.
+Add the coordinator's Nostr public key to the oracle's `coordinator_pubkeys` allowlist.
+Use the public key for `coordinator_settings.private_key_file`, not the browser user's key.
+Without these settings, the oracle rejects event creation and entry submission.
+
+The oracle accepts 2–25 entries and 1–5 winning places, with fewer places than entries.
+It limits announcements to 20,000 outcomes.
+Submit entries before the observation window ends.
+Existing NOAA `expected_observations` entries remain supported.
+
+Run the HTTP compatibility test against a disposable oracle with the test coordinator key allowlisted:
+
+```bash
+COORDINATOR_TEST_ORACLE_URL=http://127.0.0.1:9800 \
+COORDINATOR_TEST_ORACLE_KEY=/path/to/test-coordinator.pem \
+cargo test -p coordinator live_noaa_v2_create_read_and_submit_entries -- --ignored
+```
+
+The test creates an event, reads its announcement, and submits two entries.
+It does not test weather ingestion or a funded on-chain settlement.
 
 ### Upgrade from the coordinator-managed wallet
 
@@ -214,22 +309,10 @@ Its Litestream container does not guarantee a final remote sync after coordinato
 
 ### Competition State Machine
 
-1. **Created** → Competition created
-2. **EntriesCollected** → All entries paid
-3. **EscrowFundsConfirmed** → Escrow transactions confirmed
-4. **EventCreated** → Oracle event created
-5. **EntriesSubmitted** → Entries submitted to oracle
-6. **ContractCreated** → DLC contract parameters generated
-7. **NoncesCollected** → User nonces collected
-8. **AggregateNoncesGenerated** → Nonces aggregated
-9. **PartialSignaturesCollected** → User signatures collected
-10. **SigningComplete** → Signatures aggregated (via keymeld)
-11. **FundingBroadcasted** → Funding tx broadcast
-12. **FundingConfirmed** → Funding confirmed
-13. **Attested** → Oracle attestation received
-14. **OutcomeBroadcasted** → Outcome tx broadcast
-15. **DeltaBroadcasted** → Cooperative close txs broadcast
-16. **Completed** → All reclaim txs broadcast
+Competitions move through a typestate machine; the current state flow is
+documented in
+[`crates/coordinator/src/domain/competitions/states/mod.rs`](crates/coordinator/src/domain/competitions/states/mod.rs),
+next to the transition code. Any state can move to `Failed` or `Cancelled`.
 
 ### Frontend
 

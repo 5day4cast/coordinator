@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use dlctix::secp::Point;
 use log::{debug, error, warn};
-use nostr_sdk::ToBech32;
+use nostr::ToBech32;
 
 use axum::{
     extract::{Path, State},
@@ -16,13 +16,14 @@ use crate::{
     api::extractors::{AuthError, NostrAuth},
     domain::{
         scoring::{calculate_option_score, Forecast, Observation},
-        SearchBy,
+        Competition, SearchBy, UserEntry,
     },
     infra::oracle::ValueOptions,
     startup::AppState,
     templates::{
         admin::dashboard::Station,
         fragments::{
+            competition_row::competition_row,
             entry_form::{entry_form, ForecastValue, StationForecast, WeatherContext},
             leaderboard::{leaderboard, leaderboard_row, EntryScore, LeaderboardInfo},
         },
@@ -155,7 +156,7 @@ pub async fn competitions_rows_fragment(State(state): State<Arc<AppState>>) -> H
     Html(
         html! {
             @for comp in &competitions {
-                (crate::templates::fragments::competition_row::competition_row(comp))
+                (competition_row(comp))
             }
         }
         .into_string(),
@@ -497,10 +498,7 @@ struct EntryWeatherData {
 }
 
 /// Fetch forecast and observation data for an entry's display
-async fn fetch_entry_weather_data(
-    state: &AppState,
-    entry: &crate::domain::UserEntry,
-) -> Option<EntryWeatherData> {
+async fn fetch_entry_weather_data(state: &AppState, entry: &UserEntry) -> Option<EntryWeatherData> {
     use std::collections::HashMap;
 
     // Get the competition to find observation dates
@@ -749,7 +747,7 @@ async fn fetch_competitions(state: &AppState) -> Vec<CompetitionView> {
     }
 }
 
-fn determine_competition_status(competition: &crate::domain::Competition) -> String {
+fn determine_competition_status(competition: &Competition) -> String {
     use crate::domain::CompetitionState;
     use time::OffsetDateTime;
 
@@ -867,10 +865,7 @@ async fn fetch_eligible_payouts(state: &AppState, pubkey: &str) -> Vec<PayoutVie
 
 /// Calculate the payout amount in sats for an entry based on the competition outcome.
 /// Returns None if the entry is not a winner or the calculation cannot be performed.
-fn calculate_entry_payout(
-    competition: &crate::domain::Competition,
-    ephemeral_pubkey_hex: &str,
-) -> Option<u64> {
+fn calculate_entry_payout(competition: &Competition, ephemeral_pubkey_hex: &str) -> Option<u64> {
     let contract_params = competition.contract_parameters.as_ref()?;
     let outcome = competition.get_current_outcome().ok()?;
     let outcome_weights = contract_params.outcome_payouts.get(&outcome)?;
@@ -1228,13 +1223,12 @@ async fn fetch_leaderboard_scores(state: &AppState, competition_id: Uuid) -> Vec
         // Fetch entry details for username and raw score calculation
         if let Ok(Some(entry)) = state.coordinator.get_entry_by_id(oracle_entry.id).await {
             // Look up username
-            if let Ok(pubkey) = nostr_sdk::PublicKey::from_hex(&entry.pubkey) {
-                if let Ok(bech32) = pubkey.to_bech32() {
-                    if let Ok(Some(name)) = state.users_info.get_username_by_pubkey(&bech32).await {
-                        entry_score.username = name;
-                    } else {
-                        entry_score.username = entry.pubkey[..8].to_string();
-                    }
+            if let Ok(pubkey) = nostr::PublicKey::from_hex(&entry.pubkey) {
+                let bech32 = pubkey.to_bech32().unwrap_or_else(|never| match never {});
+                if let Ok(Some(name)) = state.users_info.get_username_by_pubkey(&bech32).await {
+                    entry_score.username = name;
+                } else {
+                    entry_score.username = entry.pubkey[..8].to_string();
                 }
             }
 

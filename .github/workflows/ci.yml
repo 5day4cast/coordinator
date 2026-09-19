@@ -16,6 +16,20 @@ env:
   SQLITE_DIR: ${{ github.workspace }}/.sqlite
 
 jobs:
+  release-metadata:
+    name: Release Metadata and Packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 -m unittest discover -s scripts -p 'test_release.py' -v
+      - name: Validate committed release metadata
+        run: |
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          python3 scripts/release.py validate --version "$VERSION" --dry-run true
+
   # Format check (fast, runs first)
   fmt:
     name: Format
