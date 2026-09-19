@@ -882,12 +882,13 @@ pub fn parse_optional_sqlite_datetime(
         .map(|s| {
             // SQLite datetime format: "YYYY-MM-DD HH:MM:SS"
             // Parse as UTC since SQLite doesn't include timezone info
-            let format =
-                time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]")
-                    .map_err(|e| sqlx::Error::ColumnDecode {
-                        index: column.to_string(),
-                        source: Box::new(e),
-                    })?;
+            let format = time::format_description::parse_borrowed::<1>(
+                "[year]-[month]-[day] [hour]:[minute]:[second]",
+            )
+            .map_err(|e| sqlx::Error::ColumnDecode {
+                index: column.to_string(),
+                source: Box::new(e),
+            })?;
 
             let pdt = time::PrimitiveDateTime::parse(&s, &format).map_err(|e| {
                 sqlx::Error::ColumnDecode {

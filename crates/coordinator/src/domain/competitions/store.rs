@@ -1755,9 +1755,10 @@ impl CompetitionStore {
         let expected_hash = ticket.hash.clone();
         let payment_request_owned = payment_request.to_string();
         // Use SQLite datetime format: YYYY-MM-DD HH:MM:SS
-        let format =
-            time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]")
-                .expect("valid format");
+        let format = time::format_description::parse_borrowed::<1>(
+            "[year]-[month]-[day] [hour]:[minute]:[second]",
+        )
+        .expect("valid format");
         let expires_at_str = invoice_expires_at.format(&format).unwrap_or_default();
 
         self.db_connection
