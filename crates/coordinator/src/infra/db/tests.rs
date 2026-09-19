@@ -602,7 +602,7 @@ async fn concurrent_payouts_are_exclusive_and_terminal_states_cannot_be_overwrit
     let (_directory, database, store, event_id, ticket_id) = ticket_database().await;
     let entry_id = Uuid::now_v7();
     bounded(database.execute_write(move |pool| async move {
-        sqlx::query("INSERT INTO entries (id, event_id, ticket_id, pubkey, ephemeral_pubkey, ephemeral_privatekey_encrypted, payout_preimage_encrypted, payout_hash, entry_submission) VALUES (?, ?, ?, 'owner', 'ephemeral', '', '', 'hash', '{}')")
+        sqlx::query("INSERT INTO entries (id, event_id, ticket_id, pubkey, ephemeral_pubkey, payout_hash, entry_submission) VALUES (?, ?, ?, 'owner', 'ephemeral', 'hash', '{}')")
             .bind(entry_id.to_string()).bind(event_id.to_string()).bind(ticket_id.to_string())
             .execute(&pool).await?;
         Ok(())

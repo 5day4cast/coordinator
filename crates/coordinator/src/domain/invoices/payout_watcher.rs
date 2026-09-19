@@ -248,7 +248,7 @@ mod tests {
                 .bind(event_id.to_string()).execute(&pool).await?;
             sqlx::query("INSERT INTO tickets (id, event_id, encrypted_preimage, hash) VALUES (?, ?, 'preimage', 'hash')")
                 .bind(ticket_id.to_string()).bind(event_id.to_string()).execute(&pool).await?;
-            sqlx::query("INSERT INTO entries (id, event_id, ticket_id, pubkey, ephemeral_pubkey, ephemeral_privatekey_encrypted, payout_preimage_encrypted, payout_hash, entry_submission) VALUES (?, ?, ?, 'owner', 'key', '', '', 'hash', '{}')")
+            sqlx::query("INSERT INTO entries (id, event_id, ticket_id, pubkey, ephemeral_pubkey, payout_hash, entry_submission) VALUES (?, ?, ?, 'owner', 'key', 'hash', '{}')")
                 .bind(entry_id.to_string()).bind(event_id.to_string()).bind(ticket_id.to_string()).execute(&pool).await?;
             Ok(())
         }).await.unwrap();
