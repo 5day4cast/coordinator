@@ -99,9 +99,10 @@ enclave. The entry form shows which pins are in use.
 
 Set the pins to Keymeld's reviewed PCR8 (image signer) or PCR0 (image)
 measurements when deploying Nitro enclaves. The coordinator serves this WASM,
-so the pins only protect users who can check that the served
-`coordinator_wasm_bg.wasm` matches the reproducible `nix build` output
-published with the release.
+so the pins only protect users who check that the served
+`/ui/pkg/coordinator_wasm_bg.wasm` matches the release build. Each GitHub
+release publishes `coordinator-wasm-<version>.sha256` with the SHA-256 of
+that module, and the pins it was built from are in the tagged source.
 
 ## NIP-98 requests
 
