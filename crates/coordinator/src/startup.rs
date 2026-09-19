@@ -747,61 +747,6 @@ async fn static_file_response(ui_dir: &str, path: &str) -> Response {
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Server error").into_response())
 }
 
-#[cfg(test)]
-mod static_file_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn static_routes_reject_percent_encoded_absolute_paths_and_parent_components() {
-        let directory = tempfile::tempdir().unwrap();
-        let ui_dir = directory.path().join("ui");
-        std::fs::create_dir_all(ui_dir.join("pkg")).unwrap();
-        std::fs::write(ui_dir.join("pkg/app.js"), "browser code").unwrap();
-        let secret_path = directory.path().join("secret.txt");
-        std::fs::write(&secret_path, "private data").unwrap();
-
-        let router = Router::new()
-            .route(
-                "/ui/{*path}",
-                get(
-                    |State(ui_dir): State<String>, Path(path): Path<String>| async move {
-                        static_file_response(&ui_dir, &path).await
-                    },
-                ),
-            )
-            .with_state(ui_dir.to_str().unwrap().to_owned());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let client = reqwest::Client::new();
-
-        let valid = client
-            .get(format!("http://{address}/ui/pkg/app.js"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(valid.status(), StatusCode::OK);
-        assert_eq!(valid.text().await.unwrap(), "browser code");
-
-        for path in [
-            format!(
-                "%2F{}",
-                secret_path.to_str().unwrap().trim_start_matches('/')
-            ),
-            "pkg%2F..%2F..%2Fsecret.txt".to_owned(),
-        ] {
-            let response = client
-                .get(format!("http://{address}/ui/{path}"))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
-            assert!(!response.text().await.unwrap().contains("private data"));
-        }
-        server.abort();
-    }
-}
-
 fn get_mime_type(path: &str) -> &'static str {
     let ext = path.rsplit('.').next().unwrap_or("");
     match ext {
@@ -893,5 +838,60 @@ async fn shutdown_signal() {
     select! {
         _ = sigint.recv() => info!("Received SIGINT signal"),
         _ = sigterm.recv() => info!("Received SIGTERM signal"),
+    }
+}
+
+#[cfg(test)]
+mod static_file_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn static_routes_reject_percent_encoded_absolute_paths_and_parent_components() {
+        let directory = tempfile::tempdir().unwrap();
+        let ui_dir = directory.path().join("ui");
+        std::fs::create_dir_all(ui_dir.join("pkg")).unwrap();
+        std::fs::write(ui_dir.join("pkg/app.js"), "browser code").unwrap();
+        let secret_path = directory.path().join("secret.txt");
+        std::fs::write(&secret_path, "private data").unwrap();
+
+        let router = Router::new()
+            .route(
+                "/ui/{*path}",
+                get(
+                    |State(ui_dir): State<String>, Path(path): Path<String>| async move {
+                        static_file_response(&ui_dir, &path).await
+                    },
+                ),
+            )
+            .with_state(ui_dir.to_str().unwrap().to_owned());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let valid = client
+            .get(format!("http://{address}/ui/pkg/app.js"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(valid.status(), StatusCode::OK);
+        assert_eq!(valid.text().await.unwrap(), "browser code");
+
+        for path in [
+            format!(
+                "%2F{}",
+                secret_path.to_str().unwrap().trim_start_matches('/')
+            ),
+            "pkg%2F..%2F..%2Fsecret.txt".to_owned(),
+        ] {
+            let response = client
+                .get(format!("http://{address}/ui/{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            assert!(!response.text().await.unwrap().contains("private data"));
+        }
+        server.abort();
     }
 }
