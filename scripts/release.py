@@ -112,7 +112,13 @@ def package_wasm(root, version, source, wasm, output):
         provenance = metadata(root, version, source)
         provenance["wasm_sha256"] = digest(package / "coordinator_wasm_bg.wasm")
         (package / "RELEASE.json").write_text(json.dumps(provenance, indent=2) + "\n")
-        return archive(package, output)
+        destination = archive(package, output)
+        # Preserve the public sidecar used to verify the module served by a coordinator.
+        (output / f"{package.name}.sha256").write_text(
+            f"{provenance['wasm_sha256']}  {package.name}/coordinator_wasm_bg.wasm\n"
+            f"{digest(destination)}  {destination.name}\n"
+        )
+        return destination
 
 
 def package_native(root, version, source, target, asset, wasm_archive, output):

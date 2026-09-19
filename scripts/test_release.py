@@ -1,5 +1,6 @@
 """Release regressions: version/source mismatch and incomplete browser packages."""
 
+import hashlib
 import json
 from pathlib import Path
 import tarfile
@@ -108,6 +109,14 @@ class ReleaseTests(unittest.TestCase):
     def test_native_archive_contains_browser_assets_wallet_and_provenance(self):
         self.native_files()
         wasm = self.wasm()
+        # The public sidecar must keep the documented filename, module path, and hash.
+        module_hash = hashlib.sha256((self.root / "wasm/coordinator_wasm_bg.wasm").read_bytes()).hexdigest()
+        archive_hash = hashlib.sha256(wasm.read_bytes()).hexdigest()
+        self.assertEqual(
+            (wasm.parent / f"coordinator-wasm-{VERSION}.sha256").read_text(),
+            f"{module_hash}  coordinator-wasm-{VERSION}/coordinator_wasm_bg.wasm\n"
+            f"{archive_hash}  coordinator-wasm-{VERSION}.tar.gz\n",
+        )
         destination = self.native(wasm)
         first_hash = release.digest(destination)
         with tarfile.open(destination) as archive:
