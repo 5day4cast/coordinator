@@ -124,9 +124,6 @@ that module, and the pins it was built from are in the tagged source.
   payouts stay as the automated, trust-the-coordinator option. Until then,
   the database allows one live payout per entry, and the payout row is
   written before the payment is sent.
-- **Admin and wallet routes have no authentication.** `/admin`,
-  `/api/v1/wallet/*` and `POST /api/v1/competitions` rely on the gateway
-  refusing them on the public name.
 - **Sold payout secrets are stored in plaintext.** After a sellback the
   coordinator keeps the entry key and preimage it bought, unencrypted, to sign
   the reclaim.

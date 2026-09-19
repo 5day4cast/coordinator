@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 impl CoordinatorClient {
     /// Settle a ticket's HODL invoice for testing purposes.
-    /// This endpoint must be enabled on the coordinator (testMode.enabled: true).
+    /// The coordinator serves this route on its operator listener, never on mainnet.
     pub async fn test_settle_invoice(&self, ticket_id: &Uuid) -> Result<()> {
         let url = format!(
             "{}/admin/api/test/settle-invoice/{}",
@@ -13,8 +13,7 @@ impl CoordinatorClient {
         );
 
         let resp = self
-            .http()
-            .post(&url)
+            .admin_post(&url)
             .send()
             .await
             .context("Failed to settle invoice")?;
@@ -23,7 +22,7 @@ impl CoordinatorClient {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!(
-                "Test settle invoice failed ({}): {}. Is testMode enabled on coordinator?",
+                "Test settle invoice failed ({}): {}. Is admin_url the operator listener with a valid admin token, on a non-mainnet coordinator?",
                 status,
                 body
             );
