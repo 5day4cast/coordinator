@@ -1,7 +1,7 @@
 use super::{
     states::CompetitionStatus, store::ReservedTicket, AddEntry, CompetitionError, CompetitionState,
-    CompetitionStore, FundedContract, KeymeldSigningInfo, PayoutError, PayoutInfo, SearchBy,
-    Ticket, TicketStatus, UserEntry, UserEntryView,
+    CompetitionStore, FundedContract, KeymeldSigningInfo, PayoutInfo, SearchBy, Ticket,
+    TicketStatus, UserEntry, UserEntryView,
 };
 use crate::{
     api::routes::FinalSignatures,
@@ -2931,7 +2931,7 @@ impl Coordinator {
             Err(e) => {
                 if let Err(clear_err) = self
                     .competition_store
-                    .clear_ticket_reservation(ticket.id)
+                    .clear_ticket_reservation(&ticket)
                     .await
                 {
                     error!(
@@ -2993,13 +2993,20 @@ impl Coordinator {
             let escrow_hex = hex::encode(dlctix::bitcoin::consensus::encode::serialize(&escrow_tx));
 
             // Store the escrow transaction in the database
-            self.competition_store
-                .update_ticket_escrow(ticket.id, btc_pubkey.to_string(), escrow_hex.clone())
+            let stored = self
+                .competition_store
+                .update_ticket_escrow(&ticket, btc_pubkey.to_string(), escrow_hex.clone())
                 .await
                 .map_err(|e| {
                     error!("Failed to update ticket with escrow transaction: {}", e);
                     Error::from(e)
                 })?;
+
+            if !stored {
+                return Err(Error::BadRequest(
+                    "Ticket reservation changed; request a new ticket".into(),
+                ));
+            }
 
             debug!(
                 "Created ticket {} with escrow tx {}",
@@ -3033,56 +3040,9 @@ impl Coordinator {
         let buffer_seconds = 600i64; // 10 minutes buffer for signing + broadcast
         let invoice_expiry_seconds = (time_until_entries_close + buffer_seconds).max(900); // minimum 15 min
         let payment_request = if let Some(existing_payment_request) = &ticket.payment_request {
-            // Check if the existing invoice has expired
-            let is_expired = ticket
-                .invoice_expires_at
-                .map(|expires_at| expires_at < time::OffsetDateTime::now_utc())
-                .unwrap_or(true); // If no expiry stored, treat as expired to be safe
-
-            if is_expired {
-                debug!(
-                    "Existing invoice for ticket {} has expired, creating new one",
-                    ticket.id
-                );
-                // Cancel the old invoice before creating a new one
-                if let Err(e) = self.ln.cancel_hold_invoice(hex::encode(payment_hash)).await {
-                    // Log but don't fail - the invoice might already be cancelled or not exist
-                    debug!("Failed to cancel expired invoice: {}", e);
-                }
-
-                // Create new HODL invoice
-                let invoice = self
-                    .ln
-                    .add_hold_invoice(
-                        full_fee,
-                        invoice_expiry_seconds as u64,
-                        hex::encode(payment_hash),
-                        ticket.competition_id,
-                        escrow_tx_hex.clone().unwrap_or_default(),
-                    )
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to create HODL invoice: {}", e);
-                        Error::BadRequest("Failed to create invoice".to_string())
-                    })?;
-
-                let expires_at = time::OffsetDateTime::now_utc()
-                    + time::Duration::seconds(invoice_expiry_seconds);
-
-                // Update ticket with new payment request and expiry
-                self.competition_store
-                    .update_ticket_payment_request(ticket.id, &invoice.payment_request, expires_at)
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to update ticket with payment request: {}", e);
-                        Error::from(e)
-                    })?;
-
-                invoice.payment_request
-            } else {
-                debug!("Reusing existing payment request for ticket {}", ticket.id);
-                existing_payment_request.clone()
-            }
+            // Expired unpaid invoices are rotated atomically by the ticket
+            // store. LND does not permit reusing a cancelled payment hash.
+            existing_payment_request.clone()
         } else {
             // Create new HODL invoice
             // Note: escrow_tx_hex is empty string when escrow disabled
@@ -3105,14 +3065,22 @@ impl Coordinator {
                 time::OffsetDateTime::now_utc() + time::Duration::seconds(invoice_expiry_seconds);
 
             // Update ticket with payment request and expiry
-            self.competition_store
-                .update_ticket_payment_request(ticket.id, &invoice.payment_request, expires_at)
+            let stored = self
+                .competition_store
+                .update_ticket_payment_request(&ticket, &invoice.payment_request, expires_at)
                 .await
                 .map_err(|e| {
                     error!("Failed to update ticket with payment request: {}", e);
                     Error::from(e)
                 })?;
 
+            if !stored {
+                self.cancel_superseded_invoice(ticket.id, ticket.hash.clone())
+                    .await;
+                return Err(Error::BadRequest(
+                    "Ticket reservation changed; request a new ticket".into(),
+                ));
+            }
             invoice.payment_request
         };
 
@@ -3248,7 +3216,7 @@ impl Coordinator {
         Ok(())
     }
 
-    pub async fn add_entry(&self, pubkey: String, entry: AddEntry) -> Result<UserEntry, Error> {
+    pub async fn add_entry(&self, pubkey: String, mut entry: AddEntry) -> Result<UserEntry, Error> {
         let competition = self
             .competition_store
             .get_competition(entry.event_id)
@@ -3266,7 +3234,7 @@ impl Coordinator {
                 "Competition is no longer accepting entries".into(),
             ));
         }
-        validate_entry_keys(&entry)?;
+        validate_entry_keys(&mut entry)?;
         validate_entry(entry.clone().into(), competition).await?;
 
         debug!("entry: {:?}", entry);
@@ -3894,35 +3862,9 @@ impl Coordinator {
             })?;
         info!("Payout {} initiated for entry {}", payout_id, entry_id);
 
-        if let Err(e) = self
-            .ln
-            .send_payment(
-                payout_info.ln_invoice,
-                payout_amount_sats,
-                60,   // TODO(@tee8z): make this timeout configurable, 60 second timeout
-                1000, // TODO(@tee8z): make this fee configurable, 1000 sat fee limit
-            )
-            .await
-        {
-            error!(
-                "Failed to initiate lightning payment for payout {}: {}",
-                payout_id, e
-            );
-            if let Err(mark_err) = self
-                .competition_store
-                .mark_payout_failed(
-                    payout_id,
-                    OffsetDateTime::now_utc(),
-                    PayoutError::FailedToPayOut("Failed to initiate lightning payment".into()),
-                )
-                .await
-            {
-                error!("Failed to mark payout {} failed: {}", payout_id, mark_err);
-            }
-            return Err(Error::PaymentFailed(
-                "Failed to initiate lightning payment".into(),
-            ));
-        }
+        // The payout watcher is the sole sender. Persisting this outbox item
+        // before acknowledging the request also survives shutdown before the
+        // first RPC. Ambiguous RPC errors never release the entry's payout lock.
         Ok(())
     }
 }
@@ -3968,12 +3910,16 @@ fn parse_hash32(hex_str: &str) -> Result<[u8; 32], anyhow::Error> {
 /// Entry keys are used verbatim when the contract is built; reject anything
 /// the contract builder could not parse so one entry cannot poison a
 /// competition.
-fn validate_entry_keys(entry: &AddEntry) -> Result<(), Error> {
-    Point::from_hex(&entry.ephemeral_pubkey).map_err(|_| {
+fn validate_entry_keys(entry: &mut AddEntry) -> Result<(), Error> {
+    let pubkey = Point::from_hex(&entry.ephemeral_pubkey).map_err(|_| {
         Error::BadRequest("ephemeral_pubkey must be a compressed secp256k1 point in hex".into())
     })?;
-    parse_hash32(&entry.payout_hash)
+    let payout_hash = parse_hash32(&entry.payout_hash)
         .map_err(|_| Error::BadRequest("payout_hash must be 32 bytes in hex".into()))?;
+    // The database's per-competition uniqueness constraints compare strings.
+    // Store a single encoding so case/prefix aliases cannot bypass them.
+    entry.ephemeral_pubkey = hex::encode(pubkey.serialize());
+    entry.payout_hash = hex::encode(payout_hash);
     Ok(())
 }
 
@@ -4772,6 +4718,27 @@ mod tests {
     use super::*;
     use dlctix::{attestation_locking_point, hashlock, MarketMaker};
     use rand::RngCore;
+
+    #[test]
+    fn entry_key_validation_normalizes_aliases_before_uniqueness_checks() {
+        let key = Scalar::from_slice(&[1; 32]).unwrap().base_point_mul();
+        let mut entry = AddEntry {
+            id: Uuid::now_v7(),
+            ticket_id: Uuid::now_v7(),
+            event_id: Uuid::now_v7(),
+            ephemeral_pubkey: hex::encode(key.serialize()).to_uppercase(),
+            payout_hash: format!("0x{}", hex::encode([0xab; 32]).to_uppercase()),
+            expected_observations: vec![],
+            encrypted_keymeld_private_key: None,
+            keymeld_auth_pubkey: None,
+            keymeld_registration_context: None,
+        };
+        validate_entry_keys(&mut entry).unwrap();
+        assert_eq!(entry.ephemeral_pubkey, hex::encode(key.serialize()));
+        assert_eq!(entry.payout_hash, hex::encode([0xab; 32]));
+        entry.payout_hash = "00".into();
+        assert!(validate_entry_keys(&mut entry).is_err());
+    }
 
     fn params() -> ContractParameters {
         let mut rng = rand::rng();

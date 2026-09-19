@@ -442,7 +442,7 @@ async fn taking_over_a_stale_reservation_rotates_the_ticket_and_reports_the_old_
         .unwrap();
     assert!(alice.superseded_payment_hash.is_none());
     bounded(store.update_ticket_payment_request(
-        ticket_id,
+        &alice.ticket,
         "lnbc-alice",
         OffsetDateTime::now_utc() + time::Duration::hours(1),
     ))
@@ -469,6 +469,31 @@ async fn taking_over_a_stale_reservation_rotates_the_ticket_and_reports_the_old_
     assert_ne!(bob.ticket.encrypted_preimage, "old-preimage");
     assert!(bob.ticket.payment_request.is_none());
 
+    // An in-flight request or watcher holding Alice's old snapshot must not
+    // clear Bob's reservation or overwrite his invoice and escrow.
+    assert!(!bounded(store.clear_ticket_reservation(&alice.ticket))
+        .await
+        .unwrap());
+    assert!(!bounded(store.update_ticket_payment_request(
+        &alice.ticket,
+        "stale-invoice",
+        OffsetDateTime::now_utc()
+    ))
+    .await
+    .unwrap());
+    assert!(!bounded(store.update_ticket_escrow(
+        &alice.ticket,
+        "alice-key".into(),
+        "stale-escrow".into()
+    ))
+    .await
+    .unwrap());
+    let current = bounded(store.get_ticket(ticket_id)).await.unwrap();
+    assert_eq!(current.reserved_by.as_deref(), Some("bob"));
+    assert_eq!(current.hash, bob.ticket.hash);
+    assert!(current.payment_request.is_none());
+    assert!(current.escrow_transaction.is_none());
+
     // A late payment on Alice's invoice can never be credited to Bob's ticket.
     assert!(!bounded(store.mark_ticket_paid("old-hash", event_id))
         .await
@@ -478,8 +503,155 @@ async fn taking_over_a_stale_reservation_rotates_the_ticket_and_reports_the_old_
         .unwrap());
 
     // A paid ticket is never released, even if a later request fails.
-    assert!(!bounded(store.clear_ticket_reservation(ticket_id))
+    assert!(!bounded(store.clear_ticket_reservation(&bob.ticket))
         .await
         .unwrap());
+    bounded(database.close()).await.unwrap();
+}
+
+async fn ticket_database() -> (TempDir, DBConnection, CompetitionStore, Uuid, Uuid) {
+    let directory = tempfile::tempdir().unwrap();
+    let database = bounded(DBConnection::new(
+        directory.path().to_str().unwrap(),
+        "competitions",
+        DatabasePoolConfig::default(),
+        DatabaseType::Competitions,
+    ))
+    .await
+    .unwrap();
+    let event_id = Uuid::now_v7();
+    let ticket_id = Uuid::now_v7();
+    bounded(database.execute_write(move |pool| async move {
+        sqlx::query("INSERT INTO competitions (id, created_at, event_submission) VALUES (?, datetime('now'), '{}')")
+            .bind(event_id.to_string()).execute(&pool).await?;
+        sqlx::query("INSERT INTO tickets (id, event_id, encrypted_preimage, hash) VALUES (?, ?, 'old-preimage', 'old-hash')")
+            .bind(ticket_id.to_string()).bind(event_id.to_string()).execute(&pool).await?;
+        Ok(())
+    })).await.unwrap();
+    let store = CompetitionStore::new(database.clone());
+    (directory, database, store, event_id, ticket_id)
+}
+
+#[tokio::test]
+async fn releasing_an_invoice_rotates_the_hash_and_preserves_a_concurrently_issued_invoice() {
+    let (_directory, database, store, event_id, ticket_id) = ticket_database().await;
+    let unissued = bounded(store.get_and_reserve_ticket(event_id, "alice"))
+        .await
+        .unwrap()
+        .ticket;
+    assert!(bounded(store.update_ticket_payment_request(
+        &unissued,
+        "alice-invoice",
+        OffsetDateTime::now_utc() + time::Duration::hours(1),
+    ))
+    .await
+    .unwrap());
+    // A duplicate request failed before seeing the invoice saved by its peer.
+    assert!(!bounded(store.clear_ticket_reservation(&unissued))
+        .await
+        .unwrap());
+    let issued = bounded(store.get_ticket(ticket_id)).await.unwrap();
+    assert!(bounded(store.clear_ticket_reservation(&issued))
+        .await
+        .unwrap());
+    let next = bounded(store.get_and_reserve_ticket(event_id, "bob"))
+        .await
+        .unwrap()
+        .ticket;
+    assert_ne!(next.hash, issued.hash);
+    assert_ne!(next.encrypted_preimage, issued.encrypted_preimage);
+    assert!(!bounded(store.mark_ticket_paid(&issued.hash, event_id))
+        .await
+        .unwrap());
+    assert!(!bounded(store.clear_ticket_reservation(&issued))
+        .await
+        .unwrap());
+    bounded(database.close()).await.unwrap();
+}
+
+#[tokio::test]
+async fn renewing_an_expired_invoice_rotates_its_hash_even_for_the_same_owner() {
+    let (_directory, database, store, event_id, ticket_id) = ticket_database().await;
+    let original = bounded(store.get_and_reserve_ticket(event_id, "alice"))
+        .await
+        .unwrap()
+        .ticket;
+    bounded(store.update_ticket_payment_request(
+        &original,
+        "expired-invoice",
+        OffsetDateTime::now_utc() - time::Duration::seconds(1),
+    ))
+    .await
+    .unwrap();
+    let renewed = bounded(store.get_and_reserve_ticket(event_id, "alice"))
+        .await
+        .unwrap();
+    assert_eq!(renewed.ticket.id, ticket_id);
+    assert_eq!(
+        renewed.superseded_payment_hash.as_deref(),
+        Some(original.hash.as_str())
+    );
+    assert_ne!(renewed.ticket.hash, original.hash);
+    assert!(renewed.ticket.payment_request.is_none());
+    bounded(database.close()).await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_payouts_are_exclusive_and_terminal_states_cannot_be_overwritten() {
+    use crate::domain::PayoutError;
+    let (_directory, database, store, event_id, ticket_id) = ticket_database().await;
+    let entry_id = Uuid::now_v7();
+    bounded(database.execute_write(move |pool| async move {
+        sqlx::query("INSERT INTO entries (id, event_id, ticket_id, pubkey, ephemeral_pubkey, ephemeral_privatekey_encrypted, payout_preimage_encrypted, payout_hash, entry_submission) VALUES (?, ?, ?, 'owner', 'ephemeral', '', '', 'hash', '{}')")
+            .bind(entry_id.to_string()).bind(event_id.to_string()).bind(ticket_id.to_string())
+            .execute(&pool).await?;
+        Ok(())
+    })).await.unwrap();
+    let start = || {
+        store.store_payout_info_pending(
+            entry_id,
+            "preimage".into(),
+            "private".into(),
+            "invoice".into(),
+            10,
+        )
+    };
+    let (first, second) = bounded(async { tokio::join!(start(), start()) }).await;
+    assert_ne!(first.is_ok(), second.is_ok());
+    let first_id = first.or(second).unwrap();
+    let pending = bounded(store.get_all_pending_payouts()).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, first_id);
+    bounded(store.mark_payout_failed(
+        first_id,
+        OffsetDateTime::now_utc(),
+        PayoutError::FailedToPayOut("confirmed failure".into()),
+    ))
+    .await
+    .unwrap();
+    bounded(store.mark_payout_succeeded(first_id, OffsetDateTime::now_utc()))
+        .await
+        .unwrap();
+    assert!(bounded(store.get_payout(first_id))
+        .await
+        .unwrap()
+        .unwrap()
+        .succeed_at
+        .is_none());
+    let retry_id = bounded(start()).await.unwrap();
+    bounded(store.mark_payout_succeeded(retry_id, OffsetDateTime::now_utc()))
+        .await
+        .unwrap();
+    bounded(store.mark_payout_failed(
+        retry_id,
+        OffsetDateTime::now_utc(),
+        PayoutError::FailedToPayOut("stale failure".into()),
+    ))
+    .await
+    .unwrap();
+    let succeeded = bounded(store.get_payout(retry_id)).await.unwrap().unwrap();
+    assert!(succeeded.succeed_at.is_some());
+    assert!(succeeded.failed_at.is_none());
+    assert!(bounded(start()).await.is_err());
     bounded(database.close()).await.unwrap();
 }

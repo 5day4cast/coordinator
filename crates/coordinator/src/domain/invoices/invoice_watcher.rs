@@ -98,7 +98,7 @@ impl InvoiceWatcher {
                         match self
                             .coordinator
                             .competition_store
-                            .clear_ticket_reservation(ticket.id)
+                            .clear_ticket_reservation(&ticket)
                             .await
                         {
                             Ok(_) => {
@@ -128,7 +128,7 @@ impl InvoiceWatcher {
                             .mark_ticket_paid(&ticket.hash, ticket.competition_id)
                             .await
                         {
-                            Ok(_) => {
+                            Ok(true) => {
                                 // Check if escrow is enabled
                                 if self.coordinator.is_escrow_enabled() {
                                     // Try broadcasting escrow with retries and UTXO regeneration
@@ -171,6 +171,9 @@ impl InvoiceWatcher {
                                     // Note: We don't settle the invoice here - it stays in-flight
                                     // until the contract/funding tx is broadcast later
                                 }
+                            }
+                            Ok(false) => {
+                                debug!("Ticket {} was already paid or reassigned", ticket.id)
                             }
                             Err(e) => error!("Failed to mark ticket {} as paid: {}", ticket.id, e),
                         }

@@ -346,7 +346,7 @@ impl CompetitionStore {
                 sqlx::query(
                     "UPDATE payouts
                     SET succeed_at = ?
-                    WHERE id = ?",
+                    WHERE id = ? AND succeed_at IS NULL AND failed_at IS NULL",
                 )
                 .bind(succeed_at_str)
                 .bind(payout_id_str)
@@ -375,7 +375,7 @@ impl CompetitionStore {
                 sqlx::query(
                     "UPDATE payouts
                     SET failed_at = ?, error = ?
-                    WHERE id = ?",
+                    WHERE id = ? AND succeed_at IS NULL AND failed_at IS NULL",
                 )
                 .bind(failed_at_str)
                 .bind(error_blob)
@@ -1328,6 +1328,8 @@ impl CompetitionStore {
                        LEFT JOIN entries ON tickets.id = entries.ticket_id
                        WHERE tickets.event_id = ?
                          AND tickets.reserved_by = ?
+                         AND (paid_at IS NOT NULL OR payment_request IS NULL
+                              OR invoice_expires_at > datetime('now'))
                          AND entries.id IS NULL
                        LIMIT 1"#,
                 )
@@ -1358,6 +1360,8 @@ impl CompetitionStore {
                                  reserved_at < datetime('now', '-10 minutes')
                                  AND paid_at IS NULL
                              )
+                             OR (reserved_by = ? AND paid_at IS NULL AND payment_request IS NOT NULL
+                                 AND (invoice_expires_at IS NULL OR invoice_expires_at <= datetime('now')))
                          )
                        ORDER BY
                            reserved_at IS NULL DESC,
@@ -1366,6 +1370,7 @@ impl CompetitionStore {
                        LIMIT 1"#,
                 )
                 .bind(&competition_id_str)
+                .bind(&pubkey_owned)
                 .fetch_optional(&mut *tx)
                 .await?;
 
@@ -1715,22 +1720,24 @@ impl CompetitionStore {
 
     pub async fn update_ticket_escrow(
         &self,
-        ticket_id: Uuid,
+        ticket: &Ticket,
         ephemeral_pubkey: String,
         escrow_tx: String,
     ) -> Result<bool, DatabaseWriteError> {
-        let ticket_id_str = ticket_id.to_string();
+        let ticket_id_str = ticket.id.to_string();
+        let expected_hash = ticket.hash.clone();
 
         self.db_connection
             .execute_write(move |pool| async move {
                 let result = sqlx::query(
                     "UPDATE tickets
                     SET escrow_transaction = ?, ephemeral_pubkey = ?
-                    WHERE id = ?",
+                    WHERE id = ? AND hash = ? AND reserved_by IS NOT NULL",
                 )
                 .bind(escrow_tx)
                 .bind(ephemeral_pubkey)
                 .bind(ticket_id_str)
+                .bind(expected_hash)
                 .execute(&pool)
                 .await?;
                 Ok(result.rows_affected() > 0)
@@ -1740,11 +1747,12 @@ impl CompetitionStore {
 
     pub async fn update_ticket_payment_request(
         &self,
-        ticket_id: Uuid,
+        ticket: &Ticket,
         payment_request: &str,
         invoice_expires_at: time::OffsetDateTime,
     ) -> Result<bool, DatabaseWriteError> {
-        let ticket_id_str = ticket_id.to_string();
+        let ticket_id_str = ticket.id.to_string();
+        let expected_hash = ticket.hash.clone();
         let payment_request_owned = payment_request.to_string();
         // Use SQLite datetime format: YYYY-MM-DD HH:MM:SS
         let format =
@@ -1755,11 +1763,12 @@ impl CompetitionStore {
         self.db_connection
             .execute_write(move |pool| async move {
                 let result = sqlx::query(
-                    "UPDATE tickets SET payment_request = ?, invoice_expires_at = ? WHERE id = ?",
+                    "UPDATE tickets SET payment_request = ?, invoice_expires_at = ? WHERE id = ? AND hash = ? AND reserved_by IS NOT NULL",
                 )
                 .bind(payment_request_owned)
                 .bind(expires_at_str)
                 .bind(ticket_id_str)
+                .bind(expected_hash)
                 .execute(&pool)
                 .await?;
                 Ok(result.rows_affected() > 0)
@@ -1769,24 +1778,36 @@ impl CompetitionStore {
 
     pub async fn clear_ticket_reservation(
         &self,
-        ticket_id: Uuid,
+        ticket: &Ticket,
     ) -> Result<bool, DatabaseWriteError> {
-        let ticket_id_str = ticket_id.to_string();
+        let ticket_id_str = ticket.id.to_string();
+        let expected_hash = ticket.hash.clone();
+        let expected_invoice = ticket.payment_request.clone();
+        let preimage = hashlock::preimage_random(&mut rand::rng());
+        let new_preimage = hex::encode(preimage);
+        let new_hash = hex::encode(hashlock::sha256(&preimage));
 
         self.db_connection
             .execute_write(move |pool| async move {
                 let result = sqlx::query(
                     "UPDATE tickets
-                    SET reserved_at = NULL,
+                    SET encrypted_preimage = ?,
+                        hash = ?,
+                        ephemeral_pubkey = NULL,
+                        reserved_at = NULL,
                         reserved_by = NULL,
                         escrow_transaction = NULL,
                         payment_request = NULL,
                         invoice_expires_at = NULL
-                    WHERE id = ?
+                    WHERE id = ? AND hash = ? AND payment_request IS ?
                     AND paid_at IS NULL
                     AND settled_at IS NULL",
                 )
+                .bind(new_preimage)
+                .bind(new_hash)
                 .bind(ticket_id_str)
+                .bind(expected_hash)
+                .bind(expected_invoice)
                 .execute(&pool)
                 .await?;
                 Ok(result.rows_affected() > 0)

@@ -116,6 +116,12 @@ pub struct PaymentLookupResponse {
     pub failure_reason: String,
 }
 
+/// LND has no payment attempt for this hash. This is the only lookup failure
+/// for which the payout watcher may initiate the stored invoice again.
+#[derive(Debug, thiserror::Error)]
+#[error("LND payment not found")]
+pub struct PaymentNotFound;
+
 //TODO: we might need to add tls cert as an option, skipping for now
 #[derive(Clone)]
 pub struct LnClient {
@@ -540,20 +546,33 @@ impl Ln for LnClient {
 
         let response = self
             .client
-            .get(format!(
-                "{}/v2/router/track/{}?no_inflight_updates=true",
-                self.base_url, hash_base64
-            ))
+            .get(self.base_url.join(&format!(
+                "v2/router/track/{}?no_inflight_updates=false",
+                hash_base64
+            ))?)
             .header(MACAROON_HEADER, self.macaroon.expose_secret())
+            .timeout(Duration::from_secs(10))
             .send()
             .await?;
 
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(PaymentNotFound.into());
+        }
         if !response.status().is_success() {
-            return Err(anyhow!("Failed to lookup invoice: {}", response.status()));
+            return Err(anyhow!("Failed to lookup payment: {}", response.status()));
         }
 
-        let payment = response.json::<PaymentLookupResponse>().await?;
-        Ok(payment)
+        // TrackPaymentV2 is a stream, even for an already settled payment.
+        // Read the current state without waiting for an in-flight payment to end.
+        let mut stream = response.bytes_stream();
+        let mut lines = JsonLines::default();
+        while let Some(chunk) = stream.next().await {
+            lines.push(&chunk?);
+            if let Some(line) = lines.next_line() {
+                return parse_payment_lookup(&line);
+            }
+        }
+        parse_payment_lookup(&lines.buffer)
     }
 
     async fn send_payment(
@@ -612,8 +631,8 @@ impl Ln for LnClient {
             Ok(response) => {
                 let status = response.status();
                 match response.text().await {
-                    Ok(body) if status.is_success() => {
-                        info!("Payment: {}", body);
+                    Ok(_) if status.is_success() => {
+                        debug!("Payment stream completed");
                         Ok(())
                     }
                     Ok(body) => Err(anyhow!("Payment request failed with {}: {}", status, body)),
@@ -646,8 +665,11 @@ impl Ln for LnClient {
             // Ends when the subscriber drops its receiver, which shutdown does;
             // until then, reconnect after a short pause.
             while !tx.is_closed() {
-                if let Err(e) = process_invoice_stream(&client, &url, &macaroon, &tx).await {
-                    warn!("Invoice subscription error: {}", e);
+                tokio::select! {
+                    result = process_invoice_stream(&client, &url, &macaroon, &tx) => {
+                        if let Err(e) = result { warn!("Invoice subscription error: {}", e); }
+                    }
+                    _ = tx.closed() => break,
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {
@@ -676,8 +698,11 @@ impl Ln for LnClient {
             // Ends when the subscriber drops its receiver, which shutdown does;
             // until then, reconnect after a short pause.
             while !tx.is_closed() {
-                if let Err(e) = process_payment_stream(&client, &url, &macaroon, &tx).await {
-                    warn!("Payment subscription error: {}", e);
+                tokio::select! {
+                    result = process_payment_stream(&client, &url, &macaroon, &tx) => {
+                        if let Err(e) = result { warn!("Payment subscription error: {}", e); }
+                    }
+                    _ = tx.closed() => break,
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {
@@ -702,7 +727,9 @@ fn decode_base64_to_hex(encoded: &str) -> Option<String> {
 }
 
 fn parse_invoice_update(line: &str) -> Option<InvoiceUpdate> {
-    let resp: SubscribeInvoiceResponse = serde_json::from_str(line).ok()?;
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let resp: SubscribeInvoiceResponse =
+        serde_json::from_value(value.get("result").cloned().unwrap_or(value)).ok()?;
     let r_hash = resp.r_hash.as_ref()?;
     let state = resp.state.as_ref()?;
     let payment_hash = decode_base64_to_hex(r_hash)?;
@@ -720,14 +747,18 @@ fn parse_payment_update(line: &str) -> Option<PaymentUpdate> {
     let result = resp.result?;
     let hash = result.payment_hash.as_ref()?;
     let status = result.status.as_ref()?;
-    let payment_hash = decode_base64_to_hex(hash)?;
-    let preimage = result
-        .payment_preimage
-        .as_ref()
-        .and_then(|p| decode_base64_to_hex(p));
+    // Payment.payment_hash and payment_preimage are hex strings in LND's
+    // schema; Invoice.r_hash is a bytes field and uses base64 instead.
+    let payment_hash = hex::decode(hash).ok().filter(|hash| hash.len() == 32)?;
+    let preimage = result.payment_preimage.as_ref().and_then(|value| {
+        hex::decode(value)
+            .ok()
+            .filter(|bytes| bytes.len() == 32)
+            .map(hex::encode)
+    });
 
     Some(PaymentUpdate {
-        payment_hash,
+        payment_hash: hex::encode(payment_hash),
         status: status.clone(),
         failure_reason: result.failure_reason.clone(),
         preimage,
@@ -751,13 +782,11 @@ async fn process_invoice_stream(
     }
 
     let mut stream = response.bytes_stream();
+    let mut lines = JsonLines::default();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        let Ok(text) = String::from_utf8(chunk.to_vec()) else {
-            continue;
-        };
-
-        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        lines.push(&chunk?);
+        while let Some(line) = lines.next_line() {
+            let line = std::str::from_utf8(&line)?;
             let Some(update) = parse_invoice_update(line) else {
                 continue;
             };
@@ -788,17 +817,18 @@ async fn process_payment_stream(
     }
 
     let mut stream = response.bytes_stream();
+    let mut lines = JsonLines::default();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        let Ok(text) = String::from_utf8(chunk.to_vec()) else {
-            continue;
-        };
-
-        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        lines.push(&chunk?);
+        while let Some(line) = lines.next_line() {
+            let line = std::str::from_utf8(&line)?;
             let Some(update) = parse_payment_update(line) else {
                 continue;
             };
-            debug!("Payment update: {:?}", update);
+            debug!(
+                "Payment {} status: {:?}",
+                update.payment_hash, update.status
+            );
             if tx.send(update).await.is_err() {
                 return Err(anyhow!("Channel closed"));
             }
@@ -806,6 +836,43 @@ async fn process_payment_stream(
     }
 
     Ok(())
+}
+
+// HTTP chunks have no relation to gRPC Gateway's newline-delimited messages.
+// Keep bytes until a full line is available, including split UTF-8 characters.
+#[derive(Default)]
+struct JsonLines {
+    buffer: Vec<u8>,
+}
+
+impl JsonLines {
+    fn push(&mut self, bytes: &[u8]) {
+        self.buffer.extend_from_slice(bytes);
+    }
+
+    fn next_line(&mut self) -> Option<Vec<u8>> {
+        loop {
+            let end = self.buffer.iter().position(|byte| *byte == b'\n')?;
+            let mut line: Vec<u8> = self.buffer.drain(..=end).collect();
+            line.pop();
+            if !line.iter().all(u8::is_ascii_whitespace) {
+                return Some(line);
+            }
+        }
+    }
+}
+
+fn parse_payment_lookup(line: &[u8]) -> Result<PaymentLookupResponse, anyhow::Error> {
+    let value: serde_json::Value = serde_json::from_slice(line)?;
+    if let Some(error) = value.get("error") {
+        if error.get("code").and_then(serde_json::Value::as_i64) == Some(5) {
+            return Err(PaymentNotFound.into());
+        }
+        return Err(anyhow!("LND payment lookup failed"));
+    }
+    let payment: PaymentLookupResponse =
+        serde_json::from_value(value.get("result").cloned().unwrap_or(value))?;
+    Ok(payment)
 }
 
 pub fn extract_payment_hash_from_invoice(payment_request: &str) -> Result<String, anyhow::Error> {
@@ -820,6 +887,134 @@ pub fn extract_amount_from_invoice(payment_request: &str) -> Result<Option<u64>,
     let invoice = Bolt11Invoice::from_str(payment_request)
         .map_err(|e| anyhow::anyhow!("Failed to parse BOLT11 invoice: {}", e))?;
 
-    let amt = invoice.amount_milli_satoshis().map(|amount| amount / 1000);
-    Ok(amt)
+    match invoice.amount_milli_satoshis() {
+        Some(amount) if amount % 1000 != 0 => Err(anyhow!("Invoice amount must be whole satoshis")),
+        amount => Ok(amount.map(|amount| amount / 1000)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payment_json() -> serde_json::Value {
+        json!({
+            "payment_hash": hex::encode([7; 32]), "status": "IN_FLIGHT",
+            "value": "10", "creation_date": "0", "fee": "0",
+            "value_sat": "10", "value_msat": "10000", "payment_request": "invoice",
+            "fee_sat": "0", "fee_msat": "0", "creation_time_ns": "0",
+            "failure_reason": "FAILURE_REASON_NONE"
+        })
+    }
+
+    #[test]
+    fn subscription_messages_survive_every_possible_chunk_boundary() {
+        let invoice = json!({"result": {
+            "r_hash": base64::engine::general_purpose::STANDARD.encode([7; 32]),
+            "state": "ACCEPTED", "amt_paid_sat": "10", "memo": "météo"
+        }});
+        let payment = json!({"result": {
+            "payment_hash": hex::encode([7; 32]), "status": "SUCCEEDED",
+            "payment_preimage": hex::encode([8; 32])
+        }});
+        let bytes = format!("{invoice}\n{payment}\n").into_bytes();
+        for split in 0..=bytes.len() {
+            let mut decoder = JsonLines::default();
+            let mut lines = Vec::new();
+            for chunk in [&bytes[..split], &bytes[split..]] {
+                decoder.push(chunk);
+                while let Some(line) = decoder.next_line() {
+                    lines.push(String::from_utf8(line).unwrap());
+                }
+            }
+            assert_eq!(lines.len(), 2);
+            let invoice = parse_invoice_update(&lines[0]).unwrap();
+            assert_eq!(invoice.payment_hash, hex::encode([7; 32]));
+            assert_eq!(invoice.state, InvoiceState::Accepted);
+            let payment = parse_payment_update(&lines[1]).unwrap();
+            assert_eq!(payment.payment_hash, hex::encode([7; 32]));
+            assert_eq!(payment.status, PaymentStatus::Succeeded);
+            assert_eq!(payment.preimage, Some(hex::encode([8; 32])));
+        }
+    }
+
+    #[test]
+    fn payment_not_found_is_distinct_from_transient_or_malformed_responses() {
+        assert!(
+            parse_payment_lookup(br#"{"error":{"code":5,"message":"payment not found"}}"#)
+                .unwrap_err()
+                .is::<PaymentNotFound>()
+        );
+        assert!(
+            !parse_payment_lookup(br#"{"error":{"code":14,"message":"unavailable"}}"#)
+                .unwrap_err()
+                .is::<PaymentNotFound>()
+        );
+        assert!(!parse_payment_lookup(b"invalid")
+            .unwrap_err()
+            .is::<PaymentNotFound>());
+        let wrapped = json!({"result": payment_json()});
+        let response = parse_payment_lookup(&serde_json::to_vec(&wrapped).unwrap()).unwrap();
+        assert_eq!(response.status, PaymentStatus::InFlight);
+    }
+
+    #[tokio::test]
+    async fn payment_lookup_returns_the_current_state_without_waiting_for_stream_end() {
+        use axum::{body::Body, response::Response, routing::get, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/v2/router/track/{hash}",
+            get(|| async {
+                let line = format!("{}\n", json!({"result": payment_json()}));
+                let body = futures::stream::once(async { Ok::<_, std::io::Error>(line) })
+                    .chain(futures::stream::pending());
+                Response::new(Body::from_stream(body))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let client = LnClient {
+            base_url: Url::parse(&format!("http://{address}/")).unwrap(),
+            client: ClientBuilder::new(Client::new()).build(),
+            macaroon: SecretString::from("test-macaroon"),
+        };
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.lookup_payment(&hex::encode([7; 32])),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status, PaymentStatus::InFlight);
+        assert_eq!(response.payment_hash, hex::encode([7; 32]));
+        server.abort();
+    }
+
+    #[test]
+    fn payout_amount_validation_rejects_fractional_satoshis() {
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+        use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+        let invoice = |amount| {
+            InvoiceBuilder::new(Currency::Regtest)
+                .description("payout".into())
+                .payment_hash(sha256::Hash::from_byte_array([7; 32]))
+                .payment_secret(PaymentSecret([8; 32]))
+                .amount_milli_satoshis(amount)
+                .current_timestamp()
+                .min_final_cltv_expiry_delta(18)
+                .build_signed(|hash| {
+                    Secp256k1::new()
+                        .sign_ecdsa_recoverable(hash, &SecretKey::from_slice(&[9; 32]).unwrap())
+                })
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            extract_amount_from_invoice(&invoice(10_000)).unwrap(),
+            Some(10)
+        );
+        assert!(extract_amount_from_invoice(&invoice(10_999)).is_err());
+    }
 }
