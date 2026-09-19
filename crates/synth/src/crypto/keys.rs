@@ -4,7 +4,7 @@ use dlctix::{
     bitcoin::bip32::{ChainCode, ChildNumber, DerivationPath, Xpriv},
     secp::Scalar,
 };
-use nostr_sdk::{Keys, NostrSigner, SecretKey};
+use nostr_sdk::{Keys, SecretKey};
 use rand::RngCore;
 use sha2::Sha256;
 use std::str::FromStr;
@@ -101,17 +101,6 @@ impl SynthUser {
             public_key: pubkey.to_string(),
             secret_bytes,
         })
-    }
-
-    /// Encrypt a value using NIP-44 to our own public key (for self-encrypted backup)
-    pub async fn nip44_encrypt_to_self(&self, plaintext: &str) -> Result<String> {
-        let pubkey = self.nostr_keys.public_key();
-        let encrypted = self
-            .nostr_keys
-            .nip44_encrypt(&pubkey, plaintext)
-            .await
-            .map_err(|e| anyhow::anyhow!("NIP-44 encryption failed: {}", e))?;
-        Ok(encrypted)
     }
 }
 

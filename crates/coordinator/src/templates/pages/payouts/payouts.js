@@ -17,13 +17,13 @@ class Payouts {
     const payableEntries = await Promise.all(
       entries
         .filter((entry) => !entry.paid_out_at && !entry.payout_ln_invoice)
-        .map((entry) => this.checkEntryPayout(entry, entries, competitions)),
+        .map((entry) => this.checkEntryPayout(entry, competitions)),
     );
 
     return payableEntries.filter(Boolean);
   }
 
-  async checkEntryPayout(entry, allEntries, competitions) {
+  async checkEntryPayout(entry, competitions) {
     const competition = competitions.find((c) => c.id === entry.event_id);
     if (!competition?.attestation) return null;
 
@@ -61,7 +61,6 @@ class Payouts {
     return {
       entry,
       competition,
-      entryIndex: allEntries.findIndex((e) => e.id === entry.id),
       payout_amount: payoutAmount,
       weight: playerWeight,
       total_weight: totalWeight,
@@ -100,7 +99,7 @@ class Payouts {
       return null;
 
     try {
-      return window.taprootWallet.getCurrentOutcome(
+      return window.DlcWallet.currentOutcome(
         competition.attestation,
         competition.event_announcement,
       );
@@ -110,40 +109,25 @@ class Payouts {
     }
   }
 
-  async submitPayout(
-    competitionId,
-    entryId,
-    ticketId,
-    entryIndex,
-    encryptedPayoutPreimage,
-    invoice,
-    payoutAmount,
-  ) {
+  async submitPayout(competitionId, entry, invoice, payoutAmount) {
     if (!invoice) throw new Error("Please enter a Lightning invoice");
 
     this.validateInvoice(invoice, payoutAmount);
 
-    const nostrPubkey = await window.nostrClient.getPublicKey();
-    const payoutPreimage = await window.taprootWallet.decryptKey(
-      encryptedPayoutPreimage,
-      nostrPubkey,
-    );
-    const encryptedEphemeralPrivateKey =
-      await window.taprootWallet.getEncryptedDlcPrivateKey(
-        entryIndex,
-        nostrPubkey,
-      );
-    const ephemeralPrivateKey = await window.taprootWallet.decryptKey(
-      encryptedEphemeralPrivateKey,
-      nostrPubkey,
+    // Selling the entry key and payout preimage to the coordinator is the
+    // ticketed-DLC sellback. The wallet re-derives the key from the entry id
+    // and refuses unless it matches the entry's recorded pubkey.
+    const release = window.dlcWallet.payoutRelease(
+      entry.id,
+      entry.ephemeral_pubkey,
     );
 
     const response = await this.client.post(
-      `${this.coordinator_url}/api/v1/competitions/${competitionId}/entries/${entryId}/payout`,
+      `${this.coordinator_url}/api/v1/competitions/${competitionId}/entries/${entry.id}/payout`,
       {
-        ticket_id: ticketId,
-        payout_preimage: payoutPreimage,
-        ephemeral_private_key: ephemeralPrivateKey,
+        ticket_id: entry.ticket_id,
+        payout_preimage: release.payout_preimage,
+        ephemeral_private_key: release.ephemeral_private_key,
         ln_invoice: invoice,
       },
     );
@@ -266,10 +250,7 @@ async function submitPayoutInvoice() {
 
     await payoutsInstance.submitPayout(
       currentPayoutData.competitionId,
-      currentPayoutData.entryId,
-      payableEntry.entry.ticket_id,
-      payableEntry.entryIndex,
-      payableEntry.entry.payout_preimage_encrypted,
+      payableEntry.entry,
       invoice,
       currentPayoutData.payoutAmount,
     );

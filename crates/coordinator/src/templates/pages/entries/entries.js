@@ -74,43 +74,19 @@ class Entry {
   }
 
   async setupEntry() {
-    const response = await this.client.get(
-      `${this.coordinator_url}/api/v1/entries`,
-    );
-    if (!response.ok)
-      throw new Error(`Failed to fetch existing entries: ${response.status}`);
-
-    const existingEntries = await response.json();
-    existingEntries.sort((a, b) => a.id.localeCompare(b.id));
-
-    this.entryIndex = existingEntries.length;
-    const payout_hash = await window.taprootWallet.addEntryIndex(
-      this.entryIndex,
-    );
-    const nostrPubkey = await window.nostrClient.getPublicKey();
-    const encryptedPayoutPreimage =
-      await window.taprootWallet.getEncryptedDlcPayoutPreimage(
-        this.entryIndex,
-        nostrPubkey,
-      );
-    const ephemeralPrivateKeyEncrypted =
-      await window.taprootWallet.getEncryptedDlcPrivateKey(
-        this.entryIndex,
-        nostrPubkey,
-      );
-    const ephemeralPubkey = await window.taprootWallet.getDlcPublicKey(
-      this.entryIndex,
-    );
+    // The entry key is derived from the entry id, so every entry gets its own
+    // key and no counter or entry ordering is involved.
+    const id = generateUuidV7();
+    const { ephemeral_pubkey, payout_hash } =
+      window.dlcWallet.entryRegistration(id);
 
     this.entry = {
-      id: generateUuidV7(),
+      id,
       competition_id: this.competition.id,
       submit: {},
       options: [],
       payout_hash,
-      payout_preimage_encrypted: encryptedPayoutPreimage,
-      ephemeral_pubkey: ephemeralPubkey,
-      ephemeral_privatekey_encrypted: ephemeralPrivateKeyEncrypted,
+      ephemeral_pubkey,
     };
   }
 
@@ -355,9 +331,10 @@ class Entry {
         throw new Error("The ticket is missing its authorized Keymeld registration context");
       }
       if (this.ticket.keymeld_registration) {
-        // Use the secure WASM method that keeps private key inside WASM
-        const keymeldData = await window.taprootWallet.prepareKeymeldRegistration(
-          this.entryIndex,
+        // WASM verifies the enclave's attestation and encrypts the entry key to it;
+        // the raw key never reaches JavaScript.
+        const keymeldData = await window.dlcWallet.keymeldRegistration(
+          this.entry.id,
           JSON.stringify(this.ticket.keymeld_registration),
         );
         encrypted_keymeld_private_key = keymeldData.encrypted_private_key;
@@ -368,10 +345,7 @@ class Entry {
       const entry_body = {
         id: this.entry.id,
         ephemeral_pubkey: this.entry.ephemeral_pubkey,
-        ephemeral_privatekey_encrypted:
-          this.entry.ephemeral_privatekey_encrypted,
         payout_hash: this.entry.payout_hash,
-        payout_preimage_encrypted: this.entry.payout_preimage_encrypted,
         event_id: this.competition.id,
         ticket_id: this.ticket.id,
         expected_observations: expectedObservations,
@@ -511,7 +485,7 @@ async function submitEntry() {
   }
 
   // Double-check that required WASM objects are ready
-  if (!window.nostrClient || !window.taprootWallet) {
+  if (!window.nostrClient || !window.dlcWallet) {
     errorMsg.textContent = "Please log in to submit an entry";
     errorMsg.classList.remove("hidden");
     const loginModal = document.getElementById("loginModal");
@@ -626,6 +600,33 @@ async function submitEntry() {
   }
 }
 
+/**
+ * Show where this build's keymeld enclave trust comes from. The measurements
+ * are compiled into the WASM, so they can be checked against Keymeld's
+ * published release measurements.
+ */
+function showKeymeldTrust() {
+  const element = document.getElementById("keymeldTrust");
+  if (!element || !window.DlcWallet) return;
+  try {
+    const trust = window.DlcWallet.keymeldTrust();
+    if (trust.source === "pinned") {
+      const pins = Object.entries(trust.pcrs)
+        .map(([index, value]) => `PCR${index} ${value}`)
+        .join(", ");
+      element.textContent = `Your entry key is sent only to a Keymeld enclave attested against ${pins}.`;
+    } else {
+      element.textContent =
+        "Test network: this build pins no Keymeld enclave measurements, so enclave trust comes from the coordinator.";
+      element.classList.add("has-text-warning");
+    }
+  } catch (error) {
+    element.textContent = `Keymeld enclave trust unavailable: ${error}`;
+    element.classList.add("has-text-danger");
+  }
+}
+
+window.showKeymeldTrust = showKeymeldTrust;
 window.selectPick = selectPick;
 window.submitEntry = submitEntry;
 

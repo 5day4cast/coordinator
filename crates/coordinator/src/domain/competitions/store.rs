@@ -76,8 +76,6 @@ impl CompetitionStore {
         let event_id = entry.event_id.to_string();
         let pubkey = entry.pubkey.clone();
         let ephemeral_pubkey = entry.ephemeral_pubkey.clone();
-        let ephemeral_privatekey_encrypted = entry.ephemeral_privatekey_encrypted.clone();
-        let payout_preimage_encrypted = entry.payout_preimage_encrypted.clone();
         let payout_hash = entry.payout_hash.clone();
         let encrypted_keymeld_private_key = entry.encrypted_keymeld_private_key.clone();
         let keymeld_auth_pubkey = entry.keymeld_auth_pubkey.clone();
@@ -97,22 +95,18 @@ impl CompetitionStore {
                         event_id,
                         pubkey,
                         ephemeral_pubkey,
-                        ephemeral_privatekey_encrypted,
-                        payout_preimage_encrypted,
                         payout_hash,
                         entry_submission,
                         encrypted_keymeld_private_key,
                         keymeld_auth_pubkey,
                         keymeld_registration_context
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(entry_id)
                 .bind(ticket_id_str)
                 .bind(event_id)
                 .bind(pubkey)
                 .bind(ephemeral_pubkey)
-                .bind(ephemeral_privatekey_encrypted)
-                .bind(payout_preimage_encrypted)
                 .bind(payout_hash)
                 .bind(entry_submission)
                 .bind(encrypted_keymeld_private_key)
@@ -509,7 +503,6 @@ impl CompetitionStore {
                 entries.event_id as event_id,
                 pubkey,
                 entries.ephemeral_pubkey as ephemeral_pubkey,
-                ephemeral_privatekey_encrypted,
                 ephemeral_privatekey,
                 encrypted_keymeld_private_key,
                 keymeld_auth_pubkey,
@@ -518,7 +511,6 @@ impl CompetitionStore {
                 partial_signatures,
                 funding_psbt_base64,
                 entry_submission,
-                payout_preimage_encrypted,
                 payout_hash,
                 payout_preimage,
                 signed_at,
@@ -578,7 +570,6 @@ impl CompetitionStore {
               entries.event_id as event_id,
               pubkey,
               entries.ephemeral_pubkey as ephemeral_pubkey,
-              ephemeral_privatekey_encrypted,
               ephemeral_privatekey,
               encrypted_keymeld_private_key,
               keymeld_auth_pubkey,
@@ -587,7 +578,6 @@ impl CompetitionStore {
               partial_signatures,
               funding_psbt_base64,
               entry_submission,
-              payout_preimage_encrypted,
               payout_hash,
               payout_preimage,
               signed_at,
@@ -1905,7 +1895,6 @@ impl CompetitionStore {
               entries.event_id as event_id,
               pubkey,
               entries.ephemeral_pubkey as ephemeral_pubkey,
-              ephemeral_privatekey_encrypted,
               ephemeral_privatekey,
               encrypted_keymeld_private_key,
               keymeld_auth_pubkey,
@@ -1914,7 +1903,6 @@ impl CompetitionStore {
               partial_signatures,
               funding_psbt_base64,
               entry_submission,
-              payout_preimage_encrypted,
               payout_hash,
               payout_preimage,
               signed_at,

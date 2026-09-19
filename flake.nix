@@ -100,7 +100,9 @@
             || (builtins.match ".*\\.html$" path != null)
             || (builtins.match ".*\\.js$" path != null)
             || (builtins.match ".*\\.css$" path != null)
-            || (builtins.match ".*\\.svg$" path != null);
+            || (builtins.match ".*\\.svg$" path != null)
+            # Keymeld enclave measurements compiled into the browser WASM.
+            || (builtins.match ".*/keymeld-trusted-pcrs\\.json$" path != null);
         };
 
         # Build workspace dependencies once (for caching)

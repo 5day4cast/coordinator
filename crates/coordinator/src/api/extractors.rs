@@ -1,5 +1,6 @@
 use axum::{
-    extract::{FromRequestParts, OriginalUri},
+    body::to_bytes,
+    extract::{FromRequest, FromRequestParts, OriginalUri, Request},
     http::request::Parts,
     response::IntoResponse,
     Json,
@@ -8,14 +9,16 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use hyper::{header::AUTHORIZATION, StatusCode};
 use log::{info, warn};
 use nostr_sdk::{
-    hashes::sha256::Hash as Sha256Hash,
+    hashes::{sha256::Hash as Sha256Hash, Hash},
     nips::nip98::{HttpData, HttpMethod},
     Event, EventBuilder, Keys, Kind, PublicKey, Url,
 };
-use serde::{ser::SerializeStruct, Serialize, Serializer};
+use serde::{de::DeserializeOwned, ser::SerializeStruct, Serialize, Serializer};
 use serde_json::json;
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
 use time::OffsetDateTime;
+
+use super::nip98_replay::{Nip98ReplayGuard, ReplayRejection, MAX_EVENT_SKEW_SECS};
 
 pub async fn create_auth_event(
     method: &str,
@@ -78,7 +81,8 @@ where
         }
 
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        if (now - (event.created_at.as_u64() as i64)).abs() > 60 {
+        let created_at = i64::try_from(event.created_at.as_u64()).unwrap_or(i64::MAX);
+        if (now - created_at).abs() > MAX_EVENT_SKEW_SECS {
             return Err(AuthError::ExpiredTimestamp);
         }
 
@@ -125,11 +129,58 @@ where
             .verify()
             .map_err(|e| AuthError::InvalidSignature(e.to_string()))?;
 
+        // Claim only after the signature verifies, so unsigned junk cannot
+        // fill the guard. A router without the guard fails closed.
+        parts
+            .extensions
+            .get::<Arc<Nip98ReplayGuard>>()
+            .ok_or(AuthError::ReplayGuardMissing)?
+            .claim(event.id, created_at, now)
+            .map_err(|rejection| match rejection {
+                ReplayRejection::Replayed => AuthError::Replayed,
+                ReplayRejection::Full => AuthError::ReplayGuardFull,
+            })?;
+
         Ok(Self {
             pubkey: event.pubkey,
             event,
             http_data,
         })
+    }
+}
+
+/// Upper bound on an authenticated JSON request body.
+const MAX_AUTHED_BODY_BYTES: usize = 256 * 1024;
+
+/// A NIP-98 authenticated JSON body.
+///
+/// The auth event must carry a `payload` tag equal to the SHA-256 of the exact
+/// body bytes. Without that check, a captured `Authorization` header could be
+/// replayed within its 60 second window with a different body.
+pub struct AuthedJson<T> {
+    pub auth: NostrAuth,
+    pub body: T,
+}
+
+impl<S, T> FromRequest<S> for AuthedJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = AuthError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (mut parts, body) = request.into_parts();
+        let auth = NostrAuth::from_request_parts(&mut parts, state).await?;
+        let bytes = to_bytes(body, MAX_AUTHED_BODY_BYTES)
+            .await
+            .map_err(|_| AuthError::BodyTooLarge)?;
+        if auth.http_data.payload != Some(Sha256Hash::hash(&bytes)) {
+            return Err(AuthError::PayloadMismatch);
+        }
+        let body =
+            serde_json::from_slice(&bytes).map_err(|e| AuthError::InvalidBody(e.to_string()))?;
+        Ok(Self { auth, body })
     }
 }
 
@@ -161,6 +212,18 @@ pub enum AuthError {
     InvalidSignature(String),
     #[error("Event content must be empty")]
     NonEmptyContent,
+    #[error("Payload hash does not match the request body")]
+    PayloadMismatch,
+    #[error("Request body too large")]
+    BodyTooLarge,
+    #[error("Invalid request body: {0}")]
+    InvalidBody(String),
+    #[error("Auth event was already used")]
+    Replayed,
+    #[error("Too many recent authenticated requests")]
+    ReplayGuardFull,
+    #[error("NIP-98 replay guard is not configured")]
+    ReplayGuardMissing,
 }
 
 impl From<nostr_sdk::types::ParseError> for AuthError {
@@ -190,6 +253,12 @@ impl Serialize for AuthError {
             Self::UrlMethodMismatch => "url_method_mismatch",
             Self::InvalidSignature(_) => "invalid_signature",
             Self::NonEmptyContent => "non_empty_content",
+            Self::PayloadMismatch => "payload_mismatch",
+            Self::BodyTooLarge => "body_too_large",
+            Self::InvalidBody(_) => "invalid_body",
+            Self::Replayed => "replayed",
+            Self::ReplayGuardFull => "replay_guard_full",
+            Self::ReplayGuardMissing => "replay_guard_missing",
         };
 
         state.serialize_field("type", type_str)?;
@@ -211,9 +280,19 @@ impl IntoResponse for AuthError {
             | Self::UrlMethodMismatch
             | Self::InvalidUrl(_)
             | Self::InvalidLogin
+            | Self::PayloadMismatch
+            | Self::Replayed
             | Self::InvalidMethod(_) => {
                 warn!("{}", self);
                 (json!({ "error": self }), StatusCode::UNAUTHORIZED)
+            }
+            Self::ReplayGuardFull => {
+                warn!("{}", self);
+                (json!({ "error": self }), StatusCode::SERVICE_UNAVAILABLE)
+            }
+            Self::ReplayGuardMissing => {
+                log::error!("{}", self);
+                (json!({ "error": self }), StatusCode::INTERNAL_SERVER_ERROR)
             }
             _ => {
                 warn!("{}", self);
@@ -250,6 +329,7 @@ mod tests {
         );
 
         let req = Request::builder()
+            .extension(Arc::new(Nip98ReplayGuard::new(16)))
             .method("GET")
             .uri("/test")
             .header("host", "localhost")
@@ -263,6 +343,112 @@ mod tests {
         let auth = result.unwrap();
         assert_eq!(auth.pubkey, keys.public_key());
         assert_eq!(auth.http_data.method, HttpMethod::GET);
+    }
+
+    async fn authed_json(
+        signed_body: Option<&str>,
+        sent_body: &str,
+    ) -> Result<AuthedJson<serde_json::Value>, AuthError> {
+        let keys = Keys::generate();
+        let payload = signed_body.map(|body| Sha256Hash::hash(body.as_bytes()));
+        let event = create_auth_event("POST", "http://localhost/test", payload, &keys).await;
+        let request = Request::builder()
+            .extension(Arc::new(Nip98ReplayGuard::new(16)))
+            .method("POST")
+            .uri("/test")
+            .header("host", "localhost")
+            .header(
+                AUTHORIZATION,
+                format!(
+                    "Nostr {}",
+                    BASE64.encode(serde_json::to_string(&event).unwrap())
+                ),
+            )
+            .body(axum::body::Body::from(sent_body.to_owned()))
+            .unwrap();
+        AuthedJson::from_request(request, &AppState).await
+    }
+
+    #[tokio::test]
+    async fn the_same_auth_header_is_accepted_only_once() {
+        let keys = Keys::generate();
+        let event = create_auth_event("GET", "http://localhost/test", None, &keys).await;
+        let header = format!(
+            "Nostr {}",
+            BASE64.encode(serde_json::to_string(&event).unwrap())
+        );
+        let guard = Arc::new(Nip98ReplayGuard::new(16));
+        let attempt = || {
+            Request::builder()
+                .method("GET")
+                .uri("/test")
+                .header("host", "localhost")
+                .header(AUTHORIZATION, header.clone())
+                .extension(guard.clone())
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0
+        };
+
+        assert!(NostrAuth::from_request_parts(&mut attempt(), &AppState)
+            .await
+            .is_ok());
+        assert!(matches!(
+            NostrAuth::from_request_parts(&mut attempt(), &AppState).await,
+            Err(AuthError::Replayed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_replay_guard_fails_closed() {
+        let keys = Keys::generate();
+        let event = create_auth_event("GET", "http://localhost/test", None, &keys).await;
+        let mut parts = Request::builder()
+            .method("GET")
+            .uri("/test")
+            .header("host", "localhost")
+            .header(
+                AUTHORIZATION,
+                format!(
+                    "Nostr {}",
+                    BASE64.encode(serde_json::to_string(&event).unwrap())
+                ),
+            )
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        assert!(matches!(
+            NostrAuth::from_request_parts(&mut parts, &AppState).await,
+            Err(AuthError::ReplayGuardMissing)
+        ));
+    }
+
+    #[tokio::test]
+    async fn authed_json_accepts_body_matching_signed_payload() {
+        let body = r#"{"amount":1}"#;
+        let authed = authed_json(Some(body), body).await.unwrap();
+        assert_eq!(authed.body["amount"], 1);
+    }
+
+    #[tokio::test]
+    async fn authed_json_rejects_replayed_header_with_different_body() {
+        let result = authed_json(Some(r#"{"amount":1}"#), r#"{"amount":1000}"#).await;
+        assert!(matches!(result, Err(AuthError::PayloadMismatch)));
+    }
+
+    #[tokio::test]
+    async fn authed_json_requires_a_payload_tag() {
+        let result = authed_json(None, r#"{"amount":1}"#).await;
+        assert!(matches!(result, Err(AuthError::PayloadMismatch)));
+    }
+
+    #[tokio::test]
+    async fn authed_json_bounds_the_body() {
+        let body = "x".repeat(MAX_AUTHED_BODY_BYTES + 1);
+        let result = authed_json(Some(&body), &body).await;
+        assert!(matches!(result, Err(AuthError::BodyTooLarge)));
     }
 
     #[tokio::test]
@@ -282,6 +468,7 @@ mod tests {
         );
 
         let req = Request::builder()
+            .extension(Arc::new(Nip98ReplayGuard::new(16)))
             .method("POST")
             .uri("/test")
             .header("host", "localhost")
@@ -303,6 +490,7 @@ mod tests {
         let state = Arc::new(AppState);
 
         let req = Request::builder()
+            .extension(Arc::new(Nip98ReplayGuard::new(16)))
             .method("GET")
             .uri("/test")
             .header("host", "localhost")
@@ -319,6 +507,7 @@ mod tests {
         let state = Arc::new(AppState);
 
         let req = Request::builder()
+            .extension(Arc::new(Nip98ReplayGuard::new(16)))
             .method("GET")
             .uri("/test")
             .header("host", "localhost")
@@ -336,6 +525,7 @@ mod tests {
         let state = Arc::new(AppState);
 
         let req = Request::builder()
+            .extension(Arc::new(Nip98ReplayGuard::new(16)))
             .method("GET")
             .uri("/test")
             .header("host", "localhost")
@@ -354,6 +544,7 @@ mod tests {
 
         let invalid_json = BASE64.encode("not valid json");
         let req = Request::builder()
+            .extension(Arc::new(Nip98ReplayGuard::new(16)))
             .method("GET")
             .uri("/test")
             .header("host", "localhost")
@@ -396,6 +587,7 @@ mod tests {
         );
 
         let req = Request::builder()
+            .extension(Arc::new(Nip98ReplayGuard::new(16)))
             .method("GET")
             .uri("/test")
             .header("host", "localhost")
@@ -431,6 +623,7 @@ mod tests {
         );
 
         let req = Request::builder()
+            .extension(Arc::new(Nip98ReplayGuard::new(16)))
             .method("GET")
             .uri("/test")
             .header("host", "localhost")
@@ -456,6 +649,7 @@ mod tests {
         );
 
         let req = Request::builder()
+            .extension(Arc::new(Nip98ReplayGuard::new(16)))
             .method("GET")
             .uri("/test")
             .header("host", "localhost")
@@ -481,6 +675,7 @@ mod tests {
         );
 
         let req = Request::builder()
+            .extension(Arc::new(Nip98ReplayGuard::new(16)))
             .method("GET") // Different method from event
             .uri("/test")
             .header("host", "localhost")
@@ -524,6 +719,7 @@ mod tests {
         );
 
         let req = Request::builder()
+            .extension(Arc::new(Nip98ReplayGuard::new(16)))
             .method("GET")
             .uri("/test")
             .header("host", "localhost")
@@ -555,6 +751,7 @@ mod tests {
         );
 
         let req = Request::builder()
+            .extension(Arc::new(Nip98ReplayGuard::new(16)))
             .method("GET")
             .uri("/test")
             .header("host", "localhost")

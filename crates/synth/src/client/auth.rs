@@ -7,11 +7,12 @@ use nostr_sdk::{
 use std::str::FromStr;
 
 /// Create a NIP-98 HTTP Auth header for authenticated coordinator API requests.
-pub async fn create_auth_header<T: serde::Serialize>(
+/// `body` must be the exact bytes sent; the coordinator checks its hash.
+pub async fn create_auth_header(
     keys: &Keys,
     method: &str,
     url: &str,
-    body: Option<&T>,
+    body: Option<&[u8]>,
 ) -> Result<String> {
     let http_method = HttpMethod::from_str(&method.to_uppercase())
         .map_err(|e| anyhow::anyhow!("Invalid HTTP method: {}", e))?;
@@ -19,10 +20,8 @@ pub async fn create_auth_header<T: serde::Serialize>(
 
     let mut http_data = HttpData::new(http_url, http_method);
 
-    if let Some(content) = body {
-        let content_str = serde_json::to_string(content)?;
-        let hash = Sha256Hash::hash(content_str.as_bytes());
-        http_data = http_data.payload(hash);
+    if let Some(body) = body {
+        http_data = http_data.payload(Sha256Hash::hash(body));
     }
 
     let event = EventBuilder::http_auth(http_data).sign_with_keys(keys)?;
