@@ -108,6 +108,9 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            - name: admin
+              containerPort: {{ $.Values.service.adminPort }}
+              protocol: TCP
           env:
             - name: RUST_LOG
               value: {{ $.Values.config.logLevel }}
@@ -120,6 +123,11 @@ spec:
             {{- if $.Values.secrets.privateKey.create }}
             - name: private-key
               mountPath: /etc/coordinator-secrets
+              readOnly: true
+            {{- end }}
+            {{- if or $.Values.secrets.adminToken.create $.Values.secrets.adminToken.external }}
+            - name: admin-token
+              mountPath: /etc/coordinator-admin
               readOnly: true
             {{- end }}
             {{- if $.Values.lnd.initContainer.enabled }}
@@ -214,6 +222,11 @@ spec:
         - name: private-key
           secret:
             secretName: {{ include "coordinator.fullname" $ }}-private-key
+        {{- end }}
+        {{- if or $.Values.secrets.adminToken.create $.Values.secrets.adminToken.external }}
+        - name: admin-token
+          secret:
+            secretName: {{ if $.Values.secrets.adminToken.external }}{{ $.Values.secrets.adminToken.secretName | quote }}{{ else }}{{ printf "%s-admin-token" (include "coordinator.fullname" $) | quote }}{{ end }}
         {{- end }}
         {{- if $.Values.lnd.initContainer.enabled }}
         - name: lnd-source
@@ -344,6 +357,9 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            - name: admin
+              containerPort: {{ .Values.service.adminPort }}
+              protocol: TCP
           env:
             - name: RUST_LOG
               value: {{ .Values.config.logLevel }}
@@ -356,6 +372,11 @@ spec:
             {{- if .Values.secrets.privateKey.create }}
             - name: private-key
               mountPath: /etc/coordinator-secrets
+              readOnly: true
+            {{- end }}
+            {{- if or .Values.secrets.adminToken.create .Values.secrets.adminToken.external }}
+            - name: admin-token
+              mountPath: /etc/coordinator-admin
               readOnly: true
             {{- end }}
             {{- if .Values.lnd.initContainer.enabled }}
@@ -450,6 +471,11 @@ spec:
         - name: private-key
           secret:
             secretName: {{ include "coordinator.fullname" . }}-private-key
+        {{- end }}
+        {{- if or .Values.secrets.adminToken.create .Values.secrets.adminToken.external }}
+        - name: admin-token
+          secret:
+            secretName: {{ if .Values.secrets.adminToken.external }}{{ .Values.secrets.adminToken.secretName | quote }}{{ else }}{{ printf "%s-admin-token" (include "coordinator.fullname" .) | quote }}{{ end }}
         {{- end }}
         {{- if .Values.lnd.initContainer.enabled }}
         - name: lnd-source

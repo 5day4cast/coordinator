@@ -1,4 +1,7 @@
 use maud::{html, Markup, PreEscaped, DOCTYPE};
+use serde_json::json;
+
+use crate::api::admin_auth::CSRF_HEADER;
 
 pub struct AdminPageConfig<'a> {
     pub title: &'a str,
@@ -6,9 +9,14 @@ pub struct AdminPageConfig<'a> {
     pub oracle_base: &'a str,
     pub explorer_url: &'a str,
     pub network: &'a str,
+    /// Echoed by HTMX on every request; required for cookie-session state changes.
+    pub csrf_token: Option<&'a str>,
 }
 
 pub fn admin_base(config: &AdminPageConfig, content: Markup) -> Markup {
+    let csrf_headers = config
+        .csrf_token
+        .map(|token| json!({ CSRF_HEADER: token }).to_string());
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -36,7 +44,8 @@ pub fn admin_base(config: &AdminPageConfig, content: Markup) -> Markup {
             body data-api-base=(config.api_base)
                  data-oracle-base=(config.oracle_base)
                  data-explorer-url=(config.explorer_url)
-                 data-network=(config.network) {
+                 data-network=(config.network)
+                 hx-headers=[csrf_headers] {
                 script {
                     "const API_BASE = document.body.dataset.apiBase;
                      const ORACLE_BASE = document.body.dataset.oracleBase;

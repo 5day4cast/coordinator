@@ -5,12 +5,14 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    domain::{competitions::PayoutError, Coordinator, PaymentStatus},
-    infra::lightning::Ln,
+    domain::{competitions::PayoutError, CompetitionStore, Coordinator, PaymentStatus},
+    infra::lightning::{
+        extract_payment_hash_from_invoice, invoice_is_expired, Ln, PaymentNotFound,
+    },
 };
 
 pub struct PayoutWatcher {
-    coordinator: Arc<Coordinator>,
+    competition_store: Arc<CompetitionStore>,
     ln: Arc<dyn Ln>,
     sync_interval: Duration,
     cancel_token: CancellationToken,
@@ -24,7 +26,7 @@ impl PayoutWatcher {
         sync_interval: Duration,
     ) -> Self {
         Self {
-            coordinator,
+            competition_store: coordinator.competition_store.clone(),
             ln,
             sync_interval,
             cancel_token,
@@ -40,13 +42,12 @@ impl PayoutWatcher {
                 break;
             }
 
-            match self.handle_pending_payouts().await {
-                Ok(_) => {
-                    debug!("Payout handling completed successfully");
-                }
-                Err(e) => {
-                    error!("Payout handling error: {}", e);
-                }
+            tokio::select! {
+                result = self.handle_pending_payouts() => match result {
+                    Ok(_) => debug!("Payout handling completed successfully"),
+                    Err(e) => error!("Payout handling error: {}", e),
+                },
+                _ = self.cancel_token.cancelled() => break,
             }
 
             tokio::select! {
@@ -62,41 +63,35 @@ impl PayoutWatcher {
     }
 
     async fn handle_pending_payouts(&self) -> Result<(), anyhow::Error> {
-        let pending_payouts = self
-            .coordinator
-            .competition_store
-            .get_all_pending_payouts()
-            .await?;
+        let pending_payouts = self.competition_store.get_all_pending_payouts().await?;
 
         debug!("Checking {} pending payouts", pending_payouts.len());
 
         for payout in pending_payouts {
-            let payment_hash = match crate::infra::lightning::extract_payment_hash_from_invoice(
-                &payout.payout_payment_request,
-            ) {
-                Ok(hash) => hash,
-                Err(e) => {
-                    error!("Invalid lightning invoice for payout {}: {}", payout.id, e);
+            let payment_hash =
+                match extract_payment_hash_from_invoice(&payout.payout_payment_request) {
+                    Ok(hash) => hash,
+                    Err(e) => {
+                        error!("Invalid lightning invoice for payout {}: {}", payout.id, e);
 
-                    // Mark payout as failed due to invalid invoice
-                    if let Err(mark_err) = self
-                        .coordinator
-                        .competition_store
-                        .mark_payout_failed(
-                            payout.id,
-                            OffsetDateTime::now_utc(),
-                            PayoutError::FailedToPayOut(e.to_string()),
-                        )
-                        .await
-                    {
-                        error!(
-                            "Failed to mark payout {} as failed: {}",
-                            payout.id, mark_err
-                        );
+                        // Mark payout as failed due to invalid invoice
+                        if let Err(mark_err) = self
+                            .competition_store
+                            .mark_payout_failed(
+                                payout.id,
+                                OffsetDateTime::now_utc(),
+                                PayoutError::FailedToPayOut(e.to_string()),
+                            )
+                            .await
+                        {
+                            error!(
+                                "Failed to mark payout {} as failed: {}",
+                                payout.id, mark_err
+                            );
+                        }
+                        continue;
                     }
-                    continue;
-                }
-            };
+                };
 
             match self.ln.lookup_payment(&payment_hash).await {
                 Ok(payment) => {
@@ -110,7 +105,6 @@ impl PayoutWatcher {
                             );
 
                             match self
-                                .coordinator
                                 .competition_store
                                 .mark_payout_succeeded(payout.id, OffsetDateTime::now_utc())
                                 .await
@@ -136,7 +130,6 @@ impl PayoutWatcher {
 
                             // Mark the payout as failed
                             if let Err(e) = self
-                                .coordinator
                                 .competition_store
                                 .mark_payout_failed(
                                     payout.id,
@@ -164,6 +157,46 @@ impl PayoutWatcher {
                         }
                     }
                 }
+                Err(e) if e.is::<PaymentNotFound>() => {
+                    // A queued invoice can expire while the process is offline.
+                    // LND confirms that no payment exists before we release it.
+                    let invoice = payout
+                        .payout_payment_request
+                        .parse::<lightning_invoice::Bolt11Invoice>()
+                        .map_err(|error| {
+                            anyhow::anyhow!("Invalid stored payout invoice: {error}")
+                        })?;
+                    if invoice_is_expired(&invoice) {
+                        self.competition_store
+                            .mark_payout_failed(
+                                payout.id,
+                                OffsetDateTime::now_utc(),
+                                PayoutError::FailedToPayOut(
+                                    "Invoice expired before payment initiation".into(),
+                                ),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    // Recover a crash between persisting the payout and sending it.
+                    // Keep using the same invoice/hash: LND deduplicates attempts
+                    // if the original request is accepted concurrently.
+                    if let Err(error) = self
+                        .ln
+                        .send_payment(
+                            payout.payout_payment_request,
+                            payout.payout_amount_sats,
+                            60,
+                            1000,
+                        )
+                        .await
+                    {
+                        warn!(
+                            "Payout {} remains pending after send error: {}",
+                            payout.id, error
+                        );
+                    }
+                }
                 Err(e) => {
                     debug!("Failed to lookup payment for payout {}: {}", payout.id, e);
                 }
@@ -171,5 +204,165 @@ impl PayoutWatcher {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infra::{
+        db::{DBConnection, DatabasePoolConfig, DatabaseType},
+        lightning::LnClient,
+    };
+    use axum::{
+        extract::State,
+        response::IntoResponse,
+        routing::{get, post},
+        Json, Router,
+    };
+    use bitcoin::{
+        hashes::{sha256, Hash},
+        secp256k1::{Secp256k1, SecretKey},
+    };
+    use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn payout_outbox_recovers_an_unsent_payment_and_keeps_ambiguous_errors_locked() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = DBConnection::new(
+            directory.path().to_str().unwrap(),
+            "competitions",
+            DatabasePoolConfig::default(),
+            DatabaseType::Competitions,
+        )
+        .await
+        .unwrap();
+        let store = CompetitionStore::new(database.clone());
+        let event_id = Uuid::now_v7();
+        let ticket_id = Uuid::now_v7();
+        let entry_id = Uuid::now_v7();
+        database.execute_write(move |pool| async move {
+            sqlx::query("INSERT INTO competitions (id, created_at, event_submission) VALUES (?, datetime('now'), '{}')")
+                .bind(event_id.to_string()).execute(&pool).await?;
+            sqlx::query("INSERT INTO tickets (id, event_id, encrypted_preimage, hash) VALUES (?, ?, 'preimage', 'hash')")
+                .bind(ticket_id.to_string()).bind(event_id.to_string()).execute(&pool).await?;
+            sqlx::query("INSERT INTO entries (id, event_id, ticket_id, pubkey, ephemeral_pubkey, payout_hash, entry_submission) VALUES (?, ?, ?, 'owner', 'key', 'hash', '{}')")
+                .bind(entry_id.to_string()).bind(event_id.to_string()).bind(ticket_id.to_string()).execute(&pool).await?;
+            Ok(())
+        }).await.unwrap();
+        let invoice = |timestamp| {
+            InvoiceBuilder::new(Currency::Regtest)
+                .description("payout".into())
+                .payment_hash(sha256::Hash::from_byte_array([7; 32]))
+                .payment_secret(PaymentSecret([8; 32]))
+                .amount_milli_satoshis(10_000)
+                .duration_since_epoch(timestamp)
+                .min_final_cltv_expiry_delta(18)
+                .build_signed(|hash| {
+                    Secp256k1::new()
+                        .sign_ecdsa_recoverable(hash, &SecretKey::from_slice(&[9; 32]).unwrap())
+                })
+                .unwrap()
+                .to_string()
+        };
+        // This queued invoice expired while the process was stopped.
+        let expired_id = store
+            .store_payout_info_pending(
+                entry_id,
+                "preimage".into(),
+                "private".into(),
+                invoice(Duration::from_secs(1)),
+                10,
+            )
+            .await
+            .unwrap();
+        let invoice = invoice(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap(),
+        );
+        let sends = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .route("/v2/router/track/{hash}", get(|State(sends): State<Arc<AtomicUsize>>| async move {
+                if sends.load(Ordering::SeqCst) == 0 {
+                    return reqwest::StatusCode::NOT_FOUND.into_response();
+                }
+                Json(serde_json::json!({"result": {
+                    "payment_hash": hex::encode([7; 32]), "status": "SUCCEEDED",
+                    "value": "10", "creation_date": "0", "fee": "0",
+                    "value_sat": "10", "value_msat": "10000", "payment_request": "invoice",
+                    "fee_sat": "0", "fee_msat": "0", "creation_time_ns": "0", "failure_reason": "FAILURE_REASON_NONE"
+                }})).into_response()
+            }))
+            .route("/v2/router/send", post(|State(sends): State<Arc<AtomicUsize>>| async move {
+                sends.fetch_add(1, Ordering::SeqCst);
+                // LND paid, but the proxy lost its successful response.
+                reqwest::StatusCode::BAD_GATEWAY
+            }))
+            .with_state(sends.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let watcher = PayoutWatcher {
+            competition_store: Arc::new(store.clone()),
+            ln: Arc::new(LnClient {
+                base_url: reqwest::Url::parse(&format!("http://{address}/")).unwrap(),
+                client: reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build(),
+                macaroon: secrecy::SecretString::from("test-macaroon"),
+            }),
+            sync_interval: Duration::from_secs(1),
+            cancel_token: CancellationToken::new(),
+        };
+        tokio::time::timeout(Duration::from_secs(5), watcher.handle_pending_payouts())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+        assert!(store
+            .get_payout(expired_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .failed_at
+            .is_some());
+        // Simulate another stop after persisting a fresh invoice, before its RPC.
+        let payout_id = store
+            .store_payout_info_pending(
+                entry_id,
+                "preimage".into(),
+                "private".into(),
+                invoice.clone(),
+                10,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), watcher.handle_pending_payouts())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        assert_eq!(store.get_all_pending_payouts().await.unwrap().len(), 1);
+        assert!(store
+            .store_payout_info_pending(entry_id, "preimage".into(), "private".into(), invoice, 10)
+            .await
+            .is_err());
+        tokio::time::timeout(Duration::from_secs(5), watcher.handle_pending_payouts())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .get_payout(payout_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .succeed_at
+            .is_some());
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        server.abort();
+        database.close().await.unwrap();
     }
 }

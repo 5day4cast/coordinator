@@ -6,10 +6,11 @@ use std::{
 use async_trait::async_trait;
 use blake2::{Blake2s256, Digest};
 use dlctix::{
-    attestation_locking_point,
+    attestation_locking_point, attestation_secret,
     secp::{MaybeScalar, Scalar},
     EventLockingConditions,
 };
+use itertools::Itertools;
 use uuid::Uuid;
 
 use super::oracle::{AddEventEntries, Error, Event, Oracle};
@@ -34,14 +35,12 @@ impl Outcome {
     pub fn to_bytes(&self) -> Vec<u8> {
         self.winners
             .iter()
-            .flat_map(|&idx| (idx as u32).to_be_bytes())
+            .flat_map(|&idx| (idx as u64).to_be_bytes())
             .collect()
     }
 }
 
 struct MockEvent {
-    #[allow(dead_code)]
-    config: CreateEvent,
     nonce: Scalar,
     locking_conditions: EventLockingConditions,
     entries: Vec<AddEventEntries>,
@@ -128,11 +127,13 @@ impl MockOracle {
         let oracle_pubkey = oracle_seckey.base_point_mul();
         let nonce_point = nonce.base_point_mul();
 
-        let total_outcomes = config.total_allowed_entries.min(10);
-        let locking_points: Vec<_> = (0..total_outcomes)
-            .map(|i| {
-                let msg = format!("outcome_{}", i);
-                attestation_locking_point(oracle_pubkey, nonce_point, msg.as_bytes())
+        let entries = config.total_allowed_entries;
+        let locking_points: Vec<_> = (0..entries)
+            .permutations(config.number_of_places_win)
+            .chain(std::iter::once((0..entries).collect()))
+            .map(|winners| {
+                let message = Outcome::new(winners).to_bytes();
+                attestation_locking_point(oracle_pubkey, nonce_point, &message)
             })
             .collect();
 
@@ -145,20 +146,24 @@ impl MockOracle {
     }
 
     fn generate_attestation(&self, event_id: &Uuid, outcome: &Outcome) -> MaybeScalar {
-        let mut context = event_id.as_bytes().to_vec();
-        context.extend(outcome.to_bytes());
-        MaybeScalar::Valid(self.generate_scalar(&context))
+        attestation_secret(
+            self.generate_oracle_key(),
+            self.generate_nonce(event_id),
+            outcome.to_bytes(),
+        )
     }
 }
 
 #[async_trait]
 impl Oracle for MockOracle {
     async fn create_event(&self, config: CreateEvent) -> Result<Event, Error> {
+        config
+            .validate_oracle_settings()
+            .map_err(|reason| Error::BadRequest(reason.into()))?;
         let nonce = self.generate_nonce(&config.id);
         let locking_conditions = self.generate_locking_conditions(&config, &nonce);
 
         let event = MockEvent {
-            config: config.clone(),
             nonce,
             locking_conditions: locking_conditions.clone(),
             entries: vec![],
@@ -169,7 +174,7 @@ impl Oracle for MockOracle {
 
         Ok(Event {
             id: config.id,
-            nonce,
+            nonce_point: nonce.base_point_mul(),
             event_announcement: locking_conditions,
             attestation: None,
         })
@@ -183,13 +188,23 @@ impl Oracle for MockOracle {
 
         if event.attestation.is_none() {
             if let Some(outcome) = self.pending_attestations.write().unwrap().remove(event_id) {
-                event.attestation = Some(self.generate_attestation(event_id, &outcome));
+                let attestation = self.generate_attestation(event_id, &outcome);
+                if !event
+                    .locking_conditions
+                    .locking_points
+                    .contains(&attestation.base_point_mul())
+                {
+                    return Err(Error::BadRequest(
+                        "outcome is not in the event announcement".into(),
+                    ));
+                }
+                event.attestation = Some(attestation);
             }
         }
 
         Ok(Event {
             id: *event_id,
-            nonce: event.nonce,
+            nonce_point: event.nonce.base_point_mul(),
             event_announcement: event.locking_conditions.clone(),
             attestation: event.attestation,
         })
@@ -229,6 +244,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mock_rejects_unbounded_announcements_without_creating_an_event() {
+        let oracle = MockOracle::new([0u8; 32]);
+        for (entries, places) in [(usize::MAX, 1), (25, 5)] {
+            let mut config = test_config();
+            config.total_allowed_entries = entries;
+            config.number_of_places_win = places;
+            let id = config.id;
+            assert!(matches!(
+                oracle.create_event(config).await,
+                Err(Error::BadRequest(_))
+            ));
+            assert!(matches!(
+                oracle.get_event(&id).await,
+                Err(Error::NotFound(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn test_create_and_get_event() {
         let oracle = MockOracle::new([0u8; 32]);
         let config = test_config();
@@ -250,7 +284,10 @@ mod tests {
         oracle.queue_attestation(config.id, Outcome::single_winner(0));
 
         let event = oracle.get_event(&config.id).await.unwrap();
-        assert!(event.attestation.is_some());
+        assert_eq!(
+            event.attestation.unwrap().base_point_mul(),
+            event.event_announcement.locking_points[0]
+        );
     }
 
     #[tokio::test]
@@ -263,6 +300,41 @@ mod tests {
         let event1 = oracle1.create_event(config.clone()).await.unwrap();
         let event2 = oracle2.create_event(config).await.unwrap();
 
-        assert_eq!(event1.nonce, event2.nonce);
+        assert_eq!(event1.nonce_point, event2.nonce_point);
+    }
+
+    #[tokio::test]
+    async fn multi_place_and_refund_attestations_match_the_announced_order() {
+        let oracle = MockOracle::new([42u8; 32]);
+        let mut config = test_config();
+        config.total_allowed_entries = 3;
+        config.number_of_places_win = 2;
+        let outcomes = (0..3).permutations(2).chain(std::iter::once(vec![0, 1, 2]));
+        for (index, winners) in outcomes.enumerate() {
+            config.id = Uuid::now_v7();
+            oracle.create_event(config.clone()).await.unwrap();
+            oracle.queue_attestation(config.id, Outcome::new(winners));
+            let event = oracle.get_event(&config.id).await.unwrap();
+            assert_eq!(event.event_announcement.locking_points.len(), 7);
+            assert_eq!(
+                event.attestation.unwrap().base_point_mul(),
+                event.event_announcement.locking_points[index]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unannounced_outcomes_are_refused() {
+        let oracle = MockOracle::new([0u8; 32]);
+        let config = test_config();
+        oracle.create_event(config.clone()).await.unwrap();
+        oracle.queue_attestation(
+            config.id,
+            Outcome::single_winner(config.total_allowed_entries),
+        );
+        assert!(matches!(
+            oracle.get_event(&config.id).await,
+            Err(Error::BadRequest(_))
+        ));
     }
 }

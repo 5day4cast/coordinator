@@ -28,7 +28,7 @@ port = "9990"
 origins = ["http://localhost:9990", "http://127.0.0.1:9990"]
 
 [ui_settings]
-private_url = "http://127.0.0.1:9990"
+private_url = "http://127.0.0.1:9991"
 remote_url = "http://127.0.0.1:9990"
 ui_dir = "./crates/public_ui"
 
@@ -56,6 +56,10 @@ invoice_watch_interval = 2
 payout_watch_interval = 2
 mock_enabled = true  # Use MockLnClient instead of real LND
 mock_auto_accept_secs = 2  # Auto-accept invoices after 2 seconds
+
+[admin_settings]
+listen_addr = "127.0.0.1:9991"
+token_file = "./config/e2e_admin_token"  # Test-only token; Playwright's global setup sends it
 
 [keymeld_settings]
 gateway_url = "http://localhost:8090"

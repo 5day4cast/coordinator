@@ -13,3 +13,19 @@ spec:
       name: http
   selector:
     {{- include "coordinator.serviceSelectorLabels" . | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "coordinator.fullname" . }}-admin
+  labels:
+    {{- include "coordinator.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.service.adminPort }}
+      targetPort: admin
+      protocol: TCP
+      name: admin
+  selector:
+    {{- include "coordinator.serviceSelectorLabels" . | nindent 4 }}

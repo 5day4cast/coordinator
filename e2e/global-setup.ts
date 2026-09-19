@@ -1,8 +1,17 @@
 import { request } from "@playwright/test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 // Seed test data after coordinator starts
 export default async function globalSetup() {
   const baseURL = process.env.COORDINATOR_URL || "http://localhost:9990";
+  // Competitions are created on the operator listener, which requires the
+  // operator token (config/e2e.toml points at config/e2e_admin_token).
+  const adminURL = process.env.COORDINATOR_ADMIN_URL || "http://localhost:9991";
+  const adminToken = (
+    process.env.COORDINATOR_ADMIN_TOKEN ||
+    readFileSync(join(__dirname, "..", "config", "e2e_admin_token"), "utf8")
+  ).trim();
 
   // Wait for server to be ready
   const maxRetries = 10;
@@ -27,20 +36,28 @@ export default async function globalSetup() {
   }
 
   if (!serverReady) {
-    console.error("Server failed to start");
-    return;
+    throw new Error("Coordinator public listener failed to become ready");
   }
 
-  const context = await request.newContext({ baseURL });
+  const context = await request.newContext({
+    baseURL: adminURL,
+    extraHTTPHeaders: { Authorization: `Bearer ${adminToken}` },
+  });
 
-  // Create a test competition via admin API
+  // Create a test competition via the operator API
   const now = new Date();
   const startDate = new Date(now.getTime() + 60 * 60 * 1000); // 1 hour from now
   const endDate = new Date(now.getTime() + 2 * 60 * 60 * 1000); // 2 hours from now
   const signingDate = new Date(now.getTime() + 3 * 60 * 60 * 1000); // 3 hours from now
 
   const formData = new URLSearchParams();
-  formData.append("id", crypto.randomUUID());
+  // NOAA requires UUIDv7: preserve random/variant bits and use the current 48-bit timestamp.
+  const randomId = crypto.randomUUID();
+  const timestamp = Date.now().toString(16).padStart(12, "0");
+  formData.append(
+    "id",
+    `${timestamp.slice(0, 8)}-${timestamp.slice(8)}-7${randomId.slice(15, 18)}-${randomId.slice(19)}`,
+  );
   formData.append("signing_date", signingDate.toISOString());
   formData.append("start_observation_date", startDate.toISOString());
   formData.append("end_observation_date", endDate.toISOString());
@@ -63,15 +80,13 @@ export default async function globalSetup() {
     });
 
     const responseText = await response.text();
-    if (responseText.includes("error") || responseText.includes("Error")) {
-      console.error("Competition creation error:", responseText);
-    } else {
-      console.log("Seeded test competition successfully");
+    if (!response.ok() || !responseText.includes("Competition created successfully!")) {
+      throw new Error(
+        `Competition seed failed (${response.status()}): ${responseText}`,
+      );
     }
-  } catch (error) {
-    console.error("Failed to seed competition (non-fatal):", error);
-    // Don't throw - tests can still run with existing data or without a competition
+    console.log("Seeded test competition successfully");
+  } finally {
+    await context.dispose();
   }
-
-  await context.dispose();
 }

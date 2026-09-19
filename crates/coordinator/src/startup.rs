@@ -1,4 +1,7 @@
 use crate::{
+    api::admin_auth::{
+        admin_login, admin_login_page, operator_response_headers, require_operator, AdminAccess,
+    },
     api::nip98_replay::{Nip98ReplayGuard, DEFAULT_REPLAY_CAPACITY},
     api::routes::{
         add_event_entry, admin_competition_fragment, admin_create_competition_handler,
@@ -39,13 +42,14 @@ use anyhow::anyhow;
 use axum::{
     body::Body,
     extract::{connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, Path, Request, State},
-    http::{header, Extensions, HeaderValue, StatusCode},
+    http::{header, Extensions, HeaderValue, StatusCode, Uri},
     middleware::{self, AddExtension, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     serve::Serve,
     Extension, Router,
 };
+use bitcoin::Network;
 use dlctix::secp::Scalar;
 use hyper::{
     header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
@@ -68,12 +72,19 @@ use tokio::{
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tower_http::cors::{AllowOrigin, CorsLayer};
+type HttpServer = Serve<
+    TcpListener,
+    IntoMakeServiceWithConnectInfo<Router, SocketAddr>,
+    AddExtension<Router, ConnectInfo<SocketAddr>>,
+>;
+
+/// Owns both HTTP listeners, the background producers, and the databases.
+///
+/// The public listener serves participants. The admin listener serves operator routes
+/// behind `api::admin_auth`; it never shares a socket with the public router.
 pub struct Application {
-    server: Serve<
-        TcpListener,
-        IntoMakeServiceWithConnectInfo<Router, SocketAddr>,
-        AddExtension<Router, ConnectInfo<SocketAddr>>,
-    >,
+    server: HttpServer,
+    admin_server: HttpServer,
     cancellation_token: CancellationToken,
     background_tasks: TaskTracker,
     background_abort_handles: Vec<AbortHandle>,
@@ -88,6 +99,10 @@ impl Application {
             config.api_settings.domain, config.api_settings.port
         );
         let listener = SocketAddr::from_str(&address)?;
+        let admin_listener = config.admin_settings.listen_addr;
+        let network = config.bitcoin_settings.network;
+        // Fail on a missing operator token before connecting to LND or opening databases.
+        let admin_access = Arc::new(AdminAccess::from_settings(&config.admin_settings)?);
         let (app_state, background_tasks, cancellation_token, db_connections) =
             build_app(config.clone()).await?;
         let background_abort_handles: Vec<_> = app_state
@@ -95,8 +110,22 @@ impl Application {
             .values()
             .map(JoinHandle::abort_handle)
             .collect();
-        let server = match build_server(listener, app_state, config.api_settings.origins).await {
-            Ok(server) => server,
+        let app_state = Arc::new(app_state);
+        let servers = async {
+            let server = build_server(
+                listener,
+                app(app_state.clone(), config.api_settings.origins),
+            )
+            .await?;
+            let admin_server = build_server(
+                admin_listener,
+                admin_app(app_state.clone(), admin_access, network),
+            )
+            .await?;
+            Ok::<_, anyhow::Error>((server, admin_server))
+        };
+        let (server, admin_server) = match servers.await {
+            Ok(servers) => servers,
             Err(error) => {
                 cancellation_token.cancel();
                 for handle in background_abort_handles {
@@ -113,6 +142,7 @@ impl Application {
         };
         Ok(Self {
             server,
+            admin_server,
             cancellation_token,
             background_tasks,
             background_abort_handles,
@@ -124,19 +154,17 @@ impl Application {
         info!("Starting server...");
         let Application {
             server,
+            admin_server,
             cancellation_token,
             background_tasks,
             background_abort_handles,
             db_connections,
         } = self;
         let stop_http = CancellationToken::new();
-        let http_shutdown = stop_http.clone();
-        let mut http = tokio::spawn(async move {
-            server
-                .with_graceful_shutdown(http_shutdown.cancelled_owned())
-                .await
-        });
+        let mut http = spawn_http(server, stop_http.clone());
+        let mut admin_http = spawn_http(admin_server, stop_http.clone());
         let mut http_finished = false;
+        let mut admin_http_finished = false;
         let mut shutdown_error = None;
         let writer_stopped = async {
             let waiters: Vec<_> = db_connections
@@ -153,25 +181,22 @@ impl Application {
                 http_finished = true;
                 shutdown_error = Some(anyhow!("HTTP server stopped unexpectedly: {result:?}"));
             }
+            result = &mut admin_http => {
+                admin_http_finished = true;
+                shutdown_error = Some(anyhow!("Admin HTTP server stopped unexpectedly: {result:?}"));
+            }
             () = shutdown_signal() => {}
             () = writer_stopped => {
                 shutdown_error = Some(anyhow!("Database writer stopped unexpectedly"));
             }
         }
         stop_http.cancel();
-        if !http_finished {
-            match tokio::time::timeout(Duration::from_secs(10), &mut http).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(result) => {
-                    shutdown_error
-                        .get_or_insert_with(|| anyhow!("HTTP server shutdown failed: {result:?}"));
-                }
-                Err(_) => {
-                    http.abort();
-                    let _ = http.await;
-                    shutdown_error.get_or_insert_with(|| anyhow!("HTTP server drain timed out"));
-                }
-            }
+        let (public_drain, admin_drain) = tokio::join!(
+            drain_http("HTTP server", http, http_finished),
+            drain_http("Admin HTTP server", admin_http, admin_http_finished),
+        );
+        for drain_error in [public_drain, admin_drain].into_iter().flatten() {
+            shutdown_error.get_or_insert(drain_error);
         }
         cancellation_token.cancel();
         if tokio::time::timeout(Duration::from_secs(10), background_tasks.wait())
@@ -206,6 +231,28 @@ impl Application {
                 info!("Shutdown complete");
                 Ok(())
             }
+        }
+    }
+}
+
+type HttpTask = JoinHandle<Result<(), std::io::Error>>;
+
+fn spawn_http(server: HttpServer, stop: CancellationToken) -> HttpTask {
+    tokio::spawn(async move { server.with_graceful_shutdown(stop.cancelled_owned()).await })
+}
+
+/// Wait up to 10 seconds for a listener to drain after `stop_http`; abort it afterwards.
+async fn drain_http(name: &str, mut task: HttpTask, finished: bool) -> Option<anyhow::Error> {
+    if finished {
+        return None;
+    }
+    match tokio::time::timeout(Duration::from_secs(10), &mut task).await {
+        Ok(Ok(Ok(()))) => None,
+        Ok(result) => Some(anyhow!("{name} shutdown failed: {result:?}")),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            Some(anyhow!("{name} drain timed out"))
         }
     }
 }
@@ -550,33 +597,21 @@ pub async fn build_app(
 
 pub async fn build_server(
     socket_addr: SocketAddr,
-    app_state: AppState,
-    origins: Vec<String>,
-) -> Result<
-    Serve<
-        TcpListener,
-        IntoMakeServiceWithConnectInfo<Router, SocketAddr>,
-        AddExtension<Router, ConnectInfo<SocketAddr>>,
-    >,
-    anyhow::Error,
-> {
+    router: Router,
+) -> Result<HttpServer, anyhow::Error> {
     let listener = TcpListener::bind(socket_addr).await?;
-
-    info!("Setting up service");
-    let app = app(app_state, origins);
+    let local_addr = listener.local_addr()?;
     let server = axum::serve(
         listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+        router.into_make_service_with_connect_info::<SocketAddr>(),
     );
-    info!(
-        "Service running @: http://{}:{}",
-        socket_addr.ip(),
-        socket_addr.port()
-    );
+    info!("Service running @: http://{local_addr}");
     Ok(server)
 }
 
-pub fn app(app_state: AppState, origins: Vec<String>) -> Router {
+/// Public listener: participant API, public pages, and static assets. It must never
+/// route an operator path; `startup_tests` proves this for every admin route.
+pub fn app(app_state: Arc<AppState>, origins: Vec<String>) -> Router {
     let origins: Vec<HeaderValue> = origins
         .into_iter()
         .filter_map(|origin| origin.parse().ok())
@@ -588,13 +623,6 @@ pub fn app(app_state: AppState, origins: Vec<String>) -> Router {
         .allow_origin(AllowOrigin::list(origins))
         .allow_credentials(true);
 
-    let wallet_endpoints = Router::new()
-        .route("/balance", get(get_balance))
-        .route("/address", get(get_next_address))
-        .route("/outputs", get(get_outputs))
-        .route("/send", post(send_to_address))
-        .route("/estimated_fees", get(get_estimated_fee_rates));
-
     let users_endpoints = Router::new()
         .route("/login", post(login))
         .route("/register", post(register))
@@ -603,26 +631,6 @@ pub fn app(app_state: AppState, origins: Vec<String>) -> Router {
         .route("/username/change-password", post(change_password))
         .route("/username/forgot-password", post(forgot_password_challenge))
         .route("/username/reset-password", post(forgot_password_reset));
-
-    // HTMX admin routes (pure server-side rendering, no WASM)
-    let admin_htmx_routes = Router::new()
-        .route("/", get(admin_page_handler))
-        .route("/competition", get(admin_competition_fragment))
-        .route("/wallet", get(admin_wallet_fragment))
-        .route("/wallet/balance", get(admin_wallet_balance_fragment))
-        .route("/wallet/address", get(admin_wallet_address_fragment))
-        .route("/wallet/fees", get(admin_fee_estimates_fragment))
-        .route("/wallet/outputs", get(admin_wallet_outputs_fragment))
-        .route("/wallet/send", post(admin_send_bitcoin_handler))
-        .route("/api/competitions", post(admin_create_competition_handler))
-        .route(
-            "/api/competitions/delete",
-            post(admin_delete_competition_handler),
-        )
-        .route(
-            "/api/test/settle-invoice/{ticket_id}",
-            post(admin_settle_test_invoice_handler),
-        );
 
     // HTMX public routes (some require JS bridge for auth)
     let htmx_routes = Router::new()
@@ -646,11 +654,9 @@ pub fn app(app_state: AppState, origins: Vec<String>) -> Router {
 
     Router::new()
         .route("/", get(public_page_handler))
-        .nest("/admin", admin_htmx_routes)
         .merge(htmx_routes)
-        .fallback(public_page_handler)
+        .fallback(public_fallback)
         .route("/api/v1/health_check", get(health))
-        .route("/api/v1/competitions", post(create_competition))
         .route("/api/v1/competitions", get(get_competitions))
         .route(
             "/api/v1/competitions/{competition_id}",
@@ -686,15 +692,84 @@ pub fn app(app_state: AppState, origins: Vec<String>) -> Router {
         )
         .route("/api/v1/entries", post(add_event_entry))
         .route("/api/v1/entries", get(get_entries))
-        .nest("/api/v1/wallet", wallet_endpoints)
         .nest("/api/v1/users", users_endpoints)
         .route("/ui/{*path}", get(serve_static_file))
         .layer(Extension(Arc::new(Nip98ReplayGuard::new(
             DEFAULT_REPLAY_CAPACITY,
         ))))
         .layer(middleware::from_fn(log_request))
-        .with_state(Arc::new(app_state))
+        .with_state(app_state)
         .layer(cors)
+}
+
+/// Admin listener: operator pages, the LND wallet API, and competition creation.
+///
+/// Everything except the sign-in form and static assets sits behind `require_operator`.
+/// No CORS layer: operator pages call only their own origin. The test-settle route,
+/// which marks tickets paid without a payment, is never registered on mainnet.
+pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Network) -> Router {
+    let mut admin_htmx_routes = Router::new()
+        .route("/", get(admin_page_handler))
+        .route("/competition", get(admin_competition_fragment))
+        .route("/wallet", get(admin_wallet_fragment))
+        .route("/wallet/balance", get(admin_wallet_balance_fragment))
+        .route("/wallet/address", get(admin_wallet_address_fragment))
+        .route("/wallet/fees", get(admin_fee_estimates_fragment))
+        .route("/wallet/outputs", get(admin_wallet_outputs_fragment))
+        .route("/wallet/send", post(admin_send_bitcoin_handler))
+        .route("/api/competitions", post(admin_create_competition_handler))
+        .route(
+            "/api/competitions/delete",
+            post(admin_delete_competition_handler),
+        );
+    if network != Network::Bitcoin {
+        admin_htmx_routes = admin_htmx_routes.route(
+            "/api/test/settle-invoice/{ticket_id}",
+            post(admin_settle_test_invoice_handler),
+        );
+    }
+
+    let wallet_endpoints = Router::new()
+        .route("/balance", get(get_balance))
+        .route("/address", get(get_next_address))
+        .route("/outputs", get(get_outputs))
+        .route("/send", post(send_to_address))
+        .route("/estimated_fees", get(get_estimated_fee_rates));
+
+    let operator_routes = Router::new()
+        .nest("/admin", admin_htmx_routes)
+        .nest("/api/v1/wallet", wallet_endpoints)
+        .route("/api/v1/competitions", post(create_competition))
+        .route_layer(middleware::from_fn_with_state(
+            access.clone(),
+            require_operator,
+        ))
+        .with_state(app_state.clone());
+
+    let sign_in = Router::new()
+        .route("/admin/login", get(admin_login_page).post(admin_login))
+        .with_state(access);
+
+    Router::new()
+        .merge(operator_routes)
+        .merge(sign_in)
+        .route("/ui/{*path}", get(serve_static_file))
+        .with_state(app_state)
+        .layer(middleware::from_fn(operator_response_headers))
+        .layer(middleware::from_fn(log_request))
+}
+
+/// Serve the competitions page for client-side paths, but never for paths reserved for
+/// the API or the operator listener, so a missing operator route cannot look present.
+async fn public_fallback(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
+    let path = uri.path();
+    let reserved = ["/admin", "/api"]
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")));
+    if reserved {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    public_page_handler(State(state)).await.into_response()
 }
 
 async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {
@@ -838,6 +913,299 @@ async fn shutdown_signal() {
     select! {
         _ = sigint.recv() => info!("Received SIGINT signal"),
         _ = sigterm.recv() => info!("Received SIGTERM signal"),
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use crate::api::admin_auth::{AdminCredentials, CSRF_HEADER, SESSION_COOKIE};
+    use axum::{body::to_bytes, http::HeaderMap};
+    use std::io::Write;
+    use tower::ServiceExt;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+    const SETTLE_PATH: &str = "/admin/api/test/settle-invoice/0190b7a4-0000-7000-8000-000000000000";
+
+    /// Every operator route, including the sign-in form, as (method, path).
+    const OPERATOR_ROUTES: &[(&str, &str)] = &[
+        ("GET", "/admin"),
+        ("GET", "/admin/competition"),
+        ("GET", "/admin/wallet"),
+        ("GET", "/admin/wallet/balance"),
+        ("GET", "/admin/wallet/address"),
+        ("GET", "/admin/wallet/fees"),
+        ("GET", "/admin/wallet/outputs"),
+        ("POST", "/admin/wallet/send"),
+        ("POST", "/admin/api/competitions"),
+        ("POST", "/admin/api/competitions/delete"),
+        ("POST", SETTLE_PATH),
+        ("GET", "/admin/login"),
+        ("POST", "/admin/login"),
+        ("GET", "/api/v1/wallet/balance"),
+        ("GET", "/api/v1/wallet/address"),
+        ("GET", "/api/v1/wallet/outputs"),
+        ("GET", "/api/v1/wallet/estimated_fees"),
+        ("POST", "/api/v1/wallet/send"),
+        ("POST", "/api/v1/competitions"),
+    ];
+
+    fn protected_routes() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+        OPERATOR_ROUTES
+            .iter()
+            .filter(|(_, path)| *path != "/admin/login")
+    }
+
+    /// Real application state over mock Bitcoin, LND, and oracle clients.
+    struct TestState {
+        state: Arc<AppState>,
+        tasks: TaskTracker,
+        cancel: CancellationToken,
+        databases: Vec<DBConnection>,
+        _data: tempfile::TempDir,
+    }
+
+    impl TestState {
+        async fn start() -> Self {
+            let data = tempfile::tempdir().unwrap();
+            let mut settings = Settings::default();
+            settings.db_settings.data_folder = data.path().display().to_string();
+            settings.bitcoin_settings.mock_enabled = true;
+            settings.ln_settings.mock_enabled = true;
+            settings.coordinator_settings.mock_oracle = true;
+            settings.coordinator_settings.oracle_url = String::from("mock://oracle");
+            let (state, tasks, cancel, databases) = build_app(settings).await.unwrap();
+            Self {
+                state: Arc::new(state),
+                tasks,
+                cancel,
+                databases,
+                _data: data,
+            }
+        }
+
+        fn admin(&self, access: AdminAccess, network: Network) -> Router {
+            admin_app(self.state.clone(), Arc::new(access), network)
+        }
+
+        fn public(&self) -> Router {
+            app(self.state.clone(), vec![])
+        }
+
+        async fn stop(self) {
+            self.cancel.cancel();
+            for handle in self.state.background_threads.values() {
+                handle.abort();
+            }
+            self.tasks.wait().await;
+            for database in self.databases {
+                database.close().await.unwrap();
+            }
+        }
+    }
+
+    fn token_access() -> AdminAccess {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{TOKEN}").unwrap();
+        AdminAccess::Token(AdminCredentials::load(file.path()).unwrap())
+    }
+
+    fn request(method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(path);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder.body(Body::from(body.to_owned())).unwrap()
+    }
+
+    async fn send(router: &Router, request: Request<Body>) -> (StatusCode, HeaderMap, String) {
+        let response = router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    const BEARER: &str = "Bearer 0123456789abcdef0123456789abcdef";
+    const FORM: &str = "application/x-www-form-urlencoded";
+
+    #[tokio::test]
+    async fn public_router_serves_no_operator_route() {
+        let test = TestState::start().await;
+        let public = test.public();
+        for (method, path) in OPERATOR_ROUTES {
+            for headers in [&[][..], &[("authorization", BEARER)][..]] {
+                let (status, _, _) = send(&public, request(method, path, headers, "")).await;
+                assert!(
+                    status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED,
+                    "public {method} {path} returned {status}"
+                );
+            }
+        }
+        let (status, _, _) = send(&public, request("GET", "/api/v1/health_check", &[], "")).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, _) = send(&public, request("GET", "/api/v1/competitions", &[], "")).await;
+        assert_eq!(status, StatusCode::OK);
+        test.stop().await;
+    }
+
+    #[tokio::test]
+    async fn admin_router_requires_a_valid_token_on_every_operator_route() {
+        let test = TestState::start().await;
+        let admin = test.admin(token_access(), Network::Regtest);
+        let wrong = [
+            vec![],
+            vec![("authorization", "Bearer 0123456789abcdef0123456789abcdeX")],
+            vec![("authorization", "Bearer ")],
+            vec![("authorization", TOKEN)],
+            vec![("cookie", "coordinator_admin_session=4102444800.00")],
+        ];
+        for (method, path) in protected_routes() {
+            for headers in &wrong {
+                let (status, response_headers, _) =
+                    send(&admin, request(method, path, headers, "")).await;
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "{method} {path} with {headers:?}"
+                );
+                assert_eq!(response_headers["www-authenticate"], "Bearer");
+                assert_eq!(response_headers["x-frame-options"], "DENY");
+            }
+            // The handler runs: any status but an authentication failure or missing route.
+            let (status, _, body) = send(
+                &admin,
+                request(method, path, &[("authorization", BEARER)], ""),
+            )
+            .await;
+            assert!(
+                ![
+                    StatusCode::UNAUTHORIZED,
+                    StatusCode::FORBIDDEN,
+                    StatusCode::METHOD_NOT_ALLOWED
+                ]
+                .contains(&status)
+                    && (status != StatusCode::NOT_FOUND || path == &SETTLE_PATH),
+                "{method} {path} with bearer returned {status}: {body}"
+            );
+        }
+        let (status, _, body) = send(
+            &admin,
+            request(
+                "GET",
+                "/api/v1/wallet/balance",
+                &[("authorization", BEARER)],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("confirmed"));
+        test.stop().await;
+    }
+
+    #[tokio::test]
+    async fn browser_session_needs_the_csrf_token_for_state_changes() {
+        let test = TestState::start().await;
+        let admin = test.admin(token_access(), Network::Regtest);
+
+        let (status, _, _) = send(
+            &admin,
+            request(
+                "POST",
+                "/admin/login",
+                &[("content-type", FORM)],
+                "token=wrong",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, headers, _) = send(
+            &admin,
+            request(
+                "POST",
+                "/admin/login",
+                &[("content-type", FORM)],
+                &format!("token={TOKEN}"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers["location"], "/admin");
+        let set_cookie = headers["set-cookie"].to_str().unwrap();
+        for flag in ["HttpOnly", "Secure", "SameSite=Strict", "Path=/admin"] {
+            assert!(set_cookie.contains(flag), "{set_cookie} lacks {flag}");
+        }
+        let cookie = set_cookie.split(';').next().unwrap().to_owned();
+        assert!(cookie.starts_with(SESSION_COOKIE));
+
+        let (status, _, page) = send(
+            &admin,
+            request("GET", "/admin/wallet", &[("cookie", &cookie)], ""),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let marker = format!("{CSRF_HEADER}&quot;:&quot;");
+        let csrf = page
+            .split_once(&marker)
+            .and_then(|(_, rest)| rest.split_once("&quot;"))
+            .map(|(token, _)| token.to_owned())
+            .expect("admin page renders the CSRF token for HTMX");
+
+        let delete = "competition_id=not-a-uuid";
+        let without_csrf = [("cookie", cookie.as_str()), ("content-type", FORM)];
+        let (status, _, _) = send(
+            &admin,
+            request(
+                "POST",
+                "/admin/api/competitions/delete",
+                &without_csrf,
+                delete,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let with_csrf = [
+            ("cookie", cookie.as_str()),
+            ("content-type", FORM),
+            (CSRF_HEADER, csrf.as_str()),
+        ];
+        let (status, _, body) = send(
+            &admin,
+            request("POST", "/admin/api/competitions/delete", &with_csrf, delete),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Invalid competition ID"), "{body}");
+        test.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_settlement_route_does_not_exist_on_mainnet() {
+        let test = TestState::start().await;
+        let bearer = [("authorization", BEARER)];
+        let regtest = test.admin(token_access(), Network::Regtest);
+        let (_, _, body) = send(&regtest, request("POST", SETTLE_PATH, &bearer, "")).await;
+        assert!(body.contains("Ticket not found"), "{body}");
+
+        let mainnet = test.admin(token_access(), Network::Bitcoin);
+        let (status, _, body) = send(&mainnet, request("POST", SETTLE_PATH, &bearer, "")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.is_empty(), "{body}");
+        test.stop().await;
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_development_access_admits_operator_routes() {
+        let test = TestState::start().await;
+        let admin = test.admin(AdminAccess::Unauthenticated, Network::Regtest);
+        let (status, _, _) = send(&admin, request("GET", "/api/v1/wallet/balance", &[], "")).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, _) = send(&admin, request("GET", "/admin/wallet/fees", &[], "")).await;
+        assert_eq!(status, StatusCode::OK);
+        test.stop().await;
     }
 }
 

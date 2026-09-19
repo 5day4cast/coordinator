@@ -153,16 +153,21 @@ keymeld-stop:
 # Run Commands
 # ============================================
 
+# Create the operator token the admin listener requires (idempotent)
+admin-token:
+    @mkdir -p creds
+    @test -s creds/admin_token || (openssl rand -hex 32 > creds/admin_token && chmod 600 creds/admin_token && echo "wrote creds/admin_token")
+
 # Run the coordinator server
-run:
+run: admin-token
     cargo run --bin coordinator
 
 # Run coordinator with debug logging
-run-debug:
+run-debug: admin-token
     RUST_LOG=debug cargo run --bin coordinator
 
 # Run coordinator with trace logging
-run-trace:
+run-trace: admin-token
     RUST_LOG=trace cargo run --bin coordinator
 
 # Run the wallet CLI

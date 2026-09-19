@@ -18,10 +18,13 @@ async fn main() -> anyhow::Result<()> {
     info!("  Oracle: {}", config.oracle.url);
 
     let db = SynthDb::new(&config.db.path).await?;
-    let client = CoordinatorClient::new(
+    let mut client = CoordinatorClient::new(
         &config.coordinator.url,
         config.coordinator.admin_url.as_deref(),
     );
+    if let Some(path) = &config.coordinator.admin_token_file {
+        client = client.with_admin_token_file(path)?;
+    }
     let runner = Runner::new(client, db);
 
     // Start scheduled runner if enabled

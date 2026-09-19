@@ -4,7 +4,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse},
-    Json,
+    Extension, Json,
 };
 use axum_extra::extract::Form;
 use log::{error, info};
@@ -14,6 +14,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
 use uuid::Uuid;
 
 use crate::{
+    api::admin_auth::AdminCsrf,
     infra::bitcoin::SendOptions,
     startup::AppState,
     templates::{
@@ -36,6 +37,7 @@ use crate::{
 fn render_admin_fragment(
     headers: &HeaderMap,
     state: &AppState,
+    csrf: &AdminCsrf,
     title: &str,
     content: Markup,
 ) -> Html<String> {
@@ -50,19 +52,24 @@ fn render_admin_fragment(
             oracle_base: &state.oracle_url,
             explorer_url: &state.explorer_url,
             network: &state.network,
+            csrf_token: csrf.0.as_deref(),
         };
         Html(admin_base(&config, content).into_string())
     }
 }
 
 /// Admin dashboard page (competition tab)
-pub async fn admin_page_handler(State(state): State<Arc<AppState>>) -> Html<String> {
+pub async fn admin_page_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(csrf): Extension<AdminCsrf>,
+) -> Html<String> {
     let config = AdminPageConfig {
         title: "5day4cast Admin",
         api_base: &state.private_url,
         oracle_base: &state.oracle_url,
         explorer_url: &state.explorer_url,
         network: &state.network,
+        csrf_token: csrf.0.as_deref(),
     };
 
     // Fetch stations from oracle and filter to top 200 cities
@@ -96,6 +103,7 @@ pub async fn admin_page_handler(State(state): State<Arc<AppState>>) -> Html<Stri
 /// Admin competition tab fragment (for HTMX tab switching)
 pub async fn admin_competition_fragment(
     State(state): State<Arc<AppState>>,
+    Extension(csrf): Extension<AdminCsrf>,
     headers: HeaderMap,
 ) -> Html<String> {
     // Fetch stations from oracle and filter to top 200 cities
@@ -122,12 +130,19 @@ pub async fn admin_competition_fragment(
 
     let defaults = CompetitionDefaults::default();
     let content = admin_dashboard(&stations_with_weather, &defaults);
-    render_admin_fragment(&headers, &state, "5day4cast Admin - Competition", content)
+    render_admin_fragment(
+        &headers,
+        &state,
+        &csrf,
+        "5day4cast Admin - Competition",
+        content,
+    )
 }
 
 /// Admin wallet page (full page for direct navigation, fragment for HTMX)
 pub async fn admin_wallet_fragment(
     State(state): State<Arc<AppState>>,
+    Extension(csrf): Extension<AdminCsrf>,
     headers: HeaderMap,
 ) -> Html<String> {
     let balance = fetch_balance(&state)
@@ -143,7 +158,7 @@ pub async fn admin_wallet_fragment(
         .unwrap_or_default();
 
     let content = wallet_page(&state.explorer_url, &balance, &address);
-    render_admin_fragment(&headers, &state, "5day4cast Admin - Wallet", content)
+    render_admin_fragment(&headers, &state, &csrf, "5day4cast Admin - Wallet", content)
 }
 
 /// Wallet balance fragment (for HTMX refresh)
@@ -253,7 +268,12 @@ pub async fn admin_create_competition_handler(
     }
 
     // Calculate total pool
-    let total_competition_pool = form.entry_fee * form.total_allowed_entries;
+    let Some(total_competition_pool) = form.entry_fee.checked_mul(form.total_allowed_entries)
+    else {
+        return Html(
+            competition_error("Total competition pool exceeds the supported amount").into_string(),
+        );
+    };
 
     // Create the competition via the coordinator
     let create_event = crate::domain::CreateEvent {
@@ -328,8 +348,6 @@ async fn fetch_forecasts(
         return Ok(vec![]);
     }
 
-    let client = reqwest_middleware::reqwest::Client::new();
-
     // Fetch forecasts for today and tomorrow (end date is exclusive, so +2 days)
     let today = time::OffsetDateTime::now_utc();
     let end_date = today + time::Duration::days(2);
@@ -337,22 +355,7 @@ async fn fetch_forecasts(
     let start = today.format(&Rfc3339).unwrap_or_default();
     let end = end_date.format(&Rfc3339).unwrap_or_default();
 
-    let station_ids_param = station_ids.join(",");
-
-    let response = client
-        .get(format!(
-            "{}/stations/forecasts?station_ids={}&start={}&end={}",
-            oracle_url, station_ids_param, start, end
-        ))
-        .send()
-        .await?;
-
-    if response.status().is_success() {
-        let forecasts: Vec<Forecast> = response.json().await?;
-        Ok(forecasts)
-    } else {
-        Ok(vec![])
-    }
+    fetch_station_weather(oracle_url, "forecasts", station_ids, &start, &end).await
 }
 
 async fn fetch_observations(
@@ -363,8 +366,6 @@ async fn fetch_observations(
         return Ok(vec![]);
     }
 
-    let client = reqwest_middleware::reqwest::Client::new();
-
     // Fetch observations for today only
     let today = time::OffsetDateTime::now_utc();
     let tomorrow = today + time::Duration::days(1);
@@ -372,22 +373,40 @@ async fn fetch_observations(
     let start = today.format(&Rfc3339).unwrap_or_default();
     let end = tomorrow.format(&Rfc3339).unwrap_or_default();
 
-    let station_ids_param = station_ids.join(",");
+    fetch_station_weather(oracle_url, "observations", station_ids, &start, &end).await
+}
 
-    let response = client
-        .get(format!(
-            "{}/stations/observations?station_ids={}&start={}&end={}",
-            oracle_url, station_ids_param, start, end
-        ))
-        .send()
-        .await?;
-
-    if response.status().is_success() {
-        let observations: Vec<Observation> = response.json().await?;
-        Ok(observations)
-    } else {
-        Ok(vec![])
+async fn fetch_station_weather<T: serde::de::DeserializeOwned>(
+    oracle_url: &str,
+    kind: &str,
+    station_ids: &[&str],
+    start: &str,
+    end: &str,
+) -> Result<Vec<T>, anyhow::Error> {
+    // NOAA Oracle 2.0 accepts at most 100 stations per weather query. The admin
+    // selector can contain 200 stations, so retain all of them across bounded requests.
+    let client = reqwest_middleware::reqwest::Client::new();
+    let mut weather = Vec::new();
+    for stations in station_ids.chunks(100) {
+        let station_ids = stations.join(",");
+        let mut batch = client
+            .get(format!(
+                "{}/stations/{kind}",
+                oracle_url.trim_end_matches('/')
+            ))
+            .query(&[
+                ("station_ids", station_ids.as_str()),
+                ("start", start),
+                ("end", end),
+            ])
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Vec<T>>()
+            .await?;
+        weather.append(&mut batch);
     }
+    Ok(weather)
 }
 
 fn merge_stations_with_weather(
@@ -438,6 +457,57 @@ fn merge_stations_with_weather(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod oracle_weather_tests {
+    use super::*;
+    use axum::{extract::Query, routing::get, Router};
+    use std::{collections::HashMap, sync::Mutex};
+
+    #[tokio::test]
+    async fn weather_queries_respect_the_oracle_station_limit_without_dropping_stations() {
+        let counts = Arc::new(Mutex::new(Vec::new()));
+        let requests = counts.clone();
+        let app = Router::new().route(
+            "/stations/{kind}",
+            get(move |Query(query): Query<HashMap<String, String>>| {
+                let requests = requests.clone();
+                async move {
+                    let stations: Vec<_> = query["station_ids"].split(',').collect();
+                    assert!(stations.len() <= 100);
+                    requests.lock().unwrap().push(stations.len());
+                    Json(
+                        stations
+                            .into_iter()
+                            .map(|station| {
+                                serde_json::json!({
+                                    "station_id": station,
+                                    "date": "2030-01-01",
+                                    "temp_high": 25,
+                                    "temp_low": 10,
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let stations: Vec<String> = (0..201).map(|index| format!("S{index:03}")).collect();
+        let station_ids: Vec<_> = stations.iter().map(String::as_str).collect();
+        let forecasts = fetch_forecasts(&url, &station_ids).await.unwrap();
+        let observations = fetch_observations(&url, &station_ids).await.unwrap();
+        assert_eq!(forecasts.len(), stations.len());
+        assert_eq!(observations.len(), stations.len());
+        assert_eq!(forecasts.last().unwrap().station_id, "S200");
+        assert_eq!(observations.last().unwrap().station_id, "S200");
+        assert_eq!(*counts.lock().unwrap(), vec![100, 100, 1, 100, 100, 1]);
+        server.abort();
+        let _ = server.await;
+    }
 }
 
 async fn fetch_balance(state: &AppState) -> Result<WalletBalance, anyhow::Error> {
@@ -509,6 +579,7 @@ pub async fn admin_delete_competition_handler(
 
 /// Test-only: Settle a ticket's HODL invoice without real Lightning payment.
 /// Used by the synthetic testing tool. Marks the ticket as both paid and settled.
+/// The admin router never registers this route on mainnet.
 pub async fn admin_settle_test_invoice_handler(
     State(state): State<Arc<AppState>>,
     Path(ticket_id): Path<Uuid>,

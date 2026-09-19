@@ -21,6 +21,7 @@ duckdb_lib/
 coordinator_private_key.pem
 config/*
 !config/e2e.toml
+!config/e2e_admin_token
 crates/*/src/bin/settings.toml
 
 # Nix

@@ -1,5 +1,5 @@
-use dlctix::{bitcoin::XOnlyPublicKey, musig2::PubNonce, SigMap};
-use log::{debug, info};
+use dlctix::{bitcoin::XOnlyPublicKey, hashlock, musig2::PubNonce, SigMap};
+use log::debug;
 use sqlx::{Execute, Sqlite};
 use std::collections::HashMap;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -8,10 +8,22 @@ use uuid::Uuid;
 use crate::{
     api::routes::FinalSignatures,
     domain::{EntryPayout, PayoutError, PayoutStatus},
-    infra::db::{DBConnection, DatabaseWriteError},
+    infra::{
+        db::{DBConnection, DatabaseWriteError},
+        keymeld::StoredDlcKeygenSession,
+    },
 };
 
 use super::{Competition, EntryStatus, SearchBy, Ticket, UserEntry};
+
+/// A ticket reserved for a caller. When a stale reservation was taken over,
+/// the ticket has already been given a fresh preimage and hash, and
+/// `superseded_payment_hash` is the previous holder's invoice hash for the
+/// caller to cancel.
+pub struct ReservedTicket {
+    pub ticket: Ticket,
+    pub superseded_payment_hash: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct CompetitionStore {
@@ -66,7 +78,7 @@ impl CompetitionStore {
         entry: UserEntry,
         ticket_id: Uuid,
     ) -> Result<UserEntry, DatabaseWriteError> {
-        info!("entry: {:?}", entry);
+        debug!("adding entry {} for ticket {}", entry.id, ticket_id);
 
         let entry_submission = serde_json::to_string(&entry.entry_submission)
             .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
@@ -139,7 +151,8 @@ impl CompetitionStore {
                     SET partial_signatures = ?,
                         funding_psbt_base64 = ?,
                         signed_at = datetime('now')
-                    WHERE id = ?",
+                    WHERE id = ?
+                      AND partial_signatures IS NULL",
                 )
                 .bind(sigs_json)
                 .bind(funding_psbt)
@@ -166,7 +179,8 @@ impl CompetitionStore {
                 let result = sqlx::query(
                     "UPDATE entries
                     SET public_nonces = ?
-                    WHERE id = ?",
+                    WHERE id = ?
+                      AND public_nonces IS NULL",
                 )
                 .bind(nonces_json)
                 .bind(entry_id_str)
@@ -332,7 +346,7 @@ impl CompetitionStore {
                 sqlx::query(
                     "UPDATE payouts
                     SET succeed_at = ?
-                    WHERE id = ?",
+                    WHERE id = ? AND succeed_at IS NULL AND failed_at IS NULL",
                 )
                 .bind(succeed_at_str)
                 .bind(payout_id_str)
@@ -361,7 +375,7 @@ impl CompetitionStore {
                 sqlx::query(
                     "UPDATE payouts
                     SET failed_at = ?, error = ?
-                    WHERE id = ?",
+                    WHERE id = ? AND succeed_at IS NULL AND failed_at IS NULL",
                 )
                 .bind(failed_at_str)
                 .bind(error_blob)
@@ -1279,9 +1293,15 @@ impl CompetitionStore {
         &self,
         competition_id: Uuid,
         pubkey: &str,
-    ) -> Result<Ticket, DatabaseWriteError> {
+    ) -> Result<ReservedTicket, DatabaseWriteError> {
         let competition_id_str = competition_id.to_string();
         let pubkey_owned = pubkey.to_string();
+        // Used only if a stale reservation is taken over: the ticket then gets
+        // a fresh preimage and hash, so the previous holder's invoice can never
+        // pay for the new holder's slot.
+        let rotated_preimage = hashlock::preimage_random(&mut rand::rng());
+        let rotated_preimage_hex = hex::encode(rotated_preimage);
+        let rotated_hash_hex = hex::encode(hashlock::sha256(&rotated_preimage));
 
         self.db_connection
             .execute_write(move |pool| async move {
@@ -1308,6 +1328,8 @@ impl CompetitionStore {
                        LEFT JOIN entries ON tickets.id = entries.ticket_id
                        WHERE tickets.event_id = ?
                          AND tickets.reserved_by = ?
+                         AND (paid_at IS NOT NULL OR payment_request IS NULL
+                              OR invoice_expires_at > datetime('now'))
                          AND entries.id IS NULL
                        LIMIT 1"#,
                 )
@@ -1319,7 +1341,10 @@ impl CompetitionStore {
                 if let Some(ticket) = existing_ticket {
                     debug!("Found existing reserved ticket {} for user", ticket.id);
                     tx.commit().await?;
-                    return Ok(ticket);
+                    return Ok(ReservedTicket {
+                        ticket,
+                        superseded_payment_hash: None,
+                    });
                 }
 
                 // No existing ticket, find an available one
@@ -1335,6 +1360,8 @@ impl CompetitionStore {
                                  reserved_at < datetime('now', '-10 minutes')
                                  AND paid_at IS NULL
                              )
+                             OR (reserved_by = ? AND paid_at IS NULL AND payment_request IS NOT NULL
+                                 AND (invoice_expires_at IS NULL OR invoice_expires_at <= datetime('now')))
                          )
                        ORDER BY
                            reserved_at IS NULL DESC,
@@ -1343,6 +1370,7 @@ impl CompetitionStore {
                        LIMIT 1"#,
                 )
                 .bind(&competition_id_str)
+                .bind(&pubkey_owned)
                 .fetch_optional(&mut *tx)
                 .await?;
 
@@ -1358,15 +1386,36 @@ impl CompetitionStore {
                     }
                 };
 
-                // Update the ticket to reserve it
+                // A stale reservation being taken over may still have a live
+                // invoice that the previous holder can pay.
+                let superseded: Option<(Option<String>, String)> = sqlx::query_as(
+                    "SELECT payment_request, hash FROM tickets WHERE id = ? AND reserved_by IS NOT NULL",
+                )
+                .bind(&ticket_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let superseded_payment_hash =
+                    superseded.and_then(|(payment_request, hash)| payment_request.map(|_| hash));
+
+                // Reserve the ticket. A takeover (the row still names a
+                // previous holder) also rotates its preimage and hash and
+                // drops the invoice, escrow and pubkey that belonged to them.
                 let rows_affected = sqlx::query(
                     r#"UPDATE tickets
                        SET reserved_at = datetime('now'),
-                           reserved_by = ?
+                           reserved_by = ?,
+                           encrypted_preimage = CASE WHEN reserved_by IS NULL THEN encrypted_preimage ELSE ? END,
+                           hash = CASE WHEN reserved_by IS NULL THEN hash ELSE ? END,
+                           payment_request = CASE WHEN reserved_by IS NULL THEN payment_request ELSE NULL END,
+                           invoice_expires_at = CASE WHEN reserved_by IS NULL THEN invoice_expires_at ELSE NULL END,
+                           escrow_transaction = CASE WHEN reserved_by IS NULL THEN escrow_transaction ELSE NULL END,
+                           ephemeral_pubkey = CASE WHEN reserved_by IS NULL THEN ephemeral_pubkey ELSE NULL END
                        WHERE id = ?
                          AND event_id = ?"#,
                 )
                 .bind(&pubkey_owned)
+                .bind(&rotated_preimage_hex)
+                .bind(&rotated_hash_hex)
                 .bind(&ticket_id)
                 .bind(&competition_id_str)
                 .execute(&mut *tx)
@@ -1406,7 +1455,10 @@ impl CompetitionStore {
 
                 debug!("Successfully reserved ticket {}", ticket_id);
 
-                Ok(ticket)
+                Ok(ReservedTicket {
+                    ticket,
+                    superseded_payment_hash,
+                })
             })
             .await
     }
@@ -1432,7 +1484,7 @@ impl CompetitionStore {
                WHERE reserved_at IS NOT NULL
                  AND paid_at IS NULL
                  AND entry_id IS NULL
-                 AND reserved_at > datetime('now', '-10 minutes')"#,
+                 AND payment_request IS NOT NULL"#,
         )
         .fetch_all(self.db_connection.read())
         .await?;
@@ -1599,7 +1651,6 @@ impl CompetitionStore {
         ticket_hash: &str,
         competition_id: Uuid,
     ) -> Result<bool, DatabaseWriteError> {
-        let interval = format!("-{} minutes", 10);
         let ticket_hash_owned = ticket_hash.to_string();
         let competition_id_str = competition_id.to_string();
 
@@ -1612,12 +1663,10 @@ impl CompetitionStore {
                     AND event_id = ?
                     AND paid_at IS NULL
                     AND settled_at IS NULL
-                    AND reserved_at IS NOT NULL
-                    AND reserved_at > datetime('now', ?)",
+                    AND reserved_at IS NOT NULL",
                 )
                 .bind(ticket_hash_owned)
                 .bind(competition_id_str)
-                .bind(interval)
                 .execute(&pool)
                 .await?;
                 Ok(result.rows_affected() > 0)
@@ -1671,22 +1720,24 @@ impl CompetitionStore {
 
     pub async fn update_ticket_escrow(
         &self,
-        ticket_id: Uuid,
+        ticket: &Ticket,
         ephemeral_pubkey: String,
         escrow_tx: String,
     ) -> Result<bool, DatabaseWriteError> {
-        let ticket_id_str = ticket_id.to_string();
+        let ticket_id_str = ticket.id.to_string();
+        let expected_hash = ticket.hash.clone();
 
         self.db_connection
             .execute_write(move |pool| async move {
                 let result = sqlx::query(
                     "UPDATE tickets
                     SET escrow_transaction = ?, ephemeral_pubkey = ?
-                    WHERE id = ?",
+                    WHERE id = ? AND hash = ? AND reserved_by IS NOT NULL",
                 )
                 .bind(escrow_tx)
                 .bind(ephemeral_pubkey)
                 .bind(ticket_id_str)
+                .bind(expected_hash)
                 .execute(&pool)
                 .await?;
                 Ok(result.rows_affected() > 0)
@@ -1696,11 +1747,12 @@ impl CompetitionStore {
 
     pub async fn update_ticket_payment_request(
         &self,
-        ticket_id: Uuid,
+        ticket: &Ticket,
         payment_request: &str,
         invoice_expires_at: time::OffsetDateTime,
     ) -> Result<bool, DatabaseWriteError> {
-        let ticket_id_str = ticket_id.to_string();
+        let ticket_id_str = ticket.id.to_string();
+        let expected_hash = ticket.hash.clone();
         let payment_request_owned = payment_request.to_string();
         // Use SQLite datetime format: YYYY-MM-DD HH:MM:SS
         let format =
@@ -1711,11 +1763,12 @@ impl CompetitionStore {
         self.db_connection
             .execute_write(move |pool| async move {
                 let result = sqlx::query(
-                    "UPDATE tickets SET payment_request = ?, invoice_expires_at = ? WHERE id = ?",
+                    "UPDATE tickets SET payment_request = ?, invoice_expires_at = ? WHERE id = ? AND hash = ? AND reserved_by IS NOT NULL",
                 )
                 .bind(payment_request_owned)
                 .bind(expires_at_str)
                 .bind(ticket_id_str)
+                .bind(expected_hash)
                 .execute(&pool)
                 .await?;
                 Ok(result.rows_affected() > 0)
@@ -1725,24 +1778,36 @@ impl CompetitionStore {
 
     pub async fn clear_ticket_reservation(
         &self,
-        ticket_id: Uuid,
+        ticket: &Ticket,
     ) -> Result<bool, DatabaseWriteError> {
-        let ticket_id_str = ticket_id.to_string();
+        let ticket_id_str = ticket.id.to_string();
+        let expected_hash = ticket.hash.clone();
+        let expected_invoice = ticket.payment_request.clone();
+        let preimage = hashlock::preimage_random(&mut rand::rng());
+        let new_preimage = hex::encode(preimage);
+        let new_hash = hex::encode(hashlock::sha256(&preimage));
 
         self.db_connection
             .execute_write(move |pool| async move {
                 let result = sqlx::query(
                     "UPDATE tickets
-                    SET reserved_at = NULL,
+                    SET encrypted_preimage = ?,
+                        hash = ?,
+                        ephemeral_pubkey = NULL,
+                        reserved_at = NULL,
                         reserved_by = NULL,
-                        paid_at = NULL,
                         escrow_transaction = NULL,
                         payment_request = NULL,
                         invoice_expires_at = NULL
-                    WHERE id = ?
+                    WHERE id = ? AND hash = ? AND payment_request IS ?
+                    AND paid_at IS NULL
                     AND settled_at IS NULL",
                 )
+                .bind(new_preimage)
+                .bind(new_hash)
                 .bind(ticket_id_str)
+                .bind(expected_hash)
+                .bind(expected_invoice)
                 .execute(&pool)
                 .await?;
                 Ok(result.rows_affected() > 0)
@@ -1810,7 +1875,7 @@ impl CompetitionStore {
     pub async fn store_keymeld_session(
         &self,
         competition_id: Uuid,
-        session: &crate::infra::keymeld::StoredDlcKeygenSession,
+        session: &StoredDlcKeygenSession,
     ) -> Result<bool, DatabaseWriteError> {
         let session_json =
             serde_json::to_vec(session).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
@@ -1836,7 +1901,7 @@ impl CompetitionStore {
     pub async fn get_keymeld_session(
         &self,
         competition_id: Uuid,
-    ) -> Result<Option<crate::infra::keymeld::StoredDlcKeygenSession>, sqlx::Error> {
+    ) -> Result<Option<StoredDlcKeygenSession>, sqlx::Error> {
         let session_bytes: Option<Option<Vec<u8>>> =
             sqlx::query_scalar("SELECT keymeld_session FROM competitions WHERE id = ?")
                 .bind(competition_id.to_string())

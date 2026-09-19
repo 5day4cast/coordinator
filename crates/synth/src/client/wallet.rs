@@ -18,10 +18,9 @@ pub struct AddressResponse {
 impl CoordinatorClient {
     /// Get wallet balance
     pub async fn wallet_balance(&self) -> Result<BalanceResponse> {
-        let url = format!("{}/api/v1/wallet/balance", self.base_url());
+        let url = format!("{}/api/v1/wallet/balance", self.admin_url());
         let resp = self
-            .http()
-            .get(&url)
+            .admin_get(&url)
             .send()
             .await
             .context("Failed to get wallet balance")?;
@@ -39,10 +38,9 @@ impl CoordinatorClient {
 
     /// Get a new wallet address
     pub async fn wallet_address(&self) -> Result<AddressResponse> {
-        let url = format!("{}/api/v1/wallet/address", self.base_url());
+        let url = format!("{}/api/v1/wallet/address", self.admin_url());
         let resp = self
-            .http()
-            .get(&url)
+            .admin_get(&url)
             .send()
             .await
             .context("Failed to get wallet address")?;

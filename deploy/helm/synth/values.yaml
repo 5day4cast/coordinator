@@ -31,7 +31,13 @@ persistence:
 config:
   coordinator:
     url: "http://coordinator.coordinator.svc.cluster.local:9990"
-    adminUrl: ""
+    # Operator listener; competition creation and test settlement go here.
+    adminUrl: "http://coordinator-admin.coordinator.svc.cluster.local:9991"
+    # Secret holding the coordinator's operator token, mounted as a file.
+    adminTokenSecret:
+      enabled: false
+      name: "coordinator-admin-token"
+      key: "token"
   oracle:
     url: "http://noaa-oracle.noaa-oracle.svc.cluster.local:9800"
   server:

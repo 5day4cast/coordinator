@@ -17,26 +17,10 @@ pub struct Failed {
     pub failed_at: OffsetDateTime,
     pub error: CompetitionError,
     pub previous_state: String,
-    pub(crate) competition: Option<Competition>,
+    pub(crate) competition: Competition,
 }
 
 impl Failed {
-    /// Create a new Failed state from an error.
-    pub fn new(
-        competition_id: Uuid,
-        error: CompetitionError,
-        previous_state: String,
-        competition: Option<Competition>,
-    ) -> Self {
-        Self {
-            competition_id,
-            failed_at: OffsetDateTime::now_utc(),
-            error,
-            previous_state,
-            competition,
-        }
-    }
-
     /// Reconstruct from an existing Competition loaded from DB.
     pub fn from_competition(competition: Competition) -> Self {
         let error =
@@ -55,27 +39,22 @@ impl Failed {
                 .unwrap_or_else(OffsetDateTime::now_utc),
             error,
             previous_state: "unknown".to_string(),
-            competition: Some(competition),
+            competition,
         }
     }
 }
 
 impl HasCompetitionData for Failed {
     fn competition(&self) -> &Competition {
-        self.competition
-            .as_ref()
-            .expect("Failed state should have competition data")
+        &self.competition
     }
 
     fn competition_mut(&mut self) -> &mut Competition {
-        self.competition
-            .as_mut()
-            .expect("Failed state should have competition data")
+        &mut self.competition
     }
 
     fn into_competition(self) -> Competition {
         self.competition
-            .expect("Failed state should have competition data")
     }
 }
 
@@ -91,26 +70,10 @@ pub struct Cancelled {
     pub cancelled_at: OffsetDateTime,
     pub reason: String,
     pub previous_state: String,
-    pub(crate) competition: Option<Competition>,
+    pub(crate) competition: Competition,
 }
 
 impl Cancelled {
-    /// Create a new Cancelled state.
-    pub fn new(
-        competition_id: Uuid,
-        reason: String,
-        previous_state: String,
-        competition: Option<Competition>,
-    ) -> Self {
-        Self {
-            competition_id,
-            cancelled_at: OffsetDateTime::now_utc(),
-            reason,
-            previous_state,
-            competition,
-        }
-    }
-
     /// Reconstruct from an existing Competition loaded from DB.
     pub fn from_competition(competition: Competition) -> Self {
         Self {
@@ -120,26 +83,21 @@ impl Cancelled {
                 .unwrap_or_else(OffsetDateTime::now_utc),
             reason: "Loaded from database".to_string(),
             previous_state: "unknown".to_string(),
-            competition: Some(competition),
+            competition,
         }
     }
 }
 
 impl HasCompetitionData for Cancelled {
     fn competition(&self) -> &Competition {
-        self.competition
-            .as_ref()
-            .expect("Cancelled state should have competition data")
+        &self.competition
     }
 
     fn competition_mut(&mut self) -> &mut Competition {
-        self.competition
-            .as_mut()
-            .expect("Cancelled state should have competition data")
+        &mut self.competition
     }
 
     fn into_competition(self) -> Competition {
         self.competition
-            .expect("Cancelled state should have competition data")
     }
 }

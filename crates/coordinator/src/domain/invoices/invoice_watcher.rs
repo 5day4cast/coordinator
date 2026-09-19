@@ -12,7 +12,7 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    domain::Coordinator,
+    domain::{competitions::Ticket, Coordinator},
     infra::{
         escrow::generate_escrow_tx,
         lightning::{InvoiceState, Ln},
@@ -98,7 +98,7 @@ impl InvoiceWatcher {
                         match self
                             .coordinator
                             .competition_store
-                            .clear_ticket_reservation(ticket.id)
+                            .clear_ticket_reservation(&ticket)
                             .await
                         {
                             Ok(_) => {
@@ -128,7 +128,7 @@ impl InvoiceWatcher {
                             .mark_ticket_paid(&ticket.hash, ticket.competition_id)
                             .await
                         {
-                            Ok(_) => {
+                            Ok(true) => {
                                 // Check if escrow is enabled
                                 if self.coordinator.is_escrow_enabled() {
                                     // Try broadcasting escrow with retries and UTXO regeneration
@@ -172,6 +172,9 @@ impl InvoiceWatcher {
                                     // until the contract/funding tx is broadcast later
                                 }
                             }
+                            Ok(false) => {
+                                debug!("Ticket {} was already paid or reassigned", ticket.id)
+                            }
                             Err(e) => error!("Failed to mark ticket {} as paid: {}", ticket.id, e),
                         }
                     }
@@ -185,7 +188,7 @@ impl InvoiceWatcher {
         Ok(())
     }
 
-    async fn settle_invoice_and_mark_ticket(&self, ticket: &crate::domain::competitions::Ticket) {
+    async fn settle_invoice_and_mark_ticket(&self, ticket: &Ticket) {
         match self
             .ln
             .settle_hold_invoice(ticket.encrypted_preimage.clone())
@@ -214,10 +217,7 @@ impl InvoiceWatcher {
         }
     }
 
-    async fn cancel_invoice_and_reset_ticket(
-        &self,
-        ticket: &crate::domain::competitions::Ticket,
-    ) -> Result<(), anyhow::Error> {
+    async fn cancel_invoice_and_reset_ticket(&self, ticket: &Ticket) -> Result<(), anyhow::Error> {
         // First cancel the HODL invoice
         match self.ln.cancel_hold_invoice(ticket.hash.clone()).await {
             Ok(_) => {
@@ -259,7 +259,7 @@ impl InvoiceWatcher {
 
     async fn broadcast_escrow_with_utxo_retries(
         &self,
-        ticket: &crate::domain::competitions::Ticket,
+        ticket: &Ticket,
     ) -> Result<String, anyhow::Error> {
         // First, try using the existing escrow transaction if available
         if let Some(escrow_transaction_hex) = &ticket.escrow_transaction {

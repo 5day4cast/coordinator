@@ -9,6 +9,7 @@ use std::{
     env,
     fs::{self, File},
     io::{Read, Write},
+    net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
 };
 use time::{format_description::well_known::Iso8601, OffsetDateTime};
@@ -36,6 +37,8 @@ pub struct Settings {
     pub bitcoin_settings: BitcoinSettings,
     pub ln_settings: LnSettings,
     pub keymeld_settings: KeymeldSettings,
+    #[serde(default)]
+    pub admin_settings: AdminSettings,
 }
 
 impl ConfigurableSettings for Settings {
@@ -153,6 +156,11 @@ pub struct LnSettings {
     pub macaroon_file_path: String,
     /// Optional file path to the lnd tls cert (typically only used in local development, with self signed certs)
     pub tls_cert_path: Option<String>,
+    /// Accept any TLS certificate from LND. Only for local development against a
+    /// self-signed cert without matching SANs; refused on mainnet, because the
+    /// admin macaroon travels on this connection.
+    #[serde(default)]
+    pub dangerous_accept_invalid_tls: bool,
     /// Interval in seconds to check for new invoices
     pub invoice_watch_interval: u64,
     /// Interval in seconds to check for new payouts
@@ -172,6 +180,7 @@ impl Default for LnSettings {
             base_url: String::from("https://localhost:9095"),
             macaroon_file_path: String::from("./creds/admin.macaroon"),
             tls_cert_path: Some(String::from("./creds/tls.cert")),
+            dangerous_accept_invalid_tls: false,
             invoice_watch_interval: 5,
             payout_watch_interval: 5,
             mock_enabled: false,
@@ -230,10 +239,159 @@ impl Default for KeymeldSettings {
 }
 
 impl Settings {
-    /// Reject configurations that would hand participant keys to unverified enclaves.
+    /// Reject configurations that are unsafe with real funds or that expose
+    /// operator routes without authentication.
     pub fn validate(&self) -> Result<(), anyhow::Error> {
-        self.keymeld_settings
-            .validate(self.bitcoin_settings.network)
+        let network = self.bitcoin_settings.network;
+        self.ln_settings.validate(network)?;
+        self.coordinator_settings.validate(network)?;
+        self.admin_settings.validate(network)?;
+        self.keymeld_settings.validate(network)
+    }
+}
+
+impl LnSettings {
+    pub fn validate(&self, network: Network) -> Result<(), anyhow::Error> {
+        if !self.mock_enabled
+            && network == Network::Bitcoin
+            && reqwest::Url::parse(&self.base_url)?.scheme() != "https"
+        {
+            return Err(anyhow::anyhow!(
+                "ln_settings.base_url must use HTTPS on mainnet"
+            ));
+        }
+        if self.dangerous_accept_invalid_tls && network == Network::Bitcoin {
+            return Err(anyhow::anyhow!(
+                "ln_settings.dangerous_accept_invalid_tls is refused on mainnet"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl CoordinatorSettings {
+    pub fn validate(&self, network: Network) -> Result<(), anyhow::Error> {
+        if self.escrow_enabled && network == Network::Bitcoin {
+            return Err(anyhow::anyhow!(
+                "coordinator_settings.escrow_enabled is refused on mainnet: the escrow transaction is handed out before payment and has no coordinator reclaim path"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Operator listener serving `/admin/*`, the wallet API, and competition creation.
+///
+/// Operator routes never share the public listener. Keep `listen_addr` on loopback or a
+/// private network and reach it through a tunnel or an operator-only gateway name.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AdminSettings {
+    /// Socket address of the operator listener, for example "127.0.0.1:9991".
+    pub listen_addr: SocketAddr,
+    /// File holding the operator bearer token: at least 32 characters, surrounding
+    /// whitespace ignored. The coordinator refuses to start when it is missing or empty.
+    pub token_file: String,
+    /// Serve operator routes without authentication, for local development only.
+    /// Refused on mainnet and on non-loopback addresses.
+    #[serde(default)]
+    pub dangerous_allow_unauthenticated: bool,
+}
+
+impl Default for AdminSettings {
+    fn default() -> Self {
+        AdminSettings {
+            listen_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 9991)),
+            token_file: String::from("./creds/admin_token"),
+            dangerous_allow_unauthenticated: false,
+        }
+    }
+}
+
+/// Operator listener settings that must stop startup.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AdminSettingsError {
+    #[error("admin_settings.dangerous_allow_unauthenticated is refused on mainnet")]
+    UnauthenticatedOnMainnet,
+    #[error(
+        "admin_settings.dangerous_allow_unauthenticated requires a loopback listen_addr, not {0}"
+    )]
+    UnauthenticatedOffLoopback(SocketAddr),
+}
+
+impl AdminSettings {
+    pub fn validate(&self, network: Network) -> Result<(), AdminSettingsError> {
+        if !self.dangerous_allow_unauthenticated {
+            return Ok(());
+        }
+        if network == Network::Bitcoin {
+            return Err(AdminSettingsError::UnauthenticatedOnMainnet);
+        }
+        if !self.listen_addr.ip().is_loopback() {
+            return Err(AdminSettingsError::UnauthenticatedOffLoopback(
+                self.listen_addr,
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod admin_settings_tests {
+    use super::*;
+
+    #[test]
+    fn operator_listener_defaults_to_loopback_with_authentication() {
+        let settings = AdminSettings::default();
+        assert!(settings.listen_addr.ip().is_loopback());
+        assert!(!settings.dangerous_allow_unauthenticated);
+        assert_eq!(settings.validate(Network::Bitcoin), Ok(()));
+        assert_eq!(
+            UISettings::default().private_url,
+            format!("http://{}", settings.listen_addr)
+        );
+    }
+
+    #[test]
+    fn configs_without_admin_section_load_the_authenticated_default() {
+        let text = toml::to_string(&Settings::default()).unwrap();
+        let without_admin: String = text.split("[admin_settings]").next().unwrap().to_string();
+        let parsed: Settings = toml::from_str(&without_admin).unwrap();
+        assert_eq!(
+            parsed.admin_settings.listen_addr,
+            AdminSettings::default().listen_addr
+        );
+        assert!(!parsed.admin_settings.dangerous_allow_unauthenticated);
+    }
+
+    #[test]
+    fn unauthenticated_operator_routes_are_refused_on_mainnet_and_off_loopback() {
+        let unauthenticated = AdminSettings {
+            dangerous_allow_unauthenticated: true,
+            ..AdminSettings::default()
+        };
+        assert_eq!(unauthenticated.validate(Network::Regtest), Ok(()));
+        assert_eq!(unauthenticated.validate(Network::Signet), Ok(()));
+        assert_eq!(
+            unauthenticated.validate(Network::Bitcoin),
+            Err(AdminSettingsError::UnauthenticatedOnMainnet)
+        );
+
+        let exposed = AdminSettings {
+            listen_addr: "0.0.0.0:9991".parse().unwrap(),
+            ..unauthenticated
+        };
+        assert_eq!(
+            exposed.validate(Network::Regtest),
+            Err(AdminSettingsError::UnauthenticatedOffLoopback(
+                exposed.listen_addr
+            ))
+        );
+
+        let settings = Settings {
+            admin_settings: exposed,
+            ..Settings::default()
+        };
+        assert!(settings.validate().is_err());
     }
 }
 
@@ -463,7 +621,7 @@ pub struct UISettings {
 impl Default for UISettings {
     fn default() -> Self {
         UISettings {
-            private_url: String::from("http://127.0.0.1:9990"),
+            private_url: String::from("http://127.0.0.1:9991"),
             remote_url: String::from("http://127.0.0.1:9990"),
             ui_dir: String::from("./crates/public_ui"),
         }
@@ -631,5 +789,45 @@ pub fn get_log_level(level: Option<String>) -> LevelFilter {
             "error" => LevelFilter::Error,
             _ => LevelFilter::Info,
         }
+    }
+}
+
+#[cfg(test)]
+mod mainnet_guards {
+    use super::*;
+
+    #[test]
+    fn unverified_lnd_tls_is_refused_on_mainnet_only() {
+        let unverified = LnSettings {
+            dangerous_accept_invalid_tls: true,
+            ..Default::default()
+        };
+        assert!(unverified.validate(Network::Bitcoin).is_err());
+        assert!(unverified.validate(Network::Signet).is_ok());
+        assert!(LnSettings::default().validate(Network::Bitcoin).is_ok());
+    }
+
+    #[test]
+    fn plaintext_lnd_connections_are_refused_on_mainnet() {
+        let plaintext = LnSettings {
+            base_url: "http://localhost:9095".into(),
+            ..Default::default()
+        };
+        assert!(plaintext.validate(Network::Bitcoin).is_err());
+        assert!(plaintext.validate(Network::Signet).is_ok());
+        assert!(LnSettings::default().validate(Network::Bitcoin).is_ok());
+    }
+
+    #[test]
+    fn escrow_mode_is_refused_on_mainnet_only() {
+        let escrow = CoordinatorSettings {
+            escrow_enabled: true,
+            ..Default::default()
+        };
+        assert!(escrow.validate(Network::Bitcoin).is_err());
+        assert!(escrow.validate(Network::Signet).is_ok());
+        assert!(CoordinatorSettings::default()
+            .validate(Network::Bitcoin)
+            .is_ok());
     }
 }
