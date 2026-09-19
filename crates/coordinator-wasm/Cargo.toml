@@ -21,7 +21,7 @@ nostr-sdk = { version = "0.38", default-features = false, features = ["nip07", "
 
 # Bitcoin (`base64` for PSBT encoding)
 bitcoin.workspace = true
-dlctix = { git = "https://github.com/tee8z/dlctix", branch = "external-signing-api", default-features = false }
+dlctix.workspace = true
 
 # Keymeld registration: attestation-verified, context-bound entry key envelopes
 coordinator-core = { path = "../coordinator-core", features = ["keymeld"] }
