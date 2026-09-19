@@ -40,8 +40,6 @@ impl Outcome {
 }
 
 struct MockEvent {
-    #[allow(dead_code)]
-    config: CreateEvent,
     nonce: Scalar,
     locking_conditions: EventLockingConditions,
     entries: Vec<AddEventEntries>,
@@ -158,7 +156,6 @@ impl Oracle for MockOracle {
         let locking_conditions = self.generate_locking_conditions(&config, &nonce);
 
         let event = MockEvent {
-            config: config.clone(),
             nonce,
             locking_conditions: locking_conditions.clone(),
             entries: vec![],

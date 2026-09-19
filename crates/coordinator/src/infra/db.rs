@@ -1,4 +1,4 @@
-use crate::SqliteConfigSerde;
+use crate::config::{DBSettings, SqliteConfigSerde};
 use log::{debug, error, warn};
 use sqlx::{
     migrate::MigrateDatabase,
@@ -549,8 +549,8 @@ impl From<SqliteConfigSerde> for SqliteConfig {
     }
 }
 
-impl From<crate::config::DBSettings> for DatabasePoolConfig {
-    fn from(config: crate::config::DBSettings) -> Self {
+impl From<DBSettings> for DatabasePoolConfig {
+    fn from(config: DBSettings) -> Self {
         Self {
             read_max_connections: config.read_max_connections,
             read_min_connections: config.read_min_connections,
