@@ -117,8 +117,7 @@ impl CoordinatorClient {
     ) -> Result<CompetitionResponse> {
         let url = format!("{}/api/v1/competitions", self.admin_url());
         let resp = self
-            .http()
-            .post(&url)
+            .admin_post(&url)
             .json(competition)
             .send()
             .await
