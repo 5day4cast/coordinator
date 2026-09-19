@@ -47,6 +47,7 @@ fern.workspace = true
 
 # Error handling
 anyhow.workspace = true
+zeroize.workspace = true
 thiserror.workspace = true
 
 # Crypto

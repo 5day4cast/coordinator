@@ -1,8 +1,17 @@
 import { request } from "@playwright/test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 // Seed test data after coordinator starts
 export default async function globalSetup() {
   const baseURL = process.env.COORDINATOR_URL || "http://localhost:9990";
+  // Competitions are created on the operator listener, which requires the
+  // operator token (config/e2e.toml points at config/e2e_admin_token).
+  const adminURL = process.env.COORDINATOR_ADMIN_URL || "http://localhost:9991";
+  const adminToken = (
+    process.env.COORDINATOR_ADMIN_TOKEN ||
+    readFileSync(join(__dirname, "..", "config", "e2e_admin_token"), "utf8")
+  ).trim();
 
   // Wait for server to be ready
   const maxRetries = 10;
@@ -31,9 +40,12 @@ export default async function globalSetup() {
     return;
   }
 
-  const context = await request.newContext({ baseURL });
+  const context = await request.newContext({
+    baseURL: adminURL,
+    extraHTTPHeaders: { Authorization: `Bearer ${adminToken}` },
+  });
 
-  // Create a test competition via admin API
+  // Create a test competition via the operator API
   const now = new Date();
   const startDate = new Date(now.getTime() + 60 * 60 * 1000); // 1 hour from now
   const endDate = new Date(now.getTime() + 2 * 60 * 60 * 1000); // 2 hours from now

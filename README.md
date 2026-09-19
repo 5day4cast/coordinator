@@ -130,7 +130,25 @@ enabled = true
 
 [coordinator_settings]
 oracle_url = "http://localhost:9800"
+
+[admin_settings]
+# Operator listener: /admin pages, /api/v1/wallet/*, POST /api/v1/competitions.
+# Never exposed on the public listener; keep it on loopback or a private network.
+listen_addr = "127.0.0.1:9991"
+# Bearer token for operators and tooling (synth); at least 32 characters.
+token_file = "./creds/admin_token"
 ```
+
+### Operator access
+
+Operator routes are served only by the admin listener and require the token in
+`admin_settings.token_file` (`just admin-token` generates one). Scripts send it
+as `Authorization: Bearer <token>`; the browser signs in at `/admin/login`,
+which sets a session cookie. The coordinator refuses to start without the
+token file. `admin_settings.dangerous_allow_unauthenticated = true` disables
+this for local development only; it is refused on mainnet and off loopback.
+Set `ui_settings.private_url` to the origin the operator's browser uses to
+reach the admin listener (a tunnel name in production).
 
 ### Keymeld authorization upgrade
 
