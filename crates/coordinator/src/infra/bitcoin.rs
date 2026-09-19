@@ -75,6 +75,28 @@ impl WalletBalance {
     }
 }
 
+/// The fee rate for confirmation within `conf_target` blocks from LND's
+/// estimates, rounded up to whole sat/vB and never below the 1 sat/vB relay
+/// minimum.
+pub fn fee_rate_for_target(
+    fee_rates: &std::collections::HashMap<u16, f64>,
+    conf_target: u16,
+) -> Result<FeeRate, anyhow::Error> {
+    let estimate = fee_rates.get(&conf_target).ok_or_else(|| {
+        anyhow!("LND returned no fee estimate for a {conf_target}-block confirmation target")
+    })?;
+    fee_rate_from_estimate(*estimate)
+}
+
+/// A whole-sat/vB fee rate from an LND estimate, never below 1 sat/vB.
+pub fn fee_rate_from_estimate(sat_per_vb: f64) -> Result<FeeRate, anyhow::Error> {
+    if !sat_per_vb.is_finite() || sat_per_vb < 0.0 {
+        return Err(anyhow!("invalid fee estimate {sat_per_vb} sat/vB"));
+    }
+    FeeRate::from_sat_per_vb((sat_per_vb.ceil() as u64).max(1))
+        .ok_or_else(|| anyhow!("fee estimate {sat_per_vb} sat/vB is out of range"))
+}
+
 #[async_trait]
 pub trait Bitcoin: Send + Sync {
     fn get_network(&self) -> Network;
@@ -1036,7 +1058,8 @@ impl Bitcoin for BitcoinClient {
             .lnd
             .fund_psbt(
                 &template,
-                FeeRate::from_sat_per_vb_unchecked(sat_per_vbyte.max(1)),
+                FeeRate::from_sat_per_vb(sat_per_vbyte.max(1))
+                    .ok_or_else(|| anyhow!("fee rate {sat_per_vbyte} sat/vB is out of range"))?,
             )
             .await?;
         let transaction = async {

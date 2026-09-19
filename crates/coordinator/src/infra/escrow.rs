@@ -1,7 +1,6 @@
-use crate::infra::bitcoin::Bitcoin;
+use crate::infra::bitcoin::{fee_rate_from_estimate, Bitcoin};
 use anyhow::anyhow;
 use bitcoin::{psbt::raw::ProprietaryKey, Amount, OutPoint, PublicKey, Transaction};
-use dlctix::bitcoin::FeeRate;
 use log::debug;
 use miniscript::Descriptor;
 use std::{str::FromStr, sync::Arc};
@@ -22,8 +21,11 @@ pub async fn generate_escrow_tx(
     let estimated_fee_rate = fee_rates.get(&1u16).cloned().unwrap_or(1.0);
     debug!("Estimated fee rate: {} sats/vB", estimated_fee_rate);
 
-    let fee_rate_sat_vb = estimated_fee_rate.ceil() as u64;
-    debug!("Transaction fee rate: {} sats/vB", fee_rate_sat_vb);
+    let fee_rate = fee_rate_from_estimate(estimated_fee_rate)?;
+    debug!(
+        "Transaction fee rate: {} sats/vB",
+        fee_rate.to_sat_per_vb_ceil()
+    );
 
     let coordinator_pubkey = bitcoin.get_public_key().await?;
 
@@ -38,7 +40,7 @@ pub async fn generate_escrow_tx(
         .build_psbt(
             escrow_address.script_pubkey(),
             Amount::from_sat(amount_sats),
-            FeeRate::from_sat_per_vb_unchecked(fee_rate_sat_vb),
+            fee_rate,
             vec![],
             vec![],
         )

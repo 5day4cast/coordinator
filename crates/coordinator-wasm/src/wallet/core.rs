@@ -452,7 +452,7 @@ mod tests {
                 (Outcome::Attestation(0), PayoutWeights::from([(0, 1)])),
                 (Outcome::Attestation(1), PayoutWeights::from([(1, 1)])),
             ]),
-            fee_rate: FeeRate::from_sat_per_vb_unchecked(1),
+            fee_rate: FeeRate::from_sat_per_vb_u32(1),
             funding_value: Amount::from_sat(100_000),
             relative_locktime_block_delta: 72,
         };
@@ -582,7 +582,7 @@ mod tests {
         let before = f.wallet.generate_public_nonces(id).unwrap();
 
         let mut changed = f.params.clone();
-        changed.fee_rate = FeeRate::from_sat_per_vb_unchecked(2);
+        changed.fee_rate = FeeRate::from_sat_per_vb_u32(2);
         let outpoint = OutPoint::new(psbt.unsigned_tx.compute_txid(), 0);
         f.wallet.add_contract(id, changed, outpoint).unwrap();
 

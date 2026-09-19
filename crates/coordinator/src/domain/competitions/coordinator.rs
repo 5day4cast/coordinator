@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use super::{
     states::CompetitionStatus, AddEntry, CompetitionError, CompetitionStore, FundedContract,
     KeymeldSigningInfo, PayoutInfo, SearchBy, Ticket, TicketStatus, UserEntry, UserEntryView,
@@ -7,7 +6,7 @@ use crate::{
     api::routes::FinalSignatures,
     domain::{Competition, CreateEvent, EntryStatus, Error},
     infra::{
-        bitcoin::{Bitcoin, ForeignUtxo, REQUIRED_CONFIRMATIONS_FOR_TIME},
+        bitcoin::{fee_rate_for_target, Bitcoin, ForeignUtxo, REQUIRED_CONFIRMATIONS_FOR_TIME},
         db::DatabaseWriteError,
         escrow::{create_escrow_descriptor, generate_escrow_tx, get_escrow_outpoint},
         keymeld::{
@@ -1271,14 +1270,7 @@ impl Coordinator {
         info!("Fee rates: {:?}", fee_rates);
 
         // TODO (@tee8z): make this configurable from the admin screen
-        let rate_confirm_within_2_blocks = fee_rates
-            .get(&1_u16)
-            .ok_or_else(|| {
-                anyhow!("LND returned no fee estimate for the funding confirmation target")
-            })?
-            .ceil() as u64;
-
-        let fee_rate = FeeRate::from_sat_per_vb_unchecked(rate_confirm_within_2_blocks);
+        let fee_rate = fee_rate_for_target(&fee_rates, 1)?;
 
         let contract_params =
             competition
@@ -1729,8 +1721,13 @@ impl Coordinator {
                 split_tx_signatures: dlc_signatures.split_signatures,
             };
 
-            // Build signed contract from keymeld signatures
-            let signed_contract = ticketed_dlc.into_signed_contract(contract_signatures);
+            // The market maker's verification covers every signature in the
+            // contract; a bad set would lock the funding output until every
+            // player cooperates, so the contract is only accepted once verified.
+            let market_maker = ticketed_dlc.params().market_maker.pubkey;
+            let signed_contract = ticketed_dlc
+                .into_signed_contract(market_maker, contract_signatures)
+                .map_err(|e| anyhow!("keymeld produced an invalid contract signature set: {e}"))?;
 
             if competition.signed_contract.is_none() {
                 competition.signed_contract = Some(signed_contract);
@@ -2201,13 +2198,7 @@ impl Coordinator {
 
         // Get fee rate for transactions
         let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
-        let rate_confirm_within_2_blocks = fee_rates
-            .get(&1_u16)
-            .ok_or_else(|| {
-                anyhow!("LND returned no fee estimate for the funding confirmation target")
-            })?
-            .ceil() as u64;
-        let fee_rate = FeeRate::from_sat_per_vb_unchecked(rate_confirm_within_2_blocks);
+        let fee_rate = fee_rate_for_target(&fee_rates, 1)?;
 
         // Check if we can do a unified close
         let paid_winners: Vec<(PlayerIndex, &UserEntry)> = winners
@@ -2613,13 +2604,7 @@ impl Coordinator {
 
         // Get fee rate for transactions
         let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
-        let rate_confirm_within_2_blocks = fee_rates
-            .get(&1_u16)
-            .ok_or_else(|| {
-                anyhow!("LND returned no fee estimate for the funding confirmation target")
-            })?
-            .ceil() as u64;
-        let fee_rate = FeeRate::from_sat_per_vb_unchecked(rate_confirm_within_2_blocks);
+        let fee_rate = fee_rate_for_target(&fee_rates, 1)?;
 
         // The split TX was broadcast during delta, so each winner has their
         // own output. Use split-reclaim for unpaid winners who haven't been
@@ -4719,7 +4704,7 @@ mod tests {
                 (Outcome::Attestation(0), PayoutWeights::from([(0, 1)])),
                 (Outcome::Attestation(1), PayoutWeights::from([(1, 1)])),
             ]),
-            fee_rate: dlctix::bitcoin::FeeRate::from_sat_per_vb_unchecked(1),
+            fee_rate: dlctix::bitcoin::FeeRate::from_sat_per_vb_u32(1),
             funding_value: Amount::from_sat(100_000),
             relative_locktime_block_delta: 72,
         }
@@ -4749,7 +4734,7 @@ mod tests {
         let outpoint = OutPoint::null();
         let params = params();
         let mut changed = params.clone();
-        changed.fee_rate = dlctix::bitcoin::FeeRate::from_sat_per_vb_unchecked(2);
+        changed.fee_rate = dlctix::bitcoin::FeeRate::from_sat_per_vb_u32(2);
 
         assert_ne!(
             first_draw(&outpoint, key, &params),
