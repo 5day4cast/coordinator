@@ -226,8 +226,7 @@ spec:
         {{- if or $.Values.secrets.adminToken.create $.Values.secrets.adminToken.external }}
         - name: admin-token
           secret:
-            secretName: {{- if $.Values.secrets.adminToken.external }} {{ $.Values.secrets.adminToken.secretName }}{{- else }}
- {{ include "coordinator.fullname" $ }}-admin-token{{- end }}
+            secretName: {{ if $.Values.secrets.adminToken.external }}{{ $.Values.secrets.adminToken.secretName | quote }}{{ else }}{{ printf "%s-admin-token" (include "coordinator.fullname" $) | quote }}{{ end }}
         {{- end }}
         {{- if $.Values.lnd.initContainer.enabled }}
         - name: lnd-source
@@ -476,8 +475,7 @@ spec:
         {{- if or .Values.secrets.adminToken.create .Values.secrets.adminToken.external }}
         - name: admin-token
           secret:
-            secretName: {{- if .Values.secrets.adminToken.external }} {{ .Values.secrets.adminToken.secretName }}{{- else }}
- {{ include "coordinator.fullname" . }}-admin-token{{- end }}
+            secretName: {{ if .Values.secrets.adminToken.external }}{{ .Values.secrets.adminToken.secretName | quote }}{{ else }}{{ printf "%s-admin-token" (include "coordinator.fullname" .) | quote }}{{ end }}
         {{- end }}
         {{- if .Values.lnd.initContainer.enabled }}
         - name: lnd-source

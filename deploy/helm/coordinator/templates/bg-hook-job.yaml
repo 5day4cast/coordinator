@@ -42,6 +42,8 @@ spec:
               value: "{{ .Release.Namespace }}"
             - name: SERVICE
               value: "{{ include "coordinator.fullname" . }}"
+            - name: ADMIN_SERVICE
+              value: "{{ include "coordinator.fullname" . }}-admin"
             - name: DEPLOY_PREFIX
               value: "{{ include "coordinator.fullname" . }}"
             - name: CONTAINER

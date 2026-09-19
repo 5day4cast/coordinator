@@ -36,8 +36,7 @@ export default async function globalSetup() {
   }
 
   if (!serverReady) {
-    console.error("Server failed to start");
-    return;
+    throw new Error("Coordinator public listener failed to become ready");
   }
 
   const context = await request.newContext({
@@ -81,15 +80,13 @@ export default async function globalSetup() {
     });
 
     const responseText = await response.text();
-    if (responseText.includes("error") || responseText.includes("Error")) {
-      console.error("Competition creation error:", responseText);
-    } else {
-      console.log("Seeded test competition successfully");
+    if (!response.ok() || !responseText.includes("Competition created successfully!")) {
+      throw new Error(
+        `Competition seed failed (${response.status()}): ${responseText}`,
+      );
     }
-  } catch (error) {
-    console.error("Failed to seed competition (non-fatal):", error);
-    // Don't throw - tests can still run with existing data or without a competition
+    console.log("Seeded test competition successfully");
+  } finally {
+    await context.dispose();
   }
-
-  await context.dispose();
 }

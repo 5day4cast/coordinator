@@ -15,7 +15,7 @@ pub struct CoordinatorConfig {
     /// Coordinator API URL (e.g. http://coordinator.coordinator.svc.cluster.local:9990)
     pub url: String,
     /// Coordinator operator listener URL (competition creation, test settlement).
-    /// Defaults to `url`, which only works with `dangerous_allow_unauthenticated`.
+    /// Set this separately from the participant API, including for local development.
     pub admin_url: Option<String>,
     /// File holding the coordinator's operator token, sent as a bearer token to
     /// `admin_url`. Required unless the coordinator allows unauthenticated
@@ -81,7 +81,9 @@ impl Default for SynthConfig {
         Self {
             coordinator: CoordinatorConfig {
                 url: "http://coordinator.coordinator.svc.cluster.local:9990".to_string(),
-                admin_url: None,
+                admin_url: Some(
+                    "http://coordinator-admin.coordinator.svc.cluster.local:9991".to_string(),
+                ),
                 admin_token_file: None,
             },
             oracle: OracleConfig {
@@ -125,6 +127,10 @@ pub fn load_config(path: Option<&str>) -> anyhow::Result<SynthConfig> {
         .set_default(
             "coordinator.url",
             "http://coordinator.coordinator.svc.cluster.local:9990",
+        )?
+        .set_default(
+            "coordinator.admin_url",
+            "http://coordinator-admin.coordinator.svc.cluster.local:9991",
         )?
         .set_default(
             "oracle.url",

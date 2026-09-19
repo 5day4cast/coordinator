@@ -32,7 +32,7 @@ config:
   coordinator:
     url: "http://coordinator.coordinator.svc.cluster.local:9990"
     # Operator listener; competition creation and test settlement go here.
-    adminUrl: "http://coordinator.coordinator.svc.cluster.local:9991"
+    adminUrl: "http://coordinator-admin.coordinator.svc.cluster.local:9991"
     # Secret holding the coordinator's operator token, mounted as a file.
     adminTokenSecret:
       enabled: false

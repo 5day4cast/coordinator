@@ -42,6 +42,7 @@ setup-channels     # Open channels
 run-keymeld        # Moto KMS + simulated Keymeld enclaves + gateway
 
 # Run the coordinator
+just admin-token
 cargo run --bin coordinator -- --config ./config/local.toml
 
 # Stop services
@@ -59,6 +60,7 @@ just bitcoin-dev-creds  # Export LND creds to coordinator/creds/
 
 # Then run coordinator
 cd ~/repos/coordinator
+just admin-token
 cargo run --bin coordinator -- --config ./config/local.toml
 ```
 
@@ -149,6 +151,30 @@ token file. `admin_settings.dangerous_allow_unauthenticated = true` disables
 this for local development only; it is refused on mainnet and off loopback.
 Set `ui_settings.private_url` to the origin the operator's browser uses to
 reach the admin listener (a tunnel name in production).
+
+Browser sessions use a Secure cookie. Use HTTPS for remote operator access or
+`http://localhost:9991/admin/login` through a local port-forward.
+Set `COORDINATOR_ADMIN_URL` and `COORDINATOR_ADMIN_TOKEN_FILE` when using `coord` against a remote coordinator.
+The local CLI defaults to `http://localhost:9991` for operator requests.
+
+The Helm chart exposes operator traffic on the separate `<release>-admin` ClusterIP Service.
+The public Service and ingress expose only participant traffic.
+Configure `secrets.adminToken.create` and `secrets.adminToken.value`, or use
+`secrets.adminToken.external` with `secrets.adminToken.secretName`.
+The existing Secret must contain a `token` key.
+For synth, configure `config.coordinator.adminUrl` and `config.coordinator.adminTokenSecret`.
+The synth Secret must exist in the synth namespace and contain the same operator token.
+Restart the coordinator after rotating the token; credentials load only during startup.
+
+Before upgrading an existing Argo CD blue/green deployment, create the admin Service with the current public Service selector:
+
+```bash
+kubectl -n <namespace> expose service <release> --name=<release>-admin --port=9991 --target-port=admin --type=ClusterIP
+```
+
+Use the chart's full Service name when `fullnameOverride` or `nameOverride` is configured.
+Apply the public Service's Argo CD selector-ignore rule to the admin Service too.
+The PreSync hook changes both selectors; Sync must preserve those changes.
 
 ### Keymeld authorization upgrade
 

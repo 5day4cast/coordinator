@@ -17,8 +17,12 @@ struct Cli {
     #[arg(long, env = "COORDINATOR_URL", default_value = "http://localhost:9990")]
     url: String,
 
-    /// Coordinator operator listener URL (defaults to same as url)
-    #[arg(long, env = "COORDINATOR_ADMIN_URL")]
+    /// Coordinator operator listener URL
+    #[arg(
+        long,
+        env = "COORDINATOR_ADMIN_URL",
+        default_value = "http://localhost:9991"
+    )]
     admin_url: Option<String>,
 
     /// File holding the coordinator's operator token, sent as a bearer token
