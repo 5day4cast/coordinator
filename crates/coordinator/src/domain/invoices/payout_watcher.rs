@@ -40,13 +40,12 @@ impl PayoutWatcher {
                 break;
             }
 
-            match self.handle_pending_payouts().await {
-                Ok(_) => {
-                    debug!("Payout handling completed successfully");
-                }
-                Err(e) => {
-                    error!("Payout handling error: {}", e);
-                }
+            tokio::select! {
+                result = self.handle_pending_payouts() => match result {
+                    Ok(_) => debug!("Payout handling completed successfully"),
+                    Err(e) => error!("Payout handling error: {}", e),
+                },
+                _ = self.cancel_token.cancelled() => break,
             }
 
             tokio::select! {
@@ -157,6 +156,23 @@ impl PayoutWatcher {
                     }
                 }
                 Err(e) if e.is::<PaymentNotFound>() => {
+                    // A queued invoice can expire while the process is offline.
+                    // LND confirms that no payment exists before we release it.
+                    let invoice = payout
+                        .payout_payment_request
+                        .parse::<lightning_invoice::Bolt11Invoice>()?;
+                    if invoice.is_expired() {
+                        self.competition_store
+                            .mark_payout_failed(
+                                payout.id,
+                                OffsetDateTime::now_utc(),
+                                PayoutError::FailedToPayOut(
+                                    "Invoice expired before payment initiation".into(),
+                                ),
+                            )
+                            .await?;
+                        continue;
+                    }
                     // Recover a crash between persisting the payout and sending it.
                     // Keep using the same invoice/hash: LND deduplicates attempts
                     // if the original request is accepted concurrently.
@@ -231,30 +247,37 @@ mod tests {
                 .bind(entry_id.to_string()).bind(event_id.to_string()).bind(ticket_id.to_string()).execute(&pool).await?;
             Ok(())
         }).await.unwrap();
-        let invoice = InvoiceBuilder::new(Currency::Regtest)
-            .description("payout".into())
-            .payment_hash(sha256::Hash::from_byte_array([7; 32]))
-            .payment_secret(PaymentSecret([8; 32]))
-            .amount_milli_satoshis(10_000)
-            .current_timestamp()
-            .min_final_cltv_expiry_delta(18)
-            .build_signed(|hash| {
-                Secp256k1::new()
-                    .sign_ecdsa_recoverable(hash, &SecretKey::from_slice(&[9; 32]).unwrap())
-            })
-            .unwrap()
-            .to_string();
-        // Simulate a process stopping after committing the payout, before the RPC.
-        let payout_id = store
+        let invoice = |timestamp| {
+            InvoiceBuilder::new(Currency::Regtest)
+                .description("payout".into())
+                .payment_hash(sha256::Hash::from_byte_array([7; 32]))
+                .payment_secret(PaymentSecret([8; 32]))
+                .amount_milli_satoshis(10_000)
+                .duration_since_epoch(timestamp)
+                .min_final_cltv_expiry_delta(18)
+                .build_signed(|hash| {
+                    Secp256k1::new()
+                        .sign_ecdsa_recoverable(hash, &SecretKey::from_slice(&[9; 32]).unwrap())
+                })
+                .unwrap()
+                .to_string()
+        };
+        // This queued invoice expired while the process was stopped.
+        let expired_id = store
             .store_payout_info_pending(
                 entry_id,
                 "preimage".into(),
                 "private".into(),
-                invoice.clone(),
+                invoice(Duration::from_secs(1)),
                 10,
             )
             .await
             .unwrap();
+        let invoice = invoice(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap(),
+        );
         let sends = Arc::new(AtomicUsize::new(0));
         let router = Router::new()
             .route("/v2/router/track/{hash}", get(|State(sends): State<Arc<AtomicUsize>>| async move {
@@ -289,6 +312,29 @@ mod tests {
             sync_interval: Duration::from_secs(1),
             cancel_token: CancellationToken::new(),
         };
+        tokio::time::timeout(Duration::from_secs(5), watcher.handle_pending_payouts())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+        assert!(store
+            .get_payout(expired_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .failed_at
+            .is_some());
+        // Simulate another stop after persisting a fresh invoice, before its RPC.
+        let payout_id = store
+            .store_payout_info_pending(
+                entry_id,
+                "preimage".into(),
+                "private".into(),
+                invoice.clone(),
+                10,
+            )
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(5), watcher.handle_pending_payouts())
             .await
             .unwrap()

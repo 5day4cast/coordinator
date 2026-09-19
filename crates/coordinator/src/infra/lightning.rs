@@ -567,7 +567,7 @@ impl Ln for LnClient {
         let mut stream = response.bytes_stream();
         let mut lines = JsonLines::default();
         while let Some(chunk) = stream.next().await {
-            lines.push(&chunk?);
+            lines.push(&chunk?)?;
             if let Some(line) = lines.next_line() {
                 return parse_payment_lookup(&line);
             }
@@ -630,18 +630,28 @@ impl Ln for LnClient {
         match response {
             Ok(response) => {
                 let status = response.status();
-                match response.text().await {
-                    Ok(_) if status.is_success() => {
-                        debug!("Payment stream completed");
-                        Ok(())
-                    }
-                    Ok(body) => Err(anyhow!("Payment request failed with {}: {}", status, body)),
-                    Err(e) if e.is_timeout() => {
-                        debug!("Payment stream timed out with the payment in flight: {}", e);
-                        Ok(())
-                    }
-                    Err(e) => Err(anyhow!("Failed to read payment response: {}", e)),
+                if !status.is_success() {
+                    return Err(anyhow!("Payment request failed with {}", status));
                 }
+                // Discard completed stream messages as they arrive; neither a
+                // long payment history nor an unterminated message may grow
+                // memory without a bound. Reconciliation owns terminal state.
+                let mut stream = response.bytes_stream();
+                let mut lines = JsonLines::default();
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(chunk) => lines.push(&chunk)?,
+                        Err(error) if error.is_timeout() => return Ok(()),
+                        Err(error) => return Err(error.into()),
+                    }
+                    while let Some(line) = lines.next_line() {
+                        let message: serde_json::Value = serde_json::from_slice(&line)?;
+                        if message.get("error").is_some() {
+                            return Err(anyhow!("LND payment stream reported an error"));
+                        }
+                    }
+                }
+                Ok(())
             }
             Err(e) if e.is_timeout() => {
                 debug!("Payment request timed out (expected): {}", e);
@@ -784,7 +794,7 @@ async fn process_invoice_stream(
     let mut stream = response.bytes_stream();
     let mut lines = JsonLines::default();
     while let Some(chunk) = stream.next().await {
-        lines.push(&chunk?);
+        lines.push(&chunk?)?;
         while let Some(line) = lines.next_line() {
             let line = std::str::from_utf8(&line)?;
             let Some(update) = parse_invoice_update(line) else {
@@ -819,7 +829,7 @@ async fn process_payment_stream(
     let mut stream = response.bytes_stream();
     let mut lines = JsonLines::default();
     while let Some(chunk) = stream.next().await {
-        lines.push(&chunk?);
+        lines.push(&chunk?)?;
         while let Some(line) = lines.next_line() {
             let line = std::str::from_utf8(&line)?;
             let Some(update) = parse_payment_update(line) else {
@@ -840,14 +850,20 @@ async fn process_payment_stream(
 
 // HTTP chunks have no relation to gRPC Gateway's newline-delimited messages.
 // Keep bytes until a full line is available, including split UTF-8 characters.
+const MAX_STREAM_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Default)]
 struct JsonLines {
     buffer: Vec<u8>,
 }
 
 impl JsonLines {
-    fn push(&mut self, bytes: &[u8]) {
+    fn push(&mut self, bytes: &[u8]) -> Result<(), anyhow::Error> {
+        if self.buffer.len().saturating_add(bytes.len()) > MAX_STREAM_BUFFER_BYTES {
+            return Err(anyhow!("LND stream message exceeds buffer limit"));
+        }
         self.buffer.extend_from_slice(bytes);
+        Ok(())
     }
 
     fn next_line(&mut self) -> Option<Vec<u8>> {
@@ -887,6 +903,10 @@ pub fn extract_amount_from_invoice(payment_request: &str) -> Result<Option<u64>,
     let invoice = Bolt11Invoice::from_str(payment_request)
         .map_err(|e| anyhow::anyhow!("Failed to parse BOLT11 invoice: {}", e))?;
 
+    if invoice.is_expired() {
+        return Err(anyhow!("Lightning invoice has expired"));
+    }
+
     match invoice.amount_milli_satoshis() {
         Some(amount) if amount % 1000 != 0 => Err(anyhow!("Invoice amount must be whole satoshis")),
         amount => Ok(amount.map(|amount| amount / 1000)),
@@ -922,7 +942,7 @@ mod tests {
             let mut decoder = JsonLines::default();
             let mut lines = Vec::new();
             for chunk in [&bytes[..split], &bytes[split..]] {
-                decoder.push(chunk);
+                decoder.push(chunk).unwrap();
                 while let Some(line) = decoder.next_line() {
                     lines.push(String::from_utf8(line).unwrap());
                 }
@@ -936,6 +956,14 @@ mod tests {
             assert_eq!(payment.status, PaymentStatus::Succeeded);
             assert_eq!(payment.preimage, Some(hex::encode([8; 32])));
         }
+    }
+
+    #[test]
+    fn unterminated_stream_messages_have_a_bounded_buffer() {
+        let mut lines = JsonLines::default();
+        lines.push(&vec![b'x'; MAX_STREAM_BUFFER_BYTES]).unwrap();
+        assert!(lines.push(b"x").is_err());
+        assert_eq!(lines.buffer.len(), MAX_STREAM_BUFFER_BYTES);
     }
 
     #[test]
@@ -996,13 +1024,13 @@ mod tests {
     fn payout_amount_validation_rejects_fractional_satoshis() {
         use bitcoin::secp256k1::{Secp256k1, SecretKey};
         use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
-        let invoice = |amount| {
+        let invoice = |amount, timestamp| {
             InvoiceBuilder::new(Currency::Regtest)
                 .description("payout".into())
                 .payment_hash(sha256::Hash::from_byte_array([7; 32]))
                 .payment_secret(PaymentSecret([8; 32]))
                 .amount_milli_satoshis(amount)
-                .current_timestamp()
+                .duration_since_epoch(timestamp)
                 .min_final_cltv_expiry_delta(18)
                 .build_signed(|hash| {
                     Secp256k1::new()
@@ -1012,9 +1040,22 @@ mod tests {
                 .to_string()
         };
         assert_eq!(
-            extract_amount_from_invoice(&invoice(10_000)).unwrap(),
+            extract_amount_from_invoice(&invoice(
+                10_000,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+            ))
+            .unwrap(),
             Some(10)
         );
-        assert!(extract_amount_from_invoice(&invoice(10_999)).is_err());
+        assert!(extract_amount_from_invoice(&invoice(
+            10_999,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ))
+        .is_err());
+        assert!(extract_amount_from_invoice(&invoice(10_000, Duration::from_secs(1))).is_err());
     }
 }

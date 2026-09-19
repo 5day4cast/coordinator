@@ -247,6 +247,14 @@ impl Settings {
 
 impl LnSettings {
     pub fn validate(&self, network: Network) -> Result<(), anyhow::Error> {
+        if !self.mock_enabled
+            && network == Network::Bitcoin
+            && reqwest::Url::parse(&self.base_url)?.scheme() != "https"
+        {
+            return Err(anyhow::anyhow!(
+                "ln_settings.base_url must use HTTPS on mainnet"
+            ));
+        }
         if self.dangerous_accept_invalid_tls && network == Network::Bitcoin {
             return Err(anyhow::anyhow!(
                 "ln_settings.dangerous_accept_invalid_tls is refused on mainnet"
@@ -676,6 +684,17 @@ mod mainnet_guards {
         };
         assert!(unverified.validate(Network::Bitcoin).is_err());
         assert!(unverified.validate(Network::Signet).is_ok());
+        assert!(LnSettings::default().validate(Network::Bitcoin).is_ok());
+    }
+
+    #[test]
+    fn plaintext_lnd_connections_are_refused_on_mainnet() {
+        let plaintext = LnSettings {
+            base_url: "http://localhost:9095".into(),
+            ..Default::default()
+        };
+        assert!(plaintext.validate(Network::Bitcoin).is_err());
+        assert!(plaintext.validate(Network::Signet).is_ok());
         assert!(LnSettings::default().validate(Network::Bitcoin).is_ok());
     }
 
