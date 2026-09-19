@@ -72,6 +72,41 @@ class AdminRoutingTests(unittest.TestCase):
                 config = tomllib.loads(configmap["data"]["local.toml"])
                 self.assertEqual(config["admin_settings"]["token_file"], "/etc/coordinator-admin/token")
 
+    def test_maintenance_upgrade_disables_only_the_switchover(self):
+        values = (
+            "blueGreen.enabled=true",
+            "blueGreen.activeSlot=green",
+            "secrets.adminToken.external=true",
+            "secrets.adminToken.secretName=existing-operator-token",
+        )
+        normal = render("coordinator", *values)
+        maintenance = render("coordinator", *values, "blueGreen.switchoverEnabled=false")
+        hook_names = {"coordinator-bg-script", "coordinator-bg-switchover"}
+        self.assertEqual(
+            {d["metadata"]["name"] for d in normal} & hook_names, hook_names
+        )
+        self.assertEqual(
+            maintenance, [d for d in normal if d["metadata"]["name"] not in hook_names]
+        )
+        deployments = [d for d in maintenance if d["kind"] == "Deployment"]
+        self.assertEqual(
+            {d["metadata"]["name"]: d["spec"]["replicas"] for d in deployments},
+            {"coordinator-blue": 0, "coordinator-green": 1},
+        )
+        self.assertEqual(
+            {d["metadata"]["name"] for d in maintenance if d["kind"] == "PersistentVolumeClaim"},
+            {"coordinator-blue", "coordinator-green"},
+        )
+        admin = next(d for d in maintenance if d["metadata"]["name"] == "coordinator-admin")
+        self.assertEqual(admin["spec"]["selector"]["app.kubernetes.io/slot"], "green")
+        for deployment in deployments:
+            pod = deployment["spec"]["template"]["spec"]
+            volume = next(v for v in pod["volumes"] if v["name"] == "admin-token")
+            self.assertEqual(volume["secret"]["secretName"], "existing-operator-token")
+            coordinator = next(c for c in pod["containers"] if c["name"] == "coordinator")
+            mount = next(m for m in coordinator["volumeMounts"] if m["name"] == "admin-token")
+            self.assertEqual(mount["mountPath"], "/etc/coordinator-admin")
+
     def test_synth_uses_operator_service_and_secret(self):
         documents = render("synth", "config.coordinator.adminTokenSecret.enabled=true")
         configmap = next(d for d in documents if d["kind"] == "ConfigMap")

@@ -54,6 +54,7 @@ crates/public_ui/
 .DS_Store
 
 # Test artifacts
+__pycache__/
 *.profraw
 coverage/
 e2e/node_modules/

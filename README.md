@@ -166,15 +166,38 @@ For synth, configure `config.coordinator.adminUrl` and `config.coordinator.admin
 The synth Secret must exist in the synth namespace and contain the same operator token.
 Restart the coordinator after rotating the token; credentials load only during startup.
 
-Before upgrading an existing Argo CD blue/green deployment, create the admin Service with the current public Service selector:
+For an existing Argo CD blue/green deployment, use a maintenance upgrade for v2.
+The PreSync hook changes only the image; it cannot install the new token mount, admin port, or configuration.
+Creating the admin Service alone does not prepare the old Deployment for v2.
+
+1. After active competitions complete, pause automatic synchronization and participant traffic; back up databases and recovery material.
+2. Record the public Service's active slot:
 
 ```bash
-kubectl -n <namespace> expose service <release> --name=<release>-admin --port=9991 --target-port=admin --type=ClusterIP
+kubectl -n <namespace> get service <release> -o jsonpath='{.spec.selector.app\.kubernetes\.io/slot}{"\n"}'
 ```
 
 Use the chart's full Service name when `fullnameOverride` or `nameOverride` is configured.
-Apply the public Service's Argo CD selector-ignore rule to the admin Service too.
-The PreSync hook changes both selectors; Sync must preserve those changes.
+The result must be `blue` or `green`.
+
+3. Keep `blueGreen.enabled=true` and set `blueGreen.activeSlot` to the recorded slot.
+4. Set `blueGreen.switchoverEnabled=false`; retain the existing release name and PVC names.
+5. Configure the operator token, admin origin, and remaining v2 settings described above and below.
+6. Sync the full v2 chart, including its ConfigMap, token Secret, admin Service, and both Deployment specifications.
+   For an external token Secret, provision that Secret before synchronization.
+   The active Deployment restarts on its existing PVC; the standby remains stopped.
+7. Verify active Deployment readiness, public health, and authenticated admin access before resuming traffic.
+8. Verify that both Service selectors match the recorded slot.
+9. Preserve the Argo CD ignore rules for both Deployments' `/spec/replicas` fields.
+   Ignore `/spec/selector/app.kubernetes.io~1slot` for both the public and admin Services.
+   Set `RespectIgnoreDifferences=true` in the Application's `spec.syncPolicy.syncOptions` before re-enabling the hook.
+   Without this option, ignore rules affect comparisons only; Sync can revert the hook's changes.
+   See [Argo CD's sync option documentation](https://argo-cd.readthedocs.io/en/stable/user-guide/sync-options/#respect-ignore-differences-configs).
+10. Re-enable `blueGreen.switchoverEnabled` and resume automatic synchronization after verification.
+
+Do not disable `blueGreen.enabled` during this procedure; doing so changes the Deployment and PVC names.
+Subsequent image-only upgrades can use the PreSync hook, which switches both Service selectors.
+Argo CD Sync must preserve those selector changes.
 
 ### Keymeld authorization upgrade
 

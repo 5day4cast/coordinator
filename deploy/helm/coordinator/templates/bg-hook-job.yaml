@@ -1,4 +1,4 @@
-{{- if .Values.blueGreen.enabled }}
+{{- if and .Values.blueGreen.enabled .Values.blueGreen.switchoverEnabled }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
