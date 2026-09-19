@@ -1,68 +1,89 @@
+//! Browser wallet for DLC entries.
+//!
+//! Trust boundary: the coordinator and everything it sends (contract
+//! parameters, PSBTs, aggregate nonces, enclave keys) are untrusted. The seed
+//! and every entry key stay inside WASM. The wallet encrypts only to the
+//! user's own Nostr key. The one intentional plaintext export is an entry's
+//! key and payout preimage, sold to the coordinator for an off-chain payout,
+//! and only after re-deriving the entry's recorded pubkey.
+//!
+//! Design and invariants: `docs/BROWSER_WALLET.md`.
+
 mod core;
+mod keymeld_trust;
+mod keys;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm;
 
-use dlctix::{
-    bitcoin::{psbt::PsbtParseError, OutPoint},
-    musig2::PubNonce,
-    ContractParameters, SigMap, TicketedDLC,
-};
-use secrecy::SecretString;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use thiserror::Error;
 
-pub use core::{TaprootWalletCore, TaprootWalletCoreBuilder};
+pub use core::DlcWalletCore;
+pub use keymeld_trust::{enclave_trust, EnclaveTrust};
 
 #[cfg(target_arch = "wasm32")]
-pub use wasm::{TaprootWallet, TaprootWalletBuilder};
+pub use wasm::DlcWallet;
 
 #[derive(Error, Debug)]
 pub enum WalletError {
-    #[error("Network error: {0}")]
-    NetworkError(String),
-    #[error("Key error: {0}")]
-    KeyError(String),
-    #[error("Contract error: {0}")]
-    ContractError(String),
-    #[error("Serialization error: {0}")]
-    SerializationError(String),
-    #[error("DLC error: {0}")]
-    DlcError(String),
-    #[error("DLC key error: {0}")]
-    DlcKeyError(String),
-    #[error("No contract found for entry index: {0}")]
-    NoContract(u32),
-    #[error("Failed to calculate checksum: {0}")]
-    CheckSum(String),
-    #[error("Failed to load wallet: {0}")]
-    LoadWallet(String),
-    #[error("Signer error: {0}")]
-    SignerError(String),
+    #[error("Unsupported network: {0}")]
+    Network(String),
+    #[error("Invalid wallet backup")]
+    InvalidBackup,
+    #[error("Entry key derivation failed")]
+    DerivationFailed,
+    #[error("Invalid entry id: {0}")]
+    InvalidEntryId(String),
+    #[error("Entry {0} was not created by this wallet")]
+    ForeignEntry(uuid::Uuid),
     #[error("Nostr signer not initialized")]
-    NostrNotInitialize,
-    #[error("Failed to get public key: {0}")]
-    PublicKeyError(String),
-    #[error("Failed decryption: {0}")]
-    DecryptionError(String),
-    #[error("Failed encryption: {0}")]
-    EncryptionError(String),
-    #[error("Invalid xpriv: {0}")]
-    InvalidXpriv(String),
-    #[error("Invalid bech32 nostr public key: {0}")]
-    InvalidPublicKey(String),
-    #[error("Dlc entry with index {0} not found")]
-    DlcEntryNotFound(u32),
-    #[error("Invalid escrow descriptor: {0}")]
-    InvalidEscrow(String),
-    #[error("Psbt error: {0}")]
-    PsbtError(#[from] PsbtParseError),
-    #[error("Invalid BOLT11 invoice: {0}")]
-    InvalidInvoice(String),
-    #[error("No matching outcome found for attestation")]
+    NostrNotInitialized,
+    #[error("Nostr signer error: {0}")]
+    Signer(String),
+    #[error("Keymeld error: {0}")]
+    Keymeld(String),
+    #[error("Invalid contract: {0}")]
+    Contract(String),
+    #[error("No contract loaded for entry {0}")]
+    NoContract(uuid::Uuid),
+    #[error("Entry {0} already signed different aggregate nonces")]
+    ConflictingAggregateNonces(uuid::Uuid),
+    #[error("DLC signing failed: {0}")]
+    Signing(String),
+    #[error("Refusing to sign funding PSBT: {0}")]
+    FundingPsbtRejected(String),
+    #[error("No outcome matches the attestation")]
     NoMatchingOutcome,
-    #[error("Key derivation error: {0}")]
-    KeyDerivation(String),
+}
+
+/// Public values an entry submission needs.
+#[derive(Serialize)]
+pub struct EntryRegistration {
+    pub ephemeral_pubkey: String,
+    pub payout_hash: String,
+}
+
+#[derive(Serialize)]
+pub struct EncryptedWalletBackup {
+    pub encrypted_bitcoin_private_key: String,
+    pub network: String,
+}
+
+/// Secrets sold to the coordinator in exchange for an off-chain payout.
+/// The fields are plaintext, so this type is neither `Debug` nor `Clone`.
+#[derive(Serialize)]
+pub struct PayoutRelease {
+    pub ephemeral_private_key: String,
+    pub payout_preimage: String,
+}
+
+impl Drop for PayoutRelease {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.ephemeral_private_key.zeroize();
+        self.payout_preimage.zeroize();
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -70,43 +91,4 @@ impl From<WalletError> for wasm_bindgen::JsValue {
     fn from(error: WalletError) -> Self {
         wasm_bindgen::JsValue::from_str(&error.to_string())
     }
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum NetworkKind {
-    Main,
-    Test,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct KeyPair {
-    pub descriptor: String,
-    pub change_descriptor: String,
-    pub network: NetworkKind,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct EncryptedKey {
-    pub encrypted_bitcoin_private_key: String,
-    pub network: String,
-}
-
-#[derive(Clone)]
-pub struct DlcEntry {
-    pub contract: Option<TicketedDLC>,
-    pub data: DlcEntryData,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct SigningState {
-    pub seed: [u8; 32],
-    pub public_nonces: SigMap<PubNonce>,
-}
-
-#[derive(Clone)]
-pub struct DlcEntryData {
-    pub payout_preimage: SecretString,
-    pub funding_outpoint: Option<OutPoint>,
-    pub params: Option<ContractParameters>,
-    pub ticket_preimage: Option<SecretString>,
 }

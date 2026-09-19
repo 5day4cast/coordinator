@@ -27,8 +27,6 @@ keymeld-core = { git = "https://github.com/tee8z/keymeld", tag = "v0.4.0", defau
 # Bitcoin
 bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }
 electrum-client = "0.21"
-# The browser wallet (coordinator-wasm) still builds on BDK.
-bdk_wallet = { version = "2.3.0", features = ["keys-bip39"] }
 dlctix = { git = "https://github.com/tee8z/dlctix", branch = "external-signing-api" }
 miniscript = "12.3.2"
 

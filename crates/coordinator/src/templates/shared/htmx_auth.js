@@ -10,13 +10,7 @@ function requiresAuth(url) {
 }
 
 function isLoggedIn() {
-  // Check that nostrClient exists, has an initialized signer, and taprootWallet exists
-  return (
-    window.nostrClient &&
-    typeof window.nostrClient.isSignerReady === "function" &&
-    window.nostrClient.isSignerReady() &&
-    window.taprootWallet
-  );
+  return Boolean(window.nostrClient?.isSignerReady() && window.dlcWallet);
 }
 
 async function generateAuthHeader(method, url) {
@@ -37,11 +31,13 @@ function showAuthError(message) {
   notification.className = "notification is-danger";
   notification.style.cssText =
     "position: fixed; top: 20px; right: 20px; z-index: 9999; max-width: 400px;";
-  notification.innerHTML = `
-    <button class="delete" onclick="this.parentElement.remove()"></button>
-    <strong>Authentication Error</strong><br>
-    ${message}
-  `;
+  const close = document.createElement("button");
+  close.className = "delete";
+  close.addEventListener("click", () => notification.remove());
+  const title = document.createElement("strong");
+  title.textContent = "Authentication Error";
+  // textContent, not innerHTML: messages can carry error text from elsewhere.
+  notification.append(close, title, document.createElement("br"), message);
   document.body.appendChild(notification);
 
   // Auto-remove after 5 seconds

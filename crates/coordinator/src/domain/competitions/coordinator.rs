@@ -22,7 +22,7 @@ use anyhow::anyhow;
 use bitcoin::{
     absolute::LockTime,
     consensus::encode::deserialize,
-    hashes::{sha256, Hash},
+    hashes::{sha256, Hash, HashEngine},
     transaction::Version,
     Amount, FeeRate, OutPoint, Psbt, PublicKey as BitcoinPublicKey, ScriptBuf, Transaction, TxIn,
     TxOut, Txid,
@@ -53,12 +53,12 @@ use nostr_sdk::{nips::nip44, Keys, PublicKey as NostrPublicKey, SecretKey};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use serde::Serialize;
+use std::sync::Arc;
 use std::time::Duration;
 use std::{
     collections::{BTreeMap, HashMap},
     str::FromStr,
 };
-use std::{io::Write, sync::Arc};
 use time::OffsetDateTime;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -1543,7 +1543,11 @@ impl Coordinator {
         } else {
             // Traditional MuSig2 flow: Generate local nonces
             let signing_session = {
-                let mut rng = create_deterministic_rng(&funding_outpoint, self.private_key);
+                let mut rng = create_deterministic_rng(
+                    &funding_outpoint,
+                    self.private_key,
+                    &contract_params,
+                )?;
                 SigningSession::<NonceSharingRound>::new(ticketed_dlc, &mut rng, self.private_key)?
             };
             debug!("Started musig nonce sharing round");
@@ -1604,7 +1608,8 @@ impl Coordinator {
             TicketedDLC::new(contract_parameters.to_owned(), funding_outpoint.to_owned())?;
 
         let signing_session = {
-            let mut rng = create_deterministic_rng(funding_outpoint, self.private_key);
+            let mut rng =
+                create_deterministic_rng(funding_outpoint, self.private_key, contract_parameters)?;
             SigningSession::<NonceSharingRound>::new(ticketed_dlc, &mut rng, self.private_key)?
         };
 
@@ -1746,7 +1751,11 @@ impl Coordinator {
             };
 
             let signing_session = {
-                let mut rng = create_deterministic_rng(funding_outpoint, self.private_key);
+                let mut rng = create_deterministic_rng(
+                    funding_outpoint,
+                    self.private_key,
+                    contract_parameters,
+                )?;
                 SigningSession::<NonceSharingRound>::new(ticketed_dlc, &mut rng, self.private_key)?
             };
 
@@ -4316,18 +4325,34 @@ fn simple_sweep_tx(
     }
 }
 
-fn create_deterministic_rng(funding_outpoint: &OutPoint, private_key: Scalar) -> ChaCha20Rng {
-    let mut hasher = sha256::Hash::engine();
+/// Seed for the market maker's MuSig2 nonces.
+///
+/// Secret nonces are never stored: each signing step re-derives them and checks
+/// they reproduce the published public nonces, so they must be deterministic.
+/// The seed binds the key, the funding outpoint and the full contract
+/// parameters, so a changed contract never reuses a nonce. The remaining rule
+/// is that a nonce set must only ever sign one set of aggregate nonces; the
+/// write-once `public_nonces`/`partial_signatures` fields and the one-shot
+/// nonce submission per entry enforce that.
+fn create_deterministic_rng(
+    funding_outpoint: &OutPoint,
+    private_key: Scalar,
+    params: &ContractParameters,
+) -> Result<ChaCha20Rng, anyhow::Error> {
+    let params_digest = sha256::Hash::hash(&serde_json::to_vec(params)?);
+    let tag = sha256::Hash::hash(b"coordinator/musig-nonce/v1");
 
-    hasher.write_all(&funding_outpoint.txid[..]).unwrap();
-    hasher
-        .write_all(&funding_outpoint.vout.to_le_bytes())
-        .unwrap();
-    hasher.write_all(&private_key.serialize()).unwrap();
+    let mut engine = sha256::Hash::engine();
+    engine.input(tag.as_byte_array());
+    engine.input(tag.as_byte_array());
+    engine.input(&private_key.serialize());
+    engine.input(funding_outpoint.txid.as_byte_array());
+    engine.input(&funding_outpoint.vout.to_le_bytes());
+    engine.input(params_digest.as_byte_array());
 
-    let hash = sha256::Hash::from_engine(hasher);
-    let seed: [u8; 32] = hash.to_byte_array();
-    ChaCha20Rng::from_seed(seed)
+    Ok(ChaCha20Rng::from_seed(
+        sha256::Hash::from_engine(engine).to_byte_array(),
+    ))
 }
 
 async fn validate_entry(entry: AddEventEntry, competition: Competition) -> Result<(), Error> {
@@ -4660,5 +4685,75 @@ mod keymeld_authorization_tests {
             1
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dlctix::{attestation_locking_point, hashlock, MarketMaker};
+    use rand::RngCore;
+
+    fn params() -> ContractParameters {
+        let mut rng = rand::rng();
+        let player = |rng: &mut rand::rngs::ThreadRng| Player {
+            pubkey: Scalar::random(rng).base_point_mul(),
+            ticket_hash: hashlock::sha256(&hashlock::preimage_random(rng)),
+            payout_hash: hashlock::sha256(&hashlock::preimage_random(rng)),
+        };
+        let oracle = Scalar::random(&mut rng).base_point_mul();
+        let nonce = Scalar::random(&mut rng).base_point_mul();
+        ContractParameters {
+            market_maker: MarketMaker {
+                pubkey: Scalar::random(&mut rng).base_point_mul(),
+            },
+            players: vec![player(&mut rng), player(&mut rng)],
+            event: dlctix::EventLockingConditions {
+                locking_points: vec![
+                    attestation_locking_point(oracle, nonce, b"a"),
+                    attestation_locking_point(oracle, nonce, b"b"),
+                ],
+                expiry: None,
+            },
+            outcome_payouts: BTreeMap::from([
+                (Outcome::Attestation(0), PayoutWeights::from([(0, 1)])),
+                (Outcome::Attestation(1), PayoutWeights::from([(1, 1)])),
+            ]),
+            fee_rate: dlctix::bitcoin::FeeRate::from_sat_per_vb_unchecked(1),
+            funding_value: Amount::from_sat(100_000),
+            relative_locktime_block_delta: 72,
+        }
+    }
+
+    fn first_draw(outpoint: &OutPoint, key: Scalar, params: &ContractParameters) -> u64 {
+        create_deterministic_rng(outpoint, key, params)
+            .unwrap()
+            .next_u64()
+    }
+
+    #[test]
+    fn nonce_seed_is_stable_for_the_same_contract() {
+        let key = Scalar::random(&mut rand::rng());
+        let outpoint = OutPoint::null();
+        let params = params();
+
+        assert_eq!(
+            first_draw(&outpoint, key, &params),
+            first_draw(&outpoint, key, &params)
+        );
+    }
+
+    #[test]
+    fn nonce_seed_changes_with_contract_params() {
+        let key = Scalar::random(&mut rand::rng());
+        let outpoint = OutPoint::null();
+        let params = params();
+        let mut changed = params.clone();
+        changed.fee_rate = dlctix::bitcoin::FeeRate::from_sat_per_vb_unchecked(2);
+
+        assert_ne!(
+            first_draw(&outpoint, key, &params),
+            first_draw(&outpoint, key, &changed)
+        );
     }
 }

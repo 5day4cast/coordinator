@@ -1,20 +1,14 @@
 import init, {
   NostrClientWrapper,
-  TaprootWallet,
-  TaprootWalletBuilder,
+  DlcWallet,
+  LoginCredentials,
   SignerType,
-  encryptNsecWithPassword,
-  decryptNsecWithPassword,
-  signForgotPasswordChallenge,
 } from "/ui/pkg/coordinator_wasm.js";
 
 window.NostrClientWrapper = NostrClientWrapper;
-window.TaprootWallet = TaprootWallet;
-window.TaprootWalletBuilder = TaprootWalletBuilder;
+window.DlcWallet = DlcWallet;
+window.LoginCredentials = LoginCredentials;
 window.SignerType = SignerType;
-window.encryptNsecWithPassword = encryptNsecWithPassword;
-window.decryptNsecWithPassword = decryptNsecWithPassword;
-window.signForgotPasswordChallenge = signForgotPasswordChallenge;
 
 window.wasmInitialized = false;
 window.wasmError = null;

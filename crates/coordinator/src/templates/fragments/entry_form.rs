@@ -117,6 +117,9 @@ pub fn entry_form(
                         "Submitting an entry authorizes automatic signing for this competition. "
                         "You do not need to stay online or approve each signing request."
                     }
+                    // Filled by entries.js from the WASM build's pinned keymeld measurements.
+                    p id="keymeldTrust" class="help mb-3" {}
+                    script { (maud::PreEscaped("window.showKeymeldTrust?.();")) }
                     // Submit button - triggers JS handler
                     button type="button" id="submitEntry" class="button is-info"
                            onclick="submitEntry()" {

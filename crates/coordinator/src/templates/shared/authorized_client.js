@@ -4,12 +4,10 @@ class AuthorizedClient {
         this.apiBase = apiBase;
     }
 
-    async _getAuthHeader(url, method, body) {
-        return this.wasmInstance.getAuthHeader(url, method, body);
-    }
-
     async _request(url, method, body, options = {}) {
-        const authHeader = await this._getAuthHeader(url, method, body);
+        // Serialize once: the NIP-98 payload hash must cover the exact bytes sent.
+        const payload = body ? JSON.stringify(body) : null;
+        const authHeader = await this.wasmInstance.getAuthHeader(url, method, payload);
         const response = await fetch(url, {
             ...options,
             method,
@@ -18,7 +16,7 @@ class AuthorizedClient {
                 ...options.headers,
                 'Authorization': authHeader,
             },
-            body: body ? JSON.stringify(body) : undefined,
+            body: payload ?? undefined,
         });
 
         if (!response.ok) {

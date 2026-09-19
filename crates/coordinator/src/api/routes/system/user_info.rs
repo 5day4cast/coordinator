@@ -6,33 +6,20 @@ use std::sync::Arc;
 
 use crate::{
     api::{
-        extractors::{AuthError, NostrAuth},
+        extractors::{AuthError, AuthedJson, NostrAuth},
         routes::ApiError,
     },
     domain::{
         self,
-        users::{hash_password, verify_password},
+        users::{hash_auth_key, verify_auth_key, AuthKey, PasswordError},
     },
     startup::AppState,
 };
 
-fn validate_password_strength(password: &str) -> Result<(), String> {
-    if password.len() < 10 {
-        return Err("Password must be at least 10 characters".to_string());
-    }
-    if !password.chars().any(|c| c.is_ascii_lowercase()) {
-        return Err("Password must contain a lowercase letter".to_string());
-    }
-    if !password.chars().any(|c| c.is_ascii_uppercase()) {
-        return Err("Password must contain an uppercase letter".to_string());
-    }
-    if !password.chars().any(|c| c.is_ascii_digit()) {
-        return Err("Password must contain a number".to_string());
-    }
-    if !password.chars().any(|c| !c.is_ascii_alphanumeric()) {
-        return Err("Password must contain a special character".to_string());
-    }
-    Ok(())
+/// Map a credential-hashing failure to a safe client error, logging the cause.
+fn credential_error(e: PasswordError) -> domain::Error {
+    error!("Credential processing failed: {}", e);
+    domain::Error::BadRequest("Failed to process credentials".to_string())
 }
 
 pub async fn login(
@@ -62,9 +49,11 @@ pub struct RegisterPayload {
 }
 
 pub async fn register(
-    NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
-    Json(body): Json<RegisterPayload>,
+    AuthedJson {
+        auth: NostrAuth { pubkey, .. },
+        body,
+    }: AuthedJson<RegisterPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
     let pubkey = pubkey.to_bech32().expect("public bech32 format");
 
@@ -78,10 +67,12 @@ pub async fn register(
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// No `Debug`/`Clone`: the payloads carry login credentials.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UsernameRegisterPayload {
     pub username: String,
-    pub password: String,
+    pub auth_key: AuthKey,
     pub encrypted_nsec: String,
     pub nostr_pubkey: String,
     pub encrypted_bitcoin_private_key: String,
@@ -129,10 +120,6 @@ pub async fn register_username(
         return Err(ApiError::from(domain::Error::BadRequest(e)));
     }
 
-    if let Err(e) = validate_password_strength(&body.password) {
-        return Err(ApiError::from(domain::Error::BadRequest(e)));
-    }
-
     if state.users_info.username_exists(&body.username).await? {
         return Ok((
             StatusCode::CREATED,
@@ -143,10 +130,7 @@ pub async fn register_username(
         ));
     }
 
-    let password_hash = hash_password(&body.password).map_err(|e| {
-        error!("Failed to hash password: {}", e);
-        domain::Error::BadRequest("Failed to process password".to_string())
-    })?;
+    let password_hash = hash_auth_key(&body.auth_key).map_err(credential_error)?;
 
     let user = match state
         .users_info
@@ -176,10 +160,11 @@ pub async fn register_username(
     ))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UsernameLoginPayload {
     pub username: String,
-    pub password: String,
+    pub auth_key: AuthKey,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,27 +183,22 @@ pub async fn login_username(
 
     let user_result = state.users_info.get_user_by_username(&body.username).await;
 
-    // Always verify against something to prevent timing attacks
-    let (password_hash, user) = match user_result {
-        Ok(user) => {
-            let hash = user.password_hash.clone().unwrap_or_default();
-            (hash, Some(user))
-        }
-        Err(domain::Error::NotFound(_)) => {
-            // Use a dummy hash so we still spend time on verification
-            let dummy_hash = "$argon2id$v=19$m=19456,t=2,p=1$dummysalt1234567$dummyhash123456789012345678901234567890".to_string();
-            (dummy_hash, None)
-        }
+    let user = match user_result {
+        Ok(user) => Some(user),
+        Err(domain::Error::NotFound(_)) => None,
         Err(e) => {
             error!("Failed to get user by username: {}", e);
             return Err(ApiError::from(e));
         }
     };
 
-    let valid = verify_password(&body.password, &password_hash).unwrap_or(false);
+    // Unknown users are checked against a dummy hash so timing does not
+    // reveal whether the username exists.
+    let stored_hash = user.as_ref().and_then(|u| u.password_hash.as_deref());
+    let valid = verify_auth_key(&body.auth_key, stored_hash).map_err(credential_error)?;
 
     let user = match user {
-        Some(u) if valid && u.password_hash.is_some() => u,
+        Some(u) if valid => u,
         _ => return Err(ApiError::from(AuthError::InvalidLogin)),
     };
 
@@ -238,24 +218,23 @@ pub async fn login_username(
     ))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PasswordChangePayload {
-    pub current_password: String,
-    pub new_password: String,
+    pub current_auth_key: AuthKey,
+    pub new_auth_key: AuthKey,
     pub new_encrypted_nsec: String,
 }
 
 pub async fn change_password(
-    NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
-    Json(body): Json<PasswordChangePayload>,
+    AuthedJson {
+        auth: NostrAuth { pubkey, .. },
+        body,
+    }: AuthedJson<PasswordChangePayload>,
 ) -> Result<impl IntoResponse, ApiError> {
     let pubkey_str = pubkey.to_bech32().expect("public bech32 format");
     debug!("password change for user: {}", pubkey_str);
-
-    if let Err(e) = validate_password_strength(&body.new_password) {
-        return Err(ApiError::from(domain::Error::BadRequest(e)));
-    }
 
     let user = state.users_info.login(pubkey_str.clone()).await?;
 
@@ -263,21 +242,13 @@ pub async fn change_password(
         domain::Error::BadRequest("User does not have password authentication".to_string())
     })?;
 
-    let valid = verify_password(&body.current_password, password_hash).map_err(|e| {
-        error!("Password verification error: {}", e);
-        domain::Error::BadRequest("Invalid current password".to_string())
-    })?;
-
-    if !valid {
+    if !verify_auth_key(&body.current_auth_key, Some(password_hash)).map_err(credential_error)? {
         return Err(ApiError::from(domain::Error::BadRequest(
             "Invalid current password".to_string(),
         )));
     }
 
-    let new_password_hash = hash_password(&body.new_password).map_err(|e| {
-        error!("Failed to hash password: {}", e);
-        domain::Error::BadRequest("Failed to process password".to_string())
-    })?;
+    let new_password_hash = hash_auth_key(&body.new_auth_key).map_err(credential_error)?;
 
     state
         .users_info
@@ -348,12 +319,13 @@ pub async fn forgot_password_challenge(
     ))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ForgotPasswordReset {
     pub username: String,
     pub challenge: String,
     pub signed_event: String,
-    pub new_password: String,
+    pub new_auth_key: AuthKey,
     pub new_encrypted_nsec: String,
 }
 
@@ -362,10 +334,6 @@ pub async fn forgot_password_reset(
     Json(body): Json<ForgotPasswordReset>,
 ) -> Result<impl IntoResponse, ApiError> {
     debug!("forgot password reset for: {}", body.username);
-
-    if let Err(e) = validate_password_strength(&body.new_password) {
-        return Err(ApiError::from(domain::Error::BadRequest(e)));
-    }
 
     let challenge_valid = {
         let challenges = state.forgot_password_challenges.read().await;
@@ -420,10 +388,7 @@ pub async fn forgot_password_reset(
         )));
     }
 
-    let new_password_hash = hash_password(&body.new_password).map_err(|e| {
-        error!("Failed to hash password: {}", e);
-        domain::Error::BadRequest("Failed to process password".to_string())
-    })?;
+    let new_password_hash = hash_auth_key(&body.new_auth_key).map_err(credential_error)?;
 
     state
         .users_info

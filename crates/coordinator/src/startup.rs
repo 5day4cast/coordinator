@@ -1,4 +1,5 @@
 use crate::{
+    api::nip98_replay::{Nip98ReplayGuard, DEFAULT_REPLAY_CAPACITY},
     api::routes::{
         add_event_entry, admin_competition_fragment, admin_create_competition_handler,
         admin_delete_competition_handler, admin_fee_estimates_fragment, admin_page_handler,
@@ -43,7 +44,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
     serve::Serve,
-    Router,
+    Extension, Router,
 };
 use dlctix::secp::Scalar;
 use hyper::{
@@ -688,6 +689,9 @@ pub fn app(app_state: AppState, origins: Vec<String>) -> Router {
         .nest("/api/v1/wallet", wallet_endpoints)
         .nest("/api/v1/users", users_endpoints)
         .route("/ui/{*path}", get(serve_static_file))
+        .layer(Extension(Arc::new(Nip98ReplayGuard::new(
+            DEFAULT_REPLAY_CAPACITY,
+        ))))
         .layer(middleware::from_fn(log_request))
         .with_state(Arc::new(app_state))
         .layer(cors)

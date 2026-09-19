@@ -144,8 +144,7 @@ class AuthManager {
     this.apiBase = apiBase;
     this.network = network;
     this.authorizedClient = null;
-    this.pendingNsec = null;
-    this.pendingEncryptedNsec = null;
+    this.pendingRegistration = null;
     this.forgotChallenge = null;
     this.forgotNpub = null;
   }
@@ -220,13 +219,16 @@ class AuthManager {
       return;
     }
 
+    // The password stays in the browser: the server only sees the derived
+    // auth key, and the nsec is unsealed inside WASM.
+    const credentials = window.LoginCredentials.derive(username, password);
     try {
       const response = await fetch(
         `${this.apiBase}/api/v1/users/username/login`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ username, password }),
+          body: JSON.stringify({ username, auth_key: credentials.authKey }),
         },
       );
 
@@ -249,33 +251,29 @@ class AuthManager {
         );
       }
 
-      const nsec = await window.decryptNsecWithPassword(
-        encrypted_nsec,
-        password,
-      );
-
-      await window.nostrClient.initialize(window.SignerType.PrivateKey, nsec);
+      window.nostrClient.unlockWithLogin(credentials, encrypted_nsec);
       this.authorizedClient = new window.AuthorizedClient(
         window.nostrClient,
         this.apiBase,
       );
-
-      window.taprootWallet = await new window.TaprootWalletBuilder()
-        .network(network)
-        .nostr_client(window.nostrClient)
-        .encrypted_key(encrypted_bitcoin_private_key)
-        .build();
+      window.dlcWallet = await window.DlcWallet.load(
+        window.nostrClient,
+        network,
+        encrypted_bitcoin_private_key,
+      );
 
       this.onLoginSuccess();
     } catch (error) {
       console.error("Username login failed:", error);
       if (errorElement) {
-        errorElement.textContent =
-          error.message.includes("decrypt") ||
-          error.message.includes("password")
-            ? "Invalid password"
-            : "Login failed. Please try again.";
+        errorElement.textContent = String(error.message ?? error).includes(
+          "password",
+        )
+          ? "Invalid username or password"
+          : "Login failed. Please try again.";
       }
+    } finally {
+      credentials.free();
     }
   }
 
@@ -334,28 +332,26 @@ class AuthManager {
       return;
     }
 
+    // The server never sees the password, so strength is only enforced here.
     const passwordError = this.validatePasswordStrength(password);
     if (passwordError) {
       if (errorElement) errorElement.textContent = passwordError;
       return;
     }
 
+    let credentials = null;
     try {
-      await window.nostrClient.initialize(window.SignerType.PrivateKey, null);
-      const nsec = await window.nostrClient.getPrivateKey();
+      window.nostrClient.initialize(window.SignerType.PrivateKey, null);
+      credentials = window.LoginCredentials.derive(username, password);
 
-      const encryptedNsec = await window.encryptNsecWithPassword(
-        nsec,
-        password,
-      );
-
-      this.pendingNsec = nsec;
-      this.pendingEncryptedNsec = encryptedNsec;
-      this.pendingUsername = username;
-      this.pendingPassword = password;
+      this.pendingRegistration = {
+        username,
+        authKey: credentials.authKey,
+        sealedNsec: window.nostrClient.sealForLogin(credentials),
+      };
 
       const display = document.getElementById("usernameNsecDisplay");
-      if (display) display.value = nsec;
+      if (display) display.value = window.nostrClient.recoveryKey();
 
       document
         .getElementById("usernameRegisterStep1")
@@ -367,6 +363,8 @@ class AuthManager {
       console.error("Registration step 1 failed:", error);
       if (errorElement)
         errorElement.textContent = "Failed to generate keys. Please try again.";
+    } finally {
+      credentials?.free();
     }
   }
 
@@ -374,12 +372,8 @@ class AuthManager {
     const errorElement = document.querySelector("#usernameRegisterStep2Error");
     if (errorElement) errorElement.textContent = "";
 
-    if (
-      !this.pendingNsec ||
-      !this.pendingEncryptedNsec ||
-      !this.pendingUsername ||
-      !this.pendingPassword
-    ) {
+    const pending = this.pendingRegistration;
+    if (!pending) {
       if (errorElement)
         errorElement.textContent = "Registration state lost. Please try again.";
       resetRegisterModal();
@@ -393,13 +387,8 @@ class AuthManager {
       );
 
       const pubkey = await window.nostrClient.getPublicKey();
-      const wallet = await new window.TaprootWalletBuilder()
-        .network(this.network)
-        .nostr_client(window.nostrClient)
-        .build();
-
-      const { encrypted_bitcoin_private_key } =
-        await wallet.getEncryptedMasterKey(pubkey);
+      const wallet = window.DlcWallet.create(window.nostrClient, this.network);
+      const { encrypted_bitcoin_private_key } = await wallet.encryptedBackup();
 
       const response = await fetch(
         `${this.apiBase}/api/v1/users/username/register`,
@@ -407,9 +396,9 @@ class AuthManager {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            username: this.pendingUsername,
-            password: this.pendingPassword,
-            encrypted_nsec: this.pendingEncryptedNsec,
+            username: pending.username,
+            auth_key: pending.authKey,
+            encrypted_nsec: pending.sealedNsec,
             nostr_pubkey: pubkey,
             encrypted_bitcoin_private_key,
             network: this.network,
@@ -418,6 +407,7 @@ class AuthManager {
       );
 
       if (!response.ok) {
+        wallet.free();
         const data = await response.json().catch(() => ({}));
         if (errorElement)
           errorElement.textContent =
@@ -425,12 +415,11 @@ class AuthManager {
         return;
       }
 
-      window.taprootWallet = wallet;
+      window.dlcWallet = wallet;
+      this.pendingRegistration = null;
 
-      this.pendingNsec = null;
-      this.pendingEncryptedNsec = null;
-      this.pendingUsername = null;
-      this.pendingPassword = null;
+      const display = document.getElementById("usernameNsecDisplay");
+      if (display) display.value = "";
 
       document
         .getElementById("usernameRegisterStep2")
@@ -552,7 +541,8 @@ class AuthManager {
     const errorElement = document.querySelector("#forgotStep2Error");
     if (errorElement) errorElement.textContent = "";
 
-    const nsec = document.getElementById("forgotNsec")?.value?.trim();
+    const nsecInput = document.getElementById("forgotNsec");
+    const nsec = nsecInput?.value?.trim();
     if (!nsec) {
       if (errorElement)
         errorElement.textContent = "Please enter your recovery key (nsec)";
@@ -567,21 +557,21 @@ class AuthManager {
     }
 
     try {
-      await window.nostrClient.initialize(window.SignerType.PrivateKey, nsec);
+      window.nostrClient.initialize(window.SignerType.PrivateKey, nsec);
+      if (nsecInput) nsecInput.value = "";
       const derivedNpub = await window.nostrClient.getPublicKey();
 
       if (derivedNpub !== this.forgotNpub) {
+        window.nostrClient = new window.NostrClientWrapper();
         if (errorElement)
           errorElement.textContent =
             "This recovery key does not match the account";
         return;
       }
 
-      this.forgotSignedChallenge = await window.signForgotPasswordChallenge(
-        nsec,
+      this.forgotSignedChallenge = await window.nostrClient.signChallenge(
         this.forgotChallenge,
       );
-      this.forgotNsec = nsec;
 
       document.getElementById("forgotStep2")?.classList.add("is-hidden");
       document.getElementById("forgotStep3")?.classList.remove("is-hidden");
@@ -617,23 +607,18 @@ class AuthManager {
       return;
     }
 
-    if (
-      !this.forgotSignedChallenge ||
-      !this.forgotNsec ||
-      !this.forgotUsername
-    ) {
+    if (!this.forgotSignedChallenge || !this.forgotUsername) {
       if (errorElement)
         errorElement.textContent = "Session expired. Please start over.";
       resetForgotPasswordModal();
       return;
     }
 
+    const credentials = window.LoginCredentials.derive(
+      this.forgotUsername,
+      newPassword,
+    );
     try {
-      const newEncryptedNsec = await window.encryptNsecWithPassword(
-        this.forgotNsec,
-        newPassword,
-      );
-
       const response = await fetch(
         `${this.apiBase}/api/v1/users/username/reset-password`,
         {
@@ -643,8 +628,8 @@ class AuthManager {
             username: this.forgotUsername,
             challenge: this.forgotChallenge,
             signed_event: this.forgotSignedChallenge,
-            new_password: newPassword,
-            new_encrypted_nsec: newEncryptedNsec,
+            new_auth_key: credentials.authKey,
+            new_encrypted_nsec: window.nostrClient.sealForLogin(credentials),
           }),
         },
       );
@@ -658,7 +643,8 @@ class AuthManager {
       this.forgotNpub = null;
       this.forgotUsername = null;
       this.forgotSignedChallenge = null;
-      this.forgotNsec = null;
+      // The recovery key only proved ownership; log in again with the new password.
+      window.nostrClient = new window.NostrClientWrapper();
 
       window.closeModal(document.getElementById("forgotPasswordModal"));
       resetLoginModal();
@@ -675,23 +661,24 @@ class AuthManager {
       if (errorElement)
         errorElement.textContent =
           error.message || "Password reset failed. Please try again.";
+    } finally {
+      credentials.free();
     }
   }
 
   async performRegistration() {
-    const pubkey = await window.nostrClient.getPublicKey();
-    const wallet = await new window.TaprootWalletBuilder()
-      .network(this.network)
-      .nostr_client(window.nostrClient)
-      .build();
-
-    const payload = await wallet.getEncryptedMasterKey(pubkey);
-    const response = await this.authorizedClient.post(
-      `${this.apiBase}/api/v1/users/register`,
-      payload,
-    );
-
-    if (!response.ok) throw new Error("Registration failed");
+    const wallet = window.DlcWallet.create(window.nostrClient, this.network);
+    try {
+      const payload = await wallet.encryptedBackup();
+      const response = await this.authorizedClient.post(
+        `${this.apiBase}/api/v1/users/register`,
+        payload,
+      );
+      if (!response.ok) throw new Error("Registration failed");
+    } finally {
+      // performLogin loads the wallet back from the stored backup.
+      wallet.free();
+    }
   }
 
   async performLogin() {
@@ -710,17 +697,20 @@ class AuthManager {
       );
     }
 
-    window.taprootWallet = await new window.TaprootWalletBuilder()
-      .network(network)
-      .nostr_client(window.nostrClient)
-      .encrypted_key(encrypted_bitcoin_private_key)
-      .build();
+    window.dlcWallet = await window.DlcWallet.load(
+      window.nostrClient,
+      network,
+      encrypted_bitcoin_private_key,
+    );
 
     this.onLoginSuccess();
   }
 
   handleLogout() {
-    window.taprootWallet = null;
+    // free() drops the WASM objects, which erases the keys they hold.
+    window.dlcWallet?.free();
+    window.dlcWallet = null;
+    window.nostrClient?.free();
     window.nostrClient = new window.NostrClientWrapper();
 
     document.getElementById("authButtons")?.classList.remove("is-hidden");

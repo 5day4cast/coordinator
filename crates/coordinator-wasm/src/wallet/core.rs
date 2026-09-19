@@ -1,686 +1,689 @@
-use super::{DlcEntryData, WalletError};
-use crate::NostrClientCore;
-use bdk_wallet::{
-    bitcoin::{
-        bip32::{ChainCode, ChildNumber, DerivationPath},
-        ecdsa,
-        hashes::{sha256, Hash},
-        secp256k1::{Message, Secp256k1 as BdkSecp256k1, SecretKey},
-        sighash::{EcdsaSighashType, SighashCache},
-        Network, NetworkKind as BDKNetworkKind, Psbt, PublicKey,
-    },
-    descriptor::calc_checksum,
+use super::{
+    keymeld_trust::trusted_assignment,
+    keys::{EntryKey, WalletSeed},
+    EncryptedWalletBackup, EntryRegistration, PayoutRelease, WalletError,
 };
-use blake2::{Blake2b512, Digest};
-#[cfg(feature = "keymeld")]
+use crate::nostr::{CustomSigner, NostrClientCore};
 use coordinator_core::{
     keymeld::{prepare_registration, PreparedRegistration},
     RegistrationAssignment,
 };
 use dlctix::{
-    bitcoin::{bip32::Xpriv, OutPoint},
-    musig2::{AggNonce, PartialSignature},
-    secp::{MaybeScalar, Scalar},
+    bitcoin::{
+        ecdsa,
+        hashes::Hash,
+        script::Instruction,
+        secp256k1::{All, Message, Secp256k1},
+        sighash::{EcdsaSighashType, SighashCache},
+        Network, OutPoint, Psbt, PublicKey, ScriptBuf, TxOut,
+    },
+    musig2::{AggNonce, PartialSignature, PubNonce},
+    secp::{MaybeScalar, Point},
     ContractParameters, EventLockingConditions, NonceSharingRound, Outcome, SigMap, SigningSession,
     TicketedDLC,
 };
-use log::debug;
-use nostr_sdk::{FromBech32, NostrSigner};
-use rand::{rng, RngCore, SeedableRng};
-use rand_chacha::ChaCha20Rng;
-use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use std::{collections::HashMap, io::Write, str::FromStr};
+use nostr_sdk::NostrSigner;
+use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use uuid::Uuid;
+use zeroize::Zeroizing;
 
-use super::DlcEntry;
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum NetworkKind {
-    Main,
-    Test,
-}
-
-impl From<BDKNetworkKind> for NetworkKind {
-    fn from(n: BDKNetworkKind) -> Self {
-        match n {
-            BDKNetworkKind::Main => NetworkKind::Main,
-            BDKNetworkKind::Test => NetworkKind::Test,
-        }
-    }
-}
-
-impl From<Network> for NetworkKind {
-    fn from(n: Network) -> Self {
-        match n {
-            Network::Bitcoin => NetworkKind::Main,
-            Network::Testnet | Network::Testnet4 | Network::Signet | Network::Regtest => {
-                NetworkKind::Test
-            }
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct KeyPair {
-    pub descriptor: String,
-    pub change_descriptor: String,
-    pub network: NetworkKind,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct EncryptedKey {
-    pub encrypted_bitcoin_private_key: String,
-    pub network: String,
-}
-
-#[derive(Clone)]
-pub struct TaprootWalletCoreBuilder {
-    network: Option<String>,
-    nostr_client: Option<NostrClientCore>,
-    encrypted_key: Option<String>,
-}
-
-impl Default for TaprootWalletCoreBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TaprootWalletCoreBuilder {
-    pub fn new() -> Self {
-        Self {
-            network: None,
-            nostr_client: None,
-            encrypted_key: None,
-        }
-    }
-
-    pub fn network(mut self, network: String) -> TaprootWalletCoreBuilder {
-        self.network = Some(network);
-        self
-    }
-
-    pub fn nostr_client(self, client: &NostrClientCore) -> Self {
-        Self {
-            network: self.network,
-            nostr_client: Some(client.clone()),
-            encrypted_key: self.encrypted_key,
-        }
-    }
-
-    pub fn encrypted_key(mut self, key: String) -> TaprootWalletCoreBuilder {
-        self.encrypted_key = Some(key);
-        self
-    }
-
-    pub async fn build(self) -> Result<TaprootWalletCore, WalletError> {
-        let network = self
-            .network
-            .ok_or_else(|| WalletError::NetworkError("Network is required".into()))?;
-
-        let nostr_client = self
-            .nostr_client
-            .ok_or_else(|| WalletError::SignerError("NostrClient is required".into()))?;
-
-        let network =
-            Network::from_str(&network).map_err(|e| WalletError::NetworkError(e.to_string()))?;
-
-        match self.encrypted_key {
-            Some(encrypted) => {
-                TaprootWalletCore::load_from_encrypted(&nostr_client, &encrypted, network).await
-            }
-            None => Ok(TaprootWalletCore::create_new(&nostr_client, network)?),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct TaprootWalletCore {
-    extended_key: SecretString,
-    public_data: KeyPair,
-    nostr_client: NostrClientCore,
+pub struct DlcWalletCore {
+    seed: WalletSeed,
     network: Network,
-    dlc_contracts: HashMap<u32, DlcEntry>,
+    nostr_client: NostrClientCore,
+    secp: Secp256k1<All>,
+    contracts: HashMap<Uuid, EntryContract>,
 }
 
-impl TaprootWalletCore {
-    pub fn create_new(
-        nostr_client: &NostrClientCore,
-        network: Network,
-    ) -> Result<Self, WalletError> {
-        let mut entropy = [0u8; 32];
-        rng().fill_bytes(&mut entropy);
-        let secret_key =
-            SecretKey::from_slice(&entropy).map_err(|e| WalletError::KeyError(e.to_string()))?;
+/// A contract the user has checked and agreed to sign for one entry.
+struct EntryContract {
+    dlc: TicketedDLC,
+    /// Digest of the accepted `ContractParameters`; part of the nonce seed.
+    params_digest: [u8; 32],
+    /// Digest of the aggregate nonces already signed in this page session.
+    signed_aggregate: Option<[u8; 32]>,
+}
 
-        let mut hasher = Blake2b512::new();
-        hasher.update(&secret_key[..]);
-        let hash = hasher.finalize();
-        let mut chain_code = [0u8; 32];
-        chain_code.copy_from_slice(&hash[0..32]);
-
-        let xpriv = Xpriv {
-            network: network.into(),
-            depth: 0,
-            parent_fingerprint: Default::default(),
-            chain_code: ChainCode::from(&chain_code),
-            child_number: ChildNumber::from_normal_idx(0)
-                .map_err(|e| WalletError::KeyError(e.to_string()))?,
-            private_key: secret_key,
-        };
-
-        Self::from_xpriv(nostr_client, xpriv, network)
+impl DlcWalletCore {
+    pub fn create(nostr_client: &NostrClientCore, network: Network) -> Self {
+        Self::with_seed(nostr_client, WalletSeed::generate(), network)
     }
 
-    fn from_xpriv(
+    /// Restore a wallet from the backup produced by [`Self::encrypted_backup`].
+    pub async fn load(
         nostr_client: &NostrClientCore,
-        xpriv: Xpriv,
+        encrypted_backup: &str,
         network: Network,
     ) -> Result<Self, WalletError> {
-        let extended_key = SecretString::from(xpriv.to_string());
-        let network_kind: NetworkKind = xpriv.network.into();
+        let signer = signer(nostr_client)?;
+        let own_pubkey = signer.get_public_key().await.map_err(signer_error)?;
+        let backup = Zeroizing::new(
+            signer
+                .nip44_decrypt(&own_pubkey, encrypted_backup)
+                .await
+                .map_err(signer_error)?,
+        );
+        let seed = WalletSeed::from_backup(&backup)?;
+        Ok(Self::with_seed(nostr_client, seed, network))
+    }
 
-        let external_base = format!("tr({}/0/*)", xpriv);
-        let internal_base = format!("tr({}/1/*)", xpriv);
-
-        // Calculate and append checksums
-        let external_checksum =
-            calc_checksum(&external_base).map_err(|e| WalletError::CheckSum(e.to_string()))?;
-        let internal_checksum =
-            calc_checksum(&internal_base).map_err(|e| WalletError::CheckSum(e.to_string()))?;
-
-        let external_descriptor = format!("{}#{}", external_base, external_checksum);
-        let internal_descriptor = format!("{}#{}", internal_base, internal_checksum);
-        let public_data = KeyPair {
-            descriptor: external_descriptor.clone(),
-            change_descriptor: internal_descriptor.clone(),
-            network: network_kind,
-        };
-
-        Ok(Self {
-            extended_key,
-            public_data,
-            nostr_client: nostr_client.to_owned(),
+    fn with_seed(nostr_client: &NostrClientCore, seed: WalletSeed, network: Network) -> Self {
+        Self {
+            seed,
             network,
-            dlc_contracts: HashMap::new(),
-        })
+            nostr_client: nostr_client.clone(),
+            secp: Secp256k1::new(),
+            contracts: HashMap::new(),
+        }
     }
 
-    pub async fn load_from_encrypted(
-        nostr_client: &NostrClientCore,
-        encrypted: &str,
-        network: Network,
-    ) -> Result<Self, WalletError> {
-        let signer = nostr_client
-            .signer
-            .as_ref()
-            .ok_or_else(|| WalletError::NostrNotInitialize)?;
+    fn entry_key(&self, entry_id: Uuid) -> Result<EntryKey, WalletError> {
+        self.seed.entry_key(&self.secp, self.network, entry_id)
+    }
 
-        let pubkey = signer
-            .get_public_key()
+    /// The seed backup, NIP-44 encrypted to the user's own Nostr key. There
+    /// is deliberately no way to choose the recipient: encrypting to a
+    /// caller-supplied pubkey would hand that key's owner the seed.
+    pub async fn encrypted_backup(&self) -> Result<EncryptedWalletBackup, WalletError> {
+        let signer = signer(&self.nostr_client)?;
+        let own_pubkey = signer.get_public_key().await.map_err(signer_error)?;
+        let encrypted = signer
+            .nip44_encrypt(&own_pubkey, &self.seed.to_backup())
             .await
-            .map_err(|e| WalletError::PublicKeyError(e.to_string()))?;
-
-        let xpriv_str = signer
-            .nip44_decrypt(&pubkey, encrypted)
-            .await
-            .map_err(|e| WalletError::PublicKeyError(e.to_string()))?;
-
-        let xpriv =
-            Xpriv::from_str(&xpriv_str).map_err(|e| WalletError::PublicKeyError(e.to_string()))?;
-
-        Self::from_xpriv(nostr_client, xpriv, network)
-    }
-
-    pub fn get_public_data(&self) -> KeyPair {
-        self.public_data.clone()
-    }
-
-    pub async fn get_encrypted_master_key(
-        &self,
-        nostr_pubkey: &str,
-    ) -> Result<EncryptedKey, WalletError> {
-        let encrypted = self.encrypt_key(&self.extended_key, nostr_pubkey).await?;
-
-        Ok(EncryptedKey {
+            .map_err(signer_error)?;
+        Ok(EncryptedWalletBackup {
             encrypted_bitcoin_private_key: encrypted,
             network: self.network.to_string(),
         })
     }
 
-    pub async fn encrypt_key(
-        &self,
-        key_to_encrypt: &SecretString,
-        nostr_pubkey: &str,
-    ) -> Result<String, WalletError> {
-        let pubkey = nostr_sdk::PublicKey::from_bech32(nostr_pubkey)
-            .map_err(|e| WalletError::InvalidPublicKey(e.to_string()))?;
-
-        let signer = self
-            .nostr_client
-            .signer
-            .as_ref()
-            .ok_or_else(|| WalletError::NostrNotInitialize)?;
-
-        signer
-            .nip44_encrypt(&pubkey, key_to_encrypt.expose_secret())
-            .await
-            .map_err(|e| WalletError::EncryptionError(e.to_string()))
+    pub fn entry_registration(&self, entry_id: Uuid) -> Result<EntryRegistration, WalletError> {
+        let key = self.entry_key(entry_id)?;
+        Ok(EntryRegistration {
+            ephemeral_pubkey: key.point().to_string(),
+            payout_hash: hex::encode(key.payout_hash()),
+        })
     }
 
-    pub async fn decrypt_key(
+    /// Encrypt the entry key to the keymeld enclave assigned to this ticket.
+    ///
+    /// `prepare_registration` verifies a fresh Nitro attestation of the enclave
+    /// key before encrypting, and binds the envelope to the session, manifest,
+    /// slot and enclave epoch. The attestation policy comes from this build's
+    /// pinned measurements, not from the coordinator (see `keymeld_trust`).
+    pub async fn keymeld_registration(
         &self,
-        encrypted_key: &str,
-        nostr_pubkey: &str,
-    ) -> Result<String, WalletError> {
-        let pubkey = nostr_sdk::PublicKey::from_bech32(nostr_pubkey)
-            .map_err(|e| WalletError::InvalidPublicKey(e.to_string()))?;
-
-        let signer = self
-            .nostr_client
-            .signer
-            .as_ref()
-            .ok_or_else(|| WalletError::NostrNotInitialize)?;
-
-        signer
-            .nip44_decrypt(&pubkey, encrypted_key)
-            .await
-            .map_err(|e| WalletError::DecryptionError(e.to_string()))
-    }
-
-    pub async fn get_encrypted_dlc_private_key(
-        &self,
-        entry_index: u32,
-        nostr_pubkey: &str,
-    ) -> Result<String, WalletError> {
-        let child_xpriv = self.derive_dlc_key(entry_index)?;
-        let secret_bytes = child_xpriv.private_key.secret_bytes();
-        let child_key = hex::encode(secret_bytes);
-        self.encrypt_key(&SecretString::from(child_key), nostr_pubkey)
-            .await
-    }
-
-    /// Prepare keymeld registration data for an entry.
-    /// Returns the encrypted private key (for enclave) and the derived auth pubkey.
-    /// This keeps the raw private key inside WASM and never exposes it to JavaScript.
-    #[cfg(feature = "keymeld")]
-    pub async fn prepare_keymeld_registration(
-        &self,
-        entry_index: u32,
+        entry_id: Uuid,
         assignment: &RegistrationAssignment,
     ) -> Result<PreparedRegistration, WalletError> {
-        let child_xpriv = self.derive_dlc_key(entry_index)?;
-        let secret_bytes = child_xpriv.private_key.secret_bytes();
-        prepare_registration(&secret_bytes, assignment)
+        let assignment = trusted_assignment(assignment, self.network)?;
+        let key = self.entry_key(entry_id)?;
+        prepare_registration(&key.secret_bytes(), &assignment)
             .await
-            .map_err(|e| WalletError::KeyDerivation(format!("Keymeld registration failed: {}", e)))
+            .map_err(|e| WalletError::Keymeld(e.to_string()))
     }
 
-    pub async fn get_encrypted_dlc_payout_preimage(
+    /// Release an entry's key and payout preimage for an off-chain payout.
+    ///
+    /// Refuses unless this wallet derives `expected_pubkey` for `entry_id`, so
+    /// a wrong or server-substituted entry cannot extract any other key.
+    pub fn payout_release(
         &self,
-        entry_index: u32,
-        nostr_pubkey: &str,
-    ) -> Result<String, WalletError> {
-        if let Some(entry) = self.get_dlc_entry(entry_index) {
-            self.encrypt_key(&SecretString::from(entry.payout_preimage), nostr_pubkey)
-                .await
-        } else {
-            Err(WalletError::DlcEntryNotFound(entry_index))
+        entry_id: Uuid,
+        expected_pubkey: &str,
+    ) -> Result<PayoutRelease, WalletError> {
+        let key = self.entry_key(entry_id)?;
+        if expected_pubkey.parse::<Point>().ok() != Some(key.point()) {
+            return Err(WalletError::ForeignEntry(entry_id));
         }
+        Ok(PayoutRelease {
+            ephemeral_private_key: key.secret_hex().to_string(),
+            payout_preimage: key.payout_preimage_hex().to_string(),
+        })
     }
 
-    pub async fn get_dlc_public_key(&self, entry_index: u32) -> Result<String, WalletError> {
-        let child_xpriv = self.derive_dlc_key(entry_index)?;
-
-        let secret_bytes = child_xpriv.private_key.secret_bytes();
-        let secret_scalar = Scalar::from_hex(&hex::encode(secret_bytes)).map_err(|e| {
-            WalletError::KeyError(format!("Failed to convert key to scalar: {}", e))
-        })?;
-
-        let point = secret_scalar.base_point_mul();
-        Ok(point.to_string())
-    }
-
-    pub fn derive_dlc_key(&self, entry_index: u32) -> Result<Xpriv, WalletError> {
-        // BIP86 path for Taproot: m/86'/0'/contract_index'
-        let path = format!("m/86'/0'/{}'/0/0", entry_index);
-        debug!("Deriving key with path: {}", path);
-
-        let path = DerivationPath::from_str(&path)
-            .map_err(|e| WalletError::DlcKeyError(format!("Invalid derivation path: {}", e)))?;
-
-        let secp = BdkSecp256k1::new();
-        let master_xpriv =
-            dlctix::bitcoin::bip32::Xpriv::from_str(self.extended_key.expose_secret())
-                .map_err(|e| WalletError::DlcKeyError(format!("Invalid master key: {}", e)))?;
-        debug!(
-            "Master key fingerprint: {}",
-            master_xpriv.fingerprint(&BdkSecp256k1::new())
-        );
-
-        let child_xpriv = master_xpriv
-            .derive_priv(&secp, &path)
-            .map_err(|e| WalletError::DlcKeyError(format!("Key derivation error: {}", e)))?;
-
-        Ok(child_xpriv)
-    }
-
-    pub fn add_entry_index(&mut self, entry_index: u32) -> Result<String, WalletError> {
-        let child_xpriv = self.derive_dlc_key(entry_index)?;
-        let payout_preimage =
-            self.generate_preimage_from_secret(child_xpriv.private_key.secret_bytes());
-
-        //TODO: this should be a lightning invoice hash
-        let payout_hash = self.generate_preimage_from_secret(payout_preimage);
-
-        let payout_preimage = SecretString::from(hex::encode(payout_preimage));
-        let payout_hash = hex::encode(payout_hash);
-
-        self.dlc_contracts.insert(
-            entry_index,
-            DlcEntry {
-                contract: None,
-                data: DlcEntryData {
-                    payout_preimage,
-                    params: None,
-                    funding_outpoint: None,
-                    ticket_preimage: None,
-                },
-            },
-        );
-
-        Ok(payout_hash)
-    }
-
-    fn generate_preimage_from_secret(&self, secret_bytes: [u8; 32]) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(secret_bytes);
-        hasher.finalize().into()
-    }
-
-    pub fn get_dlc_entry(&self, entry_index: u32) -> Option<DlcEntryData> {
-        let entry = self.dlc_contracts.get(&entry_index)?;
-        Some(entry.data.clone())
-    }
-
+    /// Accept contract parameters for an entry after checking that they
+    /// include this entry's key with the payout hash the wallet generated.
     pub fn add_contract(
         &mut self,
-        entry_index: u32,
+        entry_id: Uuid,
         params: ContractParameters,
         funding_outpoint: OutPoint,
     ) -> Result<(), WalletError> {
-        let contract = TicketedDLC::new(params.clone(), funding_outpoint)
-            .map_err(|e| WalletError::ContractError(e.to_string()))?;
+        let key = self.entry_key(entry_id)?;
+        let our_point = key.point();
+        let player = params
+            .players
+            .iter()
+            .find(|player| player.pubkey == our_point)
+            .ok_or_else(|| WalletError::Contract("our entry key is not a player".into()))?;
+        if player.payout_hash != key.payout_hash() {
+            return Err(WalletError::Contract(
+                "player payout hash does not match this entry".into(),
+            ));
+        }
 
-        let Some(dlc_data) = self.dlc_contracts.get_mut(&entry_index) else {
-            return Err(WalletError::NoContract(entry_index));
-        };
-
-        dlc_data.contract = Some(contract);
-        dlc_data.data.funding_outpoint = Some(funding_outpoint);
-        dlc_data.data.params = Some(params);
+        let params_digest = json_digest(&params)?;
+        let dlc = TicketedDLC::new(params, funding_outpoint)
+            .map_err(|e| WalletError::Contract(e.to_string()))?;
+        self.contracts.insert(
+            entry_id,
+            EntryContract {
+                dlc,
+                params_digest,
+                signed_aggregate: None,
+            },
+        );
         Ok(())
     }
 
-    fn reconstruct_contract(&self, entry_index: u32) -> Result<TicketedDLC, WalletError> {
-        let Some(entry) = self.dlc_contracts.get(&entry_index) else {
-            return Err(WalletError::NoContract(entry_index));
-        };
-
-        let Some(ref params) = entry.data.params else {
-            return Err(WalletError::ContractError("No parameters found".into()));
-        };
-
-        let Some(funding_outpoint) = entry.data.funding_outpoint else {
-            return Err(WalletError::ContractError(
-                "No funding outpoint found".into(),
-            ));
-        };
-
-        // Reconstruct the contract from parameters
-        TicketedDLC::new(params.clone(), funding_outpoint)
-            .map_err(|e| WalletError::ContractError(e.to_string()))
-    }
-
-    pub fn generate_public_nonces(
-        &mut self,
-        entry_index: u32,
-    ) -> Result<dlctix::SigMap<dlctix::musig2::PubNonce>, WalletError> {
-        let contract = self.reconstruct_contract(entry_index)?;
-
-        let funding_outpoint = contract.funding_outpoint();
-
-        let child_xpriv = self.derive_dlc_key(entry_index)?;
-        let secret_bytes = child_xpriv.private_key.secret_bytes();
-        let secret_scalar = Scalar::from_hex(&hex::encode(secret_bytes)).map_err(|e| {
-            WalletError::KeyError(format!("Failed to convert key to scalar: {}", e))
-        })?;
-
-        let mut rng = self.create_deterministic_rng(&funding_outpoint, secret_scalar);
-
-        let signing_session =
-            SigningSession::<NonceSharingRound>::new(contract.to_owned(), &mut rng, secret_scalar)
-                .map_err(|e| WalletError::DlcError(e.to_string()))?;
-
-        Ok(signing_session.our_public_nonces().to_owned())
-    }
-
-    pub fn sign_aggregate_nonces(
+    /// Rebuild the MuSig2 session for an entry.
+    ///
+    /// The MuSig rounds are separated by waiting for every other player, and
+    /// the page may reload in between, so secret nonces are not stored: they
+    /// are re-derived from a seed and must reproduce the public nonces sent in
+    /// round one. The seed binds the entry key, the funding outpoint and the
+    /// full contract parameters, so a different contract never reuses a nonce.
+    fn signing_session(
         &self,
-        aggregate_nonces: SigMap<AggNonce>,
-        entry_index: u32,
-    ) -> Result<SigMap<PartialSignature>, WalletError> {
-        let contract = self.reconstruct_contract(entry_index)?;
-
-        // Get funding outpoint for deterministic RNG
-        let funding_outpoint = contract.funding_outpoint();
-
-        let child_xpriv = self.derive_dlc_key(entry_index)?;
-
-        let secret_bytes = child_xpriv.private_key.secret_bytes();
-        let secret_scalar = Scalar::from_hex(&hex::encode(secret_bytes)).map_err(|e| {
-            WalletError::KeyError(format!("Failed to convert key to scalar: {}", e))
-        })?;
-
-        let pubkey = secret_scalar.base_point_mul();
-        debug!("Client signing");
-
-        contract
-            .params()
-            .players
-            .iter()
-            .position(|p| p.pubkey == pubkey)
-            .ok_or_else(|| WalletError::DlcError("Player not found in contract".into()))?;
-
-        debug!("Contract parameters: {:?}", contract.params());
-        debug!("Received aggregate nonces: {:?}", aggregate_nonces);
-
-        let mut rng = self.create_deterministic_rng(&funding_outpoint, secret_scalar);
-
-        let initial_session =
-            SigningSession::<NonceSharingRound>::new(contract.to_owned(), &mut rng, secret_scalar)
-                .map_err(|e| WalletError::DlcError(e.to_string()))?;
-
-        debug!("Generated initial nonces");
-
-        // Use all aggregate nonces for signing
-        let partial_sigs = initial_session
-            .compute_partial_signatures(aggregate_nonces)
-            .map_err(|e| WalletError::DlcError(format!("Signature computation failed: {}", e)))?;
-
-        debug!("Generated partial signatures");
-
-        Ok(partial_sigs.our_partial_signatures().to_owned())
+        entry_id: Uuid,
+        contract: &EntryContract,
+    ) -> Result<SigningSession<NonceSharingRound>, WalletError> {
+        let key = self.entry_key(entry_id)?;
+        let outpoint = contract.dlc.funding_outpoint();
+        let tag = Sha256::digest(b"coordinator/musig-nonce/v1");
+        let seed = Zeroizing::new(<[u8; 32]>::from(
+            Sha256::new()
+                .chain_update(tag)
+                .chain_update(tag)
+                .chain_update(&key.secret_bytes()[..])
+                .chain_update(outpoint.txid.to_byte_array())
+                .chain_update(outpoint.vout.to_le_bytes())
+                .chain_update(contract.params_digest)
+                .finalize(),
+        ));
+        let mut rng = ChaCha20Rng::from_seed(*seed);
+        SigningSession::<NonceSharingRound>::new(contract.dlc.clone(), &mut rng, key.scalar())
+            .map_err(|e| WalletError::Signing(e.to_string()))
     }
 
-    pub fn sign_funding_psbt(&self, mut psbt: Psbt, entry_index: u32) -> Result<Psbt, WalletError> {
-        // Derive the child key specific to this DLC entry
-        let child_xpriv = self.derive_dlc_key(entry_index)?;
-        let child_privkey = child_xpriv.to_priv();
-        let secp = BdkSecp256k1::new();
-        let child_pubkey = PublicKey::from_private_key(&secp, &child_privkey);
+    /// Round one: this entry's public nonces. Repeatable; always the same
+    /// nonces for the same accepted contract.
+    pub fn generate_public_nonces(&self, entry_id: Uuid) -> Result<SigMap<PubNonce>, WalletError> {
+        let contract = self
+            .contracts
+            .get(&entry_id)
+            .ok_or(WalletError::NoContract(entry_id))?;
+        Ok(self
+            .signing_session(entry_id, contract)?
+            .our_public_nonces()
+            .clone())
+    }
 
-        debug!(
-            "Signing funding PSBT for entry {} with derived pubkey: {}",
-            entry_index, child_pubkey
-        );
+    /// Round two: partial signatures under the coordinator's aggregate nonces.
+    ///
+    /// The nonces are deterministic, so signing a *different* aggregate with
+    /// them would give the coordinator a second equation in the entry key
+    /// (three recover it). Re-signing the same aggregate is harmless: it
+    /// reproduces the same signatures. This guard only lasts for the page
+    /// session; a caller that wires this flow up must also persist the signed
+    /// digest per entry.
+    pub fn sign_aggregate_nonces(
+        &mut self,
+        aggregate_nonces: SigMap<AggNonce>,
+        entry_id: Uuid,
+    ) -> Result<SigMap<PartialSignature>, WalletError> {
+        let digest = json_digest(&aggregate_nonces)?;
+        let contract = self
+            .contracts
+            .get(&entry_id)
+            .ok_or(WalletError::NoContract(entry_id))?;
+        if contract
+            .signed_aggregate
+            .is_some_and(|signed| signed != digest)
+        {
+            return Err(WalletError::ConflictingAggregateNonces(entry_id));
+        }
 
-        let mut signed_count = 0;
+        let signed = self
+            .signing_session(entry_id, contract)?
+            .compute_partial_signatures(aggregate_nonces)
+            .map_err(|e| WalletError::Signing(e.to_string()))?;
+        if let Some(contract) = self.contracts.get_mut(&entry_id) {
+            contract.signed_aggregate = Some(digest);
+        }
+        Ok(signed.our_partial_signatures().clone())
+    }
 
-        // Clone the transaction for sighash computation
+    /// Sign this entry's escrow input(s) in the contract funding transaction.
+    ///
+    /// The PSBT comes from the coordinator and is untrusted. Before signing:
+    /// - its transaction must be the one whose output the accepted contract
+    ///   spends (same txid, and the funding output at the contract's vout);
+    /// - each signed input's witness script must hash to its P2WSH prevout and
+    ///   contain this entry's key as a push;
+    /// - the sighash type must be `ALL`, so the transaction cannot be changed
+    ///   after signing.
+    pub fn sign_funding_psbt(&self, mut psbt: Psbt, entry_id: Uuid) -> Result<Psbt, WalletError> {
+        let contract = self
+            .contracts
+            .get(&entry_id)
+            .ok_or(WalletError::NoContract(entry_id))?;
+        check_funds_contract(
+            &psbt,
+            contract.dlc.funding_outpoint(),
+            &contract.dlc.funding_output(),
+        )?;
+
+        let key = self.entry_key(entry_id)?;
+        let our_pubkey = PublicKey::new(key.pubkey);
         let tx = psbt.unsigned_tx.clone();
+        let mut sighashes = SighashCache::new(&tx);
+        let mut signed = 0usize;
 
-        // Process each input in the PSBT
-        for (input_index, input) in psbt.inputs.iter_mut().enumerate() {
-            // Check if this is an escrow input by looking for witness_script
-            let witness_script = match &input.witness_script {
-                Some(ws) => ws,
-                None => {
-                    debug!(
-                        "Input {} is not an escrow input (no witness_script), skipping",
-                        input_index
-                    );
-                    continue;
-                }
+        for (index, input) in psbt.inputs.iter_mut().enumerate() {
+            let Some(witness_script) = &input.witness_script else {
+                continue;
             };
-
-            // Ensure we have the witness UTXO for signing
-            let witness_utxo = input.witness_utxo.as_ref().ok_or_else(|| {
-                WalletError::KeyError(format!(
-                    "Missing witness_utxo for escrow input {}",
-                    input_index
-                ))
+            if !script_pushes_key(witness_script, &our_pubkey) {
+                continue;
+            }
+            let prevout = input.witness_utxo.as_ref().ok_or_else(|| {
+                reject(format!("escrow input {index} is missing its witness UTXO"))
             })?;
-
-            // Check if we already have a signature from this key
-            if input.partial_sigs.contains_key(&child_pubkey) {
-                debug!("Input {} already has our signature, skipping", input_index);
-                continue;
+            if prevout.script_pubkey != ScriptBuf::new_p2wsh(&witness_script.wscript_hash()) {
+                return Err(reject(format!(
+                    "escrow input {index} witness script does not match its prevout"
+                )));
             }
-
-            // For miniscript escrow, verify our key is actually needed
-            // Simple verification: check if our public key bytes appear in the witness script
-            let script_bytes = witness_script.as_bytes();
-            let pubkey_bytes = child_pubkey.to_bytes();
-
-            let key_found = script_bytes
-                .windows(pubkey_bytes.len())
-                .any(|window| window == pubkey_bytes);
-
-            if !key_found {
-                debug!(
-                    "Our pubkey {} not found in witness script for input {}, skipping",
-                    child_pubkey, input_index
-                );
-                continue;
-            }
-
-            debug!(
-                "Found our key in escrow input {}, creating signature",
-                input_index
-            );
-
-            // Get the sighash type from PSBT or default to ALL
-            let sighash_type = match input.sighash_type {
-                Some(psbt_type) => {
-                    EcdsaSighashType::from_standard(psbt_type.to_u32()).map_err(|_| {
-                        WalletError::KeyError("Invalid sighash type in PSBT".to_string())
-                    })?
+            if let Some(requested) = input.sighash_type {
+                if requested.ecdsa_hash_ty() != Ok(EcdsaSighashType::All) {
+                    return Err(reject(format!(
+                        "escrow input {index} requests sighash {requested}, only ALL is allowed"
+                    )));
                 }
-                None => EcdsaSighashType::All,
-            };
+            }
 
-            // Create a sighash cache for the transaction
-            let mut sighash_cache = SighashCache::new(&tx);
-
-            // Compute the signature hash
-            let sighash = sighash_cache
-                .p2wsh_signature_hash(
-                    input_index,
-                    witness_script,
-                    witness_utxo.value,
-                    sighash_type,
-                )
-                .map_err(|e| {
-                    WalletError::KeyError(format!(
-                        "Failed to compute sighash for input {}: {}",
-                        input_index, e
-                    ))
-                })?;
-
-            // Create the ECDSA signature
-            let message = Message::from_digest(sighash.to_byte_array());
-            let signature = secp.sign_ecdsa(&message, &child_privkey.inner);
-
-            // Create ecdsa::Signature with the signature and sighash type
-            let ecdsa_sig = ecdsa::Signature {
-                signature,
-                sighash_type,
-            };
-
-            input.partial_sigs.insert(child_pubkey, ecdsa_sig);
-            signed_count += 1;
-
-            debug!(
-                "Added signature for escrow input {} (witness script: {} bytes)",
-                input_index,
-                witness_script.len()
+            let sighash = sighashes
+                .p2wsh_signature_hash(index, witness_script, prevout.value, EcdsaSighashType::All)
+                .map_err(|e| reject(format!("sighash for input {index}: {e}")))?;
+            let signature =
+                key.sign_ecdsa(&self.secp, &Message::from_digest(sighash.to_byte_array()));
+            input.partial_sigs.insert(
+                our_pubkey,
+                ecdsa::Signature {
+                    signature,
+                    sighash_type: EcdsaSighashType::All,
+                },
             );
+            signed += 1;
         }
 
-        match signed_count {
-            0 => debug!(
-                "No escrow inputs were signed - our key may not be required for these inputs"
-            ),
-            n => debug!(
-                "Successfully signed {} escrow input(s) for entry {}",
-                n, entry_index
-            ),
+        if signed == 0 {
+            return Err(reject(
+                "no escrow input is locked to this entry's key".into(),
+            ));
         }
-
         Ok(psbt)
     }
 
-    fn create_deterministic_rng(
-        &self,
-        funding_outpoint: &OutPoint,
-        private_key: Scalar,
-    ) -> ChaCha20Rng {
-        let mut hasher = sha256::Hash::engine();
-
-        hasher.write_all(&funding_outpoint.txid[..]).unwrap();
-        hasher
-            .write_all(&funding_outpoint.vout.to_le_bytes())
-            .unwrap();
-        hasher.write_all(&private_key.serialize()).unwrap();
-
-        let hash = sha256::Hash::from_engine(hasher);
-        let seed: [u8; 32] = hash.to_byte_array();
-        ChaCha20Rng::from_seed(seed)
-    }
-
-    pub fn get_current_outcome(
-        &self,
+    /// The contract outcome selected by the oracle's attestation.
+    pub fn current_outcome(
         attestation: MaybeScalar,
-        event_announcement: EventLockingConditions,
+        event: &EventLockingConditions,
     ) -> Result<Outcome, WalletError> {
         let locking_point = attestation.base_point_mul();
-        let outcome = event_announcement
+        event
             .all_outcomes()
             .into_iter()
-            .find(|outcome| {
-                match outcome {
-                    Outcome::Attestation(i) => {
-                        // Check if this outcome's locking point matches our attestation point
-                        event_announcement.locking_points[*i] == locking_point
-                    }
-                    Outcome::Expiry => false,
-                }
+            .find(|outcome| match outcome {
+                Outcome::Attestation(i) => event.locking_points.get(*i) == Some(&locking_point),
+                Outcome::Expiry => false,
             })
-            .ok_or_else(|| WalletError::NoMatchingOutcome)?;
+            .ok_or(WalletError::NoMatchingOutcome)
+    }
+}
 
-        debug!("Found outcome: {:?}", outcome);
-        Ok(outcome)
+fn signer(client: &NostrClientCore) -> Result<&CustomSigner, WalletError> {
+    client
+        .signer
+        .as_ref()
+        .ok_or(WalletError::NostrNotInitialized)
+}
+
+fn signer_error(error: impl std::fmt::Display) -> WalletError {
+    WalletError::Signer(error.to_string())
+}
+
+fn json_digest<T: serde::Serialize>(value: &T) -> Result<[u8; 32], WalletError> {
+    let json = serde_json::to_vec(value).map_err(|e| WalletError::Contract(e.to_string()))?;
+    Ok(Sha256::digest(json).into())
+}
+
+fn reject(reason: String) -> WalletError {
+    WalletError::FundingPsbtRejected(reason)
+}
+
+fn check_funds_contract(
+    psbt: &Psbt,
+    funding_outpoint: OutPoint,
+    funding_output: &TxOut,
+) -> Result<(), WalletError> {
+    if psbt.unsigned_tx.compute_txid() != funding_outpoint.txid {
+        return Err(reject(
+            "transaction is not the accepted contract's funding transaction".into(),
+        ));
+    }
+    let vout = usize::try_from(funding_outpoint.vout).unwrap_or(usize::MAX);
+    if psbt.unsigned_tx.output.get(vout) != Some(funding_output) {
+        return Err(reject(
+            "transaction does not pay the contract funding output".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn script_pushes_key(script: &ScriptBuf, key: &PublicKey) -> bool {
+    let key = key.to_bytes();
+    script.instructions().any(|instruction| {
+        matches!(instruction, Ok(Instruction::PushBytes(bytes)) if bytes.as_bytes() == key.as_slice())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dlctix::{
+        bitcoin::{
+            absolute::LockTime, psbt::PsbtSighashType, transaction::Version, Amount, FeeRate,
+            OutPoint, Sequence, Transaction, TxIn, Witness,
+        },
+        hashlock,
+        secp::{MaybePoint, Scalar},
+        MarketMaker, PayoutWeights, Player,
+    };
+    use std::collections::BTreeMap;
+
+    struct Fixture {
+        wallet: DlcWalletCore,
+        entry_id: Uuid,
+        params: ContractParameters,
+        market_maker_key: Scalar,
+        other_player_key: Scalar,
+    }
+
+    fn fixture() -> Fixture {
+        let wallet = DlcWalletCore::create(&NostrClientCore::default(), Network::Signet);
+        let entry_id = Uuid::now_v7();
+        let key = wallet.entry_key(entry_id).unwrap();
+        let mut rng = rand::rng();
+
+        let market_maker_key = Scalar::random(&mut rng);
+        let other_player_key = Scalar::random(&mut rng);
+        let other = Player {
+            pubkey: other_player_key.base_point_mul(),
+            ticket_hash: hashlock::sha256(&hashlock::preimage_random(&mut rng)),
+            payout_hash: hashlock::sha256(&hashlock::preimage_random(&mut rng)),
+        };
+        let us = Player {
+            pubkey: key.point(),
+            ticket_hash: hashlock::sha256(&hashlock::preimage_random(&mut rng)),
+            payout_hash: key.payout_hash(),
+        };
+        let oracle = Scalar::random(&mut rng).base_point_mul();
+        let nonce = Scalar::random(&mut rng).base_point_mul();
+        let locking_points: Vec<MaybePoint> = [b"us".as_slice(), b"them".as_slice()]
+            .iter()
+            .map(|msg| dlctix::attestation_locking_point(oracle, nonce, msg))
+            .collect();
+
+        let params = ContractParameters {
+            market_maker: MarketMaker {
+                pubkey: market_maker_key.base_point_mul(),
+            },
+            players: vec![us, other],
+            event: EventLockingConditions {
+                locking_points,
+                expiry: None,
+            },
+            outcome_payouts: BTreeMap::from([
+                (Outcome::Attestation(0), PayoutWeights::from([(0, 1)])),
+                (Outcome::Attestation(1), PayoutWeights::from([(1, 1)])),
+            ]),
+            fee_rate: FeeRate::from_sat_per_vb_unchecked(1),
+            funding_value: Amount::from_sat(100_000),
+            relative_locktime_block_delta: 72,
+        };
+        Fixture {
+            wallet,
+            entry_id,
+            params,
+            market_maker_key,
+            other_player_key,
+        }
+    }
+
+    /// A funding PSBT spending one P2WSH escrow input locked to `escrow_key`.
+    fn funding_psbt(f: &Fixture, escrow_key: PublicKey) -> Psbt {
+        let witness_script = ScriptBuf::builder()
+            .push_key(&escrow_key)
+            .push_opcode(dlctix::bitcoin::opcodes::all::OP_CHECKSIG)
+            .into_script();
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![f.params.funding_output().unwrap()],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(120_000),
+            script_pubkey: ScriptBuf::new_p2wsh(&witness_script.wscript_hash()),
+        });
+        psbt.inputs[0].witness_script = Some(witness_script);
+        psbt
+    }
+
+    fn our_key(f: &Fixture) -> PublicKey {
+        PublicKey::new(f.wallet.entry_key(f.entry_id).unwrap().pubkey)
+    }
+
+    /// Fixture with the contract accepted against `psbt`'s funding output.
+    fn accepted(mut f: Fixture, psbt: &Psbt) -> Fixture {
+        let outpoint = OutPoint::new(psbt.unsigned_tx.compute_txid(), 0);
+        let params = f.params.clone();
+        f.wallet.add_contract(f.entry_id, params, outpoint).unwrap();
+        f
+    }
+
+    fn rejected(result: Result<Psbt, WalletError>) -> bool {
+        matches!(result, Err(WalletError::FundingPsbtRejected(_)))
+    }
+
+    #[test]
+    fn contract_without_our_key_is_refused() {
+        let mut f = fixture();
+        f.params.players.remove(0);
+        let result = f
+            .wallet
+            .add_contract(f.entry_id, f.params.clone(), OutPoint::null());
+        assert!(matches!(result, Err(WalletError::Contract(_))));
+    }
+
+    #[test]
+    fn contract_with_foreign_payout_hash_is_refused() {
+        let mut f = fixture();
+        f.params.players[0].payout_hash = [7u8; 32];
+        let result = f
+            .wallet
+            .add_contract(f.entry_id, f.params.clone(), OutPoint::null());
+        assert!(matches!(result, Err(WalletError::Contract(_))));
+    }
+
+    #[test]
+    fn partial_signatures_verify_after_wallet_reload() {
+        let f = fixture();
+        let psbt = funding_psbt(&f, our_key(&f));
+        let mut f = accepted(f, &psbt);
+        let id = f.entry_id;
+        let dlc = f.wallet.contracts[&id].dlc.clone();
+        let our_point = f.wallet.entry_key(id).unwrap().point();
+
+        // Round one: every signer publishes nonces; the market maker aggregates.
+        let our_nonces = f.wallet.generate_public_nonces(id).unwrap();
+        let other = SigningSession::<NonceSharingRound>::new(
+            dlc.clone(),
+            &mut rand::rng(),
+            f.other_player_key,
+        )
+        .unwrap();
+        let market_maker =
+            SigningSession::<NonceSharingRound>::new(dlc, &mut rand::rng(), f.market_maker_key)
+                .unwrap()
+                .aggregate_nonces_and_compute_partial_signatures(BTreeMap::from([
+                    (our_point, our_nonces),
+                    (
+                        f.other_player_key.base_point_mul(),
+                        other.our_public_nonces().clone(),
+                    ),
+                ]))
+                .unwrap();
+
+        // The page reloads: the wallet forgets everything but the contract.
+        let outpoint = OutPoint::new(psbt.unsigned_tx.compute_txid(), 0);
+        f.wallet.contracts.clear();
+        f.wallet
+            .add_contract(id, f.params.clone(), outpoint)
+            .unwrap();
+
+        // Round two: the re-derived nonces must match the ones sent in round one.
+        let signatures = f
+            .wallet
+            .sign_aggregate_nonces(market_maker.aggregated_nonces().clone(), id)
+            .unwrap();
+        market_maker
+            .verify_partial_signatures(our_point, &signatures)
+            .expect("partial signatures from re-derived nonces verify");
+    }
+
+    #[test]
+    fn nonces_change_with_contract_params() {
+        let f = fixture();
+        let psbt = funding_psbt(&f, our_key(&f));
+        let mut f = accepted(f, &psbt);
+        let id = f.entry_id;
+        let before = f.wallet.generate_public_nonces(id).unwrap();
+
+        let mut changed = f.params.clone();
+        changed.fee_rate = FeeRate::from_sat_per_vb_unchecked(2);
+        let outpoint = OutPoint::new(psbt.unsigned_tx.compute_txid(), 0);
+        f.wallet.add_contract(id, changed, outpoint).unwrap();
+
+        assert_ne!(f.wallet.generate_public_nonces(id).unwrap(), before);
+    }
+
+    #[test]
+    fn refuses_to_sign_a_second_aggregate_nonce() {
+        let f = fixture();
+        let psbt = funding_psbt(&f, our_key(&f));
+        let mut f = accepted(f, &psbt);
+        let id = f.entry_id;
+        let nonces = f.wallet.generate_public_nonces(id).unwrap();
+        let first = nonces
+            .clone()
+            .map_values(|nonce| AggNonce::sum([nonce.clone()]));
+        let second = nonces.map_values(|nonce| AggNonce::sum([nonce.clone(), nonce.clone()]));
+
+        let signed = f.wallet.sign_aggregate_nonces(first.clone(), id).unwrap();
+        assert_eq!(
+            f.wallet.sign_aggregate_nonces(first, id).unwrap(),
+            signed,
+            "re-signing the same aggregate is idempotent"
+        );
+        assert!(matches!(
+            f.wallet.sign_aggregate_nonces(second, id),
+            Err(WalletError::ConflictingAggregateNonces(_))
+        ));
+    }
+
+    #[test]
+    fn signs_escrow_input_of_accepted_funding_tx() {
+        let f = fixture();
+        let psbt = funding_psbt(&f, our_key(&f));
+        let f = accepted(f, &psbt);
+
+        let signed = f.wallet.sign_funding_psbt(psbt, f.entry_id).unwrap();
+        assert!(signed.inputs[0].partial_sigs.contains_key(&our_key(&f)));
+    }
+
+    #[test]
+    fn refuses_tampered_funding_tx() {
+        let f = fixture();
+        let mut psbt = funding_psbt(&f, our_key(&f));
+        let f = accepted(f, &psbt);
+        psbt.unsigned_tx.output.push(TxOut {
+            value: Amount::from_sat(10_000),
+            script_pubkey: ScriptBuf::new(),
+        });
+        psbt.outputs.push(Default::default());
+
+        assert!(rejected(f.wallet.sign_funding_psbt(psbt, f.entry_id)));
+    }
+
+    #[test]
+    fn refuses_non_all_sighash() {
+        let f = fixture();
+        let mut psbt = funding_psbt(&f, our_key(&f));
+        let f = accepted(f, &psbt);
+        psbt.inputs[0].sighash_type = Some(PsbtSighashType::from(EcdsaSighashType::None));
+
+        assert!(rejected(f.wallet.sign_funding_psbt(psbt, f.entry_id)));
+    }
+
+    #[test]
+    fn refuses_witness_script_not_matching_prevout() {
+        let f = fixture();
+        let mut psbt = funding_psbt(&f, our_key(&f));
+        let f = accepted(f, &psbt);
+        psbt.inputs[0].witness_utxo.as_mut().unwrap().script_pubkey = ScriptBuf::new();
+
+        assert!(rejected(f.wallet.sign_funding_psbt(psbt, f.entry_id)));
+    }
+
+    #[test]
+    fn refuses_psbt_without_our_escrow_input() {
+        let f = fixture();
+        let stranger = PublicKey::new(f.wallet.entry_key(Uuid::now_v7()).unwrap().pubkey);
+        let psbt = funding_psbt(&f, stranger);
+        let f = accepted(f, &psbt);
+
+        assert!(rejected(f.wallet.sign_funding_psbt(psbt, f.entry_id)));
+    }
+
+    #[test]
+    fn payout_release_requires_matching_entry_pubkey() {
+        let f = fixture();
+        let ours = f.wallet.entry_registration(f.entry_id).unwrap();
+        let other = f.wallet.entry_registration(Uuid::now_v7()).unwrap();
+
+        assert!(f
+            .wallet
+            .payout_release(f.entry_id, &ours.ephemeral_pubkey)
+            .is_ok());
+        assert!(matches!(
+            f.wallet.payout_release(f.entry_id, &other.ephemeral_pubkey),
+            Err(WalletError::ForeignEntry(_))
+        ));
+        assert!(matches!(
+            f.wallet.payout_release(f.entry_id, "not a pubkey"),
+            Err(WalletError::ForeignEntry(_))
+        ));
     }
 }

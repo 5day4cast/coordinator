@@ -54,9 +54,7 @@ pub struct AddEntry {
     pub id: Uuid,
     pub ticket_id: Uuid,
     pub ephemeral_pubkey: String,
-    pub ephemeral_privatekey_encrypted: String,
     pub payout_hash: String,
-    pub payout_preimage_encrypted: String,
     pub event_id: Uuid,
     pub expected_observations: Vec<WeatherChoices>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -113,13 +111,15 @@ impl CoordinatorClient {
             btc_pubkey: btc_pubkey.to_string(),
         };
 
+        let body = serde_json::to_vec(&body)?;
         let auth = create_auth_header(keys, "POST", &url, Some(&body)).await?;
 
         let resp = self
             .http()
             .post(&url)
             .header("Authorization", auth)
-            .json(&body)
+            .header("Content-Type", "application/json")
+            .body(body)
             .send()
             .await
             .context("Failed to request ticket")?;
@@ -147,7 +147,7 @@ impl CoordinatorClient {
             ticket_id
         );
 
-        let auth = create_auth_header::<()>(keys, "GET", &url, None).await?;
+        let auth = create_auth_header(keys, "GET", &url, None).await?;
 
         let resp = self
             .http()
@@ -172,13 +172,15 @@ impl CoordinatorClient {
     pub async fn submit_entry(&self, keys: &Keys, entry: &AddEntry) -> Result<EntryResponse> {
         let url = format!("{}/api/v1/entries", self.base_url());
 
-        let auth = create_auth_header(keys, "POST", &url, Some(entry)).await?;
+        let body = serde_json::to_vec(entry)?;
+        let auth = create_auth_header(keys, "POST", &url, Some(&body)).await?;
 
         let resp = self
             .http()
             .post(&url)
             .header("Authorization", auth)
-            .json(entry)
+            .header("Content-Type", "application/json")
+            .body(body)
             .send()
             .await
             .context("Failed to submit entry")?;
@@ -203,7 +205,7 @@ impl CoordinatorClient {
             url = format!("{}?event_id={}", url, id);
         }
 
-        let auth = create_auth_header::<()>(keys, "GET", &url, None).await?;
+        let auth = create_auth_header(keys, "GET", &url, None).await?;
 
         let resp = self
             .http()

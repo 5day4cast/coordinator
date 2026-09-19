@@ -15,7 +15,10 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{
-    api::{extractors::NostrAuth, routes::ApiError},
+    api::{
+        extractors::{AuthedJson, NostrAuth},
+        routes::ApiError,
+    },
     domain::{
         AddEntry, Competition, CreateEvent, FundedContract, PayoutInfo, SearchBy, TicketResponse,
         TicketStatus, UserEntry,
@@ -74,10 +77,12 @@ pub struct TicketRequest {
 /// - The ticket secret (to claim winnings if user wins the DLC)
 /// - The escrow transaction refund path (to claim refund if needed)
 pub async fn request_competition_ticket(
-    NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
     Path(competition_id): Path<Uuid>,
-    Json(request): Json<TicketRequest>,
+    AuthedJson {
+        auth: NostrAuth { pubkey, .. },
+        body: request,
+    }: AuthedJson<TicketRequest>,
 ) -> Result<Json<TicketResponse>, ApiError> {
     let btc_pubkey = PublicKey::from_str(&request.btc_pubkey).map_err(|e| {
         error!("Invalid Bitcoin public key: {:?}", e);
@@ -117,9 +122,11 @@ pub async fn get_ticket_status(
 3) server marks ticket as paid -> include in competition
 */
 pub async fn add_event_entry(
-    NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
-    Json(body): Json<AddEntry>,
+    AuthedJson {
+        auth: NostrAuth { pubkey, .. },
+        body,
+    }: AuthedJson<AddEntry>,
 ) -> Result<Json<UserEntry>, ApiError> {
     let pubkey = pubkey.to_hex();
     state
@@ -210,10 +217,12 @@ pub async fn get_contract_parameters(
 }
 
 pub async fn submit_public_nonces(
-    NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
     Path((competition_id, entry_id)): Path<(Uuid, Uuid)>,
-    Json(public_nonces): Json<SigMap<PubNonce>>,
+    AuthedJson {
+        auth: NostrAuth { pubkey, .. },
+        body: public_nonces,
+    }: AuthedJson<SigMap<PubNonce>>,
 ) -> Result<StatusCode, ApiError> {
     let pubkey = pubkey.to_hex();
     debug!("submitted nonce by: {} {:?}", pubkey, public_nonces);
@@ -253,10 +262,12 @@ pub struct FinalSignatures {
 }
 
 pub async fn submit_final_signatures(
-    NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
     Path((competition_id, entry_id)): Path<(Uuid, Uuid)>,
-    Json(final_signatures): Json<FinalSignatures>,
+    AuthedJson {
+        auth: NostrAuth { pubkey, .. },
+        body: final_signatures,
+    }: AuthedJson<FinalSignatures>,
 ) -> Result<StatusCode, ApiError> {
     let pubkey = pubkey.to_hex();
     debug!(
@@ -276,13 +287,15 @@ pub async fn submit_final_signatures(
 }
 
 pub async fn submit_ticket_payout(
-    NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
     Path((competition_id, entry_id)): Path<(Uuid, Uuid)>,
-    Json(payout_info): Json<PayoutInfo>,
+    AuthedJson {
+        auth: NostrAuth { pubkey, .. },
+        body: payout_info,
+    }: AuthedJson<PayoutInfo>,
 ) -> Result<StatusCode, ApiError> {
     let pubkey = pubkey.to_hex();
-    debug!("submitted payout by: {} {:?}", pubkey, payout_info);
+    debug!("submitted payout by: {} for entry {}", pubkey, entry_id);
 
     state
         .coordinator
