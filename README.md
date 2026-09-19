@@ -160,6 +160,34 @@ See [Keymeld security operations](https://github.com/tee8z/keymeld/blob/v0.4.1/d
 See [the authorization design](docs/KEYMELD_AUTHORIZATION_MIGRATION.md) for the credentials the coordinator holds and the checks it enforces.
 Local mock tests do not establish Nitro attestation or live signing compatibility.
 
+### NOAA Oracle 2.0 compatibility
+
+Use the [NOAA Oracle 2.0 API](https://github.com/tee8z/noaa-oracle/blob/master/docs/attestation.md) with dlctix `0.1.0`.
+The event response supplies `nonce_point`, the public nonce commitment.
+The coordinator signs the exact JSON body with a fresh NIP-98 event for each HTTP attempt, including retries.
+
+Set `coordinator_settings.oracle_url` to the oracle's configured `remote_url` origin.
+For Helm, set `oracle.url` to that same origin.
+Add the coordinator's Nostr public key to the oracle's `coordinator_pubkeys` allowlist.
+Use the public key for `coordinator_settings.private_key_file`, not the browser user's key.
+Without these settings, the oracle rejects event creation and entry submission.
+
+The oracle accepts 2–25 entries and 1–5 winning places, with fewer places than entries.
+It limits announcements to 20,000 outcomes.
+Submit entries before the observation window ends.
+Existing NOAA `expected_observations` entries remain supported.
+
+Run the HTTP compatibility test against a disposable oracle with the test coordinator key allowlisted:
+
+```bash
+COORDINATOR_TEST_ORACLE_URL=http://127.0.0.1:9800 \
+COORDINATOR_TEST_ORACLE_KEY=/path/to/test-coordinator.pem \
+cargo test -p coordinator live_noaa_v2_create_read_and_submit_entries -- --ignored
+```
+
+The test creates an event, reads its announcement, and submits two entries.
+It does not test weather ingestion or a funded on-chain settlement.
+
 ### Upgrade from the coordinator-managed wallet
 
 The coordinator now uses the wallet in the configured LND node for on-chain funds.
