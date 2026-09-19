@@ -32,18 +32,6 @@ impl MockBitcoinClient {
             address_counter: AtomicU32::new(0),
         }
     }
-
-    /// Simulate mining a block
-    #[allow(dead_code)]
-    pub fn mine_block(&self) {
-        self.block_height.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// Set the current block height
-    #[allow(dead_code)]
-    pub fn set_block_height(&self, height: u32) {
-        self.block_height.store(height, Ordering::SeqCst);
-    }
 }
 
 #[async_trait]

@@ -112,7 +112,7 @@ impl FromRow<'_, SqliteRow> for EntryPayout {
             })?,
             payout_status,
             payout_payment_request: row.try_get("payout_payment_request")?,
-            payout_amount_sats: row.try_get("payout_amount_sats").unwrap_or(0) as u64,
+            payout_amount_sats: parse_required_u64(row, "payout_amount_sats")?,
             initiated_at: parse_required_datetime(row, "initiated_at")?,
             succeed_at,
             failed_at,
@@ -135,7 +135,9 @@ pub enum PayoutError {
     FailedToPayOut(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Debug` omits the sold payout secrets and they are never serialized: the
+/// browser re-derives them, and no client needs them back.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct UserEntry {
     pub id: Uuid,
     /// The id used by the oracle to assoicate the event with this entry
@@ -153,9 +155,11 @@ pub struct UserEntry {
     pub payout_hash: String,
     /// User's entry submission data (should be able to update until all entries have been collected)
     pub entry_submission: AddEventEntry,
-    /// User provided private de-encrypted, only used during payout
+    /// Sold to the coordinator at payout, plaintext; used to sign the reclaim.
+    #[serde(default, skip_serializing)]
     pub ephemeral_privatekey: Option<String>,
-    /// User provided preimage de-encrypted, only used during payout
+    /// Sold to the coordinator at payout, plaintext; opens the payout hash.
+    #[serde(default, skip_serializing)]
     pub payout_preimage: Option<String>,
     /// User's ephemeral private key encrypted to the keymeld enclave's public key.
     /// Used for server-side keymeld registration.
@@ -182,6 +186,22 @@ pub struct UserEntry {
     #[serde(with = "time::serde::rfc3339::option")]
     pub paid_out_at: Option<OffsetDateTime>,
     pub payout_ln_invoice: Option<String>,
+}
+
+impl std::fmt::Debug for UserEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserEntry")
+            .field("id", &self.id)
+            .field("event_id", &self.event_id)
+            .field("ticket_id", &self.ticket_id)
+            .field("pubkey", &self.pubkey)
+            .field("ephemeral_pubkey", &self.ephemeral_pubkey)
+            .field("payout_hash", &self.payout_hash)
+            .field("signed_at", &self.signed_at)
+            .field("paid_at", &self.paid_at)
+            .field("paid_out_at", &self.paid_out_at)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FromRow<'_, SqliteRow> for UserEntry {
@@ -340,11 +360,14 @@ impl std::fmt::Debug for PayoutInfo {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Debug` omits the preimage; `Ticket` is never serialized to clients.
+#[derive(Clone)]
 pub struct Ticket {
     pub id: Uuid,
     pub competition_id: Uuid,
     pub entry_id: Option<Uuid>,
+    /// Plaintext hex despite the name. Settles the ticket's HODL invoice, so it
+    /// must not reach logs or responses.
     pub encrypted_preimage: String,
     pub hash: String,
     pub payment_request: Option<String>,
@@ -357,6 +380,21 @@ pub struct Ticket {
     pub paid_at: Option<OffsetDateTime>,
     pub settled_at: Option<OffsetDateTime>,
     pub escrow_transaction: Option<String>, // Hex-encoded escrow transaction
+}
+
+impl std::fmt::Debug for Ticket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ticket")
+            .field("id", &self.id)
+            .field("competition_id", &self.competition_id)
+            .field("entry_id", &self.entry_id)
+            .field("hash", &self.hash)
+            .field("reserved_by", &self.reserved_by)
+            .field("reserved_at", &self.reserved_at)
+            .field("paid_at", &self.paid_at)
+            .field("settled_at", &self.settled_at)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FromRow<'_, SqliteRow> for Ticket {
@@ -1235,11 +1273,11 @@ impl FromRow<'_, SqliteRow> for Competition {
             })?,
             created_at: parse_required_datetime(row, "created_at")?,
             event_submission: parse_required_blob_json(row, "event_submission")?,
-            total_entries: row.try_get("total_entries").unwrap_or(0) as u64,
-            total_entry_nonces: row.try_get("total_entry_nonces").unwrap_or(0) as u64,
-            total_signed_entries: row.try_get("total_signed_entries").unwrap_or(0) as u64,
-            total_paid_entries: row.try_get("total_paid_entries").unwrap_or(0) as u64,
-            total_paid_out_entries: row.try_get("total_paid_out_entries").unwrap_or(0) as u64,
+            total_entries: parse_required_u64(row, "total_entries")?,
+            total_entry_nonces: parse_required_u64(row, "total_entry_nonces")?,
+            total_signed_entries: parse_required_u64(row, "total_signed_entries")?,
+            total_paid_entries: parse_required_u64(row, "total_paid_entries")?,
+            total_paid_out_entries: parse_required_u64(row, "total_paid_out_entries")?,
             event_announcement: parse_optional_blob_json(row, "event_announcement")?,
             funding_outpoint: parse_optional_blob_json(row, "funding_outpoint")?,
             funding_psbt_base64: row.get("funding_psbt_base64"),
@@ -1300,4 +1338,14 @@ pub enum CompetitionError {
     Expired(String),
     #[error("Invalid state transition: {0}")]
     InvalidStateTransition(String),
+}
+
+/// A NOT NULL integer or COUNT column as `u64`, failing closed on NULL or a
+/// negative value instead of silently reading zero.
+fn parse_required_u64(row: &SqliteRow, column: &str) -> Result<u64, sqlx::Error> {
+    let value: i64 = row.try_get(column)?;
+    u64::try_from(value).map_err(|e| sqlx::Error::ColumnDecode {
+        index: column.to_string(),
+        source: Box::new(e),
+    })
 }

@@ -64,8 +64,9 @@ three are enough to recover it.
 - The browser refuses a second, different aggregate for the same entry. The
   guard lasts for the page session; persist the signed digest per entry before
   wiring this flow into the UI.
-- The coordinator relies on write-once `public_nonces` and `partial_signatures`
-  fields, and on accepting each entry's nonces only once.
+- The coordinator accepts each entry's nonces and signatures once: the
+  database updates only write into a NULL column, so a repeat is rejected
+  even under concurrent requests.
 
 In production, Keymeld runs MuSig2 inside the enclave and the browser rounds
 are not used. Either way the coordinator, as market maker, verifies the
@@ -122,7 +123,9 @@ that module, and the pins it was built from are in the tagged source.
   can automate payouts but cannot make them atomic, because its invoices use
   the payee's own preimage. The planned fix is an NWC hold invoice whose
   payment hash is `payout_hash`, settled by the browser; Lightning Address
-  payouts stay as the automated, trust-the-coordinator option.
+  payouts stay as the automated, trust-the-coordinator option. Until then,
+  the database allows one live payout per entry, and the payout row is
+  written before the payment is sent.
 - **Admin and wallet routes have no authentication.** `/admin`,
   `/api/v1/wallet/*` and `POST /api/v1/competitions` rely on the gateway
   refusing them on the public name.

@@ -8,7 +8,10 @@
 //! outcome transactions) go to an electrs server over the Electrum protocol.
 //! The coordinator's own key (the seed file) is still used for DLC escrow
 //! signatures, which no wallet can produce on its behalf.
-use crate::{get_key, BitcoinSettings, LnSettings};
+use crate::{
+    config::{BitcoinSettings, LnSettings},
+    infra::secrets::get_key,
+};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};

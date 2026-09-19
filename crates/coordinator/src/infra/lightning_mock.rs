@@ -615,7 +615,7 @@ mod tests {
         assert_eq!(state, InvoiceState::Accepted);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_mock_ln_auto_accept() {
         let client = MockLnClient::with_auto_accept(Duration::from_millis(100));
         let competition_id = Uuid::now_v7();
