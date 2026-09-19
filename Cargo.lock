@@ -2212,8 +2212,8 @@ dependencies = [
 
 [[package]]
 name = "keymeld-core"
-version = "0.4.0"
-source = "git+https://github.com/tee8z/keymeld?rev=f7150cc87ec78a430f0314134ad740d870a714fe#f7150cc87ec78a430f0314134ad740d870a714fe"
+version = "0.4.1"
+source = "git+https://github.com/tee8z/keymeld?tag=v0.4.1#ac634ffa23c3544ba36f3fec1eceb9587d5af74e"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2248,8 +2248,8 @@ dependencies = [
 
 [[package]]
 name = "keymeld-sdk"
-version = "0.4.0"
-source = "git+https://github.com/tee8z/keymeld?rev=f7150cc87ec78a430f0314134ad740d870a714fe#f7150cc87ec78a430f0314134ad740d870a714fe"
+version = "0.4.1"
+source = "git+https://github.com/tee8z/keymeld?tag=v0.4.1#ac634ffa23c3544ba36f3fec1eceb9587d5af74e"
 dependencies = [
  "dlctix",
  "flate2",
@@ -5244,7 +5244,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

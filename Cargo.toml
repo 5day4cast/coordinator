@@ -20,11 +20,10 @@ name = "coordinator"
 # Internal crates
 coordinator-core = { path = "crates/coordinator-core" }
 
-# Keymeld: v0.4.0 plus the switch to the published dlctix crate
-# (tee8z/keymeld branch chore/dlctix-0.1.0). Move to the next tag once cut.
+# Keymeld: released SDK and services on the published dlctix crate.
 # keymeld-sdk and the coordinator must resolve dlctix from the same source.
-keymeld-sdk = { git = "https://github.com/tee8z/keymeld", rev = "f7150cc87ec78a430f0314134ad740d870a714fe", default-features = false }
-keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "f7150cc87ec78a430f0314134ad740d870a714fe", default-features = false }
+keymeld-sdk = { git = "https://github.com/tee8z/keymeld", tag = "v0.4.1", default-features = false }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", tag = "v0.4.1", default-features = false }
 
 # Bitcoin
 bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }

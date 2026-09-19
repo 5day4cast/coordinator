@@ -13,7 +13,7 @@
     # Keymeld for e2e testing
     # Pinned to the same release as the keymeld-sdk dependency in Cargo.toml.
     keymeld = {
-      url = "github:tee8z/keymeld/v0.4.0";
+      url = "github:tee8z/keymeld/v0.4.1";
     };
   };
 
