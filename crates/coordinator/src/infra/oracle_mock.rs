@@ -157,6 +157,9 @@ impl MockOracle {
 #[async_trait]
 impl Oracle for MockOracle {
     async fn create_event(&self, config: CreateEvent) -> Result<Event, Error> {
+        config
+            .validate_oracle_settings()
+            .map_err(|reason| Error::BadRequest(reason.into()))?;
         let nonce = self.generate_nonce(&config.id);
         let locking_conditions = self.generate_locking_conditions(&config, &nonce);
 
@@ -237,6 +240,25 @@ mod tests {
             coordinator_fee_percentage: 10,
             total_competition_pool: 9000,
             relative_locktime_block_delta: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_rejects_unbounded_announcements_without_creating_an_event() {
+        let oracle = MockOracle::new([0u8; 32]);
+        for (entries, places) in [(usize::MAX, 1), (25, 5)] {
+            let mut config = test_config();
+            config.total_allowed_entries = entries;
+            config.number_of_places_win = places;
+            let id = config.id;
+            assert!(matches!(
+                oracle.create_event(config).await,
+                Err(Error::BadRequest(_))
+            ));
+            assert!(matches!(
+                oracle.get_event(&id).await,
+                Err(Error::NotFound(_))
+            ));
         }
     }
 

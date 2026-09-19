@@ -40,7 +40,13 @@ export default async function globalSetup() {
   const signingDate = new Date(now.getTime() + 3 * 60 * 60 * 1000); // 3 hours from now
 
   const formData = new URLSearchParams();
-  formData.append("id", crypto.randomUUID());
+  // NOAA requires UUIDv7: preserve random/variant bits and use the current 48-bit timestamp.
+  const randomId = crypto.randomUUID();
+  const timestamp = Date.now().toString(16).padStart(12, "0");
+  formData.append(
+    "id",
+    `${timestamp.slice(0, 8)}-${timestamp.slice(8)}-7${randomId.slice(15, 18)}-${randomId.slice(19)}`,
+  );
   formData.append("signing_date", signingDate.toISOString());
   formData.append("start_observation_date", startDate.toISOString());
   formData.append("end_observation_date", endDate.toISOString());

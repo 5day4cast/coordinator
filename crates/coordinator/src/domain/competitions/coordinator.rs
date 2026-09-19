@@ -2810,14 +2810,10 @@ impl Coordinator {
         &self,
         create_event: CreateEvent,
     ) -> Result<Competition, Error> {
+        create_event
+            .validate_oracle_settings()
+            .map_err(|reason| Error::BadRequest(reason.into()))?;
         let competition = Competition::new(&create_event);
-
-        if competition.event_submission.number_of_places_win > 5 {
-            return Err(Error::BadRequest(format!(
-                "Number of winners exceeds maximum allowed 5 {}",
-                competition.event_submission.number_of_places_win
-            )));
-        }
 
         debug!("created competition");
         let tickets = competition

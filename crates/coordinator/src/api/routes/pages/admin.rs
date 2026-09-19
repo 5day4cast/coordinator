@@ -253,7 +253,12 @@ pub async fn admin_create_competition_handler(
     }
 
     // Calculate total pool
-    let total_competition_pool = form.entry_fee * form.total_allowed_entries;
+    let Some(total_competition_pool) = form.entry_fee.checked_mul(form.total_allowed_entries)
+    else {
+        return Html(
+            competition_error("Total competition pool exceeds the supported amount").into_string(),
+        );
+    };
 
     // Create the competition via the coordinator
     let create_event = crate::domain::CreateEvent {
