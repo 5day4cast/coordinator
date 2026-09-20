@@ -39,19 +39,11 @@ struct SettlementLedger {
     released_entries: BTreeMap<(SessionId, UserId), Uuid>,
 }
 
+#[derive(Default)]
 pub struct CoordinatorVerifier {
     #[cfg(feature = "lnurl")]
     lnurl: Option<crate::lnurl_transport::LnurlPayClient>,
     ledger: Mutex<SettlementLedger>,
-}
-impl Default for CoordinatorVerifier {
-    fn default() -> Self {
-        Self {
-            #[cfg(feature = "lnurl")]
-            lnurl: None,
-            ledger: Mutex::default(),
-        }
-    }
 }
 impl CoordinatorVerifier {
     /// Enables network preparation only in this statically registered verifier.
