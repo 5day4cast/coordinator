@@ -93,6 +93,19 @@ impl Bitcoin for MockBitcoinClient {
         Ok(rates)
     }
 
+    async fn payout_output_status(
+        &self,
+        _outpoint: OutPoint,
+        _output: bitcoin::TxOut,
+    ) -> Result<super::bitcoin::PayoutOutputStatus, anyhow::Error> {
+        let current_height = self.block_height.load(Ordering::SeqCst);
+        Ok(super::bitcoin::PayoutOutputStatus {
+            confirmation_height: Some(current_height.saturating_sub(3)),
+            current_height,
+            unspent: true,
+        })
+    }
+
     async fn get_tx_confirmation_height(&self, _txid: &Txid) -> Result<Option<u32>, anyhow::Error> {
         // Mock: return current height - 3 (confirmed 3 blocks ago)
         let height = self.block_height.load(Ordering::SeqCst);

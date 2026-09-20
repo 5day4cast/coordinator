@@ -191,6 +191,12 @@ impl Default for LnSettings {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KeymeldSettings {
+    /// Require payout escrow for new competitions. Existing competitions retain their original protocol.
+    #[serde(default)]
+    pub automatic_payouts: bool,
+    /// Fee ceiling signed by entrants before they pay for a ticket.
+    #[serde(default = "default_automatic_payout_fee_ceiling")]
+    pub automatic_payout_max_fee_rate_sat_vb: u64,
     /// Trusted Nitro PCR measurements from the reviewed enclave build; PCR0 or PCR8 is required when enabled.
     #[serde(default, with = "pcr_measurements")]
     pub trusted_pcrs: BTreeMap<u16, String>,
@@ -220,9 +226,15 @@ pub struct KeymeldSettings {
     pub polling_backoff_multiplier: f64,
 }
 
+fn default_automatic_payout_fee_ceiling() -> u64 {
+    100
+}
+
 impl Default for KeymeldSettings {
     fn default() -> Self {
         KeymeldSettings {
+            automatic_payouts: false,
+            automatic_payout_max_fee_rate_sat_vb: default_automatic_payout_fee_ceiling(),
             trusted_pcrs: BTreeMap::new(),
             gateway_url: String::from("http://localhost:8080"),
             public_gateway_url: None,
@@ -243,10 +255,38 @@ impl Settings {
     /// operator routes without authentication.
     pub fn validate(&self) -> Result<(), anyhow::Error> {
         let network = self.bitcoin_settings.network;
+        self.api_settings.validate(&self.ui_settings)?;
         self.ln_settings.validate(network)?;
         self.coordinator_settings.validate(network)?;
         self.admin_settings.validate(network)?;
         self.keymeld_settings.validate(network)
+    }
+}
+
+impl APISettings {
+    pub fn validate(&self, ui: &UISettings) -> Result<(), anyhow::Error> {
+        crate::api::nip98_origins::Nip98Origins::new(
+            self.origins
+                .iter()
+                .map(String::as_str)
+                .chain([ui.remote_url.as_str(), ui.private_url.as_str()]),
+        )?;
+        let limits = &self.rate_limit;
+        if limits.enabled
+            && [
+                limits.per_second,
+                limits.burst,
+                limits.auth_per_second,
+                limits.auth_burst,
+            ]
+            .contains(&0)
+        {
+            anyhow::bail!("api_settings.rate_limit rates and bursts must be at least 1");
+        }
+        if self.replay_capacity == 0 {
+            anyhow::bail!("api_settings.replay_capacity must be at least 1");
+        }
+        Ok(())
     }
 }
 
@@ -273,7 +313,7 @@ impl CoordinatorSettings {
     pub fn validate(&self, network: Network) -> Result<(), anyhow::Error> {
         if self.escrow_enabled && network == Network::Bitcoin {
             return Err(anyhow::anyhow!(
-                "coordinator_settings.escrow_enabled is refused on mainnet: the escrow transaction is handed out before payment and has no coordinator reclaim path"
+                "coordinator_settings.escrow_enabled is refused on mainnet until the escrow flow has been exercised end to end on a test network"
             ));
         }
         Ok(())
@@ -397,6 +437,15 @@ mod admin_settings_tests {
 
 impl KeymeldSettings {
     pub fn validate(&self, network: Network) -> Result<(), anyhow::Error> {
+        if self.automatic_payouts && !self.enabled {
+            return Err(anyhow::anyhow!("Automatic payouts require Keymeld"));
+        }
+        if self.automatic_payout_max_fee_rate_sat_vb == 0
+            || bitcoin::FeeRate::from_sat_per_vb(self.automatic_payout_max_fee_rate_sat_vb)
+                .is_none()
+        {
+            return Err(anyhow::anyhow!("Invalid automatic payout fee ceiling"));
+        }
         if !self.enabled {
             return Ok(());
         }
@@ -633,6 +682,16 @@ pub struct APISettings {
     pub domain: String,
     pub port: String,
     pub origins: Vec<String>,
+    #[serde(default)]
+    pub rate_limit: RateLimitSettings,
+    #[serde(default = "APISettings::default_replay_capacity")]
+    pub replay_capacity: usize,
+}
+
+impl APISettings {
+    fn default_replay_capacity() -> usize {
+        crate::api::nip98_replay::DEFAULT_REPLAY_CAPACITY
+    }
 }
 
 impl Default for APISettings {
@@ -641,6 +700,41 @@ impl Default for APISettings {
             domain: String::from("127.0.0.1"),
             port: String::from("9990"),
             origins: vec![String::from("http://localhost:9990")],
+            rate_limit: RateLimitSettings::default(),
+            replay_capacity: Self::default_replay_capacity(),
+        }
+    }
+}
+
+/// Public requests are keyed by the TCP peer address. Forwarded IP headers
+/// are never trusted. A reverse proxy therefore shares one limit across clients.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RateLimitSettings {
+    pub enabled: bool,
+    pub per_second: u32,
+    pub burst: u32,
+    pub auth_per_second: u32,
+    pub auth_burst: u32,
+}
+
+impl RateLimitSettings {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for RateLimitSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            per_second: 20,
+            burst: 60,
+            auth_per_second: 2,
+            auth_burst: 10,
         }
     }
 }

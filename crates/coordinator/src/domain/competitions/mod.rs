@@ -1,4 +1,6 @@
+mod automatic_store;
 mod coordinator;
+mod payout;
 pub mod states;
 mod store;
 use crate::infra::{
@@ -9,6 +11,7 @@ use crate::infra::{
     oracle::{AddEventEntry, WeatherChoices},
 };
 use anyhow::anyhow;
+pub use automatic_store::*;
 pub use coordinator::*;
 use dlctix::{
     bitcoin::{hex::DisplayHex, OutPoint, Transaction},
@@ -19,6 +22,7 @@ use dlctix::{
 };
 use keymeld_sdk::types::{RegistrationContext, SignedSessionManifest};
 use log::{debug, error};
+pub use payout::*;
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, FromRow, Row};
 use std::fmt;
@@ -54,6 +58,9 @@ pub struct AddEntry {
     /// Exact context bound to the participant possession proof.
     #[serde(default)]
     pub keymeld_registration_context: Option<RegistrationContext>,
+    /// Fresh participant-signed generic escrow consent, private to the application.
+    #[serde(default)]
+    pub keymeld_escrow_policy: Option<coordinator_escrow::escrow::SignedEscrowPolicy>,
 }
 
 pub enum EntryStatus {
@@ -71,6 +78,8 @@ pub struct EntryPayout {
     pub payout_payment_request: String,
     //  Amount paid out to user in sats via lightning
     pub payout_amount_sats: u64,
+    /// Preimage returned by the settled payment: proof the invoice was paid.
+    pub payment_preimage: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     /// Time at which the payout initiated to the user
     pub initiated_at: OffsetDateTime,
@@ -113,6 +122,7 @@ impl FromRow<'_, SqliteRow> for EntryPayout {
             payout_status,
             payout_payment_request: row.try_get("payout_payment_request")?,
             payout_amount_sats: parse_required_u64(row, "payout_amount_sats")?,
+            payment_preimage: row.try_get("payment_preimage")?,
             initiated_at: parse_required_datetime(row, "initiated_at")?,
             succeed_at,
             failed_at,
@@ -170,6 +180,9 @@ pub struct UserEntry {
     /// Exact context bound to the participant possession proof.
     #[serde(default)]
     pub keymeld_registration_context: Option<RegistrationContext>,
+    /// Fresh participant-signed generic escrow consent, private to the application.
+    #[serde(default, skip_serializing)]
+    pub keymeld_escrow_policy: Option<coordinator_escrow::escrow::SignedEscrowPolicy>,
     pub public_nonces: Option<SigMap<PubNonce>>,
     /// User signed funding psbt
     pub funding_psbt_base64: Option<String>,
@@ -238,6 +251,15 @@ impl FromRow<'_, SqliteRow> for UserEntry {
                 .map(|json| {
                     serde_json::from_str(&json).map_err(|error| sqlx::Error::ColumnDecode {
                         index: "keymeld_registration_context".into(),
+                        source: Box::new(error),
+                    })
+                })
+                .transpose()?,
+            keymeld_escrow_policy: row
+                .try_get::<Option<String>, _>("keymeld_escrow_policy")?
+                .map(|json| {
+                    serde_json::from_str(&json).map_err(|error| sqlx::Error::ColumnDecode {
+                        index: "keymeld_escrow_policy".into(),
                         source: Box::new(error),
                     })
                 })
@@ -315,6 +337,7 @@ impl AddEntry {
             encrypted_keymeld_private_key: self.encrypted_keymeld_private_key,
             keymeld_auth_pubkey: self.keymeld_auth_pubkey,
             keymeld_registration_context: self.keymeld_registration_context,
+            keymeld_escrow_policy: self.keymeld_escrow_policy,
             paid_at: None,
             sellback_broadcasted_at: None,
             reclaimed_broadcasted_at: None,
@@ -358,6 +381,32 @@ impl std::fmt::Debug for PayoutInfo {
             .field("ln_invoice", &self.ln_invoice)
             .finish_non_exhaustive()
     }
+}
+
+/// One-click payout body: the entry's key and payout preimage, paid to the
+/// account's Lightning Address. The same trust as `PayoutInfo`, minus the
+/// invoice, which the coordinator fetches from the address itself.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PayoutClaimInfo {
+    pub ticket_id: Uuid,
+    pub payout_preimage: String,
+    pub ephemeral_private_key: String,
+}
+
+impl std::fmt::Debug for PayoutClaimInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PayoutClaimInfo")
+            .field("ticket_id", &self.ticket_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PayoutClaimReceipt {
+    pub payout_id: Uuid,
+    pub lightning_address: String,
+    pub amount_sats: u64,
 }
 
 /// `Debug` omits the preimage; `Ticket` is never serialized to clients.
@@ -1521,3 +1570,6 @@ fn parse_required_u64(row: &SqliteRow, column: &str) -> Result<u64, sqlx::Error>
         source: Box::new(e),
     })
 }
+
+#[cfg(test)]
+mod automatic_store_tests;

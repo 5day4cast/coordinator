@@ -81,6 +81,9 @@ litestream:
       s3Path: users.db
 
 keymeld:
+  # Requires Keymeld built with payout; Lightning Addresses also require payout-lnurl and runtime opt-in.
+  automaticPayouts: false
+  automaticPayoutMaxFeeRateSatVb: 100
   url: "http://keymeld.keymeld.svc.cluster.local:8080"
   enabled: true
   gatewayUrl: "http://keymeld.keymeld.svc.cluster.local:8080"
@@ -153,8 +156,17 @@ config:
   api:
     domain: "0.0.0.0"
     port: "8080"
+    # Exact browser origins; wildcard origins cannot authorize NIP-98 requests.
     origins:
-      - "*"
+      - "http://localhost:8080"
+    replayCapacity: 100000
+    # Limits use TCP peer IP. Clients behind one proxy share its bucket.
+    rateLimit:
+      enabled: true
+      perSecond: 20
+      burst: 60
+      authPerSecond: 2
+      authBurst: 10
   ui:
     # Origin the operator's browser uses to reach the operator listener (tunnel name).
     privateUrl: "http://localhost:9991"

@@ -105,6 +105,7 @@ mod tests {
             gateway_url: "https://keymeld.example".into(),
             trusted_pcrs: pcrs,
             dangerous_trust_unattested_enclaves: dangerous,
+            payout_policy: None,
         }
     }
 

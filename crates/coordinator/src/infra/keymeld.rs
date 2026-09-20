@@ -1,8 +1,24 @@
 use crate::config::KeymeldSettings;
+use crate::infra::db::DBConnection;
 use async_trait::async_trait;
 use coordinator_core::RegistrationAssignment;
+use coordinator_escrow::authorization::PayoutPolicy;
 use dlctix::{Outcome, OutcomeIndex, PayoutWeights};
 use keymeld_core::authorization::EnclaveRecipientAuthorization;
+use keymeld_core::crypto::SessionSecret;
+use keymeld_core::escrow::SignedEscrowPolicy;
+#[cfg(test)]
+mod confidential_integration_tests;
+mod confidential_service;
+mod confidential_store;
+pub use coordinator_escrow::{
+    payout::ContractCommitment,
+    payout_capabilities::PayoutCapabilities,
+    payout_protocol::{
+        PayoutContractBoundResponse, PayoutPreparedResponse, PayoutSecrets, PreparePayoutRequest,
+        ReleasePayoutRequest,
+    },
+};
 pub use keymeld_sdk::types::SubsetDefinition;
 use keymeld_sdk::{
     dlctix::{
@@ -10,17 +26,15 @@ use keymeld_sdk::{
         DlcBatchBuilder, DlcSignatureResults,
     },
     prelude::*,
-    types::{
-        RegisterKeygenParticipantRequest, RegistrationAuthorization, RegistrationContext,
-        SignedRoster, SignedSessionManifest,
-    },
+    types::{RegistrationAuthorization, RegistrationContext, SignedRoster, SignedSessionManifest},
     PollingConfig,
 };
-use log::{debug, error, info};
+
 use nostr::{nips::nip44, Keys};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 /// Error type for Keymeld operations
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +50,9 @@ pub enum KeymeldError {
 
     #[error("Signing error: {0}")]
     Signing(String),
+
+    #[error("Keymeld protocol error: {0}")]
+    Protocol(#[from] keymeld_core::KeyMeldError),
 
     #[error("Keymeld is not enabled")]
     NotEnabled,
@@ -61,6 +78,9 @@ pub struct ParticipantRegistrationData {
     /// This is derived client-side using: derive_session_auth_pubkey(session_id)
     pub auth_pubkey: String,
     pub context: RegistrationContext,
+    /// Accepted policy from durable entry storage, checked against the sealed envelope.
+    pub payout_policy: Option<PayoutPolicy>,
+    pub escrow_policy: Option<SignedEscrowPolicy>,
 }
 
 /// Pre-computed DLC subset definitions for keygen session creation.
@@ -119,6 +139,29 @@ fn outcome_subsets_for_payouts(
 /// Trait for Keymeld signing operations
 #[async_trait]
 pub trait Keymeld: Send + Sync {
+    async fn payout_capabilities(&self) -> Result<PayoutCapabilities, KeymeldError>;
+
+    async fn bind_payout_contract(
+        &self,
+        session: &DlcKeygenSession,
+        contract: &ContractCommitment,
+        expected_policies: &BTreeMap<UserId, PayoutPolicy>,
+    ) -> Result<Vec<PayoutContractBoundResponse>, KeymeldError>;
+
+    async fn prepare_payout(
+        &self,
+        session: &DlcKeygenSession,
+        user_id: UserId,
+        request: PreparePayoutRequest,
+    ) -> Result<PayoutPreparedResponse, KeymeldError>;
+
+    async fn release_payout(
+        &self,
+        session: &DlcKeygenSession,
+        user_id: UserId,
+        request: ReleasePayoutRequest,
+    ) -> Result<PayoutSecrets, KeymeldError>;
+
     /// Initialize a keygen session at competition creation time with subset definitions.
     /// This creates the session with all participant user_ids (ticket_ids), subset definitions,
     /// and registers the coordinator.
@@ -283,6 +326,12 @@ impl StoredDlcKeygenSession {
     }
 }
 
+impl Drop for DlcKeygenSession {
+    fn drop(&mut self) {
+        self.session_secret.zeroize();
+    }
+}
+
 impl DlcKeygenSession {
     fn validate_credentials(&self) -> Result<(), KeymeldError> {
         self.recipient_authorization
@@ -340,15 +389,6 @@ impl DlcKeygenSession {
         }
         Ok(())
     }
-
-    fn verify_restored_recipients(&self, restored: &KeygenSession<'_>) -> Result<(), KeymeldError> {
-        if restored.recipient_authorization() != Some(&self.recipient_authorization) {
-            return Err(KeymeldError::Session(
-                "Gateway changed the pinned enclave recipients".into(),
-            ));
-        }
-        Ok(())
-    }
 }
 
 /// Hex serialization for variable-size byte vectors
@@ -371,11 +411,44 @@ mod hex_vec {
     }
 }
 
+fn verify_prepared_payout_origin(
+    session: &DlcKeygenSession,
+    user_id: &UserId,
+    response: &PayoutPreparedResponse,
+) -> Result<(), KeymeldError> {
+    let enclave_id = session
+        .recipient_authorization
+        .user_enclave_assignments
+        .get(user_id)
+        .ok_or_else(|| {
+            KeymeldError::Session("Payout participant has no authorized enclave".into())
+        })?;
+    if response.enclave_id != *enclave_id
+        || response.keygen_session_id != session.session_id
+        || &response.user_id != user_id
+    {
+        return Err(KeymeldError::Session(
+            "Payout response names a different assigned enclave or participant".into(),
+        ));
+    }
+    let public_key = session
+        .recipient_authorization
+        .recipient_public_keys
+        .get(enclave_id)
+        .ok_or_else(|| KeymeldError::Session("Payout enclave has no pinned public key".into()))?;
+    response.verify(public_key).map_err(SdkError::from)?;
+    Ok(())
+}
+
 /// Production Keymeld service implementation
 pub struct KeymeldService {
     settings: KeymeldSettings,
     client: Option<KeyMeldClient>,
     coordinator_user_id: UserId,
+    db: Option<DBConnection>,
+    store_key: SessionSecret,
+    user_credentials: UserCredentials,
+    session_locks: tokio::sync::Mutex<BTreeMap<SessionId, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl KeymeldService {
@@ -389,6 +462,10 @@ impl KeymeldService {
                 settings,
                 client: None,
                 coordinator_user_id: UserId::from(coordinator_user_id),
+                db: None,
+                store_key: SessionSecret::from_bytes(*coordinator_private_key),
+                user_credentials: UserCredentials::from_private_key(coordinator_private_key)?,
+                session_locks: Default::default(),
             });
         }
 
@@ -437,6 +514,10 @@ impl KeymeldService {
             settings,
             client: Some(client),
             coordinator_user_id: user_id,
+            db: None,
+            store_key: SessionSecret::from_bytes(*coordinator_private_key),
+            user_credentials: UserCredentials::from_private_key(coordinator_private_key)?,
+            session_locks: Default::default(),
         })
     }
 
@@ -445,500 +526,16 @@ impl KeymeldService {
     }
 }
 
-#[async_trait]
-impl Keymeld for KeymeldService {
-    fn is_enabled(&self) -> bool {
-        self.settings.enabled && self.client.is_some()
-    }
-
-    fn coordinator_user_id(&self) -> UserId {
-        self.coordinator_user_id.clone()
-    }
-
-    async fn init_keygen_session(
-        &self,
-        competition_id: Uuid,
-        player_user_ids: Vec<UserId>,
-        subset_info: DlcSubsetInfo,
-    ) -> Result<DlcKeygenSession, KeymeldError> {
-        let client = self.get_client()?;
-
-        info!(
-            "Initializing keygen session for competition {} with {} players and {} subset definitions",
-            competition_id,
-            player_user_ids.len(),
-            subset_info.definitions.len()
-        );
-
-        // All participants: coordinator + all players
-        let mut all_participants = vec![self.coordinator_user_id.clone()];
-        all_participants.extend(player_user_ids);
-        let participant_ids = all_participants.clone();
-
-        let keygen_options = KeygenOptions::default()
-            .timeout(self.settings.keygen_session_expiry_secs)
-            .tweak(TaprootTweak::None)
-            .approval(false);
-
-        // Create the keygen session WITH subset definitions
-        // These subsets define which participants sign each outcome's split transactions
-        let mut keygen_session = client
-            .keygen()
-            .create_session_with_subsets(all_participants, subset_info.definitions, keygen_options)
-            .await?;
-
-        // Register ourselves (coordinator) as a participant
-        keygen_session
-            .register_self(RegisterOptions::default().approval(false))
-            .await?;
-
-        let session_id = keygen_session.session_id().clone();
-        let session_secret = keygen_session.export_session_secret();
-        let authorization_manifest = keygen_session.authorization_manifest().clone();
-        let recipient_authorization = keygen_session
-            .recipient_authorization()
-            .cloned()
-            .ok_or_else(|| {
-                KeymeldError::Session("Missing enclave recipient authorization".into())
-            })?;
-        let signing_authority = keygen_session
-            .authorization_credentials()
-            .cloned()
-            .ok_or_else(|| KeymeldError::Session("Missing signing authority".into()))?;
-        let registration_authorities = participant_ids
-            .into_iter()
-            .map(|user| {
-                let credential = keygen_session
-                    .registration_credentials(&user)
-                    .cloned()
-                    .ok_or_else(|| {
-                        KeymeldError::Session(format!("Missing registration authority for {user}"))
-                    })?;
-                Ok((user, credential))
-            })
-            .collect::<Result<_, KeymeldError>>()?;
-
-        info!(
-            "Keygen session {} initialized with {} subsets, waiting for user registrations",
-            session_id,
-            subset_info.outcome_subset_ids.len()
-        );
-
-        // Verify the session exists on the server before returning
-        // This catches cases where the SDK returns success but the server didn't persist
-        let credentials = SessionCredentials::from_session_secret(&session_secret)?;
-        let restored = client
-            .keygen()
-            .restore_session(
-                session_id.clone(),
-                credentials,
-                authorization_manifest.clone(),
-            )
-            .await
-            .map_err(|e| {
-                error!(
-                    "Failed to verify keygen session {} exists on server: {}",
-                    session_id, e
-                );
-                e
-            })?;
-
-        if restored.recipient_authorization() != Some(&recipient_authorization) {
-            return Err(KeymeldError::Session(
-                "Gateway changed the initialized enclave recipients".into(),
-            ));
-        }
-        info!(
-            "Verified keygen session {} exists on server with status: {}",
-            session_id,
-            restored.status().as_ref()
-        );
-
-        // Return immediately without waiting for other participants
-        // The aggregate_key will be empty until completion - it's set when wait_for_keygen_completion is called
-        Ok(DlcKeygenSession {
-            session_id,
-            session_secret,
-            authorization_manifest,
-            recipient_authorization,
-            signing_authority,
-            registration_authorities,
-            aggregate_key: vec![], // Will be populated when keygen completes
-            outcome_subset_ids: subset_info.outcome_subset_ids,
-        })
-    }
-
-    async fn wait_for_keygen_completion(
-        &self,
-        session: &DlcKeygenSession,
-    ) -> Result<SignedRoster, KeymeldError> {
-        let client = self.get_client()?;
-
-        info!(
-            "Waiting for keygen session {} to complete",
-            session.session_id
-        );
-
-        // Restore session from credentials
-        let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
-
-        let mut restored_session = client
-            .keygen()
-            .restore_session(
-                session.session_id.clone(),
-                credentials,
-                session.authorization_manifest.clone(),
-            )
-            .await?;
-
-        session.verify_restored_recipients(&restored_session)?;
-
-        // Wait for all participants to register and keygen to complete
-        let _aggregate_key = restored_session.wait_for_completion().await?;
-
-        let roster = restored_session.verify_roster()?;
-
-        info!(
-            "Keygen session {} completed with aggregate key",
-            session.session_id
-        );
-
-        Ok(roster)
-    }
-
-    async fn sign_dlc_batch(
-        &self,
-        keygen_session: &DlcKeygenSession,
-        signing_data: &SigningData,
-        contract_params: &ContractParameters,
-        player_user_ids: Vec<UserId>,
-    ) -> Result<DlcSignatureResults, KeymeldError> {
-        let client = self.get_client()?;
-
-        info!(
-            "Creating DLC signing session for keygen {} with {} outcome subsets",
-            keygen_session.session_id,
-            keygen_session.outcome_subset_ids.len()
-        );
-
-        // Restore the keygen session from stored credentials
-        let credentials = SessionCredentials::from_session_secret(&keygen_session.session_secret)?;
-
-        let restored_keygen = client
-            .keygen()
-            .restore_session_with_authority(
-                keygen_session.session_id.clone(),
-                credentials,
-                keygen_session.authorization_manifest.clone(),
-                keygen_session.signing_authority.clone(),
-            )
-            .await?;
-
-        keygen_session.verify_restored_recipients(&restored_keygen)?;
-        restored_keygen.verify_roster()?;
-
-        // Reuse the authorized participant subsets with the contract's actual winners.
-        // Entries can be submitted in a different order than their ticket allocation.
-        let outcome_subsets = outcome_subsets_for_payouts(
-            &contract_params.outcome_payouts,
-            &player_user_ids,
-            &keygen_session
-                .authorization_manifest
-                .manifest
-                .coordinator_user_id,
-            &keygen_session
-                .authorization_manifest
-                .manifest
-                .subset_definitions,
-        )?;
-        let dlc_batch = DlcBatchBuilder::new(signing_data)
-            .with_outcome_subsets(&outcome_subsets)
-            .build()
-            .map_err(|e| KeymeldError::Signing(format!("Failed to build batch: {}", e)))?;
-
-        let signing_options =
-            SigningOptions::default().timeout(self.settings.signing_session_expiry_secs);
-
-        // Create signing session - need to clone items since sign_batch consumes them
-        let mut attempts = 0;
-        let mut signing_session = loop {
-            attempts += 1;
-            match client
-                .signer()
-                .sign_batch(
-                    &restored_keygen,
-                    dlc_batch.items.clone(),
-                    signing_options.clone(),
-                )
-                .await
-            {
-                Ok(session) => break session,
-                Err(SdkError::Api(keymeld_sdk::ApiError::RateLimited { retry_after_secs }))
-                    if attempts < 3 && retry_after_secs <= 30 =>
-                {
-                    tokio::time::sleep(Duration::from_secs(retry_after_secs)).await;
-                }
-                Err(error) => return Err(error.into()),
-            }
-        };
-
-        debug!(
-            "Signing session {} created, waiting for completion",
-            signing_session.session_id()
-        );
-
-        // Wait for signing to complete
-        let signature_results = signing_session.wait_for_completion().await?;
-
-        // Parse results into DLC signature format
-        let dlc_signatures = dlc_batch.parse_results(&signature_results)?;
-
-        info!(
-            "Signing session {} completed with {} outcome signatures and {} split signatures",
-            signing_session.session_id(),
-            dlc_signatures.outcome_signatures.len(),
-            dlc_signatures.split_signatures.len()
-        );
-
-        Ok(dlc_signatures)
-    }
-
-    async fn get_keygen_status(
-        &self,
-        session: &DlcKeygenSession,
-    ) -> Result<KeygenSessionStatus, KeymeldError> {
-        let client = self.get_client()?;
-
-        // Restore session credentials to make authenticated status request
-        // This calls /api/v1/keygen/{session_id}/status which returns the current status
-        let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
-
-        let restored_session = client
-            .keygen()
-            .restore_session(
-                session.session_id.clone(),
-                credentials,
-                session.authorization_manifest.clone(),
-            )
-            .await?;
-
-        session.verify_restored_recipients(&restored_session)?;
-        let status_kind = restored_session.status();
-        let is_completed = matches!(
-            status_kind,
-            keymeld_sdk::prelude::KeygenStatusKind::Completed
-        );
-
-        Ok(KeygenSessionStatus {
-            session_id: session.session_id.to_string(),
-            status: status_kind.as_ref().to_string(),
-            is_completed,
-        })
-    }
-
-    async fn register_participant(
-        &self,
-        session: &DlcKeygenSession,
-        user_id: UserId,
-        data: &ParticipantRegistrationData,
-    ) -> Result<(), KeymeldError> {
-        session.validate_registration(&user_id, data)?;
-        let client = self.get_client()?;
-        let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
-        let slots = client
-            .keygen()
-            .get_available_slots(&session.session_id, &credentials)
-            .await?;
-        let slot = slots
-            .available_slots
-            .iter()
-            .find(|slot| slot.user_id == user_id)
-            .ok_or_else(|| KeymeldError::Session("Participant slot is missing".into()))?;
-        if slot.enclave_id != data.context.enclave_id {
-            return Err(KeymeldError::Session(
-                "Gateway changed participant assignment".into(),
-            ));
-        }
-        let enclave = client
-            .health()
-            .get_enclave_key(slot.enclave_id.as_u32())
-            .await?;
-        if enclave.key_epoch != data.context.enclave_key_epoch
-            || session
-                .recipient_authorization
-                .recipient_public_keys
-                .get(&slot.enclave_id)
-                != Some(
-                    &hex::decode(&enclave.public_key)
-                        .map_err(|e| KeymeldError::Session(e.to_string()))?,
-                )
-        {
-            return Err(KeymeldError::Session(
-                "Enclave key or epoch changed; a fresh registration envelope is required".into(),
-            ));
-        }
-        let authority = session
-            .registration_authorities
-            .get(&user_id)
-            .ok_or_else(|| KeymeldError::Session("Registration authority is missing".into()))?;
-        let registration_authorization = RegistrationAuthorization::sign(
-            &authority.export_secret(),
-            data.context.clone(),
-            &data.encrypted_private_key,
-        )
-        .map_err(SdkError::from)?;
-        let encrypted_session_data = credentials.encrypt(
-            &serde_json::to_vec(&serde_json::json!({"participant_public_keys": {user_id.to_string(): data.context.public_key}}))
-                .map_err(|e| KeymeldError::Session(e.to_string()))?,
-            "keygen_participant_session",
-        )?;
-        let request = RegisterKeygenParticipantRequest {
-            registration_authorization,
-            keygen_session_id: session.session_id.clone(),
-            user_id: user_id.clone(),
-            encrypted_private_key: data.encrypted_private_key.clone(),
-            public_key: data.context.public_key.clone(),
-            encrypted_session_data,
-            enclave_public_key: enclave.public_key,
-            enclave_key_epoch: data.context.enclave_key_epoch,
-            require_signing_approval: false,
-            auth_pubkey: data.context.auth_pubkey.clone(),
-        };
-        for attempt in 0..3 {
-            let signature = credentials.sign_session_request(&session.session_id.to_string())?;
-            let result = client
-                .http()
-                .post::<_, keymeld_sdk::types::RegisterKeygenParticipantResponse>(
-                    &format!(
-                        "{}/api/v1/keygen/{}/participants",
-                        self.settings.gateway_url, session.session_id
-                    ),
-                    &request,
-                    &[("X-Session-Signature", &signature)],
-                )
-                .await;
-            match result {
-                Ok(response) => {
-                    if response.keygen_session_id != session.session_id
-                        || response.user_id != user_id
-                        || response.assigned_enclave_id != data.context.enclave_id
-                        || response.require_signing_approval
-                    {
-                        return Err(KeymeldError::Session(
-                            "Gateway returned a different registration".into(),
-                        ));
-                    }
-                    return Ok(());
-                }
-                Err(SdkError::Api(keymeld_sdk::ApiError::RateLimited { retry_after_secs }))
-                    if attempt < 2 && retry_after_secs <= 30 =>
-                {
-                    tokio::time::sleep(Duration::from_secs(retry_after_secs)).await;
-                }
-                Err(error) => {
-                    // An uncertain HTTP outcome is successful only when the signed roster confirms this exact envelope.
-                    let restored = client
-                        .keygen()
-                        .restore_session(
-                            session.session_id.clone(),
-                            SessionCredentials::from_session_secret(&session.session_secret)?,
-                            session.authorization_manifest.clone(),
-                        )
-                        .await;
-                    if let Ok(restored) = restored {
-                        session.verify_restored_recipients(&restored)?;
-                        if matches!(restored.status(), KeygenStatusKind::Completed) {
-                            let roster = restored.verify_roster()?;
-                            if let Some(accepted) = roster.roster.registrations.get(&user_id) {
-                                if accepted.context == data.context
-                                    && accepted.ciphertext_hash
-                                        == request.registration_authorization.ciphertext_hash
-                                {
-                                    return Ok(());
-                                }
-                            }
-                        }
-                    }
-                    return Err(error.into());
-                }
-            }
-        }
-        Err(KeymeldError::Session(
-            "Registration retry budget exhausted".into(),
-        ))
-    }
-
-    async fn get_registration_assignment(
-        &self,
-        session: &DlcKeygenSession,
-        user_id: UserId,
-    ) -> Result<RegistrationAssignment, KeymeldError> {
-        let client = self.get_client()?;
-        let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
-        let slots = client
-            .keygen()
-            .get_available_slots(&session.session_id, &credentials)
-            .await?;
-        let slot = slots
-            .available_slots
-            .iter()
-            .find(|slot| slot.user_id == user_id && !slot.claimed)
-            .ok_or_else(|| KeymeldError::Session("No unclaimed participant slot".into()))?;
-        let enclave = client
-            .health()
-            .get_enclave_key(slot.enclave_id.as_u32())
-            .await?;
-        if session
-            .recipient_authorization
-            .user_enclave_assignments
-            .get(&user_id)
-            != Some(&slot.enclave_id)
-            || session
-                .recipient_authorization
-                .recipient_public_keys
-                .get(&slot.enclave_id)
-                != Some(
-                    &hex::decode(&enclave.public_key)
-                        .map_err(|e| KeymeldError::Session(e.to_string()))?,
-                )
-        {
-            return Err(KeymeldError::Session(
-                "Gateway changed the authorized enclave assignment".into(),
-            ));
-        }
-        Ok(RegistrationAssignment {
-            session_id: session.session_id.to_string(),
-            user_id: Uuid::parse_str(&user_id.to_string())
-                .map_err(|e| KeymeldError::Session(e.to_string()))?,
-            manifest_hash: session
-                .authorization_manifest
-                .digest()
-                .map_err(SdkError::from)?,
-            enclave_id: slot.enclave_id.as_u32(),
-            enclave_key_epoch: enclave.key_epoch,
-            enclave_public_key: enclave.public_key,
-            gateway_url: self
-                .settings
-                .public_gateway_url
-                .clone()
-                .unwrap_or_else(|| self.settings.gateway_url.clone()),
-            trusted_pcrs: self.settings.trusted_pcrs.clone(),
-            dangerous_trust_unattested_enclaves: self.settings.dangerous_trust_unattested_enclaves,
-        })
-    }
-}
-
 /// Create a Keymeld service based on settings
 pub fn create_keymeld_service(
     settings: KeymeldSettings,
     coordinator_user_id: Uuid,
     coordinator_private_key: &[u8; 32],
+    database: DBConnection,
 ) -> Result<Arc<dyn Keymeld>, KeymeldError> {
-    Ok(Arc::new(KeymeldService::new(
-        settings,
-        coordinator_user_id,
-        coordinator_private_key,
-    )?))
+    let mut service = KeymeldService::new(settings, coordinator_user_id, coordinator_private_key)?;
+    service.db = Some(database);
+    Ok(Arc::new(service))
 }
 
 #[cfg(test)]
@@ -1075,9 +672,9 @@ mod tests {
             restored.signing_authority.export_secret(),
             session.signing_authority.export_secret()
         );
-        for (user, authority) in session.registration_authorities {
+        for (user, authority) in &session.registration_authorities {
             assert_eq!(
-                restored.registration_authorities[&user].export_secret(),
+                restored.registration_authorities[user].export_secret(),
                 authority.export_secret()
             );
         }
@@ -1134,6 +731,8 @@ mod tests {
             public_key: hex::encode(&context.public_key),
             auth_pubkey: hex::encode(&context.auth_pubkey),
             context,
+            payout_policy: None,
+            escrow_policy: None,
         };
         session.validate_registration(&user, &data).unwrap();
         assert!(session
@@ -1187,191 +786,5 @@ mod tests {
             &[1; 32],
         )
         .is_err());
-    }
-    struct GatewayFixture {
-        session_id: SessionId,
-        user_id: UserId,
-        manifest: SignedSessionManifest,
-        enclave_public_key: String,
-        proofs: std::sync::Mutex<Vec<String>>,
-    }
-
-    async fn slots(
-        axum::extract::State(state): axum::extract::State<Arc<GatewayFixture>>,
-        headers: axum::http::HeaderMap,
-    ) -> axum::Json<keymeld_sdk::GetAvailableSlotsResponse> {
-        verify_request(&state, &headers);
-        axum::Json(keymeld_sdk::GetAvailableSlotsResponse {
-            session_id: state.session_id.clone(),
-            total_slots: 1,
-            claimed_slots: 0,
-            available_slots: vec![keymeld_sdk::AvailableUserSlot {
-                user_id: state.user_id.clone(),
-                enclave_id: EnclaveId::new(1),
-                signer_index: 1,
-                claimed: false,
-            }],
-        })
-    }
-
-    async fn enclave_key(
-        axum::extract::State(state): axum::extract::State<Arc<GatewayFixture>>,
-    ) -> axum::Json<keymeld_sdk::EnclavePublicKeyResponse> {
-        axum::Json(keymeld_sdk::EnclavePublicKeyResponse {
-            enclave_id: 1,
-            public_key: state.enclave_public_key.clone(),
-            attestation_document: String::new(),
-            pcr_measurements: Default::default(),
-            timestamp: 0,
-            healthy: true,
-            key_epoch: 1,
-        })
-    }
-
-    fn verify_request(state: &GatewayFixture, headers: &axum::http::HeaderMap) {
-        let proof = keymeld_core::request_auth::RequestAuth::parse(
-            headers["X-Session-Signature"].to_str().unwrap(),
-        )
-        .unwrap();
-        proof
-            .verify(
-                keymeld_core::request_auth::AuthKind::Session,
-                &state.session_id.to_string(),
-                "",
-                &keymeld_core::PublicKey::from_slice(&state.manifest.manifest.session_public_key)
-                    .unwrap(),
-                keymeld_core::request_auth::now_timestamp_secs().unwrap(),
-            )
-            .unwrap();
-    }
-
-    async fn register(
-        axum::extract::State(state): axum::extract::State<Arc<GatewayFixture>>,
-        headers: axum::http::HeaderMap,
-        axum::Json(request): axum::Json<RegisterKeygenParticipantRequest>,
-    ) -> axum::response::Response {
-        use axum::response::IntoResponse;
-        verify_request(&state, &headers);
-        request
-            .registration_authorization
-            .verify(&state.manifest, &request.encrypted_private_key)
-            .unwrap();
-        assert_eq!(request.user_id, state.user_id);
-        assert!(!request.require_signing_approval);
-        let attempt = {
-            let mut proofs = state.proofs.lock().unwrap();
-            proofs.push(headers["X-Session-Signature"].to_str().unwrap().to_owned());
-            proofs.len()
-        };
-        if attempt == 1 {
-            return (
-                axum::http::StatusCode::TOO_MANY_REQUESTS,
-                [("Retry-After", "0")],
-            )
-                .into_response();
-        }
-        axum::Json(keymeld_sdk::RegisterKeygenParticipantResponse {
-            keygen_session_id: state.session_id.clone(),
-            user_id: state.user_id.clone(),
-            status: KeygenStatusKind::CollectingParticipants,
-            participants_registered: 2,
-            expected_participants: 2,
-            signer_index: 1,
-            assigned_enclave_id: EnclaveId::new(1),
-            require_signing_approval: false,
-        })
-        .into_response()
-    }
-
-    #[tokio::test]
-    async fn delegated_registration_uses_slot_authority_and_refreshes_auth_after_rate_limit() {
-        let session = session();
-        let user = session
-            .registration_authorities
-            .keys()
-            .next()
-            .unwrap()
-            .clone();
-        let enclave_public_key =
-            hex::encode(&session.recipient_authorization.recipient_public_keys[&EnclaveId::new(1)]);
-        let fixture = Arc::new(GatewayFixture {
-            session_id: session.session_id.clone(),
-            user_id: user.clone(),
-            manifest: session.authorization_manifest.clone(),
-            enclave_public_key: enclave_public_key.clone(),
-            proofs: Default::default(),
-        });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let router = axum::Router::new()
-            .route("/api/v1/keygen/{session}/slots", axum::routing::get(slots))
-            .route(
-                "/api/v1/enclaves/{enclave}/public-key",
-                axum::routing::get(enclave_key),
-            )
-            .route(
-                "/api/v1/keygen/{session}/participants",
-                axum::routing::post(register),
-            )
-            .layer(tower_http::decompression::RequestDecompressionLayer::new().gzip(true))
-            .with_state(fixture.clone());
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        // Only this synthetic transport test bypasses hardware evidence. Production construction requires PCR pins.
-        let client = KeyMeldClient::builder(
-            &url,
-            session
-                .authorization_manifest
-                .manifest
-                .coordinator_user_id
-                .clone(),
-        )
-        .dangerous_trust_unattested_enclaves()
-        .build()
-        .unwrap();
-        let service = KeymeldService {
-            settings: KeymeldSettings {
-                gateway_url: url,
-                enabled: true,
-                ..KeymeldSettings::default()
-            },
-            client: Some(client),
-            coordinator_user_id: session
-                .authorization_manifest
-                .manifest
-                .coordinator_user_id
-                .clone(),
-        };
-        let key = UserCredentials::from_private_key(&[7; 32]).unwrap();
-        let context = RegistrationContext {
-            keygen_session_id: session.session_id.clone(),
-            user_id: user.clone(),
-            manifest_hash: session.authorization_manifest.digest().unwrap(),
-            enclave_id: EnclaveId::new(1),
-            enclave_key_epoch: 1,
-            public_key: key.public_key_bytes(),
-            auth_pubkey: key
-                .derive_session_auth_pubkey(&session.session_id.to_string())
-                .unwrap(),
-            require_signing_approval: false,
-        };
-        let data = ParticipantRegistrationData {
-            encrypted_private_key: key
-                .prepare_registration(context.clone(), &enclave_public_key)
-                .unwrap(),
-            public_key: hex::encode(&context.public_key),
-            auth_pubkey: hex::encode(&context.auth_pubkey),
-            context,
-        };
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            service.register_participant(&session, user, &data),
-        )
-        .await;
-        server.abort();
-        let _ = server.await;
-        result.unwrap().unwrap();
-        let proofs = fixture.proofs.lock().unwrap();
-        assert_eq!(proofs.len(), 2);
-        assert_ne!(proofs[0], proofs[1]);
     }
 }

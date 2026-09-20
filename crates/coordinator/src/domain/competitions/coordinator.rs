@@ -1,7 +1,12 @@
+#[path = "automatic_coordinator.rs"]
+mod automatic;
+pub use automatic::{InvoiceFallbackRequest, PayoutAuthorizationInfo, PayoutTermsQuote};
+
 use super::{
-    states::CompetitionStatus, store::ReservedTicket, AddEntry, CompetitionError, CompetitionState,
-    CompetitionStore, FundedContract, KeymeldSigningInfo, PayoutInfo, SearchBy, Ticket,
-    TicketStatus, UserEntry, UserEntryView,
+    parse_invoice, states::CompetitionStatus, store::ReservedTicket, verify_entry_key,
+    verify_payout_preimage, winner_payout_sats, AddEntry, CompetitionError, CompetitionState,
+    CompetitionStore, FundedContract, KeymeldSigningInfo, PayoutClaimInfo, PayoutClaimReceipt,
+    PayoutInfo, PayoutRejection, SearchBy, Ticket, TicketStatus, UserEntry, UserEntryView,
 };
 use crate::{
     api::routes::FinalSignatures,
@@ -9,12 +14,16 @@ use crate::{
     infra::{
         bitcoin::{fee_rate_for_target, Bitcoin, ForeignUtxo, REQUIRED_CONFIRMATIONS_FOR_TIME},
         db::DatabaseWriteError,
-        escrow::{create_escrow_descriptor, generate_escrow_tx, get_escrow_outpoint},
+        escrow::{
+            escrow_descriptor_for_output, get_escrow_outpoint, reclaim_escrow_tx,
+            ESCROW_RECLAIM_DELAY_BLOCKS,
+        },
         keymeld::{
             DlcKeygenSession, DlcSubsetInfo, Keymeld, ParticipantRegistrationData,
             StoredDlcKeygenSession, SubsetDefinition,
         },
-        lightning::{extract_amount_from_invoice, Ln},
+        lightning::Ln,
+        lnurl::{LightningAddress, LnurlError, LnurlPay},
         oracle::{AddEventEntries, AddEventEntry, Error as OracleError, Event, Oracle},
     },
 };
@@ -23,6 +32,8 @@ use bitcoin::{
     absolute::LockTime,
     consensus::encode::deserialize,
     hashes::{sha256, Hash, HashEngine},
+    script::Instruction,
+    sighash::EcdsaSighashType,
     transaction::Version,
     Amount, FeeRate, OutPoint, Psbt, PublicKey as BitcoinPublicKey, ScriptBuf, Transaction, TxIn,
     TxOut, Txid,
@@ -31,7 +42,6 @@ use coordinator_core::RegistrationAssignment;
 use dlctix::{
     bitcoin::{
         consensus,
-        hex::DisplayHex as _,
         key::TweakedPublicKey,
         psbt::Input,
         sighash::Prevouts,
@@ -100,8 +110,7 @@ impl Competition {
 pub struct TicketResponse {
     pub ticket_id: uuid::Uuid,
     pub payment_request: String, // Lightning HODL invoice to pay for entry
-    pub escrow_tx: Option<String>, // escrow transaction the coordinator broadcasts prior to settling the HODL invoice
-    pub payment_hash: String,      // Hex-encoded payment hash for verification
+    pub payment_hash: String,    // Hex-encoded payment hash for verification
     pub amount_sats: u64,
     /// The user's keymeld user_id (same as ticket_id) - used for keymeld registration
     pub keymeld_user_id: uuid::Uuid,
@@ -170,6 +179,7 @@ pub struct Coordinator {
     pub competition_store: Arc<CompetitionStore>,
     pub bitcoin: Arc<dyn Bitcoin>,
     ln: Arc<dyn Ln>,
+    lnurl: Arc<dyn LnurlPay>,
     keymeld: Arc<dyn Keymeld>,
     keymeld_gateway_url: Option<String>,
     private_key: Scalar,
@@ -179,6 +189,8 @@ pub struct Coordinator {
     name: String,
     escrow_enabled: bool,
     invoice_settlement_confirmations: u32,
+    automatic_payouts: bool,
+    automatic_payout_max_fee_rate: FeeRate,
 }
 
 impl Coordinator {
@@ -191,6 +203,7 @@ impl Coordinator {
         competition_store: CompetitionStore,
         bitcoin: Arc<dyn Bitcoin>,
         ln: Arc<dyn Ln>,
+        lnurl: Arc<dyn LnurlPay>,
         keymeld: Arc<dyn Keymeld>,
         keymeld_gateway_url: Option<String>,
         relative_locktime_block_delta: u32,
@@ -207,6 +220,7 @@ impl Coordinator {
             competition_store: Arc::new(competition_store),
             bitcoin,
             ln,
+            lnurl,
             keymeld,
             keymeld_gateway_url,
             private_key,
@@ -216,6 +230,8 @@ impl Coordinator {
             name,
             escrow_enabled,
             invoice_settlement_confirmations,
+            automatic_payouts: false,
+            automatic_payout_max_fee_rate: FeeRate::from_sat_per_vb_u32(100),
         };
         coordinator.validate_coordinator_metadata().await?;
         Ok(coordinator)
@@ -328,10 +344,9 @@ impl Coordinator {
         );
 
         // Update stored session with aggregate key
-        let updated_session = DlcKeygenSession {
-            aggregate_key,
-            ..session
-        };
+        // The session erases its secret on drop, so fields cannot be moved out.
+        let mut updated_session = session.clone();
+        updated_session.aggregate_key = aggregate_key;
 
         self.store_keymeld_session(competition.id, updated_session)
             .await?;
@@ -443,6 +458,17 @@ impl Coordinator {
     }
 
     pub async fn competition_handler(&self) -> Result<(), anyhow::Error> {
+        // Cleanup has its own work queue: cancelled competitions are deliberately
+        // excluded from active lifecycle processing, but their invoices and
+        // time-locked escrows still need retries after outages or maturity.
+        for competition_id in self
+            .competition_store
+            .get_competitions_pending_cleanup(self.escrow_enabled)
+            .await?
+        {
+            self.release_held_invoices(competition_id).await;
+            self.reclaim_escrows(competition_id).await;
+        }
         let competitions: Vec<Competition> = self.competition_store.get_competitions(true).await?;
 
         for mut competition in competitions {
@@ -501,6 +527,7 @@ impl Coordinator {
                     ));
                 }
                 info!("Cancelled expired competition {}", competition.id);
+                self.release_held_invoices(competition.id).await;
                 continue;
             }
 
@@ -548,6 +575,7 @@ impl Coordinator {
                     }
                 }
 
+                let died = updated_competition.is_failed() || updated_competition.is_cancelled();
                 if let Err(e) = self
                     .competition_store
                     .update_competitions(vec![updated_competition])
@@ -560,11 +588,175 @@ impl Coordinator {
                         e
                     ));
                 }
+                if died {
+                    self.release_held_invoices(competition.id).await;
+                }
                 break;
             }
         }
 
         Ok(())
+    }
+
+    /// Sweep the escrow outputs of a dead competition back to the wallet once
+    /// the reclaim delay has passed. A user who paid can take the escrow with
+    /// the preimage from `USER_REFUND_DELAY_BLOCKS` on; the reclaim runs well
+    /// after that, so they always get first call. Retried every tick until
+    /// each ticket is marked reclaimed.
+    async fn reclaim_escrows(&self, competition_id: Uuid) {
+        if !self.escrow_enabled {
+            return;
+        }
+        let tickets = match self
+            .competition_store
+            .get_escrowed_tickets_for_competition(competition_id)
+            .await
+        {
+            Ok(tickets) => tickets,
+            Err(e) => {
+                error!(
+                    "Failed to list escrows of competition {}: {}",
+                    competition_id, e
+                );
+                return;
+            }
+        };
+        if tickets.is_empty() {
+            return;
+        }
+        let fee_rate = match self.bitcoin.get_estimated_fee_rates().await {
+            Ok(rates) => fee_rate_for_target(&rates, 6)
+                .or_else(|_| fee_rate_for_target(&rates, 1))
+                .unwrap_or(FeeRate::from_sat_per_vb_u32(1)),
+            Err(e) => {
+                warn!("Cannot estimate the escrow reclaim fee: {}", e);
+                return;
+            }
+        };
+        for ticket in tickets {
+            if let Err(e) = self.reclaim_escrow(&ticket, fee_rate).await {
+                warn!(
+                    "Escrow of ticket {} (competition {}) not reclaimed yet: {}",
+                    ticket.id, competition_id, e
+                );
+            }
+        }
+    }
+
+    async fn reclaim_escrow(
+        &self,
+        ticket: &Ticket,
+        fee_rate: FeeRate,
+    ) -> Result<(), anyhow::Error> {
+        let escrow_hex = ticket
+            .escrow_transaction
+            .as_ref()
+            .ok_or_else(|| anyhow!("no escrow transaction"))?;
+        let escrow_tx: Transaction = deserialize(&hex::decode(escrow_hex)?)?;
+        let txid = escrow_tx.compute_txid();
+        let confirmations = self
+            .transaction_confirmations(&txid)
+            .await?
+            .ok_or_else(|| anyhow!("escrow {txid} is not confirmed"))?;
+        if confirmations < u32::from(ESCROW_RECLAIM_DELAY_BLOCKS) {
+            return Err(anyhow!(
+                "escrow {txid} has {confirmations} of {ESCROW_RECLAIM_DELAY_BLOCKS} confirmations"
+            ));
+        }
+        let user_pubkey = ticket
+            .ephemeral_pubkey
+            .as_deref()
+            .map(BitcoinPublicKey::from_str)
+            .transpose()?
+            .ok_or_else(|| anyhow!("ticket has no escrow key"))?;
+        let preimage = hex::decode(&ticket.encrypted_preimage)?;
+        let payment_hash = sha256::Hash::hash(&preimage).to_byte_array();
+
+        let reclaim_tx = reclaim_escrow_tx(
+            self.bitcoin.clone(),
+            &escrow_tx,
+            user_pubkey,
+            payment_hash,
+            fee_rate,
+        )
+        .await?;
+        match self.bitcoin.broadcast(&reclaim_tx).await {
+            Ok(()) => info!(
+                "Reclaimed escrow {} of ticket {}: txid={}",
+                txid,
+                ticket.id,
+                reclaim_tx.compute_txid()
+            ),
+            Err(error) => {
+                // A transport error or a word in an RPC message is not evidence
+                // that this escrow was spent. Check the exact confirmed output.
+                let outpoint = reclaim_tx.input[0].previous_output;
+                let status = self
+                    .bitcoin
+                    .payout_output_status(
+                        outpoint,
+                        escrow_tx.output[outpoint.vout as usize].clone(),
+                    )
+                    .await?;
+                if status.confirmation_height.is_none() || status.unspent {
+                    return Err(error);
+                }
+                info!(
+                    "Escrow {} of ticket {} is confirmed and already spent",
+                    txid, ticket.id
+                );
+            }
+        }
+        self.competition_store
+            .mark_ticket_escrow_reclaimed(ticket.id)
+            .await?;
+        Ok(())
+    }
+
+    /// Cancel every accepted-but-unsettled HODL invoice of a competition
+    /// that failed or was cancelled, releasing the payers' funds. Each
+    /// ticket is marked once LND confirms the cancellation, so a failure
+    /// here is retried on the next tick and never repeated afterwards.
+    /// Settled tickets are not touched: their payment is complete and any
+    /// refund goes through the escrow refund path.
+    async fn release_held_invoices(&self, competition_id: Uuid) {
+        let held = match self
+            .competition_store
+            .get_held_tickets_for_competition(competition_id)
+            .await
+        {
+            Ok(tickets) => tickets,
+            Err(e) => {
+                error!(
+                    "Failed to list held invoices for competition {}: {}",
+                    competition_id, e
+                );
+                return;
+            }
+        };
+        for ticket in held {
+            if let Err(e) = self.ln.cancel_hold_invoice(ticket.hash.clone()).await {
+                warn!(
+                    "Failed to cancel held invoice of ticket {} (competition {}): {}",
+                    ticket.id, competition_id, e
+                );
+                continue;
+            }
+            match self
+                .competition_store
+                .mark_ticket_invoice_cancelled(ticket.id)
+                .await
+            {
+                Ok(_) => info!(
+                    "Released held invoice of ticket {} for dead competition {}",
+                    ticket.id, competition_id
+                ),
+                Err(e) => error!(
+                    "Cancelled the invoice of ticket {} but failed to record it: {}",
+                    ticket.id, e
+                ),
+            }
+        }
     }
 
     pub async fn process_status(&self, status: CompetitionStatus) -> CompetitionStatus {
@@ -1134,22 +1326,24 @@ impl Coordinator {
         competition: &'a mut Competition,
     ) -> Result<&'a mut Competition, anyhow::Error> {
         if competition.event_created_at.is_none() {
-            let event: Event = match self
-                .oracle_client
-                .create_event(competition.event_submission.clone())
-                .await
-            {
-                Ok(event) => Ok(event),
-                Err(OracleError::NotFound(e)) => Err(Error::NotFound(e)),
-                Err(OracleError::BadRequest(e)) => Err(Error::BadRequest(e)),
-                Err(e) => Err(Error::OracleFailed(e)),
-            }?;
-            debug!(
-                "Created competition's {} oracle event: {:?}",
-                competition.id, event
-            );
+            if competition.event_announcement.is_none() {
+                let event: Event = match self
+                    .oracle_client
+                    .create_event(competition.event_submission.clone())
+                    .await
+                {
+                    Ok(event) => Ok(event),
+                    Err(OracleError::NotFound(e)) => Err(Error::NotFound(e)),
+                    Err(OracleError::BadRequest(e)) => Err(Error::BadRequest(e)),
+                    Err(e) => Err(Error::OracleFailed(e)),
+                }?;
+                debug!(
+                    "Created competition's {} oracle event: {:?}",
+                    competition.id, event
+                );
 
-            competition.event_announcement = Some(event.event_announcement);
+                competition.event_announcement = Some(event.event_announcement);
+            }
             competition.event_created_at = Some(OffsetDateTime::now_utc());
             competition.errors = vec![];
         }
@@ -1377,8 +1571,12 @@ impl Coordinator {
                     // Use the hash that was used when creating the escrow
                     let payment_hash = payment_hash_from_preimage;
 
-                    let escrow_descriptor =
-                        create_escrow_descriptor(&coordinator_pubkey, &user_pubkey, &payment_hash)?;
+                    let escrow_descriptor = escrow_descriptor_for_output(
+                        &coordinator_pubkey,
+                        &user_pubkey,
+                        &payment_hash,
+                        &escrow_output,
+                    )?;
 
                     let witness_script = escrow_descriptor.explicit_script().map_err(|e| {
                         anyhow!("Failed to extract witness script from descriptor: {}", e)
@@ -1501,7 +1699,23 @@ impl Coordinator {
                 .map(|entry| UserId::from(entry.ticket_id))
                 .collect();
 
+            let automatic_payouts = self
+                .competition_store
+                .has_automatic_payouts(competition.id)
+                .await?;
             for (entry, user_id) in entries.iter().zip(player_user_ids.iter()) {
+                let payout_policy = self
+                    .competition_store
+                    .entry_payout_policy(entry.id)
+                    .await?
+                    .map(|json| serde_json::from_str(&json))
+                    .transpose()?;
+                if automatic_payouts && payout_policy.is_none() {
+                    return Err(anyhow!(
+                        "Entry {} is missing its accepted payout policy",
+                        entry.id
+                    ));
+                }
                 let registration_data = ParticipantRegistrationData {
                     encrypted_private_key: entry.encrypted_keymeld_private_key.clone().ok_or_else(
                         || {
@@ -1518,6 +1732,8 @@ impl Coordinator {
                     context: entry.keymeld_registration_context.clone().ok_or_else(|| {
                         anyhow!("Entry {} is missing its registration context", entry.id)
                     })?,
+                    payout_policy,
+                    escrow_policy: entry.keymeld_escrow_policy.clone(),
                 };
                 self.keymeld
                     .register_participant(&keygen_session, user_id.clone(), &registration_data)
@@ -1700,6 +1916,15 @@ impl Coordinator {
             self.verify_keymeld_competition(competition, &keygen_session)
                 .await?;
 
+            self.bind_automatic_contract(
+                competition,
+                &keygen_session,
+                &entries,
+                contract_parameters,
+                *funding_outpoint,
+            )
+            .await?;
+
             // Call keymeld to perform batch signing
             let dlc_signatures = self
                 .keymeld
@@ -1860,27 +2085,22 @@ impl Coordinator {
                 ));
             }
 
-            debug!("Merging all funding psbts");
-
             for (sender_pubkey, final_signature) in &final_signatures_by_sender {
+                let sender_key = BitcoinPublicKey::from_slice(&sender_pubkey.serialize())?;
                 let sender_funding_psbt = Psbt::from_str(&final_signature.funding_psbt_base64)?;
-                match funding_psbt.combine(sender_funding_psbt) {
-                    Ok(_) => {
-                        debug!(
-                            "✓ Funding PSBT combination succeeded for player {}",
-                            sender_pubkey
-                        );
-                    }
-                    Err(err) => {
-                        error!(
-                            "✗ Funding PSBT combination failed for player {}: {}",
-                            sender_pubkey, err
-                        );
-                    }
+                let copied =
+                    merge_sender_signatures(&mut funding_psbt, &sender_funding_psbt, &sender_key)
+                        .map_err(|e| anyhow!("Player {sender_pubkey}: {e}"))?;
+                if copied == 0 {
+                    return Err(anyhow!(
+                        "Player {sender_pubkey} signed none of their escrow inputs"
+                    ));
                 }
+                debug!(
+                    "Copied {} escrow signatures from player {}",
+                    copied, sender_pubkey
+                );
             }
-
-            debug!("Combined all psbts");
         } else {
             debug!(
                 "Escrow disabled: coordinator signs funding PSBT directly (no user PSBTs to merge)"
@@ -2177,6 +2397,18 @@ impl Coordinator {
             .checked_sub(outcome_height)
             .ok_or_else(|| anyhow!("LND chain tip is behind the outcome confirmation height"))?;
         let required_delta = signed_contract.params().relative_locktime_block_delta as u32;
+        // A participant can spend independently at the first delta. Close new
+        // Lightning sends early enough to leave the bounded HTLC settlement
+        // margin, while continuing to reconcile already submitted payments.
+        let payment_deadline = crate::infra::lightning::payout_htlc_expiry_height(
+            outcome_height,
+            signed_contract.params().relative_locktime_block_delta,
+        );
+        if payment_deadline.is_err() || current_height >= payment_deadline? {
+            self.competition_store
+                .close_payout_window(competition.id)
+                .await?;
+        }
 
         if blocks_since_outcome < required_delta {
             info!(
@@ -2186,6 +2418,17 @@ impl Coordinator {
             );
             return Ok(competition);
         };
+
+        self.competition_store
+            .close_payout_window(competition.id)
+            .await?;
+        if self
+            .competition_store
+            .has_unsettled_payout_jobs(competition.id)
+            .await?
+        {
+            return Ok(competition);
+        }
 
         // Get outcome and winner information
         let outcome = competition.get_current_outcome()?;
@@ -2813,7 +3056,29 @@ impl Coordinator {
         create_event
             .validate_oracle_settings()
             .map_err(|reason| Error::BadRequest(reason.into()))?;
-        let competition = Competition::new(&create_event);
+        if self.automatic_payouts {
+            // Reject a competition the confidential signing path cannot serve
+            // before any capability request, oracle event, ticket, or funding.
+            // The Oracle admits far more outcomes than Keymeld can sign for.
+            let capacity = coordinator_escrow::capacity::validate_competition_capacity(
+                create_event.total_allowed_entries,
+                create_event.number_of_places_win,
+            )
+            .map_err(|reason| Error::BadRequest(reason.to_string()))?;
+            debug!("confidential competition capacity: {capacity:?}");
+            self.require_payout_capabilities(false).await?;
+        }
+        let mut competition = Competition::new(&create_event);
+        if self.automatic_payouts {
+            // Entrants must authorize the oracle locking points before payment.
+            // Keep event_created_at unset until the normal lifecycle reaches
+            // EscrowConfirmed, so this early announcement cannot skip entries.
+            let event = self
+                .oracle_client
+                .create_event(competition.event_submission.clone())
+                .await?;
+            competition.event_announcement = Some(event.event_announcement);
+        }
 
         debug!("created competition");
         let tickets = competition
@@ -2824,7 +3089,7 @@ impl Coordinator {
         // First insert the competition into the database
         let competition = self
             .competition_store
-            .add_competition_with_tickets(competition, tickets.clone())
+            .add_competition_with_tickets_mode(competition, tickets.clone(), self.automatic_payouts)
             .map_err(|e| {
                 error!(
                     "competition added to oracle, but failed to be saved with tickets: competition_id {} {:?}",
@@ -2889,6 +3154,17 @@ impl Coordinator {
         competition_id: Uuid,
         btc_pubkey: BitcoinPublicKey,
     ) -> Result<TicketResponse, Error> {
+        self.request_ticket_with_payout(pubkey, competition_id, btc_pubkey, None)
+            .await
+    }
+
+    pub async fn request_ticket_with_payout(
+        &self,
+        pubkey: String,
+        competition_id: Uuid,
+        btc_pubkey: BitcoinPublicKey,
+        payout: Option<coordinator_core::PayoutRegistrationRequest>,
+    ) -> Result<TicketResponse, Error> {
         let competition = self
             .competition_store
             .get_competition(competition_id)
@@ -2901,6 +3177,16 @@ impl Coordinator {
         if competition.total_entries as usize >= competition.event_submission.total_allowed_entries
         {
             return Err(Error::CompetitionFull);
+        }
+        let automatic = self
+            .competition_store
+            .has_automatic_payouts(competition_id)
+            .await?;
+        if automatic {
+            let choice = payout.as_ref().ok_or_else(|| Error::BadRequest("This competition requires payout authorization before ticket payment; update your client".into()))?;
+            Self::validate_ticket_payout_choice(&btc_pubkey, choice)?;
+            self.require_payout_capabilities(choice.lightning_address.is_some())
+                .await?;
         }
         debug!("got competition: {:?}", competition);
 
@@ -2919,10 +3205,21 @@ impl Coordinator {
         if let Some(old_hash) = superseded_payment_hash {
             self.cancel_superseded_invoice(ticket.id, old_hash).await;
         }
-        match self
-            .create_ticket_response(ticket.clone(), btc_pubkey, competition)
-            .await
-        {
+        let result = async {
+            if automatic {
+                self.prepare_ticket_payout_policy(
+                    &competition,
+                    &ticket,
+                    &btc_pubkey,
+                    payout.as_ref().expect("validated payout choice"),
+                )
+                .await?;
+            }
+            self.create_ticket_response(ticket.clone(), btc_pubkey, competition)
+                .await
+        }
+        .await;
+        match result {
             Ok(response) => Ok(response),
             Err(e) => {
                 if let Err(clear_err) = self
@@ -2959,6 +3256,31 @@ impl Coordinator {
         btc_pubkey: BitcoinPublicKey,
         competition: Competition,
     ) -> Result<TicketResponse, Error> {
+        let mut keymeld_registration = if self.is_keymeld_enabled() {
+            let stored = self
+                .competition_store
+                .get_keymeld_session(competition.id)
+                .await
+                .map_err(Error::from)?
+                .ok_or_else(|| {
+                    Error::BadRequest("Competition has no authorized Keymeld session".into())
+                })?;
+            let session = self.restore_keymeld_session(&stored)?;
+            Some(
+                self.keymeld
+                    .get_registration_assignment(&session, UserId::from(ticket.id))
+                    .await
+                    .map_err(|error| Error::Bitcoin(anyhow!(error)))?,
+            )
+        } else {
+            None
+        };
+        if let Some(assignment) = keymeld_registration.as_mut() {
+            assignment.payout_policy = self
+                .competition_store
+                .ticket_payout_policy(ticket.id, &ticket.hash)
+                .await?;
+        }
         // Decode preimage from encrypted_preimage
         let preimage = hex::decode(&ticket.encrypted_preimage)
             .map_err(|_| Error::BadRequest("Invalid preimage".into()))?;
@@ -2966,35 +3288,17 @@ impl Coordinator {
         // Calculate payment hash from preimage
         let payment_hash = sha256::Hash::hash(&preimage).to_byte_array();
 
-        // Generate escrow transaction only if escrow is enabled
-        let escrow_tx_hex = if self.escrow_enabled {
-            let escrow_tx = generate_escrow_tx(
-                self.bitcoin.clone(),
-                ticket.id,
-                btc_pubkey,
-                payment_hash,
-                competition.event_submission.entry_fee as u64,
-                competition
-                    .funding_reservation_deadline(OffsetDateTime::now_utc())
-                    .map_err(Error::Bitcoin)?,
-            )
-            .await
-            .map_err(|e| {
-                error!("Failed to generate escrow transaction: {}", e);
-                Error::BadRequest("Failed to generate refund transaction".to_string())
-            })?;
-
-            debug!("escrow_tx: {:?}", escrow_tx);
-
-            let escrow_hex = hex::encode(dlctix::bitcoin::consensus::encode::serialize(&escrow_tx));
-
-            // Store the escrow transaction in the database
+        // The escrow transaction is built and broadcast only once the HODL
+        // invoice is accepted (see the invoice watcher): handing it out earlier
+        // let anyone lock the coordinator's funds without paying. Only the key
+        // the escrow will be locked to is recorded now.
+        if self.escrow_enabled {
             let stored = self
                 .competition_store
-                .update_ticket_escrow(&ticket, btc_pubkey.to_string(), escrow_hex.clone())
+                .update_ticket_pubkey(&ticket, btc_pubkey.to_string())
                 .await
                 .map_err(|e| {
-                    error!("Failed to update ticket with escrow transaction: {}", e);
+                    error!("Failed to record ticket {} escrow key: {}", ticket.id, e);
                     Error::from(e)
                 })?;
 
@@ -3003,21 +3307,7 @@ impl Coordinator {
                     "Ticket reservation changed; request a new ticket".into(),
                 ));
             }
-
-            debug!(
-                "Created ticket {} with escrow tx {}",
-                ticket.id,
-                escrow_tx.compute_txid()
-            );
-
-            Some(escrow_hex)
-        } else {
-            debug!(
-                "Created ticket {} without escrow (escrow disabled)",
-                ticket.id
-            );
-            None
-        };
+        }
 
         let fee_multiplier = competition.event_submission.coordinator_fee_percentage as f64 / 100.0;
         let coordinator_fee =
@@ -3041,7 +3331,6 @@ impl Coordinator {
             existing_payment_request.clone()
         } else {
             // Create new HODL invoice
-            // Note: escrow_tx_hex is empty string when escrow disabled
             let invoice = self
                 .ln
                 .add_hold_invoice(
@@ -3049,7 +3338,6 @@ impl Coordinator {
                     invoice_expiry_seconds as u64,
                     hex::encode(payment_hash),
                     ticket.competition_id,
-                    escrow_tx_hex.clone().unwrap_or_default(),
                 )
                 .await
                 .map_err(|e| {
@@ -3080,25 +3368,6 @@ impl Coordinator {
             invoice.payment_request
         };
 
-        let keymeld_registration = if self.is_keymeld_enabled() {
-            let stored = self
-                .competition_store
-                .get_keymeld_session(competition.id)
-                .await
-                .map_err(Error::from)?
-                .ok_or_else(|| {
-                    Error::BadRequest("Competition has no authorized Keymeld session".into())
-                })?;
-            let session = self.restore_keymeld_session(&stored)?;
-            Some(
-                self.keymeld
-                    .get_registration_assignment(&session, UserId::from(ticket.id))
-                    .await
-                    .map_err(|error| Error::Bitcoin(anyhow!(error)))?,
-            )
-        } else {
-            None
-        };
         let keymeld_session_id = keymeld_registration
             .as_ref()
             .map(|assignment| assignment.session_id.clone());
@@ -3109,7 +3378,6 @@ impl Coordinator {
         Ok(TicketResponse {
             ticket_id: ticket.id,
             payment_request,
-            escrow_tx: escrow_tx_hex,
             payment_hash: hex::encode(payment_hash),
             amount_sats: full_fee,
             // ticket_id is used as the keymeld user_id for consistency
@@ -3273,6 +3541,7 @@ impl Coordinator {
             }
         }
 
+        let policy = self.validate_entry_payout_policy(&entry, &ticket).await?;
         if self.is_keymeld_enabled() {
             let stored = self
                 .competition_store
@@ -3294,15 +3563,31 @@ impl Coordinator {
                 context: entry.keymeld_registration_context.clone().ok_or_else(|| {
                     Error::BadRequest("Missing Keymeld registration context".into())
                 })?,
+                payout_policy: policy
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|error| Error::Bitcoin(error.into()))?,
+                escrow_policy: entry.keymeld_escrow_policy.clone(),
             };
+            coordinator_core::keymeld::verify_registration_policy(
+                &data.context,
+                data.payout_policy.as_ref(),
+                entry.keymeld_escrow_policy.as_ref(),
+            )
+            .map_err(|error| Error::BadRequest(error.to_string()))?;
             session
                 .validate_registration(&UserId::from(ticket.id), &data)
                 .map_err(|_| Error::BadRequest("Invalid Keymeld registration context".into()))?;
         }
 
+        let mut user_entry = entry.clone().into_user_entry(pubkey);
+        if policy.is_some() {
+            user_entry.entry_submission.id = ticket.id;
+        }
         let user_entry = self
             .competition_store
-            .add_entry(entry.clone().into_user_entry(pubkey), ticket.id)
+            .add_entry_with_policy(user_entry, ticket.id, policy)
             .await
             .map_err(|e| match e {
                 DatabaseWriteError::Sqlx(sqlx::Error::RowNotFound) => {
@@ -3666,33 +3951,39 @@ impl Coordinator {
         Ok(())
     }
 
-    pub async fn submit_ticket_payout(
+    /// The checks every payout path shares: the caller owns the entry, the
+    /// competition is attested and still open for sellbacks, the entry won,
+    /// and the key and preimage handed over are the entry's own. Returns the
+    /// winnings in sats.
+    async fn verify_payout_release(
         &self,
-        pubkey: String,
+        pubkey: &str,
         competition_id: Uuid,
         entry_id: Uuid,
-        payout_info: PayoutInfo,
-    ) -> Result<(), Error> {
-        if payout_info.ln_invoice.is_empty() {
-            return Err(Error::BadRequest("Invalid lightning invoice".into()));
+        ticket_id: Uuid,
+        ephemeral_private_key: &str,
+        payout_preimage: &str,
+    ) -> Result<u64, Error> {
+        if self
+            .competition_store
+            .entry_payout_policy(entry_id)
+            .await?
+            .is_some()
+        {
+            return Err(Error::BadRequest(
+                "This entry uses payment-proof escrow; submit a signed invoice authorization"
+                    .into(),
+            ));
         }
-
-        // Get the competition and verify it's in a valid state for payouts
         let competition = self
             .competition_store
             .get_competition(competition_id)
             .await?;
-
         if !competition.is_attested() {
             return Err(Error::BadRequest(
                 "Competition results not yet attested".into(),
             ));
         }
-
-        if let Some(ref event_announcement) = competition.event_announcement {
-            debug!("Locking points: {:?}", event_announcement.locking_points);
-        }
-
         if competition.is_delta_broadcasted()
             || competition.is_expiry_broadcasted()
             || competition.is_completed()
@@ -3702,34 +3993,26 @@ impl Coordinator {
             ));
         }
 
-        // Get the entry and verify ownership
         let entries = self
             .competition_store
             .get_user_entries(
-                pubkey.clone(),
+                pubkey.to_string(),
                 SearchBy {
                     event_ids: Some(vec![competition_id]),
                 },
             )
             .await?;
-
         let entry = entries
             .iter()
             .find(|e| e.id == entry_id)
             .ok_or_else(|| Error::NotFound(format!("Entry {} not found", entry_id)))?;
-
-        // Verify the ticket matches
-        if entry.ticket_id != payout_info.ticket_id {
+        if entry.ticket_id != ticket_id {
             return Err(Error::BadRequest("Invalid ticket for this entry".into()));
         }
-
-        // Get competition tickets to verify against stored data
         let tickets = self.competition_store.get_tickets(competition_id).await?;
-        _ = tickets
-            .get(&entry.id)
-            .ok_or_else(|| Error::NotFound("Ticket not found".into()))?;
-
-        // Verify the entry hasn't already been paid out or pending a payout
+        if !tickets.contains_key(&entry.id) {
+            return Err(Error::NotFound("Ticket not found".into()));
+        }
         if let Some(paid_out_at) = entry.paid_out_at {
             return Err(Error::BadRequest(format!(
                 "Entry {} already paid out at {}",
@@ -3737,116 +4020,137 @@ impl Coordinator {
             )));
         }
 
-        // Get the current outcome
         let outcome = competition.get_current_outcome()?;
-        debug!("Current outcome: {:?}", outcome);
-
-        // Get the signed contract to verify winner
         let signed_contract = competition
             .signed_contract
             .as_ref()
             .ok_or_else(|| Error::BadRequest("Competition contract not yet signed".into()))?;
-
-        // Verify this entry is a winner
-        let winner_weights = signed_contract
-            .params()
-            .outcome_payouts
-            .get(&outcome)
-            .ok_or_else(|| Error::BadRequest("No payout mapping for outcome".into()))?;
-
         let ephemeral_pubkey = Point::from_hex(&entry.ephemeral_pubkey)
             .map_err(|e| Error::BadRequest(format!("Invalid ephemeral pubkey: {}", e)))?;
-
-        debug!("Ephemeral pubkey: {:?}", ephemeral_pubkey);
-        debug!("Winner weights: {:?}", winner_weights);
-        debug!("Players: {:?}", signed_contract.params().players);
-
-        let is_winner = winner_weights.iter().any(|(player_index, _)| {
-            if let Some(player) = signed_contract.params().players.get(*player_index) {
-                player.pubkey == ephemeral_pubkey
-            } else {
-                false
-            }
-        });
-
-        if !is_winner {
-            return Err(Error::BadRequest("Entry is not a winner".into()));
-        }
-
-        // Verify the private key matches the public key
-        let provided_private_key = Scalar::from_hex(&payout_info.ephemeral_private_key)
-            .map_err(|e| Error::BadRequest(format!("Invalid private key: {}", e)))?;
-
-        let derived_public_key = provided_private_key.base_point_mul();
-        if derived_public_key != ephemeral_pubkey {
-            return Err(Error::BadRequest(
-                "Invalid private key for this entry".into(),
-            ));
-        }
-
-        // Verify the payout preimage matches the hash
-        let provided_preimage =
-            dlctix::hashlock::preimage_from_hex(&payout_info.payout_preimage)
-                .map_err(|e| Error::BadRequest(format!("Invalid payout preimage: {}", e)))?;
-
-        let derived_hash = dlctix::hashlock::sha256(&provided_preimage);
-        if derived_hash.to_hex_string(dlctix::bitcoin::hex::Case::Lower) != entry.payout_hash {
-            return Err(Error::BadRequest(
-                "Invalid payout preimage for this entry".into(),
-            ));
-        }
-
-        if payout_info.ln_invoice.is_empty() {
-            return Err(Error::BadRequest("Invalid lightning invoice".into()));
-        }
-
-        // Calculate the payout amount based on winner's weight
-        let total_pool_sats = signed_contract.params().funding_value.to_sat();
-        let winner_weight = winner_weights
-            .iter()
-            .find_map(|(player_index, weight)| {
-                if let Some(player) = signed_contract.params().players.get(*player_index) {
-                    if player.pubkey == ephemeral_pubkey {
-                        Some(*weight)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| Error::BadRequest("Unable to determine winner weight".into()))?;
-
-        let payout_amount_sats = (total_pool_sats * winner_weight) / 100;
-
+        let rejected = |e: PayoutRejection| Error::BadRequest(e.to_string());
+        let payout_amount_sats =
+            winner_payout_sats(signed_contract.params(), &outcome, &ephemeral_pubkey)
+                .map_err(rejected)?;
+        verify_entry_key(ephemeral_private_key, &ephemeral_pubkey).map_err(rejected)?;
+        verify_payout_preimage(payout_preimage, &entry.payout_hash).map_err(rejected)?;
         debug!(
-            "Total pool: {} sats, Winner weight: {}%, Payout amount: {} sats",
-            total_pool_sats, winner_weight, payout_amount_sats
+            "Entry {} wins {} sats for outcome {:?}",
+            entry.id, payout_amount_sats, outcome
         );
+        Ok(payout_amount_sats)
+    }
 
-        let invoice_amount_sats = extract_amount_from_invoice(&payout_info.ln_invoice)
-            .map_err(|e| Error::BadRequest(format!("Invalid lightning invoice: {}", e)))?;
-
-        if let Some(invoice_amount_sats) = invoice_amount_sats {
-            if invoice_amount_sats != payout_amount_sats {
+    /// Pay a winner the invoice they pasted. The key and preimage arrive
+    /// before the payment, so the winner trusts the coordinator to pay; see
+    /// `PayoutInfo`.
+    pub async fn submit_ticket_payout(
+        &self,
+        pubkey: String,
+        competition_id: Uuid,
+        entry_id: Uuid,
+        payout_info: PayoutInfo,
+    ) -> Result<(), Error> {
+        let invoice =
+            parse_invoice(&payout_info.ln_invoice).map_err(|e| Error::BadRequest(e.to_string()))?;
+        let payout_amount_sats = self
+            .verify_payout_release(
+                &pubkey,
+                competition_id,
+                entry_id,
+                payout_info.ticket_id,
+                &payout_info.ephemeral_private_key,
+                &payout_info.payout_preimage,
+            )
+            .await?;
+        // An amountless invoice is paid the winnings; a stated amount must be
+        // exactly the winnings.
+        if let Some(invoice_msat) = invoice.amount_milli_satoshis() {
+            if invoice_msat != payout_amount_sats.saturating_mul(1000) {
                 return Err(Error::BadRequest(format!(
                     "Invoice amount {} sats does not match expected payout {} sats",
-                    invoice_amount_sats, payout_amount_sats
+                    invoice_msat / 1000,
+                    payout_amount_sats
                 )));
             }
         }
+        self.pay_payout(
+            entry_id,
+            payout_info.payout_preimage,
+            payout_info.ephemeral_private_key,
+            payout_info.ln_invoice,
+            payout_amount_sats,
+        )
+        .await?;
+        Ok(())
+    }
 
-        // The pending payout is recorded before anything is sent, and the
-        // database allows one live payout per entry, so a concurrent or
-        // repeated request cannot pay twice. The PayoutWatcher marks it paid
-        // once the payment settles.
+    /// Legacy address recovery for entries without escrow authorization.
+    /// The caller explicitly releases entry secrets before Lightning payment.
+    /// Escrow-authorized entries use the background worker instead.
+    pub async fn claim_ticket_payout(
+        &self,
+        pubkey: String,
+        competition_id: Uuid,
+        entry_id: Uuid,
+        claim: PayoutClaimInfo,
+        address: &LightningAddress,
+    ) -> Result<PayoutClaimReceipt, Error> {
+        let payout_amount_sats = self
+            .verify_payout_release(
+                &pubkey,
+                competition_id,
+                entry_id,
+                claim.ticket_id,
+                &claim.ephemeral_private_key,
+                &claim.payout_preimage,
+            )
+            .await?;
+        let amount_msat = payout_amount_sats
+            .checked_mul(1000)
+            .ok_or_else(|| Error::BadRequest("Payout amount is out of range".into()))?;
+        let request = self
+            .lnurl
+            .resolve(address)
+            .await
+            .map_err(payout_unavailable)?;
+        let invoice = self
+            .lnurl
+            .request_invoice(&request, amount_msat)
+            .await
+            .map_err(payout_unavailable)?;
+        let payout_id = self
+            .pay_payout(
+                entry_id,
+                claim.payout_preimage,
+                claim.ephemeral_private_key,
+                invoice.to_string(),
+                payout_amount_sats,
+            )
+            .await?;
+        Ok(PayoutClaimReceipt {
+            payout_id,
+            lightning_address: address.to_string(),
+            amount_sats: payout_amount_sats,
+        })
+    }
+
+    /// Record the pending payout for PayoutWatcher to send and reconcile.
+    /// The database allows one live payout per entry across concurrent requests.
+    async fn pay_payout(
+        &self,
+        entry_id: Uuid,
+        payout_preimage: String,
+        ephemeral_private_key: String,
+        ln_invoice: String,
+        payout_amount_sats: u64,
+    ) -> Result<Uuid, Error> {
         let payout_id = self
             .competition_store
             .store_payout_info_pending(
                 entry_id,
-                payout_info.payout_preimage,
-                payout_info.ephemeral_private_key,
-                payout_info.ln_invoice.clone(),
+                payout_preimage,
+                ephemeral_private_key,
+                ln_invoice.clone(),
                 payout_amount_sats,
             )
             .await
@@ -3861,8 +4165,14 @@ impl Coordinator {
         // The payout watcher is the sole sender. Persisting this outbox item
         // before acknowledging the request also survives shutdown before the
         // first RPC. Ambiguous RPC errors never release the entry's payout lock.
-        Ok(())
+        Ok(payout_id)
     }
+}
+
+/// Resolution or invoice errors are the provider's or the address's; the
+/// winner can fix the address or paste an invoice instead.
+fn payout_unavailable(error: LnurlError) -> Error {
+    Error::BadRequest(format!("Lightning Address payout failed: {error}"))
 }
 
 fn generate_players(
@@ -3922,7 +4232,7 @@ fn validate_entry_keys(entry: &mut AddEntry) -> Result<(), Error> {
 fn get_percentage_weights(num_winners: usize) -> Vec<u64> {
     match num_winners {
         1 => vec![100],
-        2 => vec![60, 40],
+        2 => vec![70, 30],
         3 => vec![45, 35, 20],
         4 => vec![42, 30, 18, 10],
         5 => vec![40, 27, 16, 9, 8],
@@ -4216,6 +4526,45 @@ fn find_player_indices(
         .collect()
 }
 
+/// Copy a player's signatures into the funding PSBT: only their own
+/// `partial_sigs`, only on inputs whose witness script pushes their key, and
+/// only from a packet spending the same transaction. Nothing else in a
+/// player's packet is trusted, so a player cannot alter other inputs or
+/// fields. Returns how many signatures were copied.
+fn merge_sender_signatures(
+    master: &mut Psbt,
+    sender: &Psbt,
+    sender_key: &BitcoinPublicKey,
+) -> Result<usize, anyhow::Error> {
+    if sender.unsigned_tx != master.unsigned_tx {
+        return Err(anyhow!("funding PSBT spends a different transaction"));
+    }
+    let key_bytes = sender_key.to_bytes();
+    let mut copied = 0;
+    for (master_input, sender_input) in master.inputs.iter_mut().zip(&sender.inputs) {
+        let Some(script) = &master_input.witness_script else {
+            continue;
+        };
+        let pushes_key = script.instructions().any(|instruction| {
+            matches!(instruction, Ok(Instruction::PushBytes(bytes)) if bytes.as_bytes() == key_bytes)
+        });
+        if !pushes_key {
+            continue;
+        }
+        if let Some(signature) = sender_input.partial_sigs.get(sender_key) {
+            if signature.sighash_type != EcdsaSighashType::All {
+                return Err(anyhow!(
+                    "escrow input signed with sighash {}, only ALL is accepted",
+                    signature.sighash_type
+                ));
+            }
+            master_input.partial_sigs.insert(*sender_key, *signature);
+            copied += 1;
+        }
+    }
+    Ok(copied)
+}
+
 async fn signed_funding_tx(
     bitcoin_client: Arc<dyn Bitcoin>,
     mut funding_tx: Psbt,
@@ -4460,6 +4809,7 @@ mod oracle_payout_order_tests {
                     encrypted_keymeld_private_key: None,
                     keymeld_auth_pubkey: None,
                     keymeld_registration_context: None,
+                    keymeld_escrow_policy: None,
                 }
                 .into_user_entry(String::new())
             })
@@ -4472,7 +4822,7 @@ mod oracle_payout_order_tests {
         {
             assert_eq!(
                 payouts[&Outcome::Attestation(outcome)],
-                BTreeMap::from([(winners[0], 60), (winners[1], 40)]),
+                BTreeMap::from([(winners[0], 70), (winners[1], 30)]),
             );
         }
         assert_eq!(
@@ -4789,12 +5139,92 @@ mod tests {
             encrypted_keymeld_private_key: None,
             keymeld_auth_pubkey: None,
             keymeld_registration_context: None,
+            keymeld_escrow_policy: None,
         };
         validate_entry_keys(&mut entry).unwrap();
         assert_eq!(entry.ephemeral_pubkey, hex::encode(key.serialize()));
         assert_eq!(entry.payout_hash, hex::encode([0xab; 32]));
         entry.payout_hash = "00".into();
         assert!(validate_entry_keys(&mut entry).is_err());
+    }
+
+    #[test]
+    fn merge_copies_only_the_players_own_escrow_signatures() {
+        use bitcoin::{
+            absolute::LockTime as AbsLockTime,
+            ecdsa,
+            script::Builder,
+            secp256k1::{Message, Secp256k1, SecretKey},
+            sighash::EcdsaSighashType,
+            transaction::Version,
+            Psbt, ScriptBuf, Transaction, TxIn, TxOut,
+        };
+        let secp = Secp256k1::new();
+        let key = |byte: u8| {
+            let secret = SecretKey::from_slice(&[byte; 32]).unwrap();
+            (secret, BitcoinPublicKey::new(secret.public_key(&secp)))
+        };
+        let (alice_secret, alice) = key(1);
+        let (mallory_secret, mallory) = key(2);
+        let script_for = |k: &BitcoinPublicKey| {
+            Builder::new()
+                .push_key(k)
+                .push_opcode(bitcoin::opcodes::all::OP_CHECKSIG)
+                .into_script()
+        };
+        let sig = |secret: &SecretKey, byte: u8| ecdsa::Signature {
+            signature: secp.sign_ecdsa(&Message::from_digest([byte; 32]), secret),
+            sighash_type: EcdsaSighashType::All,
+        };
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: AbsLockTime::ZERO,
+            input: vec![TxIn::default(), TxIn::default()],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut master = Psbt::from_unsigned_tx(tx.clone()).unwrap();
+        master.inputs[0].witness_script = Some(script_for(&alice));
+        master.inputs[1].witness_script = Some(script_for(&mallory));
+
+        // Mallory's packet carries signatures for both inputs under both keys.
+        let mut sender = master.clone();
+        sender.inputs[0]
+            .partial_sigs
+            .insert(alice, sig(&alice_secret, 9));
+        sender.inputs[0]
+            .partial_sigs
+            .insert(mallory, sig(&mallory_secret, 8));
+        sender.inputs[1]
+            .partial_sigs
+            .insert(mallory, sig(&mallory_secret, 7));
+        sender.inputs[1]
+            .partial_sigs
+            .insert(alice, sig(&alice_secret, 6));
+        let copied = merge_sender_signatures(&mut master, &sender, &mallory).unwrap();
+        assert_eq!(copied, 1);
+        assert!(master.inputs[0].partial_sigs.is_empty());
+        assert_eq!(master.inputs[1].partial_sigs.len(), 1);
+        assert!(master.inputs[1].partial_sigs.contains_key(&mallory));
+
+        // A packet for a different transaction is refused outright.
+        let mut other_tx = tx;
+        other_tx.output[0].value = Amount::from_sat(2);
+        let other = Psbt::from_unsigned_tx(other_tx).unwrap();
+        assert!(merge_sender_signatures(&mut master, &other, &alice).is_err());
+
+        // A signature with the wrong sighash is refused.
+        let mut wrong = sender.clone();
+        wrong.inputs[0].partial_sigs.insert(
+            alice,
+            ecdsa::Signature {
+                signature: sig(&alice_secret, 5).signature,
+                sighash_type: EcdsaSighashType::None,
+            },
+        );
+        assert!(merge_sender_signatures(&mut master, &wrong, &alice).is_err());
     }
 
     fn params() -> ContractParameters {

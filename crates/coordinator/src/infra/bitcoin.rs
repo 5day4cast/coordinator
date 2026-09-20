@@ -39,6 +39,7 @@ use serde_json::{json, Value};
 use std::{collections::HashMap, fs, path::Path, str::FromStr, sync::Arc, time::Duration};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
 mod funding;
 
@@ -100,6 +101,13 @@ pub fn fee_rate_from_estimate(sat_per_vb: f64) -> Result<FeeRate, anyhow::Error>
         .ok_or_else(|| anyhow!("fee estimate {sat_per_vb} sat/vB is out of range"))
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PayoutOutputStatus {
+    pub confirmation_height: Option<u32>,
+    pub current_height: u32,
+    pub unspent: bool,
+}
+
 #[async_trait]
 pub trait Bitcoin: Send + Sync {
     fn get_network(&self) -> Network;
@@ -134,6 +142,12 @@ pub trait Bitcoin: Send + Sync {
     async fn get_confirmed_blockchain_time(&self, blocks: usize) -> Result<u64, anyhow::Error>;
     async fn get_estimated_fee_rates(&self) -> Result<HashMap<u16, f64>, anyhow::Error>;
     async fn get_tx_confirmation_height(&self, txid: &Txid) -> Result<Option<u32>, anyhow::Error>;
+    /// Includes mempool spends; wallet-owned UTXO lists are insufficient for DLC outputs.
+    async fn payout_output_status(
+        &self,
+        outpoint: OutPoint,
+        output: TxOut,
+    ) -> Result<PayoutOutputStatus, anyhow::Error>;
     async fn broadcast(&self, transaction: &Transaction) -> Result<(), anyhow::Error>;
     async fn get_next_address(&self) -> Result<Address, anyhow::Error>;
     async fn get_public_key(&self) -> Result<PublicKey, anyhow::Error>;
@@ -459,9 +473,10 @@ fn read_macaroon_hex(file_path: &str) -> Result<SecretString, anyhow::Error> {
 
 pub struct BitcoinClient {
     pub network: Network,
-    seed_path: SecretString,
+    coordinator_secret: Zeroizing<[u8; 32]>,
     lnd: LndWallet,
     electrum: Arc<ElectrumClient>,
+    payout_electrum_url: String,
 }
 
 impl BitcoinClient {
@@ -479,8 +494,11 @@ impl BitcoinClient {
             fs::create_dir_all(parent)?;
         }
         // Creates the key on first start, as before.
-        get_key::<SecretKey>(&settings.seed_path)
-            .map_err(|e| anyhow!("Failed to load bitcoin private key: {}", e))?;
+        let coordinator_secret = Zeroizing::new(
+            get_key::<SecretKey>(&settings.seed_path)
+                .map_err(|e| anyhow!("Failed to load bitcoin private key: {}", e))?
+                .secret_bytes(),
+        );
 
         let lnd = LndWallet::new(ln_settings)?;
         let electrum_url = settings.electrum_url.clone();
@@ -501,9 +519,10 @@ impl BitcoinClient {
 
         let client = BitcoinClient {
             network: settings.network,
-            seed_path: SecretString::from(settings.seed_path.clone()),
+            coordinator_secret,
             lnd,
             electrum: Arc::new(electrum),
+            payout_electrum_url: settings.electrum_url.clone(),
         };
 
         let info: Value = client.lnd.get("v1/getinfo").await?;
@@ -579,7 +598,7 @@ impl BitcoinClient {
     }
 
     fn coordinator_private_key(&self) -> Result<bitcoin::PrivateKey, anyhow::Error> {
-        let secret_key = get_key::<SecretKey>(self.seed_path.expose_secret())?;
+        let secret_key = SecretKey::from_slice(&self.coordinator_secret[..])?;
         Ok(bitcoin::PrivateKey {
             compressed: true,
             network: NetworkKind::from(self.network),
@@ -784,8 +803,7 @@ impl Bitcoin for BitcoinClient {
     }
 
     async fn get_derived_private_key(&self) -> Result<Scalar, anyhow::Error> {
-        let secret_key = get_key::<SecretKey>(self.seed_path.expose_secret())?;
-        Scalar::from_hex(&hex::encode(secret_key.secret_bytes()))
+        Scalar::from_slice(&self.coordinator_secret[..])
             .map_err(|e| anyhow!("Failed to convert private key to scalar: {}", e))
     }
 
@@ -883,6 +901,45 @@ impl Bitcoin for BitcoinClient {
 
     async fn release_psbt_inputs(&self, psbt: &Psbt) -> Result<(), anyhow::Error> {
         self.lnd.release_psbt_inputs(psbt).await
+    }
+
+    async fn payout_output_status(
+        &self,
+        outpoint: OutPoint,
+        output: TxOut,
+    ) -> Result<PayoutOutputStatus, anyhow::Error> {
+        let url = self.payout_electrum_url.clone();
+        // Separate short-lived connection: no general Electrum retry backlog may
+        // delay a payout chain snapshot, and each blocking RPC has a short timeout.
+        tokio::task::spawn_blocking(move || -> Result<_, electrum_client::Error> {
+            let client = ElectrumClient::from_config(
+                &url,
+                ConfigBuilder::new().timeout(Some(3)).retry(0).build(),
+            )?;
+            let history = client.script_get_history(&output.script_pubkey)?;
+            let confirmation_height = history
+                .iter()
+                .find(|item| item.tx_hash == outpoint.txid)
+                .and_then(|item| u32::try_from(item.height).ok())
+                .filter(|height| *height > 0);
+            let unspent = client
+                .script_list_unspent(&output.script_pubkey)?
+                .iter()
+                .any(|item| {
+                    item.tx_hash == outpoint.txid
+                        && item.tx_pos == outpoint.vout as usize
+                        && item.value == output.value.to_sat()
+                });
+            let current_height = u32::try_from(client.block_headers_subscribe()?.height)
+                .map_err(|_| electrum_client::Error::Message("Invalid chain height".into()))?;
+            Ok(PayoutOutputStatus {
+                confirmation_height,
+                current_height,
+                unspent,
+            })
+        })
+        .await?
+        .map_err(Into::into)
     }
 
     async fn get_tx_confirmation_height(&self, txid: &Txid) -> Result<Option<u32>, anyhow::Error> {

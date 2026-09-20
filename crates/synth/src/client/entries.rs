@@ -12,6 +12,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize)]
 pub struct TicketRequest {
     pub btc_pubkey: String,
+    pub payout: Option<coordinator_core::PayoutRegistrationRequest>,
 }
 
 /// Response from requesting a ticket
@@ -19,7 +20,6 @@ pub struct TicketRequest {
 pub struct TicketResponse {
     pub ticket_id: Uuid,
     pub payment_request: String,
-    pub escrow_tx: Option<String>,
     pub payment_hash: String,
     pub amount_sats: u64,
     pub keymeld_user_id: Uuid,
@@ -63,6 +63,8 @@ pub struct AddEntry {
     pub keymeld_auth_pubkey: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keymeld_registration_context: Option<RegistrationContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keymeld_escrow_policy: Option<coordinator_core::keymeld::SignedEscrowPolicy>,
 }
 
 /// Entry response from the API
@@ -100,6 +102,7 @@ impl CoordinatorClient {
         keys: &Keys,
         competition_id: &Uuid,
         btc_pubkey: &str,
+        payout: Option<coordinator_core::PayoutRegistrationRequest>,
     ) -> Result<TicketResponse> {
         let url = format!(
             "{}/api/v1/competitions/{}/ticket",
@@ -109,6 +112,7 @@ impl CoordinatorClient {
 
         let body = TicketRequest {
             btc_pubkey: btc_pubkey.to_string(),
+            payout,
         };
 
         let body = serde_json::to_vec(&body)?;

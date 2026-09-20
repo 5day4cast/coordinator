@@ -2,21 +2,21 @@ use crate::{
     api::admin_auth::{
         admin_login, admin_login_page, operator_response_headers, require_operator, AdminAccess,
     },
-    api::nip98_replay::{Nip98ReplayGuard, DEFAULT_REPLAY_CAPACITY},
+    api::nip98_replay::Nip98ReplayGuard,
     api::routes::{
         add_event_entry, admin_competition_fragment, admin_create_competition_handler,
         admin_delete_competition_handler, admin_fee_estimates_fragment, admin_page_handler,
         admin_send_bitcoin_handler, admin_settle_test_invoice_handler,
         admin_wallet_address_fragment, admin_wallet_balance_fragment, admin_wallet_fragment,
-        admin_wallet_outputs_fragment, change_password, competitions_fragment,
+        admin_wallet_outputs_fragment, change_password, claim_ticket_payout, competitions_fragment,
         competitions_rows_fragment, create_competition, entries_fragment, entry_detail_fragment,
         entry_form_fragment, forgot_password_challenge, forgot_password_reset,
         get_aggregate_nonces, get_balance, get_competition, get_competitions,
         get_contract_parameters, get_entries, get_estimated_fee_rates, get_next_address,
         get_outputs, get_ticket_status, health, leaderboard_fragment, leaderboard_rows_fragment,
         login, login_username, payouts_fragment, public_page_handler, register, register_username,
-        request_competition_ticket, send_to_address, submit_final_signatures, submit_public_nonces,
-        submit_ticket_payout,
+        request_competition_ticket, send_to_address, set_lightning_address,
+        submit_final_signatures, submit_public_nonces, submit_ticket_payout,
     },
     config::Settings,
     domain::{
@@ -29,14 +29,18 @@ use crate::{
         file_utils::create_folder,
         keymeld::create_keymeld_service,
         lightning::{Ln, LnClient},
+        lnurl::{HttpsLnurlPay, LnurlPay},
         oracle::{Oracle, OracleClient},
     },
 };
 
 // Mock implementations only available with e2e-testing feature or debug builds
+use crate::api::nip98_origins::Nip98Origins;
+use crate::config::{APISettings, RateLimitSettings};
 #[cfg(any(feature = "e2e-testing", debug_assertions))]
 use crate::infra::{
-    bitcoin_mock::MockBitcoinClient, lightning_mock::MockLnClient, oracle_mock::MockOracle,
+    bitcoin_mock::MockBitcoinClient, lightning_mock::MockLnClient, lnurl_mock::MockLnurlPay,
+    oracle_mock::MockOracle,
 };
 use anyhow::anyhow;
 use axum::{
@@ -51,6 +55,7 @@ use axum::{
 };
 use bitcoin::Network;
 use dlctix::secp::Scalar;
+use futures::FutureExt;
 use hyper::{
     header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
     Method,
@@ -71,6 +76,9 @@ use tokio::{
     task::{AbortHandle, JoinHandle},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tower_governor::{
+    governor::GovernorConfigBuilder, key_extractor::PeerIpKeyExtractor, GovernorLayer,
+};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 type HttpServer = Serve<
     TcpListener,
@@ -112,11 +120,8 @@ impl Application {
             .collect();
         let app_state = Arc::new(app_state);
         let servers = async {
-            let server = build_server(
-                listener,
-                app(app_state.clone(), config.api_settings.origins),
-            )
-            .await?;
+            let server =
+                build_server(listener, app(app_state.clone(), &config.api_settings)).await?;
             let admin_server = build_server(
                 admin_listener,
                 admin_app(app_state.clone(), admin_access, network),
@@ -188,6 +193,9 @@ impl Application {
             () = shutdown_signal() => {}
             () = writer_stopped => {
                 shutdown_error = Some(anyhow!("Database writer stopped unexpectedly"));
+            }
+            () = cancellation_token.cancelled() => {
+                shutdown_error = Some(anyhow!("A background worker stopped unexpectedly"));
             }
         }
         stop_http.cancel();
@@ -268,6 +276,7 @@ pub struct AppState {
     pub bitcoin: Arc<dyn Bitcoin>,
     pub coordinator: Arc<Coordinator>,
     pub users_info: Arc<UserInfo>,
+    pub lnurl: Arc<dyn LnurlPay>,
     pub background_threads: Arc<HashMap<String, JoinHandle<()>>>,
     pub forgot_password_challenges: Arc<RwLock<HashMap<String, (String, std::time::Instant)>>>,
 }
@@ -425,6 +434,7 @@ pub async fn build_app(
         config.keymeld_settings.clone(),
         coordinator_user_id,
         &private_key_bytes,
+        competition_db_clone.clone(),
     )
     .map_err(|e| anyhow!("Failed to create keymeld service: {}", e))?;
 
@@ -445,11 +455,19 @@ pub async fn build_app(
         None
     };
 
+    // Lightning Address resolution follows the Lightning client: mocked
+    // together, real together.
+    let lnurl = lnurl_resolver(
+        config.ln_settings.mock_enabled,
+        config.bitcoin_settings.network,
+    );
+
     let coordinator = Coordinator::new(
         oracle_client,
         competition_store,
         bitcoin_client.clone(),
         ln.clone(),
+        lnurl.clone(),
         keymeld_service,
         keymeld_gateway_url,
         config
@@ -461,8 +479,12 @@ pub async fn build_app(
         config.coordinator_settings.escrow_enabled,
         config.coordinator_settings.invoice_settlement_confirmations,
     )
-    .await
-    .map(Arc::new)?;
+    .await?
+    .with_automatic_payouts(
+        config.keymeld_settings.automatic_payouts,
+        config.keymeld_settings.automatic_payout_max_fee_rate_sat_vb,
+    )?;
+    let coordinator = Arc::new(coordinator);
 
     if config.coordinator_settings.escrow_enabled {
         info!("Escrow transactions enabled");
@@ -480,16 +502,12 @@ pub async fn build_app(
         cancel_token.clone(),
         Duration::from_secs(config.coordinator_settings.sync_interval_secs),
     );
-    let competition_watcher_task = tracker.spawn(async move {
-        match competition_watcher.watch().await {
-            Ok(_) => {
-                info!("Successfully shutdown competition watcher")
-            }
-            Err(e) => {
-                error!("Error in competition watcher: {}", e)
-            }
-        }
-    });
+    let competition_watcher_task = spawn_supervised(
+        &tracker,
+        "competition watcher",
+        cancel_token.clone(),
+        async move { competition_watcher.watch().await },
+    );
 
     let bitcoin_watcher = BitcoinSyncWatcher::new(
         bitcoin_client.clone(),
@@ -497,16 +515,12 @@ pub async fn build_app(
         Duration::from_secs(config.bitcoin_settings.refresh_blocks_secs),
     );
 
-    let bitcoin_watcher_task = tracker.spawn(async move {
-        match bitcoin_watcher.watch().await {
-            Ok(_) => {
-                info!("Successfully shutdown Bitcoin sync watcher")
-            }
-            Err(e) => {
-                error!("Error in Bitcoin sync watcher: {}", e)
-            }
-        }
-    });
+    let bitcoin_watcher_task = spawn_supervised(
+        &tracker,
+        "Bitcoin sync watcher",
+        cancel_token.clone(),
+        async move { bitcoin_watcher.watch().await },
+    );
 
     threads.insert(
         String::from("competition_watcher"),
@@ -521,11 +535,12 @@ pub async fn build_app(
         Duration::from_secs(config.ln_settings.invoice_watch_interval),
     );
 
-    let invoice_watcher_handle = tracker.spawn(async move {
-        if let Err(e) = invoice_watcher.watch().await {
-            error!("Invoice watcher error: {}", e);
-        }
-    });
+    let invoice_watcher_handle = spawn_supervised(
+        &tracker,
+        "invoice watcher",
+        cancel_token.clone(),
+        async move { invoice_watcher.watch().await },
+    );
 
     threads.insert("invoice_watcher".to_string(), invoice_watcher_handle);
 
@@ -536,13 +551,38 @@ pub async fn build_app(
         Duration::from_secs(config.ln_settings.payout_watch_interval),
     );
 
-    let payout_watcher_handle = tracker.spawn(async move {
-        if let Err(e) = payout_watcher.watch().await {
-            error!("Payout watcher error: {}", e);
-        }
-    });
+    let payout_watcher_handle = spawn_supervised(
+        &tracker,
+        "payout watcher",
+        cancel_token.clone(),
+        async move { payout_watcher.watch().await },
+    );
 
     threads.insert("payout_watcher".to_string(), payout_watcher_handle);
+
+    let automatic_coordinator = coordinator.clone();
+    let automatic_cancel = cancel_token.clone();
+    let automatic_handle = spawn_supervised(
+        &tracker,
+        "automatic payouts",
+        cancel_token.clone(),
+        async move {
+            loop {
+                tokio::select! {
+                    _ = automatic_cancel.cancelled() => break,
+                    result = automatic_coordinator.automatic_payout_tick() => {
+                        if let Err(error) = result { error!("Automatic payout worker: {}", error); }
+                    }
+                }
+                tokio::select! {
+                    _ = automatic_cancel.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                }
+            }
+            Ok(())
+        },
+    );
+    threads.insert("automatic_payouts".to_string(), automatic_handle);
 
     // Subscription-based watchers for faster payment detection
     // These run alongside the polling watchers as the primary mechanism,
@@ -550,22 +590,24 @@ pub async fn build_app(
     let invoice_subscriber =
         InvoiceSubscriber::new(coordinator.clone(), ln.clone(), cancel_token.clone());
 
-    let invoice_subscriber_handle = tracker.spawn(async move {
-        if let Err(e) = invoice_subscriber.subscribe().await {
-            error!("Invoice subscriber error: {}", e);
-        }
-    });
+    let invoice_subscriber_handle = spawn_supervised(
+        &tracker,
+        "invoice subscriber",
+        cancel_token.clone(),
+        async move { invoice_subscriber.subscribe().await },
+    );
 
     threads.insert("invoice_subscriber".to_string(), invoice_subscriber_handle);
 
     let payment_subscriber =
         PaymentSubscriber::new(coordinator.clone(), ln.clone(), cancel_token.clone());
 
-    let payment_subscriber_handle = tracker.spawn(async move {
-        if let Err(e) = payment_subscriber.subscribe().await {
-            error!("Payment subscriber error: {}", e);
-        }
-    });
+    let payment_subscriber_handle = spawn_supervised(
+        &tracker,
+        "payment subscriber",
+        cancel_token.clone(),
+        async move { payment_subscriber.subscribe().await },
+    );
 
     threads.insert("payment_subscriber".to_string(), payment_subscriber_handle);
     tracker.close();
@@ -583,6 +625,7 @@ pub async fn build_app(
         network: config.bitcoin_settings.network.to_string(),
         coordinator,
         users_info: Arc::new(UserInfo::new(users_store)),
+        lnurl,
         bitcoin: bitcoin_client,
         background_threads: Arc::new(threads),
         forgot_password_challenges: Arc::new(RwLock::new(HashMap::new())),
@@ -611,11 +654,34 @@ pub async fn build_server(
 
 /// Public listener: participant API, public pages, and static assets. It must never
 /// route an operator path; `startup_tests` proves this for every admin route.
-pub fn app(app_state: Arc<AppState>, origins: Vec<String>) -> Router {
-    let origins: Vec<HeaderValue> = origins
-        .into_iter()
+pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
+    let origins: Vec<HeaderValue> = api
+        .origins
+        .iter()
         .filter_map(|origin| origin.parse().ok())
         .collect();
+
+    // NIP-98 events must name the URL clients actually use: the browser
+    // origins plus the UI's own public and private URLs. Validated at startup.
+    let nip98_origins = Nip98Origins::new(api.origins.iter().map(String::as_str).chain([
+        app_state.remote_url.as_str(),
+        app_state.private_url.as_str(),
+    ]))
+    .expect("api_settings.origins and ui_settings urls are validated at startup");
+
+    // Release expired replay entries during idle periods as well as admission.
+    let replay = Arc::new(Nip98ReplayGuard::new(api.replay_capacity));
+    {
+        let guard = Arc::downgrade(&replay);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let Some(guard) = guard.upgrade() else { break };
+                guard.prune(time::OffsetDateTime::now_utc().unix_timestamp());
+            }
+        });
+    }
 
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
@@ -627,10 +693,17 @@ pub fn app(app_state: Arc<AppState>, origins: Vec<String>) -> Router {
         .route("/login", post(login))
         .route("/register", post(register))
         .route("/username/register", post(register_username))
+        .route("/lightning-address", post(set_lightning_address))
         .route("/username/login", post(login_username))
         .route("/username/change-password", post(change_password))
         .route("/username/forgot-password", post(forgot_password_challenge))
         .route("/username/reset-password", post(forgot_password_reset));
+    let users_endpoints = limited(
+        users_endpoints,
+        &api.rate_limit,
+        api.rate_limit.auth_per_second,
+        api.rate_limit.auth_burst,
+    );
 
     // HTMX public routes (some require JS bridge for auth)
     let htmx_routes = Router::new()
@@ -652,7 +725,7 @@ pub fn app(app_state: Arc<AppState>, origins: Vec<String>) -> Router {
         .route("/entries/{entry_id}/detail", get(entry_detail_fragment))
         .route("/payouts", get(payouts_fragment));
 
-    Router::new()
+    let api_routes = Router::new()
         .route("/", get(public_page_handler))
         .merge(htmx_routes)
         .fallback(public_fallback)
@@ -661,6 +734,10 @@ pub fn app(app_state: Arc<AppState>, origins: Vec<String>) -> Router {
         .route(
             "/api/v1/competitions/{competition_id}",
             get(get_competition),
+        )
+        .route(
+            "/api/v1/competitions/{competition_id}/payout-terms",
+            get(crate::api::routes::get_payout_terms),
         )
         .route(
             "/api/v1/competitions/{competition_id}/ticket",
@@ -690,16 +767,69 @@ pub fn app(app_state: Arc<AppState>, origins: Vec<String>) -> Router {
             "/api/v1/competitions/{competitionId}/entries/{entryId}/payout",
             post(submit_ticket_payout),
         )
+        .route(
+            "/api/v1/competitions/{competitionId}/entries/{entryId}/claim",
+            post(claim_ticket_payout),
+        )
+        .route(
+            "/api/v1/competitions/{competitionId}/entries/{entryId}/payout-authorization",
+            get(crate::api::routes::get_payout_authorization)
+                .post(crate::api::routes::submit_invoice_fallback),
+        )
         .route("/api/v1/entries", post(add_event_entry))
         .route("/api/v1/entries", get(get_entries))
-        .nest("/api/v1/users", users_endpoints)
+        .nest("/api/v1/users", users_endpoints);
+    let api_routes = limited(
+        api_routes,
+        &api.rate_limit,
+        api.rate_limit.per_second,
+        api.rate_limit.burst,
+    );
+
+    Router::new()
+        .merge(api_routes)
         .route("/ui/{*path}", get(serve_static_file))
-        .layer(Extension(Arc::new(Nip98ReplayGuard::new(
-            DEFAULT_REPLAY_CAPACITY,
-        ))))
+        .layer(Extension(replay))
+        .layer(Extension(Arc::new(nip98_origins)))
         .layer(middleware::from_fn(log_request))
         .with_state(app_state)
         .layer(cors)
+}
+
+/// Per-client limit on every route of `router`, unless limiting is off.
+/// `per_second` is the sustained rate, `burst` the allowance above it.
+fn limited<S: Clone + Send + Sync + 'static>(
+    router: Router<S>,
+    settings: &RateLimitSettings,
+    per_second: u32,
+    burst: u32,
+) -> Router<S> {
+    if !settings.enabled {
+        return router;
+    }
+    let config = Arc::new(
+        GovernorConfigBuilder::default()
+            .period(Duration::from_nanos(
+                1_000_000_000_u64.div_ceil(u64::from(per_second.max(1))),
+            ))
+            .burst_size(burst.max(1))
+            .key_extractor(PeerIpKeyExtractor)
+            .finish()
+            .expect("rate limit settings are valid"),
+    );
+    // The limiter only forgets idle clients when told to.
+    let limiter = Arc::downgrade(config.limiter());
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let Some(limiter) = limiter.upgrade() else {
+                break;
+            };
+            limiter.retain_recent();
+        }
+    });
+    router.route_layer(GovernorLayer::new(config))
 }
 
 /// Admin listener: operator pages, the LND wallet API, and competition creation.
@@ -855,6 +985,53 @@ fn get_mime_type(path: &str) -> &'static str {
     }
 }
 
+#[cfg(any(feature = "e2e-testing", debug_assertions))]
+fn lnurl_resolver(mock: bool, network: Network) -> Arc<dyn LnurlPay> {
+    if mock {
+        Arc::new(MockLnurlPay::new(network))
+    } else {
+        Arc::new(HttpsLnurlPay::new(network))
+    }
+}
+
+/// Release builds refuse mocked Lightning before this is reached.
+#[cfg(not(any(feature = "e2e-testing", debug_assertions)))]
+fn lnurl_resolver(_mock: bool, network: Network) -> Arc<dyn LnurlPay> {
+    Arc::new(HttpsLnurlPay::new(network))
+}
+
+/// Run a background worker. A worker that stops for any reason other than
+/// shutdown takes the whole service down with it: the watchers settle
+/// invoices, payouts and contracts, so running without one is worse than
+/// restarting.
+fn spawn_supervised(
+    tracker: &TaskTracker,
+    name: &'static str,
+    cancel: CancellationToken,
+    work: impl std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'static,
+) -> JoinHandle<()> {
+    // Also propagate unexpected task abortion, including before its first poll.
+    let cancel_on_drop = cancel.clone().drop_guard();
+    tracker.spawn(async move {
+        let _cancel_on_drop = cancel_on_drop;
+        match std::panic::AssertUnwindSafe(work).catch_unwind().await {
+            Ok(Ok(())) if cancel.is_cancelled() => info!("{name} stopped"),
+            Ok(Ok(())) => {
+                error!("{name} stopped unexpectedly; shutting down");
+                cancel.cancel();
+            }
+            Ok(Err(e)) => {
+                error!("{name} failed: {e}; shutting down");
+                cancel.cancel();
+            }
+            Err(_) => {
+                error!("{name} panicked; shutting down");
+                cancel.cancel();
+            }
+        }
+    })
+}
+
 pub fn build_reqwest_client(client: Client) -> ClientWithMiddleware {
     let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
     ClientBuilder::new(client)
@@ -989,7 +1166,13 @@ mod startup_tests {
         }
 
         fn public(&self) -> Router {
-            app(self.state.clone(), vec![])
+            app(
+                self.state.clone(),
+                &APISettings {
+                    rate_limit: RateLimitSettings::disabled(),
+                    ..APISettings::default()
+                },
+            )
         }
 
         async fn stop(self) {
@@ -1263,3 +1446,7 @@ mod static_file_tests {
         server.abort();
     }
 }
+
+#[cfg(test)]
+#[path = "startup_hardening_tests.rs"]
+mod startup_hardening_tests;

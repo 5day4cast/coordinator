@@ -22,6 +22,7 @@ nostr = { version = "0.44.8", default-features = false, features = ["std", "nip0
 # Bitcoin (`base64` for PSBT encoding)
 bitcoin.workspace = true
 dlctix.workspace = true
+lightning-invoice.workspace = true
 
 # Keymeld registration: attestation-verified, context-bound entry key envelopes
 coordinator-core = { path = "../coordinator-core", features = ["keymeld"] }

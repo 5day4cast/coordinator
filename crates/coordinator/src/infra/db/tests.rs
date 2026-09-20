@@ -8,6 +8,74 @@ use keymeld_sdk::{
 use tempfile::TempDir;
 use uuid::Uuid;
 
+#[tokio::test]
+async fn confidential_upgrade_preserves_published_payout_migration_checksums() {
+    let historical = tempfile::tempdir().unwrap();
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/competitions");
+    for entry in std::fs::read_dir(&source).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let version: i64 = name
+            .to_str()
+            .unwrap()
+            .split('_')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        if version <= 20260924000000 {
+            std::fs::copy(entry.path(), historical.path().join(name)).unwrap();
+        }
+    }
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate::Migrator::new(historical.path())
+        .await
+        .unwrap()
+        .run(&pool)
+        .await
+        .unwrap();
+    let before: Vec<u8> =
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 20260922000000")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::migrate!("./migrations/competitions")
+        .run(&pool)
+        .await
+        .unwrap();
+    let after: Vec<u8> =
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 20260922000000")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after);
+    for (table, column) in [
+        ("entries", "payout_policy"),
+        ("competitions", "signing_receipt"),
+        ("payouts", "lightning_address"),
+        ("payouts", "lnurl_metadata"),
+        ("entries", "keymeld_escrow_policy"),
+    ] {
+        let columns: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM pragma_table_info(?) WHERE name = ?")
+                .bind(table)
+                .bind(column)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(columns, 1, "{table}.{column}");
+    }
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name IN ('payout_jobs', 'keymeld_protocol_state')",
+    ).fetch_one(&pool).await.unwrap();
+    assert_eq!(tables, 2);
+    pool.close().await;
+}
+
 async fn bounded<T>(future: impl Future<Output = T>) -> T {
     tokio::time::timeout(StdDuration::from_secs(10), future)
         .await
@@ -308,6 +376,7 @@ async fn registration_migration_preserves_legacy_entries_and_new_context_roundtr
         .unwrap();
     assert_eq!(legacy_entry.pubkey, "owner");
     assert!(legacy_entry.keymeld_registration_context.is_none());
+    assert!(legacy_entry.keymeld_escrow_policy.is_none());
     let context = RegistrationContext {
         keygen_session_id: SessionId::new_v7(),
         manifest_hash: vec![1; 32],
@@ -325,6 +394,57 @@ async fn registration_migration_preserves_legacy_entries_and_new_context_roundtr
     new_entry.ephemeral_pubkey = "ephemeral-2".into();
     new_entry.payout_hash = "hash-2".into();
     new_entry.keymeld_registration_context = Some(context.clone());
+    let signed_policy = {
+        use coordinator_escrow::escrow::{
+            self, Action, ActionGrant, ApplicationContext, Condition, EscrowContext, EscrowPolicy,
+            Permission, PublicKeyBytes, Recipient, SecretCommitment, SignedEscrowPolicy,
+        };
+        let key = PublicKeyBytes::new(
+            &keymeld_sdk::UserCredentials::from_private_key(&[9; 32])
+                .unwrap()
+                .public_key_bytes(),
+        )
+        .unwrap();
+        SignedEscrowPolicy::sign(
+            EscrowPolicy {
+                schema_version: escrow::SCHEMA_VERSION,
+                context: EscrowContext {
+                    keygen_session_id: context.keygen_session_id.clone(),
+                    user_id: context.user_id.clone(),
+                    escrow_id: new_entry.id,
+                    manifest_digest: [1; 32],
+                    application: ApplicationContext::commit("storage.test".into(), 1, &[]).unwrap(),
+                },
+                participant_public_key: key.clone(),
+                verifier: None,
+                secrets: std::collections::BTreeMap::from([(
+                    "deposit".into(),
+                    SecretCommitment::from_secret(&[6; 32]).unwrap(),
+                )]),
+                grants: std::collections::BTreeMap::from([(
+                    "release".into(),
+                    ActionGrant {
+                        preparation: coordinator_escrow::escrow::PreparationPolicy::Single,
+                        repetition: escrow::Repetition::Once,
+                        condition: Condition::HashlockSha256 {
+                            commitment: escrow::sha256(&[8; 32]),
+                        },
+                        operation: Permission::Exact {
+                            action: Action::ReleaseSecret {
+                                name: "deposit".into(),
+                                recipient: Recipient {
+                                    encryption_public_key: key,
+                                },
+                            },
+                        },
+                    },
+                )]),
+            },
+            &[9; 32],
+        )
+        .unwrap()
+    };
+    new_entry.keymeld_escrow_policy = Some(signed_policy.clone());
     bounded(store.add_entry(new_entry.clone(), new_ticket))
         .await
         .unwrap();
@@ -350,6 +470,14 @@ async fn registration_migration_preserves_legacy_entries_and_new_context_roundtr
         .unwrap()
         .unwrap();
     assert_eq!(loaded.keymeld_registration_context, Some(context.clone()));
+    assert_eq!(
+        serde_json::to_value(&loaded.keymeld_escrow_policy).unwrap(),
+        serde_json::to_value(Some(&signed_policy)).unwrap()
+    );
+    assert!(serde_json::to_value(&loaded)
+        .unwrap()
+        .get("keymeld_escrow_policy")
+        .is_none());
     for entries in [
         bounded(store.get_competition_entries(event_id, vec![]))
             .await
@@ -364,6 +492,10 @@ async fn registration_migration_preserves_legacy_entries_and_new_context_roundtr
             .find(|entry| entry.id == new_entry.id)
             .unwrap();
         assert_eq!(loaded.keymeld_registration_context, Some(context.clone()));
+        assert_eq!(
+            serde_json::to_value(&loaded.keymeld_escrow_policy).unwrap(),
+            serde_json::to_value(Some(&signed_policy)).unwrap()
+        );
     }
     bounded(database.close()).await.unwrap();
 }
@@ -629,7 +761,7 @@ async fn concurrent_payouts_are_exclusive_and_terminal_states_cannot_be_overwrit
     ))
     .await
     .unwrap();
-    bounded(store.mark_payout_succeeded(first_id, OffsetDateTime::now_utc()))
+    bounded(store.mark_payout_succeeded(first_id, OffsetDateTime::now_utc(), None))
         .await
         .unwrap();
     assert!(bounded(store.get_payout(first_id))
@@ -639,7 +771,7 @@ async fn concurrent_payouts_are_exclusive_and_terminal_states_cannot_be_overwrit
         .succeed_at
         .is_none());
     let retry_id = bounded(start()).await.unwrap();
-    bounded(store.mark_payout_succeeded(retry_id, OffsetDateTime::now_utc()))
+    bounded(store.mark_payout_succeeded(retry_id, OffsetDateTime::now_utc(), None))
         .await
         .unwrap();
     bounded(store.mark_payout_failed(

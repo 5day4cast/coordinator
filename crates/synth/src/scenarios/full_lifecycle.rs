@@ -180,9 +180,25 @@ async fn enter_competition(
     // Derive ephemeral key for this entry
     let ephemeral = user.derive_ephemeral_key(entry_index)?;
 
-    // Request ticket
+    let entry_id = Uuid::now_v7();
+    let (payout_preimage, payout_hash) =
+        crypto::payout::generate_payout_pair(&ephemeral.secret_bytes);
+    let payout_choice = coordinator_core::PayoutRegistrationRequest {
+        entry_id,
+        payout_hash: payout_hash.clone(),
+        lightning_address: None,
+        allow_invoice_fallback: true,
+        release_entry_key_after_payment: true,
+    };
+    // The lifecycle synth uses signed-invoice fallback; automated-address tests
+    // exercise a dedicated TLS LNURL provider and verify actual payment proof.
     let ticket = client
-        .request_ticket(&user.nostr_keys, competition_id, &ephemeral.public_key)
+        .request_ticket(
+            &user.nostr_keys,
+            competition_id,
+            &ephemeral.public_key,
+            Some(payout_choice.clone()),
+        )
         .await
         .context("Failed to request ticket")?;
 
@@ -190,6 +206,38 @@ async fn enter_competition(
         "  {} got ticket {} ({}sats)",
         user.name, ticket.ticket_id, ticket.amount_sats
     );
+
+    if ticket.keymeld_session_id.is_some() && ticket.keymeld_registration.is_none() {
+        anyhow::bail!("Ticket is missing authorized Keymeld registration context");
+    }
+    let registration = match &ticket.keymeld_registration {
+        Some(assignment) => Some(
+            crypto::keymeld::prepare_for_ticket(
+                &ephemeral.private_key_hex,
+                assignment,
+                &payout_choice,
+                *competition_id,
+                &ticket.payment_hash,
+                &payout_preimage,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    let (
+        encrypted_keymeld_key,
+        keymeld_auth_pubkey,
+        keymeld_registration_context,
+        keymeld_escrow_policy,
+    ) = match registration {
+        Some(data) => (
+            Some(data.encrypted_private_key),
+            Some(data.auth_pubkey),
+            Some(data.context),
+            data.escrow_policy,
+        ),
+        None => (None, None, None, None),
+    };
 
     // Settle invoice via test endpoint
     client
@@ -220,35 +268,12 @@ async fn enter_competition(
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
-    // Generate payout preimage/hash
-    let (_payout_preimage, payout_hash) =
-        crypto::payout::generate_payout_pair(&ephemeral.secret_bytes);
-
-    if ticket.keymeld_session_id.is_some() && ticket.keymeld_registration.is_none() {
-        anyhow::bail!("Ticket is missing authorized Keymeld registration context");
-    }
-    let registration = match &ticket.keymeld_registration {
-        Some(assignment) => {
-            Some(crypto::keymeld::prepare_for_ticket(&ephemeral.private_key_hex, assignment).await?)
-        }
-        None => None,
-    };
-    let (encrypted_keymeld_key, keymeld_auth_pubkey, keymeld_registration_context) =
-        match registration {
-            Some(data) => (
-                Some(data.encrypted_private_key),
-                Some(data.auth_pubkey),
-                Some(data.context),
-            ),
-            None => (None, None, None),
-        };
-
     // Generate random weather predictions
     let predictions = generate_random_predictions(&config.stations);
 
     // Submit entry
     let entry = AddEntry {
-        id: Uuid::now_v7(),
+        id: entry_id,
         ticket_id: ticket.ticket_id,
         ephemeral_pubkey: ephemeral.public_key,
         payout_hash,
@@ -257,6 +282,7 @@ async fn enter_competition(
         encrypted_keymeld_private_key: encrypted_keymeld_key,
         keymeld_auth_pubkey,
         keymeld_registration_context,
+        keymeld_escrow_policy,
     };
 
     client

@@ -10,15 +10,16 @@ invariants the code enforces.
 
 The coordinator is the market maker, a counterparty. Everything it sends is
 untrusted: contract parameters, PSBTs, aggregate nonces, Keymeld assignments.
-Entry keys never reach JavaScript except in the payout sellback described below.
+Entry keys reach JavaScript only through the explicit legacy recovery path.
+Automatic and signed-invoice payouts keep entry secrets inside WASM and the attested enclave until payment proof authorizes release.
 
 ## Keys
 
 | Material | Derivation | Leaves the browser |
 | --- | --- | --- |
 | Wallet seed | 32 random bytes | NIP-44 encrypted to the user's own Nostr key, stored by the coordinator |
-| Entry key | `tagged_hash("coordinator/entry-key/v1", seed ‖ network magic ‖ entry id)` | Encrypted to an attested Keymeld enclave; plaintext only at payout |
-| Payout preimage | `tagged_hash("coordinator/payout-preimage/v1", seed ‖ network magic ‖ entry id)` | Plaintext only at payout |
+| Entry key | `tagged_hash("coordinator/entry-key/v1", seed ‖ network magic ‖ entry id)` | Encrypted to an attested Keymeld enclave; released to the coordinator after verified payment |
+| Payout preimage | `tagged_hash("coordinator/payout-preimage/v1", seed ‖ network magic ‖ entry id)` | Encrypted with the authorized payout policy; released after verified payment |
 
 Invariants:
 
@@ -85,6 +86,11 @@ Before signing, the wallet checks all of the following:
 
 It errors if no input belongs to the entry.
 
+The coordinator builds and broadcasts the escrow transaction only after the
+ticket's HODL invoice is accepted, never hands it out beforehand, and its
+output carries a coordinator reclaim branch (`infra/escrow.rs`) so an escrow
+nobody spends is recovered once a paying user's refund window has passed.
+
 ## Keymeld enclave trust
 
 Entry keys are encrypted only to a Keymeld enclave whose fresh Nitro
@@ -116,22 +122,23 @@ that module, and the pins it was built from are in the tagged source.
   timestamp is within the 60 second window. The guard is per process, which
   matches the single-replica deployment.
 
-## Known gaps
+## Payout authorization
 
-- **The sellback is not atomic.** The payout preimage and entry key are sent
-  before the Lightning payout is made (see `PayoutInfo`). A Lightning Address
-  can automate payouts but cannot make them atomic, because its invoices use
-  the payee's own preimage. The planned fix is an NWC hold invoice whose
-  payment hash is `payout_hash`, settled by the browser; Lightning Address
-  payouts stay as the automated, trust-the-coordinator option. Until then,
-  the database allows one live payout per entry, and the payout row is
-  written before the payment is sent.
-- **Sold payout secrets are stored in plaintext.** After a sellback the
-  coordinator keeps the entry key and preimage it bought, unencrypted, to sign
-  the reclaim.
-- **Players do not verify contract signatures before buying a ticket.** The
-  browser only receives `ContractParameters`; the aggregated
-  `ContractSignatures` stay with the coordinator, so a player cannot run
-  `TicketedDLC::verify_signatures` for the outcomes they can win before paying
-  the ticket invoice. Publishing the pruned signature set per entry would close
-  this.
+[Automatic payout escrow](PAYOUT_ESCROW.md) binds an entry's recipient and payout rules before ticket payment.
+The browser checks its selected address, ticket, entry key, payout hash, and economic terms before encrypting the registration.
+The actual funding contract is bound inside Keymeld before signing.
+
+An ordinary invoice fallback signs the exact invoice and completed contract context.
+It never sends entry secrets before payment.
+The browser does not silently downgrade to legacy recovery when an authorization lookup fails.
+
+## Remaining trust limits
+
+- Legacy recovery requires explicit consent to release entry secrets before payment.
+  Existing entries cannot acquire an escrow policy without their owner's authorization.
+- After a paid sellback, the coordinator stores the purchased secrets in its database to complete settlement.
+- The complete contract does not exist before all entrants register.
+  Players authorize fixed economics first; Keymeld enforces those terms before signing the eventual contract.
+- The LNURL provider controls invoice secrets.
+  A colluding provider can disclose a preimage without receiving a payment.
+- Enclave receipts support restart recovery but cannot prevent hostile rollback without an external monotonic state service.

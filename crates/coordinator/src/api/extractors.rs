@@ -7,7 +7,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use hyper::{header::AUTHORIZATION, StatusCode};
-use log::{info, warn};
+use log::{debug, warn};
 use nostr::{
     hashes::{sha256::Hash as Sha256Hash, Hash},
     nips::nip98::{HttpData, HttpMethod},
@@ -18,6 +18,7 @@ use serde_json::json;
 use std::{str::FromStr, sync::Arc};
 use time::OffsetDateTime;
 
+use super::nip98_origins::Nip98Origins;
 use super::nip98_replay::{Nip98ReplayGuard, ReplayRejection, MAX_EVENT_SKEW_SECS};
 
 // Match the protocol crate's bounded NIP-98 parser. This extractor parses its
@@ -104,35 +105,14 @@ where
         let tags = event.tags.clone().to_vec();
         let http_data =
             HttpData::try_from(tags).map_err(|e| AuthError::InvalidHttpData(e.to_string()))?;
-        info!("Received request URI: {}", original_uri);
-        let reconstructed_url = format!(
-            "{}://{}{}",
-            if parts.headers.contains_key("x-forwarded-proto") {
-                "https"
-            } else {
-                "http"
-            },
-            parts
-                .headers
-                .get("host")
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or(""),
-            original_uri
-        );
-        info!(
-            "reconstructed_url: {}, http_data.url: {}",
-            reconstructed_url, http_data.url
-        );
-        info!(
-            "http_data.method: {}, parts.method: {}",
-            http_data.method,
-            parts.method.as_str()
-        );
-        if http_data.url != Url::from_str(&reconstructed_url)?
-            || http_data.method
-                != HttpMethod::from_str(parts.method.as_str())
-                    .map_err(|e| AuthError::InvalidMethod(e.to_string()))?
-        {
+        let origins = parts
+            .extensions
+            .get::<Arc<Nip98Origins>>()
+            .ok_or(AuthError::OriginsMissing)?;
+        let method = HttpMethod::from_str(parts.method.as_str())
+            .map_err(|e| AuthError::InvalidMethod(e.to_string()))?;
+        if !origins.accepts(&http_data.url, &original_uri) || http_data.method != method {
+            debug!("NIP-98 method or configured request URL does not match");
             return Err(AuthError::UrlMethodMismatch);
         }
 
@@ -241,6 +221,8 @@ pub enum AuthError {
     ReplayGuardFull,
     #[error("NIP-98 replay guard is not configured")]
     ReplayGuardMissing,
+    #[error("NIP-98 origins are not configured")]
+    OriginsMissing,
 }
 
 impl From<nostr::types::ParseError> for AuthError {
@@ -277,6 +259,7 @@ impl Serialize for AuthError {
             Self::Replayed => "replayed",
             Self::ReplayGuardFull => "replay_guard_full",
             Self::ReplayGuardMissing => "replay_guard_missing",
+            Self::OriginsMissing => "origins_missing",
         };
 
         state.serialize_field("type", type_str)?;
@@ -308,7 +291,7 @@ impl IntoResponse for AuthError {
                 warn!("{}", self);
                 (json!({ "error": self }), StatusCode::SERVICE_UNAVAILABLE)
             }
-            Self::ReplayGuardMissing => {
+            Self::ReplayGuardMissing | Self::OriginsMissing => {
                 log::error!("{}", self);
                 (json!({ "error": self }), StatusCode::INTERNAL_SERVER_ERROR)
             }
@@ -335,6 +318,41 @@ mod tests {
     pub struct AppState;
 
     #[tokio::test]
+    async fn forwarded_headers_cannot_choose_signed_origin_and_missing_origins_fail_closed() {
+        let keys = Keys::generate();
+        for (url, configure_origins, expected_missing) in [
+            ("https://attacker.example/test", true, false),
+            ("http://localhost/test", false, true),
+        ] {
+            let event = create_auth_event("GET", url, None, &keys).await;
+            let mut request = Request::builder()
+                .method("GET")
+                .uri("/test")
+                .header("host", "attacker.example")
+                .header("x-forwarded-proto", "https")
+                .header(
+                    AUTHORIZATION,
+                    format!(
+                        "Nostr {}",
+                        BASE64.encode(serde_json::to_vec(&event).unwrap())
+                    ),
+                )
+                .extension(Arc::new(Nip98ReplayGuard::new(16)));
+            if configure_origins {
+                request =
+                    request.extension(Arc::new(Nip98Origins::new(["http://localhost"]).unwrap()));
+            }
+            let mut parts = request.body(()).unwrap().into_parts().0;
+            let result = NostrAuth::from_request_parts(&mut parts, &AppState).await;
+            if expected_missing {
+                assert!(matches!(result, Err(AuthError::OriginsMissing)));
+            } else {
+                assert!(matches!(result, Err(AuthError::UrlMethodMismatch)));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_valid_get_request() {
         let keys = Keys::generate();
         let state = AppState;
@@ -351,6 +369,7 @@ mod tests {
             .method("GET")
             .uri("/test")
             .header("host", "localhost")
+            .extension(Arc::new(Nip98Origins::new(["http://localhost"]).unwrap()))
             .header(AUTHORIZATION, auth_header)
             .body(())
             .unwrap();
@@ -375,6 +394,7 @@ mod tests {
             .method("POST")
             .uri("/test")
             .header("host", "localhost")
+            .extension(Arc::new(Nip98Origins::new(["http://localhost"]).unwrap()))
             .header(
                 AUTHORIZATION,
                 format!(
@@ -401,6 +421,7 @@ mod tests {
                 .method("GET")
                 .uri("/test")
                 .header("host", "localhost")
+                .extension(Arc::new(Nip98Origins::new(["http://localhost"]).unwrap()))
                 .header(AUTHORIZATION, header.clone())
                 .extension(guard.clone())
                 .body(())
@@ -430,6 +451,7 @@ mod tests {
                 .method("GET")
                 .uri("/test")
                 .header("host", "localhost")
+                .extension(Arc::new(Nip98Origins::new(["http://localhost"]).unwrap()))
                 .header(AUTHORIZATION, format!("Nostr {encoded}"))
                 .body(())
                 .unwrap()
@@ -457,6 +479,7 @@ mod tests {
                 .method("GET")
                 .uri("/test")
                 .header("host", "localhost")
+                .extension(Arc::new(Nip98Origins::new(["http://localhost"]).unwrap()))
                 .header(
                     AUTHORIZATION,
                     format!(
@@ -490,6 +513,7 @@ mod tests {
                 .method("GET")
                 .uri("/test")
                 .header("host", "localhost")
+                .extension(Arc::new(Nip98Origins::new(["http://localhost"]).unwrap()))
                 .header(
                     AUTHORIZATION,
                     format!(
@@ -516,6 +540,7 @@ mod tests {
             .method("GET")
             .uri("/test")
             .header("host", "localhost")
+            .extension(Arc::new(Nip98Origins::new(["http://localhost"]).unwrap()))
             .header(
                 AUTHORIZATION,
                 format!(
@@ -580,6 +605,7 @@ mod tests {
             .method("POST")
             .uri("/test")
             .header("host", "localhost")
+            .extension(Arc::new(Nip98Origins::new(["http://localhost"]).unwrap()))
             .header(AUTHORIZATION, auth_header)
             .body(())
             .unwrap();
@@ -602,6 +628,7 @@ mod tests {
             .method("GET")
             .uri("/test")
             .header("host", "localhost")
+            .extension(Arc::new(Nip98Origins::new(["http://localhost"]).unwrap()))
             .body(())
             .unwrap();
 
@@ -619,6 +646,7 @@ mod tests {
             .method("GET")
             .uri("/test")
             .header("host", "localhost")
+            .extension(Arc::new(Nip98Origins::new(["http://localhost"]).unwrap()))
             .header(AUTHORIZATION, "InvalidFormat")
             .body(())
             .unwrap();
@@ -637,6 +665,7 @@ mod tests {
             .method("GET")
             .uri("/test")
             .header("host", "localhost")
+            .extension(Arc::new(Nip98Origins::new(["http://localhost"]).unwrap()))
             .header(AUTHORIZATION, "Nostr invalid-base64!")
             .body(())
             .unwrap();
@@ -656,6 +685,7 @@ mod tests {
             .method("GET")
             .uri("/test")
             .header("host", "localhost")
+            .extension(Arc::new(Nip98Origins::new(["http://localhost"]).unwrap()))
             .header(AUTHORIZATION, format!("Nostr {invalid_json}"))
             .body(())
             .unwrap();
@@ -699,6 +729,7 @@ mod tests {
             .method("GET")
             .uri("/test")
             .header("host", "localhost")
+            .extension(Arc::new(Nip98Origins::new(["http://localhost"]).unwrap()))
             .header(AUTHORIZATION, auth_header)
             .body(())
             .unwrap();
@@ -735,6 +766,7 @@ mod tests {
             .method("GET")
             .uri("/test")
             .header("host", "localhost")
+            .extension(Arc::new(Nip98Origins::new(["http://localhost"]).unwrap()))
             .header(AUTHORIZATION, auth_header)
             .body(())
             .unwrap();
@@ -761,6 +793,7 @@ mod tests {
             .method("GET")
             .uri("/test")
             .header("host", "localhost")
+            .extension(Arc::new(Nip98Origins::new(["http://localhost"]).unwrap()))
             .header(AUTHORIZATION, auth_header)
             .body(())
             .unwrap();
@@ -787,6 +820,7 @@ mod tests {
             .method("GET") // Different method from event
             .uri("/test")
             .header("host", "localhost")
+            .extension(Arc::new(Nip98Origins::new(["http://localhost"]).unwrap()))
             .header(AUTHORIZATION, auth_header)
             .body(())
             .unwrap();
@@ -831,6 +865,7 @@ mod tests {
             .method("GET")
             .uri("/test")
             .header("host", "localhost")
+            .extension(Arc::new(Nip98Origins::new(["http://localhost"]).unwrap()))
             .header(AUTHORIZATION, auth_header)
             .body(())
             .unwrap();
@@ -863,6 +898,7 @@ mod tests {
             .method("GET")
             .uri("/test")
             .header("host", "localhost")
+            .extension(Arc::new(Nip98Origins::new(["https://localhost"]).unwrap()))
             .header("x-forwarded-proto", "https")
             .header(AUTHORIZATION, auth_header)
             .body(())

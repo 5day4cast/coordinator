@@ -189,7 +189,16 @@ pub async fn payouts_fragment(
     HtmlNostrAuth(NostrAuth { pubkey, .. }): HtmlNostrAuth,
 ) -> Html<String> {
     let payouts = fetch_eligible_payouts(&state, &pubkey.to_hex()).await;
-    let content = payouts_page(&payouts);
+    let lightning_address = match pubkey.to_bech32() {
+        Ok(npub) => state
+            .users_info
+            .login(npub)
+            .await
+            .ok()
+            .and_then(|user| user.lightning_address),
+        Err(_) => None,
+    };
+    let content = payouts_page(&payouts, lightning_address.as_deref());
     render_fragment(&headers, &state, "Payouts - Fantasy Weather", content)
 }
 
@@ -815,8 +824,17 @@ async fn fetch_eligible_payouts(state: &AppState, pubkey: &str) -> Vec<PayoutVie
             entry.id, entry.event_id, entry.paid_out_at
         );
 
-        if entry.paid_out_at.is_some() {
-            debug!("Skipping entry {} - already paid out", entry.id);
+        let policy = state
+            .coordinator
+            .competition_store
+            .entry_payout_policy(entry.id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|json| {
+                serde_json::from_str::<coordinator_escrow::authorization::PayoutPolicy>(&json).ok()
+            });
+        if entry.paid_out_at.is_some() && policy.is_none() {
             continue;
         }
 
@@ -837,11 +855,48 @@ async fn fetch_eligible_payouts(state: &AppState, pubkey: &str) -> Vec<PayoutVie
                         "Entry {} is eligible for payout of {} sats",
                         entry.id, payout_amount
                     );
+                    let window_closed = state
+                        .coordinator
+                        .competition_store
+                        .payout_window_is_closed(competition.id)
+                        .await
+                        .unwrap_or(true)
+                        || competition.delta_broadcasted_at.is_some()
+                        || competition.expiry_broadcasted_at.is_some()
+                        || competition.completed_at.is_some()
+                        || competition.cancelled_at.is_some();
                     payouts.push(PayoutView {
                         competition_id: competition.id.to_string(),
                         entry_id: entry.id.to_string(),
-                        status: "Eligible".to_string(),
+                        status: state
+                            .coordinator
+                            .competition_store
+                            .payout_job_status(entry.id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| {
+                                if window_closed {
+                                    "On-chain settlement".into()
+                                } else if policy
+                                    .as_ref()
+                                    .is_some_and(|p| p.automatic_lightning_address.is_some())
+                                {
+                                    "Queued automatically".into()
+                                } else {
+                                    "Awaiting invoice".into()
+                                }
+                            }),
                         payout_amount,
+                        automatic_lightning_address: policy
+                            .as_ref()
+                            .and_then(|p| p.automatic_lightning_address.clone()),
+                        allow_invoice_fallback: policy
+                            .as_ref()
+                            .is_none_or(|p| p.allow_invoice_fallback)
+                            && !window_closed
+                            && entry.paid_out_at.is_none(),
+                        escrow_enabled: policy.is_some(),
                     });
                 } else {
                     debug!("Entry {} is not eligible for payout", entry.id);
@@ -1203,10 +1258,28 @@ async fn fetch_leaderboard_scores(state: &AppState, competition_id: Uuid) -> Vec
         None
     };
 
+    let local_entries = state
+        .coordinator
+        .competition_store
+        .get_competition_entries(competition_id, vec![])
+        .await
+        .unwrap_or_default();
+    let entries_by_oracle_id: std::collections::HashMap<_, _> = local_entries
+        .iter()
+        .map(|entry| (entry.entry_submission.id, entry))
+        .collect();
+
     // Build index of oracle scores for sort order (final_score with tiebreaker)
     let oracle_score_map: std::collections::HashMap<Uuid, i64> = oracle_entries
         .iter()
-        .map(|e| (e.id, e.score.unwrap_or(0)))
+        .map(|e| {
+            (
+                entries_by_oracle_id
+                    .get(&e.id)
+                    .map_or(e.id, |entry| entry.id),
+                e.score.unwrap_or(0),
+            )
+        })
         .collect();
 
     // Convert to EntryScore, computing raw scores from picks + weather data
@@ -1215,13 +1288,16 @@ async fn fetch_leaderboard_scores(state: &AppState, competition_id: Uuid) -> Vec
     for oracle_entry in &oracle_entries {
         let mut entry_score = EntryScore {
             rank: 0,
-            entry_id: oracle_entry.id.to_string(),
+            entry_id: entries_by_oracle_id
+                .get(&oracle_entry.id)
+                .map_or(oracle_entry.id, |entry| entry.id)
+                .to_string(),
             username: String::new(),
             score: 0,
         };
 
         // Fetch entry details for username and raw score calculation
-        if let Ok(Some(entry)) = state.coordinator.get_entry_by_id(oracle_entry.id).await {
+        if let Some(entry) = entries_by_oracle_id.get(&oracle_entry.id) {
             // Look up username
             if let Ok(pubkey) = nostr::PublicKey::from_hex(&entry.pubkey) {
                 let bech32 = pubkey.to_bech32().unwrap_or_else(|never| match never {});

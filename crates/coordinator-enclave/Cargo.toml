@@ -1,0 +1,16 @@
+[package]
+name = "coordinator-enclave"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+lnurl = ["coordinator-escrow-verifier/lnurl"]
+
+[dependencies]
+coordinator-escrow-verifier = { path = "../coordinator-escrow-verifier" }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "1e08d38b2bdb7203f638083d9e3833f207ea4c24", default-features = false, features = ["escrow", "enclave"] }
+keymeld-enclave = { git = "https://github.com/tee8z/keymeld", rev = "1e08d38b2bdb7203f638083d9e3833f207ea4c24", default-features = false, features = ["escrow"] }
+anyhow.workspace = true
+tokio = { workspace = true, features = ["full"] }

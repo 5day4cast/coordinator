@@ -20,6 +20,9 @@ pub struct RegistrationAssignment {
     /// only from its own development configuration and never on mainnet.
     #[serde(default)]
     pub dangerous_trust_unattested_enclaves: bool,
+    /// Exact entry payout policy to authorize inside the attested envelope.
+    #[serde(default)]
+    pub payout_policy: Option<String>,
 }
 
 /// Comparison type for predictions
@@ -122,4 +125,15 @@ pub enum CompetitionStatusKind {
     Completed,
     Failed,
     Cancelled,
+}
+
+/// The player's explicit payout choice, supplied before a ticket invoice exists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PayoutRegistrationRequest {
+    pub entry_id: Uuid,
+    pub payout_hash: String,
+    pub lightning_address: Option<String>,
+    pub allow_invoice_fallback: bool,
+    pub release_entry_key_after_payment: bool,
 }

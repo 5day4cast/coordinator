@@ -4,6 +4,7 @@ pub mod escrow;
 pub mod file_utils;
 pub mod keymeld;
 pub mod lightning;
+pub mod lnurl;
 pub mod oracle;
 pub mod secrets;
 
@@ -12,5 +13,7 @@ pub mod secrets;
 pub mod bitcoin_mock;
 #[cfg(any(feature = "e2e-testing", debug_assertions))]
 pub mod lightning_mock;
+#[cfg(any(feature = "e2e-testing", debug_assertions))]
+pub mod lnurl_mock;
 #[cfg(any(feature = "e2e-testing", debug_assertions))]
 pub mod oracle_mock;

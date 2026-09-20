@@ -27,6 +27,13 @@ domain = "127.0.0.1"
 port = "9990"
 origins = ["http://localhost:9990", "http://127.0.0.1:9990"]
 
+[api_settings.rate_limit]
+# Playwright drives every test from one address
+per_second = 200
+burst = 400
+auth_per_second = 50
+auth_burst = 100
+
 [ui_settings]
 private_url = "http://127.0.0.1:9991"
 remote_url = "http://127.0.0.1:9990"

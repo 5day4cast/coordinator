@@ -1,0 +1,21 @@
+[Unit]
+Description=Coordinator enclave LNURL TLS relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/coordinator-lnurl-relay
+Environment=TRANSPORT_MODE=vsock
+Environment=COORDINATOR_LNURL_RELAY_PORT=8101
+DynamicUser=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_VSOCK AF_INET AF_INET6 AF_UNIX
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

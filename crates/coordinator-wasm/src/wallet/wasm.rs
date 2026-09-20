@@ -1,4 +1,7 @@
-use super::{DlcWalletCore, WalletError};
+use super::{
+    core::{PayoutConsent, PayoutInvoiceConsent},
+    DlcWalletCore, WalletError,
+};
 use crate::nostr::NostrClientWrapper;
 use coordinator_core::RegistrationAssignment;
 use dlctix::{
@@ -69,6 +72,36 @@ impl DlcWallet {
             .await?;
         // JSON-compatible so byte arrays in the context survive the round trip.
         prepared
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = "keymeldPayoutRegistration")]
+    pub async fn keymeld_payout_registration(
+        &self,
+        entry_id: &str,
+        assignment_json: &str,
+        consent_json: &str,
+    ) -> Result<JsValue, JsValue> {
+        let assignment: RegistrationAssignment = serde_json::from_str(assignment_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Keymeld assignment: {e}")))?;
+        let consent: PayoutConsent = serde_json::from_str(consent_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid payout consent: {e}")))?;
+        let prepared = self
+            .inner
+            .keymeld_payout_registration(parse_entry_id(entry_id)?, &assignment, &consent)
+            .await?;
+        prepared
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = "authorizePayoutInvoice")]
+    pub fn authorize_payout_invoice(&self, consent_json: &str) -> Result<JsValue, JsValue> {
+        let consent: PayoutInvoiceConsent = serde_json::from_str(consent_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid invoice authorization: {e}")))?;
+        self.inner
+            .authorize_payout_invoice(consent)?
             .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }

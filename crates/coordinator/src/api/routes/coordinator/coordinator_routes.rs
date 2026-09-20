@@ -9,6 +9,7 @@ use dlctix::{
     SigMap,
 };
 use log::{debug, error};
+use nostr::ToBech32;
 use serde::Deserialize;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -20,9 +21,10 @@ use crate::{
         routes::ApiError,
     },
     domain::{
-        AddEntry, Competition, CreateEvent, FundedContract, PayoutInfo, SearchBy, TicketResponse,
-        TicketStatus, UserEntry,
+        AddEntry, Competition, CreateEvent, Error as DomainError, FundedContract, PayoutClaimInfo,
+        PayoutClaimReceipt, PayoutInfo, SearchBy, TicketResponse, TicketStatus, UserEntry,
     },
+    infra::lnurl::LightningAddress,
     startup::AppState,
 };
 
@@ -55,6 +57,8 @@ pub struct SettleEscrowRequest {
 #[derive(Debug, Deserialize)]
 pub struct TicketRequest {
     pub btc_pubkey: String, // Bitcoin public key for escrow refund path
+    #[serde(default)]
+    pub payout: Option<coordinator_core::PayoutRegistrationRequest>,
 }
 
 /// Request a competition ticket to enter the DLC
@@ -91,7 +95,7 @@ pub async fn request_competition_ticket(
 
     state
         .coordinator
-        .request_ticket(pubkey.to_hex(), competition_id, btc_pubkey)
+        .request_ticket_with_payout(pubkey.to_hex(), competition_id, btc_pubkey, request.payout)
         .await
         .map(Json)
         .map_err(|e| {
@@ -306,4 +310,81 @@ pub async fn submit_ticket_payout(
             error!("error submitting payout information: {:?}", e);
             e.into()
         })
+}
+
+/// One-click payout to the Lightning Address on the account.
+pub async fn claim_ticket_payout(
+    State(state): State<Arc<AppState>>,
+    Path((competition_id, entry_id)): Path<(Uuid, Uuid)>,
+    AuthedJson {
+        auth: NostrAuth { pubkey, .. },
+        body: claim,
+    }: AuthedJson<PayoutClaimInfo>,
+) -> Result<Json<PayoutClaimReceipt>, ApiError> {
+    let npub = pubkey.to_bech32().expect("public bech32 format");
+    let user = state.users_info.login(npub).await?;
+    let address = user
+        .lightning_address
+        .as_deref()
+        .map(LightningAddress::parse)
+        .transpose()
+        .map_err(|e| ApiError::from(DomainError::BadRequest(e.to_string())))?
+        .ok_or_else(|| {
+            ApiError::from(DomainError::BadRequest(
+                "Add a Lightning Address on the payouts page first".into(),
+            ))
+        })?;
+    let pubkey = pubkey.to_hex();
+    debug!("payout claim by: {} for entry {}", pubkey, entry_id);
+
+    state
+        .coordinator
+        .claim_ticket_payout(pubkey, competition_id, entry_id, claim, &address)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            error!("error claiming payout: {:?}", e);
+            e.into()
+        })
+}
+
+pub async fn get_payout_authorization(
+    NostrAuth { pubkey, .. }: NostrAuth,
+    State(state): State<Arc<AppState>>,
+    Path((competition_id, entry_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<crate::domain::PayoutAuthorizationInfo>, ApiError> {
+    state
+        .coordinator
+        .payout_authorization_info(&pubkey.to_hex(), competition_id, entry_id)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+pub async fn submit_invoice_fallback(
+    State(state): State<Arc<AppState>>,
+    Path((competition_id, entry_id)): Path<(Uuid, Uuid)>,
+    AuthedJson {
+        auth: NostrAuth { pubkey, .. },
+        body,
+    }: AuthedJson<crate::domain::InvoiceFallbackRequest>,
+) -> Result<Json<Uuid>, ApiError> {
+    state
+        .coordinator
+        .submit_invoice_fallback(&pubkey.to_hex(), competition_id, entry_id, body)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+pub async fn get_payout_terms(
+    State(state): State<Arc<AppState>>,
+    Path(competition_id): Path<Uuid>,
+) -> Result<Json<crate::domain::PayoutTermsQuote>, ApiError> {
+    state
+        .coordinator
+        .payout_terms_quote(competition_id)
+        .await
+        .map(Json)
+        .map_err(Into::into)
 }

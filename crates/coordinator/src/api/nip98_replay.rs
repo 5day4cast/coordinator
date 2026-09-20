@@ -45,8 +45,8 @@ impl Nip98ReplayGuard {
         }
     }
 
-    /// Claim `id` for a single use. Expired ids are pruned only when the
-    /// guard is full, keeping the common path to one hash lookup.
+    /// Claim `id` for a single use. Admission also prunes a full guard,
+    /// keeping the common path to one hash lookup.
     pub fn claim(&self, id: EventId, created_at: i64, now: i64) -> Result<(), ReplayRejection> {
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         if seen.contains_key(&id) {
@@ -60,6 +60,12 @@ impl Nip98ReplayGuard {
         }
         seen.insert(id, created_at + MAX_EVENT_SKEW_SECS);
         Ok(())
+    }
+
+    /// Forget expired events during idle periods without waiting for capacity.
+    pub fn prune(&self, now: i64) {
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        seen.retain(|_, last_valid| *last_valid >= now);
     }
 }
 
@@ -93,6 +99,21 @@ mod tests {
 
         // After 1_060, id(1) has expired and its slot is reused; id(2) is kept.
         assert_eq!(guard.claim(id(3), 1_061, 1_061), Ok(()));
+        assert_eq!(
+            guard.claim(id(2), 1_050, 1_061),
+            Err(ReplayRejection::Replayed)
+        );
+    }
+
+    #[test]
+    fn maintenance_prunes_idle_entries_without_forgetting_live_events() {
+        let guard = Nip98ReplayGuard::new(10);
+        guard.claim(id(1), 1_000, 1_000).unwrap();
+        guard.claim(id(2), 1_050, 1_050).unwrap();
+        guard.prune(1_060);
+        assert_eq!(guard.seen.lock().unwrap().len(), 2);
+        guard.prune(1_061);
+        assert_eq!(guard.seen.lock().unwrap().len(), 1);
         assert_eq!(
             guard.claim(id(2), 1_050, 1_061),
             Err(ReplayRejection::Replayed)

@@ -27,7 +27,7 @@ pub struct ReservedTicket {
 
 #[derive(Debug, Clone)]
 pub struct CompetitionStore {
-    db_connection: DBConnection,
+    pub(super) db_connection: DBConnection,
 }
 
 impl CompetitionStore {
@@ -78,6 +78,15 @@ impl CompetitionStore {
         entry: UserEntry,
         ticket_id: Uuid,
     ) -> Result<UserEntry, DatabaseWriteError> {
+        self.add_entry_with_policy(entry, ticket_id, None).await
+    }
+
+    pub async fn add_entry_with_policy(
+        &self,
+        entry: UserEntry,
+        ticket_id: Uuid,
+        payout_policy: Option<String>,
+    ) -> Result<UserEntry, DatabaseWriteError> {
         debug!("adding entry {} for ticket {}", entry.id, ticket_id);
 
         let entry_submission = serde_json::to_string(&entry.entry_submission)
@@ -98,8 +107,16 @@ impl CompetitionStore {
             .transpose()
             .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
 
+        let keymeld_escrow_policy = entry
+            .keymeld_escrow_policy
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
+
         self.db_connection
             .execute_write(move |pool| async move {
+                let mut tx = pool.begin().await?;
                 sqlx::query(
                     "INSERT INTO entries (
                         id,
@@ -111,10 +128,11 @@ impl CompetitionStore {
                         entry_submission,
                         encrypted_keymeld_private_key,
                         keymeld_auth_pubkey,
-                        keymeld_registration_context
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        keymeld_registration_context,
+                        keymeld_escrow_policy
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
-                .bind(entry_id)
+                .bind(&entry_id)
                 .bind(ticket_id_str)
                 .bind(event_id)
                 .bind(pubkey)
@@ -124,8 +142,19 @@ impl CompetitionStore {
                 .bind(encrypted_keymeld_private_key)
                 .bind(keymeld_auth_pubkey)
                 .bind(keymeld_registration_context)
-                .execute(&pool)
+                .bind(keymeld_escrow_policy)
+                .execute(&mut *tx)
                 .await?;
+                if let Some(policy) = payout_policy {
+                    sqlx::query(
+                        "INSERT INTO entry_payout_policies(entry_id, policy_json) VALUES (?, ?)",
+                    )
+                    .bind(entry_id)
+                    .bind(policy)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                tx.commit().await?;
                 Ok(())
             })
             .await?;
@@ -313,6 +342,17 @@ impl CompetitionStore {
                 .execute(&mut *tx)
                 .await?;
 
+                if let Ok(hash) =
+                    crate::infra::lightning::extract_payment_hash_from_invoice(&ln_invoice)
+                {
+                    sqlx::query(
+                        "INSERT INTO payout_payment_hashes(payment_hash, payout_id) VALUES (?, ?)",
+                    )
+                    .bind(hash)
+                    .bind(&payout_id_str)
+                    .execute(&mut *tx)
+                    .await?;
+                }
                 sqlx::query(
                     "UPDATE entries
                     SET payout_preimage = ?,
@@ -331,10 +371,13 @@ impl CompetitionStore {
             .await
     }
 
+    /// `payment_preimage` is the proof of payment LND reports on settlement;
+    /// a later report never erases one already stored.
     pub async fn mark_payout_succeeded(
         &self,
         payout_id: Uuid,
         succeed_at: OffsetDateTime,
+        payment_preimage: Option<String>,
     ) -> Result<(), DatabaseWriteError> {
         let succeed_at_str = succeed_at
             .format(&time::format_description::well_known::Rfc3339)
@@ -343,15 +386,31 @@ impl CompetitionStore {
 
         self.db_connection
             .execute_write(move |pool| async move {
+                let mut tx = pool.begin().await?;
+                if let Some(proof) = payment_preimage.as_ref() {
+                    let invoice: String = sqlx::query_scalar(
+                        "SELECT payout_payment_request FROM payouts WHERE id = ?",
+                    )
+                    .bind(&payout_id_str)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    let hash = crate::infra::lightning::extract_payment_hash_from_invoice(&invoice)
+                        .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+                    super::verify_payout_preimage(proof, &hash)
+                        .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+                }
                 sqlx::query(
                     "UPDATE payouts
-                    SET succeed_at = ?
-                    WHERE id = ? AND succeed_at IS NULL AND failed_at IS NULL",
+                    SET succeed_at = COALESCE(succeed_at, ?),
+                        payment_preimage = COALESCE(payment_preimage, ?)
+                    WHERE id = ? AND failed_at IS NULL",
                 )
                 .bind(succeed_at_str)
+                .bind(payment_preimage)
                 .bind(payout_id_str)
-                .execute(&pool)
+                .execute(&mut *tx)
                 .await?;
+                tx.commit().await?;
                 Ok(())
             })
             .await
@@ -397,7 +456,8 @@ impl CompetitionStore {
                 initiated_at,
                 succeed_at,
                 failed_at,
-                error
+                error,
+                payment_preimage
             FROM payouts
             WHERE id = ?",
         )
@@ -416,7 +476,8 @@ impl CompetitionStore {
                 initiated_at,
                 succeed_at,
                 failed_at,
-                error
+                error,
+                payment_preimage
             FROM payouts
             WHERE succeed_at IS NULL AND failed_at IS NULL
             ORDER BY initiated_at ASC",
@@ -460,7 +521,8 @@ impl CompetitionStore {
                 initiated_at,
                 succeed_at,
                 failed_at,
-                error
+                error,
+                payment_preimage
             FROM payouts
             WHERE entry_id = ",
         );
@@ -521,6 +583,7 @@ impl CompetitionStore {
                 encrypted_keymeld_private_key,
                 keymeld_auth_pubkey,
                 keymeld_registration_context,
+                keymeld_escrow_policy,
                 public_nonces,
                 partial_signatures,
                 funding_psbt_base64,
@@ -588,6 +651,7 @@ impl CompetitionStore {
               encrypted_keymeld_private_key,
               keymeld_auth_pubkey,
               keymeld_registration_context,
+              keymeld_escrow_policy,
               public_nonces,
               partial_signatures,
               funding_psbt_base64,
@@ -677,6 +741,16 @@ impl CompetitionStore {
         competition: Competition,
         tickets: Vec<Ticket>,
     ) -> Result<Competition, DatabaseWriteError> {
+        self.add_competition_with_tickets_mode(competition, tickets, false)
+            .await
+    }
+
+    pub async fn add_competition_with_tickets_mode(
+        &self,
+        competition: Competition,
+        tickets: Vec<Ticket>,
+        automatic: bool,
+    ) -> Result<Competition, DatabaseWriteError> {
         let created_at = competition
             .created_at
             .format(&Rfc3339)
@@ -685,6 +759,12 @@ impl CompetitionStore {
         let event_submission = serde_json::to_string(&competition.event_submission)
             .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
 
+        let event_announcement = competition
+            .event_announcement
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
         let competition_id_str = competition.id.to_string();
 
         // Prepare ticket data for the closure
@@ -709,14 +789,23 @@ impl CompetitionStore {
                     "INSERT INTO competitions (
                         id,
                         created_at,
-                        event_submission
-                    ) VALUES (?, ?, ?)",
+                        event_submission,
+                        event_announcement
+                    ) VALUES (?, ?, ?, ?)",
                 )
                 .bind(&competition_id_str)
                 .bind(&created_at)
                 .bind(&event_submission)
+                .bind(event_announcement)
                 .execute(&mut *tx)
                 .await?;
+
+                if automatic {
+                    sqlx::query("INSERT INTO automatic_payout_competitions(event_id) VALUES (?)")
+                        .bind(&competition_id_str)
+                        .execute(&mut *tx)
+                        .await?;
+                }
 
                 for (id, event_id, encrypted_preimage, hash, payment_request) in &ticket_data {
                     sqlx::query(
@@ -1047,6 +1136,29 @@ impl CompetitionStore {
                 Ok(())
             })
             .await
+    }
+
+    /// Failed and cancelled competitions retain cleanup work after their active
+    /// lifecycle ends. Successful cancellation/reclaim markers drain this queue.
+    pub async fn get_competitions_pending_cleanup(
+        &self,
+        include_escrows: bool,
+    ) -> Result<Vec<Uuid>, sqlx::Error> {
+        let ids = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT competitions.id
+             FROM competitions JOIN tickets ON tickets.event_id = competitions.id
+             WHERE (competitions.failed_at IS NOT NULL OR competitions.cancelled_at IS NOT NULL)
+               AND ((tickets.paid_at IS NOT NULL AND tickets.settled_at IS NULL
+                     AND tickets.invoice_cancelled_at IS NULL)
+                    OR (? AND tickets.escrow_transaction IS NOT NULL
+                        AND tickets.escrow_reclaimed_at IS NULL))",
+        )
+        .bind(include_escrows)
+        .fetch_all(self.db_connection.read())
+        .await?;
+        ids.into_iter()
+            .map(|id| Uuid::parse_str(&id).map_err(|error| sqlx::Error::Decode(Box::new(error))))
+            .collect()
     }
 
     pub async fn get_competitions(
@@ -1482,8 +1594,7 @@ impl CompetitionStore {
                FROM tickets
                LEFT JOIN entries ON tickets.id = entries.ticket_id
                WHERE reserved_at IS NOT NULL
-                 AND paid_at IS NULL
-                 AND entry_id IS NULL
+                 AND settled_at IS NULL
                  AND payment_request IS NOT NULL"#,
         )
         .fetch_all(self.db_connection.read())
@@ -1551,6 +1662,58 @@ impl CompetitionStore {
         .await?;
 
         Ok(tickets)
+    }
+
+    /// Tickets whose HODL invoice was accepted but never settled, and whose
+    /// invoice has not been cancelled yet: the payer's funds are still held.
+    pub async fn get_held_tickets_for_competition(
+        &self,
+        competition_id: Uuid,
+    ) -> Result<Vec<Ticket>, sqlx::Error> {
+        sqlx::query_as::<_, Ticket>(
+            r#"SELECT tickets.id as id,
+                      tickets.event_id as competition_id,
+                      entries.id as entry_id,
+                      tickets.ephemeral_pubkey as ephemeral_pubkey,
+                      encrypted_preimage,
+                      hash,
+                      payment_request,
+                      invoice_expires_at,
+                      datetime('now', '+10 minutes') as expiry,
+                      reserved_by,
+                      reserved_at,
+                      paid_at,
+                      settled_at,
+                      escrow_transaction
+               FROM tickets
+               LEFT JOIN entries ON tickets.id = entries.ticket_id
+               WHERE paid_at IS NOT NULL
+                 AND settled_at IS NULL
+                 AND invoice_cancelled_at IS NULL
+                 AND tickets.event_id = ?"#,
+        )
+        .bind(competition_id.to_string())
+        .fetch_all(self.db_connection.read())
+        .await
+    }
+
+    pub async fn mark_ticket_invoice_cancelled(
+        &self,
+        ticket_id: Uuid,
+    ) -> Result<bool, DatabaseWriteError> {
+        let ticket_id = ticket_id.to_string();
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE tickets SET invoice_cancelled_at = datetime('now')
+                    WHERE id = ? AND invoice_cancelled_at IS NULL AND settled_at IS NULL",
+                )
+                .bind(ticket_id)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
     }
 
     pub async fn get_ticket(&self, ticket_id: Uuid) -> Result<Ticket, sqlx::Error> {
@@ -1745,6 +1908,82 @@ impl CompetitionStore {
             .await
     }
 
+    /// The key the ticket's escrow will be locked to, recorded at reservation;
+    /// the escrow transaction itself is built once the invoice is accepted.
+    pub async fn update_ticket_pubkey(
+        &self,
+        ticket: &Ticket,
+        ephemeral_pubkey: String,
+    ) -> Result<bool, DatabaseWriteError> {
+        let ticket_id = ticket.id.to_string();
+        let expected_hash = ticket.hash.clone();
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE tickets SET ephemeral_pubkey = ?
+                     WHERE id = ? AND hash = ? AND reserved_by IS NOT NULL",
+                )
+                .bind(ephemeral_pubkey)
+                .bind(ticket_id)
+                .bind(expected_hash)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+    }
+
+    /// Tickets of a competition whose escrow transaction exists and has not
+    /// been reclaimed, entries or not.
+    pub async fn get_escrowed_tickets_for_competition(
+        &self,
+        competition_id: Uuid,
+    ) -> Result<Vec<Ticket>, sqlx::Error> {
+        sqlx::query_as::<_, Ticket>(
+            r#"SELECT tickets.id as id,
+                      tickets.event_id as competition_id,
+                      entries.id as entry_id,
+                      tickets.ephemeral_pubkey as ephemeral_pubkey,
+                      encrypted_preimage,
+                      hash,
+                      payment_request,
+                      invoice_expires_at,
+                      datetime('now', '+10 minutes') as expiry,
+                      reserved_by,
+                      reserved_at,
+                      paid_at,
+                      settled_at,
+                      escrow_transaction
+               FROM tickets
+               LEFT JOIN entries ON tickets.id = entries.ticket_id
+               WHERE escrow_transaction IS NOT NULL
+                 AND escrow_reclaimed_at IS NULL
+                 AND tickets.event_id = ?"#,
+        )
+        .bind(competition_id.to_string())
+        .fetch_all(self.db_connection.read())
+        .await
+    }
+
+    pub async fn mark_ticket_escrow_reclaimed(
+        &self,
+        ticket_id: Uuid,
+    ) -> Result<bool, DatabaseWriteError> {
+        let ticket_id = ticket_id.to_string();
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE tickets SET escrow_reclaimed_at = datetime('now')
+                    WHERE id = ? AND escrow_reclaimed_at IS NULL",
+                )
+                .bind(ticket_id)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+    }
+
     pub async fn update_ticket_payment_request(
         &self,
         ticket: &Ticket,
@@ -1818,17 +2057,20 @@ impl CompetitionStore {
 
     pub async fn update_ticket_escrow_transaction(
         &self,
-        ticket_id: uuid::Uuid,
+        ticket: &Ticket,
         escrow_transaction: &str,
     ) -> Result<bool, DatabaseWriteError> {
-        let ticket_id_str = ticket_id.to_string();
+        let ticket_id_str = ticket.id.to_string();
+        let expected_hash = ticket.hash.clone();
         let escrow_transaction_owned = escrow_transaction.to_string();
 
         self.db_connection
             .execute_write(move |pool| async move {
-                let result = sqlx::query("UPDATE tickets SET escrow_transaction = ? WHERE id = ?")
+                // Once bytes can be published, a retry must not replace them.
+                let result = sqlx::query("UPDATE tickets SET escrow_transaction = ? WHERE id = ? AND hash = ? AND reserved_at IS NOT NULL AND paid_at IS NOT NULL AND settled_at IS NULL AND escrow_transaction IS NULL")
                     .bind(escrow_transaction_owned)
                     .bind(ticket_id_str)
+                    .bind(expected_hash)
                     .execute(&pool)
                     .await?;
                 Ok(result.rows_affected() > 0)
@@ -1965,6 +2207,7 @@ impl CompetitionStore {
               encrypted_keymeld_private_key,
               keymeld_auth_pubkey,
               keymeld_registration_context,
+              keymeld_escrow_policy,
               public_nonces,
               partial_signatures,
               funding_psbt_base64,

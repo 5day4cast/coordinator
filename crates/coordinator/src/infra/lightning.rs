@@ -1,7 +1,7 @@
 use anyhow::anyhow;
 use async_trait::async_trait;
 use base64::Engine;
-use bitcoin::hashes::{sha256, Hash};
+use bitcoin::hashes::Hash;
 use futures::StreamExt;
 use lightning_invoice::Bolt11Invoice;
 use log::{debug, info, warn};
@@ -22,6 +22,56 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{domain::PaymentStatus, LnSettings};
+
+/// Reserve blocks for payment resolution and publishing the DLC close before
+/// the participant's earliest relative-locktime spend. This is a safety margin,
+/// not an atomic guarantee across chain reads and LND accepting the request.
+pub const PAYOUT_SETTLEMENT_MARGIN_BLOCKS: u32 = 12;
+pub const MAX_PAYOUT_CLTV_DELTA: u32 = 144;
+const LND_FINAL_CLTV_PADDING: u32 = 3;
+
+#[derive(Debug, Clone, Copy)]
+pub struct PaymentDeadline {
+    pub max_htlc_expiry_height: u32,
+    /// LND must be at least as current as the confirmed-output check.
+    pub minimum_chain_height: u32,
+}
+
+pub fn payout_htlc_expiry_height(
+    outcome_height: u32,
+    relative_delta: u16,
+) -> Result<u32, anyhow::Error> {
+    outcome_height
+        .checked_add(u32::from(relative_delta))
+        .and_then(|height| height.checked_sub(PAYOUT_SETTLEMENT_MARGIN_BLOCKS + 1))
+        .ok_or_else(|| anyhow!("DLC maturity cannot support a safe Lightning payout window"))
+}
+
+pub fn payout_cltv_limit(
+    deadline: PaymentDeadline,
+    current_height: u32,
+    final_cltv: u64,
+) -> Result<u32, anyhow::Error> {
+    if current_height < deadline.minimum_chain_height {
+        return Err(anyhow!("LND is behind the checked outcome chain tip"));
+    }
+    let limit = deadline
+        .max_htlc_expiry_height
+        .checked_sub(current_height)
+        .filter(|limit| *limit > 0)
+        .ok_or_else(|| anyhow!("Lightning payout deadline has passed"))?
+        .min(MAX_PAYOUT_CLTV_DELTA);
+    let minimum = u32::try_from(final_cltv)
+        .ok()
+        .and_then(|value| value.checked_add(LND_FINAL_CLTV_PADDING))
+        .ok_or_else(|| anyhow!("Invoice final CLTV exceeds the payout window"))?;
+    if limit < minimum {
+        return Err(anyhow!(
+            "Insufficient blocks remain for the invoice's final CLTV"
+        ));
+    }
+    Ok(limit)
+}
 
 #[derive(Debug, Clone)]
 pub struct InvoiceUpdate {
@@ -47,7 +97,6 @@ pub trait Ln: Send + Sync {
         expiry_time_secs: u64,
         ticket_hash: String,
         competition_id: Uuid,
-        hex_refund_tx: String,
     ) -> Result<InvoiceAddResponse, anyhow::Error>;
     async fn add_invoice(
         &self,
@@ -71,6 +120,15 @@ pub trait Ln: Send + Sync {
         amount_sats: u64,
         timeout_seconds: u64,
         fee_limit_sat: u64,
+    ) -> Result<(), anyhow::Error>;
+
+    async fn send_payment_before_height(
+        &self,
+        payout_payment_request: String,
+        amount_sats: u64,
+        timeout_seconds: u64,
+        fee_limit_sat: u64,
+        deadline: PaymentDeadline,
     ) -> Result<(), anyhow::Error>;
 
     async fn subscribe_invoices(&self) -> Result<mpsc::Receiver<InvoiceUpdate>, anyhow::Error>;
@@ -122,15 +180,145 @@ pub struct PaymentLookupResponse {
 #[error("LND payment not found")]
 pub struct PaymentNotFound;
 
-//TODO: we might need to add tls cert as an option, skipping for now
 #[derive(Clone)]
 pub struct LnClient {
     pub base_url: Url,
     pub client: ClientWithMiddleware,
+    /// Payments must not be transparently retried after their chain check.
+    pub(crate) payment_client: Client,
     pub macaroon: SecretString,
 }
 
 impl LnClient {
+    async fn send_payment_inner(
+        &self,
+        payout_payment_request: String,
+        amount_sats: u64,
+        timeout_seconds: u64,
+        fee_limit_sat: u64,
+        deadline: Option<PaymentDeadline>,
+    ) -> Result<(), anyhow::Error> {
+        let invoice = Bolt11Invoice::from_str(&payout_payment_request)
+            .map_err(|e| anyhow!("invalid invoice: {}", e))?;
+        if let Some(val) = invoice.amount_milli_satoshis() {
+            if val
+                != amount_sats
+                    .checked_mul(1000)
+                    .ok_or_else(|| anyhow!("Payment amount overflow"))?
+            {
+                return Err(anyhow!(
+                    "Invoice amount {} does not equal the requested amount {}",
+                    val,
+                    amount_sats
+                ));
+            }
+        }
+
+        let cltv_limit = if let Some(deadline) = deadline {
+            // timeout_seconds limits routing attempts, not accepted HTLC lifetime.
+            // Verify a current synced tip immediately before asking LND to route.
+            let response = self
+                .payment_client
+                .get(format!("{}v1/getinfo", self.base_url))
+                .header(MACAROON_HEADER, self.macaroon.expose_secret())
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                return Err(anyhow!("LND chain status unavailable"));
+            }
+            let info: serde_json::Value = response.json().await?;
+            if info["synced_to_chain"].as_bool() != Some(true) {
+                return Err(anyhow!("LND is not synchronized to the chain"));
+            }
+            let height = info["block_height"]
+                .as_u64()
+                .or_else(|| {
+                    info["block_height"]
+                        .as_str()
+                        .and_then(|value| value.parse().ok())
+                })
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| anyhow!("LND returned an invalid chain height"))?;
+            Some(payout_cltv_limit(
+                deadline,
+                height,
+                invoice.min_final_cltv_expiry_delta(),
+            )?)
+        } else {
+            None
+        };
+        let mut body = if amount_sats > 0 && invoice.amount_milli_satoshis().is_none() {
+            json!({
+                "payment_request": payout_payment_request,
+                "timeout_seconds": timeout_seconds,
+                "fee_limit_sat": fee_limit_sat.to_string(),
+                "amt": amount_sats,
+                "allow_self_payment": true,
+            })
+        } else {
+            json!({
+                "payment_request": payout_payment_request,
+                "timeout_seconds": timeout_seconds,
+                "fee_limit_sat": fee_limit_sat.to_string(),
+                "allow_self_payment": true,
+            })
+        };
+
+        if let Some(limit) = cltv_limit {
+            body["cltv_limit"] = json!(limit);
+            body["cancelable"] = json!(true);
+        }
+        debug!("sending payment: {:?}", body);
+        let url = format!("{}v2/router/send", self.base_url);
+        debug!("Making payment request to: {}", url);
+
+        let response = self
+            .payment_client
+            .post(url)
+            .json(&body)
+            .header(MACAROON_HEADER, self.macaroon.expose_secret())
+            .timeout(Duration::from_secs(timeout_seconds))
+            .send()
+            .await;
+
+        // `/v2/router/send` streams updates until the payment resolves. A slow
+        // payment hits the request timeout while still in flight; the payout
+        // stays pending and the payment subscriber records how it ends.
+        match response {
+            Ok(response) => {
+                let status = response.status();
+                if !status.is_success() {
+                    return Err(anyhow!("Payment request failed with {}", status));
+                }
+                // Discard completed stream messages as they arrive; neither a
+                // long payment history nor an unterminated message may grow
+                // memory without a bound. Reconciliation owns terminal state.
+                let mut stream = response.bytes_stream();
+                let mut lines = JsonLines::default();
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(chunk) => lines.push(&chunk)?,
+                        Err(error) if error.is_timeout() => return Ok(()),
+                        Err(error) => return Err(error.into()),
+                    }
+                    while let Some(line) = lines.next_line() {
+                        let message: serde_json::Value = serde_json::from_slice(&line)?;
+                        if message.get("error").is_some() {
+                            return Err(anyhow!("LND payment stream reported an error"));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Err(e) if e.is_timeout() => {
+                debug!("Payment request timed out (expected): {}", e);
+                Ok(())
+            }
+            Err(e) => Err(anyhow!("Failed to send payment: {}", e)),
+        }
+    }
+
     pub async fn new(
         client: ClientWithMiddleware,
         settings: LnSettings,
@@ -141,6 +329,8 @@ impl LnClient {
             .as_deref()
             .map(get_tls_cert)
             .transpose()?;
+        let payment_client =
+            build_ln_http_client(tls_cert.clone(), settings.dangerous_accept_invalid_tls)?;
         let client = match (tls_cert, settings.dangerous_accept_invalid_tls) {
             (None, false) => {
                 info!("No LND tls cert configured; verifying against the system roots");
@@ -151,6 +341,7 @@ impl LnClient {
         Ok(Self {
             base_url: Url::parse(&settings.base_url)?,
             client,
+            payment_client,
             macaroon,
         })
     }
@@ -166,7 +357,21 @@ pub fn build_reqwest_tls_client(
     dangerous_accept_invalid_certs: bool,
 ) -> Result<ClientWithMiddleware, anyhow::Error> {
     let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
-    let mut builder = Client::builder().tls_built_in_root_certs(true);
+    Ok(ClientBuilder::new(build_ln_http_client(
+        tls_cert,
+        dangerous_accept_invalid_certs,
+    )?)
+    .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+    .build())
+}
+
+fn build_ln_http_client(
+    tls_cert: Option<Certificate>,
+    dangerous_accept_invalid_certs: bool,
+) -> Result<Client, anyhow::Error> {
+    let mut builder = Client::builder()
+        .tls_built_in_root_certs(true)
+        .connect_timeout(Duration::from_secs(5));
     if let Some(tls_cert) = tls_cert {
         builder = builder.add_root_certificate(tls_cert);
     }
@@ -174,10 +379,7 @@ pub fn build_reqwest_tls_client(
         warn!("ln_settings.dangerous_accept_invalid_tls is set: LND certificate verification is disabled");
         builder = builder.danger_accept_invalid_certs(true);
     }
-    let client = ClientBuilder::new(builder.build()?)
-        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-        .build();
-    Ok(client)
+    Ok(builder.build()?)
 }
 
 pub fn get_tls_cert(file_path: &str) -> Result<Certificate, anyhow::Error> {
@@ -324,7 +526,6 @@ impl Ln for LnClient {
         expiry_time_secs: u64,
         ticket_hash_hex: String,
         competition_id: Uuid,
-        hex_refund_tx: String,
     ) -> Result<InvoiceAddResponse, anyhow::Error> {
         info!("ticket_hash_hex: {:?}", ticket_hash_hex);
 
@@ -338,9 +539,7 @@ impl Ln for LnClient {
             ));
         }
 
-        let refund_tx_hash = sha256::Hash::hash(hex_refund_tx.as_bytes()).to_byte_array();
-
-        let memo = format!("c:{};r:{:?}", competition_id, refund_tx_hash);
+        let memo = format!("c:{}", competition_id);
 
         let hash_base64 = base64::engine::general_purpose::STANDARD.encode(&hash_bytes);
 
@@ -577,88 +776,31 @@ impl Ln for LnClient {
 
     async fn send_payment(
         &self,
-        payout_payment_request: String,
+        invoice: String,
         amount_sats: u64,
         timeout_seconds: u64,
         fee_limit_sat: u64,
     ) -> Result<(), anyhow::Error> {
-        let invoice = Bolt11Invoice::from_str(&payout_payment_request)
-            .map_err(|e| anyhow!("invalid invoice: {}", e))?;
-        if let Some(val) = invoice.amount_milli_satoshis() {
-            if val != (amount_sats * 1000) {
-                return Err(anyhow!(
-                    "Invoice amount {} does not equal the requested amount {}",
-                    val,
-                    amount_sats
-                ));
-            }
-        }
+        self.send_payment_inner(invoice, amount_sats, timeout_seconds, fee_limit_sat, None)
+            .await
+    }
 
-        let body = if amount_sats > 0 && invoice.amount_milli_satoshis().is_none() {
-            json!({
-                "payment_request": payout_payment_request,
-                "timeout_seconds": timeout_seconds,
-                "fee_limit_sat": fee_limit_sat.to_string(),
-                "amt": amount_sats,
-                "allow_self_payment": true,
-            })
-        } else {
-            json!({
-                "payment_request": payout_payment_request,
-                "timeout_seconds": timeout_seconds,
-                "fee_limit_sat": fee_limit_sat.to_string(),
-                "allow_self_payment": true,
-            })
-        };
-
-        debug!("sending payment: {:?}", body);
-        let url = format!("{}v2/router/send", self.base_url);
-        debug!("Making payment request to: {}", url);
-
-        let response = self
-            .client
-            .post(url)
-            .json(&body)
-            .header(MACAROON_HEADER, self.macaroon.expose_secret())
-            .timeout(Duration::from_secs(timeout_seconds))
-            .send()
-            .await;
-
-        // `/v2/router/send` streams updates until the payment resolves. A slow
-        // payment hits the request timeout while still in flight; the payout
-        // stays pending and the payment subscriber records how it ends.
-        match response {
-            Ok(response) => {
-                let status = response.status();
-                if !status.is_success() {
-                    return Err(anyhow!("Payment request failed with {}", status));
-                }
-                // Discard completed stream messages as they arrive; neither a
-                // long payment history nor an unterminated message may grow
-                // memory without a bound. Reconciliation owns terminal state.
-                let mut stream = response.bytes_stream();
-                let mut lines = JsonLines::default();
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(chunk) => lines.push(&chunk)?,
-                        Err(error) if error.is_timeout() => return Ok(()),
-                        Err(error) => return Err(error.into()),
-                    }
-                    while let Some(line) = lines.next_line() {
-                        let message: serde_json::Value = serde_json::from_slice(&line)?;
-                        if message.get("error").is_some() {
-                            return Err(anyhow!("LND payment stream reported an error"));
-                        }
-                    }
-                }
-                Ok(())
-            }
-            Err(e) if e.is_timeout() => {
-                debug!("Payment request timed out (expected): {}", e);
-                Ok(())
-            }
-            Err(e) => Err(anyhow!("Failed to send payment: {}", e)),
-        }
+    async fn send_payment_before_height(
+        &self,
+        invoice: String,
+        amount_sats: u64,
+        timeout_seconds: u64,
+        fee_limit_sat: u64,
+        deadline: PaymentDeadline,
+    ) -> Result<(), anyhow::Error> {
+        self.send_payment_inner(
+            invoice,
+            amount_sats,
+            timeout_seconds,
+            fee_limit_sat,
+            Some(deadline),
+        )
+        .await
     }
 
     async fn subscribe_invoices(&self) -> Result<mpsc::Receiver<InvoiceUpdate>, anyhow::Error> {
@@ -923,6 +1065,250 @@ pub fn extract_amount_from_invoice(payment_request: &str) -> Result<Option<u64>,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::hashes::sha256;
+
+    #[test]
+    fn payout_deadline_reserves_resolution_blocks_and_bounds_total_route_cltv() {
+        let expiry = payout_htlc_expiry_height(100, 72).unwrap();
+        assert_eq!(expiry, 159);
+        let deadline = PaymentDeadline {
+            max_htlc_expiry_height: expiry,
+            minimum_chain_height: 103,
+        };
+        assert_eq!(payout_cltv_limit(deadline, 103, 40).unwrap(), 56);
+        assert_eq!(payout_cltv_limit(deadline, 116, 40).unwrap(), 43);
+        assert!(payout_cltv_limit(deadline, 117, 40).is_err());
+        assert!(payout_cltv_limit(deadline, 102, 18).is_err());
+        assert!(payout_cltv_limit(deadline, 159, 0).is_err());
+        assert!(payout_cltv_limit(deadline, 160, 0).is_err());
+        assert!(payout_cltv_limit(deadline, 103, u64::MAX).is_err());
+        assert!(payout_htlc_expiry_height(u32::MAX, 72).is_err());
+        assert!(payout_htlc_expiry_height(1, 1).is_err());
+        assert_eq!(
+            payout_cltv_limit(
+                PaymentDeadline {
+                    max_htlc_expiry_height: 10_000,
+                    minimum_chain_height: 100,
+                },
+                100,
+                18
+            )
+            .unwrap(),
+            MAX_PAYOUT_CLTV_DELTA
+        );
+    }
+
+    fn fresh_test_invoice() -> String {
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+        use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+        InvoiceBuilder::new(Currency::Regtest)
+            .description("bounded payout".into())
+            .payment_hash(sha256::Hash::from_byte_array([7; 32]))
+            .payment_secret(PaymentSecret([8; 32]))
+            .amount_milli_satoshis(10_000)
+            .duration_since_epoch(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap(),
+            )
+            .min_final_cltv_expiry_delta(18)
+            .build_signed(|hash| {
+                Secp256k1::new()
+                    .sign_ecdsa_recoverable(hash, &SecretKey::from_slice(&[9; 32]).unwrap())
+            })
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn bounded_send_checks_fresh_synced_height_and_does_not_retry_http_failures() {
+        use axum::{
+            extract::State,
+            routing::{get, post},
+            Json, Router,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Default)]
+        struct RpcState {
+            height: Arc<AtomicU32>,
+            synced: Arc<AtomicBool>,
+            sends: Arc<AtomicUsize>,
+            body: Arc<Mutex<serde_json::Value>>,
+        }
+        let state = RpcState::default();
+        state.height.store(100, Ordering::SeqCst);
+        let router = Router::new()
+            .route(
+                "/v1/getinfo",
+                get(|State(s): State<RpcState>| async move {
+                    Json(json!({"block_height": s.height.load(Ordering::SeqCst),
+                    "synced_to_chain": s.synced.load(Ordering::SeqCst)}))
+                }),
+            )
+            .route(
+                "/v2/router/send",
+                post(
+                    |State(s): State<RpcState>, Json(body): Json<serde_json::Value>| async move {
+                        s.sends.fetch_add(1, Ordering::SeqCst);
+                        *s.body.lock().unwrap() = body;
+                        reqwest::StatusCode::BAD_GATEWAY
+                    },
+                ),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let client = LnClient {
+            base_url: Url::parse(&format!("http://{address}/")).unwrap(),
+            // General RPC retries must never be used for payment initiation.
+            client: build_reqwest_tls_client(None, false).unwrap(),
+            payment_client: Client::new(),
+            macaroon: SecretString::from("test-macaroon"),
+        };
+        let deadline = PaymentDeadline {
+            max_htlc_expiry_height: 159,
+            minimum_chain_height: 100,
+        };
+        assert!(client
+            .send_payment_before_height(fresh_test_invoice(), 10, 2, 1000, deadline)
+            .await
+            .is_err());
+        state.synced.store(true, Ordering::SeqCst);
+        for height in [99, 140, 159] {
+            state.height.store(height, Ordering::SeqCst);
+            assert!(client
+                .send_payment_before_height(fresh_test_invoice(), 10, 2, 1000, deadline)
+                .await
+                .is_err());
+        }
+        assert_eq!(state.sends.load(Ordering::SeqCst), 0);
+        state.height.store(105, Ordering::SeqCst);
+        assert!(client
+            .send_payment_before_height(fresh_test_invoice(), 10, 2, 1000, deadline)
+            .await
+            .is_err());
+        assert_eq!(state.sends.load(Ordering::SeqCst), 1);
+        assert_eq!(state.body.lock().unwrap()["cltv_limit"], 54);
+        assert_eq!(state.body.lock().unwrap()["cancelable"], true);
+        server.abort();
+    }
+
+    /// Runs only against an explicitly supplied disposable regtest LND node.
+    /// Environment: LND_PAYOUT_TEST_{URL,TLS_CERT,MACAROON,INVOICE_FILE,
+    /// AMOUNT_SATS,DEADLINE_HEIGHT}. The invoice must be fresh and unpaid.
+    #[tokio::test]
+    #[ignore = "requires funded disposable regtest LND channel and fresh invoice"]
+    async fn live_regtest_lnd_bounded_payment_and_preimage() {
+        let env = |name: &str| {
+            std::env::var(format!("LND_PAYOUT_TEST_{name}"))
+                .expect("missing explicit regtest test environment")
+        };
+        let invoice = fs::read_to_string(env("INVOICE_FILE"))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let parsed: Bolt11Invoice = invoice.parse().unwrap();
+        assert_eq!(parsed.currency(), lightning_invoice::Currency::Regtest);
+        assert!(
+            !invoice_is_expired(&parsed),
+            "test requires a fresh invoice"
+        );
+        let amount: u64 = env("AMOUNT_SATS").parse().unwrap();
+        assert_eq!(parsed.amount_milli_satoshis(), amount.checked_mul(1000));
+        let client = LnClient::new(
+            ClientBuilder::new(Client::new()).build(),
+            LnSettings {
+                base_url: env("URL"),
+                tls_cert_path: Some(env("TLS_CERT")),
+                macaroon_file_path: env("MACAROON"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let info: serde_json::Value = client
+            .payment_client
+            .get(format!("{}v1/getinfo", client.base_url))
+            .header(MACAROON_HEADER, client.macaroon.expose_secret())
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(info["synced_to_chain"], true);
+        let height = u32::try_from(info["block_height"].as_u64().unwrap()).unwrap();
+        let hash = extract_payment_hash_from_invoice(&invoice).unwrap();
+        assert!(client
+            .lookup_payment(&hash)
+            .await
+            .unwrap_err()
+            .is::<PaymentNotFound>());
+        for expiry in [
+            height,
+            height + u32::try_from(parsed.min_final_cltv_expiry_delta()).unwrap() - 1,
+        ] {
+            assert!(client
+                .send_payment_before_height(
+                    invoice.clone(),
+                    amount,
+                    10,
+                    1000,
+                    PaymentDeadline {
+                        max_htlc_expiry_height: expiry,
+                        minimum_chain_height: height
+                    }
+                )
+                .await
+                .is_err());
+            assert!(
+                client
+                    .lookup_payment(&hash)
+                    .await
+                    .unwrap_err()
+                    .is::<PaymentNotFound>(),
+                "rejected deadline must not create an LND payment"
+            );
+        }
+        client
+            .send_payment_before_height(
+                invoice,
+                amount,
+                15,
+                1000,
+                PaymentDeadline {
+                    max_htlc_expiry_height: env("DEADLINE_HEIGHT").parse().unwrap(),
+                    minimum_chain_height: height,
+                },
+            )
+            .await
+            .unwrap();
+        let payment = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let payment = client.lookup_payment(&hash).await.unwrap();
+                match payment.status {
+                    PaymentStatus::Succeeded => break payment,
+                    PaymentStatus::Failed => panic!("regtest LND payment failed"),
+                    _ => tokio::time::sleep(Duration::from_millis(200)).await,
+                }
+            }
+        })
+        .await
+        .expect("regtest LND payment did not settle within test deadline");
+        assert_eq!(payment.value_sat.parse::<u64>().unwrap(), amount);
+        let preimage = hex::decode(payment.payment_preimage.unwrap()).unwrap();
+        assert!(
+            sha256::Hash::hash(&preimage) == *parsed.payment_hash(),
+            "settled LND proof must match invoice payment hash"
+        );
+    }
 
     fn payment_json() -> serde_json::Value {
         json!({
@@ -1013,6 +1399,7 @@ mod tests {
         let client = LnClient {
             base_url: Url::parse(&format!("http://{address}/")).unwrap(),
             client: ClientBuilder::new(Client::new()).build(),
+            payment_client: Client::new(),
             macaroon: SecretString::from("test-macaroon"),
         };
         let response = tokio::time::timeout(
