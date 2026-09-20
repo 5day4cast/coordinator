@@ -19,7 +19,6 @@ pub struct TicketRequest {
 pub struct TicketResponse {
     pub ticket_id: Uuid,
     pub payment_request: String,
-    pub escrow_tx: Option<String>,
     pub payment_hash: String,
     pub amount_sats: u64,
     pub keymeld_user_id: Uuid,

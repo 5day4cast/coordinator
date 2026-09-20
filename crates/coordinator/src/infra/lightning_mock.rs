@@ -254,7 +254,6 @@ impl Ln for MockLnClient {
         _expiry_time_secs: u64,
         ticket_hash_hex: String,
         competition_id: Uuid,
-        hex_refund_tx: String,
     ) -> Result<InvoiceAddResponse, anyhow::Error> {
         debug!(
             "Mock LN: Creating hold invoice for {} sats, competition {}",
@@ -263,8 +262,7 @@ impl Ln for MockLnClient {
 
         let payment_request = self.generate_mock_invoice(value, &ticket_hash_hex);
 
-        let refund_tx_hash = sha256::Hash::hash(hex_refund_tx.as_bytes()).to_byte_array();
-        let memo = format!("c:{};r:{:?}", competition_id, refund_tx_hash);
+        let memo = format!("c:{}", competition_id);
 
         let invoice = MockInvoice {
             payment_hash: ticket_hash_hex.clone(),
@@ -577,13 +575,7 @@ mod tests {
         let ticket_hash = "a".repeat(64); // 32 bytes hex
 
         let response = client
-            .add_hold_invoice(
-                1000,
-                3600,
-                ticket_hash.clone(),
-                competition_id,
-                "refund".to_string(),
-            )
+            .add_hold_invoice(1000, 3600, ticket_hash.clone(), competition_id)
             .await
             .unwrap();
 
@@ -601,13 +593,7 @@ mod tests {
         let ticket_hash = "b".repeat(64);
 
         client
-            .add_hold_invoice(
-                1000,
-                3600,
-                ticket_hash.clone(),
-                competition_id,
-                "refund".to_string(),
-            )
+            .add_hold_invoice(1000, 3600, ticket_hash.clone(), competition_id)
             .await
             .unwrap();
 
@@ -625,13 +611,7 @@ mod tests {
         let ticket_hash = "c".repeat(64);
 
         client
-            .add_hold_invoice(
-                1000,
-                3600,
-                ticket_hash.clone(),
-                competition_id,
-                "refund".to_string(),
-            )
+            .add_hold_invoice(1000, 3600, ticket_hash.clone(), competition_id)
             .await
             .unwrap();
 
@@ -649,13 +629,7 @@ mod tests {
         let ticket_hash = "d".repeat(64);
 
         client
-            .add_hold_invoice(
-                1000,
-                3600,
-                ticket_hash.clone(),
-                competition_id,
-                "refund".to_string(),
-            )
+            .add_hold_invoice(1000, 3600, ticket_hash.clone(), competition_id)
             .await
             .unwrap();
 
@@ -671,13 +645,7 @@ mod tests {
         let ticket_hash = "e".repeat(64);
 
         client
-            .add_hold_invoice(
-                1000,
-                3600,
-                ticket_hash.clone(),
-                competition_id,
-                "refund".to_string(),
-            )
+            .add_hold_invoice(1000, 3600, ticket_hash.clone(), competition_id)
             .await
             .unwrap();
 

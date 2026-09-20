@@ -11,7 +11,10 @@ use crate::{
     infra::{
         bitcoin::{fee_rate_for_target, Bitcoin, ForeignUtxo, REQUIRED_CONFIRMATIONS_FOR_TIME},
         db::DatabaseWriteError,
-        escrow::{create_escrow_descriptor, generate_escrow_tx, get_escrow_outpoint},
+        escrow::{
+            create_escrow_descriptor, get_escrow_outpoint, reclaim_escrow_tx,
+            ESCROW_RECLAIM_DELAY_BLOCKS,
+        },
         keymeld::{
             DlcKeygenSession, DlcSubsetInfo, Keymeld, ParticipantRegistrationData,
             StoredDlcKeygenSession, SubsetDefinition,
@@ -26,6 +29,8 @@ use bitcoin::{
     absolute::LockTime,
     consensus::encode::deserialize,
     hashes::{sha256, Hash, HashEngine},
+    script::Instruction,
+    sighash::EcdsaSighashType,
     transaction::Version,
     Amount, FeeRate, OutPoint, Psbt, PublicKey as BitcoinPublicKey, ScriptBuf, Transaction, TxIn,
     TxOut, Txid,
@@ -103,8 +108,7 @@ impl Competition {
 pub struct TicketResponse {
     pub ticket_id: uuid::Uuid,
     pub payment_request: String, // Lightning HODL invoice to pay for entry
-    pub escrow_tx: Option<String>, // escrow transaction the coordinator broadcasts prior to settling the HODL invoice
-    pub payment_hash: String,      // Hex-encoded payment hash for verification
+    pub payment_hash: String,    // Hex-encoded payment hash for verification
     pub amount_sats: u64,
     /// The user's keymeld user_id (same as ticket_id) - used for keymeld registration
     pub keymeld_user_id: uuid::Uuid,
@@ -456,9 +460,11 @@ impl Coordinator {
             const MAX_CONSECUTIVE_STATES: usize = 10;
 
             if competition.skip_competition() {
-                // A dead competition must not keep entrants' payments held.
+                // A dead competition must not keep entrants' payments held,
+                // nor the coordinator's escrows locked.
                 if competition.is_failed() || competition.is_cancelled() {
                     self.release_held_invoices(competition.id).await;
+                    self.reclaim_escrows(competition.id).await;
                 }
                 // Auto-expire failed competitions after 1 hour so they stop
                 // polluting every tick's log output and DB query results.
@@ -579,6 +585,115 @@ impl Coordinator {
             }
         }
 
+        Ok(())
+    }
+
+    /// Sweep the escrow outputs of a dead competition back to the wallet once
+    /// the reclaim delay has passed. A user who paid can take the escrow with
+    /// the preimage from `USER_REFUND_DELAY_BLOCKS` on; the reclaim runs well
+    /// after that, so they always get first call. Retried every tick until
+    /// each ticket is marked reclaimed.
+    async fn reclaim_escrows(&self, competition_id: Uuid) {
+        if !self.escrow_enabled {
+            return;
+        }
+        let tickets = match self
+            .competition_store
+            .get_escrowed_tickets_for_competition(competition_id)
+            .await
+        {
+            Ok(tickets) => tickets,
+            Err(e) => {
+                error!(
+                    "Failed to list escrows of competition {}: {}",
+                    competition_id, e
+                );
+                return;
+            }
+        };
+        if tickets.is_empty() {
+            return;
+        }
+        let fee_rate = match self.bitcoin.get_estimated_fee_rates().await {
+            Ok(rates) => fee_rate_for_target(&rates, 6)
+                .or_else(|_| fee_rate_for_target(&rates, 1))
+                .unwrap_or(FeeRate::from_sat_per_vb_u32(1)),
+            Err(e) => {
+                warn!("Cannot estimate the escrow reclaim fee: {}", e);
+                return;
+            }
+        };
+        for ticket in tickets {
+            if let Err(e) = self.reclaim_escrow(&ticket, fee_rate).await {
+                warn!(
+                    "Escrow of ticket {} (competition {}) not reclaimed yet: {}",
+                    ticket.id, competition_id, e
+                );
+            }
+        }
+    }
+
+    async fn reclaim_escrow(
+        &self,
+        ticket: &Ticket,
+        fee_rate: FeeRate,
+    ) -> Result<(), anyhow::Error> {
+        let escrow_hex = ticket
+            .escrow_transaction
+            .as_ref()
+            .ok_or_else(|| anyhow!("no escrow transaction"))?;
+        let escrow_tx: Transaction = deserialize(&hex::decode(escrow_hex)?)?;
+        let txid = escrow_tx.compute_txid();
+        let confirmations = self
+            .transaction_confirmations(&txid)
+            .await?
+            .ok_or_else(|| anyhow!("escrow {txid} is not confirmed"))?;
+        if confirmations < u32::from(ESCROW_RECLAIM_DELAY_BLOCKS) {
+            return Err(anyhow!(
+                "escrow {txid} has {confirmations} of {ESCROW_RECLAIM_DELAY_BLOCKS} confirmations"
+            ));
+        }
+        let user_pubkey = ticket
+            .ephemeral_pubkey
+            .as_deref()
+            .map(BitcoinPublicKey::from_str)
+            .transpose()?
+            .ok_or_else(|| anyhow!("ticket has no escrow key"))?;
+        let preimage = hex::decode(&ticket.encrypted_preimage)?;
+        let payment_hash = sha256::Hash::hash(&preimage).to_byte_array();
+
+        let reclaim_tx = reclaim_escrow_tx(
+            self.bitcoin.clone(),
+            &escrow_tx,
+            user_pubkey,
+            payment_hash,
+            fee_rate,
+        )
+        .await?;
+        match self.bitcoin.broadcast(&reclaim_tx).await {
+            Ok(()) => info!(
+                "Reclaimed escrow {} of ticket {}: txid={}",
+                txid,
+                ticket.id,
+                reclaim_tx.compute_txid()
+            ),
+            // Spent already: by the user's refund or the funding transaction.
+            Err(e)
+                if e.to_string()
+                    .to_ascii_lowercase()
+                    .contains("missing inputs")
+                    || e.to_string().to_ascii_lowercase().contains("spent") =>
+            {
+                info!(
+                    "Escrow {} of ticket {} was already spent; nothing to reclaim",
+                    txid, ticket.id
+                )
+            }
+            Err(e) => return Err(e),
+        }
+        self.competition_store
+            .mark_ticket_escrow_reclaimed(ticket.id)
+            .await?;
         Ok(())
     }
 
@@ -1929,27 +2044,22 @@ impl Coordinator {
                 ));
             }
 
-            debug!("Merging all funding psbts");
-
             for (sender_pubkey, final_signature) in &final_signatures_by_sender {
+                let sender_key = BitcoinPublicKey::from_slice(&sender_pubkey.serialize())?;
                 let sender_funding_psbt = Psbt::from_str(&final_signature.funding_psbt_base64)?;
-                match funding_psbt.combine(sender_funding_psbt) {
-                    Ok(_) => {
-                        debug!(
-                            "✓ Funding PSBT combination succeeded for player {}",
-                            sender_pubkey
-                        );
-                    }
-                    Err(err) => {
-                        error!(
-                            "✗ Funding PSBT combination failed for player {}: {}",
-                            sender_pubkey, err
-                        );
-                    }
+                let copied =
+                    merge_sender_signatures(&mut funding_psbt, &sender_funding_psbt, &sender_key)
+                        .map_err(|e| anyhow!("Player {sender_pubkey}: {e}"))?;
+                if copied == 0 {
+                    return Err(anyhow!(
+                        "Player {sender_pubkey} signed none of their escrow inputs"
+                    ));
                 }
+                debug!(
+                    "Copied {} escrow signatures from player {}",
+                    copied, sender_pubkey
+                );
             }
-
-            debug!("Combined all psbts");
         } else {
             debug!(
                 "Escrow disabled: coordinator signs funding PSBT directly (no user PSBTs to merge)"
@@ -3072,51 +3182,19 @@ impl Coordinator {
         // Calculate payment hash from preimage
         let payment_hash = sha256::Hash::hash(&preimage).to_byte_array();
 
-        // Generate escrow transaction only if escrow is enabled
-        let escrow_tx_hex = if self.escrow_enabled {
-            let escrow_tx = generate_escrow_tx(
-                self.bitcoin.clone(),
-                ticket.id,
-                btc_pubkey,
-                payment_hash,
-                competition.event_submission.entry_fee as u64,
-                competition
-                    .funding_reservation_deadline(OffsetDateTime::now_utc())
-                    .map_err(Error::Bitcoin)?,
-            )
-            .await
-            .map_err(|e| {
-                error!("Failed to generate escrow transaction: {}", e);
-                Error::BadRequest("Failed to generate refund transaction".to_string())
-            })?;
-
-            debug!("escrow_tx: {:?}", escrow_tx);
-
-            let escrow_hex = hex::encode(dlctix::bitcoin::consensus::encode::serialize(&escrow_tx));
-
-            // Store the escrow transaction in the database
+        // The escrow transaction is built and broadcast only once the HODL
+        // invoice is accepted (see the invoice watcher): handing it out earlier
+        // let anyone lock the coordinator's funds without paying. Only the key
+        // the escrow will be locked to is recorded now.
+        if self.escrow_enabled {
             self.competition_store
-                .update_ticket_escrow(ticket.id, btc_pubkey.to_string(), escrow_hex.clone())
+                .update_ticket_pubkey(ticket.id, btc_pubkey.to_string())
                 .await
                 .map_err(|e| {
-                    error!("Failed to update ticket with escrow transaction: {}", e);
+                    error!("Failed to record ticket {} escrow key: {}", ticket.id, e);
                     Error::from(e)
                 })?;
-
-            debug!(
-                "Created ticket {} with escrow tx {}",
-                ticket.id,
-                escrow_tx.compute_txid()
-            );
-
-            Some(escrow_hex)
-        } else {
-            debug!(
-                "Created ticket {} without escrow (escrow disabled)",
-                ticket.id
-            );
-            None
-        };
+        }
 
         let fee_multiplier = competition.event_submission.coordinator_fee_percentage as f64 / 100.0;
         let coordinator_fee =
@@ -3160,7 +3238,6 @@ impl Coordinator {
                         invoice_expiry_seconds as u64,
                         hex::encode(payment_hash),
                         ticket.competition_id,
-                        escrow_tx_hex.clone().unwrap_or_default(),
                     )
                     .await
                     .map_err(|e| {
@@ -3187,7 +3264,6 @@ impl Coordinator {
             }
         } else {
             // Create new HODL invoice
-            // Note: escrow_tx_hex is empty string when escrow disabled
             let invoice = self
                 .ln
                 .add_hold_invoice(
@@ -3195,7 +3271,6 @@ impl Coordinator {
                     invoice_expiry_seconds as u64,
                     hex::encode(payment_hash),
                     ticket.competition_id,
-                    escrow_tx_hex.clone().unwrap_or_default(),
                 )
                 .await
                 .map_err(|e| {
@@ -3247,7 +3322,6 @@ impl Coordinator {
         Ok(TicketResponse {
             ticket_id: ticket.id,
             payment_request,
-            escrow_tx: escrow_tx_hex,
             payment_hash: hex::encode(payment_hash),
             amount_sats: full_fee,
             // ticket_id is used as the keymeld user_id for consistency
@@ -4542,6 +4616,45 @@ fn find_winning_entries_pubkeys(
         .collect()
 }
 
+/// Copy a player's signatures into the funding PSBT: only their own
+/// `partial_sigs`, only on inputs whose witness script pushes their key, and
+/// only from a packet spending the same transaction. Nothing else in a
+/// player's packet is trusted, so a player cannot alter other inputs or
+/// fields. Returns how many signatures were copied.
+fn merge_sender_signatures(
+    master: &mut Psbt,
+    sender: &Psbt,
+    sender_key: &BitcoinPublicKey,
+) -> Result<usize, anyhow::Error> {
+    if sender.unsigned_tx != master.unsigned_tx {
+        return Err(anyhow!("funding PSBT spends a different transaction"));
+    }
+    let key_bytes = sender_key.to_bytes();
+    let mut copied = 0;
+    for (master_input, sender_input) in master.inputs.iter_mut().zip(&sender.inputs) {
+        let Some(script) = &master_input.witness_script else {
+            continue;
+        };
+        let pushes_key = script.instructions().any(|instruction| {
+            matches!(instruction, Ok(Instruction::PushBytes(bytes)) if bytes.as_bytes() == key_bytes)
+        });
+        if !pushes_key {
+            continue;
+        }
+        if let Some(signature) = sender_input.partial_sigs.get(sender_key) {
+            if signature.sighash_type != EcdsaSighashType::All {
+                return Err(anyhow!(
+                    "escrow input signed with sighash {}, only ALL is accepted",
+                    signature.sighash_type
+                ));
+            }
+            master_input.partial_sigs.insert(*sender_key, *signature);
+            copied += 1;
+        }
+    }
+    Ok(copied)
+}
+
 async fn signed_funding_tx(
     bitcoin_client: Arc<dyn Bitcoin>,
     mut funding_tx: Psbt,
@@ -5033,6 +5146,85 @@ mod tests {
     use super::*;
     use dlctix::{attestation_locking_point, hashlock, MarketMaker};
     use rand::RngCore;
+
+    #[test]
+    fn merge_copies_only_the_players_own_escrow_signatures() {
+        use bitcoin::{
+            absolute::LockTime as AbsLockTime,
+            ecdsa,
+            script::Builder,
+            secp256k1::{Message, Secp256k1, SecretKey},
+            sighash::EcdsaSighashType,
+            transaction::Version,
+            Psbt, ScriptBuf, Transaction, TxIn, TxOut,
+        };
+        let secp = Secp256k1::new();
+        let key = |byte: u8| {
+            let secret = SecretKey::from_slice(&[byte; 32]).unwrap();
+            (secret, BitcoinPublicKey::new(secret.public_key(&secp)))
+        };
+        let (alice_secret, alice) = key(1);
+        let (mallory_secret, mallory) = key(2);
+        let script_for = |k: &BitcoinPublicKey| {
+            Builder::new()
+                .push_key(k)
+                .push_opcode(bitcoin::opcodes::all::OP_CHECKSIG)
+                .into_script()
+        };
+        let sig = |secret: &SecretKey, byte: u8| ecdsa::Signature {
+            signature: secp.sign_ecdsa(&Message::from_digest([byte; 32]), secret),
+            sighash_type: EcdsaSighashType::All,
+        };
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: AbsLockTime::ZERO,
+            input: vec![TxIn::default(), TxIn::default()],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut master = Psbt::from_unsigned_tx(tx.clone()).unwrap();
+        master.inputs[0].witness_script = Some(script_for(&alice));
+        master.inputs[1].witness_script = Some(script_for(&mallory));
+
+        // Mallory's packet carries signatures for both inputs under both keys.
+        let mut sender = master.clone();
+        sender.inputs[0]
+            .partial_sigs
+            .insert(alice, sig(&alice_secret, 9));
+        sender.inputs[0]
+            .partial_sigs
+            .insert(mallory, sig(&mallory_secret, 8));
+        sender.inputs[1]
+            .partial_sigs
+            .insert(mallory, sig(&mallory_secret, 7));
+        sender.inputs[1]
+            .partial_sigs
+            .insert(alice, sig(&alice_secret, 6));
+        let copied = merge_sender_signatures(&mut master, &sender, &mallory).unwrap();
+        assert_eq!(copied, 1);
+        assert!(master.inputs[0].partial_sigs.is_empty());
+        assert_eq!(master.inputs[1].partial_sigs.len(), 1);
+        assert!(master.inputs[1].partial_sigs.contains_key(&mallory));
+
+        // A packet for a different transaction is refused outright.
+        let mut other_tx = tx;
+        other_tx.output[0].value = Amount::from_sat(2);
+        let other = Psbt::from_unsigned_tx(other_tx).unwrap();
+        assert!(merge_sender_signatures(&mut master, &other, &alice).is_err());
+
+        // A signature with the wrong sighash is refused.
+        let mut wrong = sender.clone();
+        wrong.inputs[0].partial_sigs.insert(
+            alice,
+            ecdsa::Signature {
+                signature: sig(&alice_secret, 5).signature,
+                sighash_type: EcdsaSighashType::None,
+            },
+        );
+        assert!(merge_sender_signatures(&mut master, &wrong, &alice).is_err());
+    }
 
     fn params() -> ContractParameters {
         let mut rng = rand::rng();

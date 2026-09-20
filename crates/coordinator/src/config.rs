@@ -265,7 +265,7 @@ impl CoordinatorSettings {
     pub fn validate(&self, network: Network) -> Result<(), anyhow::Error> {
         if self.escrow_enabled && network == Network::Bitcoin {
             return Err(anyhow::anyhow!(
-                "coordinator_settings.escrow_enabled is refused on mainnet: the escrow transaction is handed out before payment and has no coordinator reclaim path"
+                "coordinator_settings.escrow_enabled is refused on mainnet until the escrow flow has been exercised end to end on a test network"
             ));
         }
         Ok(())

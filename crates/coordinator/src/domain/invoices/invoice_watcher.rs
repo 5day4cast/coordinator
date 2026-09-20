@@ -302,11 +302,12 @@ impl InvoiceWatcher {
             .await
             .map_err(|e| anyhow!("Failed to get competition {}: {}", ticket.competition_id, e))?;
 
-        // Get user pubkey from ticket reservation
+        // The escrow is locked to the bitcoin key the user reserved the
+        // ticket with, recorded at reservation.
         let user_pubkey_str = ticket
-            .reserved_by
+            .ephemeral_pubkey
             .as_ref()
-            .ok_or_else(|| anyhow!("Ticket {} has no reserved_by field", ticket.id))?;
+            .ok_or_else(|| anyhow!("Ticket {} has no escrow public key", ticket.id))?;
 
         let user_pubkey = PublicKey::from_str(user_pubkey_str)
             .map_err(|e| anyhow!("Failed to parse user public key {}: {}", user_pubkey_str, e))?;

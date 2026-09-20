@@ -1,7 +1,7 @@
 use anyhow::anyhow;
 use async_trait::async_trait;
 use base64::Engine;
-use bitcoin::hashes::{sha256, Hash};
+use bitcoin::hashes::Hash;
 use futures::StreamExt;
 use lightning_invoice::Bolt11Invoice;
 use log::{debug, info, warn};
@@ -47,7 +47,6 @@ pub trait Ln: Send + Sync {
         expiry_time_secs: u64,
         ticket_hash: String,
         competition_id: Uuid,
-        hex_refund_tx: String,
     ) -> Result<InvoiceAddResponse, anyhow::Error>;
     async fn add_invoice(
         &self,
@@ -318,7 +317,6 @@ impl Ln for LnClient {
         expiry_time_secs: u64,
         ticket_hash_hex: String,
         competition_id: Uuid,
-        hex_refund_tx: String,
     ) -> Result<InvoiceAddResponse, anyhow::Error> {
         info!("ticket_hash_hex: {:?}", ticket_hash_hex);
 
@@ -332,9 +330,7 @@ impl Ln for LnClient {
             ));
         }
 
-        let refund_tx_hash = sha256::Hash::hash(hex_refund_tx.as_bytes()).to_byte_array();
-
-        let memo = format!("c:{};r:{:?}", competition_id, refund_tx_hash);
+        let memo = format!("c:{}", competition_id);
 
         let hash_base64 = base64::engine::general_purpose::STANDARD.encode(&hash_bytes);
 

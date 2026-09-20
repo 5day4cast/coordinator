@@ -1828,6 +1828,77 @@ impl CompetitionStore {
             .await
     }
 
+    /// The key the ticket's escrow will be locked to, recorded at reservation;
+    /// the escrow transaction itself is built once the invoice is accepted.
+    pub async fn update_ticket_pubkey(
+        &self,
+        ticket_id: Uuid,
+        ephemeral_pubkey: String,
+    ) -> Result<bool, DatabaseWriteError> {
+        let ticket_id = ticket_id.to_string();
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query("UPDATE tickets SET ephemeral_pubkey = ? WHERE id = ?")
+                    .bind(ephemeral_pubkey)
+                    .bind(ticket_id)
+                    .execute(&pool)
+                    .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+    }
+
+    /// Tickets of a competition whose escrow transaction exists and has not
+    /// been reclaimed, entries or not.
+    pub async fn get_escrowed_tickets_for_competition(
+        &self,
+        competition_id: Uuid,
+    ) -> Result<Vec<Ticket>, sqlx::Error> {
+        sqlx::query_as::<_, Ticket>(
+            r#"SELECT tickets.id as id,
+                      tickets.event_id as competition_id,
+                      entries.id as entry_id,
+                      tickets.ephemeral_pubkey as ephemeral_pubkey,
+                      encrypted_preimage,
+                      hash,
+                      payment_request,
+                      invoice_expires_at,
+                      datetime('now', '+10 minutes') as expiry,
+                      reserved_by,
+                      reserved_at,
+                      paid_at,
+                      settled_at,
+                      escrow_transaction
+               FROM tickets
+               LEFT JOIN entries ON tickets.id = entries.ticket_id
+               WHERE escrow_transaction IS NOT NULL
+                 AND escrow_reclaimed_at IS NULL
+                 AND tickets.event_id = ?"#,
+        )
+        .bind(competition_id.to_string())
+        .fetch_all(self.db_connection.read())
+        .await
+    }
+
+    pub async fn mark_ticket_escrow_reclaimed(
+        &self,
+        ticket_id: Uuid,
+    ) -> Result<bool, DatabaseWriteError> {
+        let ticket_id = ticket_id.to_string();
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE tickets SET escrow_reclaimed_at = datetime('now')
+                    WHERE id = ? AND escrow_reclaimed_at IS NULL",
+                )
+                .bind(ticket_id)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+    }
+
     pub async fn update_ticket_payment_request(
         &self,
         ticket_id: Uuid,

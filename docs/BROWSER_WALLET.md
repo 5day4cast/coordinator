@@ -85,6 +85,11 @@ Before signing, the wallet checks all of the following:
 
 It errors if no input belongs to the entry.
 
+The coordinator builds and broadcasts the escrow transaction only after the
+ticket's HODL invoice is accepted, never hands it out beforehand, and its
+output carries a coordinator reclaim branch (`infra/escrow.rs`) so an escrow
+nobody spends is recovered once a paying user's refund window has passed.
+
 ## Keymeld enclave trust
 
 Entry keys are encrypted only to a Keymeld enclave whose fresh Nitro
