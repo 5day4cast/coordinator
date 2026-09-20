@@ -31,12 +31,6 @@ pub enum Error {
     Thread(String),
     #[error("internal error")]
     Bitcoin(#[from] anyhow::Error),
-    #[error("signing error: {0}")]
-    SigningError(String),
-    #[error("Failed to create hold invoice: {0}")]
-    HoldError(anyhow::Error),
-    #[error("Failed to create or manage Lightning invoice: {0}")]
-    LnError(anyhow::Error),
     #[error("Competition full, total_allowed_entries matches total_entries")]
     CompetitionFull,
     #[error("No ticket available for competition")]

@@ -193,6 +193,9 @@ impl Application {
             () = writer_stopped => {
                 shutdown_error = Some(anyhow!("Database writer stopped unexpectedly"));
             }
+            () = cancellation_token.cancelled() => {
+                shutdown_error = Some(anyhow!("A background worker stopped unexpectedly"));
+            }
         }
         stop_http.cancel();
         let (public_drain, admin_drain) = tokio::join!(
@@ -493,16 +496,12 @@ pub async fn build_app(
         cancel_token.clone(),
         Duration::from_secs(config.coordinator_settings.sync_interval_secs),
     );
-    let competition_watcher_task = tracker.spawn(async move {
-        match competition_watcher.watch().await {
-            Ok(_) => {
-                info!("Successfully shutdown competition watcher")
-            }
-            Err(e) => {
-                error!("Error in competition watcher: {}", e)
-            }
-        }
-    });
+    let competition_watcher_task = spawn_supervised(
+        &tracker,
+        "competition watcher",
+        cancel_token.clone(),
+        async move { competition_watcher.watch().await },
+    );
 
     let bitcoin_watcher = BitcoinSyncWatcher::new(
         bitcoin_client.clone(),
@@ -510,16 +509,12 @@ pub async fn build_app(
         Duration::from_secs(config.bitcoin_settings.refresh_blocks_secs),
     );
 
-    let bitcoin_watcher_task = tracker.spawn(async move {
-        match bitcoin_watcher.watch().await {
-            Ok(_) => {
-                info!("Successfully shutdown Bitcoin sync watcher")
-            }
-            Err(e) => {
-                error!("Error in Bitcoin sync watcher: {}", e)
-            }
-        }
-    });
+    let bitcoin_watcher_task = spawn_supervised(
+        &tracker,
+        "Bitcoin sync watcher",
+        cancel_token.clone(),
+        async move { bitcoin_watcher.watch().await },
+    );
 
     threads.insert(
         String::from("competition_watcher"),
@@ -534,11 +529,12 @@ pub async fn build_app(
         Duration::from_secs(config.ln_settings.invoice_watch_interval),
     );
 
-    let invoice_watcher_handle = tracker.spawn(async move {
-        if let Err(e) = invoice_watcher.watch().await {
-            error!("Invoice watcher error: {}", e);
-        }
-    });
+    let invoice_watcher_handle = spawn_supervised(
+        &tracker,
+        "invoice watcher",
+        cancel_token.clone(),
+        async move { invoice_watcher.watch().await },
+    );
 
     threads.insert("invoice_watcher".to_string(), invoice_watcher_handle);
 
@@ -549,11 +545,12 @@ pub async fn build_app(
         Duration::from_secs(config.ln_settings.payout_watch_interval),
     );
 
-    let payout_watcher_handle = tracker.spawn(async move {
-        if let Err(e) = payout_watcher.watch().await {
-            error!("Payout watcher error: {}", e);
-        }
-    });
+    let payout_watcher_handle = spawn_supervised(
+        &tracker,
+        "payout watcher",
+        cancel_token.clone(),
+        async move { payout_watcher.watch().await },
+    );
 
     threads.insert("payout_watcher".to_string(), payout_watcher_handle);
 
@@ -563,22 +560,24 @@ pub async fn build_app(
     let invoice_subscriber =
         InvoiceSubscriber::new(coordinator.clone(), ln.clone(), cancel_token.clone());
 
-    let invoice_subscriber_handle = tracker.spawn(async move {
-        if let Err(e) = invoice_subscriber.subscribe().await {
-            error!("Invoice subscriber error: {}", e);
-        }
-    });
+    let invoice_subscriber_handle = spawn_supervised(
+        &tracker,
+        "invoice subscriber",
+        cancel_token.clone(),
+        async move { invoice_subscriber.subscribe().await },
+    );
 
     threads.insert("invoice_subscriber".to_string(), invoice_subscriber_handle);
 
     let payment_subscriber =
         PaymentSubscriber::new(coordinator.clone(), ln.clone(), cancel_token.clone());
 
-    let payment_subscriber_handle = tracker.spawn(async move {
-        if let Err(e) = payment_subscriber.subscribe().await {
-            error!("Payment subscriber error: {}", e);
-        }
-    });
+    let payment_subscriber_handle = spawn_supervised(
+        &tracker,
+        "payment subscriber",
+        cancel_token.clone(),
+        async move { payment_subscriber.subscribe().await },
+    );
 
     threads.insert("payment_subscriber".to_string(), payment_subscriber_handle);
     tracker.close();
@@ -946,6 +945,31 @@ fn lnurl_resolver(mock: bool, network: Network) -> Arc<dyn LnurlPay> {
 #[cfg(not(any(feature = "e2e-testing", debug_assertions)))]
 fn lnurl_resolver(_mock: bool, network: Network) -> Arc<dyn LnurlPay> {
     Arc::new(HttpsLnurlPay::new(network))
+}
+
+/// Run a background worker. A worker that stops for any reason other than
+/// shutdown takes the whole service down with it: the watchers settle
+/// invoices, payouts and contracts, so running without one is worse than
+/// restarting.
+fn spawn_supervised(
+    tracker: &TaskTracker,
+    name: &'static str,
+    cancel: CancellationToken,
+    work: impl std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'static,
+) -> JoinHandle<()> {
+    tracker.spawn(async move {
+        match work.await {
+            Ok(()) if cancel.is_cancelled() => info!("{name} stopped"),
+            Ok(()) => {
+                error!("{name} stopped unexpectedly; shutting down");
+                cancel.cancel();
+            }
+            Err(e) => {
+                error!("{name} failed: {e}; shutting down");
+                cancel.cancel();
+            }
+        }
+    })
 }
 
 pub fn build_reqwest_client(client: Client) -> ClientWithMiddleware {

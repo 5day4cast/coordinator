@@ -22,6 +22,7 @@ use nostr_sdk::{nips::nip44, Keys};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 /// Error type for Keymeld operations
 #[derive(Debug, thiserror::Error)]
@@ -162,7 +163,8 @@ pub trait Keymeld: Send + Sync {
     ) -> Result<RegistrationAssignment, KeymeldError>;
 }
 
-/// Holds private authority credentials; never format or serialize the live session.
+/// Holds private authority credentials; never format or serialize the live
+/// session. The session secret is erased on drop.
 #[derive(Clone)]
 pub struct DlcKeygenSession {
     pub session_id: SessionId,
@@ -261,6 +263,12 @@ impl StoredDlcKeygenSession {
         };
         session.validate_credentials()?;
         Ok(session)
+    }
+}
+
+impl Drop for DlcKeygenSession {
+    fn drop(&mut self) {
+        self.session_secret.zeroize();
     }
 }
 
@@ -1027,9 +1035,9 @@ mod tests {
             restored.signing_authority.export_secret(),
             session.signing_authority.export_secret()
         );
-        for (user, authority) in session.registration_authorities {
+        for (user, authority) in &session.registration_authorities {
             assert_eq!(
-                restored.registration_authorities[&user].export_secret(),
+                restored.registration_authorities[user].export_secret(),
                 authority.export_secret()
             );
         }

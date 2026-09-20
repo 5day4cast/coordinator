@@ -39,6 +39,7 @@ use serde_json::{json, Value};
 use std::{collections::HashMap, fs, path::Path, str::FromStr, sync::Arc, time::Duration};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
 mod funding;
 
@@ -459,7 +460,8 @@ fn read_macaroon_hex(file_path: &str) -> Result<SecretString, anyhow::Error> {
 
 pub struct BitcoinClient {
     pub network: Network,
-    seed_path: SecretString,
+    /// The coordinator's escrow/DLC key, loaded once at startup.
+    coordinator_secret: Zeroizing<[u8; 32]>,
     lnd: LndWallet,
     electrum: Arc<ElectrumClient>,
 }
@@ -479,8 +481,11 @@ impl BitcoinClient {
             fs::create_dir_all(parent)?;
         }
         // Creates the key on first start, as before.
-        get_key::<SecretKey>(&settings.seed_path)
-            .map_err(|e| anyhow!("Failed to load bitcoin private key: {}", e))?;
+        let coordinator_secret = Zeroizing::new(
+            get_key::<SecretKey>(&settings.seed_path)
+                .map_err(|e| anyhow!("Failed to load bitcoin private key: {}", e))?
+                .secret_bytes(),
+        );
 
         let lnd = LndWallet::new(ln_settings)?;
         let electrum_url = settings.electrum_url.clone();
@@ -501,7 +506,7 @@ impl BitcoinClient {
 
         let client = BitcoinClient {
             network: settings.network,
-            seed_path: SecretString::from(settings.seed_path.clone()),
+            coordinator_secret,
             lnd,
             electrum: Arc::new(electrum),
         };
@@ -579,7 +584,7 @@ impl BitcoinClient {
     }
 
     fn coordinator_private_key(&self) -> Result<bitcoin::PrivateKey, anyhow::Error> {
-        let secret_key = get_key::<SecretKey>(self.seed_path.expose_secret())?;
+        let secret_key = SecretKey::from_slice(&self.coordinator_secret[..])?;
         Ok(bitcoin::PrivateKey {
             compressed: true,
             network: NetworkKind::from(self.network),
@@ -784,8 +789,7 @@ impl Bitcoin for BitcoinClient {
     }
 
     async fn get_derived_private_key(&self) -> Result<Scalar, anyhow::Error> {
-        let secret_key = get_key::<SecretKey>(self.seed_path.expose_secret())?;
-        Scalar::from_hex(&hex::encode(secret_key.secret_bytes()))
+        Scalar::from_slice(&self.coordinator_secret[..])
             .map_err(|e| anyhow!("Failed to convert private key to scalar: {}", e))
     }
 

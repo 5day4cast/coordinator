@@ -338,10 +338,9 @@ impl Coordinator {
         );
 
         // Update stored session with aggregate key
-        let updated_session = DlcKeygenSession {
-            aggregate_key,
-            ..session
-        };
+        // The session erases its secret on drop, so fields cannot be moved out.
+        let mut updated_session = session.clone();
+        updated_session.aggregate_key = aggregate_key;
 
         self.store_keymeld_session(competition.id, updated_session)
             .await?;

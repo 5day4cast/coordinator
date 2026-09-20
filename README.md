@@ -152,7 +152,7 @@ reach the admin listener (a tunnel name in production).
 
 ### Keymeld authorization upgrade
 
-The SDK and the flake's keymeld input are pinned to the Keymeld `v0.4.0` release (protocol 0.4).
+The SDK and the flake's keymeld input are pinned to the same Keymeld revision (currently the payout-escrow head of tee8z/keymeld#56 on top of `v0.4.1`, protocol 0.4 with authorization protocol 2); move both together when Keymeld cuts a release.
 Deploy matching gateway, enclave, coordinator, and browser artifacts together.
 Complete active competitions before upgrading and archive their session state.
 Legacy session records lack authorization credentials and cannot resume under this protocol.

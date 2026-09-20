@@ -84,6 +84,48 @@ mod tests {
     use axum::body::to_bytes;
 
     #[tokio::test]
+    async fn client_errors_keep_their_message_and_internal_ones_do_not() {
+        for (error, status, message) in [
+            (
+                Error::NotFound("entry 1".into()),
+                StatusCode::NOT_FOUND,
+                "item not found: entry 1",
+            ),
+            (
+                Error::BadRequest("bad".into()),
+                StatusCode::BAD_REQUEST,
+                "bad",
+            ),
+            (
+                Error::InvalidSignature("nope".into()),
+                StatusCode::FORBIDDEN,
+                "invalid signature for request",
+            ),
+            (
+                Error::PaymentFailed("routing".into()),
+                StatusCode::BAD_REQUEST,
+                "Payout payment failed: routing",
+            ),
+            (
+                Error::Bitcoin(anyhow::anyhow!("private node detail")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error",
+            ),
+            (
+                Error::Thread("worker".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error",
+            ),
+        ] {
+            let response = error.into_response();
+            assert_eq!(response.status(), status);
+            let body = to_bytes(response.into_body(), 1024).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body, json!({ "error": message }));
+        }
+    }
+
+    #[tokio::test]
     async fn write_failures_distinguish_rejection_from_unknown_outcome() {
         for (error, status, message) in [
             (
