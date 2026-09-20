@@ -32,8 +32,8 @@ coordinator-escrow = { path = "crates/coordinator-escrow" }
 
 # Keymeld: released SDK and services on the published dlctix crate.
 # keymeld-sdk and the coordinator must resolve dlctix from the same source.
-keymeld-sdk = { git = "https://github.com/tee8z/keymeld", rev = "1e08d38b2bdb7203f638083d9e3833f207ea4c24", default-features = false, features = ["escrow", "dlctix"] }
-keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "1e08d38b2bdb7203f638083d9e3833f207ea4c24", default-features = false, features = ["escrow"] }
+keymeld-sdk = { git = "https://github.com/tee8z/keymeld", rev = "70c9b3b79e4701c2d75c9d7a85a5614b3d369692", default-features = false, features = ["escrow", "dlctix"] }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "70c9b3b79e4701c2d75c9d7a85a5614b3d369692", default-features = false, features = ["escrow"] }
 
 # Bitcoin
 bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }
