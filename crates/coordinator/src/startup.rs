@@ -2,7 +2,7 @@ use crate::{
     api::admin_auth::{
         admin_login, admin_login_page, operator_response_headers, require_operator, AdminAccess,
     },
-    api::nip98_replay::{Nip98ReplayGuard, DEFAULT_REPLAY_CAPACITY},
+    api::nip98_replay::Nip98ReplayGuard,
     api::routes::{
         add_event_entry, admin_competition_fragment, admin_create_competition_handler,
         admin_delete_competition_handler, admin_fee_estimates_fragment, admin_page_handler,
@@ -35,6 +35,8 @@ use crate::{
 };
 
 // Mock implementations only available with e2e-testing feature or debug builds
+use crate::api::nip98_origins::Nip98Origins;
+use crate::config::{APISettings, RateLimitSettings};
 #[cfg(any(feature = "e2e-testing", debug_assertions))]
 use crate::infra::{
     bitcoin_mock::MockBitcoinClient, lightning_mock::MockLnClient, lnurl_mock::MockLnurlPay,
@@ -73,6 +75,9 @@ use tokio::{
     task::{AbortHandle, JoinHandle},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tower_governor::{
+    governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer,
+};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 type HttpServer = Serve<
     TcpListener,
@@ -114,11 +119,8 @@ impl Application {
             .collect();
         let app_state = Arc::new(app_state);
         let servers = async {
-            let server = build_server(
-                listener,
-                app(app_state.clone(), config.api_settings.origins),
-            )
-            .await?;
+            let server =
+                build_server(listener, app(app_state.clone(), &config.api_settings)).await?;
             let admin_server = build_server(
                 admin_listener,
                 admin_app(app_state.clone(), admin_access, network),
@@ -623,11 +625,34 @@ pub async fn build_server(
 
 /// Public listener: participant API, public pages, and static assets. It must never
 /// route an operator path; `startup_tests` proves this for every admin route.
-pub fn app(app_state: Arc<AppState>, origins: Vec<String>) -> Router {
-    let origins: Vec<HeaderValue> = origins
-        .into_iter()
+pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
+    let origins: Vec<HeaderValue> = api
+        .origins
+        .iter()
         .filter_map(|origin| origin.parse().ok())
         .collect();
+
+    // NIP-98 events must name the URL clients actually use: the browser
+    // origins plus the UI's own public and private URLs. Validated at startup.
+    let nip98_origins = Nip98Origins::new(api.origins.iter().map(String::as_str).chain([
+        app_state.remote_url.as_str(),
+        app_state.private_url.as_str(),
+    ]))
+    .expect("api_settings.origins and ui_settings urls are validated at startup");
+
+    // Forget expired NIP-98 events on a timer, so a burst never leaves the
+    // guard refusing requests until it fills again.
+    let replay = Arc::new(Nip98ReplayGuard::new(api.replay_capacity));
+    {
+        let guard = replay.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                guard.prune(time::OffsetDateTime::now_utc().unix_timestamp());
+            }
+        });
+    }
 
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
@@ -644,6 +669,12 @@ pub fn app(app_state: Arc<AppState>, origins: Vec<String>) -> Router {
         .route("/username/change-password", post(change_password))
         .route("/username/forgot-password", post(forgot_password_challenge))
         .route("/username/reset-password", post(forgot_password_reset));
+    let users_endpoints = limited(
+        users_endpoints,
+        &api.rate_limit,
+        api.rate_limit.auth_per_second,
+        api.rate_limit.auth_burst,
+    );
 
     // HTMX public routes (some require JS bridge for auth)
     let htmx_routes = Router::new()
@@ -665,7 +696,7 @@ pub fn app(app_state: Arc<AppState>, origins: Vec<String>) -> Router {
         .route("/entries/{entry_id}/detail", get(entry_detail_fragment))
         .route("/payouts", get(payouts_fragment));
 
-    Router::new()
+    let api_routes = Router::new()
         .route("/", get(public_page_handler))
         .merge(htmx_routes)
         .fallback(public_fallback)
@@ -709,14 +740,53 @@ pub fn app(app_state: Arc<AppState>, origins: Vec<String>) -> Router {
         )
         .route("/api/v1/entries", post(add_event_entry))
         .route("/api/v1/entries", get(get_entries))
-        .nest("/api/v1/users", users_endpoints)
+        .nest("/api/v1/users", users_endpoints);
+    let api_routes = limited(
+        api_routes,
+        &api.rate_limit,
+        api.rate_limit.per_second,
+        api.rate_limit.burst,
+    );
+
+    Router::new()
+        .merge(api_routes)
         .route("/ui/{*path}", get(serve_static_file))
-        .layer(Extension(Arc::new(Nip98ReplayGuard::new(
-            DEFAULT_REPLAY_CAPACITY,
-        ))))
+        .layer(Extension(replay))
+        .layer(Extension(Arc::new(nip98_origins)))
         .layer(middleware::from_fn(log_request))
         .with_state(app_state)
         .layer(cors)
+}
+
+/// Per-client limit on every route of `router`, unless limiting is off.
+/// `per_second` is the sustained rate, `burst` the allowance above it.
+fn limited(
+    router: Router<Arc<AppState>>,
+    settings: &RateLimitSettings,
+    per_second: u32,
+    burst: u32,
+) -> Router<Arc<AppState>> {
+    if !settings.enabled {
+        return router;
+    }
+    let config = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_millisecond(u64::from(1000 / per_second.max(1)).max(1))
+            .burst_size(burst.max(1))
+            .key_extractor(SmartIpKeyExtractor)
+            .finish()
+            .expect("rate limit settings are valid"),
+    );
+    // The limiter only forgets idle clients when told to.
+    let limiter = config.limiter().clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            limiter.retain_recent();
+        }
+    });
+    router.route_layer(GovernorLayer::new(config))
 }
 
 /// Admin listener: operator pages, the LND wallet API, and competition creation.
@@ -1012,7 +1082,13 @@ mod startup_tests {
         }
 
         fn public(&self) -> Router {
-            app(self.state.clone(), vec![])
+            app(
+                self.state.clone(),
+                &APISettings {
+                    rate_limit: RateLimitSettings::disabled(),
+                    ..APISettings::default()
+                },
+            )
         }
 
         async fn stop(self) {

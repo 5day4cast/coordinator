@@ -243,10 +243,38 @@ impl Settings {
     /// operator routes without authentication.
     pub fn validate(&self) -> Result<(), anyhow::Error> {
         let network = self.bitcoin_settings.network;
+        self.api_settings.validate(&self.ui_settings)?;
         self.ln_settings.validate(network)?;
         self.coordinator_settings.validate(network)?;
         self.admin_settings.validate(network)?;
         self.keymeld_settings.validate(network)
+    }
+}
+
+impl APISettings {
+    pub fn validate(&self, ui: &UISettings) -> Result<(), anyhow::Error> {
+        crate::api::nip98_origins::Nip98Origins::new(
+            self.origins
+                .iter()
+                .map(String::as_str)
+                .chain([ui.remote_url.as_str(), ui.private_url.as_str()]),
+        )
+        .map_err(|e| anyhow::anyhow!("api_settings.origins / ui_settings urls: {e}"))?;
+        let limits = &self.rate_limit;
+        if limits.enabled
+            && [
+                limits.per_second,
+                limits.burst,
+                limits.auth_per_second,
+                limits.auth_burst,
+            ]
+            .contains(&0)
+        {
+            return Err(anyhow::anyhow!(
+                "api_settings.rate_limit rates and bursts must be at least 1"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -624,7 +652,21 @@ impl Default for UISettings {
 pub struct APISettings {
     pub domain: String,
     pub port: String,
+    /// Browser origins allowed by CORS; NIP-98 events may also name them.
     pub origins: Vec<String>,
+    #[serde(default)]
+    pub rate_limit: RateLimitSettings,
+    /// How many NIP-98 event ids are remembered against replay. 100k ids
+    /// over the two-minute acceptance window is ~830 authenticated
+    /// requests per second before new ones are refused.
+    #[serde(default = "APISettings::default_replay_capacity")]
+    pub replay_capacity: usize,
+}
+
+impl APISettings {
+    fn default_replay_capacity() -> usize {
+        100_000
+    }
 }
 
 impl Default for APISettings {
@@ -633,6 +675,67 @@ impl Default for APISettings {
             domain: String::from("127.0.0.1"),
             port: String::from("9990"),
             origins: vec![String::from("http://localhost:9990")],
+            rate_limit: RateLimitSettings::default(),
+            replay_capacity: Self::default_replay_capacity(),
+        }
+    }
+}
+
+/// Per-client request limits on the public listener. Clients are keyed by
+/// `X-Forwarded-For`, `X-Real-IP` or `Forwarded` when a reverse proxy sets
+/// them, otherwise by the peer address.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitSettings {
+    #[serde(default = "RateLimitSettings::default_enabled")]
+    pub enabled: bool,
+    /// Sustained requests per second across the public API.
+    #[serde(default = "RateLimitSettings::default_per_second")]
+    pub per_second: u32,
+    /// Requests allowed above the sustained rate before throttling.
+    #[serde(default = "RateLimitSettings::default_burst")]
+    pub burst: u32,
+    /// Sustained requests per second on login, registration and password
+    /// reset, the endpoints worth guessing against.
+    #[serde(default = "RateLimitSettings::default_auth_per_second")]
+    pub auth_per_second: u32,
+    #[serde(default = "RateLimitSettings::default_auth_burst")]
+    pub auth_burst: u32,
+}
+
+impl RateLimitSettings {
+    fn default_enabled() -> bool {
+        true
+    }
+    fn default_per_second() -> u32 {
+        20
+    }
+    fn default_burst() -> u32 {
+        60
+    }
+    fn default_auth_per_second() -> u32 {
+        2
+    }
+    fn default_auth_burst() -> u32 {
+        10
+    }
+
+    /// No limits: for tests that drive the router without a peer address.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for RateLimitSettings {
+    fn default() -> Self {
+        Self {
+            enabled: Self::default_enabled(),
+            per_second: Self::default_per_second(),
+            burst: Self::default_burst(),
+            auth_per_second: Self::default_auth_per_second(),
+            auth_burst: Self::default_auth_burst(),
         }
     }
 }

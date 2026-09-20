@@ -61,6 +61,13 @@ impl Nip98ReplayGuard {
         seen.insert(id, created_at + MAX_EVENT_SKEW_SECS);
         Ok(())
     }
+
+    /// Forget events the extractor would reject as expired anyway. Run on a
+    /// timer so a burst never leaves the guard at capacity for long.
+    pub fn prune(&self, now: i64) {
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        seen.retain(|_, last_valid| *last_valid >= now);
+    }
 }
 
 #[cfg(test)]
