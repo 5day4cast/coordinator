@@ -84,11 +84,50 @@ pub fn entry_form(
 
                     // Station forecast picks
                     form id="entryForm" data-competition-id=(competition.id)
+                         data-entry-fee=(competition.entry_fee)
+                         data-total-pool=(competition.total_pool)
+                         data-winner-count=(competition.num_winners)
                          data-max-values=(competition.number_of_values_per_entry) {
                         @for forecast in forecasts {
                             (station_picks(forecast))
                         }
                     }
+                }
+
+                div class="box mt-4" id="entryPayoutConsent" {
+                    h3 class="title is-5" { "Receive your winnings" }
+                    div class="field" {
+                        label class="label" for="entryPayoutMethod" { "Payout method" }
+                        div class="control select" {
+                            select id="entryPayoutMethod" onchange="updateEntryPayoutMethod()" {
+                                option value="automatic" selected { "Automatically to my Lightning Address" }
+                                option value="invoice" { "I will submit a Lightning invoice" }
+                            }
+                        }
+                    }
+                    div class="field" id="entryPayoutAddressField" {
+                        label class="label" for="entryLightningAddress" { "Lightning Address for this entry" }
+                        div class="control" {
+                            input class="input" id="entryLightningAddress" type="text"
+                                placeholder="you@wallet.com" autocomplete="off" spellcheck="false" maxlength="320";
+                        }
+                        p class="help" {
+                            "Winnings are paid automatically after the result, even while you are offline. "
+                            "You can submit an invoice if your provider is unavailable. "
+                            "Changing your profile address later will not change this entry."
+                        }
+                    }
+                    p id="entryPayoutTermsText" class="help mb-3" { "Loading payout terms…" }
+                    div class="field" {
+                        label class="checkbox" {
+                            input type="checkbox" id="entryPayoutApproved";
+                            span id="entryPayoutConsentText" {
+                                " I authorize this payout method and agree to exchange this entry's on-chain claim "
+                                "for the Lightning payout only after payment is verified."
+                            }
+                        }
+                    }
+                    script { (maud::PreEscaped("window.setupEntryPayoutConsent?.();")) }
                 }
 
                 // JavaScript to convert UTC times to local timezone

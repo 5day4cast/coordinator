@@ -1,0 +1,27 @@
+[package]
+name = "coordinator-escrow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+networking = ["dep:tokio"]
+
+[dependencies]
+keymeld-core = { git = "https://github.com/tee8z/keymeld", tag = "v0.5.0", default-features = false, features = ["escrow"] }
+dlctix.workspace = true
+lightning-invoice.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+secp256k1 = { version = "0.31", features = ["serde"] }
+tokio = { workspace = true, features = ["io-util"], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread"] }

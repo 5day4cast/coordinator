@@ -15,12 +15,14 @@ e2e-testing = []
 ignored = ["blake2", "coordinator-core", "h2", "hex", "better-minify-js", "openssl", "sha2", "walkdir"]
 
 [dependencies]
-coordinator-core.workspace = true
+coordinator-escrow.workspace = true
+coordinator-core = { workspace = true, features = ["keymeld"] }
 
 # Web
 axum.workspace = true
 axum-extra.workspace = true
 tower-http.workspace = true
+tower_governor.workspace = true
 maud.workspace = true
 reqwest.workspace = true
 reqwest-middleware.workspace = true
@@ -93,6 +95,8 @@ openssl.workspace = true
 pem-rfc7468.workspace = true
 
 [dev-dependencies]
+coordinator-escrow-verifier = { path = "../coordinator-escrow-verifier" }
+keymeld-enclave = { git = "https://github.com/tee8z/keymeld", tag = "v0.5.0", default-features = false, features = ["escrow", "test-support"] }
 tempfile = "3"
 # Drives routers directly in route-isolation tests.
 tower = { version = "0.5", features = ["util"] }

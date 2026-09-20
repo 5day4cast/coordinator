@@ -8,7 +8,7 @@ description = "Shared types for coordinator server and WASM client"
 
 [features]
 default = []
-keymeld = ["dep:keymeld-sdk", "dep:hex"]
+keymeld = ["dep:keymeld-sdk", "dep:coordinator-escrow", "dep:hex"]
 
 [dependencies]
 # Serialization
@@ -21,7 +21,8 @@ time.workspace = true
 # Utilities
 thiserror.workspace = true
 uuid.workspace = true
-keymeld-sdk = { workspace = true, features = ["client"], optional = true }
+keymeld-sdk = { workspace = true, features = ["client", "escrow"], optional = true }
+coordinator-escrow = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 
 [dev-dependencies]

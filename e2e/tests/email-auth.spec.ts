@@ -23,6 +23,7 @@ async function registerWithUsername(
   await page.locator("#registerUsernameInput").fill(username);
   await page.locator("#registerPassword").fill(password);
   await page.locator("#registerPasswordConfirm").fill(password);
+  await page.locator("#registerLightningAddress").fill(`${username}@mock-wallet.dev`);
 
   await page.locator("#usernameRegisterStep1Button").click();
 
@@ -108,6 +109,7 @@ test.describe("Username/Password Authentication", () => {
     await page.locator("#registerUsernameInput").fill(username);
     await page.locator("#registerPassword").fill(password);
     await page.locator("#registerPasswordConfirm").fill(password);
+    await page.locator("#registerLightningAddress").fill(`${username}@mock-wallet.dev`);
 
     await page.locator("#usernameRegisterStep1Button").click();
 
@@ -192,6 +194,7 @@ test.describe("Username/Password Authentication", () => {
     await page.locator("#registerUsernameInput").fill(username);
     await page.locator("#registerPassword").fill(differentPassword);
     await page.locator("#registerPasswordConfirm").fill(differentPassword);
+    await page.locator("#registerLightningAddress").fill(`${username}@mock-wallet.dev`);
     await page.locator("#usernameRegisterStep1Button").click();
 
     await expect(page.locator("#usernameNsecDisplay")).toHaveValue(/^nsec1/, {
@@ -375,6 +378,7 @@ test.describe("Username/Password Authentication", () => {
     await page.locator("#registerUsernameInput").fill(username);
     await page.locator("#registerPassword").fill(weakPassword);
     await page.locator("#registerPasswordConfirm").fill(weakPassword);
+    await page.locator("#registerLightningAddress").fill(`${username}@mock-wallet.dev`);
     await page.locator("#usernameRegisterStep1Button").click();
 
     await expect(page.locator("#usernameRegisterError")).toContainText(
@@ -401,6 +405,7 @@ test.describe("Username/Password Authentication", () => {
     await page.locator("#registerUsernameInput").fill(username);
     await page.locator("#registerPassword").fill(password1);
     await page.locator("#registerPasswordConfirm").fill(password2);
+    await page.locator("#registerLightningAddress").fill(`${username}@mock-wallet.dev`);
     await page.locator("#usernameRegisterStep1Button").click();
 
     await expect(page.locator("#usernameRegisterError")).toContainText(
@@ -426,6 +431,7 @@ test.describe("Username/Password Authentication", () => {
     await page.locator("#registerUsernameInput").fill("ab");
     await page.locator("#registerPassword").fill(password);
     await page.locator("#registerPasswordConfirm").fill(password);
+    await page.locator("#registerLightningAddress").fill("ab@mock-wallet.dev");
     await page.locator("#usernameRegisterStep1Button").click();
 
     await expect(page.locator("#usernameRegisterError")).toContainText(

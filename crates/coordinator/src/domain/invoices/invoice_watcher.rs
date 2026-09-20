@@ -4,7 +4,6 @@ use bitcoin::{
     hashes::{sha256, Hash},
     PublicKey, Transaction,
 };
-use dlctix::{bitcoin::hex::DisplayHex, hashlock};
 use log::{debug, error, info, warn};
 use std::{str::FromStr, sync::Arc, time::Duration};
 use time::OffsetDateTime;
@@ -14,13 +13,13 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     domain::{competitions::Ticket, Coordinator},
     infra::{
+        db::DatabaseWriteError,
         escrow::generate_escrow_tx,
         lightning::{InvoiceState, Ln},
     },
 };
 
 const MAX_BROADCAST_RETRIES: u32 = 3;
-const MAX_ESCROW_REGENERATION_RETRIES: u32 = 2;
 const RETRY_DELAY_MS: u64 = 1000;
 
 pub struct InvoiceWatcher {
@@ -91,6 +90,13 @@ impl InvoiceWatcher {
 
                     // Handle expired/canceled invoices - clear reservation so ticket can be reused
                     if invoice.state == InvoiceState::Canceled {
+                        if ticket.paid_at.is_some() || ticket.escrow_transaction.is_some() {
+                            warn!(
+                                "Canceled invoice for ticket {} retains escrow recovery state",
+                                ticket.id
+                            );
+                            continue;
+                        }
                         info!(
                             "Invoice expired/canceled for ticket {}, clearing reservation",
                             ticket.id
@@ -117,66 +123,57 @@ impl InvoiceWatcher {
                         continue;
                     }
 
-                    if invoice.state == InvoiceState::Accepted {
-                        info!("Invoice accepted for ticket {}", ticket.id);
-
-                        debug!("Marking ticket as Paid {}: ", ticket.id);
-
-                        match self
+                    if matches!(
+                        invoice.state,
+                        InvoiceState::Accepted | InvoiceState::Settled
+                    ) {
+                        // The subscription may already have marked this ticket
+                        // paid, or a previous process may have stopped after that
+                        // commit. Continue from current durable state either way.
+                        if let Err(error) = self
                             .coordinator
                             .competition_store
                             .mark_ticket_paid(&ticket.hash, ticket.competition_id)
                             .await
                         {
-                            Ok(true) => {
-                                // Check if escrow is enabled
-                                if self.coordinator.is_escrow_enabled() {
-                                    // Try broadcasting escrow with retries and UTXO regeneration
-                                    let broadcast_result =
-                                        self.broadcast_escrow_with_utxo_retries(&ticket).await;
-
-                                    match broadcast_result {
-                                        Ok(txid) => {
-                                            info!("Successfully broadcasted escrow transaction for ticket {} in competition {}: {}",
-                                                ticket.id, ticket.competition_id, txid);
-
-                                            // Proceed to settle the HODL invoice
-                                            self.settle_invoice_and_mark_ticket(&ticket).await;
-                                        }
-                                        Err(e) => {
-                                            // All broadcast attempts failed, cancel the HODL invoice and reset ticket
-                                            error!("Failed to broadcast escrow transaction after all retry attempts for ticket {}: {}",
-                                                ticket.id, e);
-
-                                            match self
-                                                .cancel_invoice_and_reset_ticket(&ticket)
-                                                .await
-                                            {
-                                                Ok(_) => {
-                                                    info!("Successfully cancelled invoice and reset ticket {} for reuse", ticket.id);
-                                                }
-                                                Err(e) => {
-                                                    error!("Failed to cancel invoice and reset ticket {}: {}", ticket.id, e);
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    // Escrow disabled - just settle the invoice directly
-                                    // The HODL invoice stays in-flight until contract tx is broadcast
-                                    info!(
-                                        "Escrow disabled, ticket {} marked as paid (invoice stays in-flight)",
-                                        ticket.id
-                                    );
-                                    // Note: We don't settle the invoice here - it stays in-flight
-                                    // until the contract/funding tx is broadcast later
-                                }
-                            }
-                            Ok(false) => {
-                                debug!("Ticket {} was already paid or reassigned", ticket.id)
-                            }
-                            Err(e) => error!("Failed to mark ticket {} as paid: {}", ticket.id, e),
+                            error!("Failed to mark ticket {} paid: {}", ticket.id, error);
+                            continue;
                         }
+                        let current = self
+                            .coordinator
+                            .competition_store
+                            .get_ticket(ticket.id)
+                            .await?;
+                        if current.hash != ticket.hash
+                            || current.paid_at.is_none()
+                            || current.settled_at.is_some()
+                        {
+                            continue;
+                        }
+                        if self.coordinator.is_escrow_enabled() {
+                            if let Err(error) = self.broadcast_persisted_escrow(&current).await {
+                                // Publication can have succeeded despite an RPC
+                                // error. Retain the exact transaction, ticket hash
+                                // and held invoice for reconciliation on retry.
+                                warn!("Escrow for ticket {} remains pending: {}", ticket.id, error);
+                                continue;
+                            }
+                            if invoice.state == InvoiceState::Accepted {
+                                self.settle_invoice_and_mark_ticket(&current).await;
+                            } else {
+                                self.coordinator
+                                    .competition_store
+                                    .mark_ticket_settled(current.id)
+                                    .await?;
+                            }
+                        } else if invoice.state == InvoiceState::Settled {
+                            self.coordinator
+                                .competition_store
+                                .mark_ticket_settled(current.id)
+                                .await?;
+                        }
+                        // Without escrow, an accepted invoice remains held until
+                        // the competition's funding transaction is published.
                     }
                 }
                 Err(e) => {
@@ -217,194 +214,80 @@ impl InvoiceWatcher {
         }
     }
 
-    async fn cancel_invoice_and_reset_ticket(&self, ticket: &Ticket) -> Result<(), anyhow::Error> {
-        // First cancel the HODL invoice
-        match self.ln.cancel_hold_invoice(ticket.hash.clone()).await {
-            Ok(_) => {
-                info!(
-                    "Successfully cancelled HODL invoice for ticket {}",
-                    ticket.id
-                );
+    async fn broadcast_persisted_escrow(&self, ticket: &Ticket) -> Result<String, anyhow::Error> {
+        let transaction = if let Some(encoded) = &ticket.escrow_transaction {
+            // Corrupt stored bytes fail closed; they never authorize fresh funds.
+            deserialize::<Transaction>(&hex::decode(encoded)?)?
+        } else {
+            let competition = self
+                .coordinator
+                .competition_store
+                .get_competition(ticket.competition_id)
+                .await?;
+            if competition.cancelled_at.is_some()
+                || competition.failed_at.is_some()
+                || competition.completed_at.is_some()
+            {
+                return Err(anyhow!("Competition no longer accepts escrow funding"));
             }
-            Err(e) => {
-                error!(
-                    "Failed to cancel HODL invoice for ticket {}: {}",
-                    ticket.id, e
-                );
-                // Continue anyway to reset the ticket
+            let key = ticket
+                .ephemeral_pubkey
+                .as_ref()
+                .ok_or_else(|| anyhow!("Ticket has no escrow public key"))?;
+            let user_pubkey = PublicKey::from_str(key)?;
+            let preimage = hex::decode(&ticket.encrypted_preimage)?;
+            let payment_hash = sha256::Hash::hash(&preimage).to_byte_array();
+            if hex::encode(payment_hash) != ticket.hash {
+                return Err(anyhow!("Ticket preimage does not match its invoice hash"));
             }
-        }
-
-        let ticket_preimage = hashlock::preimage_random(&mut rand::rng());
-        let payment_hash = sha256::Hash::hash(&ticket_preimage).to_byte_array();
-
-        // Reset the ticket with new payment details
-        self.coordinator
-            .competition_store
-            .reset_ticket_after_failed_escrow(
-                ticket.id,
-                &ticket_preimage.to_lower_hex_string(),
-                &payment_hash.to_lower_hex_string(),
-            )
-            .await
-            .map_err(|e| anyhow!("Failed to reset ticket {}: {}", ticket.id, e))?;
-
-        info!(
-            "Successfully reset ticket {} with new payment details after escrow broadcast failure",
-            ticket.id
-        );
-
-        Ok(())
-    }
-
-    async fn broadcast_escrow_with_utxo_retries(
-        &self,
-        ticket: &Ticket,
-    ) -> Result<String, anyhow::Error> {
-        // First, try using the existing escrow transaction if available
-        if let Some(escrow_transaction_hex) = &ticket.escrow_transaction {
-            debug!(
-                "Attempting to broadcast existing escrow transaction for ticket {}",
-                ticket.id
-            );
-
-            match hex::decode(escrow_transaction_hex) {
-                Ok(transaction_bytes) => {
-                    match deserialize::<Transaction>(&transaction_bytes) {
-                        Ok(transaction) => {
-                            // Try broadcasting the existing transaction
-                            match self.broadcast_with_retries(&transaction, ticket.id).await {
-                                Ok(_) => {
-                                    info!("Successfully broadcasted existing escrow transaction for ticket {}", ticket.id);
-                                    return Ok(transaction.compute_txid().to_string());
-                                }
-                                Err(e) => {
-                                    warn!("Failed to broadcast existing escrow transaction for ticket {}, will try regenerating: {}", ticket.id, e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Failed to deserialize existing escrow transaction for ticket {}: {}", ticket.id, e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to decode existing escrow transaction hex for ticket {}: {}",
-                        ticket.id, e
-                    );
-                }
-            }
-        }
-
-        // Get competition details to regenerate escrow transaction
-        let competition = self
-            .coordinator
-            .competition_store
-            .get_competition(ticket.competition_id)
-            .await
-            .map_err(|e| anyhow!("Failed to get competition {}: {}", ticket.competition_id, e))?;
-
-        // Get user pubkey from ticket reservation
-        let user_pubkey_str = ticket
-            .reserved_by
-            .as_ref()
-            .ok_or_else(|| anyhow!("Ticket {} has no reserved_by field", ticket.id))?;
-
-        let user_pubkey = PublicKey::from_str(user_pubkey_str)
-            .map_err(|e| anyhow!("Failed to parse user public key {}: {}", user_pubkey_str, e))?;
-
-        // Decode payment hash from ticket
-        let preimage = hex::decode(&ticket.encrypted_preimage)
-            .map_err(|e| anyhow!("Failed to decode preimage for ticket {}: {}", ticket.id, e))?;
-        let payment_hash = sha256::Hash::hash(&preimage).to_byte_array();
-        let entry_fee = competition.event_submission.entry_fee as u64;
-
-        // Try regenerating escrow transaction multiple times with different UTXOs
-        for attempt in 1..=MAX_ESCROW_REGENERATION_RETRIES {
-            info!(
-                "Regenerating escrow transaction for ticket {} (attempt {}/{})",
-                ticket.id, attempt, MAX_ESCROW_REGENERATION_RETRIES
-            );
-
-            // Sync wallet to get latest UTXO state
-            if let Err(e) = self.coordinator.bitcoin.sync().await {
-                warn!("Failed to sync wallet before escrow regeneration: {}", e);
-            }
-
-            match generate_escrow_tx(
+            let prepared = generate_escrow_tx(
                 self.coordinator.bitcoin.clone(),
                 ticket.id,
                 user_pubkey,
                 payment_hash,
-                entry_fee,
+                competition.event_submission.entry_fee as u64,
                 competition.funding_reservation_deadline(OffsetDateTime::now_utc())?,
             )
-            .await
-            {
-                Ok(new_transaction) => {
-                    info!(
-                        "Successfully regenerated escrow transaction for ticket {} (attempt {})",
-                        ticket.id, attempt
-                    );
-
-                    // Try broadcasting the new transaction
-                    match self
-                        .broadcast_with_retries(&new_transaction, ticket.id)
-                        .await
-                    {
-                        Ok(_) => {
-                            info!("Successfully broadcasted regenerated escrow transaction for ticket {}", ticket.id);
-
-                            // Update the ticket with the new escrow transaction
-                            let new_escrow_hex = hex::encode(
-                                bitcoin::consensus::encode::serialize(&new_transaction),
-                            );
-                            if let Err(e) = self
-                                .coordinator
-                                .competition_store
-                                .update_ticket_escrow_transaction(ticket.id, &new_escrow_hex)
-                                .await
-                            {
-                                warn!(
-                                    "Failed to update ticket {} with new escrow transaction: {}",
-                                    ticket.id, e
-                                );
-                            }
-
-                            return Ok(new_transaction.compute_txid().to_string());
-                        }
-                        Err(e) => {
-                            warn!("Failed to broadcast regenerated escrow transaction for ticket {} (attempt {}): {}",
-                                  ticket.id, attempt, e);
-
-                            if attempt < MAX_ESCROW_REGENERATION_RETRIES {
-                                // Wait before trying again to allow UTXO state to potentially change
-                                let delay =
-                                    Duration::from_millis(RETRY_DELAY_MS * 2 * attempt as u64);
-                                sleep(delay).await;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
+            .await?;
+            let encoded = hex::encode(bitcoin::consensus::encode::serialize(&prepared.transaction));
+            let stored = self
+                .coordinator
+                .competition_store
+                .update_ticket_escrow_transaction(ticket, &encoded)
+                .await;
+            let definite_failure = matches!(
+                &stored,
+                Ok(false)
+                    | Err(DatabaseWriteError::QueueFull
+                        | DatabaseWriteError::ChannelClosed
+                        | DatabaseWriteError::Sqlx(
+                            sqlx::Error::Database(_)
+                                | sqlx::Error::RowNotFound
+                                | sqlx::Error::Protocol(_)
+                        ))
+            );
+            if definite_failure {
+                if let Err(error) = self
+                    .coordinator
+                    .bitcoin
+                    .release_psbt_inputs(&prepared.funded_psbt)
+                    .await
+                {
                     warn!(
-                        "Failed to regenerate escrow transaction for ticket {} (attempt {}): {}",
-                        ticket.id, attempt, e
+                        "Failed to release unpublished escrow inputs for ticket {}: {}",
+                        ticket.id, error
                     );
-
-                    if attempt < MAX_ESCROW_REGENERATION_RETRIES {
-                        let delay = Duration::from_millis(RETRY_DELAY_MS * attempt as u64);
-                        sleep(delay).await;
-                    }
                 }
             }
-        }
-
-        Err(anyhow!(
-            "Failed to broadcast escrow transaction after {} regeneration attempts",
-            MAX_ESCROW_REGENERATION_RETRIES
-        ))
+            if !stored? {
+                return Err(anyhow!(
+                    "Ticket changed before escrow could be persisted; retry its stored state"
+                ));
+            }
+            prepared.transaction
+        };
+        self.broadcast_with_retries(&transaction, ticket.id).await?;
+        Ok(transaction.compute_txid().to_string())
     }
 
     async fn broadcast_with_retries(
@@ -428,6 +311,18 @@ impl InvoiceWatcher {
                         "Failed to broadcast transaction for ticket {} (attempt {}/{}): {}",
                         ticket_id, attempt, MAX_BROADCAST_RETRIES, e
                     );
+                    // A lost publication response or an already-known error
+                    // is reconciled by fetching the exact transaction. Failure
+                    // to observe it is inconclusive and leaves persistence intact.
+                    if self
+                        .coordinator
+                        .bitcoin
+                        .get_raw_transaction(&transaction.compute_txid())
+                        .await
+                        .is_ok_and(|known| known == *transaction)
+                    {
+                        return Ok(());
+                    }
                     last_error = Some(e);
 
                     if attempt < MAX_BROADCAST_RETRIES {
@@ -447,3 +342,7 @@ impl InvoiceWatcher {
         }))
     }
 }
+
+#[cfg(test)]
+#[path = "invoice_watcher_tests.rs"]
+mod tests;

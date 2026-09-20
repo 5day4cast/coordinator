@@ -34,6 +34,14 @@ data:
     domain = {{ .Values.config.api.domain | quote }}
     port = {{ .Values.config.api.port | quote }}
     origins = [{{ range $i, $origin := .Values.config.api.origins }}{{ if $i }}, {{ end }}{{ $origin | quote }}{{ end }}]
+    replay_capacity = {{ .Values.config.api.replayCapacity | int }}
+
+    [api_settings.rate_limit]
+    enabled = {{ .Values.config.api.rateLimit.enabled }}
+    per_second = {{ .Values.config.api.rateLimit.perSecond | int }}
+    burst = {{ .Values.config.api.rateLimit.burst | int }}
+    auth_per_second = {{ .Values.config.api.rateLimit.authPerSecond | int }}
+    auth_burst = {{ .Values.config.api.rateLimit.authBurst | int }}
 
     [ui_settings]
     private_url = {{ .Values.config.ui.privateUrl | quote }}
@@ -73,6 +81,8 @@ data:
     token_file = "/etc/coordinator-admin/token"
 
     [keymeld_settings]
+    automatic_payouts = {{ .Values.keymeld.automaticPayouts }}
+    automatic_payout_max_fee_rate_sat_vb = {{ .Values.keymeld.automaticPayoutMaxFeeRateSatVb }}
     enabled = {{ .Values.keymeld.enabled }}
     dangerous_trust_unattested_enclaves = {{ .Values.keymeld.dangerousTrustUnattestedEnclaves }}
     gateway_url = {{ .Values.keymeld.gatewayUrl | quote }}

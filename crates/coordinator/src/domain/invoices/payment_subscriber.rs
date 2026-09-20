@@ -99,7 +99,11 @@ impl PaymentSubscriber {
                 if let Err(e) = self
                     .coordinator
                     .competition_store
-                    .mark_payout_succeeded(payout.id, OffsetDateTime::now_utc())
+                    .mark_payout_succeeded(
+                        payout.id,
+                        OffsetDateTime::now_utc(),
+                        update.preimage.clone(),
+                    )
                     .await
                 {
                     error!("Failed to mark payout {} as succeeded: {}", payout.id, e);

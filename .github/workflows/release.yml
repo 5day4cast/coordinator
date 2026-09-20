@@ -48,6 +48,8 @@ jobs:
           python-version: "3.12"
       - name: Check release helper regressions
         run: python3 -m unittest discover -s scripts -p 'test_release.py' -v
+      - name: Check native OpenSSL build helper regressions
+        run: python3 -m unittest discover -s scripts -p 'test_build_release_openssl.py' -v
       - name: Validate committed versions and release tag
         id: release
         env:
@@ -148,11 +150,23 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config
+          sudo apt-get install -y build-essential pkg-config perl curl
+      - name: Build verified static OpenSSL for the native target
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash scripts/build-release-openssl.sh "$TARGET" "$RUNNER_TEMP/coordinator-openssl-$TARGET"
       - name: Build locked native binaries and UI
         env:
           TARGET: ${{ matrix.target }}
         run: cargo build --release --locked --target "$TARGET" -p coordinator
+      - name: Build the verifier enclave and LNURL relay (Linux)
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --release --locked --target "$TARGET" \
+            -p coordinator-verifier-enclave --features coordinator-verifier-enclave/lnurl \
+            -p coordinator-lnurl-relay
       - uses: actions/download-artifact@v4
         with:
           name: release-wasm
@@ -166,6 +180,13 @@ jobs:
         run: |
           python3 scripts/release.py native --version "$VERSION" --source "$SOURCE" \
             --target "$TARGET" --asset "$ASSET" --wasm "wasm-release/coordinator-wasm-$VERSION.tar.gz"
+      - name: Package the verifier enclave for Keymeld hosts (Linux)
+        if: runner.os == 'Linux'
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          SOURCE: ${{ needs.prepare-release.outputs.source }}
+          TARGET: ${{ matrix.target }}
+        run: python3 scripts/release.py enclave --version "$VERSION" --source "$SOURCE" --target "$TARGET"
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}

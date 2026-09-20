@@ -11,9 +11,10 @@
     crane.url = "github:ipetkov/crane";
 
     # Keymeld for e2e testing
-    # Pinned to the same release as the keymeld-sdk dependency in Cargo.toml.
+    # Finalize this immutable pin with Cargo.toml after committing Keymeld payout support.
+    # Local verification: --override-input keymeld git+file:///path/to/keymeld-auto
     keymeld = {
-      url = "github:tee8z/keymeld/v0.4.1";
+      url = "github:tee8z/keymeld/v0.5.0";
     };
   };
 
@@ -27,7 +28,7 @@
   outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, keymeld, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        overlays = [ (import rust-overlay) ];
+        overlays = [ (import rust-overlay) (import ./nix/openssl.nix) ];
         pkgs = import nixpkgs {
           inherit system overlays;
         };
@@ -73,6 +74,7 @@
           SQLX_OFFLINE = "true";
           RUST_LOG = "info";
           CARGO_INCREMENTAL = "1";
+          OPENSSL_NO_VENDOR = "1";
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
         };
 
@@ -242,9 +244,63 @@
           cargoExtraArgs = "--bin synth --bin coord";
         } // commonEnvs);
 
-        # Get keymeld binaries from the keymeld flake
-        keymeld-gateway = keymeld.packages.${system}.keymeld-gateway;
-        keymeld-enclave = keymeld.packages.${system}.keymeld-enclave;
+        # The gateway is generic. Coordinator's measured image owns the verifier.
+        keymeld-gateway = keymeld.packages.${system}.keymeld-gateway-escrow;
+        mkCoordinatorEnclave = lnurl: craneLib.buildPackage ({
+          pname = if lnurl then "coordinator-verifier-enclave-lnurl" else "coordinator-verifier-enclave";
+          version = workspaceVersion;
+          inherit src;
+          cargoArtifacts = workspaceDeps;
+          buildInputs = commonBuildInputs;
+          nativeBuildInputs = commonNativeBuildInputs;
+          cargoExtraArgs = "-p coordinator-verifier-enclave --bin coordinator-verifier-enclave"
+            + pkgs.lib.optionalString lnurl " --features lnurl";
+        } // commonEnvs);
+        coordinator-verifier-enclave = mkCoordinatorEnclave false;
+        coordinator-verifier-enclave-lnurl = mkCoordinatorEnclave true;
+        coordinator-lnurl-relay = craneLib.buildPackage ({
+          pname = "coordinator-lnurl-relay";
+          version = workspaceVersion;
+          inherit src;
+          cargoArtifacts = workspaceDeps;
+          buildInputs = commonBuildInputs;
+          nativeBuildInputs = commonNativeBuildInputs;
+          cargoExtraArgs = "-p coordinator-lnurl-relay --bin coordinator-lnurl-relay";
+        } // commonEnvs);
+        coordinator-nitro-entrypoint = pkgs.writeShellApplication {
+          name = "coordinator-nitro-entrypoint";
+          runtimeInputs = [ pkgs.socat pkgs.iproute2 pkgs.util-linux pkgs.coreutils ];
+          text = builtins.readFile ./scripts/coordinator-nitro-entrypoint.sh;
+        };
+        mkCoordinatorEnclaveImage = suffix: enclave: pkgs.dockerTools.buildLayeredImage {
+          name = "coordinator-verifier-enclave${suffix}";
+          tag = "latest";
+          contents = [ enclave coordinator-nitro-entrypoint pkgs.cacert pkgs.tzdata ];
+          config = {
+            Entrypoint = [ "${coordinator-nitro-entrypoint}/bin/coordinator-nitro-entrypoint" ];
+            Cmd = [ "${enclave}/bin/coordinator-verifier-enclave" ];
+            Env = [
+              "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+              "RUST_LOG=info"
+              "COORDINATOR_ESCROW_LNURL_ENABLED=false"
+              "COORDINATOR_LNURL_RELAY_PORT=8101"
+            ];
+          };
+        };
+        docker-coordinator-verifier-enclave = mkCoordinatorEnclaveImage "" coordinator-verifier-enclave;
+        docker-coordinator-verifier-enclave-lnurl = mkCoordinatorEnclaveImage "-lnurl" coordinator-verifier-enclave-lnurl;
+        docker-coordinator-lnurl-relay = pkgs.dockerTools.buildLayeredImage {
+          name = "coordinator-lnurl-relay";
+          tag = "latest";
+          contents = [ coordinator-lnurl-relay ];
+          config = {
+            Cmd = [ "${coordinator-lnurl-relay}/bin/coordinator-lnurl-relay" ];
+            Env = [ "COORDINATOR_LNURL_RELAY_PORT=8101" "TRANSPORT_MODE=vsock" ];
+          };
+        };
+        build-coordinator-eif = pkgs.writeShellScriptBin "build-coordinator-eif" ''
+          exec ${pkgs.bash}/bin/bash ${./scripts/build-coordinator-verifier-enclave-eif.sh} "$@"
+        '';
 
         # Python environment with moto for AWS S3 mocking
         moto-env = pkgs.python3.withPackages (ps: with ps; [
@@ -525,6 +581,20 @@
           KEYMELD_DIR="$DATA_DIR/keymeld"
           KEYMELD_PORT="''${KEYMELD_PORT:-8090}"
           MOTO_PORT="''${MOTO_PORT:-4566}"
+          # Compiled support does not enable outbound LNURL requests.
+          export COORDINATOR_ESCROW_LNURL_ENABLED="''${COORDINATOR_ESCROW_LNURL_ENABLED:-false}"
+          export COORDINATOR_LNURL_RELAY_PORT="''${COORDINATOR_LNURL_RELAY_PORT:-8101}"
+          case "$COORDINATOR_ESCROW_LNURL_ENABLED" in
+            true|false) ;;
+            *) echo "COORDINATOR_ESCROW_LNURL_ENABLED must be true or false" >&2; exit 1 ;;
+          esac
+          case "$COORDINATOR_LNURL_RELAY_PORT" in
+            ""|*[!0-9]*) echo "COORDINATOR_LNURL_RELAY_PORT must be a TCP port" >&2; exit 1 ;;
+          esac
+          if [ "$COORDINATOR_LNURL_RELAY_PORT" -lt 1 ] || [ "$COORDINATOR_LNURL_RELAY_PORT" -gt 65535 ]; then
+            echo "COORDINATOR_LNURL_RELAY_PORT must be between 1 and 65535" >&2
+            exit 1
+          fi
           # Browser origins allowed to fetch enclave keys directly from the gateway.
           COORDINATOR_ORIGINS="''${COORDINATOR_ORIGINS:-http://localhost:9990,http://127.0.0.1:9990}"
           KMS_ALIAS="alias/keymeld-enclave-master-key"
@@ -533,7 +603,8 @@
           # nix-built keymeld binaries; see run-moto.
           AWS="env -u LD_LIBRARY_PATH ${pkgs.awscli2}/bin/aws --endpoint-url $KMS_ENDPOINT"
           KEYMELD_GATEWAY="env -u LD_LIBRARY_PATH ${keymeld-gateway}/bin/keymeld-gateway"
-          KEYMELD_ENCLAVE="env -u LD_LIBRARY_PATH ${keymeld-enclave}/bin/keymeld-enclave"
+          KEYMELD_ENCLAVE="env -u LD_LIBRARY_PATH ${coordinator-verifier-enclave-lnurl}/bin/coordinator-verifier-enclave"
+          COORDINATOR_LNURL_RELAY="env -u LD_LIBRARY_PATH ${coordinator-lnurl-relay}/bin/coordinator-lnurl-relay"
           CURL="env -u LD_LIBRARY_PATH ${pkgs.curl}/bin/curl -fsS --max-time 2"
 
           mkdir -p "$KEYMELD_DIR" "$LOGS_DIR"
@@ -563,7 +634,11 @@
           export ENCLAVE_KMS_KEY_ID="$KMS_ALIAS"
           export ENCLAVE_KMS_ENDPOINT="$KMS_ENDPOINT"
 
-          echo "Starting keymeld enclaves (simulated, TCP)..."
+          if [ "$COORDINATOR_ESCROW_LNURL_ENABLED" = true ]; then
+            TRANSPORT_MODE=tcp $COORDINATOR_LNURL_RELAY > "$LOGS_DIR/lnurl-relay.log" 2>&1 &
+            echo $! > "$KEYMELD_DIR/lnurl-relay.pid"
+          fi
+          echo "Starting Coordinator enclaves (simulated, TCP)..."
           for i in 0 1 2; do
             port=$((5000 + i))
             ENCLAVE_ID=$i VSOCK_PORT=$port TRANSPORT_MODE=tcp TCP_HOST=127.0.0.1 \
@@ -640,10 +715,16 @@
           done
 
           echo ""
+          # Verifier capabilities are queried over confidential client transport.
+          # Gateway health must not expose installed application rules or policy state.
           echo "Keymeld stack running (simulated enclaves, attestation disabled)"
           echo "  Gateway: http://127.0.0.1:$KEYMELD_PORT"
           echo "  Enclaves: 127.0.0.1:5000-5002 (TCP)"
           echo "  KMS: Moto at $KMS_ENDPOINT"
+          echo "  Automatic Lightning Address payouts: $COORDINATOR_ESCROW_LNURL_ENABLED"
+          if [ "$COORDINATOR_ESCROW_LNURL_ENABLED" = false ]; then
+            echo "  Enable explicitly with COORDINATOR_ESCROW_LNURL_ENABLED=true run-keymeld"
+          fi
         '';
 
         # Script: Stop keymeld
@@ -906,7 +987,9 @@
 
             # Keymeld binaries for e2e testing
             keymeld-gateway
-            keymeld-enclave
+            coordinator-verifier-enclave-lnurl
+            coordinator-lnurl-relay
+            build-coordinator-eif
 
             # Helper scripts
             start-regtest
@@ -973,7 +1056,7 @@
             echo ""
           '';
 
-          inherit (commonEnvs) SQLX_OFFLINE RUST_LOG CARGO_INCREMENTAL;
+          inherit (commonEnvs) SQLX_OFFLINE RUST_LOG CARGO_INCREMENTAL OPENSSL_NO_VENDOR;
         };
 
 
@@ -1072,6 +1155,9 @@
         packages = {
           default = coordinator;
           inherit coordinator coordinator-wasm wallet-cli synth docker-coordinator docker-synth;
+          inherit coordinator-verifier-enclave coordinator-verifier-enclave-lnurl coordinator-lnurl-relay;
+          inherit docker-coordinator-verifier-enclave docker-coordinator-verifier-enclave-lnurl docker-coordinator-lnurl-relay;
+          inherit build-coordinator-eif;
           inherit start-regtest stop-regtest mine-blocks;
           inherit setup-lnd setup-channels stop-lnd;
           inherit run-keymeld stop-keymeld;

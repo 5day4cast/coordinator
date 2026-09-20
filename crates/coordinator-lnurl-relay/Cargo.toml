@@ -1,0 +1,13 @@
+[package]
+name = "coordinator-lnurl-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+coordinator-escrow = { path = "../coordinator-escrow", features = ["networking"] }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", tag = "v0.5.0", default-features = false, features = ["networking"] }
+anyhow.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tokio-vsock = "0.7.2"
+tracing = "0.1"

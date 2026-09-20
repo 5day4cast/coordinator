@@ -95,6 +95,23 @@ fn login_modal() -> Markup {
     }
 }
 
+/// Where winnings are paid. Required at signup so payouts need no further
+/// input from the winner.
+fn lightning_address_field(id: &str) -> Markup {
+    html! {
+        div class="field" {
+            label class="label" { "Lightning Address" }
+            div class="control" {
+                input class="input" type="text" id=(id) placeholder="you@cash.app"
+                      autocomplete="off" spellcheck="false";
+            }
+            p class="help" {
+                "Winnings are paid here automatically. Cash App users: your $cashtag followed by @cash.app."
+            }
+        }
+    }
+}
+
 fn register_modal() -> Markup {
     html! {
         div id="registerModal" class="modal" {
@@ -140,6 +157,7 @@ fn register_modal() -> Markup {
                                           placeholder="Confirm your password";
                                 }
                             }
+                            (lightning_address_field("registerLightningAddress"))
                             p class="help is-danger mt-2" id="usernameRegisterError" {}
                             button class="button is-info is-fullwidth mt-4" id="usernameRegisterStep1Button" {
                                 "Continue"
@@ -188,6 +206,7 @@ fn register_modal() -> Markup {
                         p class="mb-4" {
                             "Register a new account using your Nostr browser extension."
                         }
+                        (lightning_address_field("extensionLightningAddress"))
                         div class="field" {
                             div class="control" {
                                 button class="button is-info is-fullwidth" id="extensionRegisterButton" {

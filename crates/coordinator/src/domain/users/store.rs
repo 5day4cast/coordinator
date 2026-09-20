@@ -14,8 +14,13 @@ pub struct User {
     pub encrypted_bitcoin_private_key: String,
     pub network: String,
     pub username: Option<String>,
+    /// Never sent to clients, not even the account's owner.
+    #[serde(skip_serializing)]
     pub password_hash: Option<String>,
     pub encrypted_nsec: Option<String>,
+    /// LUD-16 address winnings are paid to; `None` only for accounts that
+    /// predate the requirement.
+    pub lightning_address: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -31,10 +36,24 @@ impl FromRow<'_, SqliteRow> for User {
             username: row.get("username"),
             password_hash: row.get("password_hash"),
             encrypted_nsec: row.get("encrypted_nsec"),
+            lightning_address: row.get("lightning_address"),
             created_at: parse_required_datetime(row, "created_at")?,
             updated_at: parse_required_datetime(row, "updated_at")?,
         })
     }
+}
+
+/// A username/password account as created at signup. The password hash is
+/// the Argon2 hash of the client-derived auth key; the nsec is sealed
+/// client-side.
+pub struct NewUsernameUser {
+    pub nostr_pubkey: String,
+    pub username: String,
+    pub password_hash: String,
+    pub encrypted_nsec: String,
+    pub encrypted_bitcoin_private_key: String,
+    pub network: String,
+    pub lightning_address: String,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +78,7 @@ impl UserStore {
         let now = OffsetDateTime::now_utc();
         let encrypted_key = user.encrypted_bitcoin_private_key.clone();
         let network = user.network.clone();
+        let lightning_address = user.lightning_address.clone();
 
         let user = self
             .db_connection
@@ -68,14 +88,16 @@ impl UserStore {
                         nostr_pubkey,
                         encrypted_bitcoin_private_key,
                         network,
+                        lightning_address,
                         created_at,
                         updated_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    RETURNING nostr_pubkey, encrypted_bitcoin_private_key, network, username, password_hash, encrypted_nsec, created_at, updated_at",
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    RETURNING nostr_pubkey, encrypted_bitcoin_private_key, network, username, password_hash, encrypted_nsec, lightning_address, created_at, updated_at",
                 )
                 .bind(nostr_pubkey)
                 .bind(encrypted_key)
                 .bind(network)
+                .bind(lightning_address)
                 .bind(now)
                 .bind(now)
                 .fetch_one(&pool)
@@ -96,6 +118,7 @@ impl UserStore {
                 username,
                 password_hash,
                 encrypted_nsec,
+                lightning_address,
                 created_at,
                 updated_at
             FROM user
@@ -184,6 +207,7 @@ impl UserStore {
                 username,
                 password_hash,
                 encrypted_nsec,
+                lightning_address,
                 created_at,
                 updated_at
             FROM user
@@ -236,6 +260,7 @@ impl UserStore {
                 username,
                 password_hash,
                 encrypted_nsec,
+                lightning_address,
                 created_at,
                 updated_at
             FROM user
@@ -258,6 +283,7 @@ impl UserStore {
                 username,
                 password_hash,
                 encrypted_nsec,
+                lightning_address,
                 created_at,
                 updated_at
             FROM user
@@ -271,15 +297,16 @@ impl UserStore {
         Ok(users)
     }
 
-    pub async fn register_username_user(
-        &self,
-        nostr_pubkey: String,
-        username: String,
-        password_hash: String,
-        encrypted_nsec: String,
-        encrypted_bitcoin_private_key: String,
-        network: String,
-    ) -> Result<User, Error> {
+    pub async fn register_username_user(&self, user: NewUsernameUser) -> Result<User, Error> {
+        let NewUsernameUser {
+            nostr_pubkey,
+            username,
+            password_hash,
+            encrypted_nsec,
+            encrypted_bitcoin_private_key,
+            network,
+            lightning_address,
+        } = user;
         let now = OffsetDateTime::now_utc();
 
         let user = self
@@ -293,10 +320,11 @@ impl UserStore {
                         username,
                         password_hash,
                         encrypted_nsec,
+                        lightning_address,
                         created_at,
                         updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    RETURNING nostr_pubkey, encrypted_bitcoin_private_key, network, username, password_hash, encrypted_nsec, created_at, updated_at",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    RETURNING nostr_pubkey, encrypted_bitcoin_private_key, network, username, password_hash, encrypted_nsec, lightning_address, created_at, updated_at",
                 )
                 .bind(nostr_pubkey)
                 .bind(encrypted_bitcoin_private_key)
@@ -304,6 +332,7 @@ impl UserStore {
                 .bind(username)
                 .bind(password_hash)
                 .bind(encrypted_nsec)
+                .bind(lightning_address)
                 .bind(now)
                 .bind(now)
                 .fetch_one(&pool)
@@ -324,6 +353,7 @@ impl UserStore {
                 username,
                 password_hash,
                 encrypted_nsec,
+                lightning_address,
                 created_at,
                 updated_at
             FROM user
@@ -383,6 +413,37 @@ impl UserStore {
             )));
         }
 
+        Ok(())
+    }
+
+    pub async fn update_lightning_address(
+        &self,
+        nostr_pubkey: &str,
+        lightning_address: String,
+    ) -> Result<(), Error> {
+        let now = OffsetDateTime::now_utc();
+        let nostr_pubkey = nostr_pubkey.to_string();
+        let updated = self
+            .db_connection
+            .execute_write(move |pool| async move {
+                sqlx::query(
+                    "UPDATE user
+                    SET lightning_address = ?,
+                        updated_at = ?
+                    WHERE nostr_pubkey = ?",
+                )
+                .bind(lightning_address)
+                .bind(now)
+                .bind(&nostr_pubkey)
+                .execute(&pool)
+                .await
+                .map(|result| result.rows_affected())
+            })
+            .await
+            .map_err(Error::from)?;
+        if updated == 0 {
+            return Err(Error::NotFound("User not found".to_string()));
+        }
         Ok(())
     }
 
@@ -453,6 +514,7 @@ mod tests {
         let register_payload = RegisterPayload {
             encrypted_bitcoin_private_key: "encrypted_key_123".to_string(),
             network: "testnet".to_string(),
+            lightning_address: "tester@mock-wallet.dev".to_string(),
         };
 
         let user = store
@@ -482,6 +544,7 @@ mod tests {
         let register_payload = RegisterPayload {
             encrypted_bitcoin_private_key: "encrypted_key_123".to_string(),
             network: "testnet".to_string(),
+            lightning_address: "tester@mock-wallet.dev".to_string(),
         };
 
         assert!(!store.user_exists("test_pubkey").await.unwrap());
@@ -501,6 +564,7 @@ mod tests {
         let register_payload = RegisterPayload {
             encrypted_bitcoin_private_key: "encrypted_key_123".to_string(),
             network: "testnet".to_string(),
+            lightning_address: "tester@mock-wallet.dev".to_string(),
         };
 
         store
@@ -511,6 +575,7 @@ mod tests {
         let update_payload = RegisterPayload {
             encrypted_bitcoin_private_key: "new_encrypted_key_456".to_string(),
             network: "mainnet".to_string(),
+            lightning_address: "tester@mock-wallet.dev".to_string(),
         };
 
         let updated_user = store
@@ -532,6 +597,7 @@ mod tests {
             let payload = RegisterPayload {
                 encrypted_bitcoin_private_key: format!("key_{}", i),
                 network: "testnet".to_string(),
+                lightning_address: "tester@mock-wallet.dev".to_string(),
             };
             store
                 .register_user(format!("pubkey_{}", i), payload)
@@ -553,10 +619,12 @@ mod tests {
         let testnet_payload = RegisterPayload {
             encrypted_bitcoin_private_key: "testnet_key".to_string(),
             network: "testnet".to_string(),
+            lightning_address: "tester@mock-wallet.dev".to_string(),
         };
         let mainnet_payload = RegisterPayload {
             encrypted_bitcoin_private_key: "mainnet_key".to_string(),
             network: "mainnet".to_string(),
+            lightning_address: "tester@mock-wallet.dev".to_string(),
         };
 
         store
@@ -585,6 +653,7 @@ mod tests {
             let payload = RegisterPayload {
                 encrypted_bitcoin_private_key: format!("key_{}", i),
                 network: "testnet".to_string(),
+                lightning_address: "tester@mock-wallet.dev".to_string(),
             };
             store
                 .register_user(format!("pubkey_{}", i), payload)
@@ -603,6 +672,7 @@ mod tests {
         let register_payload = RegisterPayload {
             encrypted_bitcoin_private_key: "encrypted_key_123".to_string(),
             network: "testnet".to_string(),
+            lightning_address: "tester@mock-wallet.dev".to_string(),
         };
 
         store

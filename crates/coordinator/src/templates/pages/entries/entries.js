@@ -93,7 +93,7 @@ class Entry {
   async handleTicketPayment(btc_pubkey) {
     const response = await this.client.post(
       `${this.coordinator_url}/api/v1/competitions/${this.competition.id}/ticket`,
-      { btc_pubkey },
+      { btc_pubkey, payout: this.payoutChoice },
     );
 
     if (!response.ok)
@@ -109,6 +109,46 @@ class Entry {
       keymeld_registration: ticketData.keymeld_registration,
     };
 
+    const assignment = this.ticket.keymeld_registration;
+    if (this.payoutTerms?.quote.enabled && !assignment?.payout_policy) {
+      throw new Error("The ticket omitted the approved payout escrow policy");
+    }
+    if (this.ticket.keymeld_session_id && !assignment) {
+      throw new Error("The ticket is missing its authorized Keymeld registration context");
+    }
+    if (assignment && (assignment.user_id !== this.ticket.id ||
+        assignment.session_id !== this.ticket.keymeld_session_id)) {
+      throw new Error("The Keymeld registration belongs to another ticket or session");
+    }
+    if (assignment?.payout_policy) {
+      this.preparedRegistration = await window.dlcWallet.keymeldPayoutRegistration(
+        this.entry.id,
+        JSON.stringify(assignment),
+        JSON.stringify({
+          competition_id: this.competition.id,
+          lightning_address: this.payoutChoice.lightning_address,
+          allow_invoice_fallback: this.payoutChoice.allow_invoice_fallback,
+          release_entry_key_after_payment: this.payoutChoice.release_entry_key_after_payment,
+          ticket_invoice: this.ticket.payment_request,
+          ticket_amount_sats: this.ticketAmountSats,
+          expected_funding_sats: this.payoutTerms.competition.event_submission.total_competition_pool,
+          expected_player_count: this.payoutTerms.competition.event_submission.total_allowed_entries,
+          expected_winner_count: this.payoutTerms.competition.event_submission.number_of_places_win,
+          expected_relative_locktime_delta: this.payoutTerms.quote.relative_locktime_block_delta,
+          max_fee_rate_sat_vb: this.payoutTerms.quote.max_fee_rate_sat_vb,
+          oracle_announcement: this.payoutTerms.oracle.event_announcement,
+        }),
+      );
+    } else {
+      if (this.payoutChoice.lightning_address) {
+        throw new Error("Automatic payouts are unavailable for this competition. Choose invoice payout or another competition.");
+      }
+      this.preparedRegistration = assignment
+        ? await window.dlcWallet.keymeldRegistration(this.entry.id, JSON.stringify(assignment))
+        : null;
+    }
+    // Consent, ticket hash, wallet key and enclave trust are all checked before
+    // exposing the invoice for payment. A failed check cannot leave a paid ticket.
     return this.showPaymentModal();
   }
 
@@ -323,24 +363,11 @@ class Entry {
     try {
       await this.handleTicketPayment(this.entry.ephemeral_pubkey);
 
-      let encrypted_keymeld_private_key = null;
-      let keymeld_auth_pubkey = null;
-      let keymeld_registration_context = null;
-
-      if (this.ticket.keymeld_session_id && !this.ticket.keymeld_registration) {
-        throw new Error("The ticket is missing its authorized Keymeld registration context");
-      }
-      if (this.ticket.keymeld_registration) {
-        // WASM verifies the enclave's attestation and encrypts the entry key to it;
-        // the raw key never reaches JavaScript.
-        const keymeldData = await window.dlcWallet.keymeldRegistration(
-          this.entry.id,
-          JSON.stringify(this.ticket.keymeld_registration),
-        );
-        encrypted_keymeld_private_key = keymeldData.encrypted_private_key;
-        keymeld_auth_pubkey = keymeldData.auth_pubkey;
-        keymeld_registration_context = keymeldData.context;
-      }
+      const keymeldData = this.preparedRegistration;
+      const encrypted_keymeld_private_key = keymeldData?.encrypted_private_key ?? null;
+      const keymeld_auth_pubkey = keymeldData?.auth_pubkey ?? null;
+      const keymeld_registration_context = keymeldData?.context ?? null;
+      const keymeld_escrow_policy = keymeldData?.escrow_policy ?? null;
 
       const entry_body = {
         id: this.entry.id,
@@ -352,6 +379,7 @@ class Entry {
         encrypted_keymeld_private_key,
         keymeld_auth_pubkey,
         keymeld_registration_context,
+        keymeld_escrow_policy,
       };
 
       const response = await this.client.post(
@@ -563,6 +591,31 @@ async function submitEntry() {
     currentEntry = new Entry(apiBase, oracleBase, competition);
     await currentEntry.init();
 
+    const payoutTerms = window.entryPayoutTerms;
+    if (!payoutTerms || payoutTerms.competition.id !== competitionId) {
+      throw new Error("Payout terms are not ready; reload the entry form and try again");
+    }
+    currentEntry.payoutTerms = payoutTerms;
+    const approved = document.getElementById("entryPayoutApproved")?.checked;
+    if (!approved) throw new Error("Please approve your payout method before paying for this entry");
+    const automatic = document.getElementById("entryPayoutMethod")?.value === "automatic";
+    const address = automatic
+      ? (document.getElementById("entryLightningAddress")?.value || "").trim().toLowerCase()
+      : null;
+    if (automatic && (!address || address.length > 320 || !/^[a-z0-9_+.-]+@[a-z0-9.-]+$/.test(address))) {
+      throw new Error("Enter a valid Lightning Address for automatic payouts");
+    }
+    currentEntry.ticketAmountSats = Number(form.dataset.entryFee);
+    if (!Number.isSafeInteger(currentEntry.ticketAmountSats) || currentEntry.ticketAmountSats <= 0) {
+      throw new Error("The competition is missing its entry fee");
+    }
+    currentEntry.payoutChoice = {
+      entry_id: currentEntry.entry.id,
+      payout_hash: currentEntry.entry.payout_hash,
+      lightning_address: address,
+      allow_invoice_fallback: true,
+      release_entry_key_after_payment: true,
+    };
     // Set picks on entry
     currentEntry.entry.submit = picks;
 
@@ -654,3 +707,81 @@ function generateUuidV7() {
     hex.slice(7, 19),
   ].join("-");
 }
+
+
+function updateEntryPayoutMethod() {
+  const automatic = document.getElementById("entryPayoutMethod")?.value === "automatic";
+  document.getElementById("entryPayoutAddressField")?.classList.toggle("is-hidden", !automatic);
+  const consent = document.getElementById("entryPayoutApproved");
+  if (consent) consent.checked = false;
+}
+
+async function setupEntryPayoutConsent() {
+  const input = document.getElementById("entryLightningAddress");
+  const form = document.getElementById("entryForm");
+  if (!input || !form) return;
+  window.entryPayoutTerms = null;
+  const resetConsent = () => {
+    const consent = document.getElementById("entryPayoutApproved");
+    if (consent) consent.checked = false;
+  };
+  input.addEventListener("input", resetConsent);
+  const base = document.body.dataset.apiBase || "";
+  const oracleBase = document.body.dataset.oracleBase || "";
+  const competitionId = form.dataset.competitionId;
+  const termsText = document.getElementById("entryPayoutTermsText");
+  try {
+    const [competitionResponse, quoteResponse] = await Promise.all([
+      fetch(`${base}/api/v1/competitions/${competitionId}`),
+      fetch(`${base}/api/v1/competitions/${competitionId}/payout-terms`),
+    ]);
+    if (!competitionResponse.ok || !quoteResponse.ok) throw new Error("Payout terms are unavailable");
+    const competition = await competitionResponse.json();
+    const quote = await quoteResponse.json();
+    const event = competition.event_submission;
+    if (competition.id !== competitionId || !event ||
+        event.entry_fee !== Number(form.dataset.entryFee) ||
+        event.total_competition_pool !== Number(form.dataset.totalPool) ||
+        event.number_of_places_win !== Number(form.dataset.winnerCount)) {
+      throw new Error("The displayed competition terms changed; reload this page");
+    }
+    let oracle = null;
+    if (quote.enabled) {
+      const oracleResponse = await fetch(`${oracleBase}/oracle/events/${competitionId}`);
+      if (!oracleResponse.ok) throw new Error("The oracle announcement is unavailable; no ticket payment has been requested");
+      oracle = await oracleResponse.json();
+      if (oracle.id !== competitionId || !oracle.event_announcement) throw new Error("The oracle returned a different event");
+      const percentages = {1:[100],2:[60,40],3:[45,35,20],4:[42,30,18,10],5:[40,27,16,9,8]}[event.number_of_places_win];
+      if (!percentages) throw new Error("Unsupported winner distribution");
+      if (termsText) termsText.textContent = `Pool: ${event.total_competition_pool} sats across ${event.total_allowed_entries} entries. Winner shares by rank: ${percentages.join("%, ")}%. Contract delay: ${quote.relative_locktime_block_delta} blocks. Maximum Bitcoin fee rate: ${quote.max_fee_rate_sat_vb} sat/vB.`;
+    } else {
+      const method = document.getElementById("entryPayoutMethod");
+      method.value = "invoice";
+      const automatic = method.querySelector('option[value="automatic"]');
+      if (automatic) automatic.disabled = true;
+      updateEntryPayoutMethod();
+      if (termsText) termsText.textContent = "This legacy competition does not use payout escrow. Invoice recovery releases entry secrets before payment, which is not guaranteed.";
+      const consentText = document.getElementById("entryPayoutConsentText");
+      if (consentText) consentText.textContent = " I understand this legacy entry uses recovery that releases its claim before payment.";
+    }
+    resetConsent();
+    window.entryPayoutTerms = { competition, quote, oracle };
+  } catch (error) {
+    if (termsText) termsText.textContent = error.message;
+    return;
+  }
+  if (!window.nostrClient) return;
+  try {
+    const client = new window.AuthorizedClient(window.nostrClient, base);
+    const response = await client.post(`${base}/api/v1/users/login`);
+    const user = await response.json();
+    if (!input.value && user.lightning_address) {
+      input.value = user.lightning_address;
+      resetConsent();
+    }
+  } catch (_) {
+    // Address entry remains available when profile lookup fails.
+  }
+}
+window.updateEntryPayoutMethod = updateEntryPayoutMethod;
+window.setupEntryPayoutConsent = setupEntryPayoutConsent;

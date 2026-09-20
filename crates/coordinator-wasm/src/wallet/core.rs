@@ -6,7 +6,10 @@ use super::{
 use crate::nostr::{CustomSigner, NostrClientCore};
 use ::nostr::NostrSigner;
 use coordinator_core::{
-    keymeld::{prepare_registration, PreparedRegistration},
+    keymeld::{
+        payout, payout_protocol, prepare_payout_registration, prepare_registration, PayoutPolicy,
+        PreparedRegistration,
+    },
     RegistrationAssignment,
 };
 use dlctix::{
@@ -23,9 +26,12 @@ use dlctix::{
     ContractParameters, EventLockingConditions, NonceSharingRound, Outcome, SigMap, SigningSession,
     TicketedDLC,
 };
+use lightning_invoice::Bolt11Invoice;
 use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::str::FromStr;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -44,6 +50,37 @@ struct EntryContract {
     dlc: TicketedDLC,
     /// Digest of the accepted `ContractParameters`; part of the nonce seed.
     params_digest: [u8; 32],
+}
+
+/// Explicit choices collected before the ticket payment QR is displayed.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PayoutConsent {
+    pub competition_id: Uuid,
+    pub lightning_address: Option<String>,
+    pub allow_invoice_fallback: bool,
+    pub release_entry_key_after_payment: bool,
+    pub ticket_invoice: String,
+    pub ticket_amount_sats: u64,
+    pub expected_funding_sats: u64,
+    pub expected_player_count: usize,
+    pub expected_winner_count: usize,
+    pub expected_relative_locktime_delta: u16,
+    pub max_fee_rate_sat_vb: u64,
+    pub oracle_announcement: EventLockingConditions,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PayoutInvoiceConsent {
+    pub entry_id: Uuid,
+    pub competition_id: Uuid,
+    pub expected_pubkey: String,
+    pub invoice: String,
+    pub context: payout_protocol::InvoiceAuthorizationContext,
+    pub contract: payout::ContractCommitment,
+    pub signatures: dlctix::ContractSignatures,
+    pub attestation: String,
 }
 
 impl DlcWalletCore {
@@ -124,6 +161,130 @@ impl DlcWalletCore {
         prepare_registration(&key.secret_bytes(), &assignment)
             .await
             .map_err(|e| WalletError::Keymeld(e.to_string()))
+    }
+
+    fn validate_payout_registration(
+        &self,
+        entry_id: Uuid,
+        assignment: &RegistrationAssignment,
+        consent: &PayoutConsent,
+    ) -> Result<(), WalletError> {
+        let reject = || {
+            WalletError::Keymeld("Payout policy differs from the approved entry and ticket".into())
+        };
+        let policy: PayoutPolicy =
+            serde_json::from_str(assignment.payout_policy.as_deref().ok_or_else(reject)?)
+                .map_err(|_| reject())?;
+        let terms = payout::ContractAuthorization::from_policy(&policy).map_err(|_| reject())?;
+        let key = self.entry_key(entry_id)?;
+        if consent.ticket_invoice.len() > 16 * 1024 {
+            return Err(reject());
+        }
+        let invoice = Bolt11Invoice::from_str(&consent.ticket_invoice).map_err(|_| reject())?;
+        let expected_payouts =
+            expected_payouts(consent.expected_player_count, consent.expected_winner_count)?;
+        let max_fee = dlctix::bitcoin::FeeRate::from_sat_per_vb(consent.max_fee_rate_sat_vb)
+            .ok_or_else(reject)?;
+        if terms.competition_id != consent.competition_id
+            || terms.entry_id != entry_id
+            || terms.network != self.network
+            || terms.payout_hash != key.payout_hash()
+            || terms.ticket_hash != invoice.payment_hash().to_byte_array()
+            || invoice.network() != self.network
+            || invoice.would_expire(std::time::Duration::from_secs(
+                ::nostr::Timestamp::now().as_secs(),
+            ))
+            || terms.funding_value.to_sat() != consent.expected_funding_sats
+            || terms.player_count != consent.expected_player_count
+            || terms.outcome_payouts != expected_payouts
+            || terms.event != consent.oracle_announcement
+            || terms.event.locking_points.len() + 1 != expected_payouts.len()
+            || terms.relative_locktime_block_delta != consent.expected_relative_locktime_delta
+            || max_fee == dlctix::bitcoin::FeeRate::ZERO
+            || terms.max_fee_rate > max_fee
+            || consent.ticket_amount_sats == 0
+            || invoice.amount_milli_satoshis() != consent.ticket_amount_sats.checked_mul(1000)
+            || !consent.release_entry_key_after_payment
+            || policy.release_entry_key_after_payment != consent.release_entry_key_after_payment
+            || policy.automatic_lightning_address != consent.lightning_address
+            || policy.allow_invoice_fallback != consent.allow_invoice_fallback
+        {
+            return Err(reject());
+        }
+        Ok(())
+    }
+
+    /// Verify entry-bound consent before any enclave lookup, then seal both
+    /// secrets with the policy. The wallet v1 preimage derivation is unchanged.
+    pub async fn keymeld_payout_registration(
+        &self,
+        entry_id: Uuid,
+        assignment: &RegistrationAssignment,
+        consent: &PayoutConsent,
+    ) -> Result<PreparedRegistration, WalletError> {
+        self.validate_payout_registration(entry_id, assignment, consent)?;
+        let assignment = trusted_assignment(assignment, self.network)?;
+        let key = self.entry_key(entry_id)?;
+        let mut preimage = Zeroizing::new([0u8; 32]);
+        hex::decode_to_slice(&*key.payout_preimage_hex(), &mut preimage[..])
+            .map_err(|_| WalletError::DerivationFailed)?;
+        prepare_payout_registration(&key.secret_bytes(), &preimage, &assignment)
+            .await
+            .map_err(|e| WalletError::Keymeld(e.to_string()))
+    }
+
+    /// Authorize one ordinary invoice; entry secrets remain inside WASM.
+    /// Reconstruct and verify the completed contract and attested payout first.
+    pub fn authorize_payout_invoice(
+        &self,
+        consent: PayoutInvoiceConsent,
+    ) -> Result<payout_protocol::SignedInvoiceAuthorization, WalletError> {
+        let reject = |e: String| WalletError::Keymeld(e);
+        let key = self.entry_key(consent.entry_id)?;
+        if consent.expected_pubkey.parse::<Point>().ok() != Some(key.point()) {
+            return Err(WalletError::ForeignEntry(consent.entry_id));
+        }
+        let player = consent
+            .contract
+            .contract_parameters
+            .players
+            .iter()
+            .find(|player| player.pubkey == key.point())
+            .ok_or_else(|| reject("Entry is not in the payout contract".into()))?;
+        if player.payout_hash != key.payout_hash() {
+            return Err(reject("Payout contract substituted the entry hash".into()));
+        }
+        payout::verify_completed_contract(&consent.contract, &consent.signatures)
+            .map_err(|e| reject(e.to_string()))?;
+        let mut attestation = [0u8; 32];
+        hex::decode_to_slice(&consent.attestation, &mut attestation)
+            .map_err(|_| reject("Invalid payout attestation".into()))?;
+        let outcome = payout::attested_outcome(&consent.contract.contract_parameters, &attestation)
+            .map_err(|e| reject(e.to_string()))?;
+        let owed = payout::owed_sats(
+            &consent.contract.contract_parameters,
+            &outcome,
+            &key.point().serialize(),
+        )
+        .map_err(|e| reject(e.to_string()))?;
+        let now = ::nostr::Timestamp::now().as_secs();
+        if consent.context.entry_id != consent.entry_id
+            || consent.context.competition_id != consent.competition_id
+            || consent.context.invoice_digest != payout::invoice_digest(&consent.invoice)
+            || consent.context.contract_digest
+                != payout::contract_digest(&consent.contract).map_err(|e| reject(e.to_string()))?
+            || Some(consent.context.amount_msat) != owed.checked_mul(1000)
+            || consent.context.expires_at <= now
+            || consent.context.expires_at > now.saturating_add(600)
+        {
+            return Err(reject(
+                "Invoice authorization differs from the selected entry, contract or payout".into(),
+            ));
+        }
+        payout::validate_invoice(&consent.invoice, owed, self.network, now)
+            .map_err(|e| reject(e.to_string()))?;
+        payout_protocol::SignedInvoiceAuthorization::sign(&key.secret_bytes(), consent.context)
+            .map_err(|e| reject(e.to_string()))
     }
 
     /// Release an entry's key and payout preimage for an off-chain payout.
@@ -343,6 +504,70 @@ impl DlcWalletCore {
             })
             .ok_or(WalletError::NoMatchingOutcome)
     }
+}
+
+/// NOAA rank indices use lexicographic permutations followed by the refund-all
+/// outcome. Rebuild them locally so a substituted payout table is never signed.
+fn expected_payouts(
+    players: usize,
+    winners: usize,
+) -> Result<std::collections::BTreeMap<Outcome, dlctix::PayoutWeights>, WalletError> {
+    let reject = || WalletError::Contract("Invalid or oversized payout ranking policy".into());
+    if !(2..=100).contains(&players) || winners == 0 || winners > 5 || winners >= players {
+        return Err(reject());
+    }
+    let count = (0..winners)
+        .try_fold(1usize, |count, index| count.checked_mul(players - index))
+        .ok_or_else(reject)?;
+    if count >= 20_000 {
+        return Err(reject());
+    }
+    let weights: &[u64] = match winners {
+        1 => &[100],
+        2 => &[70, 30],
+        3 => &[45, 35, 20],
+        4 => &[42, 30, 18, 10],
+        5 => &[40, 27, 16, 9, 8],
+        _ => return Err(reject()),
+    };
+    let mut result = std::collections::BTreeMap::new();
+    fn ranks(
+        players: usize,
+        weights: &[u64],
+        current: &mut Vec<usize>,
+        result: &mut std::collections::BTreeMap<Outcome, dlctix::PayoutWeights>,
+    ) {
+        if current.len() == weights.len() {
+            result.insert(
+                Outcome::Attestation(result.len()),
+                current
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, player)| (*player, weights[rank]))
+                    .collect(),
+            );
+            return;
+        }
+        for player in 0..players {
+            if !current.contains(&player) {
+                current.push(player);
+                ranks(players, weights, current, result);
+                current.pop();
+            }
+        }
+    }
+    ranks(players, weights, &mut Vec::new(), &mut result);
+    let equal: dlctix::PayoutWeights = (0..players)
+        .map(|i| {
+            (
+                i,
+                100 / players as u64 + u64::from((i as u64) < 100 % players as u64),
+            )
+        })
+        .collect();
+    result.insert(Outcome::Attestation(result.len()), equal.clone());
+    result.insert(Outcome::Expiry, equal);
+    Ok(result)
 }
 
 fn signer(client: &NostrClientCore) -> Result<&CustomSigner, WalletError> {
@@ -771,5 +996,250 @@ mod tests {
             f.wallet.payout_release(f.entry_id, "not a pubkey"),
             Err(WalletError::ForeignEntry(_))
         ));
+    }
+    fn test_invoice(amount_msat: u64) -> Bolt11Invoice {
+        use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+        InvoiceBuilder::new(Currency::Signet)
+            .description("ordinary payout".into())
+            .payment_hash(dlctix::bitcoin::hashes::sha256::Hash::hash(&[1; 32]))
+            .payment_secret(PaymentSecret([2; 32]))
+            .amount_milli_satoshis(amount_msat)
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(18)
+            .build_signed(|hash| {
+                Secp256k1::new().sign_ecdsa_recoverable(
+                    hash,
+                    &dlctix::bitcoin::secp256k1::SecretKey::from_slice(&[3; 32]).unwrap(),
+                )
+            })
+            .unwrap()
+    }
+
+    fn payout_assignment(f: &Fixture) -> (RegistrationAssignment, PayoutConsent) {
+        let invoice = test_invoice(21_000);
+        let consent = PayoutConsent {
+            competition_id: Uuid::now_v7(),
+            lightning_address: Some("alice+prize@wallet.com".into()),
+            allow_invoice_fallback: true,
+            release_entry_key_after_payment: true,
+            ticket_invoice: invoice.to_string(),
+            ticket_amount_sats: 21,
+            expected_funding_sats: f.params.funding_value.to_sat(),
+            expected_player_count: 2,
+            expected_winner_count: 1,
+            expected_relative_locktime_delta: f.params.relative_locktime_block_delta,
+            max_fee_rate_sat_vb: f.params.fee_rate.to_sat_per_vb_ceil(),
+            oracle_announcement: {
+                let mut event = f.params.event.clone();
+                event.locking_points.push(MaybePoint::Valid(
+                    Scalar::from_slice(&[7; 32]).unwrap().base_point_mul(),
+                ));
+                event
+            },
+        };
+        let outcomes = expected_payouts(2, 1).unwrap();
+        let terms = payout::ContractAuthorization {
+            competition_id: consent.competition_id,
+            entry_id: f.entry_id,
+            network: Network::Signet,
+            player_index: 0,
+            player_count: 2,
+            ticket_hash: invoice.payment_hash().to_byte_array(),
+            payout_hash: f.wallet.entry_key(f.entry_id).unwrap().payout_hash(),
+            market_maker: f.params.market_maker.clone(),
+            event: consent.oracle_announcement.clone(),
+            outcome_payouts: outcomes,
+            funding_value: f.params.funding_value,
+            relative_locktime_block_delta: f.params.relative_locktime_block_delta,
+            max_fee_rate: f.params.fee_rate,
+        };
+        let policy = PayoutPolicy {
+            automatic_lightning_address: consent.lightning_address.clone(),
+            allow_invoice_fallback: true,
+            release_entry_key_after_payment: true,
+            contract_terms: serde_json::to_string(&terms).unwrap(),
+        };
+        let assignment = RegistrationAssignment {
+            session_id: Uuid::now_v7().to_string(),
+            user_id: Uuid::now_v7(),
+            manifest_hash: vec![1; 32],
+            enclave_id: 1,
+            enclave_key_epoch: 1,
+            enclave_public_key: "key".into(),
+            gateway_url: "http://127.0.0.1:1".into(),
+            trusted_pcrs: BTreeMap::new(),
+            dangerous_trust_unattested_enclaves: true,
+            payout_policy: Some(serde_json::to_string(&policy).unwrap()),
+        };
+        (assignment, consent)
+    }
+
+    #[test]
+    fn payout_registration_checks_wallet_entry_ticket_and_explicit_choice_before_network() {
+        let f = fixture();
+        let (assignment, consent) = payout_assignment(&f);
+        f.wallet
+            .validate_payout_registration(f.entry_id, &assignment, &consent)
+            .unwrap();
+        for mutate in [
+            |c: &mut PayoutConsent| c.lightning_address = Some("mallory@wallet.com".into()),
+            |c: &mut PayoutConsent| c.release_entry_key_after_payment = false,
+            |c: &mut PayoutConsent| c.allow_invoice_fallback = false,
+            |c: &mut PayoutConsent| c.competition_id = Uuid::now_v7(),
+            |c: &mut PayoutConsent| c.ticket_amount_sats = 22,
+            |c: &mut PayoutConsent| c.expected_funding_sats += 1,
+            |c: &mut PayoutConsent| c.expected_player_count = 3,
+            |c: &mut PayoutConsent| c.expected_winner_count = 2,
+            |c: &mut PayoutConsent| c.expected_relative_locktime_delta += 1,
+            |c: &mut PayoutConsent| c.max_fee_rate_sat_vb = 0,
+            |c: &mut PayoutConsent| c.oracle_announcement.locking_points.clear(),
+        ] {
+            let mut bad = consent.clone();
+            mutate(&mut bad);
+            let mut future =
+                std::pin::pin!(f
+                    .wallet
+                    .keymeld_payout_registration(f.entry_id, &assignment, &bad));
+            use std::{
+                future::Future,
+                task::{Context, Poll, Waker},
+            };
+            assert!(
+                matches!(
+                    future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop())),
+                    Poll::Ready(Err(_))
+                ),
+                "invalid consent must fail before any async network operation"
+            );
+        }
+        for field in ["entry_id", "payout_hash", "ticket_hash", "network"] {
+            let mut bad = assignment.clone();
+            let mut policy: PayoutPolicy =
+                serde_json::from_str(bad.payout_policy.as_deref().unwrap()).unwrap();
+            let mut terms: serde_json::Value =
+                serde_json::from_str(&policy.contract_terms).unwrap();
+            terms[field] = match field {
+                "entry_id" => serde_json::json!(Uuid::now_v7()),
+                "network" => serde_json::json!("bitcoin"),
+                _ => serde_json::to_value([9u8; 32]).unwrap(),
+            };
+            policy.contract_terms = terms.to_string();
+            bad.payout_policy = Some(serde_json::to_string(&policy).unwrap());
+            assert!(
+                f.wallet
+                    .validate_payout_registration(f.entry_id, &bad, &consent)
+                    .is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    fn invoice_consent(f: &mut Fixture) -> PayoutInvoiceConsent {
+        let attestation = Scalar::from_slice(&[8; 32]).unwrap();
+        f.params.event.locking_points[0] = MaybePoint::Valid(attestation.base_point_mul());
+        for weights in f.params.outcome_payouts.values_mut() {
+            for weight in weights.values_mut() {
+                *weight = 100;
+            }
+        }
+        let contract = payout::ContractCommitment {
+            contract_parameters: f.params.clone(),
+            funding_outpoint: OutPoint::null(),
+        };
+        let dlc = TicketedDLC::new(f.params.clone(), OutPoint::null()).unwrap();
+        let key = f.wallet.entry_key(f.entry_id).unwrap();
+        let ours =
+            SigningSession::<NonceSharingRound>::new(dlc.clone(), &mut rand::rng(), key.scalar())
+                .unwrap();
+        let other = SigningSession::<NonceSharingRound>::new(
+            dlc.clone(),
+            &mut rand::rng(),
+            f.other_player_key,
+        )
+        .unwrap();
+        let dealer =
+            SigningSession::<NonceSharingRound>::new(dlc, &mut rand::rng(), f.market_maker_key)
+                .unwrap()
+                .aggregate_nonces_and_compute_partial_signatures(BTreeMap::from([
+                    (key.point(), ours.our_public_nonces().clone()),
+                    (
+                        f.other_player_key.base_point_mul(),
+                        other.our_public_nonces().clone(),
+                    ),
+                ]))
+                .unwrap();
+        let ours = ours
+            .compute_partial_signatures(dealer.aggregated_nonces().clone())
+            .unwrap();
+        let other = other
+            .compute_partial_signatures(dealer.aggregated_nonces().clone())
+            .unwrap();
+        let signed = dealer
+            .aggregate_all_signatures(BTreeMap::from([
+                (key.point(), ours.our_partial_signatures().clone()),
+                (
+                    f.other_player_key.base_point_mul(),
+                    other.our_partial_signatures().clone(),
+                ),
+            ]))
+            .unwrap();
+        let invoice = test_invoice(100_000_000).to_string();
+        let competition_id = Uuid::now_v7();
+        PayoutInvoiceConsent {
+            entry_id: f.entry_id,
+            competition_id,
+            expected_pubkey: key.point().to_string(),
+            context: payout_protocol::InvoiceAuthorizationContext {
+                keygen_session_id: Uuid::now_v7().into(),
+                user_id: Uuid::now_v7().into(),
+                claim_id: Uuid::now_v7(),
+                competition_id,
+                entry_id: f.entry_id,
+                contract_digest: payout::contract_digest(&contract).unwrap(),
+                invoice_digest: payout::invoice_digest(&invoice),
+                amount_msat: 100_000_000,
+                expires_at: ::nostr::Timestamp::now().as_secs() + 300,
+            },
+            invoice,
+            contract,
+            signatures: signed.all_signatures().clone(),
+            attestation: hex::encode(attestation.serialize()),
+        }
+    }
+
+    #[test]
+    fn invoice_authorization_binds_completed_contract_amount_and_exact_invoice() {
+        let mut f = fixture();
+        let consent = invoice_consent(&mut f);
+        let signed = f.wallet.authorize_payout_invoice(consent.clone()).unwrap();
+        signed
+            .verify(
+                &f.wallet.entry_key(f.entry_id).unwrap().point().serialize(),
+                &consent.context,
+                ::nostr::Timestamp::now().as_secs(),
+            )
+            .unwrap();
+        for mutate in [
+            |c: &mut PayoutInvoiceConsent| c.context.invoice_digest = "00".repeat(32),
+            |c: &mut PayoutInvoiceConsent| c.context.contract_digest = "00".repeat(32),
+            |c: &mut PayoutInvoiceConsent| c.context.amount_msat += 1000,
+            |c: &mut PayoutInvoiceConsent| c.context.entry_id = Uuid::now_v7(),
+            |c: &mut PayoutInvoiceConsent| c.context.competition_id = Uuid::now_v7(),
+            |c: &mut PayoutInvoiceConsent| c.context.expires_at = 0,
+            |c: &mut PayoutInvoiceConsent| {
+                c.context.expires_at = ::nostr::Timestamp::now().as_secs() + 601
+            },
+            |c: &mut PayoutInvoiceConsent| c.signatures.outcome_tx_signatures.clear(),
+            |c: &mut PayoutInvoiceConsent| {
+                c.contract.contract_parameters.players[0].payout_hash = [4; 32]
+            },
+            |c: &mut PayoutInvoiceConsent| c.invoice = test_invoice(99_000_000).to_string(),
+        ] {
+            let mut bad = consent.clone();
+            mutate(&mut bad);
+            assert!(f.wallet.authorize_payout_invoice(bad).is_err());
+        }
     }
 }

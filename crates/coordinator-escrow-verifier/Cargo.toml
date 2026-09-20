@@ -1,0 +1,36 @@
+[package]
+name = "coordinator-escrow-verifier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+lnurl = ["dep:url", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes"]
+
+[dependencies]
+coordinator-escrow = { path = "../coordinator-escrow", features = ["networking"] }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", tag = "v0.5.0", default-features = false, features = ["escrow", "enclave"] }
+keymeld-enclave = { git = "https://github.com/tee8z/keymeld", tag = "v0.5.0", default-features = false, features = ["escrow"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing = "0.1"
+url = { version = "2.5", optional = true }
+rustls = { version = "0.23.45", default-features = false, features = ["std", "aws_lc_rs", "tls12"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
+hyper = { workspace = true, features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+bytes = { version = "1", optional = true }
+
+[dev-dependencies]
+rcgen = "0.13.2"
+secp256k1 = { version = "0.31", features = ["serde"] }
+rand.workspace = true

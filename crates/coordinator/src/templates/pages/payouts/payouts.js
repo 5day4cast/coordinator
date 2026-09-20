@@ -109,31 +109,87 @@ class Payouts {
     }
   }
 
-  async submitPayout(competitionId, entry, invoice, payoutAmount) {
+  async submitPayout(competitionId, entry, invoice, payoutAmount, competition) {
     if (!invoice) throw new Error("Please enter a Lightning invoice");
-
+    const endpoint = `${this.coordinator_url}/api/v1/competitions/${competitionId}/entries/${entry.id}/payout-authorization`;
+    let response;
+    try {
+      response = await this.client.get(endpoint);
+    } catch (error) {
+      if (error.response?.status === 404) {
+        throw new Error("This entry has no verified payout authorization. Use the explicit Legacy recovery action only for old entries; this payout action will not release entry secrets.");
+      }
+      throw error;
+    }
+    const context = await response.json();
+    if (!context.allow_invoice_fallback) throw new Error("Invoice fallback was not authorized for this entry");
+    if (context.entry_id !== entry.id || context.competition_id !== competitionId ||
+        context.user_id !== entry.ticket_id) {
+      throw new Error("Payout authorization belongs to another entry");
+    }
+    if (!Number.isSafeInteger(context.amount_msat) || context.amount_msat <= 0 || context.amount_msat % 1000 !== 0) {
+      throw new Error("Invalid payout amount");
+    }
+    if (context.amount_msat / 1000 !== payoutAmount) throw new Error("The payout amount changed; refresh this page before authorizing it");
     this.validateInvoice(invoice, payoutAmount);
-
-    // Selling the entry key and payout preimage to the coordinator is the
-    // ticketed-DLC sellback. The wallet re-derives the key from the entry id
-    // and refuses unless it matches the entry's recorded pubkey.
-    const release = window.dlcWallet.payoutRelease(
-      entry.id,
-      entry.ephemeral_pubkey,
-    );
-
-    const response = await this.client.post(
-      `${this.coordinator_url}/api/v1/competitions/${competitionId}/entries/${entry.id}/payout`,
-      {
-        ticket_id: entry.ticket_id,
-        payout_preimage: release.payout_preimage,
-        ephemeral_private_key: release.ephemeral_private_key,
-        ln_invoice: invoice,
+    if (!competition?.contract_parameters || !competition.funding_outpoint || !competition.signed_contract?.signatures || !competition.attestation) {
+      throw new Error("The completed payout contract is unavailable");
+    }
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(invoice));
+    const invoiceDigest = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    const authorization = window.dlcWallet.authorizePayoutInvoice(JSON.stringify({
+      entry_id: entry.id,
+      competition_id: competitionId,
+      expected_pubkey: entry.ephemeral_pubkey,
+      invoice,
+      context: {
+        keygen_session_id: context.keygen_session_id,
+        user_id: context.user_id,
+        competition_id: competitionId,
+        entry_id: entry.id,
+        contract_digest: context.contract_digest,
+        amount_msat: context.amount_msat,
+        claim_id: crypto.randomUUID(),
+        invoice_digest: invoiceDigest,
+        expires_at: Math.floor(Date.now() / 1000) + 300,
       },
-    );
+      contract: {
+        contract_parameters: competition.contract_parameters,
+        funding_outpoint: competition.funding_outpoint,
+      },
+      signatures: competition.signed_contract.signatures,
+      attestation: competition.attestation,
+    }));
+    // The exact invoice and entry-key signature are sufficient. The wallet
+    // never exports its key or DLC preimage to this browser payout path.
+    await this.client.post(endpoint, { invoice, authorization });
+  }
 
-    if (!response.ok)
-      throw new Error(`Failed to submit payout: ${response.status}`);
+  async submitLegacyPayout(competitionId, entry, invoice, payoutAmount, explicitConsent) {
+    if (explicitConsent !== true) throw new Error("Legacy recovery requires explicit consent to release entry secrets before payment");
+    const endpoint = `${this.coordinator_url}/api/v1/competitions/${competitionId}/entries/${entry.id}`;
+    try {
+      await this.client.get(`${endpoint}/payout-authorization`);
+      throw new Error("This entry uses escrow payouts; use the signed invoice payout instead");
+    } catch (error) {
+      if (error.response?.status !== 404) throw error;
+    }
+    this.validateInvoice(invoice, payoutAmount);
+    const release = window.dlcWallet.payoutRelease(entry.id, entry.ephemeral_pubkey);
+    await this.client.post(`${endpoint}/payout`, {
+      ticket_id: entry.ticket_id,
+      payout_preimage: release.payout_preimage,
+      ephemeral_private_key: release.ephemeral_private_key,
+      ln_invoice: invoice,
+    });
+  }
+
+  async saveLightningAddress(address) {
+    const response = await this.client.post(
+      `${this.coordinator_url}/api/v1/users/lightning-address`,
+      { lightning_address: address },
+    );
+    return response.json();
   }
 
   validateInvoice(invoice, expectedAmount) {
@@ -160,12 +216,7 @@ class Payouts {
         };
       }
 
-      return {
-        isValid: true,
-        hasAmount: false,
-        amount: null,
-        type: "any-amount",
-      };
+      throw new Error("The invoice must specify the exact payout amount");
     } catch (error) {
       throw new Error(`Invalid invoice: ${error.message}`);
     }
@@ -197,6 +248,7 @@ function openPayoutModal(button) {
     entryId,
     competitionId,
     payoutAmount,
+    legacy: button.dataset.legacy === "true",
   };
 
   // Clear previous state
@@ -207,6 +259,22 @@ function openPayoutModal(button) {
     errorDiv.textContent = "";
     errorDiv.classList.add("hidden");
   }
+
+  let warning = document.getElementById("legacyPayoutWarning");
+  if (!warning) {
+    warning = document.createElement("label");
+    warning.id = "legacyPayoutWarning";
+    warning.className = "checkbox notification is-warning";
+    const approval = document.createElement("input");
+    approval.type = "checkbox";
+    approval.id = "legacyPayoutApproved";
+    warning.appendChild(approval);
+    warning.appendChild(document.createTextNode(" I confirm this is a legacy entry. Recovery sends its private key and payout preimage before payment; payment is not guaranteed."));
+    errorDiv?.parentNode.insertBefore(warning, errorDiv);
+  }
+  warning.classList.toggle("is-hidden", !currentPayoutData.legacy);
+  const legacyConsent = document.getElementById("legacyPayoutApproved");
+  if (legacyConsent) legacyConsent.checked = false;
 
   // Open modal
   const modal = document.getElementById("payoutModal");
@@ -248,23 +316,22 @@ async function submitPayoutInvoice() {
       throw new Error("Entry not found or no longer eligible for payout");
     }
 
-    await payoutsInstance.submitPayout(
-      currentPayoutData.competitionId,
-      payableEntry.entry,
-      invoice,
-      currentPayoutData.payoutAmount,
-    );
+    if (currentPayoutData.legacy) {
+      await payoutsInstance.submitLegacyPayout(
+        currentPayoutData.competitionId, payableEntry.entry, invoice,
+        currentPayoutData.payoutAmount,
+        document.getElementById("legacyPayoutApproved")?.checked === true,
+      );
+    } else {
+      await payoutsInstance.submitPayout(
+        currentPayoutData.competitionId, payableEntry.entry, invoice,
+        currentPayoutData.payoutAmount, payableEntry.competition,
+      );
+    }
 
     // Success - close modal and refresh the page
     window.closeModal(document.getElementById("payoutModal"));
-
-    // Reload the payouts page to reflect the updated status
-    const payoutsLink = document.querySelector('[hx-get="/payouts"]');
-    if (payoutsLink) {
-      payoutsLink.click();
-    } else {
-      window.location.reload();
-    }
+    reloadPayouts();
   } catch (error) {
     console.error("Payout submission failed:", error);
     errorDiv.textContent = error.message || "Failed to submit payout";
@@ -272,6 +339,71 @@ async function submitPayoutInvoice() {
   } finally {
     submitBtn.disabled = false;
     submitBtn.classList.remove("is-loading");
+  }
+}
+
+/**
+ * The server's error message for a failed AuthorizedClient request.
+ */
+async function requestErrorMessage(error, fallback) {
+  const data = await error.response?.json().catch(() => null);
+  return data?.error || error.message || fallback;
+}
+
+function reloadPayouts() {
+  const payoutsLink = document.querySelector('[hx-get="/payouts"]');
+  if (payoutsLink) {
+    payoutsLink.click();
+  } else {
+    window.location.reload();
+  }
+}
+
+function showPayoutsError(message) {
+  const errorDiv = document.getElementById("payoutsError");
+  if (!errorDiv) return;
+  errorDiv.textContent = message;
+  errorDiv.classList.toggle("hidden", !message);
+}
+
+function toggleLightningAddressForm(event) {
+  event?.preventDefault();
+  document.getElementById("lightningAddressForm")?.classList.toggle("is-hidden");
+  document.getElementById("payoutLightningAddress")?.focus();
+}
+
+async function saveLightningAddress() {
+  const errorElement = document.getElementById("lightningAddressError");
+  const button = document.getElementById("saveLightningAddress");
+  const address = window.normalizeLightningAddress(
+    document.getElementById("payoutLightningAddress")?.value,
+  );
+  const validationError = window.validateLightningAddress(address);
+  if (validationError) {
+    if (errorElement) errorElement.textContent = validationError;
+    return;
+  }
+  if (!payoutsInstance) {
+    if (errorElement) errorElement.textContent = "Please log in again.";
+    return;
+  }
+
+  if (errorElement) errorElement.textContent = "";
+  button.disabled = true;
+  button.classList.add("is-loading");
+  try {
+    await payoutsInstance.saveLightningAddress(address);
+    reloadPayouts();
+  } catch (error) {
+    console.error("Saving Lightning Address failed:", error);
+    if (errorElement)
+      errorElement.textContent = await requestErrorMessage(
+        error,
+        "Failed to save Lightning Address",
+      );
+  } finally {
+    button.disabled = false;
+    button.classList.remove("is-loading");
   }
 }
 
@@ -292,5 +424,7 @@ function setupPayoutModal() {
 
 window.initPayouts = initPayouts;
 window.openPayoutModal = openPayoutModal;
+window.toggleLightningAddressForm = toggleLightningAddressForm;
+window.saveLightningAddress = saveLightningAddress;
 window.submitPayoutInvoice = submitPayoutInvoice;
 window.setupPayoutModal = setupPayoutModal;

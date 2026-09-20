@@ -165,9 +165,38 @@ def package_native(root, version, source, target, asset, wasm_archive, output):
         return archive(package, output)
 
 
+def package_enclave(root, version, source, target, output):
+    """Package the coordinator verifier enclave and its LNURL relay for a Keymeld host."""
+    binaries = root / "target" / target / "release"
+    names = ("coordinator-verifier-enclave", "coordinator-lnurl-relay")
+    require_files(binaries, names)
+    with tempfile.TemporaryDirectory() as temporary:
+        package = Path(temporary) / f"coordinator-verifier-enclave-{version}-{target}"
+        (package / "bin").mkdir(parents=True)
+        for binary in names:
+            shutil.copy2(binaries / binary, package / "bin" / binary)
+        provenance = metadata(root, version, source)
+        provenance.update(target=target, features=["lnurl"])
+        (package / "RELEASE.json").write_text(json.dumps(provenance, indent=2) + "\n")
+        (package / "README.txt").write_text(
+            f"Coordinator verifier enclave v{version}\nSource: {source}\n\n"
+            "bin/coordinator-verifier-enclave is the Keymeld enclave with the coordinator's\n"
+            "verifier registered, built with Lightning Address (LNURL) support. Run it in place\n"
+            "of the stock keymeld-enclave binary next to a Keymeld gateway of the version this\n"
+            "release pins. It reads the same ENCLAVE_ID, VSOCK_PORT, TRANSPORT_MODE, and TCP_HOST\n"
+            "environment as keymeld-enclave, plus COORDINATOR_ESCROW_LNURL_ENABLED and\n"
+            "COORDINATOR_LNURL_RELAY_PORT.\n\n"
+            "bin/coordinator-lnurl-relay is the host-side relay the enclave uses for LNURL\n"
+            "traffic; run it on the relay port when LNURL is enabled.\n\n"
+            "Use sha256sum -c SHA256SUMS to verify files. See docs/COORDINATOR_ENCLAVE.md:\n"
+            "https://github.com/5day4cast/coordinator/blob/v" + version + "/docs/COORDINATOR_ENCLAVE.md\n"
+        )
+        return archive(package, output)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["validate", "wasm", "native", "checksums"])
+    parser.add_argument("command", choices=["validate", "wasm", "native", "enclave", "checksums"])
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--version")
     parser.add_argument("--source")
@@ -190,6 +219,8 @@ def main():
         parser.error("--source must be the complete source commit SHA")
     if args.command == "wasm":
         print(package_wasm(args.root, args.version, args.source, args.wasm, args.output))
+    elif args.command == "enclave":
+        print(package_enclave(args.root, args.version, args.source, args.target, args.output))
     else:
         print(package_native(args.root, args.version, args.source, args.target, args.asset, args.wasm, args.output))
 

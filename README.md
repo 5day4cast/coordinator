@@ -22,6 +22,9 @@ DLC-based fantasy weather prediction market coordinator with keymeld signing.
 The local service helpers start Bitcoin, LND, Moto, and Keymeld.
 Start electrs separately before starting the coordinator; `start-all` does not provide an Electrum server.
 
+Native builds link to system OpenSSL. The Nix overlay supplies patched OpenSSL 3.6.4 and disables vendored OpenSSL.
+Outside Nix, install a maintained OpenSSL development package with the current security fixes before building.
+
 `run-keymeld` runs Keymeld the way its own local launcher does: Moto stands in for AWS KMS, three enclaves listen on local TCP ports, and the gateway runs in Keymeld's development environment with a generated channel credential under `data/keymeld`.
 Simulated enclaves produce no Nitro attestation, so `config/local.toml` sets `keymeld_settings.dangerous_trust_unattested_enclaves = true`.
 This exercises the coordinator's full funding, signing, and invoice flow without enclave hardware.
@@ -140,6 +143,8 @@ listen_addr = "127.0.0.1:9991"
 # Bearer token for operators and tooling (synth); at least 32 characters.
 token_file = "./creds/admin_token"
 ```
+
+Public request limits and NIP-98 origin configuration are described in [Request controls](docs/REQUEST_HARDENING.md).
 
 ### Operator access
 
