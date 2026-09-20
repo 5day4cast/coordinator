@@ -247,17 +247,17 @@
         # The gateway is generic. Coordinator's measured image owns the verifier.
         keymeld-gateway = keymeld.packages.${system}.keymeld-gateway-escrow;
         mkCoordinatorEnclave = lnurl: craneLib.buildPackage ({
-          pname = if lnurl then "coordinator-enclave-lnurl" else "coordinator-enclave";
+          pname = if lnurl then "coordinator-verifier-enclave-lnurl" else "coordinator-verifier-enclave";
           version = workspaceVersion;
           inherit src;
           cargoArtifacts = workspaceDeps;
           buildInputs = commonBuildInputs;
           nativeBuildInputs = commonNativeBuildInputs;
-          cargoExtraArgs = "-p coordinator-enclave --bin coordinator-enclave"
+          cargoExtraArgs = "-p coordinator-verifier-enclave --bin coordinator-verifier-enclave"
             + pkgs.lib.optionalString lnurl " --features lnurl";
         } // commonEnvs);
-        coordinator-enclave = mkCoordinatorEnclave false;
-        coordinator-enclave-lnurl = mkCoordinatorEnclave true;
+        coordinator-verifier-enclave = mkCoordinatorEnclave false;
+        coordinator-verifier-enclave-lnurl = mkCoordinatorEnclave true;
         coordinator-lnurl-relay = craneLib.buildPackage ({
           pname = "coordinator-lnurl-relay";
           version = workspaceVersion;
@@ -273,12 +273,12 @@
           text = builtins.readFile ./scripts/coordinator-nitro-entrypoint.sh;
         };
         mkCoordinatorEnclaveImage = suffix: enclave: pkgs.dockerTools.buildLayeredImage {
-          name = "coordinator-enclave${suffix}";
+          name = "coordinator-verifier-enclave${suffix}";
           tag = "latest";
           contents = [ enclave coordinator-nitro-entrypoint pkgs.cacert pkgs.tzdata ];
           config = {
             Entrypoint = [ "${coordinator-nitro-entrypoint}/bin/coordinator-nitro-entrypoint" ];
-            Cmd = [ "${enclave}/bin/coordinator-enclave" ];
+            Cmd = [ "${enclave}/bin/coordinator-verifier-enclave" ];
             Env = [
               "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
               "RUST_LOG=info"
@@ -287,8 +287,8 @@
             ];
           };
         };
-        docker-coordinator-enclave = mkCoordinatorEnclaveImage "" coordinator-enclave;
-        docker-coordinator-enclave-lnurl = mkCoordinatorEnclaveImage "-lnurl" coordinator-enclave-lnurl;
+        docker-coordinator-verifier-enclave = mkCoordinatorEnclaveImage "" coordinator-verifier-enclave;
+        docker-coordinator-verifier-enclave-lnurl = mkCoordinatorEnclaveImage "-lnurl" coordinator-verifier-enclave-lnurl;
         docker-coordinator-lnurl-relay = pkgs.dockerTools.buildLayeredImage {
           name = "coordinator-lnurl-relay";
           tag = "latest";
@@ -299,7 +299,7 @@
           };
         };
         build-coordinator-eif = pkgs.writeShellScriptBin "build-coordinator-eif" ''
-          exec ${pkgs.bash}/bin/bash ${./scripts/build-coordinator-enclave-eif.sh} "$@"
+          exec ${pkgs.bash}/bin/bash ${./scripts/build-coordinator-verifier-enclave-eif.sh} "$@"
         '';
 
         # Python environment with moto for AWS S3 mocking
@@ -603,7 +603,7 @@
           # nix-built keymeld binaries; see run-moto.
           AWS="env -u LD_LIBRARY_PATH ${pkgs.awscli2}/bin/aws --endpoint-url $KMS_ENDPOINT"
           KEYMELD_GATEWAY="env -u LD_LIBRARY_PATH ${keymeld-gateway}/bin/keymeld-gateway"
-          KEYMELD_ENCLAVE="env -u LD_LIBRARY_PATH ${coordinator-enclave-lnurl}/bin/coordinator-enclave"
+          KEYMELD_ENCLAVE="env -u LD_LIBRARY_PATH ${coordinator-verifier-enclave-lnurl}/bin/coordinator-verifier-enclave"
           COORDINATOR_LNURL_RELAY="env -u LD_LIBRARY_PATH ${coordinator-lnurl-relay}/bin/coordinator-lnurl-relay"
           CURL="env -u LD_LIBRARY_PATH ${pkgs.curl}/bin/curl -fsS --max-time 2"
 
@@ -987,7 +987,7 @@
 
             # Keymeld binaries for e2e testing
             keymeld-gateway
-            coordinator-enclave-lnurl
+            coordinator-verifier-enclave-lnurl
             coordinator-lnurl-relay
             build-coordinator-eif
 
@@ -1155,8 +1155,8 @@
         packages = {
           default = coordinator;
           inherit coordinator coordinator-wasm wallet-cli synth docker-coordinator docker-synth;
-          inherit coordinator-enclave coordinator-enclave-lnurl coordinator-lnurl-relay;
-          inherit docker-coordinator-enclave docker-coordinator-enclave-lnurl docker-coordinator-lnurl-relay;
+          inherit coordinator-verifier-enclave coordinator-verifier-enclave-lnurl coordinator-lnurl-relay;
+          inherit docker-coordinator-verifier-enclave docker-coordinator-verifier-enclave-lnurl docker-coordinator-lnurl-relay;
           inherit build-coordinator-eif;
           inherit start-regtest stop-regtest mine-blocks;
           inherit setup-lnd setup-channels stop-lnd;

@@ -1,6 +1,8 @@
 # Coordinator enclave and relay
 
 Coordinator owns the DLC, invoice, and Lightning Address verifier inside its custom enclave image.
+The coordinator service itself does not run inside an enclave.
+`coordinator-verifier-enclave` is Keymeld's enclave binary with the coordinator's verifier compiled in, deployed in place of the stock `keymeld-enclave` beside an unmodified Keymeld gateway.
 Keymeld provides generic authorization, custody, confidential transport, and MuSig2 operations.
 The standard Keymeld image does not register the Coordinator verifier.
 
@@ -8,7 +10,7 @@ The standard Keymeld image does not register the Coordinator verifier.
 | --- | --- |
 | `coordinator-escrow` | Participant policy, application payloads, DLC checks, and invoice validation. |
 | `coordinator-escrow-verifier` | Trusted rules and optional enclave HTTPS. |
-| `coordinator-enclave` | Static verifier registration and generic Keymeld runtime. |
+| `coordinator-verifier-enclave` | Static verifier registration and generic Keymeld runtime. |
 | `coordinator-lnurl-relay` | Bounded host relay for DNS hints and encrypted TLS traffic. |
 
 The application receives encrypted results through Keymeld's confidential transport.
@@ -57,8 +59,8 @@ Validate the migration and funded recovery procedure before releasing the new de
 
 | Nix package | Compiled behavior |
 | --- | --- |
-| `coordinator-enclave` | Invoice fallback and prepared-payment recovery. |
-| `coordinator-enclave-lnurl` | Also includes Lightning Address resolution. |
+| `coordinator-verifier-enclave` | Invoice fallback and prepared-payment recovery. |
+| `coordinator-verifier-enclave-lnurl` | Also includes Lightning Address resolution. |
 | `coordinator-lnurl-relay` | Separate host process for enclave network access. |
 
 The `lnurl` Cargo feature is disabled by default.
@@ -89,7 +91,7 @@ Then select the compiled variant and runtime toggle:
 export COORDINATOR_ESCROW_VARIANT=lnurl
 export COORDINATOR_ESCROW_LNURL_ENABLED=true
 export COORDINATOR_LNURL_RELAY_PORT=8101
-bash scripts/build-coordinator-enclave-eif.sh
+bash scripts/build-coordinator-verifier-enclave-eif.sh
 ```
 
 `ENCLAVE_GATEWAY_PUBLIC_KEY`, `ENCLAVE_KMS_KEY_ID`, and `AWS_REGION` are required.

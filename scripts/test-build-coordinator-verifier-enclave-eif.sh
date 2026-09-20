@@ -51,9 +51,9 @@ run_case() {
   local feature="$1" enabled="$2" suffix="$3" port="$4"
   export COORDINATOR_ESCROW_VARIANT="$feature" COORDINATOR_ESCROW_LNURL_ENABLED="$enabled" COORDINATOR_LNURL_RELAY_PORT="$port"
   export OUTPUT_FILE="$coordinator_test_dir/$feature-$enabled.eif"
-  bash scripts/build-coordinator-enclave-eif.sh > "$coordinator_test_dir/build.log"
-  grep -Fq -- "build .#docker-coordinator-enclave$suffix --out-link " "$coordinator_test_dir/nix.log"
-  grep -Fxq -- "BASE_IMAGE=coordinator-enclave$suffix:latest" "$coordinator_test_dir/docker.args"
+  bash scripts/build-coordinator-verifier-enclave-eif.sh > "$coordinator_test_dir/build.log"
+  grep -Fq -- "build .#docker-coordinator-verifier-enclave$suffix --out-link " "$coordinator_test_dir/nix.log"
+  grep -Fxq -- "BASE_IMAGE=coordinator-verifier-enclave$suffix:latest" "$coordinator_test_dir/docker.args"
   grep -Fxq -- "COORDINATOR_ESCROW_LNURL_ENABLED=$enabled" "$coordinator_test_dir/docker.args"
   grep -Fxq -- "COORDINATOR_LNURL_RELAY_PORT=$port" "$coordinator_test_dir/docker.args"
   grep -Fxq 'ENV COORDINATOR_ESCROW_LNURL_ENABLED=$COORDINATOR_ESCROW_LNURL_ENABLED' "$coordinator_test_dir/Dockerfile"
@@ -73,7 +73,7 @@ jq -e '.cargo_features == ["lnurl"] and .verifier.id == "coordinator.dlc" and .v
 
 reject_case() {
   export OUTPUT_FILE="$coordinator_test_dir/rejected.eif"
-  if bash scripts/build-coordinator-enclave-eif.sh > "$coordinator_test_dir/rejected.log" 2>&1; then
+  if bash scripts/build-coordinator-verifier-enclave-eif.sh > "$coordinator_test_dir/rejected.log" 2>&1; then
     echo "Invalid feature/runtime combination was accepted" >&2; exit 1
   fi
   [[ ! -s "$coordinator_test_dir/nix.log" && ! -e "$OUTPUT_FILE" ]]
@@ -94,6 +94,6 @@ reject_case
 # Omitted settings produce a invoice-only image with measured LNURL disabled.
 unset COORDINATOR_ESCROW_VARIANT COORDINATOR_ESCROW_LNURL_ENABLED COORDINATOR_LNURL_RELAY_PORT
 export OUTPUT_FILE="$coordinator_test_dir/default.eif"
-bash scripts/build-coordinator-enclave-eif.sh > "$coordinator_test_dir/default.log"
+bash scripts/build-coordinator-verifier-enclave-eif.sh > "$coordinator_test_dir/default.log"
 jq -e '.escrow_variant == "invoice" and .escrow.lnurl.enabled == false' "$OUTPUT_FILE.manifest.json" >/dev/null
 printf '%s\n' 'EIF escrow feature/runtime build regressions passed (4 builds, 6 rejected configurations; all infrastructure mocked).'

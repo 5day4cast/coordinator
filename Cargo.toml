@@ -6,7 +6,7 @@ members = [
     "crates/synth",
     "crates/coordinator-escrow",
     "crates/coordinator-escrow-verifier",
-    "crates/coordinator-enclave",
+    "crates/coordinator-verifier-enclave",
     "crates/coordinator-lnurl-relay",
 ]
 # Nitro enclave and VSock relay binaries build only when selected explicitly.

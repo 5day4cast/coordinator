@@ -4,7 +4,7 @@ set -euo pipefail
 echo "CI/CD: Building Coordinator Enclave EIF for AWS Nitro"
 
 # Configuration
-EIF_NAME="${EIF_NAME:-coordinator-enclave}"
+EIF_NAME="${EIF_NAME:-coordinator-verifier-enclave}"
 VERSION="${VERSION:-$(git rev-parse --short HEAD 2>/dev/null || echo 'latest')}"
 ENCLAVE_ID="${ENCLAVE_ID:-0}"
 OUTPUT_FILE="${OUTPUT_FILE:-$EIF_NAME-$ENCLAVE_ID-$VERSION.eif}"
@@ -28,7 +28,7 @@ esac
 [[ "$COORDINATOR_LNURL_RELAY_PORT" =~ ^[1-9][0-9]{0,9}$ ]] && (( COORDINATOR_LNURL_RELAY_PORT <= 4294967295 )) || {
   echo "Invalid LNURL relay VSock port" >&2; exit 1;
 }
-base_image="coordinator-enclave$image_suffix:latest"
+base_image="coordinator-verifier-enclave$image_suffix:latest"
 
 # Check prerequisites
 if ! command -v nitro-cli &> /dev/null; then
@@ -64,7 +64,7 @@ provisioned_image="$EIF_NAME-$ENCLAVE_ID:$VERSION"
 # Include the Nix runtime closure; copying only the binary breaks its loader.
 build_context=$(mktemp -d -t coordinator-eif.XXXXXXXX)
 trap 'rm -rf -- "$build_context"' EXIT
-nix build ".#docker-coordinator-enclave$image_suffix" --out-link "$build_context/base-image"
+nix build ".#docker-coordinator-verifier-enclave$image_suffix" --out-link "$build_context/base-image"
 docker load < "$build_context/base-image"
 cat > "$build_context/Dockerfile" <<'EOF'
 ARG BASE_IMAGE

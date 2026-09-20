@@ -3,7 +3,7 @@
 set -euo pipefail
 
 if (( $# == 0 )); then
-    set -- /bin/coordinator-enclave
+    set -- /bin/coordinator-verifier-enclave
 fi
 if [[ "${TRANSPORT_MODE:-vsock}" == tcp ]]; then
     exec "$@"

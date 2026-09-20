@@ -1390,17 +1390,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "coordinator-enclave"
-version = "2.0.0"
-dependencies = [
- "anyhow",
- "coordinator-escrow-verifier",
- "keymeld-core",
- "keymeld-enclave",
- "tokio",
-]
-
-[[package]]
 name = "coordinator-escrow"
 version = "2.0.0"
 dependencies = [
@@ -1496,6 +1485,17 @@ dependencies = [
  "tower-http 0.5.2",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "coordinator-verifier-enclave"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "coordinator-escrow-verifier",
+ "keymeld-core",
+ "keymeld-enclave",
+ "tokio",
 ]
 
 [[package]]
