@@ -319,6 +319,47 @@ class Entry {
     });
   }
 
+  /**
+   * The enclave releases this entry's payout preimage only for an invoice
+   * signed by the node behind the account's Lightning Address, so the browser
+   * learns that node key from the provider itself (a probe invoice, never
+   * paid) rather than trusting the coordinator with it. Without an address,
+   * or if the provider cannot be reached from the browser, the entry falls
+   * back to the trusted payout.
+   */
+  async probePayoutPolicy() {
+    const address = window.currentUser?.lightning_address;
+    if (!address) return null;
+    const [user, domain] = address.split("@");
+    if (!user || !domain) return null;
+    try {
+      const payRequest = await fetch(
+        `https://${domain}/.well-known/lnurlp/${encodeURIComponent(user)}`,
+        { mode: "cors" },
+      ).then((r) => r.json());
+      if (payRequest.status === "ERROR" || payRequest.tag !== "payRequest") {
+        throw new Error(payRequest.reason || "not an LNURL pay request");
+      }
+      const callback = new URL(payRequest.callback);
+      callback.searchParams.set("amount", String(payRequest.minSendable));
+      const probe = await fetch(callback, { mode: "cors" }).then((r) =>
+        r.json(),
+      );
+      if (!probe.pr) throw new Error(probe.reason || "no invoice returned");
+      const payeeNodeId = lightningPayReq.decode(probe.pr).payeeNodeKey;
+      if (!/^[0-9a-f]{66}$/i.test(payeeNodeId ?? "")) {
+        throw new Error("invoice has no payee node key");
+      }
+      return { lightning_address: address, payee_node_id: payeeNodeId };
+    } catch (error) {
+      console.warn(
+        "Payout escrow unavailable for this entry, using trusted payout:",
+        error,
+      );
+      return null;
+    }
+  }
+
   async submit(expectedObservations) {
     try {
       await this.handleTicketPayment(this.entry.ephemeral_pubkey);
@@ -330,12 +371,16 @@ class Entry {
       if (this.ticket.keymeld_session_id && !this.ticket.keymeld_registration) {
         throw new Error("The ticket is missing its authorized Keymeld registration context");
       }
+      let payout_policy = null;
       if (this.ticket.keymeld_registration) {
+        payout_policy = await this.probePayoutPolicy();
         // WASM verifies the enclave's attestation and encrypts the entry key to it;
-        // the raw key never reaches JavaScript.
+        // the raw key never reaches JavaScript. The payout policy is sealed in
+        // the same envelope so only the enclave can honour it.
         const keymeldData = await window.dlcWallet.keymeldRegistration(
           this.entry.id,
           JSON.stringify(this.ticket.keymeld_registration),
+          payout_policy ? JSON.stringify(payout_policy) : null,
         );
         encrypted_keymeld_private_key = keymeldData.encrypted_private_key;
         keymeld_auth_pubkey = keymeldData.auth_pubkey;
@@ -352,6 +397,7 @@ class Entry {
         encrypted_keymeld_private_key,
         keymeld_auth_pubkey,
         keymeld_registration_context,
+        payout_policy,
       };
 
       const response = await this.client.post(

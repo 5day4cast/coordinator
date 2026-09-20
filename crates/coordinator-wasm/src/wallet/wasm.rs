@@ -1,6 +1,6 @@
 use super::{DlcWalletCore, WalletError};
 use crate::nostr::NostrClientWrapper;
-use coordinator_core::RegistrationAssignment;
+use coordinator_core::{PayoutPolicy, RegistrationAssignment};
 use dlctix::{
     bitcoin::{Network, OutPoint, Psbt},
     musig2::AggNonce,
@@ -54,18 +54,27 @@ impl DlcWallet {
     }
 
     /// `{ encrypted_private_key, auth_pubkey, context }` for the ticket's keymeld slot.
-    /// `assignment_json` is the ticket response's `keymeld_registration`.
+    /// `assignment_json` is the ticket response's `keymeld_registration`;
+    /// `payout_policy_json` is an optional `{ lightning_address, payee_node_id }`
+    /// sealed with the key for enclave-escrowed payouts.
     #[wasm_bindgen(js_name = "keymeldRegistration")]
     pub async fn keymeld_registration(
         &self,
         entry_id: &str,
         assignment_json: &str,
+        payout_policy_json: Option<String>,
     ) -> Result<JsValue, JsValue> {
         let assignment: RegistrationAssignment = serde_json::from_str(assignment_json)
             .map_err(|e| JsValue::from_str(&format!("Invalid keymeld assignment: {e}")))?;
+        let payout_policy = payout_policy_json
+            .as_deref()
+            .filter(|json| !json.is_empty())
+            .map(serde_json::from_str::<PayoutPolicy>)
+            .transpose()
+            .map_err(|e| JsValue::from_str(&format!("Invalid payout policy: {e}")))?;
         let prepared = self
             .inner
-            .keymeld_registration(parse_entry_id(entry_id)?, &assignment)
+            .keymeld_registration(parse_entry_id(entry_id)?, &assignment, payout_policy)
             .await?;
         // JSON-compatible so byte arrays in the context survive the round trip.
         prepared

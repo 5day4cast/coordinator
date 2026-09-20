@@ -130,6 +130,31 @@ pub async fn add_event_entry(
         body,
     }: AuthedJson<AddEntry>,
 ) -> Result<Json<UserEntry>, ApiError> {
+    // A sealed payout policy must name the account's own address, and the
+    // node key must be a real compressed key: the enclave will only ever
+    // release the payout preimage for a payment matching it.
+    if let Some(policy) = &body.payout_policy {
+        let npub = pubkey.to_bech32().expect("public bech32 format");
+        let user = state.users_info.login(npub).await?;
+        let registered = user
+            .lightning_address
+            .as_deref()
+            .map(LightningAddress::parse)
+            .transpose()
+            .map_err(|e| ApiError::from(DomainError::BadRequest(e.to_string())))?;
+        let sealed = LightningAddress::parse(&policy.lightning_address)
+            .map_err(|e| ApiError::from(DomainError::BadRequest(e.to_string())))?;
+        if registered.as_ref() != Some(&sealed) {
+            return Err(ApiError::from(DomainError::BadRequest(
+                "Payout policy must name the Lightning Address on the account".into(),
+            )));
+        }
+        policy.validate().map_err(|e| {
+            ApiError::from(DomainError::BadRequest(format!(
+                "Invalid payout policy: {e}"
+            )))
+        })?;
+    }
     let pubkey = pubkey.to_hex();
     state
         .coordinator

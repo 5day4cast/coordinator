@@ -4,6 +4,7 @@ use super::{
     EncryptedWalletBackup, EntryRegistration, PayoutRelease, WalletError,
 };
 use crate::nostr::{CustomSigner, NostrClientCore};
+use coordinator_core::PayoutPolicy;
 use coordinator_core::{
     keymeld::{prepare_registration, PreparedRegistration},
     RegistrationAssignment,
@@ -113,14 +114,19 @@ impl DlcWalletCore {
     /// key before encrypting, and binds the envelope to the session, manifest,
     /// slot and enclave epoch. The attestation policy comes from this build's
     /// pinned measurements, not from the coordinator (see `keymeld_trust`).
+    ///
+    /// `payout_policy` is sealed in the same envelope: only the enclave can
+    /// then release this entry's payout preimage, and only for a payment to
+    /// that address.
     pub async fn keymeld_registration(
         &self,
         entry_id: Uuid,
         assignment: &RegistrationAssignment,
+        payout_policy: Option<PayoutPolicy>,
     ) -> Result<PreparedRegistration, WalletError> {
         let assignment = trusted_assignment(assignment, self.network)?;
         let key = self.entry_key(entry_id)?;
-        prepare_registration(&key.secret_bytes(), &assignment)
+        prepare_registration(&key.secret_bytes(), &assignment, payout_policy)
             .await
             .map_err(|e| WalletError::Keymeld(e.to_string()))
     }

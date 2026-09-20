@@ -137,23 +137,27 @@ class Payouts {
   }
 
   /**
-   * One-click payout to the Lightning Address on the account. Like the
-   * pasted-invoice path this hands the entry key and payout preimage to the
-   * coordinator before it pays.
+   * One-click payout to the Lightning Address on the account. An entry whose
+   * payout preimage is escrowed in the Keymeld enclave (it sealed a payout
+   * policy) sends only its ticket: the coordinator pays first and buys the
+   * preimage from the enclave with the settled payment. Other entries hand
+   * the entry key and payout preimage over before the payment, like the
+   * pasted-invoice path.
    */
   async claimPayout(competitionId, entry) {
-    const release = window.dlcWallet.payoutRelease(
-      entry.id,
-      entry.ephemeral_pubkey,
-    );
+    const claim = { ticket_id: entry.ticket_id };
+    if (!entry.payout_policy) {
+      const release = window.dlcWallet.payoutRelease(
+        entry.id,
+        entry.ephemeral_pubkey,
+      );
+      claim.payout_preimage = release.payout_preimage;
+      claim.ephemeral_private_key = release.ephemeral_private_key;
+    }
 
     const response = await this.client.post(
       `${this.coordinator_url}/api/v1/competitions/${competitionId}/entries/${entry.id}/claim`,
-      {
-        ticket_id: entry.ticket_id,
-        payout_preimage: release.payout_preimage,
-        ephemeral_private_key: release.ephemeral_private_key,
-      },
+      claim,
     );
     return response.json();
   }

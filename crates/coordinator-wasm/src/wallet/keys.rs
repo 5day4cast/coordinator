@@ -1,13 +1,16 @@
 //! Wallet key material.
 //!
-//! The wallet is a 32-byte seed. Every entry key and payout preimage is a
-//! BIP-340 style tagged hash of (seed, network, entry id), so keys are bound to
-//! one entry, never reused, and recoverable from the seed and the entry id
-//! the server stores. Nothing here is `Clone`, `Debug` or `Serialize`;
+//! The wallet is a 32-byte seed. Every entry key is a BIP-340 style tagged
+//! hash of (seed, network, entry id), so keys are bound to one entry, never
+//! reused, and recoverable from the seed and the entry id the server stores.
+//! The payout preimage is Keymeld's `derive_payout_preimage(entry key)`, so
+//! the enclave holding the key can release the same value (see
+//! `docs/PAYOUT_ESCROW.md`). Nothing here is `Clone`, `Debug` or `Serialize`;
 //! buffers are erased on drop. `SecretKey` and `Scalar` are `Copy`, so
 //! library-internal stack copies are outside our control.
 
 use super::WalletError;
+use coordinator_core::derive_payout_preimage;
 use dlctix::{
     bitcoin::{
         secp256k1::{ecdsa::Signature, All, Message, PublicKey, Secp256k1, SecretKey},
@@ -24,7 +27,6 @@ const SEED_LEN: usize = 32;
 /// Versioned plaintext of the encrypted seed backup.
 const BACKUP_PREFIX: &str = "coordinator-wallet-v1:";
 const ENTRY_KEY_TAG: &[u8] = b"coordinator/entry-key/v1";
-const PAYOUT_PREIMAGE_TAG: &[u8] = b"coordinator/payout-preimage/v1";
 
 pub struct WalletSeed(Zeroizing<[u8; SEED_LEN]>);
 
@@ -62,7 +64,7 @@ impl WalletSeed {
         Ok(EntryKey {
             pubkey: secret.public_key(secp),
             secret,
-            payout_preimage: self.derive(PAYOUT_PREIMAGE_TAG, network, entry_id),
+            payout_preimage: Zeroizing::new(derive_payout_preimage(&bytes)),
         })
     }
 
@@ -157,11 +159,13 @@ mod tests {
     }
 
     #[test]
-    fn payout_preimage_is_independent_of_entry_secret() {
+    fn payout_preimage_is_the_enclave_derivation_of_the_entry_key() {
         let key = entry(&WalletSeed::generate(), Network::Signet, Uuid::now_v7());
-        let secret_hash: [u8; 32] = Sha256::digest(&key.secret_bytes()[..]).into();
-
-        assert_ne!(*key.payout_preimage, secret_hash);
+        assert_eq!(
+            *key.payout_preimage,
+            derive_payout_preimage(&key.secret_bytes())
+        );
+        assert_ne!(&key.payout_preimage[..], &key.secret_bytes()[..]);
         assert_eq!(
             key.payout_hash(),
             <[u8; 32]>::from(Sha256::digest(&key.payout_preimage[..]))

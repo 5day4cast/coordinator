@@ -1,9 +1,9 @@
 use super::{
-    parse_invoice, states::CompetitionStatus, store::ReservedTicket, verify_entry_key,
-    verify_payout_preimage, winner_payout_sats, AddEntry, CompetitionError, CompetitionState,
-    CompetitionStore, FundedContract, KeymeldSigningInfo, PayoutClaimInfo, PayoutClaimReceipt,
-    PayoutError, PayoutInfo, PayoutRejection, SearchBy, Ticket, TicketStatus, UserEntry,
-    UserEntryView,
+    decode_32_bytes, parse_invoice, states::CompetitionStatus, store::ReservedTicket,
+    verify_entry_key, verify_payout_preimage, winner_payout_sats, AddEntry, CompetitionError,
+    CompetitionState, CompetitionStore, EntryPayout, FundedContract, KeymeldSigningInfo, NewPayout,
+    PayoutClaimInfo, PayoutClaimReceipt, PayoutError, PayoutInfo, PayoutRejection, SearchBy,
+    Ticket, TicketStatus, UserEntry, UserEntryView,
 };
 use crate::{
     api::routes::FinalSignatures,
@@ -50,6 +50,7 @@ use futures::TryFutureExt;
 use itertools::Itertools;
 use keymeld_sdk::prelude::UserId;
 use keymeld_sdk::types::{RegistrationContext, SignedRoster};
+use keymeld_sdk::{payout::ContractCommitment, PayoutProof};
 use log::{debug, error, info, warn};
 use nostr_sdk::{nips::nip44, Keys, PublicKey as NostrPublicKey, SecretKey};
 use rand::SeedableRng;
@@ -1523,6 +1524,7 @@ impl Coordinator {
                     context: entry.keymeld_registration_context.clone().ok_or_else(|| {
                         anyhow!("Entry {} is missing its registration context", entry.id)
                     })?,
+                    payout_policy: entry.payout_policy.clone(),
                 };
                 self.keymeld
                     .register_participant(&keygen_session, user_id.clone(), &registration_data)
@@ -1706,7 +1708,7 @@ impl Coordinator {
                 .await?;
 
             // Call keymeld to perform batch signing
-            let dlc_signatures = self
+            let signing = self
                 .keymeld
                 .sign_dlc_batch(
                     &keygen_session,
@@ -1716,6 +1718,7 @@ impl Coordinator {
                 )
                 .await
                 .map_err(|e| anyhow!("Keymeld signing failed: {}", e))?;
+            let dlc_signatures = signing.signatures;
 
             info!(
                 "Keymeld signing completed for competition {} with {} outcome signatures and {} split signatures",
@@ -1741,6 +1744,12 @@ impl Coordinator {
             if competition.signed_contract.is_none() {
                 competition.signed_contract = Some(signed_contract);
                 competition.signed_at = Some(OffsetDateTime::now_utc());
+            }
+            // Payout claims must present the batch exactly as authorized.
+            if let Some(receipt) = signing.receipt {
+                self.competition_store
+                    .store_signing_receipt(competition.id, &receipt)
+                    .await?;
             }
         } else {
             // Traditional MuSig2 flow
@@ -2229,10 +2238,16 @@ impl Coordinator {
             })
             .filter(|(_, entry)| {
                 entry.paid_out_at.is_some()
-                    && entry.ephemeral_privatekey.is_some()
+                    && (entry.ephemeral_privatekey.is_some() || entry.payout_preimage.is_some())
                     && entry.sellback_broadcasted_at.is_none()
             })
             .collect();
+        // The unified key-path close needs every winner's key; escrowed
+        // payouts only ever yield the preimage, so they take the split path.
+        let all_winners_closable = paid_winners.len() == winners.len()
+            && paid_winners
+                .iter()
+                .all(|(_, entry)| entry.ephemeral_privatekey.is_some());
 
         info!(
             "Competition {} delta check: outcome={:?}, winners={}, paid_winners={}, entries={}",
@@ -2307,7 +2322,7 @@ impl Coordinator {
             }
         }
 
-        if paid_winners.len() == winners.len() {
+        if all_winners_closable {
             info!(
                 "Competition {} taking UNIFIED CLOSE path: all {} winners paid",
                 competition.id,
@@ -2503,30 +2518,57 @@ impl Coordinator {
                     player_index,
                 };
 
-                let (close_tx_input, close_tx_prevout) =
-                    signed_contract.split_close_tx_input_and_prevout(&win_condition)?;
-
-                let mut close_tx = simple_sweep_tx(
-                    signed_contract.params().market_maker.pubkey,
-                    close_tx_input.clone(),
-                    signed_contract.close_tx_input_weight(),
-                    close_tx_prevout.value,
-                    fee_rate,
-                );
-
-                let winner_seckey = Scalar::from_hex(entry.ephemeral_privatekey.as_ref().unwrap())
-                    .map_err(|e| anyhow!("Invalid winner secret key: {}", e))?;
-
-                let input_index = close_tx_input.previous_output.vout as usize;
-
-                signed_contract.sign_split_close_tx_input(
-                    &win_condition,
-                    &mut close_tx,
-                    input_index,
-                    &Prevouts::All(&[close_tx_prevout]),
-                    self.private_key,
-                    winner_seckey,
-                )?;
+                // The sweep has a single input, so it is always input 0.
+                let close_tx = if let Some(winner_key) = entry.ephemeral_privatekey.as_ref() {
+                    let (close_tx_input, close_tx_prevout) =
+                        signed_contract.split_close_tx_input_and_prevout(&win_condition)?;
+                    let mut close_tx = simple_sweep_tx(
+                        signed_contract.params().market_maker.pubkey,
+                        close_tx_input,
+                        signed_contract.close_tx_input_weight(),
+                        close_tx_prevout.value,
+                        fee_rate,
+                    );
+                    let winner_seckey = Scalar::from_hex(winner_key)
+                        .map_err(|e| anyhow!("Invalid winner secret key: {}", e))?;
+                    signed_contract.sign_split_close_tx_input(
+                        &win_condition,
+                        &mut close_tx,
+                        0,
+                        &Prevouts::All(&[close_tx_prevout]),
+                        self.private_key,
+                        winner_seckey,
+                    )?;
+                    close_tx
+                } else {
+                    // Escrowed payout: the enclave released only the preimage, so
+                    // the sellback leaf (market maker key + payout preimage) sweeps.
+                    let preimage_hex = entry.payout_preimage.as_ref().ok_or_else(|| {
+                        anyhow!("Paid winner {} has neither key nor preimage", entry.id)
+                    })?;
+                    let payout_preimage = dlctix::hashlock::preimage_from_hex(preimage_hex)
+                        .map_err(|e| {
+                            anyhow!("Invalid payout preimage for entry {}: {e}", entry.id)
+                        })?;
+                    let (sellback_tx_input, sellback_prevout) =
+                        signed_contract.split_sellback_tx_input_and_prevout(&win_condition)?;
+                    let mut sellback_tx = simple_sweep_tx(
+                        signed_contract.params().market_maker.pubkey,
+                        sellback_tx_input,
+                        signed_contract.split_sellback_tx_input_weight(),
+                        sellback_prevout.value,
+                        fee_rate,
+                    );
+                    signed_contract.sign_split_sellback_tx_input(
+                        &win_condition,
+                        &mut sellback_tx,
+                        0,
+                        &Prevouts::All(&[sellback_prevout]),
+                        payout_preimage,
+                        self.private_key,
+                    )?;
+                    sellback_tx
+                };
 
                 self.bitcoin.broadcast(&close_tx).await?;
                 info!(
@@ -3335,6 +3377,7 @@ impl Coordinator {
                 context: entry.keymeld_registration_context.clone().ok_or_else(|| {
                     Error::BadRequest("Missing Keymeld registration context".into())
                 })?,
+                payout_policy: entry.payout_policy.clone(),
             };
             session
                 .validate_registration(&UserId::from(ticket.id), &data)
@@ -3708,18 +3751,15 @@ impl Coordinator {
     }
 
     /// The checks every payout path shares: the caller owns the entry, the
-    /// competition is attested and still open for sellbacks, the entry won,
-    /// and the key and preimage handed over are the entry's own. Returns the
-    /// winnings in sats.
-    async fn verify_payout_release(
+    /// competition is attested and still open for sellbacks, and the entry
+    /// won. Returns the entry and the winnings in sats.
+    async fn verify_payout_eligibility(
         &self,
         pubkey: &str,
         competition_id: Uuid,
         entry_id: Uuid,
         ticket_id: Uuid,
-        ephemeral_private_key: &str,
-        payout_preimage: &str,
-    ) -> Result<u64, Error> {
+    ) -> Result<(UserEntry, u64), Error> {
         let competition = self
             .competition_store
             .get_competition(competition_id)
@@ -3772,17 +3812,29 @@ impl Coordinator {
             .ok_or_else(|| Error::BadRequest("Competition contract not yet signed".into()))?;
         let ephemeral_pubkey = Point::from_hex(&entry.ephemeral_pubkey)
             .map_err(|e| Error::BadRequest(format!("Invalid ephemeral pubkey: {}", e)))?;
-        let rejected = |e: PayoutRejection| Error::BadRequest(e.to_string());
         let payout_amount_sats =
             winner_payout_sats(signed_contract.params(), &outcome, &ephemeral_pubkey)
-                .map_err(rejected)?;
-        verify_entry_key(ephemeral_private_key, &ephemeral_pubkey).map_err(rejected)?;
-        verify_payout_preimage(payout_preimage, &entry.payout_hash).map_err(rejected)?;
+                .map_err(|e| Error::BadRequest(e.to_string()))?;
         debug!(
             "Entry {} wins {} sats for outcome {:?}",
             entry.id, payout_amount_sats, outcome
         );
-        Ok(payout_amount_sats)
+        Ok((entry.clone(), payout_amount_sats))
+    }
+
+    /// The trusted sellback: the key and preimage handed over must be the
+    /// entry's own.
+    fn verify_sold_secrets(
+        entry: &UserEntry,
+        ephemeral_private_key: &str,
+        payout_preimage: &str,
+    ) -> Result<(), Error> {
+        let ephemeral_pubkey = Point::from_hex(&entry.ephemeral_pubkey)
+            .map_err(|e| Error::BadRequest(format!("Invalid ephemeral pubkey: {}", e)))?;
+        let rejected = |e: PayoutRejection| Error::BadRequest(e.to_string());
+        verify_entry_key(ephemeral_private_key, &ephemeral_pubkey).map_err(rejected)?;
+        verify_payout_preimage(payout_preimage, &entry.payout_hash).map_err(rejected)?;
+        Ok(())
     }
 
     /// Pay a winner the invoice they pasted. The key and preimage arrive
@@ -3797,16 +3849,14 @@ impl Coordinator {
     ) -> Result<(), Error> {
         let invoice =
             parse_invoice(&payout_info.ln_invoice).map_err(|e| Error::BadRequest(e.to_string()))?;
-        let payout_amount_sats = self
-            .verify_payout_release(
-                &pubkey,
-                competition_id,
-                entry_id,
-                payout_info.ticket_id,
-                &payout_info.ephemeral_private_key,
-                &payout_info.payout_preimage,
-            )
+        let (entry, payout_amount_sats) = self
+            .verify_payout_eligibility(&pubkey, competition_id, entry_id, payout_info.ticket_id)
             .await?;
+        Self::verify_sold_secrets(
+            &entry,
+            &payout_info.ephemeral_private_key,
+            &payout_info.payout_preimage,
+        )?;
         // An amountless invoice is paid the winnings; a stated amount must be
         // exactly the winnings.
         if let Some(invoice_msat) = invoice.amount_milli_satoshis() {
@@ -3818,45 +3868,89 @@ impl Coordinator {
                 )));
             }
         }
-        self.pay_payout(
+        self.pay_payout(NewPayout {
             entry_id,
-            payout_info.payout_preimage,
-            payout_info.ephemeral_private_key,
-            payout_info.ln_invoice,
+            ln_invoice: payout_info.ln_invoice,
             payout_amount_sats,
-        )
+            sold_payout_preimage: Some(payout_info.payout_preimage),
+            sold_entry_key: Some(payout_info.ephemeral_private_key),
+            lightning_address: None,
+            lnurl_metadata: None,
+        })
         .await?;
         Ok(())
     }
 
-    /// One-click payout to the account's Lightning Address: resolve it, fetch
-    /// an invoice for exactly the winnings, and pay it. Not atomic, like the
-    /// pasted-invoice path; the enclave-escrowed preimage release is the
-    /// planned fix.
+    /// One-click payout to a Lightning Address. An entry whose payout
+    /// preimage is escrowed in the enclave (a sealed `payout_policy`) is paid
+    /// at the sealed address first; the preimage is bought from the enclave
+    /// once the payment settles (`release_escrowed_payout`). Other entries
+    /// hand over their key and preimage with the claim and are paid at the
+    /// account's current address, trusting the coordinator like a pasted
+    /// invoice.
     pub async fn claim_ticket_payout(
         &self,
         pubkey: String,
         competition_id: Uuid,
         entry_id: Uuid,
         claim: PayoutClaimInfo,
-        address: &LightningAddress,
+        account_address: &LightningAddress,
     ) -> Result<PayoutClaimReceipt, Error> {
-        let payout_amount_sats = self
-            .verify_payout_release(
-                &pubkey,
-                competition_id,
-                entry_id,
-                claim.ticket_id,
-                &claim.ephemeral_private_key,
-                &claim.payout_preimage,
-            )
+        let (entry, payout_amount_sats) = self
+            .verify_payout_eligibility(&pubkey, competition_id, entry_id, claim.ticket_id)
             .await?;
         let amount_msat = payout_amount_sats
             .checked_mul(1000)
             .ok_or_else(|| Error::BadRequest("Payout amount is out of range".into()))?;
+
+        let escrowed = match (&entry.payout_policy, &claim.payout_preimage) {
+            (Some(policy), None) => Some(policy.clone()),
+            (_, Some(_)) => None,
+            (None, None) => {
+                return Err(Error::BadRequest(
+                    "This entry's payout is not escrowed; claim with its key and preimage or an invoice"
+                        .into(),
+                ))
+            }
+        };
+        if escrowed.is_some()
+            && self
+                .competition_store
+                .get_signing_receipt(competition_id)
+                .await
+                .map_err(Error::from)?
+                .is_none()
+        {
+            return Err(Error::BadRequest(
+                "The contract's signing receipt is missing; claim with an invoice instead".into(),
+            ));
+        }
+        let (sold_payout_preimage, sold_entry_key) = match &escrowed {
+            Some(_) => (None, None),
+            None => {
+                let preimage = claim
+                    .payout_preimage
+                    .clone()
+                    .ok_or_else(|| Error::BadRequest("Missing payout preimage".into()))?;
+                let key = claim
+                    .ephemeral_private_key
+                    .clone()
+                    .ok_or_else(|| Error::BadRequest("Missing entry key".into()))?;
+                Self::verify_sold_secrets(&entry, &key, &preimage)?;
+                (Some(preimage), Some(key))
+            }
+        };
+
+        // The enclave honours only the sealed address; an address changed on
+        // the account since the entry cannot be paid through escrow.
+        let address = match &escrowed {
+            Some(policy) => LightningAddress::parse(&policy.lightning_address)
+                .map_err(|e| Error::BadRequest(format!("Sealed payout policy: {e}")))?,
+            None => account_address.clone(),
+        };
         let request = self
             .lnurl
-            .resolve(address)
+            .resolve(&address)
             .await
             .map_err(payout_unavailable)?;
         let invoice = self
@@ -3864,14 +3958,25 @@ impl Coordinator {
             .request_invoice(&request, amount_msat)
             .await
             .map_err(payout_unavailable)?;
+        if let Some(policy) = &escrowed {
+            let payee = hex::encode(invoice.recover_payee_pub_key().serialize());
+            if !payee.eq_ignore_ascii_case(policy.payee_node_id.trim()) {
+                return Err(Error::BadRequest(
+                    "The provider's node changed since the entry was sealed; claim with an invoice instead"
+                        .into(),
+                ));
+            }
+        }
         let payout_id = self
-            .pay_payout(
+            .pay_payout(NewPayout {
                 entry_id,
-                claim.payout_preimage,
-                claim.ephemeral_private_key,
-                invoice.to_string(),
+                ln_invoice: invoice.to_string(),
                 payout_amount_sats,
-            )
+                sold_payout_preimage,
+                sold_entry_key,
+                lightning_address: Some(address.to_string()),
+                lnurl_metadata: Some(request.metadata().to_string()),
+            })
             .await?;
         Ok(PayoutClaimReceipt {
             payout_id,
@@ -3880,26 +3985,106 @@ impl Coordinator {
         })
     }
 
+    /// Buy the payout preimage of a settled escrow payout from the enclave.
+    /// The settled invoice, its LNURL metadata and the payment preimage are
+    /// the proof; the released preimage must open the entry's payout hash.
+    pub async fn release_escrowed_payout(&self, payout: &EntryPayout) -> Result<(), Error> {
+        let entry = self
+            .competition_store
+            .get_entry_by_id(payout.entry_id)
+            .await
+            .map_err(Error::from)?
+            .ok_or_else(|| Error::NotFound(format!("Entry {} not found", payout.entry_id)))?;
+        if entry.payout_preimage.is_some() {
+            return Ok(());
+        }
+        if entry.payout_policy.is_none() {
+            return Err(Error::BadRequest(
+                "Entry has no sealed payout policy".into(),
+            ));
+        }
+        let lnurl_metadata = payout
+            .lnurl_metadata
+            .clone()
+            .ok_or_else(|| Error::BadRequest("Payout has no LNURL metadata".into()))?;
+        let payment_preimage = payout
+            .payment_preimage
+            .as_deref()
+            .and_then(decode_32_bytes)
+            .ok_or_else(|| Error::BadRequest("Payout has no payment preimage".into()))?;
+
+        let competition = self
+            .competition_store
+            .get_competition(entry.event_id)
+            .await?;
+        let signed_contract = competition
+            .signed_contract
+            .as_ref()
+            .ok_or_else(|| Error::BadRequest("Competition contract not yet signed".into()))?;
+        let funding_outpoint = competition
+            .funding_outpoint
+            .ok_or_else(|| Error::BadRequest("Competition has no funding outpoint".into()))?;
+        let attestation = match competition.attestation {
+            Some(dlctix::secp::MaybeScalar::Valid(scalar)) => scalar.serialize(),
+            _ => return Err(Error::BadRequest("Competition is not attested".into())),
+        };
+        let receipt = self
+            .competition_store
+            .get_signing_receipt(competition.id)
+            .await
+            .map_err(Error::from)?
+            .ok_or_else(|| Error::BadRequest("Competition has no signing receipt".into()))?;
+        let stored = self
+            .competition_store
+            .get_keymeld_session(competition.id)
+            .await
+            .map_err(Error::from)?
+            .ok_or_else(|| Error::BadRequest("Competition has no Keymeld session".into()))?;
+        let session = self.restore_keymeld_session(&stored)?;
+
+        let released = self
+            .keymeld
+            .release_payout_preimage(
+                &session,
+                &receipt,
+                UserId::from(entry.ticket_id),
+                &ContractCommitment {
+                    contract_parameters: signed_contract.params().clone(),
+                    funding_outpoint,
+                },
+                attestation,
+                PayoutProof {
+                    invoice: payout.payout_payment_request.clone(),
+                    lnurl_metadata,
+                    payment_preimage,
+                },
+            )
+            .await
+            .map_err(|e| Error::Bitcoin(anyhow!("Payout preimage release failed: {e}")))?;
+        let released_hex = hex::encode(released);
+        verify_payout_preimage(&released_hex, &entry.payout_hash)
+            .map_err(|e| Error::Bitcoin(anyhow!("Enclave released a wrong preimage: {e}")))?;
+        self.competition_store
+            .set_entry_payout_preimage(entry.id, released_hex)
+            .await
+            .map_err(Error::from)?;
+        info!(
+            "Payout preimage released for entry {} (payout {})",
+            entry.id, payout.id
+        );
+        Ok(())
+    }
+
     /// Record the pending payout, then send the payment. The database allows
     /// one live payout per entry, so a concurrent or repeated request cannot
     /// pay twice; the PayoutWatcher marks it paid once the payment settles.
-    async fn pay_payout(
-        &self,
-        entry_id: Uuid,
-        payout_preimage: String,
-        ephemeral_private_key: String,
-        ln_invoice: String,
-        payout_amount_sats: u64,
-    ) -> Result<Uuid, Error> {
+    async fn pay_payout(&self, payout: NewPayout) -> Result<Uuid, Error> {
+        let entry_id = payout.entry_id;
+        let ln_invoice = payout.ln_invoice.clone();
+        let payout_amount_sats = payout.payout_amount_sats;
         let payout_id = self
             .competition_store
-            .store_payout_info_pending(
-                entry_id,
-                payout_preimage,
-                ephemeral_private_key,
-                ln_invoice.clone(),
-                payout_amount_sats,
-            )
+            .store_payout_info_pending(payout)
             .await
             .map_err(|e| match e {
                 DatabaseWriteError::Sqlx(sqlx::Error::Database(db)) if db.is_unique_violation() => {

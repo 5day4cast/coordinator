@@ -19,6 +19,7 @@ use dlctix::{
     ContractParameters, EventLockingConditions, Outcome, SigMap, SignedContract,
 };
 use keymeld_sdk::types::{RegistrationContext, SignedSessionManifest};
+use keymeld_sdk::PayoutPolicy;
 use log::{debug, error};
 pub use payout::*;
 use serde::{Deserialize, Serialize};
@@ -56,6 +57,10 @@ pub struct AddEntry {
     /// Exact context bound to the participant possession proof.
     #[serde(default)]
     pub keymeld_registration_context: Option<RegistrationContext>,
+    /// The payout policy sealed in the envelope, in the clear, so the
+    /// coordinator can require the enclave to hold exactly this one.
+    #[serde(default)]
+    pub payout_policy: Option<PayoutPolicy>,
 }
 
 pub enum EntryStatus {
@@ -75,6 +80,10 @@ pub struct EntryPayout {
     pub payout_amount_sats: u64,
     /// Preimage returned by the settled payment: proof the invoice was paid.
     pub payment_preimage: Option<String>,
+    /// The Lightning Address the invoice was fetched for, if any.
+    pub lightning_address: Option<String>,
+    /// LNURL metadata the invoice commits to (LUD-06), if any.
+    pub lnurl_metadata: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     /// Time at which the payout initiated to the user
     pub initiated_at: OffsetDateTime,
@@ -118,6 +127,8 @@ impl FromRow<'_, SqliteRow> for EntryPayout {
             payout_payment_request: row.try_get("payout_payment_request")?,
             payout_amount_sats: parse_required_u64(row, "payout_amount_sats")?,
             payment_preimage: row.try_get("payment_preimage")?,
+            lightning_address: row.try_get("lightning_address")?,
+            lnurl_metadata: row.try_get("lnurl_metadata")?,
             initiated_at: parse_required_datetime(row, "initiated_at")?,
             succeed_at,
             failed_at,
@@ -175,6 +186,10 @@ pub struct UserEntry {
     /// Exact context bound to the participant possession proof.
     #[serde(default)]
     pub keymeld_registration_context: Option<RegistrationContext>,
+    /// Sealed in the Keymeld envelope and verified there at registration;
+    /// `Some` means the payout preimage is escrowed in the enclave.
+    #[serde(default)]
+    pub payout_policy: Option<PayoutPolicy>,
     pub public_nonces: Option<SigMap<PubNonce>>,
     /// User signed funding psbt
     pub funding_psbt_base64: Option<String>,
@@ -243,6 +258,15 @@ impl FromRow<'_, SqliteRow> for UserEntry {
                 .map(|json| {
                     serde_json::from_str(&json).map_err(|error| sqlx::Error::ColumnDecode {
                         index: "keymeld_registration_context".into(),
+                        source: Box::new(error),
+                    })
+                })
+                .transpose()?,
+            payout_policy: row
+                .try_get::<Option<String>, _>("payout_policy")?
+                .map(|json| {
+                    serde_json::from_str(&json).map_err(|error| sqlx::Error::ColumnDecode {
+                        index: "payout_policy".into(),
                         source: Box::new(error),
                     })
                 })
@@ -320,6 +344,7 @@ impl AddEntry {
             encrypted_keymeld_private_key: self.encrypted_keymeld_private_key,
             keymeld_auth_pubkey: self.keymeld_auth_pubkey,
             keymeld_registration_context: self.keymeld_registration_context,
+            payout_policy: self.payout_policy,
             paid_at: None,
             sellback_broadcasted_at: None,
             reclaimed_broadcasted_at: None,
@@ -365,15 +390,34 @@ impl std::fmt::Debug for PayoutInfo {
     }
 }
 
-/// One-click payout body: the entry's key and payout preimage, paid to the
-/// account's Lightning Address. The same trust as `PayoutInfo`, minus the
-/// invoice, which the coordinator fetches from the address itself.
+/// One-click payout to the account's Lightning Address. Entries whose
+/// payout preimage is escrowed in the Keymeld enclave send only the ticket:
+/// the coordinator pays first and buys the preimage from the enclave with
+/// the settled payment. Other entries hand over the key and preimage with
+/// the request, the same trust as `PayoutInfo` minus the invoice.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PayoutClaimInfo {
     pub ticket_id: Uuid,
-    pub payout_preimage: String,
-    pub ephemeral_private_key: String,
+    #[serde(default)]
+    pub payout_preimage: Option<String>,
+    #[serde(default)]
+    pub ephemeral_private_key: Option<String>,
+}
+
+/// A payout to record before paying it.
+pub struct NewPayout {
+    pub entry_id: Uuid,
+    pub ln_invoice: String,
+    pub payout_amount_sats: u64,
+    /// Sold with the claim (trusted flow); `None` when the preimage is
+    /// escrowed and bought from the enclave after settlement.
+    pub sold_payout_preimage: Option<String>,
+    pub sold_entry_key: Option<String>,
+    /// Where the payment went and the LNURL metadata the invoice commits to,
+    /// kept as the proof of payment the enclave will verify.
+    pub lightning_address: Option<String>,
+    pub lnurl_metadata: Option<String>,
 }
 
 impl std::fmt::Debug for PayoutClaimInfo {

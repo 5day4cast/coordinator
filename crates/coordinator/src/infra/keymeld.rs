@@ -16,6 +16,7 @@ use keymeld_sdk::{
     },
     PollingConfig,
 };
+use keymeld_sdk::{payout::ContractCommitment, types::SigningReceipt, PayoutPolicy, PayoutProof};
 use log::{debug, error, info};
 use nostr_sdk::{nips::nip44, Keys};
 use serde::{Deserialize, Serialize};
@@ -61,6 +62,16 @@ pub struct ParticipantRegistrationData {
     /// This is derived client-side using: derive_session_auth_pubkey(session_id)
     pub auth_pubkey: String,
     pub context: RegistrationContext,
+    /// The payout policy the coordinator expects sealed in the envelope; the
+    /// enclave refuses the registration if the envelope holds another.
+    pub payout_policy: Option<PayoutPolicy>,
+}
+
+/// What a Keymeld signing session leaves behind: the aggregated signatures
+/// and, for payout claims, the batch exactly as the enclaves authorized it.
+pub struct DlcSigningOutcome {
+    pub signatures: DlcSignatureResults,
+    pub receipt: Option<SigningReceipt>,
 }
 
 /// Pre-computed DLC subset definitions for keygen session creation.
@@ -120,7 +131,20 @@ pub trait Keymeld: Send + Sync {
         signing_data: &SigningData,
         contract_params: &ContractParameters,
         player_user_ids: Vec<UserId>,
-    ) -> Result<DlcSignatureResults, KeymeldError>;
+    ) -> Result<DlcSigningOutcome, KeymeldError>;
+
+    /// Buy a paid winner's payout preimage from the enclave holding their
+    /// entry key, with proof of the Lightning payment. See
+    /// docs/PAYOUT_ESCROW.md.
+    async fn release_payout_preimage(
+        &self,
+        keygen_session: &DlcKeygenSession,
+        receipt: &SigningReceipt,
+        user_id: UserId,
+        contract: &ContractCommitment,
+        attestation: [u8; 32],
+        proof: PayoutProof,
+    ) -> Result<[u8; 32], KeymeldError>;
 
     /// Check if Keymeld is enabled
     fn is_enabled(&self) -> bool;
@@ -569,7 +593,7 @@ impl Keymeld for KeymeldService {
         signing_data: &SigningData,
         _contract_params: &ContractParameters,
         _player_user_ids: Vec<UserId>,
-    ) -> Result<DlcSignatureResults, KeymeldError> {
+    ) -> Result<DlcSigningOutcome, KeymeldError> {
         let client = self.get_client()?;
 
         info!(
@@ -645,7 +669,36 @@ impl Keymeld for KeymeldService {
             dlc_signatures.split_signatures.len()
         );
 
-        Ok(dlc_signatures)
+        Ok(DlcSigningOutcome {
+            signatures: dlc_signatures,
+            receipt: signing_session.receipt(),
+        })
+    }
+
+    async fn release_payout_preimage(
+        &self,
+        keygen_session: &DlcKeygenSession,
+        receipt: &SigningReceipt,
+        user_id: UserId,
+        contract: &ContractCommitment,
+        attestation: [u8; 32],
+        proof: PayoutProof,
+    ) -> Result<[u8; 32], KeymeldError> {
+        let client = self.get_client()?;
+        let credentials = SessionCredentials::from_session_secret(&keygen_session.session_secret)?;
+        let restored_keygen = client
+            .keygen()
+            .restore_session_with_authority(
+                keygen_session.session_id.clone(),
+                credentials,
+                keygen_session.authorization_manifest.clone(),
+                keygen_session.signing_authority.clone(),
+            )
+            .await?;
+        keygen_session.verify_restored_recipients(&restored_keygen)?;
+        Ok(restored_keygen
+            .release_payout_preimage(receipt, user_id, contract, attestation, proof)
+            .await?)
     }
 
     async fn get_keygen_status(
@@ -748,6 +801,7 @@ impl Keymeld for KeymeldService {
             enclave_key_epoch: data.context.enclave_key_epoch,
             require_signing_approval: false,
             auth_pubkey: data.context.auth_pubkey.clone(),
+            payout_policy: data.payout_policy.clone(),
         };
         for attempt in 0..3 {
             let signature = credentials.sign_session_request(&session.session_id.to_string())?;
@@ -1032,6 +1086,7 @@ mod tests {
             public_key: hex::encode(&context.public_key),
             auth_pubkey: hex::encode(&context.auth_pubkey),
             context,
+            payout_policy: None,
         };
         session.validate_registration(&user, &data).unwrap();
         assert!(session
@@ -1259,6 +1314,7 @@ mod tests {
             public_key: hex::encode(&context.public_key),
             auth_pubkey: hex::encode(&context.auth_pubkey),
             context,
+            payout_policy: None,
         };
         let result = tokio::time::timeout(
             Duration::from_secs(5),

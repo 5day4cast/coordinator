@@ -20,10 +20,11 @@ name = "coordinator"
 # Internal crates
 coordinator-core = { path = "crates/coordinator-core" }
 
-# Keymeld: v0.4.1 is the first release on the published dlctix crate.
+# Keymeld: v0.4.1 plus the payout-preimage escrow (tee8z/keymeld PR #56,
+# branch feat/payout-escrow). Move to the next tag once it is cut.
 # keymeld-sdk and the coordinator must resolve dlctix from the same source.
-keymeld-sdk = { git = "https://github.com/tee8z/keymeld", tag = "v0.4.1", default-features = false }
-keymeld-core = { git = "https://github.com/tee8z/keymeld", tag = "v0.4.1", default-features = false }
+keymeld-sdk = { git = "https://github.com/tee8z/keymeld", rev = "a299904773366b3646ebca5fd7f830e96032f3be", default-features = false }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "a299904773366b3646ebca5fd7f830e96032f3be", default-features = false }
 
 # Bitcoin
 bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }

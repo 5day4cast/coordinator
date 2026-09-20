@@ -118,16 +118,15 @@ that module, and the pins it was built from are in the tagged source.
 
 ## Known gaps
 
-- **The sellback is not atomic.** The payout preimage and entry key are sent
-  before the Lightning payout is made, both for a pasted invoice
-  (`PayoutInfo`) and for the one-click claim to the account's Lightning
-  Address (`PayoutClaimInfo`). Every account registers a Lightning Address;
-  the coordinator resolves it over LNURL-pay with an HTTPS-only,
-  redirect-free, public-hosts-only client (`infra/lnurl.rs`) and pays an
-  invoice for exactly the winnings. The planned fix keeps the address but
-  escrows the payout preimage in the Keymeld enclave, which releases it only
-  against the settled invoice's preimage and the LNURL metadata hash. Until
-  then, the database allows one live payout per entry, and the payout row is
+- **The sellback is atomic only for escrowed entries.** An entry that sealed
+  a payout policy in its Keymeld registration never reveals its key or
+  preimage: the coordinator pays the sealed Lightning Address and the enclave
+  releases the payout preimage against the settled invoice (see
+  `docs/PAYOUT_ESCROW.md`). Entries without a sealed policy (no Lightning
+  Address, or a provider the browser could not reach) still send the payout
+  preimage and entry key before the payment, for a pasted invoice
+  (`PayoutInfo`) or the one-click claim (`PayoutClaimInfo`). In both cases
+  the database allows one live payout per entry, and the payout row is
   written before the payment is sent.
 - **Sold payout secrets are stored in plaintext.** After a sellback the
   coordinator keeps the entry key and preimage it bought, unencrypted, to sign

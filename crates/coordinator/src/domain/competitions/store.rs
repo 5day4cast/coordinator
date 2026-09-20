@@ -1,4 +1,5 @@
 use dlctix::{bitcoin::XOnlyPublicKey, hashlock, musig2::PubNonce, SigMap};
+use keymeld_sdk::types::SigningReceipt;
 use log::debug;
 use sqlx::{Execute, Sqlite};
 use std::collections::HashMap;
@@ -14,7 +15,7 @@ use crate::{
     },
 };
 
-use super::{Competition, EntryStatus, SearchBy, Ticket, UserEntry};
+use super::{Competition, EntryStatus, NewPayout, SearchBy, Ticket, UserEntry};
 
 /// A ticket reserved for a caller. When a stale reservation was taken over,
 /// the ticket has already been given a fresh preimage and hash, and
@@ -97,6 +98,12 @@ impl CompetitionStore {
             .map(serde_json::to_string)
             .transpose()
             .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
+        let payout_policy = entry
+            .payout_policy
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
 
         self.db_connection
             .execute_write(move |pool| async move {
@@ -111,8 +118,9 @@ impl CompetitionStore {
                         entry_submission,
                         encrypted_keymeld_private_key,
                         keymeld_auth_pubkey,
-                        keymeld_registration_context
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        keymeld_registration_context,
+                        payout_policy
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(entry_id)
                 .bind(ticket_id_str)
@@ -124,6 +132,7 @@ impl CompetitionStore {
                 .bind(encrypted_keymeld_private_key)
                 .bind(keymeld_auth_pubkey)
                 .bind(keymeld_registration_context)
+                .bind(payout_policy)
                 .execute(&pool)
                 .await?;
                 Ok(())
@@ -272,12 +281,17 @@ impl CompetitionStore {
 
     pub async fn store_payout_info_pending(
         &self,
-        entry_id: Uuid,
-        payout_preimage: String,
-        ephemeral_private_key: String,
-        ln_invoice: String,
-        payout_amount_sats: u64,
+        payout: NewPayout,
     ) -> Result<Uuid, DatabaseWriteError> {
+        let NewPayout {
+            entry_id,
+            ln_invoice,
+            payout_amount_sats,
+            sold_payout_preimage,
+            sold_entry_key,
+            lightning_address,
+            lnurl_metadata,
+        } = payout;
         let payout_id = Uuid::now_v7();
         let initiated_at = OffsetDateTime::now_utc();
         let entry_id_str = entry_id.to_string();
@@ -299,8 +313,10 @@ impl CompetitionStore {
                         initiated_at,
                         succeed_at,
                         failed_at,
-                        error
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        error,
+                        lightning_address,
+                        lnurl_metadata
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(&payout_id_str)
                 .bind(&entry_id_str)
@@ -310,20 +326,26 @@ impl CompetitionStore {
                 .bind(None::<String>) // succeed_at
                 .bind(None::<String>) // failed_at
                 .bind(None::<String>)
+                .bind(&lightning_address)
+                .bind(&lnurl_metadata)
                 .execute(&mut *tx)
                 .await?;
 
-                sqlx::query(
-                    "UPDATE entries
-                    SET payout_preimage = ?,
-                        ephemeral_privatekey = ?
-                    WHERE id = ?",
-                )
-                .bind(&payout_preimage)
-                .bind(&ephemeral_private_key)
-                .bind(&entry_id_str)
-                .execute(&mut *tx)
-                .await?;
+                if let (Some(payout_preimage), Some(entry_key)) =
+                    (&sold_payout_preimage, &sold_entry_key)
+                {
+                    sqlx::query(
+                        "UPDATE entries
+                        SET payout_preimage = ?,
+                            ephemeral_privatekey = ?
+                        WHERE id = ?",
+                    )
+                    .bind(payout_preimage)
+                    .bind(entry_key)
+                    .bind(&entry_id_str)
+                    .execute(&mut *tx)
+                    .await?;
+                }
 
                 tx.commit().await?;
                 Ok(payout_id)
@@ -403,7 +425,9 @@ impl CompetitionStore {
                 succeed_at,
                 failed_at,
                 error,
-                payment_preimage
+                payment_preimage,
+                lightning_address,
+                lnurl_metadata
             FROM payouts
             WHERE id = ?",
         )
@@ -423,7 +447,9 @@ impl CompetitionStore {
                 succeed_at,
                 failed_at,
                 error,
-                payment_preimage
+                payment_preimage,
+                lightning_address,
+                lnurl_metadata
             FROM payouts
             WHERE succeed_at IS NULL AND failed_at IS NULL
             ORDER BY initiated_at ASC",
@@ -468,7 +494,9 @@ impl CompetitionStore {
                 succeed_at,
                 failed_at,
                 error,
-                payment_preimage
+                payment_preimage,
+                lightning_address,
+                lnurl_metadata
             FROM payouts
             WHERE entry_id = ",
         );
@@ -529,6 +557,7 @@ impl CompetitionStore {
                 encrypted_keymeld_private_key,
                 keymeld_auth_pubkey,
                 keymeld_registration_context,
+                payout_policy,
                 public_nonces,
                 partial_signatures,
                 funding_psbt_base64,
@@ -596,6 +625,7 @@ impl CompetitionStore {
               encrypted_keymeld_private_key,
               keymeld_auth_pubkey,
               keymeld_registration_context,
+              payout_policy,
               public_nonces,
               partial_signatures,
               funding_psbt_base64,
@@ -1859,6 +1889,95 @@ impl CompetitionStore {
     }
 
     /// Store a Keymeld session for a competition
+    /// The authorized signing batch a later payout claim must present.
+    pub async fn store_signing_receipt(
+        &self,
+        competition_id: Uuid,
+        receipt: &SigningReceipt,
+    ) -> Result<(), DatabaseWriteError> {
+        let receipt_json =
+            serde_json::to_string(receipt).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let competition_id = competition_id.to_string();
+        self.db_connection
+            .execute_write(move |pool| async move {
+                sqlx::query("UPDATE competitions SET signing_receipt = ? WHERE id = ?")
+                    .bind(receipt_json)
+                    .bind(competition_id)
+                    .execute(&pool)
+                    .await?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn get_signing_receipt(
+        &self,
+        competition_id: Uuid,
+    ) -> Result<Option<SigningReceipt>, sqlx::Error> {
+        let receipt_json: Option<Option<String>> =
+            sqlx::query_scalar("SELECT signing_receipt FROM competitions WHERE id = ?")
+                .bind(competition_id.to_string())
+                .fetch_optional(self.db_connection.read())
+                .await?;
+        receipt_json
+            .flatten()
+            .map(|json| serde_json::from_str(&json).map_err(|e| sqlx::Error::Decode(Box::new(e))))
+            .transpose()
+    }
+
+    /// The payout preimage bought from the enclave for an escrowed payout.
+    pub async fn set_entry_payout_preimage(
+        &self,
+        entry_id: Uuid,
+        payout_preimage_hex: String,
+    ) -> Result<(), DatabaseWriteError> {
+        let entry_id = entry_id.to_string();
+        self.db_connection
+            .execute_write(move |pool| async move {
+                sqlx::query(
+                    "UPDATE entries
+                    SET payout_preimage = COALESCE(payout_preimage, ?)
+                    WHERE id = ?",
+                )
+                .bind(payout_preimage_hex)
+                .bind(entry_id)
+                .execute(&pool)
+                .await?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Settled escrow payouts whose entry does not hold its payout preimage
+    /// yet: paid to a Lightning Address with a known payment preimage, for an
+    /// entry with a sealed payout policy.
+    pub async fn get_payouts_awaiting_release(&self) -> Result<Vec<EntryPayout>, sqlx::Error> {
+        sqlx::query_as::<_, EntryPayout>(
+            "SELECT
+                p.id,
+                p.entry_id,
+                p.payout_payment_request,
+                p.payout_amount_sats,
+                p.initiated_at,
+                p.succeed_at,
+                p.failed_at,
+                p.error,
+                p.payment_preimage,
+                p.lightning_address,
+                p.lnurl_metadata
+            FROM payouts p
+            JOIN entries e ON e.id = p.entry_id
+            WHERE p.succeed_at IS NOT NULL
+              AND p.payment_preimage IS NOT NULL
+              AND p.lnurl_metadata IS NOT NULL
+              AND e.payout_policy IS NOT NULL
+              AND e.payout_preimage IS NULL
+            ORDER BY p.succeed_at ASC",
+        )
+        .fetch_all(self.db_connection.read())
+        .await
+    }
+
     pub async fn store_keymeld_session(
         &self,
         competition_id: Uuid,
@@ -1951,6 +2070,7 @@ impl CompetitionStore {
               encrypted_keymeld_private_key,
               keymeld_auth_pubkey,
               keymeld_registration_context,
+              payout_policy,
               public_nonces,
               partial_signatures,
               funding_psbt_base64,

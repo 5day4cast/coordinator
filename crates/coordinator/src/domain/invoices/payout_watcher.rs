@@ -48,6 +48,9 @@ impl PayoutWatcher {
                     error!("Payout handling error: {}", e);
                 }
             }
+            if let Err(e) = self.handle_escrow_releases().await {
+                error!("Payout release error: {}", e);
+            }
 
             tokio::select! {
                 _ = sleep(self.sync_interval) => continue,
@@ -58,6 +61,23 @@ impl PayoutWatcher {
             }
         }
 
+        Ok(())
+    }
+
+    /// Escrowed payouts: once a payment settled with its preimage, buy the
+    /// entry's payout preimage from the enclave. Retried every cycle until
+    /// the entry holds it.
+    async fn handle_escrow_releases(&self) -> Result<(), anyhow::Error> {
+        let awaiting = self
+            .coordinator
+            .competition_store
+            .get_payouts_awaiting_release()
+            .await?;
+        for payout in awaiting {
+            if let Err(e) = self.coordinator.release_escrowed_payout(&payout).await {
+                warn!("Payout {} preimage not released yet: {}", payout.id, e);
+            }
+        }
         Ok(())
     }
 

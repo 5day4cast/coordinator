@@ -247,8 +247,13 @@ class AuthManager {
         throw new Error("Login failed");
       }
 
-      const { encrypted_nsec, encrypted_bitcoin_private_key, network } =
-        await response.json();
+      const {
+        encrypted_nsec,
+        encrypted_bitcoin_private_key,
+        network,
+        lightning_address,
+      } = await response.json();
+      window.currentUser = { lightning_address: lightning_address ?? null };
 
       if (this.network !== network) {
         throw new Error(
@@ -428,6 +433,7 @@ class AuthManager {
       }
 
       window.dlcWallet = wallet;
+      window.currentUser = { lightning_address: pending.lightningAddress };
       this.pendingRegistration = null;
 
       const display = document.getElementById("usernameNsecDisplay");
@@ -711,12 +717,14 @@ class AuthManager {
       throw new Error("UNAUTHORIZED");
     if (!response.ok) throw new Error("Login failed");
 
-    const { encrypted_bitcoin_private_key, network } = await response.json();
+    const { encrypted_bitcoin_private_key, network, lightning_address } =
+      await response.json();
     if (this.network !== network) {
       throw new Error(
         `Invalid network, coordinator ${this.network} doesn't match wallet ${network}`,
       );
     }
+    window.currentUser = { lightning_address: lightning_address ?? null };
 
     window.dlcWallet = await window.DlcWallet.load(
       window.nostrClient,
@@ -728,6 +736,7 @@ class AuthManager {
   }
 
   handleLogout() {
+    window.currentUser = null;
     // free() drops the WASM objects, which erases the keys they hold.
     window.dlcWallet?.free();
     window.dlcWallet = null;

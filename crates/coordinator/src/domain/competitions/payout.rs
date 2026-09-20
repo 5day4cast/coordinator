@@ -71,7 +71,9 @@ pub fn verify_payout_preimage(
     preimage: &str,
     payout_hash_hex: &str,
 ) -> Result<[u8; 32], PayoutRejection> {
-    let preimage_hex = normalize_hex32(preimage).ok_or(PayoutRejection::InvalidPreimage)?;
+    let preimage_hex = decode_32_bytes(preimage)
+        .map(hex::encode)
+        .ok_or(PayoutRejection::InvalidPreimage)?;
     let preimage =
         hashlock::preimage_from_hex(&preimage_hex).map_err(|_| PayoutRejection::InvalidPreimage)?;
     let mut expected = [0u8; 32];
@@ -83,18 +85,20 @@ pub fn verify_payout_preimage(
     Ok(preimage)
 }
 
-/// 32 bytes given as 64 hex characters or as base64, as lowercase hex.
-fn normalize_hex32(value: &str) -> Option<String> {
+/// 32 bytes given as 64 hex characters or as base64, as LND reports
+/// preimages both ways depending on the endpoint.
+pub fn decode_32_bytes(value: &str) -> Option<[u8; 32]> {
     use base64::Engine;
     let value = value.trim();
-    if value.len() == 64 && hex::decode(value).is_ok() {
-        return Some(value.to_ascii_lowercase());
-    }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(value)
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(value))
-        .ok()?;
-    (bytes.len() == 32).then(|| hex::encode(bytes))
+    let bytes = if value.len() == 64 {
+        hex::decode(value).ok()?
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(value)
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(value))
+            .ok()?
+    };
+    bytes.try_into().ok()
 }
 
 /// Check that an entry key opens the entry's recorded pubkey.

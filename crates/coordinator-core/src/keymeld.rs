@@ -3,8 +3,8 @@
 
 use crate::RegistrationAssignment;
 use keymeld_sdk::{
-    types::RegistrationContext, AttestationPolicy, KeyMeldClient, SdkError, SessionId,
-    UserCredentials, UserId,
+    types::RegistrationContext, AttestationPolicy, KeyMeldClient, PayoutPolicy, SdkError,
+    SessionId, UserCredentials, UserId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -18,9 +18,13 @@ pub struct PreparedRegistration {
 /// Verify a fresh enclave attestation before transferring the participant key.
 /// The assignment and PCR pins must come from the coordinator's authenticated
 /// ticket response, never from the Keymeld gateway being verified.
+///
+/// `payout_policy` is sealed next to the key: the enclave then releases the
+/// entry's payout preimage only against a payment to that address.
 pub async fn prepare_registration(
     private_key: &[u8; 32],
     assignment: &RegistrationAssignment,
+    payout_policy: Option<PayoutPolicy>,
 ) -> Result<PreparedRegistration, SdkError> {
     if assignment.manifest_hash.len() != 32 {
         return Err(SdkError::InvalidInput(
@@ -75,8 +79,11 @@ pub async fn prepare_registration(
         // Coordinator holds a separate signing credential for unattended DLCs.
         require_signing_approval: false,
     };
-    let encrypted_private_key =
-        credentials.prepare_registration(context.clone(), &enclave.public_key)?;
+    let encrypted_private_key = credentials.prepare_registration_with_policy(
+        context.clone(),
+        &enclave.public_key,
+        payout_policy,
+    )?;
     Ok(PreparedRegistration {
         encrypted_private_key,
         auth_pubkey: hex::encode(&context.auth_pubkey),
@@ -133,7 +140,7 @@ mod tests {
     ) -> Result<PreparedRegistration, SdkError> {
         timeout(
             Duration::from_secs(5),
-            prepare_registration(&[1; 32], assignment),
+            prepare_registration(&[1; 32], assignment, None),
         )
         .await
         .expect("registration preparation timed out")
@@ -189,9 +196,13 @@ mod tests {
         assignment.enclave_id = 0;
         assignment.enclave_public_key = enclave.public_key;
         assignment.enclave_key_epoch = enclave.key_epoch;
-        assert!(prepare_registration(&[1; 32], &assignment).await.is_err());
+        assert!(prepare_registration(&[1; 32], &assignment, None)
+            .await
+            .is_err());
         assignment.dangerous_trust_unattested_enclaves = true;
-        let prepared = prepare_registration(&[1; 32], &assignment).await.unwrap();
+        let prepared = prepare_registration(&[1; 32], &assignment, None)
+            .await
+            .unwrap();
         assert_eq!(
             prepared.context.enclave_key_epoch,
             assignment.enclave_key_epoch
@@ -201,7 +212,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_trusted_measurements_rejects_registration_before_network_access() {
-        let error = prepare_registration(&[1; 32], &assignment("http://127.0.0.1:1".into()))
+        let error = prepare_registration(&[1; 32], &assignment("http://127.0.0.1:1".into()), None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("Pin PCR0"), "{error}");
@@ -240,7 +251,7 @@ mod tests {
         for _ in 0..2 {
             let result = timeout(
                 Duration::from_secs(5),
-                prepare_registration(&[1; 32], &assignment),
+                prepare_registration(&[1; 32], &assignment, None),
             )
             .await
             .unwrap();

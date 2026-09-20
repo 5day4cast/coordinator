@@ -12,7 +12,7 @@ pub async fn prepare_for_ticket(
     let private_key: [u8; 32] = hex::decode(private_key_hex)?
         .try_into()
         .map_err(|_| anyhow::anyhow!("Private key must be 32 bytes"))?;
-    prepare_registration(&private_key, assignment)
+    prepare_registration(&private_key, assignment, None)
         .await
         .context("Failed to prepare authorized Keymeld registration")
 }

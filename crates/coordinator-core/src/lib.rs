@@ -6,5 +6,7 @@ pub mod types;
 
 #[cfg(feature = "keymeld")]
 pub mod keymeld;
+#[cfg(feature = "keymeld")]
+pub use keymeld_sdk::{derive_payout_preimage, PayoutPolicy};
 
 pub use types::*;
