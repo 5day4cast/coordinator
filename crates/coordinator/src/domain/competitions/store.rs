@@ -1586,6 +1586,58 @@ impl CompetitionStore {
         Ok(tickets)
     }
 
+    /// Tickets whose HODL invoice was accepted but never settled, and whose
+    /// invoice has not been cancelled yet: the payer's funds are still held.
+    pub async fn get_held_tickets_for_competition(
+        &self,
+        competition_id: Uuid,
+    ) -> Result<Vec<Ticket>, sqlx::Error> {
+        sqlx::query_as::<_, Ticket>(
+            r#"SELECT tickets.id as id,
+                      tickets.event_id as competition_id,
+                      entries.id as entry_id,
+                      tickets.ephemeral_pubkey as ephemeral_pubkey,
+                      encrypted_preimage,
+                      hash,
+                      payment_request,
+                      invoice_expires_at,
+                      datetime('now', '+10 minutes') as expiry,
+                      reserved_by,
+                      reserved_at,
+                      paid_at,
+                      settled_at,
+                      escrow_transaction
+               FROM tickets
+               LEFT JOIN entries ON tickets.id = entries.ticket_id
+               WHERE paid_at IS NOT NULL
+                 AND settled_at IS NULL
+                 AND invoice_cancelled_at IS NULL
+                 AND tickets.event_id = ?"#,
+        )
+        .bind(competition_id.to_string())
+        .fetch_all(self.db_connection.read())
+        .await
+    }
+
+    pub async fn mark_ticket_invoice_cancelled(
+        &self,
+        ticket_id: Uuid,
+    ) -> Result<bool, DatabaseWriteError> {
+        let ticket_id = ticket_id.to_string();
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE tickets SET invoice_cancelled_at = datetime('now')
+                    WHERE id = ? AND invoice_cancelled_at IS NULL AND settled_at IS NULL",
+                )
+                .bind(ticket_id)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+    }
+
     pub async fn get_ticket(&self, ticket_id: Uuid) -> Result<Ticket, sqlx::Error> {
         let ticket = sqlx::query_as::<_, Ticket>(
             r#"SELECT tickets.id as id,

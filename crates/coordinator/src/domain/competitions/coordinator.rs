@@ -456,6 +456,10 @@ impl Coordinator {
             const MAX_CONSECUTIVE_STATES: usize = 10;
 
             if competition.skip_competition() {
+                // A dead competition must not keep entrants' payments held.
+                if competition.is_failed() || competition.is_cancelled() {
+                    self.release_held_invoices(competition.id).await;
+                }
                 // Auto-expire failed competitions after 1 hour so they stop
                 // polluting every tick's log output and DB query results.
                 const FAILED_EXPIRY_HOURS: i64 = 1;
@@ -507,6 +511,7 @@ impl Coordinator {
                     ));
                 }
                 info!("Cancelled expired competition {}", competition.id);
+                self.release_held_invoices(competition.id).await;
                 continue;
             }
 
@@ -554,6 +559,7 @@ impl Coordinator {
                     }
                 }
 
+                let died = updated_competition.is_failed() || updated_competition.is_cancelled();
                 if let Err(e) = self
                     .competition_store
                     .update_competitions(vec![updated_competition])
@@ -566,11 +572,60 @@ impl Coordinator {
                         e
                     ));
                 }
+                if died {
+                    self.release_held_invoices(competition.id).await;
+                }
                 break;
             }
         }
 
         Ok(())
+    }
+
+    /// Cancel every accepted-but-unsettled HODL invoice of a competition
+    /// that failed or was cancelled, releasing the payers' funds. Each
+    /// ticket is marked once LND confirms the cancellation, so a failure
+    /// here is retried on the next tick and never repeated afterwards.
+    /// Settled tickets are not touched: their payment is complete and any
+    /// refund goes through the escrow refund path.
+    async fn release_held_invoices(&self, competition_id: Uuid) {
+        let held = match self
+            .competition_store
+            .get_held_tickets_for_competition(competition_id)
+            .await
+        {
+            Ok(tickets) => tickets,
+            Err(e) => {
+                error!(
+                    "Failed to list held invoices for competition {}: {}",
+                    competition_id, e
+                );
+                return;
+            }
+        };
+        for ticket in held {
+            if let Err(e) = self.ln.cancel_hold_invoice(ticket.hash.clone()).await {
+                warn!(
+                    "Failed to cancel held invoice of ticket {} (competition {}): {}",
+                    ticket.id, competition_id, e
+                );
+                continue;
+            }
+            match self
+                .competition_store
+                .mark_ticket_invoice_cancelled(ticket.id)
+                .await
+            {
+                Ok(_) => info!(
+                    "Released held invoice of ticket {} for dead competition {}",
+                    ticket.id, competition_id
+                ),
+                Err(e) => error!(
+                    "Cancelled the invoice of ticket {} but failed to record it: {}",
+                    ticket.id, e
+                ),
+            }
+        }
     }
 
     pub async fn process_status(&self, status: CompetitionStatus) -> CompetitionStatus {
