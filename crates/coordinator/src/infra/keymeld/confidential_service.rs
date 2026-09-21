@@ -514,15 +514,27 @@ impl Keymeld for KeymeldService {
     ) -> Result<KeygenSessionStatus, KeymeldError> {
         let _guard = self.lock_session(&session.session_id).await;
         let (state, _) = self.checkpoint(session).await?;
+        // The lifecycle completes keygen (wait_for_keygen_completion, which
+        // records the roster) only after this reports ready. Requiring the
+        // roster here as well meant keygen never started. Every participant
+        // the manifest authorized having registered is the readiness signal.
+        let registered = session
+            .authorization_manifest
+            .manifest
+            .participant_verifiers
+            .keys()
+            .all(|user| state.registrations.contains_key(user));
         Ok(KeygenSessionStatus {
             session_id: session.session_id.to_string(),
             status: if state.roster.is_some() {
                 "completed"
+            } else if registered {
+                "participants_registered"
             } else {
                 "collecting_participants"
             }
             .into(),
-            is_completed: state.roster.is_some(),
+            is_completed: state.roster.is_some() || registered,
         })
     }
 
