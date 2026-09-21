@@ -3309,11 +3309,9 @@ impl Coordinator {
             }
         }
 
-        let fee_multiplier = competition.event_submission.coordinator_fee_percentage as f64 / 100.0;
-        let coordinator_fee =
-            (competition.event_submission.entry_fee as f64 * fee_multiplier).round() as u64;
-
-        let full_fee = (competition.event_submission.entry_fee as u64) + coordinator_fee;
+        // The entry form shows this same amount, and the browser refuses an
+        // invoice for anything else before exposing it for payment.
+        let full_fee = competition.calculate_invoice_amount();
 
         // Check if ticket already has a payment request (reuse existing invoice if not expired)
         // Invoice needs to stay active through:

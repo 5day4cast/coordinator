@@ -4,7 +4,7 @@ function uniqueUsername(): string {
   return `user${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
 }
 
-async function registerAndLogin(page: Page): Promise<void> {
+async function registerAndLogin(page: Page): Promise<string> {
   await page.goto("/");
 
   await page.waitForFunction(() => window.wasmInitialized === true, {
@@ -37,6 +37,7 @@ async function registerAndLogin(page: Page): Promise<void> {
   await expect(page.locator("#logoutContainer")).toBeVisible({
     timeout: 10000,
   });
+  return username;
 }
 
 test.describe("Full Entry Submission Flow", () => {
@@ -101,7 +102,7 @@ test.describe("Full Entry Submission Flow", () => {
     await expect(submitButton).toBeVisible();
     await expect(submitButton).toBeEnabled();
 
-    await expect(page.locator("#entryPayoutMethod")).toHaveValue("invoice");
+    await expect(page.locator("#entryPayoutDestination")).toContainText("pays winners by invoice");
     await expect(page.locator("#entryPayoutTermsText")).toContainText(
       "This legacy competition does not use payout escrow",
     );
@@ -184,7 +185,8 @@ test.describe("Full Entry Submission Flow", () => {
   });
 
   test("automatic payout consent refuses a ticket without the approved escrow policy", async ({ page }) => {
-    await registerAndLogin(page);
+    const username = await registerAndLogin(page);
+    const profileAddress = `${username}@mock-wallet.dev`.toLowerCase();
     await page.evaluate(() => { document.body.dataset.oracleBase = window.location.origin; });
     await page.route("**/api/v1/competitions/*/payout-terms", (route) => route.fulfill({
       json: { enabled: true, relative_locktime_block_delta: 72, max_fee_rate_sat_vb: 5 },
@@ -206,20 +208,17 @@ test.describe("Full Entry Submission Flow", () => {
     await page.locator("#competitionsDataTable tbody tr")
       .filter({ hasText: "Registration" }).locator("button, a")
       .filter({ hasText: /Enter|Create Entry/ }).first().click();
-    await expect(page.locator("#entryPayoutMethod")).toHaveValue("automatic");
+    // Winnings go to the profile's address; the entry form no longer asks for one.
+    await expect(page.locator("#entryPayoutDestination")).toHaveText(`Automatically to ${profileAddress}`);
     await expect(page.locator("#entryPayoutTermsText")).toContainText("Maximum Bitcoin fee rate: 5 sat/vB");
     await expect(page.locator("#entryPayoutTermsText")).toContainText("Winner shares by rank: 45%, 35%, 20%");
-    await page.locator("#entryLightningAddress").fill("alice+prize@wallet.example");
-    await page.locator("#entryPayoutApproved").check();
-    await page.locator("#entryLightningAddress").fill("alice+updated@wallet.example");
-    await expect(page.locator("#entryPayoutApproved")).not.toBeChecked();
     await page.locator("#entryPayoutApproved").check();
     await page.locator("#entryContent button.pick-button").first().click();
     await page.locator("#submitEntry").click();
     await expect(page.locator("#errorMessage")).toContainText("The ticket omitted the approved payout escrow policy");
     await expect(page.locator("#ticketPaymentModal")).not.toHaveClass(/is-active/);
     await expect(page.locator("#paymentRequest")).not.toHaveValue("invoice-that-must-never-be-displayed");
-    expect(ticketRequest?.payout.lightning_address).toBe("alice+updated@wallet.example");
+    expect(ticketRequest?.payout.lightning_address).toBe(profileAddress);
     expect(ticketRequest?.payout.payout_hash).toMatch(/^[0-9a-f]{64}$/);
   });
 

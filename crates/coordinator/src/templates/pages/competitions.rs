@@ -11,6 +11,8 @@ pub struct CompetitionView {
     pub signing_time: String,
     pub status: String,
     pub entry_fee: u64,
+    /// What the entrant pays: the entry fee plus the coordinator fee.
+    pub ticket_price: u64,
     pub total_pool: u64,
     pub total_entries: u64,
     pub num_winners: u64,
