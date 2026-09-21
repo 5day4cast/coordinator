@@ -2,5 +2,5 @@ apiVersion: v2
 name: synth
 description: Synthetic testing tool for 5day4cast competition platform
 type: application
-version: 3.0.0
-appVersion: "3.0.0"
+version: 2.0.0
+appVersion: "2.0.0"
