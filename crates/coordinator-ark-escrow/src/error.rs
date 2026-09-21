@@ -25,4 +25,6 @@ pub enum Error {
     Address(String),
     #[error("invalid escrow: {0}")]
     Escrow(String),
+    #[error("the Arkade server would reject this script: {0}")]
+    ServerRules(String),
 }

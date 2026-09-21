@@ -1,0 +1,392 @@
+{
+  "generator": "arkd f863e484719344edbe4a8d10cf5fe994b123f2c0 pkg/ark-lib/script TapscriptsVtxoScript.Validate",
+  "verdicts": [
+    {
+      "description": "Mutinynet signer, height locktime, 2048 second exit delay",
+      "tweakedPublicKey": "3ade96518ea2f1dd466e8f48fda608f14c1207dea5dc3ba7aa472c085b827fb7",
+      "checks": [
+        {
+          "rules": {
+            "signer": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 2048
+            },
+            "blockTimelocksAllowed": true
+          },
+          "accepted": true
+        },
+        {
+          "rules": {
+            "signer": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 2048
+            },
+            "blockTimelocksAllowed": false
+          },
+          "accepted": false,
+          "error": "invalid forfeit closure, CLTV block type not allowed"
+        },
+        {
+          "rules": {
+            "signer": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 2560
+            },
+            "blockTimelocksAllowed": true
+          },
+          "accepted": false,
+          "error": "exit delay is too short"
+        },
+        {
+          "rules": {
+            "signer": "fa73c6e4876ffb2dfc961d763cca9abc73d4b88efcb8f5e7ff92dc55e9aa553d",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 2048
+            },
+            "blockTimelocksAllowed": true
+          },
+          "accepted": false,
+          "error": "invalid forfeit closure, signer pubkey not found"
+        },
+        {
+          "rules": {
+            "signer": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 2048
+            },
+            "blockTimelocksAllowed": false
+          },
+          "accepted": false,
+          "error": "invalid forfeit closure, CLTV block type not allowed"
+        }
+      ]
+    },
+    {
+      "description": "timestamp locktime, 144 block exit delay",
+      "tweakedPublicKey": "7577f614e141f07b8520837669d4d877fee6410bb2825b1787c2e9776b1caf21",
+      "checks": [
+        {
+          "rules": {
+            "signer": "aad52d58162e9eefeafc7ad8a1cdca8060b5f01df1e7583362d052e266208f88",
+            "minExitDelay": {
+              "type": "blocks",
+              "value": 144
+            },
+            "blockTimelocksAllowed": true
+          },
+          "accepted": true
+        },
+        {
+          "rules": {
+            "signer": "aad52d58162e9eefeafc7ad8a1cdca8060b5f01df1e7583362d052e266208f88",
+            "minExitDelay": {
+              "type": "blocks",
+              "value": 144
+            },
+            "blockTimelocksAllowed": false
+          },
+          "accepted": false,
+          "error": "invalid exit closure, CSV block type not allowed"
+        },
+        {
+          "rules": {
+            "signer": "aad52d58162e9eefeafc7ad8a1cdca8060b5f01df1e7583362d052e266208f88",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 656
+            },
+            "blockTimelocksAllowed": true
+          },
+          "accepted": false,
+          "error": "exit delay is too short"
+        },
+        {
+          "rules": {
+            "signer": "fa73c6e4876ffb2dfc961d763cca9abc73d4b88efcb8f5e7ff92dc55e9aa553d",
+            "minExitDelay": {
+              "type": "blocks",
+              "value": 144
+            },
+            "blockTimelocksAllowed": true
+          },
+          "accepted": false,
+          "error": "invalid forfeit closure, signer pubkey not found"
+        },
+        {
+          "rules": {
+            "signer": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 2048
+            },
+            "blockTimelocksAllowed": false
+          },
+          "accepted": false,
+          "error": "invalid forfeit closure, signer pubkey not found"
+        }
+      ]
+    },
+    {
+      "description": "16 block exit delay encodes as OP_16, 17 block refund delay does not",
+      "tweakedPublicKey": "e56eeea3398cb9f5ed0019708bff362c01ce9eb97fd5720a30fe8df95853c768",
+      "checks": [
+        {
+          "rules": {
+            "signer": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+            "minExitDelay": {
+              "type": "blocks",
+              "value": 16
+            },
+            "blockTimelocksAllowed": true
+          },
+          "accepted": true
+        },
+        {
+          "rules": {
+            "signer": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+            "minExitDelay": {
+              "type": "blocks",
+              "value": 16
+            },
+            "blockTimelocksAllowed": false
+          },
+          "accepted": false,
+          "error": "invalid forfeit closure, CLTV block type not allowed"
+        },
+        {
+          "rules": {
+            "signer": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 528
+            },
+            "blockTimelocksAllowed": true
+          },
+          "accepted": false,
+          "error": "exit delay is too short"
+        },
+        {
+          "rules": {
+            "signer": "fa73c6e4876ffb2dfc961d763cca9abc73d4b88efcb8f5e7ff92dc55e9aa553d",
+            "minExitDelay": {
+              "type": "blocks",
+              "value": 16
+            },
+            "blockTimelocksAllowed": true
+          },
+          "accepted": false,
+          "error": "invalid forfeit closure, signer pubkey not found"
+        },
+        {
+          "rules": {
+            "signer": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 2048
+            },
+            "blockTimelocksAllowed": false
+          },
+          "accepted": false,
+          "error": "invalid forfeit closure, CLTV block type not allowed"
+        }
+      ]
+    },
+    {
+      "description": "small height locktime, maximum block refund delay",
+      "tweakedPublicKey": "932d0f6b66a767816035e5ac01ce2c27b1942910807fd7a0e969b46f5de50afe",
+      "checks": [
+        {
+          "rules": {
+            "signer": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+            "minExitDelay": {
+              "type": "blocks",
+              "value": 17
+            },
+            "blockTimelocksAllowed": true
+          },
+          "accepted": true
+        },
+        {
+          "rules": {
+            "signer": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+            "minExitDelay": {
+              "type": "blocks",
+              "value": 17
+            },
+            "blockTimelocksAllowed": false
+          },
+          "accepted": false,
+          "error": "invalid forfeit closure, CLTV block type not allowed"
+        },
+        {
+          "rules": {
+            "signer": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 529
+            },
+            "blockTimelocksAllowed": true
+          },
+          "accepted": false,
+          "error": "exit delay is too short"
+        },
+        {
+          "rules": {
+            "signer": "fa73c6e4876ffb2dfc961d763cca9abc73d4b88efcb8f5e7ff92dc55e9aa553d",
+            "minExitDelay": {
+              "type": "blocks",
+              "value": 17
+            },
+            "blockTimelocksAllowed": true
+          },
+          "accepted": false,
+          "error": "invalid forfeit closure, signer pubkey not found"
+        },
+        {
+          "rules": {
+            "signer": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 2048
+            },
+            "blockTimelocksAllowed": false
+          },
+          "accepted": false,
+          "error": "invalid forfeit closure, CLTV block type not allowed"
+        }
+      ]
+    },
+    {
+      "description": "minimum 512 second exit delay",
+      "tweakedPublicKey": "198d9a3482f179ac79f8df66074f664303c74a761d3962451354980f6efe4d6d",
+      "checks": [
+        {
+          "rules": {
+            "signer": "aad52d58162e9eefeafc7ad8a1cdca8060b5f01df1e7583362d052e266208f88",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 512
+            },
+            "blockTimelocksAllowed": true
+          },
+          "accepted": true
+        },
+        {
+          "rules": {
+            "signer": "aad52d58162e9eefeafc7ad8a1cdca8060b5f01df1e7583362d052e266208f88",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 512
+            },
+            "blockTimelocksAllowed": false
+          },
+          "accepted": true
+        },
+        {
+          "rules": {
+            "signer": "aad52d58162e9eefeafc7ad8a1cdca8060b5f01df1e7583362d052e266208f88",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 1024
+            },
+            "blockTimelocksAllowed": true
+          },
+          "accepted": false,
+          "error": "exit delay is too short"
+        },
+        {
+          "rules": {
+            "signer": "fa73c6e4876ffb2dfc961d763cca9abc73d4b88efcb8f5e7ff92dc55e9aa553d",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 512
+            },
+            "blockTimelocksAllowed": true
+          },
+          "accepted": false,
+          "error": "invalid forfeit closure, signer pubkey not found"
+        },
+        {
+          "rules": {
+            "signer": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 2048
+            },
+            "blockTimelocksAllowed": false
+          },
+          "accepted": false,
+          "error": "invalid forfeit closure, signer pubkey not found"
+        }
+      ]
+    },
+    {
+      "description": "Mutinynet signer, timestamp locktime, maximum second refund delay",
+      "tweakedPublicKey": "5de3b7e8a684420276efa2d1812184882fb4b5eb1b9a8f80811b37e395b9ed99",
+      "checks": [
+        {
+          "rules": {
+            "signer": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 2048
+            },
+            "blockTimelocksAllowed": true
+          },
+          "accepted": true
+        },
+        {
+          "rules": {
+            "signer": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 2048
+            },
+            "blockTimelocksAllowed": false
+          },
+          "accepted": true
+        },
+        {
+          "rules": {
+            "signer": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 2560
+            },
+            "blockTimelocksAllowed": true
+          },
+          "accepted": false,
+          "error": "exit delay is too short"
+        },
+        {
+          "rules": {
+            "signer": "fa73c6e4876ffb2dfc961d763cca9abc73d4b88efcb8f5e7ff92dc55e9aa553d",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 2048
+            },
+            "blockTimelocksAllowed": true
+          },
+          "accepted": false,
+          "error": "invalid forfeit closure, signer pubkey not found"
+        },
+        {
+          "rules": {
+            "signer": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+            "minExitDelay": {
+              "type": "seconds",
+              "value": 2048
+            },
+            "blockTimelocksAllowed": false
+          },
+          "accepted": true
+        }
+      ]
+    }
+  ]
+}

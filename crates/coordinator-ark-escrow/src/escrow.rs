@@ -1,14 +1,19 @@
 //! The escrow VTXO holding one competition entry's buy-in until kickoff.
 //!
 //! Each spend condition has a collaborative leaf, which the Arkade server co-signs.
-//! It also has a unilateral leaf without the server, usable only after the exit delay.
+//! It also has a unilateral leaf without the server, usable only once the VTXO is unrolled on chain.
 //!
 //! | Leaf                | Signers                      | Condition                    |
 //! |---------------------|------------------------------|------------------------------|
 //! | `Funding`           | player, coordinator, server  | none (the kickoff batch)     |
 //! | `Refund`            | player, server               | locktime `T`                 |
 //! | `UnilateralFunding` | player, coordinator          | exit delay                   |
-//! | `UnilateralRefund`  | player                       | locktime `T` and exit delay  |
+//! | `UnilateralRefund`  | player                       | unilateral refund delay      |
+//!
+//! arkd refuses timelock opcodes inside a condition, so the player's solo leaf cannot wait for `T` directly.
+//! It waits a relative delay instead, counted from when the unrolled VTXO confirms.
+//! [`EscrowTerms::unilateral_refund_delay_for`] makes that delay end after `T` plus the exit delay, even for a VTXO unrolled the moment it was created.
+//! The delay is also longer than the exit delay, so the unilateral funding leaf always opens first.
 //!
 //! Keymeld signs as the player, from the entry key deposited at registration.
 //! Each entry has its own player key, so every escrow address is unique without a nonce leaf.
@@ -17,8 +22,10 @@ use bitcoin::absolute::LockTime;
 use bitcoin::taproot::ControlBlock;
 use bitcoin::{ScriptBuf, XOnlyPublicKey};
 
-use crate::tapscript::cltv_condition;
 use crate::{ArkAddress, Error, RelativeTimelock, Tapscript, VtxoScript};
+
+/// The longest BIP68 time-based delay: 65535 intervals of 512 seconds, about 388 days.
+const MAX_RELATIVE_SECONDS: u32 = 0xffff * 512;
 
 /// Everything that fixes an entry's escrow script.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,8 +38,43 @@ pub struct EscrowTerms {
     pub server: XOnlyPublicKey,
     /// `T`, from which the player can take the escrow back.
     pub refund_locktime: LockTime,
-    /// The CSV delay on the unilateral leaves, at least the server's `unilateralExitDelay`.
+    /// The CSV delay on the unilateral funding leaf, at least the server's `unilateralExitDelay`.
     pub exit_delay: RelativeTimelock,
+    /// The CSV delay on the player's solo leaf, longer than `exit_delay` and in the same unit.
+    pub unilateral_refund_delay: RelativeTimelock,
+}
+
+impl EscrowTerms {
+    /// The shortest unilateral refund delay for an escrow created at `created_at`, in UNIX seconds.
+    ///
+    /// An unrolled VTXO cannot confirm before it exists.
+    /// So a player alone cannot spend the escrow before `T` plus `exit_delay`.
+    /// `T` must be a timestamp and `exit_delay` must be in seconds.
+    /// The delay is rounded up to BIP68's 512-second granularity.
+    pub fn unilateral_refund_delay_for(
+        refund_locktime: LockTime,
+        exit_delay: RelativeTimelock,
+        created_at: u32,
+    ) -> Result<RelativeTimelock, Error> {
+        let LockTime::Seconds(refund_at) = refund_locktime else {
+            return Err(Error::Escrow(
+                "the refund locktime must be a timestamp".into(),
+            ));
+        };
+        let RelativeTimelock::Seconds(exit_seconds) = exit_delay else {
+            return Err(Error::Escrow("the exit delay must be in seconds".into()));
+        };
+        let wait = refund_at
+            .to_consensus_u32()
+            .saturating_sub(created_at)
+            .checked_add(exit_seconds)
+            .and_then(|seconds| seconds.checked_next_multiple_of(512))
+            .filter(|seconds| *seconds <= MAX_RELATIVE_SECONDS)
+            .ok_or_else(|| {
+                Error::Escrow("the refund locktime is too far out for a relative delay".into())
+            })?;
+        Ok(RelativeTimelock::Seconds(wait.max(exit_seconds + 512)))
+    }
 }
 
 /// A spend path through the escrow.
@@ -79,6 +121,7 @@ impl EntryEscrow {
             server,
             refund_locktime,
             exit_delay,
+            unilateral_refund_delay,
         } = terms;
         if player == coordinator || player == server || coordinator == server {
             return Err(Error::Escrow(
@@ -90,6 +133,20 @@ impl EntryEscrow {
         }
         if exit_delay.to_sequence()?.to_consensus_u32() == 0 {
             return Err(Error::Escrow("the exit delay must be positive".into()));
+        }
+        let longer = match (exit_delay, unilateral_refund_delay) {
+            (RelativeTimelock::Blocks(exit), RelativeTimelock::Blocks(refund)) => refund > exit,
+            (RelativeTimelock::Seconds(exit), RelativeTimelock::Seconds(refund)) => refund > exit,
+            _ => {
+                return Err(Error::Escrow(
+                    "the exit and unilateral refund delays must use the same unit".into(),
+                ))
+            }
+        };
+        if !longer {
+            return Err(Error::Escrow(
+                "the unilateral refund delay must be longer than the exit delay".into(),
+            ));
         }
 
         let tapscripts = [
@@ -104,9 +161,8 @@ impl EntryEscrow {
                 timelock: exit_delay,
                 pubkeys: vec![player, coordinator],
             },
-            Tapscript::ConditionCsvMultisig {
-                condition: cltv_condition(refund_locktime),
-                timelock: exit_delay,
+            Tapscript::CsvMultisig {
+                timelock: unilateral_refund_delay,
                 pubkeys: vec![player],
             },
         ];
@@ -123,7 +179,7 @@ impl EntryEscrow {
     /// Fails unless the leaves are exactly an entry escrow, in order.
     pub fn from_vtxo_script(vtxo: &VtxoScript) -> Result<Self, Error> {
         let mismatch = || Error::Escrow("the leaves are not an entry escrow".into());
-        let [funding, refund, unilateral_funding, _] = vtxo.scripts() else {
+        let [funding, refund, unilateral_funding, unilateral_refund] = vtxo.scripts() else {
             return Err(mismatch());
         };
         let Tapscript::Multisig { pubkeys } = Tapscript::decode(funding)? else {
@@ -135,7 +191,18 @@ impl EntryEscrow {
         let Tapscript::CltvMultisig { locktime, .. } = Tapscript::decode(refund)? else {
             return Err(mismatch());
         };
-        let Tapscript::CsvMultisig { timelock, .. } = Tapscript::decode(unilateral_funding)? else {
+        let Tapscript::CsvMultisig {
+            timelock: exit_delay,
+            ..
+        } = Tapscript::decode(unilateral_funding)?
+        else {
+            return Err(mismatch());
+        };
+        let Tapscript::CsvMultisig {
+            timelock: unilateral_refund_delay,
+            ..
+        } = Tapscript::decode(unilateral_refund)?
+        else {
             return Err(mismatch());
         };
         let escrow = Self::new(EscrowTerms {
@@ -143,7 +210,8 @@ impl EntryEscrow {
             coordinator,
             server,
             refund_locktime: locktime,
-            exit_delay: timelock,
+            exit_delay,
+            unilateral_refund_delay,
         })?;
         if escrow.vtxo.scripts() == vtxo.scripts() {
             Ok(escrow)
@@ -199,8 +267,9 @@ mod tests {
             player: key(1),
             coordinator: key(2),
             server: key(3),
-            refund_locktime: LockTime::from_consensus(3_444_600),
+            refund_locktime: LockTime::from_consensus(1_790_000_000),
             exit_delay: RelativeTimelock::Seconds(2048),
+            unilateral_refund_delay: RelativeTimelock::Seconds(1_209_856),
         }
     }
 
@@ -243,13 +312,14 @@ mod tests {
         let swapped = VtxoScript::new(scripts).unwrap();
         assert!(EntryEscrow::from_vtxo_script(&swapped).is_err());
 
-        let other = EntryEscrow::new(EscrowTerms {
-            refund_locktime: LockTime::from_consensus(3_444_601),
-            ..terms()
-        })
-        .unwrap();
+        // The solo leaf paying the coordinator instead of the player.
         let mut spliced = escrow.vtxo_script().scripts().to_vec();
-        spliced[3] = other.script(EscrowPath::UnilateralRefund).clone();
+        spliced[3] = Tapscript::CsvMultisig {
+            timelock: terms().unilateral_refund_delay,
+            pubkeys: vec![key(2)],
+        }
+        .to_script()
+        .unwrap();
         let spliced = VtxoScript::new(spliced).unwrap();
         assert!(EntryEscrow::from_vtxo_script(&spliced).is_err());
     }
@@ -270,6 +340,56 @@ mod tests {
             exit_delay: RelativeTimelock::Blocks(0),
             ..terms()
         })
+        .is_err());
+    }
+
+    #[test]
+    fn the_solo_leaf_opens_after_the_funding_leaf() {
+        for unilateral_refund_delay in [
+            RelativeTimelock::Seconds(2048),
+            RelativeTimelock::Seconds(1536),
+            RelativeTimelock::Blocks(5000),
+        ] {
+            assert!(EntryEscrow::new(EscrowTerms {
+                unilateral_refund_delay,
+                ..terms()
+            })
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn the_refund_delay_covers_the_wait_for_t() {
+        let t = LockTime::from_consensus(1_790_000_000);
+        let exit = RelativeTimelock::Seconds(2048);
+        let day = 86_400;
+
+        // A day before T: the delay covers the day and the exit delay, rounded up to 512 seconds.
+        let delay = EscrowTerms::unilateral_refund_delay_for(t, exit, 1_790_000_000 - day).unwrap();
+        assert_eq!(delay, RelativeTimelock::Seconds(88_576));
+        assert!(88_576 >= day + 2048 && 88_576 % 512 == 0);
+
+        // At or after T, the delay still opens after the unilateral funding leaf.
+        let late = EscrowTerms::unilateral_refund_delay_for(t, exit, 1_790_000_000 + day).unwrap();
+        assert_eq!(late, RelativeTimelock::Seconds(2560));
+
+        // BIP68 cannot express a wait of more than about 388 days.
+        assert!(
+            EscrowTerms::unilateral_refund_delay_for(t, exit, 1_790_000_000 - 400 * day).is_err()
+        );
+
+        // Heights and block delays cannot be combined with a creation time.
+        assert!(EscrowTerms::unilateral_refund_delay_for(
+            LockTime::from_consensus(3_444_600),
+            exit,
+            1_790_000_000
+        )
+        .is_err());
+        assert!(EscrowTerms::unilateral_refund_delay_for(
+            t,
+            RelativeTimelock::Blocks(144),
+            1_790_000_000
+        )
         .is_err());
     }
 }

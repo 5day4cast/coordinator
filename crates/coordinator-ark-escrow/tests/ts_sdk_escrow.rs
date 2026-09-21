@@ -28,6 +28,7 @@ struct Vector {
     server: String,
     refund_locktime: u32,
     exit_delay: JsonTimelock,
+    unilateral_refund_delay: JsonTimelock,
     expected: Expected,
 }
 
@@ -55,7 +56,7 @@ fn sdk_type(tapscript: &Tapscript) -> &'static str {
 fn escrow_matches_the_sdk() {
     let fixtures: Fixtures = fixture("escrow.json");
     assert!(fixtures.generator.starts_with("@arkade-os/sdk@"));
-    assert_eq!(fixtures.vectors.len(), 5);
+    assert_eq!(fixtures.vectors.len(), 6);
     for vector in fixtures.vectors {
         let name = &vector.description;
         let escrow = EntryEscrow::new(EscrowTerms {
@@ -64,6 +65,7 @@ fn escrow_matches_the_sdk() {
             server: xonly(&vector.server),
             refund_locktime: LockTime::from_consensus(vector.refund_locktime),
             exit_delay: vector.exit_delay.to_timelock(),
+            unilateral_refund_delay: vector.unilateral_refund_delay.to_timelock(),
         })
         .unwrap();
 

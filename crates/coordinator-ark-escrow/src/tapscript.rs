@@ -2,17 +2,34 @@
 //!
 //! Each closure encodes to the same bytes as arkd and `@arkade-os/sdk`.
 //! Decoding accepts only canonical scripts: a decoded closure must re-encode to the input bytes.
+//! Conditions follow arkd, which is stricter than the SDK: see [`FORBIDDEN_CONDITION_OPCODES`].
 
 use bitcoin::absolute::LockTime;
 use bitcoin::opcodes::all::{
-    OP_CHECKSIG, OP_CHECKSIGVERIFY, OP_CLTV, OP_CSV, OP_DROP, OP_PUSHNUM_1, OP_PUSHNUM_16,
-    OP_VERIFY,
+    OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY, OP_CHECKSIG, OP_CHECKSIGADD, OP_CHECKSIGVERIFY,
+    OP_CLTV, OP_CSV, OP_DROP, OP_PUSHNUM_1, OP_PUSHNUM_16, OP_VERIFY,
 };
 use bitcoin::opcodes::{Opcode, OP_0};
 use bitcoin::script::{Builder, Instruction, PushBytesBuf};
 use bitcoin::{Script, ScriptBuf, Sequence, XOnlyPublicKey};
 
 use crate::Error;
+
+/// Opcodes arkd refuses in a condition script (`forbiddenOpcodes` in `pkg/ark-lib/script/script.go`).
+///
+/// Signatures and timelocks belong in the closure itself, not in its condition.
+pub const FORBIDDEN_CONDITION_OPCODES: [Opcode; 7] = [
+    OP_CHECKMULTISIG,
+    OP_CHECKSIG,
+    OP_CHECKSIGVERIFY,
+    OP_CHECKSIGADD,
+    OP_CHECKMULTISIGVERIFY,
+    OP_CLTV,
+    OP_CSV,
+];
+
+/// arkd's limit on a condition script (`txscript.MaxScriptSize`).
+const MAX_CONDITION_SIZE: usize = 10_000;
 
 /// Relative timelock for `CHECKSEQUENCEVERIFY`, encoded as a BIP68 sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -111,19 +128,23 @@ impl Tapscript {
             Tapscript::CsvMultisig { timelock, .. } => [csv_prefix(*timelock)?, multisig].concat(),
             Tapscript::CltvMultisig { locktime, .. } => [cltv_prefix(*locktime), multisig].concat(),
             Tapscript::ConditionMultisig { condition, .. } => {
+                check_condition(condition)?;
                 [condition.to_bytes(), vec![OP_VERIFY.to_u8()], multisig].concat()
             }
             Tapscript::ConditionCsvMultisig {
                 condition,
                 timelock,
                 ..
-            } => [
-                condition.to_bytes(),
-                vec![OP_VERIFY.to_u8()],
-                csv_prefix(*timelock)?,
-                multisig,
-            ]
-            .concat(),
+            } => {
+                check_condition(condition)?;
+                [
+                    condition.to_bytes(),
+                    vec![OP_VERIFY.to_u8()],
+                    csv_prefix(*timelock)?,
+                    multisig,
+                ]
+                .concat()
+            }
         };
         Ok(ScriptBuf::from_bytes(bytes))
     }
@@ -151,15 +172,25 @@ impl Tapscript {
     }
 }
 
-/// `<locktime> CHECKLOCKTIMEVERIFY`: a condition that holds from `locktime` on.
-///
-/// Used before `VERIFY` in a condition closure.
-/// `CHECKLOCKTIMEVERIFY` leaves the locktime on the stack, and `VERIFY` consumes it.
-/// A non-zero locktime is always true.
-pub fn cltv_condition(locktime: LockTime) -> ScriptBuf {
-    push_number(Builder::new(), i64::from(locktime.to_consensus_u32()))
-        .push_opcode(OP_CLTV)
-        .into_script()
+/// Reject a condition arkd would refuse to decode.
+fn check_condition(condition: &Script) -> Result<(), Error> {
+    if condition.len() > MAX_CONDITION_SIZE {
+        return Err(Error::InvalidScript(format!(
+            "condition is {} bytes, over arkd's {MAX_CONDITION_SIZE}",
+            condition.len()
+        )));
+    }
+    for instruction in condition.instructions() {
+        let instruction = instruction.map_err(|error| Error::InvalidScript(error.to_string()))?;
+        if let Instruction::Op(op) = instruction {
+            if FORBIDDEN_CONDITION_OPCODES.contains(&op) {
+                return Err(Error::InvalidScript(format!(
+                    "arkd forbids {op} in a condition"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn multisig_bytes(pubkeys: &[XOnlyPublicKey]) -> Result<Vec<u8>, Error> {
@@ -438,6 +469,37 @@ mod tests {
             .into_script();
         let instruction = script.instructions_minimal().next().unwrap().unwrap();
         assert_eq!(read_number(&instruction), Err(Error::NonCanonical));
+    }
+
+    #[test]
+    fn conditions_cannot_hold_signatures_or_timelocks() {
+        let key = XOnlyPublicKey::from_slice(&[
+            0xf8, 0x35, 0x2d, 0xee, 0xbd, 0xf5, 0x65, 0x8d, 0x95, 0x87, 0x5d, 0x89, 0x65, 0x61,
+            0x12, 0xb1, 0xdd, 0x15, 0x0f, 0x17, 0x6c, 0x70, 0x2e, 0xea, 0x4f, 0x91, 0xa9, 0x15,
+            0x27, 0xe4, 0x8e, 0x26,
+        ])
+        .unwrap();
+        for opcode in FORBIDDEN_CONDITION_OPCODES {
+            let condition = Builder::new()
+                .push_int(1_790_000_000)
+                .push_opcode(opcode)
+                .into_script();
+            let closure = Tapscript::ConditionMultisig {
+                condition: condition.clone(),
+                pubkeys: vec![key],
+            };
+            assert!(closure.to_script().is_err(), "{opcode}");
+
+            let script = ScriptBuf::from_bytes(
+                [
+                    condition.to_bytes(),
+                    vec![OP_VERIFY.to_u8()],
+                    multisig_bytes(&[key]).unwrap(),
+                ]
+                .concat(),
+            );
+            assert!(Tapscript::decode(&script).is_err(), "{opcode}");
+        }
     }
 
     #[test]

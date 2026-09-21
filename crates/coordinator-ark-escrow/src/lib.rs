@@ -12,11 +12,13 @@
 mod address;
 mod error;
 mod escrow;
+mod rules;
 mod tapscript;
 mod vtxo_script;
 
 pub use address::{ArkAddress, ADDRESS_VERSION, MAINNET_HRP, TESTNET_HRP};
 pub use error::Error;
 pub use escrow::{EntryEscrow, EscrowPath, EscrowTerms};
-pub use tapscript::{cltv_condition, RelativeTimelock, Tapscript};
+pub use rules::ServerRules;
+pub use tapscript::{RelativeTimelock, Tapscript, FORBIDDEN_CONDITION_OPCODES};
 pub use vtxo_script::{assemble_btcd_tree, VtxoScript, UNSPENDABLE_INTERNAL_KEY};

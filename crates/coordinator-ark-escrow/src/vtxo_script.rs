@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 
-use bitcoin::key::Secp256k1;
+use bitcoin::key::{Secp256k1, TweakedPublicKey};
 use bitcoin::taproot::{ControlBlock, LeafVersion, NodeInfo, TaprootSpendInfo};
 use bitcoin::{Script, ScriptBuf, XOnlyPublicKey};
 
@@ -99,6 +99,11 @@ impl VtxoScript {
     /// The tweaked taproot output key.
     pub fn tweaked_key(&self) -> XOnlyPublicKey {
         self.spend_info.output_key().to_x_only_public_key()
+    }
+
+    /// The tweaked taproot output key, typed as tweaked.
+    pub fn output_key(&self) -> TweakedPublicKey {
+        self.spend_info.output_key()
     }
 
     /// The P2TR output script.

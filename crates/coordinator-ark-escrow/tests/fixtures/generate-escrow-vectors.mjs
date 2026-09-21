@@ -9,14 +9,12 @@
 import {
     ArkAddress,
     CLTVMultisigTapscript,
-    ConditionCSVMultisigTapscript,
     CSVMultisigTapscript,
     decodeTapscript,
     MultisigTapscript,
     VtxoScript,
 } from "@arkade-os/sdk";
 import { hex } from "@scure/base";
-import { Script } from "@scure/btc-signer";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
@@ -44,6 +42,7 @@ const cases = [
         server: keys.mutinynetSigner,
         refundLocktime: 3444600,
         exitDelay: { type: "seconds", value: 2048 },
+        unilateralRefundDelay: { type: "seconds", value: 1209856 },
     },
     {
         description: "timestamp locktime, 144 block exit delay",
@@ -52,22 +51,25 @@ const cases = [
         server: keys.vhtlcServer,
         refundLocktime: 1790000000,
         exitDelay: { type: "blocks", value: 144 },
+        unilateralRefundDelay: { type: "blocks", value: 1008 },
     },
     {
-        description: "16 block exit delay encodes as OP_16",
+        description: "16 block exit delay encodes as OP_16, 17 block refund delay does not",
         player: keys.ex2,
         coordinator: keys.ex1,
         server: keys.mutinynetSigner,
         refundLocktime: 265,
         exitDelay: { type: "blocks", value: 16 },
+        unilateralRefundDelay: { type: "blocks", value: 17 },
     },
     {
-        description: "17 block exit delay and a small height locktime",
+        description: "small height locktime, maximum block refund delay",
         player: keys.vhtlcReceiver,
         coordinator: keys.vhtlcSender,
         server: keys.mutinynetSigner,
         refundLocktime: 17,
         exitDelay: { type: "blocks", value: 17 },
+        unilateralRefundDelay: { type: "blocks", value: 65535 },
     },
     {
         description: "minimum 512 second exit delay",
@@ -76,24 +78,31 @@ const cases = [
         server: keys.vhtlcServer,
         refundLocktime: 500000000,
         exitDelay: { type: "seconds", value: 512 },
+        unilateralRefundDelay: { type: "seconds", value: 1024 },
+    },
+    {
+        description: "Mutinynet signer, timestamp locktime, maximum second refund delay",
+        player: keys.vhtlcSender,
+        coordinator: keys.ex1,
+        server: keys.mutinynetSigner,
+        refundLocktime: 1790000000,
+        exitDelay: { type: "seconds", value: 2048 },
+        unilateralRefundDelay: { type: "seconds", value: 33553920 },
     },
 ];
 
-function escrowLeaves({ player, coordinator, server, refundLocktime, exitDelay }) {
+const relative = ({ type, value }) => ({ type, value: BigInt(value) });
+
+function escrowLeaves({ player, coordinator, server, refundLocktime, exitDelay, unilateralRefundDelay }) {
     const [p, c, s] = [player, coordinator, server].map((key) => hex.decode(key));
-    const timelock = { type: exitDelay.type, value: BigInt(exitDelay.value) };
     return [
         MultisigTapscript.encode({ pubkeys: [p, c, s] }),
         CLTVMultisigTapscript.encode({
             absoluteTimelock: BigInt(refundLocktime),
             pubkeys: [p, s],
         }),
-        CSVMultisigTapscript.encode({ timelock, pubkeys: [p, c] }),
-        ConditionCSVMultisigTapscript.encode({
-            conditionScript: Script.encode([refundLocktime, "CHECKLOCKTIMEVERIFY"]),
-            timelock,
-            pubkeys: [p],
-        }),
+        CSVMultisigTapscript.encode({ timelock: relative(exitDelay), pubkeys: [p, c] }),
+        CSVMultisigTapscript.encode({ timelock: relative(unilateralRefundDelay), pubkeys: [p] }),
     ].map((tapscript) => tapscript.script);
 }
 
