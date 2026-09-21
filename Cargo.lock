@@ -1319,7 +1319,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator"
-version = "3.0.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1384,7 +1384,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-core"
-version = "3.0.0"
+version = "2.0.0"
 dependencies = [
  "axum",
  "coordinator-escrow",
@@ -1400,7 +1400,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-escrow"
-version = "3.0.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "dlctix",
@@ -1419,7 +1419,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-escrow-verifier"
-version = "3.0.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1448,7 +1448,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-lnurl-relay"
-version = "3.0.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "coordinator-escrow",
@@ -1460,7 +1460,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-synth"
-version = "3.0.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1498,7 +1498,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-verifier-enclave"
-version = "3.0.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "coordinator-escrow-verifier",
@@ -1509,7 +1509,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-wasm"
-version = "3.0.0"
+version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
  "bitcoin",
