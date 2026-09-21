@@ -2,7 +2,7 @@
 //!
 //! | Route | Use |
 //! | --- | --- |
-//! | `POST /v1/swaps` | `{ "escrow_address", "amount_sat" }` → the swap and its invoice. Returns the open swap if the escrow already has one. |
+//! | `POST /v1/swaps` | `{ "escrow_address", "amount_sat", "preimage"? }` → the swap and its invoice. Returns the open swap if the escrow already has one. |
 //! | `GET /v1/swaps/{id}` | A swap's state. |
 //! | `GET /v1/wallet` | The Ark wallet's addresses and balance. |
 //! | `POST /v1/wallet/board` | Move confirmed boarding coins into VTXOs in the next batch. |
@@ -72,12 +72,28 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 struct CreateSwap {
     escrow_address: String,
     amount_sat: u64,
+    /// Hex. The invoice pays to its SHA256; the service makes one if absent.
+    #[serde(default)]
+    preimage: Option<String>,
 }
 
 async fn create_swap(State(state): State<AppState>, Json(request): Json<CreateSwap>) -> Response {
+    let preimage = match request.preimage.as_deref().map(hex::decode).transpose() {
+        Ok(Some(bytes)) => match <[u8; 32]>::try_from(bytes) {
+            Ok(preimage) => Some(preimage),
+            Err(_) => {
+                return failure(
+                    StatusCode::BAD_REQUEST,
+                    anyhow::anyhow!("the preimage must be 32 bytes"),
+                )
+            }
+        },
+        Ok(None) => None,
+        Err(error) => return failure(StatusCode::BAD_REQUEST, error.into()),
+    };
     match state
         .swapper
-        .create(&request.escrow_address, request.amount_sat)
+        .create(&request.escrow_address, request.amount_sat, preimage)
         .await
     {
         Ok(swap) => (StatusCode::CREATED, Json(swap)).into_response(),

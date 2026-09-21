@@ -33,21 +33,39 @@ pub struct Swapper {
 
 impl Swapper {
     /// Start a swap into `escrow_address`, or return the open one for it.
-    pub async fn create(&self, escrow_address: &str, amount_sat: u64) -> anyhow::Result<Swap> {
+    ///
+    /// With `preimage`, the invoice pays to its hash, so the payer's proof of payment is a secret
+    /// the caller chose, such as a competition ticket's. Without it, the service makes one.
+    pub async fn create(
+        &self,
+        escrow_address: &str,
+        amount_sat: u64,
+        preimage: Option<[u8; 32]>,
+    ) -> anyhow::Result<Swap> {
         let address = self.wallet.escrow_address(escrow_address)?;
         let amount = Amount::from_sat(amount_sat);
         anyhow::ensure!(amount >= self.wallet.dust(), "the amount is below dust");
         let escrow_address = address.encode();
+        let requested_hash: Option<[u8; 32]> =
+            preimage.map(|preimage| Sha256::digest(preimage).into());
         if let Some(open) = self.store.open_for_escrow(&escrow_address).await? {
             anyhow::ensure!(
-                open.amount_sat == amount_sat,
-                "an open swap for this escrow has a different amount"
+                open.amount_sat == amount_sat
+                    && requested_hash.is_none_or(|hash| hex::encode(hash) == open.payment_hash),
+                "an open swap for this escrow has a different amount or payment hash"
             );
             return Ok(open);
         }
 
-        let preimage: [u8; 32] = rand08::random();
+        let preimage = preimage.unwrap_or_else(rand08::random);
         let payment_hash: [u8; 32] = Sha256::digest(preimage).into();
+        anyhow::ensure!(
+            !self
+                .store
+                .payment_hash_used(&hex::encode(payment_hash))
+                .await?,
+            "this payment hash was already used; a new swap needs a new preimage"
+        );
         let invoice = self
             .lnd
             .add_hold_invoice(

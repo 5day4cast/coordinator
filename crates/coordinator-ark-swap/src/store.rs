@@ -166,6 +166,15 @@ impl Store {
         Ok(None)
     }
 
+    /// Whether any swap, open or finished, used `payment_hash`. LND never reuses one.
+    pub async fn payment_hash_used(&self, payment_hash: &str) -> anyhow::Result<bool> {
+        let row = sqlx::query("SELECT 1 FROM swaps WHERE payment_hash = ?")
+            .bind(payment_hash)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
     pub async fn unfinished(&self) -> anyhow::Result<Vec<Swap>> {
         let rows = sqlx::query(
             "SELECT * FROM swaps WHERE state IN ('awaiting_payment', 'paying_escrow', 'escrow_paid')
