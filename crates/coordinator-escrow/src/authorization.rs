@@ -12,4 +12,19 @@ pub struct PayoutPolicy {
     /// Application consent supplements the independent generic key-release permission.
     pub release_entry_key_after_payment: bool,
     pub contract_terms: String,
+    /// The buy-in is held in an Arkade escrow VTXO, and the pool is funded in an Arkade batch.
+    /// Absent for tickets funded any other way, so their signed policies are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ark_escrow: Option<ArkEscrowPolicy>,
+}
+
+/// Consent to spend the entry's Arkade escrow into its pool's contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArkEscrowPolicy {
+    /// The escrow's PSBT `TapTree` field, hex. It fixes every term: the player, coordinator, and
+    /// server keys, the refund locktime, and the exit delays.
+    pub escrow_tap_tree: String,
+    /// The most the coordinator may take from each escrow as its fee in the funding batch.
+    pub max_fee_sats: u64,
 }

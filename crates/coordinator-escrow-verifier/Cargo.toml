@@ -10,8 +10,9 @@ lnurl = ["dep:url", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots", "dep:h
 
 [dependencies]
 coordinator-escrow = { path = "../coordinator-escrow", features = ["networking"] }
-keymeld-core = { git = "https://github.com/tee8z/keymeld", tag = "v0.5.0", default-features = false, features = ["escrow", "enclave"] }
-keymeld-enclave = { git = "https://github.com/tee8z/keymeld", tag = "v0.5.0", default-features = false, features = ["escrow"] }
+coordinator-ark-escrow = { path = "../coordinator-ark-escrow" }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "4235b16b3177d22660b946e4b15f9f7f0b4f4e06", default-features = false, features = ["escrow", "enclave"] }
+keymeld-enclave = { git = "https://github.com/tee8z/keymeld", rev = "4235b16b3177d22660b946e4b15f9f7f0b4f4e06", default-features = false, features = ["escrow"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

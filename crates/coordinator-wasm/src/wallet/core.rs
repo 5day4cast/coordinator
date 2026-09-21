@@ -1058,6 +1058,7 @@ mod tests {
             allow_invoice_fallback: true,
             release_entry_key_after_payment: true,
             contract_terms: serde_json::to_string(&terms).unwrap(),
+            ark_escrow: None,
         };
         let assignment = RegistrationAssignment {
             session_id: Uuid::now_v7().to_string(),

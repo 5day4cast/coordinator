@@ -1852,6 +1852,89 @@ impl Coordinator {
         Ok(competition)
     }
 
+    /// Have Keymeld sign every transaction of `ticketed_dlc` for `competition`.
+    ///
+    /// This verifies the accepted roster, binds any automatic payout contract to the DLC's funding outpoint, and signs.
+    /// The caller must still verify the signatures as the market maker.
+    /// An Arkade kickoff calls this inside the batch, once the funding outpoint is known.
+    pub async fn keymeld_contract_signatures(
+        &self,
+        competition: &Competition,
+        ticketed_dlc: &TicketedDLC,
+    ) -> Result<ContractSignatures, anyhow::Error> {
+        info!(
+            "Using Keymeld for DLC signing for competition {}",
+            competition.id
+        );
+
+        // Retrieve stored keygen session and decrypt the session secret
+        let stored_session = self
+            .competition_store
+            .get_keymeld_session(competition.id)
+            .await
+            .map_err(|e| anyhow!("Failed to get keymeld session: {}", e))?
+            .ok_or_else(|| {
+                anyhow!(
+                    "No keymeld session found for competition {}",
+                    competition.id
+                )
+            })?;
+
+        let keygen_session = self.restore_keymeld_session(&stored_session)?;
+
+        // Get signing data from ticketed DLC
+        let signing_data = ticketed_dlc.signing_data()?;
+
+        // Get entries to build player_user_ids for subset definitions
+        // Sort by ticket_id to match the order used in keymeld subset definitions
+        let mut entries = self
+            .competition_store
+            .get_competition_entries(competition.id, vec![EntryStatus::Paid])
+            .await?;
+        entries.sort_by_key(|entry| entry.ticket_id);
+        let player_user_ids: Vec<UserId> = entries
+            .iter()
+            .map(|entry| UserId::from(entry.ticket_id))
+            .collect();
+
+        self.verify_keymeld_competition(competition, &keygen_session)
+            .await?;
+
+        self.bind_automatic_contract(
+            competition,
+            &keygen_session,
+            &entries,
+            ticketed_dlc.params(),
+            ticketed_dlc.funding_outpoint(),
+        )
+        .await?;
+
+        // Call keymeld to perform batch signing
+        let dlc_signatures = self
+            .keymeld
+            .sign_dlc_batch(
+                &keygen_session,
+                &signing_data,
+                ticketed_dlc.params(),
+                player_user_ids,
+            )
+            .await
+            .map_err(|e| anyhow!("Keymeld signing failed: {}", e))?;
+
+        info!(
+            "Keymeld signing completed for competition {} with {} outcome signatures and {} split signatures",
+            competition.id,
+            dlc_signatures.outcome_signatures.len(),
+            dlc_signatures.split_signatures.len()
+        );
+
+        Ok(ContractSignatures {
+            expiry_tx_signature: dlc_signatures.expiry_signature,
+            outcome_tx_signatures: dlc_signatures.outcome_signatures,
+            split_tx_signatures: dlc_signatures.split_signatures,
+        })
+    }
+
     /// Sign the DLC contract by aggregating all partial signatures
     ///
     /// When keymeld is enabled, signing is coordinated via the keymeld service which
@@ -1877,78 +1960,9 @@ impl Coordinator {
             TicketedDLC::new(contract_parameters.to_owned(), funding_outpoint.to_owned())?;
 
         if self.is_keymeld_enabled() {
-            // Keymeld flow: Use sign_dlc_batch to get all signatures
-            info!(
-                "Using Keymeld for DLC signing for competition {}",
-                competition.id
-            );
-
-            // Retrieve stored keygen session and decrypt the session secret
-            let stored_session = self
-                .competition_store
-                .get_keymeld_session(competition.id)
-                .await
-                .map_err(|e| anyhow!("Failed to get keymeld session: {}", e))?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "No keymeld session found for competition {}",
-                        competition.id
-                    )
-                })?;
-
-            let keygen_session = self.restore_keymeld_session(&stored_session)?;
-
-            // Get signing data from ticketed DLC
-            let signing_data = ticketed_dlc.signing_data()?;
-
-            // Get entries to build player_user_ids for subset definitions
-            // Sort by ticket_id to match the order used in keymeld subset definitions
-            let mut entries = self
-                .competition_store
-                .get_competition_entries(competition.id, vec![EntryStatus::Paid])
+            let contract_signatures = self
+                .keymeld_contract_signatures(competition, &ticketed_dlc)
                 .await?;
-            entries.sort_by_key(|entry| entry.ticket_id);
-            let player_user_ids: Vec<UserId> = entries
-                .iter()
-                .map(|entry| UserId::from(entry.ticket_id))
-                .collect();
-
-            self.verify_keymeld_competition(competition, &keygen_session)
-                .await?;
-
-            self.bind_automatic_contract(
-                competition,
-                &keygen_session,
-                &entries,
-                contract_parameters,
-                *funding_outpoint,
-            )
-            .await?;
-
-            // Call keymeld to perform batch signing
-            let dlc_signatures = self
-                .keymeld
-                .sign_dlc_batch(
-                    &keygen_session,
-                    &signing_data,
-                    contract_parameters,
-                    player_user_ids,
-                )
-                .await
-                .map_err(|e| anyhow!("Keymeld signing failed: {}", e))?;
-
-            info!(
-                "Keymeld signing completed for competition {} with {} outcome signatures and {} split signatures",
-                competition.id,
-                dlc_signatures.outcome_signatures.len(),
-                dlc_signatures.split_signatures.len()
-            );
-
-            let contract_signatures = ContractSignatures {
-                expiry_tx_signature: dlc_signatures.expiry_signature,
-                outcome_tx_signatures: dlc_signatures.outcome_signatures,
-                split_tx_signatures: dlc_signatures.split_signatures,
-            };
 
             // The market maker's verification covers every signature in the
             // contract; a bad set would lock the funding output until every

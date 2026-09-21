@@ -1,5 +1,6 @@
 //! Coordinator application rules and payloads; Keymeld treats these as opaque bytes.
 pub use keymeld_core::{escrow, EnclaveId, KeyMeldError, SessionId, UserId};
+pub mod ark;
 pub mod authorization;
 pub mod capacity;
 pub mod escrow_lightning;

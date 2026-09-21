@@ -1,3 +1,4 @@
+mod ark_kickoff;
 mod automatic_store;
 mod coordinator;
 mod payout;
@@ -11,6 +12,7 @@ use crate::infra::{
     oracle::{AddEventEntry, WeatherChoices},
 };
 use anyhow::anyhow;
+pub use ark_kickoff::*;
 pub use automatic_store::*;
 pub use coordinator::*;
 use dlctix::{

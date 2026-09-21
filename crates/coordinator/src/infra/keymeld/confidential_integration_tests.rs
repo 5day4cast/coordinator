@@ -249,6 +249,7 @@ async fn coordinator_service_executes_confidential_dlc_and_recovers_late_paid_ca
         allow_invoice_fallback: true,
         release_entry_key_after_payment: true,
         contract_terms: serde_json::to_string(&terms).unwrap(),
+        ark_escrow: None,
     };
     let mut assignment = service
         .get_registration_assignment(&session, player.clone())
@@ -402,4 +403,498 @@ async fn coordinator_service_executes_confidential_dlc_and_recovers_late_paid_ca
     }
     db.close().await.unwrap();
     server.abort();
+}
+
+/// Binds and signs through the confidential service, as the Arkade kickoff hook does.
+struct ServiceContractSigner {
+    service: Arc<dyn Keymeld>,
+    session: DlcKeygenSession,
+    players: Vec<UserId>,
+    policies: BTreeMap<UserId, PayoutPolicy>,
+}
+
+#[async_trait]
+impl coordinator_ark::ContractSigner for ServiceContractSigner {
+    async fn sign_contract(
+        &self,
+        dlc: &TicketedDLC,
+        _commitment_tx: &dlctix::bitcoin::Psbt,
+    ) -> Result<ContractSignatures, coordinator_ark::BoxError> {
+        let contract = ContractCommitment {
+            contract_parameters: dlc.params().clone(),
+            funding_outpoint: dlc.funding_outpoint(),
+        };
+        self.service
+            .bind_payout_contract(&self.session, &contract, &self.policies)
+            .await?;
+        let result = self
+            .service
+            .sign_dlc_batch(
+                &self.session,
+                &dlc.signing_data()?,
+                dlc.params(),
+                self.players.clone(),
+            )
+            .await?;
+        Ok(ContractSignatures {
+            outcome_tx_signatures: result.outcome_signatures,
+            split_tx_signatures: result.split_signatures,
+            expiry_tx_signature: result.expiry_signature,
+        })
+    }
+}
+
+/// A pool of `count` players, each winning one outcome, with an expiry that splits the pot.
+fn pool_parameters(count: usize) -> ContractParameters {
+    let players = (0..count)
+        .map(|index| Player {
+            pubkey: Scalar::from_slice(&[index as u8 + 20; 32])
+                .unwrap()
+                .base_point_mul(),
+            ticket_hash: payout::sha256(&[index as u8 + 100; 32]),
+            payout_hash: payout::sha256(&[index as u8 + 150; 32]),
+        })
+        .collect();
+    // Weights are percentages. Expiry splits the pot evenly, with the remainder to the first players.
+    let mut outcome_payouts: BTreeMap<Outcome, BTreeMap<usize, u64>> = (0..count)
+        .map(|index| (Outcome::Attestation(index), BTreeMap::from([(index, 100)])))
+        .collect();
+    let (share, remainder) = (100 / count as u64, 100 % count as u64);
+    outcome_payouts.insert(
+        Outcome::Expiry,
+        (0..count)
+            .map(|index| (index, share + u64::from((index as u64) < remainder)))
+            .collect(),
+    );
+    ContractParameters {
+        market_maker: MarketMaker {
+            pubkey: Scalar::from_slice(&[18; 32]).unwrap().base_point_mul(),
+        },
+        players,
+        event: EventLockingConditions {
+            locking_points: (0..count)
+                .map(|index| {
+                    Scalar::from_slice(&[index as u8 + 60; 32])
+                        .unwrap()
+                        .base_point_mul()
+                        .into()
+                })
+                .collect(),
+            expiry: Some(3_500_000),
+        },
+        outcome_payouts,
+        fee_rate: FeeRate::from_sat_per_vb_u32(2),
+        funding_value: Amount::from_sat(20_000 * count as u64),
+        relative_locktime_block_delta: 144,
+    }
+}
+
+/// A running in-process Keymeld with a pool of registered players.
+struct PoolHarness {
+    service: Arc<dyn Keymeld>,
+    session: DlcKeygenSession,
+    params: ContractParameters,
+    players: Vec<UserId>,
+    policies: BTreeMap<UserId, PayoutPolicy>,
+    db: DBConnection,
+    server: tokio::task::JoinHandle<()>,
+    _directory: tempfile::TempDir,
+}
+
+/// Entry key `index`, which is both the player's DLC key and their escrow key.
+fn entry_secret(index: usize) -> [u8; 32] {
+    [index as u8 + 20; 32]
+}
+
+impl PoolHarness {
+    /// Register `count` players. With `escrows`, each consents to its Arkade escrow.
+    async fn start(count: usize, escrows: Option<&[coordinator_ark_escrow::EntryEscrow]>) -> Self {
+        let relay_state = Relay {
+            operator: Arc::new(Mutex::new(operator())),
+            requests: Default::default(),
+            responses: Default::default(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/api/v1/confidential", post(relay))
+            .route("/api/v1/enclaves/1/public-key", get(public_key))
+            .route("/api/v1/enclaves", get(enclaves))
+            .with_state(relay_state)
+            .layer(tower_http::decompression::RequestDecompressionLayer::new());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let directory = tempfile::tempdir().unwrap();
+        let db = DBConnection::new(
+            directory.path().to_str().unwrap(),
+            "pool",
+            DatabasePoolConfig::default(),
+            DatabaseType::Competitions,
+        )
+        .await
+        .unwrap();
+        let settings = KeymeldSettings {
+            enabled: true,
+            dangerous_trust_unattested_enclaves: true,
+            gateway_url: url,
+            initial_polling_delay_ms: 1,
+            max_polling_delay_ms: 10,
+            ..Default::default()
+        };
+        let maker = Uuid::now_v7();
+        let service = create_keymeld_service(settings, maker, &[18; 32], db.clone()).unwrap();
+        let competition = Uuid::now_v7();
+        let params = pool_parameters(count);
+        let players: Vec<UserId> = (0..count).map(|_| UserId::new_v7()).collect();
+        let subsets = DlcSubsetBuilder::new(&params, UserId::from(maker), players.clone())
+            .build()
+            .unwrap();
+        let session = service
+            .init_keygen_session(
+                competition,
+                players.clone(),
+                DlcSubsetInfo {
+                    definitions: subsets.definitions,
+                    outcome_subset_ids: subsets.outcome_subset_ids,
+                },
+            )
+            .await
+            .unwrap();
+        let mut policies = BTreeMap::new();
+        for (index, player) in players.iter().enumerate() {
+            let terms = ContractAuthorization {
+                competition_id: competition,
+                entry_id: Uuid::now_v7(),
+                network: Network::Regtest,
+                player_index: index,
+                player_count: count,
+                ticket_hash: params.players[index].ticket_hash,
+                payout_hash: params.players[index].payout_hash,
+                market_maker: params.market_maker.clone(),
+                event: params.event.clone(),
+                outcome_payouts: params.outcome_payouts.clone(),
+                funding_value: params.funding_value,
+                relative_locktime_block_delta: params.relative_locktime_block_delta,
+                max_fee_rate: params.fee_rate,
+            };
+            let policy = PayoutPolicy {
+                automatic_lightning_address: None,
+                allow_invoice_fallback: true,
+                release_entry_key_after_payment: true,
+                contract_terms: serde_json::to_string(&terms).unwrap(),
+                ark_escrow: escrows.map(|escrows| {
+                    coordinator_escrow::authorization::ArkEscrowPolicy {
+                        escrow_tap_tree: hex::encode(
+                            escrows[index].vtxo_script().encode_tap_tree(),
+                        ),
+                        max_fee_sats: 0,
+                    }
+                }),
+            };
+            let mut assignment = service
+                .get_registration_assignment(&session, player.clone())
+                .await
+                .unwrap();
+            assignment.payout_policy = Some(serde_json::to_string(&policy).unwrap());
+            let prepared = coordinator_core::keymeld::prepare_payout_registration(
+                &entry_secret(index),
+                &[index as u8 + 150; 32],
+                &assignment,
+            )
+            .await
+            .unwrap();
+            service
+                .register_participant(
+                    &session,
+                    player.clone(),
+                    &ParticipantRegistrationData {
+                        encrypted_private_key: prepared.encrypted_private_key,
+                        public_key: hex::encode(&prepared.context.public_key),
+                        auth_pubkey: prepared.auth_pubkey,
+                        context: prepared.context,
+                        payout_policy: Some(policy.clone()),
+                        escrow_policy: prepared.escrow_policy,
+                    },
+                )
+                .await
+                .unwrap();
+            policies.insert(player.clone(), policy);
+        }
+        service.wait_for_keygen_completion(&session).await.unwrap();
+        Self {
+            service,
+            session,
+            params,
+            players,
+            policies,
+            db,
+            server,
+            _directory: directory,
+        }
+    }
+
+    async fn stop(self) {
+        self.db.close().await.unwrap();
+        self.server.abort();
+    }
+}
+
+/// How long Keymeld takes to bind and sign a whole pool inside the Arkade kickoff hook.
+///
+/// The kickoff must finish this within the rest of the server's session after `BatchFinalization`.
+/// This runs the real confidential transport and enclave logic in process, so it excludes network latency.
+///
+///     KEYMELD_POOL_SIZES=3,10,25 cargo test -p coordinator --release pool_signing_fits -- --ignored --nocapture
+#[tokio::test]
+#[ignore = "timing measurement; run in release"]
+async fn pool_signing_fits_in_the_kickoff_hook() {
+    let sizes: Vec<usize> = std::env::var("KEYMELD_POOL_SIZES")
+        .unwrap_or_else(|_| "3".into())
+        .split(',')
+        .map(|size| size.trim().parse().unwrap())
+        .collect();
+    for count in sizes {
+        let registered = std::time::Instant::now();
+        let pool = PoolHarness::start(count, None).await;
+        let before_batch = registered.elapsed();
+        let PoolHarness {
+            service,
+            session,
+            params,
+            players,
+            policies,
+            ..
+        } = &pool;
+        let (service, session, params, players, policies) = (
+            service.clone(),
+            session.clone(),
+            params.clone(),
+            players.clone(),
+            policies.clone(),
+        );
+
+        let hooks = coordinator_ark::DlcKickoff::new(
+            params.clone(),
+            ServiceContractSigner {
+                service: service.clone(),
+                session,
+                players,
+                policies,
+            },
+        )
+        .unwrap();
+        let commitment = dlctix::bitcoin::Transaction {
+            version: dlctix::bitcoin::transaction::Version::TWO,
+            lock_time: dlctix::bitcoin::absolute::LockTime::ZERO,
+            input: vec![dlctix::bitcoin::TxIn {
+                previous_output: OutPoint::new(dlctix::bitcoin::Txid::from_byte_array([7; 32]), 0),
+                ..Default::default()
+            }],
+            output: vec![hooks.funding_output().clone()],
+        };
+        let funding = OutPoint::new(commitment.compute_txid(), 0);
+        let commitment = dlctix::bitcoin::Psbt::from_unsigned_tx(commitment).unwrap();
+
+        let started = std::time::Instant::now();
+        coordinator_ark::KickoffHooks::before_forfeits(&hooks, funding, &commitment)
+            .await
+            .unwrap();
+        let in_hook = started.elapsed();
+        let contract = hooks.signed_contract().unwrap();
+        let signatures = contract.all_signatures();
+        println!(
+            "{count} players: registration and keygen {:.2}s; bind, sign, and verify in the hook {:.2}s \
+             ({} outcome, {} split, expiry {})",
+            before_batch.as_secs_f64(),
+            in_hook.as_secs_f64(),
+            signatures.outcome_tx_signatures.len(),
+            signatures.split_tx_signatures.len(),
+            signatures.expiry_tx_signature.is_some(),
+        );
+        pool.stop().await;
+    }
+}
+
+/// Prints how long each Keymeld signing call takes.
+struct Timed(Arc<crate::domain::KeymeldArkPool>);
+
+#[async_trait]
+impl coordinator_ark::ContractSigner for Timed {
+    async fn sign_contract(
+        &self,
+        dlc: &TicketedDLC,
+        commitment_tx: &dlctix::bitcoin::Psbt,
+    ) -> Result<ContractSignatures, coordinator_ark::BoxError> {
+        let started = std::time::Instant::now();
+        let signatures = self.0.sign_contract(dlc, commitment_tx).await;
+        println!("  contract: {:.2}s", started.elapsed().as_secs_f64());
+        signatures
+    }
+
+    async fn keep(
+        &self,
+        contract: &dlctix::SignedContract,
+        commitment_tx: &dlctix::bitcoin::Psbt,
+    ) -> Result<(), coordinator_ark::BoxError> {
+        self.0.keep(contract, commitment_tx).await
+    }
+}
+
+#[async_trait]
+impl coordinator_ark::EscrowSigner for Timed {
+    async fn sign(
+        &self,
+        requests: &[coordinator_ark::SigningRequest],
+    ) -> Result<Vec<dlctix::bitcoin::secp256k1::schnorr::Signature>, coordinator_ark::BoxError>
+    {
+        let started = std::time::Instant::now();
+        let signatures = self.0.sign(requests).await;
+        let kind = match requests.first().map(|request| &request.purpose) {
+            Some(coordinator_ark::SigningPurpose::IntentProof) => "intent proof",
+            _ => "forfeits",
+        };
+        println!(
+            "  {kind}: {} signatures in {:.2}s",
+            requests.len(),
+            started.elapsed().as_secs_f64()
+        );
+        signatures
+    }
+}
+
+/// A pool funded from Arkade escrows, with Keymeld signing every player's escrow spends and the
+/// whole contract. The scripted arkd checks every intent proof and forfeit signature itself.
+///
+///     KEYMELD_ARK_PLAYERS=10 cargo test -p coordinator --lib keymeld_signs -- --nocapture
+#[tokio::test]
+async fn keymeld_signs_an_arkade_pool_kickoff() {
+    use coordinator_ark::testing::{keypair, mock_info, xonly, Commitment, MockArkd};
+    use coordinator_ark::{
+        escrow_terms, fund_pool, server_rules, DlcKickoff, EscrowInput, KeypairSigner,
+        KickoffConfig, PoolFunding,
+    };
+
+    let count: usize = std::env::var("KEYMELD_ARK_PLAYERS")
+        .ok()
+        .map(|count| count.parse().unwrap())
+        .unwrap_or(3);
+    let info = mock_info(&keypair(7));
+    let rules = server_rules(&info).unwrap();
+    let market_maker = keypair(18);
+    let escrows: Vec<_> = (0..count)
+        .map(|index| {
+            let entry_key = keypair(entry_secret(index)[0]);
+            let terms = escrow_terms(
+                &rules,
+                xonly(&entry_key),
+                xonly(&market_maker),
+                1_790_000_000,
+                1_789_900_000,
+            )
+            .unwrap();
+            coordinator_ark_escrow::EntryEscrow::new(terms).unwrap()
+        })
+        .collect();
+    let harness = PoolHarness::start(count, Some(&escrows)).await;
+
+    // Arkade-funded: the pool is bound before the batch, without a funding outpoint.
+    harness
+        .service
+        .bind_payout_contract(
+            &harness.session,
+            &ContractCommitment {
+                contract_parameters: harness.params.clone(),
+                funding_outpoint: OutPoint::null(),
+            },
+            &harness.policies,
+        )
+        .await
+        .unwrap();
+
+    let inputs = escrows
+        .into_iter()
+        .enumerate()
+        .map(|(index, escrow)| EscrowInput {
+            escrow,
+            outpoint: OutPoint::new(
+                dlctix::bitcoin::Txid::from_byte_array([index as u8 + 1; 32]),
+                0,
+            ),
+            amount: Amount::from_sat(20_000),
+        })
+        .collect();
+    let keymeld_pool = Arc::new(crate::domain::KeymeldArkPool::new(
+        harness.service.clone(),
+        harness.session.clone(),
+        (0..count)
+            .map(|index| {
+                (
+                    xonly(&keypair(entry_secret(index)[0])),
+                    harness.players[index].clone(),
+                )
+            })
+            .collect(),
+    ));
+    let timed = Timed(keymeld_pool.clone());
+    let hooks = DlcKickoff::new(harness.params.clone(), timed).unwrap();
+    let pool = PoolFunding::new(inputs, hooks.funding_output().clone(), &rules, info.dust).unwrap();
+    let arkd = MockArkd::new(&pool, &info, Commitment::PaysThePool);
+
+    let started = std::time::Instant::now();
+    let kickoff = fund_pool(
+        &arkd,
+        &info,
+        &pool,
+        &Timed(keymeld_pool.clone()),
+        &KeypairSigner::new([market_maker]),
+        &hooks,
+        &KickoffConfig {
+            intent_lifetime: Duration::from_secs(120),
+            timeout: Duration::from_secs(120),
+        },
+    )
+    .await
+    .unwrap();
+    println!(
+        "{count} players: Keymeld signed the intent proof, contract and forfeits in {:.2}s",
+        started.elapsed().as_secs_f64()
+    );
+
+    let contract = hooks.signed_contract().expect("signed before the forfeits");
+    assert_eq!(contract.dlc().funding_outpoint(), kickoff.funding);
+    let expiry = contract.expiry_tx().expect("a signed expiry transaction");
+    assert_eq!(expiry.input[0].previous_output, kickoff.funding);
+    assert_eq!(arkd.forfeits().len(), count);
+    assert_eq!(
+        keymeld_pool
+            .signed_contract()
+            .map(|kept| kept.dlc().funding_outpoint()),
+        Some(kickoff.funding)
+    );
+
+    // A retried batch has a new commitment transaction, so the contract is signed again for the
+    // new funding outpoint, in the same keygen session.
+    let retry = MockArkd::new(&pool, &info, Commitment::PaysThePool).with_batch_nonce(1);
+    let hooks = DlcKickoff::new(harness.params.clone(), Timed(keymeld_pool.clone())).unwrap();
+    let second = fund_pool(
+        &retry,
+        &info,
+        &pool,
+        &Timed(keymeld_pool.clone()),
+        &KeypairSigner::new([market_maker]),
+        &hooks,
+        &KickoffConfig {
+            intent_lifetime: Duration::from_secs(120),
+            timeout: Duration::from_secs(120),
+        },
+    )
+    .await
+    .unwrap();
+    assert_ne!(second.funding, kickoff.funding);
+    assert_eq!(
+        hooks
+            .signed_contract()
+            .map(|signed| signed.dlc().funding_outpoint()),
+        Some(second.funding)
+    );
+    harness.stop().await;
 }

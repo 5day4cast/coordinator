@@ -1,6 +1,9 @@
 //! Typed application data carried only inside Keymeld's confidential payloads.
 use crate::{
-    authorization::PayoutPolicy, payout::ContractCommitment, payout_protocol::PayoutMethod,
+    ark::{ArkEscrowSpend, ArkFunding},
+    authorization::PayoutPolicy,
+    payout::ContractCommitment,
+    payout_protocol::PayoutMethod,
 };
 use keymeld_core::{
     escrow::{
@@ -22,6 +25,9 @@ pub const RELEASE_ENTRY_KEY: &str = "release_entry_key";
 pub const PREIMAGE_SECRET: &str = "entry_preimage";
 pub const CONTRACT_RULE: &str = "contract_signing_allowed";
 pub const SETTLEMENT_RULE: &str = "settlement_completed";
+/// Signs spends of the entry's Arkade escrow VTXO, when the ticket has one.
+pub const SIGN_ARK_ESCROW: &str = "sign_ark_escrow";
+pub const ARK_ESCROW_RULE: &str = "ark_escrow_spend_allowed";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,13 +40,23 @@ pub struct ContractBinding {
 pub enum ActionParameters {
     /// IDs and routing subsets are client-selected. The verifier reconstructs
     /// the exact contract messages, signing keys, tweaks and adaptor points.
-    SignContract { scope: SigningScope },
+    SignContract {
+        scope: SigningScope,
+        /// For an Arkade-funded pool: the commitment transaction that fixes the funding outpoint.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ark_funding: Option<ArkFunding>,
+    },
     PrepareSettlement {
         claim_id: Uuid,
         contract_signatures: String,
         attestation: String,
         method: PayoutMethod,
+        /// For an Arkade-funded pool: the commitment transaction that fixes the funding outpoint.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ark_funding: Option<ArkFunding>,
     },
+    /// Sign the entry's Arkade escrow spend. See [`crate::ark`].
+    SignArkEscrow { spend: ArkEscrowSpend },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +124,7 @@ pub fn participant_policy(
 ) -> Result<EscrowPolicy, KeyMeldError> {
     let terms = crate::payout::ContractAuthorization::from_policy(&policy)
         .map_err(|error| KeyMeldError::ValidationError(error.to_string()))?;
+    let ark_escrow = policy.ark_escrow.is_some();
     let policy_data = Payload::encode(&policy)?;
     context.application =
         ApplicationContext::commit(VERIFIER_ID.into(), VERIFIER_VERSION, policy_data.as_bytes())?;
@@ -116,7 +133,12 @@ pub fn participant_policy(
             SIGN_CONTRACT.into(),
             ActionGrant {
                 preparation: escrow::PreparationPolicy::Single,
-                repetition: escrow::Repetition::RepeatIdenticalSigningScope,
+                // An Arkade pool signs again, for a new funding outpoint, when its batch is retried.
+                repetition: if ark_escrow {
+                    escrow::Repetition::VerifierAuthorizedAttempts
+                } else {
+                    escrow::Repetition::RepeatIdenticalSigningScope
+                },
                 condition: Condition::VerifierRule {
                     rule: CONTRACT_RULE.into(),
                 },
@@ -152,6 +174,21 @@ pub fn participant_policy(
             },
         ),
     ]);
+    let mut grants = grants;
+    if ark_escrow {
+        grants.insert(
+            SIGN_ARK_ESCROW.into(),
+            ActionGrant {
+                preparation: escrow::PreparationPolicy::Single,
+                // Every batch attempt signs new transactions, and the verifier checks each one.
+                repetition: escrow::Repetition::VerifierAuthorizedAttempts,
+                condition: Condition::VerifierRule {
+                    rule: ARK_ESCROW_RULE.into(),
+                },
+                operation: Permission::SignBip340,
+            },
+        );
+    }
     let policy = EscrowPolicy {
         schema_version: escrow::SCHEMA_VERSION,
         context,

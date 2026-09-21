@@ -403,6 +403,7 @@ impl Fixture {
                 allow_invoice_fallback: true,
                 release_entry_key_after_payment: true,
                 contract_terms: serde_json::to_string(&terms).unwrap(),
+                ark_escrow: None,
             };
             use coordinator_escrow::escrow::{
                 ApplicationContext, EscrowContext, PublicKeyBytes, Recipient,

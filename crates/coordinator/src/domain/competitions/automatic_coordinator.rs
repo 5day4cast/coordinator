@@ -331,6 +331,7 @@ impl Coordinator {
             allow_invoice_fallback: choice.allow_invoice_fallback,
             release_entry_key_after_payment: choice.release_entry_key_after_payment,
             contract_terms: serde_json::to_string(&terms).map_err(|e| Error::Bitcoin(e.into()))?,
+            ark_escrow: None,
         };
         ContractAuthorization::from_policy(&policy)
             .map_err(|e| Error::BadRequest(e.to_string()))?;
