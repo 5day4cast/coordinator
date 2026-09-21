@@ -8,11 +8,12 @@ members = [
     "crates/coordinator-escrow-verifier",
     "crates/coordinator-verifier-enclave",
     "crates/coordinator-lnurl-relay",
+    "crates/coordinator-ark-escrow",
 ]
 # Nitro enclave and VSock relay binaries build only when selected explicitly.
 default-members = [
     "crates/coordinator", "crates/coordinator-core", "crates/coordinator-wasm",
-    "crates/synth", "crates/coordinator-escrow",
+    "crates/synth", "crates/coordinator-escrow", "crates/coordinator-ark-escrow",
 ]
 resolver = "2"
 
@@ -29,6 +30,7 @@ name = "coordinator"
 # Internal crates
 coordinator-core = { path = "crates/coordinator-core" }
 coordinator-escrow = { path = "crates/coordinator-escrow" }
+coordinator-ark-escrow = { path = "crates/coordinator-ark-escrow" }
 
 # Keymeld: released SDK and services on the published dlctix crate.
 # keymeld-sdk and the coordinator must resolve dlctix from the same source.

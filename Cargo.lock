@@ -1383,6 +1383,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "coordinator-ark-escrow"
+version = "2.0.0"
+dependencies = [
+ "bitcoin",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "coordinator-core"
 version = "2.0.0"
 dependencies = [
