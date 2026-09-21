@@ -259,6 +259,10 @@ async fn coordinator_service_executes_confidential_dlc_and_recovers_late_paid_ca
         coordinator_core::keymeld::prepare_payout_registration(&[14; 32], &[6; 32], &assignment)
             .await
             .unwrap();
+    // The lifecycle starts keygen only once this reports every participant registered.
+    let waiting = service.get_keygen_status(&session).await.unwrap();
+    assert!(!waiting.is_completed);
+    assert_eq!(waiting.status, "collecting_participants");
     service
         .register_participant(
             &session,
@@ -274,7 +278,17 @@ async fn coordinator_service_executes_confidential_dlc_and_recovers_late_paid_ca
         )
         .await
         .unwrap();
+    let registered = service.get_keygen_status(&session).await.unwrap();
+    assert!(
+        registered.is_completed,
+        "a fully registered session must let the lifecycle start keygen"
+    );
+    assert_eq!(registered.status, "participants_registered");
     service.wait_for_keygen_completion(&session).await.unwrap();
+    assert_eq!(
+        service.get_keygen_status(&session).await.unwrap().status,
+        "completed"
+    );
     let contract = ContractCommitment {
         contract_parameters: params.clone(),
         funding_outpoint: OutPoint::null(),
