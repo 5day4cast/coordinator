@@ -25,12 +25,15 @@ use crate::swap::Swapper;
 struct AppState {
     swapper: Arc<Swapper>,
     token: Arc<String>,
+    /// This instance, as a holder of the worker lease.
+    holder: Arc<String>,
 }
 
-pub fn router(swapper: Arc<Swapper>, token: String) -> Router {
+pub fn router(swapper: Arc<Swapper>, token: String, holder: String) -> Router {
     let state = AppState {
         swapper,
         token: Arc::new(token),
+        holder: Arc::new(holder),
     };
     let authenticated = Router::new()
         .route("/v1/swaps", post(create_swap))
@@ -117,6 +120,17 @@ async fn wallet(State(state): State<AppState>) -> Response {
 }
 
 async fn board(State(state): State<AppState>) -> Response {
+    // Only the lease holder moves the wallet's coins, so two instances never spend the same one.
+    match state.swapper.store.holds_lease(&state.holder).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return failure(
+                StatusCode::CONFLICT,
+                anyhow::anyhow!("another ark-swapd instance runs the wallet; retry there"),
+            )
+        }
+        Err(error) => return failure(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
     match state.swapper.wallet.board().await {
         Ok(txid) => {
             Json(json!({ "commitment_txid": txid.map(|txid| txid.to_string()) })).into_response()

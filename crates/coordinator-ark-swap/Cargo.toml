@@ -34,3 +34,6 @@ time = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 toml = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -102,6 +102,42 @@ impl Store {
         Ok(Self { pool })
     }
 
+    /// Take or keep the worker lease for `ttl`. False while another instance holds it.
+    pub async fn take_lease(&self, holder: &str, ttl: std::time::Duration) -> anyhow::Result<bool> {
+        let now = now_ms();
+        let taken = sqlx::query(
+            "INSERT INTO worker_lease (id, holder, expires_at) VALUES (1, ?1, ?2)
+             ON CONFLICT (id) DO UPDATE SET holder = excluded.holder, expires_at = excluded.expires_at
+             WHERE worker_lease.holder = excluded.holder OR worker_lease.expires_at <= ?3",
+        )
+        .bind(holder)
+        .bind(now.saturating_add(ttl.as_millis() as i64))
+        .bind(now)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(taken == 1)
+    }
+
+    /// Whether `holder` holds the worker lease now.
+    pub async fn holds_lease(&self, holder: &str) -> anyhow::Result<bool> {
+        let row = sqlx::query("SELECT 1 FROM worker_lease WHERE holder = ? AND expires_at > ?")
+            .bind(holder)
+            .bind(now_ms())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
+    /// Hand the worker lease over at once, on shutdown.
+    pub async fn release_lease(&self, holder: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE worker_lease SET expires_at = 0 WHERE holder = ?")
+            .bind(holder)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn insert(&self, swap: &Swap) -> anyhow::Result<()> {
         sqlx::query(
             "INSERT INTO swaps (id, escrow_address, amount_sat, payment_hash, preimage, invoice, state,
@@ -202,4 +238,48 @@ fn swap(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Swap> {
         updated_at: row.try_get("updated_at")?,
         expires_at: row.try_get("expires_at")?,
     })
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn one_instance_runs_the_swaps_until_it_hands_over() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("swaps.sqlite");
+        let blue = Store::open(&path).await.unwrap();
+        let green = Store::open(&path).await.unwrap();
+        let ttl = Duration::from_secs(15);
+
+        assert!(blue.take_lease("blue", ttl).await.unwrap());
+        assert!(!green.take_lease("green", ttl).await.unwrap());
+        assert!(
+            blue.take_lease("blue", ttl).await.unwrap(),
+            "the holder renews"
+        );
+        assert!(blue.holds_lease("blue").await.unwrap());
+        assert!(!green.holds_lease("green").await.unwrap());
+
+        blue.release_lease("blue").await.unwrap();
+        assert!(green.take_lease("green", ttl).await.unwrap());
+        assert!(!blue.take_lease("blue", ttl).await.unwrap());
+
+        // A holder that stops renewing loses the lease when it expires.
+        green.release_lease("green").await.unwrap();
+        assert!(blue
+            .take_lease("blue", Duration::from_millis(50))
+            .await
+            .unwrap());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(green.take_lease("green", ttl).await.unwrap());
+    }
 }

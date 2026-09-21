@@ -38,6 +38,10 @@ struct Cli {
 /// How often unfinished swaps advance. An HTLC is held for about this long before the escrow is paid.
 const TICK: Duration = Duration::from_secs(1);
 
+/// How long the worker lease outlives its holder. Another instance takes over a stopped one's
+/// swaps after this, or at once when it shuts down cleanly.
+const LEASE_TTL: Duration = Duration::from_secs(15);
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     fern::Dispatch::new()
@@ -76,18 +80,60 @@ async fn main() -> anyhow::Result<()> {
         view.boarding_address
     );
 
+    // Two instances can share the database during a blue/green deploy. Only the lease holder
+    // advances swaps and moves the wallet's coins; both serve the API.
+    let holder = format!("ark-swapd-{}", uuid::Uuid::now_v7());
+    let (stop, stopped) = tokio::sync::watch::channel(false);
     let worker = swapper.clone();
-    tokio::spawn(async move {
+    let worker_holder = holder.clone();
+    let mut worker_stopped = stopped.clone();
+    let worker_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(TICK);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut holding = false;
         loop {
-            interval.tick().await;
-            worker.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = worker_stopped.changed() => break,
+            }
+            match worker.store.take_lease(&worker_holder, LEASE_TTL).await {
+                Ok(true) => {
+                    if !holding {
+                        log::info!("{worker_holder} runs the swaps");
+                        holding = true;
+                    }
+                    // A tick always finishes, so a payment in flight records its result.
+                    worker.tick().await;
+                }
+                Ok(false) => {
+                    if holding {
+                        log::warn!("another ark-swapd instance took over the swaps");
+                        holding = false;
+                    }
+                }
+                Err(error) => log::warn!("cannot take the worker lease: {error:#}"),
+            }
+        }
+        if let Err(error) = worker.store.release_lease(&worker_holder).await {
+            log::warn!("cannot release the worker lease: {error:#}");
         }
     });
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
-    log::info!("listening on {}", config.listen);
-    axum::serve(listener, api::router(swapper, token)).await?;
+    log::info!("listening on {} as {holder}", config.listen);
+    axum::serve(listener, api::router(swapper, token, holder))
+        .with_graceful_shutdown(async move {
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("SIGTERM handler");
+            tokio::select! {
+                _ = terminate.recv() => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+            log::info!("stopping: finishing the current swap tick, then handing over");
+            let _ = stop.send(true);
+        })
+        .await?;
+    worker_task.await?;
     Ok(())
 }
