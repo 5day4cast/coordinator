@@ -67,10 +67,10 @@ function load(window, document, fetch) {
   return sandbox;
 }
 
-function termsFetch(event = EVENT) {
+function termsFetch(event = EVENT, quote = {}) {
   return async (url) => {
     if (url.endsWith("/payout-terms")) {
-      return { ok: true, json: async () => ({ enabled: true, relative_locktime_block_delta: 72, max_fee_rate_sat_vb: 5 }) };
+      return { ok: true, json: async () => ({ enabled: true, relative_locktime_block_delta: 72, max_fee_rate_sat_vb: 5, ...quote }) };
     }
     if (url.startsWith("https://oracle/")) {
       return { ok: true, json: async () => ({ id: COMPETITION, event_announcement: {} }) };
@@ -148,6 +148,21 @@ test("a full page load gets payout terms, then the profile address once the user
   assert.equal(sandbox.window.entryPayoutAddress, "thor@lnurl.5day4cast.com");
   assert.equal(elements.entryPayoutDestination.textContent, "Automatically to thor@lnurl.5day4cast.com");
   assert.equal(elements.entryPayoutApproved.checked, false, "a new destination needs fresh consent");
+});
+
+test("an Arkade entry says its refund goes to the profile address, with nothing more to approve", async () => {
+  const { elements, document } = entryPage();
+  const window = {
+    isLoggedIn: () => true,
+    nostrClient: {},
+    AuthorizedClient: class { async post() {
+      return { ok: true, json: async () => ({ lightning_address: "thor@lnurl.5day4cast.com" }) };
+    } },
+  };
+  const sandbox = load(window, document, termsFetch(EVENT, { arkade: true }));
+  await sandbox.window.setupEntryPayoutConsent();
+  assert.equal(elements.entryPayoutDestination.textContent,
+    "Automatically to thor@lnurl.5day4cast.com. If the competition does not start, your entry fee is refunded there.");
 });
 
 test("changed terms never tell the user to reload, which would log them out", async () => {

@@ -171,6 +171,7 @@ fn settlement_request(
             invoice,
             authorization,
         },
+        ark_funding: None,
     }
 }
 
@@ -509,6 +510,15 @@ fn entry_secret(index: usize) -> [u8; 32] {
 impl PoolHarness {
     /// Register `count` players. With `escrows`, each consents to its Arkade escrow.
     async fn start(count: usize, escrows: Option<&[coordinator_ark_escrow::EntryEscrow]>) -> Self {
+        Self::start_with(pool_parameters(count), escrows).await
+    }
+
+    /// Register the players of `params`, whose keys are the entry keys from [`entry_secret`].
+    async fn start_with(
+        params: ContractParameters,
+        escrows: Option<&[coordinator_ark_escrow::EntryEscrow]>,
+    ) -> Self {
+        let count = params.players.len();
         let relay_state = Relay {
             operator: Arc::new(Mutex::new(operator())),
             requests: Default::default(),
@@ -543,7 +553,6 @@ impl PoolHarness {
         let maker = Uuid::now_v7();
         let service = create_keymeld_service(settings, maker, &[18; 32], db.clone()).unwrap();
         let competition = Uuid::now_v7();
-        let params = pool_parameters(count);
         let players: Vec<UserId> = (0..count).map(|_| UserId::new_v7()).collect();
         let subsets = DlcSubsetBuilder::new(&params, UserId::from(maker), players.clone())
             .build()
@@ -896,5 +905,215 @@ async fn keymeld_signs_an_arkade_pool_kickoff() {
             .map(|signed| signed.dlc().funding_outpoint()),
         Some(second.funding)
     );
+    harness.stop().await;
+}
+
+/// A run of [`keymeld_kicks_off_a_pool_on_mutinynet`], kept between its steps.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MutinynetRun {
+    players: usize,
+    escrow_sats: u64,
+    created_at: u32,
+    refund_at: u32,
+    kickoff: Option<MutinynetKickoff>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MutinynetKickoff {
+    batch_id: String,
+    commitment_txid: String,
+    funding: String,
+    expiry_height: u32,
+    /// Consensus hex of the contract's expiry transaction, signed by Keymeld.
+    expiry_tx: String,
+    seconds_in_batch: f64,
+}
+
+/// Keymeld signs a pool's kickoff on Arkade's Mutinynet server: every intent proof, the contract,
+/// and every forfeit. The run is kept in `ARK_KEYMELD_STATE`, and each step is a new run:
+///
+/// 1. With no state, print each escrow's address. Fund each with `escrow_sats`, through `ark-swapd`.
+/// 2. Once every escrow holds a VTXO, kick off the pool in the next batch.
+/// 3. Once the tip reaches the contract's expiry, broadcast Keymeld's expiry transaction.
+///
+///     ARK_KEYMELD_STATE=run.json cargo test -p coordinator --lib keymeld_kicks_off -- --ignored --nocapture
+#[tokio::test]
+#[ignore = "needs Arkade's Mutinynet server and funded escrows"]
+async fn keymeld_kicks_off_a_pool_on_mutinynet() {
+    use coordinator_ark::testing::{keypair, xonly};
+    use coordinator_ark::{
+        fund_pool, ArkServer, DlcKickoff, EscrowInput, KeypairSigner, KickoffConfig, PoolFunding,
+    };
+
+    const SERVER: &str = "https://mutinynet.arkade.sh";
+    const ESPLORA: &str = "https://mutinynet.com/api";
+    const EXPIRY_BLOCKS: u32 = 6;
+
+    let path = std::path::PathBuf::from(
+        std::env::var("ARK_KEYMELD_STATE").expect("ARK_KEYMELD_STATE names the run's state file"),
+    );
+    let save = |run: &MutinynetRun| {
+        std::fs::write(&path, serde_json::to_string_pretty(run).unwrap()).unwrap()
+    };
+    let http = reqwest::Client::new();
+    let tip = || async {
+        http.get(format!("{ESPLORA}/blocks/tip/height"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap()
+    };
+    let server = ArkServer::connect(SERVER).await.unwrap();
+    let mut run: MutinynetRun = if path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+    } else {
+        let created_at = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let run = MutinynetRun {
+            players: 3,
+            escrow_sats: 2_000,
+            created_at,
+            refund_at: created_at + 2 * 24 * 60 * 60,
+            kickoff: None,
+        };
+        save(&run);
+        run
+    };
+    let market_maker = keypair(18);
+    let escrows: Vec<_> = (0..run.players)
+        .map(|index| {
+            let terms = server
+                .escrow_terms(
+                    xonly(&keypair(entry_secret(index)[0])),
+                    xonly(&market_maker),
+                    run.refund_at,
+                    run.created_at,
+                )
+                .unwrap();
+            server.entry_escrow(terms).unwrap()
+        })
+        .collect();
+
+    if let Some(kickoff) = &run.kickoff {
+        let tip = tip().await;
+        if tip < kickoff.expiry_height {
+            println!(
+                "the expiry transaction is valid from height {}; the tip is {tip}",
+                kickoff.expiry_height
+            );
+            return;
+        }
+        let response = http
+            .post(format!("{ESPLORA}/tx"))
+            .body(kickoff.expiry_tx.clone())
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(status.is_success(), "broadcast failed: {status} {body}");
+        println!("broadcast Keymeld's expiry transaction: https://mutinynet.com/tx/{body}");
+        return;
+    }
+
+    let vtxos = server.escrow_vtxos(&escrows).await.unwrap();
+    let mut inputs = Vec::new();
+    for escrow in &escrows {
+        let address = escrow.address(server.hrp()).unwrap().encode();
+        let script = escrow.script_pubkey();
+        match vtxos
+            .iter()
+            .find(|vtxo| vtxo.script == script && !vtxo.is_spent && !vtxo.is_swept)
+        {
+            Some(vtxo) => inputs.push(EscrowInput {
+                escrow: escrow.clone(),
+                outpoint: vtxo.outpoint,
+                amount: vtxo.amount,
+            }),
+            None => println!("unfunded: {address} {}", run.escrow_sats),
+        }
+    }
+    if inputs.len() < escrows.len() {
+        return;
+    }
+
+    let total: Amount = inputs.iter().map(|input| input.amount).sum();
+    let expiry_height = tip().await + EXPIRY_BLOCKS;
+    let mut params = pool_parameters(run.players);
+    params.funding_value = total;
+    params.event.expiry = Some(expiry_height);
+    params.relative_locktime_block_delta = 2;
+    let harness = PoolHarness::start_with(params.clone(), Some(&escrows)).await;
+    harness
+        .service
+        .bind_payout_contract(
+            &harness.session,
+            &ContractCommitment {
+                contract_parameters: params.clone(),
+                funding_outpoint: OutPoint::null(),
+            },
+            &harness.policies,
+        )
+        .await
+        .unwrap();
+    let keymeld_pool = Arc::new(crate::domain::KeymeldArkPool::new(
+        harness.service.clone(),
+        harness.session.clone(),
+        (0..run.players)
+            .map(|index| {
+                (
+                    xonly(&keypair(entry_secret(index)[0])),
+                    harness.players[index].clone(),
+                )
+            })
+            .collect(),
+    ));
+    let hooks = DlcKickoff::new(params, Timed(keymeld_pool.clone())).unwrap();
+    let pool = PoolFunding::new(
+        inputs,
+        hooks.funding_output().clone(),
+        server.rules(),
+        server.info().dust,
+    )
+    .unwrap();
+    println!(
+        "kicking off {} escrows worth {total}, expiry at height {expiry_height}",
+        run.players
+    );
+    let started = std::time::Instant::now();
+    let kickoff = fund_pool(
+        server.client(),
+        server.info(),
+        &pool,
+        &Timed(keymeld_pool.clone()),
+        &KeypairSigner::new([market_maker]),
+        &hooks,
+        &KickoffConfig::for_server(server.info()),
+    )
+    .await
+    .unwrap();
+    let seconds_in_batch = started.elapsed().as_secs_f64();
+    let contract = keymeld_pool
+        .signed_contract()
+        .expect("signed before the forfeits");
+    assert_eq!(contract.dlc().funding_outpoint(), kickoff.funding);
+    let expiry = contract.expiry_tx().expect("a signed expiry transaction");
+    println!(
+        "batch {} committed https://mutinynet.com/tx/{} after {seconds_in_batch:.1}s",
+        kickoff.batch_id, kickoff.commitment_txid
+    );
+    run.kickoff = Some(MutinynetKickoff {
+        batch_id: kickoff.batch_id,
+        commitment_txid: kickoff.commitment_txid.to_string(),
+        funding: kickoff.funding.to_string(),
+        expiry_height,
+        expiry_tx: dlctix::bitcoin::consensus::encode::serialize_hex(&expiry),
+        seconds_in_batch,
+    });
+    save(&run);
     harness.stop().await;
 }

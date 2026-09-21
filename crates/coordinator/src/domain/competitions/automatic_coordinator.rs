@@ -36,6 +36,8 @@ pub struct PayoutTermsQuote {
     pub enabled: bool,
     pub relative_locktime_block_delta: u16,
     pub max_fee_rate_sat_vb: u64,
+    /// Buy-ins wait in Arkade escrows, refunded to the entry's Lightning Address if the pool never starts.
+    pub arkade: bool,
 }
 
 impl Coordinator {
@@ -57,6 +59,7 @@ impl Coordinator {
                 .relative_locktime_block_delta
                 .unwrap_or(self.relative_locktime_block_delta as u16),
             max_fee_rate_sat_vb: self.automatic_payout_max_fee_rate.to_sat_per_vb_floor(),
+            arkade: self.competition_store.is_ark_funded(competition_id).await?,
         })
     }
 
@@ -331,7 +334,9 @@ impl Coordinator {
             allow_invoice_fallback: choice.allow_invoice_fallback,
             release_entry_key_after_payment: choice.release_entry_key_after_payment,
             contract_terms: serde_json::to_string(&terms).map_err(|e| Error::Bitcoin(e.into()))?,
-            ark_escrow: None,
+            ark_escrow: self
+                .ticket_ark_escrow_policy(competition, ticket, entry_pubkey)
+                .await?,
         };
         ContractAuthorization::from_policy(&policy)
             .map_err(|e| Error::BadRequest(e.to_string()))?;
@@ -692,6 +697,14 @@ impl Coordinator {
             .as_ref()
             .ok_or_else(|| anyhow!("Missing contract parameters"))?;
         let owed = winner_payout_sats(params, &outcome, &entry.ephemeral_pubkey.parse()?)?;
+        let ark_funding = self
+            .competition_store
+            .ark_commitment(entry.event_id)
+            .await?
+            .map(|done| coordinator_escrow::ark::ArkFunding {
+                commitment_tx: done.commitment_tx,
+                vout: done.funding_vout,
+            });
         let prepared = self
             .keymeld
             .prepare_payout(
@@ -703,6 +716,7 @@ impl Coordinator {
                     contract_signatures: serde_json::to_string(contract.all_signatures())?,
                     attestation: hex::encode(attestation.serialize()),
                     method: serde_json::from_str(&job.request_json)?,
+                    ark_funding,
                 },
             )
             .await?;

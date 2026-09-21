@@ -42,9 +42,18 @@ impl EntriesSubmitted {
         funding_outpoint: OutPoint,
         funding_psbt_base64: String,
     ) -> CompetitionStatus {
-        self.competition.contract_parameters = Some(contract_params);
         self.competition.funding_outpoint = Some(funding_outpoint);
         self.competition.funding_psbt_base64 = Some(funding_psbt_base64);
+        self.ark_contract_created(contract_params)
+    }
+
+    /// Transition to ContractCreated for an Arkade competition, whose funding outpoint comes
+    /// from the kickoff batch.
+    pub fn ark_contract_created(
+        mut self,
+        contract_params: ContractParameters,
+    ) -> CompetitionStatus {
+        self.competition.contract_parameters = Some(contract_params);
         self.competition.contracted_at = Some(OffsetDateTime::now_utc());
         CompetitionStatus::ContractCreated(ContractCreated::from_competition(self.competition))
     }

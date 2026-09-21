@@ -1595,7 +1595,8 @@ impl CompetitionStore {
                LEFT JOIN entries ON tickets.id = entries.ticket_id
                WHERE reserved_at IS NOT NULL
                  AND settled_at IS NULL
-                 AND payment_request IS NOT NULL"#,
+                 AND payment_request IS NOT NULL
+                 AND tickets.id NOT IN (SELECT ticket_id FROM ticket_ark_escrows)"#,
         )
         .fetch_all(self.db_connection.read())
         .await?;
@@ -1762,7 +1763,8 @@ impl CompetitionStore {
                FROM tickets
                LEFT JOIN entries ON tickets.id = entries.ticket_id
                WHERE tickets.hash = ?
-               AND tickets.paid_at IS NULL"#,
+               AND tickets.paid_at IS NULL
+               AND tickets.id NOT IN (SELECT ticket_id FROM ticket_ark_escrows)"#,
         )
         .bind(hash)
         .fetch_optional(self.db_connection.read())

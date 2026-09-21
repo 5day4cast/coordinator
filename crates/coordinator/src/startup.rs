@@ -483,7 +483,8 @@ pub async fn build_app(
     .with_automatic_payouts(
         config.keymeld_settings.automatic_payouts,
         config.keymeld_settings.automatic_payout_max_fee_rate_sat_vb,
-    )?;
+    )?
+    .with_ark(arkade(&config.ark_settings).await?)?;
     let coordinator = Arc::new(coordinator);
 
     if config.coordinator_settings.escrow_enabled {
@@ -583,6 +584,28 @@ pub async fn build_app(
         },
     );
     threads.insert("automatic_payouts".to_string(), automatic_handle);
+
+    if coordinator.ark().is_some() {
+        let ark_coordinator = coordinator.clone();
+        let ark_cancel = cancel_token.clone();
+        let ark_handle =
+            spawn_supervised(&tracker, "escrow swaps", cancel_token.clone(), async move {
+                loop {
+                    tokio::select! {
+                        _ = ark_cancel.cancelled() => break,
+                        result = ark_coordinator.check_ark_swaps() => {
+                            if let Err(error) = result { error!("Escrow swap worker: {}", error); }
+                        }
+                    }
+                    tokio::select! {
+                        _ = ark_cancel.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                    }
+                }
+                Ok(())
+            });
+        threads.insert("escrow_swaps".to_string(), ark_handle);
+    }
 
     // Subscription-based watchers for faster payment detection
     // These run alongside the polling watchers as the primary mechanism,
@@ -1450,3 +1473,26 @@ mod static_file_tests {
 #[cfg(test)]
 #[path = "startup_hardening_tests.rs"]
 mod startup_hardening_tests;
+
+/// The Arkade server and swap service, when Arkade funding is enabled.
+async fn arkade(
+    settings: &crate::config::ArkSettings,
+) -> Result<Option<crate::domain::Arkade>, anyhow::Error> {
+    if !settings.enabled {
+        return Ok(None);
+    }
+    let server = coordinator_ark::ArkServer::connect(settings.server_url.clone()).await?;
+    let swaps =
+        crate::infra::ark_swap::SwapClient::new(&settings.swap_url, settings.swap_token()?)?;
+    info!(
+        "Arkade funding enabled: server {} (signer {}), swaps at {}",
+        settings.server_url,
+        server.rules().signer,
+        settings.swap_url
+    );
+    Ok(Some(crate::domain::Arkade {
+        server,
+        swaps: Arc::new(swaps),
+        refund_after_start_secs: settings.refund_after_start_secs,
+    }))
+}

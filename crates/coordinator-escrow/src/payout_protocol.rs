@@ -70,6 +70,9 @@ pub struct PreparePayoutRequest {
     pub contract_signatures: String,
     pub attestation: String,
     pub method: PayoutMethod,
+    /// The batch that funded an Arkade pool, whose contract is bound without a funding outpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ark_funding: Option<crate::ark::ArkFunding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

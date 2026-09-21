@@ -7,8 +7,8 @@ use crate::nostr::{CustomSigner, NostrClientCore};
 use ::nostr::NostrSigner;
 use coordinator_core::{
     keymeld::{
-        payout, payout_protocol, prepare_payout_registration, prepare_registration, PayoutPolicy,
-        PreparedRegistration,
+        ark, payout, payout_protocol, prepare_payout_registration, prepare_registration,
+        PayoutPolicy, PreparedRegistration,
     },
     RegistrationAssignment,
 };
@@ -210,6 +210,32 @@ impl DlcWalletCore {
             || policy.allow_invoice_fallback != consent.allow_invoice_fallback
         {
             return Err(reject());
+        }
+        // Entering is the consent to an Arkade escrow: it must hold the entry key, fund only this
+        // pool's market maker, refund by the contract's expiry, and charge at most the ticket's markup.
+        if let Some(ark_escrow) = &policy.ark_escrow {
+            let xonly = |point: Point| {
+                ark::XOnlyPublicKey::from_slice(&point.serialize_xonly()).map_err(|_| reject())
+            };
+            ark::consented_escrow(
+                ark_escrow,
+                xonly(key.point())?,
+                xonly(terms.market_maker.pubkey)?,
+                terms.event.expiry,
+            )
+            .map_err(|_| reject())?;
+            let players = consent.expected_player_count as u64;
+            let fees = ark_escrow
+                .max_fee_sats
+                .checked_mul(players)
+                .ok_or_else(reject)?;
+            let paid = consent
+                .ticket_amount_sats
+                .checked_mul(players)
+                .ok_or_else(reject)?;
+            if fees.saturating_add(consent.expected_funding_sats) > paid {
+                return Err(reject());
+            }
         }
         Ok(())
     }
@@ -1134,6 +1160,81 @@ mod tests {
                     .is_err(),
                 "{field}"
             );
+        }
+    }
+
+    #[test]
+    fn payout_registration_checks_the_arkade_escrow() {
+        use coordinator_ark_escrow::{EntryEscrow, EscrowTerms, RelativeTimelock};
+        use coordinator_core::keymeld::ArkEscrowPolicy;
+        use dlctix::bitcoin::absolute::LockTime;
+
+        let f = fixture();
+        let (assignment, mut consent) = payout_assignment(&f);
+        let expiry = 1_900_000_000;
+        consent.oracle_announcement.expiry = Some(expiry);
+        // Each of the two players pays their 50,000 sat share of the pool plus a 100 sat fee.
+        consent.ticket_amount_sats = 50_100;
+        consent.ticket_invoice = test_invoice(50_100_000).to_string();
+        let xonly =
+            |point: Point| ark::XOnlyPublicKey::from_slice(&point.serialize_xonly()).unwrap();
+        let player = xonly(f.wallet.entry_key(f.entry_id).unwrap().point());
+        let market_maker = xonly(f.params.market_maker.pubkey);
+        let stranger = xonly(f.other_player_key.base_point_mul());
+        let server = xonly(Scalar::from_slice(&[5; 32]).unwrap().base_point_mul());
+        let with_escrow = |player, coordinator, refund_at: u32, max_fee_sats| {
+            let refund_locktime = LockTime::from_time(refund_at).unwrap();
+            let exit_delay = RelativeTimelock::Seconds(2048);
+            let escrow = EntryEscrow::new(EscrowTerms {
+                player,
+                coordinator,
+                server,
+                refund_locktime,
+                exit_delay,
+                unilateral_refund_delay: EscrowTerms::unilateral_refund_delay_for(
+                    refund_locktime,
+                    exit_delay,
+                    refund_at - 86_400,
+                )
+                .unwrap(),
+            })
+            .unwrap();
+            let mut assignment = assignment.clone();
+            let mut policy: PayoutPolicy =
+                serde_json::from_str(assignment.payout_policy.as_deref().unwrap()).unwrap();
+            let mut terms: serde_json::Value =
+                serde_json::from_str(&policy.contract_terms).unwrap();
+            terms["event"] = serde_json::to_value(&consent.oracle_announcement).unwrap();
+            policy.contract_terms = terms.to_string();
+            policy.ark_escrow = Some(ArkEscrowPolicy {
+                escrow_tap_tree: hex::encode(escrow.vtxo_script().encode_tap_tree()),
+                max_fee_sats,
+            });
+            assignment.payout_policy = Some(serde_json::to_string(&policy).unwrap());
+            f.wallet
+                .validate_payout_registration(f.entry_id, &assignment, &consent)
+        };
+
+        with_escrow(player, market_maker, expiry, 100).unwrap();
+        for (label, result) in [
+            (
+                "foreign player key",
+                with_escrow(stranger, market_maker, expiry, 100),
+            ),
+            (
+                "foreign coordinator key",
+                with_escrow(player, stranger, expiry, 100),
+            ),
+            (
+                "refund after expiry",
+                with_escrow(player, market_maker, expiry + 1, 100),
+            ),
+            (
+                "fee beyond the markup",
+                with_escrow(player, market_maker, expiry, 101),
+            ),
+        ] {
+            assert!(result.is_err(), "{label}");
         }
     }
 

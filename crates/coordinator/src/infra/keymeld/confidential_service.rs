@@ -740,7 +740,7 @@ impl Keymeld for KeymeldService {
             contract_signatures: request.contract_signatures,
             attestation: request.attestation,
             method: request.method,
-            ark_funding: None,
+            ark_funding: request.ark_funding,
         })?;
         let first_request = PrepareEscrowRequest {
             schema_version: escrow::SCHEMA_VERSION,

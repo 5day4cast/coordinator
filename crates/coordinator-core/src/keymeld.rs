@@ -3,7 +3,10 @@
 
 use crate::RegistrationAssignment;
 pub use coordinator_escrow::{
-    authorization::PayoutPolicy, escrow::SignedEscrowPolicy, payout, payout_protocol,
+    ark,
+    authorization::{ArkEscrowPolicy, PayoutPolicy},
+    escrow::SignedEscrowPolicy,
+    payout, payout_protocol,
 };
 use coordinator_escrow::{
     escrow::{ApplicationContext, EscrowContext, PublicKeyBytes, Recipient},

@@ -1,3 +1,5 @@
+#[path = "ark_coordinator.rs"]
+mod ark_coordinator;
 #[path = "automatic_coordinator.rs"]
 mod automatic;
 pub use automatic::{InvoiceFallbackRequest, PayoutAuthorizationInfo, PayoutTermsQuote};
@@ -191,6 +193,7 @@ pub struct Coordinator {
     invoice_settlement_confirmations: u32,
     automatic_payouts: bool,
     automatic_payout_max_fee_rate: FeeRate,
+    ark: Option<Arc<super::Arkade>>,
 }
 
 impl Coordinator {
@@ -232,6 +235,7 @@ impl Coordinator {
             invoice_settlement_confirmations,
             automatic_payouts: false,
             automatic_payout_max_fee_rate: FeeRate::from_sat_per_vb_u32(100),
+            ark: None,
         };
         coordinator.validate_coordinator_metadata().await?;
         Ok(coordinator)
@@ -878,6 +882,12 @@ impl Coordinator {
                             comp.funding_psbt_base64.clone(),
                         ) {
                             state.contract_created(params, outpoint, psbt)
+                        } else if let (Some(params), None) = (
+                            comp.contract_parameters.clone(),
+                            comp.funding_psbt_base64.as_ref(),
+                        ) {
+                            // Arkade: the kickoff batch will fix the funding outpoint.
+                            state.ark_contract_created(params)
                         } else {
                             CompetitionStatus::EntriesSubmitted(state)
                         }
@@ -953,6 +963,46 @@ impl Coordinator {
             }
 
             CompetitionStatus::AwaitingSignatures(mut state) => {
+                let ark_funded = match self.competition_store.is_ark_funded(competition_id).await {
+                    Ok(ark_funded) => ark_funded,
+                    Err(e) => {
+                        error!("Competition {competition_id}: {e}");
+                        return CompetitionStatus::AwaitingSignatures(state);
+                    }
+                };
+                if ark_funded {
+                    // One Arkade batch signs the contract and funds it, so the pool skips
+                    // SigningComplete's broadcast. A failed batch spends nothing and is retried.
+                    return match self.ark_kickoff(state.competition_mut()).await {
+                        Ok(()) => {
+                            let competition = state.competition();
+                            match (
+                                competition.signed_contract.clone(),
+                                competition.funding_transaction.clone(),
+                            ) {
+                                (Some(signed), Some(commitment)) => {
+                                    match state.signing_complete(signed) {
+                                        CompetitionStatus::SigningComplete(signing) => {
+                                            signing.funding_broadcasted(commitment)
+                                        }
+                                        other => other,
+                                    }
+                                }
+                                _ => CompetitionStatus::AwaitingSignatures(state),
+                            }
+                        }
+                        Err(e) => {
+                            error!("Competition {competition_id} Arkade kickoff failed: {e:#}");
+                            let error = CompetitionError::FailedBroadcast(e.to_string());
+                            state.competition_mut().errors.push(error.clone());
+                            if state.competition().should_abort() {
+                                CompetitionStatus::AwaitingSignatures(state).fail(error)
+                            } else {
+                                CompetitionStatus::AwaitingSignatures(state)
+                            }
+                        }
+                    };
+                }
                 if self.is_keymeld_enabled() {
                     match self.sign_dlc_contract(state.competition_mut()).await {
                         Ok(_) => {
@@ -1500,171 +1550,179 @@ impl Coordinator {
             .map(|user_entry| (user_entry.id, user_entry))
             .collect::<HashMap<_, _>>();
 
-        // When escrow is disabled, the coordinator funds the contract directly from its wallet
-        // When escrow is enabled, we use the escrow transactions from each ticket
-        let escrow_inputs: Vec<ForeignUtxo> = if self.escrow_enabled {
-            tickets
-                .values()
-                .map(|ticket| {
-                    let hex_data = ticket
-                        .escrow_transaction
-                        .clone()
-                        .ok_or_else(|| anyhow!("Missing escrow transaction"))?;
-
-                    let bytes = hex::decode(&hex_data)
-                        .map_err(|e| anyhow!("Failed to decode escrow transaction: {}", e))?;
-
-                    let transaction: Transaction = deserialize(&bytes)
-                        .map_err(|e| anyhow!("Failed to deserialize escrow transaction: {}", e))?;
-                    debug!("Escrow transaction: {:?}", transaction);
-                    let outpoint = get_escrow_outpoint(
-                        &transaction,
-                        Amount::from_sat(competition.event_submission.entry_fee as u64),
-                    )?;
-
-                    let escrow_output = transaction
-                        .output
-                        .get(outpoint.vout as usize)
-                        .ok_or_else(|| {
-                            anyhow!("Escrow output not found at index {}", outpoint.vout)
-                        })?
-                        .clone();
-
-                    let user_pubkey = &entries_lookup
-                        .get(&ticket.entry_id.unwrap())
-                        .ok_or_else(|| anyhow!("Missing entry for ticket {}", ticket.id))?
-                        .ephemeral_pubkey;
-
-                    let btc_pubkey = ticket
-                        .ephemeral_pubkey
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("Missing btc_pubkey for ticket {}", ticket.id))?;
-
-                    if btc_pubkey != user_pubkey {
-                        return Err(anyhow!(
-                            "Entry public key {} must match ticket escrow public key {}",
-                            user_pubkey,
-                            btc_pubkey
-                        ));
-                    }
-
-                    let user_pubkey = BdkPublicKey::from_str(user_pubkey)
-                        .map_err(|e| anyhow!("Failed to parse user public key: {}", e))?;
-                    let payment_hash_from_ticket = parse_hash32(&ticket.hash)?;
-                    let preimage = hex::decode(&ticket.encrypted_preimage)
-                        .map_err(|e| anyhow!("Failed to decode preimage: {}", e))?;
-                    let payment_hash_from_preimage = sha256::Hash::hash(&preimage).to_byte_array();
-
-                    debug!(
-                        "Payment hash from ticket.hash: {}",
-                        hex::encode(payment_hash_from_ticket)
-                    );
-                    debug!(
-                        "Payment hash from preimage: {}",
-                        hex::encode(payment_hash_from_preimage)
-                    );
-
-                    if payment_hash_from_ticket != payment_hash_from_preimage {
-                        return Err(anyhow!("Payment hash mismatch for ticket {}", ticket.id));
-                    }
-
-                    // Use the hash that was used when creating the escrow
-                    let payment_hash = payment_hash_from_preimage;
-
-                    let escrow_descriptor = escrow_descriptor_for_output(
-                        &coordinator_pubkey,
-                        &user_pubkey,
-                        &payment_hash,
-                        &escrow_output,
-                    )?;
-
-                    let witness_script = escrow_descriptor.explicit_script().map_err(|e| {
-                        anyhow!("Failed to extract witness script from descriptor: {}", e)
-                    })?;
-
-                    Ok(ForeignUtxo {
-                        outpoint,
-                        psbt: Input {
-                            witness_utxo: Some(escrow_output.clone()),
-                            non_witness_utxo: Some(transaction),
-                            witness_script: Some(witness_script),
-                            ..Default::default()
-                        },
-                        satisfaction_weight: escrow_descriptor
-                            .max_weight_to_satisfy()
-                            .map_err(|e| anyhow!("Failed to get satisfactory weight: {}", e))?,
-                    })
-                })
-                .collect::<Result<Vec<_>, anyhow::Error>>()?
+        // An Arkade competition is funded in an Arkade batch at kickoff, not from a wallet PSBT.
+        let ark_funded = self.competition_store.is_ark_funded(competition.id).await?;
+        let legacy_funding = if ark_funded {
+            None
         } else {
-            // Escrow disabled - coordinator wallet funds the contract directly
-            debug!("Escrow disabled - using coordinator wallet UTXOs for funding");
-            vec![]
-        };
+            // When escrow is disabled, the coordinator funds the contract directly from its wallet
+            // When escrow is enabled, we use the escrow transactions from each ticket
+            let escrow_inputs: Vec<ForeignUtxo> = if self.escrow_enabled {
+                tickets
+                    .values()
+                    .map(|ticket| {
+                        let hex_data = ticket
+                            .escrow_transaction
+                            .clone()
+                            .ok_or_else(|| anyhow!("Missing escrow transaction"))?;
 
-        debug!("Contract amount: {}", contract_amount_sats);
-        debug!(
-            "Escrow inputs: {} (escrow_enabled={})",
-            escrow_inputs.len(),
-            self.escrow_enabled
-        );
+                        let bytes = hex::decode(&hex_data)
+                            .map_err(|e| anyhow!("Failed to decode escrow transaction: {}", e))?;
 
-        let psbt = match &competition.funding_psbt_base64 {
-            Some(encoded) => Psbt::from_str(encoded)?,
-            None => {
-                self.bitcoin
-                    .build_psbt(
-                        funding_script.clone(),
-                        Amount::from_sat(contract_amount_sats as u64),
-                        contract_params.fee_rate,
-                        vec![],
-                        escrow_inputs,
-                    )
-                    .await?
-            }
-        };
-        if let Err(error) = self
-            .bitcoin
-            .reserve_psbt_inputs_until(
-                &psbt,
-                competition.funding_reservation_deadline(OffsetDateTime::now_utc())?,
-            )
-            .await
-        {
-            if competition.funding_psbt_base64.is_none() {
-                if let Err(release_error) = self.bitcoin.release_psbt_inputs(&psbt).await {
-                    warn!("Failed to release new funding inputs: {}", release_error);
+                        let transaction: Transaction = deserialize(&bytes).map_err(|e| {
+                            anyhow!("Failed to deserialize escrow transaction: {}", e)
+                        })?;
+                        debug!("Escrow transaction: {:?}", transaction);
+                        let outpoint = get_escrow_outpoint(
+                            &transaction,
+                            Amount::from_sat(competition.event_submission.entry_fee as u64),
+                        )?;
+
+                        let escrow_output = transaction
+                            .output
+                            .get(outpoint.vout as usize)
+                            .ok_or_else(|| {
+                                anyhow!("Escrow output not found at index {}", outpoint.vout)
+                            })?
+                            .clone();
+
+                        let user_pubkey = &entries_lookup
+                            .get(&ticket.entry_id.unwrap())
+                            .ok_or_else(|| anyhow!("Missing entry for ticket {}", ticket.id))?
+                            .ephemeral_pubkey;
+
+                        let btc_pubkey = ticket.ephemeral_pubkey.as_ref().ok_or_else(|| {
+                            anyhow!("Missing btc_pubkey for ticket {}", ticket.id)
+                        })?;
+
+                        if btc_pubkey != user_pubkey {
+                            return Err(anyhow!(
+                                "Entry public key {} must match ticket escrow public key {}",
+                                user_pubkey,
+                                btc_pubkey
+                            ));
+                        }
+
+                        let user_pubkey = BdkPublicKey::from_str(user_pubkey)
+                            .map_err(|e| anyhow!("Failed to parse user public key: {}", e))?;
+                        let payment_hash_from_ticket = parse_hash32(&ticket.hash)?;
+                        let preimage = hex::decode(&ticket.encrypted_preimage)
+                            .map_err(|e| anyhow!("Failed to decode preimage: {}", e))?;
+                        let payment_hash_from_preimage =
+                            sha256::Hash::hash(&preimage).to_byte_array();
+
+                        debug!(
+                            "Payment hash from ticket.hash: {}",
+                            hex::encode(payment_hash_from_ticket)
+                        );
+                        debug!(
+                            "Payment hash from preimage: {}",
+                            hex::encode(payment_hash_from_preimage)
+                        );
+
+                        if payment_hash_from_ticket != payment_hash_from_preimage {
+                            return Err(anyhow!("Payment hash mismatch for ticket {}", ticket.id));
+                        }
+
+                        // Use the hash that was used when creating the escrow
+                        let payment_hash = payment_hash_from_preimage;
+
+                        let escrow_descriptor = escrow_descriptor_for_output(
+                            &coordinator_pubkey,
+                            &user_pubkey,
+                            &payment_hash,
+                            &escrow_output,
+                        )?;
+
+                        let witness_script = escrow_descriptor.explicit_script().map_err(|e| {
+                            anyhow!("Failed to extract witness script from descriptor: {}", e)
+                        })?;
+
+                        Ok(ForeignUtxo {
+                            outpoint,
+                            psbt: Input {
+                                witness_utxo: Some(escrow_output.clone()),
+                                non_witness_utxo: Some(transaction),
+                                witness_script: Some(witness_script),
+                                ..Default::default()
+                            },
+                            satisfaction_weight: escrow_descriptor
+                                .max_weight_to_satisfy()
+                                .map_err(|e| anyhow!("Failed to get satisfactory weight: {}", e))?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, anyhow::Error>>()?
+            } else {
+                // Escrow disabled - coordinator wallet funds the contract directly
+                debug!("Escrow disabled - using coordinator wallet UTXOs for funding");
+                vec![]
+            };
+
+            debug!("Contract amount: {}", contract_amount_sats);
+            debug!(
+                "Escrow inputs: {} (escrow_enabled={})",
+                escrow_inputs.len(),
+                self.escrow_enabled
+            );
+
+            let psbt = match &competition.funding_psbt_base64 {
+                Some(encoded) => Psbt::from_str(encoded)?,
+                None => {
+                    self.bitcoin
+                        .build_psbt(
+                            funding_script.clone(),
+                            Amount::from_sat(contract_amount_sats as u64),
+                            contract_params.fee_rate,
+                            vec![],
+                            escrow_inputs,
+                        )
+                        .await?
                 }
+            };
+            if let Err(error) = self
+                .bitcoin
+                .reserve_psbt_inputs_until(
+                    &psbt,
+                    competition.funding_reservation_deadline(OffsetDateTime::now_utc())?,
+                )
+                .await
+            {
+                if competition.funding_psbt_base64.is_none() {
+                    if let Err(release_error) = self.bitcoin.release_psbt_inputs(&psbt).await {
+                        warn!("Failed to release new funding inputs: {}", release_error);
+                    }
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
 
-        let funding_txid = psbt.unsigned_tx.compute_txid();
-        debug!("unsigned funding txid: {:?}", funding_txid);
+            let funding_txid = psbt.unsigned_tx.compute_txid();
+            debug!("unsigned funding txid: {:?}", funding_txid);
 
-        let funding_output_index = psbt
-            .unsigned_tx
-            .output
-            .iter()
-            .position(|output| {
-                output.script_pubkey == funding_script
-                    && output.value == Amount::from_sat(contract_amount_sats as u64)
-            })
-            .ok_or_else(|| anyhow!("Funding output not found in PSBT"))?;
+            let funding_output_index = psbt
+                .unsigned_tx
+                .output
+                .iter()
+                .position(|output| {
+                    output.script_pubkey == funding_script
+                        && output.value == Amount::from_sat(contract_amount_sats as u64)
+                })
+                .ok_or_else(|| anyhow!("Funding output not found in PSBT"))?;
 
-        let funding_outpoint = OutPoint {
-            txid: funding_txid,
-            vout: funding_output_index as u32,
+            let funding_outpoint = OutPoint {
+                txid: funding_txid,
+                vout: funding_output_index as u32,
+            };
+
+            if competition.funding_psbt_base64.is_none() {
+                competition.funding_psbt_base64 = Some(psbt.to_string());
+                competition.funding_outpoint = Some(funding_outpoint);
+            }
+
+            // Note: word of warning, the ticketed_dlc may be very large in memory depending on the contract params
+            let ticketed_dlc = TicketedDLC::new(contract_params.clone(), funding_outpoint)?;
+            debug!("Built ticketed dlc");
+            Some((ticketed_dlc, funding_outpoint))
         };
-
-        if competition.funding_psbt_base64.is_none() {
-            competition.funding_psbt_base64 = Some(psbt.to_string());
-            competition.funding_outpoint = Some(funding_outpoint);
-        }
-
-        // Note: word of warning, the ticketed_dlc may be very large in memory depending on the contract params
-        let ticketed_dlc = TicketedDLC::new(contract_params.clone(), funding_outpoint)?;
-        debug!("Built ticketed dlc");
 
         if self.is_keymeld_enabled() {
             // Keymeld flow: Retrieve keygen session (created at competition creation) and register participants
@@ -1754,6 +1812,8 @@ impl Coordinator {
             }
         } else {
             // Traditional MuSig2 flow: Generate local nonces
+            let (ticketed_dlc, funding_outpoint) = legacy_funding
+                .ok_or_else(|| anyhow!("An Arkade competition needs Keymeld to sign"))?;
             let signing_session = {
                 let mut rng = create_deterministic_rng(
                     &funding_outpoint,
@@ -3112,6 +3172,12 @@ impl Coordinator {
                 Error::from(e)
             })
             .await?;
+        if self.ark.is_some() {
+            // Entries into this competition are held in Arkade escrows.
+            self.competition_store
+                .mark_ark_funded(competition.id)
+                .await?;
+        }
 
         // If keymeld is enabled, create the keygen session now with all ticket_ids
         // This allows users to derive their auth_pubkey before submitting their entry
@@ -3342,28 +3408,36 @@ impl Coordinator {
             // store. LND does not permit reusing a cancelled payment hash.
             existing_payment_request.clone()
         } else {
-            // Create new HODL invoice
-            let invoice = self
-                .ln
-                .add_hold_invoice(
-                    full_fee,
-                    invoice_expiry_seconds as u64,
-                    hex::encode(payment_hash),
-                    ticket.competition_id,
-                )
-                .await
-                .map_err(|e| {
-                    error!("Failed to create HODL invoice: {}", e);
-                    Error::BadRequest("Failed to create invoice".to_string())
-                })?;
-
-            let expires_at =
-                time::OffsetDateTime::now_utc() + time::Duration::seconds(invoice_expiry_seconds);
+            // An Arkade competition's invoice comes from the swap into the ticket's escrow.
+            let (payment_request, expires_at) =
+                if let Some(ark) = self.ark_for(ticket.competition_id).await? {
+                    self.ticket_ark_invoice(ark, &ticket, full_fee).await?
+                } else {
+                    // Create new HODL invoice
+                    let invoice = self
+                        .ln
+                        .add_hold_invoice(
+                            full_fee,
+                            invoice_expiry_seconds as u64,
+                            hex::encode(payment_hash),
+                            ticket.competition_id,
+                        )
+                        .await
+                        .map_err(|e| {
+                            error!("Failed to create HODL invoice: {}", e);
+                            Error::BadRequest("Failed to create invoice".to_string())
+                        })?;
+                    (
+                        invoice.payment_request,
+                        time::OffsetDateTime::now_utc()
+                            + time::Duration::seconds(invoice_expiry_seconds),
+                    )
+                };
 
             // Update ticket with payment request and expiry
             let stored = self
                 .competition_store
-                .update_ticket_payment_request(&ticket, &invoice.payment_request, expires_at)
+                .update_ticket_payment_request(&ticket, &payment_request, expires_at)
                 .await
                 .map_err(|e| {
                     error!("Failed to update ticket with payment request: {}", e);
@@ -3377,7 +3451,7 @@ impl Coordinator {
                     "Ticket reservation changed; request a new ticket".into(),
                 ));
             }
-            invoice.payment_request
+            payment_request
         };
 
         let keymeld_session_id = keymeld_registration
@@ -3690,12 +3764,15 @@ impl Coordinator {
             ))
         })?;
 
-        let funding_psbt_base64 = competition.funding_psbt_base64.ok_or_else(|| {
-            Error::NotFound(format!(
+        let funding_psbt_base64 = competition.funding_psbt_base64;
+        if funding_psbt_base64.is_none()
+            && !self.competition_store.is_ark_funded(competition_id).await?
+        {
+            return Err(Error::NotFound(format!(
                 "Funding psbt is not yet available for competition {}",
                 competition_id
-            ))
-        })?;
+            )));
+        }
 
         // Get keymeld signing info if enabled
         let keymeld = if self.is_keymeld_enabled() {

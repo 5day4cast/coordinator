@@ -25,6 +25,14 @@ use keymeld_sdk::prelude::UserId;
 
 use crate::infra::keymeld::{DlcKeygenSession, Keymeld};
 
+/// The Arkade server and swap service that fund Arkade competitions.
+pub struct Arkade {
+    pub server: coordinator_ark::ArkServer,
+    pub swaps: Arc<dyn crate::infra::ark_swap::EscrowSwaps>,
+    /// How long after the observation window starts an unfunded entry can be refunded.
+    pub refund_after_start_secs: u64,
+}
+
 /// Keymeld as a pool's contract signer and every player's escrow signer.
 pub struct KeymeldArkPool {
     keymeld: Arc<dyn Keymeld>,
@@ -35,6 +43,8 @@ pub struct KeymeldArkPool {
     entry_keys: HashMap<XOnlyPublicKey, UserId>,
     /// Set once the contract is signed and verified, before any forfeit.
     contract: Mutex<Option<SignedContract>>,
+    /// The batch's commitment transaction, which pays the contract's funding output.
+    commitment: Mutex<Option<bitcoin::Transaction>>,
 }
 
 impl KeymeldArkPool {
@@ -50,7 +60,16 @@ impl KeymeldArkPool {
             entry_keys: players.iter().cloned().collect(),
             players: players.into_iter().map(|(_, user)| user).collect(),
             contract: Mutex::new(None),
+            commitment: Mutex::new(None),
         }
+    }
+
+    /// The commitment transaction the signed contract spends from.
+    pub fn commitment_tx(&self) -> Option<bitcoin::Transaction> {
+        self.commitment
+            .lock()
+            .expect("the commitment lock is never poisoned")
+            .clone()
     }
 
     /// The signed contract, once the kickoff hook has run.
@@ -109,7 +128,12 @@ impl ContractSigner for KeymeldArkPool {
         })
     }
 
-    async fn keep(&self, contract: &SignedContract, _commitment_tx: &Psbt) -> Result<(), BoxError> {
+    async fn keep(&self, contract: &SignedContract, commitment_tx: &Psbt) -> Result<(), BoxError> {
+        *self
+            .commitment
+            .lock()
+            .expect("the commitment lock is never poisoned") =
+            Some(commitment_tx.unsigned_tx.clone());
         *self
             .contract
             .lock()

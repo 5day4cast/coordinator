@@ -15,6 +15,7 @@
 //! Each step that needs the real outpoint then presents the commitment transaction as [`ArkFunding`].
 
 use coordinator_ark_escrow::{EntryEscrow, EscrowPath, VtxoScript};
+use dlctix::bitcoin::absolute::LockTime;
 use dlctix::bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use dlctix::bitcoin::hashes::Hash;
 use dlctix::bitcoin::sighash::{Prevouts, SighashCache};
@@ -88,6 +89,26 @@ pub fn escrow(
     }
     if escrow.terms().coordinator != market_maker {
         return reject("the escrow's coordinator key is not the pool's market maker");
+    }
+    Ok(escrow)
+}
+
+/// The entry's escrow as the player's wallet accepts it: [`escrow`], refundable by `latest_refund`.
+///
+/// `latest_refund` is a UNIX time, normally the contract's expiry, since an unfunded pool
+/// must not hold a buy-in longer than a funded one would.
+pub fn consented_escrow(
+    policy: &ArkEscrowPolicy,
+    participant: XOnlyPublicKey,
+    market_maker: XOnlyPublicKey,
+    latest_refund: Option<u32>,
+) -> Result<EntryEscrow, ArkError> {
+    let escrow = escrow(policy, participant, market_maker)?;
+    let LockTime::Seconds(refund_at) = escrow.terms().refund_locktime else {
+        return reject("the escrow's refund time is not a timestamp");
+    };
+    if latest_refund.is_some_and(|latest| refund_at.to_consensus_u32() > latest) {
+        return reject("the escrow refunds after the contract expires");
     }
     Ok(escrow)
 }

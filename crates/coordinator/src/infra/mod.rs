@@ -1,3 +1,4 @@
+pub mod ark_swap;
 pub mod bitcoin;
 pub mod db;
 pub mod escrow;

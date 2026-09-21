@@ -774,8 +774,9 @@ async function refreshEntryPayoutAddress() {
       const user = await response.json();
       window.entryPayoutAddress = user.lightning_address || null;
       window.entryPayoutAddressLoaded = true;
+      const refund = terms?.quote.arkade ? ". If the competition does not start, your entry fee is refunded there." : "";
       destination.textContent = window.entryPayoutAddress
-        ? `Automatically to ${window.entryPayoutAddress}`
+        ? `Automatically to ${window.entryPayoutAddress}${refund}`
         : "Your profile has no Lightning Address, so you will submit a Lightning invoice after the result. Add an address on the Payouts page to be paid automatically.";
     } catch (error) {
       console.error("Profile lookup failed:", error);
