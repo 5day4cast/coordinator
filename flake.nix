@@ -60,7 +60,7 @@
           };
           cargoHash = "sha256-iqQiWbsKlLBiJFeqIYiXo3cqxGLSjNM8SOWXGM9u43E=";
           nativeBuildInputs = [ pkgs.pkg-config ];
-          buildInputs = [ pkgs.openssl ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+          buildInputs = [ pkgs.opensslPatched ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
             pkgs.curl
             pkgs.darwin.apple_sdk.frameworks.Security
           ];
@@ -87,7 +87,7 @@
         ];
 
         commonBuildInputs = with pkgs; [
-          openssl
+          opensslPatched
           sqlite
           curl
         ];
