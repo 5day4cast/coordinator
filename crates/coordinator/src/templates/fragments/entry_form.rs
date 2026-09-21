@@ -285,6 +285,9 @@ mod tests {
         let html = entry_form(&competition(1000, 1000), &[], &[]).into_string();
         assert!(html.contains(r#"id="entryPayoutDestination""#));
         assert!(!html.contains("entryLightningAddress"));
-        assert!(!html.contains("coordinator fee)"), "no fee breakdown without a fee");
+        assert!(
+            !html.contains("coordinator fee)"),
+            "no fee breakdown without a fee"
+        );
     }
 }
