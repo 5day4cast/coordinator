@@ -11,6 +11,10 @@ Use a dry run to inspect packages before publishing.
 4. Run the release helper tests, chart tests, and normal CI checks.
 5. Commit and push the release branch with signed Conventional Commits.
 
+A release's database migrations may only add tables, columns, and indexes.
+During a deploy the previous version keeps running against the migrated database, so dropping or renaming waits for a later release.
+See [Competition runners](COMPETITION_RUNNERS.md#running-two-coordinators).
+
 Nix reads the workspace version from `Cargo.toml`.
 The release version must use `X.Y.Z`, without a `v` prefix or leading zeros.
 

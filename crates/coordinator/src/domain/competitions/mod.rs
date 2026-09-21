@@ -2,7 +2,9 @@ mod ark_kickoff;
 mod ark_store;
 mod automatic_store;
 mod coordinator;
+mod lease_store;
 mod payout;
+mod runners;
 pub mod states;
 mod store;
 use crate::infra::{
@@ -25,8 +27,10 @@ use dlctix::{
     ContractParameters, EventLockingConditions, Outcome, SigMap, SignedContract,
 };
 use keymeld_sdk::types::{RegistrationContext, SignedSessionManifest};
+pub use lease_store::*;
 use log::{debug, error};
 pub use payout::*;
+pub use runners::*;
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, FromRow, Row};
 use std::fmt;

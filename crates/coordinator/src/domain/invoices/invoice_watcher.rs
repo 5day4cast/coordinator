@@ -53,13 +53,20 @@ impl InvoiceWatcher {
                 break;
             }
 
-            match self.handle_pending_invoices().await {
-                Ok(_) => {
+            // Settling and broadcasting run in one coordinator at a time.
+            match self
+                .coordinator
+                .worker_leases()
+                .tick("invoice-watcher", self.handle_pending_invoices())
+                .await
+            {
+                Some(Ok(_)) => {
                     debug!("Invoice handling completed successfully");
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     error!("Invoice handling error: {}", e);
                 }
+                None => debug!("Another coordinator watches invoices"),
             }
 
             tokio::select! {
@@ -71,6 +78,10 @@ impl InvoiceWatcher {
             }
         }
 
+        self.coordinator
+            .worker_leases()
+            .release("invoice-watcher")
+            .await;
         Ok(())
     }
 
@@ -139,6 +150,7 @@ impl InvoiceWatcher {
                             error!("Failed to mark ticket {} paid: {}", ticket.id, error);
                             continue;
                         }
+                        self.coordinator.wake_competition(ticket.competition_id);
                         let current = self
                             .coordinator
                             .competition_store

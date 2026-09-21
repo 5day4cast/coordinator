@@ -20,8 +20,8 @@ use crate::{
     },
     config::Settings,
     domain::{
-        CompetitionStore, CompetitionWatcher, Coordinator, InvoiceSubscriber, InvoiceWatcher,
-        PaymentSubscriber, PayoutWatcher, UserInfo, UserStore,
+        CompetitionRunners, CompetitionStore, CompetitionWakes, Coordinator, InvoiceSubscriber,
+        InvoiceWatcher, PaymentSubscriber, PayoutWatcher, UserInfo, UserStore,
     },
     infra::{
         bitcoin::{Bitcoin, BitcoinClient, BitcoinSyncWatcher},
@@ -462,6 +462,8 @@ pub async fn build_app(
         config.bitcoin_settings.network,
     );
 
+    let lease_holder = config.coordinator_settings.lease_holder();
+    let pacing = config.coordinator_settings.pacing();
     let coordinator = Coordinator::new(
         oracle_client,
         competition_store,
@@ -485,7 +487,12 @@ pub async fn build_app(
         config.keymeld_settings.automatic_payout_max_fee_rate_sat_vb,
     )?
     .with_ark(arkade(&config.ark_settings).await?)?;
-    let coordinator = Arc::new(coordinator);
+    let (wakes, wake_requests) = CompetitionWakes::new();
+    let coordinator = Arc::new(
+        coordinator
+            .with_wakes(wakes.clone())
+            .with_lease_holder(lease_holder.clone(), pacing.lease_ttl),
+    );
 
     if config.coordinator_settings.escrow_enabled {
         info!("Escrow transactions enabled");
@@ -498,16 +505,20 @@ pub async fn build_app(
     let tracker = TaskTracker::new();
     let mut threads = HashMap::new();
     let cancel_token = CancellationToken::new();
-    let competition_watcher = CompetitionWatcher::new(
+    let runners = CompetitionRunners::new(
         coordinator.clone(),
+        coordinator.competition_store.clone(),
+        wakes,
+        lease_holder,
+        pacing,
+        tracker.clone(),
         cancel_token.clone(),
-        Duration::from_secs(config.coordinator_settings.sync_interval_secs),
     );
     let competition_watcher_task = spawn_supervised(
         &tracker,
-        "competition watcher",
+        "competition runners",
         cancel_token.clone(),
-        async move { competition_watcher.watch().await },
+        runners.supervise(wake_requests),
     );
 
     let bitcoin_watcher = BitcoinSyncWatcher::new(
@@ -571,8 +582,10 @@ pub async fn build_app(
             loop {
                 tokio::select! {
                     _ = automatic_cancel.cancelled() => break,
-                    result = automatic_coordinator.automatic_payout_tick() => {
-                        if let Err(error) = result { error!("Automatic payout worker: {}", error); }
+                    result = automatic_coordinator
+                        .worker_leases()
+                        .tick("automatic-payouts", automatic_coordinator.automatic_payout_tick()) => {
+                        if let Some(Err(error)) = result { error!("Automatic payout worker: {}", error); }
                     }
                 }
                 tokio::select! {
@@ -580,6 +593,10 @@ pub async fn build_app(
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {}
                 }
             }
+            automatic_coordinator
+                .worker_leases()
+                .release("automatic-payouts")
+                .await;
             Ok(())
         },
     );
@@ -588,13 +605,18 @@ pub async fn build_app(
     if coordinator.ark().is_some() {
         let ark_coordinator = coordinator.clone();
         let ark_cancel = cancel_token.clone();
-        let ark_handle =
-            spawn_supervised(&tracker, "escrow swaps", cancel_token.clone(), async move {
+        let ark_handle = spawn_supervised(
+            &tracker,
+            "escrow swaps",
+            cancel_token.clone(),
+            async move {
                 loop {
                     tokio::select! {
                         _ = ark_cancel.cancelled() => break,
-                        result = ark_coordinator.check_ark_swaps() => {
-                            if let Err(error) = result { error!("Escrow swap worker: {}", error); }
+                        result = ark_coordinator
+                            .worker_leases()
+                            .tick("escrow-swaps", ark_coordinator.check_ark_swaps()) => {
+                            if let Some(Err(error)) = result { error!("Escrow swap worker: {}", error); }
                         }
                     }
                     tokio::select! {
@@ -602,8 +624,13 @@ pub async fn build_app(
                         _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                     }
                 }
+                ark_coordinator
+                    .worker_leases()
+                    .release("escrow-swaps")
+                    .await;
                 Ok(())
-            });
+            },
+        );
         threads.insert("escrow_swaps".to_string(), ark_handle);
     }
 

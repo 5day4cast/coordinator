@@ -19,6 +19,7 @@ pub struct PayoutWatcher {
     competition_store: Arc<CompetitionStore>,
     ln: Arc<dyn Ln>,
     bitcoin: Arc<dyn Bitcoin>,
+    leases: Arc<crate::domain::WorkerLeases>,
     sync_interval: Duration,
     cancel_token: CancellationToken,
 }
@@ -33,6 +34,7 @@ impl PayoutWatcher {
         Self {
             competition_store: coordinator.competition_store.clone(),
             bitcoin: coordinator.bitcoin.clone(),
+            leases: coordinator.worker_leases().clone(),
             ln,
             sync_interval,
             cancel_token,
@@ -48,10 +50,14 @@ impl PayoutWatcher {
                 break;
             }
 
+            // Payments to winners run in one coordinator at a time.
             tokio::select! {
-                result = self.handle_pending_payouts() => match result {
-                    Ok(_) => debug!("Payout handling completed successfully"),
-                    Err(e) => error!("Payout handling error: {}", e),
+                result = self
+                    .leases
+                    .tick("payout-watcher", self.handle_pending_payouts()) => match result {
+                    Some(Ok(_)) => debug!("Payout handling completed successfully"),
+                    Some(Err(e)) => error!("Payout handling error: {}", e),
+                    None => debug!("Another coordinator watches payouts"),
                 },
                 _ = self.cancel_token.cancelled() => break,
             }
@@ -65,6 +71,7 @@ impl PayoutWatcher {
             }
         }
 
+        self.leases.release("payout-watcher").await;
         Ok(())
     }
 
@@ -538,6 +545,11 @@ mod tests {
             axum::serve(listener, router).await.unwrap();
         });
         let watcher = PayoutWatcher {
+            leases: Arc::new(crate::domain::WorkerLeases::new(
+                Arc::new(store.clone()),
+                "test".into(),
+                Duration::from_secs(30),
+            )),
             competition_store: Arc::new(store.clone()),
             bitcoin: Arc::new(crate::infra::bitcoin_mock::MockBitcoinClient::new(
                 bitcoin::Network::Regtest,

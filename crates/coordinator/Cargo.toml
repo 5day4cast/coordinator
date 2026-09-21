@@ -46,6 +46,7 @@ keymeld-core.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true
+dashmap.workspace = true
 async-trait.workspace = true
 
 # Serialization

@@ -68,6 +68,7 @@ h2 = "0.4.16"
 tokio = { version = "1.39.2", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7.11", features = ["rt"] }
 futures = "0.3.28"
+dashmap = "6.1"
 async-trait = "0.1.85"
 async-channel = "2.3.1"
 

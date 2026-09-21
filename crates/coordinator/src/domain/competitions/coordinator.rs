@@ -2,6 +2,8 @@
 mod ark_coordinator;
 #[path = "automatic_coordinator.rs"]
 mod automatic;
+#[path = "competition_steps.rs"]
+mod competition_steps;
 pub use automatic::{InvoiceFallbackRequest, PayoutAuthorizationInfo, PayoutTermsQuote};
 
 use super::{
@@ -66,14 +68,11 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use serde::Serialize;
 use std::sync::Arc;
-use std::time::Duration;
 use std::{
     collections::{BTreeMap, HashMap},
     str::FromStr,
 };
 use time::OffsetDateTime;
-use tokio::time::sleep;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 fn confirmation_depth(tip: u32, inclusion_height: u32) -> u32 {
@@ -126,56 +125,6 @@ pub struct TicketResponse {
     pub keymeld_registration: Option<RegistrationAssignment>,
 }
 
-pub struct CompetitionWatcher {
-    coordinator: Arc<Coordinator>,
-    sync_interval: Duration,
-    cancel_token: CancellationToken,
-}
-
-impl CompetitionWatcher {
-    pub fn new(
-        coordinator: Arc<Coordinator>,
-        cancel_token: CancellationToken,
-        sync_interval: Duration,
-    ) -> Self {
-        Self {
-            coordinator,
-            sync_interval,
-            cancel_token,
-        }
-    }
-
-    pub async fn watch(&self) -> Result<(), anyhow::Error> {
-        info!("Starting Competition sync watcher");
-
-        loop {
-            if self.cancel_token.is_cancelled() {
-                info!("Competition sync watcher received cancellation");
-                break;
-            }
-
-            // Run each sync on its own task: a panic while handling one
-            // competition must not take the watcher down for all of them.
-            let coordinator = self.coordinator.clone();
-            match tokio::spawn(async move { coordinator.competition_handler().await }).await {
-                Ok(Ok(_)) => info!("Competition sync completed successfully"),
-                Ok(Err(e)) => error!("Competition sync error: {}", e),
-                Err(e) => error!("Competition sync task failed: {}", e),
-            }
-
-            tokio::select! {
-                _ = sleep(self.sync_interval) => continue,
-                _ = self.cancel_token.cancelled() => {
-                    info!("Competition sync watcher cancelled during sleep");
-                    break;
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
-
 pub struct Coordinator {
     oracle_client: Arc<dyn Oracle>,
     pub competition_store: Arc<CompetitionStore>,
@@ -194,6 +143,8 @@ pub struct Coordinator {
     automatic_payouts: bool,
     automatic_payout_max_fee_rate: FeeRate,
     ark: Option<Arc<super::Arkade>>,
+    wakes: super::CompetitionWakes,
+    worker_leases: Arc<super::WorkerLeases>,
 }
 
 impl Coordinator {
@@ -218,9 +169,15 @@ impl Coordinator {
         let private_key = bitcoin.get_derived_private_key().await?;
         let public_key = private_key.base_point_mul();
 
+        let competition_store = Arc::new(competition_store);
+        let worker_leases = Arc::new(super::WorkerLeases::new(
+            competition_store.clone(),
+            format!("{name}-{}", Uuid::now_v7()),
+            std::time::Duration::from_secs(30),
+        ));
         let coordinator = Self {
             oracle_client,
-            competition_store: Arc::new(competition_store),
+            competition_store,
             bitcoin,
             ln,
             lnurl,
@@ -236,6 +193,8 @@ impl Coordinator {
             automatic_payouts: false,
             automatic_payout_max_fee_rate: FeeRate::from_sat_per_vb_u32(100),
             ark: None,
+            wakes: super::CompetitionWakes::default(),
+            worker_leases,
         };
         coordinator.validate_coordinator_metadata().await?;
         Ok(coordinator)
@@ -459,147 +418,6 @@ impl Coordinator {
             .quick_check()
             .await
             .map_err(Error::from)
-    }
-
-    pub async fn competition_handler(&self) -> Result<(), anyhow::Error> {
-        // Cleanup has its own work queue: cancelled competitions are deliberately
-        // excluded from active lifecycle processing, but their invoices and
-        // time-locked escrows still need retries after outages or maturity.
-        for competition_id in self
-            .competition_store
-            .get_competitions_pending_cleanup(self.escrow_enabled)
-            .await?
-        {
-            self.release_held_invoices(competition_id).await;
-            self.reclaim_escrows(competition_id).await;
-        }
-        let competitions: Vec<Competition> = self.competition_store.get_competitions(true).await?;
-
-        for mut competition in competitions {
-            let mut processed_states = 0;
-            const MAX_CONSECUTIVE_STATES: usize = 10;
-
-            if competition.skip_competition() {
-                // Auto-expire failed competitions after 1 hour so they stop
-                // polluting every tick's log output and DB query results.
-                const FAILED_EXPIRY_HOURS: i64 = 1;
-                if competition.is_failed() && competition.cancelled_at.is_none() {
-                    if let Some(failed_at) = competition.failed_at {
-                        let age = OffsetDateTime::now_utc() - failed_at;
-                        if age.whole_hours() >= FAILED_EXPIRY_HOURS {
-                            competition.cancelled_at = Some(OffsetDateTime::now_utc());
-                            if let Err(e) = self
-                                .competition_store
-                                .update_competitions(vec![competition.clone()])
-                                .await
-                            {
-                                return Err(anyhow!(
-                                    "Failed to cancel expired-failed competition {}: {}",
-                                    competition.id,
-                                    e
-                                ));
-                            } else {
-                                info!(
-                                    "Auto-cancelled failed competition {} (failed {}h ago)",
-                                    competition.id,
-                                    age.whole_hours()
-                                );
-                            }
-                            continue;
-                        }
-                    }
-                }
-                debug!(
-                    "Skipping competition {} in state {}",
-                    competition.id,
-                    competition.get_state()
-                );
-                continue;
-            }
-
-            if competition.is_expired() && competition.cancelled_at.is_none() {
-                competition.cancelled_at = Some(OffsetDateTime::now_utc());
-                if let Err(e) = self
-                    .competition_store
-                    .update_competitions(vec![competition.clone()])
-                    .await
-                {
-                    return Err(anyhow!(
-                        "Failed to save competition {} after cancellation: {}",
-                        competition.id,
-                        e
-                    ));
-                }
-                info!("Cancelled expired competition {}", competition.id);
-                self.release_held_invoices(competition.id).await;
-                continue;
-            }
-
-            if let Err(error) = self.renew_funding_reservation(&competition).await {
-                error!(
-                    "Cannot reserve funding inputs for competition {}: {}",
-                    competition.id, error
-                );
-                continue;
-            }
-
-            loop {
-                let status: CompetitionStatus = competition.clone().into();
-                let current_state_name = status.state_name();
-
-                let new_status = self.process_status(status).await;
-                let new_state_name = new_status.state_name();
-                let is_immediate = new_status.is_immediate_transition();
-
-                let updated_competition = new_status.into_competition();
-
-                info!(
-                    "Competition {} transitioned {} -> {}",
-                    competition.id, current_state_name, new_state_name
-                );
-
-                if new_state_name != current_state_name {
-                    processed_states += 1;
-
-                    if is_immediate && processed_states < MAX_CONSECUTIVE_STATES {
-                        if let Err(e) = self
-                            .competition_store
-                            .update_competitions(vec![updated_competition.clone()])
-                            .await
-                        {
-                            return Err(anyhow!(
-                                "Failed to save competition {} in state {}: {}",
-                                competition.id,
-                                new_state_name,
-                                e
-                            ));
-                        }
-                        competition = updated_competition;
-                        continue;
-                    }
-                }
-
-                let died = updated_competition.is_failed() || updated_competition.is_cancelled();
-                if let Err(e) = self
-                    .competition_store
-                    .update_competitions(vec![updated_competition])
-                    .await
-                {
-                    return Err(anyhow!(
-                        "Failed to save competition {} in state {}: {}",
-                        competition.id,
-                        new_state_name,
-                        e
-                    ));
-                }
-                if died {
-                    self.release_held_invoices(competition.id).await;
-                }
-                break;
-            }
-        }
-
-        Ok(())
     }
 
     /// Sweep the escrow outputs of a dead competition back to the wallet once
@@ -3215,6 +3033,7 @@ impl Coordinator {
                 .await?;
         }
 
+        self.wake_competition(competition.id);
         Ok(competition)
     }
 
@@ -3562,6 +3381,7 @@ impl Coordinator {
                 }
                 e => Error::from(e),
             })?;
+        self.wake_competition(competition_id);
 
         Ok(())
     }
@@ -3691,6 +3511,7 @@ impl Coordinator {
                 }
             })?;
 
+        self.wake_competition(user_entry.event_id);
         Ok(user_entry)
     }
 

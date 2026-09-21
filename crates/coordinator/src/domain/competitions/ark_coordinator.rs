@@ -196,6 +196,7 @@ impl Coordinator {
                     .mark_ticket_settled(pending.ticket_id)
                     .await?;
                 info!("Ticket {} paid into its escrow", pending.ticket_id);
+                self.wake_competition(pending.competition_id);
             } else if swap.state.abandoned() {
                 let ticket = self.competition_store.get_ticket(pending.ticket_id).await?;
                 self.competition_store

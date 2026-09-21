@@ -22,6 +22,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Mutex,
 };
+use std::time::Duration;
 use tempfile::TempDir;
 
 fn generic_response(

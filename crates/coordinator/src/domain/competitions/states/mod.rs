@@ -185,6 +185,16 @@ impl CompetitionStatus {
         )
     }
 
+    /// When a runner should step this competition again, unless an event wakes it first.
+    ///
+    /// States with a specific policy answer themselves; the rest wait at most `idle`.
+    pub fn next_check(&self, now: OffsetDateTime, idle: std::time::Duration) -> OffsetDateTime {
+        match self {
+            Self::AwaitingAttestation(state) => state.next_check(now, idle),
+            _ => now + idle,
+        }
+    }
+
     /// Transition to Failed state from any state.
     pub fn fail(self, error: CompetitionError) -> CompetitionStatus {
         let competition_id = self.competition_id();
