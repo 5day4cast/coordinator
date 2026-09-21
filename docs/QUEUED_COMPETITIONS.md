@@ -296,7 +296,10 @@ It must refund no later than the contract's expiry, and its fee may not exceed t
 Gaps:
 
 - A cancelled Arkade competition does not refund its escrows yet; see [Refunds](#refunds).
+- Escrow VTXOs expire 7 days after they are created, and nothing renews them yet.
+  A competition must kick off within 7 days of its first paid ticket.
 - The competition handler runs competitions one at a time, so a kickoff holds up the others for a batch or two.
+  [Competition runners](COMPETITION_RUNNERS.md) proposes a task per competition.
 - If the process stops inside a batch that then completes, the next attempt fails on spent escrows until an operator records the commitment.
 
 ### Live run on Mutinynet, 2026-09-21
