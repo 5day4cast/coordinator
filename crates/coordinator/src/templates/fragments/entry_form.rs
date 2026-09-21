@@ -66,7 +66,13 @@ pub fn entry_form(
                     // Competition info
                     div class="notification is-light mb-4" {
                         p { strong { "Competition: " } (competition.id) }
-                        p { strong { "Entry Fee: " } (competition.entry_fee) " sats" }
+                        p {
+                            strong { "Ticket price: " } (competition.ticket_price) " sats"
+                            @if competition.ticket_price > competition.entry_fee {
+                                " (" (competition.entry_fee) " sats entry fee + "
+                                (competition.ticket_price - competition.entry_fee) " sats coordinator fee)"
+                            }
+                        }
                         p {
                             strong { "Observation Period: " }
                             span class="utc-time" data-utc=(competition.start_time) { (competition.start_time) }
@@ -85,6 +91,7 @@ pub fn entry_form(
                     // Station forecast picks
                     form id="entryForm" data-competition-id=(competition.id)
                          data-entry-fee=(competition.entry_fee)
+                         data-ticket-price=(competition.ticket_price)
                          data-total-pool=(competition.total_pool)
                          data-winner-count=(competition.num_winners)
                          data-max-values=(competition.number_of_values_per_entry) {
@@ -96,26 +103,14 @@ pub fn entry_form(
 
                 div class="box mt-4" id="entryPayoutConsent" {
                     h3 class="title is-5" { "Receive your winnings" }
-                    div class="field" {
-                        label class="label" for="entryPayoutMethod" { "Payout method" }
-                        div class="control select" {
-                            select id="entryPayoutMethod" onchange="updateEntryPayoutMethod()" {
-                                option value="automatic" selected { "Automatically to my Lightning Address" }
-                                option value="invoice" { "I will submit a Lightning invoice" }
-                            }
-                        }
-                    }
-                    div class="field" id="entryPayoutAddressField" {
-                        label class="label" for="entryLightningAddress" { "Lightning Address for this entry" }
-                        div class="control" {
-                            input class="input" id="entryLightningAddress" type="text"
-                                placeholder="you@wallet.com" autocomplete="off" spellcheck="false" maxlength="320";
-                        }
-                        p class="help" {
-                            "Winnings are paid automatically after the result, even while you are offline. "
-                            "You can submit an invoice if your provider is unavailable. "
-                            "Changing your profile address later will not change this entry."
-                        }
+                    // Filled by entries.js from the profile once the user is logged in.
+                    p id="entryPayoutDestination" class="mb-2" { "Log in to see where your winnings are paid." }
+                    p class="help mb-3" {
+                        "Winnings go to the Lightning Address on your profile, automatically after the result, "
+                        "even while you are offline. You can submit an invoice instead if your provider is unavailable. "
+                        "Change the address on the "
+                        a href="/payouts" hx-get="/payouts" hx-target="#main-content" hx-push-url="true" { "Payouts" }
+                        " page; an entry keeps the address it was made with."
                     }
                     p id="entryPayoutTermsText" class="help mb-3" { "Loading payout terms…" }
                     div class="field" {
@@ -162,7 +157,7 @@ pub fn entry_form(
                     // Submit button - triggers JS handler
                     button type="button" id="submitEntry" class="button is-info"
                            onclick="submitEntry()" {
-                        "Submit Entry"
+                        "Pay " (competition.ticket_price) " sats and submit entry"
                     }
                     div id="successMessage" class="notification is-success hidden" {
                         "Successfully Submitted Entry!"
@@ -253,5 +248,46 @@ fn pick_row(station_id: &str, metric: &str, label: &str, value: &ForecastValue) 
                 input type="hidden" name=(field_name) id=(field_name);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn competition(entry_fee: u64, ticket_price: u64) -> CompetitionView {
+        CompetitionView {
+            id: "01a0c225-f3c4-71f3-9f62-4b74859cfc25".into(),
+            start_time: String::new(),
+            end_time: String::new(),
+            signing_time: String::new(),
+            status: "Registration".into(),
+            entry_fee,
+            ticket_price,
+            total_pool: entry_fee * 3,
+            total_entries: 0,
+            num_winners: 1,
+            can_enter: true,
+            number_of_values_per_entry: 1,
+        }
+    }
+
+    #[test]
+    fn entry_form_shows_the_ticket_price_the_browser_approves() {
+        let html = entry_form(&competition(5000, 5250), &[], &[]).into_string();
+        assert!(html.contains(r#"data-ticket-price="5250""#));
+        assert!(html.contains("5250 sats (5000 sats entry fee + 250 sats coordinator fee)"));
+        assert!(html.contains("Pay 5250 sats and submit entry"));
+    }
+
+    #[test]
+    fn entry_form_takes_the_payout_address_from_the_profile() {
+        let html = entry_form(&competition(1000, 1000), &[], &[]).into_string();
+        assert!(html.contains(r#"id="entryPayoutDestination""#));
+        assert!(!html.contains("entryLightningAddress"));
+        assert!(
+            !html.contains("coordinator fee)"),
+            "no fee breakdown without a fee"
+        );
     }
 }

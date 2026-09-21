@@ -313,7 +313,7 @@ fn payment_modal() -> Markup {
                 div class="box" {
                     h3 class="title is-4" { "Entry Ticket Payment" }
                     div class="content" {
-                        p { "Please pay the lightning invoice to enter the competition:" }
+                        p id="ticketPaymentAmount" { "Please pay the lightning invoice to enter the competition:" }
 
                         // QR Code container
                         div id="qrContainer" class="has-text-centered mb-4" {}

@@ -112,7 +112,7 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
                      hx-indicator="#submit-indicator" {
 
                     // Hidden field for auto-generated competition ID
-                    input type="hidden" name="id" value=(defaults.id);
+                    input type="hidden" name="id" id="competitionIdInput" value=(defaults.id);
 
                     // Hidden fields synced from datetime-local inputs
                     input type="hidden" name="start_observation_date" id="start_observation_date_hidden"
@@ -351,7 +351,11 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
     }
 }
 
-/// Success notification fragment returned after competition creation
+/// Success notification fragment returned after competition creation.
+///
+/// It also gives the form a fresh ID: the ID is fixed when the page renders,
+/// so submitting again would ask the oracle to rewrite the event just created.
+/// A failed create keeps its ID, so retrying the same competition stays idempotent.
 pub fn competition_success(competition_id: &Uuid) -> Markup {
     html! {
         div class="notification is-success" {
@@ -359,6 +363,7 @@ pub fn competition_success(competition_id: &Uuid) -> Markup {
                    onclick="this.parentElement.remove()" {}
             "Competition created successfully! ID: " (competition_id)
         }
+        input type="hidden" name="id" id="competitionIdInput" value=(Uuid::now_v7()) hx-swap-oob="true";
     }
 }
 
@@ -381,5 +386,23 @@ pub fn competition_success_message(message: &str) -> Markup {
                    onclick="this.parentElement.remove()" {}
             (message)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_created_competition_gives_the_form_a_new_id() {
+        let created = Uuid::now_v7();
+        let html = competition_success(&created).into_string();
+        assert!(html.contains(r#"id="competitionIdInput""#));
+        assert!(html.contains(r#"hx-swap-oob="true""#));
+        assert_eq!(
+            html.matches(&created.to_string()).count(),
+            1,
+            "only the notification may name the created ID; the next submit needs a new one"
+        );
     }
 }

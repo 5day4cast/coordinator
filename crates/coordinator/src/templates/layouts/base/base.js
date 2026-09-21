@@ -4,6 +4,9 @@ async function initApp() {
   window.setupNavbarBurger?.();
   window.setupThemeToggle?.();
   window.setupPayoutModal?.();
+  // A full page load of the entry form renders it before this bundle exists,
+  // so the form's own inline setup calls found nothing to run.
+  window.setupEntryPayoutConsent?.();
 
   try {
     await window.initWasm();
@@ -19,6 +22,7 @@ async function initApp() {
     window.setupAuthModals(authManager);
     authManager.attachEventListeners();
     window.setupHtmxAuth?.();
+    window.showKeymeldTrust?.();
 
     // Initialize payouts functionality
     window.initPayouts?.(API_BASE, ORACLE_BASE);

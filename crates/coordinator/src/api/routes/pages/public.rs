@@ -744,6 +744,7 @@ async fn fetch_competitions(state: &AppState) -> Vec<CompetitionView> {
                         .unwrap_or_default(),
                     status,
                     entry_fee: c.event_submission.entry_fee as u64,
+                    ticket_price: c.calculate_invoice_amount(),
                     total_pool: c.event_submission.total_competition_pool as u64,
                     total_entries: c.total_entries,
                     num_winners: c.event_submission.number_of_places_win as u64,

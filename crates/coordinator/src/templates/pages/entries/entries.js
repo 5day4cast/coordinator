@@ -215,6 +215,10 @@ class Entry {
     $qrContainer.innerHTML = "";
     $qrContainer.appendChild($qrCode);
     $paymentRequest.value = this.ticket.payment_request;
+    const $amount = document.getElementById("ticketPaymentAmount");
+    if ($amount) {
+      $amount.textContent = `Pay ${invoiceAmountSats(this.ticket.payment_request) ?? this.ticketAmountSats} sats by Lightning to enter this competition:`;
+    }
     updateStatus("Waiting for payment...");
     $error.classList.add("is-hidden");
     $modal.classList.add("is-active");
@@ -591,23 +595,38 @@ async function submitEntry() {
     currentEntry = new Entry(apiBase, oracleBase, competition);
     await currentEntry.init();
 
+    // Terms may still be loading, or a full page load may have skipped them.
+    if (window.entryPayoutTerms?.competition.id !== competitionId) {
+      await setupEntryPayoutConsent();
+    }
     const payoutTerms = window.entryPayoutTerms;
     if (!payoutTerms || payoutTerms.competition.id !== competitionId) {
-      throw new Error("Payout terms are not ready; reload the entry form and try again");
+      throw new Error(
+        document.getElementById("entryPayoutTermsText")?.textContent ||
+          "Payout terms are unavailable right now; try again in a moment",
+      );
     }
     currentEntry.payoutTerms = payoutTerms;
+    // Never fall back to invoice payouts just because the profile lookup failed.
+    // A refresh that finds a different address clears consent, so it comes first.
+    if (payoutTerms.quote.enabled && !window.entryPayoutAddressLoaded) {
+      await refreshEntryPayoutAddress();
+      if (!window.entryPayoutAddressLoaded) {
+        throw new Error("Your profile's Lightning Address could not be loaded; try again in a moment");
+      }
+    }
     const approved = document.getElementById("entryPayoutApproved")?.checked;
     if (!approved) throw new Error("Please approve your payout method before paying for this entry");
-    const automatic = document.getElementById("entryPayoutMethod")?.value === "automatic";
-    const address = automatic
-      ? (document.getElementById("entryLightningAddress")?.value || "").trim().toLowerCase()
-      : null;
-    if (automatic && (!address || address.length > 320 || !/^[a-z0-9_+.-]+@[a-z0-9.-]+$/.test(address))) {
-      throw new Error("Enter a valid Lightning Address for automatic payouts");
+    // Automatic payouts go to the profile's address; without one, or for a
+    // legacy competition, the winner submits an invoice instead.
+    const address = payoutTerms.quote.enabled ? window.entryPayoutAddress || null : null;
+    if (address && (address.length > 320 || !/^[a-z0-9_+.-]+@[a-z0-9.-]+$/.test(address))) {
+      throw new Error("The Lightning Address on your profile is not valid; update it on the Payouts page");
     }
-    currentEntry.ticketAmountSats = Number(form.dataset.entryFee);
+    // The price shown on the form; the wallet refuses an invoice for any other amount.
+    currentEntry.ticketAmountSats = Number(form.dataset.ticketPrice);
     if (!Number.isSafeInteger(currentEntry.ticketAmountSats) || currentEntry.ticketAmountSats <= 0) {
-      throw new Error("The competition is missing its entry fee");
+      throw new Error("The competition is missing its ticket price");
     }
     currentEntry.payoutChoice = {
       entry_id: currentEntry.entry.id,
@@ -633,15 +652,16 @@ async function submitEntry() {
   } catch (error) {
     console.error("Entry submission failed:", error);
 
-    // Provide user-friendly error messages
-    let userMessage = error.message || "Failed to submit entry";
-    if (error.message && error.message.includes("No signer initialized")) {
+    // WASM rejects with plain strings, which have no message property.
+    const detail = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+    let userMessage = detail || "Failed to submit entry";
+    if (detail.includes("No signer initialized")) {
       userMessage = "Session expired. Please log in again.";
       const loginModal = document.getElementById("loginModal");
       if (loginModal) {
         loginModal.classList.add("is-active");
       }
-    } else if (error.message && error.message.includes("NetworkError")) {
+    } else if (detail.includes("NetworkError")) {
       userMessage =
         "Network error. Please check your connection and try again.";
     }
@@ -709,23 +729,66 @@ function generateUuidV7() {
 }
 
 
-function updateEntryPayoutMethod() {
-  const automatic = document.getElementById("entryPayoutMethod")?.value === "automatic";
-  document.getElementById("entryPayoutAddressField")?.classList.toggle("is-hidden", !automatic);
+// What the server charges for a ticket: the entry fee plus the coordinator fee,
+// rounded the same way as Competition::calculate_invoice_amount.
+function ticketPriceSats(event) {
+  return event.entry_fee + Math.round(event.entry_fee * (event.coordinator_fee_percentage / 100));
+}
+
+// The sats a BOLT11 invoice charges, or null when it cannot be decoded.
+function invoiceAmountSats(invoice) {
+  try {
+    const decoded = typeof lightningPayReq === "undefined" ? null : lightningPayReq.decode(invoice);
+    return Number.isSafeInteger(decoded?.satoshis) ? decoded.satoshis : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function resetEntryPayoutConsent() {
   const consent = document.getElementById("entryPayoutApproved");
   if (consent) consent.checked = false;
 }
 
+// Winnings go to the Lightning Address on the user's profile. Runs when the
+// form loads and again on login and logout, so a full page load that starts
+// logged out needs no second reload.
+async function refreshEntryPayoutAddress() {
+  const destination = document.getElementById("entryPayoutDestination");
+  if (!destination) return;
+  const previous = window.entryPayoutAddress ?? null;
+  window.entryPayoutAddress = null;
+  window.entryPayoutAddressLoaded = false;
+  const terms = window.entryPayoutTerms;
+  if (terms && !terms.quote.enabled) {
+    window.entryPayoutAddressLoaded = true;
+    destination.textContent = "This competition pays winners by invoice: you submit a Lightning invoice after the result.";
+  } else if (!window.isLoggedIn?.()) {
+    destination.textContent = "Log in to see where your winnings are paid.";
+  } else {
+    try {
+      const base = document.body.dataset.apiBase || "";
+      const client = new window.AuthorizedClient(window.nostrClient, base);
+      const response = await client.post(`${base}/api/v1/users/login`);
+      if (!response.ok) throw new Error(`profile lookup returned ${response.status}`);
+      const user = await response.json();
+      window.entryPayoutAddress = user.lightning_address || null;
+      window.entryPayoutAddressLoaded = true;
+      destination.textContent = window.entryPayoutAddress
+        ? `Automatically to ${window.entryPayoutAddress}`
+        : "Your profile has no Lightning Address, so you will submit a Lightning invoice after the result. Add an address on the Payouts page to be paid automatically.";
+    } catch (error) {
+      console.error("Profile lookup failed:", error);
+      destination.textContent = "Your profile's Lightning Address could not be loaded; it will be tried again when you submit.";
+    }
+  }
+  if (window.entryPayoutAddress !== previous) resetEntryPayoutConsent();
+}
+
 async function setupEntryPayoutConsent() {
-  const input = document.getElementById("entryLightningAddress");
   const form = document.getElementById("entryForm");
-  if (!input || !form) return;
+  if (!form) return;
   window.entryPayoutTerms = null;
-  const resetConsent = () => {
-    const consent = document.getElementById("entryPayoutApproved");
-    if (consent) consent.checked = false;
-  };
-  input.addEventListener("input", resetConsent);
   const base = document.body.dataset.apiBase || "";
   const oracleBase = document.body.dataset.oracleBase || "";
   const competitionId = form.dataset.competitionId;
@@ -741,9 +804,10 @@ async function setupEntryPayoutConsent() {
     const event = competition.event_submission;
     if (competition.id !== competitionId || !event ||
         event.entry_fee !== Number(form.dataset.entryFee) ||
+        ticketPriceSats(event) !== Number(form.dataset.ticketPrice) ||
         event.total_competition_pool !== Number(form.dataset.totalPool) ||
         event.number_of_places_win !== Number(form.dataset.winnerCount)) {
-      throw new Error("The displayed competition terms changed; reload this page");
+      throw new Error("This competition's terms changed since the page loaded; go back to the competitions list and open it again");
     }
     let oracle = null;
     if (quote.enabled) {
@@ -755,33 +819,17 @@ async function setupEntryPayoutConsent() {
       if (!percentages) throw new Error("Unsupported winner distribution");
       if (termsText) termsText.textContent = `Pool: ${event.total_competition_pool} sats across ${event.total_allowed_entries} entries. Winner shares by rank: ${percentages.join("%, ")}%. Contract delay: ${quote.relative_locktime_block_delta} blocks. Maximum Bitcoin fee rate: ${quote.max_fee_rate_sat_vb} sat/vB.`;
     } else {
-      const method = document.getElementById("entryPayoutMethod");
-      method.value = "invoice";
-      const automatic = method.querySelector('option[value="automatic"]');
-      if (automatic) automatic.disabled = true;
-      updateEntryPayoutMethod();
       if (termsText) termsText.textContent = "This legacy competition does not use payout escrow. Invoice recovery releases entry secrets before payment, which is not guaranteed.";
       const consentText = document.getElementById("entryPayoutConsentText");
       if (consentText) consentText.textContent = " I understand this legacy entry uses recovery that releases its claim before payment.";
     }
-    resetConsent();
     window.entryPayoutTerms = { competition, quote, oracle };
+    resetEntryPayoutConsent();
   } catch (error) {
     if (termsText) termsText.textContent = error.message;
     return;
   }
-  if (!window.nostrClient) return;
-  try {
-    const client = new window.AuthorizedClient(window.nostrClient, base);
-    const response = await client.post(`${base}/api/v1/users/login`);
-    const user = await response.json();
-    if (!input.value && user.lightning_address) {
-      input.value = user.lightning_address;
-      resetConsent();
-    }
-  } catch (_) {
-    // Address entry remains available when profile lookup fails.
-  }
+  await refreshEntryPayoutAddress();
 }
-window.updateEntryPayoutMethod = updateEntryPayoutMethod;
 window.setupEntryPayoutConsent = setupEntryPayoutConsent;
+window.refreshEntryPayoutAddress = refreshEntryPayoutAddress;

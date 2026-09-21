@@ -743,12 +743,15 @@ class AuthManager {
     if (passwordInput) passwordInput.value = "";
 
     document.querySelector('[hx-get="/competitions"]')?.click();
+    window.refreshEntryPayoutAddress?.();
   }
 
   onLoginSuccess() {
     document.getElementById("authButtons")?.classList.add("is-hidden");
     document.getElementById("logoutContainer")?.classList.remove("is-hidden");
     window.closeAllModals?.();
+    // An open entry form shows where winnings go, which needs the profile.
+    window.refreshEntryPayoutAddress?.();
   }
 
   switchLoginTab(tab) {
