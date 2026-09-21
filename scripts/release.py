@@ -194,9 +194,31 @@ def package_enclave(root, version, source, target, output):
         return archive(package, output)
 
 
+def package_swap(root, version, source, target, output):
+    """Package ark-swapd, the service that swaps Lightning payments into Arkade escrows."""
+    binaries = root / "target" / target / "release"
+    require_files(binaries, ("ark-swapd",))
+    with tempfile.TemporaryDirectory() as temporary:
+        package = Path(temporary) / f"ark-swapd-{version}-{target}"
+        (package / "bin").mkdir(parents=True)
+        shutil.copy2(binaries / "ark-swapd", package / "bin" / "ark-swapd")
+        provenance = metadata(root, version, source)
+        provenance.update(target=target)
+        (package / "RELEASE.json").write_text(json.dumps(provenance, indent=2) + "\n")
+        (package / "README.txt").write_text(
+            f"ark-swapd v{version}\nSource: {source}\n\n"
+            "bin/ark-swapd takes a hold invoice on its LND node, pays the escrow from its own\n"
+            "Arkade wallet, then settles. Run ./bin/ark-swapd --config ark-swapd.toml.\n"
+            "Its database migrations are built in and run on startup.\n\n"
+            "Use sha256sum -c SHA256SUMS to verify files. See crates/coordinator-ark-swap:\n"
+            "https://github.com/5day4cast/coordinator/tree/v" + version + "/crates/coordinator-ark-swap\n"
+        )
+        return archive(package, output)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["validate", "wasm", "native", "enclave", "checksums"])
+    parser.add_argument("command", choices=["validate", "wasm", "native", "enclave", "swap", "checksums"])
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--version")
     parser.add_argument("--source")
@@ -221,6 +243,8 @@ def main():
         print(package_wasm(args.root, args.version, args.source, args.wasm, args.output))
     elif args.command == "enclave":
         print(package_enclave(args.root, args.version, args.source, args.target, args.output))
+    elif args.command == "swap":
+        print(package_swap(args.root, args.version, args.source, args.target, args.output))
     else:
         print(package_native(args.root, args.version, args.source, args.target, args.asset, args.wasm, args.output))
 
