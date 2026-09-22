@@ -30,4 +30,8 @@ pub struct ArkEscrowPolicy {
     /// The most the swap service may keep from this escrow for paying the player's Lightning
     /// Address, when a competition that never kicked off refunds it.
     pub max_refund_fee_sats: u64,
+    /// The Arkade server's checkpoint exit script, hex. Every offchain spend passes through a
+    /// checkpoint output made of the leaf being spent and this script, so a refund's destination
+    /// can only be checked against a script the player consented to.
+    pub checkpoint_exit_script: String,
 }

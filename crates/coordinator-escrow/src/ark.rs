@@ -23,7 +23,9 @@ use dlctix::bitcoin::hashes::Hash;
 use dlctix::bitcoin::sighash::{Prevouts, SighashCache};
 use dlctix::bitcoin::taproot::LeafVersion;
 pub use dlctix::bitcoin::XOnlyPublicKey;
-use dlctix::bitcoin::{OutPoint, Psbt, TapLeafHash, TapSighashType, Transaction, TxOut};
+use dlctix::bitcoin::{
+    OutPoint, Psbt, ScriptBuf, TapLeafHash, TapSighashType, Transaction, TxOut,
+};
 use dlctix::{ContractSignatures, Outcome};
 use serde::{Deserialize, Serialize};
 
@@ -72,9 +74,13 @@ pub enum ArkEscrowSpend {
     /// The intent proof registering the pool's escrows for a batch. Hex-encoded PSBT.
     IntentProof { proof_psbt: String },
     /// A refund of this escrow, after its locktime, into the swap that pays the player's
-    /// Lightning Address. Hex-encoded PSBT, and the swap's `TapTree` field, hex.
+    /// Lightning Address. An offchain spend takes two transactions, both hex-encoded PSBTs, and
+    /// the owner signs each in turn; `purpose` says which one this signature covers. The swap's
+    /// `TapTree` field is hex.
     Refund {
-        refund_psbt: String,
+        purpose: RefundPurpose,
+        ark_psbt: String,
+        checkpoint_psbt: String,
         swap_tap_tree: String,
     },
     /// A forfeit of this escrow into the batch that funds the pool.
@@ -171,7 +177,9 @@ pub fn spend_digests(
                 .map_err(|e| ArkError(e.to_string()))?;
             intent_proof_digests(escrow, policy.max_fee_sats, &funding_output, &proof)
         }
-        ArkEscrowSpend::Refund { .. } => Ok(vec![(0, refund_from(escrow, spend)?.1.digest)]),
+        ArkEscrowSpend::Refund { .. } => {
+            Ok(vec![(0, refund_from(escrow, policy, spend)?.1.digest)])
+        }
         ArkEscrowSpend::Forfeit {
             forfeit_psbt,
             funding,
@@ -237,18 +245,36 @@ pub fn intent_proof_digests(
     Ok(digests)
 }
 
-/// The digest for this escrow's input in a refund.
+/// An Arkade offchain spend takes two transactions, and the owner signs both.
 ///
-/// A refund spends this escrow alone, through its refund leaf, and pays the whole VTXO to the
-/// swap. The swap service takes its fee on the Lightning side, by paying an invoice smaller than
-/// the VTXO it claims, so nothing here may be withheld on the Ark side.
+/// A checkpoint transaction spends the VTXO through one of its leaves into a checkpoint output;
+/// an Ark transaction then spends that output and pays the receivers. The server co-signs
+/// between the two, so the owner signs the Ark transaction first and the checkpoint second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefundPurpose {
+    /// Spends the checkpoint output and pays the swap. Signed before the server co-signs.
+    ArkTransaction,
+    /// Spends the escrow. Signed after the server co-signs the Ark transaction.
+    Checkpoint,
+}
+
+/// Check a refund's transactions, and give the digest that `purpose` signs.
 ///
-/// The swap must belong to this player: the escrow's own entry key takes it back if the service
-/// never pays, and the same Arkade server co-signs both.
+/// A refund moves the whole escrow to the swap: the service takes its fee on the Lightning side,
+/// by paying an invoice smaller than the VTXO it claims, so nothing may be withheld here. Both
+/// transactions are checked whichever one is being signed, since the first signature is useless
+/// unless the second pays where it should.
+///
+/// The checkpoint output is recomputed rather than read from the transaction. It is a taproot of
+/// the leaf being spent and the server's exit script, which the player consented to; a proposed
+/// refund that names any other output would be redirecting the money.
 pub fn refund_spend(
     escrow: &EntryEscrow,
     swap: &RefundSwap,
-    refund: &Psbt,
+    policy: &ArkEscrowPolicy,
+    refund: &RefundTransactions,
+    purpose: RefundPurpose,
 ) -> Result<RefundSpend, ArkError> {
     if swap.terms().player != escrow.terms().player {
         return reject("the swap belongs to another player");
@@ -256,39 +282,97 @@ pub fn refund_spend(
     if swap.terms().server != escrow.terms().server {
         return reject("the swap names another Arkade server");
     }
-    if refund.inputs.len() != 1 || refund.unsigned_tx.input.len() != 1 {
-        return reject("a refund spends this escrow alone");
+    let leaf = escrow.script(EscrowPath::Refund);
+    let exit_script = hex::decode(&policy.checkpoint_exit_script)
+        .map(ScriptBuf::from_bytes)
+        .map_err(|e| ArkError(e.to_string()))?;
+    let checkpoint_output = coordinator_ark_escrow::checkpoint_script_pubkey(leaf, &exit_script)
+        .map_err(|e| ArkError(e.to_string()))?;
+
+    // The checkpoint transaction spends the escrow, and only it.
+    let checkpoint = &refund.checkpoint;
+    if checkpoint.inputs.len() != 1 || checkpoint.unsigned_tx.input.len() != 1 {
+        return reject("a refund's checkpoint transaction spends this escrow alone");
     }
-    if own_inputs_through(escrow, refund, EscrowPath::Refund)? != [0] {
-        return reject("the refund's only input must be this escrow, through its refund leaf");
+    if own_inputs_through(escrow, checkpoint, EscrowPath::Refund)? != [0] {
+        return reject("the checkpoint's only input must be this escrow, through its refund leaf");
     }
-    let locked_until = escrow.terms().refund_locktime;
-    let spends_at = refund.unsigned_tx.lock_time;
-    let open = match (locked_until, spends_at) {
-        (LockTime::Seconds(until), LockTime::Seconds(at)) => at.to_consensus_u32() >= until.to_consensus_u32(),
-        (LockTime::Blocks(until), LockTime::Blocks(at)) => at.to_consensus_u32() >= until.to_consensus_u32(),
+    let value = checkpoint.inputs[0]
+        .witness_utxo
+        .as_ref()
+        .ok_or_else(|| ArkError("every input needs its witness UTXO".into()))?
+        .value;
+    open_at_refund_time(escrow, checkpoint)?;
+    match checkpoint.unsigned_tx.output.as_slice() {
+        [paid, anchor]
+            if paid.script_pubkey == checkpoint_output
+                && paid.value == value
+                && is_anchor(anchor) => {}
+        _ => return reject("the checkpoint pays something other than the whole escrow onward"),
+    }
+
+    // The Ark transaction spends that checkpoint output, and pays the swap.
+    let ark = &refund.ark;
+    if ark.inputs.len() != 1 || ark.unsigned_tx.input.len() != 1 {
+        return reject("a refund's Ark transaction spends its checkpoint alone");
+    }
+    let spent = ark.unsigned_tx.input[0].previous_output;
+    if spent.txid != checkpoint.unsigned_tx.compute_txid() || spent.vout != 0 {
+        return reject("the Ark transaction does not spend this refund's checkpoint");
+    }
+    match ark.inputs[0].witness_utxo.as_ref() {
+        Some(utxo) if *utxo == checkpoint.unsigned_tx.output[0] => {}
+        _ => return reject("the Ark transaction's input is not the checkpoint output"),
+    }
+    // The checkpoint output is spent through the same leaf the escrow was.
+    let mut leaves = ark.inputs[0].tap_scripts.values();
+    match (leaves.next(), leaves.next()) {
+        (Some((script, LeafVersion::TapScript)), None) if script == leaf => {}
+        _ => return reject("the Ark transaction does not spend the checkpoint's refund leaf"),
+    }
+    open_at_refund_time(escrow, ark)?;
+    match ark.unsigned_tx.output.as_slice() {
+        [paid, anchor]
+            if paid.script_pubkey == swap.script_pubkey()
+                && paid.value == value
+                && is_anchor(anchor) => {}
+        _ => return reject("the refund pays something other than the whole escrow to the swap"),
+    }
+
+    let signed = match purpose {
+        RefundPurpose::ArkTransaction => ark,
+        RefundPurpose::Checkpoint => checkpoint,
+    };
+    Ok(RefundSpend {
+        digest: sighash_through(escrow, signed, 0, EscrowPath::Refund)?,
+        value_sats: value.to_sat(),
+    })
+}
+
+/// A refund's transaction may only spend once the escrow's refund locktime has passed, and its
+/// input must leave `CHECKLOCKTIMEVERIFY` enabled.
+fn open_at_refund_time(escrow: &EntryEscrow, psbt: &Psbt) -> Result<(), ArkError> {
+    let open = match (escrow.terms().refund_locktime, psbt.unsigned_tx.lock_time) {
+        (LockTime::Seconds(until), LockTime::Seconds(at)) => {
+            at.to_consensus_u32() >= until.to_consensus_u32()
+        }
+        (LockTime::Blocks(until), LockTime::Blocks(at)) => {
+            at.to_consensus_u32() >= until.to_consensus_u32()
+        }
         _ => return reject("the refund's locktime is not in the escrow's unit"),
     };
     if !open {
         return reject("the refund's locktime is before the escrow's");
     }
     // A final sequence disables CHECKLOCKTIMEVERIFY, which would spend the escrow at any time.
-    if refund.unsigned_tx.input[0].sequence.is_final() {
+    if psbt.unsigned_tx.input[0].sequence.is_final() {
         return reject("the refund's input must not be final");
     }
-    let value = refund.inputs[0]
-        .witness_utxo
-        .as_ref()
-        .ok_or_else(|| ArkError("every input needs its witness UTXO".into()))?
-        .value;
-    match refund.unsigned_tx.output.as_slice() {
-        [paid] if paid.script_pubkey == swap.script_pubkey() && paid.value == value => {}
-        _ => return reject("the refund pays something other than the whole escrow to the swap"),
-    }
-    Ok(RefundSpend {
-        digest: sighash_through(escrow, refund, 0, EscrowPath::Refund)?,
-        value_sats: value.to_sat(),
-    })
+    Ok(())
+}
+
+fn is_anchor(output: &TxOut) -> bool {
+    output.script_pubkey == coordinator_ark_escrow::anchor_script_pubkey()
 }
 
 /// What the swap must pay the player over Lightning: the escrow, less the service's fee.
@@ -310,13 +394,22 @@ pub fn refund_invoice_sats(
         .ok_or_else(|| ArkError("the swap's fee leaves the player nothing".into()))
 }
 
+/// A refund's two transactions, as the coordinator built them.
+pub struct RefundTransactions {
+    pub ark: Psbt,
+    pub checkpoint: Psbt,
+}
+
 /// The refund an [`ArkEscrowSpend::Refund`] carries: the swap it pays and its spend of the escrow.
 pub fn refund_from(
     escrow: &EntryEscrow,
+    policy: &ArkEscrowPolicy,
     spend: &ArkEscrowSpend,
 ) -> Result<(RefundSwap, RefundSpend), ArkError> {
     let ArkEscrowSpend::Refund {
-        refund_psbt,
+        purpose,
+        ark_psbt,
+        checkpoint_psbt,
         swap_tap_tree,
     } = spend
     else {
@@ -325,7 +418,11 @@ pub fn refund_from(
     let tap_tree = hex::decode(swap_tap_tree).map_err(|e| ArkError(e.to_string()))?;
     let vtxo = VtxoScript::decode_tap_tree(&tap_tree).map_err(|e| ArkError(e.to_string()))?;
     let swap = RefundSwap::from_vtxo_script(&vtxo).map_err(|e| ArkError(e.to_string()))?;
-    let spend = refund_spend(escrow, &swap, &psbt(refund_psbt)?)?;
+    let transactions = RefundTransactions {
+        ark: psbt(ark_psbt)?,
+        checkpoint: psbt(checkpoint_psbt)?,
+    };
+    let spend = refund_spend(escrow, &swap, policy, &transactions, *purpose)?;
     Ok((swap, spend))
 }
 
@@ -483,10 +580,12 @@ mod refund_tests {
     use crate::authorization::ArkEscrowPolicy;
     use coordinator_ark_escrow::{EscrowTerms, RelativeTimelock, SwapTerms};
     use dlctix::bitcoin::transaction::Version;
-    use dlctix::bitcoin::{Amount, ScriptBuf, Sequence, TxIn, Txid};
+    use dlctix::bitcoin::{Amount, Sequence, TxIn, Txid};
 
     const REFUND_AT: u32 = 1_790_000_000;
     const VALUE: Amount = Amount::from_sat(50_000);
+    /// Stands in for the Arkade server's checkpoint exit script.
+    const EXIT_SCRIPT: &str = "20aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac";
 
     fn xonly(byte: u8) -> XOnlyPublicKey {
         let secp = dlctix::bitcoin::key::Secp256k1::new();
@@ -521,137 +620,263 @@ mod refund_tests {
         .unwrap()
     }
 
-    /// A refund of `escrow`, paying `outputs`, spending through `path` at `lock_time`.
-    fn refund_through(
+    fn policy(max_refund_fee_sats: u64) -> ArkEscrowPolicy {
+        ArkEscrowPolicy {
+            escrow_tap_tree: hex::encode(escrow().vtxo_script().encode_tap_tree()),
+            max_fee_sats: 500,
+            max_refund_fee_sats,
+            checkpoint_exit_script: EXIT_SCRIPT.into(),
+        }
+    }
+
+    fn exit_script() -> ScriptBuf {
+        ScriptBuf::from_bytes(hex::decode(EXIT_SCRIPT).unwrap())
+    }
+
+    fn anchor() -> TxOut {
+        TxOut {
+            value: Amount::ZERO,
+            script_pubkey: coordinator_ark_escrow::anchor_script_pubkey(),
+        }
+    }
+
+    /// One transaction of an offchain spend: `prevout` in, `outputs` out, spending `leaf`.
+    fn offchain_tx(
         escrow: &EntryEscrow,
+        prevout: (OutPoint, TxOut),
+        leaf: EscrowPath,
         outputs: Vec<TxOut>,
-        path: EscrowPath,
         lock_time: LockTime,
     ) -> Psbt {
         let mut psbt = Psbt::from_unsigned_tx(Transaction {
-            version: Version::TWO,
+            version: Version::non_standard(3),
             lock_time,
             input: vec![TxIn {
-                previous_output: OutPoint::new(Txid::from_byte_array([7u8; 32]), 0),
+                previous_output: prevout.0,
                 sequence: Sequence::ENABLE_LOCKTIME_NO_RBF,
                 ..Default::default()
             }],
             output: outputs,
         })
         .unwrap();
-        psbt.inputs[0].witness_utxo = Some(TxOut {
-            value: VALUE,
-            script_pubkey: escrow.script_pubkey(),
-        });
+        psbt.inputs[0].witness_utxo = Some(prevout.1);
         psbt.inputs[0].tap_scripts.insert(
-            escrow.control_block(path),
-            (escrow.script(path).clone(), LeafVersion::TapScript),
+            escrow.control_block(leaf),
+            (escrow.script(leaf).clone(), LeafVersion::TapScript),
         );
         psbt
     }
 
-    fn paying(swap: &RefundSwap, value: Amount) -> Vec<TxOut> {
-        vec![TxOut {
-            value,
-            script_pubkey: swap.script_pubkey(),
-        }]
-    }
-
-    fn refund(escrow: &EntryEscrow, swap: &RefundSwap) -> Psbt {
-        refund_through(
+    /// A refund of the whole escrow into `swap`, as ark-core would build it.
+    fn refund(escrow: &EntryEscrow, swap: &RefundSwap) -> RefundTransactions {
+        refund_paying(
             escrow,
-            paying(swap, VALUE),
-            EscrowPath::Refund,
-            LockTime::from_consensus(REFUND_AT),
+            vec![
+                TxOut {
+                    value: VALUE,
+                    script_pubkey: swap.script_pubkey(),
+                },
+                anchor(),
+            ],
         )
     }
 
-    #[test]
-    fn the_whole_escrow_goes_to_the_swap_at_its_locktime() {
-        let (escrow, swap) = (escrow(), swap_for(14));
-        let digest = refund_spend(&escrow, &swap, &refund(&escrow, &swap)).unwrap().digest;
-        // The digest is the refund leaf's, not the funding leaf's.
-        let funding = refund_through(
-            &escrow,
-            paying(&swap, VALUE),
-            EscrowPath::Funding,
+    /// A refund whose Ark transaction pays `outputs`.
+    fn refund_paying(escrow: &EntryEscrow, outputs: Vec<TxOut>) -> RefundTransactions {
+        let checkpoint_output = TxOut {
+            value: VALUE,
+            script_pubkey: coordinator_ark_escrow::checkpoint_script_pubkey(
+                escrow.script(EscrowPath::Refund),
+                &exit_script(),
+            )
+            .unwrap(),
+        };
+        let checkpoint = offchain_tx(
+            escrow,
+            (
+                OutPoint::new(Txid::from_byte_array([7u8; 32]), 0),
+                TxOut {
+                    value: VALUE,
+                    script_pubkey: escrow.script_pubkey(),
+                },
+            ),
+            EscrowPath::Refund,
+            vec![checkpoint_output.clone(), anchor()],
             LockTime::from_consensus(REFUND_AT),
         );
-        assert_ne!(digest, sighash(&escrow, &funding, 0).unwrap());
+        let ark = offchain_tx(
+            escrow,
+            (
+                OutPoint::new(checkpoint.unsigned_tx.compute_txid(), 0),
+                checkpoint_output,
+            ),
+            EscrowPath::Refund,
+            outputs,
+            LockTime::from_consensus(REFUND_AT),
+        );
+        RefundTransactions { ark, checkpoint }
+    }
+
+    fn spend(
+        escrow: &EntryEscrow,
+        swap: &RefundSwap,
+        refund: &RefundTransactions,
+        purpose: RefundPurpose,
+    ) -> Result<RefundSpend, ArkError> {
+        refund_spend(escrow, swap, &policy(100), refund, purpose)
     }
 
     #[test]
-    fn the_refund_waits_for_the_escrow_locktime() {
+    fn each_transaction_of_the_refund_signs_its_own_digest() {
         let (escrow, swap) = (escrow(), swap_for(14));
-        let early = refund_through(
+        let refund = refund(&escrow, &swap);
+        let checkpoint = spend(&escrow, &swap, &refund, RefundPurpose::Checkpoint).unwrap();
+        let ark = spend(&escrow, &swap, &refund, RefundPurpose::ArkTransaction).unwrap();
+        assert_eq!(checkpoint.value_sats, VALUE.to_sat());
+        assert_eq!(ark.value_sats, VALUE.to_sat());
+        assert_ne!(checkpoint.digest, ark.digest);
+    }
+
+    #[test]
+    fn the_checkpoint_must_pay_the_server_script_the_player_consented_to() {
+        let (escrow, swap) = (escrow(), swap_for(14));
+        let mut elsewhere = refund(&escrow, &swap);
+        elsewhere.checkpoint.unsigned_tx.output[0].script_pubkey = escrow.script_pubkey();
+        assert!(spend(&escrow, &swap, &elsewhere, RefundPurpose::Checkpoint).is_err());
+        // A checkpoint built for another server's exit script is a different output.
+        let other_server = ArkEscrowPolicy {
+            checkpoint_exit_script: "51".into(),
+            ..policy(100)
+        };
+        assert!(refund_spend(
             &escrow,
-            paying(&swap, VALUE),
-            EscrowPath::Refund,
-            LockTime::from_consensus(REFUND_AT - 1),
-        );
-        assert!(refund_spend(&escrow, &swap, &early).is_err());
-        let later = refund_through(
-            &escrow,
-            paying(&swap, VALUE),
-            EscrowPath::Refund,
-            LockTime::from_consensus(REFUND_AT + 60),
-        );
-        assert!(refund_spend(&escrow, &swap, &later).is_ok());
+            &swap,
+            &other_server,
+            &refund(&escrow, &swap),
+            RefundPurpose::Checkpoint,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_ark_transaction_must_spend_this_refunds_checkpoint() {
+        let (escrow, swap) = (escrow(), swap_for(14));
+        let mut detached = refund(&escrow, &swap);
+        detached.ark.unsigned_tx.input[0].previous_output =
+            OutPoint::new(Txid::from_byte_array([8u8; 32]), 0);
+        assert!(spend(&escrow, &swap, &detached, RefundPurpose::ArkTransaction).is_err());
+        assert!(spend(&escrow, &swap, &detached, RefundPurpose::Checkpoint).is_err());
+    }
+
+    #[test]
+    fn both_transactions_wait_for_the_escrow_locktime() {
+        let (escrow, swap) = (escrow(), swap_for(14));
+        for early in [RefundPurpose::ArkTransaction, RefundPurpose::Checkpoint] {
+            let mut refund = refund(&escrow, &swap);
+            let at = LockTime::from_consensus(REFUND_AT - 1);
+            match early {
+                RefundPurpose::ArkTransaction => refund.ark.unsigned_tx.lock_time = at,
+                RefundPurpose::Checkpoint => refund.checkpoint.unsigned_tx.lock_time = at,
+            }
+            assert!(spend(&escrow, &swap, &refund, RefundPurpose::Checkpoint).is_err());
+        }
     }
 
     #[test]
     fn a_final_input_would_disable_the_locktime() {
         let (escrow, swap) = (escrow(), swap_for(14));
         let mut spendable_now = refund(&escrow, &swap);
-        spendable_now.unsigned_tx.input[0].sequence = Sequence::MAX;
-        assert!(refund_spend(&escrow, &swap, &spendable_now).is_err());
+        spendable_now.checkpoint.unsigned_tx.input[0].sequence = Sequence::MAX;
+        assert!(spend(&escrow, &swap, &spendable_now, RefundPurpose::Checkpoint).is_err());
     }
 
     #[test]
     fn nothing_may_be_withheld_or_paid_elsewhere() {
         let (escrow, swap) = (escrow(), swap_for(14));
-        let short = refund_through(
+        let short = refund_paying(
             &escrow,
-            paying(&swap, VALUE - Amount::from_sat(1_000)),
-            EscrowPath::Refund,
-            LockTime::from_consensus(REFUND_AT),
+            vec![
+                TxOut {
+                    value: VALUE - Amount::from_sat(1_000),
+                    script_pubkey: swap.script_pubkey(),
+                },
+                anchor(),
+            ],
         );
-        assert!(refund_spend(&escrow, &swap, &short).is_err());
+        assert!(spend(&escrow, &swap, &short, RefundPurpose::ArkTransaction).is_err());
 
-        let elsewhere = refund_through(
+        let elsewhere = refund_paying(
             &escrow,
-            vec![TxOut {
-                value: VALUE,
-                script_pubkey: ScriptBuf::new_p2tr_tweaked(
-                    dlctix::bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(xonly(30)),
-                ),
-            }],
-            EscrowPath::Refund,
-            LockTime::from_consensus(REFUND_AT),
+            vec![
+                TxOut {
+                    value: VALUE,
+                    script_pubkey: escrow.script_pubkey(),
+                },
+                anchor(),
+            ],
         );
-        assert!(refund_spend(&escrow, &swap, &elsewhere).is_err());
+        assert!(spend(&escrow, &swap, &elsewhere, RefundPurpose::ArkTransaction).is_err());
 
-        let mut split = refund(&escrow, &swap);
-        split.unsigned_tx.output.push(TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: swap.script_pubkey(),
-        });
-        assert!(refund_spend(&escrow, &swap, &split).is_err());
+        // Change back to the coordinator, alongside the swap, is still withholding.
+        let split = refund_paying(
+            &escrow,
+            vec![
+                TxOut {
+                    value: VALUE - Amount::from_sat(1_000),
+                    script_pubkey: swap.script_pubkey(),
+                },
+                TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: escrow.script_pubkey(),
+                },
+                anchor(),
+            ],
+        );
+        assert!(spend(&escrow, &swap, &split, RefundPurpose::ArkTransaction).is_err());
     }
 
-    fn policy(max_refund_fee_sats: u64) -> ArkEscrowPolicy {
-        ArkEscrowPolicy {
-            escrow_tap_tree: hex::encode(escrow().vtxo_script().encode_tap_tree()),
-            max_fee_sats: 500,
-            max_refund_fee_sats,
-        }
+    #[test]
+    fn the_swap_must_be_this_players() {
+        let escrow = escrow();
+        let other = swap_for(15);
+        assert!(spend(
+            &escrow,
+            &other,
+            &refund(&escrow, &other),
+            RefundPurpose::Checkpoint
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_refund_spends_this_escrow_alone_through_its_refund_leaf() {
+        let (escrow, swap) = (escrow(), swap_for(14));
+        let mut funding_leaf = refund(&escrow, &swap);
+        funding_leaf.checkpoint.inputs[0].tap_scripts.clear();
+        funding_leaf.checkpoint.inputs[0].tap_scripts.insert(
+            escrow.control_block(EscrowPath::Funding),
+            (
+                escrow.script(EscrowPath::Funding).clone(),
+                LeafVersion::TapScript,
+            ),
+        );
+        assert!(spend(&escrow, &swap, &funding_leaf, RefundPurpose::Checkpoint).is_err());
+
+        let mut two_inputs = refund(&escrow, &swap);
+        two_inputs.checkpoint.unsigned_tx.input.push(TxIn {
+            previous_output: OutPoint::new(Txid::from_byte_array([9u8; 32]), 0),
+            sequence: Sequence::ENABLE_LOCKTIME_NO_RBF,
+            ..Default::default()
+        });
+        two_inputs.checkpoint.inputs.push(Default::default());
+        assert!(spend(&escrow, &swap, &two_inputs, RefundPurpose::Checkpoint).is_err());
     }
 
     #[test]
     fn the_swap_keeps_no_more_than_the_player_allowed() {
         let (escrow, swap) = (escrow(), swap_for(14));
-        let spend = refund_spend(&escrow, &swap, &refund(&escrow, &swap)).unwrap();
-        assert_eq!(spend.value_sats, VALUE.to_sat());
+        let refund = refund(&escrow, &swap);
+        let spend = spend(&escrow, &swap, &refund, RefundPurpose::Checkpoint).unwrap();
         assert_eq!(
             refund_invoice_sats(&spend, 100, &policy(100)).unwrap(),
             VALUE.to_sat() - 100
@@ -678,32 +903,5 @@ mod refund_tests {
         let deadline_too_far_out = REFUND_AT + 3_600 - MAX_REFUND_DEADLINE_SECS - 1;
         assert!(check_refund_deadline(&swap, deadline_too_far_out).is_err());
         assert!(check_refund_deadline(&swap, REFUND_AT).is_ok());
-    }
-
-    #[test]
-    fn the_swap_must_be_this_players() {
-        let escrow = escrow();
-        assert!(refund_spend(&escrow, &swap_for(15), &refund(&escrow, &swap_for(15))).is_err());
-    }
-
-    #[test]
-    fn a_refund_spends_this_escrow_alone_through_its_refund_leaf() {
-        let (escrow, swap) = (escrow(), swap_for(14));
-        let funding_leaf = refund_through(
-            &escrow,
-            paying(&swap, VALUE),
-            EscrowPath::Funding,
-            LockTime::from_consensus(REFUND_AT),
-        );
-        assert!(refund_spend(&escrow, &swap, &funding_leaf).is_err());
-
-        let mut two_inputs = refund(&escrow, &swap);
-        two_inputs.unsigned_tx.input.push(TxIn {
-            previous_output: OutPoint::new(Txid::from_byte_array([8u8; 32]), 0),
-            sequence: Sequence::ENABLE_LOCKTIME_NO_RBF,
-            ..Default::default()
-        });
-        two_inputs.inputs.push(Default::default());
-        assert!(refund_spend(&escrow, &swap, &two_inputs).is_err());
     }
 }

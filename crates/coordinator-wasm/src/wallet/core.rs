@@ -1216,6 +1216,7 @@ mod tests {
                 escrow_tap_tree: hex::encode(escrow.vtxo_script().encode_tap_tree()),
                 max_fee_sats,
                 max_refund_fee_sats: max_fee_sats.min(100),
+                checkpoint_exit_script: hex::encode([0x51]),
             });
             assignment.payout_policy = Some(serde_json::to_string(&policy).unwrap());
             f.wallet
