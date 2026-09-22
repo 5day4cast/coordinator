@@ -113,6 +113,7 @@ impl Coordinator {
         Ok(Some(ArkEscrowPolicy {
             escrow_tap_tree,
             max_fee_sats: fee,
+            max_refund_fee_sats: ark.max_refund_fee_sats,
         }))
     }
 

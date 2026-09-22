@@ -950,6 +950,7 @@ mod ark_escrow {
 
     const ESCROW_SATS: u64 = 20_000;
     const MAX_FEE_SATS: u64 = 500;
+    const MAX_REFUND_FEE_SATS: u64 = 100;
 
     fn xonly(secret: u8) -> XOnlyPublicKey {
         XOnlyPublicKey::from_slice(&public(secret)[1..]).unwrap()
@@ -970,6 +971,7 @@ mod ark_escrow {
         ArkEscrowPolicy {
             escrow_tap_tree: hex::encode(escrow.vtxo_script().encode_tap_tree()),
             max_fee_sats: MAX_FEE_SATS,
+            max_refund_fee_sats: MAX_REFUND_FEE_SATS,
         }
     }
     fn ark_fixture() -> (Fixture, EntryEscrow) {
