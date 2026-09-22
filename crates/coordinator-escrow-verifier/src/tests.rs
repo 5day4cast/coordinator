@@ -974,7 +974,7 @@ mod ark_escrow {
     use coordinator_ark_escrow::{
         EntryEscrow, EscrowPath, EscrowTerms, RefundSwap, RelativeTimelock, SwapTerms,
     };
-    use coordinator_escrow::ark::{psbt_hex, ArkEscrowSpend, ArkFunding};
+    use coordinator_escrow::ark::{psbt_hex, ArkEscrowSpend, ArkFunding, RefundPurpose};
     use dlctix::bitcoin::{
         absolute::LockTime, taproot::LeafVersion, transaction::Version, Psbt, ScriptBuf,
         Transaction, TxIn, TxOut, Txid, XOnlyPublicKey,
@@ -983,6 +983,9 @@ mod ark_escrow {
     const ESCROW_SATS: u64 = 20_000;
     /// The escrow's refund locktime, which a refund's transaction must wait for.
     const REFUND_AT: u32 = 1_790_000_000;
+    /// Stands in for the Arkade server's checkpoint exit script.
+    const EXIT_SCRIPT: &str =
+        "20aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac";
     /// A refunded escrow's value. The shared LNURL fixture answers one exact amount, so this
     /// leaves the player the 100,000 sats it expects to be asked for.
     const REFUNDED_SATS: u64 = 100_000 + MAX_REFUND_FEE_SATS;
@@ -1009,6 +1012,7 @@ mod ark_escrow {
             escrow_tap_tree: hex::encode(escrow.vtxo_script().encode_tap_tree()),
             max_fee_sats: MAX_FEE_SATS,
             max_refund_fee_sats: MAX_REFUND_FEE_SATS,
+            checkpoint_exit_script: EXIT_SCRIPT.into(),
         }
     }
     fn ark_fixture() -> (Fixture, EntryEscrow) {
@@ -1387,26 +1391,31 @@ mod ark_escrow {
             .is_err());
     }
 
-    /// A refund of `escrow` into `swap`, spending at the escrow's locktime.
-    fn refund_tx(escrow: &EntryEscrow, swap: &RefundSwap, value_sats: u64) -> Psbt {
+    fn anchor() -> TxOut {
+        TxOut {
+            value: Amount::ZERO,
+            script_pubkey: coordinator_ark_escrow::anchor_script_pubkey(),
+        }
+    }
+
+    /// One transaction of an offchain spend, spending the escrow's refund leaf.
+    fn offchain_tx(
+        escrow: &EntryEscrow,
+        prevout: (OutPoint, TxOut),
+        outputs: Vec<TxOut>,
+    ) -> Psbt {
         let mut psbt = Psbt::from_unsigned_tx(Transaction {
-            version: Version::TWO,
+            version: Version::non_standard(3),
             lock_time: LockTime::from_consensus(REFUND_AT),
             input: vec![TxIn {
-                previous_output: outpoint(11),
+                previous_output: prevout.0,
                 sequence: dlctix::bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF,
                 ..Default::default()
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(value_sats),
-                script_pubkey: swap.script_pubkey(),
-            }],
+            output: outputs,
         })
         .unwrap();
-        psbt.inputs[0].witness_utxo = Some(TxOut {
-            value: Amount::from_sat(value_sats),
-            script_pubkey: escrow.script_pubkey(),
-        });
+        psbt.inputs[0].witness_utxo = Some(prevout.1);
         psbt.inputs[0].tap_scripts.insert(
             escrow.control_block(EscrowPath::Refund),
             (
@@ -1415,6 +1424,45 @@ mod ark_escrow {
             ),
         );
         psbt
+    }
+
+    /// A refund's two transactions: the escrow into a checkpoint, the checkpoint into the swap.
+    fn refund_txs(escrow: &EntryEscrow, swap: &RefundSwap, value_sats: u64) -> (Psbt, Psbt) {
+        let value = Amount::from_sat(value_sats);
+        let checkpoint_output = TxOut {
+            value,
+            script_pubkey: coordinator_ark_escrow::checkpoint_script_pubkey(
+                escrow.script(EscrowPath::Refund),
+                &ScriptBuf::from_bytes(hex::decode(EXIT_SCRIPT).unwrap()),
+            )
+            .unwrap(),
+        };
+        let checkpoint = offchain_tx(
+            escrow,
+            (
+                outpoint(11),
+                TxOut {
+                    value,
+                    script_pubkey: escrow.script_pubkey(),
+                },
+            ),
+            vec![checkpoint_output.clone(), anchor()],
+        );
+        let ark = offchain_tx(
+            escrow,
+            (
+                OutPoint::new(checkpoint.unsigned_tx.compute_txid(), 0),
+                checkpoint_output,
+            ),
+            vec![
+                TxOut {
+                    value,
+                    script_pubkey: swap.script_pubkey(),
+                },
+                anchor(),
+            ],
+        );
+        (ark, checkpoint)
     }
 
     /// The swap a refund pays, committing to the invoice `preimage` settles.
@@ -1433,9 +1481,21 @@ mod ark_escrow {
         .unwrap()
     }
 
+    /// The Ark transaction is signed first, before the server co-signs it; the checkpoint after.
     fn refund_of(escrow: &EntryEscrow, swap: &RefundSwap) -> ArkEscrowSpend {
+        refund_signing(escrow, swap, RefundPurpose::ArkTransaction)
+    }
+
+    fn refund_signing(
+        escrow: &EntryEscrow,
+        swap: &RefundSwap,
+        purpose: RefundPurpose,
+    ) -> ArkEscrowSpend {
+        let (ark, checkpoint) = refund_txs(escrow, swap, REFUNDED_SATS);
         ArkEscrowSpend::Refund {
-            refund_psbt: psbt_hex(&refund_tx(escrow, swap, REFUNDED_SATS)),
+            purpose,
+            ark_psbt: psbt_hex(&ark),
+            checkpoint_psbt: psbt_hex(&checkpoint),
             swap_tap_tree: hex::encode(swap.vtxo_script().encode_tap_tree()),
         }
     }
@@ -1462,11 +1522,11 @@ mod ark_escrow {
         let (client, server) = discovery_tls_fixture().await;
         let verifier = CoordinatorVerifier::with_lnurl(client);
         let swap = refund_swap(preimage);
-        let attempt = attempt();
+        let first = attempt();
         let unbound = Payload::default();
         let prepared = verifier
             .prepare(
-                f.prepare_view(&unbound, &attempt, SIGN_ARK_REFUND, &BTreeMap::new()),
+                f.prepare_view(&unbound, &first, SIGN_ARK_REFUND, &BTreeMap::new()),
                 &refund_parameters(
                     refund_of(&escrow, &swap),
                     invoice.clone(),
@@ -1478,17 +1538,36 @@ mod ark_escrow {
         server.await.unwrap();
         assert_eq!(digests(&prepared.action).len(), 1);
 
+        // The server co-signs between the two, so the checkpoint is signed in its own attempt,
+        // over its own digest.
+        let (client, server) = discovery_tls_fixture().await;
+        let second = CoordinatorVerifier::with_lnurl(client);
+        let later = attempt();
+        let checkpoint = second
+            .prepare(
+                f.prepare_view(&unbound, &later, SIGN_ARK_REFUND, &BTreeMap::new()),
+                &refund_parameters(
+                    refund_signing(&escrow, &swap, RefundPurpose::Checkpoint),
+                    invoice.clone(),
+                    MAX_REFUND_FEE_SATS,
+                ),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_ne!(digests(&checkpoint.action), digests(&prepared.action));
+
         // Executing and restoring recheck the refund without resolving the address again.
         verifier
             .verify_execution(
-                f.execute_view(&unbound, &attempt, SIGN_ARK_REFUND),
+                f.execute_view(&unbound, &first, SIGN_ARK_REFUND),
                 &prepared,
                 &Payload::default(),
             )
             .await
             .unwrap();
         verifier
-            .restore_execution(f.execute_view(&unbound, &attempt, SIGN_ARK_REFUND), &prepared)
+            .restore_execution(f.execute_view(&unbound, &first, SIGN_ARK_REFUND), &prepared)
             .await
             .unwrap();
     }

@@ -114,6 +114,11 @@ impl Coordinator {
             escrow_tap_tree,
             max_fee_sats: fee,
             max_refund_fee_sats: ark.max_refund_fee_sats,
+            // A refund's transactions pass through this server's checkpoint outputs, so the
+            // player consents to the script that makes them.
+            checkpoint_exit_script: hex::encode(
+                ark.server.info().checkpoint_tapscript.as_bytes(),
+            ),
         }))
     }
 

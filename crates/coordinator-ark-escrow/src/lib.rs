@@ -11,6 +11,7 @@
 //! This crate depends only on `bitcoin`, so the coordinator, the browser wallet, and the Keymeld verifier can all use it.
 
 mod address;
+mod checkpoint;
 mod error;
 mod escrow;
 mod rules;
@@ -19,6 +20,7 @@ mod tapscript;
 mod vtxo_script;
 
 pub use address::{ArkAddress, ADDRESS_VERSION, MAINNET_HRP, TESTNET_HRP};
+pub use checkpoint::{anchor_script_pubkey, checkpoint_script_pubkey};
 pub use error::Error;
 pub use escrow::{EntryEscrow, EscrowPath, EscrowTerms};
 pub use rules::ServerRules;

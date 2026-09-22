@@ -487,7 +487,7 @@ fn ark_refund_action(
         .as_ref()
         .ok_or_else(|| invalid("This ticket has no Arkade escrow"))?;
     let escrow = ark_escrow(signed, terms, ark_policy)?;
-    let (swap, refund) = ark::refund_from(&escrow, spend).map_err(invalid)?;
+    let (swap, refund) = ark::refund_from(&escrow, ark_policy, spend).map_err(invalid)?;
     let action = Action::SignBip340 {
         scope: Bip340Scope {
             public_key: signed.policy.participant_public_key.clone(),

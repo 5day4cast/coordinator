@@ -597,6 +597,7 @@ impl PoolHarness {
                         ),
                         max_fee_sats: 0,
                         max_refund_fee_sats: 0,
+                        checkpoint_exit_script: String::new(),
                     }
                 }),
             };
