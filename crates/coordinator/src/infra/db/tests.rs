@@ -426,6 +426,7 @@ async fn registration_migration_preserves_legacy_entries_and_new_context_roundtr
                     ActionGrant {
                         preparation: coordinator_escrow::escrow::PreparationPolicy::Single,
                         repetition: escrow::Repetition::Once,
+                        unbound: false,
                         condition: Condition::HashlockSha256 {
                             commitment: escrow::sha256(&[8; 32]),
                         },
