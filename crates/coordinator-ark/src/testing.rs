@@ -63,7 +63,15 @@ pub fn mock_info(server: &Keypair) -> Info {
             .expect("a valid address")
             .require_network(Network::Signet)
             .expect("a signet address"),
-        checkpoint_tapscript: ScriptBuf::new(),
+        // Shaped like Mutinynet's: after a delay, the server alone can spend a stalled
+        // checkpoint. Offchain spends pass through an output made of this and the spent leaf.
+        checkpoint_tapscript: bitcoin::script::Builder::new()
+            .push_sequence(Sequence::from_512_second_intervals(8))
+            .push_opcode(bitcoin::opcodes::all::OP_CSV)
+            .push_opcode(bitcoin::opcodes::all::OP_DROP)
+            .push_slice(server.x_only_public_key().0.serialize())
+            .push_opcode(bitcoin::opcodes::all::OP_CHECKSIG)
+            .into_script(),
         network: Network::Signet,
         session_duration: 60,
         unilateral_exit_delay: Sequence::from_512_second_intervals(4),
