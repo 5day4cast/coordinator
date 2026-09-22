@@ -127,6 +127,16 @@ enum PreparedState {
     ArkEscrowSpend {
         spend: ArkEscrowSpend,
     },
+    /// The refund of an escrow whose competition never kicked off, with the invoice the
+    /// verifier resolved when preparing it. Later steps recheck the swap against that invoice
+    /// rather than resolving the Lightning Address again.
+    ArkRefund {
+        spend: ArkEscrowSpend,
+        invoice: String,
+        /// What the invoice pays the player. Rechecked against the escrow and the player's fee
+        /// cap, so a changed value cannot widen what the swap keeps.
+        owed_sats: u64,
+    },
     Settlement {
         request_digest: [u8; 32],
         settlement: PreparedSettlement,
@@ -186,6 +196,7 @@ fn check_permissions(
     .collect();
     if ark_escrow {
         expected.insert(generic::SIGN_ARK_ESCROW);
+        expected.insert(generic::SIGN_ARK_REFUND);
     }
     if signed
         .policy
@@ -215,12 +226,22 @@ fn check_permissions(
                 escrow::Repetition::VerifierAuthorizedAttempts,
                 escrow::PreparationPolicy::Single,
             ),
+            generic::SIGN_ARK_REFUND => (
+                generic::ARK_REFUND_RULE,
+                escrow::Repetition::VerifierAuthorizedAttempts,
+                escrow::PreparationPolicy::Single,
+            ),
             _ => (
                 generic::SETTLEMENT_RULE,
                 escrow::Repetition::Once,
                 escrow::PreparationPolicy::RenewableIdenticalAction,
             ),
         };
+        if grant.unbound != (id.as_str() == generic::SIGN_ARK_REFUND) {
+            return Err(invalid(
+                "Only the Arkade refund permission may act without a binding",
+            ));
+        }
         if grant.repetition != expected_repetition {
             return Err(invalid("Coordinator permission repetition differs"));
         }
@@ -239,6 +260,7 @@ fn check_permissions(
         match (id.as_str(), &grant.operation) {
             (generic::SIGN_CONTRACT, Permission::Sign) => {}
             (generic::SIGN_ARK_ESCROW, Permission::SignBip340) => {}
+            (generic::SIGN_ARK_REFUND, Permission::SignBip340) => {}
             (generic::RELEASE_PREIMAGE, Permission::ReleaseSecret { name, recipient })
                 if name == generic::PREIMAGE_SECRET
                     && recipient.encryption_public_key.as_bytes()
@@ -410,6 +432,74 @@ fn ark_escrow_action(
     ))
 }
 
+/// Recheck a prepared refund, against the invoice the verifier resolved when preparing it.
+///
+/// The Lightning Address is not resolved again: a second invoice would have its own payment
+/// hash, which the swap could not commit to. The deadline is not rechecked either, since it was
+/// fixed when the swap was made.
+fn check_refund(
+    context: &ExecutionView<'_>,
+    prepared: &PreparedAction,
+    spend: &ArkEscrowSpend,
+    invoice: &str,
+    owed_sats: u64,
+) -> Result<(), VerificationError> {
+    if context.rule != generic::ARK_REFUND_RULE
+        || context.permission_id != generic::SIGN_ARK_REFUND
+    {
+        return Err(invalid("Escrow refund permission differs"));
+    }
+    let (policy, terms) = validate_static(context.manifest, context.policy)?;
+    let (action, swap, refund) = ark_refund_action(context.policy, &policy, &terms, spend)?;
+    if prepared.action != action {
+        return Err(invalid("Prepared refund differs from its transactions"));
+    }
+    let ark_policy = policy
+        .ark_escrow
+        .as_ref()
+        .ok_or_else(|| invalid("This ticket has no Arkade escrow"))?;
+    let fee_sats = refund
+        .value_sats
+        .checked_sub(owed_sats)
+        .ok_or_else(|| invalid("Prepared refund pays more than the escrow holds"))?;
+    if ark::refund_invoice_sats(&refund, fee_sats, ark_policy).map_err(invalid)? != owed_sats {
+        return Err(invalid("Prepared refund pays the player a different amount"));
+    }
+    let parsed = payout::validate_prepared_invoice(invoice, owed_sats, terms.network)
+        .map_err(|_| invalid("Prepared refund invoice is invalid"))?;
+    let payment_hash = *(parsed.payment_hash().as_ref() as &[u8; 32]);
+    ark::check_refund_invoice(&swap, payment_hash).map_err(invalid)
+}
+
+/// Recompute this participant's refund, as the BIP340 action Keymeld may sign.
+///
+/// A refund acts without a binding: its pool never formed, so there is no contract and possibly
+/// no completed keygen session. Everything it needs comes from the participant's own signed
+/// policy: the escrow's terms, and the cap on what a swap may keep.
+fn ark_refund_action(
+    signed: &SignedEscrowPolicy,
+    policy: &PayoutPolicy,
+    terms: &ContractAuthorization,
+    spend: &ArkEscrowSpend,
+) -> Result<(Action, coordinator_ark_escrow::RefundSwap, ark::RefundSpend), VerificationError> {
+    let ark_policy = policy
+        .ark_escrow
+        .as_ref()
+        .ok_or_else(|| invalid("This ticket has no Arkade escrow"))?;
+    let escrow = ark_escrow(signed, terms, ark_policy)?;
+    let (swap, refund) = ark::refund_from(&escrow, spend).map_err(invalid)?;
+    let action = Action::SignBip340 {
+        scope: Bip340Scope {
+            public_key: signed.policy.participant_public_key.clone(),
+            items: vec![Bip340Item {
+                item_id: Uuid::from_u128(1),
+                digest: refund.digest,
+            }],
+        },
+    };
+    Ok((action, swap, refund))
+}
+
 /// Recompute all messages this participant must sign. Client-selected routing
 /// IDs are checked against the authenticated manifest; every cryptographic value
 /// is derived from the bound DLC instead of accepted from the application host.
@@ -551,6 +641,89 @@ fn validate_settlement(
     Ok(())
 }
 
+impl CoordinatorVerifier {
+    /// An invoice for `amount_msat` from a Lightning Address, resolved inside the enclave.
+    ///
+    /// The enclave asks for it itself, so the payment hash it then requires is one no caller
+    /// chose.
+    async fn request_invoice(
+        &self,
+        address: &str,
+        amount_msat: u64,
+    ) -> Result<String, VerificationError> {
+        #[cfg(feature = "lnurl")]
+        {
+            self.lnurl
+                .as_ref()
+                .ok_or_else(|| invalid("Automatic Lightning Address resolution is disabled"))?
+                .request_invoice(address, amount_msat)
+                .await
+                .map_err(invalid)
+        }
+        #[cfg(not(feature = "lnurl"))]
+        {
+            let _ = (address, amount_msat);
+            Err(invalid(
+                "LNURL support is not compiled into the Coordinator verifier",
+            ))
+        }
+    }
+
+    /// Authorize the refund of an escrow whose competition never kicked off.
+    ///
+    /// The player consented to the escrow's terms and to a cap on what a swap may keep. This
+    /// resolves their own Lightning Address for the remainder, and signs only a refund paying a
+    /// swap that commits to that invoice, so the service is paid by revealing its preimage.
+    async fn prepare_refund(
+        &self,
+        context: PreparationView<'_>,
+        spend: ArkEscrowSpend,
+        fee_sats: u64,
+    ) -> Result<PreparedAction, VerificationError> {
+        if context.rule != generic::ARK_REFUND_RULE
+            || context.permission_id != generic::SIGN_ARK_REFUND
+        {
+            return Err(invalid("Escrow refund permission differs"));
+        }
+        let (policy, terms) = validate_static(context.manifest, context.policy)?;
+        let (action, swap, refund) = ark_refund_action(context.policy, &policy, &terms, &spend)?;
+        let ark_policy = policy
+            .ark_escrow
+            .as_ref()
+            .ok_or_else(|| invalid("This ticket has no Arkade escrow"))?;
+        let owed_sats = ark::refund_invoice_sats(&refund, fee_sats, ark_policy).map_err(invalid)?;
+        let amount_msat = owed_sats
+            .checked_mul(1000)
+            .ok_or_else(|| invalid("Refund amount overflow"))?;
+        let address = policy
+            .automatic_lightning_address
+            .as_ref()
+            .ok_or_else(|| invalid("This entry has no Lightning Address to refund"))?;
+        let invoice = self.request_invoice(address, amount_msat).await?;
+        let parsed = payout::validate_prepared_invoice(&invoice, owed_sats, terms.network)
+            .map_err(invalid)?;
+        let payment_hash = *(parsed.payment_hash().as_ref() as &[u8; 32]);
+        ark::check_refund_invoice(&swap, payment_hash).map_err(invalid)?;
+        let now = u32::try_from(now()?).map_err(|_| invalid("Clock is out of range"))?;
+        ark::check_refund_deadline(&swap, now).map_err(invalid)?;
+        context
+            .attempt
+            .validate(&action, &context.policy.policy.context)
+            .map_err(invalid)?;
+        Ok(PreparedAction {
+            action,
+            application_state: Payload::encode(&PreparedState::ArkRefund {
+                spend,
+                invoice,
+                owed_sats,
+            })
+            .map_err(invalid)?,
+            // The signed input, as for any other escrow spend.
+            output: Payload::encode(&vec![0usize]).map_err(invalid)?,
+        })
+    }
+}
+
 impl EscrowVerifier for CoordinatorVerifier {
     fn descriptor(&self) -> VerifierDescriptor {
         VerifierDescriptor {
@@ -681,13 +854,20 @@ impl EscrowVerifier for CoordinatorVerifier {
         action_parameters: &'a Payload,
     ) -> VerificationFuture<'a, PreparedAction> {
         Box::pin(async move {
+            let parameters: ActionParameters = action_parameters.decode().map_err(invalid)?;
+            // A refund acts without a binding, so it is prepared before one is restored.
+            if let ActionParameters::RefundArkEscrow { spend, fee_sats } = parameters {
+                return self.prepare_refund(context, spend, fee_sats).await;
+            }
             let (bound, policy, terms) =
                 restore_binding(context.manifest, context.policy, context.bound_state)?;
             if bound.participant_public_keys != *context.participant_public_keys {
                 return Err(invalid("Restored binding key roster differs"));
             }
-            let parameters: ActionParameters = action_parameters.decode().map_err(invalid)?;
             match parameters {
+                ActionParameters::RefundArkEscrow { .. } => {
+                    Err(invalid("A refund is prepared without a binding"))
+                }
                 ActionParameters::SignContract { scope, ark_funding } => {
                     if context.rule != generic::CONTRACT_RULE
                         || context.permission_id != generic::SIGN_CONTRACT
@@ -808,15 +988,7 @@ impl EscrowVerifier for CoordinatorVerifier {
                                     policy.automatic_lightning_address.as_ref().ok_or_else(
                                         || invalid("Automatic settlement was not authorized"),
                                     )?;
-                                #[cfg(feature = "lnurl")]
-                                {
-                                    self.lnurl.as_ref().ok_or_else(|| invalid("Automatic Lightning Address resolution is disabled"))?.request_invoice(address, amount_msat).await.map_err(invalid)?
-                                }
-                                #[cfg(not(feature = "lnurl"))]
-                                {
-                                    let _ = address;
-                                    return Err(invalid("LNURL support is not compiled into the Coordinator verifier"));
-                                }
+                                self.request_invoice(address, amount_msat).await?
                             }
                             PayoutMethod::Invoice {
                                 invoice,
@@ -896,10 +1068,24 @@ impl EscrowVerifier for CoordinatorVerifier {
                 .attempt
                 .validate(&prepared.action, &context.policy.policy.context)
                 .map_err(invalid)?;
+            let state: PreparedState = prepared.application_state.decode().map_err(invalid)?;
+            if let PreparedState::ArkRefund {
+                spend,
+                invoice,
+                owed_sats,
+            } = &state
+            {
+                if !evidence.as_bytes().is_empty() {
+                    return Err(invalid("Invalid escrow refund execution"));
+                }
+                return check_refund(&context, prepared, spend, invoice, *owed_sats);
+            }
             let (bound, policy, terms) =
                 restore_binding(context.manifest, context.policy, context.bound_state)?;
-            let state: PreparedState = prepared.application_state.decode().map_err(invalid)?;
             match state {
+                PreparedState::ArkRefund { .. } => {
+                    Err(invalid("A refund is executed without a binding"))?
+                }
                 PreparedState::ContractSigning { ark_funding } => {
                     if context.rule != generic::CONTRACT_RULE
                         || context.permission_id != generic::SIGN_CONTRACT
@@ -982,9 +1168,21 @@ impl EscrowVerifier for CoordinatorVerifier {
                 .attempt
                 .validate(&prepared.action, &context.policy.policy.context)
                 .map_err(invalid)?;
+            let state: PreparedState = prepared.application_state.decode().map_err(invalid)?;
+            if let PreparedState::ArkRefund {
+                spend,
+                invoice,
+                owed_sats,
+            } = &state
+            {
+                return check_refund(&context, prepared, spend, invoice, *owed_sats);
+            }
             let (bound, policy, terms) =
                 restore_binding(context.manifest, context.policy, context.bound_state)?;
-            match prepared.application_state.decode().map_err(invalid)? {
+            match state {
+                PreparedState::ArkRefund { .. } => {
+                    Err(invalid("A refund is restored without a binding"))?
+                }
                 PreparedState::ContractSigning { ark_funding } => {
                     if context.rule != generic::CONTRACT_RULE
                         || context.permission_id != generic::SIGN_CONTRACT

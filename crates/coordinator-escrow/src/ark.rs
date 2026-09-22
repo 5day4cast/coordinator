@@ -171,15 +171,7 @@ pub fn spend_digests(
                 .map_err(|e| ArkError(e.to_string()))?;
             intent_proof_digests(escrow, policy.max_fee_sats, &funding_output, &proof)
         }
-        ArkEscrowSpend::Refund {
-            refund_psbt,
-            swap_tap_tree,
-        } => {
-            let tap_tree = hex::decode(swap_tap_tree).map_err(|e| ArkError(e.to_string()))?;
-            let vtxo = VtxoScript::decode_tap_tree(&tap_tree).map_err(|e| ArkError(e.to_string()))?;
-            let swap = RefundSwap::from_vtxo_script(&vtxo).map_err(|e| ArkError(e.to_string()))?;
-            Ok(vec![(0, refund_spend(escrow, &swap, &psbt(refund_psbt)?)?.digest)])
-        }
+        ArkEscrowSpend::Refund { .. } => Ok(vec![(0, refund_from(escrow, spend)?.1.digest)]),
         ArkEscrowSpend::Forfeit {
             forfeit_psbt,
             funding,
@@ -303,7 +295,7 @@ pub fn refund_spend(
 ///
 /// The player consented to the cap when entering, so a service that wants more is refused here
 /// rather than after it has the money.
-pub fn refund_invoice_msat(
+pub fn refund_invoice_sats(
     spend: &RefundSpend,
     fee_sats: u64,
     policy: &ArkEscrowPolicy,
@@ -311,13 +303,30 @@ pub fn refund_invoice_msat(
     if fee_sats > policy.max_refund_fee_sats {
         return reject("the swap keeps more than the refund fee the player allowed");
     }
-    let paid = spend
+    spend
         .value_sats
         .checked_sub(fee_sats)
         .filter(|paid| *paid > 0)
-        .ok_or_else(|| ArkError("the swap's fee leaves the player nothing".into()))?;
-    paid.checked_mul(1000)
-        .ok_or_else(|| ArkError("refund amount overflow".into()))
+        .ok_or_else(|| ArkError("the swap's fee leaves the player nothing".into()))
+}
+
+/// The refund an [`ArkEscrowSpend::Refund`] carries: the swap it pays and its spend of the escrow.
+pub fn refund_from(
+    escrow: &EntryEscrow,
+    spend: &ArkEscrowSpend,
+) -> Result<(RefundSwap, RefundSpend), ArkError> {
+    let ArkEscrowSpend::Refund {
+        refund_psbt,
+        swap_tap_tree,
+    } = spend
+    else {
+        return reject("this spend is not a refund");
+    };
+    let tap_tree = hex::decode(swap_tap_tree).map_err(|e| ArkError(e.to_string()))?;
+    let vtxo = VtxoScript::decode_tap_tree(&tap_tree).map_err(|e| ArkError(e.to_string()))?;
+    let swap = RefundSwap::from_vtxo_script(&vtxo).map_err(|e| ArkError(e.to_string()))?;
+    let spend = refund_spend(escrow, &swap, &psbt(refund_psbt)?)?;
+    Ok((swap, spend))
 }
 
 /// The soonest a refund swap's deadline may fall: the service needs time to pay the invoice.
@@ -325,19 +334,23 @@ pub const MIN_REFUND_DEADLINE_SECS: u32 = 15 * 60;
 /// The latest: after this the player's own money is held too long for a payment that failed.
 pub const MAX_REFUND_DEADLINE_SECS: u32 = 24 * 60 * 60;
 
-/// Check the swap the refund pays into, against the invoice the verifier itself fetched.
+/// Check the swap commits to the invoice the verifier itself resolved.
 ///
-/// The payment hash is what makes the swap atomic: the service claims the VTXO only by
-/// revealing the preimage of an invoice that the verifier resolved from the player's own
-/// Lightning Address. The deadline bounds how long a failed payment holds the money.
-pub fn check_refund_swap(
-    swap: &RefundSwap,
-    payment_hash: [u8; 32],
-    now: u32,
-) -> Result<(), ArkError> {
+/// This is what makes the swap atomic: the service claims the VTXO only by revealing the
+/// preimage of an invoice drawn from the player's own Lightning Address. Every later step
+/// rechecks it against the prepared invoice, without resolving the address again.
+pub fn check_refund_invoice(swap: &RefundSwap, payment_hash: [u8; 32]) -> Result<(), ArkError> {
     if swap.terms().payment_hash != payment_hash {
         return reject("the swap does not commit to the invoice the player is paid with");
     }
+    Ok(())
+}
+
+/// Check how long the swap may hold the player's money, when the refund is prepared.
+///
+/// A payment that never happens leaves the money until the deadline, so a refund prepared now
+/// must not name one far out. Later steps do not recheck this: by then the deadline is fixed.
+pub fn check_refund_deadline(swap: &RefundSwap, now: u32) -> Result<(), ArkError> {
     let LockTime::Seconds(deadline) = swap.terms().deadline else {
         return reject("the swap's deadline must be a timestamp");
     };
@@ -640,20 +653,19 @@ mod refund_tests {
         let spend = refund_spend(&escrow, &swap, &refund(&escrow, &swap)).unwrap();
         assert_eq!(spend.value_sats, VALUE.to_sat());
         assert_eq!(
-            refund_invoice_msat(&spend, 100, &policy(100)).unwrap(),
-            (VALUE.to_sat() - 100) * 1000
+            refund_invoice_sats(&spend, 100, &policy(100)).unwrap(),
+            VALUE.to_sat() - 100
         );
-        assert!(refund_invoice_msat(&spend, 101, &policy(100)).is_err());
+        assert!(refund_invoice_sats(&spend, 101, &policy(100)).is_err());
         // A fee that leaves the player nothing is refused even under a generous cap.
-        assert!(refund_invoice_msat(&spend, VALUE.to_sat(), &policy(u64::MAX)).is_err());
+        assert!(refund_invoice_sats(&spend, VALUE.to_sat(), &policy(u64::MAX)).is_err());
     }
 
     #[test]
     fn the_swap_commits_to_the_invoice_the_player_is_paid_with() {
         let swap = swap_for(14);
-        let now = REFUND_AT;
-        assert!(check_refund_swap(&swap, [5u8; 32], now).is_ok());
-        assert!(check_refund_swap(&swap, [6u8; 32], now).is_err());
+        assert!(check_refund_invoice(&swap, [5u8; 32]).is_ok());
+        assert!(check_refund_invoice(&swap, [6u8; 32]).is_err());
     }
 
     #[test]
@@ -662,10 +674,10 @@ mod refund_tests {
         // The swap's deadline is an hour after REFUND_AT, so move `now` to put that hour
         // outside each end of the window.
         let deadline_too_soon = REFUND_AT + 3_600 - MIN_REFUND_DEADLINE_SECS + 1;
-        assert!(check_refund_swap(&swap, [5u8; 32], deadline_too_soon).is_err());
+        assert!(check_refund_deadline(&swap, deadline_too_soon).is_err());
         let deadline_too_far_out = REFUND_AT + 3_600 - MAX_REFUND_DEADLINE_SECS - 1;
-        assert!(check_refund_swap(&swap, [5u8; 32], deadline_too_far_out).is_err());
-        assert!(check_refund_swap(&swap, [5u8; 32], REFUND_AT).is_ok());
+        assert!(check_refund_deadline(&swap, deadline_too_far_out).is_err());
+        assert!(check_refund_deadline(&swap, REFUND_AT).is_ok());
     }
 
     #[test]
