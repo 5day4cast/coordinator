@@ -62,10 +62,18 @@ pub struct ArkSettings {
     /// How long after the observation window starts an unfunded entry can be refunded.
     #[serde(default = "default_refund_after_start_secs")]
     pub refund_after_start_secs: u64,
+    /// The most the swap service may keep from a refunded escrow for paying the player's
+    /// Lightning Address. The player consents to this cap when entering.
+    #[serde(default = "default_max_refund_fee_sats")]
+    pub max_refund_fee_sats: u64,
 }
 
 fn default_refund_after_start_secs() -> u64 {
     24 * 60 * 60
+}
+
+fn default_max_refund_fee_sats() -> u64 {
+    100
 }
 
 impl ArkSettings {

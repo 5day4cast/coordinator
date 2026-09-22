@@ -596,6 +596,7 @@ impl PoolHarness {
                             escrows[index].vtxo_script().encode_tap_tree(),
                         ),
                         max_fee_sats: 0,
+                        max_refund_fee_sats: 0,
                     }
                 }),
             };

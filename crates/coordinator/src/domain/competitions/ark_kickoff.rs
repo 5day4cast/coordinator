@@ -31,6 +31,8 @@ pub struct Arkade {
     pub swaps: Arc<dyn crate::infra::ark_swap::EscrowSwaps>,
     /// How long after the observation window starts an unfunded entry can be refunded.
     pub refund_after_start_secs: u64,
+    /// The most a refund's swap may keep for paying the player's Lightning Address.
+    pub max_refund_fee_sats: u64,
 }
 
 /// Keymeld as a pool's contract signer and every player's escrow signer.

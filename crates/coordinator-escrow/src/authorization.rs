@@ -27,4 +27,7 @@ pub struct ArkEscrowPolicy {
     pub escrow_tap_tree: String,
     /// The most the coordinator may take from each escrow as its fee in the funding batch.
     pub max_fee_sats: u64,
+    /// The most the swap service may keep from this escrow for paying the player's Lightning
+    /// Address, when a competition that never kicked off refunds it.
+    pub max_refund_fee_sats: u64,
 }
