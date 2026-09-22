@@ -645,7 +645,7 @@ impl CoordinatorVerifier {
     /// An invoice for `amount_msat` from a Lightning Address, resolved inside the enclave.
     ///
     /// The enclave asks for it itself, so the payment hash it then requires is one no caller
-    /// chose.
+    /// chose. A refund cannot work this way; see [`CoordinatorVerifier::invoice_binding`].
     async fn request_invoice(
         &self,
         address: &str,
@@ -669,6 +669,30 @@ impl CoordinatorVerifier {
         }
     }
 
+    /// What an invoice from `address` must commit to, without requesting one.
+    async fn invoice_binding(
+        &self,
+        address: &str,
+        amount_msat: u64,
+    ) -> Result<[u8; 32], VerificationError> {
+        #[cfg(feature = "lnurl")]
+        {
+            self.lnurl
+                .as_ref()
+                .ok_or_else(|| invalid("Automatic Lightning Address resolution is disabled"))?
+                .invoice_binding(address, amount_msat)
+                .await
+                .map_err(invalid)
+        }
+        #[cfg(not(feature = "lnurl"))]
+        {
+            let _ = (address, amount_msat);
+            Err(invalid(
+                "LNURL support is not compiled into the Coordinator verifier",
+            ))
+        }
+    }
+
     /// Authorize the refund of an escrow whose competition never kicked off.
     ///
     /// The player consented to the escrow's terms and to a cap on what a swap may keep. This
@@ -678,6 +702,7 @@ impl CoordinatorVerifier {
         &self,
         context: PreparationView<'_>,
         spend: ArkEscrowSpend,
+        invoice: String,
         fee_sats: u64,
     ) -> Result<PreparedAction, VerificationError> {
         if context.rule != generic::ARK_REFUND_RULE
@@ -699,12 +724,15 @@ impl CoordinatorVerifier {
             .automatic_lightning_address
             .as_ref()
             .ok_or_else(|| invalid("This entry has no Lightning Address to refund"))?;
-        let invoice = self.request_invoice(address, amount_msat).await?;
-        let parsed = payout::validate_prepared_invoice(&invoice, owed_sats, terms.network)
-            .map_err(invalid)?;
+        let now = now()?;
+        let parsed =
+            payout::validate_invoice(&invoice, owed_sats, terms.network, now).map_err(invalid)?;
+        // The invoice is the caller's, so it is checked against the address the player signed.
+        let binding = self.invoice_binding(address, amount_msat).await?;
+        payout::validate_address_invoice(&parsed, binding).map_err(invalid)?;
         let payment_hash = *(parsed.payment_hash().as_ref() as &[u8; 32]);
         ark::check_refund_invoice(&swap, payment_hash).map_err(invalid)?;
-        let now = u32::try_from(now()?).map_err(|_| invalid("Clock is out of range"))?;
+        let now = u32::try_from(now).map_err(|_| invalid("Clock is out of range"))?;
         ark::check_refund_deadline(&swap, now).map_err(invalid)?;
         context
             .attempt
@@ -856,8 +884,13 @@ impl EscrowVerifier for CoordinatorVerifier {
         Box::pin(async move {
             let parameters: ActionParameters = action_parameters.decode().map_err(invalid)?;
             // A refund acts without a binding, so it is prepared before one is restored.
-            if let ActionParameters::RefundArkEscrow { spend, fee_sats } = parameters {
-                return self.prepare_refund(context, spend, fee_sats).await;
+            if let ActionParameters::RefundArkEscrow {
+                spend,
+                invoice,
+                fee_sats,
+            } = parameters
+            {
+                return self.prepare_refund(context, spend, invoice, fee_sats).await;
             }
             let (bound, policy, terms) =
                 restore_binding(context.manifest, context.policy, context.bound_state)?;

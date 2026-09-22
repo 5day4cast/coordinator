@@ -143,6 +143,20 @@ impl LnurlPayClient {
         Ok(response.pr)
     }
 
+    /// The metadata commitment an invoice from `address` must carry, for `amount_msat`.
+    ///
+    /// Only the provider's discovery step runs: no invoice is requested. A caller supplies the
+    /// invoice instead, which is what a refund needs, because its payment hash must be known
+    /// before the transaction paying it exists. See `payout::validate_address_invoice`.
+    pub async fn invoice_binding(&self, address: &str, amount_msat: u64) -> Result<[u8; 32]> {
+        ensure!(amount_msat > 0, "LNURL payout amount must be positive");
+        let address = validate_address(address)?;
+        let params: PayRequest = parse_response(self.get_json(discovery_url(&address)?).await?)?;
+        // Rejects a wrong tag, an unpayable amount and required payer data, as paying would.
+        params.callback_url(amount_msat)?;
+        Ok(keymeld_core::escrow::sha256(params.metadata.as_bytes()))
+    }
+
     async fn get_json(&self, url: Url) -> Result<Value> {
         validate_url(&url)?;
         // Includes relay DNS, connect, TLS, HTTP headers and complete response.
@@ -759,6 +773,19 @@ pub(crate) mod tests {
     pub(crate) async fn automatic_payout_tls_fixture(
         invoice: String,
     ) -> (LnurlPayClient, tokio::task::JoinHandle<()>) {
+        payout_fixture(Some(invoice)).await
+    }
+
+    /// The metadata this fixture's provider serves, which its invoices commit to.
+    pub(crate) const FIXTURE_METADATA: &str = "[[\"text/plain\",\"Provider display metadata\"]]";
+
+    /// The same provider, serving discovery alone: what verifying a supplied invoice needs.
+    pub(crate) async fn discovery_tls_fixture() -> (LnurlPayClient, tokio::task::JoinHandle<()>) {
+        payout_fixture(None).await
+    }
+
+    /// Serves LNURL discovery, and the callback too when an `invoice` is given.
+    async fn payout_fixture(invoice: Option<String>) -> (LnurlPayClient, tokio::task::JoinHandle<()>) {
         let certificate = rcgen::generate_simple_self_signed(vec![
             "wallet.example".into(),
             "invoices.example".into(),
@@ -786,22 +813,23 @@ pub(crate) mod tests {
                 "tag": "payRequest",
                 "callback": "https://invoices.example/pay?token=opaque%2Btoken&amount=1",
                 "minSendable": 1000, "maxSendable": 100_000_000,
-                "metadata": "[[\"text/plain\",\"Provider display metadata\"]]",
+                "metadata": FIXTURE_METADATA,
             });
-            for (host, pin, path, body) in [
-                (
-                    "wallet.example",
-                    "8.8.8.8:443",
-                    "/.well-known/lnurlp/alice+prize",
-                    discovery,
-                ),
-                (
+            let mut exchanges = vec![(
+                "wallet.example",
+                "8.8.8.8:443",
+                "/.well-known/lnurlp/alice+prize".to_string(),
+                discovery,
+            )];
+            if let Some(invoice) = invoice {
+                exchanges.push((
                     "invoices.example",
                     "9.9.9.9:443",
-                    "/pay?token=opaque%2Btoken&amount=100000000",
+                    "/pay?token=opaque%2Btoken&amount=100000000".to_string(),
                     json!({"pr": invoice}),
-                ),
-            ] {
+                ));
+            }
+            for (host, pin, path, body) in exchanges {
                 let (mut dns, _) = listener.accept().await.unwrap();
                 match read_control::<_, RelayRequest>(&mut dns).await.unwrap() {
                     RelayRequest::Resolve {

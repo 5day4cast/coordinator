@@ -61,11 +61,15 @@ pub enum ActionParameters {
     },
     /// Sign the entry's Arkade escrow spend. See [`crate::ark`].
     SignArkEscrow { spend: ArkEscrowSpend },
-    /// Sign the refund of an escrow whose competition never kicked off. The verifier resolves
-    /// the player's Lightning Address itself and requires the swap to commit to that invoice,
-    /// so only `fee_sats` is proposed here. See [`crate::ark`].
+    /// Sign the refund of an escrow whose competition never kicked off. See [`crate::ark`].
+    ///
+    /// The invoice is supplied rather than requested by the verifier, because the swap the
+    /// refund pays must already commit to its payment hash. The verifier checks it was issued
+    /// for the player's own Lightning Address before signing anything.
     RefundArkEscrow {
         spend: ArkEscrowSpend,
+        /// The invoice the swap service pays, from the player's Lightning Address.
+        invoice: String,
         /// What the swap service keeps, capped by the player's consented policy.
         fee_sats: u64,
     },
