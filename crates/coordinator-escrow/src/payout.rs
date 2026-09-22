@@ -246,6 +246,14 @@ pub fn validate_prepared_invoice(
     )
     .map_err(lightning_error)
 }
+/// Check an invoice belongs to a Lightning Address, by its provider's metadata commitment.
+pub fn validate_address_invoice(
+    invoice: &Bolt11Invoice,
+    metadata_hash: [u8; 32],
+) -> Result<(), PayoutError> {
+    crate::escrow_lightning::validate_address_invoice(invoice, metadata_hash)
+        .map_err(lightning_error)
+}
 pub fn verify_payment_preimage(invoice: &str, preimage: &[u8; 32]) -> Result<(), PayoutError> {
     crate::escrow_lightning::verify_payment_preimage(invoice, preimage).map_err(lightning_error)
 }

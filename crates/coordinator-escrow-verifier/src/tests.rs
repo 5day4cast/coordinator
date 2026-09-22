@@ -365,6 +365,31 @@ fn invoice() -> String {
 fn invoice_with_preimage(preimage: [u8; 32]) -> String {
     invoice_for(100_000, preimage)
 }
+/// An invoice for `sats`, settled by `preimage`, issued for a Lightning Address: it commits
+/// to the provider's metadata for that address, as LUD-06 requires.
+#[cfg(feature = "lnurl")]
+fn address_invoice_for(sats: u64, preimage: [u8; 32], metadata: &str) -> String {
+    use dlctix::bitcoin::{
+        hashes::sha256,
+        secp256k1::{Secp256k1, SecretKey},
+    };
+    InvoiceBuilder::new(Currency::Regtest)
+        .amount_milli_satoshis(sats * 1000)
+        .description_hash(sha256::Hash::from_byte_array(payout::sha256(
+            metadata.as_bytes(),
+        )))
+        .payment_hash(sha256::Hash::from_byte_array(payout::sha256(&preimage)))
+        .payment_secret(PaymentSecret([10; 32]))
+        .duration_since_epoch(Duration::from_secs(now().unwrap()))
+        .expiry_time(Duration::from_secs(600))
+        .min_final_cltv_expiry_delta(18)
+        .build_signed(|hash| {
+            Secp256k1::new()
+                .sign_ecdsa_recoverable(hash, &SecretKey::from_slice(&[11; 32]).unwrap())
+        })
+        .unwrap()
+        .to_string()
+}
 /// An invoice for `sats`, settled by `preimage`.
 fn invoice_for(sats: u64, preimage: [u8; 32]) -> String {
     use dlctix::bitcoin::{
@@ -1415,21 +1440,26 @@ mod ark_escrow {
         }
     }
 
-    fn refund_parameters(spend: ArkEscrowSpend, fee_sats: u64) -> Payload {
-        Payload::encode(&ActionParameters::RefundArkEscrow { spend, fee_sats }).unwrap()
+    fn refund_parameters(spend: ArkEscrowSpend, invoice: String, fee_sats: u64) -> Payload {
+        Payload::encode(&ActionParameters::RefundArkEscrow {
+            spend,
+            invoice,
+            fee_sats,
+        })
+        .unwrap()
     }
 
     #[cfg(feature = "lnurl")]
     #[tokio::test]
     async fn a_refund_pays_the_players_own_address_through_a_swap_committed_to_its_invoice() {
+        use crate::lnurl_transport::tests::{discovery_tls_fixture, FIXTURE_METADATA};
+
         let escrow = escrow_with(14, 18);
         let f = fixture_with(true, Some(policy_for(&escrow)));
         let preimage = [9u8; 32];
         let paid_sats = REFUNDED_SATS - MAX_REFUND_FEE_SATS;
-        let (client, server) = crate::lnurl_transport::tests::automatic_payout_tls_fixture(
-            invoice_for(paid_sats, preimage),
-        )
-        .await;
+        let invoice = address_invoice_for(paid_sats, preimage, FIXTURE_METADATA);
+        let (client, server) = discovery_tls_fixture().await;
         let verifier = CoordinatorVerifier::with_lnurl(client);
         let swap = refund_swap(preimage);
         let attempt = attempt();
@@ -1437,7 +1467,11 @@ mod ark_escrow {
         let prepared = verifier
             .prepare(
                 f.prepare_view(&unbound, &attempt, SIGN_ARK_REFUND, &BTreeMap::new()),
-                &refund_parameters(refund_of(&escrow, &swap), MAX_REFUND_FEE_SATS),
+                &refund_parameters(
+                    refund_of(&escrow, &swap),
+                    invoice.clone(),
+                    MAX_REFUND_FEE_SATS,
+                ),
             )
             .await
             .unwrap();
@@ -1461,44 +1495,64 @@ mod ark_escrow {
 
     #[cfg(feature = "lnurl")]
     #[tokio::test]
-    async fn a_refund_is_refused_when_the_swap_or_the_fee_is_not_the_players() {
+    async fn a_refund_is_refused_unless_the_invoice_and_swap_are_the_players() {
+        use crate::lnurl_transport::tests::{discovery_tls_fixture, FIXTURE_METADATA};
+
         let escrow = escrow_with(14, 18);
         let f = fixture_with(true, Some(policy_for(&escrow)));
         let preimage = [9u8; 32];
         let paid_sats = REFUNDED_SATS - MAX_REFUND_FEE_SATS;
         let attempt = attempt();
         let unbound = Payload::default();
+        let refund = |swap: &RefundSwap, invoice: String, fee: u64| {
+            refund_parameters(refund_of(&escrow, swap), invoice, fee)
+        };
+        let prepare = |verifier: CoordinatorVerifier, params: Payload| {
+            let f = &f;
+            let attempt = &attempt;
+            let unbound = &unbound;
+            async move {
+                verifier
+                    .prepare(
+                        f.prepare_view(unbound, attempt, SIGN_ARK_REFUND, &BTreeMap::new()),
+                        &params,
+                    )
+                    .await
+            }
+        };
 
-        // A swap committing to some other invoice cannot be claimed with the player's payment.
-        let (client, server) = crate::lnurl_transport::tests::automatic_payout_tls_fixture(
-            invoice_for(paid_sats, preimage),
-        )
-        .await;
-        let verifier = CoordinatorVerifier::with_lnurl(client);
-        let elsewhere = refund_swap([1u8; 32]);
-        assert!(verifier
-            .prepare(
-                f.prepare_view(&unbound, &attempt, SIGN_ARK_REFUND, &BTreeMap::new()),
-                &refund_parameters(refund_of(&escrow, &elsewhere), MAX_REFUND_FEE_SATS),
-            )
+        // An invoice from another provider, or for another address, commits to other metadata.
+        let (client, server) = discovery_tls_fixture().await;
+        let params = refund(
+            &refund_swap(preimage),
+            address_invoice_for(paid_sats, preimage, "[[\"text/plain\",\"Someone else\"]]"),
+            MAX_REFUND_FEE_SATS,
+        );
+        assert!(prepare(CoordinatorVerifier::with_lnurl(client), params)
             .await
             .is_err());
-        let _ = server.await;
+        server.await.unwrap();
 
-        // A fee above the player's cap never reaches the address at all.
-        let (client, server) = crate::lnurl_transport::tests::automatic_payout_tls_fixture(
-            invoice_for(paid_sats, preimage),
-        )
-        .await;
-        let verifier = CoordinatorVerifier::with_lnurl(client);
-        assert!(verifier
-            .prepare(
-                f.prepare_view(&unbound, &attempt, SIGN_ARK_REFUND, &BTreeMap::new()),
-                &refund_parameters(
-                    refund_of(&escrow, &refund_swap(preimage)),
-                    MAX_REFUND_FEE_SATS + 1
-                ),
-            )
+        // A swap that commits to a different invoice cannot be claimed by paying this one.
+        let (client, server) = discovery_tls_fixture().await;
+        let params = refund(
+            &refund_swap([1u8; 32]),
+            address_invoice_for(paid_sats, preimage, FIXTURE_METADATA),
+            MAX_REFUND_FEE_SATS,
+        );
+        assert!(prepare(CoordinatorVerifier::with_lnurl(client), params)
+            .await
+            .is_err());
+        server.await.unwrap();
+
+        // A fee above the player's cap is refused before the address is resolved at all.
+        let (client, server) = discovery_tls_fixture().await;
+        let params = refund(
+            &refund_swap(preimage),
+            address_invoice_for(paid_sats, preimage, FIXTURE_METADATA),
+            MAX_REFUND_FEE_SATS + 1,
+        );
+        assert!(prepare(CoordinatorVerifier::with_lnurl(client), params)
             .await
             .is_err());
         server.abort();
@@ -1516,7 +1570,11 @@ mod ark_escrow {
         assert!(verifier
             .prepare(
                 f.prepare_view(&unbound, &attempt, SIGN_ARK_ESCROW, &BTreeMap::new()),
-                &refund_parameters(refund_of(&escrow, &refund_swap([9u8; 32])), 0),
+                &refund_parameters(
+                    refund_of(&escrow, &refund_swap([9u8; 32])),
+                    invoice_for(1_000, [9u8; 32]),
+                    0
+                ),
             )
             .await
             .is_err());
