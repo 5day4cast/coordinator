@@ -1,0 +1,66 @@
+//! Refunding an entry escrow whose competition never kicked off.
+//!
+//! The escrow moves offchain to a swap VTXO, which pays the player's Lightning Address. That
+//! takes two transactions, as every Arkade offchain spend does: a checkpoint transaction spends
+//! the escrow through its refund leaf, and an Ark transaction spends the checkpoint output and
+//! pays the swap. Keymeld signs the Ark transaction, the server co-signs it, and Keymeld then
+//! signs the checkpoint.
+//!
+//! Nothing is withheld here. The swap receives the whole VTXO, and the swap service takes its
+//! fee on the Lightning side by paying an invoice smaller than the VTXO it claims.
+
+use ark_core::send::{build_offchain_transactions, SendReceiver, VtxoInput};
+use ark_core::ArkAddress;
+use bitcoin::{Amount, OutPoint, Psbt};
+use coordinator_ark_escrow::{EntryEscrow, EscrowPath};
+
+use crate::Error;
+
+/// A refund's unsigned transactions, in the order they are signed.
+#[derive(Debug, Clone)]
+pub struct RefundTransactions {
+    /// Spends the checkpoint output and pays the swap. Signed first, then co-signed by the server.
+    pub ark: Psbt,
+    /// Spends the escrow. Signed once the server has co-signed the Ark transaction.
+    pub checkpoint: Psbt,
+}
+
+/// Build the transactions that refund `escrow`'s VTXO into `swap`.
+///
+/// `outpoint` and `amount` come from the escrow's VTXO on the server. The refund can only be
+/// spent from the escrow's refund locktime, which fixes both transactions' locktimes.
+pub fn build_refund(
+    server: &ark_core::server::Info,
+    escrow: &EntryEscrow,
+    outpoint: OutPoint,
+    amount: Amount,
+    swap: &ArkAddress,
+) -> Result<RefundTransactions, Error> {
+    let input = VtxoInput::new(
+        escrow.script(EscrowPath::Refund).clone(),
+        Some(escrow.terms().refund_locktime),
+        escrow.control_block(EscrowPath::Refund),
+        escrow.vtxo_script().scripts().to_vec(),
+        escrow.script_pubkey(),
+        amount,
+        outpoint,
+        Vec::new(),
+    );
+    // The swap takes the whole VTXO, so there is no change; the address is required regardless.
+    let transactions = build_offchain_transactions(
+        &[SendReceiver::bitcoin(*swap, amount)],
+        swap,
+        &[input],
+        server,
+    )
+    .map_err(|error| Error::InvalidPool(format!("cannot build the refund: {error}")))?;
+    let [checkpoint] = transactions.checkpoint_txs.as_slice() else {
+        return Err(Error::InvalidPool(
+            "a refund spends one escrow, so it has one checkpoint".into(),
+        ));
+    };
+    Ok(RefundTransactions {
+        ark: transactions.ark_tx,
+        checkpoint: checkpoint.clone(),
+    })
+}

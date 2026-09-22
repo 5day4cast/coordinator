@@ -57,3 +57,32 @@ async fn mutinynet_accepts_entry_escrows() {
     let vtxos = server.escrow_vtxos(&[escrow]).await.unwrap();
     assert!(vtxos.is_empty(), "{vtxos:?}");
 }
+
+/// A refund spends the escrow offchain, which passes through a checkpoint output made of the
+/// leaf being spent and the server's own exit script. Whoever authorizes a refund recomputes
+/// that output, so the server must publish the script, and a player consents to it on entry.
+#[tokio::test]
+#[ignore = "needs the Mutinynet Arkade server"]
+async fn mutinynet_publishes_its_checkpoint_exit_script() {
+    let url = std::env::var("ARK_SERVER_URL").unwrap_or_else(|_| MUTINYNET.into());
+    let server = ArkServer::connect(url).await.unwrap();
+    let exit_script = &server.info().checkpoint_tapscript;
+    println!("checkpoint exit script {}", exit_script.to_hex_string());
+    assert!(!exit_script.is_empty(), "the server publishes no checkpoint exit script");
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
+    let terms = server
+        .escrow_terms(xonly(1), xonly(2), now + 7 * 24 * 60 * 60, now)
+        .unwrap();
+    let escrow = server.entry_escrow(terms).unwrap();
+    let checkpoint = coordinator_ark_escrow::checkpoint_script_pubkey(
+        escrow.script(EscrowPath::Refund),
+        exit_script,
+    )
+    .unwrap();
+    println!("refund checkpoint output {}", checkpoint.to_hex_string());
+    assert!(checkpoint.is_p2tr());
+}

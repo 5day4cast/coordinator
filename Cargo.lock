@@ -1656,6 +1656,7 @@ dependencies = [
  "bitcoin",
  "coordinator-ark",
  "coordinator-ark-escrow",
+ "coordinator-escrow",
  "dlctix",
  "futures",
  "hex",
