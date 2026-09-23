@@ -25,7 +25,7 @@ pub use dlc::{ContractSigner, DlcKickoff, LocalContractSigner};
 pub use error::{BoxError, Error};
 pub use kickoff::{fund_pool, EscrowInput, Kickoff, KickoffConfig, KickoffHooks, PoolFunding};
 pub use refund::{build_refund, RefundTransactions};
-pub use server::{address_hrp, escrow_terms, server_rules, ArkServer};
+pub use server::{address_hrp, escrow_terms, server_rules, ArkServer, OffchainSubmission};
 pub use signer::{
     script_spend_sighash, EscrowSigner, KeypairSigner, SigningPurpose, SigningRequest,
 };

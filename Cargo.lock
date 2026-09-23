@@ -1694,6 +1694,7 @@ dependencies = [
  "bitcoin",
  "clap",
  "coordinator-ark",
+ "coordinator-ark-escrow",
  "esplora-client",
  "fern",
  "hex",

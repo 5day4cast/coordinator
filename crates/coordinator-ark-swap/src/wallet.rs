@@ -16,22 +16,51 @@ use ark_client::{
     Blockchain, Client, Error, InMemorySwapStorage, OfflineClient, OfflineClientConfig,
     SpendStatus, TxStatus,
 };
-use ark_core::send::SendReceiver;
+use ark_core::send::{
+    build_offchain_transactions, sign_ark_transaction, sign_checkpoint_transaction,
+    OffchainTransactions, SendReceiver, VtxoInput,
+};
 use ark_core::server::GetVtxosRequest;
 use ark_core::{ArkAddress, ExplorerUtxo};
 use bitcoin::key::{Keypair, Secp256k1};
 use bitcoin::secp256k1::SecretKey;
 use bitcoin::{Address, Amount, OutPoint, Transaction, Txid};
+use bitcoin::psbt;
+use bitcoin::secp256k1::{self, schnorr};
 use coordinator_ark::ArkServer;
+use coordinator_ark_escrow::{RefundSwap, SwapPath};
 use serde::Serialize;
 
 use crate::config::Config;
 
 type ArkClient = Client<Esplora, Wallet, InMemorySwapStorage>;
 
+/// Where Arkade carries a condition's witness, for the server to finalize with.
+fn condition_key() -> psbt::raw::Key {
+    psbt::raw::Key {
+        type_value: 222,
+        key: ark_core::VTXO_CONDITION_KEY.to_vec(),
+    }
+}
+
+/// The witness elements, as the server decodes them: a count, then each length and value.
+fn encode_witness(elements: &[Vec<u8>]) -> Vec<u8> {
+    use bitcoin::consensus::Encodable;
+    let mut bytes = vec![elements.len() as u8];
+    for element in elements {
+        bitcoin::VarInt::from(element.len() as u64)
+            .consensus_encode(&mut bytes)
+            .expect("a vector encodes into memory");
+        bytes.extend_from_slice(element);
+    }
+    bytes
+}
+
 pub struct ArkWallet {
     client: ArkClient,
     server: ArkServer,
+    /// The service's own key. It signs its sends, and claims the refund swaps that pay it.
+    keypair: Keypair,
     /// One send at a time, so concurrent swaps never select the same VTXOs.
     sending: tokio::sync::Mutex<()>,
 }
@@ -76,6 +105,7 @@ impl ArkWallet {
         Ok(Self {
             client,
             server,
+            keypair,
             sending: tokio::sync::Mutex::new(()),
         })
     }
@@ -92,6 +122,30 @@ impl ArkWallet {
             "the address is for another network"
         );
         Ok(address)
+    }
+
+    /// The service's own key, which a refund swap names as its swapper.
+    pub fn swapper_key(&self) -> bitcoin::XOnlyPublicKey {
+        self.keypair.x_only_public_key().0
+    }
+
+    /// The Arkade server's signer key, which co-signs every collaborative spend.
+    pub fn server_key(&self) -> bitcoin::XOnlyPublicKey {
+        self.server.rules().signer
+    }
+
+    /// The server's shortest exit delay, which every VTXO this service mints must respect.
+    pub fn exit_delay(&self) -> coordinator_ark_escrow::RelativeTimelock {
+        self.server.rules().min_exit_delay
+    }
+
+    pub fn hrp(&self) -> &'static str {
+        self.server.hrp()
+    }
+
+    /// Check the Arkade server would accept a VTXO script this service mints.
+    pub fn accepts(&self, vtxo: &coordinator_ark_escrow::VtxoScript) -> anyhow::Result<()> {
+        Ok(self.server.rules().check(vtxo)?)
     }
 
     pub fn dust(&self) -> Amount {
@@ -126,6 +180,81 @@ impl ArkWallet {
             .into_iter()
             .find(|vtxo| vtxo.amount == amount && vtxo.created_at >= since && !vtxo.is_spent)
             .map(|vtxo| vtxo.outpoint))
+    }
+
+    /// Claim a refund swap that this service paid for, into its own wallet.
+    ///
+    /// The swap's claim leaf needs the invoice preimage as well as this service's signature, so
+    /// the coins can only be taken once the player has been paid. Arkade carries a condition's
+    /// witness in a PSBT field the server reads when it builds the final witness, so the preimage
+    /// travels with each signature rather than on the input.
+    pub async fn claim_refund_swap(
+        &self,
+        swap: &RefundSwap,
+        outpoint: OutPoint,
+        amount: Amount,
+        preimage: [u8; 32],
+    ) -> anyhow::Result<Txid> {
+        anyhow::ensure!(
+            swap.terms().swapper == self.swapper_key(),
+            "this swap names another swap service"
+        );
+        let (address, _) = self
+            .client
+            .get_offchain_address()
+            .await
+            .map_err(|error| anyhow::anyhow!("this wallet has no offchain address: {error}"))?;
+        let leaf = swap.script(SwapPath::Claim).clone();
+        let input = VtxoInput::new(
+            leaf.clone(),
+            None,
+            swap.vtxo_script()
+                .control_block(&leaf)
+                .context("the claim leaf is in the swap's tree")?,
+            swap.vtxo_script().scripts().to_vec(),
+            swap.script_pubkey(),
+            amount,
+            outpoint,
+            Vec::new(),
+        );
+        // The swap is drained, so the change address is never used.
+        let OffchainTransactions {
+            mut ark_tx,
+            checkpoint_txs,
+        } = build_offchain_transactions(
+            &[SendReceiver::bitcoin(address, amount)],
+            &address,
+            std::slice::from_ref(&input),
+            self.server.info(),
+        )
+        .map_err(|error| anyhow::anyhow!("build the claim: {error}"))?;
+
+        let sign = |input: &mut psbt::Input,
+                    message: secp256k1::Message|
+         -> Result<Vec<(schnorr::Signature, bitcoin::XOnlyPublicKey)>, ark_core::Error> {
+            input
+                .unknown
+                .insert(condition_key(), encode_witness(&[preimage.to_vec()]));
+            let signature = Secp256k1::new().sign_schnorr_no_aux_rand(&message, &self.keypair);
+            Ok(vec![(signature, self.keypair.x_only_public_key().0)])
+        };
+        sign_ark_transaction(sign, &mut ark_tx, 0)
+            .map_err(|error| anyhow::anyhow!("sign the claim: {error}"))?;
+        let ark_txid = ark_tx.unsigned_tx.compute_txid();
+
+        let _one_at_a_time = self.sending.lock().await;
+        let submitted = self.server.submit_offchain(ark_tx, checkpoint_txs).await?;
+        let mut checkpoint = submitted
+            .checkpoints
+            .first()
+            .context("the server returned no checkpoint for the claim")?
+            .clone();
+        sign_checkpoint_transaction(sign, &mut checkpoint)
+            .map_err(|error| anyhow::anyhow!("sign the claim's checkpoint: {error}"))?;
+        self.server
+            .finalize_offchain(ark_txid, vec![checkpoint])
+            .await?;
+        Ok(ark_txid)
     }
 
     pub async fn view(&self) -> anyhow::Result<WalletView> {

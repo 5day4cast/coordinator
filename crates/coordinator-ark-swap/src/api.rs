@@ -4,6 +4,9 @@
 //! | --- | --- |
 //! | `POST /v1/swaps` | `{ "escrow_address", "amount_sat", "preimage"? }` → the swap and its invoice. Returns the open swap if the escrow already has one. |
 //! | `GET /v1/swaps/{id}` | A swap's state. |
+//! | `POST /v1/refunds` | `{ "payment_hash", "amount_sat", "player_key", "deadline" }` → the swap an unused escrow's refund pays. Returns the swap already minted for that invoice. |
+//! | `POST /v1/refunds/{id}/paid` | `{ "preimage" }` → records the payment and claims the swap. |
+//! | `GET /v1/refunds/{id}` | A refund's state. |
 //! | `GET /v1/wallet` | The Ark wallet's addresses and balance. |
 //! | `POST /v1/wallet/board` | Move confirmed boarding coins into VTXOs in the next batch. |
 
@@ -38,6 +41,9 @@ pub fn router(swapper: Arc<Swapper>, token: String, holder: String) -> Router {
     let authenticated = Router::new()
         .route("/v1/swaps", post(create_swap))
         .route("/v1/swaps/{id}", get(get_swap))
+        .route("/v1/refunds", post(mint_refund))
+        .route("/v1/refunds/{id}/paid", post(refund_paid))
+        .route("/v1/refunds/{id}", get(get_refund))
         .route("/v1/wallet", get(wallet))
         .route("/v1/wallet/board", post(board))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
@@ -110,6 +116,88 @@ async fn get_swap(State(state): State<AppState>, Path(id): Path<Uuid>) -> Respon
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => failure(StatusCode::INTERNAL_SERVER_ERROR, error),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MintRefund {
+    /// Hex. The invoice the swap service pays, which the swap's claim leaf commits to.
+    payment_hash: String,
+    amount_sat: u64,
+    /// Hex x-only. The player's entry key, which reclaims the swap after the deadline.
+    player_key: String,
+    /// UNIX seconds. After this the player may take the swap back.
+    deadline: u32,
+}
+
+async fn mint_refund(State(state): State<AppState>, Json(request): Json<MintRefund>) -> Response {
+    let payment_hash = match bytes32(&request.payment_hash) {
+        Ok(hash) => hash,
+        Err(error) => return failure(StatusCode::BAD_REQUEST, error),
+    };
+    let player = match request.player_key.parse() {
+        Ok(key) => key,
+        Err(error) => {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                anyhow::anyhow!("the player key must be an x-only public key: {error}"),
+            )
+        }
+    };
+    match state
+        .swapper
+        .mint_refund(payment_hash, request.amount_sat, player, request.deadline)
+        .await
+    {
+        Ok(refund) => (StatusCode::CREATED, Json(refund)).into_response(),
+        Err(error) => failure(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefundPaid {
+    /// Hex. What paying the player's invoice revealed, and what claims the swap.
+    preimage: String,
+}
+
+async fn refund_paid(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<RefundPaid>,
+) -> Response {
+    // Only the lease holder claims, so two instances never spend the same swap.
+    match state.swapper.store.holds_lease(&state.holder).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return failure(
+                StatusCode::CONFLICT,
+                anyhow::anyhow!("another ark-swapd instance runs the wallet; retry there"),
+            )
+        }
+        Err(error) => return failure(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+    let preimage = match bytes32(&request.preimage) {
+        Ok(preimage) => preimage,
+        Err(error) => return failure(StatusCode::BAD_REQUEST, error),
+    };
+    match state.swapper.refund_paid(id, preimage).await {
+        Ok(refund) => Json(refund).into_response(),
+        Err(error) => failure(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+async fn get_refund(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
+    match state.swapper.store.refund(id).await {
+        Ok(Some(refund)) => Json(refund).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => failure(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
+fn bytes32(value: &str) -> anyhow::Result<[u8; 32]> {
+    <[u8; 32]>::try_from(hex::decode(value)?)
+        .map_err(|_| anyhow::anyhow!("expected 32 bytes, hex encoded"))
 }
 
 async fn wallet(State(state): State<AppState>) -> Response {

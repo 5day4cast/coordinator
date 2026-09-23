@@ -220,6 +220,141 @@ impl Store {
         .await?;
         rows.iter().map(swap).collect()
     }
+
+    pub async fn insert_refund(&self, refund: &Refund) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO refunds (id, payment_hash, amount_sat, player_key, deadline,
+                swap_tap_tree, swap_address, state, preimage, swap_vtxo, claim_txid, error,
+                created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(refund.id.to_string())
+        .bind(&refund.payment_hash)
+        .bind(refund.amount_sat as i64)
+        .bind(&refund.player_key)
+        .bind(refund.deadline)
+        .bind(&refund.swap_tap_tree)
+        .bind(&refund.swap_address)
+        .bind(refund.state.as_str())
+        .bind(&refund.preimage)
+        .bind(&refund.swap_vtxo)
+        .bind(&refund.claim_txid)
+        .bind(&refund.error)
+        .bind(refund.created_at)
+        .bind(refund.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn update_refund(&self, refund: &Refund) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE refunds SET state = ?, preimage = ?, swap_vtxo = ?, claim_txid = ?,
+                error = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(refund.state.as_str())
+        .bind(&refund.preimage)
+        .bind(&refund.swap_vtxo)
+        .bind(&refund.claim_txid)
+        .bind(&refund.error)
+        .bind(refund.updated_at)
+        .bind(refund.id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn refund(&self, id: Uuid) -> anyhow::Result<Option<Refund>> {
+        let row = sqlx::query("SELECT * FROM refunds WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(refund).transpose()
+    }
+
+    /// The refund minted for `payment_hash`, if this service already minted one.
+    ///
+    /// A repeated request returns the same swap, so a coordinator that retries never mints a
+    /// second swap for one invoice and strands the first.
+    pub async fn refund_for_hash(&self, payment_hash: &str) -> anyhow::Result<Option<Refund>> {
+        let row = sqlx::query("SELECT * FROM refunds WHERE payment_hash = ?")
+            .bind(payment_hash)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(refund).transpose()
+    }
+
+    /// Refunds still to claim, oldest first.
+    pub async fn unclaimed_refunds(&self) -> anyhow::Result<Vec<Refund>> {
+        let rows = sqlx::query(
+            "SELECT * FROM refunds WHERE state IN ('minted', 'paid') ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(refund).collect()
+    }
+}
+
+/// Where a refund swap is.
+///
+/// `Minted` → `Paid` → `Claimed`. It ends `Reclaimable` if the service never claimed it before
+/// the player's deadline, which needs an operator: by then the player may have taken it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefundState {
+    /// Minted and waiting for the refund to pay it.
+    Minted,
+    /// The coordinator paid the player's invoice and gave up the preimage.
+    Paid,
+    /// Claimed into this service's wallet.
+    Claimed,
+    Reclaimable,
+}
+
+impl RefundState {
+    fn as_str(self) -> &'static str {
+        match self {
+            RefundState::Minted => "minted",
+            RefundState::Paid => "paid",
+            RefundState::Claimed => "claimed",
+            RefundState::Reclaimable => "reclaimable",
+        }
+    }
+}
+
+impl FromStr for RefundState {
+    type Err = anyhow::Error;
+
+    fn from_str(state: &str) -> anyhow::Result<Self> {
+        Ok(match state {
+            "minted" => RefundState::Minted,
+            "paid" => RefundState::Paid,
+            "claimed" => RefundState::Claimed,
+            "reclaimable" => RefundState::Reclaimable,
+            other => anyhow::bail!("unknown refund state {other}"),
+        })
+    }
+}
+
+/// One escrow's refund, on its way to the player's Lightning Address.
+#[derive(Debug, Clone, Serialize)]
+pub struct Refund {
+    pub id: Uuid,
+    pub payment_hash: String,
+    pub amount_sat: u64,
+    pub player_key: String,
+    pub deadline: i64,
+    pub swap_tap_tree: String,
+    pub swap_address: String,
+    pub state: RefundState,
+    /// Never leaves the service: it is what claims the swap.
+    #[serde(skip)]
+    pub preimage: Option<String>,
+    pub swap_vtxo: Option<String>,
+    pub claim_txid: Option<String>,
+    pub error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 fn swap(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Swap> {
@@ -240,6 +375,25 @@ fn swap(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Swap> {
     })
 }
 
+fn refund(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Refund> {
+    Ok(Refund {
+        id: Uuid::parse_str(row.try_get("id")?)?,
+        payment_hash: row.try_get("payment_hash")?,
+        amount_sat: row.try_get::<i64, _>("amount_sat")? as u64,
+        player_key: row.try_get("player_key")?,
+        deadline: row.try_get("deadline")?,
+        swap_tap_tree: row.try_get("swap_tap_tree")?,
+        swap_address: row.try_get("swap_address")?,
+        state: row.try_get::<&str, _>("state")?.parse()?,
+        preimage: row.try_get("preimage")?,
+        swap_vtxo: row.try_get("swap_vtxo")?,
+        claim_txid: row.try_get("claim_txid")?,
+        error: row.try_get("error")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -251,6 +405,75 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn refund_for(payment_hash: &str) -> Refund {
+        Refund {
+            id: Uuid::now_v7(),
+            payment_hash: payment_hash.into(),
+            amount_sat: 20_000,
+            player_key: "14".repeat(32),
+            deadline: 1_790_003_600,
+            swap_tap_tree: "aa".into(),
+            swap_address: "tark1refund".into(),
+            state: RefundState::Minted,
+            preimage: None,
+            swap_vtxo: None,
+            claim_txid: None,
+            error: None,
+            created_at: 1_790_000_000,
+            updated_at: 1_790_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refund_is_claimed_once_and_kept_per_invoice() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("swaps.sqlite"))
+            .await
+            .unwrap();
+        let mut refund = refund_for(&"ab".repeat(32));
+        store.insert_refund(&refund).await.unwrap();
+
+        // One swap per invoice: a retried request finds the one already minted.
+        assert_eq!(
+            store
+                .refund_for_hash(&refund.payment_hash)
+                .await
+                .unwrap()
+                .map(|found| found.id),
+            Some(refund.id)
+        );
+        assert!(store.insert_refund(&refund_for(&refund.payment_hash)).await.is_err());
+        assert!(store.refund_for_hash(&"cd".repeat(32)).await.unwrap().is_none());
+
+        // It waits to be claimed while it is minted or paid, and not afterwards.
+        let unclaimed = |store: Store| async move {
+            store
+                .unclaimed_refunds()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|refund| refund.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(unclaimed(store.clone()).await, vec![refund.id]);
+        refund.preimage = Some("ef".repeat(32));
+        refund.state = RefundState::Paid;
+        store.update_refund(&refund).await.unwrap();
+        assert_eq!(unclaimed(store.clone()).await, vec![refund.id]);
+
+        refund.state = RefundState::Claimed;
+        refund.claim_txid = Some("00".repeat(32));
+        store.update_refund(&refund).await.unwrap();
+        assert!(unclaimed(store.clone()).await.is_empty());
+
+        // The preimage is kept for the operator, but never served.
+        let stored = store.refund(refund.id).await.unwrap().unwrap();
+        assert_eq!(stored.preimage, refund.preimage);
+        assert_eq!(stored.state, RefundState::Claimed);
+        let served = serde_json::to_value(&stored).unwrap();
+        assert!(served.get("preimage").is_none(), "{served}");
+    }
 
     #[tokio::test]
     async fn one_instance_runs_the_swaps_until_it_hands_over() {

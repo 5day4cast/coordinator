@@ -7,6 +7,7 @@
 mod api;
 mod config;
 mod lnd;
+mod refund;
 mod store;
 mod swap;
 mod wallet;
@@ -104,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     // A tick always finishes, so a payment in flight records its result.
                     worker.tick().await;
+                    worker.refund_tick().await;
                 }
                 Ok(false) => {
                     if holding {
