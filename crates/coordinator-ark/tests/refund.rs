@@ -35,11 +35,11 @@ fn escrow(info: &ark_core::server::Info) -> EntryEscrow {
     EntryEscrow::new(terms).unwrap()
 }
 
-/// The swap the refund pays, and the Ark address that receives it.
-fn swap(info: &ark_core::server::Info) -> (RefundSwap, ark_core::ArkAddress) {
+/// The swap the refund pays.
+fn swap(info: &ark_core::server::Info) -> RefundSwap {
     let deadline = bitcoin::absolute::LockTime::from_consensus(REFUND_AT + 3_600);
     let exit_delay = RelativeTimelock::Seconds(2048);
-    let swap = RefundSwap::new(SwapTerms {
+    RefundSwap::new(SwapTerms {
         player: keypair(14).x_only_public_key().0,
         swapper: keypair(30).x_only_public_key().0,
         server: server_rules(info).unwrap().signer,
@@ -53,13 +53,7 @@ fn swap(info: &ark_core::server::Info) -> (RefundSwap, ark_core::ArkAddress) {
         )
         .unwrap(),
     })
-    .unwrap();
-    let address = ark_core::ArkAddress::new(
-        info.network,
-        server_rules(info).unwrap().signer,
-        swap.vtxo_script().output_key(),
-    );
-    (swap, address)
+    .unwrap()
 }
 
 fn policy(escrow: &EntryEscrow, info: &ark_core::server::Info) -> ArkEscrowPolicy {
@@ -76,14 +70,14 @@ fn the_verifier_authorizes_the_refund_this_crate_builds() {
     let server = keypair(21);
     let info = testing::mock_info(&server);
     let escrow = escrow(&info);
-    let (swap, address) = swap(&info);
+    let swap = swap(&info);
 
     let refund = build_refund(
         &info,
         &escrow,
         OutPoint::new(Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()), 0),
         VALUE,
-        &address,
+        &swap,
     )
     .unwrap();
 
@@ -120,13 +114,13 @@ fn a_refund_to_another_swap_is_not_authorized() {
     let server = keypair(21);
     let info = testing::mock_info(&server);
     let escrow = escrow(&info);
-    let (swap, _) = swap(&info);
-    // Built to pay the escrow itself rather than the swap.
-    let elsewhere = ark_core::ArkAddress::new(
-        info.network,
-        server_rules(&info).unwrap().signer,
-        escrow.vtxo_script().output_key(),
-    );
+    let swap = swap(&info);
+    // Built to pay a swap for another invoice, which this one cannot be claimed with.
+    let elsewhere = RefundSwap::new(SwapTerms {
+        payment_hash: [6u8; 32],
+        ..*swap.terms()
+    })
+    .unwrap();
     let refund = build_refund(
         &info,
         &escrow,
