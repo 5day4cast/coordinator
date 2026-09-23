@@ -103,6 +103,9 @@ pub trait EscrowSwaps: Send + Sync {
 
     /// Report the preimage that paying the player's invoice revealed, so the swap can be claimed.
     async fn refund_paid(&self, id: Uuid, preimage: &[u8; 32]) -> anyhow::Result<RefundSwap>;
+
+    /// A refund swap as it stands, for resuming a refund after a restart.
+    async fn refund(&self, id: Uuid) -> anyhow::Result<RefundSwap>;
 }
 
 pub struct SwapClient {
@@ -184,6 +187,16 @@ impl EscrowSwaps for SwapClient {
                 "player_key": player_key,
                 "deadline": deadline,
             }))
+            .send()
+            .await?;
+        Self::checked(response).await
+    }
+
+    async fn refund(&self, id: Uuid) -> anyhow::Result<RefundSwap> {
+        let response = self
+            .http
+            .get(format!("{}/v1/refunds/{id}", self.base_url))
+            .bearer_auth(&self.token)
             .send()
             .await?;
         Self::checked(response).await

@@ -9,9 +9,12 @@
 //! Nothing is withheld here. The swap receives the whole VTXO, and the swap service takes its
 //! fee on the Lightning side by paying an invoice smaller than the VTXO it claims.
 
-use ark_core::send::{build_offchain_transactions, SendReceiver, VtxoInput};
+use ark_core::send::{
+    build_offchain_transactions, sign_ark_transaction, sign_checkpoint_transaction, SendReceiver,
+    VtxoInput,
+};
 use ark_core::ArkAddress;
-use bitcoin::{Amount, OutPoint, Psbt};
+use bitcoin::{Amount, OutPoint, Psbt, XOnlyPublicKey};
 use coordinator_ark_escrow::{EntryEscrow, EscrowPath, RefundSwap};
 
 use crate::Error;
@@ -23,6 +26,41 @@ pub struct RefundTransactions {
     pub ark: Psbt,
     /// Spends the escrow. Signed once the server has co-signed the Ark transaction.
     pub checkpoint: Psbt,
+}
+
+/// Put the player's signature on a refund's Ark transaction, where the server expects it.
+///
+/// Keymeld signs over the digest the verifier derived, so the signature is made before this and
+/// only placed here. ark-core builds the sighash again to key it; the value it computes is the
+/// one Keymeld signed, because both read the same transaction.
+pub fn sign_refund_ark_tx(
+    ark_tx: &mut Psbt,
+    player: XOnlyPublicKey,
+    signature: [u8; 64],
+) -> Result<(), Error> {
+    let signed = schnorr(signature, player)?;
+    sign_ark_transaction(|_, _| Ok(signed.clone()), ark_tx, 0)
+        .map_err(|error| Error::InvalidPool(format!("cannot place the refund signature: {error}")))
+}
+
+/// The same, for the checkpoint transaction the server hands back.
+pub fn sign_refund_checkpoint(
+    checkpoint: &mut Psbt,
+    player: XOnlyPublicKey,
+    signature: [u8; 64],
+) -> Result<(), Error> {
+    let signed = schnorr(signature, player)?;
+    sign_checkpoint_transaction(|_, _| Ok(signed.clone()), checkpoint)
+        .map_err(|error| Error::InvalidPool(format!("cannot place the refund signature: {error}")))
+}
+
+fn schnorr(
+    signature: [u8; 64],
+    player: XOnlyPublicKey,
+) -> Result<Vec<(bitcoin::secp256k1::schnorr::Signature, XOnlyPublicKey)>, Error> {
+    let signature = bitcoin::secp256k1::schnorr::Signature::from_slice(&signature)
+        .map_err(|error| Error::InvalidPool(format!("invalid refund signature: {error}")))?;
+    Ok(vec![(signature, player)])
 }
 
 /// Build the transactions that refund `escrow`'s VTXO into `swap`.

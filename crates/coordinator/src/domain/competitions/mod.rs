@@ -1,4 +1,5 @@
 mod ark_kickoff;
+mod ark_refund;
 mod ark_store;
 mod automatic_store;
 mod coordinator;
