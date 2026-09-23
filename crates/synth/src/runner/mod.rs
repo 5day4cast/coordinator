@@ -38,9 +38,7 @@ impl Runner {
             "full_lifecycle" => {
                 scenarios::run_full_lifecycle(&self.client, &self.db, &config).await
             }
-            "escrow_refund" => {
-                scenarios::run_escrow_refund(&self.client, &self.db, &config).await
-            }
+            "escrow_refund" => scenarios::run_escrow_refund(&self.client, &self.db, &config).await,
             other => {
                 error!("Unknown scenario: {}", other);
                 return Err(anyhow::anyhow!("Unknown scenario: {}", other));

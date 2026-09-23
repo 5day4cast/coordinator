@@ -4,6 +4,7 @@ use crate::client::CoordinatorClient;
 use crate::crypto;
 use crate::crypto::keys::SynthUser;
 use crate::db::SynthDb;
+use crate::lnd::Lnd;
 use anyhow::{Context, Result};
 use log::{info, warn};
 use rand::Rng;
@@ -62,11 +63,29 @@ pub async fn run_full_lifecycle(
 
     info!("Loaded {} synthetic users", users.len());
 
+    // An Arkade coordinator funds each escrow from a real payment, so pay for real when a node
+    // is configured and fall back to the coordinator's test endpoint when not.
+    let lnd = match run_step("open_payer", || async {
+        config.lnd.as_ref().map(Lnd::new).transpose()
+    })
+    .await
+    {
+        Ok((step, lnd)) => {
+            steps.push(step);
+            lnd
+        }
+        Err(step) => {
+            steps.push(*step);
+            return finish_result("full_lifecycle", started_at, scenario_start, steps, true);
+        }
+    };
+    let payer = lnd.as_ref().map_or(Payer::TestEndpoint, Payer::Lnd);
+
     // Step 3: Each user requests a ticket and submits an entry
     for (i, user) in users.iter().enumerate() {
         let step_name = format!("user_{}_enter", user.name);
         match run_step(&step_name, || async {
-            enter_competition(client, user, &comp_id, config, i as u32).await
+            enter_competition_with(client, user, &comp_id, config, i as u32, None, &payer).await
         })
         .await
         {
@@ -156,26 +175,6 @@ pub(super) enum Payer<'a> {
     TestEndpoint,
     /// A real payment, which ark-swapd swaps into the entry's escrow.
     Lnd(&'a crate::lnd::Lnd),
-}
-
-pub(super) async fn enter_competition(
-    client: &CoordinatorClient,
-    user: &SynthUser,
-    competition_id: &Uuid,
-    config: &ScenarioConfig,
-    entry_index: u32,
-) -> Result<()> {
-    enter_competition_with(
-        client,
-        user,
-        competition_id,
-        config,
-        entry_index,
-        None,
-        &Payer::TestEndpoint,
-    )
-    .await
-    .map(|_| ())
 }
 
 /// Enter, paying with `payer` and registering `lightning_address` for payouts and refunds.

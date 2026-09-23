@@ -170,7 +170,10 @@ async fn wait_for_refund(
                     "  {} refunded {} sats in {}",
                     user.name,
                     refund.paid_sats,
-                    refund.ark_txid.as_deref().unwrap_or("an Arkade transaction")
+                    refund
+                        .ark_txid
+                        .as_deref()
+                        .unwrap_or("an Arkade transaction")
                 );
                 return Ok(serde_json::json!({
                     "paid_sats": refund.paid_sats,
