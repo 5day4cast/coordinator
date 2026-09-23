@@ -6,12 +6,13 @@ use axum::{
     http::StatusCode,
     response::{Html, IntoResponse},
 };
-use maud::{html, Markup, PreEscaped, DOCTYPE};
+use maud::{html, Markup};
 use serde::Deserialize;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::routes::{Dashboard, DASHBOARD_CSS, LIVE_SCRIPT};
+use super::live;
+use super::routes::Dashboard;
 use crate::client::competitions::CompetitionResponse;
 use crate::crypto::keys::SynthUser;
 use crate::db::TestStep;
@@ -517,17 +518,36 @@ fn flow_diagram(boxes: &[FlowBox]) -> Markup {
 }
 
 pub async fn run_detail(
-    State(Dashboard {
+    State(state): State<Dashboard>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let Some(live) = run_live(&state, &id).await else {
+        return (StatusCode::NOT_FOUND, Html("No such run".to_string()));
+    };
+    let header = html! {
+        p { a href="/" { "← Dashboard" } " " span #live-status .note { "connecting…" } }
+    };
+    let page = live::page(
+        &format!("Synth - run {}", short(&id)),
+        &live::run_topic(&id),
+        header,
+        live,
+    );
+    (StatusCode::OK, Html(page.into_string()))
+}
+
+/// A run's live part: what its page shows, and what is pushed to it as the run and its
+/// competition move on. None for a run that does not exist.
+pub(super) async fn run_live(
+    Dashboard {
         runner,
         scenario_config,
         ..
-    }): State<Dashboard>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    let Ok(Some(run)) = runner.db().get_run(&id).await else {
-        return (StatusCode::NOT_FOUND, Html("No such run".to_string()));
-    };
-    let steps = runner.db().get_steps(&id).await.unwrap_or_default();
+    }: &Dashboard,
+    id: &str,
+) -> Option<Markup> {
+    let run = runner.db().get_run(id).await.ok()??;
+    let steps = runner.db().get_steps(id).await.unwrap_or_default();
     let entries = entries_of(&steps);
     let refunds = refunds_of(&steps);
     let competition_id = competition_of(&steps);
@@ -537,7 +557,7 @@ pub async fn run_detail(
     };
     let settlement = competition.as_ref().and_then(Settlement::of);
     let payouts = match competition_id {
-        Some(id) => payouts_of(&runner, id, &entries, settlement.as_ref()).await,
+        Some(id) => payouts_of(runner, id, &entries, settlement.as_ref()).await,
         None => Vec::new(),
     };
     let boxes = flow(
@@ -561,16 +581,7 @@ pub async fn run_detail(
     let address = scenario_config.lightning_address.clone();
     let public_url = runner.client().base_url().trim_end_matches('/').to_string();
 
-    let page = html! {
-        (DOCTYPE)
-        html {
-            head {
-                title { "Synth - run " (short(&run.id)) }
-                style { (DASHBOARD_CSS) (FLOW_CSS) }
-            }
-            body {
-                p { a href="/" { "← Dashboard" } " " span #live-status .note { "connecting…" } }
-                main #live {
+    Some(html! {
                 h1 { (run.scenario) " " span class=(format!("badge {}", run.status)) { (run.status) } }
                 @if let Some(live) = runner.live().filter(|live| live.run_id == run.id) {
                     p.running { "Now: " strong { (live.current_step.as_deref().unwrap_or("starting")) } }
@@ -714,12 +725,7 @@ pub async fn run_detail(
                         }
                     }
                 }
-                }
-                script { (PreEscaped(LIVE_SCRIPT)) }
-            }
-        }
-    };
-    (StatusCode::OK, Html(page.into_string()))
+    })
 }
 
 fn pretty(json: &str) -> String {
@@ -728,7 +734,7 @@ fn pretty(json: &str) -> String {
         .unwrap_or_else(|_| json.to_string())
 }
 
-const FLOW_CSS: &str = r#"
+pub(super) const FLOW_CSS: &str = r#"
 .flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 6px; margin: 16px 0; }
 .box { flex: 1 1 150px; background: #16213e; border: 2px solid #444; border-radius: 10px; padding: 10px; min-width: 150px; }
 .box .title { font-weight: bold; font-size: 1.05em; }

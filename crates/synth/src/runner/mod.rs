@@ -309,7 +309,12 @@ mod tests {
             .scope(recorder, async {
                 step_started("create_competition");
                 assert_eq!(
-                    live.lock().unwrap().as_ref().unwrap().current_step.as_deref(),
+                    live.lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .current_step
+                        .as_deref(),
                     Some("create_competition")
                 );
                 step_finished(&StepResult {
@@ -329,7 +334,11 @@ mod tests {
                 // The run is still going, and the step is already there to show.
                 let saved = db.get_steps(&run_id).await.unwrap();
                 assert_eq!(saved.len(), 1);
-                assert!(saved[0].details_json.as_deref().unwrap().contains("competition_id"));
+                assert!(saved[0]
+                    .details_json
+                    .as_deref()
+                    .unwrap()
+                    .contains("competition_id"));
             })
             .await;
         saving.await.unwrap();
