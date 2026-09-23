@@ -211,6 +211,30 @@ impl Lnd {
         Ok(added.payment_request)
     }
 
+    /// Send `sats` on-chain to `address`, returning the transaction's id. Needs a macaroon that
+    /// may send on-chain.
+    pub async fn send_on_chain(&self, address: &str, sats: u64, label: &str) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Sent {
+            txid: String,
+        }
+        let response = self
+            .client
+            .post(format!("{}v1/transactions", self.base_url))
+            .header(MACAROON_HEADER, &self.macaroon)
+            .json(&json!({
+                "addr": address,
+                "amount": sats.to_string(),
+                "target_conf": 3,
+                "label": label,
+            }))
+            .send()
+            .await
+            .context("send coins on-chain")?;
+        let sent: Sent = Self::read(response).await?;
+        Ok(sent.txid)
+    }
+
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let response = self
             .client

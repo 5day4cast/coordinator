@@ -80,10 +80,10 @@ pub struct DefaultsConfig {
     pub observation_window_secs: u64,
     /// Delay after observation ends before signing deadline, in seconds
     pub signing_delay_secs: u64,
-    /// Where a refund pays. Escrow scenarios need one: a refund goes to the player's own
-    /// Lightning Address, which the enclave resolves before signing anything.
+    /// The players' Lightning Address, where payouts and refunds go. It must resolve publicly:
+    /// the enclave checks a refund's invoice against it before signing.
     #[serde(default)]
-    pub refund_lightning_address: Option<String>,
+    pub lightning_address: Option<String>,
     /// Max time to wait for a refund to settle, which includes its escrow's locktime.
     #[serde(default = "default_refund_timeout_secs")]
     pub refund_timeout_secs: u64,
@@ -127,7 +127,7 @@ impl Default for SynthConfig {
                 entry_window_secs: 120,
                 observation_window_secs: 300,
                 signing_delay_secs: 60,
-                refund_lightning_address: None,
+                lightning_address: None,
                 refund_timeout_secs: default_refund_timeout_secs(),
             },
         }
@@ -144,7 +144,7 @@ impl SynthConfig {
             entry_window_secs: self.defaults.entry_window_secs,
             observation_window_secs: self.defaults.observation_window_secs,
             signing_delay_secs: self.defaults.signing_delay_secs,
-            refund_lightning_address: self.defaults.refund_lightning_address.clone(),
+            lightning_address: self.defaults.lightning_address.clone(),
             refund_timeout_secs: self.defaults.refund_timeout_secs,
             lnd: self.lnd.clone(),
             ..Default::default()

@@ -86,6 +86,10 @@ impl Runner {
         self.last_result.lock().await.clone()
     }
 
+    pub fn client(&self) -> &CoordinatorClient {
+        &self.client
+    }
+
     /// Get database reference
     pub fn db(&self) -> &SynthDb {
         &self.db

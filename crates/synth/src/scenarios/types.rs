@@ -19,10 +19,11 @@ pub struct ScenarioConfig {
     pub state_timeout_secs: u64,
     /// Poll interval for state transitions (seconds)
     pub poll_interval_secs: u64,
-    /// Where a refund pays. Escrow scenarios need one: a refund goes to the player's own
-    /// Lightning Address, and the enclave resolves it before signing anything.
+    /// The players' Lightning Address, where payouts and refunds go. The refund scenario needs
+    /// one, since the enclave resolves a refund's address before signing anything; without one a
+    /// cancelled entry's money stays in its escrow.
     #[serde(default)]
-    pub refund_lightning_address: Option<String>,
+    pub lightning_address: Option<String>,
     /// The node a scenario pays entries from. Escrow scenarios need one, because ark-swapd
     /// funds an escrow from a real payment.
     #[serde(default)]
@@ -47,7 +48,7 @@ impl Default for ScenarioConfig {
             signing_delay_secs: 60,
             state_timeout_secs: 600,
             poll_interval_secs: 5,
-            refund_lightning_address: None,
+            lightning_address: None,
             lnd: None,
             refund_timeout_secs: default_refund_timeout_secs(),
         }

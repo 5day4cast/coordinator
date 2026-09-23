@@ -1,5 +1,6 @@
 pub mod metrics;
 pub mod routes;
+pub mod run_detail;
 
 use crate::config::SynthConfig;
 use crate::rebalance::Rebalancer;

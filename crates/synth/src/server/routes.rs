@@ -32,6 +32,7 @@ pub fn router(state: Dashboard) -> Router {
         .route("/api/status", get(status))
         .route("/api/history", get(history))
         .route("/api/rebalance", post(trigger_rebalance))
+        .route("/runs/{id}", get(super::run_detail::run_detail))
         .with_state(state)
 }
 
@@ -56,7 +57,7 @@ async fn dashboard(
 ) -> impl IntoResponse {
     let last = runner.last_result().await;
     let observation = match &rebalancer {
-        Some(rebalancer) => rebalancer.last().await,
+        Some(rebalancer) => Some(rebalancer.last().await).filter(|o| o.checked_at.is_some()),
         None => None,
     };
     let rebalances = runner.db().list_rebalances(10).await.unwrap_or_default();
@@ -143,6 +144,9 @@ async fn dashboard(
                                     }
                                 }
                             }
+                            @if let Some(run) = runs.first() {
+                                p { a href=(format!("/runs/{}", run.id)) { "See where the money went →" } }
+                            }
                         } @else {
                             p { "No runs yet" }
                         }
@@ -152,14 +156,15 @@ async fn dashboard(
                         h2 { "Recent Runs" }
                         table {
                             thead {
-                                tr { th { "ID" } th { "Scenario" } th { "Status" } th { "Started" } th { "Duration" } }
+                                tr { th { "Run" } th { "Scenario" } th { "Status" } th { "Competition" } th { "Started" } th { "Finished" } }
                             }
                             tbody {
                                 @for run in &runs {
                                     tr {
-                                        td { (run.id.chars().take(8).collect::<String>()) "..." }
+                                        td { a href=(format!("/runs/{}", run.id)) { (run.id.chars().take(8).collect::<String>()) "…" } }
                                         td { (run.scenario) }
                                         td { span class=(format!("badge {}", run.status)) { (run.status) } }
+                                        td { code { (run.competition_id.as_deref().map(|id| id.chars().take(8).collect::<String>()).unwrap_or_else(|| "-".into())) } }
                                         td { (run.started_at) }
                                         td {
                                             @if let Some(ref completed) = run.completed_at {
@@ -182,32 +187,51 @@ async fn dashboard(
                             (Some(rebalancer), Some(observation)) => {
                                 @match &observation.channel {
                                     Some(channel) => p {
-                                        "The payer holds " strong { (channel.local_sats) }
+                                        "Lightning: the payer holds " strong { (channel.local_sats) }
                                         " of " (channel.local_sats + channel.remote_sats)
                                         " sats in channel " (channel.id)
                                         ", rebalancing below " (rebalancer.config().low_percent) "%."
                                     },
                                     None => p.error { "The payer has no active channel with the source node." },
                                 }
-                                p.note { "Checked " (observation.checked_at) }
+                                @match (&rebalancer.config().arkade, &observation.arkade) {
+                                    (None, _) => p.note { "Arkade: ark-swapd's wallet is not watched." },
+                                    (Some(_), None) => p.error { "Arkade: ark-swapd did not report its wallet." },
+                                    (Some(arkade), Some(wallet)) => p {
+                                        "Arkade: ark-swapd can fund " strong { (wallet.spendable_sat()) }
+                                        " sats of escrows, topped up with " (arkade.top_up_sats)
+                                        " sats on-chain below " (arkade.low_sats) "."
+                                    },
+                                }
+                                @if let Some(checked_at) = observation.checked_at {
+                                    p.note { "Checked " (checked_at) }
+                                }
                             }
                         }
                         @if !rebalances.is_empty() {
                             table {
                                 thead {
                                     tr {
-                                        th { "When" } th { "Moved" } th { "Payer held" }
-                                        th { "Status" } th { "Error" }
+                                        th { "When" } th { "Leg" } th { "Moved" } th { "Held before" }
+                                        th { "Status" } th { "Error / transaction" }
                                     }
                                 }
                                 tbody {
                                     @for rebalance in &rebalances {
                                         tr {
                                             td { (rebalance.created_at) }
+                                            td { (rebalance.kind.as_deref().unwrap_or("channel")) }
                                             td { (rebalance.amount_sats) " sats" }
-                                            td { (rebalance.local_before_sats) " / " (rebalance.capacity_sats) }
+                                            td {
+                                                (rebalance.local_before_sats)
+                                                @if rebalance.capacity_sats > 0 { " / " (rebalance.capacity_sats) }
+                                            }
                                             td { span class=(format!("badge {}", rebalance.status)) { (rebalance.status) } }
-                                            td { (rebalance.error_message.as_deref().unwrap_or("-")) }
+                                            td {
+                                                @if let Some(error) = &rebalance.error_message { span.error { (error) } }
+                                                @else if let Some(txid) = &rebalance.txid { code { (txid) } }
+                                                @else { "-" }
+                                            }
                                         }
                                     }
                                 }
@@ -278,10 +302,7 @@ async fn trigger_rebalance(
         );
     };
     match rebalancer.rebalance().await {
-        Ok(moved_sats) => (
-            axum::http::StatusCode::OK,
-            Json(serde_json::json!({ "moved_sats": moved_sats })),
-        ),
+        Ok(moved) => (axum::http::StatusCode::OK, Json(serde_json::json!(moved))),
         Err(e) => (
             axum::http::StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({ "error": format!("{e:#}") })),
@@ -321,7 +342,7 @@ fn step_class(status: &crate::scenarios::StepStatus) -> &'static str {
     }
 }
 
-const DASHBOARD_CSS: &str = r#"
+pub(super) const DASHBOARD_CSS: &str = r#"
 body { font-family: monospace; max-width: 960px; margin: 0 auto; padding: 20px; background: #1a1a2e; color: #e0e0e0; }
 h1 { color: #00d4ff; }
 h2 { color: #7b68ee; border-bottom: 1px solid #333; padding-bottom: 5px; }

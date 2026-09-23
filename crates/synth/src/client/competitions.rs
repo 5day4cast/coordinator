@@ -68,6 +68,14 @@ pub struct CompetitionResponse {
     pub delta_broadcasted_at: Option<OffsetDateTime>,
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub keymeld_keygen_completed_at: Option<OffsetDateTime>,
+    /// The coordinator's own name for where the competition is.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// The output funding the contract: an Arkade transaction's, for an Arkade competition.
+    #[serde(default)]
+    pub funding_outpoint: Option<String>,
+    #[serde(default)]
+    pub errors: Vec<serde_json::Value>,
 }
 
 impl CompetitionResponse {

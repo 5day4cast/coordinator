@@ -34,7 +34,8 @@ pub async fn run_full_lifecycle(
     })
     .await
     {
-        Ok((step, comp_id)) => {
+        Ok((mut step, comp_id)) => {
+            step.details = Some(serde_json::json!({ "competition_id": comp_id }));
             steps.push(step);
             comp_id
         }
@@ -84,14 +85,23 @@ pub async fn run_full_lifecycle(
     // Step 3: Each user requests a ticket and submits an entry
     for user in &users {
         let step_name = format!("user_{}_enter", user.name);
-        match run_step(&step_name, || async {
-            enter_competition_with(client, user, &comp_id, config, None, &payer).await
+        let mut trace = EntryTrace::new(user);
+        let entered = run_step(&step_name, || {
+            enter_competition_with(
+                client,
+                user,
+                &comp_id,
+                config,
+                config.lightning_address.as_deref(),
+                &payer,
+                &mut trace,
+            )
         })
-        .await
-        {
-            Ok((step, _)) => steps.push(step),
+        .await;
+        match entered {
+            Ok((step, _)) => steps.push(trace.attach(step)),
             Err(step) => {
-                steps.push(*step);
+                steps.push(trace.attach(*step));
                 return finish_result("full_lifecycle", started_at, scenario_start, steps, true);
             }
         }
@@ -169,6 +179,37 @@ async fn create_competition(client: &CoordinatorClient, config: &ScenarioConfig)
     Ok(resp.id)
 }
 
+/// Where an entry's money went, recorded as it happens so a failed entry still shows how far its
+/// payment got.
+#[derive(Debug, Default, serde::Serialize)]
+pub(super) struct EntryTrace {
+    pub user: String,
+    pub nostr_pubkey: String,
+    pub entry_id: Option<Uuid>,
+    pub ticket_id: Option<Uuid>,
+    pub amount_sats: Option<u64>,
+    /// Identifies the payment on the paying node, the invoice's node, and in ark-swapd.
+    pub payment_hash: Option<String>,
+    pub paid: bool,
+    pub entry_submitted: bool,
+}
+
+impl EntryTrace {
+    pub(super) fn new(user: &SynthUser) -> Self {
+        Self {
+            user: user.name.clone(),
+            nostr_pubkey: user.nostr_pubkey_hex(),
+            ..Self::default()
+        }
+    }
+
+    /// The step, carrying this trace as its details.
+    pub(super) fn attach(&self, mut step: StepResult) -> StepResult {
+        step.details = serde_json::to_value(self).ok();
+        step
+    }
+}
+
 /// How a scenario pays an entry's invoice.
 pub(super) enum Payer<'a> {
     /// The coordinator settles it for us. Cannot fund an Arkade escrow, which ark-swapd pays.
@@ -179,7 +220,9 @@ pub(super) enum Payer<'a> {
 
 /// Enter, paying with `payer` and registering `lightning_address` for payouts and refunds.
 ///
-/// Returns the ticket, which a refund is later read from.
+/// Returns the ticket, which a refund is later read from. `trace` records each stage as it
+/// completes.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn enter_competition_with(
     client: &CoordinatorClient,
     user: &SynthUser,
@@ -187,8 +230,10 @@ pub(super) async fn enter_competition_with(
     config: &ScenarioConfig,
     lightning_address: Option<&str>,
     payer: &Payer<'_>,
+    trace: &mut EntryTrace,
 ) -> Result<Uuid> {
     let entry_id = Uuid::now_v7();
+    trace.entry_id = Some(entry_id);
     let ephemeral = user.derive_ephemeral_key(&entry_id)?;
     let (payout_preimage, payout_hash) =
         crypto::payout::generate_payout_pair(&ephemeral.secret_bytes);
@@ -199,8 +244,8 @@ pub(super) async fn enter_competition_with(
         allow_invoice_fallback: true,
         release_entry_key_after_payment: true,
     };
-    // The lifecycle synth uses signed-invoice fallback; automated-address tests
-    // exercise a dedicated TLS LNURL provider and verify actual payment proof.
+    // Payouts and refunds go to the Lightning Address when one is configured, and to a
+    // signed invoice from the player otherwise.
     let ticket = client
         .request_ticket(
             &user.nostr_keys,
@@ -210,6 +255,9 @@ pub(super) async fn enter_competition_with(
         )
         .await
         .context("Failed to request ticket")?;
+    trace.ticket_id = Some(ticket.ticket_id);
+    trace.amount_sats = Some(ticket.amount_sats);
+    trace.payment_hash = Some(ticket.payment_hash.clone());
 
     info!(
         "  {} got ticket {} ({}sats)",
@@ -263,6 +311,7 @@ pub(super) async fn enter_competition_with(
             info!("  {} paid {} sats", user.name, ticket.amount_sats);
         }
     }
+    trace.paid = true;
 
     // Wait for ticket payment to propagate (SQLite WAL read/write pool sync)
     let mut retries = 0;
@@ -306,6 +355,7 @@ pub(super) async fn enter_competition_with(
         .submit_entry(&user.nostr_keys, &entry)
         .await
         .context("Failed to submit entry")?;
+    trace.entry_submitted = true;
 
     info!("  {} entry submitted", user.name);
     Ok(ticket.ticket_id)
