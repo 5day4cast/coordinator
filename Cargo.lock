@@ -1807,6 +1807,7 @@ dependencies = [
  "hex",
  "keymeld-sdk",
  "lazy_static",
+ "lightning-invoice",
  "log",
  "maud",
  "nostr",

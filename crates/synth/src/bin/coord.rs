@@ -209,7 +209,7 @@ async fn main() -> Result<()> {
         },
         Commands::Synth { action } => {
             let db = SynthDb::new(&cli.db_path).await?;
-            let runner = Runner::new(client, db);
+            let runner = Runner::new(client, db, coordinator_synth::events::Events::new());
 
             match action {
                 SynthCommands::Run {

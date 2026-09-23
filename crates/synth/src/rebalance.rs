@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 
 use crate::ark_swap::{ArkSwap, ArkSwapConfig, ArkWallet};
 use crate::db::{Rebalance, SynthDb};
+use crate::events::{Event, Events};
 use crate::lnd::{Channel, Lnd, LndConfig};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -109,6 +110,7 @@ pub struct Rebalancer {
     ark_swap: Option<Arc<ArkSwap>>,
     config: RebalanceConfig,
     db: SynthDb,
+    events: Events,
     last: Arc<Mutex<Observation>>,
 }
 
@@ -117,7 +119,12 @@ const CHANNEL: &str = "channel";
 const ARKADE: &str = "arkade";
 
 impl Rebalancer {
-    pub fn new(payer: &LndConfig, config: RebalanceConfig, db: SynthDb) -> Result<Self> {
+    pub fn new(
+        payer: &LndConfig,
+        config: RebalanceConfig,
+        db: SynthDb,
+        events: Events,
+    ) -> Result<Self> {
         let ark_swap = match &config.arkade {
             Some(arkade) => Some(Arc::new(
                 ArkSwap::new(&arkade.ark_swap).context("open ark-swapd")?,
@@ -130,6 +137,7 @@ impl Rebalancer {
             ark_swap,
             config,
             db,
+            events,
             last: Arc::new(Mutex::new(Observation::default())),
         })
     }
@@ -164,6 +172,7 @@ impl Rebalancer {
             Some(ark_swap) => self.top_up_arkade(ark_swap).await,
             None => Ok(None),
         };
+        self.events.send(Event::Rebalanced);
         match (channel, arkade) {
             (Ok(channel_sats), Ok(arkade_sats)) => Ok(Moved {
                 channel_sats,

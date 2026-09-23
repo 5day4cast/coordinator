@@ -21,7 +21,7 @@ use log::info;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::common::{finish_result, load_users, run_step, wait_for_state};
+use super::common::{finish_result, load_users, run_step, wait_for_state, Steps};
 use super::full_lifecycle::{enter_competition_with, EntryTrace, Payer};
 use super::types::*;
 use crate::client::competitions::CreateCompetition;
@@ -39,12 +39,26 @@ pub async fn run_escrow_refund(
 ) -> ScenarioResult {
     let started_at = OffsetDateTime::now_utc();
     let scenario_start = Instant::now();
-    let mut steps = Vec::new();
+    let mut steps = Steps::new();
 
-    // A step, and optionally what to record with it whether or not it succeeds.
+    // A step, and optionally what to record with it: from what it returned, or whether or not
+    // it succeeds. Steps are saved as they are pushed, so details go on before.
     macro_rules! step {
         ($name:expr, $work:expr) => {
             step!($name, $work, |step| step)
+        };
+        ($name:expr, $work:expr, details = $details:expr) => {
+            match run_step($name, || async { $work }).await {
+                Ok((mut step, value)) => {
+                    step.details = Some($details(&value));
+                    steps.push(step);
+                    value
+                }
+                Err(step) => {
+                    steps.push(*step);
+                    return finish_result(SCENARIO, started_at, scenario_start, steps, true);
+                }
+            }
         };
         ($name:expr, $work:expr, $attach:expr) => {
             match run_step($name, || async { $work }).await {
@@ -64,11 +78,9 @@ pub async fn run_escrow_refund(
     let lnd = step!("open_payer", payer(config));
     let comp_id = step!(
         "create_unfillable_competition",
-        create_competition(client, config).await
+        create_competition(client, config).await,
+        details = |id: &Uuid| serde_json::json!({ "competition_id": id })
     );
-    if let Some(step) = steps.last_mut() {
-        step.details = Some(serde_json::json!({ "competition_id": comp_id }));
-    }
     info!("Created competition {comp_id}, which cannot fill");
     let users = step!("load_users", load_users(db, config.users).await);
 
@@ -97,13 +109,11 @@ pub async fn run_escrow_refund(
         wait_for_state(client, &comp_id, "cancelled", config).await
     );
     for (user, ticket) in &tickets {
-        let refund = step!(
+        step!(
             &format!("refund_{}", user.name),
-            wait_for_refund(client, user, &comp_id, ticket, config).await
+            wait_for_refund(client, user, &comp_id, ticket, config).await,
+            details = |refund: &serde_json::Value| refund.clone()
         );
-        if let Some(step) = steps.last_mut() {
-            step.details = Some(refund);
-        }
     }
 
     finish_result(SCENARIO, started_at, scenario_start, steps, false)
