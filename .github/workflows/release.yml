@@ -368,8 +368,10 @@ jobs:
           nix build .#docker-synth --no-update-lock-file --print-build-logs --out-link synth-image
           docker load < synth-image
           docker tag synth:latest "ghcr.io/$ORG_LOWER/synth:$VERSION-$ARCH"
+      # Best effort: a slow or unreachable lab never fails a release.
       - name: Push this build's store paths to the lab's Nix cache
         if: vars.ATTIC_ENDPOINT != ''
+        continue-on-error: true
         env:
           ATTIC_ENDPOINT: ${{ vars.ATTIC_ENDPOINT }}
           ATTIC_CACHE: ${{ vars.ATTIC_CACHE }}
@@ -379,11 +381,13 @@ jobs:
           nix profile install --inputs-from . nixpkgs#attic-client
           attic login lab "$ATTIC_ENDPOINT" "$ATTIC_TOKEN"
           # Everything the images needed that this runner has, dependency builds included.
-          # attic skips paths cache.nixos.org already serves.
+          # attic skips paths cache.nixos.org already serves. Each upload holds one of the
+          # server's database connections until it finishes, and the lab's uplink is slow,
+          # so both architectures together keep a few uploads in flight.
           mapfile -t DRVS < <(nix path-info --derivation .#docker-coordinator .#docker-synth)
           nix-store --query --requisites --include-outputs "${DRVS[@]}" \
             | grep -v '\.drv$' | while read -r path; do [ -e "$path" ] && echo "$path"; done \
-            | xargs -r attic push "lab:$ATTIC_CACHE"
+            | xargs -r attic push --jobs 2 "lab:$ATTIC_CACHE"
       - name: Save review images
         if: needs.prepare-release.outputs.dry_run == 'true'
         env:
