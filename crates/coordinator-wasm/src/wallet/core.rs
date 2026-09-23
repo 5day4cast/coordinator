@@ -1338,8 +1338,9 @@ mod tests {
             |c: &mut PayoutInvoiceConsent| c.context.entry_id = Uuid::now_v7(),
             |c: &mut PayoutInvoiceConsent| c.context.competition_id = Uuid::now_v7(),
             |c: &mut PayoutInvoiceConsent| c.context.expires_at = 0,
+            // Well past the ten minutes allowed, so a second's drift cannot make it legal.
             |c: &mut PayoutInvoiceConsent| {
-                c.context.expires_at = ::nostr::Timestamp::now().as_secs() + 601
+                c.context.expires_at = ::nostr::Timestamp::now().as_secs() + 3_600
             },
             |c: &mut PayoutInvoiceConsent| c.signatures.outcome_tx_signatures.clear(),
             |c: &mut PayoutInvoiceConsent| {
