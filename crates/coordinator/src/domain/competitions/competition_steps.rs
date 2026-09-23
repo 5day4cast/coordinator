@@ -131,6 +131,7 @@ impl Coordinator {
         {
             self.release_held_invoices(competition_id).await;
             self.reclaim_escrows(competition_id).await;
+            self.refund_ark_escrows(competition_id).await;
         }
         Ok(())
     }

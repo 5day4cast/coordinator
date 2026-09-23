@@ -129,9 +129,9 @@ pub struct Coordinator {
     oracle_client: Arc<dyn Oracle>,
     pub competition_store: Arc<CompetitionStore>,
     pub bitcoin: Arc<dyn Bitcoin>,
-    ln: Arc<dyn Ln>,
-    lnurl: Arc<dyn LnurlPay>,
-    keymeld: Arc<dyn Keymeld>,
+    pub(super) ln: Arc<dyn Ln>,
+    pub(super) lnurl: Arc<dyn LnurlPay>,
+    pub(super) keymeld: Arc<dyn Keymeld>,
     keymeld_gateway_url: Option<String>,
     private_key: Scalar,
     public_key: Point,
@@ -342,7 +342,7 @@ impl Coordinator {
             .map_err(|error| Error::Bitcoin(anyhow!(error)))
     }
 
-    fn restore_keymeld_session(
+    pub(super) fn restore_keymeld_session(
         &self,
         stored: &StoredDlcKeygenSession,
     ) -> Result<DlcKeygenSession, Error> {

@@ -24,6 +24,67 @@ pub struct TicketArkEscrow {
     pub vtxo_sats: Option<u64>,
 }
 
+/// Where a funded escrow's refund has got to.
+///
+/// `Minted` → `Submitted` → `Paid` → `Settled`. Each step is recorded before the next begins, so
+/// an outage resumes rather than repeats: a refund never pays a player twice, and never signs a
+/// second spend of one escrow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArkRefundState {
+    /// ark-swapd minted the swap this refund pays, for an invoice from the player's address.
+    Minted,
+    /// The escrow was spent into that swap on Arkade.
+    Submitted,
+    /// The player's invoice was paid, and its preimage given to ark-swapd.
+    Paid,
+    /// ark-swapd claimed the swap, so the refund is done.
+    Settled,
+}
+
+impl ArkRefundState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ArkRefundState::Minted => "minted",
+            ArkRefundState::Submitted => "submitted",
+            ArkRefundState::Paid => "paid",
+            ArkRefundState::Settled => "settled",
+        }
+    }
+}
+
+impl std::str::FromStr for ArkRefundState {
+    type Err = sqlx::Error;
+
+    fn from_str(state: &str) -> Result<Self, Self::Err> {
+        Ok(match state {
+            "minted" => ArkRefundState::Minted,
+            "submitted" => ArkRefundState::Submitted,
+            "paid" => ArkRefundState::Paid,
+            "settled" => ArkRefundState::Settled,
+            other => {
+                return Err(sqlx::Error::Decode(
+                    format!("unknown Arkade refund state {other}").into(),
+                ))
+            }
+        })
+    }
+}
+
+/// One ticket's refund, and the swap that pays its player.
+#[derive(Debug, Clone)]
+pub struct TicketArkRefund {
+    pub ticket_id: Uuid,
+    pub refund_id: Uuid,
+    pub invoice: String,
+    pub payment_hash: String,
+    pub fee_sats: u64,
+    pub state: ArkRefundState,
+    pub ark_txid: Option<String>,
+    pub error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 /// A swap still waiting to fund a reserved ticket's escrow.
 #[derive(Debug, Clone)]
 pub struct PendingArkSwap {
@@ -40,6 +101,23 @@ pub struct ArkCommitment {
     /// Consensus hex of the commitment transaction.
     pub commitment_tx: String,
     pub funding_vout: u32,
+}
+
+fn refund_row(row: &sqlx::sqlite::SqliteRow) -> Result<TicketArkRefund, sqlx::Error> {
+    Ok(TicketArkRefund {
+        ticket_id: Uuid::parse_str(row.try_get("ticket_id")?)
+            .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+        refund_id: Uuid::parse_str(row.try_get("refund_id")?)
+            .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+        invoice: row.try_get("invoice")?,
+        payment_hash: row.try_get("payment_hash")?,
+        fee_sats: row.try_get::<i64, _>("fee_sats")? as u64,
+        state: row.try_get::<&str, _>("state")?.parse()?,
+        ark_txid: row.try_get("ark_txid")?,
+        error: row.try_get("error")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
 }
 
 fn escrow_row(row: &sqlx::sqlite::SqliteRow) -> Result<TicketArkEscrow, sqlx::Error> {
@@ -219,6 +297,75 @@ impl CompetitionStore {
         .iter()
         .map(escrow_row)
         .collect()
+    }
+
+    /// The refund of one ticket's escrow, as far as it has got.
+    pub async fn ticket_ark_refund(
+        &self,
+        ticket_id: Uuid,
+    ) -> Result<Option<TicketArkRefund>, sqlx::Error> {
+        let row = sqlx::query("SELECT * FROM ticket_ark_refunds WHERE ticket_id = ?")
+            .bind(ticket_id.to_string())
+            .fetch_optional(self.db_connection.read())
+            .await?;
+        row.as_ref().map(refund_row).transpose()
+    }
+
+    /// Record a refund's swap, before anything is signed or paid.
+    pub async fn store_ticket_ark_refund(
+        &self,
+        refund: TicketArkRefund,
+    ) -> Result<(), DatabaseWriteError> {
+        self.db_connection
+            .execute_write(move |pool| async move {
+                sqlx::query(
+                    "INSERT INTO ticket_ark_refunds (ticket_id, refund_id, invoice, payment_hash,
+                        fee_sats, state, ark_txid, error, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT (ticket_id) DO NOTHING",
+                )
+                .bind(refund.ticket_id.to_string())
+                .bind(refund.refund_id.to_string())
+                .bind(&refund.invoice)
+                .bind(&refund.payment_hash)
+                .bind(refund.fee_sats as i64)
+                .bind(refund.state.as_str())
+                .bind(&refund.ark_txid)
+                .bind(&refund.error)
+                .bind(refund.created_at)
+                .bind(refund.updated_at)
+                .execute(&pool)
+                .await?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Move a refund on, once the step before it is done.
+    pub async fn advance_ticket_ark_refund(
+        &self,
+        ticket_id: Uuid,
+        state: ArkRefundState,
+        ark_txid: Option<String>,
+        error: Option<String>,
+    ) -> Result<(), DatabaseWriteError> {
+        let updated_at = OffsetDateTime::now_utc().unix_timestamp();
+        self.db_connection
+            .execute_write(move |pool| async move {
+                sqlx::query(
+                    "UPDATE ticket_ark_refunds SET state = ?, ark_txid = COALESCE(?, ark_txid),
+                        error = ?, updated_at = ? WHERE ticket_id = ?",
+                )
+                .bind(state.as_str())
+                .bind(ark_txid)
+                .bind(error)
+                .bind(updated_at)
+                .bind(ticket_id.to_string())
+                .execute(&pool)
+                .await?;
+                Ok(())
+            })
+            .await
     }
 
     pub async fn store_ark_commitment(
