@@ -28,6 +28,9 @@ use crate::infra::keymeld::{DlcKeygenSession, Keymeld};
 /// The Arkade server and swap service that fund Arkade competitions.
 pub struct Arkade {
     pub server: coordinator_ark::ArkServer,
+    /// The calls this makes to that server. Separate from the server's own rules, so a test can
+    /// answer them without one running.
+    pub transport: Arc<dyn coordinator_ark::ArkTransport>,
     pub swaps: Arc<dyn crate::infra::ark_swap::EscrowSwaps>,
     /// How long after the observation window starts an unfunded entry can be refunded.
     pub refund_after_start_secs: u64,

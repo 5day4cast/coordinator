@@ -27,7 +27,7 @@ use bitcoin::secp256k1::SecretKey;
 use bitcoin::{Address, Amount, OutPoint, Transaction, Txid};
 use bitcoin::psbt;
 use bitcoin::secp256k1::{self, schnorr};
-use coordinator_ark::ArkServer;
+use coordinator_ark::{ArkServer, ArkTransport};
 use coordinator_ark_escrow::{RefundSwap, SwapPath};
 use serde::Serialize;
 
@@ -243,7 +243,11 @@ impl ArkWallet {
         let ark_txid = ark_tx.unsigned_tx.compute_txid();
 
         let _one_at_a_time = self.sending.lock().await;
-        let submitted = self.server.submit_offchain(ark_tx, checkpoint_txs).await?;
+        let submitted = self
+            .server
+            .client()
+            .submit_offchain(ark_tx, checkpoint_txs)
+            .await?;
         let mut checkpoint = submitted
             .checkpoints
             .first()
@@ -252,6 +256,7 @@ impl ArkWallet {
         sign_checkpoint_transaction(sign, &mut checkpoint)
             .map_err(|error| anyhow::anyhow!("sign the claim's checkpoint: {error}"))?;
         self.server
+            .client()
             .finalize_offchain(ark_txid, vec![checkpoint])
             .await?;
         Ok(ark_txid)

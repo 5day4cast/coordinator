@@ -331,7 +331,7 @@ impl Coordinator {
         coordinator_ark::sign_refund_ark_tx(&mut ark_tx, escrow_script.terms().player, signature)
             .map_err(|e| anyhow!("Cannot place the refund's signature: {e}"))?;
         let submitted = ark
-            .server
+            .transport
             .submit_offchain(ark_tx, vec![built.checkpoint.clone()])
             .await
             .map_err(|e| anyhow!("Arkade will not take the refund: {e}"))?;
@@ -387,7 +387,7 @@ impl Coordinator {
         ark_txid: dlctix::bitcoin::Txid,
         checkpoint: dlctix::bitcoin::Psbt,
     ) -> Result<(), Error> {
-        ark.server
+        ark.transport
             .finalize_offchain(ark_txid, vec![checkpoint])
             .await
             .map_err(|e| anyhow!("Arkade will not finalize the refund: {e}"))?;
@@ -461,9 +461,13 @@ impl Coordinator {
                 .map_err(|e| anyhow!("The escrow's tap tree is invalid: {e}"))?,
         )
         .map_err(|e| anyhow!("The escrow's leaves are not an entry escrow: {e}"))?;
+        let address = entry
+            .address(ark.server.hrp())
+            .map_err(|e| anyhow!("The escrow has no Ark address: {e}"))?
+            .encode();
         Ok(ark
-            .server
-            .escrow_vtxos(&[entry])
+            .transport
+            .vtxos(vec![address])
             .await
             .map_err(|e| anyhow!("Arkade will not list the escrow's VTXOs: {e}"))?
             .into_iter()

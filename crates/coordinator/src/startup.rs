@@ -1518,6 +1518,7 @@ async fn arkade(
         settings.swap_url
     );
     Ok(Some(crate::domain::Arkade {
+        transport: Arc::new(server.client().clone()),
         server,
         swaps: Arc::new(swaps),
         refund_after_start_secs: settings.refund_after_start_secs,

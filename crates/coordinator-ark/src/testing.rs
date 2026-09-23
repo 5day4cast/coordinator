@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use ark_core::intent::Intent;
 use ark_core::server::{
     BatchFailed, BatchFinalizationEvent, BatchFinalizedEvent, BatchStartedEvent,
-    BatchTreeEventType, Info, StreamEvent, TreeTxEvent,
+    BatchTreeEventType, Info, StreamEvent, TreeTxEvent, VirtualTxOutPoint,
 };
 use ark_core::TxGraphChunk;
 use async_trait::async_trait;
@@ -113,8 +113,20 @@ pub struct MockArkd {
     pub state: Mutex<MockState>,
 }
 
+/// An offchain spend the mock took, so a test can see what it was given.
+#[derive(Clone)]
+pub struct OffchainSpend {
+    pub ark_tx: Psbt,
+    pub checkpoints: Vec<Psbt>,
+    pub finalized: Vec<Psbt>,
+}
+
 #[derive(Default)]
 pub struct MockState {
+    /// The offchain spends submitted, in order, and what was finalized for each.
+    pub offchain: Vec<OffchainSpend>,
+    /// VTXOs this server reports, for the spent checks a resumed refund makes.
+    pub vtxos: Vec<VirtualTxOutPoint>,
     /// The intent's on-chain outputs.
     pub outputs: Option<Vec<TxOut>>,
     pub commitment_txid: Option<Txid>,
@@ -233,6 +245,50 @@ impl ArkTransport for MockArkd {
             batch_expiry: Sequence::from_512_second_intervals(100),
         }));
         Ok(INTENT_ID.into())
+    }
+
+    /// Co-signs an offchain spend, as the server does between the owner's two signatures.
+    ///
+    /// The owner must have signed the Ark transaction already, since the server is second on it.
+    async fn submit_offchain(
+        &self,
+        ark_tx: Psbt,
+        checkpoints: Vec<Psbt>,
+    ) -> Result<crate::OffchainSubmission, Error> {
+        assert!(
+            !ark_tx.inputs[0].tap_script_sigs.is_empty(),
+            "the owner signs the Ark transaction before submitting it"
+        );
+        self.state.lock().unwrap().offchain.push(OffchainSpend {
+            ark_tx: ark_tx.clone(),
+            checkpoints: checkpoints.clone(),
+            finalized: Vec::new(),
+        });
+        Ok(crate::OffchainSubmission {
+            ark_tx,
+            checkpoints,
+        })
+    }
+
+    async fn finalize_offchain(&self, ark_txid: Txid, checkpoints: Vec<Psbt>) -> Result<(), Error> {
+        for checkpoint in &checkpoints {
+            assert!(
+                !checkpoint.inputs[0].tap_script_sigs.is_empty(),
+                "the owner signs the checkpoint before finalizing it"
+            );
+        }
+        let mut state = self.state.lock().unwrap();
+        let spend = state
+            .offchain
+            .iter_mut()
+            .find(|spend| spend.ark_tx.unsigned_tx.compute_txid() == ark_txid)
+            .expect("finalizing a spend this server took");
+        spend.finalized = checkpoints;
+        Ok(())
+    }
+
+    async fn vtxos(&self, _addresses: Vec<String>) -> Result<Vec<VirtualTxOutPoint>, Error> {
+        Ok(self.state.lock().unwrap().vtxos.clone())
     }
 
     async fn confirm_registration(&self, intent_id: String) -> Result<(), Error> {
