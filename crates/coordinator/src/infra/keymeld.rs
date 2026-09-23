@@ -260,6 +260,28 @@ pub trait Keymeld: Send + Sync {
         Ok(signed)
     }
 
+    /// Sign a player's refund of an escrow whose competition never kicked off.
+    ///
+    /// Unlike a pool's escrow spends this needs no binding: the pool may never have formed. The
+    /// Coordinator verifier authorizes it from the player's own registered policy, checking that
+    /// `invoice` belongs to their Lightning Address and that the refund pays a swap committed to
+    /// it. `fee_sats` is what the swap service keeps, capped by that policy.
+    ///
+    /// A refund takes two transactions, signed in turn; see `RefundPurpose`.
+    async fn sign_ark_refund(
+        &self,
+        session: &DlcKeygenSession,
+        user: UserId,
+        spend: coordinator_escrow::ark::ArkEscrowSpend,
+        invoice: String,
+        fee_sats: u64,
+    ) -> Result<[u8; 64], KeymeldError> {
+        let _ = (session, user, spend, invoice, fee_sats);
+        Err(KeymeldError::Signing(
+            "Arkade refunds are not supported".into(),
+        ))
+    }
+
     /// Check if Keymeld is enabled
     fn is_enabled(&self) -> bool;
 
