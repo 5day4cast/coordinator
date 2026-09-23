@@ -238,6 +238,10 @@ impl RefundSwap {
         &self.vtxo
     }
 
+    pub fn address(&self, hrp: &str) -> Result<crate::ArkAddress, Error> {
+        self.vtxo.address(hrp, self.terms.server)
+    }
+
     pub fn script_pubkey(&self) -> ScriptBuf {
         self.vtxo.script_pubkey()
     }
