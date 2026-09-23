@@ -63,6 +63,8 @@ pub struct ArkWallet {
     keypair: Keypair,
     /// One send at a time, so concurrent swaps never select the same VTXOs.
     sending: tokio::sync::Mutex<()>,
+    /// Where the boarding address's on-chain coins are read from.
+    chain: Arc<Esplora>,
 }
 
 #[derive(Debug, Serialize)]
@@ -95,7 +97,7 @@ impl ArkWallet {
                 ..Default::default()
             },
             keypair,
-            blockchain,
+            blockchain.clone(),
             wallet,
             Arc::new(InMemorySwapStorage::new()),
         )
@@ -107,6 +109,7 @@ impl ArkWallet {
             server,
             keypair,
             sending: tokio::sync::Mutex::new(()),
+            chain: blockchain,
         })
     }
 
@@ -285,6 +288,25 @@ impl ArkWallet {
             pre_confirmed_sat: balance.pre_confirmed().to_sat(),
             recoverable_sat: balance.recoverable().to_sat(),
         })
+    }
+
+    /// Confirmed, unspent coins at the boarding address: what the next board would move in.
+    pub async fn confirmed_boarding_sat(&self) -> anyhow::Result<u64> {
+        let address = self
+            .client
+            .get_boarding_address()
+            .await
+            .map_err(|error| anyhow::anyhow!("read the boarding address: {error}"))?;
+        let outputs = self
+            .chain
+            .find_outpoints(&address)
+            .await
+            .map_err(|error| anyhow::anyhow!("list the boarding outputs: {error}"))?;
+        Ok(outputs
+            .iter()
+            .filter(|output| output.confirmations > 0 && !output.is_spent)
+            .map(|output| output.amount.to_sat())
+            .sum())
     }
 
     /// Move confirmed boarding outputs, and VTXOs near expiry, into fresh VTXOs in the next batch.
