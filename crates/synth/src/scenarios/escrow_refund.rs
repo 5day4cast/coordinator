@@ -66,10 +66,10 @@ pub async fn run_escrow_refund(
     let users = step!("load_users", load_users(db, config.users).await);
 
     let mut tickets = Vec::new();
-    for (index, user) in users.iter().enumerate() {
+    for user in &users {
         let ticket = step!(
             &format!("user_{}_enter", user.name),
-            enter(client, user, &comp_id, config, index as u32, &address, &lnd).await
+            enter(client, user, &comp_id, config, &address, &lnd).await
         );
         tickets.push((user.clone(), ticket));
     }
@@ -128,13 +128,11 @@ async fn create_competition(client: &CoordinatorClient, config: &ScenarioConfig)
     Ok(client.create_competition(&competition).await?.id)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn enter(
     client: &CoordinatorClient,
     user: &SynthUser,
     competition_id: &Uuid,
     config: &ScenarioConfig,
-    index: u32,
     address: &str,
     lnd: &Lnd,
 ) -> Result<Uuid> {
@@ -143,7 +141,6 @@ async fn enter(
         user,
         competition_id,
         config,
-        index,
         Some(address),
         &Payer::Lnd(lnd),
     )
