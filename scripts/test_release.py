@@ -155,6 +155,19 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(archive.getmember(prefix + "bin/ark-swapd").mode, 0o755)
             self.assertEqual(json.load(archive.extractfile(prefix + "RELEASE.json"))["source_commit"], SOURCE)
 
+    def test_linux_packages_record_the_builder_image_by_digest(self):
+        self.put(f"target/{TARGET}/release/ark-swapd", "binary fixture").chmod(0o755)
+        image = "ghcr.io/5day4cast/coordinator-builder@sha256:" + "c" * 64
+        destination = release.package_swap(self.root, VERSION, SOURCE, TARGET, self.root / "release", image)
+        with tarfile.open(destination) as archive:
+            manifest = json.load(archive.extractfile(f"ark-swapd-{VERSION}-{TARGET}/RELEASE.json"))
+            self.assertEqual(manifest["builder_image"], image)
+        with self.assertRaisesRegex(ValueError, "pinned by its sha256 digest"):
+            release.package_swap(
+                self.root, VERSION, SOURCE, TARGET, self.root / "again",
+                "ghcr.io/5day4cast/coordinator-builder:lock-0123",
+            )
+
     def test_swap_binary_is_required(self):
         with self.assertRaisesRegex(ValueError, "missing or empty release asset"):
             release.package_swap(self.root, VERSION, SOURCE, TARGET, self.root / "release")

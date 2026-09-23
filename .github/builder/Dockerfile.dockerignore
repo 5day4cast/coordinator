@@ -1,0 +1,10 @@
+# The planner needs every manifest and the source layout; nothing else leaves the repository.
+*
+!Cargo.toml
+!Cargo.lock
+!.cargo/config.toml
+!crates
+crates/**/target
+crates/public_ui
+!scripts/build-release-openssl.sh
+!scripts/release-cargo.sh

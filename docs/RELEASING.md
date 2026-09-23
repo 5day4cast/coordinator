@@ -45,6 +45,9 @@ The dry run builds native packages, browser WASM, Helm charts, and both containe
 It saves artifacts for 14 days without publishing a GitHub release or pushing container images.
 Each native package includes the UI and the shared browser WASM build.
 `RELEASE.json` records the source commit and hashes of the dependency locks and browser attestation pins.
+The Linux packages and the browser WASM are built in the builder image (see [Faster builds](BUILD_SPEED.md)).
+Their `RELEASE.json` also records that image's digest as `builder_image`.
+The workflow reuses the image published for the same lockfile, or builds and publishes it first.
 Verify archive checksums and the contained `SHA256SUMS` files before installation.
 
 ## Publish the reviewed version

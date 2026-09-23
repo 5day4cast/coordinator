@@ -25,6 +25,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python3 -m unittest discover -s scripts -p 'test_release.py' -v
+      - run: python3 -m unittest discover -s scripts -p 'test_builder_image.py' -v
       - name: Validate committed release metadata
         run: |
           VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')

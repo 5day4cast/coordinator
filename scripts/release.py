@@ -14,6 +14,7 @@ import tomllib
 
 
 VERSION_PATTERN = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
+BUILDER_IMAGE_PATTERN = re.compile(r"[a-z0-9./_-]+@sha256:[0-9a-f]{64}")
 
 
 def digest(path):
@@ -73,6 +74,15 @@ def metadata(root, version, source):
     }
 
 
+def record_builder(provenance, builder_image):
+    """Record the builder image, pinned by digest, that compiled a Linux or WASM package."""
+    if builder_image is None:
+        return
+    if not BUILDER_IMAGE_PATTERN.fullmatch(builder_image):
+        raise ValueError("builder image must be pinned by its sha256 digest")
+    provenance["builder_image"] = builder_image
+
+
 def require_files(directory, names):
     for name in names:
         if not (directory / name).is_file() or not (directory / name).stat().st_size:
@@ -104,13 +114,14 @@ def archive(directory, output):
     return destination
 
 
-def package_wasm(root, version, source, wasm, output):
+def package_wasm(root, version, source, wasm, output, builder_image=None):
     require_files(wasm, ["coordinator_wasm.js", "coordinator_wasm_bg.wasm"])
     with tempfile.TemporaryDirectory() as temporary:
         package = Path(temporary) / f"coordinator-wasm-{version}"
         shutil.copytree(wasm, package)
         provenance = metadata(root, version, source)
         provenance["wasm_sha256"] = digest(package / "coordinator_wasm_bg.wasm")
+        record_builder(provenance, builder_image)
         (package / "RELEASE.json").write_text(json.dumps(provenance, indent=2) + "\n")
         destination = archive(package, output)
         # Preserve the public sidecar used to verify the module served by a coordinator.
@@ -121,7 +132,7 @@ def package_wasm(root, version, source, wasm, output):
         return destination
 
 
-def package_native(root, version, source, target, asset, wasm_archive, output):
+def package_native(root, version, source, target, asset, wasm_archive, output, builder_image=None):
     binaries = root / "target" / target / "release"
     require_files(binaries, ["coordinator", "wallet-cli"])
     ui = root / "crates/public_ui"
@@ -152,6 +163,7 @@ def package_native(root, version, source, target, asset, wasm_archive, output):
             raise ValueError("WASM artifact hash does not match its release manifest")
         shutil.copytree(wasm, package / "ui/pkg")
         provenance.update(target=target, wasm_sha256=wasm_hash)
+        record_builder(provenance, builder_image)
         (package / "RELEASE.json").write_text(json.dumps(provenance, indent=2) + "\n")
         (package / "README.txt").write_text(
             f"Coordinator v{version}\nSource: {source}\n\n"
@@ -165,7 +177,7 @@ def package_native(root, version, source, target, asset, wasm_archive, output):
         return archive(package, output)
 
 
-def package_enclave(root, version, source, target, output):
+def package_enclave(root, version, source, target, output, builder_image=None):
     """Package the coordinator verifier enclave and its LNURL relay for a Keymeld host."""
     binaries = root / "target" / target / "release"
     names = ("coordinator-verifier-enclave", "coordinator-lnurl-relay")
@@ -177,6 +189,7 @@ def package_enclave(root, version, source, target, output):
             shutil.copy2(binaries / binary, package / "bin" / binary)
         provenance = metadata(root, version, source)
         provenance.update(target=target, features=["lnurl"])
+        record_builder(provenance, builder_image)
         (package / "RELEASE.json").write_text(json.dumps(provenance, indent=2) + "\n")
         (package / "README.txt").write_text(
             f"Coordinator verifier enclave v{version}\nSource: {source}\n\n"
@@ -194,7 +207,7 @@ def package_enclave(root, version, source, target, output):
         return archive(package, output)
 
 
-def package_swap(root, version, source, target, output):
+def package_swap(root, version, source, target, output, builder_image=None):
     """Package ark-swapd, the service that swaps Lightning payments into Arkade escrows."""
     binaries = root / "target" / target / "release"
     require_files(binaries, ("ark-swapd",))
@@ -204,6 +217,7 @@ def package_swap(root, version, source, target, output):
         shutil.copy2(binaries / "ark-swapd", package / "bin" / "ark-swapd")
         provenance = metadata(root, version, source)
         provenance.update(target=target)
+        record_builder(provenance, builder_image)
         (package / "RELEASE.json").write_text(json.dumps(provenance, indent=2) + "\n")
         (package / "README.txt").write_text(
             f"ark-swapd v{version}\nSource: {source}\n\n"
@@ -216,7 +230,7 @@ def package_swap(root, version, source, target, output):
         return archive(package, output)
 
 
-def package_synth(root, version, source, target, output):
+def package_synth(root, version, source, target, output, builder_image=None):
     """Package synth, which runs synthetic competitions against a coordinator and serves a dashboard."""
     binaries = root / "target" / target / "release"
     require_files(binaries, ("synth",))
@@ -226,6 +240,7 @@ def package_synth(root, version, source, target, output):
         shutil.copy2(binaries / "synth", package / "bin" / "synth")
         provenance = metadata(root, version, source)
         provenance.update(target=target)
+        record_builder(provenance, builder_image)
         (package / "RELEASE.json").write_text(json.dumps(provenance, indent=2) + "\n")
         (package / "README.txt").write_text(
             f"synth v{version}\nSource: {source}\n\n"
@@ -249,6 +264,7 @@ def main():
     parser.add_argument("--wasm", type=Path)
     parser.add_argument("--target")
     parser.add_argument("--asset")
+    parser.add_argument("--builder-image", help="the builder image, pinned by digest, that compiled the package")
     parser.add_argument("--output", type=Path, default=Path("release"))
     args = parser.parse_args()
     if args.command == "checksums":
@@ -261,15 +277,17 @@ def main():
     if not args.source or not re.fullmatch(r"[0-9a-f]{40}", args.source):
         parser.error("--source must be the complete source commit SHA")
     if args.command == "wasm":
-        print(package_wasm(args.root, args.version, args.source, args.wasm, args.output))
+        print(package_wasm(args.root, args.version, args.source, args.wasm, args.output, args.builder_image))
     elif args.command == "enclave":
-        print(package_enclave(args.root, args.version, args.source, args.target, args.output))
+        print(package_enclave(args.root, args.version, args.source, args.target, args.output, args.builder_image))
     elif args.command == "swap":
-        print(package_swap(args.root, args.version, args.source, args.target, args.output))
+        print(package_swap(args.root, args.version, args.source, args.target, args.output, args.builder_image))
     elif args.command == "synth":
-        print(package_synth(args.root, args.version, args.source, args.target, args.output))
+        print(package_synth(args.root, args.version, args.source, args.target, args.output, args.builder_image))
     else:
-        print(package_native(args.root, args.version, args.source, args.target, args.asset, args.wasm, args.output))
+        print(package_native(
+            args.root, args.version, args.source, args.target, args.asset, args.wasm, args.output, args.builder_image
+        ))
 
 
 if __name__ == "__main__":

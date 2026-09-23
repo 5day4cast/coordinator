@@ -1,7 +1,7 @@
 # Faster builds: plan
 
-Agreed on 2026-09-23; not started. A dry-run release took 33 minutes, most of it rebuilding the
-same third-party code on every run.
+Agreed on 2026-09-23. A dry-run release took 33 minutes, most of it rebuilding the same third-party
+code on every run. [Status](#status) records what is in place.
 
 ## Where the time goes
 
@@ -68,15 +68,25 @@ In the Linux job:
 - The Linux job waits about 3 minutes for the WASM. Only the final assembly step needs the WASM, so
   that step can move to its own small job.
 
-## Uncommitted stopgap
+## Status
 
-`.github/workflows/release.yml` has uncommitted edits, with a commit script at
-`/tmp/release-speed-commit.sh`. They were written before this plan and are held back:
-
-- a `build_images` input, so a dry run can skip the images (a published release refuses without
-  them);
-- `Swatinem/rust-cache` for dry runs;
-- OpenSSL built on every core.
-
-The builder image and the Nix cache replace most of them. Keep the `build_images` input and the
-OpenSSL change, and drop the rust-cache steps once the builder image works.
+- **Builder image: in place.** `.github/builder/Dockerfile` pins Rust, the static OpenSSL (built on
+  every core), `wasm-bindgen-cli`, and the Linux and WASM dependencies cooked with cargo-chef.
+  `scripts/builder_image.py tag` names it after the lockfile, the manifests, and the image's own
+  inputs, leaving out the workspace's version so a release bump reuses the image.
+  `builder-image.yml` publishes it when those inputs change on `master`, and the release calls
+  the same workflow, which reuses the published image or builds it once. The WASM and Linux jobs
+  run inside it. Every Linux and WASM package records the image digest as `builder_image` in
+  `RELEASE.json`.
+- **One Linux build: in place.** `scripts/release-cargo.sh` builds all five Linux binaries in one
+  `cargo build`, and the image cooks with the same arguments. The coordinator's dependencies gain
+  only additive features (Keymeld's `enclave` and `networking` modules, `pem`, `serde`, tonic's
+  router, rustls-native-certs on the AWS client); reqwest still selects webpki roots.
+- **Packaging split: in place.** The Linux build no longer waits for the WASM. It hands its binaries
+  and UI bundles to `package-linux`, the only Linux step that needs the WASM.
+- **Nix cache: waiting on the lab.** The image jobs substitute from and push to an attic cache when
+  the `ATTIC_ENDPOINT`, `ATTIC_CACHE` and `ATTIC_PUBLIC_KEY` repository variables and the
+  `ATTIC_TOKEN` secret are set. The flake's image builds already match `workspaceDeps`'s features,
+  so a cache hit skips the dependency build. The server is `apps/attic` in nixos_setup.
+- **Dependency alignment: not started.**
+- **macOS:** unchanged; dry runs keep `Swatinem/rust-cache`.
