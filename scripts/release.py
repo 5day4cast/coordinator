@@ -216,9 +216,30 @@ def package_swap(root, version, source, target, output):
         return archive(package, output)
 
 
+def package_synth(root, version, source, target, output):
+    """Package synth, which runs synthetic competitions against a coordinator and serves a dashboard."""
+    binaries = root / "target" / target / "release"
+    require_files(binaries, ("synth",))
+    with tempfile.TemporaryDirectory() as temporary:
+        package = Path(temporary) / f"synth-{version}-{target}"
+        (package / "bin").mkdir(parents=True)
+        shutil.copy2(binaries / "synth", package / "bin" / "synth")
+        provenance = metadata(root, version, source)
+        provenance.update(target=target)
+        (package / "RELEASE.json").write_text(json.dumps(provenance, indent=2) + "\n")
+        (package / "README.txt").write_text(
+            f"synth v{version}\nSource: {source}\n\n"
+            "bin/synth runs synthetic competitions against a coordinator, paying for entries from an\n"
+            "LND node, and serves a dashboard of how they fare. Run ./bin/synth synth.toml.\n\n"
+            "Use sha256sum -c SHA256SUMS to verify files. See crates/synth:\n"
+            "https://github.com/5day4cast/coordinator/tree/v" + version + "/crates/synth\n"
+        )
+        return archive(package, output)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["validate", "wasm", "native", "enclave", "swap", "checksums"])
+    parser.add_argument("command", choices=["validate", "wasm", "native", "enclave", "swap", "synth", "checksums"])
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--version")
     parser.add_argument("--source")
@@ -245,6 +266,8 @@ def main():
         print(package_enclave(args.root, args.version, args.source, args.target, args.output))
     elif args.command == "swap":
         print(package_swap(args.root, args.version, args.source, args.target, args.output))
+    elif args.command == "synth":
+        print(package_synth(args.root, args.version, args.source, args.target, args.output))
     else:
         print(package_native(args.root, args.version, args.source, args.target, args.asset, args.wasm, args.output))
 

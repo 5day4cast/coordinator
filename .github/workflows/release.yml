@@ -159,14 +159,14 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: cargo build --release --locked --target "$TARGET" -p coordinator
-      - name: Build the verifier enclave, LNURL relay, and ark-swapd (Linux)
+      - name: Build the verifier enclave, LNURL relay, ark-swapd, and synth (Linux)
         if: runner.os == 'Linux'
         env:
           TARGET: ${{ matrix.target }}
         run: |
           cargo build --release --locked --target "$TARGET" \
             -p coordinator-verifier-enclave --features coordinator-verifier-enclave/lnurl \
-            -p coordinator-lnurl-relay -p coordinator-ark-swap
+            -p coordinator-lnurl-relay -p coordinator-ark-swap -p coordinator-synth
       - uses: actions/download-artifact@v4
         with:
           name: release-wasm
@@ -194,6 +194,13 @@ jobs:
           SOURCE: ${{ needs.prepare-release.outputs.source }}
           TARGET: ${{ matrix.target }}
         run: python3 scripts/release.py swap --version "$VERSION" --source "$SOURCE" --target "$TARGET"
+      - name: Package synth for the synthetic-traffic host (Linux)
+        if: runner.os == 'Linux'
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          SOURCE: ${{ needs.prepare-release.outputs.source }}
+          TARGET: ${{ matrix.target }}
+        run: python3 scripts/release.py synth --version "$VERSION" --source "$SOURCE" --target "$TARGET"
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}
