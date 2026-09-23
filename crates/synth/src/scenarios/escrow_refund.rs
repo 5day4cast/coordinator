@@ -22,7 +22,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::common::{finish_result, load_users, run_step, wait_for_state};
-use super::full_lifecycle::{enter_competition_with, Payer};
+use super::full_lifecycle::{enter_competition_with, EntryTrace, Payer};
 use super::types::*;
 use crate::client::competitions::CreateCompetition;
 use crate::client::CoordinatorClient;
@@ -41,15 +41,19 @@ pub async fn run_escrow_refund(
     let scenario_start = Instant::now();
     let mut steps = Vec::new();
 
+    // A step, and optionally what to record with it whether or not it succeeds.
     macro_rules! step {
         ($name:expr, $work:expr) => {
+            step!($name, $work, |step| step)
+        };
+        ($name:expr, $work:expr, $attach:expr) => {
             match run_step($name, || async { $work }).await {
                 Ok((step, value)) => {
-                    steps.push(step);
+                    steps.push($attach(step));
                     value
                 }
                 Err(step) => {
-                    steps.push(*step);
+                    steps.push($attach(*step));
                     return finish_result(SCENARIO, started_at, scenario_start, steps, true);
                 }
             }
@@ -62,14 +66,28 @@ pub async fn run_escrow_refund(
         "create_unfillable_competition",
         create_competition(client, config).await
     );
+    if let Some(step) = steps.last_mut() {
+        step.details = Some(serde_json::json!({ "competition_id": comp_id }));
+    }
     info!("Created competition {comp_id}, which cannot fill");
     let users = step!("load_users", load_users(db, config.users).await);
 
     let mut tickets = Vec::new();
     for user in &users {
+        let mut trace = EntryTrace::new(user);
         let ticket = step!(
             &format!("user_{}_enter", user.name),
-            enter(client, user, &comp_id, config, &address, &lnd).await
+            enter_competition_with(
+                client,
+                user,
+                &comp_id,
+                config,
+                Some(&address),
+                &Payer::Lnd(&lnd),
+                &mut trace,
+            )
+            .await,
+            |step| trace.attach(step)
         );
         tickets.push((user.clone(), ticket));
     }
@@ -79,18 +97,21 @@ pub async fn run_escrow_refund(
         wait_for_state(client, &comp_id, "cancelled", config).await
     );
     for (user, ticket) in &tickets {
-        step!(
+        let refund = step!(
             &format!("refund_{}", user.name),
             wait_for_refund(client, user, &comp_id, ticket, config).await
         );
+        if let Some(step) = steps.last_mut() {
+            step.details = Some(refund);
+        }
     }
 
     finish_result(SCENARIO, started_at, scenario_start, steps, false)
 }
 
 fn refund_address(config: &ScenarioConfig) -> Result<String> {
-    config.refund_lightning_address.clone().context(
-        "set refund_lightning_address: a refund pays the player's own address, and the \
+    config.lightning_address.clone().context(
+        "set lightning_address: a refund pays the player's own address, and the \
          enclave resolves it before signing",
     )
 }
@@ -126,25 +147,6 @@ async fn create_competition(client: &CoordinatorClient, config: &ScenarioConfig)
         total_competition_pool: config.entry_fee * seats,
     };
     Ok(client.create_competition(&competition).await?.id)
-}
-
-async fn enter(
-    client: &CoordinatorClient,
-    user: &SynthUser,
-    competition_id: &Uuid,
-    config: &ScenarioConfig,
-    address: &str,
-    lnd: &Lnd,
-) -> Result<Uuid> {
-    enter_competition_with(
-        client,
-        user,
-        competition_id,
-        config,
-        Some(address),
-        &Payer::Lnd(lnd),
-    )
-    .await
 }
 
 /// Wait for a ticket's refund to settle, which is the swap service claiming what it paid for.
