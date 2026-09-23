@@ -94,6 +94,22 @@ fn is_past_state(current: &str, target: &str) -> bool {
     }
 }
 
+/// A scenario's steps. Each is saved and announced as it is pushed, so a run can be watched while
+/// it goes; set a step's details before pushing it.
+#[derive(Default)]
+pub(super) struct Steps(Vec<StepResult>);
+
+impl Steps {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn push(&mut self, step: StepResult) {
+        crate::runner::step_finished(&step);
+        self.0.push(step);
+    }
+}
+
 /// Helper to run a step with timing
 pub(super) async fn run_step<F, Fut, T>(
     name: &str,
@@ -103,6 +119,7 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
+    crate::runner::step_started(name);
     let start = Instant::now();
     match f().await {
         Ok(value) => {
@@ -136,9 +153,10 @@ pub(super) fn finish_result(
     scenario: &str,
     started_at: OffsetDateTime,
     start: Instant,
-    steps: Vec<StepResult>,
+    steps: Steps,
     failed: bool,
 ) -> ScenarioResult {
+    let steps = steps.0;
     let total_duration_ms = start.elapsed().as_millis() as i64;
     let error = if failed {
         steps

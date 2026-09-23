@@ -1,0 +1,244 @@
+{
+  "id": "01a0cd74-ccf2-71b0-a6d0-f9e8b78cafcf",
+  "created_at": "2026-09-23T08:49:39.204076868Z",
+  "event_submission": {
+    "id": "01a0cd74-ccf2-71b0-a6d0-f9e8b78cafcf",
+    "signing_date": "2026-09-23T09:14:39.05888406Z",
+    "start_observation_date": "2026-09-23T08:59:39.05888406Z",
+    "end_observation_date": "2026-09-23T09:09:39.05888406Z",
+    "locations": [
+      "KDEN",
+      "KJFK",
+      "KORD"
+    ],
+    "number_of_values_per_entry": 9,
+    "number_of_places_win": 1,
+    "total_allowed_entries": 3,
+    "entry_fee": 1000,
+    "coordinator_fee_percentage": 10,
+    "total_competition_pool": 3000,
+    "relative_locktime_block_delta": null
+  },
+  "total_entries": 3,
+  "total_entry_nonces": 0,
+  "total_signed_entries": 0,
+  "total_paid_entries": 3,
+  "total_paid_out_entries": 3,
+  "event_announcement": {
+    "locking_points": [
+      "03418e6b1244a0c2ce2e2f8ead32ce2fc58c96d2ed2561aa20191626312b4e74c4",
+      "0215dd02da3024ae11c86da7efaca89f66a78b7f5c4a3a2d4ea07a93c13ee3f0fe",
+      "0286f577e6f92d14eb834862e725c5861361e0bbde3d054926be341085d69344d7",
+      "02ed2a40c08181228c982c23d837400f6e526172f603e0dac5559d0db17e9bb953"
+    ],
+    "expiry": 1790241279
+  },
+  "funding_transaction": {
+    "version": 2,
+    "lock_time": 0,
+    "input": [
+      {
+        "previous_output": "3ca870c8f1912a6f60ec9953c173d898f02a7fdec62c8f0f84149f8ca6d66fbc:2",
+        "script_sig": "",
+        "sequence": 4294967295,
+        "witness": []
+      }
+    ],
+    "output": [
+      {
+        "value": 3000,
+        "script_pubkey": "5120f527084aa2e7c4133178f143bbfc8061c3543daf9916a11b797929ee92f3b13c"
+      },
+      {
+        "value": 990,
+        "script_pubkey": "51209122ebe105d1469a602d64b330ed58fe9a34d7ba7d3bfee930375eb0e29a5613"
+      },
+      {
+        "value": 8781246292,
+        "script_pubkey": "5120ef68a7b1cff1749c18bff42a64228e16fc60036b3e4d035aaab9210afbc6d28a"
+      }
+    ]
+  },
+  "funding_outpoint": "0a688472ed0f65c5ccfaedcc376d8eb574fce02ba26dce2b0bbc01a323dc5035:0",
+  "funding_psbt_base64": null,
+  "outcome_transaction": {
+    "version": 2,
+    "lock_time": 0,
+    "input": [
+      {
+        "previous_output": "0a688472ed0f65c5ccfaedcc376d8eb574fce02ba26dce2b0bbc01a323dc5035:0",
+        "script_sig": "",
+        "sequence": 4294967294,
+        "witness": [
+          "aab02a7bb1dd38882bc1fd0a6ee570150819f2287bb211f164a2189159a15e4e8e5897844e4757d30b2a83bbf99e591d74ed38fee41b805a2809ad4b759768a4"
+        ]
+      }
+    ],
+    "output": [
+      {
+        "value": 2778,
+        "script_pubkey": "51207d77207cf53b19355f7bfb984cd72633a1b4d75cdf7cfade985bc301f555accc"
+      }
+    ]
+  },
+  "contract_parameters": {
+    "market_maker": {
+      "pubkey": "02f6ec8ec53d59ddf828df94739f95ac125fab3797ce353ee6d5817f019e8bb273"
+    },
+    "players": [
+      {
+        "pubkey": "020033e61d10ed276d0e2799f036f6367e7ba25182f82231acb52ffc5572f9b7f5",
+        "ticket_hash": "bc29ee079808d90fd9551727425fdf6bb33c8a9fa107b0c734e66bd8828c0cfa",
+        "payout_hash": "56e05d0d5b1c4fb319c9fc243e6096da849ebcb744fb7d374a13fdb10af025a3"
+      },
+      {
+        "pubkey": "03924bf4164f691d43f81c7236d0c2567178f1361fa0e01f938edf9b35a96ab38b",
+        "ticket_hash": "1f89ec1e2dd3037cb0e71d3d4878eba5119fb9ea7960ea047372d0ff129c68aa",
+        "payout_hash": "eca1867c603f8886406e031a22b411f115a44f6d86f1d365096df8968d779e6f"
+      },
+      {
+        "pubkey": "02471853760db012cfc6c803a0c8d06ffd86f67aa228f3f7079d7e220cfb7c6227",
+        "ticket_hash": "1865d390179accc9eef6ea112dcd124fcb0440a186d085248017b494bbe4916e",
+        "payout_hash": "68211037316bf332052a43555c0a0ebfb5b18b72c40fddf4f8f030b84ae04367"
+      }
+    ],
+    "event": {
+      "locking_points": [
+        "03418e6b1244a0c2ce2e2f8ead32ce2fc58c96d2ed2561aa20191626312b4e74c4",
+        "0215dd02da3024ae11c86da7efaca89f66a78b7f5c4a3a2d4ea07a93c13ee3f0fe",
+        "0286f577e6f92d14eb834862e725c5861361e0bbde3d054926be341085d69344d7",
+        "02ed2a40c08181228c982c23d837400f6e526172f603e0dac5559d0db17e9bb953"
+      ],
+      "expiry": 1790241279
+    },
+    "outcome_payouts": {
+      "att0": {
+        "0": 100
+      },
+      "att1": {
+        "1": 100
+      },
+      "att2": {
+        "2": 100
+      },
+      "att3": {
+        "0": 34,
+        "1": 33,
+        "2": 33
+      },
+      "exp": {
+        "0": 34,
+        "1": 33,
+        "2": 33
+      }
+    },
+    "fee_rate": 500,
+    "funding_value": 3000,
+    "relative_locktime_block_delta": 144
+  },
+  "public_nonces": {
+    "by_outcome": {},
+    "by_win_condition": {}
+  },
+  "aggregated_nonces": null,
+  "partial_signatures": null,
+  "signed_contract": {
+    "signatures": {
+      "expiry_tx_signature": "b87f7c7f7f2c8921a1af96a5225969a47c2cc303a0359170dcc8f74011553f09a455542bc04498d3ec11f765731c463a9c70433f38936fcad968ff0046dd0875",
+      "outcome_tx_signatures": {
+        "0": "03a431964fa6728bad037f39ea14b7e3229bcc88a4197089acd8468c5cbc3bfd2a2610bb9a52bcc85b9f13692e7e7346466255d4b9f5875e9059f98d150c2f9af1",
+        "1": "0282dfd67987e502bf7bbee8a16fe67650a0cd5553dbf9b34d9b0558442618cc38fc54382cda21a92e2c43157ac091542c23c8ea9ca6f6755e11b7b5aa3187b59f",
+        "2": "03b92c2b5684c0d0edb7159dea36e85c887f7f830c6394aa64ae2cc366722239a6af7d5b521662f617465419a87e1ee03e6dac58f4328076d4fa21180bcaff4907",
+        "3": "028942d0e3f03908b4e2125a1b7102dc572bb5ecb289bb4eacbefca5594cf93102d83d8c5a96421212df938a754f9549480474a908c212566d70926aaaf468c5c0"
+      },
+      "split_tx_signatures": {
+        "att0:p0": "b54e4c1d381f78989b4e3f859915900b80882aa2f8d3d9d59afdfeecb22c6596064d64eec0ac9d5772916a47acad52e9904c0c3943f2551aee76045744b91b35",
+        "att1:p1": "7a24d3281323e06037787daa07fa3257d274a217160e7de85dd9fa5521a0d38f269a1357d419a3aa9307ed37a8f33090843dd711ae413e66ceb796ebc0177545",
+        "att2:p2": "9576ded27d88ea949aae5f69d2452b10e85f2a7973e798258e6a29caec243f4b16cae6ac17746008e0c9dd36503c9a99d6639e9cf6f428f1540b25907bef3cff",
+        "att3:p0": "796561fd13e2d64960fd248b92bb378d6b7fdf20ac71e8f91321a7e2bdba8ffab4fe1e262fefa47fc70e68138665ddd4905017af3dc596b44e01008444c83e1d",
+        "att3:p1": "b5b5907ca1103f98142084be7924bf117b3ca0bbe3cae3df4d09955a48b6ba081c17d1686f14fd1a59f0ad41fb56c76482d6d84788ff750963de3d33ec47137a",
+        "att3:p2": "d15fa9eaa75b100a84a7f69f1da792ab3fc411e8f716e65f96ee4ce97a80d9d7a2932f4ca83f8f18ec0daa598464ec83a274175ae3f7c37427ba73036cd8885e",
+        "exp:p0": "74b40428433c4c0e7b524bec5754f047d1e42ba63f50bfc6428c17c06968c4ef7fce58e8ed16c9134af6f700165f09a915fe0fabe8e10e2b24e08c667c06db18",
+        "exp:p1": "c914c223bb0d5800da16b1cbf0226e54e3d11e89f353b8654981c52b451a1905374e1f5b1b9c3a0faad0b738f12fab715d6af0b0cd0ef5a86844dba31ebd7da6",
+        "exp:p2": "1b8496df82db65050964645ccb415cff53262d205af417a965cd7177e43c4084f2b038d5fd2b3f159d3b73c21ca541df75c74f8334527678b83aa73b7a3f0fae"
+      }
+    },
+    "dlc": {
+      "params": {
+        "market_maker": {
+          "pubkey": "02f6ec8ec53d59ddf828df94739f95ac125fab3797ce353ee6d5817f019e8bb273"
+        },
+        "players": [
+          {
+            "pubkey": "020033e61d10ed276d0e2799f036f6367e7ba25182f82231acb52ffc5572f9b7f5",
+            "ticket_hash": "bc29ee079808d90fd9551727425fdf6bb33c8a9fa107b0c734e66bd8828c0cfa",
+            "payout_hash": "56e05d0d5b1c4fb319c9fc243e6096da849ebcb744fb7d374a13fdb10af025a3"
+          },
+          {
+            "pubkey": "03924bf4164f691d43f81c7236d0c2567178f1361fa0e01f938edf9b35a96ab38b",
+            "ticket_hash": "1f89ec1e2dd3037cb0e71d3d4878eba5119fb9ea7960ea047372d0ff129c68aa",
+            "payout_hash": "eca1867c603f8886406e031a22b411f115a44f6d86f1d365096df8968d779e6f"
+          },
+          {
+            "pubkey": "02471853760db012cfc6c803a0c8d06ffd86f67aa228f3f7079d7e220cfb7c6227",
+            "ticket_hash": "1865d390179accc9eef6ea112dcd124fcb0440a186d085248017b494bbe4916e",
+            "payout_hash": "68211037316bf332052a43555c0a0ebfb5b18b72c40fddf4f8f030b84ae04367"
+          }
+        ],
+        "event": {
+          "locking_points": [
+            "03418e6b1244a0c2ce2e2f8ead32ce2fc58c96d2ed2561aa20191626312b4e74c4",
+            "0215dd02da3024ae11c86da7efaca89f66a78b7f5c4a3a2d4ea07a93c13ee3f0fe",
+            "0286f577e6f92d14eb834862e725c5861361e0bbde3d054926be341085d69344d7",
+            "02ed2a40c08181228c982c23d837400f6e526172f603e0dac5559d0db17e9bb953"
+          ],
+          "expiry": 1790241279
+        },
+        "outcome_payouts": {
+          "att0": {
+            "0": 100
+          },
+          "att1": {
+            "1": 100
+          },
+          "att2": {
+            "2": 100
+          },
+          "att3": {
+            "0": 34,
+            "1": 33,
+            "2": 33
+          },
+          "exp": {
+            "0": 34,
+            "1": 33,
+            "2": 33
+          }
+        },
+        "fee_rate": 500,
+        "funding_value": 3000,
+        "relative_locktime_block_delta": 144
+      },
+      "funding_outpoint": "0a688472ed0f65c5ccfaedcc376d8eb574fce02ba26dce2b0bbc01a323dc5035:0"
+    }
+  },
+  "attestation": "b61b0b29b80545c02b96f946aa090fd42b276cdcd151ca287749a12d5164e425",
+  "cancelled_at": null,
+  "contracted_at": "2026-09-23T08:49:56.625494911Z",
+  "signed_at": "2026-09-23T08:52:30.428982704Z",
+  "event_created_at": "2026-09-23T08:49:55.685597094Z",
+  "entries_submitted_at": "2026-09-23T08:49:55.891978967Z",
+  "escrow_funds_confirmed_at": "2026-09-23T08:49:55.684911229Z",
+  "funding_broadcasted_at": "2026-09-23T08:52:30.428983415Z",
+  "funding_confirmed_at": "2026-09-23T08:53:31.364451256Z",
+  "funding_settled_at": "2026-09-23T08:53:31.370904649Z",
+  "awaiting_attestation_at": "2026-09-23T08:53:31.37559306Z",
+  "expiry_broadcasted_at": null,
+  "outcome_broadcasted_at": "2026-09-23T09:18:40.758659729Z",
+  "delta_broadcasted_at": "2026-09-23T10:37:47.63240131Z",
+  "completed_at": "2026-09-23T11:56:55.12875159Z",
+  "failed_at": null,
+  "keymeld_keygen_completed_at": "2026-09-23T08:50:57.614128771Z",
+  "errors": [],
+  "state": "completed"
+}

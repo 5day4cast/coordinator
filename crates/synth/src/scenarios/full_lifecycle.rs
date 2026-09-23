@@ -12,7 +12,7 @@ use std::time::Instant;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::common::{finish_result, load_users, run_step, wait_for_state};
+use super::common::{finish_result, load_users, run_step, wait_for_state, Steps};
 use super::types::*;
 
 /// Run the full competition lifecycle scenario:
@@ -27,7 +27,7 @@ pub async fn run_full_lifecycle(
 ) -> ScenarioResult {
     let started_at = OffsetDateTime::now_utc();
     let scenario_start = Instant::now();
-    let mut steps = Vec::new();
+    let mut steps = Steps::new();
     // Step 1: Create competition
     let comp_id = match run_step("create_competition", || async {
         create_competition(client, config).await

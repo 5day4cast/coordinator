@@ -76,6 +76,17 @@ pub struct CompetitionResponse {
     pub funding_outpoint: Option<String>,
     #[serde(default)]
     pub errors: Vec<serde_json::Value>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub expiry_broadcasted_at: Option<OffsetDateTime>,
+    /// The oracle's attestation, hex: the discrete log of the deciding outcome's locking point.
+    #[serde(default)]
+    pub attestation: Option<String>,
+    /// The oracle's locking points, one per outcome it can attest to.
+    #[serde(default)]
+    pub event_announcement: Option<serde_json::Value>,
+    /// The contract: its players, funding value, and each outcome's payout weights.
+    #[serde(default)]
+    pub contract_parameters: Option<serde_json::Value>,
 }
 
 impl CompetitionResponse {

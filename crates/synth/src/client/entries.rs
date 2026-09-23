@@ -89,8 +89,12 @@ pub struct EntryResponse {
     pub signed_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub paid_at: Option<OffsetDateTime>,
+    /// When the latest payout was sent, or completed; the coordinator does not say which.
     #[serde(with = "time::serde::rfc3339::option")]
     pub paid_out_at: Option<OffsetDateTime>,
+    /// The invoice the latest payout paid.
+    #[serde(default)]
+    pub payout_ln_invoice: Option<String>,
 }
 
 /// Ticket status from the coordinator API

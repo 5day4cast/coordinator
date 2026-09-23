@@ -58,6 +58,7 @@ rand_chacha.workspace = true
 
 # Bitcoin (for key derivation)
 dlctix.workspace = true
+lightning-invoice.workspace = true
 
 # Time
 time.workspace = true

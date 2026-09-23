@@ -3,12 +3,18 @@ use crate::runner::Runner;
 use crate::scenarios::{ScenarioConfig, ScenarioStatus};
 use axum::{
     extract::{Query, State},
-    response::{Html, IntoResponse},
+    response::{
+        sse::{Event as SseEvent, KeepAlive, Sse},
+        Html, IntoResponse,
+    },
     routing::{get, post},
     Json, Router,
 };
-use maud::{html, DOCTYPE};
+use futures::Stream;
+use maud::{html, PreEscaped, DOCTYPE};
 use serde::Deserialize;
+use std::convert::Infallible;
+use tokio::sync::broadcast::error::RecvError;
 
 /// What the dashboard's handlers share: the runner, and the configured run a trigger starts from.
 #[derive(Clone)]
@@ -33,6 +39,7 @@ pub fn router(state: Dashboard) -> Router {
         .route("/api/history", get(history))
         .route("/api/rebalance", post(trigger_rebalance))
         .route("/runs/{id}", get(super::run_detail::run_detail))
+        .route("/api/events", get(events))
         .with_state(state)
 }
 
@@ -46,6 +53,71 @@ struct RunParams {
 struct HistoryParams {
     limit: Option<i64>,
 }
+
+/// Everything that happens, as it happens: runs, their steps, rebalances, and their competitions
+/// moving on. Pages reload their live part on each.
+async fn events(
+    State(runner): State<Runner>,
+) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+    let receiver = runner.events().subscribe();
+    let stream = futures::stream::unfold(receiver, |mut receiver| async move {
+        loop {
+            match receiver.recv().await {
+                Ok(event) => {
+                    let event = SseEvent::default().json_data(&event).unwrap_or_default();
+                    return Some((Ok(event), receiver));
+                }
+                // A page that fell behind reloads on the next event anyway.
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => return None,
+            }
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Reloads a page's `#live` part whenever an event arrives, keeping open details open, and posts
+/// the action buttons without leaving the page.
+pub(super) const LIVE_SCRIPT: &str = r#"
+(() => {
+  const say = (text) => {
+    const status = document.getElementById('live-status');
+    if (status) status.textContent = text;
+  };
+  let pending;
+  const refresh = async () => {
+    const response = await fetch(location.href, { cache: 'no-store' });
+    if (!response.ok) return;
+    const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+    const next = page.getElementById('live');
+    const live = document.getElementById('live');
+    if (!next || !live) return;
+    const open = new Set([...live.querySelectorAll('details[open]')].map((d) => d.dataset.key));
+    live.replaceWith(next);
+    next.querySelectorAll('details').forEach((d) => { if (open.has(d.dataset.key)) d.open = true; });
+  };
+  const source = new EventSource('/api/events');
+  source.onopen = () => say('● live');
+  source.onerror = () => say('○ reconnecting…');
+  source.onmessage = () => {
+    clearTimeout(pending);
+    pending = setTimeout(refresh, 400);
+  };
+  document.addEventListener('submit', async (event) => {
+    const form = event.target;
+    if (!form.matches('form[data-async]')) return;
+    event.preventDefault();
+    const button = form.querySelector('button');
+    if (button) button.disabled = true;
+    try {
+      await fetch(form.action, { method: 'POST' });
+    } finally {
+      if (button) button.disabled = false;
+    }
+    refresh();
+  });
+})();
+"#;
 
 /// How many of a scenario's recent runs the dashboard judges it by.
 const HEALTH_WINDOW: i64 = 20;
@@ -62,6 +134,7 @@ async fn dashboard(
     };
     let rebalances = runner.db().list_rebalances(10).await.unwrap_or_default();
     let runs = runner.db().list_runs(10).await.unwrap_or_default();
+    let live = runner.live();
     let health = runner
         .db()
         .scenario_health(HEALTH_WINDOW)
@@ -77,7 +150,14 @@ async fn dashboard(
                     style { (DASHBOARD_CSS) }
                 }
                 body {
-                    h1 { "Synth Dashboard" }
+                    h1 { "Synth Dashboard" " " span #live-status .note { "connecting…" } }
+                    main #live {
+                    @if let Some(live) = &live {
+                        p.running {
+                            "Running now: " a href=(format!("/runs/{}", live.run_id)) { (live.scenario) }
+                            " — " strong { (live.current_step.as_deref().unwrap_or("starting")) }
+                        }
+                    }
 
                     section.health {
                         h2 { "Scenarios" }
@@ -169,8 +249,10 @@ async fn dashboard(
                                         td {
                                             @if let Some(ref completed) = run.completed_at {
                                                 (completed)
+                                            } @else if let Some(live) = live.as_ref().filter(|live| live.run_id == run.id) {
+                                                span.running { "running: " (live.current_step.as_deref().unwrap_or("starting")) }
                                             } @else {
-                                                "running..."
+                                                "never finished"
                                             }
                                         }
                                     }
@@ -241,18 +323,20 @@ async fn dashboard(
 
                     section.actions {
                         h2 { "Actions" }
-                        form method="POST" action="/api/run" {
+                        form method="POST" action="/api/run" data-async {
                             button type="submit" { "Run Full Lifecycle" }
                         }
-                        form method="POST" action="/api/run?scenario=escrow_refund" {
+                        form method="POST" action="/api/run?scenario=escrow_refund" data-async {
                             button type="submit" { "Run Escrow Refund" }
                         }
                         @if rebalancer.is_some() {
-                            form method="POST" action="/api/rebalance" {
+                            form method="POST" action="/api/rebalance" data-async {
                                 button type="submit" { "Rebalance Now" }
                             }
                         }
                     }
+                    }
+                    script { (PreEscaped(LIVE_SCRIPT)) }
                 }
             }
         }
