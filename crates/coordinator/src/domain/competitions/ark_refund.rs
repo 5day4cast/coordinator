@@ -115,7 +115,23 @@ impl Coordinator {
         };
         let swap = self.refund_swap(ark, &refund).await?;
 
-        if refund.state == ArkRefundState::Minted {
+        if refund.state == ArkRefundState::Submitting
+            && !self.resume_refund(ark, &escrow, &refund).await?
+        {
+            // Arkade never took it, so it is built and signed again.
+            self.submit_refund(
+                ark,
+                competition_id,
+                &escrow,
+                &escrow_script,
+                entry,
+                &swap,
+                outpoint,
+                sats,
+                &refund,
+            )
+            .await?;
+        } else if refund.state == ArkRefundState::Minted {
             self.submit_refund(
                 ark,
                 competition_id,
@@ -129,7 +145,10 @@ impl Coordinator {
             )
             .await?;
         }
-        if matches!(refund.state, ArkRefundState::Minted | ArkRefundState::Submitted) {
+        if matches!(
+            refund.state,
+            ArkRefundState::Minted | ArkRefundState::Submitting | ArkRefundState::Submitted
+        ) {
             self.pay_refund(ark, &refund, sats).await?;
         }
         info!("Refunded the escrow of ticket {ticket_id}");
@@ -224,6 +243,7 @@ impl Coordinator {
             fee_sats,
             state: ArkRefundState::Minted,
             ark_txid: None,
+            checkpoint_psbt: None,
             error: None,
             created_at: now,
             updated_at: now,
@@ -339,24 +359,115 @@ impl Coordinator {
         )
         .map_err(|e| anyhow!("Cannot place the checkpoint's signature: {e}"))?;
         let ark_txid = submitted.ark_tx.unsigned_tx.compute_txid();
-        ark.server
-            .finalize_offchain(ark_txid, vec![checkpoint])
-            .await
-            .map_err(|e| anyhow!("Arkade will not finalize the refund: {e}"))?;
-
+        // Only the escrow's owner can sign this checkpoint, so it is kept before finalizing:
+        // an interruption here finishes from it rather than signing the escrow again.
         self.competition_store
             .advance_ticket_ark_refund(
                 escrow.ticket_id,
-                ArkRefundState::Submitted,
+                ArkRefundState::Submitting,
                 Some(ark_txid.to_string()),
+                Some(psbt_hex(&checkpoint)),
                 None,
             )
+            .await?;
+        self.finalize_refund(ark, escrow.ticket_id, ark_txid, checkpoint)
             .await?;
         info!(
             "Refunded the escrow of ticket {} into its swap in {ark_txid}",
             escrow.ticket_id
         );
         Ok(())
+    }
+
+    /// Finish a submitted refund, and record that its escrow is spent.
+    async fn finalize_refund(
+        &self,
+        ark: &super::Arkade,
+        ticket_id: Uuid,
+        ark_txid: dlctix::bitcoin::Txid,
+        checkpoint: dlctix::bitcoin::Psbt,
+    ) -> Result<(), Error> {
+        ark.server
+            .finalize_offchain(ark_txid, vec![checkpoint])
+            .await
+            .map_err(|e| anyhow!("Arkade will not finalize the refund: {e}"))?;
+        self.competition_store
+            .advance_ticket_ark_refund(ticket_id, ArkRefundState::Submitted, None, None, None)
+            .await?;
+        Ok(())
+    }
+
+    /// Carry on a refund that was interrupted while Arkade had it.
+    ///
+    /// The Ark transaction may or may not have reached the server. Its checkpoint is signed only
+    /// by the escrow's owner, so if one was kept the refund finishes from it; otherwise the
+    /// escrow decides, since a spent one means the refund is already through.
+    async fn resume_refund(
+        &self,
+        ark: &super::Arkade,
+        escrow: &TicketArkEscrow,
+        refund: &TicketArkRefund,
+    ) -> Result<bool, Error> {
+        if let (Some(txid), Some(psbt)) = (&refund.ark_txid, &refund.checkpoint_psbt) {
+            let txid = txid
+                .parse()
+                .map_err(|e| anyhow!("The refund's Arkade transaction id is invalid: {e}"))?;
+            let checkpoint = hex::decode(psbt)
+                .ok()
+                .and_then(|bytes| dlctix::bitcoin::Psbt::deserialize(&bytes).ok())
+                .context("the refund's kept checkpoint is invalid")?;
+            self.finalize_refund(ark, escrow.ticket_id, txid, checkpoint)
+                .await?;
+            return Ok(true);
+        }
+        let spent = self
+            .escrow_spent(ark, escrow)
+            .await
+            .map_err(|e| anyhow!("Cannot tell whether the escrow is already refunded: {e}"))?;
+        if spent {
+            warn!(
+                "The escrow of ticket {} is spent, so its refund went through",
+                escrow.ticket_id
+            );
+            self.competition_store
+                .advance_ticket_ark_refund(
+                    escrow.ticket_id,
+                    ArkRefundState::Submitted,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+        }
+        Ok(spent)
+    }
+
+    /// Whether Arkade has already spent this escrow's VTXO.
+    async fn escrow_spent(
+        &self,
+        ark: &super::Arkade,
+        escrow: &TicketArkEscrow,
+    ) -> Result<bool, Error> {
+        let outpoint: OutPoint = escrow
+            .vtxo_outpoint
+            .as_deref()
+            .context("the escrow has no funded VTXO")?
+            .parse()
+            .map_err(|e| anyhow!("The escrow's VTXO outpoint is invalid: {e}"))?;
+        let tap_tree = hex::decode(&escrow.escrow_tap_tree)
+            .map_err(|e| anyhow!("The escrow's tap tree is not hex: {e}"))?;
+        let entry = EntryEscrow::from_vtxo_script(
+            &VtxoScript::decode_tap_tree(&tap_tree)
+                .map_err(|e| anyhow!("The escrow's tap tree is invalid: {e}"))?,
+        )
+        .map_err(|e| anyhow!("The escrow's leaves are not an entry escrow: {e}"))?;
+        Ok(ark
+            .server
+            .escrow_vtxos(&[entry])
+            .await
+            .map_err(|e| anyhow!("Arkade will not list the escrow's VTXOs: {e}"))?
+            .into_iter()
+            .any(|vtxo| vtxo.outpoint == outpoint && vtxo.is_spent))
     }
 
     /// Pay the player, and give `ark-swapd` the preimage that claims the swap.
@@ -398,7 +509,7 @@ impl Coordinator {
             .payment_preimage
             .context("LND returned no proof of the refund's payment")?;
         self.competition_store
-            .advance_ticket_ark_refund(refund.ticket_id, ArkRefundState::Paid, None, None)
+            .advance_ticket_ark_refund(refund.ticket_id, ArkRefundState::Paid, None, None, None)
             .await?;
         let preimage: [u8; 32] = hex::decode(&preimage)
             .ok()
@@ -409,7 +520,13 @@ impl Coordinator {
             .await
             .map_err(|e| anyhow!("ark-swapd cannot claim the refund's swap: {e}"))?;
         self.competition_store
-            .advance_ticket_ark_refund(refund.ticket_id, ArkRefundState::Settled, None, None)
+            .advance_ticket_ark_refund(
+                refund.ticket_id,
+                ArkRefundState::Settled,
+                None,
+                None,
+                None,
+            )
             .await?;
         Ok(())
     }

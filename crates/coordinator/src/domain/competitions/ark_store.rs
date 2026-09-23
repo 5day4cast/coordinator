@@ -33,6 +33,9 @@ pub struct TicketArkEscrow {
 pub enum ArkRefundState {
     /// ark-swapd minted the swap this refund pays, for an invoice from the player's address.
     Minted,
+    /// The refund's transactions are built and its Ark transaction is going to Arkade. The
+    /// escrow may or may not be spent yet, so a resume asks the server before rebuilding.
+    Submitting,
     /// The escrow was spent into that swap on Arkade.
     Submitted,
     /// The player's invoice was paid, and its preimage given to ark-swapd.
@@ -45,6 +48,7 @@ impl ArkRefundState {
     pub fn as_str(self) -> &'static str {
         match self {
             ArkRefundState::Minted => "minted",
+            ArkRefundState::Submitting => "submitting",
             ArkRefundState::Submitted => "submitted",
             ArkRefundState::Paid => "paid",
             ArkRefundState::Settled => "settled",
@@ -58,6 +62,7 @@ impl std::str::FromStr for ArkRefundState {
     fn from_str(state: &str) -> Result<Self, Self::Err> {
         Ok(match state {
             "minted" => ArkRefundState::Minted,
+            "submitting" => ArkRefundState::Submitting,
             "submitted" => ArkRefundState::Submitted,
             "paid" => ArkRefundState::Paid,
             "settled" => ArkRefundState::Settled,
@@ -80,6 +85,9 @@ pub struct TicketArkRefund {
     pub fee_sats: u64,
     pub state: ArkRefundState,
     pub ark_txid: Option<String>,
+    /// The checkpoint Arkade signed, hex, kept so an interrupted refund finalizes rather than
+    /// signing and spending the escrow again. Only its owner can sign it.
+    pub checkpoint_psbt: Option<String>,
     pub error: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -114,6 +122,7 @@ fn refund_row(row: &sqlx::sqlite::SqliteRow) -> Result<TicketArkRefund, sqlx::Er
         fee_sats: row.try_get::<i64, _>("fee_sats")? as u64,
         state: row.try_get::<&str, _>("state")?.parse()?,
         ark_txid: row.try_get("ark_txid")?,
+        checkpoint_psbt: row.try_get("checkpoint_psbt")?,
         error: row.try_get("error")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
@@ -320,8 +329,8 @@ impl CompetitionStore {
             .execute_write(move |pool| async move {
                 sqlx::query(
                     "INSERT INTO ticket_ark_refunds (ticket_id, refund_id, invoice, payment_hash,
-                        fee_sats, state, ark_txid, error, created_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        fee_sats, state, ark_txid, checkpoint_psbt, error, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT (ticket_id) DO NOTHING",
                 )
                 .bind(refund.ticket_id.to_string())
@@ -331,6 +340,7 @@ impl CompetitionStore {
                 .bind(refund.fee_sats as i64)
                 .bind(refund.state.as_str())
                 .bind(&refund.ark_txid)
+                .bind(&refund.checkpoint_psbt)
                 .bind(&refund.error)
                 .bind(refund.created_at)
                 .bind(refund.updated_at)
@@ -342,11 +352,14 @@ impl CompetitionStore {
     }
 
     /// Move a refund on, once the step before it is done.
+    ///
+    /// What is already recorded is kept: a step that learns nothing new passes `None`.
     pub async fn advance_ticket_ark_refund(
         &self,
         ticket_id: Uuid,
         state: ArkRefundState,
         ark_txid: Option<String>,
+        checkpoint_psbt: Option<String>,
         error: Option<String>,
     ) -> Result<(), DatabaseWriteError> {
         let updated_at = OffsetDateTime::now_utc().unix_timestamp();
@@ -354,10 +367,12 @@ impl CompetitionStore {
             .execute_write(move |pool| async move {
                 sqlx::query(
                     "UPDATE ticket_ark_refunds SET state = ?, ark_txid = COALESCE(?, ark_txid),
-                        error = ?, updated_at = ? WHERE ticket_id = ?",
+                        checkpoint_psbt = COALESCE(?, checkpoint_psbt), error = ?, updated_at = ?
+                     WHERE ticket_id = ?",
                 )
                 .bind(state.as_str())
                 .bind(ark_txid)
+                .bind(checkpoint_psbt)
                 .bind(error)
                 .bind(updated_at)
                 .bind(ticket_id.to_string())

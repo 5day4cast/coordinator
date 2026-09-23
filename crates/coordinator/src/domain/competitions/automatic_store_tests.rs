@@ -739,6 +739,7 @@ async fn a_refund_records_each_step_before_taking_it() {
         fee_sats: 100,
         state: ArkRefundState::Minted,
         ark_txid: None,
+        checkpoint_psbt: None,
         error: None,
         created_at: 1_790_000_000,
         updated_at: 1_790_000_000,
@@ -762,11 +763,13 @@ async fn a_refund_records_each_step_before_taking_it() {
     assert_eq!(stored.refund_id, refund.refund_id);
     assert_eq!(stored.state, ArkRefundState::Minted);
 
-    // The Arkade transaction is kept when the refund is submitted, and again afterwards.
+    // The Arkade transaction and the checkpoint only its owner can sign are kept once the
+    // refund is with Arkade, and survive every later step.
     bounded(fixture.store.advance_ticket_ark_refund(
         ticket_id,
-        ArkRefundState::Submitted,
+        ArkRefundState::Submitting,
         Some("00".repeat(32)),
+        Some("70736274ff".into()),
         None,
     ))
     .await
@@ -774,6 +777,7 @@ async fn a_refund_records_each_step_before_taking_it() {
     bounded(fixture.store.advance_ticket_ark_refund(
         ticket_id,
         ArkRefundState::Paid,
+        None,
         None,
         None,
     ))
@@ -785,5 +789,6 @@ async fn a_refund_records_each_step_before_taking_it() {
         .unwrap();
     assert_eq!(stored.state, ArkRefundState::Paid);
     assert_eq!(stored.ark_txid, Some("00".repeat(32)));
+    assert_eq!(stored.checkpoint_psbt.as_deref(), Some("70736274ff"));
     assert!(stored.updated_at >= refund.updated_at);
 }
