@@ -1,3 +1,4 @@
+use crate::rebalance::Rebalancer;
 use crate::runner::Runner;
 use crate::scenarios::{ScenarioConfig, ScenarioStatus};
 use axum::{
@@ -9,13 +10,29 @@ use axum::{
 use maud::{html, DOCTYPE};
 use serde::Deserialize;
 
-pub fn router(runner: Runner) -> Router {
+/// What the dashboard's handlers share: the runner, and the configured run a trigger starts from.
+#[derive(Clone)]
+pub struct Dashboard {
+    pub runner: Runner,
+    pub scenario_config: ScenarioConfig,
+    /// Absent when no rebalancing is configured.
+    pub rebalancer: Option<Rebalancer>,
+}
+
+impl axum::extract::FromRef<Dashboard> for Runner {
+    fn from_ref(dashboard: &Dashboard) -> Self {
+        dashboard.runner.clone()
+    }
+}
+
+pub fn router(state: Dashboard) -> Router {
     Router::new()
         .route("/", get(dashboard))
         .route("/api/run", post(trigger_run))
         .route("/api/status", get(status))
         .route("/api/history", get(history))
-        .with_state(runner)
+        .route("/api/rebalance", post(trigger_rebalance))
+        .with_state(state)
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,8 +49,17 @@ struct HistoryParams {
 /// How many of a scenario's recent runs the dashboard judges it by.
 const HEALTH_WINDOW: i64 = 20;
 
-async fn dashboard(State(runner): State<Runner>) -> impl IntoResponse {
+async fn dashboard(
+    State(Dashboard {
+        runner, rebalancer, ..
+    }): State<Dashboard>,
+) -> impl IntoResponse {
     let last = runner.last_result().await;
+    let observation = match &rebalancer {
+        Some(rebalancer) => rebalancer.last().await,
+        None => None,
+    };
+    let rebalances = runner.db().list_rebalances(10).await.unwrap_or_default();
     let runs = runner.db().list_runs(10).await.unwrap_or_default();
     let health = runner
         .db()
@@ -148,6 +174,47 @@ async fn dashboard(State(runner): State<Runner>) -> impl IntoResponse {
                         }
                     }
 
+                    section.liquidity {
+                        h2 { "Liquidity" }
+                        @match (&rebalancer, &observation) {
+                            (None, _) => p { "Rebalancing is not configured." },
+                            (Some(_), None) => p { "Not checked yet." },
+                            (Some(rebalancer), Some(observation)) => {
+                                @match &observation.channel {
+                                    Some(channel) => p {
+                                        "The payer holds " strong { (channel.local_sats) }
+                                        " of " (channel.local_sats + channel.remote_sats)
+                                        " sats in channel " (channel.id)
+                                        ", rebalancing below " (rebalancer.config().low_percent) "%."
+                                    },
+                                    None => p.error { "The payer has no active channel with the source node." },
+                                }
+                                p.note { "Checked " (observation.checked_at) }
+                            }
+                        }
+                        @if !rebalances.is_empty() {
+                            table {
+                                thead {
+                                    tr {
+                                        th { "When" } th { "Moved" } th { "Payer held" }
+                                        th { "Status" } th { "Error" }
+                                    }
+                                }
+                                tbody {
+                                    @for rebalance in &rebalances {
+                                        tr {
+                                            td { (rebalance.created_at) }
+                                            td { (rebalance.amount_sats) " sats" }
+                                            td { (rebalance.local_before_sats) " / " (rebalance.capacity_sats) }
+                                            td { span class=(format!("badge {}", rebalance.status)) { (rebalance.status) } }
+                                            td { (rebalance.error_message.as_deref().unwrap_or("-")) }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     section.actions {
                         h2 { "Actions" }
                         form method="POST" action="/api/run" {
@@ -155,6 +222,11 @@ async fn dashboard(State(runner): State<Runner>) -> impl IntoResponse {
                         }
                         form method="POST" action="/api/run?scenario=escrow_refund" {
                             button type="submit" { "Run Escrow Refund" }
+                        }
+                        @if rebalancer.is_some() {
+                            form method="POST" action="/api/rebalance" {
+                                button type="submit" { "Rebalance Now" }
+                            }
                         }
                     }
                 }
@@ -165,13 +237,17 @@ async fn dashboard(State(runner): State<Runner>) -> impl IntoResponse {
 }
 
 async fn trigger_run(
-    State(runner): State<Runner>,
+    State(Dashboard {
+        runner,
+        scenario_config,
+        ..
+    }): State<Dashboard>,
     Query(params): Query<RunParams>,
 ) -> impl IntoResponse {
     let scenario = params
         .scenario
         .unwrap_or_else(|| "full_lifecycle".to_string());
-    let mut config = ScenarioConfig::default();
+    let mut config = scenario_config;
     if let Some(users) = params.users {
         config.users = users;
     }
@@ -190,6 +266,27 @@ async fn trigger_run(
         "status": "started",
         "scenario": scenario_name
     }))
+}
+
+async fn trigger_rebalance(
+    State(Dashboard { rebalancer, .. }): State<Dashboard>,
+) -> impl IntoResponse {
+    let Some(rebalancer) = rebalancer else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "rebalancing is not configured" })),
+        );
+    };
+    match rebalancer.rebalance().await {
+        Ok(moved_sats) => (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({ "moved_sats": moved_sats })),
+        ),
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": format!("{e:#}") })),
+        ),
+    }
 }
 
 async fn status(State(runner): State<Runner>) -> impl IntoResponse {
@@ -232,7 +329,7 @@ table { width: 100%; border-collapse: collapse; margin: 10px 0; }
 th, td { padding: 8px; text-align: left; border-bottom: 1px solid #333; }
 th { background: #16213e; }
 .badge { padding: 2px 8px; border-radius: 4px; font-size: 0.85em; }
-.passed, .passed .badge { color: #00ff88; }
+.passed, .passed .badge, .moved { color: #00ff88; }
 .failed, .failed .badge { color: #ff4444; }
 .running, .running .badge { color: #ffaa00; }
 .skipped { color: #888; }

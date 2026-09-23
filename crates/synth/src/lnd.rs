@@ -1,4 +1,5 @@
-//! Paying a competition's entry invoices, for scenarios that need real payments.
+//! The test network's Lightning nodes: paying entry invoices for scenarios that need real
+//! payments, and moving the balance back when they drain it.
 //!
 //! An Arkade entry is funded by `ark-swapd` swapping the player's Lightning payment into their
 //! escrow VTXO, so a scenario that exercises escrows has to pay for real: the coordinator's test
@@ -83,18 +84,34 @@ impl Lnd {
     }
 
     /// Pay `invoice`, waiting for it to settle or fail.
-    ///
-    /// The router streams a payment's progress, so this reads until the last status it reports.
     pub async fn pay(&self, invoice: &str) -> Result<()> {
+        self.send(json!({
+            "payment_request": invoice,
+            "timeout_seconds": self.payment_timeout_secs,
+            "fee_limit_sat": self.fee_limit_sats.to_string(),
+        }))
+        .await
+    }
+
+    /// Pay `invoice` over `channel` only, so the payment moves that channel's balance and no
+    /// other's.
+    pub async fn pay_through(&self, invoice: &str, channel: &str) -> Result<()> {
+        self.send(json!({
+            "payment_request": invoice,
+            "timeout_seconds": self.payment_timeout_secs,
+            "fee_limit_sat": self.fee_limit_sats.to_string(),
+            "outgoing_chan_ids": [channel],
+        }))
+        .await
+    }
+
+    /// The router streams a payment's progress, so this reads until the last status it reports.
+    async fn send(&self, request: serde_json::Value) -> Result<()> {
         let response = self
             .client
             .post(format!("{}v2/router/send", self.base_url))
             .header(MACAROON_HEADER, &self.macaroon)
-            .json(&json!({
-                "payment_request": invoice,
-                "timeout_seconds": self.payment_timeout_secs,
-                "fee_limit_sat": self.fee_limit_sats.to_string(),
-            }))
+            .json(&request)
             .send()
             .await
             .context("send the payment")?;
@@ -119,8 +136,7 @@ impl Lnd {
             #[serde(default)]
             failure_reason: Option<String>,
         }
-        let update: Update =
-            serde_json::from_str(last).with_context(|| format!("parse {last}"))?;
+        let update: Update = serde_json::from_str(last).with_context(|| format!("parse {last}"))?;
         if let Some(error) = update.error {
             anyhow::bail!("LND could not pay: {error}");
         }
@@ -134,5 +150,103 @@ impl Lnd {
                 payment.failure_reason.unwrap_or_default()
             )),
         }
+    }
+
+    /// This node's public key.
+    pub async fn pubkey(&self) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Info {
+            identity_pubkey: String,
+        }
+        let info: Info = self.get("v1/getinfo").await?;
+        Ok(info.identity_pubkey)
+    }
+
+    /// The largest active channel this node has with `peer`, if any.
+    pub async fn channel_with(&self, peer: &str) -> Result<Option<Channel>> {
+        #[derive(Deserialize)]
+        struct Channels {
+            #[serde(default)]
+            channels: Vec<ListedChannel>,
+        }
+        #[derive(Deserialize)]
+        struct ListedChannel {
+            remote_pubkey: String,
+            chan_id: String,
+            #[serde(default)]
+            active: bool,
+            #[serde(default, with = "sats")]
+            local_balance: u64,
+            #[serde(default, with = "sats")]
+            remote_balance: u64,
+        }
+        let listed: Channels = self.get("v1/channels").await?;
+        Ok(listed
+            .channels
+            .into_iter()
+            .filter(|channel| channel.active && channel.remote_pubkey == peer)
+            .map(|channel| Channel {
+                id: channel.chan_id,
+                local_sats: channel.local_balance,
+                remote_sats: channel.remote_balance,
+            })
+            .max_by_key(|channel| channel.local_sats + channel.remote_sats))
+    }
+
+    /// An invoice for `sats`, which this node is paid.
+    pub async fn invoice(&self, sats: u64, memo: &str) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Added {
+            payment_request: String,
+        }
+        let response = self
+            .client
+            .post(format!("{}v1/invoices", self.base_url))
+            .header(MACAROON_HEADER, &self.macaroon)
+            .json(&json!({ "value": sats.to_string(), "memo": memo, "expiry": "600" }))
+            .send()
+            .await
+            .context("create an invoice")?;
+        let added: Added = Self::read(response).await?;
+        Ok(added.payment_request)
+    }
+
+    async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let response = self
+            .client
+            .get(format!("{}{path}", self.base_url))
+            .header(MACAROON_HEADER, &self.macaroon)
+            .send()
+            .await
+            .with_context(|| format!("GET {path}"))?;
+        Self::read(response).await
+    }
+
+    async fn read<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> Result<T> {
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("LND refused ({status}): {body}");
+        }
+        Ok(response.json().await?)
+    }
+}
+
+/// A channel's balance, from this node's side.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Channel {
+    pub id: String,
+    pub local_sats: u64,
+    pub remote_sats: u64,
+}
+
+/// LND's REST gateway writes 64-bit amounts as strings.
+mod sats {
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }

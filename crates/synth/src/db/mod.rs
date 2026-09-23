@@ -42,6 +42,29 @@ pub struct TestStep {
     pub details_json: Option<String>,
 }
 
+/// A rebalance about to be recorded.
+#[derive(Debug, Clone)]
+pub struct Rebalance {
+    pub channel_id: String,
+    pub amount_sats: u64,
+    pub local_before_sats: u64,
+    pub capacity_sats: u64,
+    /// Why it failed, if it did.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct RebalanceRecord {
+    pub id: String,
+    pub channel_id: String,
+    pub amount_sats: i64,
+    pub local_before_sats: i64,
+    pub capacity_sats: i64,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SynthUserRecord {
     pub id: String,
@@ -118,7 +141,63 @@ impl SynthDb {
         .execute(&self.pool)
         .await?;
 
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS rebalances (
+                id TEXT PRIMARY KEY,
+                channel_id TEXT NOT NULL,
+                amount_sats INTEGER NOT NULL,
+                local_before_sats INTEGER NOT NULL,
+                capacity_sats INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                error_message TEXT,
+                created_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
+    }
+
+    // --- Rebalances ---
+
+    pub async fn record_rebalance(&self, rebalance: &Rebalance) -> Result<()> {
+        let now =
+            OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+        let status = if rebalance.error.is_some() {
+            "failed"
+        } else {
+            "moved"
+        };
+        sqlx::query(
+            "INSERT INTO rebalances (id, channel_id, amount_sats, local_before_sats, capacity_sats, \
+             status, error_message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&rebalance.channel_id)
+        .bind(rebalance.amount_sats as i64)
+        .bind(rebalance.local_before_sats as i64)
+        .bind(rebalance.capacity_sats as i64)
+        .bind(status)
+        .bind(&rebalance.error)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn list_rebalances(&self, limit: i64) -> Result<Vec<RebalanceRecord>> {
+        let rebalances = sqlx::query_as::<_, RebalanceRecord>(
+            "SELECT * FROM rebalances ORDER BY rowid DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rebalances)
     }
 
     // --- Test Runs ---
@@ -361,8 +440,42 @@ mod tests {
 
         // Scenarios are listed by when they last ran, most recent first.
         assert_eq!(
-            health.iter().map(|h| h.scenario.as_str()).collect::<Vec<_>>(),
+            health
+                .iter()
+                .map(|h| h.scenario.as_str())
+                .collect::<Vec<_>>(),
             ["full_lifecycle", "escrow_refund"]
         );
+    }
+
+    /// A failed rebalance is kept with its reason, so the dashboard can say why money stopped
+    /// moving.
+    #[tokio::test]
+    async fn rebalances_are_listed_with_what_went_wrong() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synth.sqlite");
+        let db = SynthDb::new(path.to_str().unwrap()).await.unwrap();
+
+        let rebalance = |error: Option<&str>| Rebalance {
+            channel_id: "1".into(),
+            amount_sats: 200_000,
+            local_before_sats: 250_000,
+            capacity_sats: 1_000_000,
+            error: error.map(str::to_owned),
+        };
+        db.record_rebalance(&rebalance(None)).await.unwrap();
+        db.record_rebalance(&rebalance(Some("no route")))
+            .await
+            .unwrap();
+
+        let listed = db.list_rebalances(10).await.unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|r| (r.status.as_str(), r.error_message.as_deref()))
+                .collect::<Vec<_>>(),
+            [("failed", Some("no route")), ("moved", None)]
+        );
+        assert_eq!(listed[1].amount_sats, 200_000);
     }
 }
