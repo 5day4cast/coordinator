@@ -101,6 +101,26 @@ impl Swapper {
         Ok(swap)
     }
 
+    /// Board what has confirmed at the boarding address, so topping the wallet up takes only an
+    /// on-chain send to it.
+    pub async fn board_tick(&self) {
+        let boarding = match self.wallet.confirmed_boarding_sat().await {
+            Ok(sat) => sat,
+            Err(error) => {
+                log::warn!("check the boarding address: {error:#}");
+                return;
+            }
+        };
+        if boarding < self.wallet.dust().to_sat() {
+            return;
+        }
+        match self.wallet.board().await {
+            Ok(Some(txid)) => log::info!("boarded {boarding} sat in commitment {txid}"),
+            Ok(None) => log::warn!("{boarding} sat await boarding, but no batch took them"),
+            Err(error) => log::warn!("board {boarding} sat: {error:#}"),
+        }
+    }
+
     /// Advance every unfinished swap by one step.
     pub async fn tick(&self) {
         let swaps = match self.store.unfinished().await {
