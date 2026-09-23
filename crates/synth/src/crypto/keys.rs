@@ -79,9 +79,15 @@ impl SynthUser {
         self.nostr_keys.secret_key().to_secret_hex()
     }
 
-    /// Derive an ephemeral keypair for a DLC entry at the given index
-    pub fn derive_ephemeral_key(&self, entry_index: u32) -> Result<EphemeralKey> {
-        let path = format!("m/86'/0'/{}'/0/0", entry_index);
+    /// Derive the ephemeral keypair for one entry.
+    ///
+    /// Keyed by the entry, as the browser wallet's keys are: the coordinator refuses a payout hash
+    /// it has seen before, so a player entering competition after competition needs a new key for
+    /// each entry, not one per seat.
+    pub fn derive_ephemeral_key(&self, entry_id: &uuid::Uuid) -> Result<EphemeralKey> {
+        let digest = Sha256::digest(entry_id.as_bytes());
+        let index = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) & 0x7fff_ffff;
+        let path = format!("m/86'/0'/{}'/0/0", index);
         let path = DerivationPath::from_str(&path)
             .map_err(|e| anyhow::anyhow!("Invalid derivation path: {}", e))?;
 
@@ -134,4 +140,29 @@ fn generate_master_xpriv() -> Result<Xpriv> {
             .map_err(|e| anyhow::anyhow!("Invalid child number: {}", e))?,
         private_key: secret_key,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The coordinator refuses a payout hash it has seen, so a player's next entry needs a new key
+    /// even in the same seat of the next competition.
+    #[test]
+    fn each_entry_gets_its_own_key() {
+        let user = SynthUser::new_random("alice").unwrap();
+        let first = uuid::Uuid::now_v7();
+        let second = uuid::Uuid::now_v7();
+
+        let key = user.derive_ephemeral_key(&first).unwrap();
+        assert_eq!(
+            key.secret_bytes,
+            user.derive_ephemeral_key(&first).unwrap().secret_bytes,
+            "an entry's key is the same whenever it is derived"
+        );
+        assert_ne!(
+            key.secret_bytes,
+            user.derive_ephemeral_key(&second).unwrap().secret_bytes
+        );
+    }
 }

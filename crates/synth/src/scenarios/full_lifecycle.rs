@@ -82,10 +82,10 @@ pub async fn run_full_lifecycle(
     let payer = lnd.as_ref().map_or(Payer::TestEndpoint, Payer::Lnd);
 
     // Step 3: Each user requests a ticket and submits an entry
-    for (i, user) in users.iter().enumerate() {
+    for user in &users {
         let step_name = format!("user_{}_enter", user.name);
         match run_step(&step_name, || async {
-            enter_competition_with(client, user, &comp_id, config, i as u32, None, &payer).await
+            enter_competition_with(client, user, &comp_id, config, None, &payer).await
         })
         .await
         {
@@ -180,20 +180,16 @@ pub(super) enum Payer<'a> {
 /// Enter, paying with `payer` and registering `lightning_address` for payouts and refunds.
 ///
 /// Returns the ticket, which a refund is later read from.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn enter_competition_with(
     client: &CoordinatorClient,
     user: &SynthUser,
     competition_id: &Uuid,
     config: &ScenarioConfig,
-    entry_index: u32,
     lightning_address: Option<&str>,
     payer: &Payer<'_>,
 ) -> Result<Uuid> {
-    // Derive ephemeral key for this entry
-    let ephemeral = user.derive_ephemeral_key(entry_index)?;
-
     let entry_id = Uuid::now_v7();
+    let ephemeral = user.derive_ephemeral_key(&entry_id)?;
     let (payout_preimage, payout_hash) =
         crypto::payout::generate_payout_pair(&ephemeral.secret_bytes);
     let payout_choice = coordinator_core::PayoutRegistrationRequest {
