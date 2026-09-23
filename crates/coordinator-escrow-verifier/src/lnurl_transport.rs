@@ -425,6 +425,151 @@ fn validate_metadata(metadata: &str) -> Result<(), LnurlError> {
     Ok(())
 }
 
+/// Fixtures for exercising a verifier against a local LNURL provider.
+///
+/// A provider is reached over TLS from inside the enclave, so testing one takes a generated CA
+/// and a relay that claims a public address. Both belong to tests alone; the `test-support`
+/// feature carries them to the Coordinator's enclave tests, and nothing here is compiled into a
+/// release build.
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixtures {
+    use super::*;
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Connected payout-operation fixture. Only tests may trust this generated
+/// CA or route the asserted public pins to this local TLS origin.
+pub async fn automatic_payout_tls_fixture(
+    invoice: String,
+) -> (LnurlPayClient, tokio::task::JoinHandle<()>) {
+    payout_fixture(Some(invoice), 1).await
+}
+
+/// The metadata this fixture's provider serves, which its invoices commit to.
+pub const FIXTURE_METADATA: &str = "[[\"text/plain\",\"Provider display metadata\"]]";
+
+/// The same provider, serving discovery alone: what verifying a supplied invoice needs.
+///
+/// `times` is how many verifications it answers, since each resolves the address again.
+pub async fn discovery_tls_fixture_times(
+    times: usize,
+) -> (LnurlPayClient, tokio::task::JoinHandle<()>) {
+    payout_fixture(None, times).await
+}
+
+/// One verification's worth of discovery.
+pub async fn discovery_tls_fixture() -> (LnurlPayClient, tokio::task::JoinHandle<()>) {
+    discovery_tls_fixture_times(1).await
+}
+
+/// Serves LNURL discovery, and the callback too when an `invoice` is given.
+async fn payout_fixture(
+    invoice: Option<String>,
+    times: usize,
+) -> (LnurlPayClient, tokio::task::JoinHandle<()>) {
+    let certificate = rcgen::generate_simple_self_signed(vec![
+        "wallet.example".into(),
+        "invoices.example".into(),
+    ])
+    .unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(certificate.cert.der().clone()).unwrap();
+    let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![certificate.cert.der().clone()],
+        rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der())
+            .into(),
+    )
+    .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let discovery = json!({
+            "tag": "payRequest",
+            "callback": "https://invoices.example/pay?token=opaque%2Btoken&amount=1",
+            "minSendable": 1000, "maxSendable": 100_000_000,
+            "metadata": FIXTURE_METADATA,
+        });
+        let mut exchanges = vec![
+            (
+                "wallet.example",
+                "8.8.8.8:443",
+                "/.well-known/lnurlp/alice+prize".to_string(),
+                discovery,
+            );
+            times
+        ];
+        if let Some(invoice) = invoice {
+            exchanges.push((
+                "invoices.example",
+                "9.9.9.9:443",
+                "/pay?token=opaque%2Btoken&amount=100000000".to_string(),
+                json!({"pr": invoice}),
+            ));
+        }
+        for (host, pin, path, body) in exchanges {
+            let (mut dns, _) = listener.accept().await.unwrap();
+            match read_control::<_, RelayRequest>(&mut dns).await.unwrap() {
+                RelayRequest::Resolve {
+                    host: requested,
+                    port,
+                } => {
+                    assert_eq!(requested, host);
+                    assert_eq!(port, 443);
+                }
+                _ => panic!("Expected hostname resolution"),
+            }
+            let pin: SocketAddr = pin.parse().unwrap();
+            write_control(&mut dns, &RelayResponse::Addresses(vec![pin]))
+                .await
+                .unwrap();
+            drop(dns);
+            let (mut socket, _) = listener.accept().await.unwrap();
+            match read_control::<_, RelayRequest>(&mut socket).await.unwrap() {
+                RelayRequest::Connect { address } => assert_eq!(address, pin),
+                _ => panic!("Expected exact public DNS pin"),
+            }
+            write_control(&mut socket, &RelayResponse::Connected)
+                .await
+                .unwrap();
+            let mut tls = acceptor.accept(socket).await.unwrap();
+            assert_eq!(tls.get_ref().1.server_name(), Some(host));
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut buffer = [0; 1024];
+                let read = tls.read(&mut buffer).await.unwrap();
+                assert!(read > 0 && request.len() + read <= 8192);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let request = std::str::from_utf8(&request).unwrap();
+            assert!(request.starts_with(&format!("GET {path} HTTP/1.1\r\n")));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains(&format!("host: {host}\r\n")));
+            let body = body.to_string();
+            tls.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let mut client = LnurlPayClient::new(SocketConnector::tcp("127.0.0.1", address.port()));
+    client.tls = Arc::new(tls_config(roots));
+    (client, task)
+}
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -766,123 +911,6 @@ pub(crate) mod tests {
             client.tls = Arc::new(tls_config(roots));
         }
         (client, server)
-    }
-
-    /// Connected payout-operation fixture. Only tests may trust this generated
-    /// CA or route the asserted public pins to this local TLS origin.
-    pub(crate) async fn automatic_payout_tls_fixture(
-        invoice: String,
-    ) -> (LnurlPayClient, tokio::task::JoinHandle<()>) {
-        payout_fixture(Some(invoice)).await
-    }
-
-    /// The metadata this fixture's provider serves, which its invoices commit to.
-    pub(crate) const FIXTURE_METADATA: &str = "[[\"text/plain\",\"Provider display metadata\"]]";
-
-    /// The same provider, serving discovery alone: what verifying a supplied invoice needs.
-    pub(crate) async fn discovery_tls_fixture() -> (LnurlPayClient, tokio::task::JoinHandle<()>) {
-        payout_fixture(None).await
-    }
-
-    /// Serves LNURL discovery, and the callback too when an `invoice` is given.
-    async fn payout_fixture(invoice: Option<String>) -> (LnurlPayClient, tokio::task::JoinHandle<()>) {
-        let certificate = rcgen::generate_simple_self_signed(vec![
-            "wallet.example".into(),
-            "invoices.example".into(),
-        ])
-        .unwrap();
-        let mut roots = RootCertStore::empty();
-        roots.add(certificate.cert.der().clone()).unwrap();
-        let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![certificate.cert.der().clone()],
-            rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der())
-                .into(),
-        )
-        .unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move {
-            let discovery = json!({
-                "tag": "payRequest",
-                "callback": "https://invoices.example/pay?token=opaque%2Btoken&amount=1",
-                "minSendable": 1000, "maxSendable": 100_000_000,
-                "metadata": FIXTURE_METADATA,
-            });
-            let mut exchanges = vec![(
-                "wallet.example",
-                "8.8.8.8:443",
-                "/.well-known/lnurlp/alice+prize".to_string(),
-                discovery,
-            )];
-            if let Some(invoice) = invoice {
-                exchanges.push((
-                    "invoices.example",
-                    "9.9.9.9:443",
-                    "/pay?token=opaque%2Btoken&amount=100000000".to_string(),
-                    json!({"pr": invoice}),
-                ));
-            }
-            for (host, pin, path, body) in exchanges {
-                let (mut dns, _) = listener.accept().await.unwrap();
-                match read_control::<_, RelayRequest>(&mut dns).await.unwrap() {
-                    RelayRequest::Resolve {
-                        host: requested,
-                        port,
-                    } => {
-                        assert_eq!(requested, host);
-                        assert_eq!(port, 443);
-                    }
-                    _ => panic!("Expected hostname resolution"),
-                }
-                let pin: SocketAddr = pin.parse().unwrap();
-                write_control(&mut dns, &RelayResponse::Addresses(vec![pin]))
-                    .await
-                    .unwrap();
-                drop(dns);
-                let (mut socket, _) = listener.accept().await.unwrap();
-                match read_control::<_, RelayRequest>(&mut socket).await.unwrap() {
-                    RelayRequest::Connect { address } => assert_eq!(address, pin),
-                    _ => panic!("Expected exact public DNS pin"),
-                }
-                write_control(&mut socket, &RelayResponse::Connected)
-                    .await
-                    .unwrap();
-                let mut tls = acceptor.accept(socket).await.unwrap();
-                assert_eq!(tls.get_ref().1.server_name(), Some(host));
-                let mut request = Vec::new();
-                while !request.ends_with(b"\r\n\r\n") {
-                    let mut buffer = [0; 1024];
-                    let read = tls.read(&mut buffer).await.unwrap();
-                    assert!(read > 0 && request.len() + read <= 8192);
-                    request.extend_from_slice(&buffer[..read]);
-                }
-                let request = std::str::from_utf8(&request).unwrap();
-                assert!(request.starts_with(&format!("GET {path} HTTP/1.1\r\n")));
-                assert!(request
-                    .to_ascii_lowercase()
-                    .contains(&format!("host: {host}\r\n")));
-                let body = body.to_string();
-                tls.write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-            }
-        });
-        let mut client = LnurlPayClient::new(SocketConnector::tcp("127.0.0.1", address.port()));
-        client.tls = Arc::new(tls_config(roots));
-        (client, task)
     }
 
     #[tokio::test]

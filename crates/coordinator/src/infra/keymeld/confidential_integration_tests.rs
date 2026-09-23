@@ -37,9 +37,12 @@ struct Relay {
     responses: Arc<Mutex<Vec<String>>>,
 }
 fn operator() -> Arc<EnclaveOperator> {
+    operator_verifying(CoordinatorVerifier::default())
+}
+fn operator_verifying(verifier: CoordinatorVerifier) -> Arc<EnclaveOperator> {
     let operator = EnclaveOperator::with_verifiers(
         EnclaveId::new(1),
-        VerifierRegistry::new(vec![Arc::new(CoordinatorVerifier::default())]).unwrap(),
+        VerifierRegistry::new(vec![Arc::new(verifier)]).unwrap(),
     )
     .unwrap();
     operator.set_test_keys([15; 32]);
@@ -507,20 +510,53 @@ fn entry_secret(index: usize) -> [u8; 32] {
     [index as u8 + 20; 32]
 }
 
+/// What a harness's players consent to, beyond their contract.
+#[derive(Default)]
+struct Consent<'a> {
+    /// Each player's Arkade escrow, when the pool is funded from escrows.
+    escrows: Option<&'a [coordinator_ark_escrow::EntryEscrow]>,
+    /// Where a refund pays, and the most its swap may keep.
+    lightning_address: Option<String>,
+    max_refund_fee_sats: u64,
+    /// The Arkade server's checkpoint exit script, hex, which a refund's outputs are built from.
+    checkpoint_exit_script: String,
+    /// The provider a refund's invoice is checked against, for enclaves that verify one.
+    lnurl: Option<coordinator_escrow_verifier::lnurl_transport::LnurlPayClient>,
+    /// Leave keygen unfinished, as a competition cancelled before its pool filled does.
+    unfinished_keygen: bool,
+}
+
+impl<'a> Consent<'a> {
+    fn to_escrows(escrows: Option<&'a [coordinator_ark_escrow::EntryEscrow]>) -> Self {
+        Self {
+            escrows,
+            ..Default::default()
+        }
+    }
+}
+
 impl PoolHarness {
     /// Register `count` players. With `escrows`, each consents to its Arkade escrow.
     async fn start(count: usize, escrows: Option<&[coordinator_ark_escrow::EntryEscrow]>) -> Self {
-        Self::start_with(pool_parameters(count), escrows).await
+        Self::start_with(pool_parameters(count), Consent::to_escrows(escrows)).await
     }
 
     /// Register the players of `params`, whose keys are the entry keys from [`entry_secret`].
-    async fn start_with(
-        params: ContractParameters,
-        escrows: Option<&[coordinator_ark_escrow::EntryEscrow]>,
-    ) -> Self {
+    async fn start_with(params: ContractParameters, consent: Consent<'_>) -> Self {
+        let Consent {
+            escrows,
+            lightning_address,
+            max_refund_fee_sats,
+            checkpoint_exit_script,
+            lnurl,
+            unfinished_keygen,
+        } = consent;
         let count = params.players.len();
         let relay_state = Relay {
-            operator: Arc::new(Mutex::new(operator())),
+            operator: Arc::new(Mutex::new(match lnurl {
+                Some(client) => operator_verifying(CoordinatorVerifier::with_lnurl(client)),
+                None => operator(),
+            })),
             requests: Default::default(),
             responses: Default::default(),
         };
@@ -586,7 +622,7 @@ impl PoolHarness {
                 max_fee_rate: params.fee_rate,
             };
             let policy = PayoutPolicy {
-                automatic_lightning_address: None,
+                automatic_lightning_address: lightning_address.clone(),
                 allow_invoice_fallback: true,
                 release_entry_key_after_payment: true,
                 contract_terms: serde_json::to_string(&terms).unwrap(),
@@ -596,8 +632,8 @@ impl PoolHarness {
                             escrows[index].vtxo_script().encode_tap_tree(),
                         ),
                         max_fee_sats: 0,
-                        max_refund_fee_sats: 0,
-                        checkpoint_exit_script: String::new(),
+                        max_refund_fee_sats,
+                        checkpoint_exit_script: checkpoint_exit_script.clone(),
                     }
                 }),
             };
@@ -630,7 +666,9 @@ impl PoolHarness {
                 .unwrap();
             policies.insert(player.clone(), policy);
         }
-        service.wait_for_keygen_completion(&session).await.unwrap();
+        if !unfinished_keygen {
+            service.wait_for_keygen_completion(&session).await.unwrap();
+        }
         Self {
             service,
             session,
@@ -1049,7 +1087,7 @@ async fn keymeld_kicks_off_a_pool_on_mutinynet() {
     params.funding_value = total;
     params.event.expiry = Some(expiry_height);
     params.relative_locktime_block_delta = 2;
-    let harness = PoolHarness::start_with(params.clone(), Some(&escrows)).await;
+    let harness = PoolHarness::start_with(params.clone(), Consent::to_escrows(Some(&escrows))).await;
     harness
         .service
         .bind_payout_contract(
@@ -1118,4 +1156,175 @@ async fn keymeld_kicks_off_a_pool_on_mutinynet() {
     });
     save(&run);
     harness.stop().await;
+}
+
+/// A competition that never kicked off must still return its players' buy-ins, and its pool has
+/// no contract to bind that refund to. This drives one through real enclaves: the unbound
+/// permission, the Coordinator verifier's own check of the player's Lightning Address, and both
+/// transactions of the Arkade spend.
+#[tokio::test]
+async fn keymeld_signs_a_refund_for_a_pool_that_never_funded() {
+    use coordinator_ark::testing::{keypair, mock_info, xonly};
+    use coordinator_ark::{build_refund, escrow_terms, server_rules};
+    use coordinator_ark_escrow::{EntryEscrow, RefundSwap, RelativeTimelock, SwapTerms};
+    use coordinator_escrow::ark::{psbt_hex, ArkEscrowSpend, RefundPurpose};
+    use coordinator_escrow_verifier::lnurl_transport::fixtures::{
+        discovery_tls_fixture_times, FIXTURE_METADATA,
+    };
+    use dlctix::bitcoin::hashes::sha256;
+
+    const ESCROW_SATS: u64 = 100_100;
+    const REFUND_FEE_SATS: u64 = 100;
+    const REFUND_AT: u32 = 1_790_000_000;
+
+    let info = mock_info(&keypair(7));
+    let rules = server_rules(&info).unwrap();
+    let market_maker = keypair(18);
+    let entry_key = keypair(entry_secret(0)[0]);
+    let escrow = EntryEscrow::new(
+        escrow_terms(
+            &rules,
+            xonly(&entry_key),
+            xonly(&market_maker),
+            REFUND_AT,
+            REFUND_AT - 86_400,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    // The invoice the swap service pays, as the player's provider issues it: committed to that
+    // provider's metadata, for the escrow less the fee the player capped.
+    let preimage = [9u8; 32];
+    let paid_sats = ESCROW_SATS - REFUND_FEE_SATS;
+    let invoice = InvoiceBuilder::new(Currency::Regtest)
+        .amount_milli_satoshis(paid_sats * 1000)
+        .description_hash(sha256::Hash::from_byte_array(payout::sha256(
+            FIXTURE_METADATA.as_bytes(),
+        )))
+        .payment_hash(sha256::Hash::from_byte_array(payout::sha256(&preimage)))
+        .payment_secret(PaymentSecret([10; 32]))
+        .duration_since_epoch(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap(),
+        )
+        .expiry_time(Duration::from_secs(600))
+        .min_final_cltv_expiry_delta(18)
+        .build_signed(|hash| {
+            dlctix::bitcoin::secp256k1::Secp256k1::new().sign_ecdsa_recoverable(
+                hash,
+                &dlctix::bitcoin::secp256k1::SecretKey::from_slice(&[11; 32]).unwrap(),
+            )
+        })
+        .unwrap()
+        .to_string();
+
+    let deadline = dlctix::bitcoin::absolute::LockTime::from_consensus(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32
+            + 3_600,
+    );
+    let exit_delay = RelativeTimelock::Seconds(2048);
+    let swap = RefundSwap::new(SwapTerms {
+        player: xonly(&entry_key),
+        swapper: xonly(&keypair(30)),
+        server: rules.signer,
+        payment_hash: payout::sha256(&preimage),
+        deadline,
+        exit_delay,
+        unilateral_reclaim_delay: RelativeTimelock::Seconds(2048 + 512 * 100),
+    })
+    .unwrap();
+
+    // Each signature resolves the player's address again, so a provider answers once per one.
+    let (client, provider) = discovery_tls_fixture_times(2).await;
+    let consent = |lnurl, unfinished_keygen| Consent {
+        escrows: Some(std::slice::from_ref(&escrow)),
+        lightning_address: Some("alice+prize@wallet.example".into()),
+        max_refund_fee_sats: REFUND_FEE_SATS,
+        checkpoint_exit_script: hex::encode(info.checkpoint_tapscript.as_bytes()),
+        lnurl,
+        unfinished_keygen,
+    };
+    let harness = PoolHarness::start_with(pool_parameters(1), consent(Some(client), false)).await;
+
+    let refund = build_refund(
+        &info,
+        &escrow,
+        OutPoint::new(dlctix::bitcoin::Txid::from_byte_array([3u8; 32]), 0),
+        Amount::from_sat(ESCROW_SATS),
+        &swap,
+    )
+    .unwrap();
+    let spend = |purpose| ArkEscrowSpend::Refund {
+        purpose,
+        ark_psbt: psbt_hex(&refund.ark),
+        checkpoint_psbt: psbt_hex(&refund.checkpoint),
+        swap_tap_tree: hex::encode(swap.vtxo_script().encode_tap_tree()),
+    };
+    let sign = |purpose| {
+        let harness = &harness;
+        let invoice = invoice.clone();
+        async move {
+            harness
+                .service
+                .sign_ark_refund(
+                    &harness.session,
+                    harness.players[0].clone(),
+                    spend(purpose),
+                    invoice,
+                    REFUND_FEE_SATS,
+                )
+                .await
+        }
+    };
+
+    // The Ark transaction is signed first, before the server co-signs it; the checkpoint after.
+    let ark = sign(RefundPurpose::ArkTransaction).await.unwrap();
+    let checkpoint = sign(RefundPurpose::Checkpoint).await.unwrap();
+    provider.await.unwrap();
+    assert_ne!(ark, checkpoint, "each transaction signs its own digest");
+
+    // Each signature is the player's entry key over the digest the verifier derived.
+    let policy = coordinator_escrow::authorization::ArkEscrowPolicy {
+        escrow_tap_tree: hex::encode(escrow.vtxo_script().encode_tap_tree()),
+        max_fee_sats: 0,
+        max_refund_fee_sats: REFUND_FEE_SATS,
+        checkpoint_exit_script: hex::encode(info.checkpoint_tapscript.as_bytes()),
+    };
+    let secp = dlctix::bitcoin::secp256k1::Secp256k1::verification_only();
+    for (purpose, signature) in [
+        (RefundPurpose::ArkTransaction, ark),
+        (RefundPurpose::Checkpoint, checkpoint),
+    ] {
+        let (_, spent) =
+            coordinator_escrow::ark::refund_from(&escrow, &policy, &spend(purpose)).unwrap();
+        secp.verify_schnorr(
+            &dlctix::bitcoin::secp256k1::schnorr::Signature::from_slice(&signature).unwrap(),
+            &dlctix::bitcoin::secp256k1::Message::from_digest(spent.digest),
+            &xonly(&entry_key),
+        )
+        .expect("the player's entry key signed the refund");
+    }
+
+    // A competition cancelled before its pool filled never completed keygen, and its escrows
+    // must still be refundable.
+    let (client, second_provider) = discovery_tls_fixture_times(1).await;
+    let unfinished =
+        PoolHarness::start_with(pool_parameters(1), consent(Some(client), true)).await;
+    let refunded = unfinished
+        .service
+        .sign_ark_refund(
+            &unfinished.session,
+            unfinished.players[0].clone(),
+            spend(RefundPurpose::ArkTransaction),
+            invoice.clone(),
+            REFUND_FEE_SATS,
+        )
+        .await;
+    second_provider.await.unwrap();
+    refunded.expect("a pool that never completed keygen still refunds");
 }

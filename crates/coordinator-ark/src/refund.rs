@@ -12,7 +12,7 @@
 use ark_core::send::{build_offchain_transactions, SendReceiver, VtxoInput};
 use ark_core::ArkAddress;
 use bitcoin::{Amount, OutPoint, Psbt};
-use coordinator_ark_escrow::{EntryEscrow, EscrowPath};
+use coordinator_ark_escrow::{EntryEscrow, EscrowPath, RefundSwap};
 
 use crate::Error;
 
@@ -28,14 +28,20 @@ pub struct RefundTransactions {
 /// Build the transactions that refund `escrow`'s VTXO into `swap`.
 ///
 /// `outpoint` and `amount` come from the escrow's VTXO on the server. The refund can only be
-/// spent from the escrow's refund locktime, which fixes both transactions' locktimes.
+/// spent from the escrow's refund locktime, which fixes both transactions' locktimes. The whole
+/// VTXO goes to the swap, which is the only payment a verifier will authorize.
 pub fn build_refund(
     server: &ark_core::server::Info,
     escrow: &EntryEscrow,
     outpoint: OutPoint,
     amount: Amount,
-    swap: &ArkAddress,
+    swap: &RefundSwap,
 ) -> Result<RefundTransactions, Error> {
+    let swap = &ArkAddress::new(
+        server.network,
+        escrow.terms().server,
+        swap.vtxo_script().output_key(),
+    );
     let input = VtxoInput::new(
         escrow.script(EscrowPath::Refund).clone(),
         Some(escrow.terms().refund_locktime),

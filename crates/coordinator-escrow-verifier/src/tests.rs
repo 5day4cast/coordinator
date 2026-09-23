@@ -769,7 +769,7 @@ async fn preparation_rejects_forged_invoice_authorization_incomplete_signatures_
 async fn enclave_tls_prepares_automatic_invoice_and_disabled_instance_recovers_paid_claim() {
     let f = fixture(true);
     let (client, server) =
-        crate::lnurl_transport::tests::automatic_payout_tls_fixture(invoice()).await;
+        crate::lnurl_transport::fixtures::automatic_payout_tls_fixture(invoice()).await;
     let verifier = CoordinatorVerifier::with_lnurl(client);
     verifier
         .validate_registration(RegistrationView {
@@ -1512,7 +1512,7 @@ mod ark_escrow {
     #[cfg(feature = "lnurl")]
     #[tokio::test]
     async fn a_refund_pays_the_players_own_address_through_a_swap_committed_to_its_invoice() {
-        use crate::lnurl_transport::tests::{discovery_tls_fixture, FIXTURE_METADATA};
+        use crate::lnurl_transport::fixtures::{discovery_tls_fixture, FIXTURE_METADATA};
 
         let escrow = escrow_with(14, 18);
         let f = fixture_with(true, Some(policy_for(&escrow)));
@@ -1575,7 +1575,7 @@ mod ark_escrow {
     #[cfg(feature = "lnurl")]
     #[tokio::test]
     async fn a_refund_is_refused_unless_the_invoice_and_swap_are_the_players() {
-        use crate::lnurl_transport::tests::{discovery_tls_fixture, FIXTURE_METADATA};
+        use crate::lnurl_transport::fixtures::{discovery_tls_fixture, FIXTURE_METADATA};
 
         let escrow = escrow_with(14, 18);
         let f = fixture_with(true, Some(policy_for(&escrow)));
