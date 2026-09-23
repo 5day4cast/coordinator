@@ -22,7 +22,8 @@ use crate::{
     },
     domain::{
         AddEntry, Competition, CreateEvent, Error as DomainError, FundedContract, PayoutClaimInfo,
-        PayoutClaimReceipt, PayoutInfo, SearchBy, TicketResponse, TicketStatus, UserEntry,
+        PayoutClaimReceipt, PayoutInfo, SearchBy, TicketRefund, TicketResponse, TicketStatus,
+        UserEntry,
     },
     infra::lnurl::LightningAddress,
     startup::AppState,
@@ -116,6 +117,23 @@ pub async fn get_ticket_status(
         .map(Json)
         .map_err(|e| {
             error!("error getting ticket status: {:?}", e);
+            e.into()
+        })
+}
+
+/// Where a player's refund has got to, when their competition never kicked off.
+pub async fn get_ticket_refund(
+    NostrAuth { pubkey, .. }: NostrAuth,
+    State(state): State<Arc<AppState>>,
+    Path((competition_id, ticket_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Option<TicketRefund>>, ApiError> {
+    state
+        .coordinator
+        .get_ticket_refund(pubkey.to_hex(), competition_id, ticket_id)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            error!("error getting ticket refund: {:?}", e);
             e.into()
         })
 }

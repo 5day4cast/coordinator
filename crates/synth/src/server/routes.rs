@@ -29,9 +29,17 @@ struct HistoryParams {
     limit: Option<i64>,
 }
 
+/// How many of a scenario's recent runs the dashboard judges it by.
+const HEALTH_WINDOW: i64 = 20;
+
 async fn dashboard(State(runner): State<Runner>) -> impl IntoResponse {
     let last = runner.last_result().await;
     let runs = runner.db().list_runs(10).await.unwrap_or_default();
+    let health = runner
+        .db()
+        .scenario_health(HEALTH_WINDOW)
+        .await
+        .unwrap_or_default();
 
     Html(
         html! {
@@ -43,6 +51,44 @@ async fn dashboard(State(runner): State<Runner>) -> impl IntoResponse {
                 }
                 body {
                     h1 { "Synth Dashboard" }
+
+                    section.health {
+                        h2 { "Scenarios" }
+                        @if health.is_empty() {
+                            p { "No runs yet" }
+                        } @else {
+                            table {
+                                thead {
+                                    tr {
+                                        th { "Scenario" } th { "Last" } th { "Passing" }
+                                        th { "Last run" }
+                                    }
+                                }
+                                tbody {
+                                    @for scenario in &health {
+                                        tr {
+                                            td { (scenario.scenario) }
+                                            td {
+                                                span class=(format!("badge {}", scenario.last_status)) {
+                                                    (scenario.last_status)
+                                                }
+                                            }
+                                            td {
+                                                (scenario.passed) "/" (scenario.runs)
+                                                @if scenario.failed > 0 {
+                                                    span.error { " (" (scenario.failed) " failed)" }
+                                                }
+                                            }
+                                            td { (scenario.last_started_at) }
+                                        }
+                                    }
+                                }
+                            }
+                            p.note {
+                                "Of the last " (HEALTH_WINDOW) " runs of each scenario."
+                            }
+                        }
+                    }
 
                     section.status {
                         h2 { "Last Run" }
@@ -106,6 +152,9 @@ async fn dashboard(State(runner): State<Runner>) -> impl IntoResponse {
                         h2 { "Actions" }
                         form method="POST" action="/api/run" {
                             button type="submit" { "Run Full Lifecycle" }
+                        }
+                        form method="POST" action="/api/run?scenario=escrow_refund" {
+                            button type="submit" { "Run Escrow Refund" }
                         }
                     }
                 }
@@ -191,5 +240,6 @@ th { background: #16213e; }
 .result { padding: 15px; background: #16213e; border-radius: 8px; margin: 10px 0; }
 button { background: #7b68ee; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-family: monospace; }
 button:hover { background: #6a5acd; }
-form { margin: 10px 0; }
+form { margin: 10px 0; display: inline-block; margin-right: 8px; }
+.note { color: #888; font-size: 0.85em; }
 "#;

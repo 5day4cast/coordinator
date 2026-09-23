@@ -19,7 +19,18 @@ pub struct TestRun {
     pub config_json: Option<String>,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+/// A scenario's recent record, for the dashboard.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct ScenarioHealth {
+    pub scenario: String,
+    pub runs: i64,
+    pub passed: i64,
+    pub failed: i64,
+    pub last_started_at: String,
+    pub last_status: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
 pub struct TestStep {
     pub id: String,
     pub run_id: String,
@@ -159,6 +170,47 @@ impl SynthDb {
         Ok(runs)
     }
 
+    /// How each scenario has been doing, most recently run first.
+    ///
+    /// A scenario is only as good as its last runs, so this counts the recent window rather than
+    /// all of history: a run that failed a month ago says nothing about the deployment today.
+    pub async fn scenario_health(&self, window: i64) -> Result<Vec<ScenarioHealth>> {
+        let health = sqlx::query_as::<_, ScenarioHealth>(
+            "WITH recent AS (
+                 SELECT scenario, status, started_at, completed_at,
+                        ROW_NUMBER() OVER (PARTITION BY scenario ORDER BY started_at DESC) AS age
+                 FROM test_runs
+             )
+             SELECT scenario,
+                    COUNT(*) AS runs,
+                    SUM(CASE WHEN status = 'passed' THEN 1 ELSE 0 END) AS passed,
+                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                    MAX(started_at) AS last_started_at,
+                    (SELECT status FROM recent inner_recent
+                      WHERE inner_recent.scenario = recent.scenario AND inner_recent.age = 1)
+                      AS last_status
+             FROM recent WHERE age <= ?
+             GROUP BY scenario ORDER BY last_started_at DESC",
+        )
+        .bind(window)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(health)
+    }
+
+    /// The steps of a run, in the order they ran.
+    pub async fn run_steps(&self, run_id: &str) -> Result<Vec<TestStep>> {
+        let steps = sqlx::query_as::<_, TestStep>(
+            "SELECT * FROM test_steps WHERE run_id = ? ORDER BY started_at",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(steps)
+    }
+
     pub async fn get_run(&self, id: &str) -> Result<Option<TestRun>> {
         let run = sqlx::query_as::<_, TestRun>("SELECT * FROM test_runs WHERE id = ?")
             .bind(id)
@@ -269,5 +321,48 @@ impl SynthDb {
             .await?;
 
         Ok(users)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scenario is judged by its recent runs, so an old failure must not follow it forever.
+    #[tokio::test]
+    async fn health_counts_a_scenario_by_its_recent_runs() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synth.sqlite");
+        let db = SynthDb::new(path.to_str().unwrap()).await.unwrap();
+
+        let run = |db: SynthDb, scenario: &'static str, error: Option<&'static str>| async move {
+            let id = db.create_run(scenario, None).await.unwrap();
+            db.complete_run(&id, error).await.unwrap();
+        };
+        run(db.clone(), "escrow_refund", Some("no refund")).await;
+        run(db.clone(), "escrow_refund", None).await;
+        run(db.clone(), "full_lifecycle", None).await;
+
+        let health = db.scenario_health(20).await.unwrap();
+        let refund = health
+            .iter()
+            .find(|health| health.scenario == "escrow_refund")
+            .expect("the refund scenario is listed");
+        assert_eq!((refund.runs, refund.passed, refund.failed), (2, 1, 1));
+        assert_eq!(refund.last_status, "passed", "its latest run decides");
+
+        // Narrowing the window drops the older failure, leaving only what it did last.
+        let recent = db.scenario_health(1).await.unwrap();
+        let refund = recent
+            .iter()
+            .find(|health| health.scenario == "escrow_refund")
+            .unwrap();
+        assert_eq!((refund.runs, refund.passed, refund.failed), (1, 1, 0));
+
+        // Scenarios are listed by when they last ran, most recent first.
+        assert_eq!(
+            health.iter().map(|h| h.scenario.as_str()).collect::<Vec<_>>(),
+            ["full_lifecycle", "escrow_refund"]
+        );
     }
 }

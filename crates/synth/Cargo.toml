@@ -73,3 +73,6 @@ config.workspace = true
 # Metrics
 prometheus.workspace = true
 lazy_static.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,5 +1,6 @@
 mod ark_kickoff;
 mod ark_refund;
+pub use ark_refund::TicketRefund;
 mod ark_store;
 mod automatic_store;
 mod coordinator;

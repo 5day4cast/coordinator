@@ -38,7 +38,62 @@ const SWAP_DEADLINE: Duration = Duration::from_secs(60 * 60);
 /// How long a refund's payment may take before this gives up and retries later.
 const REFUND_PAYMENT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// What a player is told about their refund.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TicketRefund {
+    /// minted, submitting, submitted, paid, or settled.
+    pub state: String,
+    /// What the player is paid, after the swap service's fee.
+    pub paid_sats: u64,
+    /// The Arkade transaction that moved the escrow into the swap.
+    pub ark_txid: Option<String>,
+    /// UNIX seconds.
+    pub updated_at: i64,
+}
+
 impl Coordinator {
+    /// The refund of a player's own ticket, once their competition has one.
+    pub async fn get_ticket_refund(
+        &self,
+        user_pubkey: String,
+        competition_id: Uuid,
+        ticket_id: Uuid,
+    ) -> Result<Option<TicketRefund>, Error> {
+        let ticket = self
+            .competition_store
+            .get_ticket(ticket_id)
+            .await
+            .map_err(|e| match e {
+                sqlx::Error::RowNotFound => Error::NotFound("Ticket not found".into()),
+                e => Error::from(e),
+            })?;
+        if ticket.competition_id != competition_id {
+            return Err(Error::BadRequest(
+                "Ticket does not belong to this competition".into(),
+            ));
+        }
+        if ticket.reserved_by.as_deref() != Some(&user_pubkey) {
+            return Err(Error::BadRequest("Ticket not reserved by this user".into()));
+        }
+        let Some(refund) = self.competition_store.ticket_ark_refund(ticket_id).await? else {
+            return Ok(None);
+        };
+        let escrow = self
+            .competition_store
+            .ticket_ark_escrow(ticket_id, &ticket.hash)
+            .await?;
+        let paid_sats = escrow
+            .and_then(|escrow| escrow.vtxo_sats)
+            .unwrap_or_default()
+            .saturating_sub(refund.fee_sats);
+        Ok(Some(TicketRefund {
+            state: refund.state.as_str().into(),
+            paid_sats,
+            ark_txid: refund.ark_txid,
+            updated_at: refund.updated_at,
+        }))
+    }
+
     /// Refund every funded escrow of a competition that will never kick off.
     ///
     /// Runs from the cleanup queue, so a refund that cannot finish now is retried later: a
