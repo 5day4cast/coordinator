@@ -338,23 +338,23 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force || true
-      - uses: DeterminateSystems/nix-installer-action@main
       # The lab's attic cache keeps what earlier runs built, including the flake's
       # workspaceDeps, so an unchanged lockfile skips the dependency build. Set the
       # ATTIC_ENDPOINT, ATTIC_CACHE and ATTIC_PUBLIC_KEY variables and the ATTIC_TOKEN
-      # secret to turn it on; without them the images build from scratch.
-      - name: Substitute from the lab's Nix cache
+      # secret to turn it on; without them the images build from scratch. Determinate
+      # Nix owns /etc/nix/nix.conf, so extra-conf is the only place these settings stick.
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            ${{ vars.ATTIC_ENDPOINT != '' && format('extra-substituters = {0}/{1}', vars.ATTIC_ENDPOINT, vars.ATTIC_CACHE) || '' }}
+            ${{ vars.ATTIC_ENDPOINT != '' && format('extra-trusted-public-keys = {0}', vars.ATTIC_PUBLIC_KEY) || '' }}
+      - name: Confirm the lab's Nix cache is in use
         if: vars.ATTIC_ENDPOINT != ''
         env:
           ATTIC_ENDPOINT: ${{ vars.ATTIC_ENDPOINT }}
-          ATTIC_CACHE: ${{ vars.ATTIC_CACHE }}
-          ATTIC_PUBLIC_KEY: ${{ vars.ATTIC_PUBLIC_KEY }}
         run: |
-          {
-            echo "extra-substituters = ${ATTIC_ENDPOINT%/}/$ATTIC_CACHE"
-            echo "extra-trusted-public-keys = $ATTIC_PUBLIC_KEY"
-          } | sudo tee -a /etc/nix/nix.conf
-          sudo systemctl restart nix-daemon
+          nix config show | grep -F "$ATTIC_ENDPOINT" \
+            || echo "::warning::Nix is not using $ATTIC_ENDPOINT; the images will build from scratch"
       - name: Build images from the committed flake lock
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}

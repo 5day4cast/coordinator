@@ -183,7 +183,13 @@
 
           nativeBuildInputs = [
             wasm-bindgen-cli
+            pkgs.removeReferencesTo
           ];
+
+          # The module's panic locations name the toolchain's and the vendored crates' store
+          # paths. Left in, they made every image serving the UI carry the whole Rust
+          # toolchain and all crate sources. The browser needs nothing from the store.
+          allowedReferences = [ ];
 
           buildPhase = ''
             # Run wasm-bindgen to generate JS bindings
@@ -197,6 +203,8 @@
           installPhase = ''
             mkdir -p $out/pkg
             cp -r pkg/* $out/pkg/
+            find $out/pkg -type f -exec remove-references-to \
+              -t ${rustToolchain} -t ${craneLib.vendorCargoDeps { inherit src; }} {} +
           '';
         };
 
@@ -206,6 +214,8 @@
           version = workspaceVersion;
           inherit src;
           cargoArtifacts = workspaceDeps;
+          # CI's test job runs the suite; the release packages only build.
+          doCheck = false;
           buildInputs = commonBuildInputs;
           nativeBuildInputs = commonNativeBuildInputs;
           cargoExtraArgs = "--bin coordinator";
@@ -228,6 +238,7 @@
           version = workspaceVersion;
           inherit src;
           cargoArtifacts = workspaceDeps;
+          doCheck = false;
           buildInputs = commonBuildInputs;
           nativeBuildInputs = commonNativeBuildInputs;
           cargoExtraArgs = "--bin wallet-cli";
@@ -239,6 +250,7 @@
           version = workspaceVersion;
           inherit src;
           cargoArtifacts = workspaceDeps;
+          doCheck = false;
           buildInputs = commonBuildInputs;
           nativeBuildInputs = commonNativeBuildInputs;
           cargoExtraArgs = "--bin synth --bin coord";
@@ -251,6 +263,7 @@
           version = workspaceVersion;
           inherit src;
           cargoArtifacts = workspaceDeps;
+          doCheck = false;
           buildInputs = commonBuildInputs;
           nativeBuildInputs = commonNativeBuildInputs;
           cargoExtraArgs = "-p coordinator-verifier-enclave --bin coordinator-verifier-enclave"
@@ -263,6 +276,7 @@
           version = workspaceVersion;
           inherit src;
           cargoArtifacts = workspaceDeps;
+          doCheck = false;
           buildInputs = commonBuildInputs;
           nativeBuildInputs = commonNativeBuildInputs;
           cargoExtraArgs = "-p coordinator-lnurl-relay --bin coordinator-lnurl-relay";
