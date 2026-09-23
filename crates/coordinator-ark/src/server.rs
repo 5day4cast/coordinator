@@ -2,19 +2,12 @@
 
 use ark_core::server::{GetVtxosRequest, Info, VirtualTxOutPoint};
 use bitcoin::absolute::LockTime;
-use bitcoin::{Network, Psbt, Txid, XOnlyPublicKey};
+use bitcoin::{Network, XOnlyPublicKey};
 use coordinator_ark_escrow::{
     EntryEscrow, EscrowTerms, RelativeTimelock, ServerRules, MAINNET_HRP, TESTNET_HRP,
 };
 
 use crate::Error;
-
-/// What the server returns for a submitted offchain spend: its own signatures on the Ark
-/// transaction, and the checkpoints still waiting for the owner's.
-pub struct OffchainSubmission {
-    pub ark_tx: Psbt,
-    pub checkpoints: Vec<Psbt>,
-}
 
 /// A connected Arkade server and its `/v1/info`.
 #[derive(Clone)]
@@ -37,6 +30,20 @@ impl ArkServer {
         let rules = server_rules(&info)?;
         Ok(Self {
             client,
+            info,
+            rules,
+        })
+    }
+
+    /// A server whose parameters are known but which is never called.
+    ///
+    /// Tests answer its calls through an [`crate::ArkTransport`] instead, so they need no server
+    /// running. Its client is unconnected, and using it for a call fails.
+    #[cfg(feature = "test-utils")]
+    pub fn offline(info: Info) -> Result<Self, Error> {
+        let rules = server_rules(&info)?;
+        Ok(Self {
+            client: ark_grpc::Client::new("http://offline.invalid".into()),
             info,
             rules,
         })
@@ -71,37 +78,6 @@ impl ArkServer {
         created_at: u32,
     ) -> Result<EscrowTerms, Error> {
         escrow_terms(&self.rules, player, coordinator, refund_at, created_at)
-    }
-
-    /// Submit an offchain spend for the server to co-sign, leaving it pending.
-    ///
-    /// The owner signs the Ark transaction first, because the server's signatures come back with
-    /// this call; the checkpoints it returns are then signed and handed to [`Self::finalize_offchain`].
-    pub async fn submit_offchain(
-        &self,
-        ark_tx: Psbt,
-        checkpoints: Vec<Psbt>,
-    ) -> Result<OffchainSubmission, Error> {
-        let response = self
-            .client
-            .submit_offchain_transaction_request(ark_tx, checkpoints)
-            .await?;
-        Ok(OffchainSubmission {
-            ark_tx: response.signed_ark_tx,
-            checkpoints: response.signed_checkpoint_txs,
-        })
-    }
-
-    /// Finalize a submitted spend, once its checkpoints carry every signature.
-    pub async fn finalize_offchain(
-        &self,
-        ark_txid: Txid,
-        checkpoints: Vec<Psbt>,
-    ) -> Result<(), Error> {
-        self.client
-            .finalize_offchain_transaction(ark_txid, checkpoints)
-            .await?;
-        Ok(())
     }
 
     /// Build an escrow and confirm this server will accept it in a batch.
