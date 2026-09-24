@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+    SqlitePool,
+};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -111,9 +114,15 @@ impl SynthDb {
         }
 
         let url = format!("sqlite:{}?mode=rwc", path);
+        // The tracker can backfill thousands of old runs. Its commits must not block page
+        // readers, and a confirmed money trail must remain durable across a power loss.
+        let options = url
+            .parse::<SqliteConnectOptions>()?
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Full);
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(&url)
+            .connect_with(options)
             .await
             .context("Failed to connect to SQLite database")?;
 
@@ -218,6 +227,12 @@ impl SynthDb {
         sqlx::query("CREATE INDEX IF NOT EXISTS test_runs_by_start ON test_runs (started_at)")
             .execute(&self.pool)
             .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS test_runs_by_scenario_start \
+             ON test_runs (scenario, started_at DESC, status)",
+        )
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
@@ -367,7 +382,7 @@ impl SynthDb {
     pub async fn scenario_health(&self, window: i64) -> Result<Vec<ScenarioHealth>> {
         let health = sqlx::query_as::<_, ScenarioHealth>(
             "WITH recent AS (
-                 SELECT scenario, status, started_at, completed_at,
+                 SELECT scenario, status, started_at,
                         ROW_NUMBER() OVER (PARTITION BY scenario ORDER BY started_at DESC) AS age
                  FROM test_runs
              )
@@ -575,6 +590,47 @@ impl SynthDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Even an exclusive backfill transaction leaves pages reading the last committed state.
+    #[tokio::test]
+    async fn dashboard_reads_continue_while_a_tracker_write_is_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = SynthDb::new(directory.path().join("synth.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        let run_id = db.create_run("full_lifecycle", None).await.unwrap();
+        db.complete_run(&run_id, None).await.unwrap();
+        let details = serde_json::json!({"competition_id": Uuid::now_v7()}).to_string();
+        db.add_step(&run_id, "create_competition", 1, None, Some(&details))
+            .await
+            .unwrap();
+
+        let mut writer = db.pool.acquire().await.unwrap();
+        // Open the reader before taking the writer lock, as production's pool does.
+        let reader = db.pool.acquire().await.unwrap();
+        sqlx::query("BEGIN EXCLUSIVE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE test_runs SET status = 'failed' WHERE id = ?")
+            .bind(&run_id)
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        drop(reader);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            assert_eq!(db.list_runs(10).await.unwrap()[0].status, "passed");
+            assert_eq!(db.get_run(&run_id).await.unwrap().unwrap().status, "passed");
+            assert_eq!(db.scenario_health(20).await.unwrap()[0].passed, 1);
+            assert_eq!(db.runs_to_follow().await.unwrap().len(), 1);
+        })
+        .await
+        .expect("page reads must not wait for the writer to commit");
+
+        sqlx::query("COMMIT").execute(&mut *writer).await.unwrap();
+        assert_eq!(db.get_run(&run_id).await.unwrap().unwrap().status, "failed");
+    }
 
     /// A scenario is judged by its recent runs, so an old failure must not follow it forever.
     #[tokio::test]
