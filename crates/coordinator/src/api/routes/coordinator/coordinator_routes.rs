@@ -65,6 +65,16 @@ pub struct TicketRequest {
     pub payout: Option<coordinator_core::PayoutRegistrationRequest>,
 }
 
+/// A ticket with its invoice's QR code, which the entry form shows as an
+/// image instead of loading a QR script.
+#[derive(Debug, Serialize)]
+pub struct TicketWithQr {
+    #[serde(flatten)]
+    pub ticket: TicketResponse,
+    /// `data:image/svg+xml` URL of the invoice's QR code.
+    pub payment_request_qr: Option<String>,
+}
+
 /// Request a competition ticket to enter the DLC
 ///
 /// This endpoint:
@@ -84,16 +94,6 @@ pub struct TicketRequest {
 /// - The HODL invoice (revealed to user when coordinator settles the invoice)
 /// - The ticket secret (to claim winnings if user wins the DLC)
 /// - The escrow transaction refund path (to claim refund if needed)
-/// A ticket with its invoice's QR code, which the entry form shows as an
-/// image instead of loading a QR script.
-#[derive(Debug, Serialize)]
-pub struct TicketWithQr {
-    #[serde(flatten)]
-    pub ticket: TicketResponse,
-    /// `data:image/svg+xml` URL of the invoice's QR code.
-    pub payment_request_qr: Option<String>,
-}
-
 pub async fn request_competition_ticket(
     State(state): State<Arc<AppState>>,
     Path(competition_id): Path<Uuid>,
