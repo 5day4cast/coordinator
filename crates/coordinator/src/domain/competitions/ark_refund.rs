@@ -26,10 +26,10 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{ArkRefundState, Coordinator, TicketArkEscrow, TicketArkRefund};
-use crate::domain::{Error, UserEntry};
-use crate::domain::PaymentStatus;
-use coordinator_escrow::authorization::PayoutPolicy;
 use crate::domain::competitions::EntryStatus;
+use crate::domain::PaymentStatus;
+use crate::domain::{Error, UserEntry};
+use coordinator_escrow::authorization::PayoutPolicy;
 
 /// How long a refund's swap waits for its payment before the player may take it back. The
 /// verifier bounds this too, so a swap minted with anything wilder is refused.
@@ -129,7 +129,10 @@ impl Coordinator {
                 warn!("Ticket {ticket_id} has an escrow but no paid entry to refund");
                 continue;
             };
-            if let Err(e) = self.refund_ark_escrow(ark, competition_id, escrow, entry).await {
+            if let Err(e) = self
+                .refund_ark_escrow(ark, competition_id, escrow, entry)
+                .await
+            {
                 warn!("Cannot refund the escrow of ticket {ticket_id} yet: {e}");
             }
         }
@@ -166,7 +169,10 @@ impl Coordinator {
         let (escrow_script, outpoint, sats) = self.refundable(&escrow)?;
         let refund = match refund {
             Some(refund) => refund,
-            None => self.mint_refund(ark, &escrow, entry, &escrow_script, sats).await?,
+            None => {
+                self.mint_refund(ark, &escrow, entry, &escrow_script, sats)
+                    .await?
+            }
         };
         let swap = self.refund_swap(ark, &refund).await?;
 
@@ -232,7 +238,9 @@ impl Coordinator {
             .context("the escrow has no funded VTXO")?
             .parse()
             .map_err(|e| anyhow!("The escrow's VTXO outpoint is invalid: {e}"))?;
-        let sats = escrow.vtxo_sats.context("the escrow has no recorded value")?;
+        let sats = escrow
+            .vtxo_sats
+            .context("the escrow has no recorded value")?;
         Ok((entry, outpoint, sats))
     }
 
@@ -579,13 +587,7 @@ impl Coordinator {
             .await
             .map_err(|e| anyhow!("ark-swapd cannot claim the refund's swap: {e}"))?;
         self.competition_store
-            .advance_ticket_ark_refund(
-                refund.ticket_id,
-                ArkRefundState::Settled,
-                None,
-                None,
-                None,
-            )
+            .advance_ticket_ark_refund(refund.ticket_id, ArkRefundState::Settled, None, None, None)
             .await?;
         Ok(())
     }

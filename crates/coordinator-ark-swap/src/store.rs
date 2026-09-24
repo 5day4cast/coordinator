@@ -443,8 +443,15 @@ mod tests {
                 .map(|found| found.id),
             Some(refund.id)
         );
-        assert!(store.insert_refund(&refund_for(&refund.payment_hash)).await.is_err());
-        assert!(store.refund_for_hash(&"cd".repeat(32)).await.unwrap().is_none());
+        assert!(store
+            .insert_refund(&refund_for(&refund.payment_hash))
+            .await
+            .is_err());
+        assert!(store
+            .refund_for_hash(&"cd".repeat(32))
+            .await
+            .unwrap()
+            .is_none());
 
         // It waits to be claimed while it is minted or paid, and not afterwards.
         let unclaimed = |store: Store| async move {

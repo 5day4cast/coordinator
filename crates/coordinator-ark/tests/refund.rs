@@ -47,9 +47,7 @@ fn swap(info: &ark_core::server::Info) -> RefundSwap {
         deadline,
         exit_delay,
         unilateral_reclaim_delay: SwapTerms::unilateral_reclaim_delay_for(
-            deadline,
-            exit_delay,
-            REFUND_AT,
+            deadline, exit_delay, REFUND_AT,
         )
         .unwrap(),
     })
@@ -135,5 +133,7 @@ fn a_refund_to_another_swap_is_not_authorized() {
         checkpoint_psbt: psbt_hex(&refund.checkpoint),
         swap_tap_tree: hex::encode(swap.vtxo_script().encode_tap_tree()),
     };
-    assert!(coordinator_escrow::ark::refund_from(&escrow, &policy(&escrow, &info), &spend).is_err());
+    assert!(
+        coordinator_escrow::ark::refund_from(&escrow, &policy(&escrow, &info), &spend).is_err()
+    );
 }

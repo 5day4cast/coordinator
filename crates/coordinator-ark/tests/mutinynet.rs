@@ -68,7 +68,10 @@ async fn mutinynet_publishes_its_checkpoint_exit_script() {
     let server = ArkServer::connect(url).await.unwrap();
     let exit_script = &server.info().checkpoint_tapscript;
     println!("checkpoint exit script {}", exit_script.to_hex_string());
-    assert!(!exit_script.is_empty(), "the server publishes no checkpoint exit script");
+    assert!(
+        !exit_script.is_empty(),
+        "the server publishes no checkpoint exit script"
+    );
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

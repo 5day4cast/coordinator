@@ -298,14 +298,11 @@ mod tests {
         let swap = RefundSwap::new(terms()).unwrap();
         let vtxo = swap.vtxo_script();
         for leaf in vtxo.scripts() {
-            assert!(vtxo
-                .control_block(leaf)
-                .unwrap()
-                .verify_taproot_commitment(
-                    &Secp256k1::verification_only(),
-                    vtxo.output_key().to_x_only_public_key(),
-                    leaf,
-                ));
+            assert!(vtxo.control_block(leaf).unwrap().verify_taproot_commitment(
+                &Secp256k1::verification_only(),
+                vtxo.output_key().to_x_only_public_key(),
+                leaf,
+            ));
         }
     }
 

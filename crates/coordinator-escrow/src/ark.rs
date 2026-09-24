@@ -23,9 +23,7 @@ use dlctix::bitcoin::hashes::Hash;
 use dlctix::bitcoin::sighash::{Prevouts, SighashCache};
 use dlctix::bitcoin::taproot::LeafVersion;
 pub use dlctix::bitcoin::XOnlyPublicKey;
-use dlctix::bitcoin::{
-    OutPoint, Psbt, ScriptBuf, TapLeafHash, TapSighashType, Transaction, TxOut,
-};
+use dlctix::bitcoin::{OutPoint, Psbt, ScriptBuf, TapLeafHash, TapSighashType, Transaction, TxOut};
 use dlctix::{ContractSignatures, Outcome};
 use serde::{Deserialize, Serialize};
 
@@ -585,7 +583,8 @@ mod refund_tests {
     const REFUND_AT: u32 = 1_790_000_000;
     const VALUE: Amount = Amount::from_sat(50_000);
     /// Stands in for the Arkade server's checkpoint exit script.
-    const EXIT_SCRIPT: &str = "20aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac";
+    const EXIT_SCRIPT: &str =
+        "20aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac";
 
     fn xonly(byte: u8) -> XOnlyPublicKey {
         let secp = dlctix::bitcoin::key::Secp256k1::new();

@@ -72,8 +72,14 @@ mod tests {
         let checkpoint = checkpoint_script_pubkey(&spend, &exit).unwrap();
         assert!(checkpoint.is_p2tr());
         // Either leaf decides the output, so a proposed spend cannot substitute its own.
-        assert_ne!(checkpoint, checkpoint_script_pubkey(&leaf(3), &exit).unwrap());
-        assert_ne!(checkpoint, checkpoint_script_pubkey(&spend, &leaf(3)).unwrap());
+        assert_ne!(
+            checkpoint,
+            checkpoint_script_pubkey(&leaf(3), &exit).unwrap()
+        );
+        assert_ne!(
+            checkpoint,
+            checkpoint_script_pubkey(&spend, &leaf(3)).unwrap()
+        );
         // BIP341 sorts siblings by hash, so the two leaves may be given in either order.
         assert_eq!(checkpoint, checkpoint_script_pubkey(&exit, &spend).unwrap());
     }

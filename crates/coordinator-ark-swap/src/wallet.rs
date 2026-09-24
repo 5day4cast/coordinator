@@ -23,10 +23,10 @@ use ark_core::send::{
 use ark_core::server::GetVtxosRequest;
 use ark_core::{ArkAddress, ExplorerUtxo};
 use bitcoin::key::{Keypair, Secp256k1};
-use bitcoin::secp256k1::SecretKey;
-use bitcoin::{Address, Amount, OutPoint, Transaction, Txid};
 use bitcoin::psbt;
+use bitcoin::secp256k1::SecretKey;
 use bitcoin::secp256k1::{self, schnorr};
+use bitcoin::{Address, Amount, OutPoint, Transaction, Txid};
 use coordinator_ark::{ArkServer, ArkTransport};
 use coordinator_ark_escrow::{RefundSwap, SwapPath};
 use serde::Serialize;
@@ -234,7 +234,10 @@ impl ArkWallet {
 
         let sign = |input: &mut psbt::Input,
                     message: secp256k1::Message|
-         -> Result<Vec<(schnorr::Signature, bitcoin::XOnlyPublicKey)>, ark_core::Error> {
+         -> Result<
+            Vec<(schnorr::Signature, bitcoin::XOnlyPublicKey)>,
+            ark_core::Error,
+        > {
             input
                 .unknown
                 .insert(condition_key(), encode_witness(&[preimage.to_vec()]));

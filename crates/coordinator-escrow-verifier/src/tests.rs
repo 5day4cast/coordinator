@@ -1399,11 +1399,7 @@ mod ark_escrow {
     }
 
     /// One transaction of an offchain spend, spending the escrow's refund leaf.
-    fn offchain_tx(
-        escrow: &EntryEscrow,
-        prevout: (OutPoint, TxOut),
-        outputs: Vec<TxOut>,
-    ) -> Psbt {
+    fn offchain_tx(escrow: &EntryEscrow, prevout: (OutPoint, TxOut), outputs: Vec<TxOut>) -> Psbt {
         let mut psbt = Psbt::from_unsigned_tx(Transaction {
             version: Version::non_standard(3),
             lock_time: LockTime::from_consensus(REFUND_AT),

@@ -444,8 +444,7 @@ fn check_refund(
     invoice: &str,
     owed_sats: u64,
 ) -> Result<(), VerificationError> {
-    if context.rule != generic::ARK_REFUND_RULE
-        || context.permission_id != generic::SIGN_ARK_REFUND
+    if context.rule != generic::ARK_REFUND_RULE || context.permission_id != generic::SIGN_ARK_REFUND
     {
         return Err(invalid("Escrow refund permission differs"));
     }
@@ -463,7 +462,9 @@ fn check_refund(
         .checked_sub(owed_sats)
         .ok_or_else(|| invalid("Prepared refund pays more than the escrow holds"))?;
     if ark::refund_invoice_sats(&refund, fee_sats, ark_policy).map_err(invalid)? != owed_sats {
-        return Err(invalid("Prepared refund pays the player a different amount"));
+        return Err(invalid(
+            "Prepared refund pays the player a different amount",
+        ));
     }
     let parsed = payout::validate_prepared_invoice(invoice, owed_sats, terms.network)
         .map_err(|_| invalid("Prepared refund invoice is invalid"))?;

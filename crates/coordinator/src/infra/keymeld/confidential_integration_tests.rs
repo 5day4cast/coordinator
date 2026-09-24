@@ -1087,7 +1087,8 @@ async fn keymeld_kicks_off_a_pool_on_mutinynet() {
     params.funding_value = total;
     params.event.expiry = Some(expiry_height);
     params.relative_locktime_block_delta = 2;
-    let harness = PoolHarness::start_with(params.clone(), Consent::to_escrows(Some(&escrows))).await;
+    let harness =
+        PoolHarness::start_with(params.clone(), Consent::to_escrows(Some(&escrows))).await;
     harness
         .service
         .bind_payout_contract(
@@ -1313,8 +1314,7 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_funded() {
     // A competition cancelled before its pool filled never completed keygen, and its escrows
     // must still be refundable.
     let (client, second_provider) = discovery_tls_fixture_times(1).await;
-    let unfinished =
-        PoolHarness::start_with(pool_parameters(1), consent(Some(client), true)).await;
+    let unfinished = PoolHarness::start_with(pool_parameters(1), consent(Some(client), true)).await;
     let refunded = unfinished
         .service
         .sign_ark_refund(

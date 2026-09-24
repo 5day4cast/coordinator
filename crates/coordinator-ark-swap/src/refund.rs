@@ -52,9 +52,7 @@ impl Swapper {
             deadline: locktime,
             exit_delay,
             unilateral_reclaim_delay: SwapTerms::unilateral_reclaim_delay_for(
-                locktime,
-                exit_delay,
-                created_at,
+                locktime, exit_delay, created_at,
             )?,
         })?;
         self.wallet.accepts(swap.vtxo_script())?;
