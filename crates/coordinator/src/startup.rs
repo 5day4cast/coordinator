@@ -21,8 +21,9 @@ use crate::{
     },
     config::Settings,
     domain::{
-        CompetitionRunners, CompetitionStore, CompetitionWakes, Coordinator, InvoiceSubscriber,
-        InvoiceWatcher, PaymentSubscriber, PayoutWatcher, UserInfo, UserStore,
+        leaderboard::Leaderboards, CompetitionRunners, CompetitionStore, CompetitionWakes,
+        Coordinator, InvoiceSubscriber, InvoiceWatcher, PaymentSubscriber, PayoutWatcher, UserInfo,
+        UserStore,
     },
     infra::{
         bitcoin::{Bitcoin, BitcoinClient, BitcoinSyncWatcher},
@@ -280,6 +281,8 @@ pub struct AppState {
     pub bitcoin: Arc<dyn Bitcoin>,
     pub coordinator: Arc<Coordinator>,
     pub users_info: Arc<UserInfo>,
+    /// Leaderboards and the oracle weather pages show, served from a background cache.
+    pub leaderboards: Arc<Leaderboards>,
     pub lnurl: Arc<dyn LnurlPay>,
     pub background_threads: Arc<HashMap<String, JoinHandle<()>>>,
     pub forgot_password_challenges: Arc<RwLock<HashMap<String, (String, std::time::Instant)>>>,
@@ -664,6 +667,15 @@ pub async fn build_app(
     );
 
     threads.insert("payment_subscriber".to_string(), payment_subscriber_handle);
+
+    // Pages read the oracle's weather from a cache this keeps fresh, never from the oracle.
+    let users_info = Arc::new(UserInfo::new(users_store));
+    let leaderboards = Arc::new(Leaderboards::new(
+        coordinator.clone(),
+        users_info.clone(),
+        &config.coordinator_settings.oracle_url,
+    )?);
+    leaderboards.spawn_refresher(&tracker, cancel_token.clone());
     tracker.close();
 
     let wasm_version = crate::api::ui_files::package_version(&config.ui_settings.ui_dir);
@@ -686,7 +698,8 @@ pub async fn build_app(
         oracle_url: config.coordinator_settings.oracle_url,
         network: config.bitcoin_settings.network.to_string(),
         coordinator,
-        users_info: Arc::new(UserInfo::new(users_store)),
+        users_info,
+        leaderboards,
         lnurl,
         bitcoin: bitcoin_client,
         background_threads: Arc::new(threads),

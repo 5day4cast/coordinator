@@ -1626,6 +1626,8 @@ impl CompetitionStore {
             .await
     }
 
+    /// Reserved tickets whose invoice may still change: not settled, and not recorded as
+    /// cancelled. A cancelled invoice is final; the ticket's escrow, if any, is cleanup's job.
     pub async fn get_pending_tickets(&self) -> Result<Vec<Ticket>, sqlx::Error> {
         let tickets = sqlx::query_as::<_, Ticket>(
             r#"SELECT tickets.id as id,
@@ -1646,6 +1648,7 @@ impl CompetitionStore {
                LEFT JOIN entries ON tickets.id = entries.ticket_id
                WHERE reserved_at IS NOT NULL
                  AND settled_at IS NULL
+                 AND invoice_cancelled_at IS NULL
                  AND payment_request IS NOT NULL
                  AND tickets.id NOT IN (SELECT ticket_id FROM ticket_ark_escrows)"#,
         )

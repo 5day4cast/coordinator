@@ -179,8 +179,21 @@ impl Coordinator {
                 }
             };
             if swap.state.escrow_funded() {
-                let Some(vtxo) = swap.escrow_vtxo.clone() else {
-                    warn!("Escrow swap {} reports funding without a VTXO", swap.id);
+                let vtxo = match swap.escrow_vtxo.clone() {
+                    Some(vtxo) => Some(vtxo),
+                    None => self.find_swap_escrow_vtxo(ark, &pending, &swap).await,
+                };
+                let Some(vtxo) = vtxo else {
+                    // Checked every tick; say it once per swap rather than every two seconds.
+                    if first_report_of_missing_vtxo(swap.id) {
+                        warn!(
+                            "Escrow swap {} for ticket {} reports funding without a VTXO; \
+                             waiting for Arkade to list it",
+                            swap.id, pending.ticket_id
+                        );
+                    } else {
+                        debug!("Escrow swap {} still has no VTXO", swap.id);
+                    }
                     continue;
                 };
                 self.competition_store
@@ -213,6 +226,55 @@ impl Coordinator {
             }
         }
         Ok(())
+    }
+
+    /// The escrow VTXO a funded swap paid, when `ark-swapd` settled it before its indexer listed
+    /// the VTXO. The VTXO sits at the ticket's own escrow address and is an output of the swap's
+    /// Ark transaction, which identifies it exactly; nothing else is guessed.
+    async fn find_swap_escrow_vtxo(
+        &self,
+        ark: &Arkade,
+        pending: &crate::domain::competitions::PendingArkSwap,
+        swap: &crate::infra::ark_swap::Swap,
+    ) -> Option<String> {
+        let paid_in = swap.ark_txid.as_deref()?;
+        let escrow = match self
+            .competition_store
+            .ticket_ark_escrow(pending.ticket_id, &pending.ticket_hash)
+            .await
+        {
+            Ok(Some(escrow)) => escrow,
+            Ok(None) => return None,
+            Err(e) => {
+                debug!(
+                    "Cannot read the escrow of ticket {}: {e}",
+                    pending.ticket_id
+                );
+                return None;
+            }
+        };
+        let vtxos = match ark.transport.vtxos(vec![escrow.escrow_address]).await {
+            Ok(vtxos) => vtxos,
+            Err(e) => {
+                debug!(
+                    "Cannot list the escrow of ticket {}: {e}",
+                    pending.ticket_id
+                );
+                return None;
+            }
+        };
+        let vtxo = vtxos
+            .into_iter()
+            .find(|vtxo| {
+                vtxo.outpoint.txid.to_string() == paid_in && vtxo.amount.to_sat() == swap.amount_sat
+            })?
+            .outpoint
+            .to_string();
+        info!(
+            "Escrow swap {} paid ticket {} into {vtxo}, found on Arkade",
+            swap.id, pending.ticket_id
+        );
+        Some(vtxo)
     }
 
     /// Fund the pool in an Arkade batch, signing its contract inside the batch.
@@ -420,4 +482,15 @@ impl Coordinator {
         competition.errors = vec![];
         Ok(())
     }
+}
+
+/// Whether this is the first time this process sees `swap` funded without a VTXO.
+fn first_report_of_missing_vtxo(swap: Uuid) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, Mutex, PoisonError};
+    static REPORTED: LazyLock<Mutex<HashSet<Uuid>>> = LazyLock::new(Default::default);
+    REPORTED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(swap)
 }

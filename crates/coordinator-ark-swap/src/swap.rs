@@ -163,9 +163,25 @@ impl Swapper {
             // Resumed after a restart.
             SwapState::PayingEscrow => self.pay_escrow(&mut swap).await?,
             SwapState::EscrowPaid => self.settle(&mut swap).await?,
+            SwapState::Settled if swap.escrow_vtxo.is_none() => {
+                self.record_escrow_vtxo(&mut swap).await?
+            }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Record the escrow VTXO of a swap that paid it before the indexer listed it. The
+    /// coordinator counts the ticket as paid only once it knows which VTXO holds the buy-in.
+    async fn record_escrow_vtxo(&self, swap: &mut Swap) -> anyhow::Result<()> {
+        let Some(vtxo) = self.already_paid(swap).await? else {
+            log::debug!("swap {}: its escrow VTXO is not listed yet", swap.id);
+            return Ok(());
+        };
+        log::info!("swap {} escrow VTXO is {vtxo}", swap.id);
+        swap.escrow_vtxo = Some(vtxo);
+        swap.updated_at = unix_now();
+        self.store.update(swap).await
     }
 
     async fn pay_escrow(&self, swap: &mut Swap) -> anyhow::Result<()> {
@@ -179,7 +195,15 @@ impl Swapper {
         match self.wallet.pay(address, amount).await {
             Ok(txid) => {
                 swap.ark_txid = Some(txid.to_string());
-                swap.escrow_vtxo = self.already_paid(swap).await?;
+                // The indexer may not list the new VTXO yet. Record the payment regardless, so
+                // a retry never pays twice; `record_escrow_vtxo` finds the VTXO later.
+                swap.escrow_vtxo = match self.already_paid(swap).await {
+                    Ok(vtxo) => vtxo,
+                    Err(error) => {
+                        log::warn!("swap {}: look up its escrow VTXO: {error:#}", swap.id);
+                        None
+                    }
+                };
                 self.transition(swap, SwapState::EscrowPaid, None).await?;
                 log::info!(
                     "swap {} paid escrow {} in {txid}",
@@ -206,12 +230,19 @@ impl Swapper {
 
     async fn already_paid(&self, swap: &Swap) -> anyhow::Result<Option<String>> {
         let address = self.wallet.escrow_address(&swap.escrow_address)?;
+        let paid_in = swap
+            .ark_txid
+            .as_deref()
+            .map(str::parse::<bitcoin::Txid>)
+            .transpose()
+            .context("the swap's Ark transaction id")?;
         let paid = self
             .wallet
             .paid_vtxo(
                 address,
                 Amount::from_sat(swap.amount_sat),
                 swap.created_at - EXPIRY_GRACE_SECS,
+                paid_in,
             )
             .await?;
         Ok(paid.map(|outpoint| outpoint.to_string()))

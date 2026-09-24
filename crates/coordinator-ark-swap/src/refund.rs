@@ -160,6 +160,7 @@ impl Swapper {
                 self.wallet.escrow_address(&refund.swap_address)?,
                 amount,
                 refund.created_at,
+                None,
             )
             .await?
         else {

@@ -211,9 +211,13 @@ impl Store {
         Ok(row.is_some())
     }
 
+    /// Swaps with work left: every swap that has not ended, and settled swaps that paid their
+    /// escrow before the indexer listed its VTXO, which the coordinator needs to count the entry.
     pub async fn unfinished(&self) -> anyhow::Result<Vec<Swap>> {
         let rows = sqlx::query(
-            "SELECT * FROM swaps WHERE state IN ('awaiting_payment', 'paying_escrow', 'escrow_paid')
+            "SELECT * FROM swaps
+             WHERE state IN ('awaiting_payment', 'paying_escrow', 'escrow_paid')
+                OR (state = 'settled' AND escrow_vtxo IS NULL AND ark_txid IS NOT NULL)
              ORDER BY created_at",
         )
         .fetch_all(&self.pool)
@@ -480,6 +484,60 @@ mod tests {
         assert_eq!(stored.state, RefundState::Claimed);
         let served = serde_json::to_value(&stored).unwrap();
         assert!(served.get("preimage").is_none(), "{served}");
+    }
+
+    #[tokio::test]
+    async fn a_settled_swap_is_revisited_until_its_escrow_vtxo_is_known() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("swaps.sqlite"))
+            .await
+            .unwrap();
+        let mut swap = Swap {
+            id: Uuid::now_v7(),
+            escrow_address: "tark1escrow".into(),
+            amount_sat: 6_300,
+            payment_hash: "ab".repeat(32),
+            preimage: "cd".repeat(32),
+            invoice: "lntb1".into(),
+            state: SwapState::AwaitingPayment,
+            escrow_vtxo: None,
+            ark_txid: None,
+            error: None,
+            created_at: 1_790_000_000,
+            updated_at: 1_790_000_000,
+            expires_at: 1_790_000_600,
+        };
+        store.insert(&swap).await.unwrap();
+        let unfinished = |store: Store| async move {
+            store
+                .unfinished()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|swap| swap.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(unfinished(store.clone()).await, vec![swap.id]);
+
+        // Paid and settled before the indexer listed the VTXO: still work to do.
+        swap.state = SwapState::Settled;
+        swap.ark_txid = Some("ef".repeat(32));
+        store.update(&swap).await.unwrap();
+        assert_eq!(unfinished(store.clone()).await, vec![swap.id]);
+
+        swap.escrow_vtxo = Some(format!("{}:0", "ef".repeat(32)));
+        store.update(&swap).await.unwrap();
+        assert!(unfinished(store.clone()).await.is_empty());
+
+        // A swap that ended without paying an escrow has nothing to look up.
+        let mut expired = swap.clone();
+        expired.id = Uuid::now_v7();
+        expired.payment_hash = "12".repeat(32);
+        expired.state = SwapState::Expired;
+        expired.escrow_vtxo = None;
+        expired.ark_txid = None;
+        store.insert(&expired).await.unwrap();
+        assert!(unfinished(store).await.is_empty());
     }
 
     #[tokio::test]

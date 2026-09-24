@@ -35,15 +35,17 @@ pub async fn create_competition(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateEvent>,
 ) -> Result<Json<Competition>, ApiError> {
-    state
+    let competition = state
         .coordinator
         .create_competition(body)
         .await
-        .map(Json)
         .map_err(|e| {
             error!("error creating competition: {:?}", e);
-            e.into()
-        })
+            ApiError::from(e)
+        })?;
+    // Its entry form reads forecasts from the cache; fill it before anyone opens it.
+    state.leaderboards.warm(&competition);
+    Ok(Json(competition))
 }
 
 /// Request to settle a ticket using the escrow preimage

@@ -164,14 +164,17 @@ impl ArkWallet {
             .map_err(|error| anyhow::anyhow!("pay the escrow: {error}"))
     }
 
-    /// An unspent VTXO at `address` worth `amount`, created at or after `since` (UNIX seconds).
+    /// The VTXO at `address` worth `amount` that paid it: the output of `paid_in` when the Ark
+    /// transaction is known, otherwise an unspent one created at or after `since` (UNIX seconds).
     ///
     /// After a crash between paying and recording it, this finds the payment instead of paying twice.
+    /// The indexer can list a payment a little after `pay` returns, so `None` may only mean "not yet".
     pub async fn paid_vtxo(
         &self,
         address: ArkAddress,
         amount: Amount,
         since: i64,
+        paid_in: Option<Txid>,
     ) -> anyhow::Result<Option<OutPoint>> {
         let response = self
             .server
@@ -181,7 +184,13 @@ impl ArkWallet {
         Ok(response
             .vtxos
             .into_iter()
-            .find(|vtxo| vtxo.amount == amount && vtxo.created_at >= since && !vtxo.is_spent)
+            .find(|vtxo| {
+                vtxo.amount == amount
+                    && match paid_in {
+                        Some(txid) => vtxo.outpoint.txid == txid,
+                        None => vtxo.created_at >= since && !vtxo.is_spent,
+                    }
+            })
             .map(|vtxo| vtxo.outpoint))
     }
 
