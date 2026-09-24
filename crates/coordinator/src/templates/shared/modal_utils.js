@@ -8,6 +8,8 @@ function closeModal($modal) {
     if (!$modal) return;
     $modal.classList.remove('is-active');
     document.documentElement.classList.remove('is-clipped');
+    // Loaded content goes with the dialog, and with it any refresh it runs.
+    $modal.querySelector('[data-clear-on-close]')?.replaceChildren();
 }
 
 function closeAllModals() {

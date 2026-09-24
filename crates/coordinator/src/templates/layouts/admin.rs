@@ -3,7 +3,7 @@ use serde_json::json;
 
 use crate::{
     api::admin_auth::CSRF_HEADER,
-    templates::assets::{ADMIN_JS, STYLES_CSS},
+    templates::assets::{ADMIN_JS, HTMX_JS, STYLES_CSS},
 };
 
 pub struct AdminPageConfig<'a> {
@@ -31,7 +31,7 @@ pub fn admin_base(config: &AdminPageConfig, content: Markup) -> Markup {
                 link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@1.0.2/css/bulma.min.css";
                 link rel="stylesheet" href=(STYLES_CSS.url);
 
-                script src="https://unpkg.com/htmx.org@1.9.10" {}
+                script src=(HTMX_JS.url) defer {}
                 script src=(ADMIN_JS.url) defer {}
 
                 style {
@@ -49,7 +49,8 @@ pub fn admin_base(config: &AdminPageConfig, content: Markup) -> Markup {
                  data-oracle-base=(config.oracle_base)
                  data-explorer-url=(config.explorer_url)
                  data-network=(config.network)
-                 hx-headers=[csrf_headers] {
+                 // Every htmx request on the page carries the CSRF token.
+                 hx-headers:inherited=[csrf_headers] {
                 script {
                     "const API_BASE = document.body.dataset.apiBase;
                      const ORACLE_BASE = document.body.dataset.oracleBase;
@@ -74,7 +75,7 @@ pub fn admin_base(config: &AdminPageConfig, content: Markup) -> Markup {
                 script {
                     (PreEscaped(r#"
                         document.querySelectorAll('.tabs li').forEach(tab => {
-                            tab.addEventListener('htmx:afterRequest', function() {
+                            tab.addEventListener('htmx:after:request', function() {
                                 document.querySelectorAll('.tabs li').forEach(t => t.classList.remove('is-active'));
                                 this.classList.add('is-active');
                             });

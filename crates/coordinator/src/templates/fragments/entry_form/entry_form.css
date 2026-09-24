@@ -1,0 +1,184 @@
+/* Entry form: terms, compact station map, pick buttons. */
+
+.entry-form {
+  max-width: 48rem;
+}
+
+.how-to-pick {
+  max-width: 42rem;
+  margin-bottom: 1rem;
+}
+
+/* The map only shows where the stations are; keep it small. */
+.station-map {
+  position: relative;
+  max-width: 26rem;
+  margin: 0 0 1.25rem;
+}
+
+.station-map .usa-map {
+  display: block;
+  width: 100%;
+  height: auto;
+  opacity: 0.8;
+}
+
+[data-theme="dark"] .station-map .usa-map {
+  filter: invert(0.85);
+}
+
+.station-pins {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.station-pin {
+  fill: hsl(204, 71%, 45%);
+  stroke: #fff;
+  stroke-width: 2;
+}
+
+.station-pins a:hover .station-pin,
+.station-pins a:focus .station-pin {
+  fill: hsl(348, 70%, 50%);
+}
+
+.station-pin-label {
+  font-size: 15px;
+  font-weight: 700;
+  fill: var(--bulma-text-strong);
+  paint-order: stroke;
+  stroke: var(--bulma-scheme-main);
+  stroke-width: 3px;
+}
+
+.station-picks {
+  border: 1px solid var(--bulma-border);
+  border-radius: 0.5rem;
+  padding: 0.75rem 1rem 0.5rem;
+  margin-bottom: 1rem;
+  scroll-margin-top: 4rem;
+}
+
+.station-picks:target {
+  border-color: var(--bulma-link);
+}
+
+.station-picks legend {
+  padding: 0 0.35rem;
+  font-weight: 600;
+}
+
+.entry-form .pick-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  padding: 0.4rem 0;
+}
+
+.entry-form .pick-row + .pick-row {
+  border-top: 1px solid var(--bulma-border-weak);
+}
+
+.pick-forecast.is-missing {
+  color: var(--bulma-text-weak);
+  font-style: italic;
+}
+
+.pick-options {
+  display: inline-flex;
+  border: 1px solid var(--bulma-border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.pick-option input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.pick-option span {
+  display: inline-block;
+  min-width: 4.5rem;
+  padding: 0.35rem 0.75rem;
+  text-align: center;
+  cursor: pointer;
+  user-select: none;
+}
+
+.pick-option + .pick-option span {
+  border-left: 1px solid var(--bulma-border);
+}
+
+.pick-option input:focus-visible + span {
+  outline: 2px solid var(--bulma-link);
+  outline-offset: -2px;
+}
+
+.pick-option input:checked + span {
+  color: #fff;
+  font-weight: 600;
+}
+
+.pick-option input[value="over"]:checked + span {
+  background: hsl(271, 60%, 52%);
+}
+
+.pick-option input[value="par"]:checked + span {
+  background: hsl(171, 70%, 36%);
+}
+
+.pick-option input[value="under"]:checked + span {
+  background: hsl(217, 71%, 50%);
+}
+
+.pick-option.is-none span {
+  min-width: 0;
+  color: var(--bulma-text-weak);
+}
+
+.pick-option.is-none input:checked + span {
+  color: var(--bulma-text-weak);
+  font-weight: 400;
+  background: var(--bulma-scheme-main-ter);
+}
+
+.pick-option input:disabled + span {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.payout-line {
+  margin: 1rem 0;
+}
+
+.entry-advanced {
+  margin-bottom: 1.25rem;
+  font-size: 0.9rem;
+}
+
+.entry-advanced summary {
+  cursor: pointer;
+  color: var(--bulma-text-weak);
+}
+
+.entry-advanced ul {
+  list-style: disc;
+  margin: 0.5rem 0 0 1.25rem;
+}
+
+.entry-submit .notification {
+  margin-top: 1rem;
+}
+
+/* The ticket invoice's QR code, drawn by the server. */
+.payment-qr {
+  max-width: 100%;
+  height: auto;
+}

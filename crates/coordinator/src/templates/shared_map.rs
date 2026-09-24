@@ -1,56 +1,5 @@
 use maud::{html, Markup};
 
-/// Station marker data for map rendering
-#[derive(Debug, Clone)]
-pub struct StationMarker {
-    pub station_id: String,
-    pub station_name: String,
-    pub state: String,
-    pub latitude: f64,
-    pub longitude: f64,
-    pub svg_x: f64,
-    pub svg_y: f64,
-    pub region: u8,
-    /// Weather data for popup display
-    pub weather: Option<StationWeather>,
-}
-
-/// Weather data attached to a station marker for popup display
-#[derive(Debug, Clone)]
-pub struct StationWeather {
-    pub forecast_high: Option<f64>,
-    pub forecast_low: Option<f64>,
-    pub actual_high: Option<f64>,
-    pub actual_low: Option<f64>,
-    pub wind_speed: Option<f64>,
-}
-
-impl StationMarker {
-    /// Create a StationMarker from station data, computing SVG coordinates.
-    /// Returns None if the station is outside the continental US bounds.
-    pub fn new(
-        station_id: String,
-        station_name: String,
-        state: String,
-        latitude: f64,
-        longitude: f64,
-    ) -> Option<Self> {
-        let (svg_x, svg_y) = lat_lon_to_svg(latitude, longitude)?;
-        let region = get_region(longitude);
-        Some(Self {
-            station_id,
-            station_name,
-            state,
-            latitude,
-            longitude,
-            svg_x,
-            svg_y,
-            region,
-            weather: None,
-        })
-    }
-}
-
 /// Geographic region based on longitude
 pub fn get_region(longitude: f64) -> u8 {
     if longitude < -140.0 {
@@ -127,143 +76,36 @@ pub fn lat_lon_to_svg(lat: f64, lon: f64) -> Option<(f64, f64)> {
     Some((x.clamp(0.0, SVG_WIDTH), y.clamp(0.0, SVG_HEIGHT)))
 }
 
-/// Render a read-only station map with markers
-/// Used on the entry form to show station locations.
-/// Clicking a marker scrolls to the corresponding station pick section.
-pub fn station_map(markers: &[StationMarker]) -> Markup {
+/// A station to pin on the entry form's map.
+#[derive(Debug, Clone)]
+pub struct StationPin {
+    pub station_id: String,
+    /// Short label drawn beside the pin, such as the airport code `PWM`.
+    pub label: String,
+    pub name: String,
+    pub svg_x: f64,
+    pub svg_y: f64,
+}
+
+/// A small map showing where a competition's stations are. Each pin links to
+/// that station's picks further down the form; no script is involved.
+pub fn station_map(pins: &[StationPin]) -> Markup {
     html! {
-        div class="location-map-container" {
-            div class="map-wrapper" id="entries-map-wrapper" {
-                div class="map-zoomable" id="entries-map-zoomable" {
-                    img src=(crate::templates::assets::USA_MAP_SVG.url) alt="USA Map" class="usa-map";
-
-                    svg class="station-markers" viewBox="0 0 599.96 327.28" preserveAspectRatio="none" {
-                        @for marker in markers {
-                            circle
-                                class={"station-marker " (region_class(marker.region))}
-                                cx=(format!("{:.1}", marker.svg_x))
-                                cy=(format!("{:.1}", marker.svg_y))
-                                r="5"
-                                data-station-id=(marker.station_id)
-                                data-station-name=(marker.station_name)
-                                data-state=(marker.state)
-                                data-forecast-high=(marker.weather.as_ref().and_then(|w| w.forecast_high).map(|v| format!("{:.0}", v)).unwrap_or_default())
-                                data-forecast-low=(marker.weather.as_ref().and_then(|w| w.forecast_low).map(|v| format!("{:.0}", v)).unwrap_or_default())
-                                data-actual-high=(marker.weather.as_ref().and_then(|w| w.actual_high).map(|v| format!("{:.0}", v)).unwrap_or_default())
-                                data-actual-low=(marker.weather.as_ref().and_then(|w| w.actual_low).map(|v| format!("{:.0}", v)).unwrap_or_default())
-                                data-wind=(marker.weather.as_ref().and_then(|w| w.wind_speed).map(|v| format!("{:.0}", v)).unwrap_or_default())
-                                onclick=(format!("showStationWeather(this, '{}')", marker.station_id))
-                                style="cursor: pointer;" {}
-                        }
-                    }
-                }
-
-                // Station popup with weather data (shown on click)
-                div id="entries-station-popup" class="station-popup" style="display: none;" {
-                    div class="popup-header" {
-                        strong class="popup-station-id" {}
-                        button class="delete is-small popup-close" onclick="hideStationPopup()" {}
-                    }
-                    div class="popup-name" {}
-
-                    // Weather data grid
-                    div class="popup-weather-grid" {
-                        div class="weather-grid-row weather-grid-header" {
-                            div class="weather-grid-label" {}
-                            div class="weather-grid-value" { "High" }
-                            div class="weather-grid-value" { "Low" }
-                        }
-                        div class="weather-grid-row" {
-                            div class="weather-grid-label" { "Forecast" }
-                            div class="weather-grid-value" data-field="forecast-high" { "-" }
-                            div class="weather-grid-value" data-field="forecast-low" { "-" }
-                        }
-                        div class="weather-grid-row" {
-                            div class="weather-grid-label" { "Actual" }
-                            div class="weather-grid-value" data-field="actual-high" { "-" }
-                            div class="weather-grid-value" data-field="actual-low" { "-" }
-                        }
-                        div class="weather-grid-row" {
-                            div class="weather-grid-label" { "Wind" }
-                            div class="weather-grid-value" colspan="2" data-field="wind" { "-" }
-                        }
-                    }
-
-                    div class="popup-action mt-2" {
-                        button type="button" class="button is-small is-info is-outlined"
-                               onclick="scrollToStationFromPopup()" {
-                            "Go to picks"
-                        }
-                    }
-                }
-
-                // Zoom controls
-                div class="map-zoom-controls" {
-                    button type="button" class="button is-small" onclick="entriesMapZoomIn()" title="Zoom in" {
-                        span class="icon is-small" { (plus_icon()) }
-                    }
-                    span id="entries-zoom-level" class="zoom-level" { "100%" }
-                    button type="button" class="button is-small" onclick="entriesMapZoomOut()" title="Zoom out" {
-                        span class="icon is-small" { (minus_icon()) }
-                    }
-                    button type="button" class="button is-small" onclick="entriesMapResetZoom()" title="Reset zoom" {
-                        span class="icon is-small" { (reset_icon()) }
+        figure class="station-map" {
+            img src=(crate::templates::assets::USA_MAP_SVG.url) alt="" class="usa-map" width="600" height="327";
+            svg class="station-pins" viewBox="0 0 599.96 327.28" role="img"
+                aria-label="Where this competition's stations are" {
+                @for pin in pins {
+                    a href=(format!("#station-{}", pin.station_id)) {
+                        title { (pin.name) }
+                        circle class="station-pin" cx=(format!("{:.1}", pin.svg_x)) cy=(format!("{:.1}", pin.svg_y)) r="6" {}
+                        text class="station-pin-label"
+                             x=(format!("{:.1}", pin.svg_x + if pin.svg_x > 520.0 { -9.0 } else { 9.0 }))
+                             y=(format!("{:.1}", pin.svg_y + 4.0))
+                             text-anchor=(if pin.svg_x > 520.0 { "end" } else { "start" }) { (pin.label) }
                     }
                 }
             }
-
-            // Region legend
-            div class="region-legend mt-3" {
-                span class="legend-item" {
-                    span class="legend-dot region-eastern" {}
-                    " Eastern"
-                }
-                span class="legend-item" {
-                    span class="legend-dot region-central" {}
-                    " Central"
-                }
-                span class="legend-item" {
-                    span class="legend-dot region-mountain" {}
-                    " Mountain"
-                }
-                span class="legend-item" {
-                    span class="legend-dot region-pacific" {}
-                    " Pacific"
-                }
-            }
-
-            p class="help has-text-centered mt-2" {
-                "Click a station to scroll to its picks"
-            }
-        }
-    }
-}
-
-fn plus_icon() -> Markup {
-    html! {
-        svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"
-            fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" {
-            line x1="12" y1="5" x2="12" y2="19" {}
-            line x1="5" y1="12" x2="19" y2="12" {}
-        }
-    }
-}
-
-fn minus_icon() -> Markup {
-    html! {
-        svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"
-            fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" {
-            line x1="5" y1="12" x2="19" y2="12" {}
-        }
-    }
-}
-
-fn reset_icon() -> Markup {
-    html! {
-        svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"
-            fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" {
-            path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" {}
-            path d="M3 3v5h5" {}
         }
     }
 }

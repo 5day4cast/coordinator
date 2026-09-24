@@ -51,6 +51,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("cargo::rerun-if-changed={}", file.display());
     }
 
+    // htmx, vendored once for the workspace as published (see its README).
+    let htmx = Path::new(&manifest).join("../../vendor/htmx/4.0.0/htmx.min.js");
+    println!("cargo::rerun-if-changed={}", htmx.display());
+
     let static_dir = templates.join("static");
     let assets = [
         Asset {
@@ -73,6 +77,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             extension: "css",
             content_type: "text/css; charset=utf-8",
             bytes: stylesheet(&static_dir.join("styles.css"), &files)?,
+        },
+        // Loaded before first paint, so it stays a file of its own.
+        Asset {
+            constant: "THEME_JS",
+            stem: "theme",
+            extension: "js",
+            content_type: "text/javascript; charset=utf-8",
+            bytes: bundle_scripts(&[static_dir.join("theme-init.js")], "theme")?,
+        },
+        Asset {
+            constant: "HTMX_JS",
+            stem: "htmx",
+            extension: "js",
+            content_type: "text/javascript; charset=utf-8",
+            bytes: fs::read(&htmx)?,
         },
         Asset {
             constant: "USA_MAP_SVG",

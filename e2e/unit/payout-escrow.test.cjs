@@ -5,10 +5,18 @@ const test = require("node:test");
 const vm = require("node:vm");
 const { webcrypto } = require("node:crypto");
 
+const SCRIPTS = {
+  entries: "fragments/entry_form/entry_form.js",
+  payouts: "pages/payouts/payouts.js",
+};
+
+// The bundle shares the wallet session between its scripts (see
+// shared/wasm.js); a test hands it in with the page's window.
 function load(name, window) {
+  const session = { wasm: window, nostrClient: window.nostrClient ?? null, dlcWallet: window.dlcWallet ?? null };
   vm.runInNewContext(readFileSync(path.join(__dirname,
-    `../../crates/coordinator/src/templates/pages/${name}/${name}.js`), "utf8"),
-  { window, crypto: webcrypto, TextEncoder, console });
+    `../../crates/coordinator/src/templates/${SCRIPTS[name]}`), "utf8"),
+  { window, session, crypto: webcrypto, TextEncoder, console });
   return window;
 }
 
@@ -70,10 +78,10 @@ function payoutFixture(status = 200) {
       async post(url, body) { posted = { url, body }; return { ok: true }; }
     },
     dlcWallet: {
-      // The wallet decodes invoices; this fixture's are valid unless empty.
+      // The wallet decodes invoices; this fixture's invoices are always valid.
       validateInvoice: (invoice, amount) => {
         assert.equal(amount, 42);
-        if (!invoice) throw "Invalid invoice: empty";
+        if (!invoice) throw "Invalid invoice";
       },
       payoutRelease: () => { releases++; return { ephemeral_private_key: "legacy key", payout_preimage: "legacy preimage" }; },
       authorizePayoutInvoice: (serialized) => { authorization = JSON.parse(serialized); return { context: authorization.context, signature: [1, 2] }; },

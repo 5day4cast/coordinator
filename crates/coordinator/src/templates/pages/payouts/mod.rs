@@ -1,24 +1,15 @@
 use maud::{html, Markup};
 
-/// View data for an eligible payout
-#[derive(Debug, Clone)]
-pub struct PayoutView {
-    pub competition_id: String,
-    pub entry_id: String,
-    pub status: String,
-    pub payout_amount: u64,
-    pub automatic_lightning_address: Option<String>,
-    pub allow_invoice_fallback: bool,
-    pub escrow_enabled: bool,
-}
+use crate::domain::EligiblePayout;
+use crate::templates::format::{copyable_id, sats};
 
 /// Payout status and invoice fallback. Each entry retains its authorized address;
 /// the profile address is a default for future entries only.
-pub fn payouts_page(payouts: &[PayoutView], lightning_address: Option<&str>) -> Markup {
+pub fn payouts_page(payouts: &[EligiblePayout], lightning_address: Option<&str>) -> Markup {
     html! {
-        div id="payouts" class="container" {
-            div class="box" {
-                h3 class="title is-4 mb-4" { "Available Payouts" }
+        div id="payouts" class="account-page" {
+            div {
+                h1 class="title is-4 mb-4" { "Payouts" }
 
                 (lightning_address_panel(lightning_address))
 
@@ -29,9 +20,9 @@ pub fn payouts_page(payouts: &[PayoutView], lightning_address: Option<&str>) -> 
                         table class="table is-fullwidth is-striped is-hoverable is-card-mobile" {
                             thead {
                                 tr {
-                                    th { "Competition ID" }
-                                    th { "Entry ID" }
-                                    th { "Amount (sats)" }
+                                    th { "Competition" }
+                                    th { "Entry" }
+                                    th { "Amount" }
                                     th { "Status" }
                                     th { "Action" }
                                 }
@@ -39,9 +30,13 @@ pub fn payouts_page(payouts: &[PayoutView], lightning_address: Option<&str>) -> 
                             tbody {
                                 @for payout in payouts {
                                     tr {
-                                        td data-label="Competition" title=(payout.competition_id) { (&payout.competition_id[..8]) }
-                                        td data-label="Entry ID" title=(payout.entry_id) { (&payout.entry_id[..8]) }
-                                        td data-label="Amount" { (payout.payout_amount) " sats" }
+                                        td data-label="Competition" {
+                                            a href=(format!("/competitions/{}/leaderboard", payout.competition_id))
+                                              hx-get=(format!("/competitions/{}/leaderboard", payout.competition_id))
+                                              hx-target="#main-content" hx-push-url="true" { "Leaderboard" }
+                                        }
+                                        td data-label="Entry" { (copyable_id(&payout.entry_id.to_string())) }
+                                        td data-label="Amount" { (sats(payout.amount_sats)) }
                                         td data-label="Status" { (payout.status) }
                                         td data-label="Action" {
                                             @if let Some(address) = &payout.automatic_lightning_address {
@@ -52,8 +47,8 @@ pub fn payouts_page(payouts: &[PayoutView], lightning_address: Option<&str>) -> 
                                                     button class="button is-light is-small"
                                                         data-entry-id=(payout.entry_id)
                                                         data-competition-id=(payout.competition_id)
-                                                        data-payout-amount=(payout.payout_amount)
-                                                        onclick="openPayoutModal(this)" {
+                                                        data-payout-amount=(payout.amount_sats)
+                                                        data-payout-action="invoice" {
                                                         "Use invoice"
                                                     }
                                                 }
@@ -61,9 +56,9 @@ pub fn payouts_page(payouts: &[PayoutView], lightning_address: Option<&str>) -> 
                                                 button class="button is-warning is-light is-small"
                                                     data-entry-id=(payout.entry_id)
                                                     data-competition-id=(payout.competition_id)
-                                                    data-payout-amount=(payout.payout_amount)
+                                                    data-payout-amount=(payout.amount_sats)
                                                     data-legacy="true"
-                                                    onclick="openPayoutModal(this)" {
+                                                    data-payout-action="invoice" {
                                                     "Legacy recovery"
                                                 }
                                             }
@@ -89,13 +84,13 @@ fn lightning_address_panel(lightning_address: Option<&str>) -> Markup {
                 Some(address) => {
                     p id="payoutAddress" {
                         "Default address for new entries: " strong { (address) } ". "
-                        a href="#" onclick="toggleLightningAddressForm(event)" { "Change" }
+                        button type="button" class="button is-text is-small" data-payout-action="edit-address" { "Change" }
                     }
                 }
                 None => {
                     p id="payoutAddress" class="has-text-danger" {
                         "Add a Lightning Address to receive automatic payouts on new entries. "
-                        a href="#" onclick="toggleLightningAddressForm(event)" { "Add" }
+                        button type="button" class="button is-text is-small" data-payout-action="edit-address" { "Add" }
                     }
                 }
             }
@@ -110,8 +105,8 @@ fn lightning_address_panel(lightning_address: Option<&str>) -> Markup {
                           autocomplete="off" spellcheck="false";
                 }
                 div class="control" {
-                    button class="button is-primary" id="saveLightningAddress"
-                           onclick="saveLightningAddress()" { "Save" }
+                    button type="button" class="button is-primary" id="saveLightningAddress"
+                           data-payout-action="save-address" { "Save" }
                 }
             }
             p class="help is-danger" id="lightningAddressError" {}
@@ -122,8 +117,33 @@ fn lightning_address_panel(lightning_address: Option<&str>) -> Markup {
 /// No payouts available message
 pub fn no_payouts() -> Markup {
     html! {
-        div id="noPayoutsMessage" class="notification is-info" {
-            "No entries eligible for payout at this time."
+        div id="noPayoutsMessage" class="empty-state-box" {
+            "Nothing to collect right now. Winnings appear here after a competition you placed in finishes."
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buttons_carry_actions_instead_of_inline_handlers() {
+        let payout = EligiblePayout {
+            competition_id: uuid::Uuid::now_v7(),
+            entry_id: "01a0d0f5-52e1-7141-b4e1-8dbd7169fc2e".parse().unwrap(),
+            status: "Awaiting invoice".into(),
+            amount_sats: 10_500,
+            automatic_lightning_address: None,
+            allow_invoice_fallback: true,
+            escrow_enabled: true,
+        };
+        let html = payouts_page(&[payout], Some("freya@lnurl.example")).into_string();
+        // The page's CSP allows no inline script, handlers included.
+        assert!(!html.contains("onclick"));
+        assert!(html.contains(r#"data-payout-action="invoice""#));
+        assert!(html.contains(r#"data-payout-action="edit-address""#));
+        assert!(html.contains(r#"data-payout-action="save-address""#));
+        assert!(html.contains("10,500 sats"));
     }
 }

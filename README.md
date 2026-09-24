@@ -325,16 +325,18 @@ The frontend uses Maud templates with co-located JavaScript:
 
 ```
 src/templates/
-├── layouts/base/     # Base layout + JS
-├── pages/entries/    # Entry page + JS
-├── pages/payouts/    # Payout page + JS
-├── components/modals/# Modal component + JS
-└── shared/           # Shared JS utilities
+├── layouts/base/          # Base layout + JS/CSS
+├── pages/                 # Competitions, entries, payouts
+├── fragments/entry_form/  # Entry form + the wallet-driven submit
+├── components/modals/     # Log-in and sign-up dialogs + JS
+└── shared/                # htmx extensions, WASM loader, page helpers
 ```
 
-`build.rs` bundles and minifies the scripts and styles beside the templates
-into the binary, served at content-hashed `/assets/` URLs; only the wasm-pack
-output is read from `crates/public_ui/pkg` (`[ui_settings].ui_dir`).
+Pages are rendered on the server (Maud + htmx 4, vendored in
+`vendor/htmx/`). `build.rs` bundles and minifies the scripts and styles beside
+the templates into the binary, served at content-hashed `/assets/` URLs; only
+the wasm-pack output is read from `crates/public_ui/pkg`
+(`[ui_settings].ui_dir`). See `crates/coordinator/src/templates/README.md`.
 
 ## External Services
 

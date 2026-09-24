@@ -1,0 +1,257 @@
+/* Home page: intro, featured competition, grouped competition rows. */
+
+.intro {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(16rem, 22rem);
+  gap: 1.5rem;
+  align-items: start;
+  margin-bottom: 2rem;
+}
+
+.intro-text p {
+  max-width: 38rem;
+  color: var(--bulma-text-weak);
+}
+
+.featured-card {
+  border: 1px solid var(--bulma-border);
+  border-radius: 0.75rem;
+  padding: 1rem 1.25rem;
+  background: var(--bulma-scheme-main-bis);
+}
+
+.featured-status {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.25rem;
+}
+
+.countdown {
+  font-weight: 600;
+}
+
+.featured-window {
+  color: var(--bulma-text-weak);
+  margin-bottom: 0.75rem;
+}
+
+.featured-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem 1rem;
+  margin-bottom: 1rem;
+}
+
+.featured-facts dt {
+  font-size: 0.75rem;
+  color: var(--bulma-text-weak);
+}
+
+.featured-facts dd {
+  font-weight: 600;
+}
+
+.competition-group {
+  margin-bottom: 2rem;
+}
+
+.group-heading {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+  margin-bottom: 0.5rem;
+}
+
+.group-heading .title {
+  margin-bottom: 0;
+}
+
+.group-help,
+.cancelled-toggle {
+  font-size: 0.875rem;
+  color: var(--bulma-text-weak);
+}
+
+.cancelled-toggle {
+  margin-left: auto;
+}
+
+.competition-list {
+  border: 1px solid var(--bulma-border);
+  border-radius: 0.5rem;
+  overflow: hidden;
+}
+
+.competition-header,
+.competition-row {
+  display: grid;
+  grid-template-columns: 9rem minmax(12rem, 1.6fr) repeat(2, minmax(6rem, 1fr)) 5rem 6rem 7rem;
+  gap: 0.75rem;
+  align-items: center;
+  padding: 0.6rem 1rem;
+}
+
+.competition-header {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--bulma-text-weak);
+  background: var(--bulma-scheme-main-bis);
+}
+
+.competition-row {
+  color: var(--bulma-text);
+  border-top: 1px solid var(--bulma-border-weak);
+}
+
+.competition-row:hover,
+.competition-row:focus-visible {
+  background: var(--bulma-scheme-main-ter);
+  color: var(--bulma-text-strong);
+}
+
+.cell-window {
+  display: flex;
+  flex-direction: column;
+}
+
+.cell-note {
+  font-size: 0.8rem;
+  color: var(--bulma-text-weak);
+}
+
+.cell-action {
+  text-align: right;
+  font-size: 0.875rem;
+  color: var(--bulma-link-text);
+}
+
+.empty-state {
+  color: var(--bulma-text-weak);
+}
+
+.pager {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 1.5rem;
+  margin-top: 0.75rem;
+  font-size: 0.9rem;
+}
+
+/* Badges: Live is the loudest thing on the page; finished ones stay quiet. */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.1rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+
+.badge-live {
+  background: hsl(141, 53%, 42%);
+  color: #fff;
+}
+
+.badge-live::before {
+  content: "";
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: currentColor;
+  animation: badge-pulse 1.6s ease-in-out infinite;
+}
+
+.badge-open {
+  border-color: hsl(204, 71%, 53%);
+  color: hsl(204, 71%, 39%);
+}
+
+.badge-waiting {
+  border-color: var(--bulma-border);
+  color: var(--bulma-text);
+}
+
+.badge-quiet {
+  background: var(--bulma-scheme-main-ter);
+  color: var(--bulma-text-weak);
+}
+
+.badge-failed {
+  border-color: hsl(348, 60%, 70%);
+  color: hsl(348, 60%, 42%);
+}
+
+[data-theme="dark"] .badge-open {
+  color: hsl(204, 71%, 70%);
+}
+
+[data-theme="dark"] .badge-failed {
+  color: hsl(348, 70%, 75%);
+}
+
+@keyframes badge-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .badge-live::before {
+    animation: none;
+  }
+}
+
+/* Phones: two compact lines per competition. */
+@media screen and (max-width: 768px) {
+  .intro {
+    grid-template-columns: 1fr;
+    gap: 1rem;
+  }
+
+  .competition-header {
+    display: none;
+  }
+
+  .competition-row {
+    grid-template-columns: auto 1fr auto;
+    grid-template-areas:
+      "status window action"
+      "facts facts facts";
+    gap: 0.25rem 0.75rem;
+    padding: 0.6rem 0.75rem;
+  }
+
+  .cell-status {
+    grid-area: status;
+  }
+
+  .cell-window {
+    grid-area: window;
+  }
+
+  .cell-action {
+    grid-area: action;
+  }
+
+  .cell-fee,
+  .cell-pot,
+  .cell-entries,
+  .cell-places {
+    display: none;
+  }
+
+  .competition-row::after {
+    grid-area: facts;
+    content: attr(data-facts);
+    font-size: 0.8rem;
+    color: var(--bulma-text-weak);
+  }
+}

@@ -6,6 +6,7 @@ mod ark_store;
 mod ark_tests;
 mod automatic_store;
 mod coordinator;
+mod eligible_payouts;
 mod lease_store;
 mod payout;
 mod reported;
@@ -31,6 +32,7 @@ use dlctix::{
     secp::MaybeScalar,
     ContractParameters, EventLockingConditions, Outcome, SigMap, SignedContract,
 };
+pub use eligible_payouts::*;
 use keymeld_sdk::types::{RegistrationContext, SignedSessionManifest};
 pub use lease_store::*;
 use log::{debug, error};

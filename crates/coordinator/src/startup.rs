@@ -9,14 +9,16 @@ use crate::{
         admin_send_bitcoin_handler, admin_settle_test_invoice_handler,
         admin_wallet_address_fragment, admin_wallet_balance_fragment, admin_wallet_fragment,
         admin_wallet_outputs_fragment, change_password, claim_ticket_payout, competitions_fragment,
-        competitions_rows_fragment, create_competition, entries_fragment, entry_detail_fragment,
-        entry_form_fragment, forgot_password_challenge, forgot_password_reset,
-        get_aggregate_nonces, get_balance, get_competition, get_competitions,
-        get_contract_parameters, get_entries, get_estimated_fee_rates, get_next_address,
-        get_outputs, get_ticket_refund, get_ticket_status, health, leaderboard_fragment,
-        leaderboard_rows_fragment, login, login_username, payouts_fragment, public_page_handler,
-        register, register_username, request_competition_ticket, send_to_address,
-        set_lightning_address, submit_final_signatures, submit_public_nonces, submit_ticket_payout,
+        create_competition, entries_fragment, entry_detail_fragment, entry_forecasts_fragment,
+        entry_form_fragment, entry_payout_fragment, forgot_password_challenge,
+        forgot_password_reset, get_aggregate_nonces, get_balance, get_competition,
+        get_competitions, get_contract_parameters, get_entries, get_estimated_fee_rates,
+        get_next_address, get_outputs, get_ticket_refund, get_ticket_status, health,
+        leaderboard_fragment, leaderboard_rows_fragment, login, login_username, not_found,
+        payouts_fragment, public_page_handler, register, register_username,
+        request_competition_ticket, send_to_address, set_lightning_address,
+        submit_final_signatures, submit_public_nonces, submit_ticket_payout,
+        ticket_status_fragment,
     },
     config::Settings,
     domain::{
@@ -784,10 +786,21 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
     // HTMX public routes (some require JS bridge for auth)
     let htmx_routes = Router::new()
         .route("/competitions", get(competitions_fragment))
-        .route("/competitions/rows", get(competitions_rows_fragment))
         .route(
             "/competitions/{competition_id}/entry-form",
             get(entry_form_fragment),
+        )
+        .route(
+            "/competitions/{competition_id}/entry-forecasts",
+            get(entry_forecasts_fragment),
+        )
+        .route(
+            "/competitions/{competition_id}/entry-form/payout",
+            get(entry_payout_fragment),
+        )
+        .route(
+            "/competitions/{competition_id}/tickets/{ticket_id}/status",
+            get(ticket_status_fragment),
         )
         .route(
             "/competitions/{competition_id}/leaderboard",
@@ -969,9 +982,14 @@ pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Ne
         .layer(middleware::from_fn(log_request))
 }
 
-/// Serve the competitions page for client-side paths, but never for paths reserved for
-/// the API or the operator listener, so a missing operator route cannot look present.
-async fn public_fallback(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
+/// A page for any path the public site does not serve, with status 404. Paths
+/// reserved for the API or the operator listener get a bare 404, so a missing
+/// operator route cannot look present.
+async fn public_fallback(
+    State(state): State<Arc<AppState>>,
+    uri: Uri,
+    headers: header::HeaderMap,
+) -> Response {
     let path = uri.path();
     let reserved = ["/admin", "/api"]
         .iter()
@@ -979,7 +997,7 @@ async fn public_fallback(State(state): State<Arc<AppState>>, uri: Uri) -> Respon
     if reserved {
         return StatusCode::NOT_FOUND.into_response();
     }
-    public_page_handler(State(state)).await.into_response()
+    not_found(&headers, &state, "Page")
 }
 
 async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {
@@ -1249,6 +1267,25 @@ mod startup_tests {
         let (status, _, _) = send(&public, request("GET", "/api/v1/health_check", &[], "")).await;
         assert_eq!(status, StatusCode::OK);
         let (status, _, _) = send(&public, request("GET", "/api/v1/competitions", &[], "")).await;
+        assert_eq!(status, StatusCode::OK);
+        test.stop().await;
+    }
+
+    #[tokio::test]
+    async fn unknown_public_paths_get_a_not_found_page() {
+        let test = TestState::start().await;
+        let public = test.public();
+        let (status, _, body) = send(&public, request("GET", "/no/such/page", &[], "")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("<!DOCTYPE html>") && body.contains("Page not found"));
+        let (status, _, body) = send(
+            &public,
+            request("GET", "/no/such/page", &[("hx-request", "true")], ""),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!body.contains("<!DOCTYPE html>"));
+        let (status, _, _) = send(&public, request("GET", "/", &[], "")).await;
         assert_eq!(status, StatusCode::OK);
         test.stop().await;
     }

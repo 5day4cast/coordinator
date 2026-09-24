@@ -1,36 +1,35 @@
-const AUTH_REQUIRED_ROUTES = ["/entries", "/payouts", "/entry-form"];
-const PUBLIC_ROUTES = ["/entries/", "/detail"]; // Entry detail pages are public (leaderboard)
+// Signs account pages' htmx requests with a NIP-98 header from the WASM
+// wallet, so they can be rendered on the server. The key never leaves WASM;
+// each signature is single-use, lasts 60 s and names one method and URL.
+//
+// - Only GETs are signed here. Account changes go through AuthorizedClient,
+//   which also signs the hash of the exact body it sends.
+// - htmx 4 builds the final URL, query string included, before
+//   htmx:before:request and then calls ctx.fetch(url, request). The signature
+//   is made inside that call, for exactly the URL and method being sent.
+// - Public pages, including the leaderboard's and picks' refreshes, are never
+//   signed: polling them must not ask a Nostr extension to sign every minute.
+//
+// It is an htmx extension, registered when this script loads, so it is in
+// place before htmx sends anything and page scripts cannot run ahead of it.
 
-function requiresAuth(url) {
-  // Entry detail routes are public (accessed from leaderboard)
-  if (url.includes("/entries/") && url.includes("/detail")) {
-    return false;
-  }
-  return AUTH_REQUIRED_ROUTES.some((route) => url.includes(route));
-}
+// Pages that need an account, and pages that personalize when they have one.
+const AUTH_REQUIRED = [
+  /^\/entries$/,
+  /^\/payouts$/,
+  /^\/competitions\/[^/]+\/tickets\/[^/]+\/status$/,
+];
+const AUTH_OPTIONAL = [/^\/competitions\/[^/]+\/entry-form(\/payout)?$/];
 
-function isLoggedIn() {
-  return Boolean(window.nostrClient?.isSignerReady() && window.dlcWallet);
-}
-
-async function generateAuthHeader(method, url) {
-  if (!isLoggedIn()) return null;
-
-  try {
-    const fullUrl = new URL(url, window.location.origin).href;
-    return await window.nostrClient.getAuthHeader(fullUrl, method, null);
-  } catch (error) {
-    console.error("Failed to generate auth header:", error);
-    return null;
-  }
+function authMode(url) {
+  if (AUTH_REQUIRED.some((pattern) => pattern.test(url.pathname))) return "required";
+  if (AUTH_OPTIONAL.some((pattern) => pattern.test(url.pathname))) return "optional";
+  return null;
 }
 
 function showAuthError(message) {
-  // Show a user-visible notification that auth failed
   const notification = document.createElement("div");
-  notification.className = "notification is-danger";
-  notification.style.cssText =
-    "position: fixed; top: 20px; right: 20px; z-index: 9999; max-width: 400px;";
+  notification.className = "notification is-danger auth-error";
   const close = document.createElement("button");
   close.className = "delete";
   close.addEventListener("click", () => notification.remove());
@@ -39,73 +38,82 @@ function showAuthError(message) {
   // textContent, not innerHTML: messages can carry error text from elsewhere.
   notification.append(close, title, document.createElement("br"), message);
   document.body.appendChild(notification);
-
-  // Auto-remove after 5 seconds
   setTimeout(() => notification.remove(), 5000);
 }
 
-function setupHtmxAuth() {
-  // Use htmx:confirm for async auth header generation
-  // This event allows us to call issueRequest() after async work completes
-  document.body.addEventListener("htmx:confirm", async (event) => {
-    const { verb, path } = event.detail;
+const SIGNED_REQUEST_TIMEOUT_MS = 60_000;
 
-    // If route doesn't require auth, let HTMX proceed normally
-    if (!requiresAuth(path)) return;
+// The element whose account request waits for the visitor to log in.
+let waitingForLogin = null;
 
-    // If user is not logged in, show login modal instead of making request
-    if (!isLoggedIn()) {
-      event.preventDefault();
-      const loginModal = document.getElementById("loginModal");
-      if (loginModal) {
-        loginModal.classList.add("is-active");
-      }
-      return;
+// The fetch htmx will call, wrapped to add the signature for `url`.
+function signedFetch(send, url, signer) {
+  return async (action, request) => {
+    const sent = new URL(action, document.baseURI);
+    // A fragment identifies a position in the document; it is never sent in HTTP.
+    sent.hash = "";
+    if (sent.href !== url.href || request.method !== "GET") {
+      throw new Error(`Not signing ${request.method} ${sent.href}`);
     }
-
-    // User is logged in, need to generate auth header
-    event.preventDefault();
-
+    let authorization;
     try {
-      const authHeader = await generateAuthHeader(verb, path);
-
-      if (authHeader) {
-        event.detail.elt._pendingAuthHeader = authHeader;
-        event.detail.issueRequest();
-      } else {
-        // Auth header generation returned null - don't make the request
-        console.error("HTMX auth: Failed to generate auth header for", path);
-        showAuthError(
-          "Failed to authenticate request. Please try logging in again.",
-        );
-      }
+      authorization = await signer.getAuthHeader(url.href, "GET", null);
     } catch (error) {
-      console.error(
-        "HTMX auth: Exception during auth header generation:",
-        error,
-      );
-      showAuthError("Authentication error: " + error.message);
+      showAuthError("Could not sign the request. Please log in again.");
+      throw error;
     }
-  });
+    // Logged out, or into another account, while the wallet was signing.
+    if (!isLoggedIn() || session.nostrClient !== signer) {
+      throw new Error("The account changed while signing");
+    }
+    return send(action, { ...request, headers: { ...request.headers, Authorization: authorization } });
+  };
+}
 
-  // Synchronously apply the pre-generated header
-  document.body.addEventListener("htmx:configRequest", (event) => {
-    const elt = event.detail.elt;
-    if (elt._pendingAuthHeader) {
-      event.detail.headers["Authorization"] = elt._pendingAuthHeader;
-      delete elt._pendingAuthHeader;
+window.htmx?.registerExtension("fw-auth", {
+  htmx_before_request(elt, detail) {
+    const ctx = detail.ctx;
+    const url = new URL(ctx.request.action, document.baseURI);
+    url.hash = "";
+    const mode = authMode(url);
+    if (!mode) return;
+    if (!isLoggedIn()) {
+      // Optional pages render for everyone; a history restore of an account
+      // page comes back from the server as its log-in prompt.
+      if (mode === "optional" || ctx.request.headers["HX-History-Restore-Request"]) return;
+      waitingForLogin = elt;
+      window.openAuthModal?.("loginModal");
+      return false;
     }
-  });
+    if (ctx.request.method !== "GET" || url.origin !== window.location.origin) {
+      console.error(`Not signing an htmx ${ctx.request.method} to ${url.href}: use AuthorizedClient`);
+      return false;
+    }
+    ctx.fetch = signedFetch(ctx.fetch, url, session.nostrClient);
+    // A Nostr extension may ask the player to approve the signature, which
+    // can take longer than the page's usual 10 s request timeout.
+    clearTimeout(ctx.requestTimeout);
+    ctx.requestTimeout = setTimeout(() => ctx.request.abort?.(), SIGNED_REQUEST_TIMEOUT_MS);
+  },
 
-  // Handle auth errors from server responses
-  document.body.addEventListener("htmx:responseError", (event) => {
-    if (event.detail.xhr.status === 401) {
-      showAuthError("Session expired. Please log in again.");
+  htmx_response_error(elt, detail) {
+    if (detail.ctx.response.status === 401) {
+      showAuthError("Your session ended. Please log in again.");
+      window.openAuthModal?.("loginModal");
     }
+  },
+});
+
+function setupHtmxAuth() {
+  // htmx 1.x kept page snapshots in localStorage, account pages included.
+  // htmx 4 keeps none; clear any an older release left behind.
+  try { localStorage.removeItem("htmx-history-cache"); } catch (_) {}
+
+  document.body.addEventListener("fw:login", () => {
+    const elt = waitingForLogin;
+    waitingForLogin = null;
+    if (elt?.isConnected) elt.click();
   });
 }
 
-window.requiresAuth = requiresAuth;
-window.isLoggedIn = isLoggedIn;
-window.generateAuthHeader = generateAuthHeader;
 window.setupHtmxAuth = setupHtmxAuth;

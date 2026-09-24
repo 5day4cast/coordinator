@@ -23,7 +23,6 @@ for (const retried of [false, true]) {
       return { ok: true };
     };
     const window = {
-      nostrClient,
       AuthorizedClient: class {
         async post(url, body) {
           if (url.endsWith("/users/username/register")) return register(url, body);
@@ -38,7 +37,11 @@ for (const retried of [false, true]) {
           };
         }
       },
-      DlcWallet: {
+    };
+    const session = {
+      nostrClient,
+      dlcWallet: null,
+      wasm: { DlcWallet: {
         create: () => ({
           encryptedBackup: async () => ({ encrypted_bitcoin_private_key: candidateBackup }),
           free: () => { createdWalletFreed = true; },
@@ -49,10 +52,11 @@ for (const retried of [false, true]) {
           loadedBackup = backup;
           return restoredWallet;
         },
-      },
+      } },
     };
     const context = vm.createContext({
       window,
+      session,
       console,
       document: { querySelector: () => null, getElementById: () => null },
       fetch: async (url, options) => register(url, JSON.parse(options.body)),
@@ -65,7 +69,7 @@ for (const retried of [false, true]) {
     await manager.handleUsernameRegisterStep2();
 
     assert.equal(loadedBackup, persistedBackup);
-    assert.equal(window.dlcWallet, restoredWallet);
+    assert.equal(session.dlcWallet, restoredWallet);
     assert.equal(createdWalletFreed, true);
     assert.equal(manager.pendingRegistration, null);
   });
@@ -78,8 +82,7 @@ test("password reset signs the replacement credentials with the recovered key", 
   let sentBody;
   let credentialsFreed = false;
   const credentials = { authKey: "derived auth key", free: () => { credentialsFreed = true; } };
-  const window = {
-    nostrClient: {
+  const session = { dlcWallet: null, wasm: {}, nostrClient: {
       sealForLogin: (login) => {
         assert.equal(login, credentials);
         return "sealed nsec";
@@ -90,7 +93,8 @@ test("password reset signs the replacement credentials with the recovered key", 
         signedBody = body;
         return "Nostr signed-payload";
       },
-    },
+  } };
+  session.wasm = {
     LoginCredentials: {
       derive: (username, password) => {
         assert.equal(username, "alice");
@@ -99,11 +103,14 @@ test("password reset signs the replacement credentials with the recovered key", 
       },
     },
     NostrClientWrapper: class {},
+  };
+  const window = {
     closeModal: () => {},
     openModal: () => {},
   };
   const context = vm.createContext({
     window,
+    session,
     console,
     document: {
       querySelector: () => null,
