@@ -210,6 +210,15 @@ impl SynthDb {
         self.add_column_if_missing("rebalances", "txid", "TEXT")
             .await?;
 
+        // Hourly runs add a few dozen steps an hour. Without these, listing runs and reading a
+        // run's steps scan every step ever recorded.
+        sqlx::query("CREATE INDEX IF NOT EXISTS test_steps_by_run ON test_steps (run_id)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS test_runs_by_start ON test_runs (started_at)")
+            .execute(&self.pool)
+            .await?;
+
         Ok(())
     }
 
