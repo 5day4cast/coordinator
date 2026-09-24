@@ -1,10 +1,11 @@
 use super::format;
 use super::live::{self, Live};
+use crate::db::HeldRun;
 use crate::rebalance::Rebalancer;
 use crate::runner::Runner;
 use crate::scenarios::{ScenarioConfig, ScenarioStatus};
-use crate::trail::label_words;
-use crate::trail::tracker::Tracker;
+use crate::trail::tracker::{Tracker, UnrecordedSwaps};
+use crate::trail::{label_words, Held};
 use axum::{
     extract::{Query, State},
     http::{header, HeaderMap, StatusCode},
@@ -113,7 +114,10 @@ pub(super) fn html_by_hx_request(markup: Markup) -> Response {
 /// The dashboard's live part: what the page shows, and what is pushed to it as things change.
 pub(super) async fn dashboard_live(
     Dashboard {
-        runner, rebalancer, ..
+        runner,
+        rebalancer,
+        tracker,
+        ..
     }: &Dashboard,
 ) -> Markup {
     let now = OffsetDateTime::now_utc();
@@ -138,6 +142,8 @@ pub(super) async fn dashboard_live(
         .scenario_health(HEALTH_WINDOW)
         .await
         .unwrap_or_default();
+    let held = runner.db().held_runs().await.unwrap_or_default();
+    let unrecorded = tracker.unrecorded_swaps();
 
     html! {
         @if let Some(live) = &live {
@@ -174,6 +180,8 @@ pub(super) async fn dashboard_live(
                 }
             }
         }
+
+        (stuck_money(&held, unrecorded.as_ref(), now))
 
         section.status {
             h2 { "Last Run" }
@@ -324,6 +332,111 @@ pub(super) async fn dashboard_live(
             }
         }
         p.note { "Updated " (format::time(now, now)) }
+    }
+}
+
+/// Every run whose money is stuck now, oldest first, and the swaps ark-swapd says funded an escrow
+/// without recording its output, whoever made them.
+fn stuck_money(
+    held: &[HeldRun],
+    unrecorded: Option<&UnrecordedSwaps>,
+    now: OffsetDateTime,
+) -> Markup {
+    let mut held: Vec<(&HeldRun, &Held)> = held
+        .iter()
+        .filter_map(|run| Some((run, run.trail.held.as_ref()?)))
+        .collect();
+    held.sort_by_key(|(_, held)| held.since);
+    let total: u64 = held.iter().map(|(_, held)| held.sats).sum();
+    let nearest = held
+        .iter()
+        .filter_map(|(_, held)| held.nearest_expiry)
+        .min();
+    let swaps = unrecorded.map_or(&[][..], |unrecorded| &unrecorded.swaps[..]);
+    let run_of = |payment_hash: &str| {
+        held.iter()
+            .find(|(run, _)| {
+                run.trail
+                    .swaps
+                    .iter()
+                    .any(|swap| swap.payment_hash == payment_hash)
+            })
+            .map(|(run, _)| run.run.id.clone())
+    };
+    html! {
+        section class=(if held.is_empty() { "stuck-money" } else { "stuck-money held" }) {
+            h2 { "Stuck money" }
+            @if held.is_empty() {
+                p.note { "No run's money is stuck." }
+            } @else {
+                p {
+                    strong { (total) " sats" } " held by " (held.len()) " run(s)"
+                    @if let Some(at) = nearest.and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok()) {
+                        "; the nearest escrow expiry or refund opening is " (format::time(at, now))
+                    }
+                    ". Each run's page lays out what holds it and what should move it."
+                }
+                div.scroll { table {
+                    thead { tr { th { "Run" } th { "Held since" } th.num { "Sats" } th { "Nearest expiry" } th { "Why" } } }
+                    tbody {
+                        @for (run, held) in &held {
+                            tr {
+                                td { a href=(format!("/runs/{}", run.run.id)) title=(run.run.id) { (short_id(&run.run.id)) } br; span.note { (run.run.scenario) } }
+                                td { (format::time(held.since, now)) }
+                                td.num { (held.sats) }
+                                td {
+                                    @match held.nearest_expiry.and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok()) {
+                                        Some(at) => (format::time(at, now)),
+                                        None => span.note { "not known" },
+                                    }
+                                }
+                                td { (held.reason) }
+                            }
+                        }
+                    }
+                } }
+            }
+            @if let Some(unrecorded) = unrecorded {
+                h3 { "Swaps without an escrow output" }
+                @if let Some(error) = &unrecorded.error {
+                    p.error { "ark-swapd did not list them: " (error) }
+                } @else if swaps.is_empty() {
+                    p.note { "ark-swapd has none." }
+                } @else {
+                    p.note {
+                        "ark-swapd says these paid an escrow, or were settled, but records no escrow output, "
+                        "so nothing can spend or refund them until it is found. Not all are synth's."
+                    }
+                    div.scroll { table {
+                        thead { tr { th { "Swap" } th { "State" } th.num { "Sats" } th { "Escrow address" } th { "Run" } } }
+                        tbody {
+                            @for swap in swaps {
+                                tr {
+                                    td { (format::copyable(&swap.id.to_string())) br; span.note { (swap_created(swap.created_at, now)) } }
+                                    td { (swap.state) @if let Some(error) = &swap.error { br; span.note { (error) } } }
+                                    td.num { (swap.amount_sat) }
+                                    td { (format::copyable(&swap.escrow_address)) }
+                                    td {
+                                        @match run_of(&swap.payment_hash) {
+                                            Some(run) => a href=(format!("/runs/{run}")) { (short_id(&run)) },
+                                            None => span.note { "not a stuck synth run" },
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } }
+                }
+                p.note { "Asked ark-swapd " (format::time(unrecorded.checked_at, now)) "." }
+            }
+        }
+    }
+}
+
+fn swap_created(at: i64, now: OffsetDateTime) -> Markup {
+    match OffsetDateTime::from_unix_timestamp(at) {
+        Ok(at) if at.unix_timestamp() > 0 => html! { "made " (format::time(at, now)) },
+        _ => html! {},
     }
 }
 

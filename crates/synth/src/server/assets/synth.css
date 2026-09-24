@@ -30,7 +30,7 @@ td.num, th.num { text-align: right; white-space: nowrap; }
 .badge { display: inline-block; padding: 1px 8px; border-radius: 4px; font-size: 0.85em; border: 1px solid currentColor; white-space: nowrap; }
 .badge.passed, .badge.done, .badge.moved, .badge.paid_out, .badge.refunded, .badge.nothing_paid { color: var(--done); }
 .badge.failed, .badge.stuck { color: var(--failed); }
-.badge.running, .badge.active, .badge.following, .badge.waiting, .badge.unverified, .badge.timed_out { color: var(--active); }
+.badge.running, .badge.active, .badge.following, .badge.waiting, .badge.unverified, .badge.timed_out, .badge.was_stuck { color: var(--active); }
 .badge.interrupted, .badge.skipped { color: var(--muted); }
 .running { color: var(--active); }
 .result { padding: 12px 15px; background: var(--panel); border-radius: 8px; margin: 10px 0; }
@@ -78,3 +78,7 @@ details summary { cursor: pointer; }
   .arrow { transform: rotate(90deg); }
 }
 
+/* Money that is stuck: what holds it, laid out to debug. */
+.stuck, .stuck-money.held { border-left: 3px solid var(--failed); padding-left: 12px; }
+table.facts th { width: 13em; white-space: nowrap; }
+table.facts tr.next td { color: var(--text); }

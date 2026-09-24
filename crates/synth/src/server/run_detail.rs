@@ -1,5 +1,6 @@
 //! One run in detail: where each player's money went, drawn as a flow, then every hop with the
-//! full id to look it up by, and a ledger checking that what went in came out.
+//! full id to look it up by, and a ledger checking that what went in came out. Money that is
+//! stuck gets a block of its own, laid out for debugging.
 //!
 //! The page is drawn from synth's own database: the run's steps, and the money trail the tracker
 //! keeps for it. It asks nobody else anything, so it loads fast however slow the coordinator is.
@@ -17,6 +18,7 @@ use super::format::{self, copyable};
 use super::live;
 use super::money::{self, Ledger, Links, Row, Run, ScenarioRefund, Status};
 use super::routes::{self, Dashboard};
+use super::stuck;
 use crate::client::competitions::CompetitionResponse;
 use crate::db::{TestRun, TestStep};
 use crate::settlement::{Decided, Settlement};
@@ -541,6 +543,7 @@ pub(super) async fn run_live(state: &Dashboard, id: &str) -> Option<Markup> {
     Some(html! {
         (run_section(&view.run, live_step.as_deref(), now))
         (money_section(&view, now))
+        @if let Some(stuck) = stuck::block(&run, now) { (stuck) }
         (hops_section(&view, &rows))
         section {
             h2 { "Ledger" }
