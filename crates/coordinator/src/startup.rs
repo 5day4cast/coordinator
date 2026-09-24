@@ -1291,7 +1291,9 @@ mod startup_tests {
 
     #[tokio::test]
     async fn public_pages_carry_the_content_security_policy() {
-        let test = TestState::start().await;
+        let mut test = TestState::start().await;
+        Arc::get_mut(&mut test.state).unwrap().keymeld_public_url =
+            Some("https://keymeld.example.net/enclaves".into());
         let public = test.public();
         for path in ["/", "/competitions", "/entries", "/payouts"] {
             for (kind, headers) in [
@@ -1311,7 +1313,15 @@ mod startup_tests {
                 let elapsed = started.elapsed();
                 eprintln!("public {kind} {path}: {} ms", elapsed.as_millis());
                 assert!(elapsed < Duration::from_millis(400), "{path}: {elapsed:?}");
-                assert_eq!(status, StatusCode::OK);
+                let account = path == "/entries" || path == "/payouts";
+                assert_eq!(
+                    status,
+                    if account && kind == "fragment" {
+                        StatusCode::UNAUTHORIZED
+                    } else {
+                        StatusCode::OK
+                    }
+                );
                 let policy = response_headers["content-security-policy"]
                     .to_str()
                     .unwrap();
@@ -1320,6 +1330,10 @@ mod startup_tests {
                     "{path}: {policy}"
                 );
                 assert!(policy.contains("frame-ancestors 'none'"), "{path}");
+                assert!(
+                    policy.contains("https://keymeld.example.net"),
+                    "the wallet needs its configured attestation gateway"
+                );
                 assert_eq!(response_headers["x-content-type-options"], "nosniff");
                 assert!(!body.contains(" onclick="), "{path}");
                 assert_eq!(

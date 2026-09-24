@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn a_missing_forecast_disables_its_picks() {
         let mut station = station();
-        station.forecasts = vec![(Metric::WindSpeed, None)];
+        station.forecasts = vec![(Metric::TempHigh, Some(70.0)), (Metric::WindSpeed, None)];
         let html = entry_form(
             &view("c1", Phase::Open, 60),
             &[station],
@@ -369,5 +369,19 @@ mod tests {
         .into_string();
         assert!(html.contains("no forecast yet"));
         assert!(html.contains("disabled"));
+    }
+    #[test]
+    fn a_cold_forecast_retries_without_resetting_picks_then_offers_manual_retry() {
+        let mut station = station();
+        station.forecasts = vec![(Metric::WindSpeed, None)];
+        let loading = forecast_choices("c1", &[station.clone()], &[], 0).into_string();
+        assert!(loading.contains("Forecasts are loading"));
+        assert!(loading.contains("entry-forecasts?attempt=1"));
+        assert!(loading.contains("load delay:3s"));
+        assert!(!loading.contains("type=\"radio\""));
+        let failed = forecast_choices("c1", &[station], &[], 4).into_string();
+        assert!(failed.contains("temporarily unavailable"));
+        assert!(failed.contains(">Retry</button>"));
+        assert!(!failed.contains("hx-trigger"));
     }
 }

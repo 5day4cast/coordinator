@@ -462,7 +462,7 @@ mod tests {
         };
         let html = picks_detail("e1", &picks, updated, NOW).into_string();
         assert!(html.contains(
-            "Forecast <strong>69°F</strong> · High so far <strong>71°F</strong> · 9 of 24 h"
+            "Forecast <strong>69°F</strong> · High so far <strong>71°F</strong> · reports through 9 of 24 h"
         ));
         assert!(html.contains("Low so far <strong>55°F</strong>"));
         assert!(html.contains("Top wind so far <strong>14 knots</strong>"));
