@@ -5,12 +5,10 @@ use crate::scenarios::{
     self, ScenarioConfig, ScenarioResult, ScenarioStatus, StepResult, StepStatus,
 };
 use anyhow::Result;
-use log::{error, info, warn};
-use std::collections::HashMap;
+use log::{error, info};
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, Mutex};
-use uuid::Uuid;
 
 /// The run in progress, and the step it is on.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -223,51 +221,6 @@ impl Runner {
             }
             tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
         }
-    }
-
-    /// Announce when a competition a recent run made changes state. A run ends once its
-    /// competition awaits attestation, but the money keeps moving after that: attestation,
-    /// payouts, refunds.
-    pub async fn watch_competitions(&self, interval_secs: u64) {
-        let mut seen: HashMap<Uuid, String> = HashMap::new();
-        loop {
-            if let Err(e) = self.check_competitions(&mut seen).await {
-                warn!("Cannot check the runs' competitions: {e:#}");
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
-        }
-    }
-
-    async fn check_competitions(&self, seen: &mut HashMap<Uuid, String>) -> Result<()> {
-        let watched: Vec<Uuid> = self
-            .db
-            .list_runs(20)
-            .await?
-            .into_iter()
-            .filter_map(|run| run.competition_id?.parse().ok())
-            .collect();
-        if watched.is_empty() {
-            return Ok(());
-        }
-        for competition in self.client.list_competitions().await? {
-            if !watched.contains(&competition.id) {
-                continue;
-            }
-            let state = competition
-                .state
-                .clone()
-                .unwrap_or_else(|| competition.inferred_status().to_string());
-            let changed = seen
-                .insert(competition.id, state.clone())
-                .is_some_and(|previous| previous != state);
-            if changed {
-                self.events.send(Event::CompetitionChanged {
-                    competition_id: competition.id,
-                    state,
-                });
-            }
-        }
-        Ok(())
     }
 }
 
