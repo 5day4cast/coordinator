@@ -29,6 +29,15 @@ test('real mobile wallet compiles and username login unlocks only in memory', { 
           const authKey = credentials.authKey;
           const encrypted_nsec = session.nostrClient.sealForLogin(credentials);
           const wallet = session.wasm.DlcWallet.create(session.nostrClient, 'signet');
+          if (typeof wallet.validateInvoice !== 'function') throw new Error('Wallet package is missing validateInvoice');
+          for (const amount of [NaN, Infinity, -1, 0, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+            let rejected;
+            try { wallet.validateInvoice('invalid-invoice', amount); } catch (error) { rejected=String(error); }
+            if (rejected !== 'Invalid invoice amount') throw new Error('Wallet accepted invalid amount: '+amount);
+          }
+          let invalidInvoiceRejected=false;
+          try { wallet.validateInvoice('invalid-invoice', 21); } catch (_) { invalidInvoiceRejected=true; }
+          if (!invalidInvoiceRejected) throw new Error('Wallet accepted invalid invoice');
           const backup = await wallet.encryptedBackup();
           wallet.free(); credentials.free(); session.nostrClient.free();
           session.nostrClient = new session.wasm.NostrClientWrapper();
