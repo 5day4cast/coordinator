@@ -1,0 +1,197 @@
+{
+  "generator": "@arkade-os/sdk@0.4.74",
+  "vectors": [
+    {
+      "description": "Mutinynet signer, height locktime, 2048 second exit delay",
+      "player": "f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26",
+      "coordinator": "fc68d5ea9279cc9d2c57e6885e21bbaee9c3aec85089f1d6c705c017d321ea84",
+      "server": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+      "refundLocktime": 3444600,
+      "exitDelay": {
+        "type": "seconds",
+        "value": 2048
+      },
+      "unilateralRefundDelay": {
+        "type": "seconds",
+        "value": 1209856
+      },
+      "expected": {
+        "leaves": [
+          "20f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ad20fc68d5ea9279cc9d2c57e6885e21bbaee9c3aec85089f1d6c705c017d321ea84ad20301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127aac",
+          "03788f34b17520f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ad20301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127aac",
+          "03040040b27520f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ad20fc68d5ea9279cc9d2c57e6885e21bbaee9c3aec85089f1d6c705c017d321ea84ac",
+          "033b0940b27520f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ac"
+        ],
+        "leafTypes": [
+          "multisig",
+          "cltv-multisig",
+          "csv-multisig",
+          "csv-multisig"
+        ],
+        "tweakedPublicKey": "3ade96518ea2f1dd466e8f48fda608f14c1207dea5dc3ba7aa472c085b827fb7",
+        "tapTree": "01c06620f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ad20fc68d5ea9279cc9d2c57e6885e21bbaee9c3aec85089f1d6c705c017d321ea84ad20301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127aac01c04a03788f34b17520f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ad20301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127aac01c04a03040040b27520f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ad20fc68d5ea9279cc9d2c57e6885e21bbaee9c3aec85089f1d6c705c017d321ea84ac01c028033b0940b27520f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ac",
+        "address": "tark1qqcpq7yq3e8hhsx6ml3fud93m7827qggaurtzu3zwsr4a0qs0gf85wk7jegcagh3m4rxar6glknq3u2vzgraafwu8wn653evppdcylahp2m2uu"
+      }
+    },
+    {
+      "description": "timestamp locktime, 144 block exit delay",
+      "player": "0192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4",
+      "coordinator": "1e1bb85455fe3f5aed60d101aa4dbdb9e7714f6226769a97a17a5331dadcd53b",
+      "server": "aad52d58162e9eefeafc7ad8a1cdca8060b5f01df1e7583362d052e266208f88",
+      "refundLocktime": 1790000000,
+      "exitDelay": {
+        "type": "blocks",
+        "value": 144
+      },
+      "unilateralRefundDelay": {
+        "type": "blocks",
+        "value": 1008
+      },
+      "expected": {
+        "leaves": [
+          "200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ad201e1bb85455fe3f5aed60d101aa4dbdb9e7714f6226769a97a17a5331dadcd53bad20aad52d58162e9eefeafc7ad8a1cdca8060b5f01df1e7583362d052e266208f88ac",
+          "04803bb16ab175200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ad20aad52d58162e9eefeafc7ad8a1cdca8060b5f01df1e7583362d052e266208f88ac",
+          "029000b275200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ad201e1bb85455fe3f5aed60d101aa4dbdb9e7714f6226769a97a17a5331dadcd53bac",
+          "02f003b275200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ac"
+        ],
+        "leafTypes": [
+          "multisig",
+          "cltv-multisig",
+          "csv-multisig",
+          "csv-multisig"
+        ],
+        "tweakedPublicKey": "7577f614e141f07b8520837669d4d877fee6410bb2825b1787c2e9776b1caf21",
+        "tapTree": "01c066200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ad201e1bb85455fe3f5aed60d101aa4dbdb9e7714f6226769a97a17a5331dadcd53bad20aad52d58162e9eefeafc7ad8a1cdca8060b5f01df1e7583362d052e266208f88ac01c04b04803bb16ab175200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ad20aad52d58162e9eefeafc7ad8a1cdca8060b5f01df1e7583362d052e266208f88ac01c049029000b275200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ad201e1bb85455fe3f5aed60d101aa4dbdb9e7714f6226769a97a17a5331dadcd53bac01c02702f003b275200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ac",
+        "address": "tark1qz4d2t2czchfaml2l3ad3gwde2qxpd0srhc7wkpnvtg99cnxyz8csath7c2wzs0s0wzjpqmkd82dsal7ueqshv5ztvtc0shfwa43etepn5f0f7"
+      }
+    },
+    {
+      "description": "16 block exit delay encodes as OP_16, 17 block refund delay does not",
+      "player": "fc68d5ea9279cc9d2c57e6885e21bbaee9c3aec85089f1d6c705c017d321ea84",
+      "coordinator": "f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26",
+      "server": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+      "refundLocktime": 265,
+      "exitDelay": {
+        "type": "blocks",
+        "value": 16
+      },
+      "unilateralRefundDelay": {
+        "type": "blocks",
+        "value": 17
+      },
+      "expected": {
+        "leaves": [
+          "20fc68d5ea9279cc9d2c57e6885e21bbaee9c3aec85089f1d6c705c017d321ea84ad20f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ad20301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127aac",
+          "020901b17520fc68d5ea9279cc9d2c57e6885e21bbaee9c3aec85089f1d6c705c017d321ea84ad20301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127aac",
+          "60b27520fc68d5ea9279cc9d2c57e6885e21bbaee9c3aec85089f1d6c705c017d321ea84ad20f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ac",
+          "0111b27520fc68d5ea9279cc9d2c57e6885e21bbaee9c3aec85089f1d6c705c017d321ea84ac"
+        ],
+        "leafTypes": [
+          "multisig",
+          "cltv-multisig",
+          "csv-multisig",
+          "csv-multisig"
+        ],
+        "tweakedPublicKey": "e56eeea3398cb9f5ed0019708bff362c01ce9eb97fd5720a30fe8df95853c768",
+        "tapTree": "01c06620fc68d5ea9279cc9d2c57e6885e21bbaee9c3aec85089f1d6c705c017d321ea84ad20f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ad20301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127aac01c049020901b17520fc68d5ea9279cc9d2c57e6885e21bbaee9c3aec85089f1d6c705c017d321ea84ad20301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127aac01c04760b27520fc68d5ea9279cc9d2c57e6885e21bbaee9c3aec85089f1d6c705c017d321ea84ad20f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ac01c0260111b27520fc68d5ea9279cc9d2c57e6885e21bbaee9c3aec85089f1d6c705c017d321ea84ac",
+        "address": "tark1qqcpq7yq3e8hhsx6ml3fud93m7827qggaurtzu3zwsr4a0qs0gf84etwa63nnr9e7hksqxts30lnvtqpe60tjl74wg9rpl5dl9v983mg3zzahp"
+      }
+    },
+    {
+      "description": "small height locktime, maximum block refund delay",
+      "player": "1e1bb85455fe3f5aed60d101aa4dbdb9e7714f6226769a97a17a5331dadcd53b",
+      "coordinator": "0192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4",
+      "server": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+      "refundLocktime": 17,
+      "exitDelay": {
+        "type": "blocks",
+        "value": 17
+      },
+      "unilateralRefundDelay": {
+        "type": "blocks",
+        "value": 65535
+      },
+      "expected": {
+        "leaves": [
+          "201e1bb85455fe3f5aed60d101aa4dbdb9e7714f6226769a97a17a5331dadcd53bad200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ad20301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127aac",
+          "0111b175201e1bb85455fe3f5aed60d101aa4dbdb9e7714f6226769a97a17a5331dadcd53bad20301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127aac",
+          "0111b275201e1bb85455fe3f5aed60d101aa4dbdb9e7714f6226769a97a17a5331dadcd53bad200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ac",
+          "03ffff00b275201e1bb85455fe3f5aed60d101aa4dbdb9e7714f6226769a97a17a5331dadcd53bac"
+        ],
+        "leafTypes": [
+          "multisig",
+          "cltv-multisig",
+          "csv-multisig",
+          "csv-multisig"
+        ],
+        "tweakedPublicKey": "932d0f6b66a767816035e5ac01ce2c27b1942910807fd7a0e969b46f5de50afe",
+        "tapTree": "01c066201e1bb85455fe3f5aed60d101aa4dbdb9e7714f6226769a97a17a5331dadcd53bad200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ad20301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127aac01c0480111b175201e1bb85455fe3f5aed60d101aa4dbdb9e7714f6226769a97a17a5331dadcd53bad20301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127aac01c0480111b275201e1bb85455fe3f5aed60d101aa4dbdb9e7714f6226769a97a17a5331dadcd53bad200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ac01c02803ffff00b275201e1bb85455fe3f5aed60d101aa4dbdb9e7714f6226769a97a17a5331dadcd53bac",
+        "address": "tark1qqcpq7yq3e8hhsx6ml3fud93m7827qggaurtzu3zwsr4a0qs0gf84yedpa4kdfm8s9srtedvq88zcfa3js53pqrl67swj6d5daw72zh7qjau85"
+      }
+    },
+    {
+      "description": "minimum 512 second exit delay",
+      "player": "f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26",
+      "coordinator": "0192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4",
+      "server": "aad52d58162e9eefeafc7ad8a1cdca8060b5f01df1e7583362d052e266208f88",
+      "refundLocktime": 500000000,
+      "exitDelay": {
+        "type": "seconds",
+        "value": 512
+      },
+      "unilateralRefundDelay": {
+        "type": "seconds",
+        "value": 1024
+      },
+      "expected": {
+        "leaves": [
+          "20f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ad200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ad20aad52d58162e9eefeafc7ad8a1cdca8060b5f01df1e7583362d052e266208f88ac",
+          "040065cd1db17520f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ad20aad52d58162e9eefeafc7ad8a1cdca8060b5f01df1e7583362d052e266208f88ac",
+          "03010040b27520f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ad200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ac",
+          "03020040b27520f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ac"
+        ],
+        "leafTypes": [
+          "multisig",
+          "cltv-multisig",
+          "csv-multisig",
+          "csv-multisig"
+        ],
+        "tweakedPublicKey": "198d9a3482f179ac79f8df66074f664303c74a761d3962451354980f6efe4d6d",
+        "tapTree": "01c06620f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ad200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ad20aad52d58162e9eefeafc7ad8a1cdca8060b5f01df1e7583362d052e266208f88ac01c04b040065cd1db17520f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ad20aad52d58162e9eefeafc7ad8a1cdca8060b5f01df1e7583362d052e266208f88ac01c04a03010040b27520f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ad200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ac01c02803020040b27520f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ac",
+        "address": "tark1qz4d2t2czchfaml2l3ad3gwde2qxpd0srhc7wkpnvtg99cnxyz8csxvdng6g9ute43ul3hmxqa8kvscrca98v8fevfz3x4ycpah0untdfvrrcj"
+      }
+    },
+    {
+      "description": "Mutinynet signer, timestamp locktime, maximum second refund delay",
+      "player": "0192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4",
+      "coordinator": "f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26",
+      "server": "301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127a",
+      "refundLocktime": 1790000000,
+      "exitDelay": {
+        "type": "seconds",
+        "value": 2048
+      },
+      "unilateralRefundDelay": {
+        "type": "seconds",
+        "value": 33553920
+      },
+      "expected": {
+        "leaves": [
+          "200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ad20f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ad20301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127aac",
+          "04803bb16ab175200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ad20301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127aac",
+          "03040040b275200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ad20f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ac",
+          "03ffff40b275200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ac"
+        ],
+        "leafTypes": [
+          "multisig",
+          "cltv-multisig",
+          "csv-multisig",
+          "csv-multisig"
+        ],
+        "tweakedPublicKey": "5de3b7e8a684420276efa2d1812184882fb4b5eb1b9a8f80811b37e395b9ed99",
+        "tapTree": "01c066200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ad20f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ad20301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127aac01c04b04803bb16ab175200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ad20301078808e4f7bc0dadfe29e34b1df8eaf0108ef06b1722274075ebc107a127aac01c04a03040040b275200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ad20f8352deebdf5658d95875d89656112b1dd150f176c702eea4f91a91527e48e26ac01c02803ffff40b275200192e796452d6df9697c280542e1560557bcf79a347d925895043136225c7cb4ac",
+        "address": "tark1qqcpq7yq3e8hhsx6ml3fud93m7827qggaurtzu3zwsr4a0qs0gf85h0rkl52dpzzqfmwlgk3syscfzp0kj67kxu637qgzxehuw2mnmvepu5hra"
+      }
+    }
+  ]
+}

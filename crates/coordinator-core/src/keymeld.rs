@@ -3,7 +3,10 @@
 
 use crate::RegistrationAssignment;
 pub use coordinator_escrow::{
-    authorization::PayoutPolicy, escrow::SignedEscrowPolicy, payout, payout_protocol,
+    ark,
+    authorization::{ArkEscrowPolicy, PayoutPolicy},
+    escrow::SignedEscrowPolicy,
+    payout, payout_protocol,
 };
 use coordinator_escrow::{
     escrow::{ApplicationContext, EscrowContext, PublicKeyBytes, Recipient},
@@ -298,6 +301,7 @@ mod tests {
             allow_invoice_fallback: true,
             release_entry_key_after_payment: true,
             contract_terms: serde_json::to_string(&terms).unwrap(),
+            ark_escrow: None,
         };
         let registration = generic::registration(
             EscrowContext {

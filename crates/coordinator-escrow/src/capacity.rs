@@ -194,6 +194,7 @@ pub fn validate_competition_capacity(
         allow_invoice_fallback: false,
         release_entry_key_after_payment: true,
         contract_terms,
+        ark_escrow: None,
     };
     let context = EscrowContext {
         keygen_session_id: SessionId::from(id),
@@ -285,7 +286,10 @@ pub fn validate_competition_capacity(
     let sign_action = worst(&Action::Sign {
         scope: scope.clone(),
     })?;
-    let sign_parameters = worst(&generic::ActionParameters::SignContract { scope })?;
+    let sign_parameters = worst(&generic::ActionParameters::SignContract {
+        scope,
+        ark_funding: None,
+    })?;
     let signing_receipt = check(
         "signing receipt",
         encrypted_size(

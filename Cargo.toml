@@ -8,16 +8,20 @@ members = [
     "crates/coordinator-escrow-verifier",
     "crates/coordinator-verifier-enclave",
     "crates/coordinator-lnurl-relay",
+    "crates/coordinator-ark-escrow",
+    "crates/coordinator-ark",
+    "crates/coordinator-ark-swap",
 ]
 # Nitro enclave and VSock relay binaries build only when selected explicitly.
 default-members = [
     "crates/coordinator", "crates/coordinator-core", "crates/coordinator-wasm",
-    "crates/synth", "crates/coordinator-escrow",
+    "crates/synth", "crates/coordinator-escrow", "crates/coordinator-ark-escrow",
+    "crates/coordinator-ark", "crates/coordinator-ark-swap",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/5day4cast/coordinator"
@@ -29,11 +33,18 @@ name = "coordinator"
 # Internal crates
 coordinator-core = { path = "crates/coordinator-core" }
 coordinator-escrow = { path = "crates/coordinator-escrow" }
+coordinator-ark-escrow = { path = "crates/coordinator-ark-escrow" }
+coordinator-ark = { path = "crates/coordinator-ark" }
+
+# Arkade: arkd's Rust SDK. The generated gRPC code is checked in, so no protoc is needed.
+ark-core = "0.11"
+ark-grpc = { version = "0.11", default-features = false, features = ["tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 # Keymeld: released SDK and services on the published dlctix crate.
 # keymeld-sdk and the coordinator must resolve dlctix from the same source.
-keymeld-sdk = { git = "https://github.com/tee8z/keymeld", tag = "v0.5.0", default-features = false, features = ["escrow", "dlctix"] }
-keymeld-core = { git = "https://github.com/tee8z/keymeld", tag = "v0.5.0", default-features = false, features = ["escrow"] }
+keymeld-sdk = { git = "https://github.com/tee8z/keymeld", rev = "4235b16b3177d22660b946e4b15f9f7f0b4f4e06", default-features = false, features = ["escrow", "dlctix"] }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "4235b16b3177d22660b946e4b15f9f7f0b4f4e06", default-features = false, features = ["escrow"] }
 
 # Bitcoin
 bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }
@@ -57,6 +68,7 @@ h2 = "0.4.16"
 tokio = { version = "1.39.2", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7.11", features = ["rt"] }
 futures = "0.3.28"
+dashmap = "6.1"
 async-trait = "0.1.85"
 async-channel = "2.3.1"
 
@@ -129,3 +141,4 @@ opt-level = "s"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+

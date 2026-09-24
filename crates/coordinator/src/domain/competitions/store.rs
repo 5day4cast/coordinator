@@ -838,6 +838,30 @@ impl CompetitionStore {
         &self,
         competitions: Vec<Competition>,
     ) -> Result<(), DatabaseWriteError> {
+        self.write_competitions(competitions, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Save a competition only while `lease` still holds it. False if another process took it.
+    pub async fn update_competition_fenced(
+        &self,
+        competition: Competition,
+        lease: &super::Lease,
+    ) -> Result<bool, DatabaseWriteError> {
+        let written = self
+            .write_competitions(vec![competition], Some(lease.clone()))
+            .await?;
+        Ok(written == 1)
+    }
+
+    /// Returns how many competitions were written. With `fence`, a competition is written
+    /// only while that lease is current.
+    async fn write_competitions(
+        &self,
+        competitions: Vec<Competition>,
+        fence: Option<super::Lease>,
+    ) -> Result<u64, DatabaseWriteError> {
         // Prepare all competition data before moving into closure
         let mut prepared_updates = Vec::with_capacity(competitions.len());
 
@@ -1065,6 +1089,11 @@ impl CompetitionStore {
                     invoices_settled_at = ?,
                     errors = ?
                     WHERE id = ?";
+                let fenced_query = format!(
+                    "{query} AND EXISTS (SELECT 1 FROM leases
+                        WHERE resource = ? AND holder = ? AND token = ?)"
+                );
+                let mut written = 0;
 
                 for (
                     event_announcement,
@@ -1099,43 +1128,65 @@ impl CompetitionStore {
                     competition_id,
                 ) in prepared_updates
                 {
-                    sqlx::query(query)
-                        .bind(event_announcement)
-                        .bind(outcome_transaction)
-                        .bind(funding_psbt_base64)
-                        .bind(funding_transaction)
-                        .bind(funding_outpoint)
-                        .bind(contract_parameters)
-                        .bind(public_nonces)
-                        .bind(aggregated_nonces)
-                        .bind(partial_signatures)
-                        .bind(signed_contract)
-                        .bind(attestation)
-                        .bind(cancelled_at)
-                        .bind(contracted_at)
-                        .bind(signed_at)
-                        .bind(escrow_funds_confirmed_at)
-                        .bind(event_created_at)
-                        .bind(entries_submitted_at)
-                        .bind(funding_broadcasted_at)
-                        .bind(funding_confirmed_at)
-                        .bind(funding_settled_at)
-                        .bind(awaiting_attestation_at)
-                        .bind(expiry_broadcasted_at)
-                        .bind(outcome_broadcasted_at)
-                        .bind(delta_broadcasted_at)
-                        .bind(completed_at)
-                        .bind(failed_at)
-                        .bind(keymeld_keygen_completed_at)
-                        .bind(invoices_settled_at)
-                        .bind(errors)
-                        .bind(competition_id)
-                        .execute(&pool)
-                        .await?;
+                    let mut update = sqlx::query(if fence.is_some() {
+                        fenced_query.as_str()
+                    } else {
+                        query
+                    })
+                    .bind(event_announcement)
+                    .bind(outcome_transaction)
+                    .bind(funding_psbt_base64)
+                    .bind(funding_transaction)
+                    .bind(funding_outpoint)
+                    .bind(contract_parameters)
+                    .bind(public_nonces)
+                    .bind(aggregated_nonces)
+                    .bind(partial_signatures)
+                    .bind(signed_contract)
+                    .bind(attestation)
+                    .bind(cancelled_at)
+                    .bind(contracted_at)
+                    .bind(signed_at)
+                    .bind(escrow_funds_confirmed_at)
+                    .bind(event_created_at)
+                    .bind(entries_submitted_at)
+                    .bind(funding_broadcasted_at)
+                    .bind(funding_confirmed_at)
+                    .bind(funding_settled_at)
+                    .bind(awaiting_attestation_at)
+                    .bind(expiry_broadcasted_at)
+                    .bind(outcome_broadcasted_at)
+                    .bind(delta_broadcasted_at)
+                    .bind(completed_at)
+                    .bind(failed_at)
+                    .bind(keymeld_keygen_completed_at)
+                    .bind(invoices_settled_at)
+                    .bind(errors)
+                    .bind(competition_id);
+                    if let Some(lease) = &fence {
+                        update = update
+                            .bind(&lease.resource)
+                            .bind(&lease.holder)
+                            .bind(lease.token);
+                    }
+                    written += update.execute(&pool).await?.rows_affected();
                 }
-                Ok(())
+                Ok(written)
             })
             .await
+    }
+
+    /// Competitions with lifecycle work left, as the runners' sweep sees them.
+    pub async fn active_competition_ids(&self) -> Result<Vec<Uuid>, sqlx::Error> {
+        let ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM competitions
+             WHERE expiry_broadcasted_at IS NULL AND completed_at IS NULL AND cancelled_at IS NULL",
+        )
+        .fetch_all(self.db_connection.read())
+        .await?;
+        ids.iter()
+            .map(|id| Uuid::parse_str(id).map_err(|e| sqlx::Error::Decode(Box::new(e))))
+            .collect()
     }
 
     /// Failed and cancelled competitions retain cleanup work after their active
@@ -1595,7 +1646,8 @@ impl CompetitionStore {
                LEFT JOIN entries ON tickets.id = entries.ticket_id
                WHERE reserved_at IS NOT NULL
                  AND settled_at IS NULL
-                 AND payment_request IS NOT NULL"#,
+                 AND payment_request IS NOT NULL
+                 AND tickets.id NOT IN (SELECT ticket_id FROM ticket_ark_escrows)"#,
         )
         .fetch_all(self.db_connection.read())
         .await?;
@@ -1762,7 +1814,8 @@ impl CompetitionStore {
                FROM tickets
                LEFT JOIN entries ON tickets.id = entries.ticket_id
                WHERE tickets.hash = ?
-               AND tickets.paid_at IS NULL"#,
+               AND tickets.paid_at IS NULL
+               AND tickets.id NOT IN (SELECT ticket_id FROM ticket_ark_escrows)"#,
         )
         .bind(hash)
         .fetch_optional(self.db_connection.read())

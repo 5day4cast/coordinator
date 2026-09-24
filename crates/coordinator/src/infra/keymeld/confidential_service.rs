@@ -24,8 +24,24 @@ use keymeld_core::{
 use keymeld_sdk::{
     confidential::ConfidentialTransport,
     confidential_scope::scope_for_participant,
-    confidential_session::{ConfidentialJournal, ConfidentialSession},
+    confidential_session::{
+        CheckpointFuture, ConfidentialCheckpoint, ConfidentialJournal, ConfidentialSession,
+    },
 };
+
+/// Keeps the command journal in memory only, for work inside an Arkade batch.
+///
+/// A batch that fails is retried with a new commitment transaction, new messages, and fresh
+/// attempts, so nothing signed inside the batch needs to be replayed after a restart.
+/// Persisting the whole protocol state twice per command would also cost more with every
+/// command, which a batch's session window cannot afford.
+struct EphemeralCheckpoint;
+
+impl ConfidentialCheckpoint for EphemeralCheckpoint {
+    fn save<'a>(&'a self, _journal: &'a ConfidentialJournal) -> CheckpointFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+}
 use std::collections::BTreeSet;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use zeroize::Zeroizing;
@@ -103,7 +119,7 @@ impl KeymeldService {
         state: &ProtocolState,
         credentials: &'a SessionCredentials,
         journal: &'a mut ConfidentialJournal,
-        checkpoint: &'a DurableCheckpoint,
+        checkpoint: &'a dyn ConfidentialCheckpoint,
     ) -> Result<ConfidentialSession<'a>, KeymeldError> {
         Ok(ConfidentialSession::connect(
             self.get_client()?,
@@ -724,6 +740,7 @@ impl Keymeld for KeymeldService {
             contract_signatures: request.contract_signatures,
             attestation: request.attestation,
             method: request.method,
+            ark_funding: request.ark_funding,
         })?;
         let first_request = PrepareEscrowRequest {
             schema_version: escrow::SCHEMA_VERSION,
@@ -913,6 +930,152 @@ impl Keymeld for KeymeldService {
         params: &ContractParameters,
         players: Vec<UserId>,
     ) -> Result<DlcSignatureResults, KeymeldError> {
+        self.sign_dlc_batch_with(session, signing_data, params, players, None)
+            .await
+    }
+
+    async fn sign_ark_dlc_batch(
+        &self,
+        session: &DlcKeygenSession,
+        signing_data: &SigningData,
+        params: &ContractParameters,
+        players: Vec<UserId>,
+        ark_funding: coordinator_escrow::ark::ArkFunding,
+    ) -> Result<DlcSignatureResults, KeymeldError> {
+        self.sign_dlc_batch_with(session, signing_data, params, players, Some(ark_funding))
+            .await
+    }
+
+    async fn sign_ark_escrow(
+        &self,
+        session: &DlcKeygenSession,
+        user: UserId,
+        spend: coordinator_escrow::ark::ArkEscrowSpend,
+    ) -> Result<Vec<(usize, [u8; 64])>, KeymeldError> {
+        let mut signed = self.sign_ark_escrows(session, vec![(user, spend)]).await?;
+        Ok(signed.remove(0))
+    }
+
+    async fn sign_ark_escrows(
+        &self,
+        session: &DlcKeygenSession,
+        spends: Vec<(UserId, coordinator_escrow::ark::ArkEscrowSpend)>,
+    ) -> Result<Vec<Vec<(usize, [u8; 64])>>, KeymeldError> {
+        let _guard = self.lock_session(&session.session_id).await;
+        let (mut state, _) = self.checkpoint(session).await?;
+        let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
+        let mut journal = std::mem::take(&mut state.journal);
+        let mut driver = self
+            .connect(
+                session,
+                &state,
+                &credentials,
+                &mut journal,
+                &EphemeralCheckpoint,
+            )
+            .await?;
+        driver.restore_keygen(&state.registrations).await?;
+        let mut signed = Vec::with_capacity(spends.len());
+        for (user, spend) in spends {
+            let binding = state
+                .bindings
+                .get(&user)
+                .ok_or_else(|| invalid("The pool must be bound before its escrows are spent"))?;
+            let participant_key = &state
+                .policies
+                .get(&user)
+                .ok_or_else(|| invalid("Escrow participant has no accepted policy"))?
+                .policy
+                .participant_public_key;
+            // Every batch attempt signs new transactions, so each spend is a fresh attempt.
+            let attempt = ActionAttempt {
+                attempt_id: Uuid::now_v7(),
+                signing_session_id: None,
+            };
+            let prepare = PrepareEscrowRequest {
+                schema_version: escrow::SCHEMA_VERSION,
+                binding_receipt: binding.sealed_state.clone(),
+                action_id: generic::SIGN_ARK_ESCROW.into(),
+                attempt: attempt.clone(),
+                action: None,
+                action_parameters: Payload::encode(&generic::ActionParameters::SignArkEscrow {
+                    spend,
+                })?,
+                prior_preparation_receipts: vec![],
+            };
+            let prepared = escrow_request(
+                &mut driver,
+                session,
+                &state,
+                &credentials,
+                &user,
+                &format!("escrow/ark/prepare/{user}/{}", attempt.attempt_id),
+                Operation::Prepare,
+                Some(generic::SIGN_ARK_ESCROW),
+                Some(attempt.clone()),
+                &prepare,
+            )
+            .await?;
+            let inputs: Vec<usize> = prepared.output.decode()?;
+            let execute = ExecuteEscrowRequest {
+                schema_version: escrow::SCHEMA_VERSION,
+                prepared_receipt: prepared.sealed_state,
+                proof: ConditionProof::VerifierEvidence {
+                    evidence: Payload::default(),
+                },
+            };
+            let response = escrow_request(
+                &mut driver,
+                session,
+                &state,
+                &credentials,
+                &user,
+                &format!("escrow/ark/execute/{user}/{}", attempt.attempt_id),
+                Operation::Execute,
+                Some(generic::SIGN_ARK_ESCROW),
+                Some(attempt),
+                &execute,
+            )
+            .await?;
+            let ExecutionOutput::Bip340Signatures {
+                public_key,
+                signatures,
+            } = response.output.decode()?
+            else {
+                return Err(invalid("Enclave did not sign the escrow spend"));
+            };
+            if &public_key != participant_key || signatures.len() != inputs.len() {
+                return Err(invalid(
+                    "Escrow signatures differ from the authorized spend",
+                ));
+            }
+            signed.push(
+                inputs
+                    .into_iter()
+                    .zip(signatures)
+                    .map(|(input, signature)| {
+                        let bytes: [u8; 64] = signature
+                            .signature
+                            .try_into()
+                            .map_err(|_| invalid("Invalid BIP340 signature length"))?;
+                        Ok((input, bytes))
+                    })
+                    .collect::<Result<Vec<_>, KeymeldError>>()?,
+            );
+        }
+        Ok(signed)
+    }
+}
+
+impl KeymeldService {
+    async fn sign_dlc_batch_with(
+        &self,
+        session: &DlcKeygenSession,
+        signing_data: &SigningData,
+        params: &ContractParameters,
+        players: Vec<UserId>,
+        ark_funding: Option<coordinator_escrow::ark::ArkFunding>,
+    ) -> Result<DlcSignatureResults, KeymeldError> {
         let _guard = self.lock_session(&session.session_id).await;
         let (mut state, checkpoint) = self.checkpoint(session).await?;
         let subsets = outcome_subsets_for_payouts(
@@ -944,6 +1107,14 @@ impl Keymeld for KeymeldService {
             "coordinator-confidential-dlc-plan-v1",
             &(&players, semantics),
         )?;
+        // An Arkade attempt signs inside its batch, with a fresh plan and an in-memory journal.
+        let durable = ark_funding.is_none();
+        let saver: &dyn ConfidentialCheckpoint = if durable {
+            &checkpoint
+        } else {
+            state.signing = None;
+            &EphemeralCheckpoint
+        };
         if let Some(plan) = &state.signing {
             if plan.input_digest != input_digest {
                 return Err(invalid("Signing retry changed the accepted DLC messages"));
@@ -955,13 +1126,15 @@ impl Keymeld for KeymeldService {
                 batch: candidate,
                 prior_preparations: BTreeMap::new(),
             });
-            checkpoint.finish(state.clone()).await?;
+            if durable {
+                checkpoint.finish(state.clone()).await?;
+            }
         }
         let mut plan = state.signing.as_ref().expect("saved plan").clone();
         let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
         let mut journal = std::mem::take(&mut state.journal);
         let mut driver = self
-            .connect(session, &state, &credentials, &mut journal, &checkpoint)
+            .connect(session, &state, &credentials, &mut journal, saver)
             .await?;
         let roster = driver.restore_keygen(&state.registrations).await?;
         if driver.is_signing_aborted(&plan.session_id) {
@@ -985,9 +1158,11 @@ impl Keymeld for KeymeldService {
             drop(driver);
             state.signing = Some(plan.clone());
             state.journal = journal.clone();
-            checkpoint.finish(state.clone()).await?;
+            if durable {
+                checkpoint.finish(state.clone()).await?;
+            }
             driver = self
-                .connect(session, &state, &credentials, &mut journal, &checkpoint)
+                .connect(session, &state, &credentials, &mut journal, saver)
                 .await?;
         }
         driver
@@ -1012,6 +1187,7 @@ impl Keymeld for KeymeldService {
                 action: None,
                 action_parameters: Payload::encode(&generic::ActionParameters::SignContract {
                     scope,
+                    ark_funding: ark_funding.clone(),
                 })?,
                 prior_preparation_receipts: plan
                     .prior_preparations
@@ -1078,9 +1254,11 @@ impl Keymeld for KeymeldService {
         let results = driver.decrypt_batch_results(&encrypted)?;
         let signatures = plan.batch.parse_results(&results)?;
         drop(driver);
-        state.roster = Some(roster);
-        state.journal = journal;
-        checkpoint.finish(state).await?;
+        if durable {
+            state.roster = Some(roster);
+            state.journal = journal;
+            checkpoint.finish(state).await?;
+        }
         Ok(signatures)
     }
 }

@@ -2,6 +2,7 @@
 //! remain in Keymeld; this verifier can only propose participant-authorized actions.
 use coordinator_escrow::payout::dlctix::ContractSignatures;
 use coordinator_escrow::{
+    ark::{self, ArkEscrowSpend, ArkFunding},
     authorization::PayoutPolicy,
     generic::{self, ActionParameters, ContractBinding, PaymentEvidence, PreparedSettlement},
     payout::{self, ContractAuthorization, ContractCommitment},
@@ -10,8 +11,8 @@ use coordinator_escrow::{
 use keymeld_core::{
     authorization::SignedSessionManifest,
     escrow::{
-        self, protocol::Payload, Action, AdaptorContext, Condition, KeyTweak, Permission,
-        PublicKeyBytes, SignedEscrowPolicy, SigningScope,
+        self, protocol::Payload, Action, AdaptorContext, Bip340Item, Bip340Scope, Condition,
+        KeyTweak, Permission, PublicKeyBytes, SignedEscrowPolicy, SigningScope,
     },
     protocol::{EnclaveError, ValidationError},
     SessionId, UserId,
@@ -119,7 +120,13 @@ struct BoundContract {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum PreparedState {
-    ContractSigning,
+    ContractSigning {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ark_funding: Option<ArkFunding>,
+    },
+    ArkEscrowSpend {
+        spend: ArkEscrowSpend,
+    },
     Settlement {
         request_digest: [u8; 32],
         settlement: PreparedSettlement,
@@ -168,14 +175,18 @@ fn policy(
 fn check_permissions(
     signed: &SignedEscrowPolicy,
     terms: &ContractAuthorization,
+    ark_escrow: bool,
 ) -> Result<(), VerificationError> {
-    let expected: BTreeSet<_> = [
+    let mut expected: BTreeSet<_> = [
         generic::SIGN_CONTRACT,
         generic::RELEASE_PREIMAGE,
         generic::RELEASE_ENTRY_KEY,
     ]
     .into_iter()
     .collect();
+    if ark_escrow {
+        expected.insert(generic::SIGN_ARK_ESCROW);
+    }
     if signed
         .policy
         .grants
@@ -185,28 +196,34 @@ fn check_permissions(
         != expected
     {
         return Err(invalid(
-            "Coordinator policy requires exactly its three explicit permissions",
+            "Coordinator policy requires exactly its explicit permissions",
         ));
     }
     for (id, grant) in &signed.policy.grants {
-        let expected_rule = if id == generic::SIGN_CONTRACT {
-            generic::CONTRACT_RULE
-        } else {
-            generic::SETTLEMENT_RULE
-        };
-        let expected_repetition = if id == generic::SIGN_CONTRACT {
-            escrow::Repetition::RepeatIdenticalSigningScope
-        } else {
-            escrow::Repetition::Once
+        let (expected_rule, expected_repetition, expected_preparation) = match id.as_str() {
+            generic::SIGN_CONTRACT => (
+                generic::CONTRACT_RULE,
+                if ark_escrow {
+                    escrow::Repetition::VerifierAuthorizedAttempts
+                } else {
+                    escrow::Repetition::RepeatIdenticalSigningScope
+                },
+                escrow::PreparationPolicy::Single,
+            ),
+            generic::SIGN_ARK_ESCROW => (
+                generic::ARK_ESCROW_RULE,
+                escrow::Repetition::VerifierAuthorizedAttempts,
+                escrow::PreparationPolicy::Single,
+            ),
+            _ => (
+                generic::SETTLEMENT_RULE,
+                escrow::Repetition::Once,
+                escrow::PreparationPolicy::RenewableIdenticalAction,
+            ),
         };
         if grant.repetition != expected_repetition {
             return Err(invalid("Coordinator permission repetition differs"));
         }
-        let expected_preparation = if id == generic::SIGN_CONTRACT {
-            escrow::PreparationPolicy::Single
-        } else {
-            escrow::PreparationPolicy::RenewableIdenticalAction
-        };
         if grant.preparation != expected_preparation {
             return Err(invalid("Coordinator permission preparation policy differs"));
         }
@@ -221,6 +238,7 @@ fn check_permissions(
         }
         match (id.as_str(), &grant.operation) {
             (generic::SIGN_CONTRACT, Permission::Sign) => {}
+            (generic::SIGN_ARK_ESCROW, Permission::SignBip340) => {}
             (generic::RELEASE_PREIMAGE, Permission::ReleaseSecret { name, recipient })
                 if name == generic::PREIMAGE_SECRET
                     && recipient.encryption_public_key.as_bytes()
@@ -280,7 +298,10 @@ fn validate_static(
             "Escrow identifier differs from the authorized entry",
         ));
     }
-    check_permissions(signed, &terms)?;
+    check_permissions(signed, &terms, policy.ark_escrow.is_some())?;
+    if let Some(ark_policy) = &policy.ark_escrow {
+        ark_escrow(signed, &terms, ark_policy)?;
+    }
     if let Some(address) = &policy.automatic_lightning_address {
         #[cfg(feature = "lnurl")]
         if crate::lnurl_transport::validate_address(address).map_err(invalid)? != *address {
@@ -319,6 +340,76 @@ fn restore_binding(
     Ok((bound, policy, terms))
 }
 
+fn xonly(compressed: &[u8]) -> Result<ark::XOnlyPublicKey, VerificationError> {
+    match compressed {
+        [0x02 | 0x03, rest @ ..] => ark::XOnlyPublicKey::from_slice(rest).map_err(invalid),
+        _ => Err(invalid("Expected a compressed public key")),
+    }
+}
+/// The entry's escrow, checked against its entry key and the pool's market maker.
+fn ark_escrow(
+    signed: &SignedEscrowPolicy,
+    terms: &ContractAuthorization,
+    policy: &coordinator_escrow::authorization::ArkEscrowPolicy,
+) -> Result<coordinator_ark_escrow::EntryEscrow, VerificationError> {
+    ark::escrow(
+        policy,
+        xonly(signed.policy.participant_public_key.as_bytes())?,
+        xonly(&terms.market_maker.pubkey.serialize())?,
+    )
+    .map_err(invalid)
+}
+/// The contract to sign or settle: the bound one, or for an Arkade-funded pool, the bound one at
+/// the outpoint the batch's commitment transaction pays.
+fn funded(
+    bound: &BoundContract,
+    policy: &PayoutPolicy,
+    ark_funding: Option<&ArkFunding>,
+) -> Result<ContractCommitment, VerificationError> {
+    match (&policy.ark_escrow, ark_funding) {
+        (None, None) => Ok(bound.contract.clone()),
+        (Some(_), Some(funding)) => ark::funded_contract(&bound.contract, funding).map_err(invalid),
+        (None, Some(_)) => Err(invalid("Only an Arkade-funded pool names its commitment")),
+        (Some(_), None) => Err(invalid(
+            "An Arkade-funded pool needs its commitment transaction",
+        )),
+    }
+}
+/// Recompute this participant's escrow spend, as the BIP340 action Keymeld may sign.
+fn ark_escrow_action(
+    signed: &SignedEscrowPolicy,
+    policy: &PayoutPolicy,
+    terms: &ContractAuthorization,
+    bound: &BoundContract,
+    spend: &ArkEscrowSpend,
+) -> Result<(Action, Vec<usize>), VerificationError> {
+    let ark_policy = policy
+        .ark_escrow
+        .as_ref()
+        .ok_or_else(|| invalid("This ticket has no Arkade escrow"))?;
+    let escrow = ark_escrow(signed, terms, ark_policy)?;
+    let digests =
+        ark::spend_digests(&escrow, ark_policy, &bound.contract, spend).map_err(invalid)?;
+    let inputs = digests.iter().map(|(input, _)| *input).collect();
+    let items = digests
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_, digest))| Bip340Item {
+            item_id: Uuid::from_u128(index as u128 + 1),
+            digest,
+        })
+        .collect();
+    Ok((
+        Action::SignBip340 {
+            scope: Bip340Scope {
+                public_key: signed.policy.participant_public_key.clone(),
+                items,
+            },
+        },
+        inputs,
+    ))
+}
+
 /// Recompute all messages this participant must sign. Client-selected routing
 /// IDs are checked against the authenticated manifest; every cryptographic value
 /// is derived from the bound DLC instead of accepted from the application host.
@@ -326,6 +417,7 @@ fn validate_signing_scope(
     manifest: &SignedSessionManifest,
     signed: &SignedEscrowPolicy,
     bound: &BoundContract,
+    contract: &ContractCommitment,
     scope: &SigningScope,
 ) -> Result<(), VerificationError> {
     scope
@@ -337,7 +429,7 @@ fn validate_signing_scope(
     if scope.session_tweak != KeyTweak::None {
         return Err(invalid("DLC contract signing cannot use a key tweak"));
     }
-    let mut expected = payout::signing_requirements(&bound.contract)
+    let mut expected = payout::signing_requirements(contract)
         .map_err(invalid)?
         .into_iter()
         .filter(|(_, item)| {
@@ -596,13 +688,20 @@ impl EscrowVerifier for CoordinatorVerifier {
             }
             let parameters: ActionParameters = action_parameters.decode().map_err(invalid)?;
             match parameters {
-                ActionParameters::SignContract { scope } => {
+                ActionParameters::SignContract { scope, ark_funding } => {
                     if context.rule != generic::CONTRACT_RULE
                         || context.permission_id != generic::SIGN_CONTRACT
                     {
                         return Err(invalid("Contract signing permission differs"));
                     }
-                    validate_signing_scope(context.manifest, context.policy, &bound, &scope)?;
+                    let contract = funded(&bound, &policy, ark_funding.as_ref())?;
+                    validate_signing_scope(
+                        context.manifest,
+                        context.policy,
+                        &bound,
+                        &contract,
+                        &scope,
+                    )?;
                     let action = Action::Sign { scope };
                     context
                         .attempt
@@ -610,9 +709,33 @@ impl EscrowVerifier for CoordinatorVerifier {
                         .map_err(invalid)?;
                     Ok(PreparedAction {
                         action,
-                        application_state: Payload::encode(&PreparedState::ContractSigning)
-                            .map_err(invalid)?,
+                        application_state: Payload::encode(&PreparedState::ContractSigning {
+                            ark_funding,
+                        })
+                        .map_err(invalid)?,
                         output: Payload::default(),
+                    })
+                }
+                ActionParameters::SignArkEscrow { spend } => {
+                    if context.rule != generic::ARK_ESCROW_RULE
+                        || context.permission_id != generic::SIGN_ARK_ESCROW
+                    {
+                        return Err(invalid("Escrow spend permission differs"));
+                    }
+                    let (action, inputs) =
+                        ark_escrow_action(context.policy, &policy, &terms, &bound, &spend)?;
+                    context
+                        .attempt
+                        .validate(&action, &context.policy.policy.context)
+                        .map_err(invalid)?;
+                    Ok(PreparedAction {
+                        action,
+                        application_state: Payload::encode(&PreparedState::ArkEscrowSpend {
+                            spend,
+                        })
+                        .map_err(invalid)?,
+                        // The signed inputs, in the order of the signatures.
+                        output: Payload::encode(&inputs).map_err(invalid)?,
                     })
                 }
                 ActionParameters::PrepareSettlement {
@@ -620,6 +743,7 @@ impl EscrowVerifier for CoordinatorVerifier {
                     contract_signatures,
                     attestation,
                     method,
+                    ark_funding,
                 } => {
                     if context.rule != generic::SETTLEMENT_RULE
                         || context.attempt.attempt_id != claim_id
@@ -658,17 +782,18 @@ impl EscrowVerifier for CoordinatorVerifier {
                             }
                         }
                     } else {
+                        let contract = funded(&bound, &policy, ark_funding.as_ref())?;
                         let signatures: ContractSignatures =
                             serde_json::from_str(&contract_signatures).map_err(invalid)?;
-                        payout::verify_completed_contract(&bound.contract, &signatures)
+                        payout::verify_completed_contract(&contract, &signatures)
                             .map_err(invalid)?;
                         let outcome = payout::attested_outcome(
-                            &bound.contract.contract_parameters,
+                            &contract.contract_parameters,
                             &hex32(&attestation)?,
                         )
                         .map_err(invalid)?;
                         let owed_sats = payout::owed_sats(
-                            &bound.contract.contract_parameters,
+                            &contract.contract_parameters,
                             &outcome,
                             context.policy.policy.participant_public_key.as_bytes(),
                         )
@@ -771,11 +896,11 @@ impl EscrowVerifier for CoordinatorVerifier {
                 .attempt
                 .validate(&prepared.action, &context.policy.policy.context)
                 .map_err(invalid)?;
-            let (bound, _, terms) =
+            let (bound, policy, terms) =
                 restore_binding(context.manifest, context.policy, context.bound_state)?;
             let state: PreparedState = prepared.application_state.decode().map_err(invalid)?;
             match state {
-                PreparedState::ContractSigning => {
+                PreparedState::ContractSigning { ark_funding } => {
                     if context.rule != generic::CONTRACT_RULE
                         || context.permission_id != generic::SIGN_CONTRACT
                         || !evidence.as_bytes().is_empty()
@@ -785,7 +910,29 @@ impl EscrowVerifier for CoordinatorVerifier {
                     let Action::Sign { scope } = &prepared.action else {
                         return Err(invalid("Prepared action is not contract signing"));
                     };
-                    validate_signing_scope(context.manifest, context.policy, &bound, scope)?;
+                    let contract = funded(&bound, &policy, ark_funding.as_ref())?;
+                    validate_signing_scope(
+                        context.manifest,
+                        context.policy,
+                        &bound,
+                        &contract,
+                        scope,
+                    )?;
+                }
+                PreparedState::ArkEscrowSpend { spend } => {
+                    if context.rule != generic::ARK_ESCROW_RULE
+                        || context.permission_id != generic::SIGN_ARK_ESCROW
+                        || !evidence.as_bytes().is_empty()
+                    {
+                        return Err(invalid("Invalid escrow spend execution"));
+                    }
+                    let (action, _) =
+                        ark_escrow_action(context.policy, &policy, &terms, &bound, &spend)?;
+                    if prepared.action != action {
+                        return Err(invalid(
+                            "Prepared escrow spend differs from its transactions",
+                        ));
+                    }
                 }
                 PreparedState::Settlement { settlement, .. } => {
                     if context.rule != generic::SETTLEMENT_RULE
@@ -835,10 +982,10 @@ impl EscrowVerifier for CoordinatorVerifier {
                 .attempt
                 .validate(&prepared.action, &context.policy.policy.context)
                 .map_err(invalid)?;
-            let (bound, _, terms) =
+            let (bound, policy, terms) =
                 restore_binding(context.manifest, context.policy, context.bound_state)?;
             match prepared.application_state.decode().map_err(invalid)? {
-                PreparedState::ContractSigning => {
+                PreparedState::ContractSigning { ark_funding } => {
                     if context.rule != generic::CONTRACT_RULE
                         || context.permission_id != generic::SIGN_CONTRACT
                     {
@@ -847,7 +994,28 @@ impl EscrowVerifier for CoordinatorVerifier {
                     let Action::Sign { scope } = &prepared.action else {
                         return Err(invalid("Restored action is not contract signing"));
                     };
-                    validate_signing_scope(context.manifest, context.policy, &bound, scope)?;
+                    let contract = funded(&bound, &policy, ark_funding.as_ref())?;
+                    validate_signing_scope(
+                        context.manifest,
+                        context.policy,
+                        &bound,
+                        &contract,
+                        scope,
+                    )?;
+                }
+                PreparedState::ArkEscrowSpend { spend } => {
+                    if context.rule != generic::ARK_ESCROW_RULE
+                        || context.permission_id != generic::SIGN_ARK_ESCROW
+                    {
+                        return Err(invalid("Invalid restored escrow spend"));
+                    }
+                    let (action, _) =
+                        ark_escrow_action(context.policy, &policy, &terms, &bound, &spend)?;
+                    if prepared.action != action {
+                        return Err(invalid(
+                            "Restored escrow spend differs from its transactions",
+                        ));
+                    }
                 }
                 PreparedState::Settlement { settlement, .. } => {
                     if context.rule != generic::SETTLEMENT_RULE

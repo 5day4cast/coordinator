@@ -69,6 +69,7 @@ fn policy(terms: &ContractAuthorization) -> PayoutPolicy {
         allow_invoice_fallback: true,
         release_entry_key_after_payment: true,
         contract_terms: serde_json::to_string(terms).unwrap(),
+        ark_escrow: None,
     }
 }
 fn invoice(hashed_description: bool, currency: Currency, amount: u64) -> String {

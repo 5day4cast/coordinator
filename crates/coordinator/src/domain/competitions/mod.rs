@@ -1,6 +1,10 @@
+mod ark_kickoff;
+mod ark_store;
 mod automatic_store;
 mod coordinator;
+mod lease_store;
 mod payout;
+mod runners;
 pub mod states;
 mod store;
 use crate::infra::{
@@ -11,6 +15,8 @@ use crate::infra::{
     oracle::{AddEventEntry, WeatherChoices},
 };
 use anyhow::anyhow;
+pub use ark_kickoff::*;
+pub use ark_store::*;
 pub use automatic_store::*;
 pub use coordinator::*;
 use dlctix::{
@@ -21,8 +27,10 @@ use dlctix::{
     ContractParameters, EventLockingConditions, Outcome, SigMap, SignedContract,
 };
 use keymeld_sdk::types::{RegistrationContext, SignedSessionManifest};
+pub use lease_store::*;
 use log::{debug, error};
 pub use payout::*;
+pub use runners::*;
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, FromRow, Row};
 use std::fmt;
@@ -1166,7 +1174,9 @@ impl Competition {
 pub struct FundedContract {
     pub contract_params: ContractParameters,
     pub funding_outpoint: OutPoint,
-    pub funding_psbt_base64: String,
+    /// The wallet's funding PSBT. An Arkade pool has none: its batch pays the funding output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funding_psbt_base64: Option<String>,
     /// Keymeld signing info (present when keymeld is enabled and user has entry)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keymeld: Option<KeymeldSigningInfo>,

@@ -1,0 +1,34 @@
+[package]
+name = "coordinator-ark"
+description = "Arkade batches for queued competitions, over arkd's gRPC API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ark-core = { workspace = true }
+ark-grpc = { workspace = true }
+async-trait = { workspace = true }
+bitcoin = { workspace = true }
+coordinator-ark-escrow = { workspace = true }
+dlctix = { workspace = true }
+futures = { workspace = true }
+log = { workspace = true }
+rand = { workspace = true }
+rustls = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+
+[features]
+# A scripted arkd for tests in this and other crates.
+test-utils = []
+
+[dev-dependencies]
+coordinator-ark = { path = ".", features = ["test-utils"] }
+anyhow = { workspace = true }
+hex = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

@@ -1,7 +1,8 @@
 use super::*;
+use coordinator_escrow::authorization::ArkEscrowPolicy;
 use coordinator_escrow::generic::{
-    registration, CONTRACT_RULE, RELEASE_ENTRY_KEY, RELEASE_PREIMAGE, SETTLEMENT_RULE,
-    SIGN_CONTRACT,
+    registration, ARK_ESCROW_RULE, CONTRACT_RULE, RELEASE_ENTRY_KEY, RELEASE_PREIMAGE,
+    SETTLEMENT_RULE, SIGN_ARK_ESCROW, SIGN_CONTRACT,
 };
 use coordinator_escrow::payout::dlctix::{
     self,
@@ -34,6 +35,9 @@ struct Fixture {
     contract: ContractCommitment,
 }
 fn fixture(automatic: bool) -> Fixture {
+    fixture_with(automatic, None)
+}
+fn fixture_with(automatic: bool, ark_escrow: Option<ArkEscrowPolicy>) -> Fixture {
     let user = UserId::new_v7();
     let maker = UserId::new_v7();
     let manifest = SignedSessionManifest::sign(
@@ -112,6 +116,7 @@ fn fixture(automatic: bool) -> Fixture {
             allow_invoice_fallback: true,
             release_entry_key_after_payment: true,
             contract_terms: serde_json::to_string(&terms).unwrap(),
+            ark_escrow,
         },
         &[6; 32],
         Recipient {
@@ -176,6 +181,7 @@ impl Fixture {
         )
         .unwrap();
         Payload::encode(&ActionParameters::PrepareSettlement {
+            ark_funding: None,
             claim_id: attempt.attempt_id,
             contract_signatures: serde_json::to_string(&sign_contract(&self.contract)).unwrap(),
             attestation: hex::encode([4; 32]),
@@ -196,11 +202,7 @@ impl Fixture {
         PreparationView {
             manifest: &self.manifest,
             policy: &self.policy,
-            rule: if permission == SIGN_CONTRACT {
-                CONTRACT_RULE
-            } else {
-                SETTLEMENT_RULE
-            },
+            rule: rule(permission),
             permission_id: permission,
             attempt,
             bound_state: bound,
@@ -217,18 +219,17 @@ impl Fixture {
         ExecutionView {
             manifest: &self.manifest,
             policy: &self.policy,
-            rule: if permission == SIGN_CONTRACT {
-                CONTRACT_RULE
-            } else {
-                SETTLEMENT_RULE
-            },
+            rule: rule(permission),
             permission_id: permission,
             attempt,
             bound_state: bound,
         }
     }
     fn scope(&self) -> SigningScope {
-        let batch = payout::signing_requirements(&self.contract)
+        self.scope_for(&self.contract)
+    }
+    fn scope_for(&self, contract: &ContractCommitment) -> SigningScope {
+        let batch = payout::signing_requirements(contract)
             .unwrap()
             .into_iter()
             .map(|(message, requirement)| {
@@ -267,6 +268,13 @@ impl Fixture {
             session_tweak: KeyTweak::None,
             batch,
         }
+    }
+}
+fn rule(permission: &str) -> &'static str {
+    match permission {
+        SIGN_CONTRACT => CONTRACT_RULE,
+        SIGN_ARK_ESCROW => ARK_ESCROW_RULE,
+        _ => SETTLEMENT_RULE,
     }
 }
 fn sign_contract(contract: &ContractCommitment) -> ContractSignatures {
@@ -510,6 +518,7 @@ async fn signing_derives_messages_keys_subsets_tweaks_and_adaptors_from_bound_co
     let scope = f.scope();
     let params = Payload::encode(&ActionParameters::SignContract {
         scope: scope.clone(),
+        ark_funding: None,
     })
     .unwrap();
     let prepared = verifier
@@ -546,7 +555,11 @@ async fn signing_derives_messages_keys_subsets_tweaks_and_adaptors_from_bound_co
                 bad.batch.pop();
             }
         }
-        let params = Payload::encode(&ActionParameters::SignContract { scope: bad }).unwrap();
+        let params = Payload::encode(&ActionParameters::SignContract {
+            scope: bad,
+            ark_funding: None,
+        })
+        .unwrap();
         assert!(
             verifier
                 .prepare(
@@ -924,4 +937,414 @@ async fn renewed_invoice_keeps_late_paid_candidate_and_freezes_both_releases() {
         )
         .await
         .unwrap();
+}
+
+mod ark_escrow {
+    use super::*;
+    use coordinator_ark_escrow::{EntryEscrow, EscrowPath, EscrowTerms, RelativeTimelock};
+    use coordinator_escrow::ark::{psbt_hex, ArkEscrowSpend, ArkFunding};
+    use dlctix::bitcoin::{
+        absolute::LockTime, taproot::LeafVersion, transaction::Version, Psbt, ScriptBuf,
+        Transaction, TxIn, TxOut, Txid, XOnlyPublicKey,
+    };
+
+    const ESCROW_SATS: u64 = 20_000;
+    const MAX_FEE_SATS: u64 = 500;
+
+    fn xonly(secret: u8) -> XOnlyPublicKey {
+        XOnlyPublicKey::from_slice(&public(secret)[1..]).unwrap()
+    }
+    /// The entry key 14's escrow, with the market maker 18 as its coordinator.
+    fn escrow_with(player: u8, coordinator: u8) -> EntryEscrow {
+        EntryEscrow::new(EscrowTerms {
+            player: xonly(player),
+            coordinator: xonly(coordinator),
+            server: xonly(21),
+            refund_locktime: LockTime::from_consensus(1_790_000_000),
+            exit_delay: RelativeTimelock::Seconds(2048),
+            unilateral_refund_delay: RelativeTimelock::Seconds(2048 + 512 * 100),
+        })
+        .unwrap()
+    }
+    fn policy_for(escrow: &EntryEscrow) -> ArkEscrowPolicy {
+        ArkEscrowPolicy {
+            escrow_tap_tree: hex::encode(escrow.vtxo_script().encode_tap_tree()),
+            max_fee_sats: MAX_FEE_SATS,
+        }
+    }
+    fn ark_fixture() -> (Fixture, EntryEscrow) {
+        let escrow = escrow_with(14, 18);
+        (fixture_with(false, Some(policy_for(&escrow))), escrow)
+    }
+    fn p2tr(secret: u8) -> ScriptBuf {
+        ScriptBuf::new_p2tr_tweaked(
+            dlctix::bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(xonly(secret)),
+        )
+    }
+    fn spend_leaf(input: &mut dlctix::bitcoin::psbt::Input, escrow: &EntryEscrow) {
+        input.tap_scripts.insert(
+            escrow.control_block(EscrowPath::Funding),
+            (
+                escrow.script(EscrowPath::Funding).clone(),
+                LeafVersion::TapScript,
+            ),
+        );
+    }
+    fn outpoint(byte: u8) -> OutPoint {
+        OutPoint::new(Txid::from_byte_array([byte; 32]), 0)
+    }
+    /// A BIP322-style proof: the message input, this escrow, and another player's escrow.
+    fn intent_proof(escrow: &EntryEscrow, outputs: Vec<TxOut>) -> Psbt {
+        let mut psbt = Psbt::from_unsigned_tx(Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: [1, 2, 3]
+                .into_iter()
+                .map(|byte| TxIn {
+                    previous_output: outpoint(byte),
+                    ..Default::default()
+                })
+                .collect(),
+            output: outputs,
+        })
+        .unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: escrow.script_pubkey(),
+        });
+        psbt.inputs[1].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(ESCROW_SATS),
+            script_pubkey: escrow.script_pubkey(),
+        });
+        psbt.inputs[2].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(ESCROW_SATS),
+            script_pubkey: p2tr(30),
+        });
+        spend_leaf(&mut psbt.inputs[0], escrow);
+        spend_leaf(&mut psbt.inputs[1], escrow);
+        psbt
+    }
+    fn funding_output(f: &Fixture) -> TxOut {
+        f.contract.contract_parameters.funding_output().unwrap()
+    }
+    fn attempt() -> ActionAttempt {
+        ActionAttempt {
+            attempt_id: Uuid::now_v7(),
+            signing_session_id: None,
+        }
+    }
+    async fn prepare(
+        verifier: &CoordinatorVerifier,
+        f: &Fixture,
+        bound: &Payload,
+        spend: ArkEscrowSpend,
+    ) -> Result<(PreparedAction, ActionAttempt), VerificationError> {
+        let attempt = attempt();
+        let prior = BTreeMap::new();
+        let params = Payload::encode(&ActionParameters::SignArkEscrow { spend }).unwrap();
+        let prepared = verifier
+            .prepare(
+                f.prepare_view(bound, &attempt, SIGN_ARK_ESCROW, &prior),
+                &params,
+            )
+            .await?;
+        Ok((prepared, attempt))
+    }
+    fn digests(action: &Action) -> Vec<[u8; 32]> {
+        let Action::SignBip340 { scope } = action else {
+            panic!("expected a BIP340 action")
+        };
+        scope.items.iter().map(|item| item.digest).collect()
+    }
+
+    /// The batch: a commitment paying the pool and a connector, the connector transaction, and a forfeit.
+    struct Batch {
+        commitment: Transaction,
+        connector: Transaction,
+        forfeit: Psbt,
+    }
+    fn new_batch(f: &Fixture, escrow: &EntryEscrow) -> Batch {
+        let commitment = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint(9),
+                ..Default::default()
+            }],
+            output: vec![
+                funding_output(f),
+                TxOut {
+                    value: Amount::from_sat(330),
+                    script_pubkey: p2tr(31),
+                },
+            ],
+        };
+        let connector = Transaction {
+            version: Version::non_standard(3),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(commitment.compute_txid(), 1),
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(330),
+                script_pubkey: p2tr(32),
+            }],
+        };
+        let mut forfeit = Psbt::from_unsigned_tx(Transaction {
+            version: Version::non_standard(3),
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: OutPoint::new(connector.compute_txid(), 0),
+                    ..Default::default()
+                },
+                TxIn {
+                    previous_output: outpoint(2),
+                    ..Default::default()
+                },
+            ],
+            output: vec![TxOut {
+                value: Amount::from_sat(ESCROW_SATS + 330),
+                script_pubkey: p2tr(33),
+            }],
+        })
+        .unwrap();
+        forfeit.inputs[0].witness_utxo = Some(connector.output[0].clone());
+        forfeit.inputs[1].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(ESCROW_SATS),
+            script_pubkey: escrow.script_pubkey(),
+        });
+        spend_leaf(&mut forfeit.inputs[1], escrow);
+        Batch {
+            commitment,
+            connector,
+            forfeit,
+        }
+    }
+    fn funded(f: &Fixture, commitment: &Transaction) -> ContractCommitment {
+        ContractCommitment {
+            contract_parameters: f.contract.contract_parameters.clone(),
+            funding_outpoint: OutPoint::new(commitment.compute_txid(), 0),
+        }
+    }
+    fn forfeit_spend(batch: &Batch, signatures: &ContractSignatures) -> ArkEscrowSpend {
+        ArkEscrowSpend::Forfeit {
+            forfeit_psbt: psbt_hex(&batch.forfeit),
+            funding: ArkFunding::new(&batch.commitment, 0),
+            connector_txs: vec![dlctix::bitcoin::consensus::encode::serialize_hex(
+                &batch.connector,
+            )],
+            contract_signatures: serde_json::to_string(signatures).unwrap(),
+        }
+    }
+
+    #[test]
+    fn the_escrow_must_belong_to_the_entry_key_and_the_market_maker() {
+        let verifier = CoordinatorVerifier::default();
+        for escrow in [escrow_with(15, 18), escrow_with(14, 19)] {
+            let f = fixture_with(false, Some(policy_for(&escrow)));
+            assert!(verifier
+                .validate_registration(RegistrationView {
+                    manifest: &f.manifest,
+                    policy: &f.policy,
+                    restoring: false,
+                })
+                .is_err());
+        }
+        let (f, _) = ark_fixture();
+        verifier
+            .validate_registration(RegistrationView {
+                manifest: &f.manifest,
+                policy: &f.policy,
+                restoring: false,
+            })
+            .unwrap();
+        assert!(f.policy.policy.grants.contains_key(SIGN_ARK_ESCROW));
+        assert!(!fixture(false)
+            .policy
+            .policy
+            .grants
+            .contains_key(SIGN_ARK_ESCROW));
+    }
+
+    #[tokio::test]
+    async fn an_intent_proof_signs_only_this_escrow_into_the_pool() {
+        let verifier = CoordinatorVerifier::default();
+        let (f, escrow) = ark_fixture();
+        let bound = f.bind(&verifier);
+
+        let fee = TxOut {
+            value: Amount::from_sat(2 * MAX_FEE_SATS),
+            script_pubkey: p2tr(40),
+        };
+        let proof = intent_proof(&escrow, vec![funding_output(&f), fee.clone()]);
+        let spend = ArkEscrowSpend::IntentProof {
+            proof_psbt: psbt_hex(&proof),
+        };
+        let (prepared, attempt) = prepare(&verifier, &f, &bound, spend).await.unwrap();
+        // The message input and this escrow's input; never the other player's.
+        let inputs: Vec<usize> = prepared.output.decode().unwrap();
+        assert_eq!(inputs, vec![0, 1]);
+        assert_eq!(digests(&prepared.action).len(), 2);
+        verifier
+            .verify_execution(
+                f.execute_view(&bound, &attempt, SIGN_ARK_ESCROW),
+                &prepared,
+                &Payload::default(),
+            )
+            .await
+            .unwrap();
+
+        let over_fee = TxOut {
+            value: Amount::from_sat(2 * MAX_FEE_SATS + 1),
+            ..fee
+        };
+        let elsewhere = TxOut {
+            script_pubkey: p2tr(41),
+            ..funding_output(&f)
+        };
+        for outputs in [
+            vec![funding_output(&f), over_fee],
+            vec![elsewhere],
+            vec![funding_output(&f), funding_output(&f)],
+        ] {
+            let spend = ArkEscrowSpend::IntentProof {
+                proof_psbt: psbt_hex(&intent_proof(&escrow, outputs)),
+            };
+            assert!(prepare(&verifier, &f, &bound, spend).await.is_err());
+        }
+
+        // The escrow must be spent through its funding leaf.
+        let mut refund_leaf = intent_proof(&escrow, vec![funding_output(&f)]);
+        refund_leaf.inputs[1].tap_scripts.clear();
+        refund_leaf.inputs[1].tap_scripts.insert(
+            escrow.control_block(EscrowPath::Refund),
+            (
+                escrow.script(EscrowPath::Refund).clone(),
+                LeafVersion::TapScript,
+            ),
+        );
+        let spend = ArkEscrowSpend::IntentProof {
+            proof_psbt: psbt_hex(&refund_leaf),
+        };
+        assert!(prepare(&verifier, &f, &bound, spend).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_forfeit_needs_the_signed_contract_and_a_connector_from_the_commitment() {
+        let verifier = CoordinatorVerifier::default();
+        let (f, escrow) = ark_fixture();
+        let bound = f.bind(&verifier);
+        let batch = new_batch(&f, &escrow);
+        let signed = sign_contract(&funded(&f, &batch.commitment));
+
+        let (prepared, attempt) = prepare(&verifier, &f, &bound, forfeit_spend(&batch, &signed))
+            .await
+            .unwrap();
+        let inputs: Vec<usize> = prepared.output.decode().unwrap();
+        assert_eq!(inputs, vec![1]);
+        verifier
+            .verify_execution(
+                f.execute_view(&bound, &attempt, SIGN_ARK_ESCROW),
+                &prepared,
+                &Payload::default(),
+            )
+            .await
+            .unwrap();
+
+        // Signatures for another funding outpoint leave the players without a way out.
+        let elsewhere = sign_contract(&f.contract);
+        assert!(
+            prepare(&verifier, &f, &bound, forfeit_spend(&batch, &elsewhere))
+                .await
+                .is_err()
+        );
+        // So does a set without the expiry transaction.
+        let mut no_expiry = signed.clone();
+        no_expiry.expiry_tx_signature = None;
+        assert!(
+            prepare(&verifier, &f, &bound, forfeit_spend(&batch, &no_expiry))
+                .await
+                .is_err()
+        );
+
+        // A connector that does not descend from the commitment makes the forfeit unconditional.
+        let mut detached = new_batch(&f, &escrow);
+        detached.connector.input[0].previous_output = outpoint(8);
+        detached.forfeit.unsigned_tx.input[0].previous_output =
+            OutPoint::new(detached.connector.compute_txid(), 0);
+        assert!(
+            prepare(&verifier, &f, &bound, forfeit_spend(&detached, &signed))
+                .await
+                .is_err()
+        );
+
+        // A commitment that does not pay the pool is refused.
+        let mut unfunded = new_batch(&f, &escrow);
+        unfunded.commitment.output[0].script_pubkey = p2tr(42);
+        assert!(
+            prepare(&verifier, &f, &bound, forfeit_spend(&unfunded, &signed))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn contract_signing_uses_the_batch_outpoint() {
+        let verifier = CoordinatorVerifier::default();
+        let (f, escrow) = ark_fixture();
+        let bound = f.bind(&verifier);
+        let batch = new_batch(&f, &escrow);
+        let contract = funded(&f, &batch.commitment);
+        let attempt = ActionAttempt {
+            attempt_id: Uuid::now_v7(),
+            signing_session_id: Some(SessionId::new_v7()),
+        };
+        let prior = BTreeMap::new();
+        let sign = |ark_funding: Option<ArkFunding>, scope: SigningScope| {
+            Payload::encode(&ActionParameters::SignContract { scope, ark_funding }).unwrap()
+        };
+
+        let params = sign(
+            Some(ArkFunding::new(&batch.commitment, 0)),
+            f.scope_for(&contract),
+        );
+        let prepared = verifier
+            .prepare(
+                f.prepare_view(&bound, &attempt, SIGN_CONTRACT, &prior),
+                &params,
+            )
+            .await
+            .unwrap();
+        verifier
+            .verify_execution(
+                f.execute_view(&bound, &attempt, SIGN_CONTRACT),
+                &prepared,
+                &Payload::default(),
+            )
+            .await
+            .unwrap();
+
+        // Without the commitment, an Arkade-funded pool has no outpoint to sign against.
+        let params = sign(None, f.scope());
+        assert!(verifier
+            .prepare(
+                f.prepare_view(&bound, &attempt, SIGN_CONTRACT, &prior),
+                &params
+            )
+            .await
+            .is_err());
+        // A commitment that does not pay the pool is refused.
+        let mut unfunded = batch.commitment.clone();
+        unfunded.output[0].script_pubkey = p2tr(42);
+        let params = sign(Some(ArkFunding::new(&unfunded, 0)), f.scope_for(&contract));
+        assert!(verifier
+            .prepare(
+                f.prepare_view(&bound, &attempt, SIGN_CONTRACT, &prior),
+                &params
+            )
+            .await
+            .is_err());
+    }
 }

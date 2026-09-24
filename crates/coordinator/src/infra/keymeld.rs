@@ -208,6 +208,58 @@ pub trait Keymeld: Send + Sync {
         player_user_ids: Vec<UserId>,
     ) -> Result<DlcSignatureResults, KeymeldError>;
 
+    /// Sign an Arkade-funded pool's contract, once the batch's commitment transaction fixes its
+    /// funding outpoint. The contract must have been bound with a null funding outpoint.
+    async fn sign_ark_dlc_batch(
+        &self,
+        keygen_session: &DlcKeygenSession,
+        signing_data: &SigningData,
+        contract_params: &ContractParameters,
+        player_user_ids: Vec<UserId>,
+        ark_funding: coordinator_escrow::ark::ArkFunding,
+    ) -> Result<DlcSignatureResults, KeymeldError> {
+        let _ = (
+            keygen_session,
+            signing_data,
+            contract_params,
+            player_user_ids,
+            ark_funding,
+        );
+        Err(KeymeldError::Signing(
+            "Arkade-funded pools are not supported".into(),
+        ))
+    }
+
+    /// Sign a player's Arkade escrow spend with their deposited entry key.
+    ///
+    /// The Coordinator verifier checks the spend's transactions and derives every digest.
+    /// Each call is a fresh attempt. Returns each signed input's index with its BIP340 signature.
+    async fn sign_ark_escrow(
+        &self,
+        session: &DlcKeygenSession,
+        user: UserId,
+        spend: coordinator_escrow::ark::ArkEscrowSpend,
+    ) -> Result<Vec<(usize, [u8; 64])>, KeymeldError> {
+        let _ = (session, user, spend);
+        Err(KeymeldError::Signing(
+            "Arkade escrows are not supported".into(),
+        ))
+    }
+
+    /// Sign several players' escrow spends in one Keymeld session round trip.
+    /// Returns each spend's signed inputs, in order.
+    async fn sign_ark_escrows(
+        &self,
+        session: &DlcKeygenSession,
+        spends: Vec<(UserId, coordinator_escrow::ark::ArkEscrowSpend)>,
+    ) -> Result<Vec<Vec<(usize, [u8; 64])>>, KeymeldError> {
+        let mut signed = Vec::with_capacity(spends.len());
+        for (user, spend) in spends {
+            signed.push(self.sign_ark_escrow(session, user, spend).await?);
+        }
+        Ok(signed)
+    }
+
     /// Check if Keymeld is enabled
     fn is_enabled(&self) -> bool;
 

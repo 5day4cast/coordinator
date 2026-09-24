@@ -91,13 +91,14 @@ impl InvoiceSubscriber {
 
         info!("Invoice accepted for ticket {} (subscription)", ticket.id);
 
-        if let Err(e) = self
+        match self
             .coordinator
             .competition_store
             .mark_ticket_paid(&ticket.hash, ticket.competition_id)
             .await
         {
-            error!("Failed to mark ticket {} as paid: {}", ticket.id, e);
+            Ok(_) => self.coordinator.wake_competition(ticket.competition_id),
+            Err(e) => error!("Failed to mark ticket {} as paid: {}", ticket.id, e),
         }
     }
 }

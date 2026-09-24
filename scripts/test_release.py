@@ -145,6 +145,20 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing or empty release asset"):
             self.native(wasm)
 
+    def test_swap_archive_contains_the_service_and_provenance(self):
+        self.put(f"target/{TARGET}/release/ark-swapd", "binary fixture").chmod(0o755)
+        destination = release.package_swap(self.root, VERSION, SOURCE, TARGET, self.root / "release")
+        with tarfile.open(destination) as archive:
+            prefix = f"ark-swapd-{VERSION}-{TARGET}/"
+            for name in ("bin/ark-swapd", "RELEASE.json", "README.txt", "SHA256SUMS"):
+                self.assertIn(prefix + name, archive.getnames())
+            self.assertEqual(archive.getmember(prefix + "bin/ark-swapd").mode, 0o755)
+            self.assertEqual(json.load(archive.extractfile(prefix + "RELEASE.json"))["source_commit"], SOURCE)
+
+    def test_swap_binary_is_required(self):
+        with self.assertRaisesRegex(ValueError, "missing or empty release asset"):
+            release.package_swap(self.root, VERSION, SOURCE, TARGET, self.root / "release")
+
     def test_wasm_binary_is_required(self):
         self.put("wasm/coordinator_wasm.js", "binding fixture")
         with self.assertRaisesRegex(ValueError, "missing or empty release asset"):

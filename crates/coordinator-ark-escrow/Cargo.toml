@@ -1,0 +1,16 @@
+[package]
+name = "coordinator-ark-escrow"
+description = "Arkade escrow VTXO scripts for competition entries"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bitcoin = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

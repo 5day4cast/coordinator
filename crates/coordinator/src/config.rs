@@ -39,6 +39,60 @@ pub struct Settings {
     pub keymeld_settings: KeymeldSettings,
     #[serde(default)]
     pub admin_settings: AdminSettings,
+    #[serde(default)]
+    pub ark_settings: ArkSettings,
+}
+
+/// Arkade funding: each entry's buy-in is swapped into an escrow VTXO, and a competition's pool
+/// is funded in one Arkade batch. See `docs/QUEUED_COMPETITIONS.md`.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct ArkSettings {
+    /// Fund new competitions from Arkade escrows. Needs Keymeld with automatic payouts.
+    #[serde(default)]
+    pub enabled: bool,
+    /// arkd's URL, for example `https://mutinynet.arkade.sh`.
+    #[serde(default)]
+    pub server_url: String,
+    /// `ark-swapd`'s URL.
+    #[serde(default)]
+    pub swap_url: String,
+    /// A file holding `ark-swapd`'s bearer token.
+    #[serde(default)]
+    pub swap_token_file: String,
+    /// How long after the observation window starts an unfunded entry can be refunded.
+    #[serde(default = "default_refund_after_start_secs")]
+    pub refund_after_start_secs: u64,
+}
+
+fn default_refund_after_start_secs() -> u64 {
+    24 * 60 * 60
+}
+
+impl ArkSettings {
+    pub fn validate(&self, keymeld: &KeymeldSettings) -> Result<(), anyhow::Error> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if !keymeld.enabled || !keymeld.automatic_payouts {
+            return Err(anyhow::anyhow!(
+                "Arkade funding needs Keymeld with automatic payouts: the escrow consent is part of the payout policy"
+            ));
+        }
+        if self.server_url.is_empty() || self.swap_url.is_empty() || self.swap_token_file.is_empty()
+        {
+            return Err(anyhow::anyhow!(
+                "Arkade funding needs server_url, swap_url, and swap_token_file"
+            ));
+        }
+        Ok(())
+    }
+
+    /// `ark-swapd`'s bearer token.
+    pub fn swap_token(&self) -> Result<String, anyhow::Error> {
+        let token = std::fs::read_to_string(&self.swap_token_file)
+            .map_err(|e| anyhow::anyhow!("read {}: {e}", self.swap_token_file))?;
+        Ok(token.trim().to_owned())
+    }
 }
 
 impl ConfigurableSettings for Settings {
@@ -259,6 +313,7 @@ impl Settings {
         self.ln_settings.validate(network)?;
         self.coordinator_settings.validate(network)?;
         self.admin_settings.validate(network)?;
+        self.ark_settings.validate(&self.keymeld_settings)?;
         self.keymeld_settings.validate(network)
     }
 }
@@ -623,7 +678,27 @@ pub struct CoordinatorSettings {
     /// The number of confirmations required for a transaction to be considered confirmed
     /// by the coordinator system
     pub required_confirmations: u32,
+    /// The longest a waiting competition sleeps before it is checked again. Events such as a
+    /// paid ticket wake it sooner.
     pub sync_interval_secs: u64,
+
+    /// How often the competition runners' sweep restarts missing runners and cleans up dead
+    /// competitions.
+    #[serde(default = "default_sweep_interval_secs")]
+    pub sweep_interval_secs: u64,
+
+    /// How long a coordinator's lease on a competition lasts without renewal. When a
+    /// coordinator stops without releasing its leases, another takes over after this.
+    #[serde(default = "default_lease_ttl_secs")]
+    pub lease_ttl_secs: u64,
+
+    /// How many competition steps run at once.
+    #[serde(default = "default_max_concurrent_steps")]
+    pub max_concurrent_steps: usize,
+
+    /// Names this process in leases and logs, such as its blue/green slot.
+    #[serde(default)]
+    pub instance_name: Option<String>,
 
     /// Enable on-chain escrow transactions (default: false)
     /// When disabled, only HODL invoices protect against non-completion.
@@ -644,6 +719,40 @@ pub struct CoordinatorSettings {
     pub invoice_settlement_confirmations: u32,
 }
 
+fn default_sweep_interval_secs() -> u64 {
+    60
+}
+
+fn default_lease_ttl_secs() -> u64 {
+    30
+}
+
+fn default_max_concurrent_steps() -> usize {
+    8
+}
+
+impl CoordinatorSettings {
+    pub fn pacing(&self) -> crate::domain::Pacing {
+        crate::domain::Pacing {
+            idle: std::time::Duration::from_secs(self.sync_interval_secs.max(1)),
+            sweep: std::time::Duration::from_secs(self.sweep_interval_secs.max(1)),
+            lease_ttl: std::time::Duration::from_secs(self.lease_ttl_secs.max(3)),
+            max_concurrent_steps: self.max_concurrent_steps.max(1),
+            ..Default::default()
+        }
+    }
+
+    /// This process as a lease holder: its instance name and a fresh ID, so a restarted
+    /// process never mistakes a previous run's leases for its own.
+    pub fn lease_holder(&self) -> String {
+        format!(
+            "{}-{}",
+            self.instance_name.as_deref().unwrap_or(&self.name),
+            uuid::Uuid::now_v7()
+        )
+    }
+}
+
 impl Default for CoordinatorSettings {
     fn default() -> Self {
         CoordinatorSettings {
@@ -653,6 +762,10 @@ impl Default for CoordinatorSettings {
             relative_locktime_block_delta: 144,
             required_confirmations: 1,
             sync_interval_secs: 15,
+            sweep_interval_secs: default_sweep_interval_secs(),
+            lease_ttl_secs: default_lease_ttl_secs(),
+            max_concurrent_steps: default_max_concurrent_steps(),
+            instance_name: None,
             escrow_enabled: false,
             mock_oracle: false,
             invoice_settlement_confirmations: 0,
