@@ -151,7 +151,9 @@ const MAX_AUTHED_BODY_BYTES: usize = 256 * 1024;
 ///
 /// The auth event must carry a `payload` tag equal to the SHA-256 of the exact
 /// body bytes. Without that check, a captured `Authorization` header could be
-/// replayed within its 60 second window with a different body.
+/// replayed with a different body for as long as the extractor accepts its
+/// event: up to 120 seconds, since `created_at` may be 60 seconds either side
+/// of now.
 pub struct AuthedJson<T> {
     pub auth: NostrAuth,
     pub body: T,

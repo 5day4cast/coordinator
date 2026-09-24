@@ -1,14 +1,21 @@
 //! One-time use of NIP-98 auth events.
 //!
 //! The `NostrAuth` extractor accepts an event whose `created_at` is within
-//! [`MAX_EVENT_SKEW_SECS`] of now. Without this guard the same `Authorization`
-//! header could be replayed for that whole window. Each event id is claimed
-//! once, after its signature verifies, and is remembered until the extractor
-//! would reject it as expired anyway.
+//! [`MAX_EVENT_SKEW_SECS`] of now, before or after. An event dated that far
+//! ahead is therefore accepted for up to twice that, 120 seconds from its
+//! first use. Without this guard the same `Authorization` header could be
+//! replayed for that whole time. Each event id is claimed once, after its
+//! signature verifies, and is remembered until the extractor would reject it
+//! as expired anyway.
 //!
-//! The guard is per process. That matches the single-replica SQLite
-//! deployment; running replicas behind a load balancer would need a shared
-//! store.
+//! The guard is per process, which is enough while one process serves the
+//! public API at a time. Blue/green runs two coordinator slots on one
+//! database, but nix-rollout writes one upstream to `upstream.caddy` and stops
+//! the previous slot after a switch (nixos_setup `apps/forecast/default.nix`,
+//! nix-rollout `runtime::route_to`). What remains is a switch or restart: a
+//! header first used up to 2 × [`MAX_EVENT_SKEW_SECS`] before it can be
+//! replayed once afterwards. Serving from both slots at once, or closing that
+//! gap, needs the claims in the shared database.
 
 use nostr::EventId;
 use std::{
