@@ -7,6 +7,8 @@ pub mod keymeld;
 pub mod lightning;
 pub mod lnurl;
 pub mod oracle;
+pub mod oracle_weather;
+pub mod refresh_cache;
 pub mod secrets;
 
 // Mock implementations only available with e2e-testing feature or debug builds

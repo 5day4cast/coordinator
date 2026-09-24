@@ -5,20 +5,7 @@ use uuid::Uuid;
 
 use super::location_selector::location_selector;
 
-/// Station data from the oracle
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Station {
-    pub station_id: String,
-    pub station_name: String,
-    #[serde(default)]
-    pub state: String,
-    #[serde(default)]
-    pub iata_id: String,
-    #[serde(default)]
-    pub elevation_m: Option<f64>,
-    pub latitude: f64,
-    pub longitude: f64,
-}
+pub use crate::infra::oracle_weather::Station;
 
 /// Station with weather data for display
 #[derive(Debug, Clone)]
