@@ -358,23 +358,3 @@ fn step_class(status: &crate::scenarios::StepStatus) -> &'static str {
         crate::scenarios::StepStatus::Skipped => "skipped",
     }
 }
-
-pub(super) const DASHBOARD_CSS: &str = r#"
-body { font-family: monospace; max-width: 960px; margin: 0 auto; padding: 20px; background: #1a1a2e; color: #e0e0e0; }
-h1 { color: #00d4ff; }
-h2 { color: #7b68ee; border-bottom: 1px solid #333; padding-bottom: 5px; }
-table { width: 100%; border-collapse: collapse; margin: 10px 0; }
-th, td { padding: 8px; text-align: left; border-bottom: 1px solid #333; }
-th { background: #16213e; }
-.badge { padding: 2px 8px; border-radius: 4px; font-size: 0.85em; }
-.passed, .passed .badge, .moved { color: #00ff88; }
-.failed, .failed .badge { color: #ff4444; }
-.running, .running .badge { color: #ffaa00; }
-.skipped { color: #888; }
-.error { color: #ff4444; font-size: 0.9em; }
-.result { padding: 15px; background: #16213e; border-radius: 8px; margin: 10px 0; }
-button { background: #7b68ee; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-family: monospace; }
-button:hover { background: #6a5acd; }
-form { margin: 10px 0; display: inline-block; margin-right: 8px; }
-.note { color: #888; font-size: 0.85em; }
-"#;

@@ -77,3 +77,11 @@ lazy_static.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# Drives the asset router directly.
+tower = { version = "0.5", features = ["util"] }
+
+[build-dependencies]
+# Minify the dashboard's styles and scripts into content-hashed bundles.
+lightningcss = { version = "=1.0.0-alpha.72", default-features = false }
+better-minify-js = "0.7"
+sha2.workspace = true
