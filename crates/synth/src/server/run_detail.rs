@@ -734,31 +734,6 @@ fn pretty(json: &str) -> String {
         .unwrap_or_else(|_| json.to_string())
 }
 
-pub(super) const FLOW_CSS: &str = r#"
-.flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 6px; margin: 16px 0; }
-.box { flex: 1 1 150px; background: #16213e; border: 2px solid #444; border-radius: 10px; padding: 10px; min-width: 150px; }
-.box .title { font-weight: bold; font-size: 1.05em; }
-.box .subtitle { color: #999; font-size: 0.75em; margin-bottom: 8px; }
-.box.done { border-color: #00ff88; } .box.done .title { color: #00ff88; }
-.box.active { border-color: #ffaa00; } .box.active .title { color: #ffaa00; }
-.box.failed { border-color: #ff4444; } .box.failed .title { color: #ff4444; }
-.box.waiting { border-style: dashed; opacity: 0.6; }
-.arrow { align-self: center; font-size: 1.6em; color: #555; }
-.arrow.done { color: #00ff88; } .arrow.active { color: #ffaa00; } .arrow.failed { color: #ff4444; }
-.line { font-size: 0.8em; margin: 3px 0; display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
-.line .label { font-weight: bold; }
-.line .value { color: #bbb; word-break: break-all; }
-.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #555; flex: none; }
-.line.done .dot { background: #00ff88; } .line.active .dot { background: #ffaa00; }
-.line.failed .dot { background: #ff4444; }
-.legend { padding: 1px 6px; border-radius: 4px; border: 1px solid #555; }
-.running { color: #ffaa00; }
-.legend.done { color: #00ff88; } .legend.active { color: #ffaa00; } .legend.failed { color: #ff4444; }
-table.ids code { font-size: 0.8em; word-break: break-all; }
-pre { white-space: pre-wrap; font-size: 0.8em; }
-a { color: #00d4ff; }
-"#;
-
 #[cfg(test)]
 mod tests {
     use super::*;

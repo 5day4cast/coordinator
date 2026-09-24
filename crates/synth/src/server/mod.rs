@@ -1,3 +1,4 @@
+mod assets;
 pub mod live;
 pub mod metrics;
 pub mod routes;
@@ -28,6 +29,7 @@ pub async fn start_server(
     tokio::spawn(live::render_changes(dashboard.clone()));
     let app = Router::new()
         .merge(routes::router(dashboard))
+        .merge(assets::router())
         .merge(metrics::router());
 
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;

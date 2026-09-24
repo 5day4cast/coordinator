@@ -15,12 +15,13 @@ use std::time::Duration;
 use axum::extract::{Query, State};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use futures::Stream;
-use maud::{html, Markup, PreEscaped, DOCTYPE};
+use maud::{html, Markup, DOCTYPE};
 use serde::Deserialize;
 use tokio::sync::broadcast::{self, error::RecvError};
 
-use super::routes::{dashboard_live, Dashboard, DASHBOARD_CSS};
-use super::run_detail::{run_live, FLOW_CSS};
+use super::assets;
+use super::routes::{dashboard_live, Dashboard};
+use super::run_detail::run_live;
 use crate::events::Event;
 
 /// How long events are gathered before the topics they touch are rendered.
@@ -203,46 +204,16 @@ pub(super) fn page(title: &str, topic: &str, header: Markup, live: Markup) -> Ma
         html {
             head {
                 title { (title) }
-                style { (DASHBOARD_CSS) (FLOW_CSS) }
+                link rel="stylesheet" href=(assets::CSS_URL);
+                script src=(assets::JS_URL) defer {}
             }
             body {
                 (header)
                 main #live data-topic=(topic) { (live) }
-                script { (PreEscaped(LIVE_SCRIPT)) }
             }
         }
     }
 }
-
-/// Swaps in each fragment pushed for the page's topic, keeping open details open, and posts the
-/// action buttons without leaving the page.
-const LIVE_SCRIPT: &str = r#"
-(() => {
-  const live = document.getElementById('live');
-  const status = document.getElementById('live-status');
-  const say = (text) => { if (status) status.textContent = text; };
-  const source = new EventSource('/api/live?topic=' + encodeURIComponent(live.dataset.topic));
-  source.onopen = () => say('● live');
-  source.onerror = () => say('○ reconnecting…');
-  source.addEventListener('live', (event) => {
-    const open = new Set([...live.querySelectorAll('details[open]')].map((d) => d.dataset.key));
-    live.innerHTML = event.data;
-    live.querySelectorAll('details').forEach((d) => { if (open.has(d.dataset.key)) d.open = true; });
-  });
-  document.addEventListener('submit', async (event) => {
-    const form = event.target;
-    if (!form.matches('form[data-async]')) return;
-    event.preventDefault();
-    const button = form.querySelector('button');
-    if (button) button.disabled = true;
-    try {
-      await fetch(form.action, { method: 'POST' });
-    } finally {
-      if (button) button.disabled = false;
-    }
-  });
-})();
-"#;
 
 #[cfg(test)]
 mod tests {
