@@ -172,8 +172,15 @@ impl Tracker {
 
     /// Look at a run's competition, and refresh the run's trail if it moved or is due.
     async fn follow(&self, run: &TestRun, competition_id: Uuid) -> Result<()> {
-        let competition = self.inner.client.get_competition(&competition_id).await?;
-        let fingerprint = format!("{}|{}", run.status, fingerprint(&competition));
+        let competition = self.inner.client.get_competition(&competition_id).await;
+        let fingerprint = format!(
+            "{}|{}",
+            run.status,
+            competition
+                .as_ref()
+                .map(fingerprint)
+                .unwrap_or_else(|_| "unavailable".into())
+        );
         let due = {
             let seen = self.inner.seen.lock().expect("seen lock");
             match seen.get(&run.id) {
@@ -184,9 +191,7 @@ impl Tracker {
         if !due || !self.start(&run.id) {
             return Ok(());
         }
-        let refreshed = self
-            .refresh_run(run, competition_id, Some(competition))
-            .await;
+        let refreshed = self.refresh_run(run, competition_id, competition).await;
         self.finish(&run.id);
         refreshed?;
         self.inner
@@ -221,7 +226,10 @@ impl Tracker {
         let Some(competition_id) = competition_of(&run) else {
             return Ok(None);
         };
-        self.refresh_run(&run, competition_id, None).await.map(Some)
+        let competition = self.inner.client.get_competition(&competition_id).await;
+        self.refresh_run(&run, competition_id, competition)
+            .await
+            .map(Some)
     }
 
     fn start(&self, run_id: &str) -> bool {
@@ -240,24 +248,25 @@ impl Tracker {
         &self,
         run: &TestRun,
         competition_id: Uuid,
-        competition: Option<CompetitionResponse>,
+        competition: Result<CompetitionResponse>,
     ) -> Result<Trail> {
         let steps = self.inner.db.get_steps(&run.id).await?;
         let entries = entries_of(&steps);
         let previous = self.inner.db.get_trail(&run.id).await?;
         let mut gaps = Vec::new();
+        let unverified_entries = has_unverified_entries(&steps);
+        if unverified_entries {
+            gaps.push("one or more entry payments could not be verified".to_string());
+        }
 
         let competition = match competition {
-            Some(competition) => Some(competition),
-            None => match self.inner.client.get_competition(&competition_id).await {
-                Ok(competition) => Some(competition),
-                Err(e) => {
-                    gaps.push(format!(
-                        "the coordinator did not answer for the competition: {e:#}"
-                    ));
-                    None
-                }
-            },
+            Ok(competition) => Some(competition),
+            Err(e) => {
+                gaps.push(format!(
+                    "the coordinator did not answer for the competition: {e:#}"
+                ));
+                None
+            }
         };
         let settlement = competition
             .as_ref()
@@ -315,6 +324,10 @@ impl Tracker {
         let money = match &competition {
             // A run still going decides nothing yet, even before anyone has paid.
             _ if run.status == "running" => Money::Following,
+            _ if unverified_entries && give_up => Money::TimedOut {
+                reason: "one or more entry payments could not be verified".to_string(),
+            },
+            _ if unverified_entries => Money::Following,
             Some(competition) => judge(competition, &payouts, &refunds, paid, give_up),
             None if give_up => Money::TimedOut {
                 reason: "the coordinator never answered for the competition".to_string(),
@@ -578,6 +591,7 @@ impl Tracker {
             });
             match earlier {
                 Some(earlier) if earlier.is_confirmed() => {
+                    payout.amount_sats = earlier.amount_sats;
                     payout.preimage = earlier.preimage.clone();
                     payout.fee_msat = earlier.fee_msat;
                     payout.paid_by = earlier.paid_by.clone();
@@ -608,6 +622,7 @@ impl Tracker {
         };
         for node in &self.inner.nodes {
             if let Ok(Some(paid)) = node.lnd.payment(&hash).await {
+                payout.amount_sats = Some(paid.value_sat);
                 payout.preimage = Some(paid.preimage);
                 payout.fee_msat = Some(paid.fee_msat);
                 payout.paid_by = Some(node.name().await);
@@ -624,6 +639,7 @@ impl Tracker {
             }
             if let Ok(Some(invoice)) = node.lnd.lookup_invoice(&hash).await {
                 if invoice.state == "SETTLED" {
+                    payout.amount_sats = Some(invoice.amt_paid_sat);
                     payout.preimage = Some(invoice.preimage);
                     payout.payee_alias = Some(node.name().await);
                 }
@@ -716,6 +732,30 @@ pub fn entries_of(steps: &[TestStep]) -> Vec<EntryTrace> {
         .collect()
 }
 
+/// A missing receipt is not evidence that no money moved. A payment that timed out locally
+/// may still settle on Lightning after the entry step has failed.
+fn has_unverified_entries(steps: &[TestStep]) -> bool {
+    steps
+        .iter()
+        .filter(|step| step.step_name.ends_with("_enter"))
+        .any(|step| {
+            let entry = step
+                .details_json
+                .as_deref()
+                .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
+                .filter(|details| details.get("paid").is_some_and(|paid| paid.is_boolean()))
+                .and_then(|details| serde_json::from_value::<EntryTrace>(details).ok());
+            match entry {
+                Some(entry) => {
+                    step.status == "running"
+                        || (!entry.paid
+                            && (entry.ticket_id.is_some() || entry.payment_hash.is_some()))
+                }
+                None => true,
+            }
+        })
+}
+
 fn competition_of(run: &TestRun) -> Option<Uuid> {
     run.competition_id.as_deref()?.parse().ok()
 }
@@ -762,6 +802,241 @@ pub fn nodes(configs: &[&crate::lnd::LndConfig]) -> Vec<Lnd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Fixture {
+        tracker: Tracker,
+        server: tokio::task::JoinHandle<()>,
+        _data: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        async fn new(router: Router, with_node: bool) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let data = tempfile::tempdir().unwrap();
+            let db = SynthDb::new(data.path().join("synth.sqlite").to_str().unwrap())
+                .await
+                .unwrap();
+            let nodes = if with_node {
+                let macaroon = data.path().join("test.macaroon");
+                std::fs::write(&macaroon, [0u8]).unwrap();
+                vec![Lnd::new(&crate::lnd::LndConfig {
+                    rest_url: url.clone(),
+                    macaroon_file: macaroon,
+                    tls_cert_file: None,
+                    fee_limit_sats: 100,
+                    payment_timeout_secs: 1,
+                })
+                .unwrap()]
+            } else {
+                vec![]
+            };
+            Self {
+                tracker: Tracker::new(
+                    CoordinatorClient::new(&url, None),
+                    db,
+                    Events::new(),
+                    nodes,
+                    None,
+                    TrailConfig {
+                        follow_timeout_secs: 0,
+                        ..TrailConfig::default()
+                    },
+                    None,
+                )
+                .unwrap(),
+                server,
+                _data: data,
+            }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_competition_times_out_without_a_second_fetch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let fixture = Fixture::new(
+            Router::new().fallback(move || {
+                let calls = counted.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+            false,
+        )
+        .await;
+        let db = &fixture.tracker.inner.db;
+        let run_id = db.create_run("full_lifecycle", None).await.unwrap();
+        let details = serde_json::json!({"competition_id": Uuid::now_v7()}).to_string();
+        db.add_step(&run_id, "create_competition", 1, None, Some(&details))
+            .await
+            .unwrap();
+        let entry = serde_json::json!({
+            "user": "alice", "nostr_pubkey": "00", "paid": true, "amount_sats": 1000
+        })
+        .to_string();
+        db.add_step(&run_id, "user_alice_enter", 1, None, Some(&entry))
+            .await
+            .unwrap();
+        db.complete_run(&run_id, None).await.unwrap();
+
+        fixture.tracker.tick().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one coordinator lookup");
+        let trail = db.get_trail(&run_id).await.unwrap().unwrap();
+        assert!(matches!(trail.money, Money::TimedOut { .. }));
+        assert!(trail.gaps.iter().any(|gap| gap.contains("503")));
+        assert_eq!(db.get_run(&run_id).await.unwrap().unwrap().status, "failed");
+        assert!(db.runs_to_follow().await.unwrap().is_empty());
+        fixture.tracker.tick().await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the timed-out run left the queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_entry_evidence_is_followed_until_it_times_out() {
+        let ticket = serde_json::json!({
+            "user": "alice", "nostr_pubkey": "00", "paid": false,
+            "ticket_id": Uuid::now_v7()
+        })
+        .to_string();
+        let payment = serde_json::json!({
+            "user": "alice", "nostr_pubkey": "00", "paid": false,
+            "payment_hash": "00".repeat(32)
+        })
+        .to_string();
+        for details in [
+            None,
+            Some("{bad json"),
+            Some("{}"),
+            Some(r#"{"user":"alice","nostr_pubkey":"00"}"#),
+            Some(ticket.as_str()),
+            Some(payment.as_str()),
+        ] {
+            let mut fixture = Fixture::new(Router::new(), false).await;
+            Arc::get_mut(&mut fixture.tracker.inner)
+                .unwrap()
+                .config
+                .follow_timeout_secs = 3600;
+            let db = fixture.tracker.inner.db.clone();
+            let run_id = db.create_run("full_lifecycle", None).await.unwrap();
+            let competition_id = Uuid::now_v7();
+            let competition: CompetitionResponse = serde_json::from_value(serde_json::json!({
+                "id": competition_id,
+                "created_at": "2026-09-24T01:00:00Z",
+                "event_submission": {}
+            }))
+            .unwrap();
+            db.complete_run(&run_id, None).await.unwrap();
+            let run = db.get_run(&run_id).await.unwrap().unwrap();
+            db.add_step(&run_id, "user_alice_enter", 1, None, details)
+                .await
+                .unwrap();
+
+            let trail = fixture
+                .tracker
+                .refresh_run(&run, competition_id, Ok(competition.clone()))
+                .await
+                .unwrap();
+            assert!(matches!(trail.money, Money::Following), "{details:?}");
+            assert!(trail
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("entry payments could not be verified")));
+
+            Arc::get_mut(&mut fixture.tracker.inner)
+                .unwrap()
+                .config
+                .follow_timeout_secs = 0;
+            let trail = fixture
+                .tracker
+                .refresh_run(&run, competition_id, Ok(competition))
+                .await
+                .unwrap();
+            assert!(matches!(trail.money, Money::TimedOut { .. }), "{details:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn payout_confirmation_uses_amount_observed_by_either_lightning_node() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use sha2::{Digest, Sha256};
+
+        let preimage = [42u8; 32];
+        let hash = hex::encode(Sha256::digest(preimage));
+        for payer_visible in [true, false] {
+            let paid = serde_json::json!({"result": {
+                "payment_hash": hash, "payment_preimage": hex::encode(preimage),
+                "status": "SUCCEEDED", "value_sat": "900", "fee_msat": "20"
+            }});
+            let invoice = serde_json::json!({
+                "state": "SETTLED", "r_preimage": STANDARD.encode(preimage), "amt_paid_sat": "900"
+            });
+            let router = Router::new()
+                .route(
+                    "/v2/router/track/{hash}",
+                    get(move || {
+                        let paid = paid.clone();
+                        async move {
+                            if payer_visible {
+                                Json(paid).into_response()
+                            } else {
+                                StatusCode::NOT_FOUND.into_response()
+                            }
+                        }
+                    }),
+                )
+                .route(
+                    "/v1/getinfo",
+                    get(|| async {
+                        Json(serde_json::json!({"identity_pubkey": "payee", "alias": "test node"}))
+                    }),
+                )
+                .route(
+                    "/v1/invoice/{hash}",
+                    get(move || async move { Json(invoice) }),
+                );
+            let fixture = Fixture::new(router, true).await;
+
+            // The invoice asks for 1000, but the observed payment delivered only 900.
+            let mut short = PayoutSeen {
+                owed_sats: 1000,
+                amount_sats: Some(1000),
+                payment_hash: Some(hash.clone()),
+                payee_pubkey: Some("payee".into()),
+                ..PayoutSeen::default()
+            };
+            fixture.tracker.look_up_payout(&mut short).await;
+            assert_eq!(short.amount_sats, Some(900));
+            assert!(
+                !short.is_confirmed(),
+                "an invoice amount cannot hide a short payment"
+            );
+
+            // An amountless invoice can still be proven paid from the node's receipt.
+            let mut amountless = PayoutSeen {
+                owed_sats: 900,
+                amount_sats: None,
+                preimage: None,
+                ..short
+            };
+            fixture.tracker.look_up_payout(&mut amountless).await;
+            assert_eq!(amountless.amount_sats, Some(900));
+            assert!(amountless.is_confirmed());
+        }
+    }
 
     fn step(name: &str, details: serde_json::Value) -> TestStep {
         TestStep {

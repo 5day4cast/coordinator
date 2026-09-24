@@ -279,7 +279,7 @@ fn flow(
         }],
     });
 
-    let refunded = !trail.map_or(true, |trail| trail.refunds.is_empty()) || !refunds.is_empty();
+    let refunded = trail.is_some_and(|trail| !trail.refunds.is_empty()) || !refunds.is_empty();
     // A competition that ended before its outcome gives the escrows back instead of paying out.
     let settled = if (ended || refunded) && !attested {
         refunds_box(entries, refunds, trail, unfinished)
@@ -402,6 +402,14 @@ fn payouts_box(
             || settlement.is_some_and(|settlement| winning.len() < settlement.winners().count())
         {
             Stage::Waiting
+        } else if winning.iter().all(|line| line.stage == Stage::Done)
+            && crate::trail::confirmed_payouts(payouts)
+                .iter()
+                .filter(|p| p.owed_sats > 0)
+                .count()
+                < winning.len()
+        {
+            Stage::Active
         } else {
             Stage::of_lines(&winning)
         },
@@ -844,6 +852,16 @@ fn ledger_table(ledger: &Ledger, trail: Option<&Trail>) -> Markup {
                 tr { td { "funding transaction" } td.num { (sats(ledger.funding_fee)) } td.note { "paid by the Arkade server's wallet" } }
                 tr { td { "outcome transaction" } td.num { (sats(ledger.outcome_fee)) } td.note { "taken from the contract's output; the coordinator still pays shares in full" } }
                 tr { td { "payout routing, paid by the coordinator's node" } td.num { (msat(ledger.payout_routing_fee_msat)) } td {} }
+                tr class=(if ledger.operator_net_msat.is_some_and(|net| net < 0) { "total flag" } else { "total" }) {
+                    td { "Combined operator remainder" }
+                    td.num {
+                        @match ledger.operator_net_msat {
+                            Some(net) => { @if net < 0 { "−" } (format::msat_as_sats(net.unsigned_abs())) }
+                            None => { "not fully visible" }
+                        }
+                    }
+                    td.note { "fee allowance less swap, chain and payout routing costs; a negative amount is supplied by the operators" }
+                }
                 tr class=(if ledger.remainder != 0 { "total flag" } else { "total" }) {
                     td { "Unaccounted for" }
                     td.num { (ledger.remainder) }
@@ -973,6 +991,8 @@ mod tests {
     }
 
     fn payout(user: &str, pubkey: &str, owed_sats: u64, sent: bool) -> PayoutSeen {
+        use sha2::{Digest, Sha256};
+        let preimage = Sha256::digest(user.as_bytes());
         PayoutSeen {
             user: user.to_string(),
             pubkey: pubkey.to_string(),
@@ -980,10 +1000,8 @@ mod tests {
             owed_sats,
             sent_at: sent.then(OffsetDateTime::now_utc),
             amount_sats: sent.then_some(owed_sats),
-            preimage: sent
-                .then(|| "1111111111111111111111111111111111111111111111111111111111111111".into()),
-            payment_hash: sent
-                .then(|| "02d449a31fbb267c8f352e9968a79e3e5fc95c1bbeaa502fd6454ebde5a4bedc".into()),
+            preimage: sent.then(|| hex::encode(preimage)),
+            payment_hash: sent.then(|| hex::encode(Sha256::digest(preimage))),
             ..PayoutSeen::default()
         }
     }

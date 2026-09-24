@@ -521,6 +521,9 @@ pub struct Ledger {
     /// What the coordinator's node paid to route the payouts, in millisats; None while any is
     /// not visible to synth.
     pub payout_routing_fee_msat: Option<u64>,
+    /// The fee allowance after swap, funding, outcome and payout routing costs.
+    /// Negative means the operators supplied additional funds. Unknown if any cost is missing.
+    pub operator_net_msat: Option<i64>,
     /// What is not accounted for, once the money settled: owed and unpaid, or paid in and
     /// neither in the pot, the fee, nor refunded. Zero when it balances.
     pub remainder: i64,
@@ -577,10 +580,14 @@ pub fn ledger(
         || trail.payouts.iter().map(|p| p.owed_sats).sum(),
         |settlement| settlement.shares.iter().map(|share| share.owed_sats).sum(),
     );
-    ledger.paid_out = trail
-        .payouts
+    let sent = crate::trail::confirmed_payouts(&trail.payouts);
+    if sent.len() != trail.payouts.iter().filter(|p| p.is_confirmed()).count() {
+        ledger
+            .flags
+            .push("multiple entries reference the same settled payment; counted once".into());
+    }
+    ledger.paid_out = sent
         .iter()
-        .filter(|p| p.is_confirmed())
         .map(|p| p.amount_sats.unwrap_or(p.owed_sats))
         .sum();
     ledger.unpaid = ledger.owed.saturating_sub(ledger.paid_out);
@@ -606,13 +613,20 @@ pub fn ledger(
         (swapped.len() == entries_paid && entries_paid > 0).then(|| swapped.iter().sum());
     ledger.funding_fee = trail.funding_tx.as_ref().and_then(|tx| tx.fee_sat);
     ledger.outcome_fee = trail.outcome_tx.as_ref().and_then(|tx| tx.fee_sat);
-    let sent: Vec<&crate::trail::PayoutSeen> =
-        trail.payouts.iter().filter(|p| p.is_confirmed()).collect();
     ledger.payout_routing_fee_msat = sent
         .iter()
         .map(|p| p.fee_msat)
         .sum::<Option<u64>>()
         .filter(|_| !sent.is_empty());
+    ledger.operator_net_msat = (|| {
+        let fee = i128::from(ledger.coordinator_fee?) * 1000;
+        let costs = (i128::from(ledger.swap_fees?)
+            + i128::from(ledger.funding_fee?)
+            + i128::from(ledger.outcome_fee?))
+            * 1000
+            + i128::from(ledger.payout_routing_fee_msat?);
+        i64::try_from(fee - costs).ok()
+    })();
 
     // Players paid the pot plus the coordinator's fee; check the pot is what the entries buy.
     if let Some(pot) = pot {
@@ -713,6 +727,7 @@ mod tests {
     use super::*;
     use crate::settlement::{Decided, Settlement, Share};
     use crate::trail::{ChainTx, EntryPayment, PayoutSeen, RouteHop, SwapSeen};
+    use sha2::{Digest, Sha256};
     use time::OffsetDateTime;
 
     fn entry(user: &str, hash: &str) -> EntryTrace {
@@ -790,17 +805,14 @@ mod tests {
                 .collect(),
             payouts: owed
                 .iter()
-                .map(|owed_sats| PayoutSeen {
+                .enumerate()
+                .map(|(index, owed_sats)| PayoutSeen {
                     user: "alice".into(),
                     owed_sats: *owed_sats,
                     sent_at: sent.then(OffsetDateTime::now_utc),
                     amount_sats: sent.then_some(*owed_sats),
-                    payment_hash: sent.then(|| {
-                        "02d449a31fbb267c8f352e9968a79e3e5fc95c1bbeaa502fd6454ebde5a4bedc".into()
-                    }),
-                    preimage: sent.then(|| {
-                        "1111111111111111111111111111111111111111111111111111111111111111".into()
-                    }),
+                    payment_hash: sent.then(|| hex::encode(Sha256::digest([index as u8 + 1; 32]))),
+                    preimage: sent.then(|| hex::encode([index as u8 + 1; 32])),
                     fee_msat: sent.then_some(2000),
                     ..PayoutSeen::default()
                 })
@@ -848,6 +860,15 @@ mod tests {
             (Some(199), Some(222))
         );
         assert_eq!(ledger.payout_routing_fee_msat, Some(6000));
+        assert_eq!(ledger.operator_net_msat, Some(-127_000));
+        assert_eq!(
+            ledger.paid_in as i64 * 1000,
+            ledger.paid_out as i64 * 1000
+                + (199 + 222) * 1000
+                + 6000
+                + ledger.operator_net_msat.unwrap(),
+            "operator funding accounts for costs exceeding the entry fee allowance"
+        );
         assert_eq!(ledger.remainder, 0);
         assert!(ledger.flags.is_empty(), "{:?}", ledger.flags);
     }
@@ -866,6 +887,7 @@ mod tests {
             ["3000 sats of the pot have no confirmed payout or refund"]
         );
         assert_eq!(ledger.payout_routing_fee_msat, None);
+        assert_eq!(ledger.operator_net_msat, None);
 
         let following = ledger_following();
         assert_eq!(
@@ -892,6 +914,21 @@ mod tests {
         assert_eq!(ledger.unpaid, 3000);
         assert_eq!(ledger.left_in_pot, 0);
         assert_eq!(ledger.remainder, 3000);
+    }
+
+    #[test]
+    fn a_reused_payment_is_not_counted_twice_in_the_ledger() {
+        let mut duplicate = trail(Money::PaidOut, true);
+        duplicate.payouts[2].payment_hash = duplicate.payouts[1].payment_hash.clone();
+        duplicate.payouts[2].preimage = duplicate.payouts[1].preimage.clone();
+        let ledger = ledger(&entries(), &[], Some(&duplicate));
+        assert_eq!(ledger.paid_out, 2010);
+        assert_eq!(ledger.remainder, 990);
+        assert_eq!(ledger.payout_routing_fee_msat, Some(4000));
+        assert!(ledger
+            .flags
+            .iter()
+            .any(|flag| flag.contains("counted once")));
     }
 
     #[test]

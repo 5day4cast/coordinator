@@ -185,6 +185,18 @@ impl PayoutSeen {
     }
 }
 
+/// A settled Lightning invoice can account for only one outgoing payment.
+pub fn confirmed_payouts(payouts: &[PayoutSeen]) -> Vec<&PayoutSeen> {
+    let mut hashes = std::collections::HashSet::new();
+    payouts
+        .iter()
+        .filter(|payout| payout.is_confirmed())
+        .filter(|payout| {
+            hashes.insert(payout.payment_hash.as_deref().unwrap().to_ascii_lowercase())
+        })
+        .collect()
+}
+
 /// A refund of a ticket whose competition was cancelled before its contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefundSeen {
@@ -285,7 +297,10 @@ pub fn judge(
     give_up: bool,
 ) -> Money {
     let owed: Vec<&PayoutSeen> = payouts.iter().filter(|p| p.owed_sats > 0).collect();
-    let sent = owed.iter().filter(|p| p.is_confirmed()).count();
+    let sent = confirmed_payouts(payouts)
+        .iter()
+        .filter(|p| p.owed_sats > 0)
+        .count();
     let payouts_words = || format!("{sent} of {} payouts confirmed", owed.len());
     if paid_entries == 0 {
         return Money::NothingPaid;
@@ -466,6 +481,21 @@ mod tests {
             !winner.is_confirmed(),
             "an underpayment does not pay the share"
         );
+    }
+
+    #[test]
+    fn one_payment_cannot_settle_two_entry_shares() {
+        let completed = competition(serde_json::json!({ "completed_at": "2026-09-24T01:02:31Z" }));
+        let first = payout(1000, true);
+        let mut duplicate = first.clone();
+        duplicate.entry_id = Uuid::now_v7();
+        let payouts = [first, duplicate];
+        assert_eq!(confirmed_payouts(&payouts).len(), 1);
+        assert_eq!(judge(&completed, &payouts, &[], 2, false), Money::Following);
+        assert!(matches!(
+            judge(&completed, &payouts, &[], 2, true),
+            Money::TimedOut { .. }
+        ));
     }
 
     #[test]

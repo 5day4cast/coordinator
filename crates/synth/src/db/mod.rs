@@ -93,9 +93,9 @@ pub struct SynthUserRecord {
 
 /// A run, with the competition its steps name and where its money stands.
 const RUN_COLUMNS: &str = "SELECT test_runs.*, \
-     (SELECT json_extract(details_json, '$.competition_id') FROM test_steps \
+     (SELECT CASE WHEN json_valid(details_json) THEN json_extract(details_json, '$.competition_id') END FROM test_steps \
       WHERE test_steps.run_id = test_runs.id \
-      AND json_extract(details_json, '$.competition_id') IS NOT NULL LIMIT 1) AS competition_id, \
+      AND CASE WHEN json_valid(details_json) THEN json_extract(details_json, '$.competition_id') END IS NOT NULL LIMIT 1) AS competition_id, \
      (SELECT money FROM money_trails WHERE money_trails.run_id = test_runs.id) AS money \
      FROM test_runs";
 
@@ -694,6 +694,9 @@ mod tests {
             .await
             .unwrap();
         let old = db.create_run("full_lifecycle", None).await.unwrap();
+        db.add_step(&old, "user_alice_enter", 1, None, Some("{"))
+            .await
+            .unwrap();
         let details = serde_json::json!({"competition_id": Uuid::now_v7()}).to_string();
         db.add_step(&old, "create_competition", 1, None, Some(&details))
             .await
