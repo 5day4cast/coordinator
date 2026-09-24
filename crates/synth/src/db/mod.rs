@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+    SqlitePool,
+};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -130,9 +133,15 @@ impl SynthDb {
         }
 
         let url = format!("sqlite:{}?mode=rwc", path);
+        // The tracker can backfill thousands of old runs. Its commits must not block page
+        // readers, and a confirmed money trail must remain durable across a power loss.
+        let options = url
+            .parse::<SqliteConnectOptions>()?
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Full);
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(&url)
+            .connect_with(options)
             .await
             .context("Failed to connect to SQLite database")?;
 
@@ -236,6 +245,22 @@ impl SynthDb {
         // stuck, until it moves again.
         self.add_column_if_missing("money_trails", "follow", "INTEGER NOT NULL DEFAULT 1")
             .await?;
+
+        // Hourly runs add a few dozen steps an hour. Without these, listing runs and reading a
+        // run's steps scan every step ever recorded.
+        sqlx::query("CREATE INDEX IF NOT EXISTS test_steps_by_run ON test_steps (run_id)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS test_runs_by_start ON test_runs (started_at)")
+            .execute(&self.pool)
+            .await?;
+        // Covers the scenario health query, which reads nothing else.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS test_runs_by_scenario_start \
+             ON test_runs (scenario, started_at DESC, status)",
+        )
+        .execute(&self.pool)
+        .await?;
 
         let version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(&self.pool)
@@ -438,7 +463,7 @@ impl SynthDb {
     pub async fn scenario_health(&self, window: i64) -> Result<Vec<ScenarioHealth>> {
         let health = sqlx::query_as::<_, ScenarioHealth>(
             "WITH recent AS (
-                 SELECT scenario, status, started_at, completed_at,
+                 SELECT scenario, status, started_at,
                         ROW_NUMBER() OVER (PARTITION BY scenario ORDER BY started_at DESC) AS age
                  FROM test_runs
              )
@@ -699,8 +724,142 @@ impl SynthDb {
 }
 
 #[cfg(test)]
+impl SynthDb {
+    /// Fill the database with `runs` hourly lifecycle runs, each with its steps and a settled
+    /// money trail, the oldest first: for measuring how pages hold up as history grows.
+    pub(crate) async fn seed_history(&self, runs: usize, trail_json: &str) -> Result<Vec<String>> {
+        let mut transaction = self.pool.begin().await?;
+        let start = OffsetDateTime::now_utc() - time::Duration::hours(runs as i64);
+        let mut ids = Vec::with_capacity(runs);
+        for index in 0..runs {
+            let id = Uuid::now_v7().to_string();
+            let at = (start + time::Duration::hours(index as i64))
+                .format(&time::format_description::well_known::Rfc3339)?;
+            let competition = Uuid::now_v7().to_string();
+            sqlx::query(
+                "INSERT INTO test_runs (id, scenario, status, started_at, completed_at, competition_id) \
+                 VALUES (?, 'full_lifecycle', 'passed', ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(&at)
+            .bind(&at)
+            .bind(&competition)
+            .execute(&mut *transaction)
+            .await?;
+            let mut steps = vec![(
+                "create_competition".to_string(),
+                serde_json::json!({ "competition_id": competition }).to_string(),
+            )];
+            for user in ["alice", "bob", "charlie"] {
+                steps.push((
+                    format!("user_{user}_enter"),
+                    serde_json::json!({
+                        "user": user, "nostr_pubkey": "00".repeat(32), "paid": true,
+                        "entry_submitted": true, "amount_sats": 1100,
+                        "ticket_id": Uuid::now_v7(), "entry_id": Uuid::now_v7(),
+                        "payment_hash": "ab".repeat(32), "invoice": "lntbs11u1".repeat(40),
+                    })
+                    .to_string(),
+                ));
+            }
+            for wait in 0..9 {
+                steps.push((format!("wait_{wait}"), "{}".to_string()));
+            }
+            for (name, details) in steps {
+                sqlx::query(
+                    "INSERT INTO test_steps (id, run_id, step_name, status, started_at, \
+                     completed_at, duration_ms, details_json) VALUES (?, ?, ?, 'passed', ?, ?, 1, ?)",
+                )
+                .bind(Uuid::now_v7().to_string())
+                .bind(&id)
+                .bind(name)
+                .bind(&at)
+                .bind(&at)
+                .bind(details)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            sqlx::query(
+                "INSERT INTO money_trails (run_id, money, trail_json, updated_at, follow) \
+                 VALUES (?, 'paid_out', ?, ?, 0)",
+            )
+            .bind(&id)
+            .bind(trail_json)
+            .bind(&at)
+            .execute(&mut *transaction)
+            .await?;
+            ids.push(id);
+        }
+        transaction.commit().await?;
+        Ok(ids)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tracker commits a verdict every few seconds while pages read. In WAL mode a reader
+    /// holds a snapshot rather than a lock, so a page part way through reading does not hold up
+    /// the tracker's commit, and reads what was committed when it began. With a rollback
+    /// journal the commit would wait for the reader. An open read transaction stands in for a
+    /// long read here.
+    #[tokio::test]
+    async fn a_page_part_way_through_a_read_does_not_hold_up_the_trackers_commit() {
+        use crate::trail::Money;
+        let directory = tempfile::tempdir().unwrap();
+        let db = SynthDb::new(directory.path().join("synth.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, "wal");
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            synchronous, 2,
+            "FULL: a saved verdict survives a power loss"
+        );
+        let run_id = db.create_run("full_lifecycle", None).await.unwrap();
+        db.complete_run(&run_id, None).await.unwrap();
+
+        let mut reader = db.pool.acquire().await.unwrap();
+        sqlx::query("BEGIN").execute(&mut *reader).await.unwrap();
+        let trails = "SELECT count(*) FROM money_trails";
+        let before: i64 = sqlx::query_scalar(trails)
+            .fetch_one(&mut *reader)
+            .await
+            .unwrap();
+        assert_eq!(before, 0);
+
+        let following = trail(Money::Following);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            db.record_money(
+                &run_id,
+                &Verdict {
+                    trail: &following,
+                    follow: true,
+                    step: None,
+                    fail_passed_run: None,
+                },
+            ),
+        )
+        .await
+        .expect("the tracker's commit must not wait for a reader")
+        .unwrap();
+        let during: i64 = sqlx::query_scalar(trails)
+            .fetch_one(&mut *reader)
+            .await
+            .unwrap();
+        assert_eq!(during, 0, "the reader keeps the snapshot it began with");
+        sqlx::query("COMMIT").execute(&mut *reader).await.unwrap();
+        assert!(db.get_trail(&run_id).await.unwrap().is_some());
+    }
 
     /// A scenario is judged by its recent runs, so an old failure must not follow it forever.
     #[tokio::test]

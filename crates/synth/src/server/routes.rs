@@ -466,3 +466,170 @@ fn step_class(status: &crate::scenarios::StepStatus) -> &'static str {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::SynthDb;
+    use std::time::{Duration, Instant};
+
+    /// The load-time budget: anything slower to load is a bug.
+    const BUDGET: Duration = Duration::from_millis(400);
+
+    /// A run whose contract failed with its winners unpaid, as run 01a0d0f5's did, with every hop
+    /// synth follows and the stuck block: the heaviest run page there is.
+    async fn seed_stuck_run(db: &SynthDb, competition: &serde_json::Value) -> String {
+        use serde_json::json;
+        let hash = |n: u8| hex::encode([n; 32]);
+        let address = "freya@lnurl.5day4cast.com";
+        let run = db
+            .create_run("full_lifecycle", Some(r#"{"lnd":{}}"#))
+            .await
+            .unwrap();
+        let details = json!({ "competition_id": competition["id"] }).to_string();
+        db.add_step(&run, "create_competition", 1, None, Some(&details))
+            .await
+            .unwrap();
+        let (mut swaps, mut payouts, mut shares) = (Vec::new(), Vec::new(), Vec::new());
+        for (n, user) in (1u8..).zip(["alice", "bob", "charlie"]) {
+            let entry_id = uuid::Uuid::now_v7();
+            let entry = json!({
+                "user": user, "nostr_pubkey": hash(0x10 + n), "entry_id": entry_id,
+                "ticket_id": uuid::Uuid::now_v7(), "amount_sats": 1100, "payment_hash": hash(n),
+                "invoice": format!("lntbs11u1{}", "q".repeat(300)), "lightning_address": address,
+                "escrow": { "refund_at": 1_790_300_000, "solo_delay_secs": 86_528 },
+                "payment": {
+                    "payer_alias": "thor", "payer_pubkey": hash(0x20), "preimage": hash(0x30 + n),
+                    "fee_msat": 1001,
+                    "route": [
+                        { "chan_id": "3771505203178766336", "pubkey": hash(0x21), "alias": "odin" },
+                        { "chan_id": "3771505203178766337", "pubkey": hash(0x22), "alias": "swapd" },
+                    ],
+                },
+                "paid": true, "entry_submitted": true,
+            });
+            db.add_step(
+                &run,
+                &format!("user_{user}_enter"),
+                1,
+                None,
+                Some(&entry.to_string()),
+            )
+            .await
+            .unwrap();
+            swaps.push(json!({
+                "user": user, "payment_hash": hash(n), "id": uuid::Uuid::now_v7(),
+                "state": "settled", "amount_sat": 1090,
+                "escrow_address": format!("tark1{}", "q".repeat(60)),
+                "escrow_vtxo": (n > 1).then(|| format!("{}:0", hash(0x40 + n))),
+                "ark_txid": hash(0x40 + n), "invoice_state": "SETTLED",
+            }));
+            payouts.push(json!({
+                "user": user, "entry_id": entry_id, "pubkey": hash(0x10 + n), "weight": 33,
+                "owed_sats": 1000, "lightning_address": address,
+            }));
+            shares.push(json!({ "pubkey": hash(0x10 + n), "weight": 33, "owed_sats": 1000 }));
+        }
+        db.complete_run(&run, None).await.unwrap();
+        let mut competition = competition.clone();
+        competition["completed_at"] = serde_json::Value::Null;
+        competition["delta_broadcasted_at"] = json!("2026-09-24T04:15:12Z");
+        competition["failed_at"] = json!("2026-09-24T04:16:13Z");
+        let chain = |n: u8| json!({ "txid": hash(n), "vout": 0, "fee_sat": 199, "value_sat": 3000, "confirmed": true });
+        let reason = "the competition failed at 04:16 UTC after its outcome went on-chain, and no payout was sent";
+        let trail: crate::trail::Trail = serde_json::from_value(json!({
+            "refreshed_at": "2026-09-24T05:00:00Z",
+            "competition_id": competition["id"],
+            "competition": competition,
+            "settlement": { "pot_sats": 3000, "decided": { "Attested": 3 }, "shares": shares },
+            "swaps": swaps,
+            "payouts": payouts,
+            "funding_tx": chain(0x50),
+            "outcome_tx": chain(0x51),
+            "closing_txs": [chain(0x52)],
+            "money": { "status": "stuck", "reason": reason, "since": "2026-09-24T04:16:13Z" },
+            "held": {
+                "since": "2026-09-24T04:16:13Z", "found": "2026-09-24T05:00:00Z",
+                "reason": reason, "sats": 3000, "nearest_expiry": 1_790_300_000,
+            },
+            "gaps": ["the Arkade indexer is not configured"],
+        }))
+        .unwrap();
+        db.record_money(
+            &run,
+            &crate::db::Verdict {
+                trail: &trail,
+                follow: true,
+                step: Some(("money_stuck", 1, Some(reason), "{}")),
+                fail_passed_run: Some(reason),
+            },
+        )
+        .await
+        .unwrap();
+        run
+    }
+
+    /// Pages render from synth's own database. With a year of hourly runs behind it, and a run
+    /// whose money is stuck, the dashboard, a run's page, its exports, and the tracker's queue
+    /// must come back well inside the budget. Each is timed five times; the slowest counts.
+    ///
+    /// With SYNTH_TIMING_DB set, the database is kept at that path, to time the release binary
+    /// over HTTP against it.
+    #[tokio::test]
+    #[ignore = "timing: run with --ignored --nocapture to measure"]
+    async fn pages_render_within_the_load_budget_with_a_year_of_runs() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = std::env::var("SYNTH_TIMING_DB")
+            .unwrap_or_else(|_| directory.path().join("synth.sqlite").display().to_string());
+        let db = SynthDb::new(&path).await.unwrap();
+        let competition: serde_json::Value =
+            serde_json::from_str(include_str!("../fixtures/lab-competition.json")).unwrap();
+        let trail = serde_json::json!({
+            "refreshed_at": "2026-09-24T01:00:00Z",
+            "competition_id": competition["id"],
+            "competition": competition,
+            "money": { "status": "paid_out" },
+        })
+        .to_string();
+        let runs = db.seed_history(24 * 365, &trail).await.unwrap();
+        let stuck = seed_stuck_run(&db, &competition).await;
+        let dashboard = Dashboard::for_tests(db.clone());
+        eprintln!(
+            "seeded {} runs at {path}; stuck run {stuck}",
+            runs.len() + 1
+        );
+
+        async fn slowest<F: std::future::Future>(label: &str, mut work: impl FnMut() -> F) {
+            let mut slowest = Duration::ZERO;
+            for _ in 0..5 {
+                let start = Instant::now();
+                work().await;
+                slowest = slowest.max(start.elapsed());
+            }
+            eprintln!("{label}: {slowest:?}");
+            assert!(slowest < BUDGET, "{label} took {slowest:?}");
+        }
+        let id = |run: &str| axum::extract::Path(run.to_string());
+        slowest("dashboard", || dashboard_live(&dashboard)).await;
+        slowest("a paid-out run's page", || {
+            super::super::run_detail::run_live(&dashboard, runs.last().unwrap())
+        })
+        .await;
+        slowest("the stuck run's page", || {
+            super::super::run_detail::run_live(&dashboard, &stuck)
+        })
+        .await;
+        slowest("the stuck run's trail.json", || {
+            super::super::run_detail::trail_json(State(dashboard.clone()), id(&stuck))
+        })
+        .await;
+        slowest("the stuck run's trail.tsv", || {
+            super::super::run_detail::trail_tsv(State(dashboard.clone()), id(&stuck))
+        })
+        .await;
+        slowest("the tracker's queue", || async {
+            let queue = db.runs_to_follow().await.unwrap();
+            assert_eq!(queue.len(), 1, "only the stuck run is still watched");
+        })
+        .await;
+    }
+}
