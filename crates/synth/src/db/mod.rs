@@ -88,6 +88,10 @@ pub struct SynthUserRecord {
     pub created_at: String,
 }
 
+fn now_rfc3339() -> Result<String> {
+    Ok(OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?)
+}
+
 impl SynthDb {
     pub async fn new(path: &str) -> Result<Self> {
         // Ensure parent directory exists
@@ -358,6 +362,19 @@ impl SynthDb {
         Ok(run)
     }
 
+    /// Mark the runs a restart cut short, which would otherwise read as running forever. Call
+    /// before any run starts. Returns how many there were.
+    pub async fn interrupt_unfinished_runs(&self) -> Result<u64> {
+        let done = sqlx::query(
+            "UPDATE test_runs SET status = 'interrupted', completed_at = ?, \
+             error_message = 'synth restarted before the run finished' WHERE status = 'running'",
+        )
+        .bind(now_rfc3339()?)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected())
+    }
+
     // --- Test Steps ---
 
     pub async fn create_step(&self, run_id: &str, step_name: &str) -> Result<String> {
@@ -506,6 +523,26 @@ mod tests {
                 .map(|h| h.scenario.as_str())
                 .collect::<Vec<_>>(),
             ["full_lifecycle", "escrow_refund"]
+        );
+    }
+
+    /// A run a restart cut short says so, rather than running forever.
+    #[tokio::test]
+    async fn runs_cut_short_by_a_restart_are_marked_interrupted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synth.sqlite");
+        let db = SynthDb::new(path.to_str().unwrap()).await.unwrap();
+        let finished = db.create_run("full_lifecycle", None).await.unwrap();
+        db.complete_run(&finished, None).await.unwrap();
+        let cut_short = db.create_run("full_lifecycle", None).await.unwrap();
+
+        assert_eq!(db.interrupt_unfinished_runs().await.unwrap(), 1);
+        let run = db.get_run(&cut_short).await.unwrap().unwrap();
+        assert_eq!(run.status, "interrupted");
+        assert!(run.completed_at.is_some());
+        assert_eq!(
+            db.get_run(&finished).await.unwrap().unwrap().status,
+            "passed"
         );
     }
 
