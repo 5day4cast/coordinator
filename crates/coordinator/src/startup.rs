@@ -276,6 +276,8 @@ pub struct AppState {
     pub private_url: String,
     pub remote_url: String,
     pub oracle_url: String,
+    /// Gateway the browser calls to verify its assigned signing enclave.
+    pub keymeld_public_url: Option<String>,
     pub explorer_url: String,
     pub network: String,
     pub bitcoin: Arc<dyn Bitcoin>,
@@ -696,6 +698,13 @@ pub async fn build_app(
             .clone()
             .unwrap_or_default(),
         oracle_url: config.coordinator_settings.oracle_url,
+        keymeld_public_url: config.keymeld_settings.enabled.then(|| {
+            config
+                .keymeld_settings
+                .public_gateway_url
+                .clone()
+                .unwrap_or_else(|| config.keymeld_settings.gateway_url.clone())
+        }),
         network: config.bitcoin_settings.network.to_string(),
         coordinator,
         users_info,
@@ -872,10 +881,11 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
         api.rate_limit.burst,
     );
 
-    // The pages' scripts call the API (normally this site) and the oracle.
+    // The wallet also fetches the assigned enclave's attestation from Keymeld.
     let public_headers = Arc::new(PublicHeaders::new(&[
         app_state.remote_url.as_str(),
         app_state.oracle_url.as_str(),
+        app_state.keymeld_public_url.as_deref().unwrap_or_default(),
     ]));
 
     Router::new()

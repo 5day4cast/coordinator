@@ -1,7 +1,7 @@
 //! Headers on the public site's pages. The WASM wallet holds the player's key
 //! in memory, where injected script cannot read it but could ask it to sign;
 //! so the Content-Security-Policy allows no script but this site's own files,
-//! nothing inline, and connections only to this site and the oracle.
+//! nothing inline, and connections only to the API, oracle and configured signing gateway.
 
 use std::sync::Arc;
 
@@ -28,7 +28,7 @@ pub struct PublicHeaders {
 
 impl PublicHeaders {
     /// `connect` lists the other sites the page's scripts call: the API
-    /// (normally this site) and the oracle.
+    /// (normally this site), oracle and public Keymeld attestation gateway.
     pub fn new(connect: &[&str]) -> Self {
         let policy = content_security_policy(connect);
         Self {
@@ -46,7 +46,7 @@ fn origin(url: &str) -> Option<String> {
 /// - scripts: this site's files only (and compiling the WASM wallet); no
 ///   inline script, `on*` handlers or eval;
 /// - styles: this site's and the pinned Bulma file; no inline styles;
-/// - connections: this site, the API and the oracle.
+/// - connections: this site, the API, oracle and configured Keymeld gateway.
 pub fn content_security_policy(connect: &[&str]) -> String {
     let mut connect_src = vec!["'self'".to_owned()];
     for origin in connect.iter().filter_map(|url| origin(url)) {
@@ -113,13 +113,14 @@ mod tests {
             "https://5day4cast.com",
             "https://4casttruth.win/",
             "https://4casttruth.win/oracle",
+            "https://keymeld.example.net/enclaves",
             "not a url",
         ]);
         assert!(policy.contains("default-src 'none'"));
         assert!(policy.contains("script-src 'self' 'wasm-unsafe-eval';"));
         assert!(!policy.contains("unsafe-inline"));
         assert!(!policy.contains("'unsafe-eval'"));
-        assert!(policy.contains("connect-src 'self' https://5day4cast.com https://4casttruth.win;"));
+        assert!(policy.contains("connect-src 'self' https://5day4cast.com https://4casttruth.win https://keymeld.example.net;"));
         assert!(policy.contains(
             "style-src 'self' https://cdn.jsdelivr.net/npm/bulma@1.0.2/css/bulma.min.css;"
         ));
