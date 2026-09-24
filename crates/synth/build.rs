@@ -1,7 +1,9 @@
 //! Bundles the dashboard's styles and scripts into one stylesheet and one script, minified, and
 //! names each by its content's hash so browsers can cache them for good.
 //!
-//! Styles and scripts live beside the Rust that renders them, under `src/server/`.
+//! Styles and scripts live beside the Rust that renders them, under `src/server/`. htmx comes
+//! first, as published, from the workspace's `vendor/htmx/`: see the README there for where each
+//! file comes from and its hash.
 
 use std::{
     env,
@@ -20,6 +22,13 @@ use oxc::{
 };
 use sha2::{Digest, Sha256};
 
+/// The vendored scripts, relative to the workspace root, in the order they must load: the SSE
+/// extension registers with htmx.
+const VENDOR: [&str; 2] = [
+    "vendor/htmx/4.0.0/htmx.min.js",
+    "vendor/htmx/4.0.0/ext/hx-sse.min.js",
+];
+
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed=src/server");
@@ -27,6 +36,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let manifest = env::var_os("CARGO_MANIFEST_DIR").ok_or("CARGO_MANIFEST_DIR is missing")?;
     let output = env::var_os("OUT_DIR").ok_or("OUT_DIR is missing")?;
     let root = Path::new(&manifest);
+    let workspace = root.join("../..");
     let output = Path::new(&output);
     let server = root.join("src/server");
 
@@ -58,10 +68,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         .code;
 
     let mut js = Vec::new();
+    for name in VENDOR {
+        let path = workspace.join(name);
+        println!("cargo::rerun-if-changed={}", path.display());
+        js.extend_from_slice(&fs::read(&path).map_err(|error| {
+            io::Error::new(error.kind(), format!("read {}: {error}", path.display()))
+        })?);
+        // Semicolons keep one script's last statement apart from the next.
+        js.extend_from_slice(b"\n;\n");
+    }
     for path in &js_files {
         let source = fs::read_to_string(path)?;
         js.extend_from_slice(minify_js(path, &source)?.as_bytes());
-        // Semicolons keep one script's last statement apart from the next.
         js.extend_from_slice(b";\n");
     }
 

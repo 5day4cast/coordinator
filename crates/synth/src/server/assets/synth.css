@@ -1,42 +1,80 @@
-/* Synth's dashboard and run pages. */
-body { font-family: monospace; max-width: 960px; margin: 0 auto; padding: 20px; background: #1a1a2e; color: #e0e0e0; }
-h1 { color: #00d4ff; }
-h2 { color: #7b68ee; border-bottom: 1px solid #333; padding-bottom: 5px; }
+/* Synth's dashboard and run pages. Colour marks status only: the status column, the flow's
+   boxes, and ledger lines that do not balance. */
+:root {
+  --bg: #1a1a2e;
+  --panel: #16213e;
+  --text: #e0e0e0;
+  --muted: #999;
+  --rule: #333;
+  --accent: #00d4ff;
+  --heading: #7b68ee;
+  --done: #00ff88;
+  --active: #ffaa00;
+  --failed: #ff5555;
+}
+* { box-sizing: border-box; }
+body { font-family: ui-monospace, monospace; max-width: 1100px; margin: 0 auto; padding: 16px; background: var(--bg); color: var(--text); line-height: 1.4; }
+h1 { color: var(--accent); font-size: 1.4em; overflow-wrap: anywhere; }
+h2 { color: var(--heading); border-bottom: 1px solid var(--rule); padding-bottom: 5px; font-size: 1.15em; }
+h3 { font-size: 1em; }
+a { color: var(--accent); }
+code, .id { font-size: 0.85em; word-break: break-all; }
+pre { white-space: pre-wrap; font-size: 0.8em; word-break: break-all; }
 table { width: 100%; border-collapse: collapse; margin: 10px 0; }
-th, td { padding: 8px; text-align: left; border-bottom: 1px solid #333; }
-th { background: #16213e; }
-.badge { padding: 2px 8px; border-radius: 4px; font-size: 0.85em; }
-.passed, .passed .badge, .moved { color: #00ff88; }
-.failed, .failed .badge { color: #ff4444; }
-.running, .running .badge { color: #ffaa00; }
-.skipped { color: #888; }
-.error { color: #ff4444; font-size: 0.9em; }
-.result { padding: 15px; background: #16213e; border-radius: 8px; margin: 10px 0; }
-button { background: #7b68ee; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-family: monospace; }
+th, td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { background: var(--panel); }
+td.num, th.num { text-align: right; white-space: nowrap; }
+.scroll { overflow-x: auto; }
+.note { color: var(--muted); font-size: 0.85em; }
+.error { color: var(--failed); }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 4px; font-size: 0.85em; border: 1px solid currentColor; white-space: nowrap; }
+.badge.passed, .badge.done, .badge.moved, .badge.paid_out, .badge.refunded, .badge.nothing_paid { color: var(--done); }
+.badge.failed, .badge.stuck { color: var(--failed); }
+.badge.running, .badge.active, .badge.following, .badge.waiting, .badge.unverified, .badge.timed_out { color: var(--active); }
+.badge.interrupted, .badge.skipped { color: var(--muted); }
+.running { color: var(--active); }
+.result { padding: 12px 15px; background: var(--panel); border-radius: 8px; margin: 10px 0; }
+button { background: var(--heading); color: #fff; border: none; padding: 10px 18px; border-radius: 4px; cursor: pointer; font-family: inherit; }
 button:hover { background: #6a5acd; }
-form { margin: 10px 0; display: inline-block; margin-right: 8px; }
-.note { color: #888; font-size: 0.85em; }
+button.copy { background: transparent; color: var(--accent); border: 1px solid var(--rule); padding: 1px 6px; font-size: 0.75em; margin-left: 4px; }
+button.copy:hover { border-color: var(--accent); }
+.actions form, .actions button { margin: 0 8px 8px 0; }
+.htmx-request button, button.htmx-request { opacity: 0.6; }
+textarea { width: 100%; background: var(--panel); color: var(--text); border: 1px solid var(--rule); font-family: inherit; font-size: 0.8em; }
+details summary { cursor: pointer; }
 
 /* Where the money went: one box per stage, left to right. */
 .flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 6px; margin: 16px 0; }
-.box { flex: 1 1 150px; background: #16213e; border: 2px solid #444; border-radius: 10px; padding: 10px; min-width: 150px; }
+.box { flex: 1 1 150px; background: var(--panel); border: 2px solid #444; border-radius: 10px; padding: 10px; min-width: 150px; }
 .box .title { font-weight: bold; font-size: 1.05em; }
-.box .subtitle { color: #999; font-size: 0.75em; margin-bottom: 8px; }
-.box.done { border-color: #00ff88; } .box.done .title { color: #00ff88; }
-.box.active { border-color: #ffaa00; } .box.active .title { color: #ffaa00; }
-.box.failed { border-color: #ff4444; } .box.failed .title { color: #ff4444; }
+.box .subtitle { color: var(--muted); font-size: 0.75em; margin-bottom: 8px; }
+.box.done { border-color: var(--done); } .box.done .title { color: var(--done); }
+.box.active { border-color: var(--active); } .box.active .title { color: var(--active); }
+.box.failed { border-color: var(--failed); } .box.failed .title { color: var(--failed); }
 .box.waiting { border-style: dashed; opacity: 0.6; }
 .arrow { align-self: center; font-size: 1.6em; color: #555; }
-.arrow.done { color: #00ff88; } .arrow.active { color: #ffaa00; } .arrow.failed { color: #ff4444; }
+.arrow.done { color: var(--done); } .arrow.active { color: var(--active); } .arrow.failed { color: var(--failed); }
 .line { font-size: 0.8em; margin: 3px 0; display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
 .line .label { font-weight: bold; }
 .line .value { color: #bbb; word-break: break-all; }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #555; flex: none; }
-.line.done .dot { background: #00ff88; } .line.active .dot { background: #ffaa00; }
-.line.failed .dot { background: #ff4444; }
+.line.done .dot { background: var(--done); } .line.active .dot { background: var(--active); }
+.line.failed .dot { background: var(--failed); }
 .legend { padding: 1px 6px; border-radius: 4px; border: 1px solid #555; }
-.running { color: #ffaa00; }
-.legend.done { color: #00ff88; } .legend.active { color: #ffaa00; } .legend.failed { color: #ff4444; }
-table.ids code { font-size: 0.8em; word-break: break-all; }
-pre { white-space: pre-wrap; font-size: 0.8em; }
-a { color: #00d4ff; }
+.legend.done { color: var(--done); } .legend.active { color: var(--active); } .legend.failed { color: var(--failed); }
+
+/* The ledger: a line that does not balance stands out. */
+.ledger td.num { font-variant-numeric: tabular-nums; }
+.ledger tr.total td { border-top: 2px solid var(--rule); font-weight: bold; }
+.flag { color: var(--failed); }
+
+/* The hops: each lookup command on its own line, the node it runs on above it. */
+.lookup { margin: 2px 0; }
+
+@media (max-width: 640px) {
+  body { padding: 8px; }
+  th, td { padding: 4px; }
+  .box { flex-basis: 100%; }
+  .arrow { transform: rotate(90deg); }
+}
+

@@ -1,6 +1,8 @@
 mod assets;
+mod format;
 pub mod live;
 pub mod metrics;
+mod money;
 pub mod routes;
 pub mod run_detail;
 
@@ -40,3 +42,4 @@ pub async fn start_server(
 
     Ok(())
 }
+

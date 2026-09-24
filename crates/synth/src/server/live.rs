@@ -4,8 +4,8 @@
 //! A page names its topic: `dashboard`, or `run:<id>` for one run. Events from the runner and the
 //! rebalancer are gathered for a moment, the topics they touch are rendered once each, and the
 //! rendered HTML goes out as server-sent events to the pages watching those topics, which swap it
-//! in. Nobody watching a topic means it is not rendered, so a run's page costs the coordinator
-//! nothing while no one has it open.
+//! in with htmx 4's SSE extension. Nobody watching a topic means it is not rendered. Pages render
+//! from synth's own database, so pushing them costs the coordinator nothing.
 
 use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::{Query, State};
+use axum::http::HeaderMap;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use maud::{html, Markup, DOCTYPE};
 use serde::Deserialize;
 use tokio::sync::broadcast::{self, error::RecvError};
@@ -172,20 +173,39 @@ pub(super) struct TopicParams {
     topic: String,
 }
 
+/// The id each stream opens with. htmx's SSE extension sends it back as `Last-Event-ID` when it
+/// reconnects, which is how a page that was away says so.
+const STREAM_ID: &str = "live";
+
 /// The rendered live part of one topic, each time it changes.
+///
+/// htmx's SSE extension lets the stream go while the page is hidden, or after a network drop, and
+/// connects again later. Nothing pushed meanwhile reaches it, so a page that reconnects gets its
+/// topic as it is now before the changes that follow.
 pub(super) async fn stream(
     State(state): State<Dashboard>,
     Query(TopicParams { topic }): Query<TopicParams>,
+    headers: HeaderMap,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     let watching = Watching::new(state.live.clone(), topic);
+    // Subscribed before rendering, so no change falls between the two.
     let fragments = state.live.fragments.subscribe();
-    let stream = futures::stream::unfold(
+    let catch_up = if headers.contains_key("last-event-id") {
+        render(&state, &watching.topic).await
+    } else {
+        None
+    };
+    let opening = std::iter::once(SseEvent::default().id(STREAM_ID))
+        .chain(catch_up.map(|live| SseEvent::default().data(live.into_string())))
+        .map(Ok);
+    let changes = futures::stream::unfold(
         (fragments, watching),
         |(mut fragments, watching)| async move {
             loop {
                 match fragments.recv().await {
                     Ok(fragment) if fragment.topic == watching.topic => {
-                        let event = SseEvent::default().event("live").data(fragment.html);
+                        // Unnamed, so htmx's SSE extension swaps it into the page.
+                        let event = SseEvent::default().data(fragment.html);
                         return Some((Ok(event), (fragments, watching)));
                     }
                     Ok(_) | Err(RecvError::Lagged(_)) => continue,
@@ -194,22 +214,29 @@ pub(super) async fn stream(
             }
         },
     );
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(futures::stream::iter(opening).chain(changes)).keep_alive(KeepAlive::default())
 }
 
-/// A page whose `live` part is kept current. `header` stays put; `live` is swapped in whole.
+/// A page whose `live` part is kept current: htmx's SSE extension swaps in each fragment pushed
+/// for the page's topic, and reconnects if the stream drops. `header` stays put, and holds where
+/// the action buttons report back.
 pub(super) fn page(title: &str, topic: &str, header: Markup, live: Markup) -> Markup {
     html! {
         (DOCTYPE)
-        html {
+        html lang="en" {
             head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
                 link rel="stylesheet" href=(assets::CSS_URL);
                 script src=(assets::JS_URL) defer {}
             }
             body {
                 (header)
-                main #live data-topic=(topic) { (live) }
+                p #action-result .note aria-live="polite" {}
+                main #live hx-sse:connect=(format!("/api/live?topic={topic}")) {
+                    (live)
+                }
             }
         }
     }
@@ -246,5 +273,49 @@ mod tests {
         drop(second);
         assert!(!live.is_watched("run:r1"));
         assert!(live.watched().is_empty());
+    }
+
+    /// What a stream opens with, until it goes quiet.
+    async fn opening(app: axum::Router, reconnecting: bool) -> String {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let mut request = Request::get("/api/live?topic=dashboard");
+        if reconnecting {
+            request = request.header("last-event-id", STREAM_ID);
+        }
+        let response = app
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let mut body = response.into_body().into_data_stream();
+        let mut text = String::new();
+        while let Ok(Some(Ok(chunk))) =
+            tokio::time::timeout(Duration::from_millis(300), body.next()).await
+        {
+            text.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        text
+    }
+
+    /// A page that connects has just been rendered, so its stream only names itself. A page
+    /// that reconnects after being away missed what was pushed meanwhile, so it gets its topic
+    /// as it is now.
+    #[tokio::test]
+    async fn a_page_that_reconnects_is_sent_what_it_missed() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = crate::db::SynthDb::new(directory.path().join("synth.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        let app = super::super::routes::router(Dashboard::for_tests(db));
+
+        assert_eq!(opening(app.clone(), false).await, "id: live\n\n");
+        let again = opening(app, true).await;
+        assert!(again.starts_with("id: live\n\n"), "{again}");
+        assert!(
+            again.contains("\ndata: ") && again.contains("Scenarios"),
+            "{again}"
+        );
     }
 }
