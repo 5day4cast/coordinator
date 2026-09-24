@@ -78,7 +78,7 @@ fn location_map(stations: &[StationWithWeather]) -> Markup {
             div class="map-wrapper" {
                 // Zoomable container
                 div class="map-zoomable" {
-                    img src="/ui/usa-map.svg" alt="USA Map" class="usa-map";
+                    img src=(crate::templates::assets::USA_MAP_SVG.url) alt="USA Map" class="usa-map";
 
                     svg class="station-markers" viewBox="0 0 599.96 327.28" preserveAspectRatio="none" {
                         @for sw in stations {

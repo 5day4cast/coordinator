@@ -1,7 +1,10 @@
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 use serde_json::json;
 
-use crate::api::admin_auth::CSRF_HEADER;
+use crate::{
+    api::admin_auth::CSRF_HEADER,
+    templates::assets::{ADMIN_JS, STYLES_CSS},
+};
 
 pub struct AdminPageConfig<'a> {
     pub title: &'a str,
@@ -26,9 +29,10 @@ pub fn admin_base(config: &AdminPageConfig, content: Markup) -> Markup {
                 title { (config.title) }
 
                 link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@1.0.2/css/bulma.min.css";
-                link rel="stylesheet" href="/ui/styles.css";
+                link rel="stylesheet" href=(STYLES_CSS.url);
 
                 script src="https://unpkg.com/htmx.org@1.9.10" {}
+                script src=(ADMIN_JS.url) defer {}
 
                 style {
                     r#"

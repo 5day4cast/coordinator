@@ -135,7 +135,7 @@ pub fn station_map(markers: &[StationMarker]) -> Markup {
         div class="location-map-container" {
             div class="map-wrapper" id="entries-map-wrapper" {
                 div class="map-zoomable" id="entries-map-zoomable" {
-                    img src="/ui/usa-map.svg" alt="USA Map" class="usa-map";
+                    img src=(crate::templates::assets::USA_MAP_SVG.url) alt="USA Map" class="usa-map";
 
                     svg class="station-markers" viewBox="0 0 599.96 327.28" preserveAspectRatio="none" {
                         @for marker in markers {

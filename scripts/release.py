@@ -124,21 +124,14 @@ def package_wasm(root, version, source, wasm, output):
 def package_native(root, version, source, target, asset, wasm_archive, output):
     binaries = root / "target" / target / "release"
     require_files(binaries, ["coordinator", "wallet-cli"])
-    ui = root / "crates/public_ui"
-    require_files(ui, ["asset-manifest.json", "loader.js", "app.min.js", "admin.min.js", "styles.min.css"])
-    manifest = json.loads((ui / "asset-manifest.json").read_text())
-    for name, extension in (("app", "js"), ("admin", "js"), ("styles", "css")):
-        hash_value = manifest.get(name, "")
-        if not re.fullmatch(r"[0-9a-f]{8}", hash_value):
-            raise ValueError(f"missing or invalid {name} UI bundle hash")
-        require_files(ui, [f"{name}.{hash_value}.min.{extension}"])
     with tempfile.TemporaryDirectory() as temporary:
         package = Path(temporary) / f"{asset}-{version}"
         (package / "bin").mkdir(parents=True)
         for binary in ("coordinator", "wallet-cli"):
             shutil.copy2(binaries / binary, package / "bin" / binary)
         shutil.copytree(root / "crates/coordinator/migrations", package / "migrations")
-        shutil.copytree(ui, package / "ui", ignore=shutil.ignore_patterns("pkg"))
+        # The binary embeds its scripts and styles; ui/ holds only the WASM package.
+        (package / "ui").mkdir()
         with tarfile.open(wasm_archive) as tar:
             tar.extractall(Path(temporary) / "wasm", filter="data")
         wasm = Path(temporary) / "wasm" / f"coordinator-wasm-{version}"

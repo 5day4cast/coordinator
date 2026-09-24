@@ -54,6 +54,7 @@ fn render_fragment(
             api_base: &state.remote_url,
             oracle_base: &state.oracle_url,
             network: &state.bitcoin.get_network().to_string(),
+            wasm_version: &state.wasm_version,
         };
         Html(base(&config, content).into_string())
     }
@@ -132,6 +133,7 @@ pub async fn public_page_handler(State(state): State<Arc<AppState>>) -> Html<Str
         api_base: &state.remote_url,
         oracle_base: &state.oracle_url,
         network: &state.bitcoin.get_network().to_string(),
+        wasm_version: &state.wasm_version,
     };
 
     let competitions = fetch_competitions(&state).await;
