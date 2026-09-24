@@ -95,13 +95,20 @@ impl Coordinator {
         let status: CompetitionStatus = competition.into();
         let before = status.state_name();
         let next = self.process_status(status).await;
-        let after = next.state_name();
-        let wait = if after != before && next.is_immediate_transition() {
+        let moved_to = next.state_name();
+        let competition = next.into_competition();
+        // Name and schedule the state the next step will load, which is derived from the stored
+        // fields, so the log never reports a transition the database does not hold.
+        let stored = CompetitionStatus::from(competition.clone());
+        let after = stored.state_name();
+        if after != moved_to {
+            debug!("Competition {competition_id} moved to {moved_to}, which is stored as {after}");
+        }
+        let wait = if after != before && stored.is_immediate_transition() {
             Wait::Now
         } else {
-            Wait::Until(next.next_check(OffsetDateTime::now_utc(), pacing.idle))
+            Wait::Until(stored.next_check(OffsetDateTime::now_utc(), pacing.idle))
         };
-        let competition = next.into_competition();
         let died = competition.is_failed() || competition.is_cancelled();
         let failed_at = competition.failed_at;
         self.save_leased(competition, lease).await?;
