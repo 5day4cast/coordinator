@@ -12,16 +12,25 @@
 //! Every step is recorded before the next begins, so an outage resumes rather than repeats. The
 //! player is paid once, and a refunded escrow is never spent twice. Until the escrow's refund
 //! locktime passes there is nothing to do: the refund leaf is not open yet.
+//!
+//! Keymeld signs with the entry key the player's browser sealed to its enclave with their entry.
+//! Entries are registered with Keymeld when a competition fills, so a refund registers them first
+//! for one that died before. Two cases cannot be refunded here yet; `docs/ops/stuck-escrow-check.md`
+//! lists both:
+//!
+//! - A competition that never filled. Keymeld signs only after restoring keygen, which needs an
+//!   entry registered for every ticket.
+//! - A ticket that was paid but never used for an entry. Its player sealed no entry key.
 
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use coordinator_ark::build_refund;
+use coordinator_ark::{build_refund, RefundTransactions};
 use coordinator_ark_escrow::{EntryEscrow, RefundSwap, VtxoScript};
-use coordinator_escrow::ark::{psbt_hex, ArkEscrowSpend, RefundPurpose};
+use coordinator_escrow::ark::{psbt_hex, ArkEscrowSpend, RefundPurpose, MIN_REFUND_DEADLINE_SECS};
 use dlctix::bitcoin::absolute::LockTime;
 use dlctix::bitcoin::{Amount, OutPoint};
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -29,14 +38,28 @@ use super::{ArkRefundState, Coordinator, TicketArkEscrow, TicketArkRefund};
 use crate::domain::competitions::EntryStatus;
 use crate::domain::PaymentStatus;
 use crate::domain::{Error, UserEntry};
+use crate::infra::keymeld::DlcKeygenSession;
 use coordinator_escrow::authorization::PayoutPolicy;
 
 /// How long a refund's swap waits for its payment before the player may take it back. The
 /// verifier bounds this too, so a swap minted with anything wilder is refused.
 const SWAP_DEADLINE: Duration = Duration::from_secs(60 * 60);
 
+/// A minted refund is replaced once its swap's deadline is this close beyond the soonest
+/// deadline the verifier signs for, or its invoice this close to expiring: signing and paying
+/// take a moment. Nothing was signed or paid for it yet.
+const STALE_MARGIN: Duration = Duration::from_secs(5 * 60);
+const INVOICE_MARGIN: Duration = Duration::from_secs(2 * 60);
+
+/// A refund that keeps failing is minted again at most this often, so a player's Lightning
+/// Address provider is not asked for a new invoice on every cleanup pass.
+const REMINT_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
 /// How long a refund's payment may take before this gives up and retries later.
 const REFUND_PAYMENT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Reports about a ticket's refund, by ticket.
+const REFUND_REPORTS: &str = "escrow refund";
 
 /// What a player is told about their refund.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -49,6 +72,25 @@ pub struct TicketRefund {
     pub ark_txid: Option<String>,
     /// UNIX seconds.
     pub updated_at: i64,
+}
+
+/// A funded escrow whose refund leaf is open.
+struct Refundable {
+    escrow: TicketArkEscrow,
+    script: EntryEscrow,
+    outpoint: OutPoint,
+    sats: u64,
+    refund: Option<TicketArkRefund>,
+}
+
+/// Where Arkade says an escrow's VTXO went.
+enum EscrowSpend {
+    Unspent,
+    /// Into this refund's swap, by a submission whose checkpoint was never kept, so this
+    /// process cannot tell whether it was finalized.
+    ByRefund(dlctix::bitcoin::Txid),
+    /// By something other than this refund.
+    Elsewhere,
 }
 
 impl Coordinator {
@@ -98,43 +140,129 @@ impl Coordinator {
     ///
     /// Runs from the cleanup queue, so a refund that cannot finish now is retried later: a
     /// provider that is down, an escrow whose locktime has not passed, or a payment that failed.
+    /// Each lasting problem is logged once per ticket.
     pub(super) async fn refund_ark_escrows(&self, competition_id: Uuid) {
         let Some(ark) = self.ark() else {
             return;
         };
         let escrows = match self
             .competition_store
-            .funded_ark_escrows(competition_id)
+            .refundable_ark_escrows(competition_id)
             .await
         {
             Ok(escrows) => escrows,
             Err(e) => {
-                error!("Failed to list the escrows of competition {competition_id}: {e}");
+                warn!("Cannot list the escrows of competition {competition_id} to refund: {e}");
                 return;
             }
         };
-        if escrows.is_empty() {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let mut open = Vec::new();
+        for escrow in escrows {
+            let ticket_id = escrow.ticket_id;
+            match self.refundable(escrow, now).await {
+                Ok(Some(refundable)) => open.push(refundable),
+                Ok(None) => {}
+                Err(e) => self.report_refund(ticket_id, &e.to_string()),
+            }
+        }
+        if open.is_empty() {
             return;
         }
         let entries = match self.refundable_entries(competition_id).await {
             Ok(entries) => entries,
             Err(e) => {
-                error!("Cannot refund competition {competition_id}: {e}");
+                warn!("Cannot read the entries of competition {competition_id} to refund: {e}");
                 return;
             }
         };
-        for escrow in escrows {
-            let ticket_id = escrow.ticket_id;
+        let signing = open.iter().any(needs_signing);
+        // Keymeld signs a refund only after restoring the competition's keygen, which needs an
+        // entry registered for every ticket. A competition that never filled cannot have that,
+        // so its refunds wait for a Keymeld that signs for a partial roster, rather than
+        // minting a swap and asking the player's provider for an invoice every hour for a
+        // refund nothing can sign.
+        let roster_complete = match self.competition_store.ticket_ids(competition_id).await {
+            Ok(tickets) => tickets
+                .iter()
+                .all(|ticket| entries.iter().any(|entry| entry.ticket_id == *ticket)),
+            Err(e) => {
+                warn!("Cannot read the tickets of competition {competition_id} to refund: {e}");
+                return;
+            }
+        };
+        if signing && !roster_complete {
+            let waiting = open.iter().filter(|refundable| needs_signing(refundable));
+            let (escrows, sats) = waiting.fold((0, 0), |(escrows, sats), refundable| {
+                (escrows + 1, sats + refundable.sats)
+            });
+            let problem = format!(
+                "{escrows} funded escrows ({sats} sats) wait for refunds: only {} of its tickets \
+                 were entered, and Keymeld signs only once every ticket's entry is registered",
+                entries.len()
+            );
+            if self
+                .reported
+                .is_new(REFUND_REPORTS, competition_id, &problem)
+            {
+                warn!(
+                    "Competition {competition_id}: {problem}. They need a Keymeld that signs for \
+                     a partial roster (docs/ops/stuck-escrow-check.md)"
+                );
+            }
+        }
+        let session = if signing && roster_complete {
+            match self.refund_session(competition_id, &entries).await {
+                Ok(session) => Some(session),
+                Err(e) => {
+                    if self
+                        .reported
+                        .is_new(REFUND_REPORTS, competition_id, &e.to_string())
+                    {
+                        warn!("Cannot sign the refunds of competition {competition_id}: {e}");
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        for refundable in open {
+            let ticket_id = refundable.escrow.ticket_id;
             let Some(entry) = entries.iter().find(|entry| entry.ticket_id == ticket_id) else {
-                warn!("Ticket {ticket_id} has an escrow but no paid entry to refund");
+                self.report_refund(
+                    ticket_id,
+                    &format!(
+                        "its escrow {} holds {} sats, but the ticket was never used for an \
+                         entry, so Keymeld has no entry key to sign its refund with; it needs \
+                         an operator (docs/ops/stuck-escrow-check.md)",
+                        refundable.outpoint, refundable.sats
+                    ),
+                );
                 continue;
             };
-            if let Err(e) = self
-                .refund_ark_escrow(ark, competition_id, escrow, entry)
+            if needs_signing(&refundable) && !roster_complete {
+                continue;
+            }
+            match self
+                .refund_ark_escrow(ark, session.as_ref(), refundable, entry)
                 .await
             {
-                warn!("Cannot refund the escrow of ticket {ticket_id} yet: {e}");
+                Ok(()) => {
+                    self.reported.clear(REFUND_REPORTS, ticket_id);
+                    info!("Refunded the escrow of ticket {ticket_id}");
+                }
+                Err(e) => self.report_refund(ticket_id, &e.to_string()),
             }
+        }
+    }
+
+    /// Log why a ticket's refund cannot finish yet, once until the reason changes.
+    fn report_refund(&self, ticket_id: Uuid, problem: &str) {
+        if self.reported.is_new(REFUND_REPORTS, ticket_id, problem) {
+            warn!("Cannot refund the escrow of ticket {ticket_id} yet: {problem}");
+        } else {
+            debug!("The escrow of ticket {ticket_id} is still not refunded: {problem}");
         }
     }
 
@@ -146,91 +274,137 @@ impl Coordinator {
             .await?)
     }
 
+    /// The competition's Keymeld session, with every entry registered in it.
+    ///
+    /// Entries are registered when a competition's contract is built, so one that died before
+    /// registered none. Keymeld needs them all to sign any refund. Registering is idempotent,
+    /// so this repeats safely on every pass.
+    async fn refund_session(
+        &self,
+        competition_id: Uuid,
+        entries: &[UserEntry],
+    ) -> Result<DlcKeygenSession, Error> {
+        let stored = self
+            .competition_store
+            .get_keymeld_session(competition_id)
+            .await
+            .map_err(|e| anyhow!("Cannot load the competition's Keymeld session: {e}"))?
+            .context("the competition has no Keymeld session")?;
+        let session = self.restore_keymeld_session(&stored)?;
+        for entry in entries {
+            let registration = self
+                .keymeld_registration(entry)
+                .await
+                .map_err(|e| anyhow!("entry {} cannot be registered with Keymeld: {e}", entry.id))?;
+            self.keymeld
+                .register_participant(
+                    &session,
+                    keymeld_sdk::UserId::from(entry.ticket_id),
+                    &registration,
+                )
+                .await
+                .map_err(|e| anyhow!("Keymeld will not register entry {}: {e}", entry.id))?;
+        }
+        Ok(session)
+    }
+
+    /// Carry one escrow's refund as far as it can go now.
     async fn refund_ark_escrow(
         &self,
         ark: &super::Arkade,
-        competition_id: Uuid,
-        escrow: TicketArkEscrow,
+        session: Option<&DlcKeygenSession>,
+        refundable: Refundable,
         entry: &UserEntry,
     ) -> Result<(), Error> {
-        let ticket_id = escrow.ticket_id;
-        let refund = self
-            .competition_store
-            .ticket_ark_refund(ticket_id)
-            .await
-            .map_err(|e| anyhow!("Cannot read the refund of ticket {ticket_id}: {e}"))?;
-        if refund
-            .as_ref()
-            .is_some_and(|refund| refund.state == ArkRefundState::Settled)
-        {
-            return Ok(());
-        }
-
-        let (escrow_script, outpoint, sats) = self.refundable(&escrow)?;
-        let refund = match refund {
+        let Refundable {
+            escrow,
+            script,
+            outpoint,
+            sats,
+            refund,
+        } = refundable;
+        let mut refund = match refund {
             Some(refund) => refund,
             None => {
-                self.mint_refund(ark, &escrow, entry, &escrow_script, sats)
-                    .await?
+                // Nothing was ever submitted for this escrow, so it must still be unspent.
+                if self.listed_escrow(ark, &escrow, outpoint).await?.is_spent {
+                    return Err(anyhow!(
+                        "its escrow {outpoint} was spent by something other than a refund; \
+                         it needs an operator"
+                    )
+                    .into());
+                }
+                let refund = self.mint_refund(ark, &escrow, entry, &script, sats).await?;
+                self.competition_store
+                    .store_ticket_ark_refund(refund.clone())
+                    .await?;
+                refund
             }
         };
-        let swap = self.refund_swap(ark, &refund).await?;
 
-        if refund.state == ArkRefundState::Submitting
-            && !self.resume_refund(ark, &escrow, &refund).await?
-        {
-            // Arkade never took it, so it is built and signed again.
-            self.submit_refund(
-                ark,
-                competition_id,
-                &escrow,
-                &escrow_script,
-                entry,
-                &swap,
-                outpoint,
-                sats,
-                &refund,
-            )
-            .await?;
-        } else if refund.state == ArkRefundState::Minted {
-            self.submit_refund(
-                ark,
-                competition_id,
-                &escrow,
-                &escrow_script,
-                entry,
-                &swap,
-                outpoint,
-                sats,
-                &refund,
-            )
-            .await?;
+        match refund.state {
+            ArkRefundState::Minted => {
+                let mut swap = self.refund_swap(ark, &refund).await?;
+                let mut built = build(ark, &script, outpoint, sats, &swap)?;
+                let listed = self.listed_escrow(ark, &escrow, outpoint).await?;
+                match escrow_spend(&listed, &built) {
+                    EscrowSpend::Unspent => {
+                        if self.is_stale(&refund, &swap)? {
+                            refund = self
+                                .remint_refund(ark, &escrow, entry, &script, sats, &refund)
+                                .await?;
+                            swap = self.refund_swap(ark, &refund).await?;
+                            built = build(ark, &script, outpoint, sats, &swap)?;
+                        }
+                        let session = session.context("the refund needs Keymeld, see above")?;
+                        self.submit_refund(ark, session, &escrow, &script, &swap, &built, &refund)
+                            .await?;
+                    }
+                    // Either way the player is not paid: paying for a swap the service may
+                    // never be able to claim could pay them twice.
+                    EscrowSpend::ByRefund(ark_txid) => {
+                        return Err(anyhow!(
+                            "its escrow {outpoint} went into its refund in {ark_txid}, but \
+                             the refund's checkpoint was not kept, so whether Arkade \
+                             finalized it is unknown; it needs an operator"
+                        )
+                        .into());
+                    }
+                    EscrowSpend::Elsewhere => {
+                        return Err(anyhow!(
+                            "its escrow {outpoint} was spent by something other than its \
+                             refund; it needs an operator"
+                        )
+                        .into());
+                    }
+                }
+            }
+            ArkRefundState::Submitting => self.resume_refund(ark, &escrow, &refund).await?,
+            ArkRefundState::Submitted | ArkRefundState::Paid | ArkRefundState::Settled => {}
         }
-        if matches!(
-            refund.state,
-            ArkRefundState::Minted | ArkRefundState::Submitting | ArkRefundState::Submitted
-        ) {
+        if refund.state != ArkRefundState::Settled {
             self.pay_refund(ark, &refund, sats).await?;
         }
-        info!("Refunded the escrow of ticket {ticket_id}");
         Ok(())
     }
 
-    /// The escrow's funded VTXO, once its refund leaf has opened.
-    fn refundable(&self, escrow: &TicketArkEscrow) -> Result<(EntryEscrow, OutPoint, u64), Error> {
-        let tap_tree = hex::decode(&escrow.escrow_tap_tree)
-            .map_err(|e| anyhow!("The escrow's tap tree is not hex: {e}"))?;
-        let entry = EntryEscrow::from_vtxo_script(
-            &VtxoScript::decode_tap_tree(&tap_tree)
-                .map_err(|e| anyhow!("The escrow's tap tree is invalid: {e}"))?,
-        )
-        .map_err(|e| anyhow!("The escrow's leaves are not an entry escrow: {e}"))?;
-        let LockTime::Seconds(open_at) = entry.terms().refund_locktime else {
+    /// The escrow's funded VTXO, once its refund leaf has opened; `None` until then.
+    async fn refundable(
+        &self,
+        escrow: TicketArkEscrow,
+        now: i64,
+    ) -> Result<Option<Refundable>, Error> {
+        let script = entry_escrow(&escrow)?;
+        let LockTime::Seconds(open_at) = script.terms().refund_locktime else {
             return Err(anyhow!("The escrow's refund locktime is not a timestamp").into());
         };
-        let now = OffsetDateTime::now_utc().unix_timestamp();
-        if now < i64::from(open_at.to_consensus_u32()) {
-            return Err(anyhow!("its refund leaf opens at {}", open_at.to_consensus_u32()).into());
+        let open_at = i64::from(open_at.to_consensus_u32());
+        if now < open_at {
+            debug!(
+                "The refund leaf of ticket {}'s escrow opens at {open_at}",
+                escrow.ticket_id
+            );
+            return Ok(None);
         }
         let outpoint = escrow
             .vtxo_outpoint
@@ -241,7 +415,18 @@ impl Coordinator {
         let sats = escrow
             .vtxo_sats
             .context("the escrow has no recorded value")?;
-        Ok((entry, outpoint, sats))
+        let refund = self
+            .competition_store
+            .ticket_ark_refund(escrow.ticket_id)
+            .await
+            .map_err(|e| anyhow!("Cannot read the refund: {e}"))?;
+        Ok(Some(Refundable {
+            escrow,
+            script,
+            outpoint,
+            sats,
+            refund,
+        }))
     }
 
     /// Resolve the player's Lightning Address, and mint the swap that pays it.
@@ -263,7 +448,7 @@ impl Coordinator {
             .map_err(|e| anyhow!("The entry's payout policy is invalid: {e}"))?;
         let address = policy
             .automatic_lightning_address
-            .context("the player has no Lightning Address to refund")?
+            .context("the player gave no Lightning Address to refund to")?
             .parse()
             .map_err(|e| anyhow!("The player's Lightning Address is invalid: {e}"))?;
         let fee_sats = ark.max_refund_fee_sats.min(sats.saturating_sub(1));
@@ -298,7 +483,11 @@ impl Coordinator {
             .await
             .map_err(|e| anyhow!("ark-swapd cannot mint the refund's swap: {e}"))?;
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        let refund = TicketArkRefund {
+        debug!(
+            "Minted swap {} to refund the escrow of ticket {}",
+            minted.id, escrow.ticket_id
+        );
+        Ok(TicketArkRefund {
             ticket_id: escrow.ticket_id,
             refund_id: minted.id,
             invoice: invoice.to_string(),
@@ -310,15 +499,63 @@ impl Coordinator {
             error: None,
             created_at: now,
             updated_at: now,
+        })
+    }
+
+    /// Whether a minted refund can no longer be signed: the verifier signs only for a swap
+    /// whose deadline is at least `MIN_REFUND_DEADLINE_SECS` away, and an unexpired invoice.
+    fn is_stale(&self, refund: &TicketArkRefund, swap: &RefundSwap) -> Result<bool, Error> {
+        let now = OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
+        let soonest_deadline =
+            now + u64::from(MIN_REFUND_DEADLINE_SECS) + STALE_MARGIN.as_secs();
+        let LockTime::Seconds(deadline) = swap.terms().deadline else {
+            return Err(anyhow!("The refund's swap deadline is not a timestamp").into());
         };
-        self.competition_store
-            .store_ticket_ark_refund(refund.clone())
+        let invoice: lightning_invoice::Bolt11Invoice = refund
+            .invoice
+            .parse()
+            .map_err(|e| anyhow!("The refund's invoice is invalid: {e}"))?;
+        Ok(u64::from(deadline.to_consensus_u32()) < soonest_deadline
+            || invoice.would_expire(Duration::from_secs(now + INVOICE_MARGIN.as_secs())))
+    }
+
+    /// Replace a stale minted refund with a new swap and invoice.
+    ///
+    /// Nothing was signed or paid for the stale one: a minted refund's escrow is unspent. Its
+    /// swap at `ark-swapd` retires by itself at its deadline.
+    async fn remint_refund(
+        &self,
+        ark: &super::Arkade,
+        escrow: &TicketArkEscrow,
+        entry: &UserEntry,
+        escrow_script: &EntryEscrow,
+        sats: u64,
+        stale: &TicketArkRefund,
+    ) -> Result<TicketArkRefund, Error> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        if now < stale.created_at + REMINT_INTERVAL.as_secs() as i64 {
+            return Err(anyhow!(
+                "its minted refund expired before it could be signed; it is minted again \
+                 from {}",
+                stale.created_at + REMINT_INTERVAL.as_secs() as i64
+            )
+            .into());
+        }
+        let fresh = self
+            .mint_refund(ark, escrow, entry, escrow_script, sats)
             .await?;
-        debug!(
-            "Minted swap {} to refund the escrow of ticket {}",
-            minted.id, escrow.ticket_id
+        if !self
+            .competition_store
+            .replace_minted_ticket_ark_refund(stale.refund_id, fresh.clone())
+            .await?
+        {
+            return Err(anyhow!("its refund moved on while it was minted again").into());
+        }
+        info!(
+            "Minted the refund of ticket {} again: swap {} replaces {}, which expired unsigned",
+            escrow.ticket_id, fresh.refund_id, stale.refund_id
         );
-        Ok(refund)
+        Ok(fresh)
     }
 
     /// The swap a refund pays, as `ark-swapd` minted it.
@@ -346,31 +583,14 @@ impl Coordinator {
     async fn submit_refund(
         &self,
         ark: &super::Arkade,
-        competition_id: Uuid,
+        session: &DlcKeygenSession,
         escrow: &TicketArkEscrow,
         escrow_script: &EntryEscrow,
-        entry: &UserEntry,
         swap: &RefundSwap,
-        outpoint: OutPoint,
-        sats: u64,
+        built: &RefundTransactions,
         refund: &TicketArkRefund,
     ) -> Result<(), Error> {
-        let stored = self
-            .competition_store
-            .get_keymeld_session(competition_id)
-            .await
-            .map_err(|e| anyhow!("Cannot load the competition's Keymeld session: {e}"))?
-            .context("the competition has no Keymeld session")?;
-        let session = self.restore_keymeld_session(&stored)?;
-        let user = keymeld_sdk::UserId::from(entry.ticket_id);
-        let built = build_refund(
-            ark.server.info(),
-            escrow_script,
-            outpoint,
-            Amount::from_sat(sats),
-            swap,
-        )
-        .map_err(|e| anyhow!("Cannot build the refund: {e}"))?;
+        let user = keymeld_sdk::UserId::from(escrow.ticket_id);
         let spend = |purpose| ArkEscrowSpend::Refund {
             purpose,
             ark_psbt: psbt_hex(&built.ark),
@@ -383,7 +603,7 @@ impl Coordinator {
         let signature = self
             .keymeld
             .sign_ark_refund(
-                &session,
+                session,
                 user.clone(),
                 spend(RefundPurpose::ArkTransaction),
                 refund.invoice.clone(),
@@ -407,7 +627,7 @@ impl Coordinator {
         let signature = self
             .keymeld
             .sign_ark_refund(
-                &session,
+                session,
                 user,
                 spend(RefundPurpose::Checkpoint),
                 refund.invoice.clone(),
@@ -462,79 +682,42 @@ impl Coordinator {
 
     /// Carry on a refund that was interrupted while Arkade had it.
     ///
-    /// The Ark transaction may or may not have reached the server. Its checkpoint is signed only
-    /// by the escrow's owner, so if one was kept the refund finishes from it; otherwise the
-    /// escrow decides, since a spent one means the refund is already through.
+    /// Its checkpoint is signed only by the escrow's owner and was kept with the Ark
+    /// transaction's id, so the refund finishes from it rather than signing again.
     async fn resume_refund(
         &self,
         ark: &super::Arkade,
         escrow: &TicketArkEscrow,
         refund: &TicketArkRefund,
-    ) -> Result<bool, Error> {
-        if let (Some(txid), Some(psbt)) = (&refund.ark_txid, &refund.checkpoint_psbt) {
-            let txid = txid
-                .parse()
-                .map_err(|e| anyhow!("The refund's Arkade transaction id is invalid: {e}"))?;
-            let checkpoint = hex::decode(psbt)
-                .ok()
-                .and_then(|bytes| dlctix::bitcoin::Psbt::deserialize(&bytes).ok())
-                .context("the refund's kept checkpoint is invalid")?;
-            self.finalize_refund(ark, escrow.ticket_id, txid, checkpoint)
-                .await?;
-            return Ok(true);
-        }
-        let spent = self
-            .escrow_spent(ark, escrow)
+    ) -> Result<(), Error> {
+        let (Some(txid), Some(psbt)) = (&refund.ark_txid, &refund.checkpoint_psbt) else {
+            return Err(anyhow!("its refund was submitted without keeping its checkpoint").into());
+        };
+        let txid = txid
+            .parse()
+            .map_err(|e| anyhow!("The refund's Arkade transaction id is invalid: {e}"))?;
+        let checkpoint = hex::decode(psbt)
+            .ok()
+            .and_then(|bytes| dlctix::bitcoin::Psbt::deserialize(&bytes).ok())
+            .context("the refund's kept checkpoint is invalid")?;
+        self.finalize_refund(ark, escrow.ticket_id, txid, checkpoint)
             .await
-            .map_err(|e| anyhow!("Cannot tell whether the escrow is already refunded: {e}"))?;
-        if spent {
-            warn!(
-                "The escrow of ticket {} is spent, so its refund went through",
-                escrow.ticket_id
-            );
-            self.competition_store
-                .advance_ticket_ark_refund(
-                    escrow.ticket_id,
-                    ArkRefundState::Submitted,
-                    None,
-                    None,
-                    None,
-                )
-                .await?;
-        }
-        Ok(spent)
     }
 
-    /// Whether Arkade has already spent this escrow's VTXO.
-    async fn escrow_spent(
+    /// The escrow's VTXO, as Arkade lists it.
+    async fn listed_escrow(
         &self,
         ark: &super::Arkade,
         escrow: &TicketArkEscrow,
-    ) -> Result<bool, Error> {
-        let outpoint: OutPoint = escrow
-            .vtxo_outpoint
-            .as_deref()
-            .context("the escrow has no funded VTXO")?
-            .parse()
-            .map_err(|e| anyhow!("The escrow's VTXO outpoint is invalid: {e}"))?;
-        let tap_tree = hex::decode(&escrow.escrow_tap_tree)
-            .map_err(|e| anyhow!("The escrow's tap tree is not hex: {e}"))?;
-        let entry = EntryEscrow::from_vtxo_script(
-            &VtxoScript::decode_tap_tree(&tap_tree)
-                .map_err(|e| anyhow!("The escrow's tap tree is invalid: {e}"))?,
-        )
-        .map_err(|e| anyhow!("The escrow's leaves are not an entry escrow: {e}"))?;
-        let address = entry
-            .address(ark.server.hrp())
-            .map_err(|e| anyhow!("The escrow has no Ark address: {e}"))?
-            .encode();
-        Ok(ark
-            .transport
-            .vtxos(vec![address])
+        outpoint: OutPoint,
+    ) -> Result<coordinator_ark::VirtualTxOutPoint, Error> {
+        ark.transport
+            .vtxos(vec![escrow.escrow_address.clone()])
             .await
             .map_err(|e| anyhow!("Arkade will not list the escrow's VTXOs: {e}"))?
             .into_iter()
-            .any(|vtxo| vtxo.outpoint == outpoint && vtxo.is_spent))
+            .find(|vtxo| vtxo.outpoint == outpoint)
+            .ok_or_else(|| anyhow!("Arkade does not list its escrow {outpoint}").into())
     }
 
     /// Pay the player, and give `ark-swapd` the preimage that claims the swap.
@@ -591,4 +774,61 @@ impl Coordinator {
             .await?;
         Ok(())
     }
+}
+
+/// Whether an escrow's refund still has to be signed: it was never minted, or was minted but
+/// never submitted.
+fn needs_signing(refundable: &Refundable) -> bool {
+    refundable
+        .refund
+        .as_ref()
+        .is_none_or(|refund| refund.state == ArkRefundState::Minted)
+}
+
+/// An escrow's script, from the tap tree recorded with it.
+fn entry_escrow(escrow: &TicketArkEscrow) -> Result<EntryEscrow, Error> {
+    let tap_tree = hex::decode(&escrow.escrow_tap_tree)
+        .map_err(|e| anyhow!("The escrow's tap tree is not hex: {e}"))?;
+    Ok(EntryEscrow::from_vtxo_script(
+        &VtxoScript::decode_tap_tree(&tap_tree)
+            .map_err(|e| anyhow!("The escrow's tap tree is invalid: {e}"))?,
+    )
+    .map_err(|e| anyhow!("The escrow's leaves are not an entry escrow: {e}"))?)
+}
+
+/// Where the escrow's VTXO went: nowhere yet, into `refund` (by its checkpoint or Ark
+/// transaction), or somewhere else.
+fn escrow_spend(
+    vtxo: &coordinator_ark::VirtualTxOutPoint,
+    refund: &RefundTransactions,
+) -> EscrowSpend {
+    if !vtxo.is_spent {
+        return EscrowSpend::Unspent;
+    }
+    let ark_txid = refund.ark.unsigned_tx.compute_txid();
+    let checkpoint_txid = refund.checkpoint.unsigned_tx.compute_txid();
+    if vtxo.ark_txid == Some(ark_txid) || vtxo.spent_by == Some(checkpoint_txid) {
+        EscrowSpend::ByRefund(ark_txid)
+    } else {
+        EscrowSpend::Elsewhere
+    }
+}
+
+/// The transactions that refund the escrow into `swap`. They depend only on their inputs, so
+/// they are the same each time a refund is resumed.
+fn build(
+    ark: &super::Arkade,
+    script: &EntryEscrow,
+    outpoint: OutPoint,
+    sats: u64,
+    swap: &RefundSwap,
+) -> Result<RefundTransactions, Error> {
+    Ok(build_refund(
+        ark.server.info(),
+        script,
+        outpoint,
+        Amount::from_sat(sats),
+        swap,
+    )
+    .map_err(|e| anyhow!("Cannot build the refund: {e}"))?)
 }

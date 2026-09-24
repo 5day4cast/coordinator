@@ -354,6 +354,39 @@ impl Coordinator {
             .map_err(|error| Error::Bitcoin(anyhow!(error)))
     }
 
+    /// What Keymeld needs to register an entry's player: the envelope their browser sealed to
+    /// the enclave with the entry, and the payout policy they accepted before paying.
+    pub(super) async fn keymeld_registration(
+        &self,
+        entry: &UserEntry,
+    ) -> Result<ParticipantRegistrationData, anyhow::Error> {
+        let payout_policy = self
+            .competition_store
+            .entry_payout_policy(entry.id)
+            .await?
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?;
+        Ok(ParticipantRegistrationData {
+            encrypted_private_key: entry.encrypted_keymeld_private_key.clone().ok_or_else(
+                || {
+                    anyhow!(
+                        "Entry {} is missing its authorized registration envelope",
+                        entry.id
+                    )
+                },
+            )?,
+            public_key: entry.ephemeral_pubkey.clone(),
+            auth_pubkey: entry.keymeld_auth_pubkey.clone().ok_or_else(|| {
+                anyhow!("Entry {} is missing its authentication key", entry.id)
+            })?,
+            context: entry.keymeld_registration_context.clone().ok_or_else(|| {
+                anyhow!("Entry {} is missing its registration context", entry.id)
+            })?,
+            payout_policy,
+            escrow_policy: entry.keymeld_escrow_policy.clone(),
+        })
+    }
+
     /// Verify the complete accepted roster before signatures, funding, or invoice settlement.
     async fn verify_keymeld_competition(
         &self,
@@ -1590,37 +1623,13 @@ impl Coordinator {
                 .has_automatic_payouts(competition.id)
                 .await?;
             for (entry, user_id) in entries.iter().zip(player_user_ids.iter()) {
-                let payout_policy = self
-                    .competition_store
-                    .entry_payout_policy(entry.id)
-                    .await?
-                    .map(|json| serde_json::from_str(&json))
-                    .transpose()?;
-                if automatic_payouts && payout_policy.is_none() {
+                let registration_data = self.keymeld_registration(entry).await?;
+                if automatic_payouts && registration_data.payout_policy.is_none() {
                     return Err(anyhow!(
                         "Entry {} is missing its accepted payout policy",
                         entry.id
                     ));
                 }
-                let registration_data = ParticipantRegistrationData {
-                    encrypted_private_key: entry.encrypted_keymeld_private_key.clone().ok_or_else(
-                        || {
-                            anyhow!(
-                                "Entry {} is missing its authorized registration envelope",
-                                entry.id
-                            )
-                        },
-                    )?,
-                    public_key: entry.ephemeral_pubkey.clone(),
-                    auth_pubkey: entry.keymeld_auth_pubkey.clone().ok_or_else(|| {
-                        anyhow!("Entry {} is missing its authentication key", entry.id)
-                    })?,
-                    context: entry.keymeld_registration_context.clone().ok_or_else(|| {
-                        anyhow!("Entry {} is missing its registration context", entry.id)
-                    })?,
-                    payout_policy,
-                    escrow_policy: entry.keymeld_escrow_policy.clone(),
-                };
                 self.keymeld
                     .register_participant(&keygen_session, user_id.clone(), &registration_data)
                     .await

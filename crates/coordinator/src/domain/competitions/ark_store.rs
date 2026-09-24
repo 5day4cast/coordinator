@@ -329,6 +329,32 @@ impl CompetitionStore {
         .collect()
     }
 
+    /// The funded escrows of a competition that still need refunding, in ticket order.
+    ///
+    /// An escrow is refunded once its refund settles. The escrows of a pool that a batch funded
+    /// were spent into it, so they have nothing left to refund.
+    pub async fn refundable_ark_escrows(
+        &self,
+        event_id: Uuid,
+    ) -> Result<Vec<TicketArkEscrow>, sqlx::Error> {
+        sqlx::query(
+            "SELECT e.* FROM ticket_ark_escrows e
+             JOIN tickets t ON t.id = e.ticket_id AND t.hash = e.ticket_hash
+             LEFT JOIN ticket_ark_refunds r ON r.ticket_id = e.ticket_id
+             WHERE t.event_id = ? AND e.funded_at IS NOT NULL
+               AND (r.state IS NULL OR r.state != 'settled')
+               AND NOT EXISTS (SELECT 1 FROM ark_funded_competitions a
+                               WHERE a.event_id = t.event_id AND a.commitment_tx IS NOT NULL)
+             ORDER BY e.ticket_id",
+        )
+        .bind(event_id.to_string())
+        .fetch_all(self.db_connection.read())
+        .await?
+        .iter()
+        .map(escrow_row)
+        .collect()
+    }
+
     /// The refund of one ticket's escrow, as far as it has got.
     pub async fn ticket_ark_refund(
         &self,
@@ -368,6 +394,41 @@ impl CompetitionStore {
                 .execute(&pool)
                 .await?;
                 Ok(())
+            })
+            .await
+    }
+
+    /// Replace a minted refund that went stale before anything was signed with a fresh one.
+    ///
+    /// Only a refund still `minted` as `stale_refund_id` is replaced: in that state no spend of
+    /// the escrow was finalized and nothing was paid, so its swap and invoice can be dropped.
+    /// Returns whether it was replaced.
+    pub async fn replace_minted_ticket_ark_refund(
+        &self,
+        stale_refund_id: Uuid,
+        refund: TicketArkRefund,
+    ) -> Result<bool, DatabaseWriteError> {
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let replaced = sqlx::query(
+                    "UPDATE ticket_ark_refunds SET refund_id = ?, invoice = ?, payment_hash = ?,
+                        fee_sats = ?, state = ?, ark_txid = NULL, checkpoint_psbt = NULL,
+                        error = NULL, created_at = ?, updated_at = ?
+                     WHERE ticket_id = ? AND refund_id = ? AND state = 'minted'",
+                )
+                .bind(refund.refund_id.to_string())
+                .bind(&refund.invoice)
+                .bind(&refund.payment_hash)
+                .bind(refund.fee_sats as i64)
+                .bind(refund.state.as_str())
+                .bind(refund.created_at)
+                .bind(refund.updated_at)
+                .bind(refund.ticket_id.to_string())
+                .bind(stale_refund_id.to_string())
+                .execute(&pool)
+                .await?
+                .rows_affected();
+                Ok(replaced > 0)
             })
             .await
     }

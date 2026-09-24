@@ -37,6 +37,11 @@ struct MockInvoice {
 pub struct MockLnClient {
     invoices: Arc<RwLock<HashMap<String, MockInvoice>>>,
     payments: Arc<RwLock<HashMap<String, PaymentStatus>>>,
+    /// The proof of each payment, when the invoice reveals it: `MockLnurlPay` uses an
+    /// invoice's preimage as its payment secret, as a real payee's node would return it.
+    preimages: Arc<RwLock<HashMap<String, String>>>,
+    /// Payments sent, so a test can tell a resumed payout or refund never paid twice.
+    sent: Arc<std::sync::atomic::AtomicUsize>,
     auto_accept_delay: Option<Duration>,
     invoice_counter: Arc<RwLock<u64>>,
     /// Senders for invoice update subscriptions
@@ -57,6 +62,8 @@ impl MockLnClient {
         Self {
             invoices: Arc::new(RwLock::new(HashMap::new())),
             payments: Arc::new(RwLock::new(HashMap::new())),
+            preimages: Arc::new(RwLock::new(HashMap::new())),
+            sent: Arc::default(),
             auto_accept_delay: None,
             invoice_counter: Arc::new(RwLock::new(0)),
             invoice_subscribers: Arc::new(RwLock::new(Vec::new())),
@@ -69,6 +76,8 @@ impl MockLnClient {
         Self {
             invoices: Arc::new(RwLock::new(HashMap::new())),
             payments: Arc::new(RwLock::new(HashMap::new())),
+            preimages: Arc::new(RwLock::new(HashMap::new())),
+            sent: Arc::default(),
             auto_accept_delay: Some(delay),
             invoice_counter: Arc::new(RwLock::new(0)),
             invoice_subscribers: Arc::new(RwLock::new(Vec::new())),
@@ -137,10 +146,18 @@ impl MockLnClient {
         Ok(())
     }
 
+    /// How many payments were sent.
+    pub fn payments_sent(&self) -> usize {
+        self.sent.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Reset all mock state (invoices and payments).
     pub fn reset(&self) {
         if let Ok(mut invoices) = self.invoices.write() {
             invoices.clear();
+        }
+        if let Ok(mut preimages) = self.preimages.write() {
+            preimages.clear();
         }
         if let Ok(mut payments) = self.payments.write() {
             payments.clear();
@@ -466,13 +483,19 @@ impl Ln for MockLnClient {
             .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
 
         let status = payments.get(r_hash).cloned().ok_or(PaymentNotFound)?;
+        let payment_preimage = self
+            .preimages
+            .read()
+            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?
+            .get(r_hash)
+            .cloned();
 
         Ok(PaymentLookupResponse {
             payment_hash: r_hash.to_string(),
             value: "0".to_string(),
             creation_date: OffsetDateTime::now_utc().unix_timestamp().to_string(),
             fee: "0".to_string(),
-            payment_preimage: None,
+            payment_preimage,
             value_sat: "0".to_string(),
             value_msat: "0".to_string(),
             payment_request: String::new(),
@@ -497,6 +520,7 @@ impl Ln for MockLnClient {
         );
 
         let payment_hash_hex = extract_payment_hash_from_invoice(&payout_payment_request)?;
+        self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         {
             let mut payments = self
@@ -504,6 +528,15 @@ impl Ln for MockLnClient {
                 .write()
                 .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
             payments.insert(payment_hash_hex.clone(), PaymentStatus::Succeeded);
+        }
+        if let Ok(invoice) = payout_payment_request.parse::<lightning_invoice::Bolt11Invoice>() {
+            let secret = invoice.payment_secret().0;
+            if hex::encode(sha256::Hash::hash(&secret).to_byte_array()) == payment_hash_hex {
+                self.preimages
+                    .write()
+                    .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?
+                    .insert(payment_hash_hex.clone(), hex::encode(secret));
+            }
         }
 
         // Broadcast payment update to subscribers
