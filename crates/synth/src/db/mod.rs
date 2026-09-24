@@ -88,6 +88,10 @@ pub struct SynthUserRecord {
     pub created_at: String,
 }
 
+fn now_rfc3339() -> Result<String> {
+    Ok(OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?)
+}
+
 impl SynthDb {
     pub async fn new(path: &str) -> Result<Self> {
         // Ensure parent directory exists
@@ -358,6 +362,29 @@ impl SynthDb {
         Ok(run)
     }
 
+    /// Mark the runs a restart cut short, and the steps they were on, which would otherwise read
+    /// as running forever. Call before any run starts. Returns how many runs there were.
+    pub async fn interrupt_unfinished_runs(&self) -> Result<u64> {
+        let now = now_rfc3339()?;
+        let mut transaction = self.pool.begin().await?;
+        let done = sqlx::query(
+            "UPDATE test_runs SET status = 'interrupted', completed_at = ?, \
+             error_message = 'synth restarted before the run finished' WHERE status = 'running'",
+        )
+        .bind(&now)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE test_steps SET status = 'interrupted', completed_at = ?, \
+             error_message = 'synth restarted before the step finished' WHERE status = 'running'",
+        )
+        .bind(&now)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(done.rows_affected())
+    }
+
     // --- Test Steps ---
 
     pub async fn create_step(&self, run_id: &str, step_name: &str) -> Result<String> {
@@ -507,6 +534,34 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["full_lifecycle", "escrow_refund"]
         );
+    }
+
+    /// A run a restart cut short says so, and so does the step it was on, rather than running
+    /// forever.
+    #[tokio::test]
+    async fn runs_cut_short_by_a_restart_are_marked_interrupted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synth.sqlite");
+        let db = SynthDb::new(path.to_str().unwrap()).await.unwrap();
+        let finished = db.create_run("full_lifecycle", None).await.unwrap();
+        let step = db.create_step(&finished, "load_users").await.unwrap();
+        db.complete_step(&step, 1, None, None).await.unwrap();
+        db.complete_run(&finished, None).await.unwrap();
+        let cut_short = db.create_run("full_lifecycle", None).await.unwrap();
+        db.create_step(&cut_short, "user_alice_enter").await.unwrap();
+
+        assert_eq!(db.interrupt_unfinished_runs().await.unwrap(), 1);
+        let run = db.get_run(&cut_short).await.unwrap().unwrap();
+        assert_eq!(run.status, "interrupted");
+        assert!(run.completed_at.is_some());
+        let steps = db.get_steps(&cut_short).await.unwrap();
+        assert_eq!(steps[0].status, "interrupted");
+        assert!(steps[0].completed_at.is_some());
+        assert_eq!(
+            db.get_run(&finished).await.unwrap().unwrap().status,
+            "passed"
+        );
+        assert_eq!(db.get_steps(&finished).await.unwrap()[0].status, "passed");
     }
 
     /// A failed rebalance is kept with its reason, so the dashboard can say why money stopped

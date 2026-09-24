@@ -5,7 +5,7 @@ use coordinator_synth::events::Events;
 use coordinator_synth::rebalance::Rebalancer;
 use coordinator_synth::runner::Runner;
 use coordinator_synth::server;
-use log::info;
+use log::{info, warn};
 
 /// How often the runs' competitions are checked for changes after the runs end.
 const COMPETITION_WATCH_SECS: u64 = 20;
@@ -22,6 +22,11 @@ async fn main() -> anyhow::Result<()> {
     info!("  Oracle: {}", config.oracle.url);
 
     let db = SynthDb::new(&config.db.path).await?;
+    // Nothing runs yet, so a run still marked running was cut short by the last shutdown.
+    let interrupted = db.interrupt_unfinished_runs().await?;
+    if interrupted > 0 {
+        warn!("Marked {interrupted} run(s) the last shutdown cut short as interrupted");
+    }
     let mut client = CoordinatorClient::new(
         &config.coordinator.url,
         config.coordinator.admin_url.as_deref(),
