@@ -292,7 +292,11 @@ pub async fn admin_create_competition_handler(
     };
 
     match state.coordinator.create_competition(create_event).await {
-        Ok(competition) => Html(competition_success(&competition.id).into_string()),
+        Ok(competition) => {
+            // Its entry form reads forecasts from the cache; fill it before anyone opens it.
+            state.leaderboards.warm(&competition);
+            Html(competition_success(&competition.id).into_string())
+        }
         Err(e) => Html(competition_error(&e.to_string()).into_string()),
     }
 }
