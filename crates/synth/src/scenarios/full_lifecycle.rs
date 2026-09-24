@@ -5,6 +5,7 @@ use crate::crypto;
 use crate::crypto::keys::SynthUser;
 use crate::db::SynthDb;
 use crate::lnd::Lnd;
+use crate::trail::{EntryPayment, EntryTrace, RouteHop};
 use anyhow::{Context, Result};
 use log::{info, warn};
 use rand::Rng;
@@ -179,37 +180,6 @@ async fn create_competition(client: &CoordinatorClient, config: &ScenarioConfig)
     Ok(resp.id)
 }
 
-/// Where an entry's money went, recorded as it happens so a failed entry still shows how far its
-/// payment got.
-#[derive(Debug, Default, serde::Serialize)]
-pub(super) struct EntryTrace {
-    pub user: String,
-    pub nostr_pubkey: String,
-    pub entry_id: Option<Uuid>,
-    pub ticket_id: Option<Uuid>,
-    pub amount_sats: Option<u64>,
-    /// Identifies the payment on the paying node, the invoice's node, and in ark-swapd.
-    pub payment_hash: Option<String>,
-    pub paid: bool,
-    pub entry_submitted: bool,
-}
-
-impl EntryTrace {
-    pub(super) fn new(user: &SynthUser) -> Self {
-        Self {
-            user: user.name.clone(),
-            nostr_pubkey: user.nostr_pubkey_hex(),
-            ..Self::default()
-        }
-    }
-
-    /// The step, carrying this trace as its details.
-    pub(super) fn attach(&self, mut step: StepResult) -> StepResult {
-        step.details = serde_json::to_value(self).ok();
-        step
-    }
-}
-
 /// How a scenario pays an entry's invoice.
 pub(super) enum Payer<'a> {
     /// The coordinator settles it for us. Cannot fund an Arkade escrow, which ark-swapd pays.
@@ -258,6 +228,7 @@ pub(super) async fn enter_competition_with(
     trace.ticket_id = Some(ticket.ticket_id);
     trace.amount_sats = Some(ticket.amount_sats);
     trace.payment_hash = Some(ticket.payment_hash.clone());
+    trace.invoice = Some(ticket.payment_request.clone());
 
     info!(
         "  {} got ticket {} ({}sats)",
@@ -305,10 +276,15 @@ pub(super) async fn enter_competition_with(
             info!("  {} invoice settled", user.name);
         }
         Payer::Lnd(lnd) => {
-            lnd.pay(&ticket.payment_request)
+            let paid = lnd
+                .pay(&ticket.payment_request)
                 .await
                 .context("Failed to pay the entry invoice")?;
-            info!("  {} paid {} sats", user.name, ticket.amount_sats);
+            info!(
+                "  {} paid {} sats, {} msat in fees",
+                user.name, ticket.amount_sats, paid.fee_msat
+            );
+            trace.payment = Some(entry_payment(lnd, paid).await);
         }
     }
     trace.paid = true;
@@ -359,6 +335,31 @@ pub(super) async fn enter_competition_with(
 
     info!("  {} entry submitted", user.name);
     Ok(ticket.ticket_id)
+}
+
+/// How `lnd` paid an entry, naming the nodes it went through. A name it cannot look up is left
+/// out rather than failing an entry that went through.
+async fn entry_payment(lnd: &Lnd, paid: crate::lnd::Paid) -> EntryPayment {
+    let payer = lnd.identity().await.unwrap_or_else(|e| {
+        warn!("Cannot name the paying node: {e:#}");
+        crate::lnd::NodeIdentity::default()
+    });
+    let mut route = Vec::new();
+    for hop in paid.route {
+        let alias = lnd.alias_of(&hop.pub_key).await.ok().flatten();
+        route.push(RouteHop {
+            chan_id: hop.chan_id,
+            pubkey: hop.pub_key,
+            alias,
+        });
+    }
+    EntryPayment {
+        payer_alias: payer.alias,
+        payer_pubkey: payer.pubkey,
+        preimage: paid.preimage,
+        fee_msat: paid.fee_msat,
+        route,
+    }
 }
 
 fn generate_random_predictions(stations: &[String]) -> Vec<WeatherChoices> {

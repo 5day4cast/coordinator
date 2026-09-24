@@ -2,6 +2,7 @@ use super::live::{self, Live};
 use crate::rebalance::Rebalancer;
 use crate::runner::Runner;
 use crate::scenarios::{ScenarioConfig, ScenarioStatus};
+use crate::trail::tracker::Tracker;
 use axum::{
     extract::{Query, State},
     response::{Html, IntoResponse},
@@ -18,6 +19,8 @@ pub struct Dashboard {
     pub scenario_config: ScenarioConfig,
     /// Absent when no rebalancing is configured.
     pub rebalancer: Option<Rebalancer>,
+    /// Follows each run's money after its steps.
+    pub tracker: Tracker,
     /// The pages being watched, and what is pushed to them.
     pub live: Live,
 }

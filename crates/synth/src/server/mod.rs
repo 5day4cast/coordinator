@@ -6,6 +6,7 @@ pub mod run_detail;
 use crate::config::SynthConfig;
 use crate::rebalance::Rebalancer;
 use crate::runner::Runner;
+use crate::trail::tracker::Tracker;
 use axum::Router;
 use log::info;
 use std::net::SocketAddr;
@@ -14,11 +15,13 @@ pub async fn start_server(
     config: &SynthConfig,
     runner: Runner,
     rebalancer: Option<Rebalancer>,
+    tracker: Tracker,
 ) -> anyhow::Result<()> {
     let dashboard = routes::Dashboard {
         runner,
         scenario_config: config.scenario_config(),
         rebalancer,
+        tracker,
         live: live::Live::new(),
     };
     // Pages are pushed their live part as things change, rendered once however many watch.

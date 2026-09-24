@@ -2,7 +2,6 @@
 
 use serde::Serialize;
 use tokio::sync::broadcast;
-use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -26,11 +25,10 @@ pub enum Event {
         passed: bool,
     },
     Rebalanced,
-    /// A competition a run made moved on, which carries on after the run ends: attestation,
-    /// payouts, refunds.
-    CompetitionChanged {
-        competition_id: Uuid,
-        state: String,
+    /// Synth learned more about where a run's money went, which carries on after the run ends:
+    /// attestation, payouts, refunds.
+    TrailUpdated {
+        run_id: String,
     },
 }
 

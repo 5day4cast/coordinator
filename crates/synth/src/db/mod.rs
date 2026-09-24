@@ -20,6 +20,9 @@ pub struct TestRun {
     /// The competition the run created, from its steps' details.
     #[sqlx(default)]
     pub competition_id: Option<String>,
+    /// Where the run's money stands, once synth has followed it: see [`crate::trail::Money`].
+    #[sqlx(default)]
+    pub money: Option<String>,
 }
 
 /// A scenario's recent record, for the dashboard.
@@ -87,6 +90,14 @@ pub struct SynthUserRecord {
     pub nostr_pubkey: String,
     pub created_at: String,
 }
+
+/// A run, with the competition its steps name and where its money stands.
+const RUN_COLUMNS: &str = "SELECT test_runs.*, \
+     (SELECT json_extract(details_json, '$.competition_id') FROM test_steps \
+      WHERE test_steps.run_id = test_runs.id \
+      AND json_extract(details_json, '$.competition_id') IS NOT NULL LIMIT 1) AS competition_id, \
+     (SELECT money FROM money_trails WHERE money_trails.run_id = test_runs.id) AS money \
+     FROM test_runs";
 
 fn now_rfc3339() -> Result<String> {
     Ok(OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?)
@@ -180,6 +191,19 @@ impl SynthDb {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS money_trails (
+                run_id TEXT PRIMARY KEY REFERENCES test_runs(id),
+                money TEXT NOT NULL,
+                trail_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Databases made before synth kept ark-swapd's wallet funded.
         self.add_column_if_missing("rebalances", "kind", "TEXT NOT NULL DEFAULT 'channel'")
             .await?;
@@ -306,12 +330,9 @@ impl SynthDb {
     }
 
     pub async fn list_runs(&self, limit: i64) -> Result<Vec<TestRun>> {
-        let runs = sqlx::query_as::<_, TestRun>(
-            "SELECT test_runs.*, (SELECT json_extract(details_json, '$.competition_id') \
-             FROM test_steps WHERE test_steps.run_id = test_runs.id \
-             AND json_extract(details_json, '$.competition_id') IS NOT NULL LIMIT 1) \
-             AS competition_id FROM test_runs ORDER BY started_at DESC LIMIT ?",
-        )
+        let runs = sqlx::query_as::<_, TestRun>(&format!(
+            "{RUN_COLUMNS} ORDER BY started_at DESC LIMIT ?"
+        ))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -349,15 +370,10 @@ impl SynthDb {
     }
 
     pub async fn get_run(&self, id: &str) -> Result<Option<TestRun>> {
-        let run = sqlx::query_as::<_, TestRun>(
-            "SELECT test_runs.*, (SELECT json_extract(details_json, '$.competition_id') \
-             FROM test_steps WHERE test_steps.run_id = test_runs.id \
-             AND json_extract(details_json, '$.competition_id') IS NOT NULL LIMIT 1) \
-             AS competition_id FROM test_runs WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let run = sqlx::query_as::<_, TestRun>(&format!("{RUN_COLUMNS} WHERE id = ?"))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(run)
     }
@@ -375,7 +391,62 @@ impl SynthDb {
         Ok(done.rows_affected())
     }
 
+    /// Fail a run that passed its steps but whose money did not end where it should. A run that
+    /// already failed keeps its own error.
+    pub async fn fail_passed_run(&self, id: &str, error: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE test_runs SET status = 'failed', error_message = ? \
+             WHERE id = ? AND status = 'passed'",
+        )
+        .bind(error)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // --- Money trails ---
+
+    pub async fn save_trail(&self, run_id: &str, trail: &crate::trail::Trail) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO money_trails (run_id, money, trail_json, updated_at) VALUES (?, ?, ?, ?) \
+             ON CONFLICT(run_id) DO UPDATE SET money = excluded.money, \
+             trail_json = excluded.trail_json, updated_at = excluded.updated_at",
+        )
+        .bind(run_id)
+        .bind(trail.money.label())
+        .bind(serde_json::to_string(trail)?)
+        .bind(now_rfc3339()?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_trail(&self, run_id: &str) -> Result<Option<crate::trail::Trail>> {
+        let json: Option<String> =
+            sqlx::query_scalar("SELECT trail_json FROM money_trails WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        json.map(|json| serde_json::from_str(&json).context("read the saved money trail"))
+            .transpose()
+    }
+
     // --- Test Steps ---
+
+    /// Record a step that happened after its run's scenario ended.
+    pub async fn add_step(
+        &self,
+        run_id: &str,
+        step_name: &str,
+        duration_ms: i64,
+        error: Option<&str>,
+        details_json: Option<&str>,
+    ) -> Result<()> {
+        let id = self.create_step(run_id, step_name).await?;
+        self.complete_step(&id, duration_ms, error, details_json)
+            .await
+    }
 
     pub async fn create_step(&self, run_id: &str, step_name: &str) -> Result<String> {
         let id = Uuid::now_v7().to_string();
@@ -543,6 +614,56 @@ mod tests {
         assert_eq!(
             db.get_run(&finished).await.unwrap().unwrap().status,
             "passed"
+        );
+    }
+
+    /// A run's trail is saved over as the tracker learns more, and its money shows on the run.
+    #[tokio::test]
+    async fn a_runs_money_trail_is_saved_and_listed_with_it() {
+        use crate::trail::{Money, Trail};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synth.sqlite");
+        let db = SynthDb::new(path.to_str().unwrap()).await.unwrap();
+        let run = db.create_run("full_lifecycle", None).await.unwrap();
+        db.complete_run(&run, None).await.unwrap();
+        assert!(db.get_trail(&run).await.unwrap().is_none());
+
+        let mut trail = Trail {
+            refreshed_at: OffsetDateTime::now_utc(),
+            competition_id: Uuid::now_v7(),
+            competition: None,
+            settlement: None,
+            swaps: Vec::new(),
+            payouts: Vec::new(),
+            refunds: Vec::new(),
+            funding_tx: None,
+            outcome_tx: None,
+            money: Money::Following,
+            gaps: Vec::new(),
+        };
+        db.save_trail(&run, &trail).await.unwrap();
+        trail.money = Money::Stuck {
+            reason: "0 of 3 payouts sent".into(),
+        };
+        db.save_trail(&run, &trail).await.unwrap();
+
+        assert_eq!(
+            db.get_trail(&run).await.unwrap().unwrap().money,
+            trail.money
+        );
+        assert_eq!(
+            db.list_runs(10).await.unwrap()[0].money.as_deref(),
+            Some("stuck")
+        );
+
+        db.fail_passed_run(&run, "its payouts never went out")
+            .await
+            .unwrap();
+        let failed = db.get_run(&run).await.unwrap().unwrap();
+        assert_eq!(failed.status, "failed");
+        assert_eq!(
+            failed.error_message.as_deref(),
+            Some("its payouts never went out")
         );
     }
 

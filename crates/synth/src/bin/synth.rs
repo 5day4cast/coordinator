@@ -1,3 +1,4 @@
+use coordinator_synth::ark_swap::ArkSwap;
 use coordinator_synth::client::CoordinatorClient;
 use coordinator_synth::config::load_config;
 use coordinator_synth::db::SynthDb;
@@ -5,10 +6,8 @@ use coordinator_synth::events::Events;
 use coordinator_synth::rebalance::Rebalancer;
 use coordinator_synth::runner::Runner;
 use coordinator_synth::server;
+use coordinator_synth::trail::tracker::{self, Tracker};
 use log::{info, warn};
-
-/// How often the runs' competitions are checked for changes after the runs end.
-const COMPETITION_WATCH_SECS: u64 = 20;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -45,11 +44,37 @@ async fn main() -> anyhow::Result<()> {
         (None, Some(_)) => anyhow::bail!("rebalance needs lnd, the node it pays back"),
         _ => None,
     };
+    // Payouts and refunds happen hours after a run ends; follow each run's money until then,
+    // looking payouts up on the nodes synth can reach and swaps up in ark-swapd.
+    let nodes = tracker::nodes(
+        &[
+            config.lnd.as_ref(),
+            config.rebalance.as_ref().map(|rebalance| &rebalance.source),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>(),
+    );
+    let ark_swap = match config
+        .rebalance
+        .as_ref()
+        .and_then(|rebalance| rebalance.arkade.as_ref())
+    {
+        Some(arkade) => Some(ArkSwap::new(&arkade.ark_swap)?),
+        None => None,
+    };
+    let tracker = Tracker::new(
+        client.clone(),
+        db.clone(),
+        events.clone(),
+        nodes,
+        ark_swap,
+        config.trail.clone(),
+        config.defaults.lightning_address.clone(),
+    )?;
     let runner = Runner::new(client, db, events);
-
-    // Payouts and refunds happen after a run ends; watch its competition for them.
-    let watcher = runner.clone();
-    tokio::spawn(async move { watcher.watch_competitions(COMPETITION_WATCH_SECS).await });
+    let following = tracker.clone();
+    tokio::spawn(async move { following.run().await });
 
     // Start scheduled runner if enabled
     if config.scheduler.enabled {
@@ -69,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start HTTP server
-    server::start_server(&config, runner, rebalancer).await?;
+    server::start_server(&config, runner, rebalancer, tracker).await?;
 
     Ok(())
 }

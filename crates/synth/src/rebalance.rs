@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 use crate::ark_swap::{ArkSwap, ArkSwapConfig, ArkWallet};
 use crate::db::{Rebalance, SynthDb};
 use crate::events::{Event, Events};
-use crate::lnd::{Channel, Lnd, LndConfig};
+use crate::lnd::{Channel, Lnd, LndConfig, NodeIdentity};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RebalanceConfig {
@@ -94,6 +94,9 @@ pub struct Observation {
     pub checked_at: Option<OffsetDateTime>,
     pub channel: Option<Channel>,
     pub arkade: Option<ArkWallet>,
+    /// The two ends of the channel, as they name themselves.
+    pub payer: Option<NodeIdentity>,
+    pub source: Option<NodeIdentity>,
 }
 
 /// What one rebalance moved, by leg.
@@ -185,13 +188,23 @@ impl Rebalancer {
 
     /// Check the channel, and pay the payer back if its share is too low.
     async fn rebalance_channel(&self) -> Result<Option<u64>> {
-        let source = self.source.pubkey().await.context("read the source node")?;
+        let source = self
+            .source
+            .identity()
+            .await
+            .context("read the source node")?;
+        let payer = self.payer.identity().await.ok();
         let channel = self
             .payer
-            .channel_with(&source)
+            .channel_with(&source.pubkey)
             .await
             .context("read the payer's channels")?;
-        self.last.lock().await.channel = channel.clone();
+        {
+            let mut last = self.last.lock().await;
+            last.channel = channel.clone();
+            last.payer = payer;
+            last.source = Some(source);
+        }
         let channel =
             channel.context("the payer has no active channel with the source node to rebalance")?;
 
@@ -265,7 +278,8 @@ impl Rebalancer {
         self.source
             .pay_through(&invoice, &channel.id)
             .await
-            .context("have the source pay the payer")
+            .context("have the source pay the payer")?;
+        Ok(())
     }
 }
 
