@@ -6,8 +6,11 @@
 //!
 //! If the escrow cannot be paid, the invoice is cancelled and the payment fails back to the payer.
 //! The HTLC is held for seconds, and the service fronts one escrow's value per swap in flight.
-//! Before paying or cancelling, the service checks whether the escrow was already paid.
-//! A crash, or a send that failed after arkd accepted it, therefore never pays twice or refunds a funded escrow.
+//!
+//! Each escrow payment is recorded before it is sent. Before paying or cancelling, the service
+//! asks Arkade whether the escrow was already paid, and after a payment whose outcome is unknown
+//! it waits until Arkade would list it before concluding it never landed. A crash, or a send
+//! that failed after arkd accepted it, therefore never pays twice or refunds a funded escrow.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,6 +25,14 @@ use crate::wallet::ArkWallet;
 
 /// How long an open invoice outlives its expiry before the service cancels it.
 const EXPIRY_GRACE_SECS: i64 = 60;
+
+/// How long after sending an escrow payment Arkade's indexer is given to list it. Until then
+/// a payment whose outcome is unknown is only looked for, never sent again.
+const PAYMENT_LISTING_GRACE_SECS: i64 = 60;
+
+/// Escrow payments that Arkade showed never landed, before the swap fails and the payer's
+/// invoice is cancelled.
+const PAY_ATTEMPTS: u32 = 3;
 
 /// The first wait before looking a settled swap's escrow VTXO up again. Each miss doubles it,
 /// up to `VTXO_LOOKUP_MAX_WAIT_SECS`.
@@ -130,6 +141,8 @@ impl Swapper {
             vtxo_lookups: 0,
             vtxo_lookup_after: None,
             vtxo_lookup_gave_up_at: None,
+            pay_attempted_at: None,
+            pay_attempts: 0,
         };
         self.store.insert(&swap).await?;
         log::info!(
@@ -269,46 +282,92 @@ impl Swapper {
         self.store.update(swap).await
     }
 
+    /// Pay the escrow while the payer's HTLC is held, then settle.
+    ///
+    /// Each payment is recorded before it is sent, so a payment whose outcome was lost (to a
+    /// crash, or to a send that reported an error after arkd took it) is looked for on Arkade
+    /// until the indexer would list it. Only then is it sent again, and only after
+    /// `PAY_ATTEMPTS` such payments does the swap fail and cancel the payer's invoice.
     async fn pay_escrow(&self, swap: &mut Swap) -> anyhow::Result<()> {
-        let address = self.wallet.escrow_address(&swap.escrow_address)?;
-        let amount = Amount::from_sat(swap.amount_sat);
-        if let Some(vtxo) = self.already_paid(swap).await? {
-            swap.escrow_vtxo = Some(vtxo);
-            self.transition(swap, SwapState::EscrowPaid, None).await?;
-            return self.settle(swap).await;
-        }
-        match self.wallet.pay(address, amount).await {
-            Ok(txid) => {
-                swap.ark_txid = Some(txid.to_string());
-                // The indexer may not list the new VTXO yet. Record the payment regardless, so
-                // a retry never pays twice; `record_escrow_vtxo` finds the VTXO later.
-                swap.escrow_vtxo = match self.already_paid(swap).await {
-                    Ok(vtxo) => vtxo,
-                    Err(error) => {
-                        log::warn!("swap {}: look up its escrow VTXO: {error:#}", swap.id);
-                        None
-                    }
-                };
+        let now = unix_now();
+        let listed = self.already_paid(swap).await?;
+        match payment_step(swap, listed.is_some(), now) {
+            PaymentStep::Record => {
+                swap.escrow_vtxo = listed;
                 self.transition(swap, SwapState::EscrowPaid, None).await?;
-                log::info!(
-                    "swap {} paid escrow {} in {txid}",
-                    swap.id,
-                    swap.escrow_address
-                );
                 self.settle(swap).await
             }
-            Err(error) => {
-                // arkd may have taken the payment even though the send reported an error.
-                if let Some(vtxo) = self.already_paid(swap).await? {
-                    swap.escrow_vtxo = Some(vtxo);
-                    self.transition(swap, SwapState::EscrowPaid, None).await?;
-                    return self.settle(swap).await;
-                }
-                self.lnd.cancel(&bytes32(&swap.payment_hash)?).await?;
-                self.transition(swap, SwapState::Failed, Some(format!("{error:#}")))
-                    .await?;
-                log::error!("swap {} failed and was cancelled: {error:#}", swap.id);
+            PaymentStep::Wait => {
+                log::debug!(
+                    "swap {}: waiting for Arkade to list the escrow payment sent at {:?}",
+                    swap.id,
+                    swap.pay_attempted_at
+                );
                 Ok(())
+            }
+            PaymentStep::GiveUp => {
+                self.lnd.cancel(&bytes32(&swap.payment_hash)?).await?;
+                let error = format!(
+                    "{} escrow payments never reached Arkade; the last: {}",
+                    swap.pay_attempts,
+                    swap.error.as_deref().unwrap_or("no error was reported")
+                );
+                self.transition(swap, SwapState::Failed, Some(error.clone()))
+                    .await?;
+                log::error!("swap {} failed and was cancelled: {error}", swap.id);
+                Ok(())
+            }
+            PaymentStep::Pay => {
+                if let Some(attempted) = swap.pay_attempted_at {
+                    log::warn!(
+                        "swap {}: the escrow payment sent at {attempted} never reached Arkade; \
+                         paying again",
+                        swap.id
+                    );
+                }
+                // Recorded before sending: whatever happens next, a later pass looks for this
+                // payment before it sends another.
+                swap.pay_attempted_at = Some(now);
+                swap.pay_attempts += 1;
+                swap.updated_at = now;
+                self.store.update(swap).await?;
+                let address = self.wallet.escrow_address(&swap.escrow_address)?;
+                match self
+                    .wallet
+                    .pay(address, Amount::from_sat(swap.amount_sat))
+                    .await
+                {
+                    Ok(txid) => {
+                        swap.ark_txid = Some(txid.to_string());
+                        // The indexer may not list the new VTXO yet. Record the payment
+                        // regardless; `lookup_tick` finds the VTXO later.
+                        swap.escrow_vtxo = match self.already_paid(swap).await {
+                            Ok(vtxo) => vtxo,
+                            Err(error) => {
+                                log::warn!("swap {}: look up its escrow VTXO: {error:#}", swap.id);
+                                None
+                            }
+                        };
+                        self.transition(swap, SwapState::EscrowPaid, None).await?;
+                        log::info!(
+                            "swap {} paid escrow {} in {txid}",
+                            swap.id,
+                            swap.escrow_address
+                        );
+                        self.settle(swap).await
+                    }
+                    Err(error) => {
+                        // arkd may have taken the payment anyway, so the invoice stays held:
+                        // the next passes look for it on Arkade before anything else.
+                        swap.error = Some(format!("{error:#}"));
+                        swap.updated_at = unix_now();
+                        self.store.update(swap).await?;
+                        Err(error.context(
+                            "the escrow payment reported an error; Arkade is checked for it \
+                             before any retry",
+                        ))
+                    }
+                }
             }
         }
     }
@@ -374,6 +433,32 @@ impl Swapper {
     }
 }
 
+/// What a swap paying its escrow does next.
+#[derive(Debug, PartialEq, Eq)]
+enum PaymentStep {
+    /// Arkade lists the payment: record it and settle.
+    Record,
+    /// Send a payment: none was sent, or the last never landed.
+    Pay,
+    /// A payment was sent too recently to tell whether it landed.
+    Wait,
+    /// No payment landed after `PAY_ATTEMPTS`: fail, and give the payer's money back.
+    GiveUp,
+}
+
+/// What a swap paying its escrow does next at `now`, given whether Arkade lists its payment.
+fn payment_step(swap: &Swap, listed: bool, now: i64) -> PaymentStep {
+    if listed {
+        return PaymentStep::Record;
+    }
+    match swap.pay_attempted_at {
+        None => PaymentStep::Pay,
+        Some(attempted) if now < attempted + PAYMENT_LISTING_GRACE_SECS => PaymentStep::Wait,
+        Some(_) if swap.pay_attempts >= PAY_ATTEMPTS => PaymentStep::GiveUp,
+        Some(_) => PaymentStep::Pay,
+    }
+}
+
 /// How long to wait after the `lookups`th missed lookup of a settled swap's escrow VTXO.
 fn vtxo_lookup_wait(lookups: u32) -> i64 {
     VTXO_LOOKUP_FIRST_WAIT_SECS
@@ -398,6 +483,67 @@ pub fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn paying(pay_attempted_at: Option<i64>, pay_attempts: u32) -> Swap {
+        Swap {
+            id: Uuid::now_v7(),
+            escrow_address: "tark1escrow".into(),
+            amount_sat: 6_300,
+            payment_hash: "ab".repeat(32),
+            preimage: "cd".repeat(32),
+            invoice: "lntb1".into(),
+            state: SwapState::PayingEscrow,
+            escrow_vtxo: None,
+            ark_txid: None,
+            error: None,
+            created_at: 1_790_000_000,
+            updated_at: 1_790_000_000,
+            expires_at: 1_790_000_600,
+            vtxo_lookups: 0,
+            vtxo_lookup_after: None,
+            vtxo_lookup_gave_up_at: None,
+            pay_attempted_at,
+            pay_attempts,
+        }
+    }
+
+    #[test]
+    fn an_escrow_is_paid_again_only_once_arkade_shows_the_last_payment_never_landed() {
+        let sent = 1_790_000_010;
+        assert_eq!(payment_step(&paying(None, 0), false, sent), PaymentStep::Pay);
+        // Sent, then a crash or an error: however the send ended, it is looked for first.
+        assert_eq!(
+            payment_step(&paying(Some(sent), 1), false, sent + 1),
+            PaymentStep::Wait
+        );
+        assert_eq!(
+            payment_step(&paying(Some(sent), 1), false, sent + PAYMENT_LISTING_GRACE_SECS - 1),
+            PaymentStep::Wait
+        );
+        assert_eq!(
+            payment_step(&paying(Some(sent), 1), true, sent + 1),
+            PaymentStep::Record,
+            "a payment that landed is recorded, never sent again"
+        );
+        assert_eq!(
+            payment_step(&paying(Some(sent), 1), false, sent + PAYMENT_LISTING_GRACE_SECS),
+            PaymentStep::Pay,
+            "Arkade would list it by now, so it never landed"
+        );
+        assert_eq!(
+            payment_step(
+                &paying(Some(sent), PAY_ATTEMPTS),
+                false,
+                sent + PAYMENT_LISTING_GRACE_SECS
+            ),
+            PaymentStep::GiveUp,
+            "the payer's invoice is cancelled only once no payment landed"
+        );
+        assert_eq!(
+            payment_step(&paying(Some(sent), PAY_ATTEMPTS), true, sent + 10_000),
+            PaymentStep::Record
+        );
+    }
 
     #[test]
     fn escrow_vtxo_lookups_back_off_and_give_up_within_hours() {

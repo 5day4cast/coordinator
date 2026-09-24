@@ -86,6 +86,10 @@ pub struct Swap {
     pub vtxo_lookups: u32,
     pub vtxo_lookup_after: Option<i64>,
     pub vtxo_lookup_gave_up_at: Option<i64>,
+    /// When the last escrow payment was sent (UNIX seconds), recorded before sending it, and
+    /// how many were sent.
+    pub pay_attempted_at: Option<i64>,
+    pub pay_attempts: u32,
 }
 
 #[derive(Clone)]
@@ -147,8 +151,8 @@ impl Store {
         sqlx::query(
             "INSERT INTO swaps (id, escrow_address, amount_sat, payment_hash, preimage, invoice, state,
                 escrow_vtxo, ark_txid, error, created_at, updated_at, expires_at, vtxo_lookups,
-                vtxo_lookup_after, vtxo_lookup_gave_up_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                vtxo_lookup_after, vtxo_lookup_gave_up_at, pay_attempted_at, pay_attempts)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(swap.id.to_string())
         .bind(&swap.escrow_address)
@@ -166,6 +170,8 @@ impl Store {
         .bind(swap.vtxo_lookups)
         .bind(swap.vtxo_lookup_after)
         .bind(swap.vtxo_lookup_gave_up_at)
+        .bind(swap.pay_attempted_at)
+        .bind(swap.pay_attempts)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -174,7 +180,8 @@ impl Store {
     pub async fn update(&self, swap: &Swap) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE swaps SET state = ?, escrow_vtxo = ?, ark_txid = ?, error = ?, updated_at = ?,
-                vtxo_lookups = ?, vtxo_lookup_after = ?, vtxo_lookup_gave_up_at = ?
+                vtxo_lookups = ?, vtxo_lookup_after = ?, vtxo_lookup_gave_up_at = ?,
+                pay_attempted_at = ?, pay_attempts = ?
              WHERE id = ?",
         )
         .bind(swap.state.as_str())
@@ -185,6 +192,8 @@ impl Store {
         .bind(swap.vtxo_lookups)
         .bind(swap.vtxo_lookup_after)
         .bind(swap.vtxo_lookup_gave_up_at)
+        .bind(swap.pay_attempted_at)
+        .bind(swap.pay_attempts)
         .bind(swap.id.to_string())
         .execute(&self.pool)
         .await?;
@@ -409,6 +418,8 @@ fn swap(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Swap> {
         vtxo_lookups: row.try_get::<i64, _>("vtxo_lookups")? as u32,
         vtxo_lookup_after: row.try_get("vtxo_lookup_after")?,
         vtxo_lookup_gave_up_at: row.try_get("vtxo_lookup_gave_up_at")?,
+        pay_attempted_at: row.try_get("pay_attempted_at")?,
+        pay_attempts: row.try_get::<i64, _>("pay_attempts")? as u32,
     })
 }
 
@@ -537,6 +548,8 @@ mod tests {
             vtxo_lookups: 0,
             vtxo_lookup_after: None,
             vtxo_lookup_gave_up_at: None,
+            pay_attempted_at: None,
+            pay_attempts: 0,
         }
     }
 
@@ -568,6 +581,26 @@ mod tests {
             order,
             vec![paid.id, paying.id, awaiting.id],
             "a settled swap is not live, even without its VTXO"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_escrow_payment_is_recorded_before_it_is_sent() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("swaps.sqlite"))
+            .await
+            .unwrap();
+        let mut swap = swap_for(&"ef".repeat(32), 1_790_000_000);
+        swap.state = SwapState::PayingEscrow;
+        store.insert(&swap).await.unwrap();
+        swap.pay_attempted_at = Some(1_790_000_005);
+        swap.pay_attempts = 1;
+        store.update(&swap).await.unwrap();
+        let stored = store.get(swap.id).await.unwrap().unwrap();
+        assert_eq!(
+            (stored.pay_attempted_at, stored.pay_attempts),
+            (Some(1_790_000_005), 1),
+            "a restart sees the payment that may have been sent"
         );
     }
 
