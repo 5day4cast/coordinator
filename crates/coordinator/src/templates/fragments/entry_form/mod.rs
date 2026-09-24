@@ -178,6 +178,11 @@ pub fn payout_line(
                     " to be paid automatically."
                 }
             }
+            // Without an Arkade escrow the ticket is a held invoice, which is
+            // cancelled rather than collected if the competition doesn't fill.
+            @if !refunds {
+                " If this competition doesn't fill, your payment is never collected and returns to your wallet."
+            }
         }
     }
 }
@@ -288,6 +293,20 @@ mod tests {
         assert!(html.contains("and your refund if this competition doesn&#39;t fill")
             || html.contains("and your refund if this competition doesn't fill"));
         assert!(html.contains("<strong>freya@lnurl.example</strong>"));
+    }
+
+    #[test]
+    fn a_held_invoice_says_the_payment_returns_if_the_competition_does_not_fill() {
+        let line = |arkade| {
+            payout_line(
+                "c1",
+                Some(&terms(arkade)),
+                &PayoutDestination::Address("freya@lnurl.example".into()),
+            )
+            .into_string()
+        };
+        assert!(line(false).contains("returns to your wallet"));
+        assert!(!line(true).contains("returns to your wallet"));
     }
 
     #[test]
