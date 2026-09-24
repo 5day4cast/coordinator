@@ -138,7 +138,9 @@ pub fn leaderboard_scores(
             hx-swap=[live.then_some("outerHTML")] hx-disinherit=[live.then_some("*")] {
             @if let Some(provisional) = board.provisional {
                 p class="provisional-note" {
-                    strong { "Provisional:" } " if the window ended now"
+                    strong { "Provisional:" }
+                    @if competition.phase == Phase::Live { " if the window ended now" }
+                    @else { " awaiting the oracle result" }
                     @if let Some(at) = provisional.updated_at {
                         " · updated " (format::ago(at, now))
                     }

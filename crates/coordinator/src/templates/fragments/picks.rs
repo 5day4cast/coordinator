@@ -120,7 +120,7 @@ impl PickState {
 pub struct PickProgress {
     /// Running highest (high, wind) or lowest (low) reading so far.
     pub observed_so_far: Option<f64>,
-    /// Hours of the window the readings so far cover, of `hours_total`.
+    /// Latest report's position within the window, of `hours_total`; gaps may exist.
     pub hours_covered: u32,
     pub hours_total: u32,
     pub state: PickState,
@@ -333,7 +333,7 @@ fn live_pick_row(pick: &PickView, progress: &PickProgress) -> Markup {
                     None => { " · no reading yet" }
                 }
                 @if progress.hours_total > 0 {
-                    " · " (progress.hours_covered.min(progress.hours_total)) " of " (progress.hours_total) " h"
+                    " · reports through " (progress.hours_covered.min(progress.hours_total)) " of " (progress.hours_total) " h"
                 }
             }
             span class="pick-choice" { (pick_label(&pick.pick)) }
