@@ -68,7 +68,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             stem: "app",
             extension: "js",
             content_type: "text/javascript; charset=utf-8",
-            bytes: minify_script(&public_scripts(&templates, &files)?, "app")?,
+            bytes: private_scope(minify_script(&public_scripts(&templates, &files)?, "app")?),
         },
         Asset {
             constant: "ADMIN_JS",
@@ -83,6 +83,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             extension: "css",
             content_type: "text/css; charset=utf-8",
             bytes: stylesheet(&static_dir.join("styles.css"), &files)?,
+        },
+        // Loaded before first paint, so it stays a file of its own.
+        Asset {
+            constant: "THEME_JS",
+            stem: "theme",
+            extension: "js",
+            content_type: "text/javascript; charset=utf-8",
+            bytes: minify_script(&[static_dir.join("theme-init.js")], "theme")?,
         },
         // Vendored as published: htmx.org 1.9.10, dist/htmx.min.js.
         Asset {
@@ -166,8 +174,8 @@ fn public_scripts(templates: &Path, files: &[PathBuf]) -> Result<Vec<PathBuf>, S
 }
 
 /// Minify each script on its own and join them. Each is parsed as a classic
-/// script, so its top-level names stay global and are not renamed. A file the
-/// parser rejects fails the build.
+/// script, so its top-level names are not renamed and the scripts can use
+/// each other's. A file the parser rejects fails the build.
 fn minify_script(files: &[PathBuf], name: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut bundle = String::new();
     for file in files {
@@ -192,6 +200,16 @@ fn minify_script(files: &[PathBuf], name: &str) -> Result<Vec<u8>, Box<dyn Error
         bundle.push_str(";\n");
     }
     Ok(bundle.into_bytes())
+}
+
+/// Runs a bundle inside one function, so that its scripts share their
+/// top-level names (the wallet session in shared/wasm.js above all) without
+/// putting them on `window`. Only what a script assigns to `window` is global.
+fn private_scope(bundle: Vec<u8>) -> Vec<u8> {
+    let mut wrapped = b"(()=>{\n".to_vec();
+    wrapped.extend(bundle);
+    wrapped.extend(b"})();\n");
+    wrapped
 }
 
 /// Global styles first, then every component's styles, minified as one sheet.

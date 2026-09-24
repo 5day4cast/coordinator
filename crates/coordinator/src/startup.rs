@@ -9,14 +9,15 @@ use crate::{
         admin_send_bitcoin_handler, admin_settle_test_invoice_handler,
         admin_wallet_address_fragment, admin_wallet_balance_fragment, admin_wallet_fragment,
         admin_wallet_outputs_fragment, change_password, claim_ticket_payout, competitions_fragment,
-        create_competition, entries_fragment, entry_detail_fragment, entry_form_fragment,
-        entry_payout_fragment, forgot_password_challenge, forgot_password_reset,
-        get_aggregate_nonces, get_balance, get_competition, get_competitions,
-        get_contract_parameters, get_entries, get_estimated_fee_rates, get_next_address,
-        get_outputs, get_ticket_refund, get_ticket_status, health, leaderboard_fragment,
-        leaderboard_rows_fragment, login, login_username, payouts_fragment, public_page_handler,
-        register, register_username, request_competition_ticket, send_to_address,
-        set_lightning_address, submit_final_signatures, submit_public_nonces, submit_ticket_payout,
+        create_competition, entries_fragment, entry_detail_fragment, entry_forecasts_fragment,
+        entry_form_fragment, entry_payout_fragment, forgot_password_challenge,
+        forgot_password_reset, get_aggregate_nonces, get_balance, get_competition,
+        get_competitions, get_contract_parameters, get_entries, get_estimated_fee_rates,
+        get_next_address, get_outputs, get_ticket_refund, get_ticket_status, health,
+        leaderboard_fragment, leaderboard_rows_fragment, login, login_username, payouts_fragment,
+        public_page_handler, register, register_username, request_competition_ticket,
+        send_to_address, set_lightning_address, submit_final_signatures, submit_public_nonces,
+        submit_ticket_payout,
     },
     config::Settings,
     domain::{
@@ -36,6 +37,7 @@ use crate::{
 
 // Mock implementations only available with e2e-testing feature or debug builds
 use crate::api::nip98_origins::Nip98Origins;
+use crate::api::public_headers::{public_response_headers, PublicHeaders};
 use crate::config::{APISettings, RateLimitSettings};
 #[cfg(any(feature = "e2e-testing", debug_assertions))]
 use crate::infra::{
@@ -773,6 +775,10 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
             get(entry_form_fragment),
         )
         .route(
+            "/competitions/{competition_id}/entry-forecasts",
+            get(entry_forecasts_fragment),
+        )
+        .route(
             "/competitions/{competition_id}/entry-form/payout",
             get(entry_payout_fragment),
         )
@@ -853,15 +859,22 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
         api.rate_limit.burst,
     );
 
+    // The pages' scripts call the API (normally this site) and the oracle.
+    let public_headers = Arc::new(PublicHeaders::new(&[
+        app_state.remote_url.as_str(),
+        app_state.oracle_url.as_str(),
+    ]));
+
     Router::new()
         .merge(api_routes)
         .route("/ui/{*path}", get(serve_static_file))
-        .route(
-            "/assets/{file}",
-            get(crate::templates::assets::serve_asset),
-        )
+        .route("/assets/{file}", get(crate::templates::assets::serve_asset))
         .layer(Extension(replay))
         .layer(Extension(Arc::new(nip98_origins)))
+        .layer(middleware::from_fn_with_state(
+            public_headers,
+            public_response_headers,
+        ))
         .layer(middleware::from_fn(log_request))
         .with_state(app_state)
         .layer(cors)
@@ -955,10 +968,7 @@ pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Ne
         .merge(operator_routes)
         .merge(sign_in)
         .route("/ui/{*path}", get(serve_static_file))
-        .route(
-            "/assets/{file}",
-            get(crate::templates::assets::serve_asset),
-        )
+        .route("/assets/{file}", get(crate::templates::assets::serve_asset))
         .with_state(app_state)
         .layer(middleware::from_fn(operator_response_headers))
         .layer(middleware::from_fn(log_request))
@@ -1255,6 +1265,53 @@ mod startup_tests {
 
     const BEARER: &str = "Bearer 0123456789abcdef0123456789abcdef";
     const FORM: &str = "application/x-www-form-urlencoded";
+
+    #[tokio::test]
+    async fn public_pages_carry_the_content_security_policy() {
+        let test = TestState::start().await;
+        let public = test.public();
+        for path in ["/", "/competitions", "/entries", "/payouts"] {
+            for (kind, headers) in [
+                ("page", &[][..]),
+                ("fragment", &[("hx-request", "true")][..]),
+                (
+                    "history",
+                    &[
+                        ("hx-request", "true"),
+                        ("hx-history-restore-request", "true"),
+                    ][..],
+                ),
+            ] {
+                let started = std::time::Instant::now();
+                let (status, response_headers, body) =
+                    send(&public, request("GET", path, headers, "")).await;
+                let elapsed = started.elapsed();
+                eprintln!("public {kind} {path}: {} ms", elapsed.as_millis());
+                assert!(elapsed < Duration::from_millis(400), "{path}: {elapsed:?}");
+                assert_eq!(status, StatusCode::OK);
+                let policy = response_headers["content-security-policy"]
+                    .to_str()
+                    .unwrap();
+                assert!(
+                    policy.contains("script-src 'self' 'wasm-unsafe-eval';"),
+                    "{path}: {policy}"
+                );
+                assert!(policy.contains("frame-ancestors 'none'"), "{path}");
+                assert_eq!(response_headers["x-content-type-options"], "nosniff");
+                assert!(!body.contains(" onclick="), "{path}");
+                assert_eq!(
+                    body.contains("<!DOCTYPE html>"),
+                    kind != "fragment",
+                    "{kind} {path}"
+                );
+                if path == "/entries" || path == "/payouts" {
+                    assert_eq!(response_headers["cache-control"], "private, no-store");
+                    assert!(body.contains("sign-in-required"));
+                }
+            }
+        }
+        test.stop().await;
+    }
 
     #[tokio::test]
     async fn public_router_serves_no_operator_route() {

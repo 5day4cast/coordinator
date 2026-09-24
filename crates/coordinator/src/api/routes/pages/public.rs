@@ -18,20 +18,24 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::oracle_view::{self, OracleEventView};
+use super::oracle_view;
 use crate::{
     api::extractors::NostrAuth,
     domain::{
-        scoring::{calculate_option_score, Forecast, Observation},
+        leaderboard::{self as scores, CompetitionWeather},
         Competition, SearchBy,
     },
     startup::AppState,
     templates::{
         format::short_npub,
         fragments::{
-            entry_form::{entry_form, payout_line, PayoutDestination, StationForecast},
-            leaderboard::{leaderboard, leaderboard_rows, shared_ranks, EntryScore, LeaderboardRow},
-            picks::{picks_detail, Metric, PickView, Readings},
+            entry_form::{
+                entry_form, forecast_choices, payout_line, PayoutDestination, StationForecast,
+            },
+            leaderboard::{
+                leaderboard, leaderboard_scores, LeaderboardRow, LeaderboardView, Provisional,
+            },
+            picks::{picks_detail, Metric, PickProgress, PickState, PickView, Readings},
         },
         layouts::base::{base, PageConfig},
         pages::{
@@ -59,7 +63,13 @@ enum Caching {
 }
 
 /// Content for htmx, or the whole page for a direct visit.
-fn page(headers: &HeaderMap, state: &AppState, title: &str, content: Markup, caching: Caching) -> Response {
+fn page(
+    headers: &HeaderMap,
+    state: &AppState,
+    title: &str,
+    content: Markup,
+    caching: Caching,
+) -> Response {
     let body = if is_fragment(headers) {
         // htmx takes the document title from a <title> in the response; only
         // navigations of the main content should change it.
@@ -85,7 +95,10 @@ fn page(headers: &HeaderMap, state: &AppState, title: &str, content: Markup, cac
     let mut response = Html(body).into_response();
     let headers = response.headers_mut();
     // The same address answers with a fragment or a page; caches must not mix them.
-    headers.insert(header::VARY, HeaderValue::from_static("HX-Request"));
+    headers.insert(
+        header::VARY,
+        HeaderValue::from_static("HX-Request, HX-History-Restore-Request, HX-Target"),
+    );
     headers.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static(match caching {
@@ -150,7 +163,9 @@ impl From<ListQuery> for ListOptions {
     fn from(query: ListQuery) -> Self {
         ListOptions {
             page: query.page.unwrap_or(0),
-            show_cancelled: query.cancelled.is_some_and(|value| value == "1" || value == "true"),
+            show_cancelled: query
+                .cancelled
+                .is_some_and(|value| value == "1" || value == "true"),
         }
     }
 }
@@ -173,7 +188,13 @@ pub async fn competitions_fragment(
     let now = now();
     let competitions = competition_views(&state, now).await;
     let content = competitions_page(&competitions, query.into(), now);
-    page(&headers, &state, "Fantasy Weather: call the weather, win the pot", content, Caching::Public)
+    page(
+        &headers,
+        &state,
+        "Fantasy Weather: call the weather, win the pot",
+        content,
+        Caching::Public,
+    )
 }
 
 /// Entries page (requires auth; signed-out visitors get the log-in prompt)
@@ -205,7 +226,13 @@ pub async fn entries_fragment(
         .iter()
         .filter(|competition| competition.can_enter)
         .min_by_key(|competition| competition.start);
-    page(&headers, &state, title, entries_page(&rows, open), Caching::Private)
+    page(
+        &headers,
+        &state,
+        title,
+        entries_page(&rows, open),
+        Caching::Private,
+    )
 }
 
 /// Payouts page (requires auth; signed-out visitors get the log-in prompt)
@@ -234,8 +261,20 @@ pub async fn payouts_fragment(
 
 /// An account page opened without a signature: a prompt that loads the page
 /// once the visitor logs in. htmx requests get 401, which it does not swap.
-fn signed_out(headers: &HeaderMap, state: &AppState, title: &str, path: &str, what: &str) -> Response {
-    let mut response = page(headers, state, title, sign_in_required(path, what), Caching::Private);
+fn signed_out(
+    headers: &HeaderMap,
+    state: &AppState,
+    title: &str,
+    path: &str,
+    what: &str,
+) -> Response {
+    let mut response = page(
+        headers,
+        state,
+        title,
+        sign_in_required(path, what),
+        Caching::Private,
+    );
     if is_fragment(headers) {
         *response.status_mut() = StatusCode::UNAUTHORIZED;
     }
@@ -269,7 +308,13 @@ fn not_found(headers: &HeaderMap, state: &AppState, what: &str) -> Response {
             }
         }
     };
-    let mut response = page(headers, state, "Not found - Fantasy Weather", content, Caching::Public);
+    let mut response = page(
+        headers,
+        state,
+        "Not found - Fantasy Weather",
+        content,
+        Caching::Public,
+    );
     if !is_fragment(headers) {
         *response.status_mut() = StatusCode::NOT_FOUND;
     }
@@ -279,7 +324,7 @@ fn not_found(headers: &HeaderMap, state: &AppState, what: &str) -> Response {
 /// Each station's forecasts as the oracle recorded them for this competition.
 fn station_forecasts(
     locations: &[String],
-    event: &OracleEventView,
+    weather: Option<&CompetitionWeather>,
     stations: &std::collections::HashMap<String, crate::templates::admin::dashboard::Station>,
 ) -> Vec<StationForecast> {
     locations
@@ -290,9 +335,8 @@ fn station_forecasts(
             forecasts: Metric::ALL
                 .iter()
                 .map(|metric| {
-                    let forecast = event
-                        .reading(station_id, metric.id())
-                        .and_then(|reading| reading.baseline);
+                    let forecast = weather
+                        .and_then(|weather| weather.forecast(station_id, score_metric(*metric)));
                     (*metric, forecast)
                 })
                 .collect(),
@@ -342,23 +386,85 @@ pub async fn entry_form_fragment(
         return leaderboard_response(&state, &headers, &view);
     }
     let locations = &competition.event_submission.locations;
-    let (event, stations, terms, destination) = tokio::join!(
-        oracle_view::event(&state.oracle_url, competition_id),
-        oracle_view::stations(&state.oracle_url),
+    let (weather, stations, terms, destination) = tokio::join!(
+        state.leaderboards.weather(&competition),
+        state.leaderboards.stations(),
         state.coordinator.payout_terms_quote(competition_id),
         payout_destination(&state, auth.as_ref()),
     );
     let terms = terms
         .inspect_err(|error| warn!("payout terms for {competition_id}: {error}"))
         .ok();
+    let stations = station_map(
+        stations
+            .as_ref()
+            .map(|stations| stations.value.as_slice())
+            .unwrap_or_default(),
+    );
     let content = entry_form(
         &view,
-        &station_forecasts(locations, &event, &stations),
+        &station_forecasts(
+            locations,
+            weather.as_ref().map(|weather| &weather.value),
+            &stations,
+        ),
         &station_pins(locations, &stations),
         terms.as_ref(),
         &destination,
     );
-    page(&headers, &state, "Enter - Fantasy Weather", content, Caching::Private)
+    page(
+        &headers,
+        &state,
+        "Enter - Fantasy Weather",
+        content,
+        Caching::Private,
+    )
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct RetryQuery {
+    attempt: Option<u8>,
+}
+
+/// Public forecasts can finish loading after a cold cache without asking the wallet to sign.
+pub async fn entry_forecasts_fragment(
+    State(state): State<Arc<AppState>>,
+    Path(competition_id): Path<Uuid>,
+    Query(query): Query<RetryQuery>,
+) -> Response {
+    let Ok(competition) = state.coordinator.get_competition(competition_id).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let content = if CompetitionView::new(&competition, now()).can_enter {
+        let (weather, stations) = tokio::join!(
+            state.leaderboards.weather(&competition),
+            state.leaderboards.stations()
+        );
+        let stations = station_map(
+            stations
+                .as_ref()
+                .map(|stations| stations.value.as_slice())
+                .unwrap_or_default(),
+        );
+        let locations = &competition.event_submission.locations;
+        forecast_choices(
+            &competition_id.to_string(),
+            &station_forecasts(
+                locations,
+                weather.as_ref().map(|weather| &weather.value),
+                &stations,
+            ),
+            &station_pins(locations, &stations),
+            query.attempt.unwrap_or(0),
+        )
+    } else {
+        html! { p class="notice" { "Entries have closed. " a href=(format!("/competitions/{competition_id}/leaderboard")) { "View the leaderboard" } } }
+    };
+    let mut response = Html(content.into_string()).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
 }
 
 /// The entry form's payout line, reloaded when the player logs in or out.
@@ -372,12 +478,18 @@ pub async fn entry_payout_fragment(
         payout_destination(&state, auth.as_ref()),
     );
     let mut response = Html(
-        payout_line(&competition_id.to_string(), terms.ok().as_ref(), &destination).into_string(),
+        payout_line(
+            &competition_id.to_string(),
+            terms.ok().as_ref(),
+            &destination,
+        )
+        .into_string(),
     )
     .into_response();
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
     response
 }
 
@@ -397,232 +509,233 @@ pub async fn leaderboard_fragment(
 
 fn leaderboard_response(state: &AppState, headers: &HeaderMap, view: &CompetitionView) -> Response {
     let content = leaderboard(view, now());
-    page(headers, state, "Leaderboard - Fantasy Weather", content, Caching::Public)
+    page(
+        headers,
+        state,
+        "Leaderboard - Fantasy Weather",
+        content,
+        Caching::Public,
+    )
 }
 
-/// The leaderboard's rows: loaded after the page, and every 30 s while live.
+/// The leaderboard's scores: loaded after the page, then every minute while
+/// the window is open.
 pub async fn leaderboard_rows_fragment(
     State(state): State<Arc<AppState>>,
     Path(competition_id): Path<Uuid>,
+    Query(query): Query<RetryQuery>,
 ) -> Response {
     let Ok(competition) = state.coordinator.get_competition(competition_id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let rows = leaderboard_view_rows(&state, &competition).await;
-    let mut response = Html(leaderboard_rows(&rows).into_string()).into_response();
+    let now = now();
+    let board = state.leaderboards.get(competition_id).await.ok();
+    if board.as_ref().is_none_or(|board| {
+        board.weather_fetched_at.is_none() && board.phase != scores::Phase::Upcoming
+    }) {
+        return pending_scores(
+            "leaderboardScores",
+            &format!("/competitions/{competition_id}/leaderboard/rows"),
+            query.attempt.unwrap_or(0),
+        );
+    }
+    let board = board.as_ref().map(leaderboard_view).unwrap_or_default();
+    let view = CompetitionView::new(&competition, now);
+    let mut response = Html(leaderboard_scores(&view, &board, now).into_string()).into_response();
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     response
 }
 
-/// The browser's tag for an account: marks "You" rows without publishing npubs.
+/// Initial cache fills retry briefly, including finished events. Once data arrives,
+/// only open windows poll. Failed fetches end in a visible manual retry.
+fn pending_scores_content(id: &str, url: &str, attempt: u8) -> Markup {
+    let retry = attempt < 4;
+    let next = format!("{url}?attempt={}", attempt.saturating_add(1));
+    html! {
+        div id=(id) hx-get=[retry.then_some(&next)] hx-trigger=[retry.then_some("load delay:1s")]
+            hx-target="this" hx-swap="outerHTML" hx-disinherit="*" {
+            p class="notice" role="status" {
+                @if retry { span class="spinner" aria-hidden="true" {} " Loading observations and scores…" }
+                @else {
+                    "Observations are temporarily unavailable. "
+                    button type="button" class="button is-small" hx-get=(url) hx-target=(format!("#{id}")) hx-swap="outerHTML" { "Retry" }
+                }
+            }
+        }
+    }
+}
+
+fn pending_scores(id: &str, url: &str, attempt: u8) -> Response {
+    let mut response = Html(pending_scores_content(id, url, attempt).into_string()).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
+}
+
+/// Adapt the cached domain result; rendering never performs its own scoring or oracle fetches.
+fn leaderboard_view(board: &scores::Leaderboard) -> LeaderboardView {
+    LeaderboardView {
+        rows: board
+            .rows
+            .iter()
+            .map(|row| {
+                let npub = nostr::PublicKey::from_hex(&row.player.pubkey)
+                    .ok()
+                    .map(|key| key.to_bech32().unwrap_or_else(|never| match never {}));
+                let name = row.player.name.trim();
+                let fallback = name.is_empty()
+                    || (name.len() <= 16 && name.chars().all(|c| c.is_ascii_hexdigit()));
+                LeaderboardRow {
+                    rank: row.standing.rank,
+                    entry_id: row.entry_id.to_string(),
+                    player: if fallback {
+                        npub.as_deref()
+                            .map(short_npub)
+                            .unwrap_or_else(|| "Player".into())
+                    } else {
+                        name.into()
+                    },
+                    owner: npub.as_deref().map(owner_tag).unwrap_or_default(),
+                    score: i32::try_from(row.standing.score).unwrap_or(i32::MAX),
+                }
+            })
+            .collect(),
+        provisional: (board.provisional && board.phase != scores::Phase::Upcoming).then_some(
+            Provisional {
+                updated_at: board.observed_until.or(board.weather_fetched_at),
+            },
+        ),
+    }
+}
+
+/// Public, like the leaderboard; ownership is highlighted locally without a signature.
 pub fn owner_tag(npub: &str) -> String {
     hex::encode(Sha256::digest(npub.as_bytes()))[..16].to_owned()
 }
 
-/// Scores from `fetch_leaderboard_scores`, with shared ranks and player names.
-async fn leaderboard_view_rows(state: &AppState, competition: &Competition) -> Vec<LeaderboardRow> {
-    let (scores, entries) = tokio::join!(
-        fetch_leaderboard_scores(state, competition.id),
-        state
-            .coordinator
-            .competition_store
-            .get_competition_entries(competition.id, vec![])
-    );
-    let entries = entries.unwrap_or_default();
-    let ranks = shared_ranks(&scores.iter().map(|score| score.score).collect::<Vec<_>>());
-    scores
+fn station_map(
+    stations: &[crate::templates::admin::dashboard::Station],
+) -> std::collections::HashMap<String, crate::templates::admin::dashboard::Station> {
+    stations
         .iter()
-        .zip(ranks)
-        .map(|(score, rank)| {
-            let npub = entries
-                .iter()
-                .find(|entry| entry.id.to_string() == score.entry_id)
-                .and_then(|entry| nostr::PublicKey::from_hex(&entry.pubkey).ok())
-                .map(|pubkey| pubkey.to_bech32().unwrap_or_else(|never| match never {}));
-            LeaderboardRow {
-                rank,
-                entry_id: score.entry_id.clone(),
-                player: player_name(score, npub.as_deref()),
-                owner: npub.as_deref().map(owner_tag).unwrap_or_default(),
-                score: score.score,
-            }
-        })
+        .map(|station| (station.station_id.clone(), station.clone()))
         .collect()
 }
 
-/// The player's username, or a short npub for accounts without one.
-fn player_name(score: &EntryScore, npub: Option<&str>) -> String {
-    let username = score.username.trim();
-    // Without a username the scores carry a hex fragment of the pubkey.
-    let is_hex_fragment = username.len() == 8 && username.chars().all(|c| c.is_ascii_hexdigit());
-    match (username.is_empty() || is_hex_fragment, npub) {
-        (false, _) => username.to_owned(),
-        (true, Some(npub)) => short_npub(npub),
-        (true, None) => "Player".to_owned(),
+fn score_metric(metric: Metric) -> scores::Metric {
+    match metric {
+        Metric::TempHigh => scores::Metric::TempHigh,
+        Metric::TempLow => scores::Metric::TempLow,
+        Metric::WindSpeed => scores::Metric::WindSpeed,
     }
 }
 
-/// An entry's picks with the oracle's forecasts and readings (for the dialog)
+/// Picks are public after entries close. The domain seam withholds them beforehand.
 pub async fn entry_detail_fragment(
     State(state): State<Arc<AppState>>,
     Path(entry_id): Path<Uuid>,
+    Query(query): Query<RetryQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let entry = state.coordinator.get_entry_by_id(entry_id).await.ok().flatten();
-    let Some(entry) = entry else {
+    let Some(entry) = state
+        .coordinator
+        .get_entry_by_id(entry_id)
+        .await
+        .ok()
+        .flatten()
+    else {
         return not_found(&headers, &state, "Entry");
     };
-    let (competition, event, stations) = tokio::join!(
-        state.coordinator.get_competition(entry.event_id),
-        oracle_view::event(&state.oracle_url, entry.event_id),
-        oracle_view::stations(&state.oracle_url),
+    let (board, stations) = tokio::join!(
+        state.leaderboards.get(entry.event_id),
+        state.leaderboards.stations(),
     );
-    let readings = match competition.map(|competition| Phase::of(&competition, now())) {
-        Ok(Phase::Finished | Phase::Cancelled | Phase::Failed) => Readings::Final,
-        _ => Readings::Expected,
+    let Ok(board) = board else {
+        return not_found(&headers, &state, "Competition");
     };
-    let picks: Vec<PickView> = entry
-        .entry_submission
-        .expected_observations
+    if board.weather_fetched_at.is_none() && board.phase != scores::Phase::Upcoming {
+        let content = pending_scores_content(
+            "entryPickScores",
+            &format!("/entries/{entry_id}/detail"),
+            query.attempt.unwrap_or(0),
+        );
+        return page(
+            &headers,
+            &state,
+            "Picks - Fantasy Weather",
+            content,
+            Caching::Public,
+        );
+    }
+    let readings = match board.phase {
+        scores::Phase::Upcoming => Readings::NotStarted,
+        scores::Phase::Live => Readings::Live {
+            updated_at: board.observed_until.or(board.weather_fetched_at),
+        },
+        scores::Phase::Closed => Readings::Closed,
+        scores::Phase::Scored => Readings::Final,
+    };
+    let stations = station_map(
+        stations
+            .as_ref()
+            .map(|stations| stations.value.as_slice())
+            .unwrap_or_default(),
+    );
+    let picks = board
+        .rows
         .iter()
-        .flat_map(|choice| {
-            let station = &choice.stations;
-            let station_name = oracle_view::station_name(&stations, station);
-            [
-                (Metric::TempHigh, &choice.temp_high),
-                (Metric::TempLow, &choice.temp_low),
-                (Metric::WindSpeed, &choice.wind_speed),
-            ]
-            .into_iter()
-            .filter_map(|(metric, pick)| {
-                let pick = pick.as_ref()?;
-                let reading = event.reading(station, metric.id());
-                Some(PickView {
-                    station_id: station.clone(),
-                    station_name: station_name.clone(),
-                    metric,
-                    pick: pick.clone(),
-                    forecast: reading.and_then(|reading| reading.baseline),
-                    observed: reading.and_then(|reading| reading.observed),
-                })
-            })
-            .collect::<Vec<_>>()
+        .find(|row| row.entry_id == entry_id)
+        .map(|row| {
+            row.picks
+                .iter()
+                .map(|pick| pick_view(pick, &stations, board.phase == scores::Phase::Live))
+                .collect::<Vec<_>>()
         })
-        .collect();
-    let content = picks_detail(&entry_id.to_string(), &picks, readings);
-    page(&headers, &state, "Picks - Fantasy Weather", content, Caching::Public)
+        .unwrap_or_default();
+    page(
+        &headers,
+        &state,
+        "Picks - Fantasy Weather",
+        picks_detail(&entry_id.to_string(), &picks, readings, now()),
+        Caching::Public,
+    )
 }
 
-/// Fetch forecasts for entry score calculation
-async fn fetch_entry_forecasts(
-    oracle_url: &str,
-    station_ids: &[&str],
-    start: time::OffsetDateTime,
-    end: time::OffsetDateTime,
-) -> Result<Vec<Forecast>, anyhow::Error> {
-    if station_ids.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let client = reqwest_middleware::reqwest::Client::new();
-
-    let start_str = start
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default();
-    let end_str = end
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default();
-
-    let station_ids_param = station_ids.join(",");
-
-    let response = client
-        .get(format!(
-            "{}/stations/forecasts?station_ids={}&start={}&end={}",
-            oracle_url, station_ids_param, start_str, end_str
-        ))
-        .send()
-        .await?;
-
-    if response.status().is_success() {
-        // The oracle returns forecasts with temp_high/temp_low as integers
-        #[derive(serde::Deserialize)]
-        struct RawForecast {
-            station_id: String,
-            temp_high: i64,
-            temp_low: i64,
-            #[serde(default)]
-            wind_speed: Option<f64>,
-        }
-
-        let raw_forecasts: Vec<RawForecast> = response.json().await?;
-        Ok(raw_forecasts
-            .into_iter()
-            .map(|f| Forecast {
-                station_id: f.station_id,
-                temp_high: Some(f.temp_high as f64),
-                temp_low: Some(f.temp_low as f64),
-                wind_speed: f.wind_speed,
-            })
-            .collect())
-    } else {
-        Ok(vec![])
-    }
-}
-
-/// Fetch observations for entry score calculation
-async fn fetch_entry_observations(
-    oracle_url: &str,
-    station_ids: &[&str],
-    start: time::OffsetDateTime,
-    end: time::OffsetDateTime,
-) -> Result<Vec<Observation>, anyhow::Error> {
-    if station_ids.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let client = reqwest_middleware::reqwest::Client::new();
-
-    let start_str = start
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default();
-    let end_str = end
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default();
-
-    let station_ids_param = station_ids.join(",");
-
-    let response = client
-        .get(format!(
-            "{}/stations/observations?station_ids={}&start={}&end={}",
-            oracle_url, station_ids_param, start_str, end_str
-        ))
-        .send()
-        .await?;
-
-    if response.status().is_success() {
-        #[derive(serde::Deserialize)]
-        struct RawObservation {
-            station_id: String,
-            temp_high: f64,
-            temp_low: f64,
-            #[serde(default)]
-            wind_speed: Option<f64>,
-        }
-
-        let raw_observations: Vec<RawObservation> = response.json().await?;
-        Ok(raw_observations
-            .into_iter()
-            .map(|o| Observation {
-                station_id: o.station_id,
-                temp_high: Some(o.temp_high),
-                temp_low: Some(o.temp_low),
-                wind_speed: o.wind_speed,
-            })
-            .collect())
-    } else {
-        Ok(vec![])
+fn pick_view(
+    pick: &scores::PickProgress,
+    stations: &std::collections::HashMap<String, crate::templates::admin::dashboard::Station>,
+    live: bool,
+) -> PickView {
+    let metric = match pick.metric {
+        scores::Metric::TempHigh => Metric::TempHigh,
+        scores::Metric::TempLow => Metric::TempLow,
+        scores::Metric::WindSpeed => Metric::WindSpeed,
+    };
+    PickView {
+        station_id: pick.station_id.clone(),
+        station_name: oracle_view::station_name(stations, &pick.station_id),
+        metric,
+        pick: pick.pick.clone(),
+        forecast: pick.forecast,
+        score: u32::try_from(pick.points).unwrap_or(u32::MAX),
+        hit: pick.hit,
+        observed: if live { None } else { pick.observed },
+        progress: live.then_some(PickProgress {
+            observed_so_far: pick.observed,
+            hours_covered: pick.hours_covered.floor() as u32,
+            hours_total: pick.hours_total.ceil() as u32,
+            state: match pick.state {
+                scores::PickState::Pending => PickState::Pending,
+                scores::PickState::LockedIn => PickState::LockedIn,
+                scores::PickState::OnTrack => PickState::OnTrack,
+                scores::PickState::OffTrack => PickState::OffTrack,
+                scores::PickState::Out => PickState::Out,
+                scores::PickState::Final => PickState::Final,
+            },
+        }),
     }
 }
 
@@ -776,198 +889,4 @@ fn calculate_entry_payout(competition: &Competition, ephemeral_pubkey_hex: &str)
 
     let total_pool_sats = contract_params.funding_value.to_sat();
     Some((total_pool_sats * player_weight) / 100)
-}
-
-/// Oracle event response containing entries with scores
-#[derive(Debug, Clone, serde::Deserialize)]
-struct OracleEvent {
-    entries: Vec<OracleEntry>,
-}
-
-/// Oracle entry with score
-#[derive(Debug, Clone, serde::Deserialize)]
-struct OracleEntry {
-    id: Uuid,
-    score: Option<i64>,
-}
-
-async fn fetch_leaderboard_scores(state: &AppState, competition_id: Uuid) -> Vec<EntryScore> {
-    // Fetch event from oracle to get entries with scores (used for sort order via final_score)
-    let oracle_entries = fetch_oracle_event_entries(&state.oracle_url, competition_id).await;
-
-    if oracle_entries.is_empty() {
-        return vec![];
-    }
-
-    // Fetch competition weather data once for raw score calculation
-    let competition = state.coordinator.get_competition(competition_id).await.ok();
-    let weather = if let Some(ref comp) = competition {
-        let station_ids: Vec<&str> = comp
-            .event_submission
-            .locations
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        if !station_ids.is_empty() {
-            let (forecasts, observations) = tokio::join!(
-                fetch_entry_forecasts(
-                    &state.oracle_url,
-                    &station_ids,
-                    comp.event_submission.start_observation_date,
-                    comp.event_submission.end_observation_date
-                ),
-                fetch_entry_observations(
-                    &state.oracle_url,
-                    &station_ids,
-                    comp.event_submission.start_observation_date,
-                    comp.event_submission.end_observation_date
-                )
-            );
-            let forecast_map: std::collections::HashMap<String, Forecast> = forecasts
-                .ok()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|f| (f.station_id.clone(), f))
-                .collect();
-            let observation_map: std::collections::HashMap<String, Observation> = observations
-                .ok()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|o| (o.station_id.clone(), o))
-                .collect();
-            Some((forecast_map, observation_map))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let local_entries = state
-        .coordinator
-        .competition_store
-        .get_competition_entries(competition_id, vec![])
-        .await
-        .unwrap_or_default();
-    let entries_by_oracle_id: std::collections::HashMap<_, _> = local_entries
-        .iter()
-        .map(|entry| (entry.entry_submission.id, entry))
-        .collect();
-
-    // Build index of oracle scores for sort order (final_score with tiebreaker)
-    let oracle_score_map: std::collections::HashMap<Uuid, i64> = oracle_entries
-        .iter()
-        .map(|e| {
-            (
-                entries_by_oracle_id
-                    .get(&e.id)
-                    .map_or(e.id, |entry| entry.id),
-                e.score.unwrap_or(0),
-            )
-        })
-        .collect();
-
-    // Convert to EntryScore, computing raw scores from picks + weather data
-    let mut scores: Vec<EntryScore> = Vec::with_capacity(oracle_entries.len());
-
-    for oracle_entry in &oracle_entries {
-        let mut entry_score = EntryScore {
-            rank: 0,
-            entry_id: entries_by_oracle_id
-                .get(&oracle_entry.id)
-                .map_or(oracle_entry.id, |entry| entry.id)
-                .to_string(),
-            username: String::new(),
-            score: 0,
-        };
-
-        // Fetch entry details for username and raw score calculation
-        if let Some(entry) = entries_by_oracle_id.get(&oracle_entry.id) {
-            // Look up username
-            if let Ok(pubkey) = nostr::PublicKey::from_hex(&entry.pubkey) {
-                let bech32 = pubkey.to_bech32().unwrap_or_else(|never| match never {});
-                if let Ok(Some(name)) = state.users_info.get_username_by_pubkey(&bech32).await {
-                    entry_score.username = name;
-                } else {
-                    entry_score.username = entry.pubkey[..8].to_string();
-                }
-            }
-
-            // Compute raw score from picks + weather data
-            if let Some((ref forecast_map, ref observation_map)) = weather {
-                let mut raw_score = 0i32;
-                for obs in &entry.entry_submission.expected_observations {
-                    let forecast = forecast_map.get(&obs.stations);
-                    let observation = observation_map.get(&obs.stations);
-
-                    if let Some(pick) = &obs.temp_high {
-                        raw_score += calculate_option_score(
-                            forecast.and_then(|f| f.temp_high),
-                            observation.and_then(|o| o.temp_high),
-                            pick,
-                        );
-                    }
-                    if let Some(pick) = &obs.temp_low {
-                        raw_score += calculate_option_score(
-                            forecast.and_then(|f| f.temp_low),
-                            observation.and_then(|o| o.temp_low),
-                            pick,
-                        );
-                    }
-                    if let Some(pick) = &obs.wind_speed {
-                        raw_score += calculate_option_score(
-                            forecast.and_then(|f| f.wind_speed),
-                            observation.and_then(|o| o.wind_speed),
-                            pick,
-                        );
-                    }
-                }
-                entry_score.score = raw_score;
-            }
-        }
-
-        scores.push(entry_score);
-    }
-
-    // Sort by oracle final_score (handles tiebreaking), but display raw_score
-    scores.sort_by(|a, b| {
-        let a_oracle = oracle_score_map
-            .get(&Uuid::parse_str(&a.entry_id).unwrap_or_default())
-            .unwrap_or(&0);
-        let b_oracle = oracle_score_map
-            .get(&Uuid::parse_str(&b.entry_id).unwrap_or_default())
-            .unwrap_or(&0);
-        b_oracle
-            .cmp(a_oracle)
-            .then_with(|| a.entry_id.cmp(&b.entry_id))
-    });
-
-    // Assign ranks after sorting
-    for (idx, score) in scores.iter_mut().enumerate() {
-        score.rank = idx + 1;
-    }
-
-    scores
-}
-
-async fn fetch_oracle_event_entries(oracle_url: &str, event_id: Uuid) -> Vec<OracleEntry> {
-    let client = reqwest_middleware::reqwest::Client::new();
-
-    let response = match client
-        .get(format!("{}/oracle/events/{}", oracle_url, event_id))
-        .send()
-        .await
-    {
-        Ok(resp) => resp,
-        Err(_) => return vec![],
-    };
-
-    if response.status().is_success() {
-        match response.json::<OracleEvent>().await {
-            Ok(event) => event.entries,
-            Err(_) => vec![],
-        }
-    } else {
-        vec![]
-    }
 }

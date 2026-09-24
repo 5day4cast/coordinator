@@ -6,6 +6,7 @@ use time::OffsetDateTime;
 use crate::domain::UserEntryView;
 use crate::templates::{
     format,
+    fragments::picks::detail_url,
     pages::competitions::{phase_badge, CompetitionView},
 };
 
@@ -47,13 +48,14 @@ pub fn entries_page(rows: &[EntryRow], open: Option<&CompetitionView>) -> Markup
     }
 }
 
+/// A click anywhere on the row opens the entry's picks. The copy button stops
+/// its own click (see page.js), the Picks button's click reaches the row, and
+/// the Leaderboard link consumes its click so the row does not see it.
 fn entry_row(row: &EntryRow) -> Markup {
-    let picks = format!("/entries/{}/detail", row.entry.entry_id);
+    let picks = detail_url(&row.entry.entry_id);
     let leaderboard = format!("/competitions/{}/leaderboard", row.entry.competition_id);
     html! {
-        // Links inside the row do their own thing; a click elsewhere opens the picks.
-        tr class="is-clickable" hx-get=(picks) hx-target="#entryValues" hx-swap="innerHTML"
-           hx-trigger="click[!target.closest('a, button')]" {
+        tr class="is-clickable" hx-get=(picks) hx-target="#entryValues" hx-swap="innerHTML" {
             td data-label="Competition" {
                 @match row.competition {
                     Some(competition) => { (format::window(competition.start, competition.end)) }
@@ -66,8 +68,9 @@ fn entry_row(row: &EntryRow) -> Markup {
             td data-label="Entry" { (format::copyable_id(&row.entry.entry_id)) }
             td data-label="Payment" { (row.entry.status) }
             td class="has-text-right entry-links" {
-                a href=(picks) hx-get=(picks) hx-target="#entryValues" hx-swap="innerHTML" { "Picks" }
-                a href=(leaderboard) hx-get=(leaderboard) hx-target="#main-content" hx-push-url="true" { "Leaderboard" }
+                button type="button" class="button is-small is-text picks-button" { "Picks" }
+                a href=(leaderboard) hx-get=(leaderboard) hx-trigger="click consume"
+                  hx-target="#main-content" hx-push-url="true" { "Leaderboard" }
             }
         }
     }
@@ -97,11 +100,12 @@ pub fn no_entries(open: Option<&CompetitionView>) -> Markup {
 
 /// What a signed-out visitor sees at an account page's address. The key lives
 /// only in this tab's memory, so a reload always lands here; logging in loads
-/// the page in place.
+/// the page in place. So does Back while logged in (`fw:reload`, see
+/// htmx_auth.js), since htmx asks the server again without a signature.
 pub fn sign_in_required(path: &str, what: &str) -> Markup {
     html! {
-        div class="account-page sign-in-required"
-            hx-get=(path) hx-trigger="fw:login from:body" hx-target="this" hx-swap="outerHTML"
+        div class="account-page sign-in-required" data-signed-reload
+            hx-get=(path) hx-trigger="fw:login from:body, fw:reload" hx-target="this" hx-swap="outerHTML"
             hx-disinherit="*" {
             h1 class="title is-4" { "Log in to see " (what) }
             p {
@@ -148,6 +152,8 @@ mod tests {
         .into_string();
         assert!(html.contains(r#"hx-get="/entries/01a0d0f5-52e1-7141-b4e1-8dbd7169fc2e/detail""#));
         assert!(html.contains(r#"href="/competitions/c1/leaderboard""#));
+        assert!(html.contains(r#"hx-trigger="click consume""#));
+        assert!(!html.contains("closest"), "trigger filters need eval, which the CSP forbids");
         assert!(html.contains("…7169fc2e"));
         assert!(html.contains("badge-live"));
     }
@@ -166,6 +172,6 @@ mod tests {
         let html = sign_in_required("/entries", "your entries").into_string();
         assert!(html.contains("reloading the page or opening a new tab signs you out"));
         assert!(html.contains(r#"data-open-modal="loginModal""#));
-        assert!(html.contains(r#"hx-trigger="fw:login from:body""#));
+        assert!(html.contains(r#"hx-trigger="fw:login from:body, fw:reload""#));
     }
 }

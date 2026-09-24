@@ -12,6 +12,13 @@
   font-size: 1.25rem;
   font-weight: 700;
   white-space: nowrap;
+  text-align: right;
+}
+
+.provisional-note {
+  font-size: 0.85rem;
+  color: var(--bulma-text-weak);
+  margin-bottom: 0.75rem;
 }
 
 .entry-pending-msg {
@@ -29,7 +36,7 @@
 
 .scored-pick {
   display: grid;
-  grid-template-columns: 9rem 1fr 4rem 3.5rem;
+  grid-template-columns: 9rem 1fr 4rem 5.5rem;
   gap: 0.5rem;
   align-items: center;
   padding: 0.35rem 0.5rem;
@@ -64,6 +71,56 @@
 
 .is-miss .pick-result {
   color: var(--bulma-text-weak);
+}
+
+/* While the window is open: how each pick stands on the readings so far.
+   Settled states (locked in, out) are filled; open ones are outlined. */
+.scored-pick.is-locked-in {
+  background: hsla(141, 53%, 42%, 0.12);
+}
+
+.scored-pick.is-out {
+  background: var(--bulma-scheme-main-bis);
+}
+
+.pick-state {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.pick-state.is-locked-in {
+  background: hsla(141, 53%, 42%, 0.18);
+  color: hsl(141, 53%, 30%);
+}
+
+.pick-state.is-on-track {
+  border-color: hsla(141, 53%, 42%, 0.55);
+  color: hsl(141, 53%, 32%);
+}
+
+.pick-state.is-off-track {
+  border-color: hsla(36, 80%, 45%, 0.55);
+  color: hsl(33, 70%, 36%);
+}
+
+.pick-state.is-out,
+.pick-state.is-final {
+  background: var(--bulma-scheme-main-ter);
+  color: var(--bulma-text-weak);
+}
+
+[data-theme="dark"] .pick-state.is-locked-in,
+[data-theme="dark"] .pick-state.is-on-track {
+  color: hsl(141, 50%, 62%);
+}
+
+[data-theme="dark"] .pick-state.is-off-track {
+  color: hsl(38, 80%, 62%);
 }
 
 @media screen and (max-width: 600px) {

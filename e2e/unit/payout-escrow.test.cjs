@@ -10,10 +10,13 @@ const SCRIPTS = {
   payouts: "pages/payouts/payouts.js",
 };
 
+// The bundle shares the wallet session between its scripts (see
+// shared/wasm.js); a test hands it in with the page's window.
 function load(name, window) {
+  const session = { wasm: window, nostrClient: window.nostrClient ?? null, dlcWallet: window.dlcWallet ?? null };
   vm.runInNewContext(readFileSync(path.join(__dirname,
     `../../crates/coordinator/src/templates/${SCRIPTS[name]}`), "utf8"),
-  { window, crypto: webcrypto, TextEncoder, console });
+  { window, session, crypto: webcrypto, TextEncoder, console });
   return window;
 }
 

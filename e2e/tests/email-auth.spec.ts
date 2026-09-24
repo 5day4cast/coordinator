@@ -320,22 +320,23 @@ test.describe("Username/Password Authentication", () => {
     await logout(page);
 
     await page.goto("/");
-    // The wallet loads on demand (normally when a log-in dialog opens).
-    await page.evaluate(() => window.initWasm());
 
+    // The page keeps its signer out of reach of other scripts, so this test
+    // loads the WASM package itself and signs with the recovered nsec.
     const loginSuccess = await page.evaluate(async (nsec) => {
       try {
-        await window.nostrClient.initialize(window.SignerType.PrivateKey, nsec);
+        const version = document.body.dataset.wasmVersion;
+        const wasm = await import(`/ui/pkg/coordinator_wasm.js?v=${version}`);
+        await wasm.default({ module_or_path: `/ui/pkg/coordinator_wasm_bg.wasm?v=${version}` });
+        const client = new wasm.NostrClientWrapper();
+        await client.initialize(wasm.SignerType.PrivateKey, nsec);
 
         const apiBase = document.body.dataset.apiBase;
-        const authorizedClient = new window.AuthorizedClient(
-          window.nostrClient,
-          apiBase,
-        );
-
-        const response = await authorizedClient.post(
-          `${apiBase}/api/v1/users/login`,
-        );
+        const url = `${apiBase}/api/v1/users/login`;
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { Authorization: await client.getAuthHeader(url, "POST", null) },
+        });
 
         if (!response.ok) {
           return { success: false, status: response.status };

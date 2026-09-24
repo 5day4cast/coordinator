@@ -95,6 +95,8 @@ lightning-invoice.workspace = true
 # Misc
 # Gzips the WASM package once instead of on every download.
 flate2 = "1.1"
+# Draws the ticket invoice's QR code, so the page loads no QR script.
+qrcodegen = "1.8"
 sha2 = "0.10"
 mime.workspace = true
 openssl.workspace = true

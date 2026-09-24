@@ -248,7 +248,7 @@ class AuthManager {
 
     // The password stays in the browser: the server only sees the derived
     // auth key, and the nsec is unsealed inside WASM.
-    const credentials = window.LoginCredentials.derive(username, password);
+    const credentials = session.wasm.LoginCredentials.derive(username, password);
     try {
       const response = await fetch(
         `${this.apiBase}/api/v1/users/username/login`,
@@ -278,13 +278,13 @@ class AuthManager {
         );
       }
 
-      window.nostrClient.unlockWithLogin(credentials, encrypted_nsec);
+      session.nostrClient.unlockWithLogin(credentials, encrypted_nsec);
       this.authorizedClient = new window.AuthorizedClient(
-        window.nostrClient,
+        session.nostrClient,
         this.apiBase,
       );
-      window.dlcWallet = await window.DlcWallet.load(
-        window.nostrClient,
+      session.dlcWallet = await session.wasm.DlcWallet.load(
+        session.nostrClient,
         network,
         encrypted_bitcoin_private_key,
       );
@@ -310,9 +310,9 @@ class AuthManager {
     if (!(await this.walletReady(errorElement))) return;
 
     try {
-      await window.nostrClient.initialize(window.SignerType.NIP07, null);
+      await session.nostrClient.initialize(session.wasm.SignerType.NIP07, null);
       this.authorizedClient = new window.AuthorizedClient(
-        window.nostrClient,
+        session.nostrClient,
         this.apiBase,
       );
       await this.performLogin();
@@ -379,18 +379,18 @@ class AuthManager {
     if (!(await this.walletReady(errorElement))) return;
     let credentials = null;
     try {
-      window.nostrClient.initialize(window.SignerType.PrivateKey, null);
-      credentials = window.LoginCredentials.derive(username, password);
+      session.nostrClient.initialize(session.wasm.SignerType.PrivateKey, null);
+      credentials = session.wasm.LoginCredentials.derive(username, password);
 
       this.pendingRegistration = {
         username,
         lightningAddress,
         authKey: credentials.authKey,
-        sealedNsec: window.nostrClient.sealForLogin(credentials),
+        sealedNsec: session.nostrClient.sealForLogin(credentials),
       };
 
       const display = document.getElementById("usernameNsecDisplay");
-      if (display) display.value = window.nostrClient.recoveryKey();
+      if (display) display.value = session.nostrClient.recoveryKey();
 
       document
         .getElementById("usernameRegisterStep1")
@@ -421,11 +421,11 @@ class AuthManager {
 
     try {
       this.authorizedClient = new window.AuthorizedClient(
-        window.nostrClient,
+        session.nostrClient,
         this.apiBase,
       );
 
-      const wallet = window.DlcWallet.create(window.nostrClient, this.network);
+      const wallet = session.wasm.DlcWallet.create(session.nostrClient, this.network);
       const { encrypted_bitcoin_private_key } = await wallet.encryptedBackup();
 
       // Signed with the new Nostr key: the server takes the account pubkey
@@ -492,9 +492,9 @@ class AuthManager {
     if (!(await this.walletReady(errorElement))) return;
 
     try {
-      await window.nostrClient.initialize(window.SignerType.NIP07, null);
+      await session.nostrClient.initialize(session.wasm.SignerType.NIP07, null);
       this.authorizedClient = new window.AuthorizedClient(
-        window.nostrClient,
+        session.nostrClient,
         this.apiBase,
       );
       await this.performRegistration(lightningAddress);
@@ -607,19 +607,19 @@ class AuthManager {
     if (!(await this.walletReady(errorElement))) return;
 
     try {
-      window.nostrClient.initialize(window.SignerType.PrivateKey, nsec);
+      session.nostrClient.initialize(session.wasm.SignerType.PrivateKey, nsec);
       if (nsecInput) nsecInput.value = "";
-      const derivedNpub = await window.nostrClient.getPublicKey();
+      const derivedNpub = await session.nostrClient.getPublicKey();
 
       if (derivedNpub !== this.forgotNpub) {
-        window.nostrClient = new window.NostrClientWrapper();
+        session.nostrClient = new session.wasm.NostrClientWrapper();
         if (errorElement)
           errorElement.textContent =
             "This recovery key does not match the account";
         return;
       }
 
-      this.forgotSignedChallenge = await window.nostrClient.signChallenge(
+      this.forgotSignedChallenge = await session.nostrClient.signChallenge(
         this.forgotChallenge,
       );
 
@@ -664,14 +664,14 @@ class AuthManager {
       return;
     }
 
-    const credentials = window.LoginCredentials.derive(
+    const credentials = session.wasm.LoginCredentials.derive(
       this.forgotUsername,
       newPassword,
     );
     try {
       // Bind the replacement credentials to the recovered account key. The
       // challenge signature alone does not authenticate the replacement body.
-      const resetClient = new window.AuthorizedClient(window.nostrClient, this.apiBase);
+      const resetClient = new window.AuthorizedClient(session.nostrClient, this.apiBase);
       await resetClient.post(
         `${this.apiBase}/api/v1/users/username/reset-password`,
         {
@@ -679,7 +679,7 @@ class AuthManager {
           challenge: this.forgotChallenge,
           signed_event: this.forgotSignedChallenge,
           new_auth_key: credentials.authKey,
-          new_encrypted_nsec: window.nostrClient.sealForLogin(credentials),
+          new_encrypted_nsec: session.nostrClient.sealForLogin(credentials),
         },
       );
 
@@ -688,7 +688,7 @@ class AuthManager {
       this.forgotUsername = null;
       this.forgotSignedChallenge = null;
       // The recovery key only proved ownership; log in again with the new password.
-      window.nostrClient = new window.NostrClientWrapper();
+      session.nostrClient = new session.wasm.NostrClientWrapper();
 
       window.closeModal(document.getElementById("forgotPasswordModal"));
       resetLoginModal();
@@ -711,7 +711,7 @@ class AuthManager {
   }
 
   async performRegistration(lightningAddress) {
-    const wallet = window.DlcWallet.create(window.nostrClient, this.network);
+    const wallet = session.wasm.DlcWallet.create(session.nostrClient, this.network);
     try {
       const payload = await wallet.encryptedBackup();
       const response = await this.authorizedClient.post(
@@ -746,8 +746,8 @@ class AuthManager {
       );
     }
 
-    window.dlcWallet = await window.DlcWallet.load(
-      window.nostrClient,
+    session.dlcWallet = await session.wasm.DlcWallet.load(
+      session.nostrClient,
       network,
       encrypted_bitcoin_private_key,
     );
@@ -755,10 +755,10 @@ class AuthManager {
 
   handleLogout() {
     // free() drops the WASM objects, which erases the keys they hold.
-    window.dlcWallet?.free();
-    window.dlcWallet = null;
-    window.nostrClient?.free();
-    window.nostrClient = new window.NostrClientWrapper();
+    session.dlcWallet?.free();
+    session.dlcWallet = null;
+    session.nostrClient?.free();
+    session.nostrClient = new session.wasm.NostrClientWrapper();
 
     document.getElementById("authButtons")?.classList.remove("is-hidden");
     document.getElementById("logoutContainer")?.classList.add("is-hidden");
@@ -782,7 +782,7 @@ class AuthManager {
     // Pages waiting on a login (account pages, the entry form's payout
     // line) reload themselves on this event, now signed.
     document.body.dispatchEvent(new CustomEvent("fw:login"));
-    window.nostrClient
+    session.nostrClient
       ?.getPublicKey?.()
       .then((npub) => window.setOwnerTag?.(npub))
       .catch(() => {});

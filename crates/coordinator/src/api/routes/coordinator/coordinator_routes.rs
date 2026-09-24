@@ -10,7 +10,7 @@ use dlctix::{
 };
 use log::{debug, error};
 use nostr::ToBech32;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -27,6 +27,7 @@ use crate::{
     },
     infra::lnurl::LightningAddress,
     startup::AppState,
+    templates::qr,
 };
 
 // Private route not exposed publically so NostrAuth is not needed
@@ -81,6 +82,16 @@ pub struct TicketRequest {
 /// - The HODL invoice (revealed to user when coordinator settles the invoice)
 /// - The ticket secret (to claim winnings if user wins the DLC)
 /// - The escrow transaction refund path (to claim refund if needed)
+/// A ticket with its invoice's QR code, which the entry form shows as an
+/// image instead of loading a QR script.
+#[derive(Debug, Serialize)]
+pub struct TicketWithQr {
+    #[serde(flatten)]
+    pub ticket: TicketResponse,
+    /// `data:image/svg+xml` URL of the invoice's QR code.
+    pub payment_request_qr: Option<String>,
+}
+
 pub async fn request_competition_ticket(
     State(state): State<Arc<AppState>>,
     Path(competition_id): Path<Uuid>,
@@ -88,21 +99,26 @@ pub async fn request_competition_ticket(
         auth: NostrAuth { pubkey, .. },
         body: request,
     }: AuthedJson<TicketRequest>,
-) -> Result<Json<TicketResponse>, ApiError> {
+) -> Result<Json<TicketWithQr>, ApiError> {
     let btc_pubkey = PublicKey::from_str(&request.btc_pubkey).map_err(|e| {
         error!("Invalid Bitcoin public key: {:?}", e);
         ApiError::Status(StatusCode::BAD_REQUEST)
     })?;
 
-    state
+    let ticket = state
         .coordinator
         .request_ticket_with_payout(pubkey.to_hex(), competition_id, btc_pubkey, request.payout)
         .await
-        .map(Json)
         .map_err(|e| {
             error!("error requesting ticket: {:?}", e);
-            e.into()
-        })
+            ApiError::from(e)
+        })?;
+    let payment_request_qr = qr::lightning_invoice_svg(&ticket.payment_request)
+        .map(|svg| qr::svg_data_url(&svg));
+    Ok(Json(TicketWithQr {
+        ticket,
+        payment_request_qr,
+    }))
 }
 
 pub async fn get_ticket_status(

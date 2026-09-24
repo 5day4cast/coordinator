@@ -5,4 +5,5 @@ pub mod format;
 pub mod fragments;
 pub mod layouts;
 pub mod pages;
+pub mod qr;
 pub mod shared_map;

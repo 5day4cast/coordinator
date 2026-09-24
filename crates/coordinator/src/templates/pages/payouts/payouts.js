@@ -7,7 +7,7 @@ class Payouts {
   // Signed by whoever is logged in now: the wallet loads after this object
   // exists, and logging out and in again replaces the signer.
   get client() {
-    return new window.AuthorizedClient(window.nostrClient, this.coordinator_url);
+    return new window.AuthorizedClient(session.nostrClient, this.coordinator_url);
   }
 
   async getPayableEntries() {
@@ -101,7 +101,7 @@ class Payouts {
       return null;
 
     try {
-      return window.DlcWallet.currentOutcome(
+      return session.wasm.DlcWallet.currentOutcome(
         competition.attestation,
         competition.event_announcement,
       );
@@ -139,7 +139,7 @@ class Payouts {
     }
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(invoice));
     const invoiceDigest = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-    const authorization = window.dlcWallet.authorizePayoutInvoice(JSON.stringify({
+    const authorization = session.dlcWallet.authorizePayoutInvoice(JSON.stringify({
       entry_id: entry.id,
       competition_id: competitionId,
       expected_pubkey: entry.ephemeral_pubkey,
@@ -177,7 +177,7 @@ class Payouts {
       if (error.response?.status !== 404) throw error;
     }
     this.validateInvoice(invoice, payoutAmount);
-    const release = window.dlcWallet.payoutRelease(entry.id, entry.ephemeral_pubkey);
+    const release = session.dlcWallet.payoutRelease(entry.id, entry.ephemeral_pubkey);
     await this.client.post(`${endpoint}/payout`, {
       ticket_id: entry.ticket_id,
       payout_preimage: release.payout_preimage,
@@ -197,16 +197,14 @@ class Payouts {
   // The wallet decodes the invoice: exact amount, this network, not expired.
   validateInvoice(invoice, expectedAmount) {
     try {
-      window.dlcWallet.validateInvoice(invoice, expectedAmount);
+      session.dlcWallet.validateInvoice(invoice, expectedAmount);
     } catch (error) {
       throw new Error(`Invalid invoice: ${error?.message ?? error}`);
     }
   }
 }
 
-window.Payouts = Payouts;
-
-// Global payout state for the modal
+// Payout state for the modal
 let currentPayoutData = null;
 let payoutsInstance = null;
 
@@ -347,8 +345,7 @@ function showPayoutsError(message) {
   errorDiv.classList.toggle("hidden", !message);
 }
 
-function toggleLightningAddressForm(event) {
-  event?.preventDefault();
+function toggleLightningAddressForm() {
   document.getElementById("lightningAddressForm")?.classList.toggle("is-hidden");
   document.getElementById("payoutLightningAddress")?.focus();
 }
@@ -389,7 +386,8 @@ async function saveLightningAddress() {
 }
 
 /**
- * Set up payout modal event listeners
+ * Set up the payout dialog, and the payouts page's buttons. The page is
+ * swapped in by htmx, so its buttons are handled by one listener here.
  */
 function setupPayoutModal() {
   document
@@ -401,11 +399,25 @@ function setupPayoutModal() {
     ?.addEventListener("click", () => {
       window.closeModal(document.getElementById("payoutModal"));
     });
+
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest?.("[data-payout-action]");
+    if (!button) return;
+    event.preventDefault();
+    switch (button.dataset.payoutAction) {
+      case "invoice":
+        openPayoutModal(button);
+        break;
+      case "edit-address":
+        toggleLightningAddressForm();
+        break;
+      case "save-address":
+        saveLightningAddress();
+        break;
+    }
+  });
 }
 
+window.Payouts = Payouts;
 window.initPayouts = initPayouts;
-window.openPayoutModal = openPayoutModal;
-window.toggleLightningAddressForm = toggleLightningAddressForm;
-window.saveLightningAddress = saveLightningAddress;
-window.submitPayoutInvoice = submitPayoutInvoice;
 window.setupPayoutModal = setupPayoutModal;

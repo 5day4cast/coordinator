@@ -7,7 +7,7 @@ class Entry {
     this.coordinator_url = coordinator_url;
     this.oracle_url = oracle_url;
     this.client = new window.AuthorizedClient(
-      window.nostrClient,
+      session.nostrClient,
       coordinator_url,
     );
     this.competition = competition;
@@ -19,7 +19,7 @@ class Entry {
     // key and no counter or entry ordering is involved.
     const id = generateUuidV7();
     const { ephemeral_pubkey, payout_hash } =
-      window.dlcWallet.entryRegistration(id);
+      session.dlcWallet.entryRegistration(id);
 
     this.entry = {
       id,
@@ -47,6 +47,8 @@ class Entry {
       keymeld_enclave_public_key: ticketData.keymeld_enclave_public_key,
       keymeld_user_id: ticketData.keymeld_user_id,
       keymeld_registration: ticketData.keymeld_registration,
+      // The invoice's QR code, drawn by the server as an SVG image.
+      payment_request_qr: ticketData.payment_request_qr,
     };
 
     const assignment = this.ticket.keymeld_registration;
@@ -61,7 +63,7 @@ class Entry {
       throw new Error("The Keymeld registration belongs to another ticket or session");
     }
     if (assignment?.payout_policy) {
-      this.preparedRegistration = await window.dlcWallet.keymeldPayoutRegistration(
+      this.preparedRegistration = await session.dlcWallet.keymeldPayoutRegistration(
         this.entry.id,
         JSON.stringify(assignment),
         JSON.stringify({
@@ -84,7 +86,7 @@ class Entry {
         throw new Error("Automatic payouts are unavailable for this competition. Choose invoice payout or another competition.");
       }
       this.preparedRegistration = assignment
-        ? await window.dlcWallet.keymeldRegistration(this.entry.id, JSON.stringify(assignment))
+        ? await session.dlcWallet.keymeldRegistration(this.entry.id, JSON.stringify(assignment))
         : null;
     }
     // Ticket hash, wallet key and enclave trust are all checked before
@@ -110,33 +112,18 @@ class Entry {
       $paymentStatus.replaceChildren(text, progress);
     };
 
-    // The QR code component is only needed here, so it loads on first payment.
-    await import("https://unpkg.com/bitcoin-qr@1.4.1/dist/bitcoin-qr/bitcoin-qr.esm.js").catch(
-      (error) => console.error("QR code unavailable:", error),
-    );
-    const $qrCode = document.createElement("bitcoin-qr");
-    Object.assign($qrCode, {
-      id: "paymentQR",
-      lightning: this.ticket.payment_request,
-      width: 300,
-      height: 300,
-      type: "svg",
-      isPolling: true,
-      pollInterval: 2000,
-    });
-
-    [
-      "dots-type:rounded",
-      "corners-square-type:extra-rounded",
-      "background-color:#ffffff",
-      "dots-color:#000000",
-    ].forEach((attr) => {
-      const [key, value] = attr.split(":");
-      $qrCode.setAttribute(key, value);
-    });
+    // The server draws the QR code; an <img> of it can run nothing.
+    const $qrCode = document.createElement("img");
+    $qrCode.id = "paymentQR";
+    $qrCode.className = "payment-qr";
+    $qrCode.width = 300;
+    $qrCode.height = 300;
+    $qrCode.alt = "QR code of the Lightning invoice";
+    if (this.ticket.payment_request_qr?.startsWith("data:image/svg+xml;")) {
+      $qrCode.src = this.ticket.payment_request_qr;
+    }
 
     const cleanup = () => {
-      $qrCode.setAttribute("is-polling", "false");
       $qrContainer.replaceChildren();
       $modal.classList.remove("is-active");
       $copyFeedback.classList.add("is-hidden");
@@ -233,7 +220,7 @@ class Entry {
         }
       };
 
-      // Fallback polling in case the QR component's callback doesn't fire
+      // Check the ticket every 2 s until it is paid or fails.
       fallbackPollingInterval = setInterval(checkPaymentStatus, 2000);
 
       // Background polling function to check payment status after modal is closed
@@ -304,8 +291,6 @@ class Entry {
         $modalClose.removeEventListener("click", handleClose);
       };
 
-      // Also set QR code callback for when the component supports it
-      $qrCode.callback = checkPaymentStatus;
     });
   }
 
@@ -431,7 +416,7 @@ async function loadEntryTerms(form) {
 // and Arkade refunds, are sent. Throws rather than dropping automatic payouts.
 async function loadPayoutAddress() {
   const base = document.body.dataset.apiBase || "";
-  const client = new window.AuthorizedClient(window.nostrClient, base);
+  const client = new window.AuthorizedClient(session.nostrClient, base);
   let response;
   try {
     response = await client.post(`${base}/api/v1/users/login`);
@@ -462,11 +447,11 @@ async function submitEntry() {
   errorMsg.textContent = "";
   successMsg.classList.add("hidden");
 
-  if (!window.isLoggedIn?.() || !window.nostrClient || !window.dlcWallet) {
+  if (!isLoggedIn() || !session.nostrClient || !session.dlcWallet) {
     showLogin();
     return;
   }
-  if (typeof window.nostrClient.isSignerReady === "function" && !window.nostrClient.isSignerReady()) {
+  if (typeof session.nostrClient.isSignerReady === "function" && !session.nostrClient.isSignerReady()) {
     errorMsg.textContent = "Session expired. Please log in again.";
     errorMsg.classList.remove("hidden");
     showLogin();
@@ -554,9 +539,9 @@ async function submitEntry() {
  */
 function showKeymeldTrust() {
   const element = document.getElementById("keymeldTrust");
-  if (!element || !window.DlcWallet) return;
+  if (!element || !session.wasm?.DlcWallet) return;
   try {
-    const trust = window.DlcWallet.keymeldTrust();
+    const trust = session.wasm.DlcWallet.keymeldTrust();
     if (trust.source === "pinned") {
       const pins = Object.entries(trust.pcrs)
         .map(([index, value]) => `PCR${index} ${value}`)

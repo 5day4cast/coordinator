@@ -176,8 +176,8 @@ pub fn competitions_page(
     };
     let mut finished = by_phase(competitions, finished_phases);
     let cancelled = by_phase(competitions, &[Phase::Cancelled]).len();
-    live.sort_by_key(|competition| competition.end);
-    open.sort_by_key(|competition| competition.start);
+    live.sort_by_key(|competition| std::cmp::Reverse(competition.start));
+    open.sort_by_key(|competition| std::cmp::Reverse(competition.start));
     waiting.sort_by_key(|competition| std::cmp::Reverse(competition.end));
     finished.sort_by_key(|competition| std::cmp::Reverse(competition.end));
 
@@ -191,7 +191,8 @@ pub fn competitions_page(
         .collect();
     let featured = open
         .iter()
-        .find(|competition| competition.can_enter)
+        .filter(|competition| competition.can_enter)
+        .min_by_key(|competition| competition.start)
         .or_else(|| live.first())
         .copied();
     let show_cancelled = options.show_cancelled;
@@ -305,7 +306,12 @@ fn featured_card(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
     }
 }
 
-fn group(title: &str, help: &str, competitions: &[&CompetitionView], now: OffsetDateTime) -> Markup {
+fn group(
+    title: &str,
+    help: &str,
+    competitions: &[&CompetitionView],
+    now: OffsetDateTime,
+) -> Markup {
     html! {
         section class="competition-group" {
             div class="group-heading" {
@@ -353,7 +359,11 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
         competition.total_entries,
         competition.total_allowed_entries,
         competition.paid_places,
-        if competition.paid_places == 1 { "place" } else { "places" },
+        if competition.paid_places == 1 {
+            "place"
+        } else {
+            "places"
+        },
     );
     html! {
         a class="competition-row" data-competition-id=(competition.id) data-facts=(facts)
@@ -441,8 +451,12 @@ pub(crate) mod tests {
 
     #[test]
     fn the_open_competition_is_featured_with_a_countdown_and_enter() {
-        let html = competitions_page(&[view("open", Phase::Open, 133)], ListOptions::default(), NOW)
-            .into_string();
+        let html = competitions_page(
+            &[view("open", Phase::Open, 133)],
+            ListOptions::default(),
+            NOW,
+        )
+        .into_string();
         assert!(html.contains("Entries close in 2 h 13 min"));
         assert!(html.contains(r#"href="/competitions/open/entry-form""#));
         assert!(html.contains("Call the weather"));
@@ -473,7 +487,10 @@ pub(crate) mod tests {
         )
         .into_string();
         assert!(shown.contains("unfilled"));
-        assert!(shown.contains("fill</span>"), "an unfilled competition says so");
+        assert!(
+            shown.contains("fill</span>"),
+            "an unfilled competition says so"
+        );
         assert!(!shown.contains("badge-failed"));
         assert!(shown.contains("Hide cancelled (1)"));
     }
@@ -481,7 +498,13 @@ pub(crate) mod tests {
     #[test]
     fn finished_competitions_page_ten_at_a_time() {
         let competitions: Vec<_> = (0..25)
-            .map(|index| view(&format!("done-{index:02}"), Phase::Finished, -1000 + index * 20))
+            .map(|index| {
+                view(
+                    &format!("done-{index:02}"),
+                    Phase::Finished,
+                    -1000 + index * 20,
+                )
+            })
             .collect();
         let first = competitions_page(&competitions, ListOptions::default(), NOW).into_string();
         assert_eq!(first.matches("class=\"competition-row\"").count(), 10);

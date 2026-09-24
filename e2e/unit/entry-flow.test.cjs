@@ -61,8 +61,12 @@ function entryPage(checked = [{ name: "KPWM_temp_high", value: "over" }]) {
   return { elements, document };
 }
 
+// The bundle shares the wallet session and isLoggedIn between its scripts
+// (see shared/wasm.js); a test hands them in with the page's window.
 function load(window, document, fetch) {
-  const sandbox = { window, document, fetch, crypto: webcrypto, TextEncoder, console };
+  const session = { wasm: null, nostrClient: window.nostrClient ?? null, dlcWallet: window.dlcWallet ?? null };
+  const isLoggedIn = () => Boolean(window.isLoggedIn?.());
+  const sandbox = { window, document, fetch, crypto: webcrypto, TextEncoder, console, session, isLoggedIn };
   vm.runInNewContext(readFileSync(path.join(__dirname,
     "../../crates/coordinator/src/templates/fragments/entry_form/entry_form.js"), "utf8"), sandbox);
   return sandbox;

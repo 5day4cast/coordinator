@@ -7,7 +7,7 @@ use maud::{html, Markup};
 use crate::domain::PayoutTermsQuote;
 use crate::templates::{
     format::{self, ordinal, sats},
-    fragments::picks::{Metric, PAR_POINTS, OVER_UNDER_POINTS},
+    fragments::picks::{Metric, OVER_UNDER_POINTS, PAR_POINTS},
     pages::competitions::{fee_breakdown, CompetitionView},
     shared_map::{station_map, StationPin},
 };
@@ -87,19 +87,13 @@ pub fn entry_form(
                 }
             }
 
-            @if !pins.is_empty() {
-                (station_map(pins))
-            }
-
             form id="entryForm" data-competition-id=(competition.id)
                  data-entry-fee=(competition.entry_fee)
                  data-ticket-price=(competition.ticket_price)
                  data-total-pool=(competition.total_pool)
                  data-winner-count=(competition.paid_places)
                  data-max-values=(picks_allowed) {
-                @for station in stations {
-                    (station_picks(station))
-                }
+                (forecast_choices(&competition.id, stations, pins, 0))
             }
 
             (payout_line(&competition.id, terms, destination))
@@ -145,8 +139,47 @@ pub fn entry_form(
     }
 }
 
+/// Public forecast fragment. A cold cache shows a short loading state and retries
+/// without signing or replacing the account's payout information or filled picks.
+pub fn forecast_choices(
+    competition_id: &str,
+    stations: &[StationForecast],
+    pins: &[StationPin],
+    attempt: u8,
+) -> Markup {
+    let loading = !stations
+        .iter()
+        .flat_map(|station| &station.forecasts)
+        .any(|(_, value)| value.is_some());
+    let retry = loading && attempt < 4;
+    let url = format!(
+        "/competitions/{competition_id}/entry-forecasts?attempt={}",
+        attempt.saturating_add(1)
+    );
+    html! {
+        div id="entryForecasts" hx-get=[retry.then_some(&url)]
+            hx-trigger=[retry.then_some("load delay:3s")] hx-target=[retry.then_some("this")]
+            hx-swap=[retry.then_some("outerHTML")] hx-disinherit="*" {
+            @if loading {
+                p class="notice" role="status" {
+                    @if retry { span class="spinner" aria-hidden="true" {} " Forecasts are loading…" }
+                    @else {
+                        "Forecasts are temporarily unavailable. "
+                        button type="button" class="button is-small" hx-get=(format!("/competitions/{competition_id}/entry-forecasts"))
+                            hx-target="#entryForecasts" hx-swap="outerHTML" { "Retry" }
+                    }
+                }
+            } @else {
+                @if !pins.is_empty() { (station_map(pins)) }
+                @for station in stations { (station_picks(station)) }
+            }
+        }
+    }
+}
+
 /// Where winnings and refunds go, as one line. Refreshed when the user logs
-/// in or out, without touching the picks already made.
+/// in or out, and after Back while logged in (see htmx_auth.js), without
+/// touching the picks already made.
 pub fn payout_line(
     competition_id: &str,
     terms: Option<&PayoutTermsQuote>,
@@ -155,8 +188,8 @@ pub fn payout_line(
     let refunds = terms.is_some_and(|terms| terms.arkade);
     let url = format!("/competitions/{competition_id}/entry-form/payout");
     html! {
-        p id="entryPayoutDestination" class="payout-line"
-          hx-get=(url) hx-trigger="fw:login from:body, fw:logout from:body" hx-swap="outerHTML"
+        p id="entryPayoutDestination" class="payout-line" data-signed-reload
+          hx-get=(url) hx-trigger="fw:login from:body, fw:logout from:body, fw:reload" hx-swap="outerHTML"
           hx-disinherit="*" {
             @match (terms.map(|terms| terms.enabled), destination) {
                 (Some(false), _) => {
@@ -290,8 +323,10 @@ mod tests {
         let html = form(PayoutDestination::Address("freya@lnurl.example".into()));
         assert!(!html.contains(r#"type="checkbox""#));
         assert!(!html.contains("I authorize"));
-        assert!(html.contains("and your refund if this competition doesn&#39;t fill")
-            || html.contains("and your refund if this competition doesn't fill"));
+        assert!(
+            html.contains("and your refund if this competition doesn&#39;t fill")
+                || html.contains("and your refund if this competition doesn't fill")
+        );
         assert!(html.contains("<strong>freya@lnurl.example</strong>"));
     }
 

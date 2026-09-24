@@ -9,8 +9,8 @@ function initApp() {
   window.setupPayoutModal?.();
 
   const body = document.body;
+  // Not on window: it holds the signer once someone logs in.
   const authManager = new window.AuthManager(body.dataset.apiBase, body.dataset.network);
-  window.authManager = authManager;
   window.setupAuthModals(authManager);
   authManager.attachEventListeners();
   window.setupHtmxAuth?.();

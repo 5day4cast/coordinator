@@ -400,7 +400,8 @@ fn entry_score_modal() -> Markup {
             div class="modal-background" {}
             div class="modal-content" {
                 div class="box" {
-                    div id="entryValues" {}
+                    // Emptied on close, which also stops a live entry's refresh.
+                    div id="entryValues" data-clear-on-close {}
                 }
             }
             button class="modal-close is-large" aria-label="close" {}
