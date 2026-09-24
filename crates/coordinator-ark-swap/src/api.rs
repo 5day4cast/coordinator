@@ -5,6 +5,7 @@
 //! | `POST /v1/swaps` | `{ "escrow_address", "amount_sat", "preimage"? }` → the swap and its invoice. Returns the open swap if the escrow already has one. |
 //! | `GET /v1/swaps/{id}` | A swap's state. |
 //! | `GET /v1/swaps?payment_hash=<hex>` | The swap whose invoice pays to that hash, for tracing a payment to its escrow. |
+//! | `GET /v1/swaps?without_escrow_vtxo=true` | Swaps in `escrow_paid`, `settled` or `unsettled` that record no escrow VTXO, oldest first. Read-only, for finding money by hand. |
 //! | `POST /v1/refunds` | `{ "payment_hash", "amount_sat", "player_key", "deadline" }` → the swap an unused escrow's refund pays. Returns the swap already minted for that invoice. |
 //! | `POST /v1/refunds/{id}/paid` | `{ "preimage" }` → records the payment and claims the swap. |
 //! | `GET /v1/refunds/{id}` | A refund's state. |
@@ -115,11 +116,30 @@ async fn create_swap(State(state): State<AppState>, Json(request): Json<CreateSw
 #[serde(deny_unknown_fields)]
 struct FindSwap {
     /// Hex. The hash of the invoice the swap issued.
-    payment_hash: String,
+    #[serde(default)]
+    payment_hash: Option<String>,
+    /// List the swaps that paid an escrow without recording its output.
+    #[serde(default)]
+    without_escrow_vtxo: bool,
 }
 
 async fn find_swap(State(state): State<AppState>, Query(query): Query<FindSwap>) -> Response {
-    let payment_hash = match bytes32(&query.payment_hash) {
+    let payment_hash = match (query.payment_hash, query.without_escrow_vtxo) {
+        (Some(hash), false) => hash,
+        (None, true) => {
+            return match state.swapper.store.without_escrow_vtxo().await {
+                Ok(swaps) => Json(swaps).into_response(),
+                Err(error) => failure(StatusCode::INTERNAL_SERVER_ERROR, error),
+            };
+        }
+        _ => {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                anyhow::anyhow!("give either payment_hash or without_escrow_vtxo=true"),
+            )
+        }
+    };
+    let payment_hash = match bytes32(&payment_hash) {
         Ok(hash) => hex::encode(hash),
         Err(error) => return failure(StatusCode::BAD_REQUEST, error),
     };

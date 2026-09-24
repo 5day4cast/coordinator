@@ -233,6 +233,18 @@ impl Store {
         row.map(|row| swap(&row)).transpose()
     }
 
+    /// Swaps that paid an escrow, or say they did, without recording the escrow output they
+    /// paid, oldest first: money a debugger has to find by hand.
+    pub async fn without_escrow_vtxo(&self) -> anyhow::Result<Vec<Swap>> {
+        let rows = sqlx::query(
+            "SELECT * FROM swaps WHERE escrow_vtxo IS NULL
+             AND state IN ('escrow_paid', 'settled', 'unsettled') ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(swap).collect()
+    }
+
     /// Whether any swap, open or finished, used `payment_hash`. LND never reuses one.
     pub async fn payment_hash_used(&self, payment_hash: &str) -> anyhow::Result<bool> {
         let row = sqlx::query("SELECT 1 FROM swaps WHERE payment_hash = ?")
@@ -701,6 +713,30 @@ mod tests {
             .is_none());
         let served = serde_json::to_value(&found).unwrap();
         assert!(served.get("preimage").is_none(), "{served}");
+
+        // A swap that paid its escrow without recording the output is listed; one that
+        // recorded it, or never paid, is not.
+        assert!(store.without_escrow_vtxo().await.unwrap().is_empty());
+        let unrecorded = Swap {
+            id: Uuid::now_v7(),
+            payment_hash: "12".repeat(32),
+            escrow_vtxo: None,
+            ..swap.clone()
+        };
+        store.insert(&unrecorded).await.unwrap();
+        let waiting = Swap {
+            id: Uuid::now_v7(),
+            payment_hash: "34".repeat(32),
+            escrow_vtxo: None,
+            state: SwapState::AwaitingPayment,
+            ..swap.clone()
+        };
+        store.insert(&waiting).await.unwrap();
+        let listed = store.without_escrow_vtxo().await.unwrap();
+        assert_eq!(
+            listed.iter().map(|swap| swap.id).collect::<Vec<_>>(),
+            [unrecorded.id]
+        );
     }
 
     #[tokio::test]
