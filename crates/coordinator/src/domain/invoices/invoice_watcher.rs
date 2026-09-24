@@ -102,10 +102,24 @@ impl InvoiceWatcher {
                     // Handle expired/canceled invoices - clear reservation so ticket can be reused
                     if invoice.state == InvoiceState::Canceled {
                         if ticket.paid_at.is_some() || ticket.escrow_transaction.is_some() {
-                            warn!(
-                                "Canceled invoice for ticket {} retains escrow recovery state",
-                                ticket.id
-                            );
+                            // The ticket keeps its paid and escrow state for recovery. Recording
+                            // the cancellation ends the polling: a cancelled invoice never
+                            // changes again, and cleanup reclaims any escrow.
+                            match self
+                                .coordinator
+                                .competition_store
+                                .mark_ticket_invoice_cancelled(ticket.id)
+                                .await
+                            {
+                                Ok(_) => warn!(
+                                    "Invoice of paid ticket {} was cancelled; its escrow, if any, is left to cleanup",
+                                    ticket.id
+                                ),
+                                Err(e) => error!(
+                                    "Failed to record the cancelled invoice of ticket {}: {}",
+                                    ticket.id, e
+                                ),
+                            }
                             continue;
                         }
                         info!(
