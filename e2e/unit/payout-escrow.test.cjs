@@ -5,9 +5,14 @@ const test = require("node:test");
 const vm = require("node:vm");
 const { webcrypto } = require("node:crypto");
 
+const SCRIPTS = {
+  entries: "fragments/entry_form/entry_form.js",
+  payouts: "pages/payouts/payouts.js",
+};
+
 function load(name, window) {
   vm.runInNewContext(readFileSync(path.join(__dirname,
-    `../../crates/coordinator/src/templates/pages/${name}/${name}.js`), "utf8"),
+    `../../crates/coordinator/src/templates/${SCRIPTS[name]}`), "utf8"),
   { window, crypto: webcrypto, TextEncoder, console });
   return window;
 }

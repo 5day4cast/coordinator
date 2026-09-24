@@ -1,3 +1,7 @@
+// Paying for and submitting an entry. The form itself is server-rendered;
+// this is the part that needs the WASM wallet: entry keys, the Keymeld
+// registration, the ticket payment and the signed submission.
+
 class Entry {
   constructor(coordinator_url, oracle_url, competition) {
     this.coordinator_url = coordinator_url;
@@ -11,69 +15,6 @@ class Entry {
   }
 
   async init() {
-    const [competition_forecasts, _] = await Promise.all([
-      this.getCompetitionLastForecast(),
-      this.setupEntry(),
-    ]);
-
-    this.competition_forecasts = competition_forecasts;
-
-    for (const station_id in competition_forecasts) {
-      const forecast = competition_forecasts[station_id];
-      this.entry.options.push({
-        station_id,
-        date: forecast.date,
-        temp_high: forecast.temp_high,
-        temp_low: forecast.temp_low,
-        wind_speed: forecast.wind_speed,
-      });
-      this.entry.submit[station_id] = {};
-    }
-  }
-
-  async getCompetitionLastForecast() {
-    // Forecasts are already rendered server-side in the form, extract them from there
-    // This avoids needing a separate API call and keeps the data consistent
-    return this.getForecastsFromForm();
-  }
-
-  // Extract forecast data from the rendered entry form (for mock/test mode)
-  getForecastsFromForm() {
-    const forecasts = {};
-    const stationBoxes = document.querySelectorAll("#entryForm [data-station]");
-
-    stationBoxes.forEach((box) => {
-      const stationId = box.dataset.station;
-      forecasts[stationId] = {
-        date: new Date().toISOString().split("T")[0],
-        temp_high: null,
-        temp_low: null,
-        wind_speed: null,
-      };
-
-      // Parse values from the form labels if present
-      box.querySelectorAll(".field").forEach((field) => {
-        const label = field.querySelector(".label")?.textContent || "";
-        if (label.includes("Wind Speed")) {
-          forecasts[stationId].wind_speed = this.parseValueFromLabel(label);
-        } else if (label.includes("High Temp")) {
-          forecasts[stationId].temp_high = this.parseValueFromLabel(label);
-        } else if (label.includes("Low Temp")) {
-          forecasts[stationId].temp_low = this.parseValueFromLabel(label);
-        }
-      });
-    });
-
-    return forecasts;
-  }
-
-  parseValueFromLabel(label) {
-    // Extract numeric value from labels like "Wind Speed: 12.5 mph"
-    const match = label.match(/:\s*([\d.]+)/);
-    return match ? parseFloat(match[1]) : null;
-  }
-
-  async setupEntry() {
     // The entry key is derived from the entry id, so every entry gets its own
     // key and no counter or entry ordering is involved.
     const id = generateUuidV7();
@@ -84,7 +25,6 @@ class Entry {
       id,
       competition_id: this.competition.id,
       submit: {},
-      options: [],
       payout_hash,
       ephemeral_pubkey,
     };
@@ -147,12 +87,12 @@ class Entry {
         ? await window.dlcWallet.keymeldRegistration(this.entry.id, JSON.stringify(assignment))
         : null;
     }
-    // Consent, ticket hash, wallet key and enclave trust are all checked before
+    // Ticket hash, wallet key and enclave trust are all checked before
     // exposing the invoice for payment. A failed check cannot leave a paid ticket.
     return this.showPaymentModal();
   }
 
-  showPaymentModal() {
+  async showPaymentModal() {
     const $modal = document.getElementById("ticketPaymentModal");
     const $paymentRequest = document.getElementById("paymentRequest");
     const $copyFeedback = document.getElementById("copyFeedback");
@@ -161,12 +101,19 @@ class Entry {
     const $qrContainer = document.getElementById("qrContainer");
 
     const updateStatus = (message, type = "info") => {
-      $paymentStatus.innerHTML = `
-                <p class="has-text-${type}">${message}</p>
-                <progress class="progress is-${type}" max="100"></progress>
-            `;
+      const text = document.createElement("p");
+      text.className = `has-text-${type}`;
+      text.textContent = message;
+      const progress = document.createElement("progress");
+      progress.className = `progress is-${type}`;
+      progress.max = 100;
+      $paymentStatus.replaceChildren(text, progress);
     };
 
+    // The QR code component is only needed here, so it loads on first payment.
+    await import("https://unpkg.com/bitcoin-qr@1.4.1/dist/bitcoin-qr/bitcoin-qr.esm.js").catch(
+      (error) => console.error("QR code unavailable:", error),
+    );
     const $qrCode = document.createElement("bitcoin-qr");
     Object.assign($qrCode, {
       id: "paymentQR",
@@ -190,7 +137,7 @@ class Entry {
 
     const cleanup = () => {
       $qrCode.setAttribute("is-polling", "false");
-      $qrContainer.innerHTML = "";
+      $qrContainer.replaceChildren();
       $modal.classList.remove("is-active");
       $copyFeedback.classList.add("is-hidden");
       $paymentRequest.classList.remove("is-success");
@@ -212,12 +159,11 @@ class Entry {
 
     $paymentRequest.addEventListener("click", handleCopy);
 
-    $qrContainer.innerHTML = "";
-    $qrContainer.appendChild($qrCode);
+    $qrContainer.replaceChildren($qrCode);
     $paymentRequest.value = this.ticket.payment_request;
     const $amount = document.getElementById("ticketPaymentAmount");
     if ($amount) {
-      $amount.textContent = `Pay ${invoiceAmountSats(this.ticket.payment_request) ?? this.ticketAmountSats} sats by Lightning to enter this competition:`;
+      $amount.textContent = `Pay ${this.ticketAmountSats.toLocaleString("en-US")} sats by Lightning to enter this competition:`;
     }
     updateStatus("Waiting for payment...");
     $error.classList.add("is-hidden");
@@ -421,77 +367,88 @@ class Entry {
 
 window.Entry = Entry;
 
-// Current entry instance for the form
-let currentEntry = null;
-
-/**
- * Handle pick button selection (Over/Par/Under)
- * Called when user clicks a prediction button
- * Clicking an already-selected button will deselect it (toggle behavior)
- */
-function selectPick(button) {
-  const field = button.dataset.field;
-  const value = button.dataset.value;
-  const wasActive = button.classList.contains("is-active");
-
-  // Find all buttons in this group and deselect them
-  const group = button.closest(".buttons");
-  group.querySelectorAll(".pick-button").forEach((btn) => {
-    btn.classList.remove("is-active");
-    btn.classList.add("is-outlined");
-  });
-
-  // Update hidden input and entry state
-  const hiddenInput = document.getElementById(field);
-
-  if (wasActive) {
-    // Button was already selected - deselect it (toggle off)
-    if (hiddenInput) {
-      hiddenInput.value = "";
-    }
-
-    // Remove from current entry if exists
-    if (currentEntry) {
-      const parts = field.split("_");
-      const stationId = parts[0];
-      const metric = parts.slice(1).join("_");
-
-      if (currentEntry.entry.submit[stationId]) {
-        delete currentEntry.entry.submit[stationId][metric];
-        // Clean up empty station objects
-        if (Object.keys(currentEntry.entry.submit[stationId]).length === 0) {
-          delete currentEntry.entry.submit[stationId];
-        }
-      }
-    }
-  } else {
-    // Select clicked button - color is determined by CSS based on data-value
-    button.classList.remove("is-outlined");
-    button.classList.add("is-active");
-
-    if (hiddenInput) {
-      hiddenInput.value = value;
-    }
-
-    // Update current entry if exists
-    if (currentEntry) {
-      // Parse field name: stationId_metric (e.g., "KEWR_wind_speed")
-      const parts = field.split("_");
-      const stationId = parts[0];
-      const metric = parts.slice(1).join("_");
-
-      if (!currentEntry.entry.submit[stationId]) {
-        currentEntry.entry.submit[stationId] = {};
-      }
-      currentEntry.entry.submit[stationId][metric] = value;
-    }
+// Picks by station from the form's checked radios, named `KPWM_temp_high`.
+function collectPicks(form) {
+  const picks = {};
+  for (const input of form.querySelectorAll('input[type="radio"]:checked')) {
+    const separator = input.name.indexOf("_");
+    const stationId = input.name.slice(0, separator);
+    const metric = input.name.slice(separator + 1);
+    picks[stationId] ??= {};
+    picks[stationId][metric] = input.value;
   }
+  return picks;
+}
+
+// Radios cannot be cleared by clicking them again; picks can.
+function togglePick(input) {
+  if (input.dataset.picked === "true") {
+    input.checked = false;
+  }
+  for (const other of input.form?.querySelectorAll(`input[name="${input.name}"]`) ?? []) {
+    other.dataset.picked = String(other.checked);
+  }
+}
+
+function showLogin() {
+  window.openModal?.(document.getElementById("loginModal"));
+}
+
+// The competition, its payout terms and the oracle's announcement, fetched
+// fresh for the wallet to check against what the form showed.
+async function loadEntryTerms(form) {
+  const base = document.body.dataset.apiBase || "";
+  const oracleBase = document.body.dataset.oracleBase || "";
+  const competitionId = form.dataset.competitionId;
+  const [competitionResponse, quoteResponse] = await Promise.all([
+    fetch(`${base}/api/v1/competitions/${competitionId}`),
+    fetch(`${base}/api/v1/competitions/${competitionId}/payout-terms`),
+  ]);
+  if (!competitionResponse.ok || !quoteResponse.ok) {
+    throw new Error("Payout terms are unavailable right now; try again in a moment");
+  }
+  const competition = await competitionResponse.json();
+  const quote = await quoteResponse.json();
+  const event = competition.event_submission;
+  if (competition.id !== competitionId || !event ||
+      event.entry_fee !== Number(form.dataset.entryFee) ||
+      ticketPriceSats(event) !== Number(form.dataset.ticketPrice) ||
+      event.total_competition_pool !== Number(form.dataset.totalPool) ||
+      event.number_of_places_win !== Number(form.dataset.winnerCount)) {
+    throw new Error("This competition's terms changed since the form opened; go back to the competitions list and open it again");
+  }
+  let oracle = null;
+  if (quote.enabled) {
+    const oracleResponse = await fetch(`${oracleBase}/oracle/events/${competitionId}`);
+    if (!oracleResponse.ok) throw new Error("The oracle announcement is unavailable; no ticket payment has been requested");
+    oracle = await oracleResponse.json();
+    if (oracle.id !== competitionId || !oracle.event_announcement) throw new Error("The oracle returned a different event");
+  }
+  return { competition, quote, oracle };
+}
+
+// The Lightning Address on the player's account: where automatic payouts,
+// and Arkade refunds, are sent. Throws rather than dropping automatic payouts.
+async function loadPayoutAddress() {
+  const base = document.body.dataset.apiBase || "";
+  const client = new window.AuthorizedClient(window.nostrClient, base);
+  let response;
+  try {
+    response = await client.post(`${base}/api/v1/users/login`);
+  } catch (error) {
+    response = error.response;
+  }
+  if (!response?.ok) {
+    throw new Error("Your account's Lightning Address could not be loaded; try again in a moment");
+  }
+  const user = await response.json();
+  return user.lightning_address || null;
 }
 
 /**
  * Submit entry - handles the full flow:
  * 1. Collect picks from form
- * 2. Create Entry instance
+ * 2. Check the terms and payout address
  * 3. Request ticket (triggers payment)
  * 4. Submit entry after payment
  */
@@ -501,133 +458,59 @@ async function submitEntry() {
   const errorMsg = document.getElementById("errorMessage");
   const successMsg = document.getElementById("successMessage");
 
-  // Reset messages
   errorMsg.classList.add("hidden");
   errorMsg.textContent = "";
   successMsg.classList.add("hidden");
 
-  // Check if user is logged in
-  if (typeof window.isLoggedIn === "function" && !window.isLoggedIn()) {
-    // Show login modal
-    const loginModal = document.getElementById("loginModal");
-    if (loginModal) {
-      loginModal.classList.add("is-active");
-    }
+  if (!window.isLoggedIn?.() || !window.nostrClient || !window.dlcWallet) {
+    showLogin();
     return;
   }
-
-  // Double-check that required WASM objects are ready
-  if (!window.nostrClient || !window.dlcWallet) {
-    errorMsg.textContent = "Please log in to submit an entry";
-    errorMsg.classList.remove("hidden");
-    const loginModal = document.getElementById("loginModal");
-    if (loginModal) {
-      loginModal.classList.add("is-active");
-    }
-    return;
-  }
-
-  // Verify the signer is actually ready
-  if (
-    typeof window.nostrClient.isSignerReady === "function" &&
-    !window.nostrClient.isSignerReady()
-  ) {
+  if (typeof window.nostrClient.isSignerReady === "function" && !window.nostrClient.isSignerReady()) {
     errorMsg.textContent = "Session expired. Please log in again.";
     errorMsg.classList.remove("hidden");
-    const loginModal = document.getElementById("loginModal");
-    if (loginModal) {
-      loginModal.classList.add("is-active");
-    }
+    showLogin();
     return;
   }
 
-  // Disable button during submission
   submitBtn.disabled = true;
   submitBtn.classList.add("is-loading");
 
   try {
     const competitionId = form.dataset.competitionId;
-
-    // Collect all picks from hidden inputs
-    const picks = {};
-    form.querySelectorAll('input[type="hidden"]').forEach((input) => {
-      if (input.value) {
-        const parts = input.name.split("_");
-        const stationId = parts[0];
-        const metric = parts.slice(1).join("_");
-
-        if (!picks[stationId]) {
-          picks[stationId] = {};
-        }
-        picks[stationId][metric] = input.value;
-      }
-    });
-
-    // Count total value choices
+    const picks = collectPicks(form);
     let choiceCount = 0;
     for (const stationPicks of Object.values(picks)) {
       choiceCount += Object.keys(stationPicks).length;
     }
-
-    // Validate we have picks
     if (choiceCount === 0) {
-      throw new Error("Please make at least one prediction");
+      throw new Error("Make at least one pick");
     }
-
-    // Validate we don't have too many picks
     const maxValues = parseInt(form.dataset.maxValues, 10) || 1;
     if (choiceCount > maxValues) {
-      throw new Error(
-        `Too many predictions selected. Maximum allowed: ${maxValues}, but you selected: ${choiceCount}`,
-      );
+      throw new Error(`You can make up to ${maxValues} picks; you made ${choiceCount}`);
     }
 
-    // Get API config from body data attributes
-    const body = document.body;
-    const apiBase = body.dataset.apiBase || "";
-    const oracleBase = body.dataset.oracleBase || "";
-
-    const competition = {
-      id: competitionId,
-    };
-
-    // Create entry instance
-    currentEntry = new Entry(apiBase, oracleBase, competition);
-    await currentEntry.init();
-
-    // Terms may still be loading, or a full page load may have skipped them.
-    if (window.entryPayoutTerms?.competition.id !== competitionId) {
-      await setupEntryPayoutConsent();
-    }
-    const payoutTerms = window.entryPayoutTerms;
-    if (!payoutTerms || payoutTerms.competition.id !== competitionId) {
-      throw new Error(
-        document.getElementById("entryPayoutTermsText")?.textContent ||
-          "Payout terms are unavailable right now; try again in a moment",
-      );
-    }
-    currentEntry.payoutTerms = payoutTerms;
-    // Never fall back to invoice payouts just because the profile lookup failed.
-    // A refresh that finds a different address clears consent, so it comes first.
-    if (payoutTerms.quote.enabled && !window.entryPayoutAddressLoaded) {
-      await refreshEntryPayoutAddress();
-      if (!window.entryPayoutAddressLoaded) {
-        throw new Error("Your profile's Lightning Address could not be loaded; try again in a moment");
-      }
-    }
-    const approved = document.getElementById("entryPayoutApproved")?.checked;
-    if (!approved) throw new Error("Please approve your payout method before paying for this entry");
-    // Automatic payouts go to the profile's address; without one, or for a
+    const payoutTerms = await loadEntryTerms(form);
+    // Automatic payouts go to the account's address; without one, or for a
     // legacy competition, the winner submits an invoice instead.
-    const address = payoutTerms.quote.enabled ? window.entryPayoutAddress || null : null;
+    const address = payoutTerms.quote.enabled ? await loadPayoutAddress() : null;
     if (address && (address.length > 320 || !/^[a-z0-9_+.-]+@[a-z0-9.-]+$/.test(address))) {
-      throw new Error("The Lightning Address on your profile is not valid; update it on the Payouts page");
+      throw new Error("The Lightning Address on your account is not valid; update it on the Payouts page");
     }
     // The price shown on the form; the wallet refuses an invoice for any other amount.
-    currentEntry.ticketAmountSats = Number(form.dataset.ticketPrice);
-    if (!Number.isSafeInteger(currentEntry.ticketAmountSats) || currentEntry.ticketAmountSats <= 0) {
+    const ticketAmountSats = Number(form.dataset.ticketPrice);
+    if (!Number.isSafeInteger(ticketAmountSats) || ticketAmountSats <= 0) {
       throw new Error("The competition is missing its ticket price");
     }
+
+    const body = document.body;
+    const currentEntry = new Entry(body.dataset.apiBase || "", body.dataset.oracleBase || "", {
+      id: competitionId,
+    });
+    await currentEntry.init();
+    currentEntry.payoutTerms = payoutTerms;
+    currentEntry.ticketAmountSats = ticketAmountSats;
     currentEntry.payoutChoice = {
       entry_id: currentEntry.entry.id,
       payout_hash: currentEntry.entry.payout_hash,
@@ -635,18 +518,12 @@ async function submitEntry() {
       allow_invoice_fallback: true,
       release_entry_key_after_payment: true,
     };
-    // Set picks on entry
     currentEntry.entry.submit = picks;
 
-    // Build expected observations for submission
-    const expectedObservations = currentEntry.buildExpectedObservations(picks);
+    await currentEntry.submit(currentEntry.buildExpectedObservations(picks));
 
-    // Submit entry (handles ticket payment internally)
-    await currentEntry.submit(expectedObservations);
-
-    // Success!
     successMsg.classList.remove("hidden");
-    submitBtn.textContent = "Entry Submitted!";
+    submitBtn.textContent = "Entered";
     submitBtn.classList.remove("is-loading");
     submitBtn.classList.add("is-success");
   } catch (error) {
@@ -657,10 +534,7 @@ async function submitEntry() {
     let userMessage = detail || "Failed to submit entry";
     if (detail.includes("No signer initialized")) {
       userMessage = "Session expired. Please log in again.";
-      const loginModal = document.getElementById("loginModal");
-      if (loginModal) {
-        loginModal.classList.add("is-active");
-      }
+      showLogin();
     } else if (detail.includes("NetworkError")) {
       userMessage =
         "Network error. Please check your connection and try again.";
@@ -691,17 +565,12 @@ function showKeymeldTrust() {
     } else {
       element.textContent =
         "Test network: this build pins no Keymeld enclave measurements, so enclave trust comes from the coordinator.";
-      element.classList.add("has-text-warning");
     }
   } catch (error) {
     element.textContent = `Keymeld enclave trust unavailable: ${error}`;
-    element.classList.add("has-text-danger");
   }
+  element.classList.remove("is-hidden");
 }
-
-window.showKeymeldTrust = showKeymeldTrust;
-window.selectPick = selectPick;
-window.submitEntry = submitEntry;
 
 // Generate UUIDv7 (time-ordered UUID)
 function generateUuidV7() {
@@ -728,109 +597,26 @@ function generateUuidV7() {
   ].join("-");
 }
 
-
 // What the server charges for a ticket: the entry fee plus the coordinator fee,
 // rounded the same way as Competition::calculate_invoice_amount.
 function ticketPriceSats(event) {
   return event.entry_fee + Math.round(event.entry_fee * (event.coordinator_fee_percentage / 100));
 }
 
-// The sats a BOLT11 invoice charges, or null when it cannot be decoded.
-function invoiceAmountSats(invoice) {
-  try {
-    const decoded = typeof lightningPayReq === "undefined" ? null : lightningPayReq.decode(invoice);
-    return Number.isSafeInteger(decoded?.satoshis) ? decoded.satoshis : null;
-  } catch (_) {
-    return null;
-  }
+function setupEntryForm() {
+  document.addEventListener("click", (event) => {
+    if (event.target.closest?.("#submitEntry")) {
+      submitEntry();
+      return;
+    }
+    const pick = event.target.closest?.('.pick-option input[type="radio"]');
+    if (pick) togglePick(pick);
+  });
 }
 
-function resetEntryPayoutConsent() {
-  const consent = document.getElementById("entryPayoutApproved");
-  if (consent) consent.checked = false;
-}
-
-// Winnings go to the Lightning Address on the user's profile. Runs when the
-// form loads and again on login and logout, so a full page load that starts
-// logged out needs no second reload.
-async function refreshEntryPayoutAddress() {
-  const destination = document.getElementById("entryPayoutDestination");
-  if (!destination) return;
-  const previous = window.entryPayoutAddress ?? null;
-  window.entryPayoutAddress = null;
-  window.entryPayoutAddressLoaded = false;
-  const terms = window.entryPayoutTerms;
-  if (terms && !terms.quote.enabled) {
-    window.entryPayoutAddressLoaded = true;
-    destination.textContent = "This competition pays winners by invoice: you submit a Lightning invoice after the result.";
-  } else if (!window.isLoggedIn?.()) {
-    destination.textContent = "Log in to see where your winnings are paid.";
-  } else {
-    try {
-      const base = document.body.dataset.apiBase || "";
-      const client = new window.AuthorizedClient(window.nostrClient, base);
-      const response = await client.post(`${base}/api/v1/users/login`);
-      if (!response.ok) throw new Error(`profile lookup returned ${response.status}`);
-      const user = await response.json();
-      window.entryPayoutAddress = user.lightning_address || null;
-      window.entryPayoutAddressLoaded = true;
-      const refund = terms?.quote.arkade ? ". If the competition does not start, your entry fee is refunded there." : "";
-      destination.textContent = window.entryPayoutAddress
-        ? `Automatically to ${window.entryPayoutAddress}${refund}`
-        : "Your profile has no Lightning Address, so you will submit a Lightning invoice after the result. Add an address on the Payouts page to be paid automatically.";
-    } catch (error) {
-      console.error("Profile lookup failed:", error);
-      destination.textContent = "Your profile's Lightning Address could not be loaded; it will be tried again when you submit.";
-    }
-  }
-  if (window.entryPayoutAddress !== previous) resetEntryPayoutConsent();
-}
-
-async function setupEntryPayoutConsent() {
-  const form = document.getElementById("entryForm");
-  if (!form) return;
-  window.entryPayoutTerms = null;
-  const base = document.body.dataset.apiBase || "";
-  const oracleBase = document.body.dataset.oracleBase || "";
-  const competitionId = form.dataset.competitionId;
-  const termsText = document.getElementById("entryPayoutTermsText");
-  try {
-    const [competitionResponse, quoteResponse] = await Promise.all([
-      fetch(`${base}/api/v1/competitions/${competitionId}`),
-      fetch(`${base}/api/v1/competitions/${competitionId}/payout-terms`),
-    ]);
-    if (!competitionResponse.ok || !quoteResponse.ok) throw new Error("Payout terms are unavailable");
-    const competition = await competitionResponse.json();
-    const quote = await quoteResponse.json();
-    const event = competition.event_submission;
-    if (competition.id !== competitionId || !event ||
-        event.entry_fee !== Number(form.dataset.entryFee) ||
-        ticketPriceSats(event) !== Number(form.dataset.ticketPrice) ||
-        event.total_competition_pool !== Number(form.dataset.totalPool) ||
-        event.number_of_places_win !== Number(form.dataset.winnerCount)) {
-      throw new Error("This competition's terms changed since the page loaded; go back to the competitions list and open it again");
-    }
-    let oracle = null;
-    if (quote.enabled) {
-      const oracleResponse = await fetch(`${oracleBase}/oracle/events/${competitionId}`);
-      if (!oracleResponse.ok) throw new Error("The oracle announcement is unavailable; no ticket payment has been requested");
-      oracle = await oracleResponse.json();
-      if (oracle.id !== competitionId || !oracle.event_announcement) throw new Error("The oracle returned a different event");
-      const percentages = {1:[100],2:[60,40],3:[45,35,20],4:[42,30,18,10],5:[40,27,16,9,8]}[event.number_of_places_win];
-      if (!percentages) throw new Error("Unsupported winner distribution");
-      if (termsText) termsText.textContent = `Pool: ${event.total_competition_pool} sats across ${event.total_allowed_entries} entries. Winner shares by rank: ${percentages.join("%, ")}%. Contract delay: ${quote.relative_locktime_block_delta} blocks. Maximum Bitcoin fee rate: ${quote.max_fee_rate_sat_vb} sat/vB.`;
-    } else {
-      if (termsText) termsText.textContent = "This legacy competition does not use payout escrow. Invoice recovery releases entry secrets before payment, which is not guaranteed.";
-      const consentText = document.getElementById("entryPayoutConsentText");
-      if (consentText) consentText.textContent = " I understand this legacy entry uses recovery that releases its claim before payment.";
-    }
-    window.entryPayoutTerms = { competition, quote, oracle };
-    resetEntryPayoutConsent();
-  } catch (error) {
-    if (termsText) termsText.textContent = error.message;
-    return;
-  }
-  await refreshEntryPayoutAddress();
-}
-window.setupEntryPayoutConsent = setupEntryPayoutConsent;
-window.refreshEntryPayoutAddress = refreshEntryPayoutAddress;
+window.showKeymeldTrust = showKeymeldTrust;
+window.submitEntry = submitEntry;
+window.collectPicks = collectPicks;
+window.loadEntryTerms = loadEntryTerms;
+window.ticketPriceSats = ticketPriceSats;
+window.setupEntryForm = setupEntryForm;

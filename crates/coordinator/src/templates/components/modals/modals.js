@@ -78,15 +78,22 @@ function resetForgotPasswordModal() {
   document.getElementById("forgotStep3")?.classList.add("is-hidden");
 }
 
-function setupAuthModals(authManager) {
-  document.getElementById("loginNavClick")?.addEventListener("click", () => {
-    resetLoginModal();
-    window.openModal(document.getElementById("loginModal"));
-  });
+// Log-in and sign-up buttons anywhere on the page, including ones htmx
+// swaps in later, carry data-open-modal. Opening either starts loading the
+// wallet, so it is ready by the time the form is filled in.
+function openAuthModal(id) {
+  if (id === "loginModal") resetLoginModal();
+  if (id === "registerModal") resetRegisterModal();
+  window.openModal(document.getElementById(id));
+  window.initWasm?.().catch(() => {});
+}
 
-  document.getElementById("registerNavClick")?.addEventListener("click", () => {
-    resetRegisterModal();
-    window.openModal(document.getElementById("registerModal"));
+function setupAuthModals(authManager) {
+  document.addEventListener("click", (event) => {
+    const opener = event.target.closest?.("[data-open-modal]");
+    if (!opener) return;
+    event.preventDefault();
+    openAuthModal(opener.dataset.openModal);
   });
 
   document.getElementById("closeLoginModal")?.addEventListener("click", () => {
@@ -139,6 +146,7 @@ function setupAuthModals(authManager) {
     });
 }
 
+window.openAuthModal = openAuthModal;
 window.resetLoginModal = resetLoginModal;
 window.resetRegisterModal = resetRegisterModal;
 window.resetForgotPasswordModal = resetForgotPasswordModal;
@@ -211,9 +219,23 @@ class AuthManager {
     });
   }
 
+  // The wallet loads on first use; say so if it cannot.
+  async walletReady(errorElement) {
+    try {
+      await window.initWasm?.();
+      return true;
+    } catch (error) {
+      if (errorElement)
+        errorElement.textContent =
+          "The wallet failed to load. Check your connection and try again.";
+      return false;
+    }
+  }
+
   async handleUsernameLogin() {
     const errorElement = document.querySelector("#usernameLoginError");
     if (errorElement) errorElement.textContent = "";
+    if (!(await this.walletReady(errorElement))) return;
 
     const username = document.getElementById("loginUsername")?.value?.trim();
     const password = document.getElementById("loginPassword")?.value;
@@ -285,6 +307,7 @@ class AuthManager {
   async handleExtensionLogin() {
     const errorElement = document.querySelector("#extensionLoginError");
     if (errorElement) errorElement.textContent = "";
+    if (!(await this.walletReady(errorElement))) return;
 
     try {
       await window.nostrClient.initialize(window.SignerType.NIP07, null);
@@ -353,6 +376,7 @@ class AuthManager {
       return;
     }
 
+    if (!(await this.walletReady(errorElement))) return;
     let credentials = null;
     try {
       window.nostrClient.initialize(window.SignerType.PrivateKey, null);
@@ -465,6 +489,7 @@ class AuthManager {
       if (errorElement) errorElement.textContent = addressError;
       return;
     }
+    if (!(await this.walletReady(errorElement))) return;
 
     try {
       await window.nostrClient.initialize(window.SignerType.NIP07, null);
@@ -579,6 +604,7 @@ class AuthManager {
       resetForgotPasswordModal();
       return;
     }
+    if (!(await this.walletReady(errorElement))) return;
 
     try {
       window.nostrClient.initialize(window.SignerType.PrivateKey, nsec);
@@ -742,16 +768,24 @@ class AuthManager {
     const passwordInput = document.getElementById("loginPassword");
     if (passwordInput) passwordInput.value = "";
 
+    window.setOwnerTag?.(null);
+    document.body.dispatchEvent(new CustomEvent("fw:logout"));
+    // Leave any account page: its content belongs to the old session.
     document.querySelector('[hx-get="/competitions"]')?.click();
-    window.refreshEntryPayoutAddress?.();
   }
 
   onLoginSuccess() {
     document.getElementById("authButtons")?.classList.add("is-hidden");
     document.getElementById("logoutContainer")?.classList.remove("is-hidden");
     window.closeAllModals?.();
-    // An open entry form shows where winnings go, which needs the profile.
-    window.refreshEntryPayoutAddress?.();
+    window.showKeymeldTrust?.();
+    // Pages waiting on a login (account pages, the entry form's payout
+    // line) reload themselves on this event, now signed.
+    document.body.dispatchEvent(new CustomEvent("fw:login"));
+    window.nostrClient
+      ?.getPublicKey?.()
+      .then((npub) => window.setOwnerTag?.(npub))
+      .catch(() => {});
   }
 
   switchLoginTab(tab) {

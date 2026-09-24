@@ -1,0 +1,51 @@
+/* Leaderboard page. */
+
+.leaderboard-heading {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.leaderboard-heading .title {
+  margin-bottom: 0;
+}
+
+.leaderboard-window {
+  margin: 0.25rem 0 1rem;
+  color: var(--bulma-text-weak);
+}
+
+.leaderboard-facts,
+.entry-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 2rem;
+  margin-bottom: 1.25rem;
+}
+
+.leaderboard-facts dt,
+.entry-facts dt {
+  font-size: 0.75rem;
+  color: var(--bulma-text-weak);
+}
+
+.leaderboard-facts dd,
+.entry-facts dd {
+  font-weight: 600;
+}
+
+.prize + .prize::before {
+  content: " · ";
+  font-weight: 400;
+}
+
+.fact-note {
+  display: block;
+  font-size: 0.75rem;
+  font-weight: 400;
+  color: var(--bulma-text-weak);
+}
+
+.leaderboard-table td {
+  vertical-align: middle;
+}

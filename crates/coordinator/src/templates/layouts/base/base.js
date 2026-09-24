@@ -1,35 +1,23 @@
-async function initApp() {
-  // Setup non-WASM dependent features first (UI interactions, theme, navigation)
+// Runs last in the bundle, once the page has parsed. The WASM wallet is not
+// loaded here: it loads when someone opens the log-in or sign-up dialog.
+function initApp() {
   window.setupModalCloseHandlers?.();
   window.setupNavbarBurger?.();
   window.setupThemeToggle?.();
+  window.setupPage?.();
+  window.setupEntryForm?.();
   window.setupPayoutModal?.();
-  // A full page load of the entry form renders it before this bundle exists,
-  // so the form's own inline setup calls found nothing to run.
-  window.setupEntryPayoutConsent?.();
 
-  try {
-    await window.initWasm();
+  const body = document.body;
+  const authManager = new window.AuthManager(body.dataset.apiBase, body.dataset.network);
+  window.authManager = authManager;
+  window.setupAuthModals(authManager);
+  authManager.attachEventListeners();
+  window.setupHtmxAuth?.();
+  window.initPayouts?.(body.dataset.apiBase, body.dataset.oracleBase);
 
-    const body = document.body;
-    const API_BASE = body.dataset.apiBase;
-    const ORACLE_BASE = body.dataset.oracleBase;
-    const NETWORK = body.dataset.network;
-
-    const authManager = new window.AuthManager(API_BASE, NETWORK);
-    window.authManager = authManager;
-
-    window.setupAuthModals(authManager);
-    authManager.attachEventListeners();
-    window.setupHtmxAuth?.();
-    window.showKeymeldTrust?.();
-
-    // Initialize payouts functionality
-    window.initPayouts?.(API_BASE, ORACLE_BASE);
-  } catch (error) {
-    console.error("Failed to initialize WASM:", error);
-    // Auth features won't work, but basic UI will still function
-  }
+  // An account page opened by its address asks for a login straight away.
+  if (document.querySelector(".sign-in-required")) window.openAuthModal?.("loginModal");
 }
 
 if (document.readyState === "loading") {

@@ -9,9 +9,8 @@ async function registerWithUsername(
   username: string,
   password: string,
 ): Promise<void> {
-  await page.waitForFunction(() => window.wasmInitialized === true, {
-    timeout: 15000,
-  });
+  // The wallet loads on demand (normally when a log-in dialog opens).
+  await page.evaluate(() => window.initWasm());
 
   await page.locator("#registerNavClick").click();
   await expect(page.locator("#registerModal")).toHaveClass(/is-active/);
@@ -56,7 +55,7 @@ test.describe("Public vs Authenticated Views", () => {
     await expect(page.locator(".navbar-brand strong")).toContainText(
       "Fantasy Weather",
     );
-    await expect(page.locator("#competitionsDataTable")).toBeVisible();
+    await expect(page.locator("#competitions-page")).toBeVisible();
     await expect(page.locator("#loginNavClick")).toBeVisible();
     await expect(page.locator("#registerNavClick")).toBeVisible();
   });

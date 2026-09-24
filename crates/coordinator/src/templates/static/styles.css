@@ -217,12 +217,6 @@
 /* ===========================================
    Layout
    =========================================== */
-.parent {
-    width: 95vw;
-    height: 100vh;
-    position: relative;
-    z-index: 1;
-}
 
 /* ===========================================
    Navbar Customizations
@@ -306,135 +300,13 @@
     border-color: #666;
 }
 
-.private-key-box {
-    background-color: var(--app-modal-bg);
-    border: 1px solid var(--app-modal-border);
-    padding: 1rem;
-    border-radius: var(--bulma-radius, 6px);
-    margin: 1rem 0;
-}
-
 /* ===========================================
    Steps Progress Indicator
    =========================================== */
-.steps {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    margin-bottom: 2rem;
-}
-
-.step-item {
-    flex: 1;
-    text-align: center;
-    position: relative;
-}
-
-.step-item:not(:last-child):after {
-    content: "";
-    position: absolute;
-    left: calc(50% + 1.5rem);
-    top: 1rem;
-    width: calc(100% - 3rem);
-    height: 2px;
-    background: var(--app-border, #dbdbdb);
-}
-
-.step-marker {
-    width: 2rem;
-    height: 2rem;
-    border-radius: 50%;
-    background: var(--app-border, #dbdbdb);
-    color: #fff;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    margin: 0 auto 0.5rem;
-}
-
-.step-item.is-active .step-marker {
-    background: var(--bulma-link, #3273dc);
-}
-
-.step-item.is-completed .step-marker {
-    background: var(--bulma-success, #48c774);
-}
-
-.step-title {
-    font-size: 0.875rem;
-    color: var(--app-text, #363636);
-}
 
 /* ===========================================
    Signing Session Cards
    =========================================== */
-.signing-progress-content {
-    background: var(--app-card-bg, white);
-    border-radius: var(--bulma-radius, 6px);
-    padding: 1.5rem;
-    margin-top: 1rem;
-}
-
-#signingProgressContainer {
-    min-height: 100px;
-    padding: 1rem;
-}
-
-.signing-session-card {
-    background: var(--app-card-bg, white);
-    border-radius: var(--bulma-radius-large, 8px);
-    box-shadow: var(--app-card-shadow, 0 2px 8px rgba(0, 0, 0, 0.15));
-    margin-bottom: 15px;
-    padding: 20px;
-    transition: box-shadow 0.3s ease;
-    border-left: 4px solid transparent;
-}
-
-.signing-session-card:hover {
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
-}
-
-.signing-session-card.initialized {
-    border-left-color: var(--bulma-link, #3273dc);
-}
-
-.signing-session-card.completed {
-    border-left-color: var(--bulma-success, #48c774);
-}
-
-.signing-session-card.error {
-    border-left-color: var(--bulma-danger, #f14668);
-}
-
-.competition-details {
-    font-size: 0.9em;
-    color: var(--app-text-muted);
-    margin: 10px 0;
-}
-
-.session-status {
-    font-weight: 500;
-    color: var(--bulma-link, #3273dc);
-    margin-top: 10px;
-}
-
-.progress-steps {
-    margin-top: 15px;
-    position: relative;
-}
-
-.progress-line {
-    height: 2px;
-    background: var(--app-border, #dbdbdb);
-    position: relative;
-    margin: 10px 0;
-}
-
-.progress-line-fill {
-    height: 100%;
-    background: var(--bulma-link, #3273dc);
-    transition: width 0.3s ease;
-}
 
 /* ===========================================
    Table Enhancements
@@ -691,25 +563,14 @@ tr.is-clickable:hover {
     }
 
     /* Steps - vertical layout on mobile */
-    .steps {
-        flex-direction: column;
-        align-items: center;
-        gap: 0.5rem;
-    }
+    
 
-    .step-item {
-        width: 100%;
-        margin-bottom: 0.5rem;
-    }
+    
 
-    .step-item:not(:last-child):after {
-        display: none;
-    }
+    
 
     /* Signing cards */
-    .signing-session-card {
-        padding: 1rem;
-    }
+    
 
     /* QR code container */
     #qrContainer {
@@ -845,9 +706,7 @@ a:focus-visible {
         border-width: 2px;
     }
 
-    .signing-session-card {
-        border-left-width: 6px;
-    }
+    
 }
 
 /* ===========================================
@@ -1079,48 +938,6 @@ body,
 }
 
 /* Entries map weather popup grid */
-.popup-weather-grid {
-    font-size: 0.8rem;
-    margin-top: 0.5rem;
-}
-
-.weather-grid-row {
-    display: grid;
-    grid-template-columns: 70px 1fr 1fr;
-    gap: 0.25rem;
-    padding: 0.25rem 0;
-    align-items: center;
-}
-
-.weather-grid-row:not(:last-child) {
-    border-bottom: 1px dotted var(--bulma-border-weak, #e8e8e8);
-}
-
-.weather-grid-header {
-    font-weight: 600;
-    color: var(--bulma-text-weak, #7a7a7a);
-    border-bottom: 1px solid var(--bulma-border, #dbdbdb) !important;
-    padding-bottom: 0.3rem;
-    margin-bottom: 0.1rem;
-}
-
-.weather-grid-label {
-    font-size: 0.75rem;
-    color: var(--bulma-text-weak, #7a7a7a);
-}
-
-.weather-grid-value {
-    text-align: center;
-    font-family: monospace;
-}
-
-.popup-action {
-    text-align: center;
-}
-
-.popup-close {
-    margin-left: auto;
-}
 
 /* Region legend */
 .region-legend {
@@ -1296,104 +1113,18 @@ body,
 /* ===========================================
    Entry Form - Over/Par/Under Pick Buttons
    =========================================== */
-.pick-button {
-    min-width: 70px;
-    font-weight: 500;
-}
 
 /* Over button - purple */
-.pick-button[data-value="over"].is-active {
-    background-color: #9b59b6 !important;
-    border-color: #9b59b6 !important;
-    color: white !important;
-}
-
-.pick-button[data-value="over"]:not(.is-active):hover {
-    background-color: rgba(155, 89, 182, 0.1);
-    border-color: #9b59b6;
-    color: #9b59b6;
-}
 
 /* Par button - teal/cyan */
-.pick-button[data-value="par"].is-active {
-    background-color: #16a085 !important;
-    border-color: #16a085 !important;
-    color: white !important;
-}
-
-.pick-button[data-value="par"]:not(.is-active):hover {
-    background-color: rgba(22, 160, 133, 0.1);
-    border-color: #16a085;
-    color: #16a085;
-}
 
 /* Under button - cool blue */
-.pick-button[data-value="under"].is-active {
-    background-color: #3498db !important;
-    border-color: #3498db !important;
-    color: white !important;
-}
-
-.pick-button[data-value="under"]:not(.is-active):hover {
-    background-color: rgba(52, 152, 219, 0.1);
-    border-color: #3498db;
-    color: #3498db;
-}
 
 /* Weather context display in entry form */
-.weather-context {
-    font-size: 0.85rem;
-    color: var(--bulma-text-weak, #7a7a7a);
-    margin-bottom: 0.5rem;
-    padding: 0.5rem;
-    background: var(--app-bg-secondary, #fafafa);
-    border-radius: 4px;
-}
-
-.weather-context .weather-row {
-    display: flex;
-    justify-content: space-between;
-    padding: 0.25rem 0;
-}
-
-.weather-context .weather-label {
-    font-weight: 500;
-}
-
-.weather-context .weather-value {
-    font-family: monospace;
-}
-
-.weather-context .forecast-value {
-    color: var(--bulma-info, #3e8ed0);
-    font-weight: 600;
-}
-
-[data-theme="dark"] .weather-context {
-    background: var(--app-bg-secondary);
-}
 
 /* Competitions table - compact layout */
-.competitions-table {
-    font-size: 0.9rem;
-}
-
-.competitions-table th,
-.competitions-table td {
-    white-space: nowrap;
-    padding: 0.5em 0.75em;
-}
 
 /* Competitions table card layout on mobile */
-@media screen and (max-width: 768px) {
-    .competitions-table td {
-        white-space: normal;
-    }
-}
-
-.competitions-table .utc-time {
-    font-family: inherit;
-}
 
 /* Fix table hover/selected states in dark mode - keep text readable */
 [data-theme="dark"] .table.is-hoverable tbody tr:not(.is-selected):hover {
@@ -1415,141 +1146,8 @@ body,
 }
 
 /* Dark mode - pick buttons should have white text/border when not selected */
-[data-theme="dark"] .pick-button.is-outlined {
-    border-color: rgba(255, 255, 255, 0.6);
-    color: rgba(255, 255, 255, 0.9);
-}
-
-[data-theme="dark"] .pick-button.is-outlined:hover {
-    border-color: white;
-    color: white;
-}
 
 /* ===========================================
    Entry Detail Cards (modal)
    =========================================== */
-.entry-detail-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 1rem;
-}
 
-.entry-detail-header .entry-id {
-    font-size: 0.8rem;
-    color: var(--app-text-muted, #7a7a7a);
-    font-family: monospace;
-}
-
-.entry-detail-score {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4rem;
-    font-size: 1.1rem;
-    font-weight: 700;
-    padding: 0.3rem 0.75rem;
-    border-radius: 6px;
-    background: rgba(72, 95, 199, 0.15);
-    color: var(--bulma-link, #485fc7);
-}
-
-.entry-pick-card {
-    display: grid;
-    grid-template-columns: auto 1fr auto;
-    gap: 0.5rem;
-    align-items: center;
-    padding: 0.6rem 0.75rem;
-    border-radius: 6px;
-    background: var(--app-bg-secondary, #fafafa);
-    margin-bottom: 0.5rem;
-    font-size: 0.875rem;
-}
-
-[data-theme="dark"] .entry-pick-card {
-    background: var(--app-bg-secondary, #16213e);
-}
-
-.entry-pick-icon {
-    font-size: 1.3rem;
-    line-height: 1;
-}
-
-.entry-pick-info {
-    min-width: 0;
-}
-
-.entry-pick-label {
-    font-weight: 600;
-    font-size: 0.8rem;
-    margin-bottom: 0.15rem;
-}
-
-.entry-pick-station {
-    font-size: 0.7rem;
-    color: var(--app-text-muted, #7a7a7a);
-}
-
-.entry-pick-values {
-    display: flex;
-    flex-direction: column;
-    gap: 0.15rem;
-    font-size: 0.75rem;
-    color: var(--app-text-muted, #7a7a7a);
-    font-family: monospace;
-}
-
-.entry-pick-forecast,
-.entry-pick-observed {
-    display: block;
-}
-
-.entry-pick-observed strong {
-    color: var(--bulma-link, #485fc7);
-}
-
-.entry-pick-result {
-    text-align: right;
-    white-space: nowrap;
-}
-
-.entry-pick-choice {
-    font-size: 0.75rem;
-    font-weight: 600;
-}
-
-.entry-pick-choice.pick-over {
-    color: #9b59b6;
-}
-
-.entry-pick-choice.pick-par {
-    color: #16a085;
-}
-
-.entry-pick-choice.pick-under {
-    color: #3498db;
-}
-
-.entry-pick-points {
-    font-size: 0.8rem;
-    font-weight: 700;
-    margin-top: 0.1rem;
-}
-
-.entry-pick-points.points-high {
-    color: var(--bulma-success, #48c774);
-}
-
-.entry-pick-points.points-mid {
-    color: var(--bulma-info, #3e8ed0);
-}
-
-.entry-pick-points.points-zero {
-    color: var(--app-text-muted, #7a7a7a);
-}
-
-.entry-pending-msg {
-    font-size: 0.8rem;
-    color: var(--app-text-muted, #7a7a7a);
-    text-align: center;
-    padding: 0.5rem;
-}

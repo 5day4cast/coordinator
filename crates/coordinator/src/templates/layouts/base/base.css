@@ -1,0 +1,141 @@
+/* Layout-wide pieces used by several pages. */
+
+/* A thin bar across the top while a navigation loads. htmx marks the link or
+   row that started the request; background refreshes do not show it. */
+.page-loading {
+  position: fixed;
+  inset: 0 0 auto 0;
+  height: 3px;
+  z-index: 100;
+  background: var(--bulma-link);
+  transform: scaleX(0);
+  transform-origin: left;
+  opacity: 0;
+  pointer-events: none;
+}
+
+body:has(a.htmx-request, tr.htmx-request, button.htmx-request) .page-loading {
+  opacity: 1;
+  animation: page-loading 2s ease-out forwards;
+}
+
+@keyframes page-loading {
+  from {
+    transform: scaleX(0.1);
+  }
+  to {
+    transform: scaleX(0.9);
+  }
+}
+
+tr.htmx-request,
+a.competition-row.htmx-request {
+  opacity: 0.6;
+}
+
+.back-link {
+  display: inline-block;
+  margin-bottom: 0.75rem;
+  font-size: 0.9rem;
+}
+
+.copyable-id {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  white-space: nowrap;
+}
+
+.copyable-id code {
+  background: transparent;
+  padding: 0;
+  color: inherit;
+}
+
+.copy-button {
+  border: 1px solid var(--bulma-border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--bulma-text-weak);
+  font-size: 0.7rem;
+  padding: 0 0.35rem;
+  cursor: pointer;
+}
+
+.copy-button:hover {
+  color: var(--bulma-text-strong);
+}
+
+/* "You" on the viewer's own rows, marked in the browser. */
+.you-badge {
+  display: none;
+  margin-left: 0.4rem;
+  padding: 0 0.4rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  background: var(--bulma-link);
+  color: var(--bulma-link-invert);
+}
+
+.is-own .you-badge {
+  display: inline-block;
+}
+
+tr.is-own td {
+  background: var(--bulma-link-light);
+}
+
+.account-page {
+  max-width: 60rem;
+}
+
+.empty-state-box {
+  padding: 1.25rem;
+  border: 1px dashed var(--bulma-border);
+  border-radius: 0.5rem;
+}
+
+.notice {
+  padding: 0.75rem 1rem;
+  border-left: 3px solid var(--bulma-border);
+  background: var(--bulma-scheme-main-bis);
+  margin-bottom: 1rem;
+}
+
+.sign-in-required p {
+  max-width: 34rem;
+}
+
+.auth-error {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 9999;
+  max-width: 400px;
+}
+
+.auth-tabs {
+  margin-bottom: 1rem;
+}
+
+.session-note {
+  color: var(--bulma-text-weak);
+}
+
+.station-code {
+  font-size: 0.8em;
+  font-weight: 400;
+  color: var(--bulma-text-weak);
+}
+
+.entry-links a + a {
+  margin-left: 0.75rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body:has(a.htmx-request, tr.htmx-request, button.htmx-request) .page-loading {
+    animation: none;
+    transform: scaleX(0.6);
+  }
+}

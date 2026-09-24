@@ -11,9 +11,8 @@ async function registerWithUsername(
 ): Promise<string> {
   await page.goto("/");
 
-  await page.waitForFunction(() => window.wasmInitialized === true, {
-    timeout: 15000,
-  });
+  // The wallet loads on demand (normally when a log-in dialog opens).
+  await page.evaluate(() => window.initWasm());
 
   await page.locator("#registerNavClick").click();
   await expect(page.locator("#registerModal")).toHaveClass(/is-active/);
@@ -51,9 +50,8 @@ async function loginWithUsername(
 ): Promise<void> {
   await page.goto("/");
 
-  await page.waitForFunction(() => window.wasmInitialized === true, {
-    timeout: 15000,
-  });
+  // The wallet loads on demand (normally when a log-in dialog opens).
+  await page.evaluate(() => window.initWasm());
 
   await page.locator("#loginNavClick").click();
   await expect(page.locator("#loginModal")).toHaveClass(/is-active/);
@@ -95,9 +93,8 @@ test.describe("Username/Password Authentication", () => {
 
     await page.goto("/");
 
-    await page.waitForFunction(() => window.wasmInitialized === true, {
-      timeout: 15000,
-    });
+    // The wallet loads on demand (normally when a log-in dialog opens).
+    await page.evaluate(() => window.initWasm());
 
     await page.locator("#registerNavClick").click();
     await expect(page.locator("#registerModal")).toHaveClass(/is-active/);
@@ -158,9 +155,8 @@ test.describe("Username/Password Authentication", () => {
     await logout(page);
 
     await page.goto("/");
-    await page.waitForFunction(() => window.wasmInitialized === true, {
-      timeout: 15000,
-    });
+    // The wallet loads on demand (normally when a log-in dialog opens).
+    await page.evaluate(() => window.initWasm());
 
     await page.locator("#loginNavClick").click();
     await page.locator(".tabs li[data-target='usernameLogin']").click();
@@ -287,7 +283,7 @@ test.describe("Username/Password Authentication", () => {
     await expect(page.locator("#payouts")).toBeVisible({ timeout: 10000 });
 
     await page.locator("#allCompetitionsNavClick").click();
-    await expect(page.locator("#allCompetitions")).toBeVisible({
+    await expect(page.locator("#competitions-page")).toBeVisible({
       timeout: 10000,
     });
   });
@@ -295,9 +291,8 @@ test.describe("Username/Password Authentication", () => {
   test("extension login still works", async ({ page }) => {
     await page.goto("/");
 
-    await page.waitForFunction(() => window.wasmInitialized === true, {
-      timeout: 15000,
-    });
+    // The wallet loads on demand (normally when a log-in dialog opens).
+    await page.evaluate(() => window.initWasm());
 
     await page.locator("#loginNavClick").click();
     await expect(page.locator("#loginModal")).toHaveClass(/is-active/);
@@ -325,9 +320,8 @@ test.describe("Username/Password Authentication", () => {
     await logout(page);
 
     await page.goto("/");
-    await page.waitForFunction(() => window.wasmInitialized === true, {
-      timeout: 15000,
-    });
+    // The wallet loads on demand (normally when a log-in dialog opens).
+    await page.evaluate(() => window.initWasm());
 
     const loginSuccess = await page.evaluate(async (nsec) => {
       try {
@@ -368,9 +362,8 @@ test.describe("Username/Password Authentication", () => {
     const weakPassword = "short";
 
     await page.goto("/");
-    await page.waitForFunction(() => window.wasmInitialized === true, {
-      timeout: 15000,
-    });
+    // The wallet loads on demand (normally when a log-in dialog opens).
+    await page.evaluate(() => window.initWasm());
 
     await page.locator("#registerNavClick").click();
     await page.locator(".tabs li[data-target='registerUsername']").click();
@@ -395,9 +388,8 @@ test.describe("Username/Password Authentication", () => {
     const password2 = "differentPassword456!";
 
     await page.goto("/");
-    await page.waitForFunction(() => window.wasmInitialized === true, {
-      timeout: 15000,
-    });
+    // The wallet loads on demand (normally when a log-in dialog opens).
+    await page.evaluate(() => window.initWasm());
 
     await page.locator("#registerNavClick").click();
     await page.locator(".tabs li[data-target='registerUsername']").click();
@@ -420,9 +412,8 @@ test.describe("Username/Password Authentication", () => {
     const password = "testPassword123!";
 
     await page.goto("/");
-    await page.waitForFunction(() => window.wasmInitialized === true, {
-      timeout: 15000,
-    });
+    // The wallet loads on demand (normally when a log-in dialog opens).
+    await page.evaluate(() => window.initWasm());
 
     await page.locator("#registerNavClick").click();
     await page.locator(".tabs li[data-target='registerUsername']").click();
@@ -451,9 +442,8 @@ test.describe("Username/Password Authentication", () => {
 
   test("tab switching works correctly in login modal", async ({ page }) => {
     await page.goto("/");
-    await page.waitForFunction(() => window.wasmInitialized === true, {
-      timeout: 15000,
-    });
+    // The wallet loads on demand (normally when a log-in dialog opens).
+    await page.evaluate(() => window.initWasm());
 
     await page.locator("#loginNavClick").click();
 
@@ -471,9 +461,8 @@ test.describe("Username/Password Authentication", () => {
 
   test("tab switching works correctly in register modal", async ({ page }) => {
     await page.goto("/");
-    await page.waitForFunction(() => window.wasmInitialized === true, {
-      timeout: 15000,
-    });
+    // The wallet loads on demand (normally when a log-in dialog opens).
+    await page.evaluate(() => window.initWasm());
 
     await page.locator("#registerNavClick").click();
 

@@ -4139,7 +4139,8 @@ fn validate_entry_keys(entry: &mut AddEntry) -> Result<(), Error> {
     Ok(())
 }
 
-fn get_percentage_weights(num_winners: usize) -> Vec<u64> {
+/// Each paid place's share of the pot, in percent, first place first.
+pub fn get_percentage_weights(num_winners: usize) -> Vec<u64> {
     match num_winners {
         1 => vec![100],
         2 => vec![70, 30],

@@ -1,0 +1,79 @@
+/* An entry's picks, in the picks dialog. */
+
+.entry-detail-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.entry-detail-score {
+  font-size: 1.25rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.entry-pending-msg {
+  color: var(--bulma-text-weak);
+}
+
+.picks-station + .picks-station {
+  margin-top: 1rem;
+}
+
+.picks-station-name {
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+}
+
+.scored-pick {
+  display: grid;
+  grid-template-columns: 9rem 1fr 4rem 3.5rem;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.35rem 0.5rem;
+  border-radius: 6px;
+  font-size: 0.9rem;
+}
+
+.scored-pick + .scored-pick {
+  margin-top: 0.2rem;
+}
+
+.scored-pick.is-hit {
+  background: hsla(141, 53%, 42%, 0.12);
+}
+
+.scored-pick.is-miss {
+  background: var(--bulma-scheme-main-bis);
+}
+
+.pick-choice {
+  font-weight: 600;
+}
+
+.pick-result {
+  text-align: right;
+  font-weight: 600;
+}
+
+.is-hit .pick-result {
+  color: hsl(141, 53%, 36%);
+}
+
+.is-miss .pick-result {
+  color: var(--bulma-text-weak);
+}
+
+@media screen and (max-width: 600px) {
+  .picks-detail .scored-pick {
+    grid-template-columns: 1fr auto auto;
+  }
+
+  .picks-detail .pick-values {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    font-size: 0.8rem;
+  }
+}

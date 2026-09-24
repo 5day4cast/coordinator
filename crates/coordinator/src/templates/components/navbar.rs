@@ -2,9 +2,8 @@ use maud::{html, Markup};
 
 /// Public UI navigation bar with integrated branding
 ///
-/// Uses HTMX for navigation with `data-requires-auth` for protected routes.
-/// The crypto_bridge.js intercepts these requests to add auth headers.
-/// Updated for Bulma v1 - uses 4 spans in burger for proper animation.
+/// Links load pages with htmx; `htmx_auth.js` signs requests for account
+/// pages. Bulma v1's animated burger needs its four spans.
 pub fn navbar() -> Markup {
     html! {
         nav class="navbar is-light" role="navigation" aria-label="main navigation" {
@@ -49,8 +48,7 @@ pub fn navbar() -> Markup {
                           id="allEntriesNavClick"
                           hx-get="/entries"
                           hx-target="#main-content"
-                          hx-push-url="true"
-                          data-requires-auth="true" {
+                          hx-push-url="true" {
                             "Entries"
                         }
 
@@ -59,8 +57,7 @@ pub fn navbar() -> Markup {
                           id="payoutsNavClick"
                           hx-get="/payouts"
                           hx-target="#main-content"
-                          hx-push-url="true"
-                          data-requires-auth="true" {
+                          hx-push-url="true" {
                             "Payouts"
                         }
                     }
@@ -93,10 +90,12 @@ pub fn navbar() -> Markup {
                         // Auth buttons (shown when logged out)
                         div class="navbar-item" id="authButtons" {
                             div class="buttons" {
-                                a class="button is-primary" id="loginNavClick" {
+                                button type="button" class="button is-primary" id="loginNavClick"
+                                       data-open-modal="loginModal" {
                                     "Log in"
                                 }
-                                a class="button is-light" id="registerNavClick" {
+                                button type="button" class="button is-light" id="registerNavClick"
+                                       data-open-modal="registerModal" {
                                     "Sign up"
                                 }
                             }
@@ -105,8 +104,8 @@ pub fn navbar() -> Markup {
                         // Logout button (shown when logged in, hidden by default)
                         div class="navbar-item is-hidden" id="logoutContainer" {
                             div class="buttons" {
-                                a href="#" class="button is-light" id="logoutNavClick" {
-                                    "Logout"
+                                button type="button" class="button is-light" id="logoutNavClick" {
+                                    "Log out"
                                 }
                             }
                         }

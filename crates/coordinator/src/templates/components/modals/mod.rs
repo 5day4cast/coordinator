@@ -22,26 +22,56 @@ pub fn auth_modals() -> Markup {
     }
 }
 
+/// The rule `validatePasswordStrength` in modals.js enforces.
+const PASSWORD_RULE: &str =
+    "At least 10 characters, with an upper-case letter, a lower-case letter, a number and a symbol.";
+
+/// Log-in and sign-up both offer a password account or a Nostr extension.
+fn auth_tabs(username_panel: &str, extension_panel: &str) -> Markup {
+    html! {
+        div class="tabs is-centered is-boxed auth-tabs" {
+            ul {
+                li class="is-active" data-target=(username_panel) {
+                    a { "Username and password" }
+                }
+                li data-target=(extension_panel) {
+                    a { "Nostr extension" }
+                }
+            }
+        }
+    }
+}
+
+/// Keys are held only in this tab's memory, so say what that means.
+fn session_note() -> Markup {
+    html! {
+        p class="help session-note mb-3" {
+            "For safety your key stays in this tab's memory only: reloading the page or opening a new tab signs you out."
+        }
+    }
+}
+
+fn extension_note() -> Markup {
+    html! {
+        p class="mb-4" {
+            "Use a Nostr signer extension (NIP-07) such as Alby or nos2x. "
+            "Your key stays in the extension; it signs for this site when asked."
+        }
+    }
+}
+
 fn login_modal() -> Markup {
     html! {
         div id="loginModal" class="modal" {
             div class="modal-background" {}
             div class="modal-card" {
                 header class="modal-card-head" {
-                    p class="modal-card-title" { "Welcome Back" }
+                    p class="modal-card-title" { "Log in" }
                     button id="closeLoginModal" class="delete" aria-label="close" {}
                 }
                 section class="modal-card-body" {
-                    div class="tabs is-centered is-boxed" {
-                        ul {
-                            li class="is-active" data-target="usernameLogin" {
-                                a { span { "Username" } }
-                            }
-                            li data-target="extensionLogin" {
-                                a { span { "Browser Extension" } }
-                            }
-                        }
-                    }
+                    (session_note())
+                    (auth_tabs("usernameLogin", "extensionLogin"))
 
                     div id="usernameLogin" {
                         div class="field" {
@@ -74,6 +104,7 @@ fn login_modal() -> Markup {
                     }
 
                     div id="extensionLogin" class="is-hidden" {
+                        (extension_note())
                         div class="field" {
                             div class="control" {
                                 button class="button is-info is-fullwidth" id="extensionLoginButton" {
@@ -118,20 +149,12 @@ fn register_modal() -> Markup {
             div class="modal-background" {}
             div class="modal-card" {
                 header class="modal-card-head" {
-                    p class="modal-card-title" { "Create Account" }
+                    p class="modal-card-title" { "Sign up" }
                     button id="closeResisterModal" class="delete" aria-label="close" {}
                 }
                 section class="modal-card-body" {
-                    div class="tabs is-centered" {
-                        ul {
-                            li class="is-active" data-target="registerUsername" {
-                                a { "Username" }
-                            }
-                            li data-target="registerExtension" {
-                                a { "Browser Extension" }
-                            }
-                        }
-                    }
+                    (session_note())
+                    (auth_tabs("registerUsername", "registerExtension"))
 
                     div id="registerUsername" {
                         div id="usernameRegisterStep1" {
@@ -147,8 +170,9 @@ fn register_modal() -> Markup {
                                 label class="label" { "Password" }
                                 div class="control" {
                                     input class="input" type="password" id="registerPassword"
-                                          placeholder="Choose a strong password (min 10 characters)";
+                                          placeholder="Choose a strong password" autocomplete="new-password";
                                 }
+                                p class="help" { (PASSWORD_RULE) }
                             }
                             div class="field" {
                                 label class="label" { "Confirm Password" }
@@ -203,9 +227,7 @@ fn register_modal() -> Markup {
                     }
 
                     div id="registerExtension" class="is-hidden" {
-                        p class="mb-4" {
-                            "Register a new account using your Nostr browser extension."
-                        }
+                        (extension_note())
                         (lightning_address_field("extensionLightningAddress"))
                         div class="field" {
                             div class="control" {
@@ -278,8 +300,9 @@ fn forgot_password_modal() -> Markup {
                             label class="label" { "New Password" }
                             div class="control" {
                                 input class="input" type="password" id="forgotNewPassword"
-                                      placeholder="Choose a new password (min 10 characters)";
+                                      placeholder="Choose a new password" autocomplete="new-password";
                             }
+                            p class="help" { (PASSWORD_RULE) }
                         }
                         div class="field" {
                             label class="label" { "Confirm New Password" }

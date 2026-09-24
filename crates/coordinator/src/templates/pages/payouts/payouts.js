@@ -2,10 +2,12 @@ class Payouts {
   constructor(coordinator_url, oracle_url) {
     this.coordinator_url = coordinator_url;
     this.oracle_url = oracle_url;
-    this.client = new window.AuthorizedClient(
-      window.nostrClient,
-      coordinator_url,
-    );
+  }
+
+  // Signed by whoever is logged in now: the wallet loads after this object
+  // exists, and logging out and in again replaces the signer.
+  get client() {
+    return new window.AuthorizedClient(window.nostrClient, this.coordinator_url);
   }
 
   async getPayableEntries() {

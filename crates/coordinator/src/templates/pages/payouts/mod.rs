@@ -1,5 +1,7 @@
 use maud::{html, Markup};
 
+use crate::templates::format::{copyable_id, sats};
+
 /// View data for an eligible payout
 #[derive(Debug, Clone)]
 pub struct PayoutView {
@@ -16,9 +18,9 @@ pub struct PayoutView {
 /// the profile address is a default for future entries only.
 pub fn payouts_page(payouts: &[PayoutView], lightning_address: Option<&str>) -> Markup {
     html! {
-        div id="payouts" class="container" {
-            div class="box" {
-                h3 class="title is-4 mb-4" { "Available Payouts" }
+        div id="payouts" class="account-page" {
+            div {
+                h1 class="title is-4 mb-4" { "Payouts" }
 
                 (lightning_address_panel(lightning_address))
 
@@ -29,9 +31,9 @@ pub fn payouts_page(payouts: &[PayoutView], lightning_address: Option<&str>) -> 
                         table class="table is-fullwidth is-striped is-hoverable is-card-mobile" {
                             thead {
                                 tr {
-                                    th { "Competition ID" }
-                                    th { "Entry ID" }
-                                    th { "Amount (sats)" }
+                                    th { "Competition" }
+                                    th { "Entry" }
+                                    th { "Amount" }
                                     th { "Status" }
                                     th { "Action" }
                                 }
@@ -39,9 +41,13 @@ pub fn payouts_page(payouts: &[PayoutView], lightning_address: Option<&str>) -> 
                             tbody {
                                 @for payout in payouts {
                                     tr {
-                                        td data-label="Competition" title=(payout.competition_id) { (&payout.competition_id[..8]) }
-                                        td data-label="Entry ID" title=(payout.entry_id) { (&payout.entry_id[..8]) }
-                                        td data-label="Amount" { (payout.payout_amount) " sats" }
+                                        td data-label="Competition" {
+                                            a href=(format!("/competitions/{}/leaderboard", payout.competition_id))
+                                              hx-get=(format!("/competitions/{}/leaderboard", payout.competition_id))
+                                              hx-target="#main-content" hx-push-url="true" { "Leaderboard" }
+                                        }
+                                        td data-label="Entry" { (copyable_id(&payout.entry_id)) }
+                                        td data-label="Amount" { (sats(payout.payout_amount)) }
                                         td data-label="Status" { (payout.status) }
                                         td data-label="Action" {
                                             @if let Some(address) = &payout.automatic_lightning_address {
@@ -122,8 +128,8 @@ fn lightning_address_panel(lightning_address: Option<&str>) -> Markup {
 /// No payouts available message
 pub fn no_payouts() -> Markup {
     html! {
-        div id="noPayoutsMessage" class="notification is-info" {
-            "No entries eligible for payout at this time."
+        div id="noPayoutsMessage" class="empty-state-box" {
+            "Nothing to collect right now. Winnings appear here after a competition you placed in finishes."
         }
     }
 }

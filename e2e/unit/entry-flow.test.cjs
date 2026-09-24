@@ -30,8 +30,9 @@ function element(extra = {}) {
   };
 }
 
-// A page holding the entry form as the coordinator renders it for EVENT.
-function entryPage() {
+// A page holding the entry form as the coordinator renders it for EVENT,
+// with the given picks already checked.
+function entryPage(checked = [{ name: "KPWM_temp_high", value: "over" }]) {
   const elements = {
     entryForm: element({
       dataset: {
@@ -40,30 +41,30 @@ function entryPage() {
         ticketPrice: "5250",
         totalPool: "15000",
         winnerCount: "1",
-        maxValues: "1",
+        maxValues: "2",
       },
-      querySelectorAll: () => [{ name: "KPWM_temp_high", value: "over" }],
+      querySelectorAll: (selector) => {
+        assert.equal(selector, 'input[type="radio"]:checked');
+        return checked;
+      },
     }),
     submitEntry: element(),
     errorMessage: element({ classes: ["hidden"] }),
     successMessage: element({ classes: ["hidden"] }),
-    entryPayoutApproved: element(),
-    entryPayoutTermsText: element({ textContent: "Loading payout terms…" }),
-    entryPayoutDestination: element({ textContent: "Log in to see where your winnings are paid." }),
+    loginModal: element(),
   };
   const document = {
     body: { dataset: { apiBase: "https://coordinator", oracleBase: "https://oracle" } },
     getElementById: (id) => elements[id] ?? null,
-    querySelectorAll: () => [],
+    addEventListener: () => {},
   };
   return { elements, document };
 }
 
 function load(window, document, fetch) {
-  const sandbox = { window, document, fetch, crypto: webcrypto, TextEncoder, console,
-    lightningPayReq: { decode: () => ({ satoshis: 5250 }) } };
+  const sandbox = { window, document, fetch, crypto: webcrypto, TextEncoder, console };
   vm.runInNewContext(readFileSync(path.join(__dirname,
-    "../../crates/coordinator/src/templates/pages/entries/entries.js"), "utf8"), sandbox);
+    "../../crates/coordinator/src/templates/fragments/entry_form/entry_form.js"), "utf8"), sandbox);
   return sandbox;
 }
 
@@ -79,34 +80,50 @@ function termsFetch(event = EVENT, quote = {}) {
   };
 }
 
-test("ticket price matches the server's rounding of the coordinator fee", () => {
-  const { document } = entryPage();
-  const { ticketPriceSats } = load({}, document, termsFetch());
-  assert.equal(ticketPriceSats({ entry_fee: 5000, coordinator_fee_percentage: 5 }), 5250);
-  assert.equal(ticketPriceSats({ entry_fee: 333, coordinator_fee_percentage: 5 }), 350);
-  assert.equal(ticketPriceSats({ entry_fee: 1000, coordinator_fee_percentage: 0 }), 1000);
-});
-
-test("entry approves the full ticket price and the profile address, and shows the wallet's own refusal", async () => {
-  const { elements, document } = entryPage();
-  elements.entryPayoutApproved.checked = true;
-  let consent;
-  const refusal = "Payout policy differs from the approved entry and ticket";
-  const window = {
+function loggedIn(extra = {}) {
+  return {
     isLoggedIn: () => true,
     nostrClient: { isSignerReady: () => true },
-    entryPayoutAddress: "thor@lnurl.5day4cast.com",
-    entryPayoutAddressLoaded: true,
-    entryPayoutTerms: {
-      competition: { id: COMPETITION, event_submission: EVENT },
-      quote: { enabled: true, relative_locktime_block_delta: 72, max_fee_rate_sat_vb: 5 },
-      oracle: { event_announcement: {} },
+    ...extra,
+  };
+}
+
+test("ticket price matches the server's rounding of the coordinator fee", () => {
+  const { document } = entryPage();
+  const { window } = load({}, document, termsFetch());
+  assert.equal(window.ticketPriceSats({ entry_fee: 5000, coordinator_fee_percentage: 5 }), 5250);
+  assert.equal(window.ticketPriceSats({ entry_fee: 333, coordinator_fee_percentage: 5 }), 350);
+  assert.equal(window.ticketPriceSats({ entry_fee: 1000, coordinator_fee_percentage: 0 }), 1000);
+});
+
+test("picks come from the checked radios, grouped by station", () => {
+  const { document, elements } = entryPage([
+    { name: "KPWM_temp_high", value: "over" },
+    { name: "KPWM_wind_speed", value: "par" },
+    { name: "KBTV_temp_low", value: "under" },
+  ]);
+  const { window } = load({}, document, termsFetch());
+  assert.deepEqual(JSON.parse(JSON.stringify(window.collectPicks(elements.entryForm))), {
+    KPWM: { temp_high: "over", wind_speed: "par" },
+    KBTV: { temp_low: "under" },
+  });
+});
+
+test("entering is the consent: the ticket carries the full price and the account's address", async () => {
+  const { elements, document } = entryPage();
+  let consent;
+  const refusal = "Payout policy differs from the approved entry and ticket";
+  const window = loggedIn({
+    AuthorizedClient: class {
+      async post(url) {
+        if (url.endsWith("/api/v1/users/login")) {
+          return { ok: true, json: async () => ({ lightning_address: "thor@lnurl.5day4cast.com" }) };
+        }
+        return { ok: true, json: async () => ({ ticket_id: "ticket", payment_request: "lnbc52500n1ticket",
+          keymeld_session_id: "session", keymeld_registration: {
+            user_id: "ticket", session_id: "session", payout_policy: "policy" } }) };
+      }
     },
-    AuthorizedClient: class { async post() {
-      return { ok: true, json: async () => ({ ticket_id: "ticket", payment_request: "lnbc52500n1ticket",
-        keymeld_session_id: "session", keymeld_registration: {
-          user_id: "ticket", session_id: "session", payout_policy: "policy" } }) };
-    } },
     dlcWallet: {
       entryRegistration: () => ({ ephemeral_pubkey: "pubkey", payout_hash: "hash" }),
       keymeldPayoutRegistration: async (_entry, _assignment, serialized) => {
@@ -114,87 +131,67 @@ test("entry approves the full ticket price and the profile address, and shows th
         // WASM rejects with a plain string, not an Error.
         throw refusal;
       },
+      keymeldRegistration: () => assert.fail("escrow must not downgrade"),
     },
-  };
-  window.dlcWallet.keymeldRegistration = () => assert.fail("escrow must not downgrade");
+  });
   const sandbox = load(window, document, termsFetch());
   await sandbox.window.submitEntry();
   assert.equal(consent.ticket_amount_sats, 5250, "the approved amount includes the coordinator fee");
   assert.equal(consent.lightning_address, "thor@lnurl.5day4cast.com");
+  assert.equal(consent.max_fee_rate_sat_vb, 5);
   assert.equal(elements.errorMessage.textContent, refusal);
   assert.ok(!elements.errorMessage.classList.contains("hidden"));
+  assert.equal(elements.submitEntry.disabled, false);
 });
 
-test("a full page load gets payout terms, then the profile address once the user logs in", async () => {
+test("a signed-out visitor is asked to log in before anything is requested", async () => {
   const { elements, document } = entryPage();
-  const window = {
-    isLoggedIn: () => false,
-    AuthorizedClient: class { async post(url) {
-      assert.ok(url.endsWith("/api/v1/users/login"));
-      return { ok: true, json: async () => ({ lightning_address: "thor@lnurl.5day4cast.com" }) };
-    } },
-  };
-  const sandbox = load(window, document, termsFetch());
-  await sandbox.window.setupEntryPayoutConsent();
-  assert.equal(sandbox.window.entryPayoutTerms.competition.id, COMPETITION);
-  assert.match(elements.entryPayoutTermsText.textContent, /Maximum Bitcoin fee rate: 5 sat\/vB/);
-  assert.equal(elements.entryPayoutDestination.textContent, "Log in to see where your winnings are paid.");
-  assert.equal(sandbox.window.entryPayoutAddress, null);
-
-  window.isLoggedIn = () => true;
-  window.nostrClient = {};
-  elements.entryPayoutApproved.checked = true;
-  await sandbox.window.refreshEntryPayoutAddress();
-  assert.equal(sandbox.window.entryPayoutAddress, "thor@lnurl.5day4cast.com");
-  assert.equal(elements.entryPayoutDestination.textContent, "Automatically to thor@lnurl.5day4cast.com");
-  assert.equal(elements.entryPayoutApproved.checked, false, "a new destination needs fresh consent");
-});
-
-test("an Arkade entry says its refund goes to the profile address, with nothing more to approve", async () => {
-  const { elements, document } = entryPage();
-  const window = {
-    isLoggedIn: () => true,
-    nostrClient: {},
-    AuthorizedClient: class { async post() {
-      return { ok: true, json: async () => ({ lightning_address: "thor@lnurl.5day4cast.com" }) };
-    } },
-  };
-  const sandbox = load(window, document, termsFetch(EVENT, { arkade: true }));
-  await sandbox.window.setupEntryPayoutConsent();
-  assert.equal(elements.entryPayoutDestination.textContent,
-    "Automatically to thor@lnurl.5day4cast.com. If the competition does not start, your entry fee is refunded there.");
+  let opened = null;
+  const sandbox = load({ isLoggedIn: () => false, openModal: (modal) => { opened = modal; } }, document,
+    async () => assert.fail("nothing may be fetched while signed out"));
+  await sandbox.window.submitEntry();
+  assert.equal(opened, elements.loginModal);
 });
 
 test("changed terms never tell the user to reload, which would log them out", async () => {
   const { elements, document } = entryPage();
-  const sandbox = load({ isLoggedIn: () => false }, document,
-    termsFetch({ ...EVENT, coordinator_fee_percentage: 10 }));
-  await sandbox.window.setupEntryPayoutConsent();
-  assert.equal(sandbox.window.entryPayoutTerms, null);
-  assert.match(elements.entryPayoutTermsText.textContent, /terms changed/);
-  assert.doesNotMatch(elements.entryPayoutTermsText.textContent, /reload/i);
+  const window = loggedIn({
+    AuthorizedClient: class { async post() { assert.fail("no ticket for changed terms"); } },
+    dlcWallet: { entryRegistration: () => assert.fail("no entry key for changed terms") },
+  });
+  const sandbox = load(window, document, termsFetch({ ...EVENT, coordinator_fee_percentage: 10 }));
+  await sandbox.window.submitEntry();
+  assert.match(elements.errorMessage.textContent, /terms changed/);
+  assert.doesNotMatch(elements.errorMessage.textContent, /reload/i);
 });
 
-test("a failed profile lookup refuses the entry instead of dropping automatic payouts", async () => {
+test("a failed address lookup refuses the entry instead of dropping automatic payouts", async () => {
   const { elements, document } = entryPage();
-  elements.entryPayoutApproved.checked = true;
   const requests = [];
-  const window = {
-    isLoggedIn: () => true,
-    nostrClient: { isSignerReady: () => true },
-    entryPayoutTerms: {
-      competition: { id: COMPETITION, event_submission: EVENT },
-      quote: { enabled: true, relative_locktime_block_delta: 72, max_fee_rate_sat_vb: 5 },
-      oracle: { event_announcement: {} },
+  const window = loggedIn({
+    AuthorizedClient: class {
+      async post(url) {
+        requests.push(url);
+        const error = new Error("HTTP error! status: 503");
+        error.response = { ok: false, status: 503 };
+        throw error;
+      }
     },
-    AuthorizedClient: class { async post(url) {
-      requests.push(url);
-      return { ok: false, status: 503, json: async () => ({}) };
-    } },
     dlcWallet: { entryRegistration: () => ({ ephemeral_pubkey: "pubkey", payout_hash: "hash" }) },
-  };
+  });
   const sandbox = load(window, document, termsFetch());
   await sandbox.window.submitEntry();
   assert.match(elements.errorMessage.textContent, /Lightning Address could not be loaded/);
   assert.ok(requests.every((url) => url.endsWith("/api/v1/users/login")), "no ticket may be requested");
+});
+
+test("too many picks are refused before any payment", async () => {
+  const { elements, document } = entryPage([
+    { name: "KPWM_temp_high", value: "over" },
+    { name: "KPWM_temp_low", value: "par" },
+    { name: "KPWM_wind_speed", value: "under" },
+  ]);
+  const sandbox = load(loggedIn({ dlcWallet: {} }), document, async () => assert.fail("nothing fetched"));
+  await sandbox.window.submitEntry();
+  assert.match(elements.errorMessage.textContent, /up to 2 picks/);
 });
