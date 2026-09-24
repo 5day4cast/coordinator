@@ -174,8 +174,11 @@ fn minify_script(files: &[PathBuf], name: &str) -> Result<Vec<u8>, Box<dyn Error
         let source = fs::read_to_string(file)?;
         let allocator = Allocator::default();
         let parsed = Parser::new(&allocator, &source, SourceType::script()).parse();
-        if let Some(error) = parsed.errors.first() {
+        if let Some(error) = parsed.diagnostics.errors().next() {
             return Err(format!("{name}.js: {}: {error}", file.display()).into());
+        }
+        if parsed.panicked {
+            return Err(format!("{name}.js: {}: the parser gave up", file.display()).into());
         }
         let mut program = parsed.program;
         let minified = Minifier::new(MinifierOptions::default()).minify(&allocator, &mut program);
