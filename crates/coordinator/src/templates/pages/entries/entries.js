@@ -76,7 +76,7 @@ class Entry {
   async setupEntry() {
     // The entry key is derived from the entry id, so every entry gets its own
     // key and no counter or entry ordering is involved.
-    const id = generateUuidV7();
+    const id = window.DlcWallet.newEntryId();
     const { ephemeral_pubkey, payout_hash } =
       window.dlcWallet.entryRegistration(id);
 
@@ -167,29 +167,17 @@ class Entry {
             `;
     };
 
-    const $qrCode = document.createElement("bitcoin-qr");
-    Object.assign($qrCode, {
-      id: "paymentQR",
-      lightning: this.ticket.payment_request,
-      width: 300,
-      height: 300,
-      type: "svg",
-      isPolling: true,
-      pollInterval: 2000,
-    });
-
-    [
-      "dots-type:rounded",
-      "corners-square-type:extra-rounded",
-      "background-color:#ffffff",
-      "dots-color:#000000",
-    ].forEach((attr) => {
-      const [key, value] = attr.split(":");
-      $qrCode.setAttribute(key, value);
-    });
+    // The wallet draws the QR code from the invoice after checking that it
+    // charges the ticket price on this network; an <img> of it can run nothing.
+    const $qrCode = document.createElement("img");
+    $qrCode.id = "paymentQR";
+    $qrCode.className = "payment-qr";
+    $qrCode.width = 300;
+    $qrCode.height = 300;
+    $qrCode.alt = "QR code of the Lightning invoice";
+    $qrCode.src = window.dlcWallet.invoiceQr(this.ticket.payment_request, this.ticketAmountSats);
 
     const cleanup = () => {
-      $qrCode.setAttribute("is-polling", "false");
       $qrContainer.innerHTML = "";
       $modal.classList.remove("is-active");
       $copyFeedback.classList.add("is-hidden");
@@ -217,7 +205,7 @@ class Entry {
     $paymentRequest.value = this.ticket.payment_request;
     const $amount = document.getElementById("ticketPaymentAmount");
     if ($amount) {
-      $amount.textContent = `Pay ${invoiceAmountSats(this.ticket.payment_request) ?? this.ticketAmountSats} sats by Lightning to enter this competition:`;
+      $amount.textContent = `Pay ${this.ticketAmountSats} sats by Lightning to enter this competition:`;
     }
     updateStatus("Waiting for payment...");
     $error.classList.add("is-hidden");
@@ -358,8 +346,6 @@ class Entry {
         $modalClose.removeEventListener("click", handleClose);
       };
 
-      // Also set QR code callback for when the component supports it
-      $qrCode.callback = checkPaymentStatus;
     });
   }
 
@@ -703,46 +689,10 @@ window.showKeymeldTrust = showKeymeldTrust;
 window.selectPick = selectPick;
 window.submitEntry = submitEntry;
 
-// Generate UUIDv7 (time-ordered UUID)
-function generateUuidV7() {
-  const timestamp = Date.now();
-  const timestampHex = timestamp.toString(16).padStart(12, "0");
-
-  // Get random bytes for the rest
-  const randomBytes = new Uint8Array(10);
-  crypto.getRandomValues(randomBytes);
-
-  // Build UUIDv7: tttttttt-tttt-7xxx-yxxx-xxxxxxxxxxxx
-  // t = timestamp, 7 = version, y = variant (8, 9, a, or b), x = random
-  const hex = Array.from(randomBytes)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-
-  return [
-    timestampHex.slice(0, 8),
-    timestampHex.slice(8, 12),
-    "7" + hex.slice(0, 3),
-    ((parseInt(hex.slice(3, 4), 16) & 0x3) | 0x8).toString(16) +
-      hex.slice(4, 7),
-    hex.slice(7, 19),
-  ].join("-");
-}
-
-
 // What the server charges for a ticket: the entry fee plus the coordinator fee,
 // rounded the same way as Competition::calculate_invoice_amount.
 function ticketPriceSats(event) {
   return event.entry_fee + Math.round(event.entry_fee * (event.coordinator_fee_percentage / 100));
-}
-
-// The sats a BOLT11 invoice charges, or null when it cannot be decoded.
-function invoiceAmountSats(invoice) {
-  try {
-    const decoded = typeof lightningPayReq === "undefined" ? null : lightningPayReq.decode(invoice);
-    return Number.isSafeInteger(decoded?.satoshis) ? decoded.satoshis : null;
-  } catch (_) {
-    return null;
-  }
 }
 
 function resetEntryPayoutConsent() {

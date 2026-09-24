@@ -23,8 +23,6 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                 link rel="stylesheet" href="/ui/styles.css";
 
                 script src="https://unpkg.com/htmx.org@1.9.10" {}
-                script src="/ui/bolt11.min.js" {}
-                script type="module" src="https://unpkg.com/bitcoin-qr@1.4.1/dist/bitcoin-qr/bitcoin-qr.esm.js" {}
             }
             body data-api-base=(config.api_base) data-oracle-base=(config.oracle_base) data-network=(config.network) {
                 (navbar())

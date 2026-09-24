@@ -40,7 +40,7 @@ fn main() {
     // Build admin bundle: shared + admin
     let admin_dirs = vec!["shared", "admin"];
 
-    // Copy static files (loader.js, styles.css, bolt11.min.js, etc.) FIRST
+    // Copy static files (loader.js, styles.css, etc.) FIRST
     // so they're available for bundling
     copy_static_files(&templates_dir, &output_dir);
 

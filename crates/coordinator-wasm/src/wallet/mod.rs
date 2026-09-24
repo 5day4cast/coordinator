@@ -12,6 +12,7 @@
 mod core;
 mod keymeld_trust;
 mod keys;
+mod qr;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm;
@@ -43,6 +44,8 @@ pub enum WalletError {
     Signer(String),
     #[error("Keymeld error: {0}")]
     Keymeld(String),
+    #[error("Invalid invoice: {0}")]
+    Invoice(String),
     #[error("Invalid contract: {0}")]
     Contract(String),
     #[error("No contract loaded for entry {0}")]

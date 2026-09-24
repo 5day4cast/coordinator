@@ -717,7 +717,7 @@ tr.is-clickable:hover {
         overflow: hidden;
     }
 
-    #qrContainer bitcoin-qr {
+    #qrContainer .payment-qr {
         max-width: 280px;
         margin: 0 auto;
         display: block;
@@ -793,7 +793,7 @@ tr.is-clickable:hover {
     }
 
     /* QR code smaller */
-    #qrContainer bitcoin-qr {
+    #qrContainer .payment-qr {
         max-width: 240px;
     }
 }

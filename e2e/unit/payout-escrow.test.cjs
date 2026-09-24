@@ -8,8 +8,7 @@ const { webcrypto } = require("node:crypto");
 function load(name, window) {
   vm.runInNewContext(readFileSync(path.join(__dirname,
     `../../crates/coordinator/src/templates/pages/${name}/${name}.js`), "utf8"),
-  { window, crypto: webcrypto, TextEncoder, console,
-    lightningPayReq: { decode: () => ({ satoshis: 42, timeExpireDate: Date.now() / 1000 + 600 }) } });
+  { window, crypto: webcrypto, TextEncoder, console });
   return window;
 }
 
@@ -71,6 +70,11 @@ function payoutFixture(status = 200) {
       async post(url, body) { posted = { url, body }; return { ok: true }; }
     },
     dlcWallet: {
+      // The wallet decodes invoices; this fixture's are valid unless empty.
+      validateInvoice: (invoice, amount) => {
+        assert.equal(amount, 42);
+        if (!invoice) throw "Invalid invoice: empty";
+      },
       payoutRelease: () => { releases++; return { ephemeral_private_key: "legacy key", payout_preimage: "legacy preimage" }; },
       authorizePayoutInvoice: (serialized) => { authorization = JSON.parse(serialized); return { context: authorization.context, signature: [1, 2] }; },
     },

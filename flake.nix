@@ -1078,7 +1078,7 @@
           cp -rL ${coordinator-wasm}/pkg/* $out/app/ui/pkg/
 
           # Verify critical files exist
-          for f in loader.js styles.css bolt11.min.js app.min.js styles.min.css; do
+          for f in loader.js styles.css app.min.js styles.min.css; do
             if [ ! -f "$out/app/ui/$f" ]; then
               echo "ERROR: Missing required file: $f"
               echo "Contents of $out/app/ui/:"

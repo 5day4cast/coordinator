@@ -60,8 +60,8 @@ function entryPage() {
 }
 
 function load(window, document, fetch) {
-  const sandbox = { window, document, fetch, crypto: webcrypto, TextEncoder, console,
-    lightningPayReq: { decode: () => ({ satoshis: 5250 }) } };
+  window.DlcWallet ??= { newEntryId: () => "0190b6a0-0000-7000-8000-000000000001" };
+  const sandbox = { window, document, fetch, crypto: webcrypto, TextEncoder, console };
   vm.runInNewContext(readFileSync(path.join(__dirname,
     "../../crates/coordinator/src/templates/pages/entries/entries.js"), "utf8"), sandbox);
   return sandbox;
