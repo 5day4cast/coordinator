@@ -95,13 +95,32 @@ impl Coordinator {
         let status: CompetitionStatus = competition.into();
         let before = status.state_name();
         let next = self.process_status(status).await;
-        let after = next.state_name();
-        let wait = if after != before && next.is_immediate_transition() {
+        let moved_to = next.state_name();
+        // Name and schedule the state the next step will load, which is derived from the stored
+        // fields, so the log never reports a transition the database does not hold.
+        let stored = CompetitionStatus::from(next.into_competition());
+        let after = stored.state_name();
+        if after != moved_to {
+            // Every state a step moves to has stored fields that imply it. One that does not is
+            // lost on reload, so the competition repeats the same step and cannot progress.
+            if self
+                .reported
+                .is_new("unstored state", competition_id, moved_to)
+            {
+                warn!(
+                    "Competition {competition_id} moved to {moved_to}, but its stored fields \
+                     reload it as {after}, so it cannot progress"
+                );
+            } else {
+                debug!("Competition {competition_id} moved to {moved_to} again, stored as {after}");
+            }
+        }
+        let wait = if after != before && stored.is_immediate_transition() {
             Wait::Now
         } else {
-            Wait::Until(next.next_check(OffsetDateTime::now_utc(), pacing.idle))
+            Wait::Until(stored.next_check(OffsetDateTime::now_utc(), pacing.idle))
         };
-        let competition = next.into_competition();
+        let competition = stored.into_competition();
         let died = competition.is_failed() || competition.is_cancelled();
         let failed_at = competition.failed_at;
         self.save_leased(competition, lease).await?;
@@ -155,5 +174,125 @@ impl CompetitionSteps for Coordinator {
 
     async fn clean_up(&self) -> Result<(), anyhow::Error> {
         self.clean_up_competitions().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::KeymeldSettings,
+        infra::{
+            bitcoin_mock::MockBitcoinClient,
+            db::{DBConnection, DatabasePoolConfig, DatabaseType},
+            keymeld::KeymeldService,
+            lightning_mock::MockLnClient,
+            lnurl_mock::MockLnurlPay,
+            oracle_mock::MockOracle,
+        },
+    };
+    use bitcoin::Network;
+
+    fn parameters() -> ContractParameters {
+        ContractParameters {
+            market_maker: dlctix::MarketMaker {
+                pubkey: Scalar::from_slice(&[9; 32]).unwrap().base_point_mul(),
+            },
+            players: [1, 3]
+                .into_iter()
+                .map(|key| Player {
+                    pubkey: Scalar::from_slice(&[key; 32]).unwrap().base_point_mul(),
+                    ticket_hash: dlctix::hashlock::sha256(&[key + 10; 32]),
+                    payout_hash: dlctix::hashlock::sha256(&[key + 1; 32]),
+                })
+                .collect(),
+            event: dlctix::EventLockingConditions {
+                locking_points: vec![Scalar::from_slice(&[10; 32])
+                    .unwrap()
+                    .base_point_mul()
+                    .into()],
+                expiry: None,
+            },
+            outcome_payouts: BTreeMap::from([(
+                Outcome::Attestation(0),
+                PayoutWeights::from([(0, 100)]),
+            )]),
+            fee_rate: FeeRate::from_sat_per_vb_u32(1),
+            funding_value: Amount::from_sat(100_000),
+            relative_locktime_block_delta: 72,
+        }
+    }
+
+    /// Without Keymeld nothing stores AwaitingSignatures, so a competition whose contract is
+    /// built waits for its players' nonces as ContractCreated, the state it reloads as. It used
+    /// to move to AwaitingSignatures in memory on every step, lose that on reload, and never
+    /// sign.
+    #[tokio::test]
+    async fn a_legacy_contract_waits_for_nonces_in_the_state_it_reloads_as() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = DBConnection::new(
+            directory.path().to_str().unwrap(),
+            "competitions",
+            DatabasePoolConfig::default(),
+            DatabaseType::Competitions,
+        )
+        .await
+        .unwrap();
+        let coordinator = Coordinator::new(
+            Arc::new(MockOracle::new([12; 32])),
+            CompetitionStore::new(database.clone()),
+            Arc::new(MockBitcoinClient::new(Network::Regtest)),
+            Arc::new(MockLnClient::new()),
+            Arc::new(MockLnurlPay::new(Network::Regtest)),
+            Arc::new(
+                KeymeldService::new(KeymeldSettings::default(), Uuid::now_v7(), &[1; 32]).unwrap(),
+            ),
+            None,
+            72,
+            1,
+            "legacy-signing-test".into(),
+            false,
+            1,
+        )
+        .await
+        .unwrap();
+        assert!(!coordinator.is_keymeld_enabled());
+
+        let now = OffsetDateTime::now_utc();
+        let mut competition = Competition::new(&CreateEvent {
+            id: Uuid::now_v7(),
+            signing_date: now + time::Duration::hours(3),
+            start_observation_date: now + time::Duration::hours(1),
+            end_observation_date: now + time::Duration::hours(2),
+            locations: vec!["KDEN".into()],
+            number_of_values_per_entry: 3,
+            number_of_places_win: 1,
+            total_allowed_entries: 2,
+            entry_fee: 50_000,
+            coordinator_fee_percentage: 0,
+            total_competition_pool: 100_000,
+            relative_locktime_block_delta: Some(72),
+        });
+        competition.total_entries = 2;
+        competition.total_paid_entries = 2;
+        // One player has sent nonces; the other has not yet.
+        competition.total_entry_nonces = 1;
+        competition.contract_parameters = Some(parameters());
+        competition.contracted_at = Some(now);
+        competition.public_nonces = Some(SigMap {
+            by_outcome: BTreeMap::new(),
+            by_win_condition: BTreeMap::new(),
+        });
+
+        let status = CompetitionStatus::from(competition);
+        assert_eq!(status.state_name(), "contract_created");
+        let next = coordinator.process_status(status).await;
+        assert_eq!(next.state_name(), "contract_created");
+        assert_eq!(
+            CompetitionStatus::from(next.into_competition()).state_name(),
+            "contract_created",
+            "the state a waiting legacy contract moves to is the one it reloads as"
+        );
+        database.close().await.unwrap();
     }
 }

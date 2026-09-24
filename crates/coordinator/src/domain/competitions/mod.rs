@@ -6,6 +6,7 @@ mod automatic_store;
 mod coordinator;
 mod lease_store;
 mod payout;
+mod reported;
 mod runners;
 pub mod states;
 mod store;
@@ -21,6 +22,7 @@ pub use ark_kickoff::*;
 pub use ark_store::*;
 pub use automatic_store::*;
 pub use coordinator::*;
+pub(crate) use reported::Reported;
 use dlctix::{
     bitcoin::{hex::DisplayHex, OutPoint, Transaction},
     hashlock,
