@@ -269,9 +269,6 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
                 }
             }
 
-        // Include location selector JavaScript
-        script src="/ui/location_selector.js" {}
-
         // Sync datetime-local inputs to hidden RFC3339 fields
         script {
             (PreEscaped(r#"

@@ -268,6 +268,8 @@ async fn drain_http(name: &str, mut task: HttpTask, finished: bool) -> Option<an
 #[derive(Clone)]
 pub struct AppState {
     pub ui_dir: String,
+    /// Hash of the WASM package in `ui_dir`; pages request it by this version.
+    pub wasm_version: String,
     pub private_url: String,
     pub remote_url: String,
     pub oracle_url: String,
@@ -662,8 +664,16 @@ pub async fn build_app(
     threads.insert("payment_subscriber".to_string(), payment_subscriber_handle);
     tracker.close();
 
+    let wasm_version = crate::api::ui_files::package_version(&config.ui_settings.ui_dir);
+    if wasm_version.is_empty() {
+        warn!(
+            "No WASM package in {}/pkg; browsers cannot log in",
+            config.ui_settings.ui_dir
+        );
+    }
     let app_state = AppState {
         ui_dir: config.ui_settings.ui_dir,
+        wasm_version,
         private_url: config.ui_settings.private_url,
         remote_url: config.ui_settings.remote_url,
         explorer_url: config
@@ -843,6 +853,10 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
     Router::new()
         .merge(api_routes)
         .route("/ui/{*path}", get(serve_static_file))
+        .route(
+            "/assets/{file}",
+            get(crate::templates::assets::serve_asset),
+        )
         .layer(Extension(replay))
         .layer(Extension(Arc::new(nip98_origins)))
         .layer(middleware::from_fn(log_request))
@@ -938,6 +952,10 @@ pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Ne
         .merge(operator_routes)
         .merge(sign_in)
         .route("/ui/{*path}", get(serve_static_file))
+        .route(
+            "/assets/{file}",
+            get(crate::templates::assets::serve_asset),
+        )
         .with_state(app_state)
         .layer(middleware::from_fn(operator_response_headers))
         .layer(middleware::from_fn(log_request))
@@ -975,68 +993,28 @@ async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {
 async fn serve_static_file(
     State(state): State<Arc<AppState>>,
     Path(path): Path<String>,
+    uri: Uri,
+    headers: header::HeaderMap,
 ) -> Response {
-    static_file_response(&state.ui_dir, &path).await
+    static_file_response(&state, &path, &uri, &headers).await
 }
 
-async fn static_file_response(ui_dir: &str, path: &str) -> Response {
-    // Axum percent-decodes the wildcard before extraction. An encoded leading
-    // slash would make Path::join discard ui_dir, even without any '..'.
-    if path.is_empty()
-        || !std::path::Path::new(path)
-            .components()
-            .all(|component| matches!(component, std::path::Component::Normal(_)))
-    {
-        return (StatusCode::BAD_REQUEST, "Bad request").into_response();
-    }
-
-    let file_path = std::path::Path::new(ui_dir).join(path);
-
-    let content = match tokio::fs::read(&file_path).await {
-        Ok(c) => c,
-        Err(_) => return (StatusCode::NOT_FOUND, "Not found").into_response(),
-    };
-
-    let mime_type = get_mime_type(path);
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, mime_type)
-        .body(Body::from(content))
-        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Server error").into_response())
-}
-
-fn get_mime_type(path: &str) -> &'static str {
-    let ext = path.rsplit('.').next().unwrap_or("");
-    match ext {
-        // JavaScript
-        "js" | "mjs" => "application/javascript; charset=utf-8",
-        // CSS
-        "css" => "text/css; charset=utf-8",
-        // HTML
-        "html" | "htm" => "text/html; charset=utf-8",
-        // JSON
-        "json" | "map" => "application/json",
-        // Images
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "svg" => "image/svg+xml",
-        "ico" => "image/x-icon",
-        "webp" => "image/webp",
-        // Fonts
-        "woff" => "font/woff",
-        "woff2" => "font/woff2",
-        "ttf" => "font/ttf",
-        "otf" => "font/otf",
-        "eot" => "application/vnd.ms-fontobject",
-        // Other
-        "txt" => "text/plain; charset=utf-8",
-        "xml" => "application/xml",
-        "wasm" => "application/wasm",
-        // Default
-        _ => "application/octet-stream",
-    }
+async fn static_file_response(
+    state: &AppState,
+    path: &str,
+    uri: &Uri,
+    headers: &header::HeaderMap,
+) -> Response {
+    // Only a request naming the package this server hashed may be cached.
+    let versioned = !state.wasm_version.is_empty()
+        && uri.query() == Some(format!("v={}", state.wasm_version).as_str());
+    crate::api::ui_files::respond(
+        &state.ui_dir,
+        path,
+        versioned,
+        crate::api::ui_files::accepts_gzip(headers),
+    )
+    .await
 }
 
 #[cfg(any(feature = "e2e-testing", debug_assertions))]
@@ -1464,7 +1442,7 @@ mod static_file_tests {
                 "/ui/{*path}",
                 get(
                     |State(ui_dir): State<String>, Path(path): Path<String>| async move {
-                        static_file_response(&ui_dir, &path).await
+                        crate::api::ui_files::respond(&ui_dir, &path, false, false).await
                     },
                 ),
             )

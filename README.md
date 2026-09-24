@@ -332,7 +332,9 @@ src/templates/
 └── shared/           # Shared JS utilities
 ```
 
-JavaScript is bundled at compile time via `build.rs` into `crates/public_ui/`.
+`build.rs` bundles and minifies the scripts and styles beside the templates
+into the binary, served at content-hashed `/assets/` URLs; only the wasm-pack
+output is read from `crates/public_ui/pkg` (`[ui_settings].ui_dir`).
 
 ## External Services
 

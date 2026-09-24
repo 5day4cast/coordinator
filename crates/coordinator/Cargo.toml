@@ -12,7 +12,7 @@ default = []
 e2e-testing = []
 
 [package.metadata.cargo-machete]
-ignored = ["blake2", "coordinator-core", "h2", "hex", "better-minify-js", "openssl", "sha2", "walkdir"]
+ignored = ["blake2", "coordinator-core", "h2", "hex", "lightningcss", "openssl", "oxc"]
 
 [dependencies]
 coordinator-ark.workspace = true
@@ -93,6 +93,9 @@ config.workspace = true
 lightning-invoice.workspace = true
 
 # Misc
+# Gzips the WASM package once instead of on every download.
+flate2 = "1.1"
+sha2 = "0.10"
 mime.workspace = true
 openssl.workspace = true
 pem-rfc7468.workspace = true
@@ -113,8 +116,9 @@ tokio-test = "0.4"
 env_logger = "0.11.6"
 
 [build-dependencies]
-better-minify-js = "0.7"
-walkdir = "2.5"
+oxc = { version = "0.146", default-features = false, features = ["codegen", "minifier"] }
+flate2 = "1.1"
+lightningcss = { version = "=1.0.0-alpha.72", default-features = false }
 sha2 = "0.10"
 hex = "0.4"
 

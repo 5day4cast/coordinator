@@ -213,12 +213,6 @@
           postInstall = ''
             mkdir -p $out/share/coordinator
             cp -r crates/coordinator/migrations $out/share/coordinator/
-
-            # Copy frontend assets from public_ui (where build.rs outputs them)
-            if [ -d crates/public_ui ]; then
-              mkdir -p $out/share/coordinator/frontend/public
-              cp -r crates/public_ui/* $out/share/coordinator/frontend/public/
-            fi
           '';
         } // commonEnvs);
 
@@ -1069,16 +1063,12 @@
         } ''
           mkdir -p $out/app/ui/pkg
 
-          # Copy bundled JS/CSS assets from coordinator build (actual files, not symlinks)
-          if [ -d ${coordinator}/share/coordinator/frontend/public ]; then
-            cp -rL ${coordinator}/share/coordinator/frontend/public/* $out/app/ui/
-          fi
-
-          # Copy WASM module (actual files, not symlinks)
+          # The coordinator binary embeds its scripts and styles; the UI
+          # directory holds only the WASM module (actual files, not symlinks).
           cp -rL ${coordinator-wasm}/pkg/* $out/app/ui/pkg/
 
           # Verify critical files exist
-          for f in loader.js styles.css bolt11.min.js app.min.js styles.min.css; do
+          for f in pkg/coordinator_wasm.js pkg/coordinator_wasm_bg.wasm; do
             if [ ! -f "$out/app/ui/$f" ]; then
               echo "ERROR: Missing required file: $f"
               echo "Contents of $out/app/ui/:"

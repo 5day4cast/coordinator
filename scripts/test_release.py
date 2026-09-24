@@ -50,12 +50,6 @@ class ReleaseTests(unittest.TestCase):
         for binary in ("coordinator", "wallet-cli"):
             self.put(f"target/{TARGET}/release/{binary}", "binary fixture").chmod(0o755)
         self.put("crates/coordinator/migrations/competitions/001.sql", "SELECT 1;")
-        self.put("crates/public_ui/loader.js", "loader fixture")
-        manifest = {name: "01234567" for name in ("app", "admin", "styles")}
-        self.put("crates/public_ui/asset-manifest.json", json.dumps(manifest))
-        for name, extension in (("app", "js"), ("admin", "js"), ("styles", "css")):
-            for suffix in ("", ".01234567"):
-                self.put(f"crates/public_ui/{name}{suffix}.min.{extension}", "bundle fixture")
 
     def test_committed_versions_must_all_match(self):
         release.validate_version(self.root, VERSION)
@@ -121,7 +115,7 @@ class ReleaseTests(unittest.TestCase):
         first_hash = release.digest(destination)
         with tarfile.open(destination) as archive:
             prefix = "coordinator-x86_64-linux-2.0.0/"
-            for name in ("bin/coordinator", "bin/wallet-cli", "ui/pkg/coordinator_wasm_bg.wasm", "ui/pkg/coordinator_wasm.js", "ui/admin.01234567.min.js", "migrations/competitions/001.sql", "SHA256SUMS"):
+            for name in ("bin/coordinator", "bin/wallet-cli", "ui/pkg/coordinator_wasm_bg.wasm", "ui/pkg/coordinator_wasm.js", "migrations/competitions/001.sql", "SHA256SUMS"):
                 self.assertIn(prefix + name, archive.getnames())
             self.assertEqual(archive.getmember(prefix + "bin/coordinator").mode, 0o755)
             manifest = json.load(archive.extractfile(prefix + "RELEASE.json"))
@@ -138,12 +132,15 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different release source"):
             self.native(self.wasm(source="b" * 40))
 
-    def test_missing_hashed_admin_bundle_fails_packaging(self):
+    def test_ui_directory_holds_only_the_wasm_package(self):
+        # Scripts and styles are embedded in the binary; nothing else ships beside it.
         self.native_files()
-        wasm = self.wasm()
-        (self.root / "crates/public_ui/admin.01234567.min.js").unlink()
-        with self.assertRaisesRegex(ValueError, "missing or empty release asset"):
-            self.native(wasm)
+        destination = self.native(self.wasm())
+        with tarfile.open(destination) as archive:
+            prefix = "coordinator-x86_64-linux-2.0.0/ui/"
+            names = [name[len(prefix):] for name in archive.getnames() if name.startswith(prefix)]
+        self.assertTrue(names)
+        self.assertTrue(all(name.startswith("pkg") for name in names), names)
 
     def test_swap_archive_contains_the_service_and_provenance(self):
         self.put(f"target/{TARGET}/release/ark-swapd", "binary fixture").chmod(0o755)
