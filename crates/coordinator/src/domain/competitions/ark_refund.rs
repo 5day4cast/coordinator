@@ -292,10 +292,9 @@ impl Coordinator {
             .context("the competition has no Keymeld session")?;
         let session = self.restore_keymeld_session(&stored)?;
         for entry in entries {
-            let registration = self
-                .keymeld_registration(entry)
-                .await
-                .map_err(|e| anyhow!("entry {} cannot be registered with Keymeld: {e}", entry.id))?;
+            let registration = self.keymeld_registration(entry).await.map_err(|e| {
+                anyhow!("entry {} cannot be registered with Keymeld: {e}", entry.id)
+            })?;
             self.keymeld
                 .register_participant(
                     &session,
@@ -506,8 +505,7 @@ impl Coordinator {
     /// whose deadline is at least `MIN_REFUND_DEADLINE_SECS` away, and an unexpired invoice.
     fn is_stale(&self, refund: &TicketArkRefund, swap: &RefundSwap) -> Result<bool, Error> {
         let now = OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
-        let soonest_deadline =
-            now + u64::from(MIN_REFUND_DEADLINE_SECS) + STALE_MARGIN.as_secs();
+        let soonest_deadline = now + u64::from(MIN_REFUND_DEADLINE_SECS) + STALE_MARGIN.as_secs();
         let LockTime::Seconds(deadline) = swap.terms().deadline else {
             return Err(anyhow!("The refund's swap deadline is not a timestamp").into());
         };

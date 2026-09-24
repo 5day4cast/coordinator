@@ -376,12 +376,14 @@ impl Coordinator {
                 },
             )?,
             public_key: entry.ephemeral_pubkey.clone(),
-            auth_pubkey: entry.keymeld_auth_pubkey.clone().ok_or_else(|| {
-                anyhow!("Entry {} is missing its authentication key", entry.id)
-            })?,
-            context: entry.keymeld_registration_context.clone().ok_or_else(|| {
-                anyhow!("Entry {} is missing its registration context", entry.id)
-            })?,
+            auth_pubkey: entry
+                .keymeld_auth_pubkey
+                .clone()
+                .ok_or_else(|| anyhow!("Entry {} is missing its authentication key", entry.id))?,
+            context: entry
+                .keymeld_registration_context
+                .clone()
+                .ok_or_else(|| anyhow!("Entry {} is missing its registration context", entry.id))?,
             payout_policy,
             escrow_policy: entry.keymeld_escrow_policy.clone(),
         })

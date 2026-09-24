@@ -609,11 +609,7 @@ impl PoolHarness {
             .await
             .unwrap();
         let mut policies = BTreeMap::new();
-        for (index, player) in players
-            .iter()
-            .enumerate()
-            .take(registered.unwrap_or(count))
-        {
+        for (index, player) in players.iter().enumerate().take(registered.unwrap_or(count)) {
             let terms = ContractAuthorization {
                 competition_id: competition,
                 entry_id: Uuid::now_v7(),

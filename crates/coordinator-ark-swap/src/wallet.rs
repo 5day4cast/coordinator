@@ -470,7 +470,12 @@ fn payment_among(
 mod tests {
     use super::*;
 
-    fn vtxo(txid: u8, amount: u64, created_at: i64, spent: bool) -> ark_core::server::VirtualTxOutPoint {
+    fn vtxo(
+        txid: u8,
+        amount: u64,
+        created_at: i64,
+        spent: bool,
+    ) -> ark_core::server::VirtualTxOutPoint {
         use bitcoin::hashes::Hash;
         ark_core::server::VirtualTxOutPoint {
             outpoint: OutPoint::new(Txid::from_byte_array([txid; 32]), 0),

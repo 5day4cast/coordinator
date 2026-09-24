@@ -24,7 +24,6 @@ pub use ark_kickoff::*;
 pub use ark_store::*;
 pub use automatic_store::*;
 pub use coordinator::*;
-pub(crate) use reported::Reported;
 use dlctix::{
     bitcoin::{hex::DisplayHex, OutPoint, Transaction},
     hashlock,
@@ -36,6 +35,7 @@ use keymeld_sdk::types::{RegistrationContext, SignedSessionManifest};
 pub use lease_store::*;
 use log::{debug, error};
 pub use payout::*;
+pub(crate) use reported::Reported;
 pub use runners::*;
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, FromRow, Row};

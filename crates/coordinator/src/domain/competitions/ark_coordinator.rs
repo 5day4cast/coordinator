@@ -303,7 +303,11 @@ impl Coordinator {
             );
             return None;
         }
-        let vtxos = match ark.transport.vtxos(vec![escrow.escrow_address.clone()]).await {
+        let vtxos = match ark
+            .transport
+            .vtxos(vec![escrow.escrow_address.clone()])
+            .await
+        {
             Ok(vtxos) => vtxos,
             Err(e) => {
                 self.report_swap(pending, format!("cannot list its escrow on Arkade: {e}"));
@@ -569,9 +573,11 @@ fn paid_escrow_vtxo(
         (Some(named), _) => vtxos.iter().find(|vtxo| vtxo.outpoint == named),
         (None, Some(paid_in)) => vtxos.iter().find(|vtxo| vtxo.outpoint.txid == paid_in),
         (None, None) => {
-            return Err("reports its player paid, but neither its escrow VTXO nor the Ark \
+            return Err(
+                "reports its player paid, but neither its escrow VTXO nor the Ark \
                         transaction that paid it"
-                .into())
+                    .into(),
+            )
         }
     };
     let Some(vtxo) = vtxo else {

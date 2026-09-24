@@ -510,14 +510,21 @@ mod tests {
     #[test]
     fn an_escrow_is_paid_again_only_once_arkade_shows_the_last_payment_never_landed() {
         let sent = 1_790_000_010;
-        assert_eq!(payment_step(&paying(None, 0), false, sent), PaymentStep::Pay);
+        assert_eq!(
+            payment_step(&paying(None, 0), false, sent),
+            PaymentStep::Pay
+        );
         // Sent, then a crash or an error: however the send ended, it is looked for first.
         assert_eq!(
             payment_step(&paying(Some(sent), 1), false, sent + 1),
             PaymentStep::Wait
         );
         assert_eq!(
-            payment_step(&paying(Some(sent), 1), false, sent + PAYMENT_LISTING_GRACE_SECS - 1),
+            payment_step(
+                &paying(Some(sent), 1),
+                false,
+                sent + PAYMENT_LISTING_GRACE_SECS - 1
+            ),
             PaymentStep::Wait
         );
         assert_eq!(
@@ -526,7 +533,11 @@ mod tests {
             "a payment that landed is recorded, never sent again"
         );
         assert_eq!(
-            payment_step(&paying(Some(sent), 1), false, sent + PAYMENT_LISTING_GRACE_SECS),
+            payment_step(
+                &paying(Some(sent), 1),
+                false,
+                sent + PAYMENT_LISTING_GRACE_SECS
+            ),
             PaymentStep::Pay,
             "Arkade would list it by now, so it never landed"
         );

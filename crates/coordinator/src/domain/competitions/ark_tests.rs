@@ -63,7 +63,12 @@ impl Swaps {
     }
 
     /// A refund swap for `payment_hash` that the player can take back from `deadline`.
-    fn refund_swap(&self, player: bitcoin::XOnlyPublicKey, payment_hash: [u8; 32], deadline: u32) -> RefundSwap {
+    fn refund_swap(
+        &self,
+        player: bitcoin::XOnlyPublicKey,
+        payment_hash: [u8; 32],
+        deadline: u32,
+    ) -> RefundSwap {
         let rules = self.server.rules();
         let deadline = bitcoin::absolute::LockTime::from_time(deadline).unwrap();
         let created_at = OffsetDateTime::now_utc().unix_timestamp() as u32;
@@ -282,7 +287,10 @@ impl Keymeld for Enclaves {
         let (_, refund) = coordinator_escrow::ark::refund_from(escrow, policy, &spend).unwrap();
         self.signatures.fetch_add(1, Ordering::SeqCst);
         Ok(bitcoin::secp256k1::Secp256k1::new()
-            .sign_schnorr_no_aux_rand(&bitcoin::secp256k1::Message::from_digest(refund.digest), key)
+            .sign_schnorr_no_aux_rand(
+                &bitcoin::secp256k1::Message::from_digest(refund.digest),
+                key,
+            )
             .serialize())
     }
     fn is_enabled(&self) -> bool {
@@ -570,9 +578,7 @@ impl Fixture {
             escrow_tap_tree: hex::encode(escrow.vtxo_script().encode_tap_tree()),
             max_fee_sats: PRICE - 5_000,
             max_refund_fee_sats: 100,
-            checkpoint_exit_script: hex::encode(
-                self.server.info().checkpoint_tapscript.as_bytes(),
-            ),
+            checkpoint_exit_script: hex::encode(self.server.info().checkpoint_tapscript.as_bytes()),
         };
         let policy = PayoutPolicy {
             automatic_lightning_address: Some(format!("player{player}@mock-wallet.dev")),
@@ -756,7 +762,11 @@ async fn a_settled_swap_pays_the_ticket_once_arkade_lists_its_escrow_vtxo() {
     // transaction that paid it.
     f.swap_reports(&ticket, SwapState::Settled, None, Some(paid.txid));
     f.coordinator.check_ark_swaps().await.unwrap();
-    assert_eq!(f.paid_by(&ticket).await, None, "Arkade has not listed it yet");
+    assert_eq!(
+        f.paid_by(&ticket).await,
+        None,
+        "Arkade has not listed it yet"
+    );
     assert_eq!(f.pending().await, 1);
 
     f.arkade_lists(&ticket.escrow_address, paid, PRICE, false);
@@ -782,7 +792,12 @@ async fn the_vtxo_a_swap_names_must_be_listed_at_the_escrow_with_the_ticket_pric
 async fn a_vtxo_from_another_transaction_does_not_pay_the_ticket() {
     let f = Fixture::new().await;
     let ticket = f.ticket(21, PRICE).await;
-    f.swap_reports(&ticket, SwapState::Settled, None, Some(outpoint(0xa3, 0).txid));
+    f.swap_reports(
+        &ticket,
+        SwapState::Settled,
+        None,
+        Some(outpoint(0xa3, 0).txid),
+    );
     f.arkade_lists(&ticket.escrow_address, outpoint(0xb3, 0), PRICE, false);
     f.coordinator.check_ark_swaps().await.unwrap();
     assert_eq!(f.paid_by(&ticket).await, None);
@@ -898,7 +913,11 @@ async fn a_cancelled_arkade_competition_refunds_each_funded_escrow_once() {
         vec![UserId::from(first.id), UserId::from(second.id)],
         "a competition that never filled registers its entries before signing their refunds"
     );
-    assert_eq!(f.spends(), (2, 2), "each escrow was spent into its swap once");
+    assert_eq!(
+        f.spends(),
+        (2, 2),
+        "each escrow was spent into its swap once"
+    );
     assert_eq!(f.enclaves.signatures.load(Ordering::SeqCst), 4);
     assert_eq!(f.ln.payments_sent(), 2);
     assert_eq!(f.swaps.claimed.lock().unwrap().len(), 2);
@@ -1001,7 +1020,10 @@ async fn a_minted_refund_that_expired_unsigned_is_minted_again() {
 
     f.clean_up().await;
     let refund = f.refund(&ticket).await.unwrap();
-    assert_ne!(refund.refund_id, stale.refund_id, "a fresh swap and invoice");
+    assert_ne!(
+        refund.refund_id, stale.refund_id,
+        "a fresh swap and invoice"
+    );
     assert_eq!(refund.state, ArkRefundState::Settled);
     assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 2);
     assert_eq!(f.spends(), (1, 1));
