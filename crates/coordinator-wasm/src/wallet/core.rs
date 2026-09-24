@@ -265,6 +265,19 @@ impl DlcWalletCore {
             .map_err(|e| WalletError::Keymeld(e.to_string()))
     }
 
+    /// Check that `invoice` pays exactly `amount_sats` on this wallet's network
+    /// and has not expired, before anything is released for it.
+    pub fn validate_invoice(&self, invoice: &str, amount_sats: u64) -> Result<(), WalletError> {
+        payout::validate_invoice(
+            invoice,
+            amount_sats,
+            self.network,
+            ::nostr::Timestamp::now().as_secs(),
+        )
+        .map(|_| ())
+        .map_err(|e| WalletError::Keymeld(e.to_string()))
+    }
+
     /// Authorize one ordinary invoice; entry secrets remain inside WASM.
     /// Reconstruct and verify the completed contract and attested payout first.
     pub fn authorize_payout_invoice(

@@ -106,6 +106,18 @@ impl DlcWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    /// Throws unless `invoice` pays exactly `amount_sats` on this wallet's
+    /// network and has not expired.
+    #[wasm_bindgen(js_name = "validateInvoice")]
+    pub fn validate_invoice(&self, invoice: &str, amount_sats: f64) -> Result<(), JsValue> {
+        if !(amount_sats.is_finite() && amount_sats > 0.0 && amount_sats.fract() == 0.0)
+            || amount_sats > 9_007_199_254_740_991.0
+        {
+            return Err(JsValue::from_str("Invalid invoice amount"));
+        }
+        Ok(self.inner.validate_invoice(invoice, amount_sats as u64)?)
+    }
+
     /// `{ ephemeral_private_key, payout_preimage }` for an entry this wallet created.
     #[wasm_bindgen(js_name = "payoutRelease")]
     pub fn payout_release(

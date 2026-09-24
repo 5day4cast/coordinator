@@ -192,33 +192,12 @@ class Payouts {
     return response.json();
   }
 
+  // The wallet decodes the invoice: exact amount, this network, not expired.
   validateInvoice(invoice, expectedAmount) {
     try {
-      const decoded = lightningPayReq.decode(invoice);
-
-      if (decoded.timeExpireDate) {
-        const currentTime = Math.floor(Date.now() / 1000);
-        if (currentTime > decoded.timeExpireDate)
-          throw new Error("Invoice has expired");
-      }
-
-      if (decoded.satoshis !== null && decoded.satoshis !== undefined) {
-        if (decoded.satoshis !== expectedAmount) {
-          throw new Error(
-            `Invoice amount (${decoded.satoshis} sats) doesn't match expected (${expectedAmount} sats)`,
-          );
-        }
-        return {
-          isValid: true,
-          hasAmount: true,
-          amount: decoded.satoshis,
-          type: "fixed-amount",
-        };
-      }
-
-      throw new Error("The invoice must specify the exact payout amount");
+      window.dlcWallet.validateInvoice(invoice, expectedAmount);
     } catch (error) {
-      throw new Error(`Invalid invoice: ${error.message}`);
+      throw new Error(`Invalid invoice: ${error?.message ?? error}`);
     }
   }
 }
