@@ -213,6 +213,10 @@ pub fn picks_detail(
     now: OffsetDateTime,
 ) -> Markup {
     let live = matches!(readings, Readings::Live { .. });
+    let updated_at = match readings {
+        Readings::Live { updated_at } => updated_at,
+        _ => None,
+    };
     let any_observed = picks.iter().any(|pick| pick.observed().is_some());
     let total: u32 = picks.iter().map(PickView::points_now).sum();
     let mut stations: Vec<&str> = Vec::new();
@@ -245,7 +249,7 @@ pub fn picks_detail(
                     }
                 }
             }
-            @if let Readings::Live { updated_at } = readings {
+            @if live {
                 p class="provisional-note" {
                     "Provisional: scored as if the window ended now"
                     @if let Some(at) = updated_at {
@@ -262,9 +266,9 @@ pub fn picks_detail(
             } @else if !any_observed {
                 p class="entry-pending-msg mb-3" {
                     @match readings {
-                        Readings::NotStarted => "Readings appear here once the window opens.",
-                        Readings::Live { .. } | Readings::Closed => "Readings appear here as the oracle records them.",
-                        Readings::Final => "No readings were recorded for these stations in the window, so no pick scored.",
+                        Readings::NotStarted => { "Readings appear here once the window opens." }
+                        Readings::Live { .. } | Readings::Closed => { "Readings appear here as the oracle records them." }
+                        Readings::Final => { "No readings were recorded for these stations in the window, so no pick scored." }
                     }
                 }
             }

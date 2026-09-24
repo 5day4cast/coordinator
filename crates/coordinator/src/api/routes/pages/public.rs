@@ -39,7 +39,7 @@ use crate::{
         },
         layouts::base::{base, PageConfig},
         pages::{
-            competitions::{competitions_page, CompetitionView, ListOptions, Phase},
+            competitions::{competitions_page, CompetitionView, ListOptions},
             entries::{entries_page, sign_in_required, EntryRow},
             payouts::{payouts_page, PayoutView},
         },

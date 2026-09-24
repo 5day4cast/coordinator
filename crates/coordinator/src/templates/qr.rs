@@ -46,7 +46,7 @@ mod tests {
         let invoice = "lnbcrt52500n1pnexample0dqqcqzzsxqyz5vqsp5example9qyyssq";
         let svg = lightning_invoice_svg(invoice).unwrap();
         assert!(svg.starts_with(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 "#));
-        assert!(svg.contains(r#"fill="#000""#));
+        assert!(svg.contains(r##"fill="#000""##));
         assert!(!svg.contains("<script"));
         let url = svg_data_url(&svg);
         assert!(url.starts_with("data:image/svg+xml;base64,PHN2Zy"));
