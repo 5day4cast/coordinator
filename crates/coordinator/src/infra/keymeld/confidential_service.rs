@@ -1065,6 +1065,108 @@ impl Keymeld for KeymeldService {
         }
         Ok(signed)
     }
+
+    async fn sign_ark_refund(
+        &self,
+        session: &DlcKeygenSession,
+        user: UserId,
+        spend: coordinator_escrow::ark::ArkEscrowSpend,
+        invoice: String,
+        fee_sats: u64,
+    ) -> Result<[u8; 64], KeymeldError> {
+        let _guard = self.lock_session(&session.session_id).await;
+        let (mut state, _) = self.checkpoint(session).await?;
+        let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
+        let mut journal = std::mem::take(&mut state.journal);
+        let mut driver = self
+            .connect(
+                session,
+                &state,
+                &credentials,
+                &mut journal,
+                &EphemeralCheckpoint,
+            )
+            .await?;
+        driver.restore_keygen(&state.registrations).await?;
+        let participant_key = &state
+            .policies
+            .get(&user)
+            .ok_or_else(|| invalid("Refund participant has no accepted policy"))?
+            .policy
+            .participant_public_key;
+        // Each transaction of the refund is signed in its own attempt, as is a retry with a new
+        // invoice; the verifier checks every one.
+        let attempt = ActionAttempt {
+            attempt_id: Uuid::now_v7(),
+            signing_session_id: None,
+        };
+        let prepare = PrepareEscrowRequest {
+            schema_version: escrow::SCHEMA_VERSION,
+            // A refund is unbound: the pool it would have funded may never have formed, so the
+            // enclave derives this action's binding from the player's own policy.
+            binding_receipt: Payload::default(),
+            action_id: generic::SIGN_ARK_REFUND.into(),
+            attempt: attempt.clone(),
+            action: None,
+            action_parameters: Payload::encode(&generic::ActionParameters::RefundArkEscrow {
+                spend,
+                invoice,
+                fee_sats,
+            })?,
+            prior_preparation_receipts: vec![],
+        };
+        let prepared = escrow_request(
+            &mut driver,
+            session,
+            &state,
+            &credentials,
+            &user,
+            &format!("escrow/refund/prepare/{user}/{}", attempt.attempt_id),
+            Operation::Prepare,
+            Some(generic::SIGN_ARK_REFUND),
+            Some(attempt.clone()),
+            &prepare,
+        )
+        .await?;
+        let execute = ExecuteEscrowRequest {
+            schema_version: escrow::SCHEMA_VERSION,
+            prepared_receipt: prepared.sealed_state,
+            proof: ConditionProof::VerifierEvidence {
+                evidence: Payload::default(),
+            },
+        };
+        let response = escrow_request(
+            &mut driver,
+            session,
+            &state,
+            &credentials,
+            &user,
+            &format!("escrow/refund/execute/{user}/{}", attempt.attempt_id),
+            Operation::Execute,
+            Some(generic::SIGN_ARK_REFUND),
+            Some(attempt),
+            &execute,
+        )
+        .await?;
+        let ExecutionOutput::Bip340Signatures {
+            public_key,
+            signatures,
+        } = response.output.decode()?
+        else {
+            return Err(invalid("Enclave did not sign the refund"));
+        };
+        let [signature] = signatures.as_slice() else {
+            return Err(invalid("A refund signs one transaction at a time"));
+        };
+        if &public_key != participant_key {
+            return Err(invalid("The refund was signed by another key"));
+        }
+        signature
+            .signature
+            .clone()
+            .try_into()
+            .map_err(|_| invalid("Invalid BIP340 signature length"))
+    }
 }
 
 impl KeymeldService {

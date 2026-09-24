@@ -3,6 +3,12 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 pub struct SynthConfig {
     pub coordinator: CoordinatorConfig,
+    /// The node scenarios pay entries from, for the ones that need real payments.
+    #[serde(default)]
+    pub lnd: Option<crate::lnd::LndConfig>,
+    /// Paying `lnd` back as scenarios drain it.
+    #[serde(default)]
+    pub rebalance: Option<crate::rebalance::RebalanceConfig>,
     pub oracle: OracleConfig,
     pub server: ServerConfig,
     pub db: DbConfig,
@@ -74,11 +80,24 @@ pub struct DefaultsConfig {
     pub observation_window_secs: u64,
     /// Delay after observation ends before signing deadline, in seconds
     pub signing_delay_secs: u64,
+    /// The players' Lightning Address, where payouts and refunds go. It must resolve publicly:
+    /// the enclave checks a refund's invoice against it before signing.
+    #[serde(default)]
+    pub lightning_address: Option<String>,
+    /// Max time to wait for a refund to settle, which includes its escrow's locktime.
+    #[serde(default = "default_refund_timeout_secs")]
+    pub refund_timeout_secs: u64,
+}
+
+fn default_refund_timeout_secs() -> u64 {
+    30 * 60
 }
 
 impl Default for SynthConfig {
     fn default() -> Self {
         Self {
+            lnd: None,
+            rebalance: None,
             coordinator: CoordinatorConfig {
                 url: "http://coordinator.coordinator.svc.cluster.local:9990".to_string(),
                 admin_url: Some(
@@ -108,7 +127,27 @@ impl Default for SynthConfig {
                 entry_window_secs: 120,
                 observation_window_secs: 300,
                 signing_delay_secs: 60,
+                lightning_address: None,
+                refund_timeout_secs: default_refund_timeout_secs(),
             },
+        }
+    }
+}
+
+impl SynthConfig {
+    /// What a scenario run starts from, whether scheduled or triggered from the dashboard.
+    pub fn scenario_config(&self) -> crate::scenarios::ScenarioConfig {
+        crate::scenarios::ScenarioConfig {
+            users: self.defaults.users,
+            stations: self.defaults.stations.clone(),
+            entry_fee: self.defaults.entry_fee,
+            entry_window_secs: self.defaults.entry_window_secs,
+            observation_window_secs: self.defaults.observation_window_secs,
+            signing_delay_secs: self.defaults.signing_delay_secs,
+            lightning_address: self.defaults.lightning_address.clone(),
+            refund_timeout_secs: self.defaults.refund_timeout_secs,
+            lnd: self.lnd.clone(),
+            ..Default::default()
         }
     }
 }
@@ -146,7 +185,8 @@ pub fn load_config(path: Option<&str>) -> anyhow::Result<SynthConfig> {
         .set_default("defaults.entry_fee", 1000)?
         .set_default("defaults.entry_window_secs", 120)?
         .set_default("defaults.observation_window_secs", 300)?
-        .set_default("defaults.signing_delay_secs", 60)?;
+        .set_default("defaults.signing_delay_secs", 60)?
+        .set_default("defaults.refund_timeout_secs", 30 * 60)?;
 
     let config = builder.build()?;
     Ok(config.try_deserialize()?)

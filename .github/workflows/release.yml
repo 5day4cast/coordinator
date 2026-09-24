@@ -15,6 +15,11 @@ on:
         required: false
         type: boolean
         default: true
+      build_images:
+        description: "Build the container images; a dry run that needs only the packages can skip them"
+        required: false
+        type: boolean
+        default: true
 
 # Serialize publication, including updates to the latest container manifests.
 concurrency:
@@ -38,6 +43,7 @@ jobs:
       version_name: ${{ steps.release.outputs.version_name }}
       source: ${{ steps.release.outputs.source }}
       dry_run: ${{ steps.release.outputs.dry_run }}
+      build_images: ${{ steps.release.outputs.build_images }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -55,13 +61,20 @@ jobs:
         env:
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          INPUT_BUILD_IMAGES: ${{ inputs.build_images }}
         run: |
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             VERSION="$INPUT_VERSION"
             DRY_RUN="$INPUT_DRY_RUN"
+            BUILD_IMAGES="$INPUT_BUILD_IMAGES"
           else
             VERSION="${GITHUB_REF#refs/tags/v}"
             DRY_RUN=false
+            BUILD_IMAGES=true
+          fi
+          if [ "$DRY_RUN" != true ] && [ "$BUILD_IMAGES" != true ]; then
+            echo "A published release needs its container images; only a dry run may skip them." >&2
+            exit 1
           fi
           SOURCE=$(python3 scripts/release.py validate --version "$VERSION" \
             --event "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF" --dry-run "$DRY_RUN")
@@ -70,6 +83,7 @@ jobs:
             echo "version_name=v$VERSION"
             echo "source=$SOURCE"
             echo "dry_run=$DRY_RUN"
+            echo "build_images=$BUILD_IMAGES"
           } >> "$GITHUB_OUTPUT"
           echo "Release v$VERSION from $SOURCE (dry_run=$DRY_RUN)" >> "$GITHUB_STEP_SUMMARY"
 
@@ -88,6 +102,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+      # Dry runs reuse earlier builds' dependencies; a published release always builds cold.
+      - uses: Swatinem/rust-cache@v2
+        if: needs.prepare-release.outputs.dry_run == 'true'
+        with:
+          key: wasm
       - name: Install matching WASM bindings generator
         run: |
           BINDGEN_VERSION=$(python3 -c 'import tomllib; print(next(p["version"] for p in tomllib.load(open("Cargo.lock", "rb"))["package"] if p["name"] == "wasm-bindgen"))')
@@ -146,6 +165,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # Dry runs reuse earlier builds' dependencies; a published release always builds cold.
+      - uses: Swatinem/rust-cache@v2
+        if: needs.prepare-release.outputs.dry_run == 'true'
+        with:
+          key: ${{ matrix.target }}
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -154,19 +178,21 @@ jobs:
       - name: Build verified static OpenSSL for the native target
         env:
           TARGET: ${{ matrix.target }}
-        run: bash scripts/build-release-openssl.sh "$TARGET" "$RUNNER_TEMP/coordinator-openssl-$TARGET"
+        run: |
+          OPENSSL_BUILD_JOBS=$(getconf _NPROCESSORS_ONLN) \
+            bash scripts/build-release-openssl.sh "$TARGET" "$RUNNER_TEMP/coordinator-openssl-$TARGET"
       - name: Build locked native binaries and UI
         env:
           TARGET: ${{ matrix.target }}
         run: cargo build --release --locked --target "$TARGET" -p coordinator
-      - name: Build the verifier enclave, LNURL relay, and ark-swapd (Linux)
+      - name: Build the verifier enclave, LNURL relay, ark-swapd, and synth (Linux)
         if: runner.os == 'Linux'
         env:
           TARGET: ${{ matrix.target }}
         run: |
           cargo build --release --locked --target "$TARGET" \
             -p coordinator-verifier-enclave --features coordinator-verifier-enclave/lnurl \
-            -p coordinator-lnurl-relay -p coordinator-ark-swap
+            -p coordinator-lnurl-relay -p coordinator-ark-swap -p coordinator-synth
       - uses: actions/download-artifact@v4
         with:
           name: release-wasm
@@ -194,6 +220,13 @@ jobs:
           SOURCE: ${{ needs.prepare-release.outputs.source }}
           TARGET: ${{ matrix.target }}
         run: python3 scripts/release.py swap --version "$VERSION" --source "$SOURCE" --target "$TARGET"
+      - name: Package synth for the synthetic-traffic host (Linux)
+        if: runner.os == 'Linux'
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          SOURCE: ${{ needs.prepare-release.outputs.source }}
+          TARGET: ${{ matrix.target }}
+        run: python3 scripts/release.py synth --version "$VERSION" --source "$SOURCE" --target "$TARGET"
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}
@@ -232,6 +265,7 @@ jobs:
     name: Build Docker Images (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
     needs: prepare-release
+    if: needs.prepare-release.outputs.build_images == 'true'
     permissions:
       contents: read
       packages: write

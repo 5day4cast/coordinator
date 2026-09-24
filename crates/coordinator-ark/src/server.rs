@@ -35,6 +35,20 @@ impl ArkServer {
         })
     }
 
+    /// A server whose parameters are known but which is never called.
+    ///
+    /// Tests answer its calls through an [`crate::ArkTransport`] instead, so they need no server
+    /// running. Its client is unconnected, and using it for a call fails.
+    #[cfg(feature = "test-utils")]
+    pub fn offline(info: Info) -> Result<Self, Error> {
+        let rules = server_rules(&info)?;
+        Ok(Self {
+            client: ark_grpc::Client::new("http://offline.invalid".into()),
+            info,
+            rules,
+        })
+    }
+
     pub fn client(&self) -> &ark_grpc::Client {
         &self.client
     }

@@ -717,3 +717,78 @@ async fn escrow_reservation_key_update_rejects_a_recycled_ticket() {
     assert!(current.escrow_transaction.is_none());
     bounded(f.database.close()).await.unwrap();
 }
+
+/// A refund crosses one step at a time, so an outage resumes rather than repeats: the player is
+/// paid once, and a refunded escrow is never spent twice.
+#[tokio::test]
+async fn a_refund_records_each_step_before_taking_it() {
+    use super::{ArkRefundState, TicketArkRefund};
+
+    let fixture = Fixture::new().await;
+    let ticket_id = fixture.ticket_id;
+    assert!(bounded(fixture.store.ticket_ark_refund(ticket_id))
+        .await
+        .unwrap()
+        .is_none());
+
+    let refund = TicketArkRefund {
+        ticket_id,
+        refund_id: Uuid::now_v7(),
+        invoice: "lnbcrt1refund".into(),
+        payment_hash: "ab".repeat(32),
+        fee_sats: 100,
+        state: ArkRefundState::Minted,
+        ark_txid: None,
+        checkpoint_psbt: None,
+        error: None,
+        created_at: 1_790_000_000,
+        updated_at: 1_790_000_000,
+    };
+    bounded(fixture.store.store_ticket_ark_refund(refund.clone()))
+        .await
+        .unwrap();
+
+    // Recording it twice keeps the first swap, so a retry never strands one already minted.
+    let second = TicketArkRefund {
+        refund_id: Uuid::now_v7(),
+        ..refund.clone()
+    };
+    bounded(fixture.store.store_ticket_ark_refund(second.clone()))
+        .await
+        .unwrap();
+    let stored = bounded(fixture.store.ticket_ark_refund(ticket_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.refund_id, refund.refund_id);
+    assert_eq!(stored.state, ArkRefundState::Minted);
+
+    // The Arkade transaction and the checkpoint only its owner can sign are kept once the
+    // refund is with Arkade, and survive every later step.
+    bounded(fixture.store.advance_ticket_ark_refund(
+        ticket_id,
+        ArkRefundState::Submitting,
+        Some("00".repeat(32)),
+        Some("70736274ff".into()),
+        None,
+    ))
+    .await
+    .unwrap();
+    bounded(fixture.store.advance_ticket_ark_refund(
+        ticket_id,
+        ArkRefundState::Paid,
+        None,
+        None,
+        None,
+    ))
+    .await
+    .unwrap();
+    let stored = bounded(fixture.store.ticket_ark_refund(ticket_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, ArkRefundState::Paid);
+    assert_eq!(stored.ark_txid, Some("00".repeat(32)));
+    assert_eq!(stored.checkpoint_psbt.as_deref(), Some("70736274ff"));
+    assert!(stored.updated_at >= refund.updated_at);
+}

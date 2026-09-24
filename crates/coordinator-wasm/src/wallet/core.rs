@@ -224,6 +224,12 @@ impl DlcWalletCore {
                 terms.event.expiry,
             )
             .map_err(|_| reject())?;
+            // A refund costs no more than entering did, and never the whole buy-in.
+            if ark_escrow.max_refund_fee_sats > ark_escrow.max_fee_sats
+                || ark_escrow.max_refund_fee_sats >= consent.ticket_amount_sats
+            {
+                return Err(reject());
+            }
             let players = consent.expected_player_count as u64;
             let fees = ark_escrow
                 .max_fee_sats
@@ -1209,6 +1215,8 @@ mod tests {
             policy.ark_escrow = Some(ArkEscrowPolicy {
                 escrow_tap_tree: hex::encode(escrow.vtxo_script().encode_tap_tree()),
                 max_fee_sats,
+                max_refund_fee_sats: max_fee_sats.min(100),
+                checkpoint_exit_script: hex::encode([0x51]),
             });
             assignment.payout_policy = Some(serde_json::to_string(&policy).unwrap());
             f.wallet
@@ -1330,8 +1338,9 @@ mod tests {
             |c: &mut PayoutInvoiceConsent| c.context.entry_id = Uuid::now_v7(),
             |c: &mut PayoutInvoiceConsent| c.context.competition_id = Uuid::now_v7(),
             |c: &mut PayoutInvoiceConsent| c.context.expires_at = 0,
+            // Well past the ten minutes allowed, so a second's drift cannot make it legal.
             |c: &mut PayoutInvoiceConsent| {
-                c.context.expires_at = ::nostr::Timestamp::now().as_secs() + 601
+                c.context.expires_at = ::nostr::Timestamp::now().as_secs() + 3_600
             },
             |c: &mut PayoutInvoiceConsent| c.signatures.outcome_tx_signatures.clear(),
             |c: &mut PayoutInvoiceConsent| {

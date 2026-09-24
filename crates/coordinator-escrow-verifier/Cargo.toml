@@ -7,12 +7,14 @@ license.workspace = true
 [features]
 default = []
 lnurl = ["dep:url", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes"]
+# Carries the LNURL provider fixtures to other crates' tests. Never enable in a release build.
+test-support = ["lnurl", "dep:rcgen"]
 
 [dependencies]
 coordinator-escrow = { path = "../coordinator-escrow", features = ["networking"] }
 coordinator-ark-escrow = { path = "../coordinator-ark-escrow" }
-keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "4235b16b3177d22660b946e4b15f9f7f0b4f4e06", default-features = false, features = ["escrow", "enclave"] }
-keymeld-enclave = { git = "https://github.com/tee8z/keymeld", rev = "4235b16b3177d22660b946e4b15f9f7f0b4f4e06", default-features = false, features = ["escrow"] }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "98f3420dee497508d2c1ff19180ea795dab5a40e", default-features = false, features = ["escrow", "enclave"] }
+keymeld-enclave = { git = "https://github.com/tee8z/keymeld", rev = "98f3420dee497508d2c1ff19180ea795dab5a40e", default-features = false, features = ["escrow"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -26,6 +28,7 @@ url = { version = "2.5", optional = true }
 rustls = { version = "0.23.45", default-features = false, features = ["std", "aws_lc_rs", "tls12"], optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"], optional = true }
 webpki-roots = { version = "1", optional = true }
+rcgen = { version = "0.13.2", optional = true }
 hyper = { workspace = true, features = ["client", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }

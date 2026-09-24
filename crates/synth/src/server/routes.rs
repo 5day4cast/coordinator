@@ -1,3 +1,5 @@
+use super::live::{self, Live};
+use crate::rebalance::Rebalancer;
 use crate::runner::Runner;
 use crate::scenarios::{ScenarioConfig, ScenarioStatus};
 use axum::{
@@ -6,16 +8,36 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use maud::{html, DOCTYPE};
+use maud::{html, Markup};
 use serde::Deserialize;
 
-pub fn router(runner: Runner) -> Router {
+/// What the dashboard's handlers share: the runner, and the configured run a trigger starts from.
+#[derive(Clone)]
+pub struct Dashboard {
+    pub runner: Runner,
+    pub scenario_config: ScenarioConfig,
+    /// Absent when no rebalancing is configured.
+    pub rebalancer: Option<Rebalancer>,
+    /// The pages being watched, and what is pushed to them.
+    pub live: Live,
+}
+
+impl axum::extract::FromRef<Dashboard> for Runner {
+    fn from_ref(dashboard: &Dashboard) -> Self {
+        dashboard.runner.clone()
+    }
+}
+
+pub fn router(state: Dashboard) -> Router {
     Router::new()
         .route("/", get(dashboard))
         .route("/api/run", post(trigger_run))
         .route("/api/status", get(status))
         .route("/api/history", get(history))
-        .with_state(runner)
+        .route("/api/rebalance", post(trigger_rebalance))
+        .route("/runs/{id}", get(super::run_detail::run_detail))
+        .route("/api/live", get(live::stream))
+        .with_state(state)
 }
 
 #[derive(Debug, Deserialize)]
@@ -29,20 +51,87 @@ struct HistoryParams {
     limit: Option<i64>,
 }
 
-async fn dashboard(State(runner): State<Runner>) -> impl IntoResponse {
-    let last = runner.last_result().await;
-    let runs = runner.db().list_runs(10).await.unwrap_or_default();
+/// How many of a scenario's recent runs the dashboard judges it by.
+const HEALTH_WINDOW: i64 = 20;
 
+async fn dashboard(State(state): State<Dashboard>) -> Html<String> {
+    let header = html! { h1 { "Synth Dashboard" " " span #live-status .note { "connecting…" } } };
     Html(
-        html! {
-            (DOCTYPE)
-            html {
-                head {
-                    title { "Synth - Synthetic Testing Dashboard" }
-                    style { (DASHBOARD_CSS) }
-                }
-                body {
-                    h1 { "Synth Dashboard" }
+        live::page(
+            "Synth - Synthetic Testing Dashboard",
+            live::DASHBOARD,
+            header,
+            dashboard_live(&state).await,
+        )
+        .into_string(),
+    )
+}
+
+/// The dashboard's live part: what the page shows, and what is pushed to it as things change.
+pub(super) async fn dashboard_live(
+    Dashboard {
+        runner, rebalancer, ..
+    }: &Dashboard,
+) -> Markup {
+    let last = runner.last_result().await;
+    let observation = match &rebalancer {
+        Some(rebalancer) => Some(rebalancer.last().await).filter(|o| o.checked_at.is_some()),
+        None => None,
+    };
+    let rebalances = runner.db().list_rebalances(10).await.unwrap_or_default();
+    let runs = runner.db().list_runs(10).await.unwrap_or_default();
+    let live = runner.live();
+    let health = runner
+        .db()
+        .scenario_health(HEALTH_WINDOW)
+        .await
+        .unwrap_or_default();
+
+    html! {
+                    @if let Some(live) = &live {
+                        p.running {
+                            "Running now: " a href=(format!("/runs/{}", live.run_id)) { (live.scenario) }
+                            " — " strong { (live.current_step.as_deref().unwrap_or("starting")) }
+                        }
+                    }
+
+                    section.health {
+                        h2 { "Scenarios" }
+                        @if health.is_empty() {
+                            p { "No runs yet" }
+                        } @else {
+                            table {
+                                thead {
+                                    tr {
+                                        th { "Scenario" } th { "Last" } th { "Passing" }
+                                        th { "Last run" }
+                                    }
+                                }
+                                tbody {
+                                    @for scenario in &health {
+                                        tr {
+                                            td { (scenario.scenario) }
+                                            td {
+                                                span class=(format!("badge {}", scenario.last_status)) {
+                                                    (scenario.last_status)
+                                                }
+                                            }
+                                            td {
+                                                (scenario.passed) "/" (scenario.runs)
+                                                @if scenario.failed > 0 {
+                                                    span.error { " (" (scenario.failed) " failed)" }
+                                                }
+                                            }
+                                            td { (scenario.last_started_at) }
+                                        }
+                                    }
+                                }
+                            }
+                            p.note {
+                                "Of the last " (HEALTH_WINDOW) " runs of each scenario."
+                            }
+                        }
+                    }
 
                     section.status {
                         h2 { "Last Run" }
@@ -71,6 +160,9 @@ async fn dashboard(State(runner): State<Runner>) -> impl IntoResponse {
                                     }
                                 }
                             }
+                            @if let Some(run) = runs.first() {
+                                p { a href=(format!("/runs/{}", run.id)) { "See where the money went →" } }
+                            }
                         } @else {
                             p { "No runs yet" }
                         }
@@ -80,20 +172,83 @@ async fn dashboard(State(runner): State<Runner>) -> impl IntoResponse {
                         h2 { "Recent Runs" }
                         table {
                             thead {
-                                tr { th { "ID" } th { "Scenario" } th { "Status" } th { "Started" } th { "Duration" } }
+                                tr { th { "Run" } th { "Scenario" } th { "Status" } th { "Competition" } th { "Started" } th { "Finished" } }
                             }
                             tbody {
                                 @for run in &runs {
                                     tr {
-                                        td { (run.id.chars().take(8).collect::<String>()) "..." }
+                                        td { a href=(format!("/runs/{}", run.id)) { (run.id.chars().take(8).collect::<String>()) "…" } }
                                         td { (run.scenario) }
                                         td { span class=(format!("badge {}", run.status)) { (run.status) } }
+                                        td { code { (run.competition_id.as_deref().map(|id| id.chars().take(8).collect::<String>()).unwrap_or_else(|| "-".into())) } }
                                         td { (run.started_at) }
                                         td {
                                             @if let Some(ref completed) = run.completed_at {
                                                 (completed)
+                                            } @else if let Some(live) = live.as_ref().filter(|live| live.run_id == run.id) {
+                                                span.running { "running: " (live.current_step.as_deref().unwrap_or("starting")) }
                                             } @else {
-                                                "running..."
+                                                "never finished"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    section.liquidity {
+                        h2 { "Liquidity" }
+                        @match (&rebalancer, &observation) {
+                            (None, _) => p { "Rebalancing is not configured." },
+                            (Some(_), None) => p { "Not checked yet." },
+                            (Some(rebalancer), Some(observation)) => {
+                                @match &observation.channel {
+                                    Some(channel) => p {
+                                        "Lightning: the payer holds " strong { (channel.local_sats) }
+                                        " of " (channel.local_sats + channel.remote_sats)
+                                        " sats in channel " (channel.id)
+                                        ", rebalancing below " (rebalancer.config().low_percent) "%."
+                                    },
+                                    None => p.error { "The payer has no active channel with the source node." },
+                                }
+                                @match (&rebalancer.config().arkade, &observation.arkade) {
+                                    (None, _) => p.note { "Arkade: ark-swapd's wallet is not watched." },
+                                    (Some(_), None) => p.error { "Arkade: ark-swapd did not report its wallet." },
+                                    (Some(arkade), Some(wallet)) => p {
+                                        "Arkade: ark-swapd can fund " strong { (wallet.spendable_sat()) }
+                                        " sats of escrows, topped up with " (arkade.top_up_sats)
+                                        " sats on-chain below " (arkade.low_sats) "."
+                                    },
+                                }
+                                @if let Some(checked_at) = observation.checked_at {
+                                    p.note { "Checked " (checked_at) }
+                                }
+                            }
+                        }
+                        @if !rebalances.is_empty() {
+                            table {
+                                thead {
+                                    tr {
+                                        th { "When" } th { "Leg" } th { "Moved" } th { "Held before" }
+                                        th { "Status" } th { "Error / transaction" }
+                                    }
+                                }
+                                tbody {
+                                    @for rebalance in &rebalances {
+                                        tr {
+                                            td { (rebalance.created_at) }
+                                            td { (rebalance.kind.as_deref().unwrap_or("channel")) }
+                                            td { (rebalance.amount_sats) " sats" }
+                                            td {
+                                                (rebalance.local_before_sats)
+                                                @if rebalance.capacity_sats > 0 { " / " (rebalance.capacity_sats) }
+                                            }
+                                            td { span class=(format!("badge {}", rebalance.status)) { (rebalance.status) } }
+                                            td {
+                                                @if let Some(error) = &rebalance.error_message { span.error { (error) } }
+                                                @else if let Some(txid) = &rebalance.txid { code { (txid) } }
+                                                @else { "-" }
                                             }
                                         }
                                     }
@@ -104,25 +259,33 @@ async fn dashboard(State(runner): State<Runner>) -> impl IntoResponse {
 
                     section.actions {
                         h2 { "Actions" }
-                        form method="POST" action="/api/run" {
+                        form method="POST" action="/api/run" data-async {
                             button type="submit" { "Run Full Lifecycle" }
                         }
+                        form method="POST" action="/api/run?scenario=escrow_refund" data-async {
+                            button type="submit" { "Run Escrow Refund" }
+                        }
+                        @if rebalancer.is_some() {
+                            form method="POST" action="/api/rebalance" data-async {
+                                button type="submit" { "Rebalance Now" }
+                            }
+                        }
                     }
-                }
-            }
-        }
-        .into_string(),
-    )
+    }
 }
 
 async fn trigger_run(
-    State(runner): State<Runner>,
+    State(Dashboard {
+        runner,
+        scenario_config,
+        ..
+    }): State<Dashboard>,
     Query(params): Query<RunParams>,
 ) -> impl IntoResponse {
     let scenario = params
         .scenario
         .unwrap_or_else(|| "full_lifecycle".to_string());
-    let mut config = ScenarioConfig::default();
+    let mut config = scenario_config;
     if let Some(users) = params.users {
         config.users = users;
     }
@@ -141,6 +304,24 @@ async fn trigger_run(
         "status": "started",
         "scenario": scenario_name
     }))
+}
+
+async fn trigger_rebalance(
+    State(Dashboard { rebalancer, .. }): State<Dashboard>,
+) -> impl IntoResponse {
+    let Some(rebalancer) = rebalancer else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "rebalancing is not configured" })),
+        );
+    };
+    match rebalancer.rebalance().await {
+        Ok(moved) => (axum::http::StatusCode::OK, Json(serde_json::json!(moved))),
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": format!("{e:#}") })),
+        ),
+    }
 }
 
 async fn status(State(runner): State<Runner>) -> impl IntoResponse {
@@ -175,7 +356,7 @@ fn step_class(status: &crate::scenarios::StepStatus) -> &'static str {
     }
 }
 
-const DASHBOARD_CSS: &str = r#"
+pub(super) const DASHBOARD_CSS: &str = r#"
 body { font-family: monospace; max-width: 960px; margin: 0 auto; padding: 20px; background: #1a1a2e; color: #e0e0e0; }
 h1 { color: #00d4ff; }
 h2 { color: #7b68ee; border-bottom: 1px solid #333; padding-bottom: 5px; }
@@ -183,7 +364,7 @@ table { width: 100%; border-collapse: collapse; margin: 10px 0; }
 th, td { padding: 8px; text-align: left; border-bottom: 1px solid #333; }
 th { background: #16213e; }
 .badge { padding: 2px 8px; border-radius: 4px; font-size: 0.85em; }
-.passed, .passed .badge { color: #00ff88; }
+.passed, .passed .badge, .moved { color: #00ff88; }
 .failed, .failed .badge { color: #ff4444; }
 .running, .running .badge { color: #ffaa00; }
 .skipped { color: #888; }
@@ -191,5 +372,6 @@ th { background: #16213e; }
 .result { padding: 15px; background: #16213e; border-radius: 8px; margin: 10px 0; }
 button { background: #7b68ee; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-family: monospace; }
 button:hover { background: #6a5acd; }
-form { margin: 10px 0; }
+form { margin: 10px 0; display: inline-block; margin-right: 8px; }
+.note { color: #888; font-size: 0.85em; }
 "#;

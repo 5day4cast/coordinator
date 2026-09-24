@@ -159,6 +159,19 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing or empty release asset"):
             release.package_swap(self.root, VERSION, SOURCE, TARGET, self.root / "release")
 
+    def test_synth_archive_contains_the_service_and_provenance(self):
+        self.put(f"target/{TARGET}/release/synth", "binary fixture").chmod(0o755)
+        destination = release.package_synth(self.root, VERSION, SOURCE, TARGET, self.root / "release")
+        with tarfile.open(destination) as archive:
+            prefix = f"synth-{VERSION}-{TARGET}/"
+            for name in ("bin/synth", "RELEASE.json", "README.txt", "SHA256SUMS"):
+                self.assertIn(prefix + name, archive.getnames())
+            self.assertEqual(archive.getmember(prefix + "bin/synth").mode, 0o755)
+
+    def test_synth_binary_is_required(self):
+        with self.assertRaisesRegex(ValueError, "missing or empty release asset"):
+            release.package_synth(self.root, VERSION, SOURCE, TARGET, self.root / "release")
+
     def test_wasm_binary_is_required(self):
         self.put("wasm/coordinator_wasm.js", "binding fixture")
         with self.assertRaisesRegex(ValueError, "missing or empty release asset"):

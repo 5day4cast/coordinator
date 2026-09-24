@@ -135,6 +135,24 @@ mod tests {
     }
 
     #[test]
+    fn a_refund_swap_is_accepted() {
+        // The server sees the swap's script when the refund's intent pays into it.
+        let deadline = LockTime::from_consensus(KICKOFF_PLUS_A_DAY);
+        let exit_delay = RelativeTimelock::Seconds(2048);
+        let swap = crate::RefundSwap::new(crate::SwapTerms {
+            player: key(1),
+            swapper: key(2),
+            server: key(3),
+            payment_hash: [9u8; 32],
+            deadline,
+            exit_delay,
+            unilateral_reclaim_delay: RelativeTimelock::Seconds(2048 + 512 * 1008),
+        })
+        .unwrap();
+        rules().check(swap.vtxo_script()).unwrap();
+    }
+
+    #[test]
     fn block_timelocks_need_a_block_based_server() {
         let height = escrow(
             LockTime::from_consensus(3_444_600),

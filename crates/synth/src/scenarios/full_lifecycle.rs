@@ -4,13 +4,15 @@ use crate::client::CoordinatorClient;
 use crate::crypto;
 use crate::crypto::keys::SynthUser;
 use crate::db::SynthDb;
+use crate::lnd::Lnd;
 use anyhow::{Context, Result};
-use log::{error, info, warn};
+use log::{info, warn};
 use rand::Rng;
 use std::time::Instant;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use super::common::{finish_result, load_users, run_step, wait_for_state, Steps};
 use super::types::*;
 
 /// Run the full competition lifecycle scenario:
@@ -25,14 +27,15 @@ pub async fn run_full_lifecycle(
 ) -> ScenarioResult {
     let started_at = OffsetDateTime::now_utc();
     let scenario_start = Instant::now();
-    let mut steps = Vec::new();
+    let mut steps = Steps::new();
     // Step 1: Create competition
     let comp_id = match run_step("create_competition", || async {
         create_competition(client, config).await
     })
     .await
     {
-        Ok((step, comp_id)) => {
+        Ok((mut step, comp_id)) => {
+            step.details = Some(serde_json::json!({ "competition_id": comp_id }));
             steps.push(step);
             comp_id
         }
@@ -61,17 +64,44 @@ pub async fn run_full_lifecycle(
 
     info!("Loaded {} synthetic users", users.len());
 
+    // An Arkade coordinator funds each escrow from a real payment, so pay for real when a node
+    // is configured and fall back to the coordinator's test endpoint when not.
+    let lnd = match run_step("open_payer", || async {
+        config.lnd.as_ref().map(Lnd::new).transpose()
+    })
+    .await
+    {
+        Ok((step, lnd)) => {
+            steps.push(step);
+            lnd
+        }
+        Err(step) => {
+            steps.push(*step);
+            return finish_result("full_lifecycle", started_at, scenario_start, steps, true);
+        }
+    };
+    let payer = lnd.as_ref().map_or(Payer::TestEndpoint, Payer::Lnd);
+
     // Step 3: Each user requests a ticket and submits an entry
-    for (i, user) in users.iter().enumerate() {
+    for user in &users {
         let step_name = format!("user_{}_enter", user.name);
-        match run_step(&step_name, || async {
-            enter_competition(client, user, &comp_id, config, i as u32).await
+        let mut trace = EntryTrace::new(user);
+        let entered = run_step(&step_name, || {
+            enter_competition_with(
+                client,
+                user,
+                &comp_id,
+                config,
+                config.lightning_address.as_deref(),
+                &payer,
+                &mut trace,
+            )
         })
-        .await
-        {
-            Ok((step, _)) => steps.push(step),
+        .await;
+        match entered {
+            Ok((step, _)) => steps.push(trace.attach(step)),
             Err(step) => {
-                steps.push(*step);
+                steps.push(trace.attach(*step));
                 return finish_result("full_lifecycle", started_at, scenario_start, steps, true);
             }
         }
@@ -149,49 +179,73 @@ async fn create_competition(client: &CoordinatorClient, config: &ScenarioConfig)
     Ok(resp.id)
 }
 
-async fn load_users(db: &SynthDb, count: usize) -> Result<Vec<SynthUser>> {
-    let names = [
-        "alice", "bob", "charlie", "dave", "eve", "frank", "grace", "heidi",
-    ];
-    let mut users = Vec::new();
-
-    for i in 0..count {
-        let name = if i < names.len() {
-            names[i].to_string()
-        } else {
-            format!("user_{}", i)
-        };
-
-        let record = db.get_or_create_user(&name).await?;
-        let user = SynthUser::from_secret_key(&record.name, &record.nostr_secret_key)?;
-        users.push(user);
-    }
-
-    Ok(users)
+/// Where an entry's money went, recorded as it happens so a failed entry still shows how far its
+/// payment got.
+#[derive(Debug, Default, serde::Serialize)]
+pub(super) struct EntryTrace {
+    pub user: String,
+    pub nostr_pubkey: String,
+    pub entry_id: Option<Uuid>,
+    pub ticket_id: Option<Uuid>,
+    pub amount_sats: Option<u64>,
+    /// Identifies the payment on the paying node, the invoice's node, and in ark-swapd.
+    pub payment_hash: Option<String>,
+    pub paid: bool,
+    pub entry_submitted: bool,
 }
 
-async fn enter_competition(
+impl EntryTrace {
+    pub(super) fn new(user: &SynthUser) -> Self {
+        Self {
+            user: user.name.clone(),
+            nostr_pubkey: user.nostr_pubkey_hex(),
+            ..Self::default()
+        }
+    }
+
+    /// The step, carrying this trace as its details.
+    pub(super) fn attach(&self, mut step: StepResult) -> StepResult {
+        step.details = serde_json::to_value(self).ok();
+        step
+    }
+}
+
+/// How a scenario pays an entry's invoice.
+pub(super) enum Payer<'a> {
+    /// The coordinator settles it for us. Cannot fund an Arkade escrow, which ark-swapd pays.
+    TestEndpoint,
+    /// A real payment, which ark-swapd swaps into the entry's escrow.
+    Lnd(&'a crate::lnd::Lnd),
+}
+
+/// Enter, paying with `payer` and registering `lightning_address` for payouts and refunds.
+///
+/// Returns the ticket, which a refund is later read from. `trace` records each stage as it
+/// completes.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn enter_competition_with(
     client: &CoordinatorClient,
     user: &SynthUser,
     competition_id: &Uuid,
     config: &ScenarioConfig,
-    entry_index: u32,
-) -> Result<()> {
-    // Derive ephemeral key for this entry
-    let ephemeral = user.derive_ephemeral_key(entry_index)?;
-
+    lightning_address: Option<&str>,
+    payer: &Payer<'_>,
+    trace: &mut EntryTrace,
+) -> Result<Uuid> {
     let entry_id = Uuid::now_v7();
+    trace.entry_id = Some(entry_id);
+    let ephemeral = user.derive_ephemeral_key(&entry_id)?;
     let (payout_preimage, payout_hash) =
         crypto::payout::generate_payout_pair(&ephemeral.secret_bytes);
     let payout_choice = coordinator_core::PayoutRegistrationRequest {
         entry_id,
         payout_hash: payout_hash.clone(),
-        lightning_address: None,
+        lightning_address: lightning_address.map(str::to_string),
         allow_invoice_fallback: true,
         release_entry_key_after_payment: true,
     };
-    // The lifecycle synth uses signed-invoice fallback; automated-address tests
-    // exercise a dedicated TLS LNURL provider and verify actual payment proof.
+    // Payouts and refunds go to the Lightning Address when one is configured, and to a
+    // signed invoice from the player otherwise.
     let ticket = client
         .request_ticket(
             &user.nostr_keys,
@@ -201,6 +255,9 @@ async fn enter_competition(
         )
         .await
         .context("Failed to request ticket")?;
+    trace.ticket_id = Some(ticket.ticket_id);
+    trace.amount_sats = Some(ticket.amount_sats);
+    trace.payment_hash = Some(ticket.payment_hash.clone());
 
     info!(
         "  {} got ticket {} ({}sats)",
@@ -239,13 +296,22 @@ async fn enter_competition(
         None => (None, None, None, None),
     };
 
-    // Settle invoice via test endpoint
-    client
-        .test_settle_invoice(&ticket.ticket_id)
-        .await
-        .context("Failed to settle invoice")?;
-
-    info!("  {} invoice settled", user.name);
+    match payer {
+        Payer::TestEndpoint => {
+            client
+                .test_settle_invoice(&ticket.ticket_id)
+                .await
+                .context("Failed to settle invoice")?;
+            info!("  {} invoice settled", user.name);
+        }
+        Payer::Lnd(lnd) => {
+            lnd.pay(&ticket.payment_request)
+                .await
+                .context("Failed to pay the entry invoice")?;
+            info!("  {} paid {} sats", user.name, ticket.amount_sats);
+        }
+    }
+    trace.paid = true;
 
     // Wait for ticket payment to propagate (SQLite WAL read/write pool sync)
     let mut retries = 0;
@@ -289,9 +355,10 @@ async fn enter_competition(
         .submit_entry(&user.nostr_keys, &entry)
         .await
         .context("Failed to submit entry")?;
+    trace.entry_submitted = true;
 
     info!("  {} entry submitted", user.name);
-    Ok(())
+    Ok(ticket.ticket_id)
 }
 
 fn generate_random_predictions(stations: &[String]) -> Vec<WeatherChoices> {
@@ -312,135 +379,4 @@ fn generate_random_predictions(stations: &[String]) -> Vec<WeatherChoices> {
             }
         })
         .collect()
-}
-
-async fn wait_for_state(
-    client: &CoordinatorClient,
-    competition_id: &Uuid,
-    target_state: &str,
-    config: &ScenarioConfig,
-) -> Result<()> {
-    let deadline = Instant::now() + std::time::Duration::from_secs(config.state_timeout_secs);
-
-    loop {
-        if Instant::now() > deadline {
-            anyhow::bail!("Timeout waiting for state: {}", target_state);
-        }
-
-        let comp = client.get_competition(competition_id).await?;
-        let current = comp.inferred_status();
-
-        if current == target_state || is_past_state(current, target_state) {
-            return Ok(());
-        }
-
-        if current == "failed" || current == "cancelled" {
-            anyhow::bail!(
-                "Competition entered terminal state '{}' while waiting for '{}'",
-                current,
-                target_state
-            );
-        }
-
-        tokio::time::sleep(std::time::Duration::from_secs(config.poll_interval_secs)).await;
-    }
-}
-
-/// Check if `current` is a later state than `target` in the lifecycle
-fn is_past_state(current: &str, target: &str) -> bool {
-    let order = [
-        "created",
-        "collecting_entries",
-        "escrow_confirmed",
-        "event_created",
-        "entries_submitted",
-        "contract_created",
-        "signing_complete",
-        "funding_broadcasted",
-        "funding_confirmed",
-        "funding_settled",
-        "awaiting_attestation",
-        "outcome_broadcasted",
-        "delta_broadcasted",
-        "completed",
-    ];
-
-    let current_idx = order.iter().position(|s| *s == current);
-    let target_idx = order.iter().position(|s| *s == target);
-
-    match (current_idx, target_idx) {
-        (Some(c), Some(t)) => c > t,
-        _ => false,
-    }
-}
-
-/// Helper to run a step with timing
-async fn run_step<F, Fut, T>(
-    name: &str,
-    f: F,
-) -> std::result::Result<(StepResult, T), Box<StepResult>>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<T>>,
-{
-    let start = Instant::now();
-    match f().await {
-        Ok(value) => {
-            let duration = start.elapsed().as_millis() as i64;
-            Ok((
-                StepResult {
-                    name: name.to_string(),
-                    status: StepStatus::Passed,
-                    duration_ms: duration,
-                    details: None,
-                    error: None,
-                },
-                value,
-            ))
-        }
-        Err(e) => {
-            let duration = start.elapsed().as_millis() as i64;
-            error!("Step '{}' failed: {:?}", name, e);
-            Err(Box::new(StepResult {
-                name: name.to_string(),
-                status: StepStatus::Failed,
-                duration_ms: duration,
-                details: None,
-                error: Some(e.to_string()),
-            }))
-        }
-    }
-}
-
-fn finish_result(
-    scenario: &str,
-    started_at: OffsetDateTime,
-    start: Instant,
-    steps: Vec<StepResult>,
-    failed: bool,
-) -> ScenarioResult {
-    let total_duration_ms = start.elapsed().as_millis() as i64;
-    let error = if failed {
-        steps
-            .iter()
-            .rev()
-            .find(|s| s.status == StepStatus::Failed)
-            .and_then(|s| s.error.clone())
-    } else {
-        None
-    };
-
-    ScenarioResult {
-        scenario: scenario.to_string(),
-        status: if failed {
-            ScenarioStatus::Failed
-        } else {
-            ScenarioStatus::Passed
-        },
-        steps,
-        total_duration_ms,
-        started_at,
-        completed_at: Some(OffsetDateTime::now_utc()),
-        error,
-    }
 }

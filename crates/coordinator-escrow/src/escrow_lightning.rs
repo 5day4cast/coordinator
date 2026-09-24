@@ -3,7 +3,7 @@
 //! The caller must bind the invoice to a participant-authorized destination.
 
 use keymeld_core::escrow::sha256;
-use lightning_invoice::{Bolt11Invoice, Currency};
+use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescriptionRef, Currency};
 use serde::{Deserialize, Serialize};
 use std::{str::FromStr, time::Duration};
 use thiserror::Error;
@@ -83,6 +83,32 @@ pub fn validate_prepared_invoice(
         ));
     }
     Ok(invoice)
+}
+
+/// Check an invoice was issued for a Lightning Address, by its LUD-06 metadata binding.
+///
+/// A provider serves metadata for each address it hosts, and commits its SHA-256 in the `h` tag
+/// of every invoice it issues for that address. An invoice carrying a different commitment was
+/// issued for someone else, or by someone else.
+///
+/// This lets a caller supply the invoice, which an enclave needs when the payment hash must be
+/// known before the transaction paying it exists. It is weaker than issuing the request
+/// directly: it inherits whatever the provider puts in its metadata.
+pub fn validate_address_invoice(
+    invoice: &Bolt11Invoice,
+    metadata_hash: [u8; 32],
+) -> Result<(), LightningEvidenceError> {
+    match invoice.description() {
+        Bolt11InvoiceDescriptionRef::Hash(hash) if hash.0.as_ref() as &[u8] == metadata_hash => {
+            Ok(())
+        }
+        Bolt11InvoiceDescriptionRef::Hash(_) => Err(LightningEvidenceError::InvalidInvoice(
+            "Invoice was issued for another Lightning Address".into(),
+        )),
+        Bolt11InvoiceDescriptionRef::Direct(_) => Err(LightningEvidenceError::InvalidInvoice(
+            "Invoice does not commit to its Lightning Address metadata".into(),
+        )),
+    }
 }
 
 /// Prove knowledge of the invoice preimage. Its recipient controls this secret;

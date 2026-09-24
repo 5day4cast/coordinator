@@ -10,7 +10,7 @@ lnurl = ["coordinator-escrow-verifier/lnurl"]
 
 [dependencies]
 coordinator-escrow-verifier = { path = "../coordinator-escrow-verifier" }
-keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "4235b16b3177d22660b946e4b15f9f7f0b4f4e06", default-features = false, features = ["escrow", "enclave"] }
-keymeld-enclave = { git = "https://github.com/tee8z/keymeld", rev = "4235b16b3177d22660b946e4b15f9f7f0b4f4e06", default-features = false, features = ["escrow"] }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "98f3420dee497508d2c1ff19180ea795dab5a40e", default-features = false, features = ["escrow", "enclave"] }
+keymeld-enclave = { git = "https://github.com/tee8z/keymeld", rev = "98f3420dee497508d2c1ff19180ea795dab5a40e", default-features = false, features = ["escrow"] }
 anyhow.workspace = true
 tokio = { workspace = true, features = ["full"] }

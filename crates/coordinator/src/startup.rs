@@ -13,10 +13,10 @@ use crate::{
         entry_form_fragment, forgot_password_challenge, forgot_password_reset,
         get_aggregate_nonces, get_balance, get_competition, get_competitions,
         get_contract_parameters, get_entries, get_estimated_fee_rates, get_next_address,
-        get_outputs, get_ticket_status, health, leaderboard_fragment, leaderboard_rows_fragment,
-        login, login_username, payouts_fragment, public_page_handler, register, register_username,
-        request_competition_ticket, send_to_address, set_lightning_address,
-        submit_final_signatures, submit_public_nonces, submit_ticket_payout,
+        get_outputs, get_ticket_refund, get_ticket_status, health, leaderboard_fragment,
+        leaderboard_rows_fragment, login, login_username, payouts_fragment, public_page_handler,
+        register, register_username, request_competition_ticket, send_to_address,
+        set_lightning_address, submit_final_signatures, submit_public_nonces, submit_ticket_payout,
     },
     config::Settings,
     domain::{
@@ -798,6 +798,10 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
             get(get_ticket_status),
         )
         .route(
+            "/api/v1/competitions/{competition_id}/tickets/{ticket_id}/refund",
+            get(get_ticket_refund),
+        )
+        .route(
             "/api/v1/competitions/{id}/contract",
             get(get_contract_parameters),
         )
@@ -1518,8 +1522,10 @@ async fn arkade(
         settings.swap_url
     );
     Ok(Some(crate::domain::Arkade {
+        transport: Arc::new(server.client().clone()),
         server,
         swaps: Arc::new(swaps),
         refund_after_start_secs: settings.refund_after_start_secs,
+        max_refund_fee_sats: settings.max_refund_fee_sats,
     }))
 }

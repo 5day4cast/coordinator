@@ -26,6 +26,8 @@ test-utils = []
 
 [dev-dependencies]
 coordinator-ark = { path = ".", features = ["test-utils"] }
+# Proves the transactions this crate builds are the ones the verifier authorizes.
+coordinator-escrow = { workspace = true }
 anyhow = { workspace = true }
 hex = { workspace = true }
 reqwest = { workspace = true }

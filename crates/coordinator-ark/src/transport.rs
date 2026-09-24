@@ -1,11 +1,12 @@
-//! The batch calls the kickoff makes to an Arkade server.
+//! The calls this crate makes to an Arkade server: a kickoff's batch, and an offchain spend.
 //!
 //! [`ark_grpc::Client`] implements this. Tests replace it with a scripted server.
 
 use ark_core::intent::Intent;
-use ark_core::server::StreamEvent;
+use ark_core::server::{GetVtxosRequest, StreamEvent, VirtualTxOutPoint};
+use ark_core::ArkAddress;
 use async_trait::async_trait;
-use bitcoin::Psbt;
+use bitcoin::{Psbt, Txid};
 use futures::stream::BoxStream;
 use futures::StreamExt;
 
@@ -29,6 +30,30 @@ pub trait ArkTransport: Send + Sync {
 
     /// Hand the server the signed forfeit transactions.
     async fn submit_forfeits(&self, forfeits: Vec<Psbt>) -> Result<(), Error>;
+
+    /// Submit an offchain spend for the server to co-sign, leaving it pending.
+    ///
+    /// The owner signs the Ark transaction first, because the server's signatures come back with
+    /// this call; the checkpoints it returns are then signed and handed to
+    /// [`ArkTransport::finalize_offchain`].
+    async fn submit_offchain(
+        &self,
+        ark_tx: Psbt,
+        checkpoints: Vec<Psbt>,
+    ) -> Result<OffchainSubmission, Error>;
+
+    /// Finalize a submitted spend, once its checkpoints carry every signature.
+    async fn finalize_offchain(&self, ark_txid: Txid, checkpoints: Vec<Psbt>) -> Result<(), Error>;
+
+    /// The server's view of the VTXOs at `addresses`, encoded, including the spent ones.
+    async fn vtxos(&self, addresses: Vec<String>) -> Result<Vec<VirtualTxOutPoint>, Error>;
+}
+
+/// What the server returns for a submitted offchain spend: its own signatures on the Ark
+/// transaction, and the checkpoints still waiting for the owner's.
+pub struct OffchainSubmission {
+    pub ark_tx: Psbt,
+    pub checkpoints: Vec<Psbt>,
 }
 
 #[async_trait]
@@ -48,5 +73,37 @@ impl ArkTransport for ark_grpc::Client {
 
     async fn submit_forfeits(&self, forfeits: Vec<Psbt>) -> Result<(), Error> {
         Ok(self.submit_signed_forfeit_txs(forfeits, None).await?)
+    }
+
+    async fn submit_offchain(
+        &self,
+        ark_tx: Psbt,
+        checkpoints: Vec<Psbt>,
+    ) -> Result<OffchainSubmission, Error> {
+        let response = self
+            .submit_offchain_transaction_request(ark_tx, checkpoints)
+            .await?;
+        Ok(OffchainSubmission {
+            ark_tx: response.signed_ark_tx,
+            checkpoints: response.signed_checkpoint_txs,
+        })
+    }
+
+    async fn finalize_offchain(&self, ark_txid: Txid, checkpoints: Vec<Psbt>) -> Result<(), Error> {
+        self.finalize_offchain_transaction(ark_txid, checkpoints)
+            .await?;
+        Ok(())
+    }
+
+    async fn vtxos(&self, addresses: Vec<String>) -> Result<Vec<VirtualTxOutPoint>, Error> {
+        let addresses = addresses
+            .iter()
+            .map(|address| ArkAddress::decode(address))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| Error::ServerInfo(format!("invalid Ark address: {error}")))?;
+        Ok(self
+            .list_vtxos(GetVtxosRequest::new_for_addresses(addresses.into_iter()))
+            .await?
+            .vtxos)
     }
 }

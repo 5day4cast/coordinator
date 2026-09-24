@@ -1,8 +1,8 @@
 use super::*;
 use coordinator_escrow::authorization::ArkEscrowPolicy;
 use coordinator_escrow::generic::{
-    registration, ARK_ESCROW_RULE, CONTRACT_RULE, RELEASE_ENTRY_KEY, RELEASE_PREIMAGE,
-    SETTLEMENT_RULE, SIGN_ARK_ESCROW, SIGN_CONTRACT,
+    registration, ARK_ESCROW_RULE, ARK_REFUND_RULE, CONTRACT_RULE, RELEASE_ENTRY_KEY,
+    RELEASE_PREIMAGE, SETTLEMENT_RULE, SIGN_ARK_ESCROW, SIGN_ARK_REFUND, SIGN_CONTRACT,
 };
 use coordinator_escrow::payout::dlctix::{
     self,
@@ -274,6 +274,7 @@ fn rule(permission: &str) -> &'static str {
     match permission {
         SIGN_CONTRACT => CONTRACT_RULE,
         SIGN_ARK_ESCROW => ARK_ESCROW_RULE,
+        SIGN_ARK_REFUND => ARK_REFUND_RULE,
         _ => SETTLEMENT_RULE,
     }
 }
@@ -362,12 +363,41 @@ fn invoice() -> String {
     invoice_with_preimage([9; 32])
 }
 fn invoice_with_preimage(preimage: [u8; 32]) -> String {
+    invoice_for(100_000, preimage)
+}
+/// An invoice for `sats`, settled by `preimage`, issued for a Lightning Address: it commits
+/// to the provider's metadata for that address, as LUD-06 requires.
+#[cfg(feature = "lnurl")]
+fn address_invoice_for(sats: u64, preimage: [u8; 32], metadata: &str) -> String {
     use dlctix::bitcoin::{
         hashes::sha256,
         secp256k1::{Secp256k1, SecretKey},
     };
     InvoiceBuilder::new(Currency::Regtest)
-        .amount_milli_satoshis(100_000_000)
+        .amount_milli_satoshis(sats * 1000)
+        .description_hash(sha256::Hash::from_byte_array(payout::sha256(
+            metadata.as_bytes(),
+        )))
+        .payment_hash(sha256::Hash::from_byte_array(payout::sha256(&preimage)))
+        .payment_secret(PaymentSecret([10; 32]))
+        .duration_since_epoch(Duration::from_secs(now().unwrap()))
+        .expiry_time(Duration::from_secs(600))
+        .min_final_cltv_expiry_delta(18)
+        .build_signed(|hash| {
+            Secp256k1::new()
+                .sign_ecdsa_recoverable(hash, &SecretKey::from_slice(&[11; 32]).unwrap())
+        })
+        .unwrap()
+        .to_string()
+}
+/// An invoice for `sats`, settled by `preimage`.
+fn invoice_for(sats: u64, preimage: [u8; 32]) -> String {
+    use dlctix::bitcoin::{
+        hashes::sha256,
+        secp256k1::{Secp256k1, SecretKey},
+    };
+    InvoiceBuilder::new(Currency::Regtest)
+        .amount_milli_satoshis(sats * 1000)
         .description("Direct fallback invoice".into())
         .payment_hash(sha256::Hash::from_byte_array(payout::sha256(&preimage)))
         .payment_secret(PaymentSecret([10; 32]))
@@ -739,7 +769,7 @@ async fn preparation_rejects_forged_invoice_authorization_incomplete_signatures_
 async fn enclave_tls_prepares_automatic_invoice_and_disabled_instance_recovers_paid_claim() {
     let f = fixture(true);
     let (client, server) =
-        crate::lnurl_transport::tests::automatic_payout_tls_fixture(invoice()).await;
+        crate::lnurl_transport::fixtures::automatic_payout_tls_fixture(invoice()).await;
     let verifier = CoordinatorVerifier::with_lnurl(client);
     verifier
         .validate_registration(RegistrationView {
@@ -941,15 +971,26 @@ async fn renewed_invoice_keeps_late_paid_candidate_and_freezes_both_releases() {
 
 mod ark_escrow {
     use super::*;
-    use coordinator_ark_escrow::{EntryEscrow, EscrowPath, EscrowTerms, RelativeTimelock};
-    use coordinator_escrow::ark::{psbt_hex, ArkEscrowSpend, ArkFunding};
+    use coordinator_ark_escrow::{
+        EntryEscrow, EscrowPath, EscrowTerms, RefundSwap, RelativeTimelock, SwapTerms,
+    };
+    use coordinator_escrow::ark::{psbt_hex, ArkEscrowSpend, ArkFunding, RefundPurpose};
     use dlctix::bitcoin::{
         absolute::LockTime, taproot::LeafVersion, transaction::Version, Psbt, ScriptBuf,
         Transaction, TxIn, TxOut, Txid, XOnlyPublicKey,
     };
 
     const ESCROW_SATS: u64 = 20_000;
+    /// The escrow's refund locktime, which a refund's transaction must wait for.
+    const REFUND_AT: u32 = 1_790_000_000;
+    /// Stands in for the Arkade server's checkpoint exit script.
+    const EXIT_SCRIPT: &str =
+        "20aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac";
+    /// A refunded escrow's value. The shared LNURL fixture answers one exact amount, so this
+    /// leaves the player the 100,000 sats it expects to be asked for.
+    const REFUNDED_SATS: u64 = 100_000 + MAX_REFUND_FEE_SATS;
     const MAX_FEE_SATS: u64 = 500;
+    const MAX_REFUND_FEE_SATS: u64 = 100;
 
     fn xonly(secret: u8) -> XOnlyPublicKey {
         XOnlyPublicKey::from_slice(&public(secret)[1..]).unwrap()
@@ -960,7 +1001,7 @@ mod ark_escrow {
             player: xonly(player),
             coordinator: xonly(coordinator),
             server: xonly(21),
-            refund_locktime: LockTime::from_consensus(1_790_000_000),
+            refund_locktime: LockTime::from_consensus(REFUND_AT),
             exit_delay: RelativeTimelock::Seconds(2048),
             unilateral_refund_delay: RelativeTimelock::Seconds(2048 + 512 * 100),
         })
@@ -970,6 +1011,8 @@ mod ark_escrow {
         ArkEscrowPolicy {
             escrow_tap_tree: hex::encode(escrow.vtxo_script().encode_tap_tree()),
             max_fee_sats: MAX_FEE_SATS,
+            max_refund_fee_sats: MAX_REFUND_FEE_SATS,
+            checkpoint_exit_script: EXIT_SCRIPT.into(),
         }
     }
     fn ark_fixture() -> (Fixture, EntryEscrow) {
@@ -1343,6 +1386,282 @@ mod ark_escrow {
             .prepare(
                 f.prepare_view(&bound, &attempt, SIGN_CONTRACT, &prior),
                 &params
+            )
+            .await
+            .is_err());
+    }
+
+    fn anchor() -> TxOut {
+        TxOut {
+            value: Amount::ZERO,
+            script_pubkey: coordinator_ark_escrow::anchor_script_pubkey(),
+        }
+    }
+
+    /// One transaction of an offchain spend, spending the escrow's refund leaf.
+    fn offchain_tx(escrow: &EntryEscrow, prevout: (OutPoint, TxOut), outputs: Vec<TxOut>) -> Psbt {
+        let mut psbt = Psbt::from_unsigned_tx(Transaction {
+            version: Version::non_standard(3),
+            lock_time: LockTime::from_consensus(REFUND_AT),
+            input: vec![TxIn {
+                previous_output: prevout.0,
+                sequence: dlctix::bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF,
+                ..Default::default()
+            }],
+            output: outputs,
+        })
+        .unwrap();
+        psbt.inputs[0].witness_utxo = Some(prevout.1);
+        psbt.inputs[0].tap_scripts.insert(
+            escrow.control_block(EscrowPath::Refund),
+            (
+                escrow.script(EscrowPath::Refund).clone(),
+                LeafVersion::TapScript,
+            ),
+        );
+        psbt
+    }
+
+    /// A refund's two transactions: the escrow into a checkpoint, the checkpoint into the swap.
+    fn refund_txs(escrow: &EntryEscrow, swap: &RefundSwap, value_sats: u64) -> (Psbt, Psbt) {
+        let value = Amount::from_sat(value_sats);
+        let checkpoint_output = TxOut {
+            value,
+            script_pubkey: coordinator_ark_escrow::checkpoint_script_pubkey(
+                escrow.script(EscrowPath::Refund),
+                &ScriptBuf::from_bytes(hex::decode(EXIT_SCRIPT).unwrap()),
+            )
+            .unwrap(),
+        };
+        let checkpoint = offchain_tx(
+            escrow,
+            (
+                outpoint(11),
+                TxOut {
+                    value,
+                    script_pubkey: escrow.script_pubkey(),
+                },
+            ),
+            vec![checkpoint_output.clone(), anchor()],
+        );
+        let ark = offchain_tx(
+            escrow,
+            (
+                OutPoint::new(checkpoint.unsigned_tx.compute_txid(), 0),
+                checkpoint_output,
+            ),
+            vec![
+                TxOut {
+                    value,
+                    script_pubkey: swap.script_pubkey(),
+                },
+                anchor(),
+            ],
+        );
+        (ark, checkpoint)
+    }
+
+    /// The swap a refund pays, committing to the invoice `preimage` settles.
+    fn refund_swap(preimage: [u8; 32]) -> RefundSwap {
+        let deadline = LockTime::from_consensus(now().unwrap() as u32 + 3_600);
+        let exit_delay = RelativeTimelock::Seconds(2048);
+        RefundSwap::new(SwapTerms {
+            player: xonly(14),
+            swapper: xonly(30),
+            server: xonly(21),
+            payment_hash: payout::sha256(&preimage),
+            deadline,
+            exit_delay,
+            unilateral_reclaim_delay: RelativeTimelock::Seconds(2048 + 512 * 100),
+        })
+        .unwrap()
+    }
+
+    /// The Ark transaction is signed first, before the server co-signs it; the checkpoint after.
+    fn refund_of(escrow: &EntryEscrow, swap: &RefundSwap) -> ArkEscrowSpend {
+        refund_signing(escrow, swap, RefundPurpose::ArkTransaction)
+    }
+
+    fn refund_signing(
+        escrow: &EntryEscrow,
+        swap: &RefundSwap,
+        purpose: RefundPurpose,
+    ) -> ArkEscrowSpend {
+        let (ark, checkpoint) = refund_txs(escrow, swap, REFUNDED_SATS);
+        ArkEscrowSpend::Refund {
+            purpose,
+            ark_psbt: psbt_hex(&ark),
+            checkpoint_psbt: psbt_hex(&checkpoint),
+            swap_tap_tree: hex::encode(swap.vtxo_script().encode_tap_tree()),
+        }
+    }
+
+    fn refund_parameters(spend: ArkEscrowSpend, invoice: String, fee_sats: u64) -> Payload {
+        Payload::encode(&ActionParameters::RefundArkEscrow {
+            spend,
+            invoice,
+            fee_sats,
+        })
+        .unwrap()
+    }
+
+    #[cfg(feature = "lnurl")]
+    #[tokio::test]
+    async fn a_refund_pays_the_players_own_address_through_a_swap_committed_to_its_invoice() {
+        use crate::lnurl_transport::fixtures::{discovery_tls_fixture, FIXTURE_METADATA};
+
+        let escrow = escrow_with(14, 18);
+        let f = fixture_with(true, Some(policy_for(&escrow)));
+        let preimage = [9u8; 32];
+        let paid_sats = REFUNDED_SATS - MAX_REFUND_FEE_SATS;
+        let invoice = address_invoice_for(paid_sats, preimage, FIXTURE_METADATA);
+        let (client, server) = discovery_tls_fixture().await;
+        let verifier = CoordinatorVerifier::with_lnurl(client);
+        let swap = refund_swap(preimage);
+        let first = attempt();
+        let unbound = Payload::default();
+        let prepared = verifier
+            .prepare(
+                f.prepare_view(&unbound, &first, SIGN_ARK_REFUND, &BTreeMap::new()),
+                &refund_parameters(
+                    refund_of(&escrow, &swap),
+                    invoice.clone(),
+                    MAX_REFUND_FEE_SATS,
+                ),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(digests(&prepared.action).len(), 1);
+
+        // The server co-signs between the two, so the checkpoint is signed in its own attempt,
+        // over its own digest.
+        let (client, server) = discovery_tls_fixture().await;
+        let second = CoordinatorVerifier::with_lnurl(client);
+        let later = attempt();
+        let checkpoint = second
+            .prepare(
+                f.prepare_view(&unbound, &later, SIGN_ARK_REFUND, &BTreeMap::new()),
+                &refund_parameters(
+                    refund_signing(&escrow, &swap, RefundPurpose::Checkpoint),
+                    invoice.clone(),
+                    MAX_REFUND_FEE_SATS,
+                ),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_ne!(digests(&checkpoint.action), digests(&prepared.action));
+
+        // Executing and restoring recheck the refund without resolving the address again.
+        verifier
+            .verify_execution(
+                f.execute_view(&unbound, &first, SIGN_ARK_REFUND),
+                &prepared,
+                &Payload::default(),
+            )
+            .await
+            .unwrap();
+        verifier
+            .restore_execution(f.execute_view(&unbound, &first, SIGN_ARK_REFUND), &prepared)
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "lnurl")]
+    #[tokio::test]
+    async fn a_refund_is_refused_unless_the_invoice_and_swap_are_the_players() {
+        use crate::lnurl_transport::fixtures::{discovery_tls_fixture, FIXTURE_METADATA};
+
+        let escrow = escrow_with(14, 18);
+        let f = fixture_with(true, Some(policy_for(&escrow)));
+        let preimage = [9u8; 32];
+        let paid_sats = REFUNDED_SATS - MAX_REFUND_FEE_SATS;
+        let attempt = attempt();
+        let unbound = Payload::default();
+        let refund = |swap: &RefundSwap, invoice: String, fee: u64| {
+            refund_parameters(refund_of(&escrow, swap), invoice, fee)
+        };
+        let prepare = |verifier: CoordinatorVerifier, params: Payload| {
+            let f = &f;
+            let attempt = &attempt;
+            let unbound = &unbound;
+            async move {
+                verifier
+                    .prepare(
+                        f.prepare_view(unbound, attempt, SIGN_ARK_REFUND, &BTreeMap::new()),
+                        &params,
+                    )
+                    .await
+            }
+        };
+
+        // An invoice from another provider, or for another address, commits to other metadata.
+        let (client, server) = discovery_tls_fixture().await;
+        let params = refund(
+            &refund_swap(preimage),
+            address_invoice_for(paid_sats, preimage, "[[\"text/plain\",\"Someone else\"]]"),
+            MAX_REFUND_FEE_SATS,
+        );
+        assert!(prepare(CoordinatorVerifier::with_lnurl(client), params)
+            .await
+            .is_err());
+        server.await.unwrap();
+
+        // A swap that commits to a different invoice cannot be claimed by paying this one.
+        let (client, server) = discovery_tls_fixture().await;
+        let params = refund(
+            &refund_swap([1u8; 32]),
+            address_invoice_for(paid_sats, preimage, FIXTURE_METADATA),
+            MAX_REFUND_FEE_SATS,
+        );
+        assert!(prepare(CoordinatorVerifier::with_lnurl(client), params)
+            .await
+            .is_err());
+        server.await.unwrap();
+
+        // A fee above the player's cap is refused before the address is resolved at all.
+        let (client, server) = discovery_tls_fixture().await;
+        let params = refund(
+            &refund_swap(preimage),
+            address_invoice_for(paid_sats, preimage, FIXTURE_METADATA),
+            MAX_REFUND_FEE_SATS + 1,
+        );
+        assert!(prepare(CoordinatorVerifier::with_lnurl(client), params)
+            .await
+            .is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn only_the_refund_permission_signs_a_refund() {
+        let escrow = escrow_with(14, 18);
+        let f = fixture_with(true, Some(policy_for(&escrow)));
+        let verifier = CoordinatorVerifier::default();
+        let attempt = attempt();
+        let unbound = Payload::default();
+        // The escrow spending permission may not sign a refund, and the refund permission may
+        // not sign a batch.
+        assert!(verifier
+            .prepare(
+                f.prepare_view(&unbound, &attempt, SIGN_ARK_ESCROW, &BTreeMap::new()),
+                &refund_parameters(
+                    refund_of(&escrow, &refund_swap([9u8; 32])),
+                    invoice_for(1_000, [9u8; 32]),
+                    0
+                ),
+            )
+            .await
+            .is_err());
+        assert!(verifier
+            .prepare(
+                f.prepare_view(&unbound, &attempt, SIGN_ARK_REFUND, &BTreeMap::new()),
+                &Payload::encode(&ActionParameters::SignArkEscrow {
+                    spend: ArkEscrowSpend::IntentProof {
+                        proof_psbt: String::new()
+                    }
+                })
+                .unwrap(),
             )
             .await
             .is_err());

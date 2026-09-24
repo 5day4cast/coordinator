@@ -17,9 +17,23 @@ pub struct TestRun {
     pub completed_at: Option<String>,
     pub error_message: Option<String>,
     pub config_json: Option<String>,
+    /// The competition the run created, from its steps' details.
+    #[sqlx(default)]
+    pub competition_id: Option<String>,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+/// A scenario's recent record, for the dashboard.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct ScenarioHealth {
+    pub scenario: String,
+    pub runs: i64,
+    pub passed: i64,
+    pub failed: i64,
+    pub last_started_at: String,
+    pub last_status: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
 pub struct TestStep {
     pub id: String,
     pub run_id: String,
@@ -29,6 +43,40 @@ pub struct TestStep {
     pub completed_at: Option<String>,
     pub duration_ms: Option<i64>,
     pub details_json: Option<String>,
+    #[sqlx(default)]
+    pub error_message: Option<String>,
+}
+
+/// A rebalance about to be recorded.
+#[derive(Debug, Clone)]
+pub struct Rebalance {
+    /// `channel`, for the payer's channel, or `arkade`, for ark-swapd's wallet.
+    pub kind: &'static str,
+    /// The channel, or `ark-swapd` for its wallet.
+    pub channel_id: String,
+    pub amount_sats: u64,
+    pub local_before_sats: u64,
+    pub capacity_sats: u64,
+    /// The on-chain transaction, for an Arkade top-up.
+    pub txid: Option<String>,
+    /// Why it failed, if it did.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct RebalanceRecord {
+    pub id: String,
+    #[sqlx(default)]
+    pub kind: Option<String>,
+    #[sqlx(default)]
+    pub txid: Option<String>,
+    pub channel_id: String,
+    pub amount_sats: i64,
+    pub local_before_sats: i64,
+    pub capacity_sats: i64,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -86,12 +134,17 @@ impl SynthDb {
                 started_at TEXT NOT NULL,
                 completed_at TEXT,
                 duration_ms INTEGER,
-                details_json TEXT
+                details_json TEXT,
+                error_message TEXT
             )
             "#,
         )
         .execute(&self.pool)
         .await?;
+
+        // Databases made before steps kept their errors.
+        self.add_column_if_missing("test_steps", "error_message", "TEXT")
+            .await?;
 
         sqlx::query(
             r#"
@@ -107,7 +160,107 @@ impl SynthDb {
         .execute(&self.pool)
         .await?;
 
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS rebalances (
+                id TEXT PRIMARY KEY,
+                channel_id TEXT NOT NULL,
+                amount_sats INTEGER NOT NULL,
+                local_before_sats INTEGER NOT NULL,
+                capacity_sats INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                error_message TEXT,
+                created_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        // Databases made before synth kept ark-swapd's wallet funded.
+        self.add_column_if_missing("rebalances", "kind", "TEXT NOT NULL DEFAULT 'channel'")
+            .await?;
+        self.add_column_if_missing("rebalances", "txid", "TEXT")
+            .await?;
+
         Ok(())
+    }
+
+    async fn add_column_if_missing(
+        &self,
+        table: &str,
+        column: &str,
+        definition: &str,
+    ) -> Result<()> {
+        let exists: bool =
+            sqlx::query_scalar("SELECT count(*) > 0 FROM pragma_table_info(?) WHERE name = ?")
+                .bind(table)
+                .bind(column)
+                .fetch_one(&self.pool)
+                .await?;
+        if !exists {
+            sqlx::query(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+            ))
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    // --- Rebalances ---
+
+    pub async fn record_rebalance(&self, rebalance: &Rebalance) -> Result<()> {
+        let now =
+            OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+        let status = if rebalance.error.is_some() {
+            "failed"
+        } else {
+            "moved"
+        };
+        sqlx::query(
+            "INSERT INTO rebalances (id, kind, channel_id, amount_sats, local_before_sats, \
+             capacity_sats, txid, status, error_message, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(rebalance.kind)
+        .bind(&rebalance.channel_id)
+        .bind(rebalance.amount_sats as i64)
+        .bind(rebalance.local_before_sats as i64)
+        .bind(rebalance.capacity_sats as i64)
+        .bind(&rebalance.txid)
+        .bind(status)
+        .bind(&rebalance.error)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// When the last rebalance of `kind` that went through was made.
+    pub async fn last_rebalance_at(&self, kind: &str) -> Result<Option<OffsetDateTime>> {
+        let at: Option<String> = sqlx::query_scalar(
+            "SELECT created_at FROM rebalances WHERE kind = ? AND status = 'moved' \
+             ORDER BY rowid DESC LIMIT 1",
+        )
+        .bind(kind)
+        .fetch_optional(&self.pool)
+        .await?;
+        at.map(|at| OffsetDateTime::parse(&at, &time::format_description::well_known::Rfc3339))
+            .transpose()
+            .context("read when the last rebalance was")
+    }
+
+    pub async fn list_rebalances(&self, limit: i64) -> Result<Vec<RebalanceRecord>> {
+        let rebalances = sqlx::query_as::<_, RebalanceRecord>(
+            "SELECT * FROM rebalances ORDER BY rowid DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rebalances)
     }
 
     // --- Test Runs ---
@@ -150,7 +303,10 @@ impl SynthDb {
 
     pub async fn list_runs(&self, limit: i64) -> Result<Vec<TestRun>> {
         let runs = sqlx::query_as::<_, TestRun>(
-            "SELECT * FROM test_runs ORDER BY started_at DESC LIMIT ?",
+            "SELECT test_runs.*, (SELECT json_extract(details_json, '$.competition_id') \
+             FROM test_steps WHERE test_steps.run_id = test_runs.id \
+             AND json_extract(details_json, '$.competition_id') IS NOT NULL LIMIT 1) \
+             AS competition_id FROM test_runs ORDER BY started_at DESC LIMIT ?",
         )
         .bind(limit)
         .fetch_all(&self.pool)
@@ -159,11 +315,45 @@ impl SynthDb {
         Ok(runs)
     }
 
+    /// How each scenario has been doing, most recently run first.
+    ///
+    /// A scenario is only as good as its last runs, so this counts the recent window rather than
+    /// all of history: a run that failed a month ago says nothing about the deployment today.
+    pub async fn scenario_health(&self, window: i64) -> Result<Vec<ScenarioHealth>> {
+        let health = sqlx::query_as::<_, ScenarioHealth>(
+            "WITH recent AS (
+                 SELECT scenario, status, started_at, completed_at,
+                        ROW_NUMBER() OVER (PARTITION BY scenario ORDER BY started_at DESC) AS age
+                 FROM test_runs
+             )
+             SELECT scenario,
+                    COUNT(*) AS runs,
+                    SUM(CASE WHEN status = 'passed' THEN 1 ELSE 0 END) AS passed,
+                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                    MAX(started_at) AS last_started_at,
+                    (SELECT status FROM recent inner_recent
+                      WHERE inner_recent.scenario = recent.scenario AND inner_recent.age = 1)
+                      AS last_status
+             FROM recent WHERE age <= ?
+             GROUP BY scenario ORDER BY last_started_at DESC",
+        )
+        .bind(window)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(health)
+    }
+
     pub async fn get_run(&self, id: &str) -> Result<Option<TestRun>> {
-        let run = sqlx::query_as::<_, TestRun>("SELECT * FROM test_runs WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let run = sqlx::query_as::<_, TestRun>(
+            "SELECT test_runs.*, (SELECT json_extract(details_json, '$.competition_id') \
+             FROM test_steps WHERE test_steps.run_id = test_runs.id \
+             AND json_extract(details_json, '$.competition_id') IS NOT NULL LIMIT 1) \
+             AS competition_id FROM test_runs WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
 
         Ok(run)
     }
@@ -200,12 +390,14 @@ impl SynthDb {
         let status = if error.is_some() { "failed" } else { "passed" };
 
         sqlx::query(
-            "UPDATE test_steps SET status = ?, completed_at = ?, duration_ms = ?, details_json = ? WHERE id = ?",
+            "UPDATE test_steps SET status = ?, completed_at = ?, duration_ms = ?, details_json = ?, \
+             error_message = ? WHERE id = ?",
         )
         .bind(status)
         .bind(&now)
         .bind(duration_ms)
         .bind(details_json)
+        .bind(error)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -215,7 +407,7 @@ impl SynthDb {
 
     pub async fn get_steps(&self, run_id: &str) -> Result<Vec<TestStep>> {
         let steps = sqlx::query_as::<_, TestStep>(
-            "SELECT * FROM test_steps WHERE run_id = ? ORDER BY started_at ASC",
+            "SELECT * FROM test_steps WHERE run_id = ? ORDER BY rowid",
         )
         .bind(run_id)
         .fetch_all(&self.pool)
@@ -269,5 +461,84 @@ impl SynthDb {
             .await?;
 
         Ok(users)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scenario is judged by its recent runs, so an old failure must not follow it forever.
+    #[tokio::test]
+    async fn health_counts_a_scenario_by_its_recent_runs() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synth.sqlite");
+        let db = SynthDb::new(path.to_str().unwrap()).await.unwrap();
+
+        let run = |db: SynthDb, scenario: &'static str, error: Option<&'static str>| async move {
+            let id = db.create_run(scenario, None).await.unwrap();
+            db.complete_run(&id, error).await.unwrap();
+        };
+        run(db.clone(), "escrow_refund", Some("no refund")).await;
+        run(db.clone(), "escrow_refund", None).await;
+        run(db.clone(), "full_lifecycle", None).await;
+
+        let health = db.scenario_health(20).await.unwrap();
+        let refund = health
+            .iter()
+            .find(|health| health.scenario == "escrow_refund")
+            .expect("the refund scenario is listed");
+        assert_eq!((refund.runs, refund.passed, refund.failed), (2, 1, 1));
+        assert_eq!(refund.last_status, "passed", "its latest run decides");
+
+        // Narrowing the window drops the older failure, leaving only what it did last.
+        let recent = db.scenario_health(1).await.unwrap();
+        let refund = recent
+            .iter()
+            .find(|health| health.scenario == "escrow_refund")
+            .unwrap();
+        assert_eq!((refund.runs, refund.passed, refund.failed), (1, 1, 0));
+
+        // Scenarios are listed by when they last ran, most recent first.
+        assert_eq!(
+            health
+                .iter()
+                .map(|h| h.scenario.as_str())
+                .collect::<Vec<_>>(),
+            ["full_lifecycle", "escrow_refund"]
+        );
+    }
+
+    /// A failed rebalance is kept with its reason, so the dashboard can say why money stopped
+    /// moving.
+    #[tokio::test]
+    async fn rebalances_are_listed_with_what_went_wrong() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synth.sqlite");
+        let db = SynthDb::new(path.to_str().unwrap()).await.unwrap();
+
+        let rebalance = |error: Option<&str>| Rebalance {
+            kind: "channel",
+            channel_id: "1".into(),
+            amount_sats: 200_000,
+            local_before_sats: 250_000,
+            capacity_sats: 1_000_000,
+            txid: None,
+            error: error.map(str::to_owned),
+        };
+        db.record_rebalance(&rebalance(None)).await.unwrap();
+        db.record_rebalance(&rebalance(Some("no route")))
+            .await
+            .unwrap();
+
+        let listed = db.list_rebalances(10).await.unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|r| (r.status.as_str(), r.error_message.as_deref()))
+                .collect::<Vec<_>>(),
+            [("failed", Some("no route")), ("moved", None)]
+        );
+        assert_eq!(listed[1].amount_sats, 200_000);
     }
 }

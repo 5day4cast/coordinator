@@ -28,6 +28,10 @@ pub const SETTLEMENT_RULE: &str = "settlement_completed";
 /// Signs spends of the entry's Arkade escrow VTXO, when the ticket has one.
 pub const SIGN_ARK_ESCROW: &str = "sign_ark_escrow";
 pub const ARK_ESCROW_RULE: &str = "ark_escrow_spend_allowed";
+/// Signs the refund of an escrow whose competition never kicked off. Unbound, because a pool
+/// that never filled has no contract and may have no completed keygen session.
+pub const SIGN_ARK_REFUND: &str = "sign_ark_refund";
+pub const ARK_REFUND_RULE: &str = "ark_refund_allowed";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +61,18 @@ pub enum ActionParameters {
     },
     /// Sign the entry's Arkade escrow spend. See [`crate::ark`].
     SignArkEscrow { spend: ArkEscrowSpend },
+    /// Sign the refund of an escrow whose competition never kicked off. See [`crate::ark`].
+    ///
+    /// The invoice is supplied rather than requested by the verifier, because the swap the
+    /// refund pays must already commit to its payment hash. The verifier checks it was issued
+    /// for the player's own Lightning Address before signing anything.
+    RefundArkEscrow {
+        spend: ArkEscrowSpend,
+        /// The invoice the swap service pays, from the player's Lightning Address.
+        invoice: String,
+        /// What the swap service keeps, capped by the player's consented policy.
+        fee_sats: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +155,7 @@ pub fn participant_policy(
                 } else {
                     escrow::Repetition::RepeatIdenticalSigningScope
                 },
+                unbound: false,
                 condition: Condition::VerifierRule {
                     rule: CONTRACT_RULE.into(),
                 },
@@ -150,6 +167,7 @@ pub fn participant_policy(
             ActionGrant {
                 preparation: escrow::PreparationPolicy::RenewableIdenticalAction,
                 repetition: escrow::Repetition::Once,
+                unbound: false,
                 condition: Condition::VerifierRule {
                     rule: SETTLEMENT_RULE.into(),
                 },
@@ -164,6 +182,7 @@ pub fn participant_policy(
             ActionGrant {
                 preparation: escrow::PreparationPolicy::RenewableIdenticalAction,
                 repetition: escrow::Repetition::Once,
+                unbound: false,
                 condition: Condition::VerifierRule {
                     rule: SETTLEMENT_RULE.into(),
                 },
@@ -182,8 +201,23 @@ pub fn participant_policy(
                 preparation: escrow::PreparationPolicy::Single,
                 // Every batch attempt signs new transactions, and the verifier checks each one.
                 repetition: escrow::Repetition::VerifierAuthorizedAttempts,
+                unbound: false,
                 condition: Condition::VerifierRule {
                     rule: ARK_ESCROW_RULE.into(),
+                },
+                operation: Permission::SignBip340,
+            },
+        );
+        grants.insert(
+            SIGN_ARK_REFUND.into(),
+            ActionGrant {
+                preparation: escrow::PreparationPolicy::Single,
+                // A refund is retried with a fresh invoice and swap, which the verifier checks.
+                repetition: escrow::Repetition::VerifierAuthorizedAttempts,
+                // The pool never formed, so there is no binding to act under.
+                unbound: true,
+                condition: Condition::VerifierRule {
+                    rule: ARK_REFUND_RULE.into(),
                 },
                 operation: Permission::SignBip340,
             },
