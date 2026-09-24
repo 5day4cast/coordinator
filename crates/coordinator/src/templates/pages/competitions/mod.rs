@@ -119,7 +119,7 @@ pub fn phase_badge(competition: &CompetitionView) -> Markup {
     };
     let title = competition
         .did_not_fill()
-        .then_some("Not enough entries by the start; every entry fee is refunded");
+        .then_some("Not enough entries by the start; every entry fee is returned");
     html! { span class=(class) title=[title] { (label) } }
 }
 

@@ -339,7 +339,7 @@ pub async fn entry_form_fragment(
     let view = CompetitionView::new(&competition, now());
     if !view.can_enter {
         // Entries are closed; the leaderboard is what there is to see.
-        return leaderboard_response(&state, &headers, &competition, &view).await;
+        return leaderboard_response(&state, &headers, &view);
     }
     let locations = &competition.event_submission.locations;
     let (event, stations, terms, destination) = tokio::join!(
@@ -381,7 +381,8 @@ pub async fn entry_payout_fragment(
     response
 }
 
-/// Leaderboard for a competition
+/// Leaderboard for a competition. It needs only the competition, so it
+/// renders at once; the scores load into it from the rows fragment.
 pub async fn leaderboard_fragment(
     State(state): State<Arc<AppState>>,
     Path(competition_id): Path<Uuid>,
@@ -391,21 +392,15 @@ pub async fn leaderboard_fragment(
         return not_found(&headers, &state, "Competition");
     };
     let view = CompetitionView::new(&competition, now());
-    leaderboard_response(&state, &headers, &competition, &view).await
+    leaderboard_response(&state, &headers, &view)
 }
 
-async fn leaderboard_response(
-    state: &AppState,
-    headers: &HeaderMap,
-    competition: &Competition,
-    view: &CompetitionView,
-) -> Response {
-    let rows = leaderboard_view_rows(state, competition).await;
-    let content = leaderboard(view, &rows, now());
+fn leaderboard_response(state: &AppState, headers: &HeaderMap, view: &CompetitionView) -> Response {
+    let content = leaderboard(view, now());
     page(headers, state, "Leaderboard - Fantasy Weather", content, Caching::Public)
 }
 
-/// Leaderboard rows fragment (for auto-refresh)
+/// The leaderboard's rows: loaded after the page, and every 30 s while live.
 pub async fn leaderboard_rows_fragment(
     State(state): State<Arc<AppState>>,
     Path(competition_id): Path<Uuid>,
