@@ -1579,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1647,7 +1647,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-ark"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "ark-core",
@@ -1672,7 +1672,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-ark-escrow"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "bitcoin",
  "hex",
@@ -1683,7 +1683,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-ark-swap"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "ark-bdk-wallet",
@@ -1714,7 +1714,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-core"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "axum",
  "coordinator-escrow",
@@ -1730,7 +1730,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-escrow"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "coordinator-ark-escrow",
@@ -1750,7 +1750,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-escrow-verifier"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1780,7 +1780,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-lnurl-relay"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "coordinator-escrow",
@@ -1792,7 +1792,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-synth"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1832,7 +1832,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-verifier-enclave"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "coordinator-escrow-verifier",
@@ -1843,7 +1843,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-wasm"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "base64 0.22.1",
  "bitcoin",
