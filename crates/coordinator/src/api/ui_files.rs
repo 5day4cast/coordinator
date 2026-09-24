@@ -55,15 +55,36 @@ struct UiFile {
 
 static FILES: LazyLock<Mutex<HashMap<PathBuf, Arc<UiFile>>>> = LazyLock::new(Default::default);
 
+/// Honor exact encoding tokens and quality weights; explicit gzip exclusions
+/// take precedence over a wildcard. Malformed weights fail closed to identity.
 pub fn accepts_gzip(headers: &HeaderMap) -> bool {
-    headers
-        .get(header::ACCEPT_ENCODING)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(',')
-                .any(|coding| coding.trim().starts_with("gzip"))
-        })
+    let mut gzip = None;
+    let mut wildcard = None;
+    for value in headers.get_all(header::ACCEPT_ENCODING) {
+        let Ok(value) = value.to_str() else { continue };
+        for coding in value.split(',') {
+            let mut parts = coding.split(';');
+            let name = parts.next().unwrap_or_default().trim();
+            let choice = if name.eq_ignore_ascii_case("gzip") {
+                &mut gzip
+            } else if name == "*" {
+                &mut wildcard
+            } else {
+                continue;
+            };
+            let allowed = parts
+                .filter_map(|parameter| parameter.trim().split_once('='))
+                .filter(|(name, _)| name.trim().eq_ignore_ascii_case("q"))
+                .all(|(_, value)| {
+                    value
+                        .trim()
+                        .parse::<f32>()
+                        .is_ok_and(|q| q > 0.0 && q <= 1.0)
+                });
+            *choice = Some(choice.unwrap_or(true) && allowed);
+        }
+    }
+    gzip.or(wildcard).unwrap_or(false)
 }
 
 /// Serve `path` from `ui_dir`. `versioned` marks a request carrying the
@@ -183,6 +204,31 @@ mod tests {
         )
         .unwrap();
         directory
+    }
+
+    #[test]
+    fn gzip_negotiation_honors_tokens_weights_and_explicit_exclusions() {
+        for (value, expected) in [
+            ("br, gzip", true),
+            ("GZIP; q=0.5", true),
+            ("*;q=1", true),
+            ("gzipfoo", false),
+            ("gzip;q=0", false),
+            ("gzip;q=0.000, identity", false),
+            ("gzip;q=0, *;q=1", false),
+            ("gzip;q=invalid", false),
+            ("gzip;q=2", false),
+            ("gzip;q=NaN", false),
+            ("*;q=0", false),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::ACCEPT_ENCODING, value.parse().unwrap());
+            assert_eq!(accepts_gzip(&headers), expected, "{value}");
+        }
+        let mut headers = HeaderMap::new();
+        headers.append(header::ACCEPT_ENCODING, "br".parse().unwrap());
+        headers.append(header::ACCEPT_ENCODING, "gzip;q=0.8".parse().unwrap());
+        assert!(accepts_gzip(&headers));
     }
 
     #[tokio::test]

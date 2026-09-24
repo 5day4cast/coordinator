@@ -32,14 +32,7 @@ pub async fn serve_asset(Path(file): Path<String>, headers: HeaderMap) -> Respon
     let Some(asset) = find(&file) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let accepts_gzip = headers
-        .get(header::ACCEPT_ENCODING)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(',')
-                .any(|coding| coding.trim().starts_with("gzip"))
-        });
+    let accepts_gzip = crate::api::ui_files::accepts_gzip(&headers);
     let mut response = if accepts_gzip {
         ([(header::CONTENT_ENCODING, "gzip")], asset.gzip).into_response()
     } else {
