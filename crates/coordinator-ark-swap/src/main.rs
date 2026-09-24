@@ -40,6 +40,9 @@ struct Cli {
 const TICK: Duration = Duration::from_secs(1);
 /// How often the wallet's holder boards what has confirmed at its boarding address.
 const BOARD_EVERY: Duration = Duration::from_secs(60);
+/// How often settled swaps whose escrow VTXO is unknown are checked for lookups that are due.
+/// Each swap waits out its own backoff; see `Swapper::lookup_tick`.
+const LOOKUP_EVERY: Duration = Duration::from_secs(10);
 
 /// How long the worker lease outlives its holder. Another instance takes over a stopped one's
 /// swaps after this, or at once when it shuts down cleanly.
@@ -73,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
         wallet: ArkWallet::open(&config).await?,
         invoice_expiry_secs: config.invoice_expiry_secs,
         invoice_cltv_expiry: config.invoice_cltv_expiry,
+        errors: Default::default(),
     });
     let view = swapper.wallet.view().await?;
     log::info!(
@@ -95,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut holding = false;
         let mut boarded_at = tokio::time::Instant::now();
+        let mut looked_up_at = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 _ = interval.tick() => {}
@@ -109,6 +114,10 @@ async fn main() -> anyhow::Result<()> {
                     // A tick always finishes, so a payment in flight records its result.
                     worker.tick().await;
                     worker.refund_tick().await;
+                    if looked_up_at.elapsed() >= LOOKUP_EVERY {
+                        worker.lookup_tick().await;
+                        looked_up_at = tokio::time::Instant::now();
+                    }
                     if boarded_at.elapsed() >= BOARD_EVERY {
                         worker.board_tick().await;
                         boarded_at = tokio::time::Instant::now();

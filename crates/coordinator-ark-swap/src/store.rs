@@ -81,6 +81,11 @@ pub struct Swap {
     pub created_at: i64,
     pub updated_at: i64,
     pub expires_at: i64,
+    /// Lookups of the escrow VTXO after the swap settled without it, the time the next is due
+    /// (UNIX seconds), and when the service gave up looking.
+    pub vtxo_lookups: u32,
+    pub vtxo_lookup_after: Option<i64>,
+    pub vtxo_lookup_gave_up_at: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -141,8 +146,9 @@ impl Store {
     pub async fn insert(&self, swap: &Swap) -> anyhow::Result<()> {
         sqlx::query(
             "INSERT INTO swaps (id, escrow_address, amount_sat, payment_hash, preimage, invoice, state,
-                escrow_vtxo, ark_txid, error, created_at, updated_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                escrow_vtxo, ark_txid, error, created_at, updated_at, expires_at, vtxo_lookups,
+                vtxo_lookup_after, vtxo_lookup_gave_up_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(swap.id.to_string())
         .bind(&swap.escrow_address)
@@ -157,6 +163,9 @@ impl Store {
         .bind(swap.created_at)
         .bind(swap.updated_at)
         .bind(swap.expires_at)
+        .bind(swap.vtxo_lookups)
+        .bind(swap.vtxo_lookup_after)
+        .bind(swap.vtxo_lookup_gave_up_at)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -164,7 +173,8 @@ impl Store {
 
     pub async fn update(&self, swap: &Swap) -> anyhow::Result<()> {
         sqlx::query(
-            "UPDATE swaps SET state = ?, escrow_vtxo = ?, ark_txid = ?, error = ?, updated_at = ?
+            "UPDATE swaps SET state = ?, escrow_vtxo = ?, ark_txid = ?, error = ?, updated_at = ?,
+                vtxo_lookups = ?, vtxo_lookup_after = ?, vtxo_lookup_gave_up_at = ?
              WHERE id = ?",
         )
         .bind(swap.state.as_str())
@@ -172,6 +182,9 @@ impl Store {
         .bind(&swap.ark_txid)
         .bind(&swap.error)
         .bind(swap.updated_at)
+        .bind(swap.vtxo_lookups)
+        .bind(swap.vtxo_lookup_after)
+        .bind(swap.vtxo_lookup_gave_up_at)
         .bind(swap.id.to_string())
         .execute(&self.pool)
         .await?;
@@ -211,11 +224,32 @@ impl Store {
         Ok(row.is_some())
     }
 
+    /// Swaps that have not ended. Those holding a payer's HTLC while the escrow is paid or
+    /// settled come first, then those awaiting payment, oldest first within each.
     pub async fn unfinished(&self) -> anyhow::Result<Vec<Swap>> {
         let rows = sqlx::query(
-            "SELECT * FROM swaps WHERE state IN ('awaiting_payment', 'paying_escrow', 'escrow_paid')
+            "SELECT * FROM swaps
+             WHERE state IN ('awaiting_payment', 'paying_escrow', 'escrow_paid')
+             ORDER BY CASE state WHEN 'escrow_paid' THEN 0 WHEN 'paying_escrow' THEN 1 ELSE 2 END,
+                      created_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(swap).collect()
+    }
+
+    /// Settled swaps whose escrow VTXO is still to be looked up at `now` (UNIX seconds): they
+    /// paid the escrow before the indexer listed it, and the coordinator counts the entry only
+    /// once it knows the VTXO. Swaps the service gave up on are left to an operator.
+    pub async fn vtxo_lookups_due(&self, now: i64) -> anyhow::Result<Vec<Swap>> {
+        let rows = sqlx::query(
+            "SELECT * FROM swaps
+             WHERE state = 'settled' AND escrow_vtxo IS NULL AND ark_txid IS NOT NULL
+               AND vtxo_lookup_gave_up_at IS NULL
+               AND (vtxo_lookup_after IS NULL OR vtxo_lookup_after <= ?)
              ORDER BY created_at",
         )
+        .bind(now)
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(swap).collect()
@@ -372,6 +406,9 @@ fn swap(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Swap> {
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         expires_at: row.try_get("expires_at")?,
+        vtxo_lookups: row.try_get::<i64, _>("vtxo_lookups")? as u32,
+        vtxo_lookup_after: row.try_get("vtxo_lookup_after")?,
+        vtxo_lookup_gave_up_at: row.try_get("vtxo_lookup_gave_up_at")?,
     })
 }
 
@@ -480,6 +517,117 @@ mod tests {
         assert_eq!(stored.state, RefundState::Claimed);
         let served = serde_json::to_value(&stored).unwrap();
         assert!(served.get("preimage").is_none(), "{served}");
+    }
+
+    fn swap_for(payment_hash: &str, created_at: i64) -> Swap {
+        Swap {
+            id: Uuid::now_v7(),
+            escrow_address: "tark1escrow".into(),
+            amount_sat: 6_300,
+            payment_hash: payment_hash.into(),
+            preimage: "cd".repeat(32),
+            invoice: "lntb1".into(),
+            state: SwapState::AwaitingPayment,
+            escrow_vtxo: None,
+            ark_txid: None,
+            error: None,
+            created_at,
+            updated_at: created_at,
+            expires_at: created_at + 600,
+            vtxo_lookups: 0,
+            vtxo_lookup_after: None,
+            vtxo_lookup_gave_up_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn swaps_holding_a_payment_come_before_those_awaiting_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("swaps.sqlite"))
+            .await
+            .unwrap();
+        let awaiting = swap_for(&"a1".repeat(32), 1_790_000_000);
+        let mut paying = swap_for(&"a2".repeat(32), 1_790_000_100);
+        paying.state = SwapState::PayingEscrow;
+        let mut paid = swap_for(&"a3".repeat(32), 1_790_000_200);
+        paid.state = SwapState::EscrowPaid;
+        let mut settled = swap_for(&"a4".repeat(32), 1_789_999_000);
+        settled.state = SwapState::Settled;
+        settled.ark_txid = Some("ef".repeat(32));
+        for swap in [&awaiting, &paying, &paid, &settled] {
+            store.insert(swap).await.unwrap();
+        }
+        let order: Vec<Uuid> = store
+            .unfinished()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|swap| swap.id)
+            .collect();
+        assert_eq!(
+            order,
+            vec![paid.id, paying.id, awaiting.id],
+            "a settled swap is not live, even without its VTXO"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_settled_swap_is_looked_up_on_its_backoff_until_found_or_given_up() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("swaps.sqlite"))
+            .await
+            .unwrap();
+        let now = 1_790_000_000;
+        let due = |store: Store, at: i64| async move {
+            store
+                .vtxo_lookups_due(at)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|swap| swap.id)
+                .collect::<Vec<_>>()
+        };
+        let mut swap = swap_for(&"ab".repeat(32), now - 60);
+        store.insert(&swap).await.unwrap();
+        assert!(due(store.clone(), now).await.is_empty(), "not settled yet");
+
+        // Paid and settled before the indexer listed the VTXO: looked up at once.
+        swap.state = SwapState::Settled;
+        swap.ark_txid = Some("ef".repeat(32));
+        store.update(&swap).await.unwrap();
+        assert_eq!(due(store.clone(), now).await, vec![swap.id]);
+
+        // A lookup that missed waits out its backoff.
+        swap.vtxo_lookups = 1;
+        swap.vtxo_lookup_after = Some(now + 10);
+        store.update(&swap).await.unwrap();
+        assert!(due(store.clone(), now).await.is_empty());
+        assert_eq!(due(store.clone(), now + 10).await, vec![swap.id]);
+
+        let stored = store.get(swap.id).await.unwrap().unwrap();
+        assert_eq!(
+            (stored.vtxo_lookups, stored.vtxo_lookup_after),
+            (1, Some(now + 10))
+        );
+
+        // Found: nothing left to look up.
+        swap.escrow_vtxo = Some(format!("{}:0", "ef".repeat(32)));
+        store.update(&swap).await.unwrap();
+        assert!(due(store.clone(), now + 10).await.is_empty());
+
+        // Given up: left to an operator, never looked up again.
+        let mut abandoned = swap_for(&"cd".repeat(32), now);
+        abandoned.state = SwapState::Settled;
+        abandoned.ark_txid = Some("12".repeat(32));
+        abandoned.vtxo_lookup_gave_up_at = Some(now);
+        store.insert(&abandoned).await.unwrap();
+        assert!(due(store.clone(), now + 1_000_000).await.is_empty());
+
+        // A swap that ended without paying an escrow has nothing to look up.
+        let mut expired = swap_for(&"34".repeat(32), now);
+        expired.state = SwapState::Expired;
+        store.insert(&expired).await.unwrap();
+        assert!(due(store, now + 1_000_000).await.is_empty());
     }
 
     #[tokio::test]
