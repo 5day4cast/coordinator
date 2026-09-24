@@ -1,6 +1,6 @@
 # E2E Test Configuration
 # This config enables mock services for fast, deterministic Playwright testing
-# No external dependencies required (no LND, no Oracle server, no Bitcoin node)
+# No external dependencies; Playwright starts the local weather fixture.
 
 [db_settings]
 data_folder = "./data/e2e"
@@ -40,14 +40,14 @@ remote_url = "http://127.0.0.1:9990"
 ui_dir = "./crates/public_ui"
 
 [coordinator_settings]
-oracle_url = "mock://oracle"
+oracle_url = "http://127.0.0.1:9992" # Playwright's isolated weather fixture
 private_key_file = "./creds/coordinator_private_key.pem"
 relative_locktime_block_delta = 6  # Shorter for testing
 required_confirmations = 1
 sync_interval_secs = 5  # Faster for testing
 name = "e2e-coordinator"
 escrow_enabled = false
-mock_oracle = true  # Use MockOracle instead of real Oracle server
+mock_oracle = true  # Domain events/attestations use MockOracle; weather uses the fixture above
 
 [bitcoin_settings]
 network = "regtest"
