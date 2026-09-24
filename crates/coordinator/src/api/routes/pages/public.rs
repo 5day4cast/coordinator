@@ -15,13 +15,12 @@ use uuid::Uuid;
 use crate::{
     api::extractors::{AuthError, NostrAuth},
     domain::{
-        scoring::{calculate_option_score, Forecast, Observation},
-        Competition, SearchBy, UserEntry,
+        leaderboard::{Metric, PickProgress, FIRST_READ_WAIT},
+        Competition, SearchBy,
     },
     infra::oracle::ValueOptions,
     startup::AppState,
     templates::{
-        admin::dashboard::Station,
         fragments::{
             competition_row::competition_row,
             entry_form::{entry_form, ForecastValue, StationForecast, WeatherContext},
@@ -265,13 +264,11 @@ pub async fn leaderboard_fragment(
     Path(competition_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Html<String> {
-    let scores = fetch_leaderboard_scores(&state, competition_id).await;
-
-    // Fetch competition details for observation period
-    let info = match state.coordinator.get_competition(competition_id).await {
+    let (info, scores) = match state.coordinator.get_competition(competition_id).await {
         Ok(comp) => {
             let status = determine_competition_status(&comp);
-            LeaderboardInfo {
+            let scores = leaderboard_scores(&state, &comp).await;
+            let info = LeaderboardInfo {
                 competition_id: competition_id.to_string(),
                 start_time: comp
                     .event_submission
@@ -284,14 +281,18 @@ pub async fn leaderboard_fragment(
                     .format(&time::format_description::well_known::Rfc3339)
                     .unwrap_or_default(),
                 status,
-            }
+            };
+            (info, scores)
         }
-        Err(_) => LeaderboardInfo {
-            competition_id: competition_id.to_string(),
-            start_time: String::new(),
-            end_time: String::new(),
-            status: "Unknown".to_string(),
-        },
+        Err(_) => (
+            LeaderboardInfo {
+                competition_id: competition_id.to_string(),
+                start_time: String::new(),
+                end_time: String::new(),
+                status: "Unknown".to_string(),
+            },
+            vec![],
+        ),
     };
 
     let content = leaderboard(&info, &scores);
@@ -303,7 +304,10 @@ pub async fn leaderboard_rows_fragment(
     State(state): State<Arc<AppState>>,
     Path(competition_id): Path<Uuid>,
 ) -> Html<String> {
-    let scores = fetch_leaderboard_scores(&state, competition_id).await;
+    let scores = match state.coordinator.get_competition(competition_id).await {
+        Ok(competition) => leaderboard_scores(&state, &competition).await,
+        Err(_) => vec![],
+    };
     Html(
         html! {
             @for score in &scores {
@@ -314,25 +318,40 @@ pub async fn leaderboard_rows_fragment(
     )
 }
 
-/// Entry detail fragment (for modal)
+/// Entry detail fragment (for modal). Picks are public once the observation window opens.
 pub async fn entry_detail_fragment(
     State(state): State<Arc<AppState>>,
     Path(entry_id): Path<Uuid>,
 ) -> Html<String> {
-    // Fetch the entry details
     let entry = state
         .coordinator
         .get_entry_by_id(entry_id)
         .await
         .ok()
         .flatten();
-
-    // If we have an entry, fetch forecast and observation data
-    let weather_data = if let Some(ref entry) = entry {
-        fetch_entry_weather_data(&state, entry).await
-    } else {
-        None
+    let competition = match &entry {
+        Some(entry) => state.coordinator.get_competition(entry.event_id).await.ok(),
+        None => None,
     };
+    let board = match &competition {
+        Some(competition) => state
+            .leaderboards
+            .get(competition, FIRST_READ_WAIT)
+            .await
+            .inspect_err(|e| warn!("Leaderboard for entry {entry_id}: {e}"))
+            .ok(),
+        None => None,
+    };
+    let row = board
+        .as_ref()
+        .and_then(|board| board.rows.iter().find(|row| row.entry_id == entry_id));
+    let window_open = competition.as_ref().is_some_and(|competition| {
+        time::OffsetDateTime::now_utc() >= competition.event_submission.start_observation_date
+    });
+    let has_weather = board
+        .as_ref()
+        .is_some_and(|board| board.weather_fetched_at.is_some());
+    let provisional = board.as_ref().is_none_or(|board| board.provisional);
 
     Html(
         html! {
@@ -343,63 +362,30 @@ pub async fn entry_detail_fragment(
                         h5 class="title is-5 mb-1" { "Picks & Score" }
                         span class="entry-id" { (format!("#{}", &entry_id.to_string()[..8])) }
                     }
-                    @if entry.is_some() {
-                        @if let Some(ref data) = weather_data {
-                            @if let Some(total_score) = data.total_score {
-                                span class="entry-detail-score" { "🏆 " (total_score) " pts" }
-                            }
-                        }
+                    @if let Some(row) = row.filter(|row| has_weather && !row.picks.is_empty()) {
+                        span class="entry-detail-score" { "🏆 " (row.standing.score) " pts" }
                     }
                 }
 
-                @if let Some(entry) = entry {
-                    @if entry.entry_submission.expected_observations.is_empty() {
-                        p class="has-text-grey" { "No picks recorded" }
-                    } @else if let Some(ref data) = weather_data {
-                        @if data.total_score.is_none() {
-                            p class="entry-pending-msg mb-3" {
-                                "Scores available after observations are recorded"
-                            }
+                @match row {
+                    None => p class="has-text-grey" { "Entry details not available" },
+                    Some(row) if row.picks.is_empty() => {
+                        @if window_open {
+                            p class="has-text-grey" { "No picks recorded" }
+                        } @else {
+                            p class="has-text-grey" { "Picks are shown once the observation window opens" }
                         }
-                        @for obs in &entry.entry_submission.expected_observations {
-                            @let forecast = data.forecasts.get(&obs.stations);
-                            @let observation = data.observations.get(&obs.stations);
-                            // Temp High card
-                            @if let Some(pick) = &obs.temp_high {
-                                @let forecast_val = forecast.and_then(|f| f.temp_high);
-                                @let obs_val = observation.and_then(|o| o.temp_high);
-                                (pick_card(&PickCardData { icon: "🟡", label: "High", station_id: &obs.stations, forecast_val, obs_val, unit: "°F", pick, show_points: data.has_observations }))
-                            }
-                            // Temp Low card
-                            @if let Some(pick) = &obs.temp_low {
-                                @let forecast_val = forecast.and_then(|f| f.temp_low);
-                                @let obs_val = observation.and_then(|o| o.temp_low);
-                                (pick_card(&PickCardData { icon: "🔵", label: "Low", station_id: &obs.stations, forecast_val, obs_val, unit: "°F", pick, show_points: data.has_observations }))
-                            }
-                            // Wind Speed card
-                            @if let Some(pick) = &obs.wind_speed {
-                                @let forecast_val = forecast.and_then(|f| f.wind_speed);
-                                @let obs_val = observation.and_then(|o| o.wind_speed);
-                                (pick_card(&PickCardData { icon: "💨", label: "Wind", station_id: &obs.stations, forecast_val, obs_val, unit: " mph", pick, show_points: data.has_observations }))
-                            }
+                    },
+                    Some(row) => {
+                        @if !has_weather {
+                            p class="entry-pending-msg mb-3" { "Weather data unavailable" }
+                        } @else if provisional {
+                            p class="entry-pending-msg mb-3" { "Provisional: the points if the window ended now" }
                         }
-                    } @else {
-                        // No weather data - show picks only
-                        p class="entry-pending-msg mb-3" { "Weather data unavailable" }
-                        @for obs in &entry.entry_submission.expected_observations {
-                            @if let Some(pick) = &obs.temp_high {
-                                (pick_card(&PickCardData { icon: "🟡", label: "High", station_id: &obs.stations, forecast_val: None, obs_val: None, unit: "°F", pick, show_points: false }))
-                            }
-                            @if let Some(pick) = &obs.temp_low {
-                                (pick_card(&PickCardData { icon: "🔵", label: "Low", station_id: &obs.stations, forecast_val: None, obs_val: None, unit: "°F", pick, show_points: false }))
-                            }
-                            @if let Some(pick) = &obs.wind_speed {
-                                (pick_card(&PickCardData { icon: "💨", label: "Wind", station_id: &obs.stations, forecast_val: None, obs_val: None, unit: " mph", pick, show_points: false }))
-                            }
+                        @for pick in &row.picks {
+                            (pick_card(pick, has_weather))
                         }
-                    }
-                } @else {
-                    p class="has-text-grey" { "Entry details not available" }
+                    },
                 }
             }
         }
@@ -407,54 +393,37 @@ pub async fn entry_detail_fragment(
     )
 }
 
-/// Data for rendering a pick card
-struct PickCardData<'a> {
-    icon: &'a str,
-    label: &'a str,
-    station_id: &'a str,
-    forecast_val: Option<f64>,
-    obs_val: Option<f64>,
-    unit: &'a str,
-    pick: &'a ValueOptions,
-    show_points: bool,
-}
-
 /// Render a compact pick card
-fn pick_card(data: &PickCardData) -> Markup {
-    let points = if data.show_points {
-        Some(calculate_option_score(
-            data.forecast_val,
-            data.obs_val,
-            data.pick,
-        ))
-    } else {
-        None
+fn pick_card(pick: &PickProgress, show_points: bool) -> Markup {
+    let (icon, label, unit) = match pick.metric {
+        Metric::TempHigh => ("🟡", "High", "°F"),
+        Metric::TempLow => ("🔵", "Low", "°F"),
+        Metric::WindSpeed => ("💨", "Wind", " kt"),
     };
-
     html! {
         div class="entry-pick-card" {
-            span class="entry-pick-icon" { (data.icon) }
+            span class="entry-pick-icon" { (icon) }
             div class="entry-pick-info" {
-                div class="entry-pick-label" { (data.label) " · " (data.station_id) }
-                @if data.forecast_val.is_some() || data.obs_val.is_some() {
+                div class="entry-pick-label" { (label) " · " (pick.station_id) }
+                @if pick.forecast.is_some() || pick.observed.is_some() {
                     div class="entry-pick-values" {
                         span class="entry-pick-forecast" {
                             "Forecasted: "
-                            strong { (format_value(data.forecast_val, data.unit)) }
+                            strong { (format_value(pick.forecast, unit)) }
                         }
-                        @if data.obs_val.is_some() {
+                        @if pick.observed.is_some() {
                             span class="entry-pick-observed" {
                                 "Observed: "
-                                strong { (format_value(data.obs_val, data.unit)) }
+                                strong { (format_value(pick.observed, unit)) }
                             }
                         }
                     }
                 }
             }
             div class="entry-pick-result" {
-                span class=(pick_choice_class(data.pick)) { (format_pick_short(data.pick)) }
-                @if let Some(pts) = points {
-                    div class=(points_class(pts)) { (pts) " pts" }
+                span class=(pick_choice_class(&pick.pick)) { (format_pick_short(&pick.pick)) }
+                @if show_points {
+                    div class=(points_class(pick.points)) { (pick.points) " pts" }
                 }
             }
         }
@@ -488,229 +457,13 @@ fn pick_choice_class(pick: &ValueOptions) -> &'static str {
 }
 
 /// Get CSS class for points display
-fn points_class(points: i32) -> &'static str {
+fn points_class(points: u64) -> &'static str {
     if points >= 20 {
         "entry-pick-points points-high"
     } else if points > 0 {
         "entry-pick-points points-mid"
     } else {
         "entry-pick-points points-zero"
-    }
-}
-
-/// Entry weather data for display
-struct EntryWeatherData {
-    forecasts: std::collections::HashMap<String, Forecast>,
-    observations: std::collections::HashMap<String, Observation>,
-    total_score: Option<i32>,
-    has_observations: bool,
-}
-
-/// Fetch forecast and observation data for an entry's display
-async fn fetch_entry_weather_data(state: &AppState, entry: &UserEntry) -> Option<EntryWeatherData> {
-    use std::collections::HashMap;
-
-    // Get the competition to find observation dates
-    let competition = state
-        .coordinator
-        .get_competition(entry.event_id)
-        .await
-        .ok()?;
-
-    // Get station IDs from the entry's picks
-    let station_ids: Vec<&str> = entry
-        .entry_submission
-        .expected_observations
-        .iter()
-        .map(|obs| obs.stations.as_str())
-        .collect();
-
-    if station_ids.is_empty() {
-        return None;
-    }
-
-    // Fetch forecasts and observations for the competition period
-    let (forecasts, observations) = tokio::join!(
-        fetch_entry_forecasts(
-            &state.oracle_url,
-            &station_ids,
-            competition.event_submission.start_observation_date,
-            competition.event_submission.end_observation_date
-        ),
-        fetch_entry_observations(
-            &state.oracle_url,
-            &station_ids,
-            competition.event_submission.start_observation_date,
-            competition.event_submission.end_observation_date
-        )
-    );
-
-    let forecasts = forecasts.ok().unwrap_or_default();
-    let observations = observations.ok().unwrap_or_default();
-
-    // Index by station ID
-    let mut forecast_map: HashMap<String, Forecast> = HashMap::new();
-    for f in forecasts {
-        forecast_map.insert(f.station_id.clone(), f);
-    }
-
-    let mut observation_map: HashMap<String, Observation> = HashMap::new();
-    for o in observations {
-        observation_map.insert(o.station_id.clone(), o);
-    }
-
-    let has_observations = !observation_map.is_empty();
-
-    // Calculate total score whenever observations exist (live or complete)
-    let total_score = if has_observations {
-        let mut score = 0i32;
-        for obs in &entry.entry_submission.expected_observations {
-            let forecast = forecast_map.get(&obs.stations);
-            let observation = observation_map.get(&obs.stations);
-
-            if let Some(pick) = &obs.temp_high {
-                score += calculate_option_score(
-                    forecast.and_then(|f| f.temp_high),
-                    observation.and_then(|o| o.temp_high),
-                    pick,
-                );
-            }
-            if let Some(pick) = &obs.temp_low {
-                score += calculate_option_score(
-                    forecast.and_then(|f| f.temp_low),
-                    observation.and_then(|o| o.temp_low),
-                    pick,
-                );
-            }
-            if let Some(pick) = &obs.wind_speed {
-                score += calculate_option_score(
-                    forecast.and_then(|f| f.wind_speed),
-                    observation.and_then(|o| o.wind_speed),
-                    pick,
-                );
-            }
-        }
-        Some(score)
-    } else {
-        None
-    };
-
-    Some(EntryWeatherData {
-        forecasts: forecast_map,
-        observations: observation_map,
-        total_score,
-        has_observations,
-    })
-}
-
-/// Fetch forecasts for entry score calculation
-async fn fetch_entry_forecasts(
-    oracle_url: &str,
-    station_ids: &[&str],
-    start: time::OffsetDateTime,
-    end: time::OffsetDateTime,
-) -> Result<Vec<Forecast>, anyhow::Error> {
-    if station_ids.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let client = reqwest_middleware::reqwest::Client::new();
-
-    let start_str = start
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default();
-    let end_str = end
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default();
-
-    let station_ids_param = station_ids.join(",");
-
-    let response = client
-        .get(format!(
-            "{}/stations/forecasts?station_ids={}&start={}&end={}",
-            oracle_url, station_ids_param, start_str, end_str
-        ))
-        .send()
-        .await?;
-
-    if response.status().is_success() {
-        // The oracle returns forecasts with temp_high/temp_low as integers
-        #[derive(serde::Deserialize)]
-        struct RawForecast {
-            station_id: String,
-            temp_high: i64,
-            temp_low: i64,
-            #[serde(default)]
-            wind_speed: Option<f64>,
-        }
-
-        let raw_forecasts: Vec<RawForecast> = response.json().await?;
-        Ok(raw_forecasts
-            .into_iter()
-            .map(|f| Forecast {
-                station_id: f.station_id,
-                temp_high: Some(f.temp_high as f64),
-                temp_low: Some(f.temp_low as f64),
-                wind_speed: f.wind_speed,
-            })
-            .collect())
-    } else {
-        Ok(vec![])
-    }
-}
-
-/// Fetch observations for entry score calculation
-async fn fetch_entry_observations(
-    oracle_url: &str,
-    station_ids: &[&str],
-    start: time::OffsetDateTime,
-    end: time::OffsetDateTime,
-) -> Result<Vec<Observation>, anyhow::Error> {
-    if station_ids.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let client = reqwest_middleware::reqwest::Client::new();
-
-    let start_str = start
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default();
-    let end_str = end
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default();
-
-    let station_ids_param = station_ids.join(",");
-
-    let response = client
-        .get(format!(
-            "{}/stations/observations?station_ids={}&start={}&end={}",
-            oracle_url, station_ids_param, start_str, end_str
-        ))
-        .send()
-        .await?;
-
-    if response.status().is_success() {
-        #[derive(serde::Deserialize)]
-        struct RawObservation {
-            station_id: String,
-            temp_high: f64,
-            temp_low: f64,
-            #[serde(default)]
-            wind_speed: Option<f64>,
-        }
-
-        let raw_observations: Vec<RawObservation> = response.json().await?;
-        Ok(raw_observations
-            .into_iter()
-            .map(|o| Observation {
-                station_id: o.station_id,
-                temp_high: Some(o.temp_high),
-                temp_low: Some(o.temp_low),
-                wind_speed: o.wind_speed,
-            })
-            .collect())
-    } else {
-        Ok(vec![])
     }
 }
 
@@ -951,46 +704,28 @@ async fn fetch_station_markers(state: &AppState, competition_id: Uuid) -> Vec<St
         return vec![];
     }
 
-    let all_stations = match fetch_all_stations(&state.oracle_url).await {
-        Ok(stations) => stations,
-        Err(e) => {
-            warn!("Failed to fetch stations for map: {}", e);
-            return vec![];
-        }
+    let stations = state.leaderboards.stations(FIRST_READ_WAIT).await;
+    let Some(all_stations) = stations.value() else {
+        warn!("No stations from the oracle for the map yet");
+        return vec![];
     };
 
     let location_set: std::collections::HashSet<&str> =
         locations.iter().map(|s| s.as_str()).collect();
 
     all_stations
-        .into_iter()
+        .iter()
         .filter(|s| location_set.contains(s.station_id.as_str()))
         .filter_map(|s| {
             StationMarker::new(
-                s.station_id,
-                s.station_name,
-                s.state,
+                s.station_id.clone(),
+                s.station_name.clone(),
+                s.state.clone(),
                 s.latitude,
                 s.longitude,
             )
         })
         .collect()
-}
-
-/// Fetch all stations from the Oracle API
-async fn fetch_all_stations(oracle_url: &str) -> Result<Vec<Station>, anyhow::Error> {
-    let client = reqwest_middleware::reqwest::Client::new();
-    let response = client
-        .get(format!("{}/stations", oracle_url))
-        .send()
-        .await?;
-
-    if response.status().is_success() {
-        let stations: Vec<Station> = response.json().await?;
-        Ok(stations)
-    } else {
-        Ok(vec![])
-    }
 }
 
 async fn fetch_forecasts(state: &AppState, competition: &CompetitionView) -> Vec<StationForecast> {
@@ -1194,196 +929,22 @@ fn get_station_name(station_id: &str) -> String {
     }
 }
 
-/// Oracle event response containing entries with scores
-#[derive(Debug, Clone, serde::Deserialize)]
-struct OracleEvent {
-    entries: Vec<OracleEntry>,
-}
-
-/// Oracle entry with score
-#[derive(Debug, Clone, serde::Deserialize)]
-struct OracleEntry {
-    id: Uuid,
-    score: Option<i64>,
-}
-
-async fn fetch_leaderboard_scores(state: &AppState, competition_id: Uuid) -> Vec<EntryScore> {
-    // Fetch event from oracle to get entries with scores (used for sort order via final_score)
-    let oracle_entries = fetch_oracle_event_entries(&state.oracle_url, competition_id).await;
-
-    if oracle_entries.is_empty() {
-        return vec![];
-    }
-
-    // Fetch competition weather data once for raw score calculation
-    let competition = state.coordinator.get_competition(competition_id).await.ok();
-    let weather = if let Some(ref comp) = competition {
-        let station_ids: Vec<&str> = comp
-            .event_submission
-            .locations
+/// The leaderboard's rows, from the cached leaderboard: the page never waits on the oracle.
+async fn leaderboard_scores(state: &AppState, competition: &Competition) -> Vec<EntryScore> {
+    match state.leaderboards.get(competition, FIRST_READ_WAIT).await {
+        Ok(board) => board
+            .rows
             .iter()
-            .map(|s| s.as_str())
-            .collect();
-        if !station_ids.is_empty() {
-            let (forecasts, observations) = tokio::join!(
-                fetch_entry_forecasts(
-                    &state.oracle_url,
-                    &station_ids,
-                    comp.event_submission.start_observation_date,
-                    comp.event_submission.end_observation_date
-                ),
-                fetch_entry_observations(
-                    &state.oracle_url,
-                    &station_ids,
-                    comp.event_submission.start_observation_date,
-                    comp.event_submission.end_observation_date
-                )
-            );
-            let forecast_map: std::collections::HashMap<String, Forecast> = forecasts
-                .ok()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|f| (f.station_id.clone(), f))
-                .collect();
-            let observation_map: std::collections::HashMap<String, Observation> = observations
-                .ok()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|o| (o.station_id.clone(), o))
-                .collect();
-            Some((forecast_map, observation_map))
-        } else {
-            None
+            .map(|row| EntryScore {
+                rank: row.standing.rank,
+                entry_id: row.entry_id.to_string(),
+                username: row.player.name.clone(),
+                score: i32::try_from(row.standing.score).unwrap_or(i32::MAX),
+            })
+            .collect(),
+        Err(e) => {
+            error!("Leaderboard for competition {}: {e}", competition.id);
+            vec![]
         }
-    } else {
-        None
-    };
-
-    let local_entries = state
-        .coordinator
-        .competition_store
-        .get_competition_entries(competition_id, vec![])
-        .await
-        .unwrap_or_default();
-    let entries_by_oracle_id: std::collections::HashMap<_, _> = local_entries
-        .iter()
-        .map(|entry| (entry.entry_submission.id, entry))
-        .collect();
-
-    // Build index of oracle scores for sort order (final_score with tiebreaker)
-    let oracle_score_map: std::collections::HashMap<Uuid, i64> = oracle_entries
-        .iter()
-        .map(|e| {
-            (
-                entries_by_oracle_id
-                    .get(&e.id)
-                    .map_or(e.id, |entry| entry.id),
-                e.score.unwrap_or(0),
-            )
-        })
-        .collect();
-
-    // Convert to EntryScore, computing raw scores from picks + weather data
-    let mut scores: Vec<EntryScore> = Vec::with_capacity(oracle_entries.len());
-
-    for oracle_entry in &oracle_entries {
-        let mut entry_score = EntryScore {
-            rank: 0,
-            entry_id: entries_by_oracle_id
-                .get(&oracle_entry.id)
-                .map_or(oracle_entry.id, |entry| entry.id)
-                .to_string(),
-            username: String::new(),
-            score: 0,
-        };
-
-        // Fetch entry details for username and raw score calculation
-        if let Some(entry) = entries_by_oracle_id.get(&oracle_entry.id) {
-            // Look up username
-            if let Ok(pubkey) = nostr::PublicKey::from_hex(&entry.pubkey) {
-                let bech32 = pubkey.to_bech32().unwrap_or_else(|never| match never {});
-                if let Ok(Some(name)) = state.users_info.get_username_by_pubkey(&bech32).await {
-                    entry_score.username = name;
-                } else {
-                    entry_score.username = entry.pubkey[..8].to_string();
-                }
-            }
-
-            // Compute raw score from picks + weather data
-            if let Some((ref forecast_map, ref observation_map)) = weather {
-                let mut raw_score = 0i32;
-                for obs in &entry.entry_submission.expected_observations {
-                    let forecast = forecast_map.get(&obs.stations);
-                    let observation = observation_map.get(&obs.stations);
-
-                    if let Some(pick) = &obs.temp_high {
-                        raw_score += calculate_option_score(
-                            forecast.and_then(|f| f.temp_high),
-                            observation.and_then(|o| o.temp_high),
-                            pick,
-                        );
-                    }
-                    if let Some(pick) = &obs.temp_low {
-                        raw_score += calculate_option_score(
-                            forecast.and_then(|f| f.temp_low),
-                            observation.and_then(|o| o.temp_low),
-                            pick,
-                        );
-                    }
-                    if let Some(pick) = &obs.wind_speed {
-                        raw_score += calculate_option_score(
-                            forecast.and_then(|f| f.wind_speed),
-                            observation.and_then(|o| o.wind_speed),
-                            pick,
-                        );
-                    }
-                }
-                entry_score.score = raw_score;
-            }
-        }
-
-        scores.push(entry_score);
-    }
-
-    // Sort by oracle final_score (handles tiebreaking), but display raw_score
-    scores.sort_by(|a, b| {
-        let a_oracle = oracle_score_map
-            .get(&Uuid::parse_str(&a.entry_id).unwrap_or_default())
-            .unwrap_or(&0);
-        let b_oracle = oracle_score_map
-            .get(&Uuid::parse_str(&b.entry_id).unwrap_or_default())
-            .unwrap_or(&0);
-        b_oracle
-            .cmp(a_oracle)
-            .then_with(|| a.entry_id.cmp(&b.entry_id))
-    });
-
-    // Assign ranks after sorting
-    for (idx, score) in scores.iter_mut().enumerate() {
-        score.rank = idx + 1;
-    }
-
-    scores
-}
-
-async fn fetch_oracle_event_entries(oracle_url: &str, event_id: Uuid) -> Vec<OracleEntry> {
-    let client = reqwest_middleware::reqwest::Client::new();
-
-    let response = match client
-        .get(format!("{}/oracle/events/{}", oracle_url, event_id))
-        .send()
-        .await
-    {
-        Ok(resp) => resp,
-        Err(_) => return vec![],
-    };
-
-    if response.status().is_success() {
-        match response.json::<OracleEvent>().await {
-            Ok(event) => event.entries,
-            Err(_) => vec![],
-        }
-    } else {
-        vec![]
     }
 }

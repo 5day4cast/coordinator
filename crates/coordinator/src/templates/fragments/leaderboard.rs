@@ -1,7 +1,5 @@
 use maud::{html, Markup};
 
-use crate::domain::scoring::ScoredEntry;
-
 /// Entry score for the leaderboard (simplified view)
 #[derive(Debug, Clone)]
 pub struct EntryScore {
@@ -9,17 +7,6 @@ pub struct EntryScore {
     pub entry_id: String,
     pub username: String,
     pub score: i32,
-}
-
-impl EntryScore {
-    pub fn from_scored_entry(entry: &ScoredEntry, rank: usize) -> Self {
-        Self {
-            rank,
-            entry_id: entry.entry_id.clone(),
-            username: String::new(),
-            score: entry.raw_score,
-        }
-    }
 }
 
 /// Competition info for the leaderboard header
