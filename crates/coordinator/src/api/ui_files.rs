@@ -59,7 +59,11 @@ pub fn accepts_gzip(headers: &HeaderMap) -> bool {
     headers
         .get(header::ACCEPT_ENCODING)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.split(',').any(|coding| coding.trim().starts_with("gzip")))
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|coding| coding.trim().starts_with("gzip"))
+        })
 }
 
 /// Serve `path` from `ui_dir`. `versioned` marks a request carrying the
@@ -224,7 +228,11 @@ mod tests {
         let ui_dir = directory.path().to_str().unwrap();
         let version = package_version(ui_dir);
         assert_eq!(version.len(), 16);
-        std::fs::write(directory.path().join("pkg/coordinator_wasm_bg.wasm"), [1u8; 8]).unwrap();
+        std::fs::write(
+            directory.path().join("pkg/coordinator_wasm_bg.wasm"),
+            [1u8; 8],
+        )
+        .unwrap();
         assert_ne!(package_version(ui_dir), version);
         assert_eq!(package_version("/nonexistent"), "");
     }

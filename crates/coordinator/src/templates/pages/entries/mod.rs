@@ -153,7 +153,10 @@ mod tests {
         assert!(html.contains(r#"hx-get="/entries/01a0d0f5-52e1-7141-b4e1-8dbd7169fc2e/detail""#));
         assert!(html.contains(r#"href="/competitions/c1/leaderboard""#));
         assert!(html.contains(r#"hx-trigger="click consume""#));
-        assert!(!html.contains("closest"), "trigger filters need eval, which the CSP forbids");
+        assert!(
+            !html.contains("closest"),
+            "trigger filters need eval, which the CSP forbids"
+        );
         assert!(html.contains("…7169fc2e"));
         assert!(html.contains("badge-live"));
     }

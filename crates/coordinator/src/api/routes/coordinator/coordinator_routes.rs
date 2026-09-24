@@ -115,8 +115,8 @@ pub async fn request_competition_ticket(
             error!("error requesting ticket: {:?}", e);
             ApiError::from(e)
         })?;
-    let payment_request_qr = qr::lightning_invoice_svg(&ticket.payment_request)
-        .map(|svg| qr::svg_data_url(&svg));
+    let payment_request_qr =
+        qr::lightning_invoice_svg(&ticket.payment_request).map(|svg| qr::svg_data_url(&svg));
     Ok(Json(TicketWithQr {
         ticket,
         payment_request_qr,

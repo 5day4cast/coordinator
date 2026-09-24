@@ -85,8 +85,8 @@ pub fn ago(at: OffsetDateTime, now: OffsetDateTime) -> Markup {
 
 /// A competition's observation window: `Sep 24, 11:44 – 11:54`.
 pub fn window(start: OffsetDateTime, end: OffsetDateTime) -> Markup {
-    let same_day = start.to_offset(time::UtcOffset::UTC).date()
-        == end.to_offset(time::UtcOffset::UTC).date();
+    let same_day =
+        start.to_offset(time::UtcOffset::UTC).date() == end.to_offset(time::UtcOffset::UTC).date();
     html! {
         span class="window" {
             (time(start, TimeStyle::DateTime))
@@ -160,9 +160,14 @@ mod tests {
 
     #[test]
     fn times_fall_back_to_utc_until_the_browser_localizes_them() {
-        let html = window(datetime!(2026-09-24 11:44 UTC), datetime!(2026-09-24 11:54 UTC))
-            .into_string();
-        assert!(html.contains(r#"datetime="2026-09-24T11:44:00Z" data-local="datetime">Sep 24, 11:44 UTC"#));
+        let html = window(
+            datetime!(2026-09-24 11:44 UTC),
+            datetime!(2026-09-24 11:54 UTC),
+        )
+        .into_string();
+        assert!(html.contains(
+            r#"datetime="2026-09-24T11:44:00Z" data-local="datetime">Sep 24, 11:44 UTC"#
+        ));
         assert!(html.contains(r#"data-local="time">11:54 UTC"#));
     }
 
@@ -171,7 +176,10 @@ mod tests {
         let now = datetime!(2026-09-24 12:52 UTC);
         let html = ago(datetime!(2026-09-24 12:40 UTC), now).into_string();
         assert!(html.contains(r#"title="Sep 24, 12:40 UTC">12 min ago</time>"#));
-        assert!(!html.contains("data-local"), "the browser must not rewrite it");
+        assert!(
+            !html.contains("data-local"),
+            "the browser must not rewrite it"
+        );
         assert!(ago(now, now).into_string().contains("just now"));
     }
 

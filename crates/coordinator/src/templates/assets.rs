@@ -35,7 +35,11 @@ pub async fn serve_asset(Path(file): Path<String>, headers: HeaderMap) -> Respon
     let accepts_gzip = headers
         .get(header::ACCEPT_ENCODING)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.split(',').any(|coding| coding.trim().starts_with("gzip")));
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|coding| coding.trim().starts_with("gzip"))
+        });
     let mut response = if accepts_gzip {
         ([(header::CONTENT_ENCODING, "gzip")], asset.gzip).into_response()
     } else {
@@ -50,7 +54,10 @@ pub async fn serve_asset(Path(file): Path<String>, headers: HeaderMap) -> Respon
         header::CACHE_CONTROL,
         header::HeaderValue::from_static(CACHE_POLICY),
     );
-    headers.insert(header::VARY, header::HeaderValue::from_static("accept-encoding"));
+    headers.insert(
+        header::VARY,
+        header::HeaderValue::from_static("accept-encoding"),
+    );
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         header::HeaderValue::from_static("nosniff"),
@@ -107,7 +114,11 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_hashes_and_unhashed_names_are_not_found() {
-        for url in ["/assets/app.js", "/assets/app.0000000000000000.js", "/assets/styles.css"] {
+        for url in [
+            "/assets/app.js",
+            "/assets/app.0000000000000000.js",
+            "/assets/styles.css",
+        ] {
             let response = get_asset(url, false).await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{url}");
             assert!(!response.headers().contains_key(header::CACHE_CONTROL));
