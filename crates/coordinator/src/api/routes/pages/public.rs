@@ -551,10 +551,11 @@ pub async fn leaderboard_rows_fragment(
 /// Initial cache fills retry briefly, including finished events. Once data arrives,
 /// only open windows poll. Failed fetches end in a visible manual retry.
 fn pending_scores_content(id: &str, url: &str, attempt: u8) -> Markup {
-    let retry = attempt < 4;
+    let trigger = crate::templates::loading_retry(attempt);
+    let retry = trigger.is_some();
     let next = format!("{url}?attempt={}", attempt.saturating_add(1));
     html! {
-        div id=(id) hx-get=[retry.then_some(&next)] hx-trigger=[retry.then_some("load delay:1s")]
+        div id=(id) hx-get=[retry.then_some(&next)] hx-trigger=[trigger]
             hx-target="this" hx-swap="outerHTML" hx-disinherit="*" {
             p class="notice" role="status" {
                 @if retry { span class="spinner" aria-hidden="true" {} " Loading observations and scores…" }

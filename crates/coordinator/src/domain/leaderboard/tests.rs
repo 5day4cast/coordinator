@@ -359,6 +359,74 @@ async fn public_weather_pages_stay_under_budget_while_the_oracle_is_slow() {
         startup::{app, build_app},
     };
 
+    async fn fragment(router: &Router, path: &str, label: &str) -> String {
+        let started = Instant::now();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("HX-Request", "true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let elapsed = started.elapsed();
+        println!("{label} {path}: {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(400), "{path}: {elapsed:?}");
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    // Follow the HTML's actual htmx URLs and delays, including its request cap. A quick
+    // loading response is not enough: a slow oracle must still reach usable content.
+    async fn finish_loading(router: &Router, mut body: String, id: &str, loading: &str) -> String {
+        assert!(body.contains(loading), "the test starts with a cold cache");
+        let started = Instant::now();
+        let mut requests = 0;
+        while body.contains(loading) {
+            assert!(requests < 4, "loading retries must stay bounded");
+            let marker = format!("id=\"{id}\"");
+            let tag = body
+                .split_once(&marker)
+                .unwrap()
+                .1
+                .split('>')
+                .next()
+                .unwrap();
+            let attribute = |name: &str| {
+                tag.split_once(&format!("{name}=\""))
+                    .unwrap()
+                    .1
+                    .split('"')
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            };
+            let url = attribute("hx-get").replace("&amp;", "&");
+            let trigger = attribute("hx-trigger");
+            let delay = trigger.strip_prefix("load delay:").unwrap();
+            let delay = match delay.strip_suffix("ms") {
+                Some(milliseconds) => Duration::from_millis(milliseconds.parse().unwrap()),
+                None => Duration::from_secs(delay.strip_suffix('s').unwrap().parse().unwrap()),
+            };
+            tokio::time::sleep(delay).await;
+            requests += 1;
+            body = fragment(router, &url, "loading retry").await;
+            assert!(
+                !body.contains("temporarily unavailable"),
+                "the retry budget must outlast the two-second oracle fetch"
+            );
+        }
+        println!(
+            "{id} data after {:?}, {requests} retries",
+            started.elapsed()
+        );
+        body
+    }
+
     let slow_oracle = Router::new()
         .route(
             "/stations",
@@ -386,7 +454,7 @@ async fn public_weather_pages_stay_under_budget_while_the_oracle_is_slow() {
     settings.coordinator_settings.mock_oracle = true;
     settings.coordinator_settings.oracle_url = oracle_url;
     let (state, tasks, cancel, databases) = build_app(settings).await.unwrap();
-    let competition = state
+    let upcoming = state
         .coordinator
         .competition_store
         .add_competition_with_tickets(competition(), vec![])
@@ -402,34 +470,50 @@ async fn public_weather_pages_stay_under_budget_while_the_oracle_is_slow() {
     );
 
     for cache in ["cold", "warm"] {
+        let mut entry_form = String::new();
         for suffix in ["leaderboard", "leaderboard/rows", "entry-form"] {
-            let path = format!("/competitions/{}/{suffix}", competition.id);
-            let started = Instant::now();
-            let response = router
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri(&path)
-                        .header("HX-Request", "true")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            to_bytes(response.into_body(), 1 << 20).await.unwrap();
-            let elapsed = started.elapsed();
-            println!("{cache} {suffix}: {elapsed:?}");
-            assert!(
-                elapsed < Duration::from_millis(400),
-                "{cache} {path}: {elapsed:?}"
-            );
+            let path = format!("/competitions/{}/{suffix}", upcoming.id);
+            let body = fragment(&router, &path, cache).await;
+            if suffix == "entry-form" {
+                entry_form = body;
+            }
         }
-        // Both background fetches have finished by the second pass.
         if cache == "cold" {
-            tokio::time::sleep(Duration::from_millis(2100)).await;
+            entry_form = finish_loading(
+                &router,
+                entry_form,
+                "entryForecasts",
+                "Forecasts are loading",
+            )
+            .await;
         }
+        assert!(entry_form.contains("<strong class=\"pick-forecast\">66°F</strong>"));
+        assert!(entry_form.contains("name=\"KPWM_temp_high\""));
     }
+
+    // A separate live competition starts with another cold weather cache. Its score
+    // fragment must finish loading, then return to the existing unsigned minute polling.
+    let mut live = competition();
+    live.event_submission.start_observation_date = OffsetDateTime::now_utc() - time::Duration::HOUR;
+    live.event_submission.end_observation_date = OffsetDateTime::now_utc() + time::Duration::HOUR;
+    let live = state
+        .coordinator
+        .competition_store
+        .add_competition_with_tickets(live, vec![])
+        .await
+        .unwrap();
+    let path = format!("/competitions/{}/leaderboard/rows", live.id);
+    let body = fragment(&router, &path, "cold live scores").await;
+    let scores = finish_loading(
+        &router,
+        body,
+        "leaderboardScores",
+        "Loading observations and scores",
+    )
+    .await;
+    assert!(scores.contains("id=\"competitionLeaderboardData\""));
+    assert!(scores.contains("Provisional:"));
+    assert!(scores.contains("hx-trigger=\"every 60s\""));
 
     cancel.cancel();
     for handle in state.background_threads.values() {

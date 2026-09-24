@@ -151,14 +151,15 @@ pub fn forecast_choices(
         .iter()
         .flat_map(|station| &station.forecasts)
         .any(|(_, value)| value.is_some());
-    let retry = loading && attempt < 4;
+    let trigger = crate::templates::loading_retry(attempt).filter(|_| loading);
+    let retry = trigger.is_some();
     let url = format!(
         "/competitions/{competition_id}/entry-forecasts?attempt={}",
         attempt.saturating_add(1)
     );
     html! {
         div id="entryForecasts" hx-get=[retry.then_some(&url)]
-            hx-trigger=[retry.then_some("load delay:3s")] hx-target=[retry.then_some("this")]
+            hx-trigger=[trigger] hx-target=[retry.then_some("this")]
             hx-swap=[retry.then_some("outerHTML")] hx-disinherit="*" {
             @if loading {
                 p class="notice" role="status" {
@@ -377,7 +378,7 @@ mod tests {
         let loading = forecast_choices("c1", &[station.clone()], &[], 0).into_string();
         assert!(loading.contains("Forecasts are loading"));
         assert!(loading.contains("entry-forecasts?attempt=1"));
-        assert!(loading.contains("load delay:3s"));
+        assert!(loading.contains("load delay:50ms"));
         assert!(!loading.contains("type=\"radio\""));
         let failed = forecast_choices("c1", &[station], &[], 4).into_string();
         assert!(failed.contains("temporarily unavailable"));
