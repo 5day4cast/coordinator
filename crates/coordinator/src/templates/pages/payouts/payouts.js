@@ -7,7 +7,7 @@ class Payouts {
   // Signed by whoever is logged in now: the wallet loads after this object
   // exists, and logging out and in again replaces the signer.
   get client() {
-    return new window.AuthorizedClient(session.nostrClient, this.coordinator_url);
+    return new AuthorizedClient(session.nostrClient, this.coordinator_url);
   }
 
   async getPayableEntries() {
@@ -259,7 +259,7 @@ function openPayoutModal(button) {
 
   // Open modal
   const modal = document.getElementById("payoutModal");
-  window.openModal(modal);
+  openModal(modal);
 }
 
 /**
@@ -311,7 +311,7 @@ async function submitPayoutInvoice() {
     }
 
     // Success - close modal and refresh the page
-    window.closeModal(document.getElementById("payoutModal"));
+    closeModal(document.getElementById("payoutModal"));
     reloadPayouts();
   } catch (error) {
     console.error("Payout submission failed:", error);
@@ -355,10 +355,10 @@ function toggleLightningAddressForm() {
 async function saveLightningAddress() {
   const errorElement = document.getElementById("lightningAddressError");
   const button = document.getElementById("saveLightningAddress");
-  const address = window.normalizeLightningAddress(
+  const address = normalizeLightningAddress(
     document.getElementById("payoutLightningAddress")?.value,
   );
-  const validationError = window.validateLightningAddress(address);
+  const validationError = validateLightningAddress(address);
   if (validationError) {
     if (errorElement) errorElement.textContent = validationError;
     return;
@@ -399,7 +399,7 @@ function setupPayoutModal() {
   document
     .getElementById("cancelPayoutModal")
     ?.addEventListener("click", () => {
-      window.closeModal(document.getElementById("payoutModal"));
+      closeModal(document.getElementById("payoutModal"));
     });
 
   document.addEventListener("click", (event) => {
@@ -420,6 +420,3 @@ function setupPayoutModal() {
   });
 }
 
-window.Payouts = Payouts;
-window.initPayouts = initPayouts;
-window.setupPayoutModal = setupPayoutModal;

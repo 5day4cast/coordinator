@@ -62,9 +62,7 @@ function setupPage() {
   // Content swapped into a modal (an entry's picks) opens that modal.
   document.addEventListener("htmx:after:swap", (event) => {
     const modal = event.detail.ctx.target?.closest?.(".modal");
-    if (modal) window.openModal(modal);
+    if (modal) openModal(modal);
   });
 }
 
-window.setOwnerTag = setOwnerTag;
-window.setupPage = setupPage;

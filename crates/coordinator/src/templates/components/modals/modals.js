@@ -84,8 +84,8 @@ function resetForgotPasswordModal() {
 function openAuthModal(id) {
   if (id === "loginModal") resetLoginModal();
   if (id === "registerModal") resetRegisterModal();
-  window.openModal(document.getElementById(id));
-  window.initWasm?.().catch(() => {});
+  openModal(document.getElementById(id));
+  initWasm().catch(() => {});
 }
 
 function setupAuthModals(authManager) {
@@ -97,60 +97,55 @@ function setupAuthModals(authManager) {
   });
 
   document.getElementById("closeLoginModal")?.addEventListener("click", () => {
-    window.closeModal(document.getElementById("loginModal"));
+    closeModal(document.getElementById("loginModal"));
   });
 
   document
     .getElementById("closeResisterModal")
     ?.addEventListener("click", () => {
       resetRegisterModal();
-      window.closeModal(document.getElementById("registerModal"));
+      closeModal(document.getElementById("registerModal"));
     });
 
   document
     .getElementById("closeForgotPasswordModal")
     ?.addEventListener("click", () => {
       resetForgotPasswordModal();
-      window.closeModal(document.getElementById("forgotPasswordModal"));
+      closeModal(document.getElementById("forgotPasswordModal"));
     });
 
   document
     .getElementById("showRegisterButton")
     ?.addEventListener("click", () => {
-      window.closeModal(document.getElementById("loginModal"));
+      closeModal(document.getElementById("loginModal"));
       resetRegisterModal();
-      window.openModal(document.getElementById("registerModal"));
+      openModal(document.getElementById("registerModal"));
     });
 
   document.getElementById("goToLoginButton")?.addEventListener("click", () => {
-    window.closeModal(document.getElementById("registerModal"));
-    window.openModal(document.getElementById("loginModal"));
+    closeModal(document.getElementById("registerModal"));
+    openModal(document.getElementById("loginModal"));
   });
 
   document
     .getElementById("forgotPasswordLink")
     ?.addEventListener("click", (e) => {
       e.preventDefault();
-      window.closeModal(document.getElementById("loginModal"));
+      closeModal(document.getElementById("loginModal"));
       resetForgotPasswordModal();
-      window.openModal(document.getElementById("forgotPasswordModal"));
+      openModal(document.getElementById("forgotPasswordModal"));
     });
 
   document
     .getElementById("backToLoginFromForgot")
     ?.addEventListener("click", (e) => {
       e.preventDefault();
-      window.closeModal(document.getElementById("forgotPasswordModal"));
+      closeModal(document.getElementById("forgotPasswordModal"));
       resetLoginModal();
-      window.openModal(document.getElementById("loginModal"));
+      openModal(document.getElementById("loginModal"));
     });
 }
 
-window.openAuthModal = openAuthModal;
-window.resetLoginModal = resetLoginModal;
-window.resetRegisterModal = resetRegisterModal;
-window.resetForgotPasswordModal = resetForgotPasswordModal;
-window.setupAuthModals = setupAuthModals;
 
 class AuthManager {
   constructor(apiBase, network) {
@@ -222,7 +217,7 @@ class AuthManager {
   // The wallet loads on first use; say so if it cannot.
   async walletReady(errorElement) {
     try {
-      await window.initWasm?.();
+      await initWasm();
       return true;
     } catch (error) {
       if (errorElement)
@@ -279,7 +274,7 @@ class AuthManager {
       }
 
       session.nostrClient.unlockWithLogin(credentials, encrypted_nsec);
-      this.authorizedClient = new window.AuthorizedClient(
+      this.authorizedClient = new AuthorizedClient(
         session.nostrClient,
         this.apiBase,
       );
@@ -311,7 +306,7 @@ class AuthManager {
 
     try {
       await session.nostrClient.initialize(session.wasm.SignerType.NIP07, null);
-      this.authorizedClient = new window.AuthorizedClient(
+      this.authorizedClient = new AuthorizedClient(
         session.nostrClient,
         this.apiBase,
       );
@@ -367,10 +362,10 @@ class AuthManager {
       return;
     }
 
-    const lightningAddress = window.normalizeLightningAddress(
+    const lightningAddress = normalizeLightningAddress(
       document.getElementById("registerLightningAddress")?.value,
     );
-    const addressError = window.validateLightningAddress(lightningAddress);
+    const addressError = validateLightningAddress(lightningAddress);
     if (addressError) {
       if (errorElement) errorElement.textContent = addressError;
       return;
@@ -420,7 +415,7 @@ class AuthManager {
     }
 
     try {
-      this.authorizedClient = new window.AuthorizedClient(
+      this.authorizedClient = new AuthorizedClient(
         session.nostrClient,
         this.apiBase,
       );
@@ -481,10 +476,10 @@ class AuthManager {
     const errorElement = document.querySelector("#extensionRegisterError");
     if (errorElement) errorElement.textContent = "";
 
-    const lightningAddress = window.normalizeLightningAddress(
+    const lightningAddress = normalizeLightningAddress(
       document.getElementById("extensionLightningAddress")?.value,
     );
-    const addressError = window.validateLightningAddress(lightningAddress);
+    const addressError = validateLightningAddress(lightningAddress);
     if (addressError) {
       if (errorElement) errorElement.textContent = addressError;
       return;
@@ -493,7 +488,7 @@ class AuthManager {
 
     try {
       await session.nostrClient.initialize(session.wasm.SignerType.NIP07, null);
-      this.authorizedClient = new window.AuthorizedClient(
+      this.authorizedClient = new AuthorizedClient(
         session.nostrClient,
         this.apiBase,
       );
@@ -671,7 +666,7 @@ class AuthManager {
     try {
       // Bind the replacement credentials to the recovered account key. The
       // challenge signature alone does not authenticate the replacement body.
-      const resetClient = new window.AuthorizedClient(session.nostrClient, this.apiBase);
+      const resetClient = new AuthorizedClient(session.nostrClient, this.apiBase);
       await resetClient.post(
         `${this.apiBase}/api/v1/users/username/reset-password`,
         {
@@ -690,9 +685,9 @@ class AuthManager {
       // The recovery key only proved ownership; log in again with the new password.
       session.nostrClient = new session.wasm.NostrClientWrapper();
 
-      window.closeModal(document.getElementById("forgotPasswordModal"));
+      closeModal(document.getElementById("forgotPasswordModal"));
       resetLoginModal();
-      window.openModal(document.getElementById("loginModal"));
+      openModal(document.getElementById("loginModal"));
 
       const loginError = document.querySelector("#usernameLoginError");
       if (loginError) {
@@ -768,7 +763,7 @@ class AuthManager {
     const passwordInput = document.getElementById("loginPassword");
     if (passwordInput) passwordInput.value = "";
 
-    window.setOwnerTag?.(null);
+    setOwnerTag(null);
     document.body.dispatchEvent(new CustomEvent("fw:logout"));
     // Leave any account page: its content belongs to the old session.
     document.querySelector('[hx-get="/competitions"]')?.click();
@@ -777,14 +772,14 @@ class AuthManager {
   onLoginSuccess() {
     document.getElementById("authButtons")?.classList.add("is-hidden");
     document.getElementById("logoutContainer")?.classList.remove("is-hidden");
-    window.closeAllModals?.();
-    window.showKeymeldTrust?.();
+    closeAllModals();
+    showKeymeldTrust();
     // Pages waiting on a login (account pages, the entry form's payout
     // line) reload themselves on this event, now signed.
     document.body.dispatchEvent(new CustomEvent("fw:login"));
     session.nostrClient
       ?.getPublicKey?.()
-      .then((npub) => window.setOwnerTag?.(npub))
+      .then((npub) => setOwnerTag(npub))
       .catch(() => {});
   }
 
@@ -819,7 +814,6 @@ class AuthManager {
   }
 }
 
-window.AuthManager = AuthManager;
 
 /**
  * Lightning Addresses are case-insensitive; the server stores them lowercase.
@@ -842,5 +836,3 @@ function validateLightningAddress(address) {
   return null;
 }
 
-window.normalizeLightningAddress = normalizeLightningAddress;
-window.validateLightningAddress = validateLightningAddress;

@@ -82,7 +82,7 @@ window.htmx?.registerExtension("fw-auth", {
       // page comes back from the server as its log-in prompt.
       if (mode === "optional" || ctx.request.headers["HX-History-Restore-Request"]) return;
       waitingForLogin = elt;
-      window.openAuthModal?.("loginModal");
+      openAuthModal("loginModal");
       return false;
     }
     if (ctx.request.method !== "GET" || url.origin !== window.location.origin) {
@@ -99,7 +99,7 @@ window.htmx?.registerExtension("fw-auth", {
   htmx_response_error(elt, detail) {
     if (detail.ctx.response.status === 401) {
       showAuthError("Your session ended. Please log in again.");
-      window.openAuthModal?.("loginModal");
+      openAuthModal("loginModal");
     }
   },
 });
@@ -116,4 +116,3 @@ function setupHtmxAuth() {
   });
 }
 
-window.setupHtmxAuth = setupHtmxAuth;

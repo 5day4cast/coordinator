@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             stem: "app",
             extension: "js",
             content_type: "text/javascript; charset=utf-8",
-            bytes: bundle_scripts(&public_scripts(&templates, &files)?, "app")?,
+            bytes: private_scope(bundle_scripts(&public_scripts(&templates, &files)?, "app")?),
         },
         Asset {
             constant: "ADMIN_JS",
@@ -187,6 +187,16 @@ fn bundle_scripts(files: &[PathBuf], name: &str) -> Result<Vec<u8>, Box<dyn Erro
         bundle.push_str(";\n");
     }
     Ok(bundle.into_bytes())
+}
+
+/// Runs a bundle inside one function, so that its scripts share their
+/// top-level names (the wallet session in shared/wasm.js above all) without
+/// putting them on `window`. Only what a script assigns to `window` is global.
+fn private_scope(bundle: Vec<u8>) -> Vec<u8> {
+    let mut wrapped = b"(()=>{\n".to_vec();
+    wrapped.extend(bundle);
+    wrapped.extend(b"})();\n");
+    wrapped
 }
 
 /// The one place this script calls oxc, whose 0.x API changes between

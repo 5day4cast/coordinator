@@ -17,4 +17,3 @@ function setupThemeToggle() {
   });
 }
 
-window.setupThemeToggle = setupThemeToggle;

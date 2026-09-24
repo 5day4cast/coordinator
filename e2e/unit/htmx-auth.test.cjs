@@ -2,10 +2,8 @@
 // the request context htmx hands it. e2e/browser/htmx-security.test.cjs runs
 // it against the real htmx.
 const assert = require('node:assert/strict');
-const { readFileSync } = require('node:fs');
-const path = require('node:path');
 const test = require('node:test');
-const vm = require('node:vm');
+const { loadBundle } = require('./bundle.cjs');
 const ORIGIN = 'https://5day4cast.example';
 
 function load({ loggedIn = true, signer } = {}) {
@@ -18,16 +16,17 @@ function load({ loggedIn = true, signer } = {}) {
   let extension;
   const window = {
     location: { origin: ORIGIN },
-    openAuthModal: (id) => opened.push(id),
     htmx: { registerExtension: (name, hooks) => { assert.equal(name, 'fw-auth'); extension = hooks; } },
   };
-  vm.runInNewContext(readFileSync(path.join(__dirname, '../../crates/coordinator/src/templates/shared/htmx_auth.js'), 'utf8'), {
+  loadBundle(['shared/htmx_auth.js'], {
     window, session, isLoggedIn: () => state.loggedIn, URL,
+    openAuthModal: (id) => opened.push(id),
     console: { error: (message) => errors.push(message) },
     setTimeout: () => 0, clearTimeout: () => {},
     document: { baseURI: `${ORIGIN}/competitions`, body: { addEventListener() {}, appendChild() {} },
       createElement: () => ({ append() {}, addEventListener() {} }) },
-  });
+  }, []);
+  assert.deepEqual(Object.keys(window), ['location', 'htmx'], 'nothing is put on window');
 
   // What htmx 4 does for one request: before:request, then ctx.fetch(action, request).
   async function request(action, { method = 'GET', elt = {}, headers = {}, sentAction = action } = {}) {

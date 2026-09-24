@@ -21,8 +21,9 @@ const BULMA_INTEGRITY: &str =
 /// - history stores nothing: Back fetches the page from the server again
 ///   (htmx 4 keeps no snapshots, so account pages never sit in storage);
 /// - no inline indicator styles (base.css has them);
-/// - only this site's own htmx extension may register.
-pub const HTMX_CONFIG: &str = r#"{"mode":"same-origin","defaultTimeout":10000,"implicitInheritance":false,"noSwap":[204,304,"4xx","5xx"],"history":true,"includeIndicatorCSS":false,"extensions":"fw-auth"}"#;
+/// - only this site's own htmx extensions may register: the NIP-98 signer
+///   and the Trusted Types policy (shared/htmx_auth.js, htmx_security.js).
+pub const HTMX_CONFIG: &str = r#"{"mode":"same-origin","defaultTimeout":10000,"implicitInheritance":false,"noSwap":[204,304,"4xx","5xx"],"history":true,"includeIndicatorCSS":false,"extensions":"fw-auth, fw-security"}"#;
 
 pub struct PageConfig<'a> {
     pub title: &'a str,

@@ -36,8 +36,13 @@ tree:
 | `theme.js` | `static/theme-init.js`, loaded before first paint |
 | `usa-map.svg` | copied from `static/` |
 
-Scripts are minified with oxc, each parsed as a classic script so top-level
-names stay global; a script that does not parse fails the build. Each bundle
+Scripts are minified with oxc, each parsed as a classic script so its
+top-level names are kept; a script that does not parse fails the build. The
+public bundle then runs inside one function, so its scripts share those names
+with each other but not with `window`: nothing a script injected into the page
+could reach leads to the wallet's signer. Only `initWasm` is on `window` (the
+e2e tests call it; loading the module hands out no key). Tests load a file in
+a `vm` context with its neighbours' names passed in. Each bundle
 is embedded with `include_bytes!` at `/assets/<name>.<hash>.<ext>` and served
 with a one-year immutable cache (gzipped for browsers that accept it).
 Templates link them through the constants in `templates::assets`

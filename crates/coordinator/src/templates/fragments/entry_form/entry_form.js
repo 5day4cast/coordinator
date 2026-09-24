@@ -6,7 +6,7 @@ class Entry {
   constructor(coordinator_url, oracle_url, competition) {
     this.coordinator_url = coordinator_url;
     this.oracle_url = oracle_url;
-    this.client = new window.AuthorizedClient(
+    this.client = new AuthorizedClient(
       session.nostrClient,
       coordinator_url,
     );
@@ -227,7 +227,6 @@ class Entry {
   }
 }
 
-window.Entry = Entry;
 
 // Picks by station from the form's checked radios, named `KPWM_temp_high`.
 // "No pick" has an empty value.
@@ -245,7 +244,7 @@ function collectPicks(form) {
 }
 
 function showLogin() {
-  window.openModal?.(document.getElementById("loginModal"));
+  openModal(document.getElementById("loginModal"));
 }
 
 // The competition, its payout terms and the oracle's announcement, fetched
@@ -285,7 +284,7 @@ async function loadEntryTerms(form) {
 // and Arkade refunds, are sent. Throws rather than dropping automatic payouts.
 async function loadPayoutAddress() {
   const base = document.body.dataset.apiBase || "";
-  const client = new window.AuthorizedClient(session.nostrClient, base);
+  const client = new AuthorizedClient(session.nostrClient, base);
   let response;
   try {
     response = await client.post(`${base}/api/v1/users/login`);
@@ -438,9 +437,3 @@ function setupEntryForm() {
   });
 }
 
-window.showKeymeldTrust = showKeymeldTrust;
-window.submitEntry = submitEntry;
-window.collectPicks = collectPicks;
-window.loadEntryTerms = loadEntryTerms;
-window.ticketPriceSats = ticketPriceSats;
-window.setupEntryForm = setupEntryForm;

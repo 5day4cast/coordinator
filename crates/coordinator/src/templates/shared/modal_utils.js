@@ -28,7 +28,3 @@ function setupModalCloseHandlers() {
     });
 }
 
-window.openModal = openModal;
-window.closeModal = closeModal;
-window.closeAllModals = closeAllModals;
-window.setupModalCloseHandlers = setupModalCloseHandlers;

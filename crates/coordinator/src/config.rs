@@ -499,6 +499,14 @@ mod admin_settings_tests {
 }
 
 impl KeymeldSettings {
+    /// The gateway browsers call for fresh enclave attestation: the public
+    /// URL when one is set, otherwise the one the coordinator uses.
+    pub fn browser_gateway_url(&self) -> &str {
+        self.public_gateway_url
+            .as_deref()
+            .unwrap_or(&self.gateway_url)
+    }
+
     pub fn validate(&self, network: Network) -> Result<(), anyhow::Error> {
         if self.automatic_payouts && !self.enabled {
             return Err(anyhow::anyhow!("Automatic payouts require Keymeld"));
@@ -578,6 +586,23 @@ mod keymeld_config_tests {
         let parsed: KeymeldSettings = toml::from_str(&text).unwrap();
         assert_eq!(parsed.trusted_pcrs, settings.trusted_pcrs);
         assert_eq!(parsed.public_gateway_url, settings.public_gateway_url);
+    }
+
+    #[test]
+    fn browsers_use_the_public_gateway_when_there_is_one() {
+        let mut settings = KeymeldSettings {
+            gateway_url: "http://keymeld.internal:8080".into(),
+            ..KeymeldSettings::default()
+        };
+        assert_eq!(
+            settings.browser_gateway_url(),
+            "http://keymeld.internal:8080"
+        );
+        settings.public_gateway_url = Some("https://keymeld.example.com".into());
+        assert_eq!(
+            settings.browser_gateway_url(),
+            "https://keymeld.example.com"
+        );
     }
 
     #[test]

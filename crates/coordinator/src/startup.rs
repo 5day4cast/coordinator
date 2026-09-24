@@ -39,6 +39,7 @@ use crate::{
 
 // Mock implementations only available with e2e-testing feature or debug builds
 use crate::api::nip98_origins::Nip98Origins;
+use crate::api::public_headers::{public_response_headers, PublicHeaders};
 use crate::config::{APISettings, RateLimitSettings};
 #[cfg(any(feature = "e2e-testing", debug_assertions))]
 use crate::infra::{
@@ -279,6 +280,8 @@ pub struct AppState {
     pub private_url: String,
     pub remote_url: String,
     pub oracle_url: String,
+    /// Gateway the browser calls to verify its assigned signing enclave.
+    pub keymeld_public_url: Option<String>,
     pub explorer_url: String,
     pub network: String,
     pub bitcoin: Arc<dyn Bitcoin>,
@@ -699,6 +702,10 @@ pub async fn build_app(
             .clone()
             .unwrap_or_default(),
         oracle_url: config.coordinator_settings.oracle_url,
+        keymeld_public_url: config
+            .keymeld_settings
+            .enabled
+            .then(|| config.keymeld_settings.browser_gateway_url().to_owned()),
         network: config.bitcoin_settings.network.to_string(),
         coordinator,
         users_info,
@@ -879,11 +886,22 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
         api.rate_limit.burst,
     );
 
+    // The wallet also fetches the assigned enclave's attestation from Keymeld.
+    let public_headers = Arc::new(PublicHeaders::new(&[
+        app_state.remote_url.as_str(),
+        app_state.oracle_url.as_str(),
+        app_state.keymeld_public_url.as_deref().unwrap_or_default(),
+    ]));
+
     Router::new()
         .merge(api_routes)
         .merge(static_files(&app_state))
         .layer(Extension(replay))
         .layer(Extension(Arc::new(nip98_origins)))
+        .layer(middleware::from_fn_with_state(
+            public_headers,
+            public_response_headers,
+        ))
         .layer(middleware::from_fn(log_request))
         .with_state(app_state)
         .layer(cors)
@@ -1250,6 +1268,62 @@ mod startup_tests {
 
     const BEARER: &str = "Bearer 0123456789abcdef0123456789abcdef";
     const FORM: &str = "application/x-www-form-urlencoded";
+
+    #[tokio::test]
+    async fn public_pages_carry_the_content_security_policy() {
+        let mut test = TestState::start().await;
+        Arc::get_mut(&mut test.state).unwrap().keymeld_public_url =
+            Some("https://keymeld.example.net/enclaves".into());
+        let public = test.public();
+        for path in ["/", "/competitions", "/entries", "/payouts"] {
+            for (kind, headers) in [
+                ("page", &[][..]),
+                ("fragment", &[("hx-request", "true")][..]),
+                ("history", &[("hx-history-restore-request", "true")][..]),
+            ] {
+                let (status, response_headers, body) =
+                    send(&public, request("GET", path, headers, "")).await;
+                let account = path == "/entries" || path == "/payouts";
+                assert_eq!(
+                    status,
+                    if account && kind == "fragment" {
+                        StatusCode::UNAUTHORIZED
+                    } else {
+                        StatusCode::OK
+                    }
+                );
+                let policy = response_headers["content-security-policy"]
+                    .to_str()
+                    .unwrap();
+                assert!(
+                    policy.contains("script-src 'self' 'wasm-unsafe-eval';"),
+                    "{path}: {policy}"
+                );
+                assert!(
+                    policy.contains("require-trusted-types-for 'script'"),
+                    "{path}"
+                );
+                assert!(policy.contains("trusted-types htmx"), "{path}");
+                assert!(policy.contains("frame-ancestors 'none'"), "{path}");
+                assert!(
+                    policy.contains("https://keymeld.example.net"),
+                    "the wallet needs its configured attestation gateway"
+                );
+                assert_eq!(response_headers["x-content-type-options"], "nosniff");
+                assert!(!body.contains(" onclick="), "{path}");
+                assert_eq!(
+                    body.contains("<!DOCTYPE html>"),
+                    kind != "fragment",
+                    "{kind} {path}"
+                );
+                if account {
+                    assert_eq!(response_headers["cache-control"], "private, no-store");
+                    assert!(body.contains("sign-in-required"));
+                }
+            }
+        }
+        test.stop().await;
+    }
 
     #[tokio::test]
     async fn public_router_serves_no_operator_route() {
