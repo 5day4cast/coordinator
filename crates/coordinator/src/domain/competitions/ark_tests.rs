@@ -393,6 +393,9 @@ impl Fixture {
         assert_eq!(competition.calculate_invoice_amount(), PRICE);
         let competition_id = competition.id;
         let store = &coordinator.competition_store;
+        // No tickets up front: its tickets are the ones a test reserves. Keymeld's roster is
+        // the competition's tickets, so it is complete once each has an entry, as when a
+        // competition fills. A ticket reserved without an entry models one that never filled.
         store
             .add_competition_with_tickets(competition, vec![])
             .await
@@ -641,7 +644,7 @@ impl Fixture {
         ticket
     }
 
-    /// The competition dies, as when it expires without filling.
+    /// The competition is cancelled before a batch funds its pool.
     async fn cancel(&self) {
         let mut competition = self
             .store()
@@ -911,7 +914,8 @@ async fn a_cancelled_arkade_competition_refunds_each_funded_escrow_once() {
     assert_eq!(
         f.enclaves.registered.lock().unwrap().clone(),
         vec![UserId::from(first.id), UserId::from(second.id)],
-        "a competition that never filled registers its entries before signing their refunds"
+        "a competition that filled but died before its contract registers its entries before \
+         signing their refunds"
     );
     assert_eq!(
         f.spends(),
