@@ -396,7 +396,9 @@ fn payouts_box(
     FlowBox {
         title: "Payouts",
         subtitle,
-        stage: if winning.is_empty()
+        stage: if winning.iter().any(|line| line.stage == Stage::Failed) {
+            Stage::Failed
+        } else if winning.is_empty()
             || settlement.is_some_and(|settlement| winning.len() < settlement.winners().count())
         {
             Stage::Waiting
@@ -1014,6 +1016,11 @@ mod tests {
         ];
         let paid = payouts_box(&completed, Some(&settled), &payouts);
         assert_eq!(paid.stage, Stage::Done);
+        assert_eq!(
+            payouts_box(&completed, Some(&settled), &payouts[..1]).stage,
+            Stage::Waiting,
+            "one confirmed share does not verify the other winners"
+        );
         assert_eq!(
             paid.subtitle,
             "tie: split between alice, bob, charlie (outcome 3)"
