@@ -239,28 +239,49 @@ impl CompetitionStore {
             .await
     }
 
-    /// Record the VTXO that funded a ticket's escrow.
-    pub async fn mark_ticket_ark_funded(
+    /// Record the VTXO that funded a ticket's escrow, and the ticket as paid and settled.
+    ///
+    /// One transaction: a funded escrow is no longer a pending swap, so a ticket left unpaid
+    /// beside it would never be marked paid. The swap service settles an Arkade ticket's
+    /// invoice itself, so paid and settled are the same moment. Returns whether the ticket was
+    /// still reserved for this hash and is now paid.
+    pub async fn mark_ticket_ark_paid(
         &self,
         ticket_id: Uuid,
         ticket_hash: String,
+        competition_id: Uuid,
         vtxo_outpoint: String,
         vtxo_sats: u64,
-    ) -> Result<(), DatabaseWriteError> {
+    ) -> Result<bool, DatabaseWriteError> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         self.db_connection
             .execute_write(move |pool| async move {
+                let mut tx = pool.begin().await?;
                 sqlx::query(
-                    "UPDATE ticket_ark_escrows SET vtxo_outpoint = ?, vtxo_sats = ?, funded_at = ? WHERE ticket_id = ? AND ticket_hash = ? AND funded_at IS NULL",
+                    "UPDATE ticket_ark_escrows SET vtxo_outpoint = ?, vtxo_sats = ?, funded_at = ?
+                     WHERE ticket_id = ? AND ticket_hash = ? AND funded_at IS NULL",
                 )
                 .bind(vtxo_outpoint)
                 .bind(vtxo_sats as i64)
                 .bind(now)
                 .bind(ticket_id.to_string())
-                .bind(ticket_hash)
-                .execute(&pool)
+                .bind(&ticket_hash)
+                .execute(&mut *tx)
                 .await?;
-                Ok(())
+                let paid = sqlx::query(
+                    "UPDATE tickets SET paid_at = COALESCE(paid_at, datetime('now')),
+                        settled_at = COALESCE(settled_at, datetime('now'))
+                     WHERE id = ? AND hash = ? AND event_id = ? AND reserved_at IS NOT NULL",
+                )
+                .bind(ticket_id.to_string())
+                .bind(&ticket_hash)
+                .bind(competition_id.to_string())
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+                    > 0;
+                tx.commit().await?;
+                Ok(paid)
             })
             .await
     }

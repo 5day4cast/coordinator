@@ -30,3 +30,7 @@ pub use signer::{
     script_spend_sighash, EscrowSigner, KeypairSigner, SigningPurpose, SigningRequest,
 };
 pub use transport::{ArkTransport, EventStream, OffchainSubmission};
+
+/// What [`ArkTransport::vtxos`] lists, and the addresses it lists them for.
+pub use ark_core::server::VirtualTxOutPoint;
+pub use ark_core::ArkAddress;

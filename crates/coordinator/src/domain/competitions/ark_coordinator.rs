@@ -162,7 +162,8 @@ impl Coordinator {
         Ok((swap.invoice, expires_at))
     }
 
-    /// Advance every pending escrow swap. A ticket is paid once its escrow holds the buy-in.
+    /// Advance every pending escrow swap. A ticket is paid once its player's payment settled
+    /// and Arkade lists the escrow VTXO holding the ticket's price.
     pub async fn check_ark_swaps(&self) -> Result<(), Error> {
         let Some(ark) = self.ark() else {
             return Ok(());
@@ -171,37 +172,50 @@ impl Coordinator {
             let swap = match ark.swaps.swap(pending.swap_id).await {
                 Ok(swap) => swap,
                 Err(e) => {
-                    warn!(
-                        "Escrow swap {} for ticket {}: {e:#}",
-                        pending.swap_id, pending.ticket_id
-                    );
+                    self.report_swap(&pending, format!("cannot be read from ark-swapd: {e:#}"));
                     continue;
                 }
             };
-            if swap.state.escrow_funded() {
-                let Some(vtxo) = swap.escrow_vtxo.clone() else {
-                    warn!("Escrow swap {} reports funding without a VTXO", swap.id);
+            if swap.state.player_paid() {
+                let Some((vtxo, sats)) = self.verified_escrow_vtxo(ark, &pending, &swap).await
+                else {
                     continue;
                 };
-                self.competition_store
-                    .mark_ticket_ark_funded(
+                let paid = self
+                    .competition_store
+                    .mark_ticket_ark_paid(
                         pending.ticket_id,
                         pending.ticket_hash.clone(),
-                        vtxo,
-                        swap.amount_sat,
+                        pending.competition_id,
+                        vtxo.clone(),
+                        sats,
                     )
                     .await?;
-                self.competition_store
-                    .mark_ticket_paid(&pending.ticket_hash, pending.competition_id)
-                    .await?;
-                // The swap service settles the player's invoice itself once the escrow is funded,
-                // so the coordinator never settles an Arkade ticket's invoice.
-                self.competition_store
-                    .mark_ticket_settled(pending.ticket_id)
-                    .await?;
-                info!("Ticket {} paid into its escrow", pending.ticket_id);
+                self.reported.clear(SWAP_REPORTS, pending.swap_id);
+                if paid {
+                    info!("Ticket {} paid into its escrow {vtxo}", pending.ticket_id);
+                } else {
+                    // Its escrow is recorded as funded, so cleanup can still refund it.
+                    warn!(
+                        "Escrow {vtxo} of ticket {} is funded, but the ticket is no longer \
+                         reserved, so it was not marked paid",
+                        pending.ticket_id
+                    );
+                }
                 self.wake_competition(pending.competition_id);
-            } else if swap.state.abandoned() {
+            } else if swap.state.ended_unpaid() {
+                if swap.state == crate::infra::ark_swap::SwapState::Unsettled
+                    && self
+                        .reported
+                        .is_new(SWAP_REPORTS, pending.swap_id, "unsettled")
+                {
+                    error!(
+                        "Escrow swap {} paid the escrow of ticket {}, but could not settle the \
+                         player's invoice, so their payment went back to them. The ticket is \
+                         released; the escrow holds ark-swapd's coins and needs an operator.",
+                        swap.id, pending.ticket_id
+                    );
+                }
                 let ticket = self.competition_store.get_ticket(pending.ticket_id).await?;
                 self.competition_store
                     .clear_ticket_reservation(&ticket)
@@ -213,6 +227,96 @@ impl Coordinator {
             }
         }
         Ok(())
+    }
+
+    /// Log a problem with a pending swap once, then at debug while it lasts: swaps are checked
+    /// every few seconds.
+    fn report_swap(&self, pending: &crate::domain::competitions::PendingArkSwap, problem: String) {
+        if self
+            .reported
+            .is_new(SWAP_REPORTS, pending.swap_id, &problem)
+        {
+            warn!(
+                "Escrow swap {} for ticket {} {problem}",
+                pending.swap_id, pending.ticket_id
+            );
+        } else {
+            debug!("Escrow swap {} {problem}", pending.swap_id);
+        }
+    }
+
+    /// The escrow VTXO holding a paid swap's buy-in, and its value, as Arkade lists it.
+    ///
+    /// ark-swapd reports the VTXO it paid, or at least the Ark transaction that paid it, and
+    /// neither is taken on trust: the swap must pay the ticket's own escrow address its price,
+    /// and Arkade must list an unspent VTXO there with that value. Until it does the ticket
+    /// stays unpaid.
+    async fn verified_escrow_vtxo(
+        &self,
+        ark: &Arkade,
+        pending: &crate::domain::competitions::PendingArkSwap,
+        swap: &crate::infra::ark_swap::Swap,
+    ) -> Option<(String, u64)> {
+        let escrow = match self
+            .competition_store
+            .ticket_ark_escrow(pending.ticket_id, &pending.ticket_hash)
+            .await
+        {
+            Ok(Some(escrow)) => escrow,
+            Ok(None) => {
+                self.report_swap(pending, "funds a ticket that has no escrow".into());
+                return None;
+            }
+            Err(e) => {
+                self.report_swap(pending, format!("cannot find its ticket's escrow: {e}"));
+                return None;
+            }
+        };
+        let price = match self
+            .competition_store
+            .get_competition(pending.competition_id)
+            .await
+        {
+            Ok(competition) => competition.calculate_invoice_amount(),
+            Err(e) => {
+                self.report_swap(pending, format!("cannot read its competition: {e}"));
+                return None;
+            }
+        };
+        if swap.escrow_address != escrow.escrow_address {
+            self.report_swap(
+                pending,
+                format!(
+                    "pays {}, not the ticket's escrow {}",
+                    swap.escrow_address, escrow.escrow_address
+                ),
+            );
+            return None;
+        }
+        if swap.amount_sat != price {
+            self.report_swap(
+                pending,
+                format!(
+                    "pays {} sats, not the ticket's price of {price}",
+                    swap.amount_sat
+                ),
+            );
+            return None;
+        }
+        let vtxos = match ark.transport.vtxos(vec![escrow.escrow_address.clone()]).await {
+            Ok(vtxos) => vtxos,
+            Err(e) => {
+                self.report_swap(pending, format!("cannot list its escrow on Arkade: {e}"));
+                return None;
+            }
+        };
+        match paid_escrow_vtxo(&vtxos, &escrow.escrow_address, swap, price) {
+            Ok(outpoint) => Some((outpoint.to_string(), price)),
+            Err(problem) => {
+                self.report_swap(pending, problem);
+                None
+            }
+        }
     }
 
     /// Fund the pool in an Arkade batch, signing its contract inside the batch.
@@ -420,4 +524,76 @@ impl Coordinator {
         competition.errors = vec![];
         Ok(())
     }
+}
+
+/// Reports about pending escrow swaps, by swap.
+const SWAP_REPORTS: &str = "escrow swap";
+
+/// The VTXO among `vtxos` that a paid swap put in the escrow at `address`.
+///
+/// It is the one the swap names, or else the output of the swap's Ark transaction. It must be
+/// at `address`, unspent, and worth `price`. The error says what is missing or wrong.
+fn paid_escrow_vtxo(
+    vtxos: &[coordinator_ark::VirtualTxOutPoint],
+    address: &str,
+    swap: &crate::infra::ark_swap::Swap,
+    price: u64,
+) -> Result<OutPoint, String> {
+    let script = coordinator_ark::ArkAddress::decode(address)
+        .map_err(|e| format!("pays an escrow whose address is invalid: {e}"))?
+        .to_p2tr_script_pubkey();
+    let named: Option<OutPoint> = swap
+        .escrow_vtxo
+        .as_deref()
+        .map(|vtxo| {
+            vtxo.parse()
+                .map_err(|e| format!("names an invalid escrow VTXO {vtxo}: {e}"))
+        })
+        .transpose()?;
+    let paid_in: Option<bitcoin::Txid> = swap
+        .ark_txid
+        .as_deref()
+        .map(|txid| {
+            txid.parse()
+                .map_err(|e| format!("names an invalid Ark transaction {txid}: {e}"))
+        })
+        .transpose()?;
+    if let (Some(named), Some(paid_in)) = (named, paid_in) {
+        if named.txid != paid_in {
+            return Err(format!(
+                "names escrow VTXO {named}, which its Ark transaction {paid_in} did not create"
+            ));
+        }
+    }
+    let vtxo = match (named, paid_in) {
+        (Some(named), _) => vtxos.iter().find(|vtxo| vtxo.outpoint == named),
+        (None, Some(paid_in)) => vtxos.iter().find(|vtxo| vtxo.outpoint.txid == paid_in),
+        (None, None) => {
+            return Err("reports its player paid, but neither its escrow VTXO nor the Ark \
+                        transaction that paid it"
+                .into())
+        }
+    };
+    let Some(vtxo) = vtxo else {
+        return Err(format!(
+            "reports its player paid; waiting for Arkade to list the escrow VTXO at {address}"
+        ));
+    };
+    if vtxo.script != script {
+        return Err(format!("paid {}, which is not at {address}", vtxo.outpoint));
+    }
+    if vtxo.amount.to_sat() != price {
+        return Err(format!(
+            "paid {} with {} sats, not the ticket's price of {price}",
+            vtxo.outpoint,
+            vtxo.amount.to_sat()
+        ));
+    }
+    if vtxo.is_spent {
+        return Err(format!(
+            "paid {}, which Arkade lists as already spent",
+            vtxo.outpoint
+        ));
+    }
+    Ok(vtxo.outpoint)
 }
