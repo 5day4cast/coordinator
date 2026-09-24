@@ -4,8 +4,8 @@
 //! A page names its topic: `dashboard`, or `run:<id>` for one run. Events from the runner and the
 //! rebalancer are gathered for a moment, the topics they touch are rendered once each, and the
 //! rendered HTML goes out as server-sent events to the pages watching those topics, which swap it
-//! in. Nobody watching a topic means it is not rendered, so a run's page costs the coordinator
-//! nothing while no one has it open.
+//! in with htmx's SSE extension. Nobody watching a topic means it is not rendered. Pages render
+//! from synth's own database, so pushing them costs the coordinator nothing.
 
 use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
@@ -197,19 +197,25 @@ pub(super) async fn stream(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-/// A page whose `live` part is kept current. `header` stays put; `live` is swapped in whole.
+/// A page whose `live` part is kept current: htmx's SSE extension swaps in each fragment pushed
+/// for the page's topic. `header` stays put, and holds where the action buttons report back.
 pub(super) fn page(title: &str, topic: &str, header: Markup, live: Markup) -> Markup {
     html! {
         (DOCTYPE)
-        html {
+        html lang="en" {
             head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
                 link rel="stylesheet" href=(assets::CSS_URL);
                 script src=(assets::JS_URL) defer {}
             }
             body {
                 (header)
-                main #live data-topic=(topic) { (live) }
+                p #action-result .note aria-live="polite" {}
+                main #live hx-ext="sse" sse-connect=(format!("/api/live?topic={topic}")) sse-swap="live" {
+                    (live)
+                }
             }
         }
     }

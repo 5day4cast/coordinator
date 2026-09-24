@@ -1,3 +1,4 @@
+use super::format;
 use super::live::{self, Live};
 use crate::rebalance::Rebalancer;
 use crate::runner::Runner;
@@ -5,12 +6,14 @@ use crate::scenarios::{ScenarioConfig, ScenarioStatus};
 use crate::trail::tracker::Tracker;
 use axum::{
     extract::{Query, State},
-    response::{Html, IntoResponse},
+    http::{header, HeaderMap, StatusCode},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use maud::{html, Markup};
 use serde::Deserialize;
+use time::OffsetDateTime;
 
 /// What the dashboard's handlers share: the runner, and the configured run a trigger starts from.
 #[derive(Clone)]
@@ -39,6 +42,8 @@ pub fn router(state: Dashboard) -> Router {
         .route("/api/history", get(history))
         .route("/api/rebalance", post(trigger_rebalance))
         .route("/runs/{id}", get(super::run_detail::run_detail))
+        .route("/runs/{id}/trail.json", get(super::run_detail::trail_json))
+        .route("/runs/{id}/trail.tsv", get(super::run_detail::trail_tsv))
         .route("/api/live", get(live::stream))
         .with_state(state)
 }
@@ -57,17 +62,24 @@ struct HistoryParams {
 /// How many of a scenario's recent runs the dashboard judges it by.
 const HEALTH_WINDOW: i64 = 20;
 
-async fn dashboard(State(state): State<Dashboard>) -> Html<String> {
-    let header = html! { h1 { "Synth Dashboard" " " span #live-status .note { "connecting…" } } };
-    Html(
-        live::page(
-            "Synth - Synthetic Testing Dashboard",
-            live::DASHBOARD,
-            header,
-            dashboard_live(&state).await,
-        )
-        .into_string(),
-    )
+async fn dashboard(State(state): State<Dashboard>, headers: HeaderMap) -> Response {
+    let live = dashboard_live(&state).await;
+    if from_htmx(&headers) {
+        return html_by_hx_request(live);
+    }
+    let header = html! { h1 { "Synth Dashboard" } };
+    html_by_hx_request(live::page(
+        "Synth - Synthetic Testing Dashboard",
+        live::DASHBOARD,
+        header,
+        live,
+    ))
+}
+
+/// A page, or its live part alone when htmx asks for it. The two share a URL, so caches must
+/// tell them apart.
+pub(super) fn html_by_hx_request(markup: Markup) -> Response {
+    ([(header::VARY, "HX-Request")], Html(markup.into_string())).into_response()
 }
 
 /// The dashboard's live part: what the page shows, and what is pushed to it as things change.
@@ -76,12 +88,21 @@ pub(super) async fn dashboard_live(
         runner, rebalancer, ..
     }: &Dashboard,
 ) -> Markup {
+    let now = OffsetDateTime::now_utc();
     let last = runner.last_result().await;
     let observation = match &rebalancer {
         Some(rebalancer) => Some(rebalancer.last().await).filter(|o| o.checked_at.is_some()),
         None => None,
     };
     let rebalances = runner.db().list_rebalances(10).await.unwrap_or_default();
+    // The rebalanced channel joins the payer and the source node, whatever it is called now.
+    let channel_ends = observation.as_ref().map(|observation| {
+        format!(
+            "{} ↔ {}",
+            name(observation.payer.as_ref(), "the payer"),
+            name(observation.source.as_ref(), "the source node")
+        )
+    });
     let runs = runner.db().list_runs(10).await.unwrap_or_default();
     let live = runner.live();
     let health = runner
@@ -91,190 +112,213 @@ pub(super) async fn dashboard_live(
         .unwrap_or_default();
 
     html! {
-                    @if let Some(live) = &live {
-                        p.running {
-                            "Running now: " a href=(format!("/runs/{}", live.run_id)) { (live.scenario) }
-                            " — " strong { (live.current_step.as_deref().unwrap_or("starting")) }
-                        }
-                    }
+        @if let Some(live) = &live {
+            p.running {
+                "Running now: " a href=(format!("/runs/{}", live.run_id)) { (live.scenario) }
+                " — " strong { (live.current_step.as_deref().unwrap_or("starting")) }
+            }
+        }
 
-                    section.health {
-                        h2 { "Scenarios" }
-                        @if health.is_empty() {
-                            p { "No runs yet" }
-                        } @else {
-                            table {
-                                thead {
-                                    tr {
-                                        th { "Scenario" } th { "Last" } th { "Passing" }
-                                        th { "Last run" }
-                                    }
+        section.health {
+            h2 { "Scenarios" }
+            @if health.is_empty() {
+                p { "No runs yet" }
+            } @else {
+                div.scroll { table {
+                    thead { tr { th { "Scenario" } th { "Last" } th { "Passing" } th { "Last run" } } }
+                    tbody {
+                        @for scenario in &health {
+                            tr {
+                                td { (scenario.scenario) }
+                                td { span class=(format!("badge {}", scenario.last_status)) { (scenario.last_status) } }
+                                td {
+                                    (scenario.passed) "/" (scenario.runs)
+                                    @if scenario.failed > 0 { " (" (scenario.failed) " failed)" }
                                 }
-                                tbody {
-                                    @for scenario in &health {
-                                        tr {
-                                            td { (scenario.scenario) }
-                                            td {
-                                                span class=(format!("badge {}", scenario.last_status)) {
-                                                    (scenario.last_status)
-                                                }
-                                            }
-                                            td {
-                                                (scenario.passed) "/" (scenario.runs)
-                                                @if scenario.failed > 0 {
-                                                    span.error { " (" (scenario.failed) " failed)" }
-                                                }
-                                            }
-                                            td { (scenario.last_started_at) }
-                                        }
-                                    }
-                                }
-                            }
-                            p.note {
-                                "Of the last " (HEALTH_WINDOW) " runs of each scenario."
+                                td { (format::time_text(&scenario.last_started_at, now)) }
                             }
                         }
                     }
+                } }
+                p.note {
+                    "Of the last " (HEALTH_WINDOW) " runs of each scenario. A run whose money "
+                    "did not reach its winners or come back as refunds counts as failed."
+                }
+            }
+        }
 
-                    section.status {
-                        h2 { "Last Run" }
-                        @if let Some(ref result) = last {
-                            div class=(format!("result {}", status_class(&result.status))) {
-                                p { "Scenario: " strong { (result.scenario) } }
-                                p { "Status: " span class=(format!("badge {}", status_class(&result.status))) { (format!("{:?}", result.status)) } }
-                                p { "Duration: " (result.total_duration_ms) "ms" }
-                                @if let Some(ref err) = result.error {
-                                    p.error { "Error: " (err) }
-                                }
+        section.status {
+            h2 { "Last Run" }
+            @if let Some(ref result) = last {
+                div.result {
+                    p { "Scenario: " strong { (result.scenario) } " "
+                        span class=(format!("badge {}", status_class(&result.status))) { (status_class(&result.status)) } }
+                    p { "Took " (format::duration_ms(result.total_duration_ms)) }
+                    @if let Some(ref err) = result.error {
+                        p.error { "Error: " (err) }
+                    }
+                }
+                h3 { "Steps" }
+                div.scroll { table {
+                    thead { tr { th { "Step" } th { "Status" } th.num { "Took" } th { "Error" } } }
+                    tbody {
+                        @for step in &result.steps {
+                            tr {
+                                td { (step.name) }
+                                td { span class=(format!("badge {}", step_class(&step.status))) { (step_class(&step.status)) } }
+                                td.num { (format::duration_ms(step.duration_ms)) }
+                                td { @if let Some(error) = &step.error { span.error { (error) } } @else { "-" } }
                             }
-                            h3 { "Steps" }
-                            table {
-                                thead {
-                                    tr { th { "Step" } th { "Status" } th { "Duration" } th { "Error" } }
-                                }
-                                tbody {
-                                    @for step in &result.steps {
-                                        tr class=(step_class(&step.status)) {
-                                            td { (step.name) }
-                                            td { (format!("{:?}", step.status)) }
-                                            td { (step.duration_ms) "ms" }
-                                            td { (step.error.as_deref().unwrap_or("-")) }
-                                        }
-                                    }
-                                }
-                            }
-                            @if let Some(run) = runs.first() {
-                                p { a href=(format!("/runs/{}", run.id)) { "See where the money went →" } }
-                            }
-                        } @else {
-                            p { "No runs yet" }
                         }
                     }
+                } }
+                @if let Some(run) = runs.first() {
+                    p { a href=(format!("/runs/{}", run.id)) { "See where the money went →" } }
+                }
+            } @else {
+                p { "No runs since synth started." }
+            }
+        }
 
-                    section.history {
-                        h2 { "Recent Runs" }
-                        table {
-                            thead {
-                                tr { th { "Run" } th { "Scenario" } th { "Status" } th { "Competition" } th { "Started" } th { "Finished" } }
+        section.history {
+            h2 { "Recent Runs" }
+            div.scroll { table {
+                thead { tr { th { "Run" } th { "Scenario" } th { "Status" } th { "Money" } th { "Started" } th { "Finished" } } }
+                tbody {
+                    @for run in &runs {
+                        tr {
+                            td { a href=(format!("/runs/{}", run.id)) title=(run.id) { (short_id(&run.id)) } }
+                            td { (run.scenario) }
+                            td { span class=(format!("badge {}", run.status)) { (run.status) } }
+                            td {
+                                @match run.money.as_deref() {
+                                    Some(money) => span class=(format!("badge {money}")) { (money.replace('_', " ")) },
+                                    None => "-",
+                                }
                             }
-                            tbody {
-                                @for run in &runs {
-                                    tr {
-                                        td { a href=(format!("/runs/{}", run.id)) { (run.id.chars().take(8).collect::<String>()) "…" } }
-                                        td { (run.scenario) }
-                                        td { span class=(format!("badge {}", run.status)) { (run.status) } }
-                                        td { code { (run.competition_id.as_deref().map(|id| id.chars().take(8).collect::<String>()).unwrap_or_else(|| "-".into())) } }
-                                        td { (run.started_at) }
-                                        td {
-                                            @if let Some(ref completed) = run.completed_at {
-                                                (completed)
-                                            } @else if let Some(live) = live.as_ref().filter(|live| live.run_id == run.id) {
-                                                span.running { "running: " (live.current_step.as_deref().unwrap_or("starting")) }
-                                            } @else {
-                                                "never finished"
-                                            }
-                                        }
-                                    }
+                            td { (format::time_text(&run.started_at, now)) }
+                            td {
+                                @if let Some(ref completed) = run.completed_at {
+                                    (format::time_text(completed, now))
+                                } @else if let Some(live) = live.as_ref().filter(|live| live.run_id == run.id) {
+                                    span.running { "running: " (live.current_step.as_deref().unwrap_or("starting")) }
+                                } @else {
+                                    "not yet"
                                 }
                             }
                         }
                     }
+                }
+            } }
+        }
 
-                    section.liquidity {
-                        h2 { "Liquidity" }
-                        @match (&rebalancer, &observation) {
-                            (None, _) => p { "Rebalancing is not configured." },
-                            (Some(_), None) => p { "Not checked yet." },
-                            (Some(rebalancer), Some(observation)) => {
-                                @match &observation.channel {
-                                    Some(channel) => p {
-                                        "Lightning: the payer holds " strong { (channel.local_sats) }
-                                        " of " (channel.local_sats + channel.remote_sats)
-                                        " sats in channel " (channel.id)
-                                        ", rebalancing below " (rebalancer.config().low_percent) "%."
-                                    },
-                                    None => p.error { "The payer has no active channel with the source node." },
-                                }
-                                @match (&rebalancer.config().arkade, &observation.arkade) {
-                                    (None, _) => p.note { "Arkade: ark-swapd's wallet is not watched." },
-                                    (Some(_), None) => p.error { "Arkade: ark-swapd did not report its wallet." },
-                                    (Some(arkade), Some(wallet)) => p {
-                                        "Arkade: ark-swapd can fund " strong { (wallet.spendable_sat()) }
-                                        " sats of escrows, topped up with " (arkade.top_up_sats)
-                                        " sats on-chain below " (arkade.low_sats) "."
-                                    },
-                                }
-                                @if let Some(checked_at) = observation.checked_at {
-                                    p.note { "Checked " (checked_at) }
-                                }
-                            }
-                        }
-                        @if !rebalances.is_empty() {
-                            table {
-                                thead {
-                                    tr {
-                                        th { "When" } th { "Leg" } th { "Moved" } th { "Held before" }
-                                        th { "Status" } th { "Error / transaction" }
+        section.liquidity {
+            h2 { "Liquidity" }
+            @match (&rebalancer, &observation) {
+                (None, _) => p { "Rebalancing is not configured." },
+                (Some(_), None) => p { "Not checked yet." },
+                (Some(rebalancer), Some(observation)) => {
+                    @match &observation.channel {
+                        Some(channel) => p {
+                            "Lightning: the payer, " strong { (name(observation.payer.as_ref(), "the payer")) }
+                            ", holds " strong { (channel.local_sats) } " of " (channel.local_sats + channel.remote_sats)
+                            " sats in channel " code { (channel.id) } " with "
+                            strong { (name(observation.source.as_ref(), "the source node")) }
+                            ", rebalancing below " (rebalancer.config().low_percent) "%."
+                        },
+                        None => p.error { "The payer has no active channel with the source node." },
+                    }
+                    @match (&rebalancer.config().arkade, &observation.arkade) {
+                        (None, _) => p.note { "Arkade: ark-swapd's wallet is not watched." },
+                        (Some(_), None) => p.error { "Arkade: ark-swapd did not report its wallet." },
+                        (Some(arkade), Some(wallet)) => p {
+                            "Arkade: ark-swapd can fund " strong { (wallet.spendable_sat()) }
+                            " sats of escrows, topped up with " (arkade.top_up_sats)
+                            " sats on-chain below " (arkade.low_sats) "."
+                        },
+                    }
+                    @if let Some(checked_at) = observation.checked_at {
+                        p.note { "Checked " (format::time(checked_at, now)) }
+                    }
+                }
+            }
+            @if !rebalances.is_empty() {
+                div.scroll { table {
+                    thead { tr {
+                        th { "When" } th { "Leg" } th.num { "Moved" } th.num { "Held before" }
+                        th { "Status" } th { "Error / transaction" }
+                    } }
+                    tbody {
+                        @for rebalance in &rebalances {
+                            tr {
+                                td { (format::time_text(&rebalance.created_at, now)) }
+                                td {
+                                    (rebalance.kind.as_deref().unwrap_or("channel"))
+                                    @if rebalance.kind.as_deref() != Some("arkade") {
+                                        br; code { (rebalance.channel_id) }
+                                        @if let Some(ends) = &channel_ends { br; span.note { (ends) } }
                                     }
                                 }
-                                tbody {
-                                    @for rebalance in &rebalances {
-                                        tr {
-                                            td { (rebalance.created_at) }
-                                            td { (rebalance.kind.as_deref().unwrap_or("channel")) }
-                                            td { (rebalance.amount_sats) " sats" }
-                                            td {
-                                                (rebalance.local_before_sats)
-                                                @if rebalance.capacity_sats > 0 { " / " (rebalance.capacity_sats) }
-                                            }
-                                            td { span class=(format!("badge {}", rebalance.status)) { (rebalance.status) } }
-                                            td {
-                                                @if let Some(error) = &rebalance.error_message { span.error { (error) } }
-                                                @else if let Some(txid) = &rebalance.txid { code { (txid) } }
-                                                @else { "-" }
-                                            }
-                                        }
-                                    }
+                                td.num { (rebalance.amount_sats) " sats" }
+                                td.num {
+                                    (rebalance.local_before_sats)
+                                    @if rebalance.capacity_sats > 0 { " / " (rebalance.capacity_sats) }
+                                }
+                                td { span class=(format!("badge {}", rebalance.status)) { (rebalance.status) } }
+                                td {
+                                    @if let Some(error) = &rebalance.error_message { span.error { (error) } }
+                                    @else if let Some(txid) = &rebalance.txid { code { (txid) } }
+                                    @else { "-" }
                                 }
                             }
                         }
                     }
+                } }
+            }
+        }
 
-                    section.actions {
-                        h2 { "Actions" }
-                        form method="POST" action="/api/run" data-async {
-                            button type="submit" { "Run Full Lifecycle" }
-                        }
-                        form method="POST" action="/api/run?scenario=escrow_refund" data-async {
-                            button type="submit" { "Run Escrow Refund" }
-                        }
-                        @if rebalancer.is_some() {
-                            form method="POST" action="/api/rebalance" data-async {
-                                button type="submit" { "Rebalance Now" }
-                            }
-                        }
-                    }
+        section.actions {
+            h2 { "Actions" }
+            button hx-post="/api/run" hx-target="#action-result"
+                hx-confirm="Start a full lifecycle run? It pays real entries from the payer's node." {
+                "Run Full Lifecycle"
+            }
+            button hx-post="/api/run?scenario=escrow_refund" hx-target="#action-result"
+                hx-confirm="Start an escrow refund run? It pays real entries and waits for their refunds." {
+                "Run Escrow Refund"
+            }
+            @if rebalancer.is_some() {
+                button hx-post="/api/rebalance" hx-target="#action-result"
+                    hx-confirm="Rebalance now? This moves real sats between the nodes and may send ark-swapd coins on-chain." {
+                    "Rebalance Now"
+                }
+            }
+        }
+        p.note { "Updated " (format::time(now, now)) }
     }
+}
+
+/// A node by the name it gives itself, else by the start of its key.
+fn name(node: Option<&crate::lnd::NodeIdentity>, fallback: &str) -> String {
+    match node {
+        Some(node) if !node.alias.is_empty() => node.alias.clone(),
+        Some(node) => short_id(&node.pubkey),
+        None => fallback.to_string(),
+    }
+}
+
+pub(super) fn short_id(id: &str) -> String {
+    let short: String = id.chars().take(8).collect();
+    if short.len() < id.len() {
+        format!("{short}…")
+    } else {
+        short
+    }
+}
+
+/// Whether htmx sent the request, so it wants a fragment rather than a whole page or JSON.
+pub(super) fn from_htmx(headers: &HeaderMap) -> bool {
+    headers.contains_key("hx-request")
 }
 
 async fn trigger_run(
@@ -284,7 +328,8 @@ async fn trigger_run(
         ..
     }): State<Dashboard>,
     Query(params): Query<RunParams>,
-) -> impl IntoResponse {
+    headers: HeaderMap,
+) -> Response {
     let scenario = params
         .scenario
         .unwrap_or_else(|| "full_lifecycle".to_string());
@@ -303,27 +348,55 @@ async fn trigger_run(
         }
     });
 
+    if from_htmx(&headers) {
+        return Html(
+            html! { "Started " strong { (scenario_name) } "; it shows under Running now." }
+                .into_string(),
+        )
+        .into_response();
+    }
     Json(serde_json::json!({
         "status": "started",
         "scenario": scenario_name
     }))
+    .into_response()
 }
 
 async fn trigger_rebalance(
     State(Dashboard { rebalancer, .. }): State<Dashboard>,
-) -> impl IntoResponse {
+    headers: HeaderMap,
+) -> Response {
+    let htmx = from_htmx(&headers);
     let Some(rebalancer) = rebalancer else {
         return (
-            axum::http::StatusCode::NOT_FOUND,
+            StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "rebalancing is not configured" })),
-        );
+        )
+            .into_response();
     };
-    match rebalancer.rebalance().await {
-        Ok(moved) => (axum::http::StatusCode::OK, Json(serde_json::json!(moved))),
-        Err(e) => (
-            axum::http::StatusCode::BAD_GATEWAY,
+    match (rebalancer.rebalance().await, htmx) {
+        (Ok(moved), true) => Html(
+            html! {
+                "Rebalanced: "
+                (moved.channel_sats.map_or("nothing".to_string(), |sats| format!("{sats} sats")))
+                " over the channel, "
+                (moved.arkade_sats.map_or("nothing".to_string(), |sats| format!("{sats} sats")))
+                " on-chain to ark-swapd."
+            }
+            .into_string(),
+        )
+        .into_response(),
+        (Ok(moved), false) => Json(serde_json::json!(moved)).into_response(),
+        // htmx swaps only successful responses in, so a failure is said with a 200.
+        (Err(e), true) => {
+            Html(html! { span.error { "Rebalance failed: " (format!("{e:#}")) } }.into_string())
+                .into_response()
+        }
+        (Err(e), false) => (
+            StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({ "error": format!("{e:#}") })),
-        ),
+        )
+            .into_response(),
     }
 }
 

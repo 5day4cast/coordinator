@@ -65,12 +65,16 @@ mod tests {
         );
     }
 
-    /// The styles and the live-update script are bundled, minified.
+    /// htmx and its SSE extension come first and whole, then synth's own script, minified.
     #[test]
-    fn the_bundles_carry_the_styles_and_the_live_updates() {
+    fn the_script_carries_htmx_its_sse_extension_and_the_copy_button() {
         let js = std::str::from_utf8(JS_BYTES).unwrap();
-        assert!(js.contains("EventSource"), "the live updates are bundled");
-        assert!(!js.contains("\n  "), "minified");
+        let htmx = js.find("var htmx=").expect("htmx is bundled");
+        let sse = js
+            .find("defineExtension(\"sse\"")
+            .expect("the SSE extension is bundled");
+        let copy = js.find("clipboard").expect("the copy button is bundled");
+        assert!(htmx < sse && sse < copy);
         let css = std::str::from_utf8(CSS_BYTES).unwrap();
         assert!(
             css.contains(".flow{"),

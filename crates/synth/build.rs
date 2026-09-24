@@ -1,7 +1,11 @@
 //! Bundles the dashboard's styles and scripts into one stylesheet and one script, minified, and
 //! names each by its content's hash so browsers can cache them for good.
 //!
-//! Styles and scripts live beside the Rust that renders them, under `src/server/`.
+//! Styles and scripts live beside the Rust that renders them, under `src/server/`. Third-party
+//! scripts in `src/server/assets/vendor/` are already minified and go first, as published:
+//!
+//! - `htmx-2.0.7.min.js`: <https://unpkg.com/htmx.org@2.0.7/dist/htmx.min.js> (0BSD)
+//! - `htmx-ext-sse-2.2.3.min.js`: <https://unpkg.com/htmx-ext-sse@2.2.3/dist/sse.min.js> (0BSD)
 
 use std::{
     env,
@@ -14,6 +18,9 @@ use better_minify_js::{minify, Session, TopLevelMode};
 use lightningcss::stylesheet::{MinifyOptions, ParserOptions, PrinterOptions, StyleSheet};
 use sha2::{Digest, Sha256};
 
+/// The vendored scripts, in the order they must load: the SSE extension registers with htmx.
+const VENDOR: [&str; 2] = ["htmx-2.0.7.min.js", "htmx-ext-sse-2.2.3.min.js"];
+
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed=src/server");
@@ -23,10 +30,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let root = Path::new(&manifest);
     let output = Path::new(&output);
     let server = root.join("src/server");
+    let vendor = server.join("assets/vendor");
 
     let mut css_files = Vec::new();
     let mut js_files = Vec::new();
-    collect_assets(&server, &mut css_files, &mut js_files)?;
+    collect_assets(&server, &vendor, &mut css_files, &mut js_files)?;
     // The base stylesheet first, so components can refine it.
     let base = server.join("assets/synth.css");
     css_files.sort_by(|left, right| (left != &base, left).cmp(&(right != &base, right)));
@@ -54,10 +62,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Newlines end trailing line comments; semicolons separate standalone scripts.
     let own = concatenate(&js_files, "\n;\n")?;
     let session = Session::new();
-    let mut js = Vec::new();
+    let mut minified = Vec::new();
     // The page loads a classic deferred script, so keep global-script semantics.
-    minify(&session, TopLevelMode::Global, own.as_bytes(), &mut js)
-        .map_err(|error| io::Error::other(format!("minify src/server JavaScript: {error:?}")))?;
+    minify(
+        &session,
+        TopLevelMode::Global,
+        own.as_bytes(),
+        &mut minified,
+    )
+    .map_err(|error| io::Error::other(format!("minify src/server JavaScript: {error:?}")))?;
+    let vendored: Vec<PathBuf> = VENDOR.iter().map(|name| vendor.join(name)).collect();
+    let mut js = concatenate(&vendored, "\n;\n")?.into_bytes();
+    js.extend_from_slice(&minified);
 
     let css_url = write_asset(output, "css", css.as_bytes())?;
     let js_url = write_asset(output, "js", &js)?;
@@ -77,6 +93,7 @@ pub const JS_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/synth.js")
 
 fn collect_assets(
     directory: &Path,
+    vendor: &Path,
     css: &mut Vec<PathBuf>,
     javascript: &mut Vec<PathBuf>,
 ) -> io::Result<()> {
@@ -84,7 +101,9 @@ fn collect_assets(
         let entry = entry?;
         let path = entry.path();
         if entry.file_type()?.is_dir() {
-            collect_assets(&path, css, javascript)?;
+            if path != vendor {
+                collect_assets(&path, vendor, css, javascript)?;
+            }
             continue;
         }
         match path.extension().and_then(|extension| extension.to_str()) {
