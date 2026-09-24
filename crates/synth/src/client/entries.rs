@@ -22,6 +22,11 @@ pub struct TicketRefund {
     pub state: String,
     pub paid_sats: u64,
     pub ark_txid: Option<String>,
+    /// The invoice the refund pays, and its hash. Older coordinators leave them out.
+    #[serde(default)]
+    pub invoice: Option<String>,
+    #[serde(default)]
+    pub payment_hash: Option<String>,
     pub updated_at: i64,
 }
 

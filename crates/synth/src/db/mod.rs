@@ -17,9 +17,32 @@ pub struct TestRun {
     pub completed_at: Option<String>,
     pub error_message: Option<String>,
     pub config_json: Option<String>,
-    /// The competition the run created, from its steps' details.
+    /// The competition the run created, saved with the step that created it.
     #[sqlx(default)]
     pub competition_id: Option<String>,
+    /// Where the run's money stands, once synth has followed it: see [`crate::trail::Money`].
+    #[sqlx(default)]
+    pub money: Option<String>,
+}
+
+/// A run whose money is stuck, for the dashboard's list of held money.
+#[derive(Debug, Clone)]
+pub struct HeldRun {
+    pub run: TestRun,
+    pub trail: crate::trail::Trail,
+}
+
+/// How a run's money was last judged, saved in one transaction with what the verdict does to the
+/// run, so a restart cannot leave one without the other.
+pub struct Verdict<'a> {
+    pub trail: &'a crate::trail::Trail,
+    /// Whether synth should keep looking at the run's money.
+    pub follow: bool,
+    /// A step to add to the run: its name, how long after the run it came, its error, and its
+    /// details.
+    pub step: Option<(&'a str, i64, Option<&'a str>, &'a str)>,
+    /// Fail a run that passed its steps, with this error.
+    pub fail_passed_run: Option<&'a str>,
 }
 
 /// A scenario's recent record, for the dashboard.
@@ -87,6 +110,13 @@ pub struct SynthUserRecord {
     pub nostr_pubkey: String,
     pub created_at: String,
 }
+
+/// A run, with where its money stands.
+const RUN_COLUMNS: &str = "SELECT test_runs.*, money_trails.money AS money FROM test_runs \
+     LEFT JOIN money_trails ON money_trails.run_id = test_runs.id";
+
+/// Bumped with each migration that rewrites existing rows, so each runs once.
+const SCHEMA_VERSION: i64 = 1;
 
 fn now_rfc3339() -> Result<String> {
     Ok(OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?)
@@ -180,11 +210,58 @@ impl SynthDb {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS money_trails (
+                run_id TEXT PRIMARY KEY REFERENCES test_runs(id),
+                money TEXT NOT NULL,
+                trail_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Databases made before synth kept ark-swapd's wallet funded.
         self.add_column_if_missing("rebalances", "kind", "TEXT NOT NULL DEFAULT 'channel'")
             .await?;
         self.add_column_if_missing("rebalances", "txid", "TEXT")
             .await?;
+        // The tracker reads which competition each run made on every tick, so it is saved with
+        // the run rather than dug out of the steps' details each time.
+        self.add_column_if_missing("test_runs", "competition_id", "TEXT")
+            .await?;
+        // Whether the tracker still looks at a run's money: while it moves, and while it is
+        // stuck, until it moves again.
+        self.add_column_if_missing("money_trails", "follow", "INTEGER NOT NULL DEFAULT 1")
+            .await?;
+
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&self.pool)
+            .await?;
+        if version < 1 {
+            // Once: runs made before the column existed name their competition in a step.
+            sqlx::query(
+                "UPDATE test_runs SET competition_id = ( \
+                     SELECT CASE WHEN json_valid(details_json) \
+                         THEN json_extract(details_json, '$.competition_id') END FROM test_steps \
+                     WHERE test_steps.run_id = test_runs.id AND CASE WHEN json_valid(details_json) \
+                         THEN json_extract(details_json, '$.competition_id') END IS NOT NULL \
+                     LIMIT 1) \
+                 WHERE competition_id IS NULL",
+            )
+            .execute(&self.pool)
+            .await?;
+            sqlx::query("UPDATE money_trails SET follow = money IN ('following', 'stuck')")
+                .execute(&self.pool)
+                .await?;
+        }
+        if version < SCHEMA_VERSION {
+            sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+                .execute(&self.pool)
+                .await?;
+        }
 
         Ok(())
     }
@@ -306,17 +383,52 @@ impl SynthDb {
     }
 
     pub async fn list_runs(&self, limit: i64) -> Result<Vec<TestRun>> {
-        let runs = sqlx::query_as::<_, TestRun>(
-            "SELECT test_runs.*, (SELECT json_extract(details_json, '$.competition_id') \
-             FROM test_steps WHERE test_steps.run_id = test_runs.id \
-             AND json_extract(details_json, '$.competition_id') IS NOT NULL LIMIT 1) \
-             AS competition_id FROM test_runs ORDER BY started_at DESC LIMIT ?",
-        )
+        let runs = sqlx::query_as::<_, TestRun>(&format!(
+            "{RUN_COLUMNS} ORDER BY started_at DESC LIMIT ?"
+        ))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
 
         Ok(runs)
+    }
+
+    /// Pending money must stay visible even after newer runs fill the dashboard's page.
+    pub async fn runs_to_follow(&self) -> Result<Vec<TestRun>> {
+        sqlx::query_as::<_, TestRun>(&format!(
+            "{RUN_COLUMNS} WHERE test_runs.competition_id IS NOT NULL \
+             AND (money_trails.run_id IS NULL OR money_trails.follow = 1) ORDER BY started_at"
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .context("list runs whose money is still being followed")
+    }
+
+    /// Runs whose money is stuck now, with their trails, oldest first.
+    pub async fn held_runs(&self) -> Result<Vec<HeldRun>> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            #[sqlx(flatten)]
+            run: TestRun,
+            trail_json: String,
+        }
+        let rows = sqlx::query_as::<_, Row>(
+            "SELECT test_runs.*, money_trails.money AS money, money_trails.trail_json \
+             FROM money_trails JOIN test_runs ON test_runs.id = money_trails.run_id \
+             WHERE money_trails.money = 'stuck' ORDER BY test_runs.started_at",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("list runs whose money is stuck")?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(HeldRun {
+                    trail: serde_json::from_str(&row.trail_json)
+                        .with_context(|| format!("read run {}'s money trail", row.run.id))?,
+                    run: row.run,
+                })
+            })
+            .collect()
     }
 
     /// How each scenario has been doing, most recently run first.
@@ -349,15 +461,10 @@ impl SynthDb {
     }
 
     pub async fn get_run(&self, id: &str) -> Result<Option<TestRun>> {
-        let run = sqlx::query_as::<_, TestRun>(
-            "SELECT test_runs.*, (SELECT json_extract(details_json, '$.competition_id') \
-             FROM test_steps WHERE test_steps.run_id = test_runs.id \
-             AND json_extract(details_json, '$.competition_id') IS NOT NULL LIMIT 1) \
-             AS competition_id FROM test_runs WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let run = sqlx::query_as::<_, TestRun>(&format!("{RUN_COLUMNS} WHERE test_runs.id = ?"))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(run)
     }
@@ -385,7 +492,93 @@ impl SynthDb {
         Ok(done.rows_affected())
     }
 
+    // --- Money trails ---
+
+    /// Save a run's trail, and what its verdict does to the run, together.
+    pub async fn record_money(&self, run_id: &str, verdict: &Verdict<'_>) -> Result<()> {
+        let now = now_rfc3339()?;
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO money_trails (run_id, money, trail_json, updated_at, follow) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(run_id) DO UPDATE SET money = excluded.money, \
+             trail_json = excluded.trail_json, updated_at = excluded.updated_at, \
+             follow = excluded.follow",
+        )
+        .bind(run_id)
+        .bind(verdict.trail.money.label())
+        .bind(serde_json::to_string(verdict.trail)?)
+        .bind(&now)
+        .bind(verdict.follow)
+        .execute(&mut *transaction)
+        .await?;
+        if let Some((name, duration_ms, error, details)) = verdict.step {
+            sqlx::query(
+                "INSERT INTO test_steps (id, run_id, step_name, status, started_at, completed_at, \
+                 duration_ms, details_json, error_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(run_id)
+            .bind(name)
+            .bind(if error.is_some() { "failed" } else { "passed" })
+            .bind(&now)
+            .bind(&now)
+            .bind(duration_ms)
+            .bind(details)
+            .bind(error)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        // A run that already failed keeps its own error.
+        if let Some(error) = verdict.fail_passed_run {
+            sqlx::query(
+                "UPDATE test_runs SET status = 'failed', error_message = ? \
+                 WHERE id = ? AND status = 'passed'",
+            )
+            .bind(error)
+            .bind(run_id)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn get_trail(&self, run_id: &str) -> Result<Option<crate::trail::Trail>> {
+        let json: Option<String> =
+            sqlx::query_scalar("SELECT trail_json FROM money_trails WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        json.map(|json| serde_json::from_str(&json).context("read the saved money trail"))
+            .transpose()
+    }
+
     // --- Test Steps ---
+
+    /// Record a step that happened after its run's scenario ended.
+    pub async fn add_step(
+        &self,
+        run_id: &str,
+        step_name: &str,
+        duration_ms: i64,
+        error: Option<&str>,
+        details_json: Option<&str>,
+    ) -> Result<()> {
+        let id = self.create_step(run_id, step_name).await?;
+        self.complete_step(&id, duration_ms, error, details_json)
+            .await
+    }
+
+    /// Keep what a step has done so far, before it finishes.
+    pub async fn update_step_details(&self, id: &str, details_json: &str) -> Result<()> {
+        sqlx::query("UPDATE test_steps SET details_json = ? WHERE id = ?")
+            .bind(details_json)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 
     pub async fn create_step(&self, run_id: &str, step_name: &str) -> Result<String> {
         let id = Uuid::now_v7().to_string();
@@ -428,6 +621,20 @@ impl SynthDb {
         .bind(id)
         .execute(&self.pool)
         .await?;
+        // The step that made the run's competition names it, and the run keeps it.
+        let competition = details_json
+            .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
+            .and_then(|details| details.get("competition_id")?.as_str().map(str::to_owned));
+        if let Some(competition) = competition {
+            sqlx::query(
+                "UPDATE test_runs SET competition_id = ? WHERE competition_id IS NULL \
+                 AND id = (SELECT run_id FROM test_steps WHERE id = ?)",
+            )
+            .bind(competition)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        }
 
         Ok(())
     }
@@ -544,11 +751,14 @@ mod tests {
         let path = directory.path().join("synth.sqlite");
         let db = SynthDb::new(path.to_str().unwrap()).await.unwrap();
         let finished = db.create_run("full_lifecycle", None).await.unwrap();
-        let step = db.create_step(&finished, "load_users").await.unwrap();
-        db.complete_step(&step, 1, None, None).await.unwrap();
+        db.add_step(&finished, "load_users", 1, None, None)
+            .await
+            .unwrap();
         db.complete_run(&finished, None).await.unwrap();
         let cut_short = db.create_run("full_lifecycle", None).await.unwrap();
-        db.create_step(&cut_short, "user_alice_enter").await.unwrap();
+        db.create_step(&cut_short, "user_alice_enter")
+            .await
+            .unwrap();
 
         assert_eq!(db.interrupt_unfinished_runs().await.unwrap(), 1);
         let run = db.get_run(&cut_short).await.unwrap().unwrap();
@@ -562,6 +772,194 @@ mod tests {
             "passed"
         );
         assert_eq!(db.get_steps(&finished).await.unwrap()[0].status, "passed");
+    }
+
+    fn trail(money: crate::trail::Money) -> crate::trail::Trail {
+        crate::trail::Trail {
+            refreshed_at: OffsetDateTime::now_utc(),
+            competition_id: Uuid::now_v7(),
+            competition: None,
+            settlement: None,
+            swaps: Vec::new(),
+            late_payments: Vec::new(),
+            payouts: Vec::new(),
+            refunds: Vec::new(),
+            funding_tx: None,
+            outcome_tx: None,
+            closing_txs: Vec::new(),
+            money,
+            held: None,
+            gaps: Vec::new(),
+        }
+    }
+
+    /// A run's trail is saved over as the tracker learns more, and its money shows on the run.
+    /// A verdict's step and its failing the run are saved with the trail, or not at all.
+    #[tokio::test]
+    async fn a_runs_money_trail_is_saved_with_what_its_verdict_does() {
+        use crate::trail::Money;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synth.sqlite");
+        let db = SynthDb::new(path.to_str().unwrap()).await.unwrap();
+        let run = db.create_run("full_lifecycle", None).await.unwrap();
+        db.add_step(
+            &run,
+            "create_competition",
+            1,
+            None,
+            Some(&serde_json::json!({"competition_id": "c"}).to_string()),
+        )
+        .await
+        .unwrap();
+        db.complete_run(&run, None).await.unwrap();
+        assert!(db.get_trail(&run).await.unwrap().is_none());
+        assert_eq!(
+            db.get_run(&run)
+                .await
+                .unwrap()
+                .unwrap()
+                .competition_id
+                .as_deref(),
+            Some("c"),
+            "the step that made the competition names it on the run"
+        );
+
+        let following = trail(Money::Following);
+        let verdict = |trail| Verdict {
+            trail,
+            follow: true,
+            step: None,
+            fail_passed_run: None,
+        };
+        db.record_money(&run, &verdict(&following)).await.unwrap();
+        assert_eq!(db.runs_to_follow().await.unwrap().len(), 1);
+
+        let stuck = trail(Money::Stuck {
+            reason: "0 of 3 payouts sent".into(),
+            since: OffsetDateTime::now_utc(),
+        });
+        db.record_money(
+            &run,
+            &Verdict {
+                trail: &stuck,
+                follow: true,
+                step: Some(("money_settled", 5, Some("0 of 3 payouts sent"), "{}")),
+                fail_passed_run: Some("its payouts never went out"),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.get_trail(&run).await.unwrap().unwrap().money,
+            stuck.money
+        );
+        assert_eq!(
+            db.list_runs(10).await.unwrap()[0].money.as_deref(),
+            Some("stuck")
+        );
+        let failed = db.get_run(&run).await.unwrap().unwrap();
+        assert_eq!(failed.status, "failed");
+        assert_eq!(
+            failed.error_message.as_deref(),
+            Some("its payouts never went out")
+        );
+        let steps = db.get_steps(&run).await.unwrap();
+        assert_eq!(steps.last().unwrap().step_name, "money_settled");
+        assert_eq!(steps.last().unwrap().status, "failed");
+        assert_eq!(
+            db.runs_to_follow().await.unwrap().len(),
+            1,
+            "stuck is watched"
+        );
+        let held = db.held_runs().await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].run.id, run);
+
+        let refunded = trail(Money::Refunded);
+        db.record_money(
+            &run,
+            &Verdict {
+                follow: false,
+                ..verdict(&refunded)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(db.runs_to_follow().await.unwrap().is_empty());
+        assert!(db.held_runs().await.unwrap().is_empty());
+    }
+
+    /// Databases made before runs kept their competition find it in the steps, once.
+    #[tokio::test]
+    async fn older_runs_find_their_competition_in_their_steps() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synth.sqlite");
+        let db = SynthDb::new(path.to_str().unwrap()).await.unwrap();
+        let run = db.create_run("full_lifecycle", None).await.unwrap();
+        db.add_step(&run, "bad", 1, None, Some("{not json"))
+            .await
+            .unwrap();
+        db.add_step(
+            &run,
+            "create_competition",
+            1,
+            None,
+            Some(&serde_json::json!({"competition_id": "c"}).to_string()),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE test_runs SET competition_id = NULL")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version = 0")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db.pool.close().await;
+
+        let reopened = SynthDb::new(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(
+            reopened
+                .get_run(&run)
+                .await
+                .unwrap()
+                .unwrap()
+                .competition_id
+                .as_deref(),
+            Some("c")
+        );
+    }
+
+    #[tokio::test]
+    async fn older_unsettled_runs_remain_in_the_tracking_queue() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = SynthDb::new(directory.path().join("synth.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        let old = db.create_run("full_lifecycle", None).await.unwrap();
+        db.add_step(&old, "user_alice_enter", 1, None, Some("{"))
+            .await
+            .unwrap();
+        let details = serde_json::json!({"competition_id": Uuid::now_v7()}).to_string();
+        db.add_step(&old, "create_competition", 1, None, Some(&details))
+            .await
+            .unwrap();
+        db.complete_run(&old, None).await.unwrap();
+        for _ in 0..31 {
+            let newer = db.create_run("full_lifecycle", None).await.unwrap();
+            db.complete_run(&newer, None).await.unwrap();
+        }
+        assert!(!db
+            .list_runs(30)
+            .await
+            .unwrap()
+            .iter()
+            .any(|run| run.id == old));
+        let pending = db.runs_to_follow().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, old);
     }
 
     /// A failed rebalance is kept with its reason, so the dashboard can say why money stopped

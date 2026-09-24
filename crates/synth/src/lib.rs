@@ -10,3 +10,4 @@ pub mod runner;
 pub mod scenarios;
 pub mod server;
 pub mod settlement;
+pub mod trail;

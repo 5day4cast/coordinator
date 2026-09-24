@@ -16,6 +16,8 @@ path = "src/bin/coord.rs"
 
 [dependencies]
 coordinator-core = { workspace = true, features = ["keymeld"] }
+# Reads an entry's Arkade escrow terms from the payout policy it signs.
+coordinator-ark-escrow.workspace = true
 
 # Keymeld SDK for auth pubkey derivation and enclave encryption
 keymeld-sdk.workspace = true

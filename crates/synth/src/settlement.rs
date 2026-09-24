@@ -13,7 +13,7 @@ use dlctix::{ContractParameters, EventLockingConditions, Outcome};
 use crate::client::competitions::CompetitionResponse;
 
 /// A contract's outcome, once one has decided it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Decided {
     /// The oracle attested to the outcome at this index.
     Attested(usize),
@@ -22,7 +22,7 @@ pub enum Decided {
 }
 
 /// What one player in the contract was owed under the deciding outcome.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Share {
     /// The player's entry key, as the contract lists it.
     pub pubkey: String,
@@ -31,7 +31,7 @@ pub struct Share {
     pub owed_sats: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Settlement {
     /// What the contract holds, and what the payouts are shares of.
     pub pot_sats: u64,

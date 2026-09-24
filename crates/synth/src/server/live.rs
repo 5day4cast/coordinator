@@ -15,7 +15,6 @@ use std::time::Duration;
 use axum::extract::{Query, State};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use futures::Stream;
-use log::warn;
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 use serde::Deserialize;
 use tokio::sync::broadcast::{self, error::RecvError};
@@ -112,14 +111,15 @@ impl Drop for Watching {
     }
 }
 
-/// The topics an event changes, before the runs of a competition are looked up.
+/// The topics an event changes.
 fn topics_of(event: &Event) -> Vec<String> {
     match event {
         Event::RunStarted { run_id, .. }
         | Event::StepStarted { run_id, .. }
         | Event::StepFinished { run_id, .. }
-        | Event::RunFinished { run_id, .. } => vec![DASHBOARD.to_string(), run_topic(run_id)],
-        Event::Rebalanced | Event::CompetitionChanged { .. } => vec![DASHBOARD.to_string()],
+        | Event::RunFinished { run_id, .. }
+        | Event::TrailUpdated { run_id } => vec![DASHBOARD.to_string(), run_topic(run_id)],
+        Event::Rebalanced => vec![DASHBOARD.to_string()],
     }
 }
 
@@ -129,7 +129,7 @@ pub async fn render_changes(state: Dashboard) {
     loop {
         let mut topics = BTreeSet::new();
         match events.recv().await {
-            Ok(event) => topics.extend(touched(&state, &event).await),
+            Ok(event) => topics.extend(topics_of(&event)),
             // Too much happened to say what; render everything someone is watching.
             Err(RecvError::Lagged(_)) => topics.extend(state.live.watched()),
             Err(RecvError::Closed) => return,
@@ -137,7 +137,7 @@ pub async fn render_changes(state: Dashboard) {
         tokio::time::sleep(BATCH).await;
         loop {
             match events.try_recv() {
-                Ok(event) => topics.extend(touched(&state, &event).await),
+                Ok(event) => topics.extend(topics_of(&event)),
                 Err(broadcast::error::TryRecvError::Lagged(_)) => {
                     topics.extend(state.live.watched())
                 }
@@ -156,24 +156,6 @@ pub async fn render_changes(state: Dashboard) {
             }
         }
     }
-}
-
-/// The topics an event changes, including the pages of the runs whose competition moved on.
-async fn touched(state: &Dashboard, event: &Event) -> Vec<String> {
-    let mut topics = topics_of(event);
-    if let Event::CompetitionChanged { competition_id, .. } = event {
-        match state.runner.db().list_runs(50).await {
-            Ok(runs) => topics.extend(
-                runs.into_iter()
-                    .filter(|run| {
-                        run.competition_id.as_deref() == Some(&competition_id.to_string())
-                    })
-                    .map(|run| run_topic(&run.id)),
-            ),
-            Err(e) => warn!("Cannot find the runs of competition {competition_id}: {e:#}"),
-        }
-    }
-    topics
 }
 
 async fn render(state: &Dashboard, topic: &str) -> Option<Markup> {
@@ -275,6 +257,10 @@ mod tests {
         };
         assert_eq!(topics_of(&step), ["dashboard", "run:r1"]);
         assert_eq!(topics_of(&Event::Rebalanced), ["dashboard"]);
+        let traced = Event::TrailUpdated {
+            run_id: "r1".into(),
+        };
+        assert_eq!(topics_of(&traced), ["dashboard", "run:r1"]);
     }
 
     /// A topic is rendered only while a page watches it, and stops once the page goes.

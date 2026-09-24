@@ -22,7 +22,12 @@ pub struct CoordinatorClient {
 impl CoordinatorClient {
     pub fn new(base_url: &str, admin_url: Option<&str>) -> Self {
         Self {
-            http: Client::new(),
+            // A page or the tracker waiting on the coordinator must give up eventually.
+            http: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
             base_url: base_url.trim_end_matches('/').to_string(),
             admin_url: admin_url
                 .unwrap_or(base_url)
