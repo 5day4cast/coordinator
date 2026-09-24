@@ -4,6 +4,7 @@
 //! | --- | --- |
 //! | `POST /v1/swaps` | `{ "escrow_address", "amount_sat", "preimage"? }` → the swap and its invoice. Returns the open swap if the escrow already has one. |
 //! | `GET /v1/swaps/{id}` | A swap's state. |
+//! | `GET /v1/swaps?payment_hash=<hex>` | The swap whose invoice pays to that hash, for tracing a payment to its escrow. |
 //! | `POST /v1/refunds` | `{ "payment_hash", "amount_sat", "player_key", "deadline" }` → the swap an unused escrow's refund pays. Returns the swap already minted for that invoice. |
 //! | `POST /v1/refunds/{id}/paid` | `{ "preimage" }` → records the payment and claims the swap. |
 //! | `GET /v1/refunds/{id}` | A refund's state. |
@@ -12,7 +13,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -39,7 +40,7 @@ pub fn router(swapper: Arc<Swapper>, token: String, holder: String) -> Router {
         holder: Arc::new(holder),
     };
     let authenticated = Router::new()
-        .route("/v1/swaps", post(create_swap))
+        .route("/v1/swaps", post(create_swap).get(find_swap))
         .route("/v1/swaps/{id}", get(get_swap))
         .route("/v1/refunds", post(mint_refund))
         .route("/v1/refunds/{id}/paid", post(refund_paid))
@@ -107,6 +108,25 @@ async fn create_swap(State(state): State<AppState>, Json(request): Json<CreateSw
     {
         Ok(swap) => (StatusCode::CREATED, Json(swap)).into_response(),
         Err(error) => failure(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FindSwap {
+    /// Hex. The hash of the invoice the swap issued.
+    payment_hash: String,
+}
+
+async fn find_swap(State(state): State<AppState>, Query(query): Query<FindSwap>) -> Response {
+    let payment_hash = match bytes32(&query.payment_hash) {
+        Ok(hash) => hex::encode(hash),
+        Err(error) => return failure(StatusCode::BAD_REQUEST, error),
+    };
+    match state.swapper.store.for_payment_hash(&payment_hash).await {
+        Ok(Some(swap)) => Json(swap).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => failure(StatusCode::INTERNAL_SERVER_ERROR, error),
     }
 }
 

@@ -224,6 +224,15 @@ impl Store {
         Ok(None)
     }
 
+    /// The swap whose invoice pays to `payment_hash`, open or finished. There is at most one.
+    pub async fn for_payment_hash(&self, payment_hash: &str) -> anyhow::Result<Option<Swap>> {
+        let row = sqlx::query("SELECT * FROM swaps WHERE payment_hash = ?")
+            .bind(payment_hash)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| swap(&row)).transpose()
+    }
+
     /// Whether any swap, open or finished, used `payment_hash`. LND never reuses one.
     pub async fn payment_hash_used(&self, payment_hash: &str) -> anyhow::Result<bool> {
         let row = sqlx::query("SELECT 1 FROM swaps WHERE payment_hash = ?")
@@ -661,6 +670,37 @@ mod tests {
         expired.state = SwapState::Expired;
         store.insert(&expired).await.unwrap();
         assert!(due(store, now + 1_000_000).await.is_empty());
+    }
+
+    /// Whoever paid an invoice can find the swap it funded, and the escrow it paid, from the
+    /// payment hash alone.
+    #[tokio::test]
+    async fn a_swap_is_found_by_its_invoice_payment_hash() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("swaps.sqlite"))
+            .await
+            .unwrap();
+        let mut swap = swap_for(&"ab".repeat(32), 1_790_000_000);
+        swap.amount_sat = 1_100;
+        swap.state = SwapState::Settled;
+        swap.escrow_vtxo = Some(format!("{}:0", "ef".repeat(32)));
+        swap.ark_txid = Some("ef".repeat(32));
+        store.insert(&swap).await.unwrap();
+
+        let found = store
+            .for_payment_hash(&swap.payment_hash)
+            .await
+            .unwrap()
+            .expect("the swap is found by its hash");
+        assert_eq!(found.id, swap.id);
+        assert_eq!(found.escrow_vtxo, swap.escrow_vtxo);
+        assert!(store
+            .for_payment_hash(&"00".repeat(32))
+            .await
+            .unwrap()
+            .is_none());
+        let served = serde_json::to_value(&found).unwrap();
+        assert!(served.get("preimage").is_none(), "{served}");
     }
 
     #[tokio::test]
