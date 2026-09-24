@@ -349,6 +349,17 @@ impl SynthDb {
         Ok(runs)
     }
 
+    /// Pending money must stay visible even after newer runs fill the dashboard's page.
+    pub async fn runs_to_follow(&self) -> Result<Vec<TestRun>> {
+        sqlx::query_as::<_, TestRun>(&format!(
+            "SELECT * FROM ({RUN_COLUMNS}) WHERE competition_id IS NOT NULL \
+             AND (money IS NULL OR money = 'following') ORDER BY started_at"
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .context("list runs whose money is still being followed")
+    }
+
     /// How each scenario has been doing, most recently run first.
     ///
     /// A scenario is only as good as its last runs, so this counts the recent window rather than
@@ -674,6 +685,33 @@ mod tests {
             failed.error_message.as_deref(),
             Some("its payouts never went out")
         );
+    }
+
+    #[tokio::test]
+    async fn older_unsettled_runs_remain_in_the_tracking_queue() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = SynthDb::new(directory.path().join("synth.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        let old = db.create_run("full_lifecycle", None).await.unwrap();
+        let details = serde_json::json!({"competition_id": Uuid::now_v7()}).to_string();
+        db.add_step(&old, "create_competition", 1, None, Some(&details))
+            .await
+            .unwrap();
+        db.complete_run(&old, None).await.unwrap();
+        for _ in 0..31 {
+            let newer = db.create_run("full_lifecycle", None).await.unwrap();
+            db.complete_run(&newer, None).await.unwrap();
+        }
+        assert!(!db
+            .list_runs(30)
+            .await
+            .unwrap()
+            .iter()
+            .any(|run| run.id == old));
+        let pending = db.runs_to_follow().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, old);
     }
 
     /// A failed rebalance is kept with its reason, so the dashboard can say why money stopped

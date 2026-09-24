@@ -165,6 +165,26 @@ pub struct PayoutSeen {
     pub paid_by: Option<String>,
 }
 
+impl PayoutSeen {
+    /// The entries API's `paid_out_at` includes an initiated payment. Only a matching
+    /// preimage observed on a Lightning node proves that the invoice settled.
+    pub fn is_confirmed(&self) -> bool {
+        use sha2::{Digest, Sha256};
+        let (Some(preimage), Some(hash)) = (&self.preimage, &self.payment_hash) else {
+            return false;
+        };
+        let (Ok(preimage), Ok(hash)) = (hex::decode(preimage), hex::decode(hash)) else {
+            return false;
+        };
+        preimage.len() == 32
+            && hash.len() == 32
+            && Sha256::digest(&preimage).as_slice() == hash.as_slice()
+            && self
+                .amount_sats
+                .is_some_and(|amount| amount >= self.owed_sats)
+    }
+}
+
 /// A refund of a ticket whose competition was cancelled before its contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefundSeen {
@@ -265,25 +285,46 @@ pub fn judge(
     give_up: bool,
 ) -> Money {
     let owed: Vec<&PayoutSeen> = payouts.iter().filter(|p| p.owed_sats > 0).collect();
-    let sent = owed.iter().filter(|p| p.sent_at.is_some()).count();
-    let payouts_words = || format!("{sent} of {} payouts sent", owed.len());
+    let sent = owed.iter().filter(|p| p.is_confirmed()).count();
+    let payouts_words = || format!("{sent} of {} payouts confirmed", owed.len());
     if paid_entries == 0 {
         return Money::NothingPaid;
     }
     if competition.completed_at.is_some() {
+        // Missing entry lookups or an unavailable settlement must not make an empty
+        // set of payouts count as success. Retry incomplete evidence until timeout.
+        if payouts.len() < paid_entries || owed.is_empty() {
+            return if give_up {
+                Money::TimedOut {
+                    reason: "payout records are incomplete; settlement could not be verified"
+                        .into(),
+                }
+            } else {
+                Money::Following
+            };
+        }
         return if sent == owed.len() {
             Money::PaidOut
-        } else {
-            Money::Stuck {
+        } else if give_up {
+            Money::TimedOut {
                 reason: format!("the competition completed with {}", payouts_words()),
             }
+        } else {
+            Money::Following
         };
     }
     let ended = competition.failed_at.or(competition.cancelled_at);
     let contracted = competition.outcome_broadcasted_at.is_some()
         || competition.funding_broadcasted_at.is_some();
     match ended {
-        Some(_) if contracted && !owed.is_empty() && sent == owed.len() => Money::PaidOut,
+        Some(_)
+            if contracted
+                && payouts.len() >= paid_entries
+                && !owed.is_empty()
+                && sent == owed.len() =>
+        {
+            Money::PaidOut
+        }
         Some(at) if contracted => Money::Stuck {
             reason: format!(
                 "the competition {} at {} UTC after {}, with {}",
@@ -353,6 +394,11 @@ mod tests {
         PayoutSeen {
             owed_sats,
             sent_at: sent.then(OffsetDateTime::now_utc),
+            amount_sats: sent.then_some(owed_sats),
+            preimage: sent
+                .then(|| "1111111111111111111111111111111111111111111111111111111111111111".into()),
+            payment_hash: sent
+                .then(|| "02d449a31fbb267c8f352e9968a79e3e5fc95c1bbeaa502fd6454ebde5a4bedc".into()),
             ..PayoutSeen::default()
         }
     }
@@ -373,7 +419,7 @@ mod tests {
             judge(&failed, &payouts, &[], 3, false),
             Money::Stuck {
                 reason: "the competition failed at 04:16 UTC after its outcome went on-chain, \
-                         with 0 of 3 payouts sent"
+                         with 0 of 3 payouts confirmed"
                     .into()
             }
         );
@@ -386,9 +432,40 @@ mod tests {
         assert_eq!(judge(&completed, &payouts, &[], 2, false), Money::PaidOut);
         let short = [payout(1020, true), payout(990, false)];
         assert!(matches!(
-            judge(&completed, &short, &[], 2, false),
-            Money::Stuck { .. }
+            judge(&completed, &short, &[], 2, true),
+            Money::TimedOut { .. }
         ));
+    }
+
+    #[test]
+    fn missing_records_and_initiated_payments_are_not_paid_out() {
+        let completed = competition(serde_json::json!({ "completed_at": "2026-09-24T01:02:31Z" }));
+        assert_eq!(judge(&completed, &[], &[], 2, false), Money::Following);
+        assert!(matches!(
+            judge(&completed, &[], &[], 2, true),
+            Money::TimedOut { .. }
+        ));
+        let mut winner = payout(3000, true);
+        assert_eq!(
+            judge(&completed, &[winner.clone()], &[], 2, false),
+            Money::Following
+        );
+        winner.preimage = None;
+        assert_eq!(
+            judge(&completed, &[winner.clone()], &[], 1, false),
+            Money::Following
+        );
+        winner.preimage = Some("00".repeat(32));
+        assert!(
+            !winner.is_confirmed(),
+            "a preimage for a different invoice proves nothing"
+        );
+        let mut winner = payout(3000, true);
+        winner.amount_sats = Some(2999);
+        assert!(
+            !winner.is_confirmed(),
+            "an underpayment does not pay the share"
+        );
     }
 
     #[test]
@@ -403,7 +480,7 @@ mod tests {
             judge(&waiting, &payouts, &[], 3, true),
             Money::TimedOut {
                 reason:
-                    "synth stopped following it at outcome_broadcasted, with 0 of 1 payouts sent"
+                    "synth stopped following it at outcome_broadcasted, with 0 of 1 payouts confirmed"
                         .into()
             }
         );

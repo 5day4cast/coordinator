@@ -360,18 +360,18 @@ fn payouts_box(
             lines: Vec::new(),
         };
     }
-    let completed = reached(competition.completed_at);
     let failed = reached(competition.failed_at) || reached(competition.cancelled_at);
     let lines: Vec<(bool, Line)> = payouts
         .iter()
         .map(|payout| {
             let winner = payout.owed_sats > 0;
-            let (value, stage) = match (winner, payout.sent_at, completed) {
+            let (value, stage) = match (winner, payout.sent_at, payout.is_confirmed()) {
                 (false, _, _) => ("owed nothing".to_string(), Stage::Waiting),
-                (true, Some(_), true) => (format!("{} sats paid", payout.owed_sats), Stage::Done),
-                (true, Some(_), false) => {
-                    (format!("{} sats sending", payout.owed_sats), Stage::Active)
-                }
+                (true, _, true) => (format!("{} sats paid", payout.owed_sats), Stage::Done),
+                (true, Some(_), false) => (
+                    format!("{} sats sent; settlement unverified", payout.owed_sats),
+                    Stage::Active,
+                ),
                 (true, None, _) if failed => (
                     format!("{} sats never sent", payout.owed_sats),
                     Stage::Failed,
@@ -396,8 +396,10 @@ fn payouts_box(
     FlowBox {
         title: "Payouts",
         subtitle,
-        stage: if winning.is_empty() {
-            Stage::Done
+        stage: if winning.is_empty()
+            || settlement.is_some_and(|settlement| winning.len() < settlement.winners().count())
+        {
+            Stage::Waiting
         } else {
             Stage::of_lines(&winning)
         },
@@ -834,9 +836,9 @@ fn ledger_table(ledger: &Ledger, trail: Option<&Trail>) -> Markup {
                 @if ledger.refunded > 0 {
                     tr { td { "Refunded" } td.num { (ledger.refunded) } td {} }
                 }
-                tr.total { td { "Fees outside the players' payments" } td {} td {} }
-                tr { td { "entry routing, paid by the payer's node" } td.num { (format::msat_as_sats(ledger.entry_routing_fee_msat)) } td {} }
-                tr { td { "ark-swapd's swap fees" } td.num { (sats(ledger.swap_fees)) } td.note { "entry price less what reached each escrow" } }
+                tr.total { td { "Fees and operator costs" } td {} td {} }
+                tr { td { "entry routing, paid by the payer's node" } td.num { (msat(ledger.entry_routing_fee_msat)) } td {} }
+                tr { td { "ark-swapd's swap fees" } td.num { (sats(ledger.swap_fees)) } td.note { "included in the entry price: price less what reached each escrow" } }
                 tr { td { "funding transaction" } td.num { (sats(ledger.funding_fee)) } td.note { "paid by the Arkade server's wallet" } }
                 tr { td { "outcome transaction" } td.num { (sats(ledger.outcome_fee)) } td.note { "taken from the contract's output; the coordinator still pays shares in full" } }
                 tr { td { "payout routing, paid by the coordinator's node" } td.num { (msat(ledger.payout_routing_fee_msat)) } td {} }
@@ -848,7 +850,7 @@ fn ledger_table(ledger: &Ledger, trail: Option<&Trail>) -> Markup {
             }
         } }
         @if ledger.flags.is_empty() {
-            @if settled { p.note { "It balances." } }
+            @if settled { p.note { "Player payments balance. Fees and operator costs are shown separately; unavailable fees are not treated as zero." } }
         } @else {
             ul { @for flag in &ledger.flags { li.flag { (flag) } } }
         }
@@ -975,6 +977,11 @@ mod tests {
             weight: owed_sats * 100 / 3000,
             owed_sats,
             sent_at: sent.then(OffsetDateTime::now_utc),
+            amount_sats: sent.then_some(owed_sats),
+            preimage: sent
+                .then(|| "1111111111111111111111111111111111111111111111111111111111111111".into()),
+            payment_hash: sent
+                .then(|| "02d449a31fbb267c8f352e9968a79e3e5fc95c1bbeaa502fd6454ebde5a4bedc".into()),
             ..PayoutSeen::default()
         }
     }

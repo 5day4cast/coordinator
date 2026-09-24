@@ -426,10 +426,10 @@ fn payout_rows(trail: &Trail) -> Vec<Row> {
         .iter()
         .filter(|p| p.owed_sats > 0 || p.invoice.is_some())
     {
-        let status = match (payout.sent_at, ended) {
-            (Some(_), _) => Status::Done,
-            (None, true) => Status::Failed,
-            (None, false) => Status::Waiting,
+        let status = match (payout.is_confirmed(), ended) {
+            (true, _) => Status::Done,
+            (false, true) => Status::Failed,
+            (false, false) => Status::Waiting,
         };
         let from = payout
             .paid_by
@@ -511,7 +511,7 @@ pub struct Ledger {
     /// In the pot but owed to nobody: what the shares' rounding leaves.
     pub left_in_pot: u64,
     /// What the payer's node paid in routing fees on top of the entries, in millisats.
-    pub entry_routing_fee_msat: u64,
+    pub entry_routing_fee_msat: Option<u64>,
     /// What the players paid beyond what ark-swapd put in their escrows.
     pub swap_fees: Option<u64>,
     /// On-chain fees: the funding transaction's, which the Arkade server's wallet pays, and the
@@ -540,11 +540,19 @@ pub fn ledger(
         paid_in,
         entry_routing_fee_msat: entries
             .iter()
-            .filter_map(|entry| entry.payment.as_ref())
-            .map(|payment| payment.fee_msat)
+            .filter(|entry| entry.paid)
+            .map(|entry| entry.payment.as_ref().map(|payment| payment.fee_msat))
             .sum(),
         ..Ledger::default()
     };
+    if entries
+        .iter()
+        .any(|entry| entry.paid && entry.amount_sats.is_none())
+    {
+        ledger
+            .flags
+            .push("an entry was paid, but its amount was not recorded".into());
+    }
     let refunded_traced: u64 = trail
         .map(|trail| {
             trail
@@ -565,19 +573,17 @@ pub fn ledger(
     let pot = trail.settlement.as_ref().map(|s| s.pot_sats);
     ledger.pot = pot;
     ledger.coordinator_fee = pot.map(|pot| paid_in.saturating_sub(pot));
-    ledger.owed = trail.payouts.iter().map(|p| p.owed_sats).sum();
+    ledger.owed = trail.settlement.as_ref().map_or_else(
+        || trail.payouts.iter().map(|p| p.owed_sats).sum(),
+        |settlement| settlement.shares.iter().map(|share| share.owed_sats).sum(),
+    );
     ledger.paid_out = trail
         .payouts
         .iter()
-        .filter(|p| p.sent_at.is_some())
+        .filter(|p| p.is_confirmed())
         .map(|p| p.amount_sats.unwrap_or(p.owed_sats))
         .sum();
-    ledger.unpaid = trail
-        .payouts
-        .iter()
-        .filter(|p| p.owed_sats > 0 && p.sent_at.is_none())
-        .map(|p| p.owed_sats)
-        .sum();
+    ledger.unpaid = ledger.owed.saturating_sub(ledger.paid_out);
     let decided = trail
         .settlement
         .as_ref()
@@ -600,11 +606,8 @@ pub fn ledger(
         (swapped.len() == entries_paid && entries_paid > 0).then(|| swapped.iter().sum());
     ledger.funding_fee = trail.funding_tx.as_ref().and_then(|tx| tx.fee_sat);
     ledger.outcome_fee = trail.outcome_tx.as_ref().and_then(|tx| tx.fee_sat);
-    let sent: Vec<&crate::trail::PayoutSeen> = trail
-        .payouts
-        .iter()
-        .filter(|p| p.sent_at.is_some())
-        .collect();
+    let sent: Vec<&crate::trail::PayoutSeen> =
+        trail.payouts.iter().filter(|p| p.is_confirmed()).collect();
     ledger.payout_routing_fee_msat = sent
         .iter()
         .map(|p| p.fee_msat)
@@ -647,7 +650,7 @@ pub fn ledger(
     // What should be gone once the money settled.
     ledger.remainder = match (&trail.money, pot) {
         (Money::Refunded, _) | (_, None) if settled => paid_in as i64 - ledger.refunded as i64,
-        _ if settled => ledger.unpaid as i64,
+        (_, Some(pot)) if settled => pot as i64 - ledger.paid_out as i64 - ledger.refunded as i64,
         _ => 0,
     };
     if settled && ledger.remainder != 0 {
@@ -656,7 +659,7 @@ pub fn ledger(
                 format!("{} sats paid in were never refunded", ledger.remainder)
             }
             _ => format!(
-                "{} sats owed to winners were never paid out",
+                "{} sats of the pot have no confirmed payout or refund",
                 ledger.remainder
             ),
         });
@@ -792,7 +795,12 @@ mod tests {
                     owed_sats: *owed_sats,
                     sent_at: sent.then(OffsetDateTime::now_utc),
                     amount_sats: sent.then_some(*owed_sats),
-                    payment_hash: sent.then(|| "ff".repeat(32)),
+                    payment_hash: sent.then(|| {
+                        "02d449a31fbb267c8f352e9968a79e3e5fc95c1bbeaa502fd6454ebde5a4bedc".into()
+                    }),
+                    preimage: sent.then(|| {
+                        "1111111111111111111111111111111111111111111111111111111111111111".into()
+                    }),
                     fee_msat: sent.then_some(2000),
                     ..PayoutSeen::default()
                 })
@@ -833,7 +841,7 @@ mod tests {
         assert_eq!(ledger.coordinator_fee, Some(300));
         assert_eq!(ledger.paid_out, 3000);
         assert_eq!(ledger.unpaid, 0);
-        assert_eq!(ledger.entry_routing_fee_msat, 3003);
+        assert_eq!(ledger.entry_routing_fee_msat, Some(3003));
         assert_eq!(ledger.swap_fees, Some(0));
         assert_eq!(
             (ledger.funding_fee, ledger.outcome_fee),
@@ -855,7 +863,7 @@ mod tests {
         assert_eq!(ledger.remainder, 3000);
         assert_eq!(
             ledger.flags,
-            ["3000 sats owed to winners were never paid out"]
+            ["3000 sats of the pot have no confirmed payout or refund"]
         );
         assert_eq!(ledger.payout_routing_fee_msat, None);
 
@@ -868,6 +876,22 @@ mod tests {
 
     fn ledger_following() -> Ledger {
         ledger(&entries(), &[], Some(&trail(Money::Following, false)))
+    }
+
+    #[test]
+    fn absent_payout_records_do_not_erase_the_pots_obligations() {
+        let mut missing = trail(
+            Money::TimedOut {
+                reason: "unreachable".into(),
+            },
+            false,
+        );
+        missing.payouts.clear();
+        let ledger = ledger(&entries(), &[], Some(&missing));
+        assert_eq!(ledger.owed, 3000);
+        assert_eq!(ledger.unpaid, 3000);
+        assert_eq!(ledger.left_in_pot, 0);
+        assert_eq!(ledger.remainder, 3000);
     }
 
     #[test]

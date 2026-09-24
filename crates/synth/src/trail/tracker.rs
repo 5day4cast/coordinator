@@ -57,9 +57,6 @@ impl Default for TrailConfig {
 /// payouts show up on the nodes and in ark-swapd without the competition's state changing.
 const REFRESH_AT_LEAST_EVERY: Duration = Duration::from_secs(5 * 60);
 
-/// How many recent runs are followed.
-const FOLLOWED_RUNS: i64 = 30;
-
 /// A Lightning node synth can reach, by the name it gives itself.
 struct Node {
     lnd: Lnd,
@@ -162,14 +159,7 @@ impl Tracker {
     }
 
     async fn tick(&self) -> Result<()> {
-        for run in self.inner.db.list_runs(FOLLOWED_RUNS).await? {
-            if run
-                .money
-                .as_deref()
-                .is_some_and(|money| money != "following")
-            {
-                continue;
-            }
+        for run in self.inner.db.runs_to_follow().await? {
             let Some(competition_id) = competition_of(&run) else {
                 continue;
             };
@@ -587,7 +577,7 @@ impl Tracker {
                     .find(|p| p.payment_hash.is_some() && p.payment_hash == payout.payment_hash)
             });
             match earlier {
-                Some(earlier) if earlier.preimage.is_some() => {
+                Some(earlier) if earlier.is_confirmed() => {
                     payout.preimage = earlier.preimage.clone();
                     payout.fee_msat = earlier.fee_msat;
                     payout.paid_by = earlier.paid_by.clone();
