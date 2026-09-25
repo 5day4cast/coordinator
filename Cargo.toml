@@ -45,8 +45,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # keymeld-sdk and the coordinator must resolve dlctix from the same source.
 # Pinned to the head of tee8z/keymeld#71 (feat/partial-roster-keygen), which signs refunds for a
 # pool that never filled. Re-pin every Keymeld rev here and in the crates once that merges.
-keymeld-sdk = { git = "https://github.com/tee8z/keymeld", rev = "e1e733e0e24623802e734c023d66e2d3a94ffe5f", default-features = false, features = ["escrow", "dlctix"] }
-keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "e1e733e0e24623802e734c023d66e2d3a94ffe5f", default-features = false, features = ["escrow"] }
+keymeld-sdk = { git = "https://github.com/tee8z/keymeld", rev = "178288af0aeed3e449c9529bbdf046d4b402109f", default-features = false, features = ["escrow", "dlctix"] }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "178288af0aeed3e449c9529bbdf046d4b402109f", default-features = false, features = ["escrow"] }
 
 # Bitcoin
 bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }
