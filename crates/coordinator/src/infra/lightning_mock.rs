@@ -182,16 +182,30 @@ impl MockLnClient {
             .and_then(|invoices| invoices.get(payment_hash_hex).map(|i| i.state.clone()))
     }
 
-    /// Generate a deterministic mock BOLT11 invoice.
-    fn generate_mock_invoice(&self, value_sats: u64, payment_hash_hex: &str) -> String {
-        // Generate a fake but valid-looking BOLT11 invoice
-        // In a real implementation, you'd use lightning-invoice crate
-        // For mock purposes, we use a recognizable format
-        format!(
-            "lnbcrt{}n1mock{}",
-            value_sats,
-            &payment_hash_hex[..16] // Use first 16 chars of hash for uniqueness
-        )
+    /// A real, signed regtest BOLT11 invoice for `payment_hash_hex`, so the
+    /// browser wallet's invoice checks (amount, network, expiry) pass in e2e runs.
+    /// It is signed by a fixed test key; nothing can pay it.
+    fn generate_mock_invoice(
+        &self,
+        value_sats: u64,
+        payment_hash_hex: &str,
+    ) -> Result<String, anyhow::Error> {
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+        use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+
+        let mut payment_hash = [0u8; 32];
+        hex::decode_to_slice(payment_hash_hex, &mut payment_hash)
+            .map_err(|e| anyhow::anyhow!("payment hash is not 32 bytes of hex: {e}"))?;
+        let key = SecretKey::from_slice(&[0x42; 32])?;
+        let invoice = InvoiceBuilder::new(Currency::Regtest)
+            .description("mock invoice".into())
+            .payment_hash(sha256::Hash::from_byte_array(payment_hash))
+            .payment_secret(PaymentSecret([0x24; 32]))
+            .amount_milli_satoshis(value_sats * 1000)
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(18)
+            .build_signed(|hash| Secp256k1::new().sign_ecdsa_recoverable(hash, &key))?;
+        Ok(invoice.to_string())
     }
 
     fn spawn_auto_accept(&self, payment_hash_hex: String, delay: Duration) {
@@ -277,7 +291,7 @@ impl Ln for MockLnClient {
             value, competition_id
         );
 
-        let payment_request = self.generate_mock_invoice(value, &ticket_hash_hex);
+        let payment_request = self.generate_mock_invoice(value, &ticket_hash_hex)?;
 
         let memo = format!("c:{}", competition_id);
 
@@ -335,7 +349,7 @@ impl Ln for MockLnClient {
         let payment_hash = sha256::Hash::hash(hash_input.as_bytes());
         let payment_hash_hex = hex::encode(payment_hash.to_byte_array());
 
-        let payment_request = self.generate_mock_invoice(value, &payment_hash_hex);
+        let payment_request = self.generate_mock_invoice(value, &payment_hash_hex)?;
 
         let invoice = MockInvoice {
             payment_hash: payment_hash_hex.clone(),
@@ -382,7 +396,7 @@ impl Ln for MockLnClient {
         let payment_hash = sha256::Hash::hash(hash_input.as_bytes());
         let payment_hash_hex = hex::encode(payment_hash.to_byte_array());
 
-        let payment_request = self.generate_mock_invoice(value, &payment_hash_hex);
+        let payment_request = self.generate_mock_invoice(value, &payment_hash_hex)?;
 
         let invoice = MockInvoice {
             payment_hash: payment_hash_hex.clone(),
@@ -615,7 +629,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!response.payment_request.is_empty());
+        let invoice: lightning_invoice::Bolt11Invoice = response.payment_request.parse().unwrap();
+        assert_eq!(invoice.currency(), lightning_invoice::Currency::Regtest);
+        assert_eq!(invoice.amount_milli_satoshis(), Some(1_000_000));
+        assert_eq!(
+            extract_payment_hash_from_invoice(&response.payment_request).unwrap(),
+            ticket_hash
+        );
 
         // Invoice should be in Open state
         let state = client.get_invoice_state(&ticket_hash).unwrap();

@@ -78,71 +78,74 @@ function resetForgotPasswordModal() {
   document.getElementById("forgotStep3")?.classList.add("is-hidden");
 }
 
-function setupAuthModals(authManager) {
-  document.getElementById("loginNavClick")?.addEventListener("click", () => {
-    resetLoginModal();
-    window.openModal(document.getElementById("loginModal"));
-  });
+// Log-in and sign-up buttons anywhere on the page, including ones htmx
+// swaps in later, carry data-open-modal. Opening either starts loading the
+// wallet, so it is ready by the time the form is filled in.
+function openAuthModal(id) {
+  if (id === "loginModal") resetLoginModal();
+  if (id === "registerModal") resetRegisterModal();
+  openModal(document.getElementById(id));
+  initWasm().catch(() => {});
+}
 
-  document.getElementById("registerNavClick")?.addEventListener("click", () => {
-    resetRegisterModal();
-    window.openModal(document.getElementById("registerModal"));
+function setupAuthModals(authManager) {
+  document.addEventListener("click", (event) => {
+    const opener = event.target.closest?.("[data-open-modal]");
+    if (!opener) return;
+    event.preventDefault();
+    openAuthModal(opener.dataset.openModal);
   });
 
   document.getElementById("closeLoginModal")?.addEventListener("click", () => {
-    window.closeModal(document.getElementById("loginModal"));
+    closeModal(document.getElementById("loginModal"));
   });
 
   document
     .getElementById("closeResisterModal")
     ?.addEventListener("click", () => {
       resetRegisterModal();
-      window.closeModal(document.getElementById("registerModal"));
+      closeModal(document.getElementById("registerModal"));
     });
 
   document
     .getElementById("closeForgotPasswordModal")
     ?.addEventListener("click", () => {
       resetForgotPasswordModal();
-      window.closeModal(document.getElementById("forgotPasswordModal"));
+      closeModal(document.getElementById("forgotPasswordModal"));
     });
 
   document
     .getElementById("showRegisterButton")
     ?.addEventListener("click", () => {
-      window.closeModal(document.getElementById("loginModal"));
+      closeModal(document.getElementById("loginModal"));
       resetRegisterModal();
-      window.openModal(document.getElementById("registerModal"));
+      openModal(document.getElementById("registerModal"));
     });
 
   document.getElementById("goToLoginButton")?.addEventListener("click", () => {
-    window.closeModal(document.getElementById("registerModal"));
-    window.openModal(document.getElementById("loginModal"));
+    closeModal(document.getElementById("registerModal"));
+    openModal(document.getElementById("loginModal"));
   });
 
   document
     .getElementById("forgotPasswordLink")
     ?.addEventListener("click", (e) => {
       e.preventDefault();
-      window.closeModal(document.getElementById("loginModal"));
+      closeModal(document.getElementById("loginModal"));
       resetForgotPasswordModal();
-      window.openModal(document.getElementById("forgotPasswordModal"));
+      openModal(document.getElementById("forgotPasswordModal"));
     });
 
   document
     .getElementById("backToLoginFromForgot")
     ?.addEventListener("click", (e) => {
       e.preventDefault();
-      window.closeModal(document.getElementById("forgotPasswordModal"));
+      closeModal(document.getElementById("forgotPasswordModal"));
       resetLoginModal();
-      window.openModal(document.getElementById("loginModal"));
+      openModal(document.getElementById("loginModal"));
     });
 }
 
-window.resetLoginModal = resetLoginModal;
-window.resetRegisterModal = resetRegisterModal;
-window.resetForgotPasswordModal = resetForgotPasswordModal;
-window.setupAuthModals = setupAuthModals;
 
 class AuthManager {
   constructor(apiBase, network) {
@@ -211,9 +214,23 @@ class AuthManager {
     });
   }
 
+  // The wallet loads on first use; say so if it cannot.
+  async walletReady(errorElement) {
+    try {
+      await initWasm();
+      return true;
+    } catch (error) {
+      if (errorElement)
+        errorElement.textContent =
+          "The wallet failed to load. Check your connection and try again.";
+      return false;
+    }
+  }
+
   async handleUsernameLogin() {
     const errorElement = document.querySelector("#usernameLoginError");
     if (errorElement) errorElement.textContent = "";
+    if (!(await this.walletReady(errorElement))) return;
 
     const username = document.getElementById("loginUsername")?.value?.trim();
     const password = document.getElementById("loginPassword")?.value;
@@ -226,7 +243,7 @@ class AuthManager {
 
     // The password stays in the browser: the server only sees the derived
     // auth key, and the nsec is unsealed inside WASM.
-    const credentials = window.LoginCredentials.derive(username, password);
+    const credentials = session.wasm.LoginCredentials.derive(username, password);
     try {
       const response = await fetch(
         `${this.apiBase}/api/v1/users/username/login`,
@@ -256,13 +273,13 @@ class AuthManager {
         );
       }
 
-      window.nostrClient.unlockWithLogin(credentials, encrypted_nsec);
-      this.authorizedClient = new window.AuthorizedClient(
-        window.nostrClient,
+      session.nostrClient.unlockWithLogin(credentials, encrypted_nsec);
+      this.authorizedClient = new AuthorizedClient(
+        session.nostrClient,
         this.apiBase,
       );
-      window.dlcWallet = await window.DlcWallet.load(
-        window.nostrClient,
+      session.dlcWallet = await session.wasm.DlcWallet.load(
+        session.nostrClient,
         network,
         encrypted_bitcoin_private_key,
       );
@@ -285,11 +302,12 @@ class AuthManager {
   async handleExtensionLogin() {
     const errorElement = document.querySelector("#extensionLoginError");
     if (errorElement) errorElement.textContent = "";
+    if (!(await this.walletReady(errorElement))) return;
 
     try {
-      await window.nostrClient.initialize(window.SignerType.NIP07, null);
-      this.authorizedClient = new window.AuthorizedClient(
-        window.nostrClient,
+      await session.nostrClient.initialize(session.wasm.SignerType.NIP07, null);
+      this.authorizedClient = new AuthorizedClient(
+        session.nostrClient,
         this.apiBase,
       );
       await this.performLogin();
@@ -344,29 +362,30 @@ class AuthManager {
       return;
     }
 
-    const lightningAddress = window.normalizeLightningAddress(
+    const lightningAddress = normalizeLightningAddress(
       document.getElementById("registerLightningAddress")?.value,
     );
-    const addressError = window.validateLightningAddress(lightningAddress);
+    const addressError = validateLightningAddress(lightningAddress);
     if (addressError) {
       if (errorElement) errorElement.textContent = addressError;
       return;
     }
 
+    if (!(await this.walletReady(errorElement))) return;
     let credentials = null;
     try {
-      window.nostrClient.initialize(window.SignerType.PrivateKey, null);
-      credentials = window.LoginCredentials.derive(username, password);
+      session.nostrClient.initialize(session.wasm.SignerType.PrivateKey, null);
+      credentials = session.wasm.LoginCredentials.derive(username, password);
 
       this.pendingRegistration = {
         username,
         lightningAddress,
         authKey: credentials.authKey,
-        sealedNsec: window.nostrClient.sealForLogin(credentials),
+        sealedNsec: session.nostrClient.sealForLogin(credentials),
       };
 
       const display = document.getElementById("usernameNsecDisplay");
-      if (display) display.value = window.nostrClient.recoveryKey();
+      if (display) display.value = session.nostrClient.recoveryKey();
 
       document
         .getElementById("usernameRegisterStep1")
@@ -396,12 +415,12 @@ class AuthManager {
     }
 
     try {
-      this.authorizedClient = new window.AuthorizedClient(
-        window.nostrClient,
+      this.authorizedClient = new AuthorizedClient(
+        session.nostrClient,
         this.apiBase,
       );
 
-      const wallet = window.DlcWallet.create(window.nostrClient, this.network);
+      const wallet = session.wasm.DlcWallet.create(session.nostrClient, this.network);
       const { encrypted_bitcoin_private_key } = await wallet.encryptedBackup();
 
       // Signed with the new Nostr key: the server takes the account pubkey
@@ -457,19 +476,20 @@ class AuthManager {
     const errorElement = document.querySelector("#extensionRegisterError");
     if (errorElement) errorElement.textContent = "";
 
-    const lightningAddress = window.normalizeLightningAddress(
+    const lightningAddress = normalizeLightningAddress(
       document.getElementById("extensionLightningAddress")?.value,
     );
-    const addressError = window.validateLightningAddress(lightningAddress);
+    const addressError = validateLightningAddress(lightningAddress);
     if (addressError) {
       if (errorElement) errorElement.textContent = addressError;
       return;
     }
+    if (!(await this.walletReady(errorElement))) return;
 
     try {
-      await window.nostrClient.initialize(window.SignerType.NIP07, null);
-      this.authorizedClient = new window.AuthorizedClient(
-        window.nostrClient,
+      await session.nostrClient.initialize(session.wasm.SignerType.NIP07, null);
+      this.authorizedClient = new AuthorizedClient(
+        session.nostrClient,
         this.apiBase,
       );
       await this.performRegistration(lightningAddress);
@@ -579,21 +599,22 @@ class AuthManager {
       resetForgotPasswordModal();
       return;
     }
+    if (!(await this.walletReady(errorElement))) return;
 
     try {
-      window.nostrClient.initialize(window.SignerType.PrivateKey, nsec);
+      session.nostrClient.initialize(session.wasm.SignerType.PrivateKey, nsec);
       if (nsecInput) nsecInput.value = "";
-      const derivedNpub = await window.nostrClient.getPublicKey();
+      const derivedNpub = await session.nostrClient.getPublicKey();
 
       if (derivedNpub !== this.forgotNpub) {
-        window.nostrClient = new window.NostrClientWrapper();
+        session.nostrClient = new session.wasm.NostrClientWrapper();
         if (errorElement)
           errorElement.textContent =
             "This recovery key does not match the account";
         return;
       }
 
-      this.forgotSignedChallenge = await window.nostrClient.signChallenge(
+      this.forgotSignedChallenge = await session.nostrClient.signChallenge(
         this.forgotChallenge,
       );
 
@@ -638,14 +659,14 @@ class AuthManager {
       return;
     }
 
-    const credentials = window.LoginCredentials.derive(
+    const credentials = session.wasm.LoginCredentials.derive(
       this.forgotUsername,
       newPassword,
     );
     try {
       // Bind the replacement credentials to the recovered account key. The
       // challenge signature alone does not authenticate the replacement body.
-      const resetClient = new window.AuthorizedClient(window.nostrClient, this.apiBase);
+      const resetClient = new AuthorizedClient(session.nostrClient, this.apiBase);
       await resetClient.post(
         `${this.apiBase}/api/v1/users/username/reset-password`,
         {
@@ -653,7 +674,7 @@ class AuthManager {
           challenge: this.forgotChallenge,
           signed_event: this.forgotSignedChallenge,
           new_auth_key: credentials.authKey,
-          new_encrypted_nsec: window.nostrClient.sealForLogin(credentials),
+          new_encrypted_nsec: session.nostrClient.sealForLogin(credentials),
         },
       );
 
@@ -662,11 +683,11 @@ class AuthManager {
       this.forgotUsername = null;
       this.forgotSignedChallenge = null;
       // The recovery key only proved ownership; log in again with the new password.
-      window.nostrClient = new window.NostrClientWrapper();
+      session.nostrClient = new session.wasm.NostrClientWrapper();
 
-      window.closeModal(document.getElementById("forgotPasswordModal"));
+      closeModal(document.getElementById("forgotPasswordModal"));
       resetLoginModal();
-      window.openModal(document.getElementById("loginModal"));
+      openModal(document.getElementById("loginModal"));
 
       const loginError = document.querySelector("#usernameLoginError");
       if (loginError) {
@@ -685,7 +706,7 @@ class AuthManager {
   }
 
   async performRegistration(lightningAddress) {
-    const wallet = window.DlcWallet.create(window.nostrClient, this.network);
+    const wallet = session.wasm.DlcWallet.create(session.nostrClient, this.network);
     try {
       const payload = await wallet.encryptedBackup();
       const response = await this.authorizedClient.post(
@@ -720,8 +741,8 @@ class AuthManager {
       );
     }
 
-    window.dlcWallet = await window.DlcWallet.load(
-      window.nostrClient,
+    session.dlcWallet = await session.wasm.DlcWallet.load(
+      session.nostrClient,
       network,
       encrypted_bitcoin_private_key,
     );
@@ -729,10 +750,10 @@ class AuthManager {
 
   handleLogout() {
     // free() drops the WASM objects, which erases the keys they hold.
-    window.dlcWallet?.free();
-    window.dlcWallet = null;
-    window.nostrClient?.free();
-    window.nostrClient = new window.NostrClientWrapper();
+    session.dlcWallet?.free();
+    session.dlcWallet = null;
+    session.nostrClient?.free();
+    session.nostrClient = new session.wasm.NostrClientWrapper();
 
     document.getElementById("authButtons")?.classList.remove("is-hidden");
     document.getElementById("logoutContainer")?.classList.add("is-hidden");
@@ -742,16 +763,24 @@ class AuthManager {
     const passwordInput = document.getElementById("loginPassword");
     if (passwordInput) passwordInput.value = "";
 
+    setOwnerTag(null);
+    document.body.dispatchEvent(new CustomEvent("fw:logout"));
+    // Leave any account page: its content belongs to the old session.
     document.querySelector('[hx-get="/competitions"]')?.click();
-    window.refreshEntryPayoutAddress?.();
   }
 
   onLoginSuccess() {
     document.getElementById("authButtons")?.classList.add("is-hidden");
     document.getElementById("logoutContainer")?.classList.remove("is-hidden");
-    window.closeAllModals?.();
-    // An open entry form shows where winnings go, which needs the profile.
-    window.refreshEntryPayoutAddress?.();
+    closeAllModals();
+    showKeymeldTrust();
+    // Pages waiting on a login (account pages, the entry form's payout
+    // line) reload themselves on this event, now signed.
+    document.body.dispatchEvent(new CustomEvent("fw:login"));
+    session.nostrClient
+      ?.getPublicKey?.()
+      .then((npub) => setOwnerTag(npub))
+      .catch(() => {});
   }
 
   switchLoginTab(tab) {
@@ -785,7 +814,6 @@ class AuthManager {
   }
 }
 
-window.AuthManager = AuthManager;
 
 /**
  * Lightning Addresses are case-insensitive; the server stores them lowercase.
@@ -808,5 +836,3 @@ function validateLightningAddress(address) {
   return null;
 }
 
-window.normalizeLightningAddress = normalizeLightningAddress;
-window.validateLightningAddress = validateLightningAddress;

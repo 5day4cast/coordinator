@@ -43,7 +43,10 @@ hex.workspace = true
 
 # Utilities
 thiserror.workspace = true
-uuid.workspace = true
+# `js`: UUIDv7 entry ids take their time from the browser's clock.
+uuid = { workspace = true, features = ["js"] }
+# The ticket invoice's QR code, drawn from the invoice the wallet checked.
+qrcodegen = "1.8"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 nostr-browser-signer = "0.44.2"

@@ -1,606 +1,267 @@
-use better_minify_js::{minify, Session, TopLevelMode};
+//! Bundles the browser assets that live beside the templates.
+//!
+//! Every `.js` and `.css` file under `src/templates` belongs to the component
+//! beside it. This script minifies them (oxc for scripts, lightningcss for
+//! styles), concatenates them into `OUT_DIR` and writes `assets.rs`, which
+//! embeds each file with `include_bytes!` under a URL containing a hash of
+//! its content. Nothing is written to the source tree; only the separately
+//! built WASM package is still served from disk.
+
+use std::{
+    env,
+    error::Error,
+    fmt::Write as _,
+    fs, io,
+    path::{Path, PathBuf},
+};
+
+use lightningcss::stylesheet::{MinifyOptions, ParserOptions, PrinterOptions, StyleSheet};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::env;
-use std::fs;
-use std::path::Path;
-use walkdir::WalkDir;
 
-fn main() {
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let templates_dir = Path::new(&manifest_dir).join("src/templates");
-    let output_dir = Path::new(&manifest_dir).join("../../crates/public_ui");
+/// Directories whose scripts make up the public site's bundle, in load order.
+const PUBLIC_DIRS: &[&str] = &["shared", "components", "fragments", "pages", "layouts"];
+/// The public bundle's entry point; it runs after every other script.
+const PUBLIC_ENTRY: &str = "base.js";
+/// Directories whose scripts make up the operator dashboard's bundle.
+const ADMIN_DIRS: &[&str] = &["admin"];
 
-    if !templates_dir.exists() {
-        println!("cargo:warning=Templates directory not found, skipping JS bundling");
-        return;
-    }
-
-    // In debug mode, clean up old hashed bundles to avoid duplicates
-    if !is_release_build() {
-        clean_old_bundles(&output_dir);
-    }
-
-    // Rerun if any JS or CSS file in templates changes
-    println!("cargo:rerun-if-changed={}", templates_dir.display());
-    for entry in WalkDir::new(&templates_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "js" || ext == "css")
-        })
-    {
-        println!("cargo:rerun-if-changed={}", entry.path().display());
-    }
-
-    // Build public app bundle: shared + components + pages + layouts/base.js
-    let public_dirs = vec!["shared", "components", "pages", "layouts"];
-    // Build admin bundle: shared + admin
-    let admin_dirs = vec!["shared", "admin"];
-
-    // Copy static files (loader.js, styles.css, bolt11.min.js, etc.) FIRST
-    // so they're available for bundling
-    copy_static_files(&templates_dir, &output_dir);
-
-    let mut manifest = HashMap::new();
-
-    match build_bundle(
-        &templates_dir,
-        &output_dir,
-        "app",
-        &public_dirs,
-        Some("base.js"),
-    ) {
-        Ok((hash, has_content)) => {
-            if has_content {
-                manifest.insert("app".to_string(), hash);
-            }
-        }
-        Err(e) => println!("cargo:warning=Failed to build app bundle: {}", e),
-    }
-
-    match build_bundle(&templates_dir, &output_dir, "admin", &admin_dirs, None) {
-        Ok((hash, has_content)) => {
-            if has_content {
-                manifest.insert("admin".to_string(), hash);
-            }
-        }
-        Err(e) => println!("cargo:warning=Failed to build admin bundle: {}", e),
-    }
-
-    // Bundle CSS from templates + base styles
-    match build_css_bundle(&templates_dir, &output_dir, &public_dirs) {
-        Ok(Some(hash)) => {
-            manifest.insert("styles".to_string(), hash);
-        }
-        Ok(None) => {}
-        Err(e) => println!("cargo:warning=Failed to build CSS bundle: {}", e),
-    }
-
-    if !manifest.is_empty() {
-        let manifest_path = output_dir.join("asset-manifest.json");
-        let manifest_json = serde_json_minimal(&manifest);
-        let _ = fs::write(&manifest_path, manifest_json);
-    }
+struct Asset {
+    /// Rust constant naming the asset in `assets.rs`.
+    constant: &'static str,
+    /// File stem of the public URL, before the hash.
+    stem: &'static str,
+    extension: &'static str,
+    content_type: &'static str,
+    bytes: Vec<u8>,
 }
 
-fn copy_static_files(templates_dir: &Path, output_dir: &Path) {
-    let static_dir = templates_dir.join("static");
-    if !static_dir.exists() {
-        return;
+fn main() -> Result<(), Box<dyn Error>> {
+    println!("cargo::rerun-if-changed=build.rs");
+    let manifest = env::var_os("CARGO_MANIFEST_DIR").ok_or("CARGO_MANIFEST_DIR is missing")?;
+    let output = env::var_os("OUT_DIR").ok_or("OUT_DIR is missing")?;
+    let templates = Path::new(&manifest).join("src/templates");
+    let output = Path::new(&output);
+
+    let mut files = Vec::new();
+    collect(&templates, &mut files)?;
+    files.sort();
+    // Directories too, so added or removed files trigger a rebuild.
+    println!("cargo::rerun-if-changed={}", templates.display());
+    for file in &files {
+        println!("cargo::rerun-if-changed={}", file.display());
     }
 
-    for entry in WalkDir::new(&static_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_file())
-    {
-        let src_path = entry.path();
-        let relative_path = src_path.strip_prefix(&static_dir).unwrap();
-        let dest_path = output_dir.join(relative_path);
+    // htmx, vendored once for the workspace as published (see its README).
+    let htmx = Path::new(&manifest).join("../../vendor/htmx/4.0.0/htmx.min.js");
+    println!("cargo::rerun-if-changed={}", htmx.display());
+    // Bulma, vendored the same way; served from this site rather than a CDN.
+    let bulma = Path::new(&manifest).join("../../vendor/bulma/1.0.2/bulma.min.css");
+    println!("cargo::rerun-if-changed={}", bulma.display());
 
-        // Create parent directories if needed
-        if let Some(parent) = dest_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
+    let static_dir = templates.join("static");
+    let assets = [
+        Asset {
+            constant: "APP_JS",
+            stem: "app",
+            extension: "js",
+            content_type: "text/javascript; charset=utf-8",
+            bytes: private_scope(bundle_scripts(&public_scripts(&templates, &files)?, "app")?),
+        },
+        Asset {
+            constant: "ADMIN_JS",
+            stem: "admin",
+            extension: "js",
+            content_type: "text/javascript; charset=utf-8",
+            bytes: bundle_scripts(&scripts_in(&templates, ADMIN_DIRS, &files), "admin")?,
+        },
+        Asset {
+            constant: "BULMA_CSS",
+            stem: "bulma",
+            extension: "css",
+            content_type: "text/css; charset=utf-8",
+            bytes: fs::read(&bulma)?,
+        },
+        Asset {
+            constant: "STYLES_CSS",
+            stem: "styles",
+            extension: "css",
+            content_type: "text/css; charset=utf-8",
+            bytes: stylesheet(&static_dir.join("styles.css"), &files)?,
+        },
+        // Loaded before first paint, so it stays a file of its own.
+        Asset {
+            constant: "THEME_JS",
+            stem: "theme",
+            extension: "js",
+            content_type: "text/javascript; charset=utf-8",
+            bytes: bundle_scripts(&[static_dir.join("theme-init.js")], "theme")?,
+        },
+        Asset {
+            constant: "HTMX_JS",
+            stem: "htmx",
+            extension: "js",
+            content_type: "text/javascript; charset=utf-8",
+            bytes: fs::read(&htmx)?,
+        },
+        Asset {
+            constant: "USA_MAP_SVG",
+            stem: "usa-map",
+            extension: "svg",
+            content_type: "image/svg+xml",
+            bytes: fs::read(static_dir.join("usa-map.svg"))?,
+        },
+    ];
 
-        if let Err(e) = fs::copy(src_path, &dest_path) {
-            println!("cargo:warning=Failed to copy {:?}: {}", src_path, e);
-        } else {
-            println!("cargo:warning=Copied static file: {:?}", relative_path);
-        }
+    let mut generated =
+        String::from("// Generated by build.rs; edit the files under src/templates instead.\n");
+    for asset in &assets {
+        let file = format!("{}.{}", asset.stem, asset.extension);
+        fs::write(output.join(&file), &asset.bytes)?;
+        let digest = hex::encode(Sha256::digest(&asset.bytes));
+        let url = format!(
+            "/assets/{}.{}.{}",
+            asset.stem,
+            &digest[..16],
+            asset.extension
+        );
+        writeln!(
+            generated,
+            "pub const {constant}: Asset = Asset {{ url: {url:?}, content_type: {content_type:?}, \
+             bytes: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{file}\")) }};",
+            constant = asset.constant,
+            content_type = asset.content_type,
+        )?;
     }
+    let constants: Vec<_> = assets.iter().map(|asset| asset.constant).collect();
+    writeln!(
+        generated,
+        "pub const ALL: &[Asset] = &[{}];",
+        constants.join(", ")
+    )?;
+    fs::write(output.join("assets.rs"), generated)?;
+    Ok(())
 }
 
-fn build_css_bundle(
-    templates_dir: &Path,
-    output_dir: &Path,
-    source_dirs: &[&str],
-) -> Result<Option<String>, String> {
-    let mut combined_css = String::new();
-
-    // Start with base styles.css if it exists
-    let base_styles = output_dir.join("styles.css");
-    if base_styles.exists() {
-        let content = fs::read_to_string(&base_styles)
-            .map_err(|e| format!("Failed to read base styles: {}", e))?;
-        combined_css.push_str(&content);
-        combined_css.push('\n');
-    }
-
-    // Collect CSS from template directories
-    for source_dir in source_dirs {
-        let dir_path = templates_dir.join(source_dir);
-        if !dir_path.exists() {
-            continue;
-        }
-
-        let mut css_files: Vec<_> = WalkDir::new(&dir_path)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "css"))
-            .map(|e| e.path().to_path_buf())
-            .collect();
-
-        css_files.sort();
-
-        for css_file in css_files {
-            let content = fs::read_to_string(&css_file)
-                .map_err(|e| format!("Failed to read {:?}: {}", css_file, e))?;
-
-            if content.trim().is_empty() {
-                continue;
-            }
-
-            let relative_path = css_file
-                .strip_prefix(templates_dir)
-                .unwrap_or(&css_file)
-                .display()
-                .to_string();
-
-            combined_css.push_str(&format!("\n/* === {} === */\n", relative_path));
-            combined_css.push_str(&content);
-            combined_css.push('\n');
-        }
-    }
-
-    if combined_css.trim().is_empty() {
-        return Ok(None);
-    }
-
-    let minified = minify_css(&combined_css);
-    let hash = hash_content(&minified);
-    let short_hash = &hash[..8];
-
-    fs::write(
-        output_dir.join(format!("styles.{}.min.css", short_hash)),
-        &minified,
-    )
-    .map_err(|e| format!("Failed to write CSS bundle: {}", e))?;
-
-    fs::write(output_dir.join("styles.min.css"), &minified)
-        .map_err(|e| format!("Failed to write dev CSS: {}", e))?;
-
-    println!(
-        "cargo:warning=Built styles -> styles.{}.min.css ({} bytes)",
-        short_hash,
-        minified.len()
-    );
-
-    Ok(Some(short_hash.to_string()))
-}
-
-fn is_release_build() -> bool {
-    env::var("PROFILE").is_ok_and(|p| p == "release")
-}
-
-fn clean_old_bundles(output_dir: &Path) {
-    if !output_dir.exists() {
-        return;
-    }
-
-    // Remove old hashed bundle files (pattern: name.hash.min.js, name.hash.min.css)
-    for entry in fs::read_dir(output_dir).into_iter().flatten().flatten() {
+fn collect(directory: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
         let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-
-        let filename = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n,
-            None => continue,
-        };
-
-        // Check if file matches hashed bundle pattern (e.g., app.a1b2c3d4.min.js)
-        let parts: Vec<&str> = filename.split('.').collect();
-        if parts.len() >= 4 {
-            let is_hashed_bundle = (parts.len() == 4
-                && parts[2] == "min"
-                && (parts[3] == "js" || parts[3] == "css"))
-                || (parts.len() == 5 && parts[2] == "min" && parts[3] == "js" && parts[4] == "map");
-
-            // Verify second part looks like a hash (8 hex chars)
-            let looks_like_hash =
-                parts[1].len() == 8 && parts[1].chars().all(|c| c.is_ascii_hexdigit());
-
-            if is_hashed_bundle && looks_like_hash {
-                let _ = fs::remove_file(&path);
-            }
+        if entry.file_type()?.is_dir() {
+            collect(&path, files)?;
+        } else {
+            files.push(path);
         }
     }
+    Ok(())
 }
 
-fn build_bundle(
-    templates_dir: &Path,
-    output_dir: &Path,
-    bundle_name: &str,
-    source_dirs: &[&str],
-    layout_file: Option<&str>,
-) -> Result<(String, bool), String> {
-    let mut combined_source = String::new();
-    let mut source_map_entries = Vec::new();
-    let mut current_line = 1;
-    let mut has_any_content = false;
+fn has_extension(path: &Path, extension: &str) -> bool {
+    path.extension().is_some_and(|found| found == extension)
+}
 
-    for source_dir in source_dirs {
-        let dir_path = templates_dir.join(source_dir);
-        if !dir_path.exists() {
-            continue;
-        }
+/// Scripts under `dirs`, one directory after another, each sorted by path.
+fn scripts_in(templates: &Path, dirs: &[&str], files: &[PathBuf]) -> Vec<PathBuf> {
+    dirs.iter()
+        .flat_map(|dir| {
+            let root = templates.join(dir);
+            files
+                .iter()
+                .filter(move |file| file.starts_with(&root) && has_extension(file, "js"))
+                .cloned()
+        })
+        .collect()
+}
 
-        let mut js_files: Vec<_> = WalkDir::new(&dir_path)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "js"))
-            .map(|e| e.path().to_path_buf())
-            .collect();
+fn public_scripts(templates: &Path, files: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    let mut scripts = scripts_in(templates, PUBLIC_DIRS, files);
+    let entry = scripts
+        .iter()
+        .position(|file| file.file_name().is_some_and(|name| name == PUBLIC_ENTRY))
+        .ok_or_else(|| format!("the public bundle needs its entry point {PUBLIC_ENTRY}"))?;
+    let entry = scripts.remove(entry);
+    scripts.push(entry);
+    Ok(scripts)
+}
 
-        // Sort for deterministic order, but put layout file last
-        js_files.sort_by(|a, b| {
-            let a_is_layout = layout_file.is_some_and(|lf| a.file_name().is_some_and(|n| n == lf));
-            let b_is_layout = layout_file.is_some_and(|lf| b.file_name().is_some_and(|n| n == lf));
-            match (a_is_layout, b_is_layout) {
-                (true, false) => std::cmp::Ordering::Greater,
-                (false, true) => std::cmp::Ordering::Less,
-                _ => a.cmp(b),
-            }
-        });
-
-        for js_file in js_files {
-            let content = fs::read_to_string(&js_file)
-                .map_err(|e| format!("Failed to read {:?}: {}", js_file, e))?;
-
-            if content.trim().is_empty() {
-                continue;
-            }
-
-            has_any_content = true;
-
-            let relative_path = js_file
-                .strip_prefix(templates_dir)
-                .unwrap_or(&js_file)
-                .display()
-                .to_string();
-
-            let file_marker = format!("\n// === {} ===\n", relative_path);
-            let line_count = content.lines().count();
-
-            source_map_entries.push(SourceMapEntry {
-                source_file: relative_path,
-                start_line: current_line,
-                line_count,
-            });
-
-            combined_source.push_str(&file_marker);
-            current_line += file_marker.lines().count();
-            combined_source.push_str(&content);
-            combined_source.push('\n');
-            current_line += line_count + 1;
-        }
+/// Minify each script on its own and join them. Each is parsed as a classic
+/// script, so its top-level names are not renamed and the scripts can use
+/// each other's. A file the parser rejects fails the build.
+fn bundle_scripts(files: &[PathBuf], name: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut bundle = String::new();
+    for file in files {
+        let source = fs::read_to_string(file)?;
+        let code = minify_script(&source)
+            .map_err(|error| format!("{name}.js: {}: {error}", file.display()))?;
+        bundle.push_str(&code);
+        // Semicolons keep one script's last statement apart from the next.
+        bundle.push_str(";\n");
     }
+    Ok(bundle.into_bytes())
+}
 
-    if !has_any_content {
-        return Ok((String::new(), false));
-    }
+/// Runs a bundle inside one function, so that its scripts share their
+/// top-level names (the wallet session in shared/wasm.js above all) without
+/// putting them on `window`. Only what a script assigns to `window` is global.
+fn private_scope(bundle: Vec<u8>) -> Vec<u8> {
+    let mut wrapped = b"(()=>{\n".to_vec();
+    wrapped.extend(bundle);
+    wrapped.extend(b"})();\n");
+    wrapped
+}
 
-    let minified_str = match try_minify(&combined_source) {
-        Ok(s) => s,
-        Err(e) => {
-            println!(
-                "cargo:warning=Minification failed for {}, using unminified: {}",
-                bundle_name, e
-            );
-            combined_source.clone()
-        }
+/// The one place this script calls oxc, whose 0.x API changes between
+/// releases (the version is pinned in Cargo.toml).
+fn minify_script(source: &str) -> Result<String, String> {
+    use oxc::{
+        allocator::Allocator,
+        codegen::{Codegen, CodegenOptions},
+        minifier::{Minifier, MinifierOptions},
+        parser::Parser,
+        span::SourceType,
     };
 
-    let hash = hash_content(&minified_str);
-    let short_hash = &hash[..8];
-
-    let bundle_filename = format!("{}.{}.min.js", bundle_name, short_hash);
-    fs::write(output_dir.join(&bundle_filename), &minified_str)
-        .map_err(|e| format!("Failed to write bundle: {}", e))?;
-
-    if !is_release_build() {
-        let source_map = generate_source_map(&source_map_entries);
-        fs::write(
-            output_dir.join(format!("{}.{}.min.js.map", bundle_name, short_hash)),
-            source_map,
-        )
-        .map_err(|e| format!("Failed to write source map: {}", e))?;
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, SourceType::script()).parse();
+    if let Some(error) = parsed.diagnostics.errors().next() {
+        return Err(error.to_string());
     }
+    if parsed.fatal_error {
+        return Err("the parser gave up".into());
+    }
+    let mut program = parsed.program;
+    let minified = Minifier::new(MinifierOptions::default()).minify(&allocator, &mut program);
+    Ok(Codegen::new()
+        .with_options(CodegenOptions::minify())
+        .with_scoping(minified.scoping)
+        .build(&program)
+        .code)
+}
 
-    fs::write(
-        output_dir.join(format!("{}.min.js", bundle_name)),
-        &minified_str,
+/// Global styles first, then every component's styles, minified as one sheet.
+fn stylesheet(base: &Path, files: &[PathBuf]) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut css = fs::read_to_string(base)?;
+    for file in files {
+        if has_extension(file, "css") && file != base {
+            css.push('\n');
+            css.push_str(&fs::read_to_string(file)?);
+        }
+    }
+    let mut sheet = StyleSheet::parse(
+        &css,
+        ParserOptions {
+            filename: "src/templates (combined CSS)".into(),
+            ..ParserOptions::default()
+        },
     )
-    .map_err(|e| format!("Failed to write dev bundle: {}", e))?;
-
-    if !is_release_build() {
-        fs::write(
-            output_dir.join(format!("{}.debug.js", bundle_name)),
-            &combined_source,
-        )
-        .map_err(|e| format!("Failed to write debug bundle: {}", e))?;
-    }
-
-    println!(
-        "cargo:warning=Built {} -> {} ({} bytes)",
-        bundle_name,
-        bundle_filename,
-        minified_str.len()
-    );
-
-    Ok((short_hash.to_string(), true))
-}
-
-struct SourceMapEntry {
-    source_file: String,
-    start_line: usize,
-    line_count: usize,
-}
-
-fn generate_source_map(entries: &[SourceMapEntry]) -> String {
-    let mut map = String::from("// Source Map - File Locations\n");
-    for entry in entries {
-        map.push_str(&format!(
-            "// Lines {}-{}: {}\n",
-            entry.start_line,
-            entry.start_line + entry.line_count - 1,
-            entry.source_file
-        ));
-    }
-    map
-}
-
-fn try_minify(source: &str) -> Result<String, String> {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
-
-    // In debug builds, skip minification for faster builds
-    if !is_release_build() {
-        return Ok(simple_minify(source));
-    }
-
-    let source_owned = source.to_string();
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let session = Session::new();
-        let mut minified = Vec::new();
-        match minify(
-            &session,
-            TopLevelMode::Global,
-            source_owned.as_bytes(),
-            &mut minified,
-        ) {
-            Ok(_) => String::from_utf8(minified).map_err(|e| format!("UTF-8: {}", e)),
-            Err(e) => Err(format!("{:?}", e)),
-        }
-    }));
-
-    match result {
-        Ok(Ok(s)) => Ok(s),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err("minifier panicked".to_string()),
-    }
-}
-
-/// Simple minification: remove comments and excess whitespace
-/// Used as fallback when full minification fails or in debug builds
-fn simple_minify(source: &str) -> String {
-    let mut result = String::with_capacity(source.len());
-    let mut chars = source.chars().peekable();
-    let mut in_string = None; // None, Some('"'), or Some('\'')
-    let mut in_template = false;
-    let mut in_single_comment = false;
-    let mut in_multi_comment = false;
-    let mut last_was_space = false;
-    let mut in_regex = false;
-    let mut last_token_char: Option<char> = None;
-
-    while let Some(c) = chars.next() {
-        // Handle single-line comments
-        if in_single_comment {
-            if c == '\n' {
-                in_single_comment = false;
-                if !last_was_space && !result.is_empty() {
-                    result.push(' ');
-                    last_was_space = true;
-                }
-            }
-            continue;
-        }
-
-        // Handle multi-line comments
-        if in_multi_comment {
-            if c == '*' && chars.peek() == Some(&'/') {
-                chars.next();
-                in_multi_comment = false;
-            }
-            continue;
-        }
-
-        // Handle strings
-        if let Some(quote) = in_string {
-            result.push(c);
-            if c == quote {
-                in_string = None;
-            } else if c == '\\' {
-                if let Some(&next) = chars.peek() {
-                    result.push(next);
-                    chars.next();
-                }
-            }
-            continue;
-        }
-
-        // Handle template literals
-        if in_template {
-            result.push(c);
-            if c == '`' {
-                in_template = false;
-            } else if c == '\\' {
-                if let Some(&next) = chars.peek() {
-                    result.push(next);
-                    chars.next();
-                }
-            }
-            continue;
-        }
-
-        // Handle regex literals (simplified detection)
-        if in_regex {
-            result.push(c);
-            if c == '/' {
-                in_regex = false;
-            } else if c == '\\' {
-                if let Some(&next) = chars.peek() {
-                    result.push(next);
-                    chars.next();
-                }
-            }
-            continue;
-        }
-
-        // Check for comment start
-        if c == '/' {
-            if chars.peek() == Some(&'/') {
-                chars.next();
-                in_single_comment = true;
-                continue;
-            } else if chars.peek() == Some(&'*') {
-                chars.next();
-                in_multi_comment = true;
-                continue;
-            } else if last_token_char.is_none_or(|tc| {
-                matches!(
-                    tc,
-                    '=' | '(' | ',' | '[' | '!' | '&' | '|' | ':' | ';' | '{' | '}' | '\n'
-                )
-            }) {
-                // Likely a regex
-                in_regex = true;
-                result.push(c);
-                last_was_space = false;
-                last_token_char = Some(c);
-                continue;
-            }
-        }
-
-        // Check for string/template start
-        if c == '"' || c == '\'' {
-            in_string = Some(c);
-            result.push(c);
-            last_was_space = false;
-            last_token_char = Some(c);
-            continue;
-        }
-        if c == '`' {
-            in_template = true;
-            result.push(c);
-            last_was_space = false;
-            last_token_char = Some(c);
-            continue;
-        }
-
-        // Handle whitespace
-        if c.is_whitespace() {
-            if !last_was_space && !result.is_empty() {
-                // Keep one space between tokens that need it
-                let last_char = result.chars().last();
-                if last_char.is_some_and(|lc| lc.is_alphanumeric() || lc == '_' || lc == '$') {
-                    result.push(' ');
-                    last_was_space = true;
-                }
-            }
-            continue;
-        }
-
-        // Regular character
-        result.push(c);
-        last_was_space = false;
-        if !c.is_whitespace() {
-            last_token_char = Some(c);
-        }
-    }
-
-    result
-}
-
-fn hash_content(content: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-fn minify_css(css: &str) -> String {
-    let mut result = String::with_capacity(css.len());
-    let mut in_comment = false;
-    let mut chars = css.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if in_comment {
-            if c == '*' && chars.peek() == Some(&'/') {
-                chars.next();
-                in_comment = false;
-            }
-            continue;
-        }
-
-        if c == '/' && chars.peek() == Some(&'*') {
-            chars.next();
-            in_comment = true;
-            continue;
-        }
-
-        if c.is_whitespace() {
-            if !result.ends_with(|ch: char| {
-                ch.is_whitespace() || ch == '{' || ch == ':' || ch == ';' || ch == ','
-            }) {
-                if let Some(&next) = chars.peek() {
-                    if !matches!(next, '{' | '}' | ':' | ';' | ',') {
-                        result.push(' ');
-                    }
-                }
-            }
-            continue;
-        }
-
-        result.push(c);
-    }
-
-    result
-}
-
-fn serde_json_minimal(map: &HashMap<String, String>) -> String {
-    let mut json = String::from("{");
-    let entries: Vec<_> = map.iter().collect();
-    for (i, (key, value)) in entries.iter().enumerate() {
-        json.push_str(&format!("\"{}\":\"{}\"", key, value));
-        if i < entries.len() - 1 {
-            json.push(',');
-        }
-    }
-    json.push('}');
-    json
+    .map_err(|error| io::Error::other(format!("parse CSS: {error}")))?;
+    sheet
+        .minify(MinifyOptions::default())
+        .map_err(|error| io::Error::other(format!("minify CSS: {error}")))?;
+    let printed = sheet
+        .to_css(PrinterOptions {
+            minify: true,
+            ..PrinterOptions::default()
+        })
+        .map_err(|error| io::Error::other(format!("print CSS: {error}")))?;
+    Ok(printed.code.into_bytes())
 }

@@ -44,4 +44,3 @@ class AuthorizedClient {
     }
 }
 
-window.AuthorizedClient = AuthorizedClient;

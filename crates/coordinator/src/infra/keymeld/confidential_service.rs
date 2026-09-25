@@ -583,11 +583,7 @@ impl Keymeld for KeymeldService {
             enclave_id: enclave.as_u32(),
             enclave_key_epoch: pinned.key_epoch(),
             enclave_public_key: hex::encode(pinned.public_key()),
-            gateway_url: self
-                .settings
-                .public_gateway_url
-                .clone()
-                .unwrap_or_else(|| self.settings.gateway_url.clone()),
+            gateway_url: self.settings.browser_gateway_url().to_owned(),
             trusted_pcrs: self.settings.trusted_pcrs.clone(),
             dangerous_trust_unattested_enclaves: self.settings.dangerous_trust_unattested_enclaves,
             payout_policy: None,

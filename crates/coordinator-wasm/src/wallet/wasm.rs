@@ -106,6 +106,28 @@ impl DlcWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    /// Throws unless `invoice` pays exactly `amount_sats` on this wallet's
+    /// network and has not expired.
+    #[wasm_bindgen(js_name = "validateInvoice")]
+    pub fn validate_invoice(&self, invoice: &str, amount_sats: f64) -> Result<(), JsValue> {
+        Ok(self
+            .inner
+            .validate_invoice(invoice, parse_sats(amount_sats)?)?)
+    }
+
+    /// The invoice's QR code as a `data:image/svg+xml` URL for an `<img>`,
+    /// after the same checks as `validateInvoice`.
+    #[wasm_bindgen(js_name = "invoiceQr")]
+    pub fn invoice_qr(&self, invoice: &str, amount_sats: f64) -> Result<String, JsValue> {
+        Ok(self.inner.invoice_qr(invoice, parse_sats(amount_sats)?)?)
+    }
+
+    /// A new entry id: a UUIDv7, so entries sort by when they were made.
+    #[wasm_bindgen(js_name = "newEntryId")]
+    pub fn new_entry_id() -> String {
+        Uuid::now_v7().to_string()
+    }
+
     /// `{ ephemeral_private_key, payout_preimage }` for an entry this wallet created.
     #[wasm_bindgen(js_name = "payoutRelease")]
     pub fn payout_release(
@@ -189,6 +211,19 @@ impl DlcWallet {
 
 fn parse_network(network: &str) -> Result<Network, WalletError> {
     Network::from_str(network).map_err(|_| WalletError::Network(network.to_owned()))
+}
+
+/// A whole, positive number of sats that JavaScript can represent exactly.
+fn parse_sats(amount_sats: f64) -> Result<u64, WalletError> {
+    if amount_sats.is_finite()
+        && amount_sats > 0.0
+        && amount_sats.fract() == 0.0
+        && amount_sats <= 9_007_199_254_740_991.0
+    {
+        Ok(amount_sats as u64)
+    } else {
+        Err(WalletError::Invoice("invalid amount".into()))
+    }
 }
 
 fn parse_entry_id(entry_id: &str) -> Result<Uuid, WalletError> {

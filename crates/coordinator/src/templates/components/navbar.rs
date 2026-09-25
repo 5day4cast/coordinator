@@ -1,29 +1,41 @@
 use maud::{html, Markup};
 
+/// The checkbox that opens the phone menu, in CSS alone (see base.css).
+/// `out_of_band` renders it for a navigation's response, which swaps it in
+/// unchecked, so the menu closes once the next page is in.
+pub fn menu_toggle(out_of_band: bool) -> Markup {
+    html! {
+        input type="checkbox" id="navToggle" class="nav-toggle is-sr-only"
+              aria-label="Menu" aria-controls="navMenu"
+              hx-swap-oob=[out_of_band.then_some("true")];
+    }
+}
+
 /// Public UI navigation bar with integrated branding
 ///
-/// Uses HTMX for navigation with `data-requires-auth` for protected routes.
-/// The crypto_bridge.js intercepts these requests to add auth headers.
-/// Updated for Bulma v1 - uses 4 spans in burger for proper animation.
+/// Links load pages with htmx; `htmx_auth.js` signs requests for account
+/// pages. Bulma v1's burger needs its four spans.
 pub fn navbar() -> Markup {
     html! {
         nav class="navbar is-light" role="navigation" aria-label="main navigation" {
+            (menu_toggle(false))
+            // Tapping outside the open menu closes it.
+            label for="navToggle" class="nav-backdrop" aria-hidden="true" {}
             div class="container" {
                 // Navbar Brand (logo + hamburger for mobile)
                 div class="navbar-brand" {
-                    div class="navbar-item" style="flex-direction: column; align-items: flex-start;" {
+                    div class="navbar-item navbar-brand-text" {
                         a href="/" {
                             strong class="is-size-5" { "Fantasy Weather" }
                         }
                         span class="is-size-7 has-text-grey" {
                             "Powered by "
-                            a href="https://www.4casttruth.win/" target="_blank" style="text-decoration: underline;" { "4cast Truth Oracle" }
+                            a href="https://www.4casttruth.win/" target="_blank" rel="noopener" class="is-underlined" { "4cast Truth Oracle" }
                         }
                     }
 
-                    a role="button" class="navbar-burger" aria-label="menu"
-                      aria-expanded="false" data-target="navMenu" {
-                        // Bulma v1 requires 4 spans for the animated burger
+                    label for="navToggle" class="navbar-burger" aria-hidden="true" {
+                        // Bulma v1 requires 4 spans for the burger
                         span aria-hidden="true" {}
                         span aria-hidden="true" {}
                         span aria-hidden="true" {}
@@ -49,8 +61,7 @@ pub fn navbar() -> Markup {
                           id="allEntriesNavClick"
                           hx-get="/entries"
                           hx-target="#main-content"
-                          hx-push-url="true"
-                          data-requires-auth="true" {
+                          hx-push-url="true" {
                             "Entries"
                         }
 
@@ -59,8 +70,7 @@ pub fn navbar() -> Markup {
                           id="payoutsNavClick"
                           hx-get="/payouts"
                           hx-target="#main-content"
-                          hx-push-url="true"
-                          data-requires-auth="true" {
+                          hx-push-url="true" {
                             "Payouts"
                         }
                     }
@@ -93,10 +103,12 @@ pub fn navbar() -> Markup {
                         // Auth buttons (shown when logged out)
                         div class="navbar-item" id="authButtons" {
                             div class="buttons" {
-                                a class="button is-primary" id="loginNavClick" {
+                                button type="button" class="button is-primary" id="loginNavClick"
+                                       data-open-modal="loginModal" {
                                     "Log in"
                                 }
-                                a class="button is-light" id="registerNavClick" {
+                                button type="button" class="button is-light" id="registerNavClick"
+                                       data-open-modal="registerModal" {
                                     "Sign up"
                                 }
                             }
@@ -105,8 +117,8 @@ pub fn navbar() -> Markup {
                         // Logout button (shown when logged in, hidden by default)
                         div class="navbar-item is-hidden" id="logoutContainer" {
                             div class="buttons" {
-                                a href="#" class="button is-light" id="logoutNavClick" {
-                                    "Logout"
+                                button type="button" class="button is-light" id="logoutNavClick" {
+                                    "Log out"
                                 }
                             }
                         }
@@ -120,8 +132,7 @@ pub fn navbar() -> Markup {
 /// GitHub icon (Octicons)
 fn github_icon() -> Markup {
     html! {
-        svg height="24" width="24" viewBox="0 0 16 16" version="1.1" aria-hidden="true"
-            style="fill: currentColor; vertical-align: middle;" {
+        svg class="github-icon" height="24" width="24" viewBox="0 0 16 16" version="1.1" aria-hidden="true" {
             path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z" {}
         }
     }

@@ -720,11 +720,12 @@ document.addEventListener("DOMContentLoaded", function () {
   initMapZoom();
 });
 
-// Re-initialize after HTMX swaps
-document.addEventListener("htmx:afterSwap", function (e) {
+// Re-initialize after htmx swaps the dashboard in
+document.addEventListener("htmx:after:swap", function (e) {
+  const target = e.detail.ctx.target;
   if (
-    e.target.querySelector(".location-map-container") ||
-    e.target.querySelector(".location-table-container")
+    target?.querySelector(".location-map-container") ||
+    target?.querySelector(".location-table-container")
   ) {
     const savedView = localStorage.getItem("locationView") || "map";
     switchLocationView(savedView);

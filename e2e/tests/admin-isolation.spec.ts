@@ -21,7 +21,7 @@ test("operator browser session authenticates and enforces CSRF", async ({ page, 
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page).toHaveURL(`${adminURL}/admin`);
   await page.goto(`${adminURL}/admin/wallet`);
-  const csrfHeaders = await page.locator("body").getAttribute("hx-headers");
+  const csrfHeaders = await page.locator("body").getAttribute("hx-headers:inherited");
   expect(csrfHeaders).not.toBeNull();
 
   // Browser fetch supplies the real cookie. The invalid ID prevents any mutation.

@@ -9,9 +9,8 @@ async function registerWithUsername(
   username: string,
   password: string,
 ): Promise<void> {
-  await page.waitForFunction(() => window.wasmInitialized === true, {
-    timeout: 15000,
-  });
+  // The wallet loads on demand (normally when a log-in dialog opens).
+  await page.evaluate(() => window.initWasm());
 
   await page.locator("#registerNavClick").click();
   await expect(page.locator("#registerModal")).toHaveClass(/is-active/);
@@ -46,7 +45,7 @@ test.describe("Basic UI", () => {
       "Fantasy Weather",
     );
 
-    await expect(page.locator("#competitionsDataTable")).toBeVisible();
+    await expect(page.locator("#competitions-page")).toBeVisible();
   });
 
   test("navigation links are present", async ({ page }) => {
@@ -140,11 +139,12 @@ test.describe("Competitions", () => {
   });
 
   test("competitions table shows headers", async ({ page }) => {
-    const headers = page.locator("#competitionsDataTable thead th");
+    const headers = page.locator("#competitions-page .competition-header").first().locator("span");
     await expect(headers.nth(0)).toContainText("Status");
-    await expect(headers.nth(1)).toContainText("Start");
-    await expect(headers.nth(4)).toContainText("Fee");
-    await expect(headers.nth(5)).toContainText("Pool");
+    await expect(headers.nth(1)).toContainText("Window");
+    await expect(headers.nth(2)).toContainText("Entry");
+    await expect(headers.nth(3)).toContainText("Pot");
+    await expect(headers.nth(5)).toContainText("Paid places");
   });
 
   test("can navigate to entries page", async ({ page }) => {
@@ -175,15 +175,12 @@ test.describe("Entry Form", () => {
   test("entry container shows when clicking enter on a competition", async ({
     page,
   }) => {
-    await page.waitForSelector("#competitionsDataTable tbody tr", {
+    await page.waitForSelector("#competitions-page a.competition-row", {
       timeout: 10000,
     });
 
     const enterButton = page
-      .locator("#competitionsDataTable tbody tr")
-      .filter({ hasText: "Registration" })
-      .locator("button, a")
-      .filter({ hasText: /Enter|Create Entry/ })
+      .locator("#competitions-page a.competition-row[href$='/entry-form']")
       .first();
 
     const canEnter = (await enterButton.count()) > 0;
@@ -197,7 +194,7 @@ test.describe("Entry Form", () => {
 
       await expect(page.locator("#submitEntry")).toBeVisible();
 
-      await expect(page.locator("#backToCompetitions")).toBeVisible();
+      await expect(page.locator("#entryContainer .back-link")).toBeVisible();
     } else {
       console.log("No competitions in Registration status available for entry");
       test.skip();
@@ -205,15 +202,12 @@ test.describe("Entry Form", () => {
   });
 
   test("can go back from entry form", async ({ page }) => {
-    await page.waitForSelector("#competitionsDataTable tbody tr", {
+    await page.waitForSelector("#competitions-page a.competition-row", {
       timeout: 10000,
     });
 
     const enterButton = page
-      .locator("#competitionsDataTable tbody tr")
-      .filter({ hasText: "Registration" })
-      .locator("button, a")
-      .filter({ hasText: /Enter|Create Entry/ })
+      .locator("#competitions-page a.competition-row[href$='/entry-form']")
       .first();
 
     const canEnter = (await enterButton.count()) > 0;
@@ -226,10 +220,10 @@ test.describe("Entry Form", () => {
 
       await Promise.all([
         page.waitForResponse((resp) => resp.url().includes("/competitions")),
-        page.locator("#backToCompetitions").click(),
+        page.locator("#entryContainer .back-link").click(),
       ]);
 
-      await expect(page.locator("#allCompetitions")).toBeVisible();
+      await expect(page.locator("#competitions-page")).toBeVisible();
       await expect(page.locator("#entryContainer")).not.toBeVisible();
     } else {
       console.log("No competitions in Registration status available for entry");
@@ -238,15 +232,12 @@ test.describe("Entry Form", () => {
   });
 
   test("entry form shows weather prediction options", async ({ page }) => {
-    await page.waitForSelector("#competitionsDataTable tbody tr", {
+    await page.waitForSelector("#competitions-page a.competition-row", {
       timeout: 10000,
     });
 
     const enterButton = page
-      .locator("#competitionsDataTable tbody tr")
-      .filter({ hasText: "Registration" })
-      .locator("button, a")
-      .filter({ hasText: /Enter|Create Entry/ })
+      .locator("#competitions-page a.competition-row[href$='/entry-form']")
       .first();
 
     const canEnter = (await enterButton.count()) > 0;
@@ -257,11 +248,11 @@ test.describe("Entry Form", () => {
         timeout: 5000,
       });
 
-      await page.waitForSelector("#entryContent button.pick-button", {
+      await page.waitForSelector("#entryForm .pick-option", {
         timeout: 10000,
       });
 
-      const buttons = page.locator("#entryContent button.pick-button");
+      const buttons = page.locator("#entryForm .pick-option");
       const buttonCount = await buttons.count();
 
       if (buttonCount > 0) {
@@ -279,15 +270,12 @@ test.describe("Entry Form", () => {
   });
 
   test("can select predictions before submitting", async ({ page }) => {
-    await page.waitForSelector("#competitionsDataTable tbody tr", {
+    await page.waitForSelector("#competitions-page a.competition-row", {
       timeout: 10000,
     });
 
     const enterButton = page
-      .locator("#competitionsDataTable tbody tr")
-      .filter({ hasText: "Registration" })
-      .locator("button, a")
-      .filter({ hasText: /Enter|Create Entry/ })
+      .locator("#competitions-page a.competition-row[href$='/entry-form']")
       .first();
 
     const canEnter = (await enterButton.count()) > 0;
@@ -298,20 +286,26 @@ test.describe("Entry Form", () => {
         timeout: 5000,
       });
 
-      await page.waitForSelector("#entryContent button.pick-button", {
+      await page.waitForSelector("#entryForm .pick-option", {
         timeout: 10000,
       });
 
-      const firstPickButton = page
-        .locator("#entryContent button.pick-button")
-        .first();
-
-      await expect(firstPickButton).toHaveClass(/is-outlined/);
+      const row = page.locator("#entryForm .pick-options").first();
+      const firstPickButton = row.locator(".pick-option").first();
+      const input = firstPickButton.locator("input");
+      const noPickButton = row.locator(".pick-option.is-none");
+      const noPick = noPickButton.locator("input");
+      await expect(noPick).toBeChecked();
+      await expect(input).not.toBeChecked();
 
       await firstPickButton.click();
+      await expect(input).toBeChecked();
+      await expect(noPick).not.toBeChecked();
 
-      await expect(firstPickButton).not.toHaveClass(/is-outlined/);
-      await expect(firstPickButton).toHaveClass(/is-active/);
+      // "No pick" takes the pick back.
+      await noPickButton.click();
+      await expect(input).not.toBeChecked();
+      await expect(noPick).toBeChecked();
     } else {
       console.log("No competitions in Registration status available for entry");
       test.skip();

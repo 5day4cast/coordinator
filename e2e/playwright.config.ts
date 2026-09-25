@@ -44,10 +44,17 @@ export default defineConfig({
   },
 
   // Web server configuration
-  // In CI, start the pre-built coordinator binary with e2e config
+  // In CI, start the local weather fixture and pre-built coordinator with e2e config.
   // Locally, assume the server is already running (use `just run`)
   webServer: isCI
-    ? {
+    ? [
+      {
+        command: "node fixtures/weather-oracle.cjs",
+        url: "http://127.0.0.1:9992/stations",
+        reuseExistingServer: false,
+        timeout: 10_000,
+      },
+      {
         command:
           process.env.COORDINATOR_BIN ||
           "./target/release/coordinator --config ./config/e2e.toml",
@@ -57,6 +64,7 @@ export default defineConfig({
         timeout: 30_000, // 30 seconds - binary is pre-built, just needs to start
         stdout: "pipe",
         stderr: "pipe",
-      }
+      },
+    ]
     : undefined,
 });

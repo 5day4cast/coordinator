@@ -1,13 +1,6 @@
 const assert = require("node:assert/strict");
-const { readFileSync } = require("node:fs");
-const path = require("node:path");
 const test = require("node:test");
-const vm = require("node:vm");
-
-const source = readFileSync(
-  path.join(__dirname, "../../crates/coordinator/src/templates/components/modals/modals.js"),
-  "utf8",
-);
+const { loadBundle } = require("./bundle.cjs");
 
 for (const retried of [false, true]) {
   test(`username registration uses the stored wallet (${retried ? "retry" : "new account"})`, async () => {
@@ -23,7 +16,6 @@ for (const retried of [false, true]) {
       return { ok: true };
     };
     const window = {
-      nostrClient,
       AuthorizedClient: class {
         async post(url, body) {
           if (url.endsWith("/users/username/register")) return register(url, body);
@@ -38,7 +30,11 @@ for (const retried of [false, true]) {
           };
         }
       },
-      DlcWallet: {
+    };
+    const session = {
+      nostrClient,
+      dlcWallet: null,
+      wasm: { DlcWallet: {
         create: () => ({
           encryptedBackup: async () => ({ encrypted_bitcoin_private_key: candidateBackup }),
           free: () => { createdWalletFreed = true; },
@@ -49,23 +45,24 @@ for (const retried of [false, true]) {
           loadedBackup = backup;
           return restoredWallet;
         },
-      },
+      } },
     };
-    const context = vm.createContext({
+    const { AuthManager } = loadBundle(["components/modals/modals.js"], {
+      ...window,
       window,
+      session,
       console,
       document: { querySelector: () => null, getElementById: () => null },
       fetch: async (url, options) => register(url, JSON.parse(options.body)),
       setTimeout: () => {},
-    });
-    vm.runInContext(source, context);
-    const manager = new window.AuthManager("https://coordinator.example", "signet");
+    }, ["AuthManager"]);
+    const manager = new AuthManager("https://coordinator.example", "signet");
     manager.pendingRegistration = { username: "alice", authKey: "credential", sealedNsec: "sealed" };
 
     await manager.handleUsernameRegisterStep2();
 
     assert.equal(loadedBackup, persistedBackup);
-    assert.equal(window.dlcWallet, restoredWallet);
+    assert.equal(session.dlcWallet, restoredWallet);
     assert.equal(createdWalletFreed, true);
     assert.equal(manager.pendingRegistration, null);
   });
@@ -78,8 +75,7 @@ test("password reset signs the replacement credentials with the recovered key", 
   let sentBody;
   let credentialsFreed = false;
   const credentials = { authKey: "derived auth key", free: () => { credentialsFreed = true; } };
-  const window = {
-    nostrClient: {
+  const session = { dlcWallet: null, wasm: {}, nostrClient: {
       sealForLogin: (login) => {
         assert.equal(login, credentials);
         return "sealed nsec";
@@ -90,7 +86,8 @@ test("password reset signs the replacement credentials with the recovered key", 
         signedBody = body;
         return "Nostr signed-payload";
       },
-    },
+  } };
+  session.wasm = {
     LoginCredentials: {
       derive: (username, password) => {
         assert.equal(username, "alice");
@@ -99,11 +96,15 @@ test("password reset signs the replacement credentials with the recovered key", 
       },
     },
     NostrClientWrapper: class {},
+  };
+  const window = {
     closeModal: () => {},
     openModal: () => {},
   };
-  const context = vm.createContext({
+  const { AuthManager } = loadBundle(["shared/authorized_client.js", "components/modals/modals.js"], {
+    ...window,
     window,
+    session,
     console,
     document: {
       querySelector: () => null,
@@ -116,13 +117,8 @@ test("password reset signs the replacement credentials with the recovered key", 
       sentBody = options.body;
       return { ok: true };
     },
-  });
-  vm.runInContext(readFileSync(
-    path.join(__dirname, "../../crates/coordinator/src/templates/shared/authorized_client.js"),
-    "utf8",
-  ), context);
-  vm.runInContext(source, context);
-  const manager = new window.AuthManager("https://coordinator.example", "signet");
+  }, ["AuthManager"]);
+  const manager = new AuthManager("https://coordinator.example", "signet");
   manager.forgotUsername = "alice";
   manager.forgotChallenge = "challenge";
   manager.forgotSignedChallenge = "signed challenge";

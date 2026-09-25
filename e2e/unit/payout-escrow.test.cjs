@@ -1,16 +1,19 @@
 const assert = require("node:assert/strict");
-const { readFileSync } = require("node:fs");
-const path = require("node:path");
 const test = require("node:test");
-const vm = require("node:vm");
 const { webcrypto } = require("node:crypto");
+const { loadBundle } = require("./bundle.cjs");
 
-function load(name, window) {
-  vm.runInNewContext(readFileSync(path.join(__dirname,
-    `../../crates/coordinator/src/templates/pages/${name}/${name}.js`), "utf8"),
-  { window, crypto: webcrypto, TextEncoder, console,
-    lightningPayReq: { decode: () => ({ satoshis: 42, timeExpireDate: Date.now() / 1000 + 600 }) } });
-  return window;
+const SCRIPTS = {
+  entries: ["fragments/entry_form/entry_form.js", "Entry"],
+  payouts: ["pages/payouts/payouts.js", "Payouts"],
+};
+
+// The bundle shares the wallet session and its other scripts' names between
+// its scripts, inside one scope; a test hands them in with the page.
+function load(name, page) {
+  const session = { wasm: page, nostrClient: page.nostrClient ?? null, dlcWallet: page.dlcWallet ?? null };
+  const [file, exported] = SCRIPTS[name];
+  return loadBundle([file], { ...page, window: {}, session, crypto: webcrypto, TextEncoder, console }, [exported]);
 }
 
 for (const rejection of ["missing policy", "wrong ticket", "wrong session", "wallet rejects policy", null]) {
@@ -18,7 +21,7 @@ for (const rejection of ["missing policy", "wrong ticket", "wrong session", "wal
     let shown = 0;
     let ordinaryRegistrations = 0;
     let request;
-    const window = load("entries", {
+    const bundle = load("entries", {
       AuthorizedClient: class { async post(url, body) {
         request = body;
         return { ok: true, json: async () => ({ ticket_id: "ticket", payment_request: "ticket-invoice",
@@ -40,7 +43,7 @@ for (const rejection of ["missing policy", "wrong ticket", "wrong session", "wal
         },
       },
     });
-    const entry = new window.Entry("https://coordinator", "https://oracle", { id: "competition" });
+    const entry = new bundle.Entry("https://coordinator", "https://oracle", { id: "competition" });
     entry.entry = { id: "entry" };
     entry.payoutChoice = { entry_id: "entry", payout_hash: "own hash", lightning_address: "alice+prize@wallet.com",
       allow_invoice_fallback: true, release_entry_key_after_payment: true };
@@ -61,7 +64,7 @@ function payoutFixture(status = 200) {
   let releases = 0;
   let authorization;
   let posted;
-  const window = load("payouts", {
+  const bundle = load("payouts", {
     AuthorizedClient: class {
       async get() {
         if (status !== 200) throw Object.assign(new Error("request failed"), { response: { status } });
@@ -71,11 +74,16 @@ function payoutFixture(status = 200) {
       async post(url, body) { posted = { url, body }; return { ok: true }; }
     },
     dlcWallet: {
+      // The wallet decodes invoices; this fixture's invoices are always valid.
+      validateInvoice: (invoice, amount) => {
+        assert.equal(amount, 42);
+        if (!invoice) throw "Invalid invoice";
+      },
       payoutRelease: () => { releases++; return { ephemeral_private_key: "legacy key", payout_preimage: "legacy preimage" }; },
       authorizePayoutInvoice: (serialized) => { authorization = JSON.parse(serialized); return { context: authorization.context, signature: [1, 2] }; },
     },
   });
-  const payouts = new window.Payouts("https://coordinator", "https://oracle");
+  const payouts = new bundle.Payouts("https://coordinator", "https://oracle");
   const entry = { id: "entry", ephemeral_pubkey: "entry pubkey", ticket_id: "ticket" };
   const competition = { contract_parameters: {}, funding_outpoint: {}, signed_contract: { signatures: {} }, attestation: "attestation" };
   return { payouts, entry, competition, state: () => ({ releases, authorization, posted }) };

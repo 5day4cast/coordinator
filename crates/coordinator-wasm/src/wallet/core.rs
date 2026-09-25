@@ -265,6 +265,26 @@ impl DlcWalletCore {
             .map_err(|e| WalletError::Keymeld(e.to_string()))
     }
 
+    /// Check that `invoice` pays exactly `amount_sats` on this wallet's network
+    /// and has not expired, before anything is released or paid for it.
+    pub fn validate_invoice(&self, invoice: &str, amount_sats: u64) -> Result<(), WalletError> {
+        payout::validate_invoice(
+            invoice,
+            amount_sats,
+            self.network,
+            ::nostr::Timestamp::now().as_secs(),
+        )
+        .map(|_| ())
+        .map_err(|e| WalletError::Invoice(e.to_string()))
+    }
+
+    /// The QR code of `invoice` as a `data:` URL, drawn only once the invoice
+    /// passes [`Self::validate_invoice`]: what a phone scans is what was checked.
+    pub fn invoice_qr(&self, invoice: &str, amount_sats: u64) -> Result<String, WalletError> {
+        self.validate_invoice(invoice, amount_sats)?;
+        super::qr::lightning_invoice_data_url(invoice)
+    }
+
     /// Authorize one ordinary invoice; entry secrets remain inside WASM.
     /// Reconstruct and verify the completed contract and attested payout first.
     pub fn authorize_payout_invoice(
@@ -314,7 +334,7 @@ impl DlcWalletCore {
             ));
         }
         payout::validate_invoice(&consent.invoice, owed, self.network, now)
-            .map_err(|e| reject(e.to_string()))?;
+            .map_err(|e| WalletError::Invoice(e.to_string()))?;
         payout_protocol::SignedInvoiceAuthorization::sign(&key.secret_bytes(), consent.context)
             .map_err(|e| reject(e.to_string()))
     }

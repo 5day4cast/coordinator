@@ -12,7 +12,7 @@ default = []
 e2e-testing = []
 
 [package.metadata.cargo-machete]
-ignored = ["blake2", "coordinator-core", "h2", "hex", "better-minify-js", "openssl", "sha2", "walkdir"]
+ignored = ["blake2", "coordinator-core", "h2", "hex", "lightningcss", "openssl", "oxc"]
 
 [dependencies]
 coordinator-ark.workspace = true
@@ -23,7 +23,8 @@ coordinator-core = { workspace = true, features = ["keymeld"] }
 # Web
 axum.workspace = true
 axum-extra.workspace = true
-tower-http.workspace = true
+# Compresses the embedded assets and the WASM package for browsers that accept gzip.
+tower-http = { workspace = true, features = ["compression-gzip"] }
 tower_governor.workspace = true
 maud.workspace = true
 reqwest.workspace = true
@@ -93,6 +94,8 @@ config.workspace = true
 lightning-invoice.workspace = true
 
 # Misc
+# Hashes the WASM package, whose URLs carry it so browsers can cache them.
+sha2 = "0.10"
 mime.workspace = true
 openssl.workspace = true
 pem-rfc7468.workspace = true
@@ -113,8 +116,10 @@ tokio-test = "0.4"
 env_logger = "0.11.6"
 
 [build-dependencies]
-better-minify-js = "0.7"
-walkdir = "2.5"
+# Pinned: oxc's 0.x API changes between releases. Keep the same version as the
+# synth crate and the oracle so one minifier builds every site.
+oxc = { version = "=0.151.0", default-features = false, features = ["codegen", "minifier"] }
+lightningcss = { version = "=1.0.0-alpha.72", default-features = false }
 sha2 = "0.10"
 hex = "0.4"
 

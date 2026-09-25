@@ -9,14 +9,16 @@ use crate::{
         admin_send_bitcoin_handler, admin_settle_test_invoice_handler,
         admin_wallet_address_fragment, admin_wallet_balance_fragment, admin_wallet_fragment,
         admin_wallet_outputs_fragment, change_password, claim_ticket_payout, competitions_fragment,
-        competitions_rows_fragment, create_competition, entries_fragment, entry_detail_fragment,
-        entry_form_fragment, forgot_password_challenge, forgot_password_reset,
-        get_aggregate_nonces, get_balance, get_competition, get_competitions,
-        get_contract_parameters, get_entries, get_estimated_fee_rates, get_next_address,
-        get_outputs, get_ticket_refund, get_ticket_status, health, leaderboard_fragment,
-        leaderboard_rows_fragment, login, login_username, payouts_fragment, public_page_handler,
-        register, register_username, request_competition_ticket, send_to_address,
-        set_lightning_address, submit_final_signatures, submit_public_nonces, submit_ticket_payout,
+        create_competition, entries_fragment, entry_detail_fragment, entry_forecasts_fragment,
+        entry_form_fragment, entry_payout_fragment, forgot_password_challenge,
+        forgot_password_reset, get_aggregate_nonces, get_balance, get_competition,
+        get_competitions, get_contract_parameters, get_entries, get_estimated_fee_rates,
+        get_next_address, get_outputs, get_ticket_refund, get_ticket_status, health,
+        leaderboard_fragment, leaderboard_rows_fragment, login, login_username, not_found,
+        payouts_fragment, public_page_handler, register, register_username,
+        request_competition_ticket, send_to_address, set_lightning_address,
+        submit_final_signatures, submit_public_nonces, submit_ticket_payout,
+        ticket_status_fragment,
     },
     config::Settings,
     domain::{
@@ -37,6 +39,7 @@ use crate::{
 
 // Mock implementations only available with e2e-testing feature or debug builds
 use crate::api::nip98_origins::Nip98Origins;
+use crate::api::public_headers::{public_response_headers, PublicHeaders};
 use crate::config::{APISettings, RateLimitSettings};
 #[cfg(any(feature = "e2e-testing", debug_assertions))]
 use crate::infra::{
@@ -46,7 +49,7 @@ use crate::infra::{
 use anyhow::anyhow;
 use axum::{
     body::Body,
-    extract::{connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, Path, Request, State},
+    extract::{connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, Request, State},
     http::{header, Extensions, HeaderValue, StatusCode, Uri},
     middleware::{self, AddExtension, Next},
     response::{IntoResponse, Response},
@@ -80,7 +83,10 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tower_governor::{
     governor::GovernorConfigBuilder, key_extractor::PeerIpKeyExtractor, GovernorLayer,
 };
-use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::{
+    compression::CompressionLayer,
+    cors::{AllowOrigin, CorsLayer},
+};
 type HttpServer = Serve<
     TcpListener,
     IntoMakeServiceWithConnectInfo<Router, SocketAddr>,
@@ -269,9 +275,13 @@ async fn drain_http(name: &str, mut task: HttpTask, finished: bool) -> Option<an
 #[derive(Clone)]
 pub struct AppState {
     pub ui_dir: String,
+    /// Hash of the WASM package in `ui_dir`; pages request it by this version.
+    pub wasm_version: String,
     pub private_url: String,
     pub remote_url: String,
     pub oracle_url: String,
+    /// Gateway the browser calls to verify its assigned signing enclave.
+    pub keymeld_public_url: Option<String>,
     pub explorer_url: String,
     pub network: String,
     pub bitcoin: Arc<dyn Bitcoin>,
@@ -674,8 +684,16 @@ pub async fn build_app(
     leaderboards.spawn_refresher(&tracker, cancel_token.clone());
     tracker.close();
 
+    let wasm_version = crate::api::ui_files::package_version(&config.ui_settings.ui_dir);
+    if wasm_version.is_empty() {
+        warn!(
+            "No WASM package in {}/pkg; browsers cannot log in",
+            config.ui_settings.ui_dir
+        );
+    }
     let app_state = AppState {
         ui_dir: config.ui_settings.ui_dir,
+        wasm_version,
         private_url: config.ui_settings.private_url,
         remote_url: config.ui_settings.remote_url,
         explorer_url: config
@@ -684,6 +702,10 @@ pub async fn build_app(
             .clone()
             .unwrap_or_default(),
         oracle_url: config.coordinator_settings.oracle_url,
+        keymeld_public_url: config
+            .keymeld_settings
+            .enabled
+            .then(|| config.keymeld_settings.browser_gateway_url().to_owned()),
         network: config.bitcoin_settings.network.to_string(),
         coordinator,
         users_info,
@@ -771,10 +793,21 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
     // HTMX public routes (some require JS bridge for auth)
     let htmx_routes = Router::new()
         .route("/competitions", get(competitions_fragment))
-        .route("/competitions/rows", get(competitions_rows_fragment))
         .route(
             "/competitions/{competition_id}/entry-form",
             get(entry_form_fragment),
+        )
+        .route(
+            "/competitions/{competition_id}/entry-forecasts",
+            get(entry_forecasts_fragment),
+        )
+        .route(
+            "/competitions/{competition_id}/entry-form/payout",
+            get(entry_payout_fragment),
+        )
+        .route(
+            "/competitions/{competition_id}/tickets/{ticket_id}/status",
+            get(ticket_status_fragment),
         )
         .route(
             "/competitions/{competition_id}/leaderboard",
@@ -853,11 +886,22 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
         api.rate_limit.burst,
     );
 
+    // The wallet also fetches the assigned enclave's attestation from Keymeld.
+    let public_headers = Arc::new(PublicHeaders::new(&[
+        app_state.remote_url.as_str(),
+        app_state.oracle_url.as_str(),
+        app_state.keymeld_public_url.as_deref().unwrap_or_default(),
+    ]));
+
     Router::new()
         .merge(api_routes)
-        .route("/ui/{*path}", get(serve_static_file))
+        .merge(static_files(&app_state))
         .layer(Extension(replay))
         .layer(Extension(Arc::new(nip98_origins)))
+        .layer(middleware::from_fn_with_state(
+            public_headers,
+            public_response_headers,
+        ))
         .layer(middleware::from_fn(log_request))
         .with_state(app_state)
         .layer(cors)
@@ -950,15 +994,20 @@ pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Ne
     Router::new()
         .merge(operator_routes)
         .merge(sign_in)
-        .route("/ui/{*path}", get(serve_static_file))
+        .merge(static_files(&app_state))
         .with_state(app_state)
         .layer(middleware::from_fn(operator_response_headers))
         .layer(middleware::from_fn(log_request))
 }
 
-/// Serve the competitions page for client-side paths, but never for paths reserved for
-/// the API or the operator listener, so a missing operator route cannot look present.
-async fn public_fallback(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
+/// A page for any path the public site does not serve, with status 404. Paths
+/// reserved for the API or the operator listener get a bare 404, so a missing
+/// operator route cannot look present.
+async fn public_fallback(
+    State(state): State<Arc<AppState>>,
+    uri: Uri,
+    headers: header::HeaderMap,
+) -> Response {
     let path = uri.path();
     let reserved = ["/admin", "/api"]
         .iter()
@@ -966,7 +1015,7 @@ async fn public_fallback(State(state): State<Arc<AppState>>, uri: Uri) -> Respon
     if reserved {
         return StatusCode::NOT_FOUND.into_response();
     }
-    public_page_handler(State(state)).await.into_response()
+    not_found(&headers, &state, "Page")
 }
 
 async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {
@@ -985,71 +1034,12 @@ async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {
     response
 }
 
-async fn serve_static_file(
-    State(state): State<Arc<AppState>>,
-    Path(path): Path<String>,
-) -> Response {
-    static_file_response(&state.ui_dir, &path).await
-}
-
-async fn static_file_response(ui_dir: &str, path: &str) -> Response {
-    // Axum percent-decodes the wildcard before extraction. An encoded leading
-    // slash would make Path::join discard ui_dir, even without any '..'.
-    if path.is_empty()
-        || !std::path::Path::new(path)
-            .components()
-            .all(|component| matches!(component, std::path::Component::Normal(_)))
-    {
-        return (StatusCode::BAD_REQUEST, "Bad request").into_response();
-    }
-
-    let file_path = std::path::Path::new(ui_dir).join(path);
-
-    let content = match tokio::fs::read(&file_path).await {
-        Ok(c) => c,
-        Err(_) => return (StatusCode::NOT_FOUND, "Not found").into_response(),
-    };
-
-    let mime_type = get_mime_type(path);
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, mime_type)
-        .body(Body::from(content))
-        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Server error").into_response())
-}
-
-fn get_mime_type(path: &str) -> &'static str {
-    let ext = path.rsplit('.').next().unwrap_or("");
-    match ext {
-        // JavaScript
-        "js" | "mjs" => "application/javascript; charset=utf-8",
-        // CSS
-        "css" => "text/css; charset=utf-8",
-        // HTML
-        "html" | "htm" => "text/html; charset=utf-8",
-        // JSON
-        "json" | "map" => "application/json",
-        // Images
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "svg" => "image/svg+xml",
-        "ico" => "image/x-icon",
-        "webp" => "image/webp",
-        // Fonts
-        "woff" => "font/woff",
-        "woff2" => "font/woff2",
-        "ttf" => "font/ttf",
-        "otf" => "font/otf",
-        "eot" => "application/vnd.ms-fontobject",
-        // Other
-        "txt" => "text/plain; charset=utf-8",
-        "xml" => "application/xml",
-        "wasm" => "application/wasm",
-        // Default
-        _ => "application/octet-stream",
-    }
+/// The WASM package (`/ui`) and the embedded scripts and styles (`/assets`),
+/// gzipped for browsers that accept it.
+fn static_files(state: &AppState) -> Router<Arc<AppState>> {
+    crate::api::ui_files::router(&state.ui_dir, state.wasm_version.clone())
+        .route("/assets/{file}", get(crate::templates::assets::serve_asset))
+        .layer(CompressionLayer::new())
 }
 
 #[cfg(any(feature = "e2e-testing", debug_assertions))]
@@ -1280,6 +1270,62 @@ mod startup_tests {
     const FORM: &str = "application/x-www-form-urlencoded";
 
     #[tokio::test]
+    async fn public_pages_carry_the_content_security_policy() {
+        let mut test = TestState::start().await;
+        Arc::get_mut(&mut test.state).unwrap().keymeld_public_url =
+            Some("https://keymeld.example.net/enclaves".into());
+        let public = test.public();
+        for path in ["/", "/competitions", "/entries", "/payouts"] {
+            for (kind, headers) in [
+                ("page", &[][..]),
+                ("fragment", &[("hx-request", "true")][..]),
+                ("history", &[("hx-history-restore-request", "true")][..]),
+            ] {
+                let (status, response_headers, body) =
+                    send(&public, request("GET", path, headers, "")).await;
+                let account = path == "/entries" || path == "/payouts";
+                assert_eq!(
+                    status,
+                    if account && kind == "fragment" {
+                        StatusCode::UNAUTHORIZED
+                    } else {
+                        StatusCode::OK
+                    }
+                );
+                let policy = response_headers["content-security-policy"]
+                    .to_str()
+                    .unwrap();
+                assert!(
+                    policy.contains("script-src 'self' 'wasm-unsafe-eval';"),
+                    "{path}: {policy}"
+                );
+                assert!(
+                    policy.contains("require-trusted-types-for 'script'"),
+                    "{path}"
+                );
+                assert!(policy.contains("trusted-types htmx"), "{path}");
+                assert!(policy.contains("frame-ancestors 'none'"), "{path}");
+                assert!(
+                    policy.contains("https://keymeld.example.net"),
+                    "the wallet needs its configured attestation gateway"
+                );
+                assert_eq!(response_headers["x-content-type-options"], "nosniff");
+                assert!(!body.contains(" onclick="), "{path}");
+                assert_eq!(
+                    body.contains("<!DOCTYPE html>"),
+                    kind != "fragment",
+                    "{kind} {path}"
+                );
+                if account {
+                    assert_eq!(response_headers["cache-control"], "private, no-store");
+                    assert!(body.contains("sign-in-required"));
+                }
+            }
+        }
+        test.stop().await;
+    }
+
+    #[tokio::test]
     async fn public_router_serves_no_operator_route() {
         let test = TestState::start().await;
         let public = test.public();
@@ -1295,6 +1341,25 @@ mod startup_tests {
         let (status, _, _) = send(&public, request("GET", "/api/v1/health_check", &[], "")).await;
         assert_eq!(status, StatusCode::OK);
         let (status, _, _) = send(&public, request("GET", "/api/v1/competitions", &[], "")).await;
+        assert_eq!(status, StatusCode::OK);
+        test.stop().await;
+    }
+
+    #[tokio::test]
+    async fn unknown_public_paths_get_a_not_found_page() {
+        let test = TestState::start().await;
+        let public = test.public();
+        let (status, _, body) = send(&public, request("GET", "/no/such/page", &[], "")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("<!DOCTYPE html>") && body.contains("Page not found"));
+        let (status, _, body) = send(
+            &public,
+            request("GET", "/no/such/page", &[("hx-request", "true")], ""),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!body.contains("<!DOCTYPE html>"));
+        let (status, _, _) = send(&public, request("GET", "/", &[], "")).await;
         assert_eq!(status, StatusCode::OK);
         test.stop().await;
     }
@@ -1456,61 +1521,6 @@ mod startup_tests {
         let (status, _, _) = send(&admin, request("GET", "/admin/wallet/fees", &[], "")).await;
         assert_eq!(status, StatusCode::OK);
         test.stop().await;
-    }
-}
-
-#[cfg(test)]
-mod static_file_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn static_routes_reject_percent_encoded_absolute_paths_and_parent_components() {
-        let directory = tempfile::tempdir().unwrap();
-        let ui_dir = directory.path().join("ui");
-        std::fs::create_dir_all(ui_dir.join("pkg")).unwrap();
-        std::fs::write(ui_dir.join("pkg/app.js"), "browser code").unwrap();
-        let secret_path = directory.path().join("secret.txt");
-        std::fs::write(&secret_path, "private data").unwrap();
-
-        let router = Router::new()
-            .route(
-                "/ui/{*path}",
-                get(
-                    |State(ui_dir): State<String>, Path(path): Path<String>| async move {
-                        static_file_response(&ui_dir, &path).await
-                    },
-                ),
-            )
-            .with_state(ui_dir.to_str().unwrap().to_owned());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let client = reqwest::Client::new();
-
-        let valid = client
-            .get(format!("http://{address}/ui/pkg/app.js"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(valid.status(), StatusCode::OK);
-        assert_eq!(valid.text().await.unwrap(), "browser code");
-
-        for path in [
-            format!(
-                "%2F{}",
-                secret_path.to_str().unwrap().trim_start_matches('/')
-            ),
-            "pkg%2F..%2F..%2Fsecret.txt".to_owned(),
-        ] {
-            let response = client
-                .get(format!("http://{address}/ui/{path}"))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
-            assert!(!response.text().await.unwrap().contains("private data"));
-        }
-        server.abort();
     }
 }
 

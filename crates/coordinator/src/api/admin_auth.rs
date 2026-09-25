@@ -343,7 +343,7 @@ fn login_page(error: Option<&str>) -> Html<String> {
                     meta charset="UTF-8";
                     meta name="viewport" content="width=device-width, initial-scale=1.0";
                     title { "5day4cast Admin - Sign in" }
-                    link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@1.0.2/css/bulma.min.css";
+                    link rel="stylesheet" href=(crate::templates::assets::BULMA_CSS.url);
                 }
                 body {
                     section class="section" {

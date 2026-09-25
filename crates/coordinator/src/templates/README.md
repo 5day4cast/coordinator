@@ -1,270 +1,72 @@
 # Templates & Frontend Assets
 
-Server-rendered HTML using [Maud](https://maud.lambda.xyz/) with co-located JavaScript and CSS.
+Pages are rendered on the server with [Maud](https://maud.lambda.xyz/) and
+updated with [htmx](https://four.htmx.org/) 4. JavaScript is kept for what only
+the browser can do: the WASM wallet (keys, signing, payment), the htmx
+extension that signs account requests, and a few small page behaviours.
 
 ## Structure
 
 ```
 templates/
-├── shared/           # JS utilities used across templates
-│   └── *.js
-├── layouts/          # Page shells
-│   └── base/
-│       ├── mod.rs
-│       └── base.js
-├── components/       # Reusable UI
-│   ├── navbar.rs     # Simple template (no JS/CSS)
-│   └── modals/       # Folder when JS/CSS needed
-│       ├── mod.rs
-│       ├── modals.js
-│       └── modals.css  # Component-specific styles
-├── pages/
-│   └── entries/
-│       ├── mod.rs
-│       ├── entries.js
-│       └── entries.css
-└── fragments/        # HTMX partials
-    └── *.rs
+├── shared/        # scripts used across pages (WASM loader, auth hook, helpers)
+├── layouts/       # page shells (base/ has the public layout and its script)
+├── components/    # navbar, dialogs
+├── fragments/     # htmx partials; a folder when it has its own .js/.css
+├── pages/         # full pages (competitions, entries, payouts)
+├── admin/         # operator dashboard
+└── static/        # global styles.css and the map outline
 ```
+
+A component's `.css` and `.js` sit beside the Rust that renders it: a
+template with no script or styles is a single `foo.rs`; one with them is a
+folder with `foo/mod.rs`, `foo.js` and `foo.css`.
+
+## Build
+
+`build.rs` bundles everything into `OUT_DIR`; nothing is written to the source
+tree:
+
+| Bundle | Contents |
+|--------|----------|
+| `app.js` | every `.js` under `shared`, `components`, `fragments`, `pages`, `layouts`; `base.js` last |
+| `admin.js` | every `.js` under `admin` |
+| `styles.css` | `static/styles.css`, then every other `.css`, minified with lightningcss |
+| `htmx.js` | `vendor/htmx/4.0.0/htmx.min.js` at the workspace root, as published |
+| `theme.js` | `static/theme-init.js`, loaded before first paint |
+| `usa-map.svg` | copied from `static/` |
+
+Scripts are minified with oxc, each parsed as a classic script so its
+top-level names are kept; a script that does not parse fails the build. The
+public bundle then runs inside one function, so its scripts share those names
+with each other but not with `window`: nothing a script injected into the page
+could reach leads to the wallet's signer. Only `initWasm` is on `window` (the
+e2e tests call it; loading the module hands out no key). Tests load a file in
+a `vm` context with its neighbours' names passed in. Each bundle
+is embedded with `include_bytes!` at `/assets/<name>.<hash>.<ext>` and served
+with a one-year immutable cache (gzipped for browsers that accept it).
+Templates link them through the constants in `templates::assets`
+(`APP_JS.url`, `STYLES_CSS.url`, …).
+
+The WASM package is built separately by `wasm-pack` into the UI directory
+(`[ui_settings].ui_dir`, `crates/public_ui` in development) and served from
+`/ui/pkg/` by tower-http. Pages request it with `?v=<hash>` computed at
+startup, which is also cached for a year; `shared/wasm.js` loads it.
 
 ## Conventions
 
-**No JS/CSS needed:** single `foo.rs` file
-
-**JS/CSS needed:** folder with `foo/mod.rs` + `foo.js` and/or `foo.css`
-
-**Shared JS:** put in `shared/` directory
-
-## Build Process
-
-At compile time, `build.rs`:
-
-**JavaScript:**
-1. Finds all `.js` files in `templates/`
-2. Concatenates them (shared first, base.js last)
-3. Minifies and hashes for cache busting
-4. Outputs to `crates/public_ui/` (generated; gitignored)
-
-**CSS:**
-1. Starts with `templates/static/styles.css` (base/global styles)
-2. Appends any `.css` files found in `templates/`
-3. Minifies into `styles.min.css`
-
-## Loader Pattern
-
-External dependencies (WASM, large libraries) go in `templates/static/loader.js`:
-
-```javascript
-// loader.js - not bundled, loaded directly
-import init, { NostrClientWrapper } from '/ui/dist/client_validator.js';
-
-window.NostrClientWrapper = NostrClientWrapper;
-window.initWasm = async () => { await init(); };
-
-// Load app bundle after deps ready
-const script = document.createElement('script');
-script.src = '/ui/app.min.js';
-document.head.appendChild(script);
-```
-
-Then in template JS, access via `window`:
-```javascript
-const client = new window.NostrClientWrapper();
-```
-
-**Why?**
-- Keeps ES module imports out of bundled code
-- Single place to manage WASM/external versions
-- App code stays clean and testable
-
-## Adding JavaScript
-
-1. Convert `pages/foo.rs` to `pages/foo/mod.rs`
-2. Create `pages/foo/foo.js` with your code
-3. Rebuild - automatically bundled
-
-## Adding CSS
-
-**Global styles:** Edit `templates/static/styles.css`
-
-**Component styles:** Add `mycomponent.css` next to `mod.rs`:
-```
-components/
-└── widget/
-    ├── mod.rs
-    ├── widget.js
-    └── widget.css   # Styles specific to this component
-```
-
-Reference in layout:
-```rust
-link rel="stylesheet" href="/ui/styles.min.css";
-```
-
-## Key Files
-
-| File | Purpose |
-|------|---------|
-| `build.rs` | Bundles JS/CSS at compile time |
-| `templates/static/loader.js` | WASM/external deps, loads app bundle |
-| `templates/static/styles.css` | Base/global styles (manual) |
-| `crates/public_ui/app.<hash>.min.js` | Generated JS bundle (do not edit) |
-| `crates/public_ui/styles.<hash>.min.css` | Generated CSS bundle (do not edit) |
-| `shared/*.js` | Utilities for all templates |
-| `layouts/base/base.js` | App init (runs last) |
-
----
-
-## Porting to Another Project
-
-### 1. Add build dependencies
-
-```toml
-[build-dependencies]
-minify-js = "0.6"
-walkdir = "2.5"
-sha2 = "0.10"
-hex = "0.4"
-```
-
-### 2. Create build.rs
-
-```rust
-use minify_js::{minify, Session, TopLevelMode};
-use sha2::{Digest, Sha256};
-use std::{env, fs, path::Path};
-use walkdir::WalkDir;
-
-fn main() {
-    let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let templates = Path::new(&manifest).join("src/templates");
-    let output = Path::new(&manifest).join("static");
-
-    if !templates.exists() { return; }
-
-    for entry in WalkDir::new(&templates).into_iter().filter_map(|e| e.ok()) {
-        let ext = entry.path().extension().and_then(|e| e.to_str());
-        if matches!(ext, Some("js") | Some("css")) {
-            println!("cargo:rerun-if-changed={}", entry.path().display());
-        }
-    }
-
-    let _ = fs::create_dir_all(&output);
-    build_js(&templates, &output);
-    build_css(&templates, &output);
-}
-
-fn build_js(templates: &Path, output: &Path) {
-    let mut files: Vec<_> = WalkDir::new(templates)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |e| e == "js"))
-        .map(|e| e.path().to_path_buf())
-        .collect();
-    files.sort();
-
-    let mut combined = String::new();
-    for file in files {
-        if let Ok(content) = fs::read_to_string(&file) {
-            combined.push_str(&content);
-            combined.push('\n');
-        }
-    }
-
-    if combined.is_empty() { return; }
-
-    let minified = try_minify_js(&combined).unwrap_or(combined);
-    let hash = hex::encode(Sha256::digest(minified.as_bytes()));
-    let _ = fs::write(output.join(format!("app.{}.min.js", &hash[..8])), &minified);
-    let _ = fs::write(output.join("app.min.js"), &minified);
-}
-
-fn build_css(templates: &Path, output: &Path) {
-    let mut combined = String::new();
-
-    // Base styles first
-    let base = output.join("styles.css");
-    if base.exists() {
-        if let Ok(content) = fs::read_to_string(&base) {
-            combined.push_str(&content);
-            combined.push('\n');
-        }
-    }
-
-    // Then template CSS
-    let mut files: Vec<_> = WalkDir::new(templates)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |e| e == "css"))
-        .map(|e| e.path().to_path_buf())
-        .collect();
-    files.sort();
-
-    for file in files {
-        if let Ok(content) = fs::read_to_string(&file) {
-            combined.push_str(&content);
-            combined.push('\n');
-        }
-    }
-
-    if combined.is_empty() { return; }
-
-    let minified = minify_css(&combined);
-    let hash = hex::encode(Sha256::digest(minified.as_bytes()));
-    let _ = fs::write(output.join(format!("styles.{}.min.css", &hash[..8])), &minified);
-    let _ = fs::write(output.join("styles.min.css"), &minified);
-}
-
-fn try_minify_js(src: &str) -> Option<String> {
-    let session = Session::new();
-    let mut out = Vec::new();
-    minify(&session, TopLevelMode::Module, src.as_bytes(), &mut out).ok()?;
-    String::from_utf8(out).ok()
-}
-
-fn minify_css(css: &str) -> String {
-    // Simple minification: remove comments and excess whitespace
-    let mut out = String::new();
-    let mut in_comment = false;
-    let mut chars = css.chars().peekable();
-    while let Some(c) = chars.next() {
-        if in_comment {
-            if c == '*' && chars.peek() == Some(&'/') { chars.next(); in_comment = false; }
-            continue;
-        }
-        if c == '/' && chars.peek() == Some(&'*') { chars.next(); in_comment = true; continue; }
-        if c.is_whitespace() {
-            if !out.ends_with(|ch: char| ch.is_whitespace() || "{:;,".contains(ch)) {
-                if chars.peek().map_or(false, |&n| !"{}:;,".contains(n)) { out.push(' '); }
-            }
-            continue;
-        }
-        out.push(c);
-    }
-    out
-}
-```
-
-### 3. Create loader.js (if using WASM/external deps)
-
-```javascript
-// static/loader.js
-import * as myLib from 'https://cdn.example.com/lib.js';
-window.myLib = myLib;
-
-const script = document.createElement('script');
-script.type = 'module';
-script.src = '/static/app.min.js';
-document.head.appendChild(script);
-```
-
-### 4. Serve and reference
-
-```rust
-// Router
-.nest_service("/static", ServeDir::new("static"))
-
-// Template - load loader.js, NOT app.min.js directly
-script type="module" src="/static/loader.js" {}
-link rel="stylesheet" href="/static/styles.min.css";
-```
+- Handlers answer htmx requests (`HX-Request`) with content only and direct
+  visits, reloads and Back (`HX-History-Restore-Request`) with the whole page,
+  so every URL works when reloaded or shared.
+- htmx 4 attributes apply only to the element they are on (no inheritance
+  without `:inherited`). Error responses are not swapped in unless the element
+  asks with `hx-status:<code>`; fragments that show a server error use 500.
+- Account pages (`/entries`, `/payouts`) and a ticket's status are signed with
+  NIP-98 by `shared/htmx_auth.js`; opened directly they show a log-in prompt
+  that loads the page once the visitor logs in (the `fw:login` event).
+- Fragments that need the oracle's weather wait briefly on the leaderboard
+  cache and otherwise show `fragments::loading`'s placeholder.
+- Times are rendered as `<time datetime=… data-local>` in UTC and shown in the
+  reader's time zone by `shared/page.js`.
+- Prefer attributes (`hx-get`, `data-open-modal`, `data-copy`) and delegated
+  listeners over inline `onclick` and per-element setup.

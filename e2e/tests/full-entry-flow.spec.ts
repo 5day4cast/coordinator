@@ -7,9 +7,8 @@ function uniqueUsername(): string {
 async function registerAndLogin(page: Page): Promise<string> {
   await page.goto("/");
 
-  await page.waitForFunction(() => window.wasmInitialized === true, {
-    timeout: 15000,
-  });
+  // The wallet loads on demand (normally when a log-in dialog opens).
+  await page.evaluate(() => window.initWasm());
 
   const username = uniqueUsername();
   const password = "testPassword123!";
@@ -46,12 +45,12 @@ test.describe("Full Entry Submission Flow", () => {
   }) => {
     await registerAndLogin(page);
 
-    await page.waitForSelector("#competitionsDataTable tbody tr", {
+    await page.waitForSelector("#competitions-page a.competition-row", {
       timeout: 15000,
     });
 
     let rowCount = await page
-      .locator("#competitionsDataTable tbody tr")
+      .locator("#competitions-page a.competition-row")
       .count();
 
     if (rowCount === 0) {
@@ -63,10 +62,7 @@ test.describe("Full Entry Submission Flow", () => {
     }
 
     const enterButton = page
-      .locator("#competitionsDataTable tbody tr")
-      .filter({ hasText: "Registration" })
-      .locator("button, a")
-      .filter({ hasText: /Enter|Create Entry/ })
+      .locator("#competitions-page a.competition-row[href$='/entry-form']")
       .first();
 
     const canEnter = (await enterButton.count()) > 0;
@@ -83,18 +79,18 @@ test.describe("Full Entry Submission Flow", () => {
       timeout: 5000,
     });
 
-    await expect(page.locator("#entryContent")).toBeVisible();
+    await expect(page.locator("#entryForm")).toBeVisible();
 
-    await page.waitForSelector("#entryContent button", { timeout: 10000 });
+    await page.waitForSelector("#entryForm .pick-option", { timeout: 10000 });
 
-    const allPickButtons = page.locator("#entryContent button.pick-button");
+    const allPickButtons = page.locator("#entryForm .pick-option");
     const buttonCount = await allPickButtons.count();
 
     if (buttonCount > 0) {
       for (let i = 0; i < Math.min(3, buttonCount); i++) {
         const button = allPickButtons.nth(i);
         await button.click();
-        await expect(button).toHaveClass(/is-active/);
+        await expect(button.locator("input")).toBeChecked();
       }
     }
 
@@ -102,24 +98,18 @@ test.describe("Full Entry Submission Flow", () => {
     await expect(submitButton).toBeVisible();
     await expect(submitButton).toBeEnabled();
 
-    await expect(page.locator("#entryPayoutDestination")).toContainText("pays winners by invoice");
-    await expect(page.locator("#entryPayoutTermsText")).toContainText(
-      "This legacy competition does not use payout escrow",
+    // Entering is the consent: no checkbox, one line about where money goes.
+    await expect(page.locator("#entryPayoutDestination")).toContainText("submit a Lightning invoice");
+    await expect(page.locator("#entryContainer input[type=checkbox]")).toHaveCount(0);
+    await expect(page.locator("#entryContainer details.entry-advanced")).toContainText(
+      "no payout escrow",
     );
-    await expect(page.locator("#entryPayoutApproved")).not.toBeChecked();
     const ticketRequests: string[] = [];
     page.on("request", (request) => {
       if (request.method() === "POST" && /\/competitions\/[^/]+\/ticket$/.test(request.url())) {
         ticketRequests.push(request.url());
       }
     });
-    await submitButton.click();
-    await expect(page.locator("#errorMessage")).toContainText(
-      "Please approve your payout method before paying for this entry",
-    );
-    expect(ticketRequests).toHaveLength(0);
-    await expect(page.locator("#ticketPaymentModal")).not.toHaveClass(/is-active/);
-    await page.locator("#entryPayoutApproved").check();
 
     page.on("console", (msg) => {
       if (msg.type() === "error" || msg.type() === "warning") {
@@ -153,7 +143,7 @@ test.describe("Full Entry Submission Flow", () => {
       timeout: 5000,
     });
 
-    await expect(page.locator("#submitEntry")).toHaveText("Entry Submitted!");
+    await expect(page.locator("#submitEntry")).toHaveText("Entered");
     expect(ticketRequests).toHaveLength(1);
   });
 
@@ -162,15 +152,12 @@ test.describe("Full Entry Submission Flow", () => {
   }) => {
     await registerAndLogin(page);
 
-    await page.waitForSelector("#competitionsDataTable tbody tr", {
+    await page.waitForSelector("#competitions-page a.competition-row", {
       timeout: 15000,
     });
 
     const enterButton = page
-      .locator("#competitionsDataTable tbody tr")
-      .filter({ hasText: "Registration" })
-      .locator("button, a")
-      .filter({ hasText: /Enter|Create Entry/ })
+      .locator("#competitions-page a.competition-row[href$='/entry-form']")
       .first();
 
     await enterButton.click();
@@ -178,7 +165,7 @@ test.describe("Full Entry Submission Flow", () => {
       timeout: 5000,
     });
 
-    const entryContent = page.locator("#entryContent");
+    const entryContent = page.locator("#entryForm");
     await expect(entryContent).toBeVisible();
 
     await expect(page.locator("#submitEntry")).toBeVisible();
@@ -205,15 +192,16 @@ test.describe("Full Entry Submission Flow", () => {
         keymeld_registration: null,
       } });
     });
-    await page.locator("#competitionsDataTable tbody tr")
-      .filter({ hasText: "Registration" }).locator("button, a")
-      .filter({ hasText: /Enter|Create Entry/ }).first().click();
-    // Winnings go to the profile's address; the entry form no longer asks for one.
-    await expect(page.locator("#entryPayoutDestination")).toHaveText(`Automatically to ${profileAddress}`);
-    await expect(page.locator("#entryPayoutTermsText")).toContainText("Maximum Bitcoin fee rate: 5 sat/vB");
-    await expect(page.locator("#entryPayoutTermsText")).toContainText("Winner shares by rank: 45%, 35%, 20%");
-    await page.locator("#entryPayoutApproved").check();
-    await page.locator("#entryContent button.pick-button").first().click();
+    await page
+      .locator("#competitions-page a.competition-row[href$='/entry-form']")
+      .first().click();
+    // Winnings go to the profile's address; the entry form asks nothing more.
+    await expect(page.locator("#entryContainer input[type=checkbox]")).toHaveCount(0);
+    // The fee cap and the winners' shares, in the Advanced section.
+    const advanced = page.locator("#entryContainer details.entry-advanced");
+    await expect(advanced).toContainText("On-chain fees for the contract are capped at 100 sat/vB");
+    await expect(advanced).toContainText("Winner shares by rank: 45%, 35%, 20%");
+    await page.locator("#entryForm .pick-option").first().click();
     await page.locator("#submitEntry").click();
     await expect(page.locator("#errorMessage")).toContainText("The ticket omitted the approved payout escrow policy");
     await expect(page.locator("#ticketPaymentModal")).not.toHaveClass(/is-active/);
@@ -227,15 +215,12 @@ test.describe("Full Entry Submission Flow", () => {
   }) => {
     await registerAndLogin(page);
 
-    await page.waitForSelector("#competitionsDataTable tbody tr", {
+    await page.waitForSelector("#competitions-page a.competition-row", {
       timeout: 15000,
     });
 
     const enterButton = page
-      .locator("#competitionsDataTable tbody tr")
-      .filter({ hasText: "Registration" })
-      .locator("button, a")
-      .filter({ hasText: /Enter|Create Entry/ })
+      .locator("#competitions-page a.competition-row[href$='/entry-form']")
       .first();
 
     await enterButton.click();
@@ -245,25 +230,22 @@ test.describe("Full Entry Submission Flow", () => {
 
     await Promise.all([
       page.waitForResponse((resp) => resp.url().includes("/competitions")),
-      page.locator("#backToCompetitions").click(),
+      page.locator("#entryContainer .back-link").click(),
     ]);
 
-    await expect(page.locator("#allCompetitions")).toBeVisible();
+    await expect(page.locator("#competitions-page")).toBeVisible();
     await expect(page.locator("#entryContainer")).not.toBeVisible();
   });
 
-  test("prediction buttons toggle correctly", async ({ page }) => {
+  test("a pick can be made and taken back with No pick", async ({ page }) => {
     await registerAndLogin(page);
 
-    await page.waitForSelector("#competitionsDataTable tbody tr", {
+    await page.waitForSelector("#competitions-page a.competition-row", {
       timeout: 15000,
     });
 
     const enterButton = page
-      .locator("#competitionsDataTable tbody tr")
-      .filter({ hasText: "Registration" })
-      .locator("button, a")
-      .filter({ hasText: /Enter|Create Entry/ })
+      .locator("#competitions-page a.competition-row[href$='/entry-form']")
       .first();
 
     await enterButton.click();
@@ -271,78 +253,64 @@ test.describe("Full Entry Submission Flow", () => {
       timeout: 5000,
     });
 
-    await page.waitForSelector("#entryContent button.pick-button", {
+    await page.waitForSelector("#entryForm .pick-option", {
       timeout: 10000,
     });
 
-    const firstButton = page
-      .locator("#entryContent button.pick-button")
-      .first();
+    const row = page.locator("#entryForm .pick-row").first();
+    const firstButton = row.locator(".pick-option").first();
+    const noPick = row.locator(".pick-option.is-none");
 
-    await expect(firstButton).toHaveClass(/is-outlined/);
+    const input = firstButton.locator("input");
+    await expect(input).not.toBeChecked();
+    await expect(noPick.locator("input")).toBeChecked();
 
     await firstButton.click();
+    await expect(input).toBeChecked();
 
-    await expect(firstButton).toHaveClass(/is-active/);
-    await expect(firstButton).not.toHaveClass(/is-outlined/);
+    await noPick.click();
+    await expect(input).not.toBeChecked();
+    await expect(noPick.locator("input")).toBeChecked();
   });
 });
 
 test.describe("Competition Status Display", () => {
-  test("competitions table shows correct status badges", async ({ page }) => {
+  test("competitions are grouped with a status badge on every row", async ({ page }) => {
     await page.goto("/");
 
-    await page.waitForSelector("#competitionsDataTable", { timeout: 10000 });
+    await page.waitForSelector("#competitions-page", { timeout: 10000 });
+    await expect(page.locator("#competitions-page .intro")).toContainText("win the pot");
 
-    const statusHeader = page.locator(
-      "#competitionsDataTable thead th:has-text('Status')",
-    );
-    await expect(statusHeader).toBeVisible();
-
-    const rows = await page.locator("#competitionsDataTable tbody tr").count();
-
-    if (rows > 0) {
-      const firstRowStatus = page
-        .locator("#competitionsDataTable tbody tr")
-        .first()
-        .locator("td")
-        .nth(0);
-
-      await expect(firstRowStatus).toBeVisible();
-
-      const statusText = await firstRowStatus.textContent();
+    const rows = page.locator("#competitions-page a.competition-row");
+    const count = await rows.count();
+    for (let i = 0; i < count; i++) {
+      const status = await rows.nth(i).locator(".cell-status").textContent();
       expect(
-        ["Registration", "Live", "Setup", "Signing", "Completed"].some((s) =>
-          statusText?.includes(s),
+        ["Open", "Full", "Live", "Awaiting results", "Finished", "Didn't fill", "Cancelled", "Failed"].some((s) =>
+          status?.includes(s),
         ),
       ).toBe(true);
     }
   });
 
-  test("only Registration status competitions have Enter button", async ({
-    page,
-  }) => {
-    await registerAndLogin(page);
+  test("only open competitions link to the entry form", async ({ page }) => {
+    await page.goto("/");
+    await page.waitForSelector("#competitions-page", { timeout: 10000 });
 
-    await page.waitForSelector("#competitionsDataTable tbody tr", {
-      timeout: 15000,
-    });
-
-    const rows = page.locator("#competitionsDataTable tbody tr");
-    const rowCount = await rows.count();
-
-    for (let i = 0; i < rowCount; i++) {
+    const rows = page.locator("#competitions-page a.competition-row");
+    const count = await rows.count();
+    for (let i = 0; i < count; i++) {
       const row = rows.nth(i);
-      const statusCell = row.locator("td").nth(0);
-      const statusText = await statusCell.textContent();
-
-      const enterButton = row
-        .locator("button, a")
-        .filter({ hasText: /Enter|Create Entry/ });
-
-      if (statusText?.includes("Registration")) {
-        await expect(enterButton.first()).toBeVisible();
-      }
+      const status = await row.locator(".cell-status").textContent();
+      const href = await row.getAttribute("href");
+      expect(href?.endsWith("/entry-form")).toBe(status?.trim() === "Open");
     }
+  });
+
+  test("an account page opened by its address offers the log-in dialog", async ({ page }) => {
+    await page.goto("/entries");
+    await expect(page.locator(".sign-in-required")).toContainText("signs you out");
+    await expect(page.locator("#loginModal")).toHaveClass(/is-active/);
+    await expect(page.locator("nav.navbar")).toBeVisible();
   });
 });
