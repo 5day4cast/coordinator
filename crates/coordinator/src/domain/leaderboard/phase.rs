@@ -67,6 +67,7 @@ mod tests {
             coordinator_fee_percentage: 5,
             total_competition_pool: 2_000,
             relative_locktime_block_delta: None,
+            unlisted: false,
         })
     }
 

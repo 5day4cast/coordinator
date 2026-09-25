@@ -82,6 +82,17 @@ pub struct AddEntry {
     pub keymeld_escrow_policy: Option<coordinator_core::keymeld::SignedEscrowPolicy>,
 }
 
+/// The Keymeld registration a player sends for their ticket before paying for it, so the ticket
+/// can be refunded even if it is never used for an entry.
+#[derive(Debug, Clone, Serialize)]
+pub struct TicketRegistration {
+    pub ephemeral_pubkey: String,
+    pub encrypted_keymeld_private_key: String,
+    pub keymeld_auth_pubkey: String,
+    pub keymeld_registration_context: RegistrationContext,
+    pub keymeld_escrow_policy: Option<coordinator_core::keymeld::SignedEscrowPolicy>,
+}
+
 /// Entry response from the API
 #[derive(Debug, Clone, Deserialize)]
 pub struct EntryResponse {
@@ -154,6 +165,39 @@ impl CoordinatorClient {
         }
 
         resp.json().await.context("Failed to parse ticket response")
+    }
+
+    /// Send the ticket's Keymeld registration, before paying for it (requires Nostr auth).
+    pub async fn register_ticket(
+        &self,
+        keys: &Keys,
+        competition_id: &Uuid,
+        ticket_id: &Uuid,
+        registration: &TicketRegistration,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/api/v1/competitions/{}/tickets/{}/registration",
+            self.base_url(),
+            competition_id,
+            ticket_id
+        );
+        let body = serde_json::to_vec(registration)?;
+        let auth = create_auth_header(keys, "POST", &url, Some(&body)).await?;
+        let resp = self
+            .http()
+            .post(&url)
+            .header("Authorization", auth)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .context("Failed to register the ticket")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Register ticket failed ({}): {}", status, body);
+        }
+        Ok(())
     }
 
     /// Check ticket payment status

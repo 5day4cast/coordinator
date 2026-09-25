@@ -13,14 +13,14 @@
 //! player is paid once, and a refunded escrow is never spent twice. Until the escrow's refund
 //! locktime passes there is nothing to do: the refund leaf is not open yet.
 //!
-//! Keymeld signs with the entry key the player's browser sealed to its enclave with their entry.
-//! Entries are registered with Keymeld when a competition fills, so a refund registers them first
-//! for one that died before. Two cases cannot be refunded here yet; `docs/ops/stuck-escrow-check.md`
-//! lists both:
-//!
-//! - A competition that never filled. Keymeld signs only after restoring keygen, which needs an
-//!   entry registered for every ticket.
-//! - A ticket that was paid but never used for an entry. Its player sealed no entry key.
+//! Keymeld signs with the entry key the player's browser sealed to its enclave. The browser sends
+//! that registration before it shows the ticket's invoice, and again with the entry. Entries are
+//! registered with Keymeld when a competition fills, so a refund registers every paid ticket first
+//! for one that died before, entered or not. For a competition that never filled, Keymeld is
+//! given only those players, and signs each refund with that player's own key; no key is formed
+//! from the roster. Once Keymeld has a competition's roster it cannot change, so a ticket counted
+//! after that needs an operator, as does a paid ticket whose player never sent a registration
+//! (`docs/ops/stuck-escrow-check.md`).
 
 use std::time::Duration;
 
@@ -35,11 +35,12 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{ArkRefundState, Coordinator, TicketArkEscrow, TicketArkRefund};
+use super::{PaidTicketRegistration, TicketRegistration};
 use crate::domain::competitions::EntryStatus;
+use crate::domain::Error;
 use crate::domain::PaymentStatus;
-use crate::domain::{Error, UserEntry};
-use crate::infra::keymeld::DlcKeygenSession;
-use coordinator_escrow::authorization::PayoutPolicy;
+use crate::infra::keymeld::{DlcKeygenSession, KeymeldError, ParticipantRegistrationData};
+use std::collections::BTreeSet;
 
 /// How long a refund's swap waits for its payment before the player may take it back. The
 /// verifier bounds this too, so a swap minted with anything wilder is refused.
@@ -76,6 +77,20 @@ pub struct TicketRefund {
     pub payment_hash: String,
     /// UNIX seconds.
     pub updated_at: i64,
+}
+
+/// The player of a paid ticket, and what Keymeld registers for them, or why it cannot.
+struct RefundPlayer {
+    ticket_id: Uuid,
+    registration: Result<ParticipantRegistrationData, String>,
+}
+
+impl RefundPlayer {
+    fn registration(&self) -> Result<&ParticipantRegistrationData, Error> {
+        self.registration
+            .as_ref()
+            .map_err(|e| anyhow!("{e}").into())
+    }
 }
 
 /// A funded escrow whose refund leaf is open.
@@ -175,51 +190,22 @@ impl Coordinator {
         if open.is_empty() {
             return;
         }
-        let entries = match self.refundable_entries(competition_id).await {
-            Ok(entries) => entries,
+        let players = match self.refund_players(competition_id).await {
+            Ok(players) => players,
             Err(e) => {
-                warn!("Cannot read the entries of competition {competition_id} to refund: {e}");
+                if self
+                    .reported
+                    .is_new(REFUND_REPORTS, competition_id, &e.to_string())
+                {
+                    warn!("Cannot read the players of competition {competition_id} to refund: {e}");
+                }
                 return;
             }
         };
         let signing = open.iter().any(needs_signing);
-        // Keymeld signs a refund only after restoring the competition's keygen, which needs an
-        // entry registered for every ticket. A competition that never filled cannot have that,
-        // so its refunds wait for a Keymeld that signs for a partial roster, rather than
-        // minting a swap and asking the player's provider for an invoice every hour for a
-        // refund nothing can sign.
-        let roster_complete = match self.competition_store.ticket_ids(competition_id).await {
-            Ok(tickets) => tickets
-                .iter()
-                .all(|ticket| entries.iter().any(|entry| entry.ticket_id == *ticket)),
-            Err(e) => {
-                warn!("Cannot read the tickets of competition {competition_id} to refund: {e}");
-                return;
-            }
-        };
-        if signing && !roster_complete {
-            let waiting = open.iter().filter(|refundable| needs_signing(refundable));
-            let (escrows, sats) = waiting.fold((0, 0), |(escrows, sats), refundable| {
-                (escrows + 1, sats + refundable.sats)
-            });
-            let problem = format!(
-                "{escrows} funded escrows ({sats} sats) wait for refunds: only {} of its tickets \
-                 were entered, and Keymeld signs only once every ticket's entry is registered",
-                entries.len()
-            );
-            if self
-                .reported
-                .is_new(REFUND_REPORTS, competition_id, &problem)
-            {
-                warn!(
-                    "Competition {competition_id}: {problem}. They need a Keymeld that signs for \
-                     a partial roster (docs/ops/stuck-escrow-check.md)"
-                );
-            }
-        }
-        let session = if signing && roster_complete {
-            match self.refund_session(competition_id, &entries).await {
-                Ok(session) => Some(session),
+        let (session, late) = if signing {
+            match self.refund_session(competition_id, &players).await {
+                Ok((session, late)) => (Some(session), late),
                 Err(e) => {
                     if self
                         .reported
@@ -227,31 +213,46 @@ impl Coordinator {
                     {
                         warn!("Cannot sign the refunds of competition {competition_id}: {e}");
                     }
-                    None
+                    (None, BTreeSet::new())
                 }
             }
         } else {
-            None
+            (None, BTreeSet::new())
         };
         for refundable in open {
             let ticket_id = refundable.escrow.ticket_id;
-            let Some(entry) = entries.iter().find(|entry| entry.ticket_id == ticket_id) else {
+            let Some(player) = players.iter().find(|player| player.ticket_id == ticket_id) else {
                 self.report_refund(
                     ticket_id,
                     &format!(
-                        "its escrow {} holds {} sats, but the ticket was never used for an \
-                         entry, so Keymeld has no entry key to sign its refund with; it needs \
-                         an operator (docs/ops/stuck-escrow-check.md)",
+                        "its escrow {} holds {} sats, but its player never sent Keymeld the \
+                         entry key to sign its refund with; it needs an operator \
+                         (docs/ops/stuck-escrow-check.md)",
                         refundable.outpoint, refundable.sats
                     ),
                 );
                 continue;
             };
-            if needs_signing(&refundable) && !roster_complete {
+            // Without Keymeld nothing can be signed, and a refund is not minted, asking the
+            // player's provider for an invoice, until it can be. The reason was logged above.
+            if needs_signing(&refundable) && session.is_none() {
+                continue;
+            }
+            if needs_signing(&refundable) && late.contains(&ticket_id) {
+                self.report_refund(
+                    ticket_id,
+                    &format!(
+                        "its escrow {} holds {} sats, but its ticket was counted after Keymeld \
+                         was given the competition's roster, which cannot change, so Keymeld \
+                         cannot sign its refund; it needs an operator \
+                         (docs/ops/stuck-escrow-check.md)",
+                        refundable.outpoint, refundable.sats
+                    ),
+                );
                 continue;
             }
             match self
-                .refund_ark_escrow(ark, session.as_ref(), refundable, entry)
+                .refund_ark_escrow(ark, session.as_ref(), refundable, player)
                 .await
             {
                 Ok(()) => {
@@ -272,24 +273,71 @@ impl Coordinator {
         }
     }
 
-    /// The paid entries of a competition, whose tickets hold the escrows to refund.
-    async fn refundable_entries(&self, competition_id: Uuid) -> Result<Vec<UserEntry>, Error> {
-        Ok(self
+    /// The players of a competition's paid tickets, and what Keymeld registers for each: an
+    /// entry's registration, or for a ticket never used for an entry, the one its player sent
+    /// before paying. An unpaid ticket's is never included.
+    async fn refund_players(&self, competition_id: Uuid) -> Result<Vec<RefundPlayer>, Error> {
+        let mut players = Vec::new();
+        for entry in self
             .competition_store
             .get_competition_entries(competition_id, vec![EntryStatus::Paid])
-            .await?)
+            .await?
+        {
+            let registration = self
+                .keymeld_registration(&entry)
+                .await
+                .map_err(|e| format!("entry {} cannot be registered with Keymeld: {e}", entry.id));
+            players.push(RefundPlayer {
+                ticket_id: entry.ticket_id,
+                registration,
+            });
+        }
+        for ticket in self
+            .competition_store
+            .paid_ticket_registrations(competition_id)
+            .await?
+        {
+            players.push(RefundPlayer {
+                ticket_id: ticket.ticket_id,
+                registration: ticket_registration(&ticket).map_err(|e| {
+                    format!(
+                        "ticket {}'s registration cannot be registered with Keymeld: {e}",
+                        ticket.ticket_id
+                    )
+                }),
+            });
+        }
+        Ok(players)
     }
 
-    /// The competition's Keymeld session, with every entry registered in it.
+    /// The competition's Keymeld session, with every paid ticket's player registered in it, and
+    /// the tickets that were counted too late to join it.
     ///
     /// Entries are registered when a competition's contract is built, so one that died before
-    /// registered none. Keymeld needs them all to sign any refund. Registering is idempotent,
-    /// so this repeats safely on every pass.
+    /// registered none. Registering is idempotent, so this repeats safely on every pass.
+    ///
+    /// Keymeld is sent the roster with the first refund it signs, and it cannot change after
+    /// that. So no refund is signed while a ticket's invoice can still be paid: that player
+    /// would be left out. A ticket counted after the roster was sent is returned, to be left for
+    /// an operator; any other failure to register stops every refund until the next pass, so a
+    /// passing fault cannot leave a player out.
     async fn refund_session(
         &self,
         competition_id: Uuid,
-        entries: &[UserEntry],
-    ) -> Result<DlcKeygenSession, Error> {
+        players: &[RefundPlayer],
+    ) -> Result<(DlcKeygenSession, BTreeSet<Uuid>), Error> {
+        let payable = self
+            .competition_store
+            .payable_ticket_count(competition_id)
+            .await
+            .map_err(|e| anyhow!("Cannot read the competition's unpaid tickets: {e}"))?;
+        if payable > 0 {
+            return Err(anyhow!(
+                "{payable} of its tickets can still be paid, and Keymeld's roster cannot change \
+                 once it signs a refund, so the refunds wait for those invoices to expire"
+            )
+            .into());
+        }
         let stored = self
             .competition_store
             .get_keymeld_session(competition_id)
@@ -297,20 +345,31 @@ impl Coordinator {
             .map_err(|e| anyhow!("Cannot load the competition's Keymeld session: {e}"))?
             .context("the competition has no Keymeld session")?;
         let session = self.restore_keymeld_session(&stored)?;
-        for entry in entries {
-            let registration = self.keymeld_registration(entry).await.map_err(|e| {
-                anyhow!("entry {} cannot be registered with Keymeld: {e}", entry.id)
-            })?;
-            self.keymeld
+        let mut late = BTreeSet::new();
+        for player in players {
+            match self
+                .keymeld
                 .register_participant(
                     &session,
-                    keymeld_sdk::UserId::from(entry.ticket_id),
-                    &registration,
+                    keymeld_sdk::UserId::from(player.ticket_id),
+                    player.registration()?,
                 )
                 .await
-                .map_err(|e| anyhow!("Keymeld will not register entry {}: {e}", entry.id))?;
+            {
+                Ok(()) => {}
+                Err(KeymeldError::RosterFixed(_)) => {
+                    late.insert(player.ticket_id);
+                }
+                Err(e) => {
+                    return Err(anyhow!(
+                        "Keymeld will not register the player of ticket {}: {e}",
+                        player.ticket_id
+                    )
+                    .into())
+                }
+            }
         }
-        Ok(session)
+        Ok((session, late))
     }
 
     /// Carry one escrow's refund as far as it can go now.
@@ -319,7 +378,7 @@ impl Coordinator {
         ark: &super::Arkade,
         session: Option<&DlcKeygenSession>,
         refundable: Refundable,
-        entry: &UserEntry,
+        player: &RefundPlayer,
     ) -> Result<(), Error> {
         let Refundable {
             escrow,
@@ -339,7 +398,9 @@ impl Coordinator {
                     )
                     .into());
                 }
-                let refund = self.mint_refund(ark, &escrow, entry, &script, sats).await?;
+                let refund = self
+                    .mint_refund(ark, &escrow, player, &script, sats)
+                    .await?;
                 self.competition_store
                     .store_ticket_ark_refund(refund.clone())
                     .await?;
@@ -356,7 +417,7 @@ impl Coordinator {
                     EscrowSpend::Unspent => {
                         if self.is_stale(&refund, &swap)? {
                             refund = self
-                                .remint_refund(ark, &escrow, entry, &script, sats, &refund)
+                                .remint_refund(ark, &escrow, player, &script, sats, &refund)
                                 .await?;
                             swap = self.refund_swap(ark, &refund).await?;
                             built = build(ark, &script, outpoint, sats, &swap)?;
@@ -439,20 +500,18 @@ impl Coordinator {
         &self,
         ark: &super::Arkade,
         escrow: &TicketArkEscrow,
-        entry: &UserEntry,
+        player: &RefundPlayer,
         escrow_script: &EntryEscrow,
         sats: u64,
     ) -> Result<TicketArkRefund, Error> {
-        let policy = self
-            .competition_store
-            .entry_payout_policy(entry.id)
-            .await
-            .map_err(|e| anyhow!("Cannot read the entry's payout policy: {e}"))?
-            .context("the entry has no payout policy")?;
-        let policy: PayoutPolicy = serde_json::from_str(&policy)
-            .map_err(|e| anyhow!("The entry's payout policy is invalid: {e}"))?;
+        let policy = player
+            .registration()?
+            .payout_policy
+            .as_ref()
+            .context("the ticket has no payout policy")?;
         let address = policy
             .automatic_lightning_address
+            .as_deref()
             .context("the player gave no Lightning Address to refund to")?
             .parse()
             .map_err(|e| anyhow!("The player's Lightning Address is invalid: {e}"))?;
@@ -531,7 +590,7 @@ impl Coordinator {
         &self,
         ark: &super::Arkade,
         escrow: &TicketArkEscrow,
-        entry: &UserEntry,
+        player: &RefundPlayer,
         escrow_script: &EntryEscrow,
         sats: u64,
         stale: &TicketArkRefund,
@@ -546,7 +605,7 @@ impl Coordinator {
             .into());
         }
         let fresh = self
-            .mint_refund(ark, escrow, entry, escrow_script, sats)
+            .mint_refund(ark, escrow, player, escrow_script, sats)
             .await?;
         if !self
             .competition_store
@@ -778,6 +837,26 @@ impl Coordinator {
             .await?;
         Ok(())
     }
+}
+
+/// What Keymeld registers for a paid ticket never used for an entry: the registration its player
+/// sent before paying, with the payout policy they accepted for the ticket.
+fn ticket_registration(
+    ticket: &PaidTicketRegistration,
+) -> Result<ParticipantRegistrationData, serde_json::Error> {
+    let sent: TicketRegistration = serde_json::from_str(&ticket.registration)?;
+    Ok(ParticipantRegistrationData {
+        encrypted_private_key: sent.encrypted_keymeld_private_key,
+        public_key: sent.ephemeral_pubkey,
+        auth_pubkey: sent.keymeld_auth_pubkey,
+        context: sent.keymeld_registration_context,
+        payout_policy: ticket
+            .payout_policy
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?,
+        escrow_policy: sent.keymeld_escrow_policy,
+    })
 }
 
 /// Whether an escrow's refund still has to be signed: it was never minted, or was minted but

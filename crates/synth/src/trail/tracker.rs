@@ -73,7 +73,8 @@ impl Default for TrailConfig {
 /// The node the players' payouts and refunds should reach.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PayeeConfig {
-    /// Its public key. Taken from `lnd` when that is set.
+    /// Its public key. Without it, it is asked of `lnd`, which needs a macaroon that may read
+    /// the node's info; an `invoices:read` macaroon may not.
     #[serde(default)]
     pub pubkey: Option<String>,
     /// The node itself, with a macaroon that may read invoices, to confirm a payout on the
@@ -96,13 +97,21 @@ const UNRECORDED_SWAPS_EVERY: Duration = Duration::from_secs(5 * 60);
 struct Node {
     lnd: Lnd,
     identity: OnceCell<NodeIdentity>,
+    /// Its key as configured, for a node synth may not ask: a payee's macaroon may only read
+    /// invoices, and asking a node who it is takes `info:read`.
+    pubkey: Option<String>,
 }
 
 impl Node {
     fn new(lnd: Lnd) -> Self {
+        Self::known_as(lnd, None)
+    }
+
+    fn known_as(lnd: Lnd, pubkey: Option<String>) -> Self {
         Self {
             lnd,
             identity: OnceCell::new(),
+            pubkey,
         }
     }
 
@@ -114,16 +123,20 @@ impl Node {
     }
 
     async fn is(&self, pubkey: &str) -> bool {
+        if self.pubkey.as_deref() == Some(pubkey) {
+            return true;
+        }
         self.identity()
             .await
             .is_some_and(|identity| identity.pubkey == pubkey)
     }
 
     async fn name(&self) -> String {
-        match self.identity().await {
-            Some(identity) if !identity.alias.is_empty() => identity.alias.clone(),
-            Some(identity) => identity.pubkey.chars().take(12).collect(),
-            None => "an unreachable node".to_string(),
+        match (self.identity().await, &self.pubkey) {
+            (Some(identity), _) if !identity.alias.is_empty() => identity.alias.clone(),
+            (Some(identity), _) => identity.pubkey.chars().take(12).collect(),
+            (None, Some(pubkey)) => pubkey.chars().take(12).collect(),
+            (None, None) => "an unreachable node".to_string(),
         }
     }
 }
@@ -182,7 +195,12 @@ impl Tracker {
         config: TrailConfig,
     ) -> Result<Self> {
         let (payee_pubkey, payee_node) = match payee {
-            Some(payee) => (payee.pubkey, payee.lnd.map(Node::new)),
+            Some(payee) => {
+                let node = payee
+                    .lnd
+                    .map(|lnd| Node::known_as(lnd, payee.pubkey.clone()));
+                (payee.pubkey, node)
+            }
             None => (None, None),
         };
         Ok(Self {
@@ -1406,6 +1424,8 @@ mod tests {
     struct Fixture {
         tracker: Tracker,
         server: tokio::task::JoinHandle<()>,
+        /// Where the one server answers.
+        url: String,
         _data: tempfile::TempDir,
     }
 
@@ -1456,6 +1476,7 @@ mod tests {
             )
             .unwrap(),
             server,
+            url,
             _data: data,
         }
     }
@@ -1940,6 +1961,54 @@ mod tests {
             assert_eq!(amountless.amount_sats, Some(900));
             assert!(amountless.is_confirmed());
         }
+    }
+
+    /// A payee's node is read with a macaroon that may only read invoices, so it cannot say
+    /// who it is. Its configured key names it, and a payout it settled is confirmed on its side.
+    #[tokio::test]
+    async fn a_payee_node_that_only_reads_invoices_confirms_payouts() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use sha2::{Digest, Sha256};
+
+        let preimage = [42u8; 32];
+        let hash = hex::encode(Sha256::digest(preimage));
+        let invoice = serde_json::json!({
+            "state": "SETTLED", "r_preimage": STANDARD.encode(preimage), "amt_paid_sat": "900"
+        });
+        let router = Router::new()
+            .route("/v1/getinfo", get(|| async { StatusCode::FORBIDDEN }))
+            .route(
+                "/v1/invoice/{hash}",
+                get(move || async move { Json(invoice) }),
+            );
+        let mut fixture = fixture(router, false, false).await;
+        let macaroon = fixture._data.path().join("invoices-read.macaroon");
+        std::fs::write(&macaroon, [0u8]).unwrap();
+        let payee = Lnd::new(&LndConfig {
+            rest_url: fixture.url.clone(),
+            macaroon_file: macaroon,
+            tls_cert_file: None,
+            fee_limit_sats: 100,
+            payment_timeout_secs: 1,
+        })
+        .unwrap();
+        let inner = Arc::get_mut(&mut fixture.tracker.inner).unwrap();
+        inner.payee_pubkey = Some("payee".into());
+        inner.payee_node = Some(Node::known_as(payee, Some("payee".into())));
+
+        let mut payout = PayoutSeen {
+            owed_sats: 900,
+            payment_hash: Some(hash),
+            payee_pubkey: Some("payee".into()),
+            ..PayoutSeen::default()
+        };
+        payout.payee = fixture.tracker.payee_check_of(&payout).await;
+        assert_eq!(payout.payee, PayeeCheck::Matches);
+        fixture.tracker.look_up_payout(&mut payout).await;
+        assert_eq!(payout.payee, PayeeCheck::SettledOnPayee);
+        assert_eq!(payout.amount_sats, Some(900));
+        assert_eq!(payout.payee_alias.as_deref(), Some("payee"));
+        assert!(payout.is_confirmed());
     }
 
     /// With a payee configured, a payout whose invoice pays another node is caught.

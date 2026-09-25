@@ -289,6 +289,7 @@ pub async fn admin_create_competition_handler(
         coordinator_fee_percentage: form.coordinator_fee_percentage,
         total_competition_pool,
         relative_locktime_block_delta: form.relative_locktime_block_delta,
+        unlisted: false,
     };
 
     match state.coordinator.create_competition(create_event).await {

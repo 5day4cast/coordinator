@@ -142,6 +142,10 @@ impl Coordinator {
     /// Cleanup has its own work queue: cancelled competitions are excluded from active lifecycle
     /// processing, but their invoices and time-locked escrows still need retries after outages
     /// or maturity.
+    ///
+    /// Then the Keymeld registrations players sent before paying are deleted once nothing will
+    /// use them: those of released reservations, and those of competitions that ended with no
+    /// refund left to sign.
     pub async fn clean_up_competitions(&self) -> Result<(), anyhow::Error> {
         for competition_id in self
             .competition_store
@@ -151,6 +155,10 @@ impl Coordinator {
             self.release_held_invoices(competition_id).await;
             self.reclaim_escrows(competition_id).await;
             self.refund_ark_escrows(competition_id).await;
+        }
+        let purged = self.competition_store.purge_ticket_registrations().await?;
+        if purged > 0 {
+            debug!("Deleted {purged} Keymeld registrations that nothing will use");
         }
         Ok(())
     }
@@ -272,6 +280,7 @@ mod tests {
             coordinator_fee_percentage: 0,
             total_competition_pool: 100_000,
             relative_locktime_block_delta: Some(72),
+            unlisted: false,
         });
         competition.total_entries = 2;
         competition.total_paid_entries = 2;

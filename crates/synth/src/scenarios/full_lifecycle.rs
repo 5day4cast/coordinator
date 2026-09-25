@@ -1,5 +1,7 @@
 use crate::client::competitions::CreateCompetition;
-use crate::client::entries::{AddEntry, TicketStatus, ValueOption, WeatherChoices};
+use crate::client::entries::{
+    AddEntry, TicketRegistration, TicketStatus, ValueOption, WeatherChoices,
+};
 use crate::client::CoordinatorClient;
 use crate::crypto;
 use crate::crypto::keys::SynthUser;
@@ -153,7 +155,10 @@ pub async fn run_full_lifecycle(
     finish_result("full_lifecycle", started_at, scenario_start, steps, false)
 }
 
-async fn create_competition(client: &CoordinatorClient, config: &ScenarioConfig) -> Result<Uuid> {
+pub(super) async fn create_competition(
+    client: &CoordinatorClient,
+    config: &ScenarioConfig,
+) -> Result<Uuid> {
     let now = OffsetDateTime::now_utc();
     let observation_window = time::Duration::seconds(config.observation_window_secs as i64);
 
@@ -175,6 +180,8 @@ async fn create_competition(client: &CoordinatorClient, config: &ScenarioConfig)
         entry_fee: config.entry_fee,
         coordinator_fee_percentage: 10,
         total_competition_pool: config.entry_fee * config.users,
+        // A test competition: kept off the oracle's public events list.
+        unlisted: true,
     };
 
     let resp = client.create_competition(&competition).await?;
@@ -257,6 +264,25 @@ pub(super) async fn enter_competition_with(
         ),
         None => None,
     };
+    // As the browser does, the registration goes before the invoice is paid, so a ticket paid
+    // for but never entered can still be refunded.
+    if let Some(data) = &registration {
+        client
+            .register_ticket(
+                &user.nostr_keys,
+                competition_id,
+                &ticket.ticket_id,
+                &TicketRegistration {
+                    ephemeral_pubkey: ephemeral.public_key.clone(),
+                    encrypted_keymeld_private_key: data.encrypted_private_key.clone(),
+                    keymeld_auth_pubkey: data.auth_pubkey.clone(),
+                    keymeld_registration_context: data.context.clone(),
+                    keymeld_escrow_policy: data.escrow_policy.clone(),
+                },
+            )
+            .await
+            .context("Failed to register the ticket before paying")?;
+    }
     let (
         encrypted_keymeld_key,
         keymeld_auth_pubkey,

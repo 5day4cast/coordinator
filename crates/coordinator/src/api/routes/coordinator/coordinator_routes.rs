@@ -22,8 +22,8 @@ use crate::{
     },
     domain::{
         AddEntry, Competition, CreateEvent, Error as DomainError, FundedContract, PayoutClaimInfo,
-        PayoutClaimReceipt, PayoutInfo, SearchBy, TicketRefund, TicketResponse, TicketStatus,
-        UserEntry,
+        PayoutClaimReceipt, PayoutInfo, SearchBy, TicketRefund, TicketRegistration, TicketResponse,
+        TicketStatus, UserEntry,
     },
     infra::lnurl::LightningAddress,
     startup::AppState,
@@ -119,6 +119,28 @@ pub async fn get_ticket_status(
         .map(Json)
         .map_err(|e| {
             error!("error getting ticket status: {:?}", e);
+            e.into()
+        })
+}
+
+/// Keep the Keymeld registration the player's browser sealed for their ticket, sent before it
+/// shows the ticket's invoice, so that the ticket can be refunded even if it is never used for an
+/// entry. It is deleted if the reservation is released unpaid.
+pub async fn register_ticket(
+    State(state): State<Arc<AppState>>,
+    Path((competition_id, ticket_id)): Path<(Uuid, Uuid)>,
+    AuthedJson {
+        auth: NostrAuth { pubkey, .. },
+        body,
+    }: AuthedJson<TicketRegistration>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .coordinator
+        .register_ticket(pubkey.to_hex(), competition_id, ticket_id, body)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|e| {
+            error!("error registering ticket: {:?}", e);
             e.into()
         })
 }

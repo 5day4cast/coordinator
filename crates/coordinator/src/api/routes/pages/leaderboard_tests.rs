@@ -134,6 +134,7 @@ impl Coordinator {
             coordinator_fee_percentage: 5,
             total_competition_pool: 6_000 * entries,
             relative_locktime_block_delta: None,
+            unlisted: false,
         });
         self.state
             .coordinator

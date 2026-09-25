@@ -13,6 +13,7 @@ mod reported;
 mod runners;
 pub mod states;
 mod store;
+mod ticket_registration;
 use crate::infra::{
     db::{
         parse_optional_blob_json, parse_optional_datetime, parse_optional_sqlite_datetime,
@@ -43,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, FromRow, Row};
 use std::fmt;
 pub use store::*;
+pub use ticket_registration::*;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
@@ -612,6 +614,11 @@ pub struct CreateEvent {
     /// If not set, uses the coordinator-level default from config.
     #[serde(default)]
     pub relative_locktime_block_delta: Option<u16>,
+    /// Ask the oracle to keep the event off its public events list, as for the test
+    /// competitions synth runs. It stays reachable by id. Defaults to false; oracles before
+    /// 2.3.0 ignore it.
+    #[serde(default)]
+    pub unlisted: bool,
 }
 
 impl CreateEvent {
@@ -697,6 +704,7 @@ mod oracle_event_validation_tests {
             coordinator_fee_percentage: 10,
             total_competition_pool: 1_800,
             relative_locktime_block_delta: None,
+            unlisted: false,
         }
     }
 

@@ -195,3 +195,91 @@ pub fn load_config(path: Option<&str>) -> anyhow::Result<SynthConfig> {
     let config = builder.build()?;
     Ok(config.try_deserialize()?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// The payee checks and the Arkade lookups are configured under `trail`, from the config file
+    /// or from `SYNTH__`-prefixed environment variables.
+    #[test]
+    fn the_payee_and_arkd_settings_are_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synth.toml");
+        std::fs::write(
+            &path,
+            r#"
+[defaults]
+stations = ["KDEN"]
+
+[trail]
+arkd_url = "https://arkd.example"
+
+[trail.payee]
+pubkey = "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[trail.payee.lnd]
+rest_url = "https://payee.example:8080"
+macaroon_file = "/run/secrets/payee-invoices-read.macaroon"
+tls_cert_file = "/run/secrets/payee.tls.cert"
+"#,
+        )
+        .unwrap();
+        let config = load_config(Some(path.to_str().unwrap())).unwrap();
+        assert_eq!(
+            config.trail.arkd_url.as_deref(),
+            Some("https://arkd.example")
+        );
+        let payee = config.trail.payee.expect("trail.payee");
+        assert_eq!(
+            payee.pubkey.as_deref(),
+            Some("02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        let lnd = payee.lnd.expect("trail.payee.lnd");
+        assert_eq!(lnd.rest_url, "https://payee.example:8080");
+        assert_eq!(
+            lnd.macaroon_file,
+            Path::new("/run/secrets/payee-invoices-read.macaroon")
+        );
+        assert_eq!(
+            lnd.tls_cert_file.as_deref(),
+            Some(Path::new("/run/secrets/payee.tls.cert"))
+        );
+
+        // The same settings from the environment, with nothing about them in the file.
+        let bare = directory.path().join("bare.toml");
+        std::fs::write(&bare, "[defaults]\nstations = [\"KDEN\"]\n").unwrap();
+        let variables = [
+            ("SYNTH__TRAIL__ARKD_URL", "https://arkd.example"),
+            ("SYNTH__TRAIL__PAYEE__PUBKEY", "02ab"),
+            (
+                "SYNTH__TRAIL__PAYEE__LND__REST_URL",
+                "https://payee.example:8080",
+            ),
+            ("SYNTH__TRAIL__PAYEE__LND__MACAROON_FILE", "/run/secrets/m"),
+            ("SYNTH__TRAIL__PAYEE__LND__TLS_CERT_FILE", "/run/secrets/c"),
+        ];
+        for (name, value) in variables {
+            std::env::set_var(name, value);
+        }
+        let config = load_config(Some(bare.to_str().unwrap()));
+        for (name, _) in variables {
+            std::env::remove_var(name);
+        }
+        let config = config.unwrap();
+        assert_eq!(
+            config.trail.arkd_url.as_deref(),
+            Some("https://arkd.example")
+        );
+        let payee = config.trail.payee.expect("trail.payee");
+        assert_eq!(payee.pubkey.as_deref(), Some("02ab"));
+        let lnd = payee.lnd.expect("trail.payee.lnd");
+        assert_eq!(lnd.rest_url, "https://payee.example:8080");
+        assert_eq!(lnd.macaroon_file, Path::new("/run/secrets/m"));
+        assert_eq!(
+            lnd.tls_cert_file.as_deref(),
+            Some(Path::new("/run/secrets/c"))
+        );
+    }
+}

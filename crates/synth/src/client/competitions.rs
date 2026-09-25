@@ -21,6 +21,9 @@ pub struct CreateCompetition {
     pub entry_fee: usize,
     pub coordinator_fee_percentage: usize,
     pub total_competition_pool: usize,
+    /// Keep the competition's oracle event off the oracle's public list. Set for the test
+    /// competitions synth makes.
+    pub unlisted: bool,
 }
 
 /// Competition response from the API

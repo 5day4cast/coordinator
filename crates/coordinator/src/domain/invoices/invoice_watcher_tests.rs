@@ -128,6 +128,7 @@ impl Fixture {
             coordinator_fee_percentage: 0,
             total_competition_pool: 100_000,
             relative_locktime_block_delta: Some(72),
+            unlisted: false,
         });
         let tickets = (1..=2u8)
             .map(|byte| Ticket {

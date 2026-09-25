@@ -21,8 +21,14 @@ for (const rejection of ["missing policy", "wrong ticket", "wrong session", "wal
     let shown = 0;
     let ordinaryRegistrations = 0;
     let request;
+    let registered = 0;
     const bundle = load("entries", {
       AuthorizedClient: class { async post(url, body) {
+        if (url.endsWith("/registration")) {
+          assert.equal(shown, 0, "the registration goes before the invoice is shown");
+          registered++;
+          return { ok: true, status: 204 };
+        }
         request = body;
         return { ok: true, json: async () => ({ ticket_id: "ticket", payment_request: "ticket-invoice",
           keymeld_session_id: "session", keymeld_registration: {
@@ -55,6 +61,7 @@ for (const rejection of ["missing policy", "wrong ticket", "wrong session", "wal
     if (rejection) await assert.rejects(entry.handleTicketPayment("pubkey"));
     else await entry.handleTicketPayment("pubkey");
     assert.equal(shown, rejection ? 0 : 1);
+    assert.equal(registered, rejection ? 0 : 1);
     assert.equal(ordinaryRegistrations, 0, "escrow consent must never downgrade to ordinary enrollment");
     assert.equal(request.payout.payout_hash, "own hash");
   });

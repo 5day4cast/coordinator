@@ -91,7 +91,26 @@ class Entry {
     }
     // Ticket hash, wallet key and enclave trust are all checked before
     // exposing the invoice for payment. A failed check cannot leave a paid ticket.
+    // The registration is sent before the invoice is shown, so a ticket paid
+    // for but never entered can still be refunded.
+    if (this.preparedRegistration) await this.sendRegistration();
     return this.showPaymentModal();
+  }
+
+  async sendRegistration() {
+    const registration = this.preparedRegistration;
+    const response = await this.client.post(
+      `${this.coordinator_url}/api/v1/competitions/${this.competition.id}/tickets/${this.ticket.id}/registration`,
+      {
+        ephemeral_pubkey: this.entry.ephemeral_pubkey,
+        encrypted_keymeld_private_key: registration.encrypted_private_key,
+        keymeld_auth_pubkey: registration.auth_pubkey,
+        keymeld_registration_context: registration.context,
+        keymeld_escrow_policy: registration.escrow_policy ?? null,
+      },
+    );
+    if (!response.ok)
+      throw new Error(`Failed to register the ticket: ${response.status}`);
   }
 
   // Shows the invoice and waits for it to be paid. The ticket's status is an

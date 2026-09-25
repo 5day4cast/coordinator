@@ -184,6 +184,8 @@ struct Enclaves {
     /// Each registered player's entry key, escrow, and consent to its refunds.
     players: Mutex<HashMap<UserId, (Keypair, EntryEscrow, ArkEscrowPolicy)>>,
     registered: Mutex<Vec<UserId>>,
+    /// Whether a refund was signed, which sends Keymeld the roster: no one can join after.
+    roster_sent: AtomicBool,
     signatures: AtomicUsize,
     /// Why Keymeld refuses to sign refunds, if it does.
     refusal: Mutex<Option<String>>,
@@ -241,6 +243,9 @@ impl Keymeld for Enclaves {
         );
         let mut registered = self.registered.lock().unwrap();
         if !registered.contains(&user) {
+            if self.roster_sent.load(Ordering::SeqCst) {
+                return Err(KeymeldError::RosterFixed(user.to_string()));
+            }
             registered.push(user);
         }
         Ok(())
@@ -282,6 +287,7 @@ impl Keymeld for Enclaves {
             self.registered.lock().unwrap().contains(&user),
             "Keymeld signs only for a registered entry"
         );
+        self.roster_sent.store(true, Ordering::SeqCst);
         let players = self.players.lock().unwrap();
         let (key, escrow, policy) = players.get(&user).expect("a known player");
         let (_, refund) = coordinator_escrow::ark::refund_from(escrow, policy, &spend).unwrap();
@@ -306,6 +312,16 @@ impl Keymeld for Enclaves {
     ) -> Result<RegistrationAssignment, KeymeldError> {
         panic!("no registration here")
     }
+}
+
+/// What a ticket's player sent Keymeld.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sent {
+    Nothing,
+    /// The registration their browser sends before showing the invoice, and no entry.
+    Registration,
+    /// An entry.
+    Entry,
 }
 
 /// A ticket reserved for its escrow swap.
@@ -389,6 +405,7 @@ impl Fixture {
             coordinator_fee_percentage: 10,
             total_competition_pool: 15_000,
             relative_locktime_block_delta: Some(72),
+            unlisted: false,
         });
         assert_eq!(competition.calculate_invoice_amount(), PRICE);
         let competition_id = competition.id;
@@ -552,7 +569,12 @@ impl Fixture {
 
     /// The competition's Keymeld session, as created with the competition.
     async fn keymeld_session(&self) -> DlcKeygenSession {
-        let session = session();
+        self.keymeld_session_for(&[UserId::new_v7()]).await
+    }
+
+    /// The competition's Keymeld session, whose manifest names `players`.
+    async fn keymeld_session_for(&self, players: &[UserId]) -> DlcKeygenSession {
+        let session = session_for(players);
         self.coordinator
             .store_keymeld_session(self.competition_id, session.clone())
             .await
@@ -562,44 +584,39 @@ impl Fixture {
 
     /// A ticket of test key `player` whose escrow ark-swapd funded with the ticket price, and
     /// whose refund leaf is open. With `entered`, the player used it for an entry that gave a
-    /// Lightning Address; without, they paid but never entered.
+    /// Lightning Address; without, they paid but never entered, nor sent a registration.
     async fn funded(&self, session: &DlcKeygenSession, player: u8, entered: bool) -> ArkTicket {
+        let sent = if entered { Sent::Entry } else { Sent::Nothing };
+        self.funded_after(session, player, sent).await
+    }
+
+    /// A ticket as [`Fixture::funded`] makes it, whose player sent Keymeld `sent`.
+    async fn funded_after(&self, session: &DlcKeygenSession, player: u8, sent: Sent) -> ArkTicket {
         let now = OffsetDateTime::now_utc().unix_timestamp() as u32;
         let (ticket, escrow) = self.ticket_refundable_from(player, PRICE, now - 60).await;
+        let (registration, policy) = self.registration(session, &ticket, &escrow, player);
+        if sent == Sent::Registration {
+            // Sent before paying, with the payout policy accepted for the ticket.
+            self.store()
+                .store_ticket_payout_policy(
+                    ticket.id,
+                    ticket.hash.clone(),
+                    registration.ephemeral_pubkey.clone(),
+                    serde_json::to_string(&policy).unwrap(),
+                )
+                .await
+                .unwrap();
+            self.register(&ticket, &registration).await;
+        }
         let vtxo = outpoint(player, 0);
         self.arkade_lists(&ticket.escrow_address, vtxo, PRICE, false);
         self.swap_reports(&ticket, SwapState::Settled, Some(vtxo), Some(vtxo.txid));
         self.coordinator.check_ark_swaps().await.unwrap();
         assert!(self.paid_by(&ticket).await.is_some());
-        if !entered {
+        if sent != Sent::Entry {
             return ticket;
         }
 
-        let key = keypair(player);
-        let user = UserId::from(ticket.id);
-        let ark_escrow = ArkEscrowPolicy {
-            escrow_tap_tree: hex::encode(escrow.vtxo_script().encode_tap_tree()),
-            max_fee_sats: PRICE - 5_000,
-            max_refund_fee_sats: 100,
-            checkpoint_exit_script: hex::encode(self.server.info().checkpoint_tapscript.as_bytes()),
-        };
-        let policy = PayoutPolicy {
-            automatic_lightning_address: Some(format!("player{player}@mock-wallet.dev")),
-            allow_invoice_fallback: true,
-            release_entry_key_after_payment: true,
-            contract_terms: "{}".into(),
-            ark_escrow: Some(ark_escrow.clone()),
-        };
-        let context = RegistrationContext {
-            keygen_session_id: session.session_id.clone(),
-            manifest_hash: session.authorization_manifest.digest().unwrap(),
-            user_id: user.clone(),
-            enclave_id: EnclaveId::new(1),
-            enclave_key_epoch: 1,
-            public_key: key.public_key().serialize().to_vec(),
-            auth_pubkey: vec![2; 33],
-            require_signing_approval: false,
-        };
         let entry_id = ticket.id;
         let submission = serde_json::to_string(&crate::infra::oracle::AddEventEntry {
             id: entry_id,
@@ -608,8 +625,8 @@ impl Fixture {
         })
         .unwrap();
         let (competition_id, ticket_id) = (self.competition_id.to_string(), ticket.id.to_string());
-        let entry_key = key.public_key().to_string();
-        let context = serde_json::to_string(&context).unwrap();
+        let entry_key = registration.ephemeral_pubkey.clone();
+        let context = serde_json::to_string(&registration.keymeld_registration_context).unwrap();
         self.database
             .execute_write(move |pool| async move {
                 sqlx::query(
@@ -636,12 +653,107 @@ impl Fixture {
             .store_entry_payout_policy(entry_id, serde_json::to_string(&policy).unwrap())
             .await
             .unwrap();
+        ticket
+    }
+
+    /// The registration test key `player`'s browser seals for `ticket`, and the payout policy it
+    /// accepts; Keymeld is told the key, to sign as the player.
+    fn registration(
+        &self,
+        session: &DlcKeygenSession,
+        ticket: &ArkTicket,
+        escrow: &EntryEscrow,
+        player: u8,
+    ) -> (TicketRegistration, PayoutPolicy) {
+        let key = keypair(player);
+        let user = UserId::from(ticket.id);
+        let ark_escrow = ArkEscrowPolicy {
+            escrow_tap_tree: hex::encode(escrow.vtxo_script().encode_tap_tree()),
+            max_fee_sats: PRICE - 5_000,
+            max_refund_fee_sats: 100,
+            checkpoint_exit_script: hex::encode(self.server.info().checkpoint_tapscript.as_bytes()),
+        };
+        let policy = PayoutPolicy {
+            automatic_lightning_address: Some(format!("player{player}@mock-wallet.dev")),
+            allow_invoice_fallback: true,
+            release_entry_key_after_payment: true,
+            contract_terms: "{}".into(),
+            ark_escrow: Some(ark_escrow.clone()),
+        };
+        let context = RegistrationContext {
+            keygen_session_id: session.session_id.clone(),
+            manifest_hash: session.authorization_manifest.digest().unwrap(),
+            user_id: user.clone(),
+            enclave_id: EnclaveId::new(1),
+            enclave_key_epoch: 1,
+            public_key: key.public_key().serialize().to_vec(),
+            auth_pubkey: vec![2; 33],
+            require_signing_approval: false,
+        };
         self.enclaves
             .players
             .lock()
             .unwrap()
-            .insert(user, (key, escrow, ark_escrow));
+            .insert(user, (key, escrow.clone(), ark_escrow));
+        let registration = TicketRegistration {
+            ephemeral_pubkey: key.public_key().to_string(),
+            encrypted_keymeld_private_key: "sealed-to-the-enclave".into(),
+            keymeld_auth_pubkey: hex::encode([2; 33]),
+            keymeld_registration_context: context,
+            keymeld_escrow_policy: None,
+        };
+        (registration, policy)
+    }
+
+    /// Keep `registration` for the ticket, as its player's browser sends it before paying.
+    async fn register(&self, ticket: &ArkTicket, registration: &TicketRegistration) {
+        assert_eq!(
+            self.store()
+                .store_ticket_registration(
+                    ticket.id,
+                    ticket.hash.clone(),
+                    "player".into(),
+                    serde_json::to_string(registration).unwrap(),
+                )
+                .await
+                .unwrap(),
+            RegistrationStored::Stored
+        );
+    }
+
+    /// An unpaid ticket of test key `player`, whose player sent their registration.
+    async fn registered_unpaid(&self, session: &DlcKeygenSession, player: u8) -> ArkTicket {
+        let now = OffsetDateTime::now_utc().unix_timestamp() as u32;
+        let (ticket, escrow) = self.ticket_refundable_from(player, PRICE, now - 60).await;
+        let (registration, _) = self.registration(session, &ticket, &escrow, player);
+        self.register(&ticket, &registration).await;
         ticket
+    }
+
+    /// The ticket's invoice expires at `offset` from now, as SQLite reads it: "+1 hour".
+    async fn invoice_expires(&self, ticket: &ArkTicket, offset: &str) {
+        let (ticket_id, offset) = (ticket.id.to_string(), offset.to_string());
+        self.database
+            .execute_write(move |pool| async move {
+                sqlx::query(
+                    "UPDATE tickets SET invoice_expires_at = datetime('now', ?) WHERE id = ?",
+                )
+                .bind(offset)
+                .bind(ticket_id)
+                .execute(&pool)
+                .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// How many registrations players sent before paying are kept.
+    async fn registrations(&self) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM ticket_keymeld_registrations")
+            .fetch_one(self.database.read())
+            .await
+            .unwrap()
     }
 
     /// The competition is cancelled before a batch funds its pool.
@@ -688,14 +800,15 @@ impl Fixture {
     }
 }
 
-/// A Keymeld session like the one made with each competition.
-fn session() -> DlcKeygenSession {
+/// A Keymeld session like the one made with each competition, whose manifest names `players`,
+/// one per ticket.
+fn session_for(players: &[UserId]) -> DlcKeygenSession {
     let coordinator = UserId::from(Uuid::from_u128(999));
     let creator = AuthorizationCredentials::from_secret(&[11; 32]).unwrap();
     let signing = AuthorizationCredentials::from_secret(&[12; 32]).unwrap();
     let credentials = SessionCredentials::from_session_secret(&[13; 32]).unwrap();
-    let registrations: BTreeMap<_, _> = [coordinator.clone(), UserId::new_v7()]
-        .into_iter()
+    let registrations: BTreeMap<_, _> = std::iter::once(coordinator.clone())
+        .chain(players.iter().cloned())
         .enumerate()
         .map(|(i, user)| {
             (
@@ -937,7 +1050,78 @@ async fn a_cancelled_arkade_competition_refunds_each_funded_escrow_once() {
 }
 
 #[tokio::test]
-async fn a_funded_ticket_never_used_for_an_entry_is_left_for_an_operator() {
+async fn a_paid_ticket_never_entered_is_refunded_with_the_registration_sent_before_paying() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let entered = f.funded(&session, 21, true).await;
+    let never_entered = f.funded_after(&session, 23, Sent::Registration).await;
+    f.cancel().await;
+
+    f.clean_up().await;
+    for ticket in [&entered, &never_entered] {
+        assert_eq!(
+            f.refund(ticket).await.unwrap().state,
+            ArkRefundState::Settled
+        );
+    }
+    assert_eq!(
+        f.enclaves.registered.lock().unwrap().clone(),
+        vec![UserId::from(entered.id), UserId::from(never_entered.id)],
+        "Keymeld registers the entry, and the ticket that was paid and never entered"
+    );
+    assert_eq!(f.spends(), (2, 2));
+    assert_eq!(f.ln.payments_sent(), 2);
+    assert_eq!(
+        f.registrations().await,
+        0,
+        "with nothing left to refund, the registrations are deleted"
+    );
+    assert!(!f.awaiting_cleanup().await);
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_player_keymeld_cannot_register_holds_back_signing_but_not_a_refund_under_way() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let first = f.funded(&session, 21, true).await;
+    f.cancel().await;
+    // The first refund is paid, and its claim is lost, so it is still under way.
+    f.swaps.lose_next_claim.store(true, Ordering::SeqCst);
+    f.clean_up().await;
+    assert_eq!(f.refund(&first).await.unwrap().state, ArkRefundState::Paid);
+
+    // A second entry turns up whose sealed key is missing, so it cannot be registered.
+    let broken = f.funded(&session, 23, true).await;
+    let ticket_id = broken.id.to_string();
+    f.database
+        .execute_write(move |pool| async move {
+            sqlx::query(
+                "UPDATE entries SET encrypted_keymeld_private_key = NULL WHERE ticket_id = ?",
+            )
+            .bind(ticket_id)
+            .execute(&pool)
+            .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    f.clean_up().await;
+    assert_eq!(
+        f.refund(&first).await.unwrap().state,
+        ArkRefundState::Settled,
+        "the refund under way needs nothing more from Keymeld"
+    );
+    assert!(
+        f.refund(&broken).await.is_none(),
+        "nothing is minted for a refund Keymeld cannot sign"
+    );
+    assert_eq!(f.ln.payments_sent(), 1);
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_paid_ticket_whose_player_sent_no_registration_is_left_for_an_operator() {
     let f = Fixture::new().await;
     let session = f.keymeld_session().await;
     let ticket = f.funded(&session, 21, false).await;
@@ -953,6 +1137,212 @@ async fn a_funded_ticket_never_used_for_an_entry_is_left_for_an_operator() {
         f.awaiting_cleanup().await,
         "it stays listed as holding a buy-in"
     );
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn unpaid_tickets_registrations_never_reach_keymeld() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let entered = f.funded(&session, 21, true).await;
+    // Two players registered and never paid. Their invoices expired, and the watchers have not
+    // released their reservations yet.
+    for player in [23, 25] {
+        let ticket = f.registered_unpaid(&session, player).await;
+        f.invoice_expires(&ticket, "-1 minute").await;
+    }
+    assert_eq!(f.registrations().await, 2);
+    f.cancel().await;
+
+    f.clean_up().await;
+    assert_eq!(
+        f.refund(&entered).await.unwrap().state,
+        ArkRefundState::Settled
+    );
+    assert_eq!(
+        f.enclaves.registered.lock().unwrap().clone(),
+        vec![UserId::from(entered.id)],
+        "only a paid ticket's player is registered with Keymeld"
+    );
+    assert_eq!(
+        f.registrations().await,
+        0,
+        "a dead competition keeps no registration of a ticket that can no longer be paid"
+    );
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn registrations_go_with_their_released_reservations() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let mut unpaid = Vec::new();
+    for player in [23, 25] {
+        let ticket = f.registered_unpaid(&session, player).await;
+        f.invoice_expires(&ticket, "+1 hour").await;
+        unpaid.push(ticket);
+    }
+    f.clean_up().await;
+    assert_eq!(
+        f.registrations().await,
+        2,
+        "reservations still held keep theirs"
+    );
+
+    // The first invoice is cancelled, and the invoice watcher releases the reservation.
+    let cancelled = f.store().get_ticket(unpaid[0].id).await.unwrap();
+    assert!(f
+        .store()
+        .clear_ticket_reservation(&cancelled)
+        .await
+        .unwrap());
+    assert!(f
+        .store()
+        .ticket_registration(unpaid[0].id, &unpaid[0].hash)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(f.registrations().await, 1);
+
+    // The second one's swap expires unpaid, and the swap watcher releases the reservation.
+    f.swap_reports(&unpaid[1], SwapState::Expired, None, None);
+    f.coordinator.check_ark_swaps().await.unwrap();
+    assert_eq!(f.registrations().await, 0);
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_taken_over_reservation_loses_its_registration() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let now = OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let (ticket, escrow) = f.ticket_refundable_from(23, PRICE, now + 3_600).await;
+    let (registration, _) = f.registration(&session, &ticket, &escrow, 23);
+    f.register(&ticket, &registration).await;
+    let ticket_id = ticket.id.to_string();
+    f.database
+        .execute_write(move |pool| async move {
+            sqlx::query(
+                "UPDATE tickets SET reserved_at = datetime('now', '-11 minutes') WHERE id = ?",
+            )
+            .bind(ticket_id)
+            .execute(&pool)
+            .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let taken = f
+        .store()
+        .get_and_reserve_ticket(f.competition_id, "someone else")
+        .await
+        .unwrap();
+    assert_eq!(taken.ticket.id, ticket.id);
+    assert_ne!(
+        taken.ticket.hash, ticket.hash,
+        "a takeover rotates the hash"
+    );
+    assert_eq!(f.registrations().await, 0);
+    // The first player's registration cannot come back for the new reservation.
+    assert_eq!(
+        f.store()
+            .store_ticket_registration(
+                ticket.id,
+                ticket.hash.clone(),
+                "player".into(),
+                serde_json::to_string(&registration).unwrap(),
+            )
+            .await
+            .unwrap(),
+        RegistrationStored::ReservationChanged
+    );
+    f.database.close().await.unwrap();
+}
+
+/// Store `registration` for `ticket` as `player` sends it.
+async fn store_as(
+    f: &Fixture,
+    ticket: &ArkTicket,
+    registration: &TicketRegistration,
+    player: &str,
+) -> RegistrationStored {
+    f.store()
+        .store_ticket_registration(
+            ticket.id,
+            ticket.hash.clone(),
+            player.into(),
+            serde_json::to_string(registration).unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_registration_is_fixed_once_its_ticket_is_paid() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let now = OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let (ticket, escrow) = f.ticket_refundable_from(23, PRICE, now + 3_600).await;
+    let (registration, _) = f.registration(&session, &ticket, &escrow, 23);
+    let mut resealed = registration.clone();
+    resealed.encrypted_keymeld_private_key = "sealed-again".into();
+
+    assert_eq!(
+        store_as(&f, &ticket, &registration, "mallory").await,
+        RegistrationStored::ReservationChanged,
+        "only the ticket's holder registers it"
+    );
+    assert_eq!(
+        store_as(&f, &ticket, &registration, "player").await,
+        RegistrationStored::Stored
+    );
+    assert_eq!(
+        store_as(&f, &ticket, &registration, "player").await,
+        RegistrationStored::Unchanged
+    );
+    assert_eq!(
+        store_as(&f, &ticket, &resealed, "player").await,
+        RegistrationStored::Stored,
+        "an unpaid ticket's player may send it again"
+    );
+
+    let vtxo = outpoint(23, 0);
+    f.arkade_lists(&ticket.escrow_address, vtxo, PRICE, false);
+    f.swap_reports(&ticket, SwapState::Settled, Some(vtxo), Some(vtxo.txid));
+    f.coordinator.check_ark_swaps().await.unwrap();
+    assert!(f.paid_by(&ticket).await.is_some());
+    assert_eq!(
+        store_as(&f, &ticket, &registration, "player").await,
+        RegistrationStored::Fixed
+    );
+    assert_eq!(
+        store_as(&f, &ticket, &resealed, "player").await,
+        RegistrationStored::Unchanged
+    );
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_completed_competition_keeps_no_registrations() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    f.funded_after(&session, 21, Sent::Registration).await;
+    f.clean_up().await;
+    assert_eq!(
+        f.registrations().await,
+        1,
+        "a live competition keeps its own"
+    );
+
+    let mut competition = f.store().get_competition(f.competition_id).await.unwrap();
+    competition.completed_at = Some(OffsetDateTime::now_utc());
+    f.store()
+        .update_competitions(vec![competition])
+        .await
+        .unwrap();
+    f.clean_up().await;
+    assert_eq!(f.registrations().await, 0);
     f.database.close().await.unwrap();
 }
 
@@ -989,9 +1379,8 @@ async fn a_minted_refund_that_expired_unsigned_is_minted_again() {
     let ticket = f.funded(&session, 21, true).await;
     f.cancel().await;
 
-    // Keymeld cannot sign yet, as for a pool that never finished registering.
-    *f.enclaves.refusal.lock().unwrap() =
-        Some("Keygen requires the complete authorized registration roster".into());
+    // Keymeld cannot sign yet, as when its enclave cannot be reached.
+    *f.enclaves.refusal.lock().unwrap() = Some("the enclave did not answer".into());
     f.clean_up().await;
     let stale = f.refund(&ticket).await.unwrap();
     assert_eq!(stale.state, ArkRefundState::Minted);
@@ -1086,26 +1475,153 @@ async fn an_escrow_spent_by_something_else_pays_no_refund() {
 }
 
 #[tokio::test]
-async fn a_competition_that_never_filled_mints_no_refund_keymeld_cannot_sign() {
+async fn a_competition_that_never_filled_refunds_the_players_who_entered() {
     let f = Fixture::new().await;
     let session = f.keymeld_session().await;
     let entered = f.funded(&session, 21, true).await;
-    // A second ticket was reserved but its player never entered, so Keymeld's roster for the
-    // competition can never be complete.
+    // A second ticket was reserved but its player never paid, so the competition never filled.
     f.ticket(23, PRICE).await;
     f.cancel().await;
     assert!(f.awaiting_cleanup().await);
 
     f.clean_up().await;
-    assert!(f.refund(&entered).await.is_none());
-    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 0);
-    assert!(
-        f.enclaves.registered.lock().unwrap().is_empty(),
-        "nothing is asked of Keymeld that it cannot do"
+    let refund = f.refund(&entered).await.unwrap();
+    assert_eq!(refund.state, ArkRefundState::Settled);
+    assert_eq!(
+        f.enclaves.registered.lock().unwrap().clone(),
+        vec![UserId::from(entered.id)],
+        "only the player who paid and entered is registered"
     );
+    assert_eq!(f.spends(), (1, 1));
+    assert_eq!(f.ln.payments_sent(), 1);
+    assert!(!f.awaiting_cleanup().await, "nothing is left to refund");
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn refunds_wait_while_a_ticket_can_still_be_paid() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let entered = f.funded(&session, 21, true).await;
+    // Another player holds a ticket whose invoice has not expired. Keymeld's roster cannot
+    // change once it signs a refund, so signing now could leave them out if they pay.
+    let unpaid = f.ticket(23, PRICE).await;
+    f.invoice_expires(&unpaid, "+1 hour").await;
+    f.cancel().await;
+
+    f.clean_up().await;
+    assert!(f.refund(&entered).await.is_none());
+    assert!(f.enclaves.registered.lock().unwrap().is_empty());
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 0);
+
+    // Its invoice expires unpaid.
+    f.invoice_expires(&unpaid, "-1 minute").await;
+    f.clean_up().await;
+    assert_eq!(
+        f.refund(&entered).await.unwrap().state,
+        ArkRefundState::Settled
+    );
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_ticket_counted_after_keymeld_has_the_roster_is_left_for_an_operator() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let first = f.funded(&session, 21, true).await;
+    f.cancel().await;
+    f.clean_up().await;
+    assert_eq!(
+        f.refund(&first).await.unwrap().state,
+        ArkRefundState::Settled
+    );
+
+    // ark-swapd reports a second player's payment only now, after the first refund sent
+    // Keymeld the roster.
+    let late = f.funded(&session, 23, true).await;
+    f.clean_up().await;
+    assert!(
+        f.refund(&late).await.is_none(),
+        "nothing is minted for a refund Keymeld cannot sign"
+    );
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 1);
+    assert_eq!(f.ln.payments_sent(), 1);
     assert!(
         f.awaiting_cleanup().await,
-        "the escrow stays listed as holding a buy-in"
+        "its escrow stays listed as holding a buy-in"
     );
+    f.database.close().await.unwrap();
+}
+
+/// The registration a player sends before paying is checked like an entry's, kept only for the
+/// ticket's holder, and must be the one the entry registers.
+#[tokio::test]
+async fn the_registration_sent_before_paying_is_the_one_the_entry_registers() {
+    let f = Fixture::new().await;
+    let now = OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let (ticket, escrow) = f.ticket_refundable_from(23, PRICE, now + 3_600).await;
+    let session = f.keymeld_session_for(&[UserId::from(ticket.id)]).await;
+    let (registration, _) = f.registration(&session, &ticket, &escrow, 23);
+    let register = |player: &str, registration: TicketRegistration| {
+        f.coordinator
+            .register_ticket(player.into(), f.competition_id, ticket.id, registration)
+    };
+
+    assert!(matches!(
+        register("mallory", registration.clone()).await,
+        Err(Error::BadRequest(_))
+    ));
+    let mut another_key = registration.clone();
+    another_key.ephemeral_pubkey = keypair(24).public_key().to_string();
+    assert!(
+        matches!(
+            register("player", another_key).await,
+            Err(Error::BadRequest(_))
+        ),
+        "the envelope's context names the key it registers"
+    );
+    let mut another_slot = registration.clone();
+    another_slot.keymeld_registration_context.user_id = UserId::new_v7();
+    assert!(matches!(
+        register("player", another_slot).await,
+        Err(Error::BadRequest(_))
+    ));
+    assert_eq!(f.registrations().await, 0);
+    register("player", registration.clone()).await.unwrap();
+    assert_eq!(f.registrations().await, 1);
+
+    let vtxo = outpoint(23, 0);
+    f.arkade_lists(&ticket.escrow_address, vtxo, PRICE, false);
+    f.swap_reports(&ticket, SwapState::Settled, Some(vtxo), Some(vtxo.txid));
+    f.coordinator.check_ark_swaps().await.unwrap();
+
+    let entry = |sealed: &str| AddEntry {
+        id: Uuid::now_v7(),
+        ticket_id: ticket.id,
+        ephemeral_pubkey: registration.ephemeral_pubkey.clone(),
+        payout_hash: hex::encode([23; 32]),
+        event_id: f.competition_id,
+        expected_observations: vec![],
+        encrypted_keymeld_private_key: Some(sealed.into()),
+        keymeld_auth_pubkey: Some(registration.keymeld_auth_pubkey.clone()),
+        keymeld_registration_context: Some(registration.keymeld_registration_context.clone()),
+        keymeld_escrow_policy: None,
+    };
+    assert!(
+        matches!(
+            f.coordinator
+                .add_entry("player".into(), entry("sealed-again"))
+                .await,
+            Err(Error::BadRequest(_))
+        ),
+        "an entry cannot swap in another envelope than the one the ticket was paid with"
+    );
+    f.coordinator
+        .add_entry(
+            "player".into(),
+            entry(&registration.encrypted_keymeld_private_key),
+        )
+        .await
+        .unwrap();
     f.database.close().await.unwrap();
 }

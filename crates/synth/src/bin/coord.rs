@@ -79,6 +79,10 @@ enum CompetitionCommands {
         /// Observation window in minutes
         #[arg(long, default_value = "5")]
         observation_window: u64,
+        /// List the competition's event on the oracle's public events list. Test competitions
+        /// are unlisted by default.
+        #[arg(long)]
+        listed: bool,
     },
 }
 
@@ -169,6 +173,7 @@ async fn main() -> Result<()> {
                 entry_fee,
                 max_entries,
                 observation_window,
+                listed,
             } => {
                 let station_list: Vec<String> =
                     stations.split(',').map(|s| s.trim().to_string()).collect();
@@ -187,6 +192,7 @@ async fn main() -> Result<()> {
                     entry_fee,
                     coordinator_fee_percentage: 10,
                     total_competition_pool: entry_fee * max_entries,
+                    unlisted: !listed,
                 };
 
                 let resp = client.create_competition(&competition).await?;
