@@ -65,8 +65,16 @@ async fn main() -> anyhow::Result<()> {
             .as_ref()
             .and_then(|lnd| tracker::nodes(&[lnd]).pop()),
     });
-    if payee.is_none() {
-        warn!("trail.payee is not set, so payouts are confirmed without checking who they paid");
+    match &config.trail.payee {
+        None => {
+            warn!("trail.payee is not set, so payouts are confirmed without checking who they paid")
+        }
+        // An invoices:read macaroon cannot ask the node for its key.
+        Some(payee) if payee.pubkey.is_none() && payee.lnd.is_some() => warn!(
+            "trail.payee.pubkey is not set, so the payee is known only if trail.payee.lnd's \
+             macaroon may read the node's info"
+        ),
+        Some(_) => {}
     }
     let ark_swap = match config
         .rebalance
