@@ -420,3 +420,40 @@ async fn definite_storage_failure_releases_owned_leases_without_publication_or_t
     assert_eq!(f.released.lock().unwrap().len(), 1);
     f.database.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_cancelled_invoice_of_a_paid_ticket_is_recorded_once_and_no_longer_polled() {
+    let f = Fixture::new(false).await;
+    // The escrow is persisted, but its publication is unknown, so the ticket stays pending.
+    f.watcher().await.handle_pending_invoices().await.unwrap();
+    let store = CompetitionStore::new(f.database.clone());
+    assert_eq!(store.get_pending_tickets().await.unwrap().len(), 1);
+
+    // The competition dies and its held invoice is cancelled.
+    f.ln.cancel_hold_invoice(f.ticket.hash.clone())
+        .await
+        .unwrap();
+    f.watcher().await.handle_pending_invoices().await.unwrap();
+
+    let ticket = f.ticket().await;
+    assert!(
+        ticket.paid_at.is_some(),
+        "the paid state is kept for recovery"
+    );
+    assert!(
+        ticket.escrow_transaction.is_some(),
+        "the escrow is kept for cleanup to reclaim"
+    );
+    assert!(
+        store.get_pending_tickets().await.unwrap().is_empty(),
+        "a cancelled invoice is final, so the watcher stops looking it up"
+    );
+    assert!(
+        !store
+            .mark_ticket_invoice_cancelled(ticket.id)
+            .await
+            .unwrap(),
+        "the cancellation is recorded"
+    );
+    f.database.close().await.unwrap();
+}

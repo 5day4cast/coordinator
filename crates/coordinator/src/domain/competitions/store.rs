@@ -1190,7 +1190,12 @@ impl CompetitionStore {
     }
 
     /// Failed and cancelled competitions retain cleanup work after their active
-    /// lifecycle ends. Successful cancellation/reclaim markers drain this queue.
+    /// lifecycle ends. Successful cancellation/reclaim/refund markers drain this queue.
+    ///
+    /// The work is a held invoice to cancel, an on-chain escrow to reclaim, or a funded Arkade
+    /// escrow to refund. An Arkade ticket is paid and settled at once, since the swap service
+    /// settles its invoice, so only its escrow says it still holds the player's buy-in. The
+    /// escrows of a pool that a batch funded were spent into it, so they are not refunded.
     pub async fn get_competitions_pending_cleanup(
         &self,
         include_escrows: bool,
@@ -1202,7 +1207,15 @@ impl CompetitionStore {
                AND ((tickets.paid_at IS NOT NULL AND tickets.settled_at IS NULL
                      AND tickets.invoice_cancelled_at IS NULL)
                     OR (? AND tickets.escrow_transaction IS NOT NULL
-                        AND tickets.escrow_reclaimed_at IS NULL))",
+                        AND tickets.escrow_reclaimed_at IS NULL)
+                    OR (EXISTS (SELECT 1 FROM ticket_ark_escrows e
+                                LEFT JOIN ticket_ark_refunds r ON r.ticket_id = e.ticket_id
+                                WHERE e.ticket_id = tickets.id AND e.ticket_hash = tickets.hash
+                                  AND e.funded_at IS NOT NULL
+                                  AND (r.state IS NULL OR r.state != 'settled'))
+                        AND NOT EXISTS (SELECT 1 FROM ark_funded_competitions a
+                                        WHERE a.event_id = competitions.id
+                                          AND a.commitment_tx IS NOT NULL)))",
         )
         .bind(include_escrows)
         .fetch_all(self.db_connection.read())
@@ -1626,6 +1639,8 @@ impl CompetitionStore {
             .await
     }
 
+    /// Reserved tickets whose invoice may still change: not settled, and not recorded as
+    /// cancelled. A cancelled invoice is final; the ticket's escrow, if any, is cleanup's job.
     pub async fn get_pending_tickets(&self) -> Result<Vec<Ticket>, sqlx::Error> {
         let tickets = sqlx::query_as::<_, Ticket>(
             r#"SELECT tickets.id as id,
@@ -1646,6 +1661,7 @@ impl CompetitionStore {
                LEFT JOIN entries ON tickets.id = entries.ticket_id
                WHERE reserved_at IS NOT NULL
                  AND settled_at IS NULL
+                 AND invoice_cancelled_at IS NULL
                  AND payment_request IS NOT NULL
                  AND tickets.id NOT IN (SELECT ticket_id FROM ticket_ark_escrows)"#,
         )

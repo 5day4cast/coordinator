@@ -164,25 +164,24 @@ impl ArkWallet {
             .map_err(|error| anyhow::anyhow!("pay the escrow: {error}"))
     }
 
-    /// An unspent VTXO at `address` worth `amount`, created at or after `since` (UNIX seconds).
+    /// The VTXO at `address` worth `amount` that paid it: the output of `paid_in` when the Ark
+    /// transaction is known, otherwise an unspent one created at or after `since` (UNIX seconds).
     ///
     /// After a crash between paying and recording it, this finds the payment instead of paying twice.
+    /// The indexer can list a payment a little after `pay` returns, so `None` may only mean "not yet".
     pub async fn paid_vtxo(
         &self,
         address: ArkAddress,
         amount: Amount,
         since: i64,
+        paid_in: Option<Txid>,
     ) -> anyhow::Result<Option<OutPoint>> {
         let response = self
             .server
             .client()
             .list_vtxos(GetVtxosRequest::new_for_addresses(std::iter::once(address)))
             .await?;
-        Ok(response
-            .vtxos
-            .into_iter()
-            .find(|vtxo| vtxo.amount == amount && vtxo.created_at >= since && !vtxo.is_spent)
-            .map(|vtxo| vtxo.outpoint))
+        Ok(payment_among(&response.vtxos, amount, since, paid_in))
     }
 
     /// Claim a refund swap that this service paid for, into its own wallet.
@@ -443,5 +442,94 @@ impl Blockchain for Esplora {
             self.broadcast(tx).await?;
         }
         Ok(())
+    }
+}
+
+/// The VTXO among an address's `vtxos` that a payment of `amount` created: the output of
+/// `paid_in` when the Ark transaction is known, spent or not; otherwise an unspent one created
+/// at or after `since` (UNIX seconds).
+fn payment_among(
+    vtxos: &[ark_core::server::VirtualTxOutPoint],
+    amount: Amount,
+    since: i64,
+    paid_in: Option<Txid>,
+) -> Option<OutPoint> {
+    vtxos
+        .iter()
+        .find(|vtxo| {
+            vtxo.amount == amount
+                && match paid_in {
+                    Some(txid) => vtxo.outpoint.txid == txid,
+                    None => vtxo.created_at >= since && !vtxo.is_spent,
+                }
+        })
+        .map(|vtxo| vtxo.outpoint)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vtxo(
+        txid: u8,
+        amount: u64,
+        created_at: i64,
+        spent: bool,
+    ) -> ark_core::server::VirtualTxOutPoint {
+        use bitcoin::hashes::Hash;
+        ark_core::server::VirtualTxOutPoint {
+            outpoint: OutPoint::new(Txid::from_byte_array([txid; 32]), 0),
+            created_at,
+            expires_at: created_at + 86_400,
+            amount: Amount::from_sat(amount),
+            script: bitcoin::ScriptBuf::new(),
+            is_preconfirmed: true,
+            is_swept: false,
+            is_unrolled: false,
+            is_spent: spent,
+            spent_by: None,
+            commitment_txids: Vec::new(),
+            settled_by: None,
+            ark_txid: None,
+            assets: Vec::new(),
+            depth: 0,
+        }
+    }
+
+    #[test]
+    fn a_payment_is_the_vtxo_its_ark_transaction_created() {
+        use bitcoin::hashes::Hash;
+        let paid_in = Some(Txid::from_byte_array([2; 32]));
+        let amount = Amount::from_sat(6_300);
+        let listed = [
+            vtxo(1, 6_300, 1_000, false),
+            vtxo(2, 6_000, 1_000, false),
+            vtxo(2, 6_300, 1_000, true),
+        ];
+        assert_eq!(
+            payment_among(&listed, amount, 900, paid_in),
+            Some(listed[2].outpoint),
+            "the right transaction and amount, even once spent"
+        );
+        assert_eq!(
+            payment_among(&listed[..2], amount, 900, paid_in),
+            None,
+            "another transaction's VTXO, or the wrong amount, is not the payment"
+        );
+    }
+
+    #[test]
+    fn without_its_transaction_a_payment_is_an_unspent_vtxo_made_since_the_swap() {
+        let amount = Amount::from_sat(6_300);
+        let listed = [
+            vtxo(1, 6_300, 800, false),
+            vtxo(2, 6_300, 1_000, true),
+            vtxo(3, 6_300, 1_000, false),
+        ];
+        assert_eq!(
+            payment_among(&listed, amount, 900, None),
+            Some(listed[2].outpoint)
+        );
+        assert_eq!(payment_among(&listed[..2], amount, 900, None), None);
     }
 }

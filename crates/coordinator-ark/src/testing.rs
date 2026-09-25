@@ -125,7 +125,8 @@ pub struct OffchainSpend {
 pub struct MockState {
     /// The offchain spends submitted, in order, and what was finalized for each.
     pub offchain: Vec<OffchainSpend>,
-    /// VTXOs this server reports, for the spent checks a resumed refund makes.
+    /// VTXOs this server lists, by the address whose script they pay. A finalized offchain
+    /// spend marks its inputs spent here.
     pub vtxos: Vec<VirtualTxOutPoint>,
     /// The intent's on-chain outputs.
     pub outputs: Option<Vec<TxOut>>,
@@ -162,6 +163,55 @@ impl MockArkd {
             receiver: Mutex::new(Some(receiver)),
             state: Mutex::default(),
         }
+    }
+
+    /// A server that runs no batch: it takes offchain spends and lists VTXOs, as an escrow's
+    /// funding check and refund need.
+    pub fn offchain(info: &Info) -> Self {
+        let (sender, receiver) = mpsc::unbounded();
+        Self {
+            commitment: Commitment::PaysThePool,
+            signers: HashMap::new(),
+            amounts: HashMap::new(),
+            batch_nonce: 0,
+            forfeit_script: info.forfeit_address.script_pubkey(),
+            dust: info.dust,
+            sender,
+            receiver: Mutex::new(Some(receiver)),
+            state: Mutex::default(),
+        }
+    }
+
+    /// List a VTXO at the encoded Ark `address`, worth `amount`, created at `created_at` (UNIX
+    /// seconds).
+    pub fn add_vtxo(
+        &self,
+        address: &str,
+        outpoint: OutPoint,
+        amount: Amount,
+        created_at: i64,
+        is_spent: bool,
+    ) {
+        let script = ark_core::ArkAddress::decode(address)
+            .expect("an Ark address")
+            .to_p2tr_script_pubkey();
+        self.state.lock().unwrap().vtxos.push(VirtualTxOutPoint {
+            outpoint,
+            created_at,
+            expires_at: created_at + 30 * 24 * 60 * 60,
+            amount,
+            script,
+            is_preconfirmed: true,
+            is_swept: false,
+            is_unrolled: false,
+            is_spent,
+            spent_by: None,
+            commitment_txids: Vec::new(),
+            settled_by: None,
+            ark_txid: None,
+            assets: Vec::new(),
+            depth: 0,
+        });
     }
 
     /// A later batch, whose commitment transaction differs from the first mock's.
@@ -283,12 +333,43 @@ impl ArkTransport for MockArkd {
             .iter_mut()
             .find(|spend| spend.ark_tx.unsigned_tx.compute_txid() == ark_txid)
             .expect("finalizing a spend this server took");
-        spend.finalized = checkpoints;
+        spend.finalized = checkpoints.clone();
+        for checkpoint in &checkpoints {
+            let checkpoint_txid = checkpoint.unsigned_tx.compute_txid();
+            for input in &checkpoint.unsigned_tx.input {
+                if let Some(vtxo) = state
+                    .vtxos
+                    .iter_mut()
+                    .find(|vtxo| vtxo.outpoint == input.previous_output)
+                {
+                    vtxo.is_spent = true;
+                    vtxo.spent_by = Some(checkpoint_txid);
+                    vtxo.ark_txid = Some(ark_txid);
+                }
+            }
+        }
         Ok(())
     }
 
-    async fn vtxos(&self, _addresses: Vec<String>) -> Result<Vec<VirtualTxOutPoint>, Error> {
-        Ok(self.state.lock().unwrap().vtxos.clone())
+    /// The VTXOs at `addresses`, spent or not, as arkd's indexer lists them.
+    async fn vtxos(&self, addresses: Vec<String>) -> Result<Vec<VirtualTxOutPoint>, Error> {
+        let scripts = addresses
+            .iter()
+            .map(|address| {
+                ark_core::ArkAddress::decode(address)
+                    .map(|address| address.to_p2tr_script_pubkey())
+                    .map_err(|error| Error::ServerInfo(format!("invalid Ark address: {error}")))
+            })
+            .collect::<Result<HashSet<_>, _>>()?;
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .vtxos
+            .iter()
+            .filter(|vtxo| scripts.contains(&vtxo.script))
+            .cloned()
+            .collect())
     }
 
     async fn confirm_registration(&self, intent_id: String) -> Result<(), Error> {

@@ -524,6 +524,9 @@ struct Consent<'a> {
     lnurl: Option<coordinator_escrow_verifier::lnurl_transport::LnurlPayClient>,
     /// Leave keygen unfinished, as a competition cancelled before its pool filled does.
     unfinished_keygen: bool,
+    /// Register only the first this many players, as a pool that never filled did. All when
+    /// unset.
+    registered: Option<usize>,
 }
 
 impl<'a> Consent<'a> {
@@ -550,6 +553,7 @@ impl PoolHarness {
             checkpoint_exit_script,
             lnurl,
             unfinished_keygen,
+            registered,
         } = consent;
         let count = params.players.len();
         let relay_state = Relay {
@@ -605,7 +609,7 @@ impl PoolHarness {
             .await
             .unwrap();
         let mut policies = BTreeMap::new();
-        for (index, player) in players.iter().enumerate() {
+        for (index, player) in players.iter().enumerate().take(registered.unwrap_or(count)) {
             let terms = ContractAuthorization {
                 competition_id: competition,
                 entry_id: Uuid::now_v7(),
@@ -1249,6 +1253,7 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_funded() {
         checkpoint_exit_script: hex::encode(info.checkpoint_tapscript.as_bytes()),
         lnurl,
         unfinished_keygen,
+        registered: None,
     };
     let harness = PoolHarness::start_with(pool_parameters(1), consent(Some(client), false)).await;
 
@@ -1327,4 +1332,128 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_funded() {
         .await;
     second_provider.await.unwrap();
     refunded.expect("a pool that never completed keygen still refunds");
+}
+
+/// A competition that expires before its pool fills registered only the players who entered,
+/// and Keymeld must still sign each of their refunds. At this Keymeld revision it cannot:
+/// signing first restores keygen, which needs every authorized participant registered. This
+/// fails with "Keygen requires the complete authorized registration roster" until Keymeld can
+/// act for a partial roster; see `docs/ops/stuck-escrow-check.md`.
+#[tokio::test]
+#[ignore = "Keymeld 98f3420 signs only for a complete roster; see docs/ops/stuck-escrow-check.md"]
+async fn keymeld_signs_a_refund_for_a_pool_that_never_filled() {
+    use coordinator_ark::testing::{keypair, mock_info, xonly};
+    use coordinator_ark::{build_refund, escrow_terms, server_rules};
+    use coordinator_ark_escrow::{EntryEscrow, RefundSwap, RelativeTimelock, SwapTerms};
+    use coordinator_escrow::ark::{psbt_hex, ArkEscrowSpend, RefundPurpose};
+    use coordinator_escrow_verifier::lnurl_transport::fixtures::{
+        discovery_tls_fixture_times, FIXTURE_METADATA,
+    };
+    use dlctix::bitcoin::hashes::sha256;
+
+    const ESCROW_SATS: u64 = 100_100;
+    const REFUND_FEE_SATS: u64 = 100;
+    const REFUND_AT: u32 = 1_790_000_000;
+
+    let info = mock_info(&keypair(7));
+    let rules = server_rules(&info).unwrap();
+    let market_maker = keypair(18);
+    let escrows: Vec<EntryEscrow> = (0..2)
+        .map(|index| {
+            EntryEscrow::new(
+                escrow_terms(
+                    &rules,
+                    xonly(&keypair(entry_secret(index)[0])),
+                    xonly(&market_maker),
+                    REFUND_AT,
+                    REFUND_AT - 86_400,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+
+    let preimage = [9u8; 32];
+    let invoice = InvoiceBuilder::new(Currency::Regtest)
+        .amount_milli_satoshis((ESCROW_SATS - REFUND_FEE_SATS) * 1000)
+        .description_hash(sha256::Hash::from_byte_array(payout::sha256(
+            FIXTURE_METADATA.as_bytes(),
+        )))
+        .payment_hash(sha256::Hash::from_byte_array(payout::sha256(&preimage)))
+        .payment_secret(PaymentSecret([10; 32]))
+        .duration_since_epoch(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap(),
+        )
+        .expiry_time(Duration::from_secs(600))
+        .min_final_cltv_expiry_delta(18)
+        .build_signed(|hash| {
+            dlctix::bitcoin::secp256k1::Secp256k1::new().sign_ecdsa_recoverable(
+                hash,
+                &dlctix::bitcoin::secp256k1::SecretKey::from_slice(&[11; 32]).unwrap(),
+            )
+        })
+        .unwrap()
+        .to_string();
+    let deadline = dlctix::bitcoin::absolute::LockTime::from_consensus(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32
+            + 3_600,
+    );
+    let swap = RefundSwap::new(SwapTerms {
+        player: xonly(&keypair(entry_secret(0)[0])),
+        swapper: xonly(&keypair(30)),
+        server: rules.signer,
+        payment_hash: payout::sha256(&preimage),
+        deadline,
+        exit_delay: RelativeTimelock::Seconds(2048),
+        unilateral_reclaim_delay: RelativeTimelock::Seconds(2048 + 512 * 100),
+    })
+    .unwrap();
+
+    // Two tickets, one entry: only its player registered before the competition expired.
+    let (client, provider) = discovery_tls_fixture_times(1).await;
+    let harness = PoolHarness::start_with(
+        pool_parameters(2),
+        Consent {
+            escrows: Some(&escrows),
+            lightning_address: Some("alice+prize@wallet.example".into()),
+            max_refund_fee_sats: REFUND_FEE_SATS,
+            checkpoint_exit_script: hex::encode(info.checkpoint_tapscript.as_bytes()),
+            lnurl: Some(client),
+            unfinished_keygen: true,
+            registered: Some(1),
+        },
+    )
+    .await;
+    let refund = build_refund(
+        &info,
+        &escrows[0],
+        OutPoint::new(dlctix::bitcoin::Txid::from_byte_array([3u8; 32]), 0),
+        Amount::from_sat(ESCROW_SATS),
+        &swap,
+    )
+    .unwrap();
+    let signed = harness
+        .service
+        .sign_ark_refund(
+            &harness.session,
+            harness.players[0].clone(),
+            ArkEscrowSpend::Refund {
+                purpose: RefundPurpose::ArkTransaction,
+                ark_psbt: psbt_hex(&refund.ark),
+                checkpoint_psbt: psbt_hex(&refund.checkpoint),
+                swap_tap_tree: hex::encode(swap.vtxo_script().encode_tap_tree()),
+            },
+            invoice,
+            REFUND_FEE_SATS,
+        )
+        .await;
+    provider.await.unwrap();
+    signed.expect("a pool that never filled still refunds the players who entered");
+    harness.stop().await;
 }

@@ -280,6 +280,14 @@ impl From<Competition> for CompetitionStatus {
         let state = competition.get_state();
 
         match state {
+            // `get_state` has no state for a competition that has entries but is not full yet.
+            // Its entry count is stored, so it reloads as collecting entries, the state its first
+            // entry moved it to; otherwise every step would log that move again.
+            super::CompetitionState::Created if competition.total_entries > 0 => {
+                CompetitionStatus::CollectingEntries(CollectingEntries::from_competition(
+                    competition,
+                ))
+            }
             super::CompetitionState::Created => {
                 CompetitionStatus::Created(Created::from_competition(competition))
             }
@@ -338,5 +346,76 @@ impl From<Competition> for CompetitionStatus {
                 CompetitionStatus::Cancelled(Cancelled::from_competition(competition))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::competitions::CreateEvent;
+
+    fn competition() -> Competition {
+        let start = OffsetDateTime::from_unix_timestamp(1_900_000_000).unwrap();
+        Competition::new(&CreateEvent {
+            id: Uuid::now_v7(),
+            signing_date: start + time::Duration::days(2),
+            start_observation_date: start,
+            end_observation_date: start + time::Duration::DAY,
+            locations: vec!["KORD".into()],
+            number_of_values_per_entry: 3,
+            number_of_places_win: 1,
+            total_allowed_entries: 3,
+            entry_fee: 1_000,
+            coordinator_fee_percentage: 10,
+            total_competition_pool: 2_700,
+            relative_locktime_block_delta: None,
+        })
+    }
+
+    /// What a runner logs as the next state must be what the next step loads.
+    fn stored(status: CompetitionStatus) -> &'static str {
+        CompetitionStatus::from(status.into_competition()).state_name()
+    }
+
+    #[test]
+    fn a_competition_without_entries_loads_as_created() {
+        assert_eq!(
+            CompetitionStatus::from(competition()).state_name(),
+            "created"
+        );
+    }
+
+    #[test]
+    fn the_first_entry_loads_a_competition_as_collecting_entries() {
+        let mut competition = competition();
+        competition.total_entries = 1;
+        let status = CompetitionStatus::from(competition);
+        assert_eq!(
+            status.state_name(),
+            "collecting_entries",
+            "a competition with some entries reloads as collecting them, not as created"
+        );
+        assert_eq!(stored(status), "collecting_entries");
+    }
+
+    #[test]
+    fn a_partly_filled_competition_stays_collecting_entries() {
+        let mut competition = competition();
+        competition.total_entries = 2;
+        competition.total_paid_entries = 2;
+        let status = CompetitionStatus::from(competition);
+        assert_eq!(status.state_name(), "collecting_entries");
+        assert_eq!(stored(status), "collecting_entries");
+    }
+
+    #[test]
+    fn a_full_paid_competition_still_loads_as_awaiting_escrow() {
+        let mut competition = competition();
+        competition.total_entries = 3;
+        competition.total_paid_entries = 3;
+        assert_eq!(
+            CompetitionStatus::from(competition).state_name(),
+            "awaiting_escrow"
+        );
     }
 }

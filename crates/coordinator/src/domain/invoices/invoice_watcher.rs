@@ -102,10 +102,48 @@ impl InvoiceWatcher {
                     // Handle expired/canceled invoices - clear reservation so ticket can be reused
                     if invoice.state == InvoiceState::Canceled {
                         if ticket.paid_at.is_some() || ticket.escrow_transaction.is_some() {
-                            warn!(
-                                "Canceled invoice for ticket {} retains escrow recovery state",
-                                ticket.id
-                            );
+                            // The ticket keeps its paid and escrow state for recovery. Recording
+                            // the cancellation ends the polling: a cancelled invoice never
+                            // changes again, and cleanup reclaims any escrow.
+                            if let Err(e) = self
+                                .coordinator
+                                .competition_store
+                                .mark_ticket_invoice_cancelled(ticket.id)
+                                .await
+                            {
+                                error!(
+                                    "Failed to record the cancelled invoice of ticket {}: {}",
+                                    ticket.id, e
+                                );
+                                continue;
+                            }
+                            let ended = self
+                                .coordinator
+                                .competition_store
+                                .get_competition(ticket.competition_id)
+                                .await
+                                .map(|competition| {
+                                    competition.is_cancelled() || competition.is_failed()
+                                });
+                            match ended {
+                                Ok(true) => info!(
+                                    "Invoice of paid ticket {} was cancelled with its competition \
+                                     {}; cleanup reclaims its escrow, if any",
+                                    ticket.id, ticket.competition_id
+                                ),
+                                // LND cancels a held HTLC as its CLTV expiry nears.
+                                Ok(false) => error!(
+                                    "The held payment of paid ticket {} was cancelled while \
+                                     competition {} is still running: it went back to the payer, \
+                                     so the ticket's invoice can no longer be settled",
+                                    ticket.id, ticket.competition_id
+                                ),
+                                Err(e) => warn!(
+                                    "Invoice of paid ticket {} was cancelled; cannot read its \
+                                     competition {}: {}",
+                                    ticket.id, ticket.competition_id, e
+                                ),
+                            }
                             continue;
                         }
                         info!(

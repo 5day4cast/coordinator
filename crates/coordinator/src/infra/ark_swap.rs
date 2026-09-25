@@ -21,17 +21,23 @@ pub enum SwapState {
 }
 
 impl SwapState {
-    /// The escrow holds the player's buy-in.
-    pub fn escrow_funded(self) -> bool {
-        matches!(
-            self,
-            SwapState::EscrowPaid | SwapState::Settled | SwapState::Unsettled
-        )
+    /// The player paid: their invoice settled once the escrow held the buy-in.
+    ///
+    /// `EscrowPaid` is not enough. The service has paid the escrow but not settled the invoice
+    /// yet, and it may still fail to: then the swap ends `Unsettled`, and the player's payment
+    /// goes back to them.
+    pub fn player_paid(self) -> bool {
+        matches!(self, SwapState::Settled)
     }
 
-    /// The swap ended without funding the escrow; the player's payment failed back.
-    pub fn abandoned(self) -> bool {
-        matches!(self, SwapState::Expired | SwapState::Failed)
+    /// The swap ended and the player's payment went back to them, so the ticket is unpaid.
+    ///
+    /// After `Unsettled` the escrow holds the service's own coins, which an operator recovers.
+    pub fn ended_unpaid(self) -> bool {
+        matches!(
+            self,
+            SwapState::Expired | SwapState::Failed | SwapState::Unsettled
+        )
     }
 }
 

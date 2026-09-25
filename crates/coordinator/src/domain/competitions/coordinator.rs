@@ -145,6 +145,8 @@ pub struct Coordinator {
     ark: Option<Arc<super::Arkade>>,
     wakes: super::CompetitionWakes,
     worker_leases: Arc<super::WorkerLeases>,
+    /// Lasting conditions already logged, so each is warned about once rather than every step.
+    pub(super) reported: super::Reported,
 }
 
 impl Coordinator {
@@ -195,6 +197,7 @@ impl Coordinator {
             ark: None,
             wakes: super::CompetitionWakes::default(),
             worker_leases,
+            reported: super::Reported::default(),
         };
         coordinator.validate_coordinator_metadata().await?;
         Ok(coordinator)
@@ -349,6 +352,41 @@ impl Coordinator {
         stored
             .to_session(&self.keymeld_storage_keys()?)
             .map_err(|error| Error::Bitcoin(anyhow!(error)))
+    }
+
+    /// What Keymeld needs to register an entry's player: the envelope their browser sealed to
+    /// the enclave with the entry, and the payout policy they accepted before paying.
+    pub(super) async fn keymeld_registration(
+        &self,
+        entry: &UserEntry,
+    ) -> Result<ParticipantRegistrationData, anyhow::Error> {
+        let payout_policy = self
+            .competition_store
+            .entry_payout_policy(entry.id)
+            .await?
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?;
+        Ok(ParticipantRegistrationData {
+            encrypted_private_key: entry.encrypted_keymeld_private_key.clone().ok_or_else(
+                || {
+                    anyhow!(
+                        "Entry {} is missing its authorized registration envelope",
+                        entry.id
+                    )
+                },
+            )?,
+            public_key: entry.ephemeral_pubkey.clone(),
+            auth_pubkey: entry
+                .keymeld_auth_pubkey
+                .clone()
+                .ok_or_else(|| anyhow!("Entry {} is missing its authentication key", entry.id))?,
+            context: entry
+                .keymeld_registration_context
+                .clone()
+                .ok_or_else(|| anyhow!("Entry {} is missing its registration context", entry.id))?,
+            payout_policy,
+            escrow_policy: entry.keymeld_escrow_policy.clone(),
+        })
     }
 
     /// Verify the complete accepted roster before signatures, funding, or invoice settlement.
@@ -592,20 +630,14 @@ impl Coordinator {
         );
 
         match status {
+            // A competition with any entry loads as CollectingEntries (see
+            // `CompetitionStatus::from`), so one that is Created has none yet.
             CompetitionStatus::Created(state) => {
                 debug!(
-                    "Competition {}, waiting for entries: {}/{}",
-                    state.competition_id,
-                    state.competition.total_entries,
-                    state.competition.event_submission.total_allowed_entries
+                    "Competition {} is waiting for its first entry",
+                    state.competition_id
                 );
-                // Check if we have entries and should transition
-                if state.competition.total_entries > 0 {
-                    // Transition to CollectingEntries
-                    state.first_entry_added()
-                } else {
-                    CompetitionStatus::Created(state)
-                }
+                CompetitionStatus::Created(state)
             }
 
             CompetitionStatus::CollectingEntries(state) => {
@@ -771,10 +803,23 @@ impl Coordinator {
                         }
                     }
                 } else if state.has_nonces() {
-                    // Legacy flow: proceed when we have nonces
-                    CompetitionStatus::AwaitingSignatures(AwaitingSignatures::from_competition(
-                        state.into_competition(),
-                    ))
+                    // Legacy flow. No stored field marks AwaitingSignatures here (`get_state`
+                    // derives it from Keymeld's keygen), so a move to it would be lost on reload
+                    // and its work would never run. Do that work from this state instead, until
+                    // it signs the contract.
+                    let waiting = AwaitingSignatures::from_competition(state.into_competition());
+                    match Box::pin(
+                        self.process_status(CompetitionStatus::AwaitingSignatures(waiting)),
+                    )
+                    .await
+                    {
+                        CompetitionStatus::AwaitingSignatures(waiting) => {
+                            CompetitionStatus::ContractCreated(ContractCreated::from_competition(
+                                waiting.into_competition(),
+                            ))
+                        }
+                        next => next,
+                    }
                 } else {
                     CompetitionStatus::ContractCreated(state)
                 }
@@ -1580,37 +1625,13 @@ impl Coordinator {
                 .has_automatic_payouts(competition.id)
                 .await?;
             for (entry, user_id) in entries.iter().zip(player_user_ids.iter()) {
-                let payout_policy = self
-                    .competition_store
-                    .entry_payout_policy(entry.id)
-                    .await?
-                    .map(|json| serde_json::from_str(&json))
-                    .transpose()?;
-                if automatic_payouts && payout_policy.is_none() {
+                let registration_data = self.keymeld_registration(entry).await?;
+                if automatic_payouts && registration_data.payout_policy.is_none() {
                     return Err(anyhow!(
                         "Entry {} is missing its accepted payout policy",
                         entry.id
                     ));
                 }
-                let registration_data = ParticipantRegistrationData {
-                    encrypted_private_key: entry.encrypted_keymeld_private_key.clone().ok_or_else(
-                        || {
-                            anyhow!(
-                                "Entry {} is missing its authorized registration envelope",
-                                entry.id
-                            )
-                        },
-                    )?,
-                    public_key: entry.ephemeral_pubkey.clone(),
-                    auth_pubkey: entry.keymeld_auth_pubkey.clone().ok_or_else(|| {
-                        anyhow!("Entry {} is missing its authentication key", entry.id)
-                    })?,
-                    context: entry.keymeld_registration_context.clone().ok_or_else(|| {
-                        anyhow!("Entry {} is missing its registration context", entry.id)
-                    })?,
-                    payout_policy,
-                    escrow_policy: entry.keymeld_escrow_policy.clone(),
-                };
                 self.keymeld
                     .register_participant(&keygen_session, user_id.clone(), &registration_data)
                     .await

@@ -1,6 +1,6 @@
 //! Created state - initial state when competition is first created.
 
-use super::{CollectingEntries, CompetitionStatus, HasCompetitionData};
+use super::HasCompetitionData;
 use crate::domain::competitions::{Competition, CreateEvent};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -34,15 +34,6 @@ impl Created {
             created_at: competition.created_at,
             competition,
         }
-    }
-
-    /// Transition to CollectingEntries when the first entry is added.
-    ///
-    /// This transition occurs when a user pays for a ticket and submits an entry.
-    pub fn first_entry_added(self) -> CompetitionStatus {
-        // The entry has already been added to the competition via the store
-        // We just need to transition to the next state
-        CompetitionStatus::CollectingEntries(CollectingEntries::from_competition(self.competition))
     }
 
     /// Check if competition is expired before receiving any entries.

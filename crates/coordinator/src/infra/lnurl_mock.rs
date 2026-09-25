@@ -58,6 +58,7 @@ impl LnurlPay for MockLnurlPay {
         let node_key = SecretKey::from_slice(&[0x11; 32]).expect("constant key is valid");
         let mut preimage = [0u8; 32];
         rand::rng().fill_bytes(&mut preimage);
+        // The payment secret is the preimage, so `MockLnClient` can prove it paid the invoice.
         let invoice = InvoiceBuilder::new(currency(self.network))
             .description(format!("Payout to {}", request.address()))
             .payment_hash(sha256::Hash::hash(&preimage))
