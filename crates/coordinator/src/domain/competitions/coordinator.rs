@@ -4872,6 +4872,7 @@ mod oracle_payout_order_tests {
             coordinator_fee_percentage: 10,
             total_competition_pool: 2_700,
             relative_locktime_block_delta: None,
+            unlisted: false,
         });
         let entry_ids = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
         let tickets = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
@@ -4950,6 +4951,7 @@ mod funding_lifecycle_tests {
             coordinator_fee_percentage: 10,
             total_competition_pool: 900,
             relative_locktime_block_delta: None,
+            unlisted: false,
         });
         assert_eq!(
             competition.funding_reservation_deadline(now).unwrap(),

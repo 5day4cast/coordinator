@@ -138,7 +138,10 @@ fn payer(config: &ScenarioConfig) -> Result<Lnd> {
 }
 
 /// A competition with one more seat than the scenario fills, so it expires unfilled.
-async fn create_competition(client: &CoordinatorClient, config: &ScenarioConfig) -> Result<Uuid> {
+pub(super) async fn create_competition(
+    client: &CoordinatorClient,
+    config: &ScenarioConfig,
+) -> Result<Uuid> {
     let now = OffsetDateTime::now_utc();
     let entry_window = time::Duration::seconds(config.entry_window_secs as i64);
     let observation_window = time::Duration::seconds(config.observation_window_secs as i64);
@@ -158,6 +161,8 @@ async fn create_competition(client: &CoordinatorClient, config: &ScenarioConfig)
         entry_fee: config.entry_fee,
         coordinator_fee_percentage: 10,
         total_competition_pool: config.entry_fee * seats,
+        // A test competition: kept off the oracle's public events list.
+        unlisted: true,
     };
     Ok(client.create_competition(&competition).await?.id)
 }

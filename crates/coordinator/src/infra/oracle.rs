@@ -98,6 +98,9 @@ struct StoredEvent {
     scoring_fields: Vec<String>,
     coordinator_pubkey: String,
     entries: Vec<StoredEntry>,
+    /// Oracles before 2.3.0 do not report it.
+    #[serde(default)]
+    unlisted: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -136,6 +139,9 @@ impl OracleWrite {
                     && stored.number_of_places_win == event.number_of_places_win
                     && stored.source == "noaa_weather"
                     && stored.scoring_fields == ["temp_high", "temp_low", "wind_speed"]
+                    && stored
+                        .unlisted
+                        .is_none_or(|unlisted| unlisted == event.unlisted)
             }
             Self::Entries(submission) => {
                 let ids: std::collections::HashSet<_> =
@@ -646,6 +652,7 @@ mod tests {
             coordinator_fee_percentage: 10,
             total_competition_pool: 1_800,
             relative_locktime_block_delta: None,
+            unlisted: false,
         }
     }
 
@@ -1015,5 +1022,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(client.get_event(&config.id).await.unwrap(), created);
+    }
+
+    #[derive(Clone)]
+    struct CreateServer {
+        posted: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    async fn create_server(
+        State(state): State<CreateServer>,
+        Json(body): Json<serde_json::Value>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        let id: Uuid = serde_json::from_value(body["id"].clone()).unwrap();
+        state.posted.lock().unwrap().push(body);
+        (StatusCode::OK, Json(event_response(id)))
+    }
+
+    /// The oracle keeps an event off its public list only when asked: the coordinator passes
+    /// the competition's `unlisted` through, and it is false unless set.
+    #[tokio::test]
+    async fn the_oracle_is_told_whether_an_event_is_unlisted() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let state = CreateServer {
+            posted: Arc::default(),
+        };
+        let posted = state.posted.clone();
+        let app = Router::new()
+            .route("/oracle/events", post(create_server))
+            .with_state(state);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let directory = tempfile::tempdir().unwrap();
+        let key = directory.path().join("coordinator.pem");
+        let _: Secp256k1SecretKey = get_key(key.to_str().unwrap()).unwrap();
+        let client = OracleClient::new(
+            ClientBuilder::new(reqwest::Client::new()).build(),
+            &base,
+            key.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let listed = event_config();
+        let unlisted = CreateEvent {
+            unlisted: true,
+            ..event_config()
+        };
+        client.create_event(listed).await.unwrap();
+        client.create_event(unlisted).await.unwrap();
+        server.abort();
+        let posted = posted.lock().unwrap();
+        assert_eq!(posted[0]["unlisted"], serde_json::json!(false));
+        assert_eq!(posted[1]["unlisted"], serde_json::json!(true));
+    }
+
+    /// An admin request that leaves `unlisted` out creates a listed event.
+    #[test]
+    fn a_competition_is_listed_unless_created_unlisted() {
+        let mut body = serde_json::to_value(event_config()).unwrap();
+        body.as_object_mut().unwrap().remove("unlisted");
+        let listed: CreateEvent = serde_json::from_value(body.clone()).unwrap();
+        assert!(!listed.unlisted);
+        body["unlisted"] = true.into();
+        let unlisted: CreateEvent = serde_json::from_value(body).unwrap();
+        assert!(unlisted.unlisted);
+    }
+
+    /// A create whose response was lost is recovered only if the oracle's event has the same
+    /// listing; an oracle that does not report it is taken at its word.
+    #[tokio::test]
+    async fn a_recovered_event_must_have_the_listing_asked_for() {
+        let config = CreateEvent {
+            unlisted: true,
+            ..event_config()
+        };
+        let (client, state, server, _directory) = recovery_fixture(&config).await;
+        state.saved.lock().unwrap().replace({
+            let mut listed = state.created.clone();
+            listed["unlisted"] = false.into();
+            listed
+        });
+        assert!(client.create_event(config.clone()).await.is_err());
+        state.saved.lock().unwrap().replace({
+            let mut older = state.created.clone();
+            older.as_object_mut().unwrap().remove("unlisted");
+            older
+        });
+        assert_eq!(
+            client.create_event(config.clone()).await.unwrap().id,
+            config.id
+        );
+        assert_eq!(state.create_posts.load(Ordering::SeqCst), 0);
+        server.abort();
     }
 }

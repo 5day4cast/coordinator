@@ -155,7 +155,10 @@ pub async fn run_full_lifecycle(
     finish_result("full_lifecycle", started_at, scenario_start, steps, false)
 }
 
-async fn create_competition(client: &CoordinatorClient, config: &ScenarioConfig) -> Result<Uuid> {
+pub(super) async fn create_competition(
+    client: &CoordinatorClient,
+    config: &ScenarioConfig,
+) -> Result<Uuid> {
     let now = OffsetDateTime::now_utc();
     let observation_window = time::Duration::seconds(config.observation_window_secs as i64);
 
@@ -177,6 +180,8 @@ async fn create_competition(client: &CoordinatorClient, config: &ScenarioConfig)
         entry_fee: config.entry_fee,
         coordinator_fee_percentage: 10,
         total_competition_pool: config.entry_fee * config.users,
+        // A test competition: kept off the oracle's public events list.
+        unlisted: true,
     };
 
     let resp = client.create_competition(&competition).await?;

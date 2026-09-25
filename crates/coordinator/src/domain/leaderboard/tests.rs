@@ -29,6 +29,7 @@ fn competition() -> Competition {
         coordinator_fee_percentage: 5,
         total_competition_pool: 18_000,
         relative_locktime_block_delta: None,
+        unlisted: false,
     });
     competition.total_entries = 3;
     competition.total_paid_entries = 3;
