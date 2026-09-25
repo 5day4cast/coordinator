@@ -15,7 +15,7 @@ use crate::{
         get_competitions, get_contract_parameters, get_entries, get_estimated_fee_rates,
         get_next_address, get_outputs, get_ticket_refund, get_ticket_status, health,
         leaderboard_fragment, leaderboard_rows_fragment, login, login_username, not_found,
-        payouts_fragment, public_page_handler, register, register_username,
+        payouts_fragment, public_page_handler, register, register_ticket, register_username,
         request_competition_ticket, send_to_address, set_lightning_address,
         submit_final_signatures, submit_public_nonces, submit_ticket_payout,
         ticket_status_fragment,
@@ -842,6 +842,10 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
         .route(
             "/api/v1/competitions/{competition_id}/tickets/{ticket_id}/status",
             get(get_ticket_status),
+        )
+        .route(
+            "/api/v1/competitions/{competition_id}/tickets/{ticket_id}/registration",
+            post(register_ticket),
         )
         .route(
             "/api/v1/competitions/{competition_id}/tickets/{ticket_id}/refund",

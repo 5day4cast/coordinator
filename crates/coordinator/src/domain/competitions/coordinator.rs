@@ -10,7 +10,8 @@ use super::{
     parse_invoice, states::CompetitionStatus, store::ReservedTicket, verify_entry_key,
     verify_payout_preimage, winner_payout_sats, AddEntry, CompetitionError, CompetitionState,
     CompetitionStore, FundedContract, KeymeldSigningInfo, PayoutClaimInfo, PayoutClaimReceipt,
-    PayoutInfo, PayoutRejection, SearchBy, Ticket, TicketStatus, UserEntry, UserEntryView,
+    PayoutInfo, PayoutRejection, RegistrationStored, SearchBy, Ticket, TicketRegistration,
+    TicketStatus, UserEntry, UserEntryView,
 };
 use crate::{
     api::routes::FinalSignatures,
@@ -3506,6 +3507,30 @@ impl Coordinator {
             session
                 .validate_registration(&UserId::from(ticket.id), &data)
                 .map_err(|_| Error::BadRequest("Invalid Keymeld registration context".into()))?;
+            // The entry must register the key the ticket was paid with, if one was sent before
+            // paying: that is the key its escrow is refunded with.
+            if let Some(stored) = self
+                .competition_store
+                .ticket_registration(ticket.id, &ticket.hash)
+                .await?
+            {
+                let stored: TicketRegistration =
+                    serde_json::from_str(&stored).map_err(|e| Error::Bitcoin(e.into()))?;
+                let sent = TicketRegistration {
+                    ephemeral_pubkey: entry.ephemeral_pubkey.clone(),
+                    encrypted_keymeld_private_key: data.encrypted_private_key.clone(),
+                    keymeld_auth_pubkey: data.auth_pubkey.clone(),
+                    keymeld_registration_context: data.context.clone(),
+                    keymeld_escrow_policy: data.escrow_policy.clone(),
+                };
+                if !stored.same_as(&sent) {
+                    return Err(Error::BadRequest(
+                        "The entry's Keymeld registration differs from the one sent for its \
+                         ticket before paying"
+                            .into(),
+                    ));
+                }
+            }
         }
 
         let mut user_entry = entry.clone().into_user_entry(pubkey);
@@ -3534,6 +3559,137 @@ impl Coordinator {
 
         self.wake_competition(user_entry.event_id);
         Ok(user_entry)
+    }
+
+    /// Keep the Keymeld registration a player sends for their ticket before paying for it.
+    ///
+    /// It is checked as an entry's would be, so that a ticket paid for but never used for an
+    /// entry can still have its escrow refunded. It lasts only as long as the reservation.
+    pub async fn register_ticket(
+        &self,
+        pubkey: String,
+        competition_id: Uuid,
+        ticket_id: Uuid,
+        mut registration: TicketRegistration,
+    ) -> Result<(), Error> {
+        if !self.is_keymeld_enabled() {
+            return Err(Error::BadRequest(
+                "This coordinator does not register entries with Keymeld".into(),
+            ));
+        }
+        let competition = self
+            .competition_store
+            .get_competition(competition_id)
+            .await
+            .map_err(|e| match e {
+                sqlx::Error::RowNotFound => Error::NotFound("Competition not found".into()),
+                e => Error::from(e),
+            })?;
+        if !matches!(competition.get_state(), CompetitionState::Created) {
+            return Err(Error::BadRequest(
+                "Competition is no longer accepting entries".into(),
+            ));
+        }
+        let ticket = self
+            .competition_store
+            .get_ticket(ticket_id)
+            .await
+            .map_err(|e| match e {
+                sqlx::Error::RowNotFound => Error::NotFound("Ticket not found".into()),
+                e => Error::from(e),
+            })?;
+        if ticket.competition_id != competition_id {
+            return Err(Error::BadRequest(
+                "Ticket belongs to a different competition".into(),
+            ));
+        }
+        if ticket.reserved_by.as_deref() != Some(&pubkey) {
+            return Err(Error::BadRequest("Ticket not reserved by this user".into()));
+        }
+        if ticket.entry_id.is_some() {
+            return Err(Error::BadRequest("Ticket has already been used".into()));
+        }
+        let entry_key = Point::from_hex(&registration.ephemeral_pubkey).map_err(|_| {
+            Error::BadRequest("ephemeral_pubkey must be a compressed secp256k1 point in hex".into())
+        })?;
+        registration.ephemeral_pubkey = hex::encode(entry_key.serialize());
+        if ticket
+            .ephemeral_pubkey
+            .as_ref()
+            .is_some_and(|key| key != &registration.ephemeral_pubkey)
+        {
+            return Err(Error::BadRequest(
+                "The registration's key differs from the ticket's escrow key".into(),
+            ));
+        }
+        let policy = self
+            .competition_store
+            .ticket_payout_policy(ticket.id, &ticket.hash)
+            .await?;
+        if self
+            .competition_store
+            .has_automatic_payouts(competition_id)
+            .await?
+        {
+            if policy.is_none() {
+                return Err(Error::BadRequest(
+                    "Missing pre-payment payout authorization".into(),
+                ));
+            }
+            let registered_key = self
+                .competition_store
+                .ticket_payout_public_key(ticket.id, &ticket.hash)
+                .await?;
+            if registered_key != registration.ephemeral_pubkey {
+                return Err(Error::BadRequest(
+                    "The registration's key differs from its pre-payment payout authorization"
+                        .into(),
+                ));
+            }
+        }
+        let data = ParticipantRegistrationData {
+            encrypted_private_key: registration.encrypted_keymeld_private_key.clone(),
+            public_key: registration.ephemeral_pubkey.clone(),
+            auth_pubkey: registration.keymeld_auth_pubkey.clone(),
+            context: registration.keymeld_registration_context.clone(),
+            payout_policy: policy
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|error| Error::Bitcoin(error.into()))?,
+            escrow_policy: registration.keymeld_escrow_policy.clone(),
+        };
+        coordinator_core::keymeld::verify_registration_policy(
+            &data.context,
+            data.payout_policy.as_ref(),
+            data.escrow_policy.as_ref(),
+        )
+        .map_err(|error| Error::BadRequest(error.to_string()))?;
+        let stored = self
+            .competition_store
+            .get_keymeld_session(competition_id)
+            .await
+            .map_err(Error::from)?
+            .ok_or_else(|| {
+                Error::BadRequest("Competition has no authorized Keymeld session".into())
+            })?;
+        self.restore_keymeld_session(&stored)?
+            .validate_registration(&UserId::from(ticket.id), &data)
+            .map_err(|_| Error::BadRequest("Invalid Keymeld registration context".into()))?;
+        let json = serde_json::to_string(&registration).map_err(|e| Error::Bitcoin(e.into()))?;
+        match self
+            .competition_store
+            .store_ticket_registration(ticket.id, ticket.hash.clone(), pubkey, json)
+            .await?
+        {
+            RegistrationStored::Stored | RegistrationStored::Unchanged => Ok(()),
+            RegistrationStored::ReservationChanged => Err(Error::BadRequest(
+                "Ticket reservation changed; request a new ticket".into(),
+            )),
+            RegistrationStored::Fixed => Err(Error::BadRequest(
+                "The ticket is paid, so its Keymeld registration can no longer change".into(),
+            )),
+        }
     }
 
     pub async fn get_entries(

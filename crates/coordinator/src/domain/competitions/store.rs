@@ -1603,6 +1603,15 @@ impl CompetitionStore {
                     tx.rollback().await?;
                     return Err(sqlx::Error::RowNotFound);
                 }
+                // A registration sent for a released reservation is never used.
+                sqlx::query(
+                    "DELETE FROM ticket_keymeld_registrations
+                     WHERE ticket_id = ? AND ticket_hash != (SELECT hash FROM tickets WHERE id = ?)",
+                )
+                .bind(&ticket_id)
+                .bind(&ticket_id)
+                .execute(&mut *tx)
+                .await?;
 
                 // Get the updated ticket
                 let ticket = sqlx::query_as::<_, Ticket>(
@@ -2098,6 +2107,7 @@ impl CompetitionStore {
 
         self.db_connection
             .execute_write(move |pool| async move {
+                let mut tx = pool.begin().await?;
                 let result = sqlx::query(
                     "UPDATE tickets
                     SET encrypted_preimage = ?,
@@ -2114,12 +2124,21 @@ impl CompetitionStore {
                 )
                 .bind(new_preimage)
                 .bind(new_hash)
-                .bind(ticket_id_str)
+                .bind(&ticket_id_str)
                 .bind(expected_hash)
                 .bind(expected_invoice)
-                .execute(&pool)
+                .execute(&mut *tx)
                 .await?;
-                Ok(result.rows_affected() > 0)
+                let released = result.rows_affected() > 0;
+                if released {
+                    // The released reservation's Keymeld registration goes with it.
+                    sqlx::query("DELETE FROM ticket_keymeld_registrations WHERE ticket_id = ?")
+                        .bind(&ticket_id_str)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                tx.commit().await?;
+                Ok(released)
             })
             .await
     }
@@ -2159,6 +2178,7 @@ impl CompetitionStore {
 
         self.db_connection
             .execute_write(move |pool| async move {
+                let mut tx = pool.begin().await?;
                 let result = sqlx::query(
                     "UPDATE tickets
                     SET
@@ -2175,9 +2195,15 @@ impl CompetitionStore {
                 )
                 .bind(new_encrypted_preimage_owned)
                 .bind(new_hash_owned)
-                .bind(ticket_id_str)
-                .execute(&pool)
+                .bind(&ticket_id_str)
+                .execute(&mut *tx)
                 .await?;
+                // The released reservation's Keymeld registration goes with it.
+                sqlx::query("DELETE FROM ticket_keymeld_registrations WHERE ticket_id = ?")
+                    .bind(&ticket_id_str)
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
                 Ok(result.rows_affected() > 0)
             })
             .await

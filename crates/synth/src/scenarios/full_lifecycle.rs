@@ -1,5 +1,7 @@
 use crate::client::competitions::CreateCompetition;
-use crate::client::entries::{AddEntry, TicketStatus, ValueOption, WeatherChoices};
+use crate::client::entries::{
+    AddEntry, TicketRegistration, TicketStatus, ValueOption, WeatherChoices,
+};
 use crate::client::CoordinatorClient;
 use crate::crypto;
 use crate::crypto::keys::SynthUser;
@@ -257,6 +259,25 @@ pub(super) async fn enter_competition_with(
         ),
         None => None,
     };
+    // As the browser does, the registration goes before the invoice is paid, so a ticket paid
+    // for but never entered can still be refunded.
+    if let Some(data) = &registration {
+        client
+            .register_ticket(
+                &user.nostr_keys,
+                competition_id,
+                &ticket.ticket_id,
+                &TicketRegistration {
+                    ephemeral_pubkey: ephemeral.public_key.clone(),
+                    encrypted_keymeld_private_key: data.encrypted_private_key.clone(),
+                    keymeld_auth_pubkey: data.auth_pubkey.clone(),
+                    keymeld_registration_context: data.context.clone(),
+                    keymeld_escrow_policy: data.escrow_policy.clone(),
+                },
+            )
+            .await
+            .context("Failed to register the ticket before paying")?;
+    }
     let (
         encrypted_keymeld_key,
         keymeld_auth_pubkey,

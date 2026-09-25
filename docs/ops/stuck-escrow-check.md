@@ -77,8 +77,9 @@ SELECT c.id AS competition,
        (SELECT COUNT(*) FROM entries WHERE event_id = c.id) AS entries,
        t.id AS ticket, e.swap_id, e.vtxo_outpoint, e.vtxo_sats,
        datetime(e.funded_at, 'unixepoch') AS funded,
-       en.id AS entry,
-       json_extract(p.policy_json, '$.automatic_lightning_address') AS refund_to,
+       en.id AS entry, k.ticket_id IS NOT NULL AS registered,
+       json_extract(COALESCE(p.policy_json, tp.policy_json),
+                    '$.automatic_lightning_address') AS refund_to,
        r.state AS refund_state, r.error AS refund_error,
        a.commitment_tx IS NOT NULL AS pool_funded
 FROM ticket_ark_escrows e
@@ -86,6 +87,8 @@ JOIN tickets t ON t.id = e.ticket_id AND t.hash = e.ticket_hash
 JOIN competitions c ON c.id = t.event_id
 LEFT JOIN entries en ON en.ticket_id = t.id
 LEFT JOIN entry_payout_policies p ON p.entry_id = en.id
+LEFT JOIN ticket_payout_policies tp ON tp.ticket_id = t.id AND tp.ticket_hash = t.hash
+LEFT JOIN ticket_keymeld_registrations k ON k.ticket_id = t.id AND k.ticket_hash = t.hash
 LEFT JOIN ticket_ark_refunds r ON r.ticket_id = e.ticket_id
 LEFT JOIN ark_funded_competitions a ON a.event_id = c.id
 WHERE (c.cancelled_at IS NOT NULL OR c.failed_at IS NOT NULL)
@@ -99,7 +102,8 @@ Read each row as one of these cases:
 | Row | What happens |
 | --- | --- |
 | `pool_funded = 1` | The kickoff batch spent the escrow into the pool. Not a refund; the pool pays out or expires. |
-| `entry` empty | The player paid but never entered, so they never sealed an entry key to Keymeld and nothing can sign the escrow's refund leaf. Needs an operator. |
+| `entry` empty, `registered = 1` | The player paid but never entered. Their browser sent Keymeld's registration before showing the invoice, so the refund is signed with it like an entry's. |
+| `entry` empty, `registered = 0` | The player paid but never entered, and no registration was kept for the ticket, so nothing can sign the escrow's refund leaf. Needs an operator. |
 | `refund_to` empty | The player gave no Lightning Address, and a refund can only pay one. Needs an operator. |
 | `entries < tickets` | The competition never filled. Keymeld is given only the paid entries, and signs each refund with that player's own key. Refunds wait while any ticket's invoice can still be paid, because Keymeld's roster cannot change once it signs a refund. A ticket counted after that is logged as needing an operator. |
 | otherwise | Refunded by cleanup once the escrow's refund leaf opens (`refund_after_start_secs` after the window starts, 24 h by default). `refund_state`/`refund_error` show progress. |

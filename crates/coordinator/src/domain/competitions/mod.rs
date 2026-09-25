@@ -13,6 +13,7 @@ mod reported;
 mod runners;
 pub mod states;
 mod store;
+mod ticket_registration;
 use crate::infra::{
     db::{
         parse_optional_blob_json, parse_optional_datetime, parse_optional_sqlite_datetime,
@@ -43,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, FromRow, Row};
 use std::fmt;
 pub use store::*;
+pub use ticket_registration::*;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 

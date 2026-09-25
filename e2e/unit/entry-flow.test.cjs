@@ -201,3 +201,74 @@ test("too many picks are refused before any payment", async () => {
   await sandbox.submitEntry();
   assert.match(elements.errorMessage.textContent, /up to 2 picks/);
 });
+
+// A player whose ticket has an Arkade escrow: the wallet seals their entry key
+// to Keymeld, and the page must hand that to the coordinator before it shows
+// the invoice, or a ticket paid and never entered could not be refunded.
+function registeringPlayer({ refuseRegistration = false } = {}) {
+  const { elements, document } = entryPage();
+  const requests = [];
+  let shownAfter = null;
+  const getElementById = document.getElementById;
+  document.getElementById = (id) => {
+    if (id === "ticketPaymentModal") {
+      shownAfter = [...requests];
+      throw new Error("the invoice is shown");
+    }
+    return getElementById(id);
+  };
+  const window = loggedIn({
+    AuthorizedClient: class {
+      async post(url, body) {
+        requests.push({ url, body });
+        if (url.endsWith("/api/v1/users/login")) {
+          return { ok: true, json: async () => ({ lightning_address: "thor@lnurl.5day4cast.com" }) };
+        }
+        if (url.endsWith("/registration")) {
+          if (refuseRegistration) {
+            const error = new Error("HTTP error! status: 400");
+            error.response = { ok: false, status: 400 };
+            throw error;
+          }
+          return { ok: true, status: 204 };
+        }
+        return { ok: true, json: async () => ({ ticket_id: "ticket", payment_request: "lnbc52500n1ticket",
+          keymeld_session_id: "session", keymeld_registration: {
+            user_id: "ticket", session_id: "session", payout_policy: "policy" } }) };
+      }
+    },
+    dlcWallet: {
+      entryRegistration: () => ({ ephemeral_pubkey: "pubkey", payout_hash: "hash" }),
+      keymeldPayoutRegistration: async () => ({
+        encrypted_private_key: "sealed", auth_pubkey: "auth",
+        context: { user_id: "ticket" }, escrow_policy: { policy: "signed" },
+      }),
+    },
+  });
+  const sandbox = load(window, document, termsFetch());
+  return { sandbox, elements, requests, shown: () => shownAfter };
+}
+
+test("the ticket's Keymeld registration is sent before its invoice is shown", async () => {
+  const { sandbox, requests, shown } = registeringPlayer();
+  await sandbox.submitEntry();
+  const registration = requests.find(({ url }) => url.endsWith("/registration"));
+  assert.equal(registration.url,
+    `https://coordinator/api/v1/competitions/${COMPETITION}/tickets/ticket/registration`);
+  assert.deepEqual(JSON.parse(JSON.stringify(registration.body)), {
+    ephemeral_pubkey: "pubkey",
+    encrypted_keymeld_private_key: "sealed",
+    keymeld_auth_pubkey: "auth",
+    keymeld_registration_context: { user_id: "ticket" },
+    keymeld_escrow_policy: { policy: "signed" },
+  });
+  assert.ok(shown()?.includes(registration), "the registration went out before the invoice was shown");
+});
+
+test("a refused registration never shows the invoice", async () => {
+  const { sandbox, elements, shown } = registeringPlayer({ refuseRegistration: true });
+  await sandbox.submitEntry();
+  assert.equal(shown(), null, "no invoice to pay");
+  assert.ok(!elements.errorMessage.classList.contains("hidden"), "the player is told it failed");
+  assert.equal(elements.submitEntry.disabled, false);
+});
