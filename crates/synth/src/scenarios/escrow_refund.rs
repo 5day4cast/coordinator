@@ -22,13 +22,14 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::common::{finish_result, load_users, run_step, wait_for_state, Steps};
-use super::full_lifecycle::{enter_competition_with, EntryTrace, Payer};
+use super::full_lifecycle::{enter_competition_with, Payer};
 use super::types::*;
 use crate::client::competitions::CreateCompetition;
 use crate::client::CoordinatorClient;
 use crate::crypto::keys::SynthUser;
 use crate::db::SynthDb;
 use crate::lnd::Lnd;
+use crate::trail::EntryTrace;
 
 const SCENARIO: &str = "escrow_refund";
 
@@ -87,8 +88,9 @@ pub async fn run_escrow_refund(
     let mut tickets = Vec::new();
     for user in &users {
         let mut trace = EntryTrace::new(user);
+        let step_name = format!("user_{}_enter", user.name);
         let ticket = step!(
-            &format!("user_{}_enter", user.name),
+            &step_name,
             enter_competition_with(
                 client,
                 user,
@@ -96,6 +98,7 @@ pub async fn run_escrow_refund(
                 config,
                 Some(&address),
                 &Payer::Lnd(&lnd),
+                &step_name,
                 &mut trace,
             )
             .await,

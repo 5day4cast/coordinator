@@ -5,12 +5,11 @@ use crate::scenarios::{
     self, ScenarioConfig, ScenarioResult, ScenarioStatus, StepResult, StepStatus,
 };
 use anyhow::Result;
-use log::{error, info, warn};
+use log::{error, info};
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
-use tokio::sync::{mpsc, Mutex};
-use uuid::Uuid;
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 /// The run in progress, and the step it is on.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -43,7 +42,18 @@ struct Recorder {
     run_id: String,
     events: Events,
     live: Arc<std::sync::Mutex<Option<LiveRun>>>,
-    steps: mpsc::UnboundedSender<StepResult>,
+    steps: mpsc::UnboundedSender<Record>,
+}
+
+/// What a scenario records about a step, saved in the order recorded.
+enum Record {
+    /// What the step has done so far; `saved` is told once it is in the database.
+    Progress {
+        step: String,
+        details: serde_json::Value,
+        saved: oneshot::Sender<()>,
+    },
+    Finished(StepResult),
 }
 
 /// Announce that the running scenario has begun `step`. Does nothing outside a run.
@@ -62,8 +72,26 @@ pub(crate) fn step_started(step: &str) {
 /// Save and announce a step the running scenario finished. Does nothing outside a run.
 pub(crate) fn step_finished(step: &StepResult) {
     let _ = RECORDER.try_with(|recorder| {
-        let _ = recorder.steps.send(step.clone());
+        let _ = recorder.steps.send(Record::Finished(step.clone()));
     });
+}
+
+/// Save what the running scenario's `step` has done so far, and wait until it is saved: for a
+/// step about to do something a restart must not lose track of, such as paying. The step shows
+/// as running until it finishes. Does nothing outside a run.
+pub(crate) async fn step_progress(step: &str, details: serde_json::Value) {
+    let Ok(saved) = RECORDER.try_with(|recorder| {
+        let (saved, is_saved) = oneshot::channel();
+        let _ = recorder.steps.send(Record::Progress {
+            step: step.to_string(),
+            details,
+            saved,
+        });
+        is_saved
+    }) else {
+        return;
+    };
+    let _ = saved.await;
 }
 
 /// Save each step in the order recorded, announcing each once it is saved.
@@ -71,29 +99,66 @@ async fn save_steps(
     db: SynthDb,
     events: Events,
     run_id: String,
-    mut steps: mpsc::UnboundedReceiver<StepResult>,
+    mut records: mpsc::UnboundedReceiver<Record>,
 ) {
-    while let Some(step) = steps.recv().await {
-        let details = step.details.as_ref().map(|d| d.to_string());
-        let saved = async {
-            let step_id = db.create_step(&run_id, &step.name).await?;
-            db.complete_step(
-                &step_id,
-                step.duration_ms,
-                step.error.as_deref(),
-                details.as_deref(),
-            )
-            .await
+    // Steps saved before they finished, by name, and their rows.
+    let mut open: HashMap<String, String> = HashMap::new();
+    while let Some(record) = records.recv().await {
+        match record {
+            Record::Progress {
+                step,
+                details,
+                saved,
+            } => {
+                let row = match open.get(&step) {
+                    Some(row) => Ok(row.clone()),
+                    None => db.create_step(&run_id, &step).await,
+                };
+                let written = match row {
+                    Ok(row) => {
+                        let written = db.update_step_details(&row, &details.to_string()).await;
+                        open.insert(step.clone(), row);
+                        written
+                    }
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = written {
+                    error!("Cannot save step {step} of run {run_id} so far: {e:#}");
+                }
+                let _ = saved.send(());
+                events.send(Event::StepStarted {
+                    run_id: run_id.clone(),
+                    step,
+                });
+            }
+            Record::Finished(step) => {
+                let details = step.details.as_ref().map(|d| d.to_string());
+                let row = match open.remove(&step.name) {
+                    Some(row) => Ok(row),
+                    None => db.create_step(&run_id, &step.name).await,
+                };
+                let saved = match row {
+                    Ok(row) => {
+                        db.complete_step(
+                            &row,
+                            step.duration_ms,
+                            step.error.as_deref(),
+                            details.as_deref(),
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = saved {
+                    error!("Cannot save step {} of run {run_id}: {e:#}", step.name);
+                }
+                events.send(Event::StepFinished {
+                    run_id: run_id.clone(),
+                    step: step.name.clone(),
+                    passed: step.status == StepStatus::Passed,
+                });
+            }
         }
-        .await;
-        if let Err(e) = saved {
-            error!("Cannot save step {} of run {run_id}: {e:#}", step.name);
-        }
-        events.send(Event::StepFinished {
-            run_id: run_id.clone(),
-            step: step.name.clone(),
-            passed: step.status == StepStatus::Passed,
-        });
     }
 }
 
@@ -224,51 +289,6 @@ impl Runner {
             tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
         }
     }
-
-    /// Announce when a competition a recent run made changes state. A run ends once its
-    /// competition awaits attestation, but the money keeps moving after that: attestation,
-    /// payouts, refunds.
-    pub async fn watch_competitions(&self, interval_secs: u64) {
-        let mut seen: HashMap<Uuid, String> = HashMap::new();
-        loop {
-            if let Err(e) = self.check_competitions(&mut seen).await {
-                warn!("Cannot check the runs' competitions: {e:#}");
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
-        }
-    }
-
-    async fn check_competitions(&self, seen: &mut HashMap<Uuid, String>) -> Result<()> {
-        let watched: Vec<Uuid> = self
-            .db
-            .list_runs(20)
-            .await?
-            .into_iter()
-            .filter_map(|run| run.competition_id?.parse().ok())
-            .collect();
-        if watched.is_empty() {
-            return Ok(());
-        }
-        for competition in self.client.list_competitions().await? {
-            if !watched.contains(&competition.id) {
-                continue;
-            }
-            let state = competition
-                .state
-                .clone()
-                .unwrap_or_else(|| competition.inferred_status().to_string());
-            let changed = seen
-                .insert(competition.id, state.clone())
-                .is_some_and(|previous| previous != state);
-            if changed {
-                self.events.send(Event::CompetitionChanged {
-                    competition_id: competition.id,
-                    state,
-                });
-            }
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -339,6 +359,31 @@ mod tests {
                     .as_deref()
                     .unwrap()
                     .contains("competition_id"));
+
+                // A step saves what it has done before paying, and finishes in the same row.
+                step_progress("user_alice_enter", serde_json::json!({ "ticket_id": "t" })).await;
+                let saved = db.get_steps(&run_id).await.unwrap();
+                assert_eq!(saved.len(), 2, "saved before the step finishes");
+                assert_eq!(saved[1].status, "running");
+                assert!(saved[1].details_json.as_deref().unwrap().contains("\"t\""));
+                step_finished(&StepResult {
+                    name: "user_alice_enter".into(),
+                    status: StepStatus::Passed,
+                    duration_ms: 5,
+                    details: Some(serde_json::json!({ "ticket_id": "t", "paid": true })),
+                    error: None,
+                });
+                loop {
+                    if let Event::StepFinished { step, .. } = watching.recv().await.unwrap() {
+                        if step == "user_alice_enter" {
+                            break;
+                        }
+                    }
+                }
+                let saved = db.get_steps(&run_id).await.unwrap();
+                assert_eq!(saved.len(), 2, "finished in the row it was saved in");
+                assert_eq!(saved[1].status, "passed");
+                assert!(saved[1].details_json.as_deref().unwrap().contains("paid"));
             })
             .await;
         saving.await.unwrap();

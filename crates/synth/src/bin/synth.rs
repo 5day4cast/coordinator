@@ -1,3 +1,4 @@
+use coordinator_synth::ark_swap::ArkSwap;
 use coordinator_synth::client::CoordinatorClient;
 use coordinator_synth::config::load_config;
 use coordinator_synth::db::SynthDb;
@@ -5,10 +6,8 @@ use coordinator_synth::events::Events;
 use coordinator_synth::rebalance::Rebalancer;
 use coordinator_synth::runner::Runner;
 use coordinator_synth::server;
-use log::info;
-
-/// How often the runs' competitions are checked for changes after the runs end.
-const COMPETITION_WATCH_SECS: u64 = 20;
+use coordinator_synth::trail::tracker::{self, Tracker};
+use log::{info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -22,6 +21,11 @@ async fn main() -> anyhow::Result<()> {
     info!("  Oracle: {}", config.oracle.url);
 
     let db = SynthDb::new(&config.db.path).await?;
+    // Nothing runs yet, so a run still marked running was cut short by the last shutdown.
+    let interrupted = db.interrupt_unfinished_runs().await?;
+    if interrupted > 0 {
+        warn!("Marked {interrupted} run(s) the last shutdown cut short as interrupted");
+    }
     let mut client = CoordinatorClient::new(
         &config.coordinator.url,
         config.coordinator.admin_url.as_deref(),
@@ -40,11 +44,51 @@ async fn main() -> anyhow::Result<()> {
         (None, Some(_)) => anyhow::bail!("rebalance needs lnd, the node it pays back"),
         _ => None,
     };
+    // Payouts and refunds happen hours after a run ends; follow each run's money until then,
+    // looking payments up on the nodes synth can reach and swaps up in ark-swapd.
+    let payer = config
+        .lnd
+        .as_ref()
+        .and_then(|payer| tracker::nodes(&[payer]).pop());
+    let others = tracker::nodes(
+        &config
+            .rebalance
+            .as_ref()
+            .map(|rebalance| &rebalance.source)
+            .into_iter()
+            .collect::<Vec<_>>(),
+    );
+    let payee = config.trail.payee.as_ref().map(|payee| tracker::Payee {
+        pubkey: payee.pubkey.clone(),
+        lnd: payee
+            .lnd
+            .as_ref()
+            .and_then(|lnd| tracker::nodes(&[lnd]).pop()),
+    });
+    if payee.is_none() {
+        warn!("trail.payee is not set, so payouts are confirmed without checking who they paid");
+    }
+    let ark_swap = match config
+        .rebalance
+        .as_ref()
+        .and_then(|rebalance| rebalance.arkade.as_ref())
+    {
+        Some(arkade) => Some(ArkSwap::new(&arkade.ark_swap)?),
+        None => None,
+    };
+    let tracker = Tracker::new(
+        client.clone(),
+        db.clone(),
+        events.clone(),
+        payer,
+        others,
+        payee,
+        ark_swap,
+        config.trail.clone(),
+    )?;
     let runner = Runner::new(client, db, events);
-
-    // Payouts and refunds happen after a run ends; watch its competition for them.
-    let watcher = runner.clone();
-    tokio::spawn(async move { watcher.watch_competitions(COMPETITION_WATCH_SECS).await });
+    let following = tracker.clone();
+    tokio::spawn(async move { following.run().await });
 
     // Start scheduled runner if enabled
     if config.scheduler.enabled {
@@ -64,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start HTTP server
-    server::start_server(&config, runner, rebalancer).await?;
+    server::start_server(&config, runner, rebalancer, tracker).await?;
 
     Ok(())
 }

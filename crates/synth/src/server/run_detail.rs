@@ -1,82 +1,32 @@
-//! One run in detail: where each player's money went, drawn as a flow, and every id needed to
-//! follow it through the payer's node, ark-swapd, and the coordinator.
+//! One run in detail: where each player's money went, drawn as a flow, then every hop with the
+//! full id to look it up by, and a ledger checking that what went in came out. Money that is
+//! stuck gets a block of its own, laid out for debugging.
+//!
+//! The page is drawn from synth's own database: the run's steps, and the money trail the tracker
+//! keeps for it. It asks nobody else anything, so it loads fast however slow the coordinator is.
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
-    response::{Html, IntoResponse},
+    http::{header, HeaderMap, StatusCode},
+    response::{Html, IntoResponse, Response},
 };
 use maud::{html, Markup};
-use serde::Deserialize;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use super::format::{self, copyable};
 use super::live;
-use super::routes::Dashboard;
+use super::money::{self, Ledger, Links, Row, Run, ScenarioRefund, Status};
+use super::routes::{self, Dashboard};
+use super::stuck;
 use crate::client::competitions::CompetitionResponse;
-use crate::crypto::keys::SynthUser;
-use crate::db::TestStep;
-use crate::runner::Runner;
+use crate::db::{TestRun, TestStep};
 use crate::settlement::{Decided, Settlement};
-
-/// An entry's trace, as a scenario recorded it in its step.
-#[derive(Debug, Clone, Deserialize)]
-struct EntryView {
-    user: String,
-    nostr_pubkey: String,
-    entry_id: Option<Uuid>,
-    ticket_id: Option<Uuid>,
-    amount_sats: Option<u64>,
-    payment_hash: Option<String>,
-    #[serde(default)]
-    paid: bool,
-    #[serde(default)]
-    entry_submitted: bool,
-}
-
-/// A settled refund, as the refund scenario recorded it.
-#[derive(Debug, Clone, Deserialize)]
-struct RefundView {
-    paid_sats: u64,
-    ark_txid: Option<String>,
-}
-
-/// What one player was owed at the end, and what the coordinator sent them.
-#[derive(Debug, Clone, Default)]
-struct PlayerPayout {
-    user: String,
-    /// Their entry key, which is how the contract names them.
-    pubkey: String,
-    weight: u64,
-    owed_sats: u64,
-    /// When the coordinator sent the payout, or finished it; it does not say which.
-    sent_at: Option<OffsetDateTime>,
-    invoice: Option<InvoiceView>,
-}
-
-/// The invoice a payout paid.
-#[derive(Debug, Clone)]
-struct InvoiceView {
-    amount_sats: Option<u64>,
-    payee: String,
-    payment_hash: String,
-}
-
-fn invoice_view(invoice: &str) -> Option<InvoiceView> {
-    let invoice: lightning_invoice::Bolt11Invoice = invoice.trim().parse().ok()?;
-    Some(InvoiceView {
-        amount_sats: invoice.amount_milli_satoshis().map(|msat| msat / 1000),
-        payee: invoice
-            .payee_pub_key()
-            .copied()
-            .unwrap_or_else(|| invoice.recover_payee_pub_key())
-            .to_string(),
-        payment_hash: invoice.payment_hash().to_string(),
-    })
-}
+use crate::trail::tracker::entries_of;
+use crate::trail::{payout_states, EntryTrace, PayoutSeen, PayoutState, Trail};
 
 /// How the competition settled, in words, naming players by the scenario's names.
-fn outcome_words(settlement: &Settlement, payouts: &[PlayerPayout]) -> String {
+fn outcome_words(settlement: &Settlement, payouts: &[PayoutSeen]) -> String {
     let name = |pubkey: &str| {
         payouts
             .iter()
@@ -103,51 +53,31 @@ fn outcome_words(settlement: &Settlement, payouts: &[PlayerPayout]) -> String {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Stage {
-    Done,
-    Active,
-    Failed,
-    Waiting,
-}
-
-impl Stage {
-    fn class(self) -> &'static str {
-        match self {
-            Stage::Done => "done",
-            Stage::Active => "active",
-            Stage::Failed => "failed",
-            Stage::Waiting => "waiting",
-        }
-    }
-
-    /// The stage of a box that holds one line per player: failed if any did, done once all are.
-    fn of_lines(lines: &[Line]) -> Stage {
-        if lines.iter().any(|line| line.stage == Stage::Failed) {
-            Stage::Failed
-        } else if !lines.is_empty() && lines.iter().all(|line| line.stage == Stage::Done) {
-            Stage::Done
-        } else if lines.iter().any(|line| line.stage != Stage::Waiting) {
-            Stage::Active
-        } else {
-            Stage::Waiting
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct Line {
     label: String,
     value: String,
-    stage: Stage,
+    status: Status,
 }
 
 #[derive(Debug, Clone)]
 struct FlowBox {
     title: &'static str,
     subtitle: String,
-    stage: Stage,
+    status: Status,
     lines: Vec<Line>,
+}
+
+impl FlowBox {
+    /// A box holding one line per player: failed if any did, done once all are.
+    fn of_lines(title: &'static str, subtitle: impl Into<String>, lines: Vec<Line>) -> Self {
+        Self {
+            title,
+            subtitle: subtitle.into(),
+            status: Status::of_all(lines.iter().map(|line| line.status)),
+            lines,
+        }
+    }
 }
 
 fn short(id: &str) -> String {
@@ -158,71 +88,92 @@ fn short(id: &str) -> String {
     }
 }
 
-fn reached(at: Option<OffsetDateTime>) -> bool {
-    at.is_some()
-}
-
 /// Where each part of the run's money flow got to: the players' payments, their escrows and
-/// entries, the Arkade funding, the contract, and how it settled.
+/// entries, the funding, the contract, and how it settled. The ids are in the hops below it.
 fn flow(
-    entries: &[EntryView],
-    refunds: &[(String, RefundView)],
-    competition: Option<&CompetitionResponse>,
-    settlement: Option<&Settlement>,
-    payouts: &[PlayerPayout],
+    entries: &[EntryTrace],
+    refunds: &[(String, ScenarioRefund)],
+    trail: Option<&Trail>,
     run_failed: bool,
 ) -> Vec<FlowBox> {
+    let competition = trail.and_then(|trail| trail.competition.as_ref());
     // Once the run has failed, whatever an entry had not done it never will.
     let unfinished = if run_failed {
-        Stage::Failed
+        Status::Failed
     } else {
-        Stage::Waiting
+        Status::Waiting
     };
-    let ended = competition.is_some_and(|c| reached(c.cancelled_at) || reached(c.failed_at));
+    let ended = trail.is_some_and(Trail::ended);
+    let paid = |entry: &EntryTrace| {
+        entry.paid || trail.is_some_and(|trail| trail.late_payment(entry).is_some())
+    };
 
-    let payments: Vec<Line> = entries
+    let payments = entries
         .iter()
-        .map(|entry| Line {
-            label: entry.user.clone(),
-            value: match (entry.amount_sats, &entry.payment_hash) {
-                (Some(sats), Some(hash)) => format!("{sats} sats · hash {}", short(hash)),
-                _ => "no ticket yet".to_string(),
-            },
-            stage: if entry.paid { Stage::Done } else { unfinished },
+        .map(|entry| {
+            let payment = entry
+                .payment
+                .as_ref()
+                .or_else(|| trail?.late_payment(entry));
+            Line {
+                label: entry.user.clone(),
+                value: match (entry.amount_sats, payment) {
+                    (Some(sats), Some(payment)) if paid(entry) => format!(
+                        "{sats} sats, {} fee",
+                        format::msat_as_sats(payment.fee_msat)
+                    ),
+                    (Some(sats), _) if paid(entry) => format!("{sats} sats"),
+                    (Some(sats), _) => format!("{sats} sats unpaid"),
+                    (None, _) => "no ticket yet".to_string(),
+                },
+                status: if paid(entry) {
+                    Status::Done
+                } else {
+                    unfinished
+                },
+            }
         })
         .collect();
 
-    let escrows_confirmed = competition.is_some_and(|c| reached(c.escrow_funds_confirmed_at));
-    let escrows: Vec<Line> = entries
+    let escrows_confirmed = competition.is_some_and(|c| c.escrow_funds_confirmed_at.is_some());
+    let escrows = entries
         .iter()
-        .map(|entry| Line {
-            label: entry.user.clone(),
-            value: entry
-                .ticket_id
-                .map(|ticket| format!("ticket {}", short(&ticket.to_string())))
-                .unwrap_or_else(|| "-".to_string()),
-            stage: match (entry.paid, escrows_confirmed) {
-                (true, true) => Stage::Done,
-                (true, false) if ended => Stage::Failed,
-                (true, false) => Stage::Active,
-                (false, _) => unfinished,
-            },
+        .map(|entry| {
+            let swap = trail.and_then(|trail| trail.swap_of(entry));
+            Line {
+                label: entry.user.clone(),
+                value: match swap {
+                    Some(swap) if swap.funded_without_vtxo() => {
+                        format!("{} sats, swap {}, no output", swap.amount_sat, swap.state)
+                    }
+                    Some(swap) => format!("{} sats, swap {}", swap.amount_sat, swap.state),
+                    None if paid(entry) => "paid in".to_string(),
+                    None => "-".to_string(),
+                },
+                status: match (paid(entry), escrows_confirmed) {
+                    (true, true) => Status::Done,
+                    (true, false) if ended => Status::Failed,
+                    (true, false) => Status::Active,
+                    (false, _) => unfinished,
+                },
+            }
         })
         .collect();
 
-    let submitted: Vec<Line> = entries
+    let submitted = entries
         .iter()
         .map(|entry| Line {
             label: entry.user.clone(),
-            value: entry
-                .entry_id
-                .map(|id| format!("entry {}", short(&id.to_string())))
-                .unwrap_or_else(|| "-".to_string()),
-            stage: if entry.entry_submitted {
-                Stage::Done
-            } else if entry.paid {
+            value: if entry.entry_submitted {
+                "entered".to_string()
+            } else {
+                "not entered".to_string()
+            },
+            status: if entry.entry_submitted {
+                Status::Done
+            } else if paid(entry) {
                 // Paid for, but never entered: the money is in an escrow the run left behind.
-                Stage::Failed
+                Status::Failed
             } else {
                 unfinished
             },
@@ -230,246 +181,189 @@ fn flow(
         .collect();
 
     let mut boxes = vec![
-        FlowBox {
-            title: "Payments",
-            subtitle: "Lightning, from the payer's node to the invoice's".to_string(),
-            stage: Stage::of_lines(&payments),
-            lines: payments,
-        },
-        FlowBox {
-            title: "Escrows",
-            subtitle: "ark-swapd pays each ticket's Arkade escrow".to_string(),
-            stage: Stage::of_lines(&escrows),
-            lines: escrows,
-        },
-        FlowBox {
-            title: "Entries",
-            subtitle: "each player's entry, against their escrow".to_string(),
-            stage: Stage::of_lines(&submitted),
-            lines: submitted,
-        },
+        FlowBox::of_lines(
+            "Payments",
+            "Lightning, from the payer's node to ark-swapd's invoice",
+            payments,
+        ),
+        FlowBox::of_lines(
+            "Escrows",
+            "ark-swapd pays each ticket's Arkade escrow",
+            escrows,
+        ),
+        FlowBox::of_lines(
+            "Entries",
+            "each player's entry, against their escrow",
+            submitted,
+        ),
     ];
 
     let Some(competition) = competition else {
         boxes.push(FlowBox {
             title: "Competition",
-            subtitle: "the coordinator did not answer for it".to_string(),
-            stage: Stage::Waiting,
+            subtitle: "not looked up yet".to_string(),
+            status: Status::Waiting,
             lines: Vec::new(),
         });
         return boxes;
     };
 
-    let funding_stage = if reached(competition.funding_confirmed_at) {
-        Stage::Done
+    let funding_status = if competition.funding_confirmed_at.is_some() {
+        Status::Done
     } else if ended {
-        Stage::Failed
-    } else if reached(competition.signed_at) || reached(competition.funding_broadcasted_at) {
-        Stage::Active
+        Status::Failed
+    } else if competition.signed_at.is_some() || competition.funding_broadcasted_at.is_some() {
+        Status::Active
     } else {
-        Stage::Waiting
+        Status::Waiting
     };
+    let funding = trail.and_then(|trail| trail.funding_tx.as_ref());
     boxes.push(FlowBox {
         title: "Funding",
-        subtitle: "one Arkade transaction funds the contract".to_string(),
-        stage: funding_stage,
-        lines: competition
-            .funding_outpoint
-            .iter()
-            .map(|outpoint| Line {
-                label: "outpoint".to_string(),
-                value: short(outpoint),
-                stage: funding_stage,
+        subtitle: "one transaction funds the contract on-chain".to_string(),
+        status: funding_status,
+        lines: funding
+            .map(|funding| Line {
+                label: "on-chain".to_string(),
+                value: match funding.fee_sat {
+                    Some(fee) => format!("{fee} sats batch fee"),
+                    None => "fee not known yet".to_string(),
+                },
+                status: funding_status,
             })
+            .into_iter()
             .collect(),
     });
 
     let attested = competition.state.as_deref() == Some("attested")
-        || reached(competition.outcome_broadcasted_at)
-        || reached(competition.completed_at);
-    let contract_stage = if attested {
-        Stage::Done
+        || competition.outcome_broadcasted_at.is_some()
+        || competition.completed_at.is_some();
+    let contract_status = if attested {
+        Status::Done
     } else if ended {
-        Stage::Failed
-    } else if reached(competition.contracted_at) {
-        Stage::Active
+        Status::Failed
+    } else if competition.contracted_at.is_some() {
+        Status::Active
     } else {
-        Stage::Waiting
+        Status::Waiting
     };
     boxes.push(FlowBox {
         title: "Contract",
         subtitle: "signed, then settled by the oracle's attestation".to_string(),
-        stage: contract_stage,
+        status: contract_status,
         lines: vec![Line {
             label: "state".to_string(),
             value: competition
                 .state
                 .clone()
                 .unwrap_or_else(|| competition.inferred_status().to_string()),
-            stage: contract_stage,
+            status: contract_status,
         }],
     });
 
-    let settlement = if reached(competition.cancelled_at) {
-        let lines: Vec<Line> = entries
-            .iter()
-            .filter(|entry| entry.paid)
-            .map(
-                |entry| match refunds.iter().find(|(user, _)| *user == entry.user) {
-                    Some((_, refund)) => Line {
-                        label: entry.user.clone(),
-                        value: format!(
-                            "{} sats back{}",
-                            refund.paid_sats,
-                            refund
-                                .ark_txid
-                                .as_deref()
-                                .map(|txid| format!(" · ark tx {}", short(txid)))
-                                .unwrap_or_default()
-                        ),
-                        stage: Stage::Done,
-                    },
-                    None => Line {
-                        label: entry.user.clone(),
-                        value: "not refunded".to_string(),
-                        stage: unfinished,
-                    },
-                },
-            )
-            .collect();
-        FlowBox {
-            title: "Refunds",
-            subtitle: "cancelled: each escrow goes back to its player".to_string(),
-            stage: Stage::of_lines(&lines),
-            lines,
-        }
+    let refunded = trail.is_some_and(|trail| !trail.refunds.is_empty()) || !refunds.is_empty();
+    // A competition that ended before its outcome gives the escrows back instead of paying out.
+    boxes.push(if (ended || refunded) && !attested {
+        refunds_box(entries, refunds, trail, unfinished)
     } else {
-        payouts_box(competition, settlement, payouts)
-    };
-    boxes.push(settlement);
+        payouts_box(trail)
+    });
     boxes
+}
+
+/// Each paid entry's refund: from the tracker, or the refund scenario's own steps.
+fn refunds_box(
+    entries: &[EntryTrace],
+    refunds: &[(String, ScenarioRefund)],
+    trail: Option<&Trail>,
+    unfinished: Status,
+) -> FlowBox {
+    let lines = entries
+        .iter()
+        .filter(|entry| entry.paid || trail.is_some_and(|t| t.late_payment(entry).is_some()))
+        .map(|entry| {
+            let traced = trail.and_then(|trail| trail.refund_of(entry));
+            let scenario = refunds.iter().find(|(user, _)| *user == entry.user);
+            let (value, status) = match (traced, scenario) {
+                (Some(refund), _) if refund.is_settled() => {
+                    (format!("{} sats back", refund.paid_sats), Status::Done)
+                }
+                (_, Some((_, refund))) => (format!("{} sats back", refund.paid_sats), Status::Done),
+                (Some(refund), None) => (format!("refund {}", refund.state), Status::Active),
+                (None, None) => ("not refunded".to_string(), unfinished),
+            };
+            Line {
+                label: entry.user.clone(),
+                value,
+                status,
+            }
+        })
+        .collect();
+    FlowBox::of_lines(
+        "Refunds",
+        "cancelled: each escrow goes back to its player",
+        lines,
+    )
 }
 
 /// Each player's payout: their share under the deciding outcome, and whether it was sent. A
 /// player the outcome does not pay is shown, but does not hold the box back.
-fn payouts_box(
-    competition: &CompetitionResponse,
-    settlement: Option<&Settlement>,
-    payouts: &[PlayerPayout],
-) -> FlowBox {
-    let decided = settlement.and_then(|settlement| settlement.decided.as_ref());
+fn payouts_box(trail: Option<&Trail>) -> FlowBox {
+    let settlement = trail.and_then(|trail| trail.settlement.as_ref());
+    let payouts = trail.map_or(&[][..], |trail| &trail.payouts[..]);
     let subtitle = settlement.map_or_else(
         || "winners are paid once the outcome settles".to_string(),
         |settlement| outcome_words(settlement, payouts),
     );
-    if decided.is_none() {
+    if settlement.is_none_or(|settlement| settlement.decided.is_none()) {
         return FlowBox {
             title: "Payouts",
             subtitle,
-            stage: Stage::Waiting,
+            status: Status::Waiting,
             lines: Vec::new(),
         };
     }
-    let completed = reached(competition.completed_at);
-    let failed = reached(competition.failed_at);
-    let lines: Vec<(bool, Line)> = payouts
+    let states = payout_states(payouts, trail.is_some_and(Trail::ended));
+    let lines: Vec<Line> = payouts
         .iter()
-        .map(|payout| {
-            let winner = payout.owed_sats > 0;
-            let (value, stage) = match (winner, payout.sent_at, completed) {
-                (false, _, _) => ("owed nothing".to_string(), Stage::Waiting),
-                (true, Some(_), true) => (format!("{} sats paid", payout.owed_sats), Stage::Done),
-                (true, Some(_), false) => {
-                    (format!("{} sats sending", payout.owed_sats), Stage::Active)
+        .zip(&states)
+        .map(|(payout, state)| Line {
+            label: payout.user.clone(),
+            value: match state {
+                PayoutState::OwedNothing => "owed nothing".to_string(),
+                PayoutState::Paid => format!("{} sats paid", payout.owed_sats),
+                PayoutState::SentUnconfirmed => {
+                    format!("{} sats sent; settlement unverified", payout.owed_sats)
                 }
-                (true, None, _) if failed => (
-                    format!("{} sats never sent", payout.owed_sats),
-                    Stage::Failed,
-                ),
-                (true, None, _) => (format!("{} sats owed", payout.owed_sats), Stage::Active),
-            };
-            (
-                winner,
-                Line {
-                    label: payout.user.clone(),
-                    value,
-                    stage,
-                },
-            )
+                PayoutState::OtherNode => format!("{} sats paid to another node", payout.owed_sats),
+                PayoutState::NeverSent => format!("{} sats never sent", payout.owed_sats),
+                PayoutState::Owed => format!("{} sats owed", payout.owed_sats),
+            },
+            status: Status::from(*state),
         })
         .collect();
-    let winning: Vec<Line> = lines
+    let winners = settlement.map_or(0, |settlement| settlement.winners().count());
+    let owed: Vec<Status> = states
         .iter()
-        .filter(|(winner, _)| *winner)
-        .map(|(_, line)| line.clone())
+        .filter(|state| state.is_owed())
+        .map(|state| Status::from(*state))
         .collect();
     FlowBox {
         title: "Payouts",
         subtitle,
-        stage: if winning.is_empty() {
-            Stage::Done
+        // Until every winner has a payout record, one confirmed share does not settle the rest.
+        status: if owed.contains(&Status::Failed) {
+            Status::Failed
+        } else if owed.len() < winners || owed.is_empty() {
+            Status::Waiting
         } else {
-            Stage::of_lines(&winning)
+            Status::of_all(owed)
         },
-        lines: lines.into_iter().map(|(_, line)| line).collect(),
+        lines,
     }
 }
 
-/// What each player the run entered was owed and sent, from their own view of their entry.
-async fn payouts_of(
-    runner: &Runner,
-    competition_id: Uuid,
-    entries: &[EntryView],
-    settlement: Option<&Settlement>,
-) -> Vec<PlayerPayout> {
-    let users = runner.db().list_users().await.unwrap_or_default();
-    let mut payouts = Vec::new();
-    for entry in entries.iter().filter(|entry| entry.entry_submitted) {
-        let Some(user) = users
-            .iter()
-            .find(|user| user.name == entry.user)
-            .and_then(|user| SynthUser::from_secret_key(&user.name, &user.nostr_secret_key).ok())
-        else {
-            continue;
-        };
-        let listed = runner
-            .client()
-            .list_entries(&user.nostr_keys, Some(&competition_id))
-            .await
-            .unwrap_or_default();
-        let Some(listed) = listed
-            .into_iter()
-            .find(|listed| Some(listed.id) == entry.entry_id)
-        else {
-            continue;
-        };
-        let share = settlement.and_then(|settlement| {
-            settlement
-                .shares
-                .iter()
-                .find(|share| share.pubkey == listed.ephemeral_pubkey)
-        });
-        payouts.push(PlayerPayout {
-            user: entry.user.clone(),
-            pubkey: listed.ephemeral_pubkey.clone(),
-            weight: share.map_or(0, |share| share.weight),
-            owed_sats: share.map_or(0, |share| share.owed_sats),
-            sent_at: listed.paid_out_at,
-            invoice: listed.payout_ln_invoice.as_deref().and_then(invoice_view),
-        });
-    }
-    payouts
-}
-
-fn entries_of(steps: &[TestStep]) -> Vec<EntryView> {
-    steps
-        .iter()
-        .filter_map(|step| step.details_json.as_deref())
-        .filter_map(|details| serde_json::from_str::<EntryView>(details).ok())
-        .collect()
-}
-
-fn refunds_of(steps: &[TestStep]) -> Vec<(String, RefundView)> {
+fn refunds_of(steps: &[TestStep]) -> Vec<(String, ScenarioRefund)> {
     steps
         .iter()
         .filter_map(|step| {
@@ -480,26 +374,18 @@ fn refunds_of(steps: &[TestStep]) -> Vec<(String, RefundView)> {
         .collect()
 }
 
-fn competition_of(steps: &[TestStep]) -> Option<Uuid> {
-    steps
-        .iter()
-        .filter_map(|step| step.details_json.as_deref())
-        .filter_map(|details| serde_json::from_str::<serde_json::Value>(details).ok())
-        .find_map(|details| details.get("competition_id")?.as_str()?.parse().ok())
-}
-
 fn flow_diagram(boxes: &[FlowBox]) -> Markup {
     html! {
         div.flow {
             @for (index, flow_box) in boxes.iter().enumerate() {
                 @if index > 0 {
-                    div class=(format!("arrow {}", boxes[index - 1].stage.class())) { "→" }
+                    div class=(format!("arrow {}", boxes[index - 1].status.class())) { "→" }
                 }
-                div class=(format!("box {}", flow_box.stage.class())) {
+                div class=(format!("box {}", flow_box.status.class())) {
                     div.title { (flow_box.title) }
                     div.subtitle { (flow_box.subtitle) }
                     @for line in &flow_box.lines {
-                        div class=(format!("line {}", line.stage.class())) {
+                        div class=(format!("line {}", line.status.class())) {
                             span.dot {}
                             span.label { (line.label) }
                             span.value { (line.value) }
@@ -517,215 +403,424 @@ fn flow_diagram(boxes: &[FlowBox]) -> Markup {
     }
 }
 
+/// Everything a run's page and its exports show, from synth's database alone.
+struct RunView {
+    run: TestRun,
+    steps: Vec<TestStep>,
+    entries: Vec<EntryTrace>,
+    scenario_refunds: Vec<(String, ScenarioRefund)>,
+    competition_id: Option<Uuid>,
+    trail: Option<Trail>,
+    links: Links,
+    paid_by_node: Option<bool>,
+}
+
+impl RunView {
+    async fn load(state: &Dashboard, id: &str) -> Option<Self> {
+        let db = state.runner.db();
+        let run = db.get_run(id).await.ok()??;
+        let steps = db.get_steps(id).await.unwrap_or_default();
+        let entries = entries_of(&steps);
+        let scenario_refunds = refunds_of(&steps);
+        let competition_id = run.competition_id.as_deref().and_then(|id| id.parse().ok());
+        let trail = db.get_trail(id).await.ok().flatten();
+        if trail.is_none() && competition_id.is_some() {
+            // Nobody has followed this run's money yet; the page updates once someone has.
+            state.tracker.request(id);
+        }
+        let config = state.tracker.config();
+        let links = Links {
+            explorer: config.explorer_url.clone(),
+            oracle: config.oracle_url.clone(),
+            coordinator: state.runner.client().base_url().to_string(),
+            ark_swap: state.tracker.ark_swap_url().map(str::to_string),
+            arkd: config.arkd_url.clone(),
+        };
+        // A run's configuration says whether it paid entries from a node.
+        let paid_by_node = run
+            .config_json
+            .as_deref()
+            .and_then(|config| serde_json::from_str::<serde_json::Value>(config).ok())
+            .map(|config| config.get("lnd").is_some_and(|lnd| !lnd.is_null()));
+        Some(Self {
+            run,
+            steps,
+            entries,
+            scenario_refunds,
+            competition_id,
+            trail,
+            links,
+            paid_by_node,
+        })
+    }
+
+    fn money(&self) -> Run<'_> {
+        Run {
+            competition_id: self.competition_id,
+            entries: &self.entries,
+            scenario_refunds: &self.scenario_refunds,
+            trail: self.trail.as_ref(),
+            links: &self.links,
+            paid_by_node: self.paid_by_node,
+        }
+    }
+}
+
 pub async fn run_detail(
     State(state): State<Dashboard>,
     Path(id): Path<String>,
-) -> impl IntoResponse {
+    headers: HeaderMap,
+) -> Response {
     let Some(live) = run_live(&state, &id).await else {
-        return (StatusCode::NOT_FOUND, Html("No such run".to_string()));
+        return (StatusCode::NOT_FOUND, Html("No such run".to_string())).into_response();
     };
-    let header = html! {
-        p { a href="/" { "← Dashboard" } " " span #live-status .note { "connecting…" } }
-    };
-    let page = live::page(
+    if routes::from_htmx(&headers) {
+        return routes::html_by_hx_request(live);
+    }
+    let header = html! { p { a href="/" { "← Dashboard" } } };
+    routes::html_by_hx_request(live::page(
         &format!("Synth - run {}", short(&id)),
         &live::run_topic(&id),
         header,
         live,
-    );
-    (StatusCode::OK, Html(page.into_string()))
+    ))
 }
 
-/// A run's live part: what its page shows, and what is pushed to it as the run and its
-/// competition move on. None for a run that does not exist.
-pub(super) async fn run_live(
-    Dashboard {
-        runner,
-        scenario_config,
-        ..
-    }: &Dashboard,
-    id: &str,
-) -> Option<Markup> {
-    let run = runner.db().get_run(id).await.ok()??;
-    let steps = runner.db().get_steps(id).await.unwrap_or_default();
-    let entries = entries_of(&steps);
-    let refunds = refunds_of(&steps);
-    let competition_id = competition_of(&steps);
-    let competition = match competition_id {
-        Some(id) => runner.client().get_competition(&id).await.ok(),
-        None => None,
-    };
-    let settlement = competition.as_ref().and_then(Settlement::of);
-    let payouts = match competition_id {
-        Some(id) => payouts_of(runner, id, &entries, settlement.as_ref()).await,
-        None => Vec::new(),
-    };
-    let boxes = flow(
-        &entries,
-        &refunds,
-        competition.as_ref(),
-        settlement.as_ref(),
-        &payouts,
-        run.status == "failed",
-    );
-    let paid_in: u64 = entries
-        .iter()
-        .filter(|entry| entry.paid)
-        .filter_map(|entry| entry.amount_sats)
-        .sum();
-    let paid_out: u64 = payouts
-        .iter()
-        .filter(|payout| payout.sent_at.is_some())
-        .filter_map(|payout| payout.invoice.as_ref()?.amount_sats)
-        .sum();
-    let address = scenario_config.lightning_address.clone();
-    let public_url = runner.client().base_url().trim_end_matches('/').to_string();
+/// The run's money trail as JSON: where the money stands, where it was held, the ledger, and
+/// every hop.
+pub async fn trail_json(State(state): State<Dashboard>, Path(id): Path<String>) -> Response {
+    match RunView::load(&state, &id).await {
+        Some(view) => {
+            let run = view.money();
+            let rows = money::rows(&run);
+            let body = money::json(&id, &run, &money::ledger(&run), &rows);
+            export(&id, "json", "application/json", body)
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
 
+/// The run's money trail as tab-separated lines, a header first.
+pub async fn trail_tsv(State(state): State<Dashboard>, Path(id): Path<String>) -> Response {
+    match RunView::load(&state, &id).await {
+        Some(view) => export(
+            &id,
+            "tsv",
+            "text/tab-separated-values; charset=utf-8",
+            money::tsv(&money::rows(&view.money())),
+        ),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+fn export(id: &str, extension: &str, content_type: &'static str, body: String) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type.to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("inline; filename=\"synth-run-{id}-money.{extension}\""),
+            ),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// A run's live part: what its page shows, and what is pushed to it as the run and its money
+/// move on. None for a run that does not exist.
+pub(super) async fn run_live(state: &Dashboard, id: &str) -> Option<Markup> {
+    let view = RunView::load(state, id).await?;
+    let now = OffsetDateTime::now_utc();
+    let live_step = state
+        .runner
+        .live()
+        .filter(|live| live.run_id == view.run.id)
+        .and_then(|live| live.current_step);
+    let run = view.money();
+    let rows = money::rows(&run);
     Some(html! {
-                h1 { (run.scenario) " " span class=(format!("badge {}", run.status)) { (run.status) } }
-                @if let Some(live) = runner.live().filter(|live| live.run_id == run.id) {
-                    p.running { "Now: " strong { (live.current_step.as_deref().unwrap_or("starting")) } }
-                }
-                p.note { "Run " code { (run.id) } " · started " (run.started_at)
-                    @if let Some(completed) = &run.completed_at { " · finished " (completed) } }
-                @if let Some(error) = &run.error_message {
-                    p.error { "Error: " (error) }
-                }
-
-                section {
-                    h2 { "Where the money went" }
-                    (flow_diagram(&boxes))
-                }
-
-                section {
-                    h2 { "Competition" }
-                    @match (competition_id, &competition) {
-                        (None, _) => p { "The run made no competition." },
-                        (Some(id), competition) => table.ids {
-                            tr { th { "Competition" } td { code { (id) } " "
-                                a href=(format!("{public_url}/api/v1/competitions/{id}")) { "json" } } }
-                            @if let Some(competition) = competition {
-                                tr { th { "State" } td { (competition.state.as_deref().unwrap_or(competition.inferred_status())) } }
-                                tr { th { "Entries" } td { (competition.total_paid_entries) " paid of " (competition.total_entries)
-                                    ", " (competition.total_paid_out_entries) " paid out" } }
-                                tr { th { "Funding outpoint" } td { code { (competition.funding_outpoint.as_deref().unwrap_or("-")) } } }
-                                @if !competition.errors.is_empty() {
-                                    tr { th { "Errors" } td.error { (serde_json::to_string(&competition.errors).unwrap_or_default()) } }
-                                }
-                            } @else {
-                                tr { th { "State" } td.error { "the coordinator did not answer for it" } }
-                            }
-                        },
-                    }
-                }
-
-                section {
-                    h2 { "Settlement" }
-                    @match &settlement {
-                        None => p { "No contract yet." },
-                        Some(settlement) => {
-                            p { strong { (outcome_words(settlement, &payouts)) } }
-                            p.note {
-                                "In: " (paid_in) " sats from players · pot " (settlement.pot_sats)
-                                " sats · coordinator kept " (paid_in.saturating_sub(settlement.pot_sats))
-                                " sats · paid out " (paid_out) " sats"
-                            }
-                            @if !payouts.is_empty() {
-                                table.ids {
-                                    thead { tr {
-                                        th { "Player" } th { "Share" } th { "Owed" } th { "Payout" }
-                                        th { "Invoice" } th { "Paid to" } th { "Payment hash" }
-                                    } }
-                                    tbody {
-                                        @for payout in &payouts {
-                                            tr class=(if payout.owed_sats > 0 { "" } else { "skipped" }) {
-                                                td { (payout.user) }
-                                                td { (payout.weight) "%" }
-                                                td { (payout.owed_sats) " sats" }
-                                                td {
-                                                    @match (payout.sent_at, payout.owed_sats > 0) {
-                                                        (Some(at), _) => {
-                                                            @if competition.as_ref().is_some_and(|c| c.completed_at.is_some()) { "paid " } @else { "sent " }
-                                                            (at.date()) " " (at.time().to_string().chars().take(8).collect::<String>())
-                                                        },
-                                                        (None, true) => span.running { "not sent yet" },
-                                                        (None, false) => "-",
-                                                    }
-                                                }
-                                                td {
-                                                    @match payout.invoice.as_ref().and_then(|i| i.amount_sats) {
-                                                        Some(sats) => { (sats) " sats" },
-                                                        None => "-",
-                                                    }
-                                                }
-                                                td {
-                                                    @if let Some(invoice) = &payout.invoice {
-                                                        @if let Some(address) = &address { (address) br; }
-                                                        span.note title=(invoice.payee) { "node " (short(&invoice.payee)) }
-                                                    } @else { "-" }
-                                                }
-                                                td { code { (payout.invoice.as_ref().map(|i| i.payment_hash.clone()).unwrap_or_else(|| "-".into())) } }
-                                            }
-                                        }
-                                    }
-                                }
-                                p.note { "The coordinator pays each winner their share of the pot over Lightning. Search the payment hash on the coordinator's node and on the payee's." }
-                            }
-                        }
-                    }
-                }
-
-                section {
-                    h2 { "Players" }
-                    @if entries.is_empty() {
-                        p { "No player entered." }
-                    } @else {
-                        table.ids {
-                            thead { tr { th { "Player" } th { "Paid" } th { "Payment hash" } th { "Ticket" } th { "Entry" } } }
-                            tbody {
-                                @for entry in &entries {
-                                    tr {
-                                        td { (entry.user) br; span.note title=(entry.nostr_pubkey) { (short(&entry.nostr_pubkey)) } }
-                                        td class=(if entry.paid { "passed" } else { "failed" }) {
-                                            @match entry.amount_sats { Some(sats) => { (sats) " sats" }, None => "-" }
-                                            @if !entry.paid { br; "unpaid" }
-                                        }
-                                        td { code { (entry.payment_hash.as_deref().unwrap_or("-")) } }
-                                        td { code { (entry.ticket_id.map(|t| t.to_string()).unwrap_or_else(|| "-".into())) } }
-                                        td class=(if entry.entry_submitted { "" } else { "failed" }) {
-                                            code { (entry.entry_id.map(|e| e.to_string()).unwrap_or_else(|| "-".into())) }
-                                            @if !entry.entry_submitted { br; "not entered" }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        p.note { "Search the payment hash on the payer's node, the invoice's node, and in ark-swapd's swaps; the ticket in the coordinator." }
-                    }
-                }
-
-                section {
-                    h2 { "Steps" }
-                    table {
-                        thead { tr { th { "Step" } th { "Status" } th { "Duration" } th { "Error / details" } } }
-                        tbody {
-                            @for step in &steps {
-                                tr class=(step.status) {
-                                    td { (step.step_name) }
-                                    td { (step.status) }
-                                    td { (step.duration_ms.unwrap_or(0)) "ms" }
-                                    td {
-                                        @if let Some(error) = &step.error_message { span.error { (error) } }
-                                        @if let Some(details) = &step.details_json {
-                                            details data-key=(step.step_name) { summary { "details" } pre { (pretty(details)) } }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+        (run_section(&view.run, live_step.as_deref(), now))
+        (money_section(&view, now))
+        @if let Some(stuck) = stuck::block(&run, now) { (stuck) }
+        (hops_section(&view, &rows))
+        section {
+            h2 { "Ledger" }
+            (ledger_table(&money::ledger(&run), view.trail.as_ref()))
+        }
+        (competition_section(&view, now))
+        (steps_section(&view.steps))
+        p.note { "Updated " (format::time(now, now)) }
     })
+}
+
+fn run_section(run: &TestRun, live_step: Option<&str>, now: OffsetDateTime) -> Markup {
+    let took = match (
+        format::parse(&run.started_at),
+        run.completed_at.as_deref().and_then(format::parse),
+    ) {
+        (Some(started), Some(completed)) => Some(format::duration_ms(
+            (completed - started).whole_milliseconds() as i64,
+        )),
+        _ => None,
+    };
+    html! {
+        h1 { (run.scenario) " " span class=(format!("badge {}", run.status)) { (run.status) } }
+        @if let Some(step) = live_step {
+            p.running { "Now: " strong { (step) } }
+        }
+        p.note {
+            "Run " (copyable(&run.id))
+            br;
+            "Started " (format::time_text(&run.started_at, now))
+            @if let Some(completed) = &run.completed_at { " · finished " (format::time_text(completed, now)) }
+            @if let Some(took) = &took { " · took " (took) }
+        }
+        @if let Some(error) = &run.error_message {
+            p.error { "Error: " (error) }
+        }
+    }
+}
+
+fn money_section(view: &RunView, now: OffsetDateTime) -> Markup {
+    let trail = view.trail.as_ref();
+    html! {
+        section {
+            h2 { "Where the money went" }
+            @match trail {
+                Some(trail) => p {
+                    span class=(format!("badge {}", trail.money.label())) { (trail.money.words()) }
+                    @if let Some(reason) = trail.money.reason() { " " (reason) }
+                    @if !trail.money.is_final() {
+                        " · synth keeps looking until the winners are paid or the escrows refunded"
+                    }
+                    span.note { " · looked " (format::time(trail.refreshed_at, now)) }
+                },
+                None if view.competition_id.is_some() => p.note { "Looking the money up; this page updates when it has." },
+                None => p.note { "The run made no competition, so no money moved past the payments." },
+            }
+            (flow_diagram(&flow(&view.entries, &view.scenario_refunds, trail, view.run.status == "failed")))
+        }
+    }
+}
+
+fn hops_section(view: &RunView, rows: &[Row]) -> Markup {
+    let run_id = &view.run.id;
+    html! {
+        section {
+            h2 { "Every hop" }
+            div.scroll { table.trail {
+                thead { tr {
+                    th { "Status" } th { "Step" } th { "From → to" } th.num { "Sats" } th.num { "Fee" }
+                    th { "ID" } th { "Look it up" }
+                } }
+                tbody {
+                    @for row in rows {
+                        tr {
+                            td { span class=(format!("badge {}", row.status.class())) { (row.status.class()) } }
+                            td { (row.step) }
+                            td { (row.from) " → " (row.to) }
+                            td.num { @if let Some(sats) = row.amount_sats { (sats) } @else { "-" } }
+                            td.num { (row.fee_sats.as_deref().unwrap_or("-")) }
+                            td {
+                                (copyable(&row.id))
+                                @if let Some(preimage) = &row.preimage {
+                                    br; span.note { "preimage " } (copyable(preimage))
+                                }
+                            }
+                            td {
+                                @if let Some(link) = &row.link {
+                                    a href=(link) rel="noreferrer" { (link) }
+                                }
+                                @for lookup in &row.lookups {
+                                    div.lookup {
+                                        @if let Some(on) = &lookup.on { span.note { "on " (on) } br; }
+                                        (copyable(&lookup.command))
+                                    }
+                                }
+                                @if let Some(note) = &row.note { div.note { (note) } }
+                            }
+                        }
+                    }
+                }
+            } }
+            @if let Some(trail) = view.trail.as_ref().filter(|trail| !trail.gaps.is_empty()) {
+                p.note {
+                    "Not looked up: "
+                    @for (index, gap) in trail.gaps.iter().enumerate() {
+                        @if index > 0 { "; " }
+                        (gap)
+                    }
+                }
+            }
+            p {
+                button.copy type="button" data-copy-url=(format!("/runs/{run_id}/trail.json")) { "Copy money trail as JSON" }
+                " "
+                button.copy type="button" data-copy-url=(format!("/runs/{run_id}/trail.tsv")) { "Copy as TSV" }
+                " · "
+                a href=(format!("/runs/{run_id}/trail.json")) { "trail.json" }
+                " · "
+                a href=(format!("/runs/{run_id}/trail.tsv")) { "trail.tsv" }
+            }
+        }
+    }
+}
+
+fn competition_section(view: &RunView, now: OffsetDateTime) -> Markup {
+    let trail = view.trail.as_ref();
+    let competition = trail.and_then(|trail| trail.competition.as_ref());
+    let coordinator = view.links.coordinator();
+    html! {
+        section {
+            h2 { "Competition" }
+            @match view.competition_id {
+                None => p { "The run made no competition." },
+                Some(id) => {
+                    table {
+                        tr { th { "Competition" } td { (copyable(&id.to_string())) } }
+                        tr { th { "Pages" } td {
+                            a href=(format!("{coordinator}/competitions/{id}/leaderboard")) rel="noreferrer" { "leaderboard" }
+                            " · "
+                            a href=(format!("{}/events/{id}", view.links.oracle.trim_end_matches('/'))) rel="noreferrer" { "oracle event" }
+                            " · "
+                            a href=(format!("{coordinator}/api/v1/competitions/{id}")) rel="noreferrer" { "json" }
+                        } }
+                        @if let Some(competition) = competition {
+                            tr { th { "State" } td { (competition.state.as_deref().unwrap_or(competition.inferred_status())) } }
+                            tr { th { "Entries" } td { (competition.total_paid_entries) " paid of " (competition.total_entries)
+                                ", " (competition.total_paid_out_entries) " paid out" } }
+                            @if let Some((settlement, trail)) = trail.and_then(|trail| Some((trail.settlement.as_ref()?, trail))) {
+                                tr { th { "Outcome" } td { (outcome_words(settlement, &trail.payouts)) } }
+                            }
+                            @for (label, at) in milestones(competition) {
+                                tr { th { (label) } td { (format::time(at, now)) } }
+                            }
+                            @if !competition.errors.is_empty() {
+                                tr { th { "Errors" } td.error { (serde_json::to_string(&competition.errors).unwrap_or_default()) } }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn steps_section(steps: &[TestStep]) -> Markup {
+    html! {
+        section {
+            h2 { "Steps" }
+            div.scroll { table {
+                thead { tr { th { "Step" } th { "Status" } th.num { "Took" } th { "Error / details" } } }
+                tbody {
+                    @for step in steps {
+                        tr {
+                            td { (step.step_name) }
+                            td { span class=(format!("badge {}", step.status)) { (step.status) } }
+                            td.num { (format::duration_ms(step.duration_ms.unwrap_or(0))) }
+                            td {
+                                @if let Some(error) = &step.error_message { span.error { (error) } }
+                                @if let Some(details) = &step.details_json {
+                                    // A saved step never changes once finished, so it stays open
+                                    // across pushes.
+                                    details id=(format!("step-{}", step.id)) hx-preserve {
+                                        summary { "details" }
+                                        pre { (pretty(details)) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } }
+        }
+    }
+}
+
+/// When the competition reached each stage it has reached, in order.
+fn milestones(competition: &CompetitionResponse) -> Vec<(&'static str, OffsetDateTime)> {
+    [
+        ("Created", Some(competition.created_at)),
+        ("Escrows confirmed", competition.escrow_funds_confirmed_at),
+        ("Contract made", competition.contracted_at),
+        ("Signed", competition.signed_at),
+        ("Funding sent", competition.funding_broadcasted_at),
+        ("Funding confirmed", competition.funding_confirmed_at),
+        ("Awaiting the oracle", competition.awaiting_attestation_at),
+        ("Outcome on-chain", competition.outcome_broadcasted_at),
+        ("Delta on-chain", competition.delta_broadcasted_at),
+        ("Expiry on-chain", competition.expiry_broadcasted_at),
+        ("Completed", competition.completed_at),
+        ("Failed", competition.failed_at),
+        ("Cancelled", competition.cancelled_at),
+    ]
+    .into_iter()
+    .filter_map(|(label, at)| Some((label, at?)))
+    .collect()
+}
+
+fn ledger_table(ledger: &Ledger, trail: Option<&Trail>) -> Markup {
+    let sats = |value: Option<u64>| value.map_or("-".to_string(), |v| v.to_string());
+    let msat = |value: Option<u64>| value.map_or("not visible".to_string(), format::msat_as_sats);
+    let stopped = trail.is_some_and(|trail| {
+        trail.money.is_final() || matches!(trail.money, crate::trail::Money::Stuck { .. })
+    });
+    html! {
+        div.scroll { table.ledger {
+            thead { tr { th { "" } th.num { "Sats" } th { "" } } }
+            tbody {
+                tr.total {
+                    td { "Players paid" }
+                    td.num { (ledger.paid_in) }
+                    td.note { (ledger.entries_paid) " entries" }
+                }
+                tr {
+                    td { "→ into their escrows" }
+                    td.num { (sats(ledger.escrowed)) }
+                    td.note { "what ark-swapd put in them; the rest is its fee" }
+                }
+                tr { td { "→ into the pot (the contract)" } td.num { (sats(ledger.pot)) } td {} }
+                tr { td { "→ coordinator's fee" } td.num { (sats(ledger.coordinator_fee)) } td.note { "what players paid beyond the pot" } }
+                @if ledger.pot.is_some() {
+                    tr.total { td { "Pot" } td.num { (sats(ledger.pot)) } td {} }
+                    tr { td { "→ owed to winners" } td.num { (ledger.owed) } td.note { "their shares under the outcome" } }
+                    tr { td { "→ confirmed paid over Lightning" } td.num { (ledger.paid_out) } td.note { (ledger.confirmed_payouts) " payouts" } }
+                    tr class=(if stopped && ledger.unpaid > 0 { "flag" } else { "" }) {
+                        td { "→ owed, not confirmed paid" } td.num { (ledger.unpaid) }
+                        td.note { @if !stopped && ledger.unpaid > 0 { "still to come" } }
+                    }
+                    @if ledger.rounding > 0 {
+                        tr { td { "→ owed to nobody" } td.num { (ledger.rounding) } td.note { "rounding the shares down leaves it in the pot" } }
+                    }
+                }
+                @if ledger.refunded > 0 {
+                    tr { td { "Refunded" } td.num { (ledger.refunded) } td.note {
+                        @if let Some(fees) = ledger.refund_fees { (fees) " sats kept by the refunds' swaps and payments" }
+                    } }
+                }
+                tr.total { td { "Fees" } td {} td {} }
+                tr { td { "entry routing, paid by the payer's node" } td.num { (msat(ledger.entry_routing_fee_msat)) } td {} }
+                tr { td { "ark-swapd's swap fees" } td.num { @match ledger.swap_fees { Some(fees) => (fees), None => "-" } } td.note { "included in the entry price" } }
+                tr { td { "funding batch" } td.num { (sats(ledger.funding_batch_fee)) } td.note { "the whole Arkade batch's fee, shared by every output in it" } }
+                tr { td { "outcome transaction" } td.num { (sats(ledger.outcome_fee)) } td.note { "taken from the contract's output; the coordinator still pays shares in full" } }
+                @if ledger.closing_fees.is_some() {
+                    tr { td { "delta or expiry transactions" } td.num { (sats(ledger.closing_fees)) } td {} }
+                }
+                tr { td { "payout routing, paid by the coordinator's node" } td.num { (msat(ledger.payout_routing_fee_msat)) } td.note { "for the " (ledger.confirmed_payouts) " confirmed payouts" } }
+                tr class=(if ledger.remainder != 0 { "total flag" } else { "total" }) {
+                    td { "Unaccounted for" }
+                    td.num { (ledger.remainder) }
+                    td.note { @if !stopped { "judged once the money stops moving" } }
+                }
+            }
+        } }
+        @if ledger.flags.is_empty() {
+            @if stopped { p.note { "Player payments balance. Fees are shown separately; unavailable fees are not treated as zero." } }
+        } @else {
+            ul { @for flag in &ledger.flags { li.flag { (flag) } } }
+        }
+    }
 }
 
 fn pretty(json: &str) -> String {
@@ -734,45 +829,27 @@ fn pretty(json: &str) -> String {
         .unwrap_or_else(|_| json.to_string())
 }
 
-pub(super) const FLOW_CSS: &str = r#"
-.flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 6px; margin: 16px 0; }
-.box { flex: 1 1 150px; background: #16213e; border: 2px solid #444; border-radius: 10px; padding: 10px; min-width: 150px; }
-.box .title { font-weight: bold; font-size: 1.05em; }
-.box .subtitle { color: #999; font-size: 0.75em; margin-bottom: 8px; }
-.box.done { border-color: #00ff88; } .box.done .title { color: #00ff88; }
-.box.active { border-color: #ffaa00; } .box.active .title { color: #ffaa00; }
-.box.failed { border-color: #ff4444; } .box.failed .title { color: #ff4444; }
-.box.waiting { border-style: dashed; opacity: 0.6; }
-.arrow { align-self: center; font-size: 1.6em; color: #555; }
-.arrow.done { color: #00ff88; } .arrow.active { color: #ffaa00; } .arrow.failed { color: #ff4444; }
-.line { font-size: 0.8em; margin: 3px 0; display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
-.line .label { font-weight: bold; }
-.line .value { color: #bbb; word-break: break-all; }
-.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #555; flex: none; }
-.line.done .dot { background: #00ff88; } .line.active .dot { background: #ffaa00; }
-.line.failed .dot { background: #ff4444; }
-.legend { padding: 1px 6px; border-radius: 4px; border: 1px solid #555; }
-.running { color: #ffaa00; }
-.legend.done { color: #00ff88; } .legend.active { color: #ffaa00; } .legend.failed { color: #ff4444; }
-table.ids code { font-size: 0.8em; word-break: break-all; }
-pre { white-space: pre-wrap; font-size: 0.8em; }
-a { color: #00d4ff; }
-"#;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::routes::short_id;
+    use crate::trail::{EntryPayment, Money, RefundSeen};
 
-    fn entry(user: &str, paid: bool, entry_submitted: bool) -> EntryView {
-        EntryView {
+    fn entry(user: &str, paid: bool, entry_submitted: bool) -> EntryTrace {
+        EntryTrace {
             user: user.to_string(),
             nostr_pubkey: "00".repeat(32),
             entry_id: Some(Uuid::now_v7()),
             ticket_id: Some(Uuid::now_v7()),
             amount_sats: Some(1100),
             payment_hash: Some("ab".repeat(32)),
+            payment: Some(EntryPayment {
+                fee_msat: 1001,
+                ..EntryPayment::default()
+            }),
             paid,
             entry_submitted,
+            ..EntryTrace::default()
         }
     }
 
@@ -788,8 +865,27 @@ mod tests {
         serde_json::from_value(base).unwrap()
     }
 
-    fn stages(boxes: &[FlowBox]) -> Vec<(&'static str, Stage)> {
-        boxes.iter().map(|b| (b.title, b.stage)).collect()
+    fn trail_of(competition: CompetitionResponse, settlement: Option<Settlement>) -> Trail {
+        Trail {
+            refreshed_at: OffsetDateTime::now_utc(),
+            competition_id: competition.id,
+            competition: Some(competition),
+            settlement,
+            swaps: Vec::new(),
+            late_payments: Vec::new(),
+            payouts: Vec::new(),
+            refunds: Vec::new(),
+            funding_tx: None,
+            outcome_tx: None,
+            closing_txs: Vec::new(),
+            money: Money::Following,
+            held: None,
+            gaps: Vec::new(),
+        }
+    }
+
+    fn statuses(boxes: &[FlowBox]) -> Vec<(&'static str, Status)> {
+        boxes.iter().map(|b| (b.title, b.status)).collect()
     }
 
     #[test]
@@ -804,43 +900,58 @@ mod tests {
             "awaiting_attestation_at": "2026-09-23T03:04:00Z",
             "funding_outpoint": "803c8ce3:0",
         }));
-        let boxes = flow(&entries, &[], Some(&competition), None, &[], false);
+        let trail = trail_of(competition, None);
+        let boxes = flow(&entries, &[], Some(&trail), false);
         assert_eq!(
-            stages(&boxes),
+            statuses(&boxes),
             [
-                ("Payments", Stage::Done),
-                ("Escrows", Stage::Done),
-                ("Entries", Stage::Done),
-                ("Funding", Stage::Done),
-                ("Contract", Stage::Active),
-                ("Payouts", Stage::Waiting),
+                ("Payments", Status::Done),
+                ("Escrows", Status::Done),
+                ("Entries", Status::Done),
+                ("Funding", Status::Done),
+                ("Contract", Status::Active),
+                ("Payouts", Status::Waiting),
             ]
         );
+        assert_eq!(boxes[0].lines[0].value, "1100 sats, 1.001 fee");
     }
 
     /// The case that lost alice's buy-in: paid for, never entered, so the money sits in an escrow.
     #[test]
     fn a_paid_entry_that_never_went_in_shows_where_the_money_stopped() {
         let entries = [entry("alice", true, false)];
-        let competition = competition(serde_json::json!({}));
-        let boxes = flow(&entries, &[], Some(&competition), None, &[], true);
+        let trail = trail_of(competition(serde_json::json!({})), None);
+        let boxes = flow(&entries, &[], Some(&trail), true);
         let entered = boxes.iter().find(|b| b.title == "Entries").unwrap();
-        assert_eq!(entered.stage, Stage::Failed);
+        assert_eq!(entered.status, Status::Failed);
         assert_eq!(
-            boxes[0].stage,
-            Stage::Done,
+            boxes[0].status,
+            Status::Done,
             "the payment itself went through"
         );
     }
 
-    fn payout(user: &str, pubkey: &str, owed_sats: u64, sent: bool) -> PlayerPayout {
-        PlayerPayout {
+    #[test]
+    fn a_run_not_traced_yet_still_shows_its_payments() {
+        let entries = [entry("alice", true, true)];
+        let boxes = flow(&entries, &[], None, false);
+        assert_eq!(boxes.last().unwrap().title, "Competition");
+        assert_eq!(boxes[0].status, Status::Done);
+    }
+
+    fn payout(user: &str, pubkey: &str, owed_sats: u64, sent: bool) -> PayoutSeen {
+        use sha2::{Digest, Sha256};
+        let preimage = Sha256::digest(user.as_bytes());
+        PayoutSeen {
             user: user.to_string(),
             pubkey: pubkey.to_string(),
             weight: owed_sats * 100 / 3000,
             owed_sats,
             sent_at: sent.then(OffsetDateTime::now_utc),
-            invoice: None,
+            amount_sats: sent.then_some(owed_sats),
+            preimage: sent.then(|| hex::encode(preimage)),
+            payment_hash: sent.then(|| hex::encode(Sha256::digest(preimage))),
+            ..PayoutSeen::default()
         }
     }
 
@@ -860,18 +971,33 @@ mod tests {
         }
     }
 
+    fn settled(
+        competition: CompetitionResponse,
+        settlement: Settlement,
+        payouts: &[PayoutSeen],
+    ) -> Trail {
+        let mut trail = trail_of(competition, Some(settlement));
+        trail.payouts = payouts.to_vec();
+        trail
+    }
+
     /// What "3 of 3 paid out" was: a tie, paying each player their share.
     #[test]
     fn a_tie_pays_everyone_and_says_so() {
         let completed = competition(serde_json::json!({ "completed_at": "2026-09-23T03:30:00Z" }));
-        let settled = settlement(Some(Decided::Attested(3)), [1020, 990, 990]);
+        let split = settlement(Some(Decided::Attested(3)), [1020, 990, 990]);
         let payouts = [
             payout("alice", "a", 1020, true),
             payout("bob", "b", 990, true),
             payout("charlie", "c", 990, true),
         ];
-        let paid = payouts_box(&completed, Some(&settled), &payouts);
-        assert_eq!(paid.stage, Stage::Done);
+        let paid = payouts_box(Some(&settled(completed.clone(), split.clone(), &payouts)));
+        assert_eq!(paid.status, Status::Done);
+        assert_eq!(
+            payouts_box(Some(&settled(completed, split, &payouts[..1]))).status,
+            Status::Waiting,
+            "one confirmed share does not verify the other winners"
+        );
         assert_eq!(
             paid.subtitle,
             "tie: split between alice, bob, charlie (outcome 3)"
@@ -882,17 +1008,20 @@ mod tests {
     #[test]
     fn a_single_winner_is_paid_and_the_rest_are_owed_nothing() {
         let completed = competition(serde_json::json!({ "completed_at": "2026-09-23T03:30:00Z" }));
-        let settled = settlement(Some(Decided::Attested(1)), [0, 3000, 0]);
         let payouts = [
             payout("alice", "a", 0, false),
             payout("bob", "b", 3000, true),
             payout("charlie", "c", 0, false),
         ];
-        let paid = payouts_box(&completed, Some(&settled), &payouts);
+        let paid = payouts_box(Some(&settled(
+            completed,
+            settlement(Some(Decided::Attested(1)), [0, 3000, 0]),
+            &payouts,
+        )));
         assert_eq!(paid.subtitle, "bob won (outcome 1)");
         assert_eq!(
-            paid.stage,
-            Stage::Done,
+            paid.status,
+            Status::Done,
             "losers owed nothing do not hold it back"
         );
         assert_eq!(
@@ -911,11 +1040,39 @@ mod tests {
     #[test]
     fn a_winner_whose_payout_is_not_sent_yet_keeps_it_in_progress() {
         let running = competition(serde_json::json!({}));
-        let settled = settlement(Some(Decided::Attested(0)), [3000, 0, 0]);
         let payouts = [payout("alice", "a", 3000, false)];
-        let paid = payouts_box(&running, Some(&settled), &payouts);
-        assert_eq!(paid.stage, Stage::Active);
+        let paid = payouts_box(Some(&settled(
+            running,
+            settlement(Some(Decided::Attested(0)), [3000, 0, 0]),
+            &payouts,
+        )));
+        assert_eq!(paid.status, Status::Active);
         assert_eq!(paid.lines[0].value, "3000 sats owed");
+    }
+
+    /// Run 01a0d0f5: the outcome went on-chain, then the competition failed with nothing sent.
+    #[test]
+    fn winners_never_paid_before_the_competition_failed_show_as_failed() {
+        let failed = competition(serde_json::json!({
+            "outcome_broadcasted_at": "2026-09-24T01:36:37Z",
+            "failed_at": "2026-09-24T04:16:13Z",
+            "cancelled_at": "2026-09-24T05:16:13Z",
+        }));
+        let split = settlement(Some(Decided::Attested(3)), [1020, 990, 990]);
+        let payouts = [payout("alice", "a", 1020, false)];
+        let trail = settled(failed, split, &payouts);
+        let paid = payouts_box(Some(&trail));
+        assert_eq!(paid.status, Status::Failed);
+        assert_eq!(paid.lines[0].value, "1020 sats never sent");
+        let entries = [entry("alice", true, true)];
+        assert_eq!(
+            flow(&entries, &[], Some(&trail), false)
+                .last()
+                .unwrap()
+                .title,
+            "Payouts",
+            "a contract that reached its outcome settles by payouts, not refunds"
+        );
     }
 
     #[test]
@@ -927,22 +1084,36 @@ mod tests {
         }));
         let refunds = [(
             "alice".to_string(),
-            RefundView {
+            ScenarioRefund {
                 paid_sats: 1000,
                 ark_txid: None,
             },
         )];
-        let boxes = flow(&entries, &refunds, Some(&competition), None, &[], false);
+        let mut trail = trail_of(competition, None);
+        trail.refunds.push(RefundSeen {
+            user: "bob".into(),
+            ticket_id: entries[1].ticket_id.unwrap(),
+            state: "submitted".into(),
+            paid_sats: 0,
+            ark_txid: None,
+            invoice: None,
+            payment_hash: None,
+            preimage: None,
+            fee_msat: None,
+            paid_by: None,
+        });
+        let boxes = flow(&entries, &refunds, Some(&trail), false);
         let settled = boxes.last().unwrap();
         assert_eq!(settled.title, "Refunds");
         assert_eq!(
-            settled.stage,
-            Stage::Active,
+            settled.status,
+            Status::Active,
             "bob's refund is still to come"
         );
         assert_eq!(
-            settled.lines.iter().map(|l| l.stage).collect::<Vec<_>>(),
-            [Stage::Done, Stage::Waiting]
+            settled.lines.iter().map(|l| l.status).collect::<Vec<_>>(),
+            [Status::Done, Status::Active]
         );
+        assert_eq!(short_id("01a0d0f5-0b58"), "01a0d0f5…");
     }
 }

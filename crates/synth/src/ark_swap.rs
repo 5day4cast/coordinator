@@ -30,6 +30,25 @@ impl ArkWallet {
     }
 }
 
+/// A swap of a Lightning payment into an escrow, as `GET /v1/swaps` reports it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Swap {
+    pub id: uuid::Uuid,
+    pub escrow_address: String,
+    pub amount_sat: u64,
+    pub payment_hash: String,
+    pub state: String,
+    #[serde(default)]
+    pub escrow_vtxo: Option<String>,
+    #[serde(default)]
+    pub ark_txid: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    /// UNIX seconds.
+    #[serde(default)]
+    pub created_at: i64,
+}
+
 pub struct ArkSwap {
     client: reqwest::Client,
     url: String,
@@ -52,6 +71,55 @@ impl ArkSwap {
             url: config.url.trim_end_matches('/').to_string(),
             token,
         })
+    }
+
+    /// Where ark-swapd's API is, for naming lookups an operator can repeat.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// The swap whose invoice pays to `payment_hash`. None if ark-swapd has none, or is too old
+    /// to look swaps up by hash.
+    pub async fn swap_for(&self, payment_hash: &str) -> Result<Option<Swap>> {
+        let response = self
+            .client
+            .get(format!("{}/v1/swaps", self.url))
+            .query(&[("payment_hash", payment_hash)])
+            .bearer_auth(self.token.as_str())
+            .send()
+            .await
+            .context("ask ark-swapd for the swap")?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if status == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+            anyhow::bail!("this ark-swapd cannot look swaps up by payment hash");
+        }
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("ark-swapd refused ({status}): {body}");
+        }
+        Ok(Some(response.json().await?))
+    }
+
+    /// Swaps that paid an escrow, or say they did, without recording the escrow output they
+    /// paid, oldest first. Fails on an ark-swapd too old to list them.
+    pub async fn swaps_without_escrow_vtxo(&self) -> Result<Vec<Swap>> {
+        let response = self
+            .client
+            .get(format!("{}/v1/swaps", self.url))
+            .query(&[("without_escrow_vtxo", "true")])
+            .bearer_auth(self.token.as_str())
+            .send()
+            .await
+            .context("ask ark-swapd for swaps without an escrow output")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("ark-swapd refused ({status}): {body}");
+        }
+        Ok(response.json().await?)
     }
 
     pub async fn wallet(&self) -> Result<ArkWallet> {

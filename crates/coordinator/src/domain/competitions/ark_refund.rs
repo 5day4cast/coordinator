@@ -70,6 +70,10 @@ pub struct TicketRefund {
     pub paid_sats: u64,
     /// The Arkade transaction that moved the escrow into the swap.
     pub ark_txid: Option<String>,
+    /// The invoice the refund pays, from the player's Lightning Address, and its payment hash:
+    /// what the player's wallet shows the refund as.
+    pub invoice: String,
+    pub payment_hash: String,
     /// UNIX seconds.
     pub updated_at: i64,
 }
@@ -132,6 +136,8 @@ impl Coordinator {
             state: refund.state.as_str().into(),
             paid_sats,
             ark_txid: refund.ark_txid,
+            invoice: refund.invoice,
+            payment_hash: refund.payment_hash,
             updated_at: refund.updated_at,
         }))
     }

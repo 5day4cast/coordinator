@@ -24,7 +24,7 @@ pub struct CreateCompetition {
 }
 
 /// Competition response from the API
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompetitionResponse {
     pub id: Uuid,
     #[serde(with = "time::serde::rfc3339")]
@@ -87,6 +87,34 @@ pub struct CompetitionResponse {
     /// The contract: its players, funding value, and each outcome's payout weights.
     #[serde(default)]
     pub contract_parameters: Option<serde_json::Value>,
+    /// The transaction settling the contract on the attested outcome, once broadcast.
+    #[serde(default)]
+    pub outcome_transaction: Option<serde_json::Value>,
+}
+
+impl CompetitionResponse {
+    /// The outcome transaction's id, once it is broadcast.
+    pub fn outcome_txid(&self) -> Option<String> {
+        let transaction: dlctix::bitcoin::Transaction =
+            serde_json::from_value(self.outcome_transaction.clone()?).ok()?;
+        Some(transaction.compute_txid().to_string())
+    }
+
+    /// The funding transaction's id and the contract's output, from `txid:vout`.
+    pub fn funding(&self) -> Option<(String, Option<u32>)> {
+        let outpoint = self.funding_outpoint.as_deref()?;
+        let (txid, vout) = outpoint.split_once(':').unwrap_or((outpoint, ""));
+        Some((txid.to_string(), vout.parse().ok()))
+    }
+
+    /// Itself without the contract, signatures, and transactions: what a page needs to say where
+    /// the competition got to, small enough to keep with each run.
+    pub fn slim(mut self) -> Self {
+        self.contract_parameters = None;
+        self.event_announcement = None;
+        self.outcome_transaction = None;
+        self
+    }
 }
 
 impl CompetitionResponse {

@@ -14,6 +14,9 @@ pub struct SynthConfig {
     pub db: DbConfig,
     pub scheduler: SchedulerConfig,
     pub defaults: DefaultsConfig,
+    /// Following each run's money after its steps, and where to point people to look it up.
+    #[serde(default)]
+    pub trail: crate::trail::tracker::TrailConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -120,6 +123,7 @@ impl Default for SynthConfig {
                 interval_secs: 3600,
                 scenario: "full_lifecycle".to_string(),
             },
+            trail: Default::default(),
             defaults: DefaultsConfig {
                 users: 3,
                 stations: vec!["KDEN".to_string(), "KJFK".to_string(), "KORD".to_string()],
