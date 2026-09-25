@@ -20,8 +20,6 @@ use axum::{
     response::Response,
 };
 
-use crate::templates::layouts::base::BULMA_CSS;
-
 /// The policy for the public pages, computed once at startup.
 #[derive(Clone)]
 pub struct PublicHeaders {
@@ -49,7 +47,7 @@ fn origin(url: &str) -> Option<String> {
 ///   inline script, `on*` handlers or eval;
 /// - Trusted Types for every script sink, created only by the policy named
 ///   `htmx`, so HTML and script reach the DOM only through htmx's swaps;
-/// - styles: this site's and the pinned Bulma file; no inline styles;
+/// - styles: this site's only (Bulma is vendored); no inline styles;
 /// - connections: this site, the API, oracle and configured Keymeld gateway.
 pub fn content_security_policy(connect: &[&str]) -> String {
     let mut connect_src = vec!["'self'".to_owned()];
@@ -61,7 +59,7 @@ pub fn content_security_policy(connect: &[&str]) -> String {
     [
         "default-src 'none'".to_owned(),
         "script-src 'self' 'wasm-unsafe-eval'".to_owned(),
-        format!("style-src 'self' {BULMA_CSS}"),
+        "style-src 'self'".to_owned(),
         "img-src 'self' data:".to_owned(),
         format!("connect-src {}", connect_src.join(" ")),
         "object-src 'none'".to_owned(),
@@ -127,9 +125,7 @@ mod tests {
         assert!(!policy.contains("unsafe-inline"));
         assert!(!policy.contains("'unsafe-eval'"));
         assert!(policy.contains("connect-src 'self' https://5day4cast.com https://4casttruth.win https://keymeld.example.net;"));
-        assert!(policy.contains(
-            "style-src 'self' https://cdn.jsdelivr.net/npm/bulma@1.0.2/css/bulma.min.css;"
-        ));
+        assert!(policy.contains("style-src 'self';"));
         for directive in [
             "require-trusted-types-for 'script'",
             "trusted-types htmx",

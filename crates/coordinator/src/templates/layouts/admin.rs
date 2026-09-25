@@ -3,7 +3,7 @@ use serde_json::json;
 
 use crate::{
     api::admin_auth::CSRF_HEADER,
-    templates::assets::{ADMIN_JS, HTMX_JS, STYLES_CSS},
+    templates::assets::{ADMIN_JS, BULMA_CSS, HTMX_JS, STYLES_CSS},
 };
 
 pub struct AdminPageConfig<'a> {
@@ -28,7 +28,7 @@ pub fn admin_base(config: &AdminPageConfig, content: Markup) -> Markup {
                 meta name="viewport" content="width=device-width, initial-scale=1.0";
                 title { (config.title) }
 
-                link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@1.0.2/css/bulma.min.css";
+                link rel="stylesheet" href=(BULMA_CSS.url);
                 link rel="stylesheet" href=(STYLES_CSS.url);
 
                 script src=(HTMX_JS.url) defer {}

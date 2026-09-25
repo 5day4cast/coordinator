@@ -54,6 +54,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     // htmx, vendored once for the workspace as published (see its README).
     let htmx = Path::new(&manifest).join("../../vendor/htmx/4.0.0/htmx.min.js");
     println!("cargo::rerun-if-changed={}", htmx.display());
+    // Bulma, vendored the same way; served from this site rather than a CDN.
+    let bulma = Path::new(&manifest).join("../../vendor/bulma/1.0.2/bulma.min.css");
+    println!("cargo::rerun-if-changed={}", bulma.display());
 
     let static_dir = templates.join("static");
     let assets = [
@@ -70,6 +73,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             extension: "js",
             content_type: "text/javascript; charset=utf-8",
             bytes: bundle_scripts(&scripts_in(&templates, ADMIN_DIRS, &files), "admin")?,
+        },
+        Asset {
+            constant: "BULMA_CSS",
+            stem: "bulma",
+            extension: "css",
+            content_type: "text/css; charset=utf-8",
+            bytes: fs::read(&bulma)?,
         },
         Asset {
             constant: "STYLES_CSS",

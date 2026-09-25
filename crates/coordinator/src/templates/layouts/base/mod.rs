@@ -1,14 +1,9 @@
 use maud::{html, Markup, DOCTYPE};
 
 use crate::templates::{
-    assets::{APP_JS, HTMX_JS, STYLES_CSS, THEME_JS},
+    assets::{APP_JS, BULMA_CSS, HTMX_JS, STYLES_CSS, THEME_JS},
     components::{auth_modals, navbar},
 };
-
-/// Bulma, from its CDN, pinned to the exact file by its hash.
-pub const BULMA_CSS: &str = "https://cdn.jsdelivr.net/npm/bulma@1.0.2/css/bulma.min.css";
-const BULMA_INTEGRITY: &str =
-    "sha384-tl5h4XuWmVzPeVWU0x8bx0j/5iMwCBduLEgZ+2lH4Wjda+4+q3mpCww74dgAB3OX";
 
 /// htmx 4 settings for the public pages, stated in full so they hold whatever
 /// htmx's defaults become:
@@ -44,7 +39,7 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                 meta name="htmx-config" content=(HTMX_CONFIG);
                 title { (config.title) }
 
-                link rel="stylesheet" href=(BULMA_CSS) integrity=(BULMA_INTEGRITY) crossorigin="anonymous";
+                link rel="stylesheet" href=(BULMA_CSS.url);
                 link rel="stylesheet" href=(STYLES_CSS.url);
 
                 // The saved or system theme, applied before first paint.
