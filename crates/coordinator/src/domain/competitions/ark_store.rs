@@ -329,6 +329,20 @@ impl CompetitionStore {
         .collect()
     }
 
+    /// How many of a competition's tickets are reserved with an invoice that can still be paid.
+    pub async fn payable_ticket_count(&self, event_id: Uuid) -> Result<u64, sqlx::Error> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tickets
+             WHERE event_id = ? AND paid_at IS NULL AND reserved_at IS NOT NULL
+               AND payment_request IS NOT NULL AND invoice_cancelled_at IS NULL
+               AND invoice_expires_at > datetime('now')",
+        )
+        .bind(event_id.to_string())
+        .fetch_one(self.db_connection.read())
+        .await?;
+        Ok(count as u64)
+    }
+
     /// The funded escrows of a competition that still need refunding, in ticket order.
     ///
     /// An escrow is refunded once its refund settles. The escrows of a pool that a batch funded

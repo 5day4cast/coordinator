@@ -42,6 +42,65 @@ impl ConfidentialCheckpoint for EphemeralCheckpoint {
         Box::pin(async { Ok(()) })
     }
 }
+
+/// Keeps the command journal durably until [`KeygenCheckpoint::keep_in_memory`], then only in
+/// memory, for a refund: its keygen commands must survive a restart, its signing commands need not.
+///
+/// The enclaves bind a session to the route of the journal that started it. A journal that lost
+/// its keygen commands starts over on a new route, and the enclaves refuse it. A refund's signing
+/// commands are fresh attempts each time, so, as in a batch, they are not kept.
+struct KeygenCheckpoint<'a> {
+    durable: &'a DurableCheckpoint,
+    keep: std::sync::atomic::AtomicBool,
+}
+
+impl<'a> KeygenCheckpoint<'a> {
+    fn new(durable: &'a DurableCheckpoint) -> Self {
+        Self {
+            durable,
+            keep: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    fn keep_in_memory(&self) {
+        self.keep.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl ConfidentialCheckpoint for KeygenCheckpoint<'_> {
+    fn save<'a>(&'a self, journal: &'a ConfidentialJournal) -> CheckpointFuture<'a> {
+        if self.keep.load(std::sync::atomic::Ordering::SeqCst) {
+            self.durable.save(journal)
+        } else {
+            Box::pin(async { Ok(()) })
+        }
+    }
+}
+
+/// Whether Keymeld was already sent this session's roster: some enclave journaled the batch that
+/// registers its participants. After that no participant can join, since an enclave would never
+/// be sent them.
+fn roster_sent(session: &DlcKeygenSession, journal: &ConfidentialJournal) -> bool {
+    session
+        .recipient_authorization
+        .recipient_public_keys
+        .keys()
+        .any(|enclave| {
+            journal
+                .recorded_command("keygen/register", *enclave)
+                .is_some()
+        })
+}
+
+/// Whether every participant the manifest authorizes is registered, as when a competition filled.
+fn roster_complete(session: &DlcKeygenSession, state: &ProtocolState) -> bool {
+    session
+        .authorization_manifest
+        .manifest
+        .participant_verifiers
+        .keys()
+        .all(|user| state.registrations.contains_key(user))
+}
 use std::collections::BTreeSet;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use zeroize::Zeroizing;
@@ -488,6 +547,9 @@ impl Keymeld for KeymeldService {
                 ));
             }
             return Ok(());
+        }
+        if roster_sent(session, &state.journal) {
+            return Err(KeymeldError::RosterFixed(user.to_string()));
         }
         let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
         let mut journal = std::mem::take(&mut state.journal);
@@ -1071,19 +1133,22 @@ impl Keymeld for KeymeldService {
         fee_sats: u64,
     ) -> Result<[u8; 64], KeymeldError> {
         let _guard = self.lock_session(&session.session_id).await;
-        let (mut state, _) = self.checkpoint(session).await?;
+        let (mut state, durable) = self.checkpoint(session).await?;
         let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
         let mut journal = std::mem::take(&mut state.journal);
+        let checkpoint = KeygenCheckpoint::new(&durable);
         let mut driver = self
-            .connect(
-                session,
-                &state,
-                &credentials,
-                &mut journal,
-                &EphemeralCheckpoint,
-            )
+            .connect(session, &state, &credentials, &mut journal, &checkpoint)
             .await?;
-        driver.restore_keygen(&state.registrations).await?;
+        if roster_complete(session, &state) {
+            driver.restore_keygen(&state.registrations).await?;
+        } else {
+            // A pool that never filled has no complete roster to form a key from. Keymeld
+            // registers the participants present and signs each one's refund with their own
+            // entry key. Repeating this only replays the requests journaled the first time.
+            driver.register_partial_roster(&state.registrations).await?;
+        }
+        checkpoint.keep_in_memory();
         let participant_key = &state
             .policies
             .get(&user)

@@ -56,6 +56,10 @@ pub enum KeymeldError {
 
     #[error("Keymeld is not enabled")]
     NotEnabled,
+
+    /// Keymeld was already sent the session's roster, so this participant cannot join it.
+    #[error("Keymeld was already sent this session's roster without participant {0}")]
+    RosterFixed(String),
 }
 
 /// Status of a keygen session for polling

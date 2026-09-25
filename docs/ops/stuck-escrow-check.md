@@ -101,7 +101,7 @@ Read each row as one of these cases:
 | `pool_funded = 1` | The kickoff batch spent the escrow into the pool. Not a refund; the pool pays out or expires. |
 | `entry` empty | The player paid but never entered, so they never sealed an entry key to Keymeld and nothing can sign the escrow's refund leaf. Needs an operator. |
 | `refund_to` empty | The player gave no Lightning Address, and a refund can only pay one. Needs an operator. |
-| `entries < tickets` | The competition never filled. Keymeld (as of `98f3420`) signs only after restoring keygen, which needs every ticket's entry registered, so the coordinator logs this once and waits. Needs a Keymeld release that signs for a partial roster. |
+| `entries < tickets` | The competition never filled. Keymeld is given only the paid entries, and signs each refund with that player's own key. Refunds wait while any ticket's invoice can still be paid, because Keymeld's roster cannot change once it signs a refund. A ticket counted after that is logged as needing an operator. |
 | otherwise | Refunded by cleanup once the escrow's refund leaf opens (`refund_after_start_secs` after the window starts, 24 h by default). `refund_state`/`refund_error` show progress. |
 
 Before this branch, cleanup never picked any of these rows up.
@@ -162,7 +162,8 @@ The coordinator and ark-swapd log each of these once per ticket, swap, or compet
 debug while the condition lasts:
 
 - `Cannot refund the escrow of ticket … yet: …`: a refund is blocked, with the reason.
-- `Competition …: N funded escrows (S sats) wait for refunds: only E of its tickets were entered…`: the partial-roster case above.
+- `Cannot sign the refunds of competition …: N of its tickets can still be paid…`: refunds wait for those invoices to expire.
+- `… its ticket was counted after Keymeld was given the competition's roster…`: a ticket paid too late to join the roster; needs an operator.
 - `Escrow swap … for ticket … reports its player paid; waiting for Arkade to list the escrow VTXO…`: section 4.
 - `Escrow swap … paid the escrow of ticket …, but could not settle…`: an `unsettled` swap.
 - `swap … paid escrow … but its VTXO was not found in N lookups…`: ark-swapd gave up looking.

@@ -184,6 +184,8 @@ struct Enclaves {
     /// Each registered player's entry key, escrow, and consent to its refunds.
     players: Mutex<HashMap<UserId, (Keypair, EntryEscrow, ArkEscrowPolicy)>>,
     registered: Mutex<Vec<UserId>>,
+    /// Whether a refund was signed, which sends Keymeld the roster: no one can join after.
+    roster_sent: AtomicBool,
     signatures: AtomicUsize,
     /// Why Keymeld refuses to sign refunds, if it does.
     refusal: Mutex<Option<String>>,
@@ -241,6 +243,9 @@ impl Keymeld for Enclaves {
         );
         let mut registered = self.registered.lock().unwrap();
         if !registered.contains(&user) {
+            if self.roster_sent.load(Ordering::SeqCst) {
+                return Err(KeymeldError::RosterFixed(user.to_string()));
+            }
             registered.push(user);
         }
         Ok(())
@@ -282,6 +287,7 @@ impl Keymeld for Enclaves {
             self.registered.lock().unwrap().contains(&user),
             "Keymeld signs only for a registered entry"
         );
+        self.roster_sent.store(true, Ordering::SeqCst);
         let players = self.players.lock().unwrap();
         let (key, escrow, policy) = players.get(&user).expect("a known player");
         let (_, refund) = coordinator_escrow::ark::refund_from(escrow, policy, &spend).unwrap();
@@ -989,9 +995,8 @@ async fn a_minted_refund_that_expired_unsigned_is_minted_again() {
     let ticket = f.funded(&session, 21, true).await;
     f.cancel().await;
 
-    // Keymeld cannot sign yet, as for a pool that never finished registering.
-    *f.enclaves.refusal.lock().unwrap() =
-        Some("Keygen requires the complete authorized registration roster".into());
+    // Keymeld cannot sign yet, as when its enclave cannot be reached.
+    *f.enclaves.refusal.lock().unwrap() = Some("the enclave did not answer".into());
     f.clean_up().await;
     let stale = f.refund(&ticket).await.unwrap();
     assert_eq!(stale.state, ArkRefundState::Minted);
@@ -1086,26 +1091,104 @@ async fn an_escrow_spent_by_something_else_pays_no_refund() {
 }
 
 #[tokio::test]
-async fn a_competition_that_never_filled_mints_no_refund_keymeld_cannot_sign() {
+async fn a_competition_that_never_filled_refunds_the_players_who_entered() {
     let f = Fixture::new().await;
     let session = f.keymeld_session().await;
     let entered = f.funded(&session, 21, true).await;
-    // A second ticket was reserved but its player never entered, so Keymeld's roster for the
-    // competition can never be complete.
+    // A second ticket was reserved but its player never paid, so the competition never filled.
     f.ticket(23, PRICE).await;
     f.cancel().await;
     assert!(f.awaiting_cleanup().await);
 
     f.clean_up().await;
-    assert!(f.refund(&entered).await.is_none());
-    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 0);
-    assert!(
-        f.enclaves.registered.lock().unwrap().is_empty(),
-        "nothing is asked of Keymeld that it cannot do"
+    let refund = f.refund(&entered).await.unwrap();
+    assert_eq!(refund.state, ArkRefundState::Settled);
+    assert_eq!(
+        f.enclaves.registered.lock().unwrap().clone(),
+        vec![UserId::from(entered.id)],
+        "only the player who paid and entered is registered"
     );
+    assert_eq!(f.spends(), (1, 1));
+    assert_eq!(f.ln.payments_sent(), 1);
+    assert!(!f.awaiting_cleanup().await, "nothing is left to refund");
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn refunds_wait_while_a_ticket_can_still_be_paid() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let entered = f.funded(&session, 21, true).await;
+    // Another player holds a ticket whose invoice has not expired. Keymeld's roster cannot
+    // change once it signs a refund, so signing now could leave them out if they pay.
+    let unpaid = f.ticket(23, PRICE).await;
+    let ticket_id = unpaid.id.to_string();
+    f.database
+        .execute_write(move |pool| async move {
+            sqlx::query(
+                "UPDATE tickets SET invoice_expires_at = datetime('now', '+1 hour') WHERE id = ?",
+            )
+            .bind(ticket_id)
+            .execute(&pool)
+            .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    f.cancel().await;
+
+    f.clean_up().await;
+    assert!(f.refund(&entered).await.is_none());
+    assert!(f.enclaves.registered.lock().unwrap().is_empty());
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 0);
+
+    // Its invoice expires unpaid.
+    let ticket_id = unpaid.id.to_string();
+    f.database
+        .execute_write(move |pool| async move {
+            sqlx::query(
+                "UPDATE tickets SET invoice_expires_at = datetime('now', '-1 minute') WHERE id = ?",
+            )
+            .bind(ticket_id)
+            .execute(&pool)
+            .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    f.clean_up().await;
+    assert_eq!(
+        f.refund(&entered).await.unwrap().state,
+        ArkRefundState::Settled
+    );
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_ticket_counted_after_keymeld_has_the_roster_is_left_for_an_operator() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let first = f.funded(&session, 21, true).await;
+    f.cancel().await;
+    f.clean_up().await;
+    assert_eq!(
+        f.refund(&first).await.unwrap().state,
+        ArkRefundState::Settled
+    );
+
+    // ark-swapd reports a second player's payment only now, after the first refund sent
+    // Keymeld the roster.
+    let late = f.funded(&session, 23, true).await;
+    f.clean_up().await;
+    assert!(
+        f.refund(&late).await.is_none(),
+        "nothing is minted for a refund Keymeld cannot sign"
+    );
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 1);
+    assert_eq!(f.ln.payments_sent(), 1);
     assert!(
         f.awaiting_cleanup().await,
-        "the escrow stays listed as holding a buy-in"
+        "its escrow stays listed as holding a buy-in"
     );
     f.database.close().await.unwrap();
 }

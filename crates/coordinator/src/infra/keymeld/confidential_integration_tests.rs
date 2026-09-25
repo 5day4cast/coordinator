@@ -500,6 +500,8 @@ struct PoolHarness {
     params: ContractParameters,
     players: Vec<UserId>,
     policies: BTreeMap<UserId, PayoutPolicy>,
+    /// The registrations of the players left unregistered, as their browsers prepared them.
+    unregistered: Vec<(UserId, ParticipantRegistrationData)>,
     db: DBConnection,
     server: tokio::task::JoinHandle<()>,
     _directory: tempfile::TempDir,
@@ -609,7 +611,8 @@ impl PoolHarness {
             .await
             .unwrap();
         let mut policies = BTreeMap::new();
-        for (index, player) in players.iter().enumerate().take(registered.unwrap_or(count)) {
+        let mut unregistered = Vec::new();
+        for (index, player) in players.iter().enumerate() {
             let terms = ContractAuthorization {
                 competition_id: competition,
                 entry_id: Uuid::now_v7(),
@@ -653,19 +656,20 @@ impl PoolHarness {
             )
             .await
             .unwrap();
+            let registration = ParticipantRegistrationData {
+                encrypted_private_key: prepared.encrypted_private_key,
+                public_key: hex::encode(&prepared.context.public_key),
+                auth_pubkey: prepared.auth_pubkey,
+                context: prepared.context,
+                payout_policy: Some(policy.clone()),
+                escrow_policy: prepared.escrow_policy,
+            };
+            if index >= registered.unwrap_or(count) {
+                unregistered.push((player.clone(), registration));
+                continue;
+            }
             service
-                .register_participant(
-                    &session,
-                    player.clone(),
-                    &ParticipantRegistrationData {
-                        encrypted_private_key: prepared.encrypted_private_key,
-                        public_key: hex::encode(&prepared.context.public_key),
-                        auth_pubkey: prepared.auth_pubkey,
-                        context: prepared.context,
-                        payout_policy: Some(policy.clone()),
-                        escrow_policy: prepared.escrow_policy,
-                    },
-                )
+                .register_participant(&session, player.clone(), &registration)
                 .await
                 .unwrap();
             policies.insert(player.clone(), policy);
@@ -679,6 +683,7 @@ impl PoolHarness {
             params,
             players,
             policies,
+            unregistered,
             db,
             server,
             _directory: directory,
@@ -1335,12 +1340,9 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_funded() {
 }
 
 /// A competition that expires before its pool fills registered only the players who entered,
-/// and Keymeld must still sign each of their refunds. At this Keymeld revision it cannot:
-/// signing first restores keygen, which needs every authorized participant registered. This
-/// fails with "Keygen requires the complete authorized registration roster" until Keymeld can
-/// act for a partial roster; see `docs/ops/stuck-escrow-check.md`.
+/// and Keymeld must still sign each of their refunds: it registers the partial roster, and signs
+/// with each player's own entry key. The roster is then fixed.
 #[tokio::test]
-#[ignore = "Keymeld 98f3420 signs only for a complete roster; see docs/ops/stuck-escrow-check.md"]
 async fn keymeld_signs_a_refund_for_a_pool_that_never_filled() {
     use coordinator_ark::testing::{keypair, mock_info, xonly};
     use coordinator_ark::{build_refund, escrow_terms, server_rules};
@@ -1416,7 +1418,8 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_filled() {
     .unwrap();
 
     // Two tickets, one entry: only its player registered before the competition expired.
-    let (client, provider) = discovery_tls_fixture_times(1).await;
+    // Each signature resolves the player's address again, so a provider answers once per one.
+    let (client, provider) = discovery_tls_fixture_times(2).await;
     let harness = PoolHarness::start_with(
         pool_parameters(2),
         Consent {
@@ -1438,22 +1441,66 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_filled() {
         &swap,
     )
     .unwrap();
-    let signed = harness
-        .service
-        .sign_ark_refund(
-            &harness.session,
-            harness.players[0].clone(),
-            ArkEscrowSpend::Refund {
-                purpose: RefundPurpose::ArkTransaction,
-                ark_psbt: psbt_hex(&refund.ark),
-                checkpoint_psbt: psbt_hex(&refund.checkpoint),
-                swap_tap_tree: hex::encode(swap.vtxo_script().encode_tap_tree()),
-            },
-            invoice,
-            REFUND_FEE_SATS,
-        )
-        .await;
+    let spend = |purpose| ArkEscrowSpend::Refund {
+        purpose,
+        ark_psbt: psbt_hex(&refund.ark),
+        checkpoint_psbt: psbt_hex(&refund.checkpoint),
+        swap_tap_tree: hex::encode(swap.vtxo_script().encode_tap_tree()),
+    };
+    let sign = |player: usize, purpose| {
+        let harness = &harness;
+        let invoice = invoice.clone();
+        async move {
+            harness
+                .service
+                .sign_ark_refund(
+                    &harness.session,
+                    harness.players[player].clone(),
+                    spend(purpose),
+                    invoice,
+                    REFUND_FEE_SATS,
+                )
+                .await
+        }
+    };
+
+    // The first signature registers the partial roster; the second only replays it.
+    let ark = sign(0, RefundPurpose::ArkTransaction)
+        .await
+        .expect("a pool that never filled still refunds the players who entered");
+    let checkpoint = sign(0, RefundPurpose::Checkpoint).await.unwrap();
     provider.await.unwrap();
-    signed.expect("a pool that never filled still refunds the players who entered");
+    let policy = coordinator_escrow::authorization::ArkEscrowPolicy {
+        escrow_tap_tree: hex::encode(escrows[0].vtxo_script().encode_tap_tree()),
+        max_fee_sats: 0,
+        max_refund_fee_sats: REFUND_FEE_SATS,
+        checkpoint_exit_script: hex::encode(info.checkpoint_tapscript.as_bytes()),
+    };
+    let secp = dlctix::bitcoin::secp256k1::Secp256k1::verification_only();
+    for (purpose, signature) in [
+        (RefundPurpose::ArkTransaction, ark),
+        (RefundPurpose::Checkpoint, checkpoint),
+    ] {
+        let (_, spent) =
+            coordinator_escrow::ark::refund_from(&escrows[0], &policy, &spend(purpose)).unwrap();
+        secp.verify_schnorr(
+            &dlctix::bitcoin::secp256k1::schnorr::Signature::from_slice(&signature).unwrap(),
+            &dlctix::bitcoin::secp256k1::Message::from_digest(spent.digest),
+            &xonly(&keypair(entry_secret(0)[0])),
+        )
+        .expect("the player's own entry key signed the refund");
+    }
+
+    // Keymeld has the roster now, so the player who never entered cannot join it, and has
+    // nothing for Keymeld to sign with.
+    let (late, registration) = &harness.unregistered[0];
+    assert!(matches!(
+        harness
+            .service
+            .register_participant(&harness.session, late.clone(), registration)
+            .await,
+        Err(KeymeldError::RosterFixed(_))
+    ));
+    assert!(sign(1, RefundPurpose::ArkTransaction).await.is_err());
     harness.stop().await;
 }
