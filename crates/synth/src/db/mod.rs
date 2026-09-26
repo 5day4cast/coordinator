@@ -11,7 +11,7 @@ pub struct SynthDb {
     pool: SqlitePool,
 }
 
-#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct TestRun {
     pub id: String,
     pub scenario: String,
@@ -59,7 +59,7 @@ pub struct ScenarioHealth {
     pub last_status: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct TestStep {
     pub id: String,
     pub run_id: String,

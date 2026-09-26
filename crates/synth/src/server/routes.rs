@@ -7,7 +7,7 @@ use crate::scenarios::{ScenarioConfig, ScenarioStatus};
 use crate::trail::tracker::{Tracker, UnrecordedSwaps};
 use crate::trail::{label_words, Held};
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -70,6 +70,7 @@ pub fn router(state: Dashboard) -> Router {
         .route("/api/status", get(status))
         .route("/api/history", get(history))
         .route("/api/rebalance", post(trigger_rebalance))
+        .route("/api/runs/{id}", get(run_json))
         .route("/runs/{id}", get(super::run_detail::run_detail))
         .route("/runs/{id}/trail.json", get(super::run_detail::trail_json))
         .route("/runs/{id}/trail.tsv", get(super::run_detail::trail_tsv))
@@ -481,12 +482,27 @@ async fn trigger_run(
         config.users = users;
     }
 
+    // Recorded before the response, so the caller learns the run's id and can follow it.
+    let run_id = match runner.record_run(&scenario, &config).await {
+        Ok(run_id) => run_id,
+        Err(e) if from_htmx(&headers) => {
+            return Html(html! { span.error { (format!("{e:#}")) } }.into_string()).into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("{e:#}") })),
+            )
+                .into_response()
+        }
+    };
     let scenario_name = scenario.clone();
 
     // Run in background so we don't block the response
     let runner_clone = runner.clone();
+    let started = run_id.clone();
     tokio::spawn(async move {
-        if let Err(e) = runner_clone.run_scenario(&scenario, config).await {
+        if let Err(e) = runner_clone.run_recorded(started, &scenario, config).await {
             log::error!("Triggered run failed: {}", e);
         }
     });
@@ -500,7 +516,45 @@ async fn trigger_run(
     }
     Json(serde_json::json!({
         "status": "started",
-        "scenario": scenario_name
+        "scenario": scenario_name,
+        "run_id": run_id,
+    }))
+    .into_response()
+}
+
+/// A run and its steps as JSON, for `synth runs show` and scripts; its money trail is at
+/// `/runs/{id}/trail.json`.
+async fn run_json(State(runner): State<Runner>, Path(id): Path<String>) -> Response {
+    let failed = |e: anyhow::Error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("{e:#}") })),
+        )
+            .into_response()
+    };
+    let run = match runner.db().get_run(&id).await {
+        Ok(Some(run)) => run,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("no run {id}") })),
+            )
+                .into_response()
+        }
+        Err(e) => return failed(e),
+    };
+    let steps = match runner.db().get_steps(&id).await {
+        Ok(steps) => steps,
+        Err(e) => return failed(e),
+    };
+    let current_step = runner
+        .live()
+        .filter(|live| live.run_id == id)
+        .and_then(|live| live.current_step);
+    Json(serde_json::json!({
+        "run": run,
+        "steps": steps,
+        "current_step": current_step,
     }))
     .into_response()
 }
@@ -746,6 +800,68 @@ mod tests {
         assert!(badge("passed", None).contains(r#"class="badge passed""#));
         assert!(badge("failed", Some("stuck")).contains(r#"class="badge failed""#));
         assert!(badge("passed", Some("stuck")).contains("money stuck"));
+    }
+
+    /// `GET /api/runs/{id}` gives a run and its steps as JSON, and 404s for a run it lacks;
+    /// `POST /api/run` refuses an unknown scenario before recording or starting anything.
+    #[tokio::test]
+    async fn the_run_api_serves_runs_and_refuses_unknown_scenarios() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (dashboard, run) = stuck_dashboard(&directory).await;
+        let app = router(dashboard.clone());
+        let body = |response: Response| async move {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/runs/{run}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body(response).await;
+        assert_eq!(json["run"]["id"], run.as_str());
+        assert_eq!(json["run"]["money"], "stuck");
+        let steps = json["steps"].as_array().unwrap();
+        assert!(steps
+            .iter()
+            .any(|step| step["step_name"] == "create_competition"));
+        assert!(json["current_step"].is_null());
+
+        let response = app
+            .clone()
+            .oneshot(Request::get("/api/runs/nope").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let runs_before = dashboard.runner.db().list_runs(100).await.unwrap().len();
+        let response = app
+            .oneshot(
+                Request::post("/api/run?scenario=sideways")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body(response).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown scenario"));
+        let runs_after = dashboard.runner.db().list_runs(100).await.unwrap().len();
+        assert_eq!(runs_before, runs_after, "nothing was recorded");
     }
 
     #[tokio::test]

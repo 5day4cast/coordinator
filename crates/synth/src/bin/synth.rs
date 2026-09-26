@@ -1,4 +1,5 @@
 use coordinator_synth::ark_swap::ArkSwap;
+use coordinator_synth::cli;
 use coordinator_synth::client::CoordinatorClient;
 use coordinator_synth::config::load_config;
 use coordinator_synth::db::SynthDb;
@@ -11,10 +12,13 @@ use log::{info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = <cli::Cli as clap::Parser>::parse();
+    if let Some(command) = cli.command {
+        std::process::exit(cli::run(command).await?);
+    }
     setup_logging();
 
-    let config_path = std::env::args().nth(1);
-    let config = load_config(config_path.as_deref())?;
+    let config = load_config(cli.config.as_deref())?;
 
     info!("Synth starting up");
     info!("  Coordinator: {}", config.coordinator.url);

@@ -25,7 +25,7 @@ pub struct TicketArkEscrow {
 }
 
 /// A competition's funded escrows, and how many of their players have been refunded.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RefundProgress {
     pub escrowed: u64,
     pub refunded: u64,
