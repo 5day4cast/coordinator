@@ -8,6 +8,7 @@ target=$1
 prefix=$2
 case "$target" in
   x86_64-unknown-linux-gnu) configure_target=linux-x86_64 ;;
+  aarch64-unknown-linux-gnu) configure_target=linux-aarch64 ;;
   x86_64-apple-darwin) configure_target=darwin64-x86_64-cc ;;
   aarch64-apple-darwin) configure_target=darwin64-arm64-cc ;;
   *) fail "unsupported target: $target" ;;
@@ -20,7 +21,6 @@ safe_path() {
   case "/${1#/}/" in */../*|*/./*) return 1 ;; esac
 }
 safe_path "$prefix" || fail 'prefix must be an absolute path containing only letters, digits, /, _, ., and -'
-[[ ! -e "$prefix" && ! -L "$prefix" ]] || fail 'prefix already exists; use a fresh build directory'
 temp_root=${TMPDIR:-/tmp}
 safe_path "$temp_root" || fail 'unsafe temporary directory'
 jobs=${OPENSSL_BUILD_JOBS:-2}
@@ -30,6 +30,44 @@ readonly version=3.6.4
 # Published at https://openssl-library.org/source/ and the release's .sha256 asset.
 readonly expected_sha256=9bffaa1ad1e07b354c21bd3324ec02fa15579f45a7d0494b3e74bc449b7333ef
 readonly source_url="https://github.com/openssl/openssl/releases/download/openssl-$version/openssl-$version.tar.gz"
+verify_install() {
+  [[ -s "$prefix/lib/libssl.a" && -s "$prefix/lib/libcrypto.a" ]] || fail 'static libraries were not installed'
+  [[ -s "$prefix/include/openssl/opensslv.h" ]] || fail 'OpenSSL headers were not installed'
+  for library in "$prefix"/lib/*.so* "$prefix"/lib/*.dylib; do
+    [[ ! -e "$library" ]] || fail "unexpected shared library: $library"
+  done
+}
+
+target_env=$(printf '%s' "${target//-/_}" | tr '[:lower:]' '[:upper:]')
+build_environment() {
+  printf 'OPENSSL_DIR=%s\nOPENSSL_LIB_DIR=%s/lib\nOPENSSL_INCLUDE_DIR=%s/include\n' "$prefix" "$prefix" "$prefix"
+  printf 'OPENSSL_STATIC=1\nOPENSSL_NO_VENDOR=1\nPKG_CONFIG_PATH=%s/lib/pkgconfig\n' "$prefix"
+  # openssl-sys prefers target-specific variables over the generic variables.
+  printf '%s_OPENSSL_DIR=%s\n%s_OPENSSL_LIB_DIR=%s/lib\n%s_OPENSSL_INCLUDE_DIR=%s/include\n' \
+    "$target_env" "$prefix" "$target_env" "$prefix" "$target_env" "$prefix"
+  printf '%s_OPENSSL_STATIC=1\n%s_OPENSSL_NO_VENDOR=1\n' "$target_env" "$target_env"
+}
+publish_environment() {
+  if [[ -n ${GITHUB_ENV:-} ]]; then
+    build_environment >> "$GITHUB_ENV"
+  else
+    build_environment
+  fi
+}
+# What a finished build records in its prefix, so a cached copy can be reused
+# only for the same verified release and Configure target.
+stamp="openssl-$version $expected_sha256 $configure_target"
+stamp_file="$prefix/.coordinator-openssl"
+# OPENSSL_REUSE_PREFIX=1: a prefix restored from a cache of an earlier build of
+# this script is reused when its stamp matches, instead of building again.
+if [[ ${OPENSSL_REUSE_PREFIX:-} == 1 && -d $prefix && ! -L $prefix && -f $stamp_file && ! -L $stamp_file ]]; then
+  [[ $(<"$stamp_file") == "$stamp" ]] || fail 'cached build is for another OpenSSL release or target'
+  verify_install
+  publish_environment
+  printf 'Reused static OpenSSL %s for %s at %s\n' "$version" "$target" "$prefix"
+  exit 0
+fi
+[[ ! -e "$prefix" && ! -L "$prefix" ]] || fail 'prefix already exists; use a fresh build directory'
 work_dir=$(mktemp -d "$temp_root/coordinator-openssl.XXXXXX")
 trap 'rm -rf "$work_dir"' EXIT
 archive="$work_dir/openssl.tar.gz"
@@ -56,24 +94,7 @@ tar -xzf "$archive" -C "$work_dir"
   make -j"$jobs" build_libs
   make install_dev
 )
-[[ -s "$prefix/lib/libssl.a" && -s "$prefix/lib/libcrypto.a" ]] || fail 'static libraries were not installed'
-[[ -s "$prefix/include/openssl/opensslv.h" ]] || fail 'OpenSSL headers were not installed'
-for library in "$prefix"/lib/*.so* "$prefix"/lib/*.dylib; do
-  [[ ! -e "$library" ]] || fail "unexpected shared library: $library"
-done
-
-target_env=$(printf '%s' "${target//-/_}" | tr '[:lower:]' '[:upper:]')
-build_environment() {
-  printf 'OPENSSL_DIR=%s\nOPENSSL_LIB_DIR=%s/lib\nOPENSSL_INCLUDE_DIR=%s/include\n' "$prefix" "$prefix" "$prefix"
-  printf 'OPENSSL_STATIC=1\nOPENSSL_NO_VENDOR=1\nPKG_CONFIG_PATH=%s/lib/pkgconfig\n' "$prefix"
-  # openssl-sys prefers target-specific variables over the generic variables.
-  printf '%s_OPENSSL_DIR=%s\n%s_OPENSSL_LIB_DIR=%s/lib\n%s_OPENSSL_INCLUDE_DIR=%s/include\n' \
-    "$target_env" "$prefix" "$target_env" "$prefix" "$target_env" "$prefix"
-  printf '%s_OPENSSL_STATIC=1\n%s_OPENSSL_NO_VENDOR=1\n' "$target_env" "$target_env"
-}
-if [[ -n ${GITHUB_ENV:-} ]]; then
-  build_environment >> "$GITHUB_ENV"
-else
-  build_environment
-fi
+verify_install
+printf '%s\n' "$stamp" > "$stamp_file"
+publish_environment
 printf 'Built static OpenSSL %s for %s at %s\n' "$version" "$target" "$prefix"

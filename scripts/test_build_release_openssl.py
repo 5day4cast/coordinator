@@ -87,6 +87,7 @@ class BuildReleaseOpenSSLTests(unittest.TestCase):
     def test_supported_targets_install_static_and_emit_target_environment(self):
         for target, configure_target in [
             ("x86_64-unknown-linux-gnu", "linux-x86_64"),
+            ("aarch64-unknown-linux-gnu", "linux-aarch64"),
             ("x86_64-apple-darwin", "darwin64-x86_64-cc"),
             ("aarch64-apple-darwin", "darwin64-arm64-cc"),
         ]:
@@ -182,6 +183,39 @@ class BuildReleaseOpenSSLTests(unittest.TestCase):
         self.assertIn("prefix already exists", result.stderr)
         self.assertEqual(self.commands(), [])
         self.assertFalse((self.root / "unexpected-destination").exists())
+
+    def test_a_stamped_cached_build_is_reused_without_downloading(self):
+        prefix = self.root / "install"
+        self.assertEqual(self.run_helper(prefix=prefix).returncode, 0)
+        self.log.unlink()
+        self.env_file.unlink()
+        result = self.run_helper(prefix=prefix, extra_env={"OPENSSL_REUSE_PREFIX": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Reused static OpenSSL", result.stdout)
+        self.assertEqual(self.commands(), [])
+        values = dict(line.split("=", 1) for line in self.env_file.read_text().splitlines())
+        self.assertEqual(values["OPENSSL_DIR"], str(prefix))
+        self.assertEqual(values["X86_64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC"], "1")
+
+    def test_a_cached_build_for_another_target_or_release_is_refused(self):
+        prefix = self.root / "install"
+        self.assertEqual(self.run_helper(prefix=prefix).returncode, 0)
+        self.env_file.unlink()
+        result = self.run_helper("aarch64-apple-darwin", prefix, {"OPENSSL_REUSE_PREFIX": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("another OpenSSL release or target", result.stderr)
+        self.assertFalse(self.env_file.exists())
+
+    def test_reuse_needs_a_stamp_and_is_off_by_default(self):
+        prefix = self.root / "install"
+        prefix.mkdir()
+        # No stamp: an arbitrary existing directory is still refused.
+        result = self.run_helper(prefix=prefix, extra_env={"OPENSSL_REUSE_PREFIX": "1"})
+        self.assertIn("prefix already exists", result.stderr)
+        self.assertEqual(self.run_helper(prefix=self.root / "fresh").returncode, 0)
+        # A finished build without OPENSSL_REUSE_PREFIX is refused as before.
+        result = self.run_helper(prefix=self.root / "fresh")
+        self.assertIn("prefix already exists", result.stderr)
 
 
 if __name__ == "__main__":
