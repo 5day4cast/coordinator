@@ -24,6 +24,16 @@ pub struct Cli {
     /// Log level to run with the service (default: info)
     #[arg(short, long)]
     pub level: Option<String>,
+
+    /// Without a command, run the coordinator.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum Command {
+    /// Drive a running coordinator through its operator listener.
+    Admin(crate::admin_cli::AdminArgs),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

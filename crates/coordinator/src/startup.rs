@@ -15,7 +15,8 @@ use crate::{
         get_competitions, get_contract_parameters, get_entries, get_estimated_fee_rates,
         get_next_address, get_outputs, get_ticket_refund, get_ticket_status, health,
         leaderboard_fragment, leaderboard_rows_fragment, login, login_username, not_found,
-        payouts_fragment, public_page_handler, register, register_ticket, register_username,
+        operator_competition, operator_competitions, operator_delete_competition, payouts_fragment,
+        public_page_handler, register, register_ticket, register_username,
         request_competition_ticket, send_to_address, set_lightning_address,
         submit_final_signatures, submit_public_nonces, submit_ticket_payout,
         ticket_status_fragment,
@@ -947,7 +948,8 @@ fn limited<S: Clone + Send + Sync + 'static>(
     router.route_layer(GovernorLayer::new(config))
 }
 
-/// Admin listener: operator pages, the LND wallet API, and competition creation.
+/// Admin listener: operator pages, the LND wallet API, and competition creation, viewing and
+/// deletion for scripts and `coordinator admin`.
 ///
 /// Everything except the sign-in form and static assets sits behind `require_operator`.
 /// No CORS layer: operator pages call only their own origin. The test-settle route,
@@ -985,6 +987,11 @@ pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Ne
         .nest("/admin", admin_htmx_routes)
         .nest("/api/v1/wallet", wallet_endpoints)
         .route("/api/v1/competitions", post(create_competition))
+        .route("/api/v1/admin/competitions", get(operator_competitions))
+        .route(
+            "/api/v1/admin/competitions/{competition_id}",
+            get(operator_competition).delete(operator_delete_competition),
+        )
         .route_layer(middleware::from_fn_with_state(
             access.clone(),
             require_operator,
@@ -1164,6 +1171,8 @@ mod startup_tests {
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
     const SETTLE_PATH: &str = "/admin/api/test/settle-invoice/0190b7a4-0000-7000-8000-000000000000";
+    const COMPETITION_PATH: &str =
+        "/api/v1/admin/competitions/0190b7a4-0000-7000-8000-000000000000";
 
     /// Every operator route, including the sign-in form, as (method, path).
     const OPERATOR_ROUTES: &[(&str, &str)] = &[
@@ -1186,6 +1195,9 @@ mod startup_tests {
         ("GET", "/api/v1/wallet/estimated_fees"),
         ("POST", "/api/v1/wallet/send"),
         ("POST", "/api/v1/competitions"),
+        ("GET", "/api/v1/admin/competitions"),
+        ("GET", COMPETITION_PATH),
+        ("DELETE", COMPETITION_PATH),
     ];
 
     fn protected_routes() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
@@ -1404,7 +1416,9 @@ mod startup_tests {
                     StatusCode::METHOD_NOT_ALLOWED
                 ]
                 .contains(&status)
-                    && (status != StatusCode::NOT_FOUND || path == &SETTLE_PATH),
+                    && (status != StatusCode::NOT_FOUND
+                        || path == &SETTLE_PATH
+                        || path == &COMPETITION_PATH),
                 "{method} {path} with bearer returned {status}: {body}"
             );
         }
@@ -1513,6 +1527,71 @@ mod startup_tests {
         let (status, _, body) = send(&mainnet, request("POST", SETTLE_PATH, &bearer, "")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(body.is_empty(), "{body}");
+        test.stop().await;
+    }
+
+    /// `coordinator admin` against the real operator listener: create, list, show and delete a
+    /// competition with the bearer token, and be refused without it.
+    #[tokio::test]
+    async fn the_admin_command_line_drives_competitions_through_the_operator_listener() {
+        use crate::admin_cli::{list_table, show_text, AdminClient};
+
+        let test = TestState::start().await;
+        let admin = test.admin(token_access(), Network::Regtest);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, admin).await.unwrap() });
+
+        let mut token = tempfile::NamedTempFile::new().unwrap();
+        writeln!(token, "  {TOKEN}  ").unwrap();
+        let client = AdminClient::with_token_file(&url, Some(token.path())).unwrap();
+
+        let now = time::OffsetDateTime::now_utc();
+        let event = crate::domain::CreateEvent {
+            id: uuid::Uuid::now_v7(),
+            signing_date: now + time::Duration::hours(33),
+            start_observation_date: now + time::Duration::hours(6),
+            end_observation_date: now + time::Duration::hours(24),
+            locations: vec!["KDEN".into()],
+            number_of_values_per_entry: 1,
+            number_of_places_win: 1,
+            total_allowed_entries: 3,
+            entry_fee: 5000,
+            coordinator_fee_percentage: 5,
+            total_competition_pool: 15000,
+            relative_locktime_block_delta: None,
+            unlisted: true,
+        };
+        let id = client.create(&event).await.unwrap();
+        assert_eq!(id, event.id);
+
+        let listed = client.competitions().await.unwrap();
+        let created = listed.iter().find(|c| c.id == id).expect("listed");
+        assert_eq!(created.state, "created");
+        assert!(created.event_submission.unlisted);
+        assert!(created.refunds.is_none());
+        assert!(list_table(&listed).contains(&id.to_string()));
+
+        let shown = client.competition(id).await.unwrap();
+        assert_eq!(shown.milestones[0].name, "created");
+        let text = show_text(&shown);
+        assert!(
+            text.contains("KDEN") && text.contains("no funded escrows"),
+            "{text}"
+        );
+
+        let missing = client.competition(uuid::Uuid::now_v7()).await.unwrap_err();
+        assert!(missing.to_string().contains("404"), "{missing:#}");
+
+        let anonymous = AdminClient::new(&url, None).unwrap();
+        let refused = anonymous.competitions().await.unwrap_err();
+        assert!(refused.to_string().contains("401"), "{refused:#}");
+
+        client.delete(id).await.unwrap();
+        assert!(client.competition(id).await.is_err());
+
+        server.abort();
+        let _ = server.await;
         test.stop().await;
     }
 
