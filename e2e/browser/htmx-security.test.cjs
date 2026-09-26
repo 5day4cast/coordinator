@@ -14,7 +14,7 @@ const templates = path.join(root, 'crates/coordinator/src/templates');
 const htmx = readFileSync(path.join(root, 'vendor/htmx/4.0.0/htmx.min.js'));
 const config = readFileSync(path.join(templates, 'layouts/base/mod.rs'), 'utf8').match(/HTMX_CONFIG: &str = r#"(.*?)"#;/)[1];
 // As public_headers.rs builds it for the public pages.
-const policy = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types htmx";
+const policy = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types htmx login-worker";
 
 // The two extensions as build.rs bundles them: inside one function, with a
 // wallet session that records what it signs.

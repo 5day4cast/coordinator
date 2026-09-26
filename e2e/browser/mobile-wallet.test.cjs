@@ -12,7 +12,7 @@ const test = require('node:test');
 const { chromium } = require(process.env.PLAYWRIGHT_CORE || 'playwright');
 
 const templates = path.join(__dirname, '../../crates/coordinator/src/templates');
-const policy = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types htmx";
+const policy = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types htmx login-worker";
 
 // A signet invoice for exactly 21 sats, made 2026-09-24 and valid for 20
 // years, signed by a throwaway key (0x42 repeated). Only its checks matter.

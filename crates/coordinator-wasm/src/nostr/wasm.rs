@@ -1,7 +1,7 @@
-use super::{core::NostrClientCore, LoginKeys, NostrError, SignerType};
+use super::{core::NostrClientCore, stretch, LoginKeys, NostrError, SignerType};
 use ::nostr::{JsonUtil, ToBech32};
 use wasm_bindgen::prelude::*;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 #[wasm_bindgen]
 #[derive(Default)]
@@ -95,10 +95,28 @@ pub struct LoginCredentials {
 
 #[wasm_bindgen]
 impl LoginCredentials {
-    /// Slow on purpose (scrypt, ~1-2 s).
+    /// Slow on purpose (scrypt, ~1-2 s), and blocks the thread it runs on.
+    /// Pages stretch the password in a worker and call `fromStretched`.
     pub fn derive(username: &str, password: &str) -> Result<LoginCredentials, JsValue> {
         let inner = LoginKeys::derive(username, password).map_err(NostrError::from)?;
         Ok(Self { inner })
+    }
+
+    /// The credentials from `stretchLoginPassword`'s 32 bytes, which are
+    /// zeroed in place: the caller's array holds nothing afterwards.
+    #[wasm_bindgen(js_name = "fromStretched")]
+    pub fn from_stretched(stretched: &mut [u8]) -> Result<LoginCredentials, JsValue> {
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        let result = if stretched.len() == 32 {
+            bytes.copy_from_slice(stretched);
+            Ok(Self {
+                inner: LoginKeys::from_stretched(&bytes),
+            })
+        } else {
+            Err(JsValue::from_str("stretched login key must be 32 bytes"))
+        };
+        stretched.zeroize();
+        result
     }
 
     /// Credential sent to the server in place of the password.
@@ -106,4 +124,13 @@ impl LoginCredentials {
     pub fn auth_key(&self) -> String {
         self.inner.auth_key_hex()
     }
+}
+
+/// scrypt(password) salted with the username, for `LoginCredentials.fromStretched`.
+/// The log-in worker runs this so the page stays responsive; its output
+/// unlocks the account as the password does, so zero it once passed on.
+#[wasm_bindgen(js_name = "stretchLoginPassword")]
+pub fn stretch_login_password(username: &str, password: &str) -> Result<Vec<u8>, JsValue> {
+    let stretched = stretch(username, password).map_err(NostrError::from)?;
+    Ok(stretched.to_vec())
 }

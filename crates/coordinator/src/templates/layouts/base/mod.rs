@@ -1,7 +1,7 @@
 use maud::{html, Markup, DOCTYPE};
 
 use crate::templates::{
-    assets::{APP_JS, BULMA_CSS, HTMX_JS, STYLES_CSS, THEME_JS},
+    assets::{APP_JS, BULMA_CSS, HTMX_JS, LOGIN_WORKER_JS, STYLES_CSS, THEME_JS},
     components::{auth_modals, navbar},
 };
 
@@ -48,7 +48,8 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                 script src=(APP_JS.url) defer {}
             }
             body data-api-base=(config.api_base) data-oracle-base=(config.oracle_base)
-                 data-network=(config.network) data-wasm-version=(config.wasm_version) {
+                 data-network=(config.network) data-wasm-version=(config.wasm_version)
+                 data-login-worker=(LOGIN_WORKER_JS.url) {
                 // Shown while a navigation is loading (see base.css).
                 div class="page-loading" aria-hidden="true" {}
                 (navbar())

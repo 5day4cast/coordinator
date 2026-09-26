@@ -6,7 +6,7 @@ mod types;
 mod wasm;
 
 pub use core::NostrClientCore;
-pub use login::{LoginError, LoginKeys};
+pub use login::{stretch, LoginError, LoginKeys};
 pub use types::{CustomSigner, SignerType};
 
 #[cfg(target_arch = "wasm32")]

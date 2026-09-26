@@ -96,6 +96,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             content_type: "text/javascript; charset=utf-8",
             bytes: bundle_scripts(&[static_dir.join("theme-init.js")], "theme")?,
         },
+        // A worker's script must be a file of its own; see shared/wasm.js.
+        Asset {
+            constant: "LOGIN_WORKER_JS",
+            stem: "login-worker",
+            extension: "js",
+            content_type: "text/javascript; charset=utf-8",
+            bytes: bundle_scripts(&[static_dir.join("login-worker.js")], "login-worker")?,
+        },
         Asset {
             constant: "HTMX_JS",
             stem: "htmx",

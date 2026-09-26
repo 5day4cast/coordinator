@@ -46,7 +46,8 @@ fn origin(url: &str) -> Option<String> {
 /// - scripts: this site's files only (and compiling the WASM wallet); no
 ///   inline script, `on*` handlers or eval;
 /// - Trusted Types for every script sink, created only by the policy named
-///   `htmx`, so HTML and script reach the DOM only through htmx's swaps;
+///   `htmx`, so HTML and script reach the DOM only through htmx's swaps, and
+///   `login-worker`, which admits only the log-in worker's URL (shared/wasm.js);
 /// - styles: this site's only (Bulma is vendored); no inline styles;
 /// - connections: this site, the API, oracle and configured Keymeld gateway.
 pub fn content_security_policy(connect: &[&str]) -> String {
@@ -67,7 +68,7 @@ pub fn content_security_policy(connect: &[&str]) -> String {
         "frame-ancestors 'none'".to_owned(),
         "form-action 'self'".to_owned(),
         "require-trusted-types-for 'script'".to_owned(),
-        "trusted-types htmx".to_owned(),
+        "trusted-types htmx login-worker".to_owned(),
     ]
     .join("; ")
 }
@@ -128,7 +129,7 @@ mod tests {
         assert!(policy.contains("style-src 'self';"));
         for directive in [
             "require-trusted-types-for 'script'",
-            "trusted-types htmx",
+            "trusted-types htmx login-worker",
             "object-src 'none'",
             "base-uri 'none'",
             "frame-ancestors 'none'",
