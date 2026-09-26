@@ -14,7 +14,7 @@ use crate::domain::leaderboard::Phase;
 use crate::templates::{
     format::{self, ordinal, sats},
     fragments::picks::{detail_url, LIVE_REFRESH},
-    pages::competitions::{phase_badge, CompetitionView},
+    pages::competitions::{phase_badge, CompetitionView, Refunds},
 };
 
 /// One leaderboard row as shown.
@@ -43,6 +43,14 @@ pub struct LeaderboardView {
     pub phase: Phase,
     /// When the readings behind the scores last changed, if known.
     pub updated_at: Option<OffsetDateTime>,
+    /// Any pick has a reading from the window.
+    pub any_readings: bool,
+}
+
+/// Whether a competition in `phase` ran, so its entries have scores. One that didn't fill, or
+/// was cancelled or failed before its contract, scores nothing.
+pub fn ran(phase: Phase) -> bool {
+    !matches!(phase, Phase::Unfilled | Phase::Cancelled | Phase::Failed)
 }
 
 /// Leaderboard page content. The scores load separately (see
@@ -88,9 +96,12 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
             }
             @if competition.did_not_fill() {
                 p class="notice" {
-                    "Not enough entries arrived before the window started, so this competition doesn't run: "
-                    "entry fees are returned to the refund destination shown when entering."
+                    "Not enough entries arrived before the window started, so this competition "
+                    "doesn't run and nothing is scored. "
+                    (refund_note(competition))
                 }
+            } @else if !ran(competition.phase) {
+                p class="notice" { "This competition did not run, so nothing is scored." }
             }
 
             @if competition.total_entries == 0 {
@@ -150,9 +161,26 @@ pub fn leaderboard_scores(
                 Phase::Expired => {
                     p class="notice" { "The oracle never published a result, so every entry was refunded." }
                 }
+                Phase::Scored if competition.pot_refunded => {
+                    p class="notice" {
+                        "No station reported inside the window, so nothing was scored and every "
+                        "entry was refunded: the pot went back to all " (competition.total_entries)
+                        " entries in equal shares, less network fees."
+                    }
+                }
+                Phase::Scored if !board.any_readings && !board.rows.is_empty() => {
+                    p class="notice" {
+                        "No readings were recorded at these stations during the window, so every "
+                        "entry scored 0 and tied. The oracle's tie-break decided who was paid."
+                    }
+                }
                 _ => {}
             }
-            (scores_table(competition, provisional, leaderboard_rows(&board.rows)))
+            (scores_table(
+                competition,
+                provisional,
+                leaderboard_rows(&board.rows, ran(board.phase) && !competition.pot_refunded),
+            ))
         }
     }
 }
@@ -183,11 +211,30 @@ fn scores_table(competition: &CompetitionView, provisional: bool, rows: Markup) 
     }
 }
 
-/// The rows of the leaderboard's table.
-pub fn leaderboard_rows(rows: &[LeaderboardRow]) -> Markup {
+/// What happened to the entry fees of a competition that didn't fill.
+fn refund_note(competition: &CompetitionView) -> Markup {
+    let progress = competition.refunds;
+    html! {
+        @match competition.refunds() {
+            Refunds::Nothing => { "No entry fees were paid." }
+            Refunds::Done => { "Every entry fee has been returned." }
+            Refunds::Pending if progress.escrowed > 0 => {
+                "Entry fees go back to the refund destination shown when entering: "
+                (progress.refunded) " of " (progress.escrowed) " returned so far."
+            }
+            Refunds::Pending => {
+                "Entry fees go back to the refund destination shown when entering once it is cancelled."
+            }
+        }
+    }
+}
+
+/// The rows of the leaderboard's table. Entries of a competition that didn't run are listed
+/// without a rank or score.
+pub fn leaderboard_rows(rows: &[LeaderboardRow], scored: bool) -> Markup {
     html! {
         @for row in rows {
-            (leaderboard_row(row))
+            (leaderboard_row(row, scored))
         }
         @if rows.is_empty() {
             tr {
@@ -201,18 +248,20 @@ pub fn leaderboard_rows(rows: &[LeaderboardRow]) -> Markup {
 
 /// A click anywhere on the row opens the entry's picks. The copy button
 /// stops its own click (see page.js); the Picks button's click reaches the row.
-fn leaderboard_row(row: &LeaderboardRow) -> Markup {
+fn leaderboard_row(row: &LeaderboardRow, scored: bool) -> Markup {
     html! {
         tr class="is-clickable" data-owner=(row.owner)
            hx-get=(detail_url(&row.entry_id)) hx-target="#entryValues" hx-swap="innerHTML"
            "hx-status:500"="swap:innerHTML" {
-            td data-label="Rank" { (row.rank) }
+            td data-label="Rank" { @if scored { (row.rank) } @else { "—" } }
             td data-label="Player" {
                 (row.player)
                 span class="you-badge" { "You" }
             }
             td data-label="Entry" { (format::copyable_id(&row.entry_id)) }
-            td data-label="Score" class="has-text-right" { (row.score) " pts" }
+            td data-label="Score" class="has-text-right" {
+                @if scored { (row.score) " pts" } @else { "not scored" }
+            }
             td class="has-text-right" {
                 button type="button" class="button is-small is-text picks-button" { "Picks" }
             }
@@ -264,20 +313,20 @@ mod tests {
             ),
             row("01a0d0f5-0000-7000-8000-00000000cccc", "carol", 20, 1),
         ];
-        let html = leaderboard_rows(&rows).into_string();
+        let html = leaderboard_rows(&rows, true).into_string();
         assert!(html.contains("…0000aaaa") && html.contains("…0000bbbb"));
         assert!(html.contains(r#"data-copy="01a0d0f5-0000-7000-8000-00000000aaaa""#));
         assert!(html.contains(r#"data-owner="owner-alice""#));
         assert!(html.contains("npub1abcd…wxyz"));
         assert!(!html.contains("No scores yet"));
-        assert!(leaderboard_rows(&[])
+        assert!(leaderboard_rows(&[], true)
             .into_string()
             .contains("No scores yet"));
     }
 
     #[test]
     fn rows_open_the_picks_without_script_filters() {
-        let html = leaderboard_rows(&[row("e1", "bob", 0, 1)]).into_string();
+        let html = leaderboard_rows(&[row("e1", "bob", 0, 1)], true).into_string();
         assert!(html.contains(r#"hx-get="/entries/e1/detail""#));
         assert!(
             !html.contains("hx-trigger"),
@@ -299,6 +348,7 @@ mod tests {
             rows: vec![row("e1", "bob", 30, 1)],
             phase: Phase::Live,
             updated_at: Some(NOW - time::Duration::minutes(12)),
+            any_readings: true,
         };
         let live = leaderboard_scores(&competition, &board, NOW).into_string();
         assert!(live.contains("<strong>Provisional:</strong> if the window ended now · updated"));
@@ -338,6 +388,7 @@ mod tests {
             rows: vec![row("e1", "bob", 0, 1)],
             phase: Phase::Cancelled,
             updated_at: None,
+            any_readings: false,
         };
         assert!(!leaderboard_scores(&competition, &board, NOW)
             .into_string()
@@ -349,11 +400,86 @@ mod tests {
         let mut competition = view("c1", Phase::Cancelled, -60);
         competition.total_entries = 0;
         let html = leaderboard(&competition, NOW).into_string();
-        assert!(html.contains("entry fees are returned"));
+        assert!(html.contains("No entry fees were paid."));
         assert!(html.contains("No entries yet."));
         assert!(
             !html.contains("leaderboard/rows"),
             "nothing to load without entries"
         );
+    }
+
+    /// A competition that didn't run lists its entries without ranks or scores, and says why
+    /// and where the entry fees stand.
+    #[test]
+    fn a_competition_that_did_not_run_scores_nothing() {
+        let mut competition = view("c1", Phase::Unfilled, -60);
+        competition.total_entries = 2;
+        competition.refunds = crate::domain::RefundProgress {
+            escrowed: 2,
+            refunded: 1,
+        };
+        let page = leaderboard(&competition, NOW).into_string();
+        assert!(page.contains("nothing is scored"));
+        assert!(page.contains("1 of 2 returned so far"));
+
+        let board = LeaderboardView {
+            rows: vec![row("e1", "bob", 30, 1), row("e2", "amy", 30, 1)],
+            phase: Phase::Unfilled,
+            updated_at: None,
+            any_readings: true,
+        };
+        let scores = leaderboard_scores(&competition, &board, NOW).into_string();
+        assert!(!scores.contains("30 pts"), "{scores}");
+        assert_eq!(scores.matches("not scored").count(), 2);
+
+        competition.refunds.refunded = 2;
+        assert!(leaderboard(&competition, NOW)
+            .into_string()
+            .contains("Every entry fee has been returned."));
+        competition.total_entries = 0;
+        competition.refunds = Default::default();
+        assert!(leaderboard(&competition, NOW)
+            .into_string()
+            .contains("No entry fees were paid."));
+    }
+
+    /// A finished competition with no readings says so, and how the pot went: back to every
+    /// entry when the oracle attested the refund outcome, with no ranks or scores.
+    #[test]
+    fn a_finished_competition_without_readings_explains_its_result() {
+        let mut competition = view("c1", Phase::Scored, -60);
+        competition.total_entries = 3;
+        competition.pot_refunded = true;
+        let mut board = LeaderboardView {
+            rows: vec![
+                row("e1", "amy", 0, 1),
+                row("e2", "bob", 0, 1),
+                row("e3", "cat", 0, 1),
+            ],
+            phase: Phase::Scored,
+            updated_at: None,
+            any_readings: false,
+        };
+        let html = leaderboard_scores(&competition, &board, NOW).into_string();
+        assert!(html.contains("No station reported inside the window"));
+        assert!(html.contains("the pot went back to all 3 entries in equal shares"));
+        assert!(!html.contains("0 pts"), "{html}");
+        assert_eq!(html.matches("not scored").count(), 3);
+        assert!(phase_badge(&competition)
+            .into_string()
+            .contains(">Refunded</span>"));
+
+        competition.pot_refunded = false;
+        let html = leaderboard_scores(&competition, &board, NOW).into_string();
+        assert!(html.contains("tie-break decided who was paid"));
+        assert!(html.contains("0 pts"));
+        assert!(phase_badge(&competition)
+            .into_string()
+            .contains(">Finished</span>"));
+
+        board.any_readings = true;
+        assert!(!leaderboard_scores(&competition, &board, NOW)
+            .into_string()
+            .contains("No readings"));
     }
 }

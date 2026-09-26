@@ -30,11 +30,16 @@ impl Phase {
     /// [`Leaderboard::phase`](super::Leaderboard::phase).
     pub fn of(competition: &Competition, now: OffsetDateTime) -> Self {
         let event = &competition.event_submission;
+        // Once its funding confirms, the pot is on-chain and the contract decides where it goes.
+        // A failure or cancellation stored after that (earlier versions stored one after a
+        // settlement error) does not mean the competition didn't run.
+        let on_chain = competition.funding_confirmed_at.is_some();
         match competition.get_state() {
-            CompetitionState::Cancelled => Phase::Cancelled,
-            CompetitionState::Failed => Phase::Failed,
+            CompetitionState::Cancelled if !on_chain => Phase::Cancelled,
+            CompetitionState::Failed if !on_chain => Phase::Failed,
             _ if competition.attestation.is_some() => Phase::Scored,
-            CompetitionState::ExpiryBroadcasted | CompetitionState::Completed => Phase::Expired,
+            _ if competition.expiry_broadcasted_at.is_some() => Phase::Expired,
+            CompetitionState::Completed => Phase::Expired,
             _ if now < event.start_observation_date => Phase::Upcoming,
             CompetitionState::Created => Phase::Unfilled,
             _ if now < event.end_observation_date => Phase::Live,
@@ -130,5 +135,25 @@ mod tests {
             Phase::of(&expired, start() + time::Duration::days(3)),
             Phase::Expired
         );
+    }
+
+    /// A competition whose contract was funded ran, whatever an earlier version stored after a
+    /// settlement error: it shows its result, or waits for it, and never reads as cancelled.
+    #[test]
+    fn a_funded_contract_is_never_shown_as_cancelled() {
+        let after = start() + time::Duration::days(1);
+        let mut stranded = filled();
+        stranded.funding_confirmed_at = Some(start() - time::Duration::minutes(5));
+        stranded.failed_at = Some(start() + time::Duration::hours(19));
+        stranded.cancelled_at = Some(start() + time::Duration::hours(20));
+        assert_eq!(Phase::of(&stranded, after), Phase::AwaitingResult);
+
+        let mut scored = stranded.clone();
+        scored.attestation = Some(dlctix::secp::MaybeScalar::Valid(dlctix::secp::Scalar::one()));
+        assert_eq!(Phase::of(&scored, after), Phase::Scored);
+
+        let mut refunded = stranded;
+        refunded.expiry_broadcasted_at = Some(after);
+        assert_eq!(Phase::of(&refunded, after), Phase::Expired);
     }
 }

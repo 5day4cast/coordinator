@@ -202,6 +202,10 @@ impl CompetitionStatus {
         let mut competition = self.into_competition();
         let failed_at = OffsetDateTime::now_utc();
         competition.failed_at = Some(failed_at);
+        // Stored with the competition, so why it failed is not lost with the process's logs.
+        if competition.errors.last().map(ToString::to_string) != Some(error.to_string()) {
+            competition.errors.push(error.clone());
+        }
         CompetitionStatus::Failed(Failed {
             competition_id,
             failed_at,

@@ -65,6 +65,12 @@ impl Coordinator {
             .map_err(|e| anyhow!("Failed to load competition {competition_id}: {e}"))?;
         let now = OffsetDateTime::now_utc();
 
+        if competition.resume_stranded_settlement() {
+            warn!(
+                "Resuming settlement of competition {competition_id}: its contract holds the pot \
+                 on-chain, but it was stopped as failed or cancelled"
+            );
+        }
         if competition.is_cancelled()
             || competition.is_completed()
             || competition.is_expiry_broadcasted()
@@ -302,6 +308,177 @@ mod tests {
             "contract_created",
             "the state a waiting legacy contract moves to is the one it reloads as"
         );
+        database.close().await.unwrap();
+    }
+
+    async fn test_coordinator(directory: &std::path::Path) -> (Coordinator, DBConnection) {
+        let database = DBConnection::new(
+            directory.to_str().unwrap(),
+            "competitions",
+            DatabasePoolConfig::default(),
+            DatabaseType::Competitions,
+        )
+        .await
+        .unwrap();
+        let coordinator = Coordinator::new(
+            Arc::new(MockOracle::new([12; 32])),
+            CompetitionStore::new(database.clone()),
+            Arc::new(MockBitcoinClient::new(Network::Regtest)),
+            Arc::new(MockLnClient::new()),
+            Arc::new(MockLnurlPay::new(Network::Regtest)),
+            Arc::new(
+                KeymeldService::new(KeymeldSettings::default(), Uuid::now_v7(), &[1; 32]).unwrap(),
+            ),
+            None,
+            72,
+            1,
+            "settlement-test".into(),
+            false,
+            1,
+        )
+        .await
+        .unwrap();
+        (coordinator, database)
+    }
+
+    /// A filled competition whose contract funding has confirmed, so the pot is on-chain.
+    fn funded_competition() -> Competition {
+        let now = OffsetDateTime::now_utc();
+        let mut competition = Competition::new(&CreateEvent {
+            id: Uuid::now_v7(),
+            signing_date: now - time::Duration::hours(1),
+            start_observation_date: now - time::Duration::hours(3),
+            end_observation_date: now - time::Duration::hours(2),
+            locations: vec!["KDEN".into()],
+            number_of_values_per_entry: 3,
+            number_of_places_win: 1,
+            total_allowed_entries: 2,
+            entry_fee: 50_000,
+            coordinator_fee_percentage: 0,
+            total_competition_pool: 100_000,
+            relative_locktime_block_delta: Some(72),
+            unlisted: false,
+        });
+        competition.total_entries = 2;
+        competition.total_paid_entries = 2;
+        competition.contract_parameters = Some(parameters());
+        competition.contracted_at = Some(now - time::Duration::hours(4));
+        competition.signed_at = Some(now - time::Duration::hours(4));
+        competition.funding_broadcasted_at = Some(now - time::Duration::hours(4));
+        competition.funding_confirmed_at = Some(now - time::Duration::hours(4));
+        competition.funding_settled_at = Some(now - time::Duration::hours(4));
+        competition.awaiting_attestation_at = Some(now - time::Duration::hours(4));
+        competition
+    }
+
+    /// Settling a funded contract that errs (here: it has no signed contract to build the next
+    /// transaction from) stays in its state to try again. It used to fail at the first error and
+    /// be cancelled an hour later, leaving the pot in the contract's outputs.
+    #[tokio::test]
+    async fn settlement_errors_are_retried_instead_of_failing_the_competition() {
+        let directory = tempfile::tempdir().unwrap();
+        let (coordinator, database) = test_coordinator(directory.path()).await;
+        let now = OffsetDateTime::now_utc();
+
+        let mut outcome = funded_competition();
+        outcome.outcome_broadcasted_at = Some(now);
+        let mut delta = funded_competition();
+        delta.outcome_broadcasted_at = Some(now);
+        delta.delta_broadcasted_at = Some(now);
+
+        for (competition, state) in [
+            (outcome, "outcome_broadcasted"),
+            (delta, "delta_broadcasted"),
+        ] {
+            let mut status = CompetitionStatus::from(competition);
+            assert_eq!(status.state_name(), state);
+            // More errors than a pre-funding step tolerates before it fails.
+            for _ in 0..(KEPT_SETTLEMENT_ERRORS + 3) {
+                status = coordinator.process_status(status).await;
+                assert_eq!(
+                    status.state_name(),
+                    state,
+                    "an error does not end settlement"
+                );
+            }
+            let competition = status.into_competition();
+            assert!(competition.failed_at.is_none());
+            assert!(competition.cancelled_at.is_none());
+            assert_eq!(
+                competition.errors.len(),
+                KEPT_SETTLEMENT_ERRORS,
+                "the latest errors are kept, and the list stays bounded"
+            );
+            assert_eq!(
+                CompetitionStatus::from(competition).state_name(),
+                state,
+                "it reloads in the state it retries from"
+            );
+        }
+        database.close().await.unwrap();
+    }
+
+    /// Competitions an earlier version failed, then cancelled, while their contract held the pot
+    /// on-chain are picked up again and settle; ones that never had a funded contract stay
+    /// cancelled.
+    #[tokio::test]
+    async fn stranded_settlements_resume_and_unfunded_cancellations_stay() {
+        let directory = tempfile::tempdir().unwrap();
+        let (coordinator, database) = test_coordinator(directory.path()).await;
+        let store = &coordinator.competition_store;
+        let now = OffsetDateTime::now_utc();
+
+        let mut stranded = funded_competition();
+        stranded.outcome_broadcasted_at = Some(now - time::Duration::hours(3));
+        stranded.delta_broadcasted_at = Some(now - time::Duration::hours(1));
+        stranded.failed_at = Some(now - time::Duration::hours(1));
+        stranded.cancelled_at = Some(now);
+
+        let mut unfunded = funded_competition();
+        unfunded.funding_broadcasted_at = None;
+        unfunded.funding_confirmed_at = None;
+        unfunded.funding_settled_at = None;
+        unfunded.awaiting_attestation_at = None;
+        unfunded.failed_at = Some(now - time::Duration::hours(1));
+        unfunded.cancelled_at = Some(now);
+
+        let mut settled = funded_competition();
+        settled.outcome_broadcasted_at = Some(now - time::Duration::hours(3));
+        settled.completed_at = Some(now);
+
+        for competition in [&stranded, &unfunded, &settled] {
+            store
+                .add_competition_with_tickets(competition.clone(), vec![])
+                .await
+                .unwrap();
+        }
+        store
+            .update_competitions(vec![stranded.clone(), unfunded.clone(), settled.clone()])
+            .await
+            .unwrap();
+
+        let active = store.active_competition_ids().await.unwrap();
+        assert!(
+            active.contains(&stranded.id),
+            "the stranded pot is swept again"
+        );
+        assert!(!active.contains(&unfunded.id));
+        assert!(!active.contains(&settled.id));
+
+        let mut resumed = store.get_competition(stranded.id).await.unwrap();
+        assert!(resumed.resume_stranded_settlement());
+        assert_eq!(
+            CompetitionStatus::from(resumed.clone()).state_name(),
+            "delta_broadcasted",
+            "it resumes where settlement stopped"
+        );
+        assert!(!resumed.resume_stranded_settlement(), "only once");
+
+        let mut unfunded = store.get_competition(unfunded.id).await.unwrap();
+        assert!(!unfunded.resume_stranded_settlement());
+        assert!(unfunded.is_cancelled());
+        let mut settled = store.get_competition(settled.id).await.unwrap();
+        assert!(!settled.resume_stranded_settlement());
         database.close().await.unwrap();
     }
 }

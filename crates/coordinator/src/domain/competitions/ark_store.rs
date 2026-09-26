@@ -24,6 +24,13 @@ pub struct TicketArkEscrow {
     pub vtxo_sats: Option<u64>,
 }
 
+/// A competition's funded escrows, and how many of their players have been refunded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RefundProgress {
+    pub escrowed: u64,
+    pub refunded: u64,
+}
+
 /// Where a funded escrow's refund has got to.
 ///
 /// `Minted` → `Submitted` → `Paid` → `Settled`. Each step is recorded before the next begins, so
@@ -341,6 +348,45 @@ impl CompetitionStore {
         .fetch_one(self.db_connection.read())
         .await?;
         Ok(count as u64)
+    }
+
+    /// How far the refunds of each competition's funded escrows have got, for `event_id` or for
+    /// every competition. Competitions without funded escrows are left out.
+    ///
+    /// An escrow counts once its player has been paid; the escrows of a pool that a batch
+    /// funded were spent into it, so they are not counted at all.
+    pub async fn ark_refund_progress(
+        &self,
+        event_id: Option<Uuid>,
+    ) -> Result<std::collections::HashMap<Uuid, RefundProgress>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT t.event_id AS event_id, COUNT(*) AS escrowed,
+                    SUM(CASE WHEN r.state IN ('paid', 'settled') THEN 1 ELSE 0 END) AS refunded
+             FROM ticket_ark_escrows e
+             JOIN tickets t ON t.id = e.ticket_id AND t.hash = e.ticket_hash
+             LEFT JOIN ticket_ark_refunds r ON r.ticket_id = e.ticket_id
+             WHERE e.funded_at IS NOT NULL
+               AND (?1 IS NULL OR t.event_id = ?1)
+               AND NOT EXISTS (SELECT 1 FROM ark_funded_competitions a
+                               WHERE a.event_id = t.event_id AND a.commitment_tx IS NOT NULL)
+             GROUP BY t.event_id",
+        )
+        .bind(event_id.map(|id| id.to_string()))
+        .fetch_all(self.db_connection.read())
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let id: String = row.try_get("event_id")?;
+                let id = Uuid::parse_str(&id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+                Ok((
+                    id,
+                    RefundProgress {
+                        escrowed: row.try_get::<i64, _>("escrowed")? as u64,
+                        refunded: row.try_get::<i64, _>("refunded")? as u64,
+                    },
+                ))
+            })
+            .collect()
     }
 
     /// The funded escrows of a competition that still need refunding, in ticket order.

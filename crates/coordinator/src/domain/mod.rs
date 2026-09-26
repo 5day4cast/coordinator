@@ -40,3 +40,14 @@ pub enum Error {
     #[error("Payout payment failed: {0}")]
     PaymentFailed(String),
 }
+
+impl Error {
+    /// The error with its causes, for logs. Players see `Bitcoin` errors only as "internal
+    /// error", which says nothing to an operator.
+    pub fn detail(&self) -> String {
+        match self {
+            Error::Bitcoin(error) => format!("{error:#}"),
+            other => other.to_string(),
+        }
+    }
+}

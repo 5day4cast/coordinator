@@ -82,6 +82,57 @@ fn confirmation_depth(tip: u32, inclusion_height: u32) -> u32 {
         .unwrap_or(0)
 }
 
+/// Settlement errors kept on a competition; older ones are dropped.
+const KEPT_SETTLEMENT_ERRORS: usize = 5;
+
+/// Keep a competition whose contract holds the pot on-chain in its state after an error, so
+/// the next step tries again.
+///
+/// Once funding has confirmed, only settling the contract moves the pot. Failing would stop the
+/// competition for good, and an hour later it would be cancelled with the money left in the
+/// contract's outputs: that is how an outage, or a transaction broadcast before its timelock,
+/// stranded winners' payouts.
+fn retry_settlement(status: CompetitionStatus, error: CompetitionError) -> CompetitionStatus {
+    let mut competition = status.into_competition();
+    competition.errors.push(error);
+    let dropped = competition
+        .errors
+        .len()
+        .saturating_sub(KEPT_SETTLEMENT_ERRORS);
+    competition.errors.drain(..dropped);
+    CompetitionStatus::from(competition)
+}
+
+/// Whether the split-reclaim transactions can be broadcast yet.
+///
+/// The market maker's reclaim path on a split output is locked for the contract's reclaim delay
+/// relative to the split transaction's own confirmation, not the outcome's. Broadcast earlier,
+/// the reclaim is rejected as non-final.
+#[derive(Debug, PartialEq, Eq)]
+enum ReclaimReadiness {
+    Ready,
+    SplitUnconfirmed,
+    Wait { blocks: u32 },
+}
+
+fn reclaim_readiness(
+    split_confirmation: Option<u32>,
+    current_height: u32,
+    reclaim_delay: u32,
+) -> ReclaimReadiness {
+    let Some(confirmed_at) = split_confirmation else {
+        return ReclaimReadiness::SplitUnconfirmed;
+    };
+    let elapsed = current_height.saturating_sub(confirmed_at);
+    if elapsed >= reclaim_delay {
+        ReclaimReadiness::Ready
+    } else {
+        ReclaimReadiness::Wait {
+            blocks: reclaim_delay - elapsed,
+        }
+    }
+}
+
 impl Competition {
     pub(crate) fn funding_reservation_deadline(
         &self,
@@ -1052,18 +1103,13 @@ impl Coordinator {
                             );
                         } else {
                             error!(
-                                "Competition {} attestation check failed: {}",
+                                "Competition {} attestation check failed, will retry: {}",
                                 competition_id, e
                             );
-                            state
-                                .competition_mut()
-                                .errors
-                                .push(CompetitionError::FailedCheckingAttestation(e.to_string()));
-                            if state.competition().should_abort() {
-                                return CompetitionStatus::AwaitingAttestation(state).fail(
-                                    CompetitionError::FailedCheckingAttestation(e.to_string()),
-                                );
-                            }
+                            return retry_settlement(
+                                CompetitionStatus::AwaitingAttestation(state),
+                                CompetitionError::FailedCheckingAttestation(e.to_string()),
+                            );
                         }
                         CompetitionStatus::AwaitingAttestation(state)
                     }
@@ -1084,11 +1130,13 @@ impl Coordinator {
                     }
                     Err(e) => {
                         error!(
-                            "Competition {} outcome broadcast failed: {}",
+                            "Competition {} outcome broadcast failed, will retry: {}",
                             competition_id, e
                         );
-                        CompetitionStatus::Attested(state)
-                            .fail(CompetitionError::FailedBroadcast(e.to_string()))
+                        retry_settlement(
+                            CompetitionStatus::Attested(state),
+                            CompetitionError::FailedBroadcast(e.to_string()),
+                        )
                     }
                 }
             }
@@ -1109,11 +1157,13 @@ impl Coordinator {
                     }
                     Err(e) => {
                         error!(
-                            "Competition {} delta broadcast failed: {}",
+                            "Competition {} delta broadcast failed, will retry: {}",
                             competition_id, e
                         );
-                        CompetitionStatus::OutcomeBroadcasted(state)
-                            .fail(CompetitionError::FailedBroadcast(e.to_string()))
+                        retry_settlement(
+                            CompetitionStatus::OutcomeBroadcasted(state),
+                            CompetitionError::FailedBroadcast(e.to_string()),
+                        )
                     }
                 }
             }
@@ -1132,11 +1182,13 @@ impl Coordinator {
                     }
                     Err(e) => {
                         error!(
-                            "Competition {} delta2 broadcast failed: {}",
+                            "Competition {} delta2 broadcast failed, will retry: {}",
                             competition_id, e
                         );
-                        CompetitionStatus::DeltaBroadcasted(state)
-                            .fail(CompetitionError::FailedBroadcast(e.to_string()))
+                        retry_settlement(
+                            CompetitionStatus::DeltaBroadcasted(state),
+                            CompetitionError::FailedBroadcast(e.to_string()),
+                        )
                     }
                 }
             }
@@ -2769,7 +2821,8 @@ impl Coordinator {
 
         // The split TX was broadcast during delta, so each winner has their
         // own output. Use split-reclaim for unpaid winners who haven't been
-        // closed or reclaimed yet.
+        // closed or reclaimed yet, once the split TX's reclaim delay has passed.
+        let mut split_confirmation = None;
         for &player_index in winners.keys() {
             if let Some(entry) = entries.iter().find(|entry| {
                 let Ok(pubkey) = Point::from_hex(&entry.ephemeral_pubkey) else {
@@ -2796,6 +2849,34 @@ impl Coordinator {
 
                 let (reclaim_tx_input, reclaim_tx_prevout) =
                     signed_contract.split_reclaim_tx_input_and_prevout(&win_condition)?;
+
+                // Every winner's output is in the one split TX.
+                let split_txid = reclaim_tx_input.previous_output.txid;
+                if split_confirmation.is_none() {
+                    split_confirmation =
+                        Some(self.bitcoin.get_tx_confirmation_height(&split_txid).await?);
+                }
+                match reclaim_readiness(
+                    split_confirmation.flatten(),
+                    current_height,
+                    u32::from(signed_contract.params().reclaim_block_delay()),
+                ) {
+                    ReclaimReadiness::Ready => {}
+                    ReclaimReadiness::SplitUnconfirmed => {
+                        info!(
+                            "Competition {} split tx {} is not confirmed yet; reclaiming later",
+                            competition.id, split_txid
+                        );
+                        return Ok(competition);
+                    }
+                    ReclaimReadiness::Wait { blocks } => {
+                        info!(
+                            "Competition {} can reclaim unpaid split outputs in {} more blocks",
+                            competition.id, blocks
+                        );
+                        return Ok(competition);
+                    }
+                }
 
                 let mut reclaim_tx = simple_sweep_tx(
                     signed_contract.params().market_maker.pubkey,
@@ -2826,6 +2907,16 @@ impl Coordinator {
                 self.competition_store
                     .mark_entry_reclaim_broadcast(entry.id, OffsetDateTime::now_utc())
                     .await?;
+                // The winner was never paid over Lightning, and with the entry key held in
+                // escrow cannot claim on-chain either, so the coordinator now holds their share.
+                warn!(
+                    "Competition {} reclaimed the split output of unpaid winner entry {} \
+                     (player {}, {} sats before fees); the winner is still owed their payout",
+                    competition.id,
+                    entry.id,
+                    player_index,
+                    reclaim_tx_prevout.value.to_sat()
+                );
             }
         }
 
@@ -3057,6 +3148,17 @@ impl Coordinator {
 
         self.wake_competition(competition.id);
         Ok(competition)
+    }
+
+    /// How far the Arkade escrow refunds of `competition_id`, or of every competition, have got.
+    pub async fn refund_progress(
+        &self,
+        competition_id: Option<Uuid>,
+    ) -> Result<std::collections::HashMap<Uuid, super::RefundProgress>, Error> {
+        Ok(self
+            .competition_store
+            .ark_refund_progress(competition_id)
+            .await?)
     }
 
     pub async fn get_competitions(&self) -> Result<Vec<Competition>, Error> {
@@ -5377,6 +5479,35 @@ mod tests {
         assert_ne!(
             first_draw(&outpoint, key, &params),
             first_draw(&outpoint, key, &changed)
+        );
+    }
+
+    /// The reclaim of an unpaid winner's split output waits for the split transaction to
+    /// confirm and then its full reclaim delay. It used to count from the outcome, so it was
+    /// broadcast a minute after the split and rejected, which failed the competition.
+    #[test]
+    fn split_reclaim_waits_for_the_split_confirmation_and_its_delay() {
+        assert_eq!(
+            reclaim_readiness(None, 5_000, 288),
+            ReclaimReadiness::SplitUnconfirmed
+        );
+        // Just confirmed, though the outcome is far more than 288 blocks old.
+        assert_eq!(
+            reclaim_readiness(Some(5_000), 5_000, 288),
+            ReclaimReadiness::Wait { blocks: 288 }
+        );
+        assert_eq!(
+            reclaim_readiness(Some(5_000), 5_287, 288),
+            ReclaimReadiness::Wait { blocks: 1 }
+        );
+        assert_eq!(
+            reclaim_readiness(Some(5_000), 5_288, 288),
+            ReclaimReadiness::Ready
+        );
+        // A tip that disagrees with the confirmation waits rather than broadcasting.
+        assert_eq!(
+            reclaim_readiness(Some(5_000), 4_990, 288),
+            ReclaimReadiness::Wait { blocks: 288 }
         );
     }
 }
