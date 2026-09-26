@@ -19,11 +19,15 @@
     --app-card-bg: #ffffff;
     --app-card-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
 
-    /* Modal colors (always dark for contrast) */
-    --app-modal-bg: #1a1a1a;
-    --app-modal-border: #363636;
-    --app-modal-text: #ffffff;
-    --app-input-bg: #0d0d0d;
+    /* Dialogs follow the page's theme. Contrast on --app-modal-bg:
+       text 12.1:1, muted 7.0:1, danger 6.2:1, link 7.2:1. */
+    --app-modal-bg: #ffffff;
+    --app-modal-border: #dbdbdb;
+    --app-modal-text: #363636;
+    --app-modal-muted: #595959;
+    --app-modal-danger: #c0152f;
+    --app-modal-link: #3a4fb0;
+    --app-input-bg: #ffffff;
 }
 
 /* ===========================================
@@ -39,10 +43,13 @@
     --app-card-bg: #1f1f3a;
     --app-card-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
 
-    /* Modal colors stay dark */
+    /* Contrast on --app-modal-bg: text 19.0:1, muted 9.3:1, danger 8.5:1, link 8.7:1. */
     --app-modal-bg: #0f0f1a;
     --app-modal-border: #2a2a4a;
     --app-modal-text: #ffffff;
+    --app-modal-muted: #b4b4c8;
+    --app-modal-danger: #ff8a9b;
+    --app-modal-link: #9aabff;
     --app-input-bg: #0a0a15;
 }
 
@@ -237,7 +244,7 @@
 }
 
 /* ===========================================
-   Modal Customizations (Always Dark Theme)
+   Modal Customizations (follow the page's theme)
    =========================================== */
 .modal {
     z-index: 9999 !important;
@@ -265,7 +272,35 @@
     color: var(--app-modal-text);
 }
 
-/* Dark-themed inputs inside modals */
+/* Bulma colours labels and help text for its own scheme, which need not match the dialog's
+   background; take them from the dialog's theme instead. */
+.modal .label,
+.modal .checkbox,
+.modal .content,
+.modal .title,
+.modal .subtitle,
+.modal .box {
+    color: var(--app-modal-text);
+}
+
+.modal .box {
+    background-color: var(--app-modal-bg);
+}
+
+.modal .help,
+.modal .has-text-grey {
+    color: var(--app-modal-muted) !important;
+}
+
+.modal .help.is-danger {
+    color: var(--app-modal-danger) !important;
+}
+
+.modal a.has-text-info {
+    color: var(--app-modal-link) !important;
+}
+
+/* Inputs inside modals */
 .modal .input,
 .modal .textarea {
     background-color: var(--app-input-bg);
@@ -281,18 +316,24 @@
 
 .modal .input::placeholder,
 .modal .textarea::placeholder {
-    color: #666;
+    color: var(--app-modal-muted);
+    opacity: 0.8;
 }
 
 /* Tabs in modals */
 .modal .tabs li.is-active a {
     border-color: var(--bulma-link, #485fc7);
-    color: var(--bulma-link, #485fc7);
 }
 
 .modal .tabs a {
-    color: #999;
+    color: var(--app-modal-muted);
     border-color: var(--app-modal-border);
+}
+
+.modal .tabs.is-boxed li.is-active a {
+    background-color: var(--app-modal-bg);
+    border-bottom-color: transparent;
+    color: var(--app-modal-link);
 }
 
 .modal .tabs a:hover {
