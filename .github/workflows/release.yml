@@ -168,10 +168,11 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # Compiles in parallel with build-wasm; package-native adds the WASM.
   build-release:
-    name: Build Native Package (${{ matrix.target }})
+    name: Build Native Binaries (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
-    needs: [prepare-release, build-wasm]
+    needs: prepare-release
     strategy:
       fail-fast: false
       matrix:
@@ -242,19 +243,18 @@ jobs:
           cargo build --release --locked --target "$TARGET" \
             -p coordinator-verifier-enclave --features coordinator-verifier-enclave/lnurl \
             -p coordinator-lnurl-relay -p coordinator-ark-swap -p coordinator-synth
-      - uses: actions/download-artifact@v4
-        with:
-          name: release-wasm
-          path: wasm-release
-      - name: Assemble complete package and verify required UI assets
+      - name: Stage the coordinator binaries for packaging
         env:
-          VERSION: ${{ needs.prepare-release.outputs.version }}
-          SOURCE: ${{ needs.prepare-release.outputs.source }}
           TARGET: ${{ matrix.target }}
-          ASSET: ${{ matrix.asset }}
         run: |
-          python3 scripts/release.py native --version "$VERSION" --source "$SOURCE" \
-            --target "$TARGET" --asset "$ASSET" --wasm "wasm-release/coordinator-wasm-$VERSION.tar.gz"
+          mkdir -p native-bin
+          cp "target/$TARGET/release/coordinator" "target/$TARGET/release/wallet-cli" native-bin/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-bin-${{ matrix.target }}
+          path: native-bin/*
+          if-no-files-found: error
+          retention-days: 14
       - name: Package the verifier enclave for Keymeld hosts (Linux)
         if: runner.os == 'Linux'
         env:
@@ -277,8 +277,9 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: python3 scripts/release.py synth --version "$VERSION" --source "$SOURCE" --target "$TARGET"
       - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
         with:
-          name: release-${{ matrix.target }}
+          name: release-hosts-${{ matrix.target }}
           path: release/*
           if-no-files-found: error
           retention-days: 14
@@ -296,6 +297,58 @@ jobs:
         with:
           name: image-bin-${{ matrix.target }}
           path: image-bin/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # The coordinator package: build-release's binaries plus the WASM package.
+  # Only copying and archiving, so every target packages on one small runner.
+  package-native:
+    name: Package Native (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    needs: [prepare-release, build-wasm, build-release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            asset: coordinator-x86_64-linux
+          - target: aarch64-unknown-linux-gnu
+            asset: coordinator-aarch64-linux
+          - target: x86_64-apple-darwin
+            asset: coordinator-x86_64-macos
+          - target: aarch64-apple-darwin
+            asset: coordinator-aarch64-macos
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.source }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-bin-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-wasm
+          path: wasm-release
+      - name: Assemble complete package and verify required UI assets
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          SOURCE: ${{ needs.prepare-release.outputs.source }}
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          # Artifacts don't keep file modes.
+          chmod 755 "target/$TARGET/release/coordinator" "target/$TARGET/release/wallet-cli"
+          python3 scripts/release.py native --version "$VERSION" --source "$SOURCE" \
+            --target "$TARGET" --asset "$ASSET" --wasm "wasm-release/coordinator-wasm-$VERSION.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: release/*
           if-no-files-found: error
           retention-days: 14
 
@@ -442,7 +495,7 @@ jobs:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
     # The tarballs don't wait for the container images, which publish on their own.
-    needs: [prepare-release, build-release, build-wasm, package-charts]
+    needs: [prepare-release, build-release, build-wasm, package-native, package-charts]
     if: needs.prepare-release.outputs.dry_run != 'true'
     permissions:
       contents: write
