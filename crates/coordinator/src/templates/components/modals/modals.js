@@ -243,7 +243,7 @@ class AuthManager {
 
     // The password stays in the browser: the server only sees the derived
     // auth key, and the nsec is unsealed inside WASM.
-    const credentials = session.wasm.LoginCredentials.derive(username, password);
+    const credentials = await deriveLoginCredentials(username, password);
     try {
       const response = await fetch(
         `${this.apiBase}/api/v1/users/username/login`,
@@ -375,7 +375,7 @@ class AuthManager {
     let credentials = null;
     try {
       session.nostrClient.initialize(session.wasm.SignerType.PrivateKey, null);
-      credentials = session.wasm.LoginCredentials.derive(username, password);
+      credentials = await deriveLoginCredentials(username, password);
 
       this.pendingRegistration = {
         username,
@@ -659,7 +659,7 @@ class AuthManager {
       return;
     }
 
-    const credentials = session.wasm.LoginCredentials.derive(
+    const credentials = await deriveLoginCredentials(
       this.forgotUsername,
       newPassword,
     );

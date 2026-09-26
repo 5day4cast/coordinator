@@ -52,24 +52,16 @@ pub struct LoginKeys {
 
 impl LoginKeys {
     pub fn derive(username: &str, password: &str) -> Result<Self, LoginError> {
-        Self::derive_with(username, password, SCRYPT_LOG_N)
+        Ok(Self::from_stretched(&*stretch(username, password)?))
     }
 
-    fn derive_with(username: &str, password: &str, log_n: u8) -> Result<Self, LoginError> {
-        let salt = tagged_hash(
-            b"coordinator/login-salt/v1",
-            username.to_lowercase().as_bytes(),
-        );
-        let params =
-            Params::new(log_n, SCRYPT_R, SCRYPT_P, 32).map_err(|_| LoginError::KeyStretching)?;
-        let mut stretched = Zeroizing::new([0u8; 32]);
-        scrypt(password.as_bytes(), &salt[..], &params, &mut stretched[..])
-            .map_err(|_| LoginError::KeyStretching)?;
-
-        Ok(Self {
+    /// The keys from [`stretch`]'s output. Cheap: log-in stretches the
+    /// password in a worker, off the page's thread, and finishes here.
+    pub fn from_stretched(stretched: &[u8; 32]) -> Self {
+        Self {
             auth_key: tagged_hash(b"coordinator/login-auth/v1", &stretched[..]),
             vault_key: tagged_hash(b"coordinator/login-vault/v1", &stretched[..]),
-        })
+        }
     }
 
     /// Hex credential the server verifies in place of the password.
@@ -127,6 +119,29 @@ impl LoginKeys {
     }
 }
 
+/// scrypt(password) salted with the username: the slow step, ~1-2 s. Its
+/// output unlocks the account as the password does, so treat it as one.
+pub fn stretch(username: &str, password: &str) -> Result<Zeroizing<[u8; 32]>, LoginError> {
+    stretch_with(username, password, SCRYPT_LOG_N)
+}
+
+fn stretch_with(
+    username: &str,
+    password: &str,
+    log_n: u8,
+) -> Result<Zeroizing<[u8; 32]>, LoginError> {
+    let salt = tagged_hash(
+        b"coordinator/login-salt/v1",
+        username.to_lowercase().as_bytes(),
+    );
+    let params =
+        Params::new(log_n, SCRYPT_R, SCRYPT_P, 32).map_err(|_| LoginError::KeyStretching)?;
+    let mut stretched = Zeroizing::new([0u8; 32]);
+    scrypt(password.as_bytes(), &salt[..], &params, &mut stretched[..])
+        .map_err(|_| LoginError::KeyStretching)?;
+    Ok(stretched)
+}
+
 fn tagged_hash(tag: &[u8], data: &[u8]) -> Zeroizing<[u8; 32]> {
     let tag_hash = Sha256::digest(tag);
     let mut hasher = Sha256::new();
@@ -140,11 +155,11 @@ fn tagged_hash(tag: &[u8], data: &[u8]) -> Zeroizing<[u8; 32]> {
 mod tests {
     use super::*;
 
-    // Cheap scrypt cost so tests stay fast; production cost is covered by `derive`.
+    // Cheap scrypt cost so tests stay fast; production cost is covered by `stretch`.
     const TEST_LOG_N: u8 = 4;
 
     fn keys(username: &str, password: &str) -> LoginKeys {
-        LoginKeys::derive_with(username, password, TEST_LOG_N).unwrap()
+        LoginKeys::from_stretched(&stretch_with(username, password, TEST_LOG_N).unwrap())
     }
 
     #[test]

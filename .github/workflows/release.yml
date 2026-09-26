@@ -111,11 +111,22 @@ jobs:
         run: |
           BINDGEN_VERSION=$(python3 -c 'import tomllib; print(next(p["version"] for p in tomllib.load(open("Cargo.lock", "rb"))["package"] if p["name"] == "wasm-bindgen"))')
           cargo install wasm-bindgen-cli --version "$BINDGEN_VERSION" --locked
+      - name: Install wasm-opt and brotli
+        run: |
+          curl -fsSL https://github.com/WebAssembly/binaryen/releases/download/version_125/binaryen-version_125-x86_64-linux.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/binaryen-version_125/bin" >> "$GITHUB_PATH"
+          sudo apt-get install -y --no-install-recommends brotli
       - name: Build locked browser module
         run: |
-          cargo build --locked --release --target wasm32-unknown-unknown -p coordinator-wasm
-          wasm-bindgen --target web --out-dir wasm-pkg --out-name coordinator_wasm \
-            target/wasm32-unknown-unknown/release/coordinator_wasm.wasm
+          scripts/build-wasm.sh wasm-pkg
+          # Brotli and gzip copies, which the server sends to browsers that
+          # accept them instead of the full module.
+          for f in wasm-pkg/*.js wasm-pkg/*.wasm; do
+            brotli -q 11 -k "$f"
+            gzip -9 -k -n "$f"
+          done
+          ls -l wasm-pkg
         env:
           CC_wasm32_unknown_unknown: clang
           CFLAGS_wasm32_unknown_unknown: "-Wno-error=implicit-function-declaration"

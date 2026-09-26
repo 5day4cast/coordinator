@@ -105,6 +105,9 @@ test("password reset signs the replacement credentials with the recovered key", 
     ...window,
     window,
     session,
+    // shared/wasm.js stretches the password in a worker; here, directly.
+    deriveLoginCredentials: async (username, password) =>
+      session.wasm.LoginCredentials.derive(username, password),
     console,
     document: {
       querySelector: () => null,

@@ -144,3 +144,28 @@ opt-level = "s"
 inherits = "release"
 lto = "thin"
 
+# The browser module (coordinator-wasm): smallest code overall, but the
+# key-derivation crates at full speed, since log-in runs scrypt (N=2^17)
+# on the page. panic=abort drops the unwinding tables wasm never uses.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.wasm-release.package.scrypt]
+opt-level = 3
+
+[profile.wasm-release.package.salsa20]
+opt-level = 3
+
+[profile.wasm-release.package.pbkdf2]
+opt-level = 3
+
+[profile.wasm-release.package.hmac]
+opt-level = 3
+
+[profile.wasm-release.package.sha2]
+opt-level = 3
