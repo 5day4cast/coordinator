@@ -184,7 +184,7 @@ impl Coordinator {
             match self.refundable(escrow, now).await {
                 Ok(Some(refundable)) => open.push(refundable),
                 Ok(None) => {}
-                Err(e) => self.report_refund(ticket_id, &e.to_string()),
+                Err(e) => self.report_refund(ticket_id, &e.detail()),
             }
         }
         if open.is_empty() {
@@ -195,9 +195,12 @@ impl Coordinator {
             Err(e) => {
                 if self
                     .reported
-                    .is_new(REFUND_REPORTS, competition_id, &e.to_string())
+                    .is_new(REFUND_REPORTS, competition_id, &e.detail())
                 {
-                    warn!("Cannot read the players of competition {competition_id} to refund: {e}");
+                    warn!(
+                        "Cannot read the players of competition {competition_id} to refund: {}",
+                        e.detail()
+                    );
                 }
                 return;
             }
@@ -209,9 +212,12 @@ impl Coordinator {
                 Err(e) => {
                     if self
                         .reported
-                        .is_new(REFUND_REPORTS, competition_id, &e.to_string())
+                        .is_new(REFUND_REPORTS, competition_id, &e.detail())
                     {
-                        warn!("Cannot sign the refunds of competition {competition_id}: {e}");
+                        warn!(
+                            "Cannot sign the refunds of competition {competition_id}: {}",
+                            e.detail()
+                        );
                     }
                     (None, BTreeSet::new())
                 }
@@ -259,7 +265,7 @@ impl Coordinator {
                     self.reported.clear(REFUND_REPORTS, ticket_id);
                     info!("Refunded the escrow of ticket {ticket_id}");
                 }
-                Err(e) => self.report_refund(ticket_id, &e.to_string()),
+                Err(e) => self.report_refund(ticket_id, &e.detail()),
             }
         }
     }
