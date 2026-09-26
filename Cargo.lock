@@ -1645,6 +1645,7 @@ dependencies = [
  "openssl",
  "oxc",
  "pem-rfc7468",
+ "prometheus",
  "rand 0.9.5",
  "rand_chacha 0.9.0",
  "reqwest 0.12.28",

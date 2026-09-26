@@ -41,6 +41,87 @@ pub struct Settings {
     pub admin_settings: AdminSettings,
     #[serde(default)]
     pub ark_settings: ArkSettings,
+    #[serde(default)]
+    pub metrics_settings: MetricsSettings,
+}
+
+/// Environment variable that sets `metrics_settings.listen_addr`, overriding the file.
+pub const METRICS_LISTEN_ADDR_ENV: &str = "COORDINATOR_METRICS_LISTEN_ADDR";
+
+/// Prometheus metrics listener, serving only `GET /metrics`.
+///
+/// Unset by default: no metrics listener runs. Metrics never share the public listener,
+/// which a public gateway proxies in full. The listener has no authentication, so bind it
+/// to loopback or a private network that only the scraper reaches.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricsSettings {
+    /// Socket address of the metrics listener, for example "127.0.0.1:9992".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_addr: Option<SocketAddr>,
+}
+
+impl MetricsSettings {
+    /// Apply the value of `COORDINATOR_METRICS_LISTEN_ADDR`, when set. An empty value
+    /// turns the listener off.
+    pub fn apply_env_override(&mut self, value: Option<String>) -> Result<(), anyhow::Error> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        let value = value.trim();
+        self.listen_addr = if value.is_empty() {
+            None
+        } else {
+            Some(value.parse().map_err(|e| {
+                anyhow!("{METRICS_LISTEN_ADDR_ENV} must be a socket address such as 127.0.0.1:9992: {e}")
+            })?)
+        };
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod metrics_settings_tests {
+    use super::*;
+
+    #[test]
+    fn metrics_listener_is_off_unless_configured() {
+        assert_eq!(MetricsSettings::default().listen_addr, None);
+
+        // A config written before this setting existed loads with the listener off.
+        let text = toml::to_string(&Settings::default()).unwrap();
+        let without_metrics: String = text.split("[metrics_settings]").next().unwrap().to_string();
+        let parsed: Settings = toml::from_str(&without_metrics).unwrap();
+        assert_eq!(parsed.metrics_settings.listen_addr, None);
+
+        let configured: MetricsSettings =
+            toml::from_str("listen_addr = \"127.0.0.1:9992\"").unwrap();
+        assert_eq!(
+            configured.listen_addr,
+            Some("127.0.0.1:9992".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn environment_overrides_the_metrics_listener() {
+        let mut settings = MetricsSettings::default();
+        settings.apply_env_override(None).unwrap();
+        assert_eq!(settings.listen_addr, None);
+
+        settings
+            .apply_env_override(Some("127.0.0.1:9992".into()))
+            .unwrap();
+        assert_eq!(
+            settings.listen_addr,
+            Some("127.0.0.1:9992".parse().unwrap())
+        );
+
+        settings.apply_env_override(Some(" ".into())).unwrap();
+        assert_eq!(settings.listen_addr, None);
+
+        assert!(settings
+            .apply_env_override(Some("not an address".into()))
+            .is_err());
+    }
 }
 
 /// Arkade funding: each entry's buy-in is swapped into an escrow VTXO, and a competition's pool
@@ -886,7 +967,11 @@ impl Default for RateLimitSettings {
 }
 
 pub fn get_settings() -> Result<Settings, anyhow::Error> {
-    get_settings_with_cli(Cli::parse().into())
+    let mut settings: Settings = get_settings_with_cli(Cli::parse().into())?;
+    settings
+        .metrics_settings
+        .apply_env_override(env::var(METRICS_LISTEN_ADDR_ENV).ok())?;
+    Ok(settings)
 }
 
 pub struct CliSettings {

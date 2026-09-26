@@ -35,6 +35,7 @@ use crate::{
         lnurl::{HttpsLnurlPay, LnurlPay},
         oracle::{Oracle, OracleClient},
     },
+    metrics::{metrics_app, Metrics},
 };
 
 // Mock implementations only available with e2e-testing feature or debug builds
@@ -93,13 +94,15 @@ type HttpServer = Serve<
     AddExtension<Router, ConnectInfo<SocketAddr>>,
 >;
 
-/// Owns both HTTP listeners, the background producers, and the databases.
+/// Owns the HTTP listeners, the background producers, and the databases.
 ///
 /// The public listener serves participants. The admin listener serves operator routes
-/// behind `api::admin_auth`; it never shares a socket with the public router.
+/// behind `api::admin_auth`; it never shares a socket with the public router. The
+/// optional metrics listener serves only `GET /metrics`.
 pub struct Application {
     server: HttpServer,
     admin_server: HttpServer,
+    metrics_server: Option<HttpServer>,
     cancellation_token: CancellationToken,
     background_tasks: TaskTracker,
     background_abort_handles: Vec<AbortHandle>,
@@ -115,6 +118,7 @@ impl Application {
         );
         let listener = SocketAddr::from_str(&address)?;
         let admin_listener = config.admin_settings.listen_addr;
+        let metrics_listener = config.metrics_settings.listen_addr;
         let network = config.bitcoin_settings.network;
         // Fail on a missing operator token before connecting to LND or opening databases.
         let admin_access = Arc::new(AdminAccess::from_settings(&config.admin_settings)?);
@@ -134,9 +138,19 @@ impl Application {
                 admin_app(app_state.clone(), admin_access, network),
             )
             .await?;
-            Ok::<_, anyhow::Error>((server, admin_server))
+            let metrics_server = match metrics_listener {
+                Some(address) => {
+                    let metrics = Metrics::new(
+                        app_state.coordinator.competition_store.clone(),
+                        app_state.background_threads.clone(),
+                    )?;
+                    Some(build_server(address, metrics_app(Arc::new(metrics))).await?)
+                }
+                None => None,
+            };
+            Ok::<_, anyhow::Error>((server, admin_server, metrics_server))
         };
-        let (server, admin_server) = match servers.await {
+        let (server, admin_server, metrics_server) = match servers.await {
             Ok(servers) => servers,
             Err(error) => {
                 cancellation_token.cancel();
@@ -155,6 +169,7 @@ impl Application {
         Ok(Self {
             server,
             admin_server,
+            metrics_server,
             cancellation_token,
             background_tasks,
             background_abort_handles,
@@ -167,6 +182,7 @@ impl Application {
         let Application {
             server,
             admin_server,
+            metrics_server,
             cancellation_token,
             background_tasks,
             background_abort_handles,
@@ -175,8 +191,10 @@ impl Application {
         let stop_http = CancellationToken::new();
         let mut http = spawn_http(server, stop_http.clone());
         let mut admin_http = spawn_http(admin_server, stop_http.clone());
+        let mut metrics_http = metrics_server.map(|server| spawn_http(server, stop_http.clone()));
         let mut http_finished = false;
         let mut admin_http_finished = false;
+        let mut metrics_http_finished = false;
         let mut shutdown_error = None;
         let writer_stopped = async {
             let waiters: Vec<_> = db_connections
@@ -197,6 +215,15 @@ impl Application {
                 admin_http_finished = true;
                 shutdown_error = Some(anyhow!("Admin HTTP server stopped unexpectedly: {result:?}"));
             }
+            Some(result) = async {
+                match metrics_http.as_mut() {
+                    Some(task) => Some(task.await),
+                    None => None,
+                }
+            } => {
+                metrics_http_finished = true;
+                shutdown_error = Some(anyhow!("Metrics HTTP server stopped unexpectedly: {result:?}"));
+            }
             () = shutdown_signal() => {}
             () = writer_stopped => {
                 shutdown_error = Some(anyhow!("Database writer stopped unexpectedly"));
@@ -206,11 +233,22 @@ impl Application {
             }
         }
         stop_http.cancel();
-        let (public_drain, admin_drain) = tokio::join!(
+        let (public_drain, admin_drain, metrics_drain) = tokio::join!(
             drain_http("HTTP server", http, http_finished),
             drain_http("Admin HTTP server", admin_http, admin_http_finished),
+            async {
+                match metrics_http {
+                    Some(task) => {
+                        drain_http("Metrics HTTP server", task, metrics_http_finished).await
+                    }
+                    None => None,
+                }
+            },
         );
-        for drain_error in [public_drain, admin_drain].into_iter().flatten() {
+        for drain_error in [public_drain, admin_drain, metrics_drain]
+            .into_iter()
+            .flatten()
+        {
             shutdown_error.get_or_insert(drain_error);
         }
         cancellation_token.cancel();

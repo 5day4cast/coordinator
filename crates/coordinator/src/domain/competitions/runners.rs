@@ -393,6 +393,7 @@ impl CompetitionRunners {
                 }
                 Err(StepError::Failed(e)) => {
                     failures += 1;
+                    crate::metrics::COMPETITION_STEP_FAILURES.inc();
                     error!("Competition {competition_id} step failed: {e:#}");
                     lease = Some(held);
                     Wait::Until(OffsetDateTime::now_utc() + self.backoff(failures))
