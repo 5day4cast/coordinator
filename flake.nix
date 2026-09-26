@@ -146,6 +146,8 @@
           nativeBuildInputs = commonNativeBuildInputs ++ [ wasm32-clang ];
           CARGO_BUILD_TARGET = wasmTarget;
           cargoExtraArgs = "-p coordinator-wasm";
+          # Smaller and faster than `release` (see Cargo.toml).
+          CARGO_PROFILE = "wasm-release";
           # Use our wrapper clang for wasm32 target to work around secp256k1-sys
           # missing memmove declaration in wasm-sysroot (fixed in 0.12.0+)
           CC_wasm32_unknown_unknown = "${wasm32-clang}/bin/wasm32-clang";
@@ -166,6 +168,7 @@
             nativeBuildInputs = commonNativeBuildInputs;
             CARGO_BUILD_TARGET = wasmTarget;
             cargoExtraArgs = "-p coordinator-wasm";
+            CARGO_PROFILE = "wasm-release";
             # Use our wrapper clang for wasm32 target
             CC_wasm32_unknown_unknown = "${wasm32-clang}/bin/wasm32-clang";
 
@@ -174,8 +177,7 @@
 
             installPhase = ''
               mkdir -p $out
-              cp -r target/${wasmTarget}/release/*.wasm $out/ || true
-              cp -r target/${wasmTarget}/release/coordinator_wasm.wasm $out/ || true
+              cp target/${wasmTarget}/wasm-release/coordinator_wasm.wasm $out/
               # Also copy the Cargo.toml for wasm-bindgen to read metadata
               cp crates/coordinator-wasm/Cargo.toml $out/
             '';
@@ -183,8 +185,10 @@
 
           nativeBuildInputs = [
             wasm-bindgen-cli
+            pkgs.binaryen
           ];
 
+          # The same steps as scripts/build-wasm.sh; keep the two in step.
           buildPhase = ''
             # Run wasm-bindgen to generate JS bindings
             wasm-bindgen \
@@ -192,6 +196,8 @@
               --out-dir pkg \
               --out-name coordinator_wasm \
               $src/coordinator_wasm.wasm
+            wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-reference-types --enable-multivalue \
+              pkg/coordinator_wasm_bg.wasm -o pkg/coordinator_wasm_bg.wasm
           '';
 
           installPhase = ''
@@ -1060,15 +1066,17 @@
         frontend-assets = pkgs.runCommand "coordinator-frontend-assets" {
           # Force rebuild when coordinator or wasm changes
           inherit coordinator coordinator-wasm;
+          nativeBuildInputs = [ pkgs.brotli ];
         } ''
           mkdir -p $out/app/ui/pkg
 
           # The coordinator binary embeds its scripts and styles; the UI
           # directory holds only the WASM module (actual files, not symlinks).
           cp -rL ${coordinator-wasm}/pkg/* $out/app/ui/pkg/
-          # A gzipped copy beside each, which the server sends to browsers
-          # that accept gzip instead of compressing on every download.
+          # Brotli and gzip copies beside each, which the server sends to
+          # browsers that accept them instead of compressing every download.
           for f in $out/app/ui/pkg/*.js $out/app/ui/pkg/*.wasm; do
+            brotli -q 11 -k "$f"
             gzip -9 -k -n "$f"
           done
 
