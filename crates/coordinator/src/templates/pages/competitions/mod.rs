@@ -4,7 +4,7 @@
 use maud::{html, Markup};
 use time::OffsetDateTime;
 
-use crate::domain::{get_percentage_weights, leaderboard::Phase, Competition};
+use crate::domain::{get_percentage_weights, leaderboard::Phase, Competition, RefundProgress};
 use crate::templates::format::{self, sats, thousands};
 
 /// Finished competitions shown per page.
@@ -27,6 +27,20 @@ pub struct CompetitionView {
     pub can_enter: bool,
     pub number_of_values_per_entry: usize,
     pub locations: Vec<String>,
+    /// Its Arkade escrows and how many have been refunded; none until the page adds them.
+    pub refunds: RefundProgress,
+    /// The oracle attested the contract's refund outcome (no station reported inside the
+    /// window), so the pot went back to every entry in equal shares instead of to winners.
+    pub pot_refunded: bool,
+}
+
+/// Where the entry fees of a competition that didn't run stand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refunds {
+    /// No entry fee was paid, so nothing is owed.
+    Nothing,
+    Pending,
+    Done,
 }
 
 impl CompetitionView {
@@ -48,6 +62,8 @@ impl CompetitionView {
                 && competition.total_entries < event.total_allowed_entries as u64,
             number_of_values_per_entry: event.number_of_values_per_entry,
             locations: event.locations.clone(),
+            refunds: RefundProgress::default(),
+            pot_refunded: phase == Phase::Scored && competition.refunds_every_entry(),
         }
     }
 
@@ -66,6 +82,26 @@ impl CompetitionView {
             || (self.phase == Phase::Cancelled && self.total_entries < self.total_allowed_entries)
     }
 
+    /// Where the entry fees of a competition that didn't fill stand. Escrowed fees are returned
+    /// once their players are paid; held Lightning payments are released when the competition
+    /// is cancelled.
+    pub fn refunds(&self) -> Refunds {
+        let RefundProgress { escrowed, refunded } = self.refunds;
+        if escrowed > 0 {
+            if refunded >= escrowed {
+                Refunds::Done
+            } else {
+                Refunds::Pending
+            }
+        } else if self.total_entries == 0 {
+            Refunds::Nothing
+        } else if self.phase == Phase::Unfilled {
+            Refunds::Pending
+        } else {
+            Refunds::Done
+        }
+    }
+
     pub fn url(&self) -> String {
         if self.can_enter {
             format!("/competitions/{}/entry-form", self.id)
@@ -81,19 +117,33 @@ pub fn phase_badge(competition: &CompetitionView) -> Markup {
     let (class, label) = match competition.phase {
         Phase::Upcoming if !competition.can_enter => ("badge badge-open", "Full"),
         Phase::Upcoming => ("badge badge-open", "Open"),
-        Phase::Unfilled => ("badge badge-quiet", "Didn't fill: refund pending"),
+        Phase::Unfilled => ("badge badge-quiet", unfilled_label(competition)),
         Phase::Live => ("badge badge-live", "Live"),
         Phase::AwaitingResult => ("badge badge-waiting", "Awaiting results"),
+        Phase::Scored if competition.pot_refunded => ("badge badge-quiet", "Refunded"),
         Phase::Scored => ("badge badge-quiet", "Finished"),
         Phase::Expired => ("badge badge-quiet", "Refunded"),
-        Phase::Cancelled if competition.did_not_fill() => ("badge badge-quiet", "Didn't fill"),
+        Phase::Cancelled if competition.did_not_fill() => {
+            ("badge badge-quiet", unfilled_label(competition))
+        }
         Phase::Cancelled => ("badge badge-quiet", "Cancelled"),
         Phase::Failed => ("badge badge-failed", "Failed"),
     };
     let title = competition
         .did_not_fill()
-        .then_some("Not enough entries by the start; every entry fee is returned");
+        .then(|| match competition.refunds() {
+            Refunds::Nothing => "Not enough entries by the start; no entry fees were paid",
+            _ => "Not enough entries by the start; every entry fee is returned",
+        });
     html! { span class=(class) title=[title] { (label) } }
+}
+
+fn unfilled_label(competition: &CompetitionView) -> &'static str {
+    match competition.refunds() {
+        Refunds::Nothing => "Didn't fill",
+        Refunds::Pending => "Didn't fill: refund pending",
+        Refunds::Done => "Didn't fill: refunded",
+    }
 }
 
 /// What the list shows: which page of finished competitions, and whether
@@ -406,6 +456,8 @@ pub(crate) mod tests {
             can_enter: phase == Phase::Upcoming,
             number_of_values_per_entry: 9,
             locations: vec!["KPWM".into()],
+            refunds: RefundProgress::default(),
+            pot_refunded: false,
         }
     }
 
@@ -471,7 +523,7 @@ pub(crate) mod tests {
         .into_string();
         assert!(shown.contains("unfilled"));
         assert!(
-            shown.contains("fill</span>"),
+            shown.contains("Didn't fill"),
             "an unfilled competition says so"
         );
         assert!(!shown.contains("badge-failed"));
@@ -490,6 +542,41 @@ pub(crate) mod tests {
         assert!(!html.contains("ends in"));
         assert!(unfilled.did_not_fill());
         assert!(!unfilled.can_enter);
+    }
+
+    /// "Refund pending" only while something is owed: never with nothing paid in, and it
+    /// moves to "refunded" once every escrowed fee is back.
+    #[test]
+    fn an_unfilled_competition_says_where_its_refunds_stand() {
+        let badge = |view: &CompetitionView| phase_badge(view).into_string();
+
+        let mut empty = view("empty", Phase::Unfilled, -5);
+        empty.total_entries = 0;
+        assert!(badge(&empty).contains(">Didn't fill</span>"));
+        assert!(badge(&empty).contains("no entry fees were paid"));
+
+        // A fee paid into escrow without an entry is still owed back.
+        let mut escrowed = empty.clone();
+        escrowed.refunds = RefundProgress {
+            escrowed: 1,
+            refunded: 0,
+        };
+        assert!(badge(&escrowed).contains("Didn't fill: refund pending"));
+
+        let mut cancelled = view("cancelled", Phase::Cancelled, -600);
+        cancelled.total_entries = 2;
+        cancelled.refunds = RefundProgress {
+            escrowed: 3,
+            refunded: 2,
+        };
+        assert!(badge(&cancelled).contains("Didn't fill: refund pending"));
+        cancelled.refunds.refunded = 3;
+        assert!(badge(&cancelled).contains("Didn't fill: refunded"));
+
+        // Held Lightning payments are released when it is cancelled.
+        let mut held = view("held", Phase::Cancelled, -600);
+        held.total_entries = 2;
+        assert!(badge(&held).contains("Didn't fill: refunded"));
     }
 
     #[test]

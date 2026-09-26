@@ -27,7 +27,7 @@ use crate::{
     api::extractors::NostrAuth,
     domain::{
         leaderboard::{Leaderboard, Phase, FIRST_READ_WAIT},
-        Competition, Error,
+        Competition, Error, RefundProgress,
     },
     infra::refresh_cache::Cached,
     startup::AppState,
@@ -183,16 +183,54 @@ fn now() -> OffsetDateTime {
 }
 
 async fn competition_views(state: &AppState, now: OffsetDateTime) -> Vec<CompetitionView> {
-    match state.coordinator.get_competitions().await {
+    let (competitions, refunds) = tokio::join!(
+        state.coordinator.get_competitions(),
+        refund_progress(state, None),
+    );
+    match competitions {
         Ok(competitions) => competitions
             .iter()
-            .map(|competition| CompetitionView::new(competition, now))
+            .map(|competition| {
+                let mut view = CompetitionView::new(competition, now);
+                view.refunds = refunds.get(&competition.id).copied().unwrap_or_default();
+                view
+            })
             .collect(),
         Err(error) => {
             error!("failed to load competitions: {error}");
             vec![]
         }
     }
+}
+
+/// How far competitions' escrow refunds have got; none if that can't be read, so a page still
+/// renders.
+async fn refund_progress(
+    state: &AppState,
+    competition_id: Option<Uuid>,
+) -> std::collections::HashMap<Uuid, RefundProgress> {
+    state
+        .coordinator
+        .refund_progress(competition_id)
+        .await
+        .unwrap_or_else(|error| {
+            error!("failed to read refund progress: {error}");
+            Default::default()
+        })
+}
+
+/// One competition as the page shows it, with its refunds.
+async fn competition_view(
+    state: &AppState,
+    competition: &Competition,
+    now: OffsetDateTime,
+) -> CompetitionView {
+    let mut view = CompetitionView::new(competition, now);
+    view.refunds = refund_progress(state, Some(competition.id))
+        .await
+        .remove(&competition.id)
+        .unwrap_or_default();
+    view
 }
 
 /// `?page=1&cancelled=1` on the competitions list.
@@ -427,7 +465,7 @@ pub async fn entry_form_fragment(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let view = CompetitionView::new(&competition, now());
+    let view = competition_view(&state, &competition, now()).await;
     if !view.can_enter {
         // Entries are closed; the leaderboard is what there is to see.
         return leaderboard_response(&state, &headers, &view);
@@ -548,7 +586,7 @@ pub async fn leaderboard_fragment(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let view = CompetitionView::new(&competition, now());
+    let view = competition_view(&state, &competition, now()).await;
     leaderboard_response(&state, &headers, &view)
 }
 
@@ -614,7 +652,7 @@ pub async fn leaderboard_rows_fragment(
         );
     }
     let now = now();
-    let view = CompetitionView::new(&competition, now);
+    let view = competition_view(&state, &competition, now).await;
     fragment(
         leaderboard_scores(&view, &leaderboard_view(&board), now),
         Caching::Public,
@@ -652,6 +690,10 @@ fn leaderboard_view(board: &Leaderboard) -> LeaderboardView {
             .collect(),
         phase: board.phase,
         updated_at: board.observed_until.or(board.weather_fetched_at),
+        any_readings: board
+            .rows
+            .iter()
+            .any(|row| row.picks.iter().any(|pick| pick.observed.is_some())),
     }
 }
 

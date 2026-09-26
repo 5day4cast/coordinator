@@ -792,6 +792,57 @@ mod oracle_event_validation_tests {
             OffsetDateTime::from_unix_timestamp(i64::from(u32::MAX) - 86_400).unwrap();
         assert_eq!(candidate.validate_oracle_settings(), Ok(()));
     }
+
+    /// Only the contract's refund outcome, which weights every player equally, counts as
+    /// refunding every entry; a ranking that pays a winner does not.
+    #[test]
+    fn only_the_refund_outcome_refunds_every_entry() {
+        use dlctix::{
+            bitcoin::{Amount, FeeRate},
+            secp::Scalar,
+            MarketMaker, PayoutWeights, Player,
+        };
+        let attestation = |byte: u8| Scalar::from_slice(&[byte; 32]).unwrap();
+        let point = |byte: u8| attestation(byte).base_point_mul();
+        let players: Vec<Player> = [1u8, 3]
+            .into_iter()
+            .map(|key| Player {
+                pubkey: point(key),
+                ticket_hash: hashlock::sha256(&[key + 10; 32]),
+                payout_hash: hashlock::sha256(&[key + 1; 32]),
+            })
+            .collect();
+        let locking = EventLockingConditions {
+            locking_points: vec![point(20).into(), point(21).into()],
+            expiry: None,
+        };
+        let params = ContractParameters {
+            market_maker: MarketMaker { pubkey: point(5) },
+            players,
+            event: locking.clone(),
+            outcome_payouts: [
+                (Outcome::Attestation(0), PayoutWeights::from([(0, 100)])),
+                (
+                    Outcome::Attestation(1),
+                    PayoutWeights::from([(0, 50), (1, 50)]),
+                ),
+            ]
+            .into(),
+            fee_rate: FeeRate::from_sat_per_vb_u32(1),
+            funding_value: Amount::from_sat(2_000),
+            relative_locktime_block_delta: 72,
+        };
+        let mut competition = Competition::new(&event());
+        assert!(!competition.refunds_every_entry(), "no contract yet");
+        competition.contract_parameters = Some(params);
+        competition.event_announcement = Some(locking);
+        assert!(!competition.refunds_every_entry(), "not attested yet");
+
+        competition.attestation = Some(attestation(20).into());
+        assert!(!competition.refunds_every_entry(), "a winner takes the pot");
+        competition.attestation = Some(attestation(21).into());
+        assert!(competition.refunds_every_entry());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1031,6 +1082,27 @@ impl Competition {
         }
 
         Ok(latest_signing_end)
+    }
+
+    /// The attested outcome pays every entry the same share. That is the contract's refund
+    /// outcome, which the oracle attests when no station reported inside the window: no
+    /// ranking of the paid places gives every player an equal weight.
+    pub fn refunds_every_entry(&self) -> bool {
+        let Some(params) = self.contract_parameters.as_ref() else {
+            return false;
+        };
+        let Ok(outcome) = self.get_current_outcome() else {
+            return false;
+        };
+        params.players.len() > 1
+            && params.outcome_payouts.get(&outcome).is_some_and(|weights| {
+                weights.len() == params.players.len()
+                    && weights
+                        .values()
+                        .max()
+                        .zip(weights.values().min())
+                        .is_some_and(|(max, min)| max - min <= 1)
+            })
     }
 
     pub(crate) fn get_current_outcome(&self) -> Result<Outcome, anyhow::Error> {

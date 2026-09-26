@@ -3150,6 +3150,17 @@ impl Coordinator {
         Ok(competition)
     }
 
+    /// How far the Arkade escrow refunds of `competition_id`, or of every competition, have got.
+    pub async fn refund_progress(
+        &self,
+        competition_id: Option<Uuid>,
+    ) -> Result<std::collections::HashMap<Uuid, super::RefundProgress>, Error> {
+        Ok(self
+            .competition_store
+            .ark_refund_progress(competition_id)
+            .await?)
+    }
+
     pub async fn get_competitions(&self) -> Result<Vec<Competition>, Error> {
         self.competition_store
             .get_competitions(false)
