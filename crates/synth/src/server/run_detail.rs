@@ -559,7 +559,7 @@ pub(super) async fn run_live(state: &Dashboard, id: &str) -> Option<Markup> {
     let run = view.money();
     let rows = money::rows(&run);
     Some(html! {
-        (run_section(&view.run, live_step.as_deref(), now))
+        (run_section(&view.run, view.trail.as_ref(), live_step.as_deref(), now))
         (money_section(&view, now))
         @if let Some(stuck) = stuck::block(&run, now) { (stuck) }
         (hops_section(&view, &rows))
@@ -573,7 +573,13 @@ pub(super) async fn run_live(state: &Dashboard, id: &str) -> Option<Markup> {
     })
 }
 
-fn run_section(run: &TestRun, live_step: Option<&str>, now: OffsetDateTime) -> Markup {
+fn run_section(
+    run: &TestRun,
+    trail: Option<&Trail>,
+    live_step: Option<&str>,
+    now: OffsetDateTime,
+) -> Markup {
+    let money = trail.map(|trail| trail.money.label());
     let took = match (
         format::parse(&run.started_at),
         run.completed_at.as_deref().and_then(format::parse),
@@ -584,7 +590,10 @@ fn run_section(run: &TestRun, live_step: Option<&str>, now: OffsetDateTime) -> M
         _ => None,
     };
     html! {
-        h1 { (run.scenario) " " span class=(format!("badge {}", run.status)) { (run.status) } }
+        h1 { (run.scenario) " " (routes::run_status(&run.status, money)) }
+        @if run.status == "passed" && money == Some("stuck") {
+            p.note { "Its steps passed, but its money is stuck: see where it is held below." }
+        }
         @if let Some(step) = live_step {
             p.running { "Now: " strong { (step) } }
         }

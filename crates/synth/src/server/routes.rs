@@ -225,7 +225,7 @@ pub(super) async fn dashboard_live(
                         tr {
                             td { a href=(format!("/runs/{}", run.id)) title=(run.id) { (short_id(&run.id)) } }
                             td { (run.scenario) }
-                            td { span class=(format!("badge {}", run.status)) { (run.status) } }
+                            td { (run_status(&run.status, run.money.as_deref())) }
                             td {
                                 @match run.money.as_deref() {
                                     Some(money) => span class=(format!("badge {money}")) { (label_words(money)) },
@@ -563,6 +563,19 @@ async fn history(
     Json(serde_json::json!({ "runs": runs }))
 }
 
+/// A run's status badge. A run whose steps passed but whose money is stuck now reads as stuck, so
+/// it never shows green over money nobody can move. Runs that finished before synth failed them
+/// for it keep "passed" in the database, so this is decided when the page is drawn.
+pub(super) fn run_status(status: &str, money: Option<&str>) -> Markup {
+    if status == "passed" && money == Some("stuck") {
+        html! {
+            span class="badge stuck" title="Its steps passed, but its money is stuck" { "money stuck" }
+        }
+    } else {
+        html! { span class=(format!("badge {status}")) { (status) } }
+    }
+}
+
 fn status_class(status: &ScenarioStatus) -> &'static str {
     match status {
         ScenarioStatus::Passed => "passed",
@@ -590,7 +603,10 @@ mod tests {
 
     /// A run whose contract failed with its winners unpaid, as run 01a0d0f5's did, with every hop
     /// synth follows and the stuck block: the heaviest run page there is.
-    async fn seed_stuck_run(db: &SynthDb, competition: &serde_json::Value) -> String {
+    ///
+    /// With `fail` unset its status stays "passed", as for a run that finished before synth
+    /// failed runs for stuck money.
+    async fn seed_stuck_run(db: &SynthDb, competition: &serde_json::Value, fail: bool) -> String {
         use serde_json::json;
         let hash = |n: u8| hex::encode([n; 32]);
         let address = "freya@lnurl.5day4cast.com";
@@ -673,12 +689,62 @@ mod tests {
                 trail: &trail,
                 follow: true,
                 step: Some(("money_stuck", 1, Some(reason), "{}")),
-                fail_passed_run: Some(reason),
+                fail_passed_run: fail.then_some(reason),
             },
         )
         .await
         .unwrap();
         run
+    }
+
+    /// A dashboard over one stuck run that passed its steps, and that run's id.
+    async fn stuck_dashboard(directory: &tempfile::TempDir) -> (Dashboard, String) {
+        let db = SynthDb::new(&directory.path().join("synth.sqlite").display().to_string())
+            .await
+            .unwrap();
+        let competition: serde_json::Value =
+            serde_json::from_str(include_str!("../fixtures/lab-competition.json")).unwrap();
+        let run = seed_stuck_run(&db, &competition, false).await;
+        (Dashboard::for_tests(db), run)
+    }
+
+    /// The text between `start` and the `end` after it.
+    fn between<'a>(page: &'a str, start: &str, end: &str) -> &'a str {
+        let from = page
+            .find(start)
+            .unwrap_or_else(|| panic!("no {start} in {page}"));
+        let rest = &page[from..];
+        &rest[..rest.find(end).unwrap_or(rest.len())]
+    }
+
+    #[tokio::test]
+    async fn a_run_that_passed_with_its_money_stuck_reads_as_stuck() {
+        let directory = tempfile::tempdir().unwrap();
+        let (dashboard, run) = stuck_dashboard(&directory).await;
+        let page = super::super::run_detail::run_live(&dashboard, &run)
+            .await
+            .unwrap()
+            .into_string();
+        let header = between(&page, "<h1>", "</h1>");
+        assert!(header.contains(r#"class="badge stuck""#), "{header}");
+        assert!(header.contains("money stuck"), "{header}");
+        assert!(!header.contains(r#"class="badge passed""#), "{header}");
+        assert!(!header.contains(">passed<"), "{header}");
+        assert!(page.contains("Its steps passed, but its money is stuck"));
+
+        let home = dashboard_live(&dashboard).await.into_string();
+        let recent = between(&home, "Recent Runs", "</section>");
+        assert!(recent.contains("money stuck"), "{recent}");
+        assert!(!recent.contains(r#"class="badge passed""#), "{recent}");
+    }
+
+    #[test]
+    fn only_a_passed_run_with_stuck_money_is_relabelled() {
+        let badge = |status, money| run_status(status, money).into_string();
+        assert!(badge("passed", Some("paid_out")).contains(r#"class="badge passed""#));
+        assert!(badge("passed", None).contains(r#"class="badge passed""#));
+        assert!(badge("failed", Some("stuck")).contains(r#"class="badge failed""#));
+        assert!(badge("passed", Some("stuck")).contains("money stuck"));
     }
 
     /// Pages render from synth's own database. With a year of hourly runs behind it, and a run
@@ -704,7 +770,7 @@ mod tests {
         })
         .to_string();
         let runs = db.seed_history(24 * 365, &trail).await.unwrap();
-        let stuck = seed_stuck_run(&db, &competition).await;
+        let stuck = seed_stuck_run(&db, &competition, true).await;
         let dashboard = Dashboard::for_tests(db.clone());
         eprintln!(
             "seeded {} runs at {path}; stuck run {stuck}",
