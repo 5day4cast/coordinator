@@ -637,33 +637,35 @@ fn hops_section(view: &RunView, rows: &[Row]) -> Markup {
     html! {
         section {
             h2 { "Every hop" }
-            div.scroll { table.trail {
+            // The money columns come first, so a long id never pushes them out of view; on a
+            // phone each hop stacks into a card of its own.
+            div.scroll { table.trail.stack {
                 thead { tr {
-                    th { "Status" } th { "Step" } th { "From → to" } th.num { "Sats" } th.num { "Fee" }
+                    th { "Status" } th { "Step" } th.num { "Sats" } th.num { "Fee" } th { "From → to" }
                     th { "ID" } th { "Look it up" }
                 } }
                 tbody {
                     @for row in rows {
                         tr {
-                            td { span class=(format!("badge {}", row.status.class())) { (row.status.class()) } }
-                            td { (row.step) }
-                            td { (row.from) " → " (row.to) }
-                            td.num { @if let Some(sats) = row.amount_sats { (format::sats(sats)) } @else { "-" } }
-                            td.num { (row.fee_sats.as_deref().map_or("-".to_string(), format::group)) }
-                            td {
-                                (copyable(&row.id))
+                            td data-label="Status" { span class=(format!("badge {}", row.status.class())) { (row.status.class()) } }
+                            td data-label="Step" { (row.step) }
+                            td.num data-label="Sats" { @if let Some(sats) = row.amount_sats { (format::sats(sats)) } @else { "-" } }
+                            td.num data-label="Fee" { (row.fee_sats.as_deref().map_or("-".to_string(), format::group)) }
+                            td data-label="From → to" { (endpoint(&row.from)) " → " (endpoint(&row.to)) }
+                            td data-label="ID" {
+                                (format::copyable_short(&row.id))
                                 @if let Some(preimage) = &row.preimage {
-                                    br; span.note { "preimage " } (copyable(preimage))
+                                    br; span.note { "preimage " } (format::copyable_short(preimage))
                                 }
                             }
-                            td {
+                            td data-label="Look it up" {
                                 @if let Some(link) = &row.link {
-                                    a href=(link) rel="noreferrer" { (link) }
+                                    a href=(link) rel="noreferrer" title=(link) { (format::link_text(link)) }
                                 }
                                 @for lookup in &row.lookups {
                                     div.lookup {
                                         @if let Some(on) = &lookup.on { span.note { "on " (on) } br; }
-                                        (copyable(&lookup.command))
+                                        (format::copyable_command(&lookup.command))
                                     }
                                 }
                                 @if let Some(note) = &row.note { div.note { (note) } }
@@ -691,6 +693,17 @@ fn hops_section(view: &RunView, rows: &[Row]) -> Markup {
                 a href=(format!("/runs/{run_id}/trail.tsv")) { "trail.tsv" }
             }
         }
+    }
+}
+
+/// One end of a hop. A long bare address or id, such as an escrow's Arkade address, is shortened
+/// with a button to copy it whole; names, Lightning Addresses and phrases are shown as they are.
+fn endpoint(end: &str) -> Markup {
+    let bare = !end.contains(char::is_whitespace) && !end.contains('@');
+    if bare && end.chars().count() > 40 {
+        format::copyable_short(end)
+    } else {
+        html! { (end) }
     }
 }
 

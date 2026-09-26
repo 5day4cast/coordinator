@@ -68,14 +68,26 @@ details summary { cursor: pointer; }
 .ledger tr.total td { border-top: 2px solid var(--rule); font-weight: bold; }
 .flag { color: var(--failed); }
 
-/* The hops: each lookup command on its own line, the node it runs on above it. */
+/* The hops: each lookup command on its own line, the node it runs on above it. Long ids,
+   addresses and links wrap anywhere, so no single one widens the table past its box. */
 .lookup { margin: 2px 0; }
+table.trail td, table.stack td { overflow-wrap: anywhere; }
+table.trail td.num, table.stack td.num { overflow-wrap: normal; }
+table.trail { font-size: 0.95em; }
+table.trail .badge { font-size: 0.8em; }
 
 @media (max-width: 640px) {
   body { padding: 8px; }
   th, td { padding: 4px; }
   .box { flex-basis: 100%; }
   .arrow { transform: rotate(90deg); }
+  /* A wide table stacks on a phone: each row a card, each cell under its column's name. */
+  table.stack, table.stack tbody, table.stack tr, table.stack td { display: block; width: 100%; }
+  table.stack thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  table.stack tr { border-bottom: 2px solid var(--rule); padding: 6px 0; }
+  table.stack td { border: none; padding: 2px 4px; }
+  table.stack td.num { text-align: left; }
+  table.stack td[data-label]::before { content: attr(data-label); display: block; color: var(--muted); font-size: 0.8em; }
 }
 
 /* Money that is stuck: what holds it, laid out to debug. */

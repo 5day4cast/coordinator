@@ -376,21 +376,22 @@ fn stuck_money(
                     }
                     ". Each run's page lays out what holds it and what should move it."
                 }
-                div.scroll { table {
+                // On a phone each run stacks into a card, so the reason is never cut off.
+                div.scroll { table.stack {
                     thead { tr { th { "Run" } th { "Held since" } th.num { "Sats" } th { "Nearest expiry" } th { "Why" } } }
                     tbody {
                         @for (run, held) in &held {
                             tr {
-                                td { a href=(format!("/runs/{}", run.run.id)) title=(run.run.id) { (short_id(&run.run.id)) } br; span.note { (run.run.scenario) } }
-                                td { (format::time(held.since, now)) }
-                                td.num { (format::sats(held.sats)) }
-                                td {
+                                td data-label="Run" { a href=(format!("/runs/{}", run.run.id)) title=(run.run.id) { (short_id(&run.run.id)) } br; span.note { (run.run.scenario) } }
+                                td data-label="Held since" { (format::time(held.since, now)) }
+                                td.num data-label="Sats" { (format::sats(held.sats)) }
+                                td data-label="Nearest expiry" {
                                     @match held.nearest_expiry.and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok()) {
                                         Some(at) => (format::time(at, now)),
                                         None => span.note { "not known" },
                                     }
                                 }
-                                td { (held.reason) }
+                                td data-label="Why" { (held.reason) }
                             }
                         }
                     }
@@ -407,16 +408,16 @@ fn stuck_money(
                         "ark-swapd says these paid an escrow, or were settled, but records no escrow output, "
                         "so nothing can spend or refund them until it is found. Not all are synth's."
                     }
-                    div.scroll { table {
+                    div.scroll { table.stack {
                         thead { tr { th { "Swap" } th { "State" } th.num { "Sats" } th { "Escrow address" } th { "Run" } } }
                         tbody {
                             @for swap in swaps {
                                 tr {
-                                    td { (format::copyable(&swap.id.to_string())) br; span.note { (swap_created(swap.created_at, now)) } }
-                                    td { (swap.state) @if let Some(error) = &swap.error { br; span.note { (error) } } }
-                                    td.num { (format::sats(swap.amount_sat)) }
-                                    td { (format::copyable(&swap.escrow_address)) }
-                                    td {
+                                    td data-label="Swap" { (format::copyable(&swap.id.to_string())) br; span.note { (swap_created(swap.created_at, now)) } }
+                                    td data-label="State" { (swap.state) @if let Some(error) = &swap.error { br; span.note { (error) } } }
+                                    td.num data-label="Sats" { (format::sats(swap.amount_sat)) }
+                                    td data-label="Escrow address" { (format::copyable_short(&swap.escrow_address)) }
+                                    td data-label="Run" {
                                         @match run_of(&swap.payment_hash) {
                                             Some(run) => a href=(format!("/runs/{run}")) { (short_id(&run)) },
                                             None => span.note { "not a stuck synth run" },
@@ -745,6 +746,77 @@ mod tests {
         assert!(badge("passed", None).contains(r#"class="badge passed""#));
         assert!(badge("failed", Some("stuck")).contains(r#"class="badge failed""#));
         assert!(badge("passed", Some("stuck")).contains("money stuck"));
+    }
+
+    #[tokio::test]
+    async fn the_hops_table_keeps_its_money_columns_in_view() {
+        let directory = tempfile::tempdir().unwrap();
+        let (dashboard, run) = stuck_dashboard(&directory).await;
+        let page = super::super::run_detail::run_live(&dashboard, &run)
+            .await
+            .unwrap()
+            .into_string();
+        let table = between(&page, r#"<table class="trail stack">"#, "</table>");
+        let head = between(table, "<thead>", "</thead>");
+        let column = |name: &str| {
+            head.find(name)
+                .unwrap_or_else(|| panic!("no {name} in {head}"))
+        };
+        assert!(column("Sats") < column("From → to"), "{head}");
+        assert!(column("Fee") < column("From → to"), "{head}");
+        assert!(column("From → to") < column("ID"), "{head}");
+        // Every cell is labelled, for the stacked phone layout.
+        let body = between(table, "<tbody>", "</tbody>");
+        assert_eq!(
+            body.matches("<td").count(),
+            body.matches("data-label=").count(),
+            "{body}"
+        );
+        // The escrow's Arkade address is shortened in view and copied whole.
+        let address = format!("tark1{}", "q".repeat(60));
+        assert!(
+            body.contains(&format!(r#"data-copy="{address}""#)),
+            "{body}"
+        );
+        assert!(!body.contains(&format!(">{address}<")), "{body}");
+        assert!(!body.contains(&format!("{address} →")), "{body}");
+        assert!(body.contains("tark1qqq…"), "{body}");
+        // Hashes, ids and the hashes in lookup commands are shortened in view too, and links
+        // read as their host and last part.
+        for code in body.split(r#"<code class="id""#).skip(1) {
+            let text = &code[code.find('>').unwrap() + 1..code.find('<').unwrap()];
+            assert!(
+                text.split(' ').all(|word| word.chars().count() <= 40),
+                "{text}"
+            );
+        }
+        assert!(!body.contains(">http"), "{body}");
+        // Lightning Addresses stay whole.
+        assert!(body.contains("freya@lnurl.5day4cast.com"), "{body}");
+        // Amounts are grouped.
+        assert!(body.contains(">1,100<"), "{body}");
+        assert!(body.contains(">1,090<"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_stuck_money_table_stacks_and_groups_its_sats() {
+        let directory = tempfile::tempdir().unwrap();
+        let (dashboard, _) = stuck_dashboard(&directory).await;
+        let home = dashboard_live(&dashboard).await.into_string();
+        let stuck = between(&home, "Stuck money", "</section>");
+        assert!(stuck.contains("<strong>3,000 sats</strong>"), "{stuck}");
+        let table = between(stuck, r#"<table class="stack">"#, "</table>");
+        assert!(table.contains(r#"data-label="Why""#), "{table}");
+        assert!(table.contains(">3,000<"), "{table}");
+    }
+
+    #[test]
+    fn stacked_tables_turn_into_cards_on_a_phone() {
+        let css = include_str!("assets/synth.css");
+        let phone = between(css, "@media (max-width: 640px)", "\n}\n");
+        assert!(phone.contains("table.stack tr"), "{phone}");
+        assert!(phone.contains("attr(data-label)"), "{phone}");
+        assert!(css.contains("table.trail td, table.stack td { overflow-wrap: anywhere; }"));
     }
 
     /// Pages render from synth's own database. With a year of hourly runs behind it, and a run
