@@ -52,7 +52,7 @@ pub struct LoginKeys {
 
 impl LoginKeys {
     pub fn derive(username: &str, password: &str) -> Result<Self, LoginError> {
-        Ok(Self::from_stretched(&stretch(username, password)?))
+        Ok(Self::from_stretched(&*stretch(username, password)?))
     }
 
     /// The keys from [`stretch`]'s output. Cheap: log-in stretches the
@@ -159,7 +159,7 @@ mod tests {
     const TEST_LOG_N: u8 = 4;
 
     fn keys(username: &str, password: &str) -> LoginKeys {
-        LoginKeys::from_stretched(&stretch_with(username, password, TEST_LOG_N).unwrap())
+        LoginKeys::from_stretched(&*stretch_with(username, password, TEST_LOG_N).unwrap())
     }
 
     #[test]

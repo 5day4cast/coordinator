@@ -110,7 +110,7 @@ impl LoginCredentials {
         let result = if stretched.len() == 32 {
             bytes.copy_from_slice(stretched);
             Ok(Self {
-                inner: LoginKeys::from_stretched(&bytes),
+                inner: LoginKeys::from_stretched(&*bytes),
             })
         } else {
             Err(JsValue::from_str("stretched login key must be 32 bytes"))
