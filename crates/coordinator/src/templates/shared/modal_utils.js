@@ -1,5 +1,9 @@
 function openModal($modal) {
     if (!$modal) return;
+    // A dialog opened from the phone menu replaces it: the menu is closed, so it isn't still
+    // open over the page once the dialog is done (after logging in, say).
+    const menu = document.getElementById('navToggle');
+    if (menu) menu.checked = false;
     $modal.classList.add('is-active');
     document.documentElement.classList.add('is-clipped');
 }
