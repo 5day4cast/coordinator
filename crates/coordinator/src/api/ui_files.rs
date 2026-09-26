@@ -1,12 +1,12 @@
-//! Files served from the UI directory: the WASM package that wasm-pack builds
-//! outside Cargo. Everything else the browser loads is embedded (see
-//! `templates::assets`).
+//! Files served from the UI directory: the WASM package, built separately
+//! (`scripts/build-wasm.sh`, or the flake). Everything else the browser loads
+//! is embedded (see `templates::assets`).
 //!
 //! tower-http's `ServeDir` does the serving: safe paths, content types,
-//! conditional and range requests, and a `.gz` file beside the requested one
-//! when the browser accepts gzip. Pages request the package with
-//! `?v=<hash>`, the hash the server computed at startup, so a versioned
-//! request may be cached for a year.
+//! conditional and range requests, and a `.br` or `.gz` file beside the
+//! requested one when the browser accepts brotli or gzip. Pages request the
+//! package with `?v=<hash>`, the hash the server computed at startup, so a
+//! versioned request may be cached for a year.
 
 use std::{io::Read, path::Path, sync::Arc};
 
@@ -46,6 +46,7 @@ pub fn package_version(ui_dir: &str) -> String {
 /// `/ui/*`, served from `ui_dir`. `version` is [`package_version`].
 pub fn router<S: Clone + Send + Sync + 'static>(ui_dir: &str, version: String) -> Router<S> {
     let files = ServeDir::new(ui_dir)
+        .precompressed_br()
         .precompressed_gzip()
         .append_index_html_on_directories(false);
     Router::new()
@@ -149,31 +150,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_gzipped_copy_is_served_to_browsers_that_accept_it() {
+    async fn a_precompressed_copy_is_served_to_browsers_that_accept_it() {
         let directory = package();
         let ui_dir = directory.path().join("ui");
         std::fs::write(ui_dir.join("pkg/coordinator_wasm.js.gz"), b"gzipped bytes").unwrap();
+        std::fs::write(ui_dir.join("pkg/coordinator_wasm.js.br"), b"brotli bytes").unwrap();
         let router: Router = router(ui_dir.to_str().unwrap(), String::new());
 
-        let gzip = get(
-            &router,
-            "/ui/pkg/coordinator_wasm.js",
-            &[("accept-encoding", "br;q=1, gzip;q=0.5")],
-        )
-        .await;
-        assert_eq!(gzip.headers()[header::CONTENT_ENCODING], "gzip");
-        assert_eq!(
-            to_bytes(gzip.into_body(), 100).await.unwrap(),
-            "gzipped bytes"
-        );
+        for (accept, encoding, body) in [
+            ("br;q=1, gzip;q=0.5", "br", "brotli bytes"),
+            ("gzip, deflate, br", "br", "brotli bytes"),
+            ("gzip", "gzip", "gzipped bytes"),
+            ("br;q=0.5, gzip;q=1", "gzip", "gzipped bytes"),
+        ] {
+            let response = get(
+                &router,
+                "/ui/pkg/coordinator_wasm.js",
+                &[("accept-encoding", accept)],
+            )
+            .await;
+            assert_eq!(
+                response.headers()[header::CONTENT_ENCODING],
+                encoding,
+                "{accept}"
+            );
+            assert_eq!(to_bytes(response.into_body(), 100).await.unwrap(), body);
+        }
 
         let plain = get(
             &router,
             "/ui/pkg/coordinator_wasm.js",
-            &[("accept-encoding", "gzip;q=0")],
+            &[("accept-encoding", "gzip;q=0, br;q=0")],
         )
         .await;
         assert!(!plain.headers().contains_key(header::CONTENT_ENCODING));
+
+        // Without a brotli copy, the gzip one is sent, still typed as WASM
+        // so browsers can compile it while it downloads.
+        std::fs::write(
+            ui_dir.join("pkg/coordinator_wasm_bg.wasm.gz"),
+            b"gzipped wasm",
+        )
+        .unwrap();
+        let wasm = get(
+            &router,
+            "/ui/pkg/coordinator_wasm_bg.wasm",
+            &[("accept-encoding", "br, gzip")],
+        )
+        .await;
+        assert_eq!(wasm.headers()[header::CONTENT_ENCODING], "gzip");
+        assert_eq!(wasm.headers()[header::CONTENT_TYPE], "application/wasm");
     }
 
     #[tokio::test]
