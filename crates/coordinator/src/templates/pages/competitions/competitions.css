@@ -118,6 +118,18 @@
   flex-direction: column;
 }
 
+/* A long status ("Didn't fill: refund pending") wraps inside its column rather than running
+   into the window beside it. */
+.cell-status {
+  min-width: 0;
+}
+
+.cell-status .badge {
+  max-width: 100%;
+  white-space: normal;
+  border-radius: 0.75rem;
+}
+
 .cell-note {
   font-size: 0.8rem;
   color: var(--bulma-text-weak);
