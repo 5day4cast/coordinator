@@ -11,6 +11,9 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
+/// The scenarios synth runs, by the names runs are started with.
+pub const SCENARIOS: &[&str] = &["full_lifecycle", "escrow_refund"];
+
 /// The run in progress, and the step it is on.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LiveRun {
@@ -179,13 +182,31 @@ impl Runner {
         scenario: &str,
         config: ScenarioConfig,
     ) -> Result<ScenarioResult> {
-        if !matches!(scenario, "full_lifecycle" | "escrow_refund") {
-            error!("Unknown scenario: {}", scenario);
-            return Err(anyhow::anyhow!("Unknown scenario: {}", scenario));
-        }
-        let config_json = serde_json::to_string(&config)?;
-        let run_id = self.db.create_run(scenario, Some(&config_json)).await?;
+        let run_id = self.record_run(scenario, &config).await?;
+        self.run_recorded(run_id, scenario, config).await
+    }
 
+    /// Check `scenario` is one synth runs, and record a run of it, returning the run's id. Run
+    /// it with [`Runner::run_recorded`].
+    pub async fn record_run(&self, scenario: &str, config: &ScenarioConfig) -> Result<String> {
+        if !SCENARIOS.contains(&scenario) {
+            error!("Unknown scenario: {}", scenario);
+            return Err(anyhow::anyhow!(
+                "Unknown scenario: {scenario}; expected one of {}",
+                SCENARIOS.join(", ")
+            ));
+        }
+        let config_json = serde_json::to_string(config)?;
+        self.db.create_run(scenario, Some(&config_json)).await
+    }
+
+    /// Run the scenario of a run [`Runner::record_run`] recorded.
+    pub async fn run_recorded(
+        &self,
+        run_id: String,
+        scenario: &str,
+        config: ScenarioConfig,
+    ) -> Result<ScenarioResult> {
         info!("Starting scenario '{}' (run: {})", scenario, run_id);
         *self.live.lock().expect("live run lock") = Some(LiveRun {
             run_id: run_id.clone(),
