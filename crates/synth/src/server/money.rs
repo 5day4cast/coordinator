@@ -4,7 +4,7 @@
 use serde::Serialize;
 use uuid::Uuid;
 
-use super::format::msat_as_sats;
+use super::format::{msat_as_sats, sats};
 use crate::trail::{
     contracted, payout_states, EntryPayment, EntryTrace, Money, PayeeCheck, PayoutState, Trail,
 };
@@ -732,7 +732,7 @@ pub fn ledger(run: &Run) -> Ledger {
             if *escrowed > paid {
                 ledger.flags.push(format!(
                     "ark-swapd put {} sats more in {}'s escrow than {} paid",
-                    escrowed - paid,
+                    sats(escrowed - paid),
                     entry.user,
                     entry.user
                 ));
@@ -809,26 +809,34 @@ pub fn ledger(run: &Run) -> Ledger {
             let expected = entry_fee * ledger.entries_paid as u64;
             if pot != expected {
                 ledger.flags.push(format!(
-                    "the pot holds {pot} sats, but {} entries of {entry_fee} make {expected}",
-                    ledger.entries_paid
+                    "the pot holds {} sats, but {} entries of {} make {}",
+                    sats(pot),
+                    ledger.entries_paid,
+                    sats(entry_fee),
+                    sats(expected)
                 ));
             }
         }
         if let Some(escrowed) = ledger.escrowed.filter(|escrowed| pot > *escrowed) {
             ledger.flags.push(format!(
-                "the pot holds {pot} sats, more than the {escrowed} the escrows held"
+                "the pot holds {} sats, more than the {} the escrows held",
+                sats(pot),
+                sats(escrowed)
             ));
         }
         if pot > paid_in {
             ledger.flags.push(format!(
-                "the pot holds {pot} sats, more than the {paid_in} the players paid"
+                "the pot holds {} sats, more than the {} the players paid",
+                sats(pot),
+                sats(paid_in)
             ));
         }
     }
     if ledger.paid_out > ledger.owed && ledger.owed > 0 {
         ledger.flags.push(format!(
             "{} sats were paid out, more than the {} owed",
-            ledger.paid_out, ledger.owed
+            sats(ledger.paid_out),
+            sats(ledger.owed)
         ));
     }
 
@@ -846,11 +854,12 @@ pub fn ledger(run: &Run) -> Ledger {
             match ledger.remainder {
                 0 => {}
                 missing if missing > 0 => ledger.flags.push(format!(
-                    "{missing} sats owed to the winners have no confirmed payout"
+                    "{} sats owed to the winners have no confirmed payout",
+                    sats(missing.unsigned_abs())
                 )),
                 extra => ledger.flags.push(format!(
                     "{} sats more were paid out than the winners were owed",
-                    -extra
+                    sats(extra.unsigned_abs())
                 )),
             }
         } else if trail.ended() {
@@ -872,9 +881,10 @@ pub fn ledger(run: &Run) -> Ledger {
             let scenario_covered = run.scenario_refunds.len() >= paid.len();
             ledger.remainder = if scenario_covered { 0 } else { held as i64 };
             if ledger.remainder > 0 {
-                ledger
-                    .flags
-                    .push(format!("{held} sats in the escrows were never refunded"));
+                ledger.flags.push(format!(
+                    "{} sats in the escrows were never refunded",
+                    sats(held)
+                ));
             }
         }
     }
@@ -1123,7 +1133,7 @@ mod tests {
             ledger.flags,
             [
                 "ark-swapd put 50 sats more in alice's escrow than alice paid",
-                "the pot holds 3000 sats, more than the 2950 the escrows held",
+                "the pot holds 3,000 sats, more than the 2,950 the escrows held",
             ]
         );
         assert_eq!(ledger.swap_fees, Some(350));
@@ -1166,7 +1176,7 @@ mod tests {
         assert_eq!(ledger.remainder, 3000);
         assert_eq!(
             ledger.flags,
-            ["3000 sats owed to the winners have no confirmed payout"]
+            ["3,000 sats owed to the winners have no confirmed payout"]
         );
         assert_eq!(ledger.payout_routing_fee_msat, None);
 
@@ -1259,7 +1269,7 @@ mod tests {
         assert_eq!(ledger.remainder, 2180);
         assert_eq!(
             ledger.flags,
-            ["2180 sats in the escrows were never refunded"]
+            ["2,180 sats in the escrows were never refunded"]
         );
     }
 

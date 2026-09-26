@@ -23,7 +23,7 @@ pub fn block(run: &Run, now: OffsetDateTime) -> Option<Markup> {
         section.stuck {
             h2 {
                 @if still { span class="badge stuck" { "Stuck" } " " } @else { span class="badge was_stuck" { "Was stuck" } " " }
-                (held.sats) " sats held"
+                (format::sats(held.sats)) " sats held"
             }
             p {
                 (held.reason)
@@ -141,7 +141,7 @@ fn escrow_facts(trail: &Trail, entry: &EntryTrace, links: &Links, now: OffsetDat
             (fact("Arkade transaction", swap.and_then(|swap| swap.ark_txid.as_deref()), None))
             (fact("Escrow address", swap.map(|swap| swap.escrow_address.as_str()), None))
             (fact("Escrow output", swap.and_then(|swap| swap.escrow_vtxo.as_deref()),
-                swap.map(|swap| html! { (swap.amount_sat) " sats"
+                swap.map(|swap| html! { (format::sats(swap.amount_sat)) " sats"
                     @if swap.funded_without_vtxo() { ", but ark-swapd records no output" } })))
             @match swap.and_then(|swap| Some((swap.escrow_vtxo.as_deref()?, swap.vtxo.as_ref()))) {
                 Some((_, Some(vtxo))) => tr {
@@ -355,21 +355,28 @@ fn contract_facts(trail: &Trail, links: &Links) -> Markup {
             })))
             @for closing in &trail.closing_txs {
                 (fact("Delta or expiry", Some(&closing.txid), Some(html! {
-                    @if let Some(value) = closing.value_sat { (value) " sats out · " }
+                    @if let Some(value) = closing.value_sat { (format::sats(value)) " sats out · " }
                     a href=(links.tx(&closing.txid)) rel="noreferrer" { "on the explorer" }
                 })))
             }
             @for (payout, state) in trail.payouts.iter().zip(&states).filter(|(_, state)| state.is_owed()) {
-                (fact(&format!("{} is owed", payout.user), Some(&payout.owed_sats.to_string()), Some(html! {
-                    (match state {
-                        PayoutState::Paid => "paid",
-                        PayoutState::SentUnconfirmed => "sent, not confirmed",
-                        PayoutState::OtherNode => "paid to another node",
-                        PayoutState::Owed | PayoutState::NeverSent => "never sent",
-                        PayoutState::OwedNothing => "owed nothing",
-                    })
-                    @if let Some(hash) = &payout.payment_hash { " · payment hash " (copyable(hash)) }
-                })))
+                tr {
+                    th { (payout.user) " is owed" }
+                    td {
+                        (format::sats(payout.owed_sats)) " sats"
+                        br;
+                        span.note {
+                            (match state {
+                                PayoutState::Paid => "paid",
+                                PayoutState::SentUnconfirmed => "sent, not confirmed",
+                                PayoutState::OtherNode => "paid to another node",
+                                PayoutState::Owed | PayoutState::NeverSent => "never sent",
+                                PayoutState::OwedNothing => "owed nothing",
+                            })
+                            @if let Some(hash) = &payout.payment_hash { " · payment hash " (copyable(hash)) }
+                        }
+                    }
+                }
             }
             tr.next { th { "Moves it next" } td { strong { (component) } br; (why) } }
         } }
@@ -493,7 +500,7 @@ mod tests {
         assert!(why.contains("records no escrow output"), "{why}");
         let page = render(&trail, std::slice::from_ref(&entry));
         assert!(page.contains("the player was charged"));
-        assert!(page.contains("1090 sats held"));
+        assert!(page.contains("1,090 sats held"));
     }
 
     /// A cancelled competition's funded escrow, its refund leaf open, and no refund: coordinator

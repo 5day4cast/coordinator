@@ -257,7 +257,7 @@ pub(super) async fn dashboard_live(
                     @match &observation.channel {
                         Some(channel) => p {
                             "Lightning: the payer, " strong { (name(observation.payer.as_ref(), "the payer")) }
-                            ", holds " strong { (channel.local_sats) } " of " (channel.local_sats + channel.remote_sats)
+                            ", holds " strong { (format::sats(channel.local_sats)) } " of " (format::sats(channel.local_sats + channel.remote_sats))
                             " sats in channel " code { (channel.id) } " with "
                             strong { (name(observation.source.as_ref(), "the source node")) }
                             ", rebalancing below " (rebalancer.config().low_percent) "%."
@@ -268,9 +268,9 @@ pub(super) async fn dashboard_live(
                         (None, _) => p.note { "Arkade: ark-swapd's wallet is not watched." },
                         (Some(_), None) => p.error { "Arkade: ark-swapd did not report its wallet." },
                         (Some(arkade), Some(wallet)) => p {
-                            "Arkade: ark-swapd can fund " strong { (wallet.spendable_sat()) }
-                            " sats of escrows, topped up with " (arkade.top_up_sats)
-                            " sats on-chain below " (arkade.low_sats) "."
+                            "Arkade: ark-swapd can fund " strong { (format::sats(wallet.spendable_sat())) }
+                            " sats of escrows, topped up with " (format::sats(arkade.top_up_sats))
+                            " sats on-chain below " (format::sats(arkade.low_sats)) "."
                         },
                     }
                     @if let Some(checked_at) = observation.checked_at {
@@ -295,10 +295,10 @@ pub(super) async fn dashboard_live(
                                         @if let Some(ends) = &channel_ends { br; span.note { (ends) } }
                                     }
                                 }
-                                td.num { (rebalance.amount_sats) " sats" }
+                                td.num { (format::sats_signed(rebalance.amount_sats)) " sats" }
                                 td.num {
-                                    (rebalance.local_before_sats)
-                                    @if rebalance.capacity_sats > 0 { " / " (rebalance.capacity_sats) }
+                                    (format::sats_signed(rebalance.local_before_sats))
+                                    @if rebalance.capacity_sats > 0 { " / " (format::sats_signed(rebalance.capacity_sats)) }
                                 }
                                 td { span class=(format!("badge {}", rebalance.status)) { (rebalance.status) } }
                                 td {
@@ -370,7 +370,7 @@ fn stuck_money(
                 p.note { "No run's money is stuck." }
             } @else {
                 p {
-                    strong { (total) " sats" } " held by " (held.len()) " run(s)"
+                    strong { (format::sats(total)) " sats" } " held by " (held.len()) " run(s)"
                     @if let Some(at) = nearest.and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok()) {
                         "; the nearest escrow expiry or refund opening is " (format::time(at, now))
                     }
@@ -383,7 +383,7 @@ fn stuck_money(
                             tr {
                                 td { a href=(format!("/runs/{}", run.run.id)) title=(run.run.id) { (short_id(&run.run.id)) } br; span.note { (run.run.scenario) } }
                                 td { (format::time(held.since, now)) }
-                                td.num { (held.sats) }
+                                td.num { (format::sats(held.sats)) }
                                 td {
                                     @match held.nearest_expiry.and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok()) {
                                         Some(at) => (format::time(at, now)),
@@ -414,7 +414,7 @@ fn stuck_money(
                                 tr {
                                     td { (format::copyable(&swap.id.to_string())) br; span.note { (swap_created(swap.created_at, now)) } }
                                     td { (swap.state) @if let Some(error) = &swap.error { br; span.note { (error) } } }
-                                    td.num { (swap.amount_sat) }
+                                    td.num { (format::sats(swap.amount_sat)) }
                                     td { (format::copyable(&swap.escrow_address)) }
                                     td {
                                         @match run_of(&swap.payment_hash) {
@@ -525,9 +525,9 @@ async fn trigger_rebalance(
         (Ok(moved), true) => Html(
             html! {
                 "Rebalanced: "
-                (moved.channel_sats.map_or("nothing".to_string(), |sats| format!("{sats} sats")))
+                (moved.channel_sats.map_or("nothing".to_string(), |sats| format!("{} sats", format::sats(sats))))
                 " over the channel, "
-                (moved.arkade_sats.map_or("nothing".to_string(), |sats| format!("{sats} sats")))
+                (moved.arkade_sats.map_or("nothing".to_string(), |sats| format!("{} sats", format::sats(sats))))
                 " on-chain to ark-swapd."
             }
             .into_string(),

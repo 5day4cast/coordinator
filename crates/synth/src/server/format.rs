@@ -1,5 +1,6 @@
 //! Values as people read them: times as "02:12 UTC · 22 min ago", durations as "3m 58s", and
-//! amounts in sats with the millisats a routing fee comes in.
+//! amounts in sats grouped by thousands ("1,999,038"), with the millisats a routing fee comes in.
+//! The exports keep plain numbers; only pages group them.
 
 use maud::{html, Markup};
 use time::OffsetDateTime;
@@ -59,6 +60,37 @@ pub fn copyable(id: &str) -> Markup {
         code.id { (id) }
         @if !id.is_empty() { button.copy type="button" data-copy=(id) title="Copy" { "copy" } }
     }
+}
+
+/// An amount of sats as people read it: "40,700", "1,999,038".
+pub fn sats(sats: u64) -> String {
+    group(&sats.to_string())
+}
+
+/// A signed amount of sats, as [`sats`] writes it: "-1,100".
+pub fn sats_signed(sats: i64) -> String {
+    match sats {
+        negative if negative < 0 => format!("-{}", group(&negative.unsigned_abs().to_string())),
+        positive => group(&positive.to_string()),
+    }
+}
+
+/// A number written in digits, its whole part grouped by thousands: "1234.5" is "1,234.5".
+/// Anything else is left as it is.
+pub fn group(number: &str) -> String {
+    let (whole, rest) = number.split_at(number.find('.').unwrap_or(number.len()));
+    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) {
+        return number.to_string();
+    }
+    let mut grouped = String::with_capacity(number.len() + whole.len() / 3);
+    for (index, digit) in whole.chars().enumerate() {
+        if index > 0 && (whole.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped.push_str(rest);
+    grouped
 }
 
 /// A span of time to the nearest unit people use for it.
@@ -173,5 +205,21 @@ mod tests {
         assert_eq!(msat_as_sats(500), "0.5");
         assert_eq!(msat_as_sats(12_000), "12");
         assert_eq!(msat_as_sats(0), "0");
+    }
+
+    #[test]
+    fn sats_are_grouped_by_thousands() {
+        assert_eq!(sats(0), "0");
+        assert_eq!(sats(999), "999");
+        assert_eq!(sats(1_100), "1,100");
+        assert_eq!(sats(40_700), "40,700");
+        assert_eq!(sats(768_803), "768,803");
+        assert_eq!(sats(1_999_038), "1,999,038");
+        assert_eq!(sats_signed(-1_100), "-1,100");
+        assert_eq!(sats_signed(-5), "-5");
+        assert_eq!(sats_signed(3_000), "3,000");
+        assert_eq!(group("1234.001"), "1,234.001");
+        assert_eq!(group("0.5"), "0.5");
+        assert_eq!(group("-"), "-");
     }
 }
