@@ -2,6 +2,7 @@ pub mod api;
 pub mod config;
 pub mod domain;
 pub mod infra;
+pub mod metrics;
 pub mod startup;
 pub mod templates;
 

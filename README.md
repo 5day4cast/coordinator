@@ -146,6 +146,21 @@ token_file = "./creds/admin_token"
 
 Public request limits and NIP-98 origin configuration are described in [Request controls](docs/REQUEST_HARDENING.md).
 
+### Metrics
+
+Prometheus metrics are off by default. Set a listener address to serve
+`GET /metrics` on a socket of its own; every other path returns 404, and the
+public and admin listeners never serve metrics. The listener has no
+authentication, so bind it to loopback or a private network.
+
+```toml
+[metrics_settings]
+listen_addr = "127.0.0.1:9992"
+```
+
+`COORDINATOR_METRICS_LISTEN_ADDR` overrides the file; an empty value turns the
+listener off. Database-derived gauges are refreshed at most every 15 seconds.
+
 ### Operator access
 
 Operator routes are served only by the admin listener and require the token in

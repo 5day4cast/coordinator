@@ -384,9 +384,16 @@ impl CompetitionStore {
             .unwrap();
         let payout_id_str = payout_id.to_string();
 
-        self.db_connection
+        let newly_succeeded = self
+            .db_connection
             .execute_write(move |pool| async move {
                 let mut tx = pool.begin().await?;
+                let was_open: Option<bool> = sqlx::query_scalar(
+                    "SELECT succeed_at IS NULL AND failed_at IS NULL FROM payouts WHERE id = ?",
+                )
+                .bind(&payout_id_str)
+                .fetch_optional(&mut *tx)
+                .await?;
                 if let Some(proof) = payment_preimage.as_ref() {
                     let invoice: String = sqlx::query_scalar(
                         "SELECT payout_payment_request FROM payouts WHERE id = ?",
@@ -411,9 +418,13 @@ impl CompetitionStore {
                 .execute(&mut *tx)
                 .await?;
                 tx.commit().await?;
-                Ok(())
+                Ok(was_open.unwrap_or(false))
             })
-            .await
+            .await?;
+        if newly_succeeded {
+            crate::metrics::record_payout_result(true);
+        }
+        Ok(())
     }
 
     pub async fn mark_payout_failed(
@@ -429,9 +440,10 @@ impl CompetitionStore {
             .unwrap();
         let payout_id_str = payout_id.to_string();
 
-        self.db_connection
+        let newly_failed = self
+            .db_connection
             .execute_write(move |pool| async move {
-                sqlx::query(
+                let result = sqlx::query(
                     "UPDATE payouts
                     SET failed_at = ?, error = ?
                     WHERE id = ? AND succeed_at IS NULL AND failed_at IS NULL",
@@ -441,9 +453,13 @@ impl CompetitionStore {
                 .bind(payout_id_str)
                 .execute(&pool)
                 .await?;
-                Ok(())
+                Ok(result.rows_affected() > 0)
             })
-            .await
+            .await?;
+        if newly_failed {
+            crate::metrics::record_payout_result(false);
+        }
+        Ok(())
     }
 
     pub async fn get_payout(&self, payout_id: Uuid) -> Result<Option<EntryPayout>, sqlx::Error> {

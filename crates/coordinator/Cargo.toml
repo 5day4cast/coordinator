@@ -65,6 +65,9 @@ nostr.workspace = true
 log.workspace = true
 fern.workspace = true
 
+# Metrics
+prometheus.workspace = true
+
 # Error handling
 anyhow.workspace = true
 thiserror.workspace = true
