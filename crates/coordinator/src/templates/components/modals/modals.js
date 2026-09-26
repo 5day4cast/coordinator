@@ -261,7 +261,7 @@ class AuthManager {
       }
 
       if (!response.ok) {
-        throw new Error("Login failed");
+        throw new Error("Log-in failed");
       }
 
       const { encrypted_nsec, encrypted_bitcoin_private_key, network } =
@@ -292,7 +292,7 @@ class AuthManager {
           "password",
         )
           ? "Invalid username or password"
-          : "Login failed. Please try again.";
+          : "Log-in failed. Please try again.";
       }
     } finally {
       credentials.free();
@@ -321,7 +321,7 @@ class AuthManager {
           errorElement.textContent =
             "No Nostr extension found. Please install nos2x, Alby, or another NIP-07 compatible extension.";
         } else {
-          errorElement.textContent = "Login failed. Please try again.";
+          errorElement.textContent = "Log-in failed. Please try again.";
         }
       }
     }
@@ -499,7 +499,7 @@ class AuthManager {
       if (errorElement) {
         errorElement.textContent = error.message.includes("No NIP-07")
           ? "No Nostr extension found. Please install nos2x, Alby, or another NIP-07 compatible extension."
-          : "Registration failed. If you have already registered, please go to Login.";
+          : "Registration failed. If you have already registered, please log in.";
       }
     }
   }
@@ -732,7 +732,7 @@ class AuthManager {
 
     if (response.status === 401 || response.status === 403)
       throw new Error("UNAUTHORIZED");
-    if (!response.ok) throw new Error("Login failed");
+    if (!response.ok) throw new Error("Log-in failed");
 
     const { encrypted_bitcoin_private_key, network } = await response.json();
     if (this.network !== network) {

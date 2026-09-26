@@ -92,7 +92,7 @@ fn login_modal() -> Markup {
                         div class="field mt-4" {
                             div class="control" {
                                 button class="button is-info is-fullwidth" id="usernameLoginButton" {
-                                    "Login"
+                                    "Log in"
                                 }
                             }
                         }
@@ -241,7 +241,7 @@ fn register_modal() -> Markup {
 
                     p class="has-text-centered mt-5" {
                         a href="#" id="goToLoginButton" class="has-text-info" {
-                            "Already have an account? Login"
+                            "Already have an account? Log in"
                         }
                     }
                 }
@@ -319,7 +319,7 @@ fn forgot_password_modal() -> Markup {
 
                     p class="has-text-centered mt-5" {
                         a href="#" id="backToLoginFromForgot" class="has-text-info" {
-                            "Back to Login"
+                            "Back to log in"
                         }
                     }
                 }
