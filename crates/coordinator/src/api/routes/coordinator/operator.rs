@@ -115,7 +115,7 @@ pub async fn operator_competitions(
         .iter()
         .map(|c| OperatorCompetition::new(c, refunds.get(&c.id).copied()))
         .collect();
-    competitions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    competitions.sort_by_key(|c| std::cmp::Reverse(c.created_at));
     Ok(Json(competitions))
 }
 
