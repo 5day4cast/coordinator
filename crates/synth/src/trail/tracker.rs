@@ -1249,7 +1249,10 @@ fn held(
         (Money::Stuck { reason, since }, previous) => {
             let (sats, nearest_expiry) = holding(trail, entries);
             Some(match previous.filter(|held| held.until.is_none()) {
+                // Keep when it was first held, but say why it is held now: refunds that went
+                // through since then change the reason ("1 of 2 escrows were refunded").
                 Some(held) => Held {
+                    reason: reason.clone(),
                     sats,
                     nearest_expiry,
                     ..held
@@ -1827,6 +1830,52 @@ mod tests {
             Some(moved),
             "the record stays once the money moved"
         );
+    }
+
+    /// While money stays stuck, the stuck-money table gives the current reason, not the one from
+    /// when it was first found: it read "0 of 2 escrows were refunded" after one had been.
+    #[test]
+    fn stuck_money_keeps_its_reason_current() {
+        let since = time::macros::datetime!(2026-09-25 07:57:00 UTC);
+        let found = time::macros::datetime!(2026-09-25 18:18:00 UTC);
+        let later = time::macros::datetime!(2026-09-25 23:00:00 UTC);
+        let now_reason = "the competition was cancelled at 07:57 UTC before its contract, and 1 \
+                          of 2 escrows were refunded";
+        let trail = Trail {
+            refreshed_at: later,
+            competition_id: Uuid::now_v7(),
+            competition: None,
+            settlement: None,
+            swaps: Vec::new(),
+            late_payments: Vec::new(),
+            payouts: Vec::new(),
+            refunds: Vec::new(),
+            funding_tx: None,
+            outcome_tx: None,
+            closing_txs: Vec::new(),
+            money: Money::Stuck {
+                reason: now_reason.into(),
+                since,
+            },
+            held: None,
+            gaps: Vec::new(),
+        };
+        let earlier = Held {
+            since,
+            found,
+            reason: "the competition was cancelled at 07:57 UTC before its contract, and 0 of 2 \
+                     escrows were refunded"
+                .into(),
+            sats: 2200,
+            nearest_expiry: None,
+            until: None,
+            then: None,
+        };
+        let still = held(&trail, &[], Some(earlier), later).unwrap();
+        assert_eq!(still.reason, now_reason);
+        assert_eq!(still.since, since, "when it was first held stays");
+        assert_eq!(still.found, found);
+        assert_eq!(still.until, None);
     }
 
     /// An explorer that cannot answer now does not undo what it said before.
