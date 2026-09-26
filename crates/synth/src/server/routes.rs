@@ -225,7 +225,7 @@ pub(super) async fn dashboard_live(
                         tr {
                             td { a href=(format!("/runs/{}", run.id)) title=(run.id) { (short_id(&run.id)) } }
                             td { (run.scenario) }
-                            td { span class=(format!("badge {}", run.status)) { (run.status) } }
+                            td { (run_status(&run.status, run.money.as_deref())) }
                             td {
                                 @match run.money.as_deref() {
                                     Some(money) => span class=(format!("badge {money}")) { (label_words(money)) },
@@ -257,7 +257,7 @@ pub(super) async fn dashboard_live(
                     @match &observation.channel {
                         Some(channel) => p {
                             "Lightning: the payer, " strong { (name(observation.payer.as_ref(), "the payer")) }
-                            ", holds " strong { (channel.local_sats) } " of " (channel.local_sats + channel.remote_sats)
+                            ", holds " strong { (format::sats(channel.local_sats)) } " of " (format::sats(channel.local_sats + channel.remote_sats))
                             " sats in channel " code { (channel.id) } " with "
                             strong { (name(observation.source.as_ref(), "the source node")) }
                             ", rebalancing below " (rebalancer.config().low_percent) "%."
@@ -268,9 +268,9 @@ pub(super) async fn dashboard_live(
                         (None, _) => p.note { "Arkade: ark-swapd's wallet is not watched." },
                         (Some(_), None) => p.error { "Arkade: ark-swapd did not report its wallet." },
                         (Some(arkade), Some(wallet)) => p {
-                            "Arkade: ark-swapd can fund " strong { (wallet.spendable_sat()) }
-                            " sats of escrows, topped up with " (arkade.top_up_sats)
-                            " sats on-chain below " (arkade.low_sats) "."
+                            "Arkade: ark-swapd can fund " strong { (format::sats(wallet.spendable_sat())) }
+                            " sats of escrows, topped up with " (format::sats(arkade.top_up_sats))
+                            " sats on-chain below " (format::sats(arkade.low_sats)) "."
                         },
                     }
                     @if let Some(checked_at) = observation.checked_at {
@@ -295,10 +295,10 @@ pub(super) async fn dashboard_live(
                                         @if let Some(ends) = &channel_ends { br; span.note { (ends) } }
                                     }
                                 }
-                                td.num { (rebalance.amount_sats) " sats" }
+                                td.num { (format::sats_signed(rebalance.amount_sats)) " sats" }
                                 td.num {
-                                    (rebalance.local_before_sats)
-                                    @if rebalance.capacity_sats > 0 { " / " (rebalance.capacity_sats) }
+                                    (format::sats_signed(rebalance.local_before_sats))
+                                    @if rebalance.capacity_sats > 0 { " / " (format::sats_signed(rebalance.capacity_sats)) }
                                 }
                                 td { span class=(format!("badge {}", rebalance.status)) { (rebalance.status) } }
                                 td {
@@ -370,27 +370,28 @@ fn stuck_money(
                 p.note { "No run's money is stuck." }
             } @else {
                 p {
-                    strong { (total) " sats" } " held by " (held.len()) " run(s)"
+                    strong { (format::sats(total)) " sats" } " held by " (held.len()) " run(s)"
                     @if let Some(at) = nearest.and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok()) {
                         "; the nearest escrow expiry or refund opening is " (format::time(at, now))
                     }
                     ". Each run's page lays out what holds it and what should move it."
                 }
-                div.scroll { table {
+                // On a phone each run stacks into a card, so the reason is never cut off.
+                div.scroll { table.stack {
                     thead { tr { th { "Run" } th { "Held since" } th.num { "Sats" } th { "Nearest expiry" } th { "Why" } } }
                     tbody {
                         @for (run, held) in &held {
                             tr {
-                                td { a href=(format!("/runs/{}", run.run.id)) title=(run.run.id) { (short_id(&run.run.id)) } br; span.note { (run.run.scenario) } }
-                                td { (format::time(held.since, now)) }
-                                td.num { (held.sats) }
-                                td {
+                                td data-label="Run" { a href=(format!("/runs/{}", run.run.id)) title=(run.run.id) { (short_id(&run.run.id)) } br; span.note { (run.run.scenario) } }
+                                td data-label="Held since" { (format::time(held.since, now)) }
+                                td.num data-label="Sats" { (format::sats(held.sats)) }
+                                td data-label="Nearest expiry" {
                                     @match held.nearest_expiry.and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok()) {
                                         Some(at) => (format::time(at, now)),
                                         None => span.note { "not known" },
                                     }
                                 }
-                                td { (held.reason) }
+                                td data-label="Why" { (held.reason) }
                             }
                         }
                     }
@@ -407,16 +408,16 @@ fn stuck_money(
                         "ark-swapd says these paid an escrow, or were settled, but records no escrow output, "
                         "so nothing can spend or refund them until it is found. Not all are synth's."
                     }
-                    div.scroll { table {
+                    div.scroll { table.stack {
                         thead { tr { th { "Swap" } th { "State" } th.num { "Sats" } th { "Escrow address" } th { "Run" } } }
                         tbody {
                             @for swap in swaps {
                                 tr {
-                                    td { (format::copyable(&swap.id.to_string())) br; span.note { (swap_created(swap.created_at, now)) } }
-                                    td { (swap.state) @if let Some(error) = &swap.error { br; span.note { (error) } } }
-                                    td.num { (swap.amount_sat) }
-                                    td { (format::copyable(&swap.escrow_address)) }
-                                    td {
+                                    td data-label="Swap" { (format::copyable(&swap.id.to_string())) br; span.note { (swap_created(swap.created_at, now)) } }
+                                    td data-label="State" { (swap.state) @if let Some(error) = &swap.error { br; span.note { (error) } } }
+                                    td.num data-label="Sats" { (format::sats(swap.amount_sat)) }
+                                    td data-label="Escrow address" { (format::copyable_short(&swap.escrow_address)) }
+                                    td data-label="Run" {
                                         @match run_of(&swap.payment_hash) {
                                             Some(run) => a href=(format!("/runs/{run}")) { (short_id(&run)) },
                                             None => span.note { "not a stuck synth run" },
@@ -525,9 +526,9 @@ async fn trigger_rebalance(
         (Ok(moved), true) => Html(
             html! {
                 "Rebalanced: "
-                (moved.channel_sats.map_or("nothing".to_string(), |sats| format!("{sats} sats")))
+                (moved.channel_sats.map_or("nothing".to_string(), |sats| format!("{} sats", format::sats(sats))))
                 " over the channel, "
-                (moved.arkade_sats.map_or("nothing".to_string(), |sats| format!("{sats} sats")))
+                (moved.arkade_sats.map_or("nothing".to_string(), |sats| format!("{} sats", format::sats(sats))))
                 " on-chain to ark-swapd."
             }
             .into_string(),
@@ -563,6 +564,19 @@ async fn history(
     Json(serde_json::json!({ "runs": runs }))
 }
 
+/// A run's status badge. A run whose steps passed but whose money is stuck now reads as stuck, so
+/// it never shows green over money nobody can move. Runs that finished before synth failed them
+/// for it keep "passed" in the database, so this is decided when the page is drawn.
+pub(super) fn run_status(status: &str, money: Option<&str>) -> Markup {
+    if status == "passed" && money == Some("stuck") {
+        html! {
+            span class="badge stuck" title="Its steps passed, but its money is stuck" { "money stuck" }
+        }
+    } else {
+        html! { span class=(format!("badge {status}")) { (status) } }
+    }
+}
+
 fn status_class(status: &ScenarioStatus) -> &'static str {
     match status {
         ScenarioStatus::Passed => "passed",
@@ -590,7 +604,10 @@ mod tests {
 
     /// A run whose contract failed with its winners unpaid, as run 01a0d0f5's did, with every hop
     /// synth follows and the stuck block: the heaviest run page there is.
-    async fn seed_stuck_run(db: &SynthDb, competition: &serde_json::Value) -> String {
+    ///
+    /// With `fail` unset its status stays "passed", as for a run that finished before synth
+    /// failed runs for stuck money.
+    async fn seed_stuck_run(db: &SynthDb, competition: &serde_json::Value, fail: bool) -> String {
         use serde_json::json;
         let hash = |n: u8| hex::encode([n; 32]);
         let address = "freya@lnurl.5day4cast.com";
@@ -673,12 +690,133 @@ mod tests {
                 trail: &trail,
                 follow: true,
                 step: Some(("money_stuck", 1, Some(reason), "{}")),
-                fail_passed_run: Some(reason),
+                fail_passed_run: fail.then_some(reason),
             },
         )
         .await
         .unwrap();
         run
+    }
+
+    /// A dashboard over one stuck run that passed its steps, and that run's id.
+    async fn stuck_dashboard(directory: &tempfile::TempDir) -> (Dashboard, String) {
+        let db = SynthDb::new(&directory.path().join("synth.sqlite").display().to_string())
+            .await
+            .unwrap();
+        let competition: serde_json::Value =
+            serde_json::from_str(include_str!("../fixtures/lab-competition.json")).unwrap();
+        let run = seed_stuck_run(&db, &competition, false).await;
+        (Dashboard::for_tests(db), run)
+    }
+
+    /// The text between `start` and the `end` after it.
+    fn between<'a>(page: &'a str, start: &str, end: &str) -> &'a str {
+        let from = page
+            .find(start)
+            .unwrap_or_else(|| panic!("no {start} in {page}"));
+        let rest = &page[from..];
+        &rest[..rest.find(end).unwrap_or(rest.len())]
+    }
+
+    #[tokio::test]
+    async fn a_run_that_passed_with_its_money_stuck_reads_as_stuck() {
+        let directory = tempfile::tempdir().unwrap();
+        let (dashboard, run) = stuck_dashboard(&directory).await;
+        let page = super::super::run_detail::run_live(&dashboard, &run)
+            .await
+            .unwrap()
+            .into_string();
+        let header = between(&page, "<h1>", "</h1>");
+        assert!(header.contains(r#"class="badge stuck""#), "{header}");
+        assert!(header.contains("money stuck"), "{header}");
+        assert!(!header.contains(r#"class="badge passed""#), "{header}");
+        assert!(!header.contains(">passed<"), "{header}");
+        assert!(page.contains("Its steps passed, but its money is stuck"));
+
+        let home = dashboard_live(&dashboard).await.into_string();
+        let recent = between(&home, "Recent Runs", "</section>");
+        assert!(recent.contains("money stuck"), "{recent}");
+        assert!(!recent.contains(r#"class="badge passed""#), "{recent}");
+    }
+
+    #[test]
+    fn only_a_passed_run_with_stuck_money_is_relabelled() {
+        let badge = |status, money| run_status(status, money).into_string();
+        assert!(badge("passed", Some("paid_out")).contains(r#"class="badge passed""#));
+        assert!(badge("passed", None).contains(r#"class="badge passed""#));
+        assert!(badge("failed", Some("stuck")).contains(r#"class="badge failed""#));
+        assert!(badge("passed", Some("stuck")).contains("money stuck"));
+    }
+
+    #[tokio::test]
+    async fn the_hops_table_keeps_its_money_columns_in_view() {
+        let directory = tempfile::tempdir().unwrap();
+        let (dashboard, run) = stuck_dashboard(&directory).await;
+        let page = super::super::run_detail::run_live(&dashboard, &run)
+            .await
+            .unwrap()
+            .into_string();
+        let table = between(&page, r#"<table class="trail stack">"#, "</table>");
+        let head = between(table, "<thead>", "</thead>");
+        let column = |name: &str| {
+            head.find(name)
+                .unwrap_or_else(|| panic!("no {name} in {head}"))
+        };
+        assert!(column("Sats") < column("From → to"), "{head}");
+        assert!(column("Fee") < column("From → to"), "{head}");
+        assert!(column("From → to") < column("ID"), "{head}");
+        // Every cell is labelled, for the stacked phone layout.
+        let body = between(table, "<tbody>", "</tbody>");
+        assert_eq!(
+            body.matches("<td").count(),
+            body.matches("data-label=").count(),
+            "{body}"
+        );
+        // The escrow's Arkade address is shortened in view and copied whole.
+        let address = format!("tark1{}", "q".repeat(60));
+        assert!(
+            body.contains(&format!(r#"data-copy="{address}""#)),
+            "{body}"
+        );
+        assert!(!body.contains(&format!(">{address}<")), "{body}");
+        assert!(!body.contains(&format!("{address} →")), "{body}");
+        assert!(body.contains("tark1qqq…"), "{body}");
+        // Hashes, ids and the hashes in lookup commands are shortened in view too, and links
+        // read as their host and last part.
+        for code in body.split(r#"<code class="id""#).skip(1) {
+            let text = &code[code.find('>').unwrap() + 1..code.find('<').unwrap()];
+            assert!(
+                text.split(' ').all(|word| word.chars().count() <= 40),
+                "{text}"
+            );
+        }
+        assert!(!body.contains(">http"), "{body}");
+        // Lightning Addresses stay whole.
+        assert!(body.contains("freya@lnurl.5day4cast.com"), "{body}");
+        // Amounts are grouped.
+        assert!(body.contains(">1,100<"), "{body}");
+        assert!(body.contains(">1,090<"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_stuck_money_table_stacks_and_groups_its_sats() {
+        let directory = tempfile::tempdir().unwrap();
+        let (dashboard, _) = stuck_dashboard(&directory).await;
+        let home = dashboard_live(&dashboard).await.into_string();
+        let stuck = between(&home, "Stuck money", "</section>");
+        assert!(stuck.contains("<strong>3,000 sats</strong>"), "{stuck}");
+        let table = between(stuck, r#"<table class="stack">"#, "</table>");
+        assert!(table.contains(r#"data-label="Why""#), "{table}");
+        assert!(table.contains(">3,000<"), "{table}");
+    }
+
+    #[test]
+    fn stacked_tables_turn_into_cards_on_a_phone() {
+        let css = include_str!("assets/synth.css");
+        let phone = between(css, "@media (max-width: 640px)", "\n}\n");
+        assert!(phone.contains("table.stack tr"), "{phone}");
+        assert!(phone.contains("attr(data-label)"), "{phone}");
+        assert!(css.contains("table.trail td, table.stack td { overflow-wrap: anywhere; }"));
     }
 
     /// Pages render from synth's own database. With a year of hourly runs behind it, and a run
@@ -704,7 +842,7 @@ mod tests {
         })
         .to_string();
         let runs = db.seed_history(24 * 365, &trail).await.unwrap();
-        let stuck = seed_stuck_run(&db, &competition).await;
+        let stuck = seed_stuck_run(&db, &competition, true).await;
         let dashboard = Dashboard::for_tests(db.clone());
         eprintln!(
             "seeded {} runs at {path}; stuck run {stuck}",

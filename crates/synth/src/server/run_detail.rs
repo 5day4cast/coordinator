@@ -119,11 +119,12 @@ fn flow(
                 label: entry.user.clone(),
                 value: match (entry.amount_sats, payment) {
                     (Some(sats), Some(payment)) if paid(entry) => format!(
-                        "{sats} sats, {} fee",
-                        format::msat_as_sats(payment.fee_msat)
+                        "{} sats, {} fee",
+                        format::sats(sats),
+                        format::group(&format::msat_as_sats(payment.fee_msat))
                     ),
-                    (Some(sats), _) if paid(entry) => format!("{sats} sats"),
-                    (Some(sats), _) => format!("{sats} sats unpaid"),
+                    (Some(sats), _) if paid(entry) => format!("{} sats", format::sats(sats)),
+                    (Some(sats), _) => format!("{} sats unpaid", format::sats(sats)),
                     (None, _) => "no ticket yet".to_string(),
                 },
                 status: if paid(entry) {
@@ -144,9 +145,19 @@ fn flow(
                 label: entry.user.clone(),
                 value: match swap {
                     Some(swap) if swap.funded_without_vtxo() => {
-                        format!("{} sats, swap {}, no output", swap.amount_sat, swap.state)
+                        format!(
+                            "{} sats, swap {}, no output",
+                            format::sats(swap.amount_sat),
+                            swap.state
+                        )
                     }
-                    Some(swap) => format!("{} sats, swap {}", swap.amount_sat, swap.state),
+                    Some(swap) => {
+                        format!(
+                            "{} sats, swap {}",
+                            format::sats(swap.amount_sat),
+                            swap.state
+                        )
+                    }
                     None if paid(entry) => "paid in".to_string(),
                     None => "-".to_string(),
                 },
@@ -226,7 +237,7 @@ fn flow(
             .map(|funding| Line {
                 label: "on-chain".to_string(),
                 value: match funding.fee_sat {
-                    Some(fee) => format!("{fee} sats batch fee"),
+                    Some(fee) => format!("{} sats batch fee", format::sats(fee)),
                     None => "fee not known yet".to_string(),
                 },
                 status: funding_status,
@@ -285,10 +296,14 @@ fn refunds_box(
             let traced = trail.and_then(|trail| trail.refund_of(entry));
             let scenario = refunds.iter().find(|(user, _)| *user == entry.user);
             let (value, status) = match (traced, scenario) {
-                (Some(refund), _) if refund.is_settled() => {
-                    (format!("{} sats back", refund.paid_sats), Status::Done)
-                }
-                (_, Some((_, refund))) => (format!("{} sats back", refund.paid_sats), Status::Done),
+                (Some(refund), _) if refund.is_settled() => (
+                    format!("{} sats back", format::sats(refund.paid_sats)),
+                    Status::Done,
+                ),
+                (_, Some((_, refund))) => (
+                    format!("{} sats back", format::sats(refund.paid_sats)),
+                    Status::Done,
+                ),
                 (Some(refund), None) => (format!("refund {}", refund.state), Status::Active),
                 (None, None) => ("not refunded".to_string(), unfinished),
             };
@@ -329,15 +344,18 @@ fn payouts_box(trail: Option<&Trail>) -> FlowBox {
         .zip(&states)
         .map(|(payout, state)| Line {
             label: payout.user.clone(),
-            value: match state {
-                PayoutState::OwedNothing => "owed nothing".to_string(),
-                PayoutState::Paid => format!("{} sats paid", payout.owed_sats),
-                PayoutState::SentUnconfirmed => {
-                    format!("{} sats sent; settlement unverified", payout.owed_sats)
+            value: {
+                let owed = format::sats(payout.owed_sats);
+                match state {
+                    PayoutState::OwedNothing => "owed nothing".to_string(),
+                    PayoutState::Paid => format!("{owed} sats paid"),
+                    PayoutState::SentUnconfirmed => {
+                        format!("{owed} sats sent; settlement unverified")
+                    }
+                    PayoutState::OtherNode => format!("{owed} sats paid to another node"),
+                    PayoutState::NeverSent => format!("{owed} sats never sent"),
+                    PayoutState::Owed => format!("{owed} sats owed"),
                 }
-                PayoutState::OtherNode => format!("{} sats paid to another node", payout.owed_sats),
-                PayoutState::NeverSent => format!("{} sats never sent", payout.owed_sats),
-                PayoutState::Owed => format!("{} sats owed", payout.owed_sats),
             },
             status: Status::from(*state),
         })
@@ -541,7 +559,7 @@ pub(super) async fn run_live(state: &Dashboard, id: &str) -> Option<Markup> {
     let run = view.money();
     let rows = money::rows(&run);
     Some(html! {
-        (run_section(&view.run, live_step.as_deref(), now))
+        (run_section(&view.run, view.trail.as_ref(), live_step.as_deref(), now))
         (money_section(&view, now))
         @if let Some(stuck) = stuck::block(&run, now) { (stuck) }
         (hops_section(&view, &rows))
@@ -555,7 +573,13 @@ pub(super) async fn run_live(state: &Dashboard, id: &str) -> Option<Markup> {
     })
 }
 
-fn run_section(run: &TestRun, live_step: Option<&str>, now: OffsetDateTime) -> Markup {
+fn run_section(
+    run: &TestRun,
+    trail: Option<&Trail>,
+    live_step: Option<&str>,
+    now: OffsetDateTime,
+) -> Markup {
+    let money = trail.map(|trail| trail.money.label());
     let took = match (
         format::parse(&run.started_at),
         run.completed_at.as_deref().and_then(format::parse),
@@ -566,7 +590,10 @@ fn run_section(run: &TestRun, live_step: Option<&str>, now: OffsetDateTime) -> M
         _ => None,
     };
     html! {
-        h1 { (run.scenario) " " span class=(format!("badge {}", run.status)) { (run.status) } }
+        h1 { (run.scenario) " " (routes::run_status(&run.status, money)) }
+        @if run.status == "passed" && money == Some("stuck") {
+            p.note { "Its steps passed, but its money is stuck: see where it is held below." }
+        }
         @if let Some(step) = live_step {
             p.running { "Now: " strong { (step) } }
         }
@@ -610,33 +637,35 @@ fn hops_section(view: &RunView, rows: &[Row]) -> Markup {
     html! {
         section {
             h2 { "Every hop" }
-            div.scroll { table.trail {
+            // The money columns come first, so a long id never pushes them out of view; on a
+            // phone each hop stacks into a card of its own.
+            div.scroll { table.trail.stack {
                 thead { tr {
-                    th { "Status" } th { "Step" } th { "From → to" } th.num { "Sats" } th.num { "Fee" }
+                    th { "Status" } th { "Step" } th.num { "Sats" } th.num { "Fee" } th { "From → to" }
                     th { "ID" } th { "Look it up" }
                 } }
                 tbody {
                     @for row in rows {
                         tr {
-                            td { span class=(format!("badge {}", row.status.class())) { (row.status.class()) } }
-                            td { (row.step) }
-                            td { (row.from) " → " (row.to) }
-                            td.num { @if let Some(sats) = row.amount_sats { (sats) } @else { "-" } }
-                            td.num { (row.fee_sats.as_deref().unwrap_or("-")) }
-                            td {
-                                (copyable(&row.id))
+                            td data-label="Status" { span class=(format!("badge {}", row.status.class())) { (row.status.class()) } }
+                            td data-label="Step" { (row.step) }
+                            td.num data-label="Sats" { @if let Some(sats) = row.amount_sats { (format::sats(sats)) } @else { "-" } }
+                            td.num data-label="Fee" { (row.fee_sats.as_deref().map_or("-".to_string(), format::group)) }
+                            td data-label="From → to" { (endpoint(&row.from)) " → " (endpoint(&row.to)) }
+                            td data-label="ID" {
+                                (format::copyable_short(&row.id))
                                 @if let Some(preimage) = &row.preimage {
-                                    br; span.note { "preimage " } (copyable(preimage))
+                                    br; span.note { "preimage " } (format::copyable_short(preimage))
                                 }
                             }
-                            td {
+                            td data-label="Look it up" {
                                 @if let Some(link) = &row.link {
-                                    a href=(link) rel="noreferrer" { (link) }
+                                    a href=(link) rel="noreferrer" title=(link) { (format::link_text(link)) }
                                 }
                                 @for lookup in &row.lookups {
                                     div.lookup {
                                         @if let Some(on) = &lookup.on { span.note { "on " (on) } br; }
-                                        (copyable(&lookup.command))
+                                        (format::copyable_command(&lookup.command))
                                     }
                                 }
                                 @if let Some(note) = &row.note { div.note { (note) } }
@@ -664,6 +693,17 @@ fn hops_section(view: &RunView, rows: &[Row]) -> Markup {
                 a href=(format!("/runs/{run_id}/trail.tsv")) { "trail.tsv" }
             }
         }
+    }
+}
+
+/// One end of a hop. A long bare address or id, such as an escrow's Arkade address, is shortened
+/// with a button to copy it whole; names, Lightning Addresses and phrases are shown as they are.
+fn endpoint(end: &str) -> Markup {
+    let bare = !end.contains(char::is_whitespace) && !end.contains('@');
+    if bare && end.chars().count() > 40 {
+        format::copyable_short(end)
+    } else {
+        html! { (end) }
     }
 }
 
@@ -761,8 +801,12 @@ fn milestones(competition: &CompetitionResponse) -> Vec<(&'static str, OffsetDat
 }
 
 fn ledger_table(ledger: &Ledger, trail: Option<&Trail>) -> Markup {
-    let sats = |value: Option<u64>| value.map_or("-".to_string(), |v| v.to_string());
-    let msat = |value: Option<u64>| value.map_or("not visible".to_string(), format::msat_as_sats);
+    let sats = |value: Option<u64>| value.map_or("-".to_string(), format::sats);
+    let msat = |value: Option<u64>| {
+        value.map_or("not visible".to_string(), |msat| {
+            format::group(&format::msat_as_sats(msat))
+        })
+    };
     let stopped = trail.is_some_and(|trail| {
         trail.money.is_final() || matches!(trail.money, crate::trail::Money::Stuck { .. })
     });
@@ -772,7 +816,7 @@ fn ledger_table(ledger: &Ledger, trail: Option<&Trail>) -> Markup {
             tbody {
                 tr.total {
                     td { "Players paid" }
-                    td.num { (ledger.paid_in) }
+                    td.num { (format::sats(ledger.paid_in)) }
                     td.note { (ledger.entries_paid) " entries" }
                 }
                 tr {
@@ -784,24 +828,24 @@ fn ledger_table(ledger: &Ledger, trail: Option<&Trail>) -> Markup {
                 tr { td { "→ coordinator's fee" } td.num { (sats(ledger.coordinator_fee)) } td.note { "what players paid beyond the pot" } }
                 @if ledger.pot.is_some() {
                     tr.total { td { "Pot" } td.num { (sats(ledger.pot)) } td {} }
-                    tr { td { "→ owed to winners" } td.num { (ledger.owed) } td.note { "their shares under the outcome" } }
-                    tr { td { "→ confirmed paid over Lightning" } td.num { (ledger.paid_out) } td.note { (ledger.confirmed_payouts) " payouts" } }
+                    tr { td { "→ owed to winners" } td.num { (format::sats(ledger.owed)) } td.note { "their shares under the outcome" } }
+                    tr { td { "→ confirmed paid over Lightning" } td.num { (format::sats(ledger.paid_out)) } td.note { (ledger.confirmed_payouts) " payouts" } }
                     tr class=(if stopped && ledger.unpaid > 0 { "flag" } else { "" }) {
-                        td { "→ owed, not confirmed paid" } td.num { (ledger.unpaid) }
+                        td { "→ owed, not confirmed paid" } td.num { (format::sats(ledger.unpaid)) }
                         td.note { @if !stopped && ledger.unpaid > 0 { "still to come" } }
                     }
                     @if ledger.rounding > 0 {
-                        tr { td { "→ owed to nobody" } td.num { (ledger.rounding) } td.note { "rounding the shares down leaves it in the pot" } }
+                        tr { td { "→ owed to nobody" } td.num { (format::sats(ledger.rounding)) } td.note { "rounding the shares down leaves it in the pot" } }
                     }
                 }
                 @if ledger.refunded > 0 {
-                    tr { td { "Refunded" } td.num { (ledger.refunded) } td.note {
-                        @if let Some(fees) = ledger.refund_fees { (fees) " sats kept by the refunds' swaps and payments" }
+                    tr { td { "Refunded" } td.num { (format::sats(ledger.refunded)) } td.note {
+                        @if let Some(fees) = ledger.refund_fees { (format::sats(fees)) " sats kept by the refunds' swaps and payments" }
                     } }
                 }
                 tr.total { td { "Fees" } td {} td {} }
                 tr { td { "entry routing, paid by the payer's node" } td.num { (msat(ledger.entry_routing_fee_msat)) } td {} }
-                tr { td { "ark-swapd's swap fees" } td.num { @match ledger.swap_fees { Some(fees) => (fees), None => "-" } } td.note { "included in the entry price" } }
+                tr { td { "ark-swapd's swap fees" } td.num { @match ledger.swap_fees { Some(fees) => (format::sats_signed(fees)), None => "-" } } td.note { "included in the entry price" } }
                 tr { td { "funding batch" } td.num { (sats(ledger.funding_batch_fee)) } td.note { "the whole Arkade batch's fee, shared by every output in it" } }
                 tr { td { "outcome transaction" } td.num { (sats(ledger.outcome_fee)) } td.note { "taken from the contract's output; the coordinator still pays shares in full" } }
                 @if ledger.closing_fees.is_some() {
@@ -810,7 +854,7 @@ fn ledger_table(ledger: &Ledger, trail: Option<&Trail>) -> Markup {
                 tr { td { "payout routing, paid by the coordinator's node" } td.num { (msat(ledger.payout_routing_fee_msat)) } td.note { "for the " (ledger.confirmed_payouts) " confirmed payouts" } }
                 tr class=(if ledger.remainder != 0 { "total flag" } else { "total" }) {
                     td { "Unaccounted for" }
-                    td.num { (ledger.remainder) }
+                    td.num { (format::sats_signed(ledger.remainder)) }
                     td.note { @if !stopped { "judged once the money stops moving" } }
                 }
             }
@@ -913,7 +957,7 @@ mod tests {
                 ("Payouts", Status::Waiting),
             ]
         );
-        assert_eq!(boxes[0].lines[0].value, "1100 sats, 1.001 fee");
+        assert_eq!(boxes[0].lines[0].value, "1,100 sats, 1.001 fee");
     }
 
     /// The case that lost alice's buy-in: paid for, never entered, so the money sits in an escrow.
@@ -1002,7 +1046,7 @@ mod tests {
             paid.subtitle,
             "tie: split between alice, bob, charlie (outcome 3)"
         );
-        assert_eq!(paid.lines[0].value, "1020 sats paid");
+        assert_eq!(paid.lines[0].value, "1,020 sats paid");
     }
 
     #[test]
@@ -1031,7 +1075,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 ("alice", "owed nothing"),
-                ("bob", "3000 sats paid"),
+                ("bob", "3,000 sats paid"),
                 ("charlie", "owed nothing")
             ]
         );
@@ -1047,7 +1091,7 @@ mod tests {
             &payouts,
         )));
         assert_eq!(paid.status, Status::Active);
-        assert_eq!(paid.lines[0].value, "3000 sats owed");
+        assert_eq!(paid.lines[0].value, "3,000 sats owed");
     }
 
     /// Run 01a0d0f5: the outcome went on-chain, then the competition failed with nothing sent.
@@ -1063,7 +1107,7 @@ mod tests {
         let trail = settled(failed, split, &payouts);
         let paid = payouts_box(Some(&trail));
         assert_eq!(paid.status, Status::Failed);
-        assert_eq!(paid.lines[0].value, "1020 sats never sent");
+        assert_eq!(paid.lines[0].value, "1,020 sats never sent");
         let entries = [entry("alice", true, true)];
         assert_eq!(
             flow(&entries, &[], Some(&trail), false)

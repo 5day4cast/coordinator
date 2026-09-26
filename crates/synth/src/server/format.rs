@@ -1,5 +1,6 @@
 //! Values as people read them: times as "02:12 UTC · 22 min ago", durations as "3m 58s", and
-//! amounts in sats with the millisats a routing fee comes in.
+//! amounts in sats grouped by thousands ("1,999,038"), with the millisats a routing fee comes in.
+//! The exports keep plain numbers; only pages group them.
 
 use maud::{html, Markup};
 use time::OffsetDateTime;
@@ -59,6 +60,100 @@ pub fn copyable(id: &str) -> Markup {
         code.id { (id) }
         @if !id.is_empty() { button.copy type="button" data-copy=(id) title="Copy" { "copy" } }
     }
+}
+
+/// A long id shortened to its ends, "tark1qqq…qqqqqqqq", or `None` if it is short enough to show
+/// whole.
+fn shorten(id: &str) -> Option<String> {
+    const ENDS: usize = 8;
+    let chars: Vec<char> = id.chars().collect();
+    if chars.len() <= 2 * ENDS + 3 {
+        return None;
+    }
+    let head: String = chars[..ENDS].iter().collect();
+    let tail: String = chars[chars.len() - ENDS..].iter().collect();
+    Some(format!("{head}…{tail}"))
+}
+
+/// A long id shortened to its ends, with the full id to hover and a button to copy it whole. For
+/// ids in tables, where the whole one would push the columns beside it away.
+pub fn copyable_short(id: &str) -> Markup {
+    match shorten(id) {
+        Some(short) => html! {
+            code.id title=(id) { (short) }
+            button.copy type="button" data-copy=(id) title="Copy" { "copy" }
+        },
+        None => copyable(id),
+    }
+}
+
+/// A command with each long argument (a hash, an address) shortened to its ends; the copy button
+/// copies the whole command.
+pub fn copyable_command(command: &str) -> Markup {
+    let shown = command
+        .split(' ')
+        .map(|word| shorten(word).unwrap_or_else(|| word.to_string()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    html! {
+        code.id title=(command) { (shown) }
+        @if !command.is_empty() { button.copy type="button" data-copy=(command) title="Copy" { "copy" } }
+    }
+}
+
+/// A link's text: its host and the last part of its path, "5day4cast.com/…/leaderboard", or the
+/// whole path when it has two parts, "4casttruth.win/events/01a0da04…ebc77891". Long parts are
+/// shortened; the link itself stays whole.
+pub fn link_text(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let path = rest.split(['?', '#']).next().unwrap_or(rest);
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    match parts.as_slice() {
+        [] => rest.to_string(),
+        [host] => host.to_string(),
+        [host, middle @ .., last] => {
+            let last = shorten(last).unwrap_or_else(|| last.to_string());
+            match middle {
+                [] => format!("{host}/{last}"),
+                [one] => {
+                    let one = shorten(one).unwrap_or_else(|| one.to_string());
+                    format!("{host}/{one}/{last}")
+                }
+                _ => format!("{host}/…/{last}"),
+            }
+        }
+    }
+}
+
+/// An amount of sats as people read it: "40,700", "1,999,038".
+pub fn sats(sats: u64) -> String {
+    group(&sats.to_string())
+}
+
+/// A signed amount of sats, as [`sats`] writes it: "-1,100".
+pub fn sats_signed(sats: i64) -> String {
+    match sats {
+        negative if negative < 0 => format!("-{}", group(&negative.unsigned_abs().to_string())),
+        positive => group(&positive.to_string()),
+    }
+}
+
+/// A number written in digits, its whole part grouped by thousands: "1234.5" is "1,234.5".
+/// Anything else is left as it is.
+pub fn group(number: &str) -> String {
+    let (whole, rest) = number.split_at(number.find('.').unwrap_or(number.len()));
+    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) {
+        return number.to_string();
+    }
+    let mut grouped = String::with_capacity(number.len() + whole.len() / 3);
+    for (index, digit) in whole.chars().enumerate() {
+        if index > 0 && (whole.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped.push_str(rest);
+    grouped
 }
 
 /// A span of time to the nearest unit people use for it.
@@ -173,5 +268,72 @@ mod tests {
         assert_eq!(msat_as_sats(500), "0.5");
         assert_eq!(msat_as_sats(12_000), "12");
         assert_eq!(msat_as_sats(0), "0");
+    }
+
+    #[test]
+    fn sats_are_grouped_by_thousands() {
+        assert_eq!(sats(0), "0");
+        assert_eq!(sats(999), "999");
+        assert_eq!(sats(1_100), "1,100");
+        assert_eq!(sats(40_700), "40,700");
+        assert_eq!(sats(768_803), "768,803");
+        assert_eq!(sats(1_999_038), "1,999,038");
+        assert_eq!(sats_signed(-1_100), "-1,100");
+        assert_eq!(sats_signed(-5), "-5");
+        assert_eq!(sats_signed(3_000), "3,000");
+        assert_eq!(group("1234.001"), "1,234.001");
+        assert_eq!(group("0.5"), "0.5");
+        assert_eq!(group("-"), "-");
+    }
+
+    #[test]
+    fn a_long_id_is_shortened_but_copied_whole() {
+        let address = format!("tark1{}", "q".repeat(60));
+        let shown = copyable_short(&address).into_string();
+        assert!(shown.contains("tark1qqq…qqqqqqqq"), "{shown}");
+        assert!(
+            shown.contains(&format!("data-copy=\"{address}\"")),
+            "{shown}"
+        );
+        assert!(shown.contains(&format!("title=\"{address}\"")), "{shown}");
+        assert_eq!(
+            copyable_short("alice").into_string(),
+            copyable("alice").into_string()
+        );
+    }
+
+    #[test]
+    fn a_command_shows_its_long_arguments_shortened_and_copies_whole() {
+        let hash = "ab".repeat(32);
+        let command = format!("lncli lookupinvoice {hash}");
+        let shown = copyable_command(&command).into_string();
+        assert!(
+            shown.contains(">lncli lookupinvoice abababab…abababab<"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(&format!("data-copy=\"{command}\"")),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_link_reads_as_its_host_and_last_part() {
+        let id = "01a0da04-c7a4-7fc1-8d0f-0dfeebc77891";
+        assert_eq!(
+            link_text(&format!(
+                "https://5day4cast.com/competitions/{id}/leaderboard"
+            )),
+            "5day4cast.com/…/leaderboard"
+        );
+        assert_eq!(
+            link_text(&format!("https://4casttruth.win/events/{id}")),
+            "4casttruth.win/events/01a0da04…ebc77891"
+        );
+        assert_eq!(
+            link_text("https://5day4cast.com/api/v1/entries?event_id=abc"),
+            "5day4cast.com/…/entries"
+        );
+        assert_eq!(link_text("https://mutinynet.com/"), "mutinynet.com");
     }
 }
