@@ -159,7 +159,7 @@ mod tests {
     const TEST_LOG_N: u8 = 4;
 
     fn keys(username: &str, password: &str) -> LoginKeys {
-        LoginKeys::from_stretched(&*stretch_with(username, password, TEST_LOG_N).unwrap())
+        LoginKeys::from_stretched(&stretch_with(username, password, TEST_LOG_N).unwrap())
     }
 
     #[test]
