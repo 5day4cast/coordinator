@@ -1420,6 +1420,29 @@ impl Competition {
         self.failed_at.is_some()
     }
 
+    /// The contract's funding has confirmed and the contract is not settled yet: the pot is
+    /// on-chain, and only settling the contract (outcome, then delta transactions, or the
+    /// expiry transaction) moves it. Such a competition must never be abandoned as failed or
+    /// cancelled.
+    pub fn is_settling_on_chain(&self) -> bool {
+        self.funding_confirmed_at.is_some()
+            && self.completed_at.is_none()
+            && self.expiry_broadcasted_at.is_none()
+    }
+
+    /// Undo a failure or cancellation that stopped a competition while its contract held the
+    /// pot on-chain, as earlier versions did after a single settlement error. Returns
+    /// whether it resumed.
+    pub fn resume_stranded_settlement(&mut self) -> bool {
+        if !self.is_settling_on_chain() || (self.failed_at.is_none() && self.cancelled_at.is_none())
+        {
+            return false;
+        }
+        self.failed_at = None;
+        self.cancelled_at = None;
+        true
+    }
+
     pub fn should_abort(&self) -> bool {
         self.errors.len() > 5
     }
