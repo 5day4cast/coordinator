@@ -8,6 +8,7 @@ target=$1
 prefix=$2
 case "$target" in
   x86_64-unknown-linux-gnu) configure_target=linux-x86_64 ;;
+  aarch64-unknown-linux-gnu) configure_target=linux-aarch64 ;;
   x86_64-apple-darwin) configure_target=darwin64-x86_64-cc ;;
   aarch64-apple-darwin) configure_target=darwin64-arm64-cc ;;
   *) fail "unsupported target: $target" ;;
