@@ -15,7 +15,7 @@ terminationGracePeriodSeconds: 120
 
 image:
   repository: ghcr.io/5day4cast/coordinator
-  tag: "2.4.1"
+  tag: "2.5.0"
   pullPolicy: IfNotPresent
 
 serviceAccount:
