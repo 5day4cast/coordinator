@@ -380,11 +380,13 @@ impl Coordinator {
                 "Entry key differs from its pre-payment payout authorization".into(),
             ));
         }
-        let terms = ContractAuthorization::from_policy(&policy)
+        // A queued entry consents to its competition's terms, not a contract: only the fields
+        // every entry has are checked here.
+        let terms = coordinator_escrow::queued::EntryConsent::from_policy(&policy)
             .map_err(|e| Error::BadRequest(e.to_string()))?;
-        if terms.entry_id != entry.id
-            || terms.competition_id != entry.event_id
-            || terms.payout_hash != parse_hash32(&entry.payout_hash).map_err(Error::Bitcoin)?
+        if terms.entry_id() != entry.id
+            || terms.competition_id() != entry.event_id
+            || terms.payout_hash() != parse_hash32(&entry.payout_hash).map_err(Error::Bitcoin)?
         {
             return Err(Error::BadRequest(
                 "Entry differs from its payout authorization".into(),
@@ -492,10 +494,32 @@ impl Coordinator {
             signed_digests.insert(user.clone(), signed.policy.digest()?);
             registrations.insert(user, context);
         }
-        let bindings = self
-            .keymeld
-            .bind_payout_contract(session, &contract, &expected_policies)
-            .await?;
+        // A pool's players consented to terms, not this contract: Keymeld derives each one's
+        // contract from the oracle's signed statement of the pool's event.
+        let statement = match self.pool_of(competition).await? {
+            Some((settings, record)) => Some(
+                self.pool_statement(competition, &settings, &record.members)
+                    .await?,
+            ),
+            None => None,
+        };
+        let bindings = match statement {
+            Some(statement) => {
+                self.keymeld
+                    .bind_payout_contract_with_statement(
+                        session,
+                        &contract,
+                        &expected_policies,
+                        statement,
+                    )
+                    .await?
+            }
+            None => {
+                self.keymeld
+                    .bind_payout_contract(session, &contract, &expected_policies)
+                    .await?
+            }
+        };
         let expected_set =
             coordinator_escrow::payout_protocol::accepted_policy_set_digest(&signed_digests)?;
         let expected_contract = coordinator_escrow::payout::contract_digest(&contract)?;
@@ -565,7 +589,8 @@ impl Coordinator {
         &self,
         competition: &Competition,
     ) -> Result<(), anyhow::Error> {
-        if competition.attestation.is_none()
+        if competition.kind == crate::domain::competitions::CompetitionKind::Queued
+            || competition.attestation.is_none()
             || competition.signed_contract.is_none()
             || competition.funding_confirmed_at.is_none()
             || competition.delta_broadcasted_at.is_some()

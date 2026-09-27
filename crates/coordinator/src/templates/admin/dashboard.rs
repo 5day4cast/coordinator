@@ -239,6 +239,50 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
                         }
                     }
 
+                    // Queued competition: entries without a seat count, split into pools
+                    div class="box" {
+                        h3 class="subtitle is-5" { "Queued Competition" }
+                        div class="field" {
+                            label class="checkbox" {
+                                input type="checkbox" name="queued" value="true";
+                                " Queue entries and form pools when observation starts"
+                            }
+                            p class="help" {
+                                "Ignores Total Allowed Entries, Places and Scoring: each pool pays one winner, scored with lines."
+                            }
+                        }
+                        div class="columns" {
+                            div class="column" {
+                                div class="field" {
+                                    label class="label" { "Minimum Pool Size" }
+                                    div class="control" {
+                                        input class="input" type="number" name="min_players"
+                                              value="2" min="2" max="13";
+                                    }
+                                }
+                            }
+                            div class="column" {
+                                div class="field" {
+                                    label class="label" { "Maximum Pool Size" }
+                                    div class="control" {
+                                        input class="input" type="number" name="max_pool_size"
+                                              value="25" min="3" max="25";
+                                    }
+                                    p class="help" { "At least twice the minimum, less one" }
+                                }
+                            }
+                            div class="column" {
+                                div class="field" {
+                                    label class="label" { "Entry Cap" }
+                                    div class="control" {
+                                        input class="input" type="number" name="max_entries"
+                                              value="" min="2" max="1500" placeholder="500";
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Location selector with map, table, and Create Competition button
                     (location_selector(stations))
                 }

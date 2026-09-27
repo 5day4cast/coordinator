@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     api::routes::OperatorCompetition,
-    domain::{CoordinatorFee, CreateEvent},
+    domain::{CoordinatorFee, CreateEvent, CreateQueuedCompetition},
     infra::oracle::ScoringRules,
 };
 
@@ -118,6 +118,20 @@ pub struct CreateArgs {
     /// 10 points a right pick) or `fixed` (exact Par 20, Over or Under 10).
     #[arg(long, default_value = "lines", value_parser = parse_scoring_rules)]
     pub scoring_rules: ScoringRules,
+    /// Queue entries without a seat count, and split them into pools when observation starts.
+    /// Each pool pays one winner and scores lines, so --max-entries, --places-win and
+    /// --scoring-rules do not apply.
+    #[arg(long)]
+    pub queued: bool,
+    /// A queued competition's smallest pool.
+    #[arg(long, default_value_t = crate::domain::DEFAULT_MIN_PLAYERS)]
+    pub min_players: usize,
+    /// A queued competition's largest pool.
+    #[arg(long, default_value_t = coordinator_escrow::pools::MAX_POOL_PLAYERS)]
+    pub max_pool_size: usize,
+    /// A queued competition's entry cap; the coordinator's default if unset.
+    #[arg(long)]
+    pub entry_cap: Option<u32>,
     /// The competition's id; a new one if unset.
     #[arg(long)]
     pub id: Option<Uuid>,
@@ -147,6 +161,7 @@ pub const STATES: &[&str] = &[
     "completed",
     "failed",
     "cancelled",
+    "pools_formed",
 ];
 
 const FINISHED: &[&str] = &["completed", "failed", "cancelled"];
@@ -231,6 +246,27 @@ impl CreateArgs {
     }
 }
 
+impl CreateArgs {
+    /// The request the operator listener's queued create endpoint takes.
+    pub fn to_queued(&self) -> Result<CreateQueuedCompetition> {
+        let event = self.to_event()?;
+        Ok(CreateQueuedCompetition {
+            id: event.id,
+            signing_date: event.signing_date,
+            start_observation_date: event.start_observation_date,
+            end_observation_date: event.end_observation_date,
+            locations: event.locations,
+            number_of_values_per_entry: event.number_of_values_per_entry,
+            entry_fee: event.entry_fee,
+            coordinator_fee: event.coordinator_fee,
+            relative_locktime_block_delta: event.relative_locktime_block_delta,
+            min_players: self.min_players,
+            max_pool_size: self.max_pool_size,
+            max_entries: self.entry_cap,
+        })
+    }
+}
+
 fn parse_scoring_rules(text: &str) -> Result<ScoringRules, String> {
     ScoringRules::parse(text).ok_or_else(|| format!("{text:?} is not `lines` or `fixed`"))
 }
@@ -309,13 +345,23 @@ impl AdminClient {
 
     /// Create a competition, returning its id.
     pub async fn create(&self, event: &CreateEvent) -> Result<Uuid> {
+        self.post_create("/api/v1/competitions", event).await
+    }
+
+    /// Create a queued competition, returning its id.
+    pub async fn create_queued(&self, request: &CreateQueuedCompetition) -> Result<Uuid> {
+        self.post_create("/api/v1/competitions/queued", request)
+            .await
+    }
+
+    async fn post_create<T: serde::Serialize>(&self, path: &str, body: &T) -> Result<Uuid> {
         #[derive(serde::Deserialize)]
         struct Created {
             id: Uuid,
         }
         let response = self
-            .request(reqwest::Method::POST, "/api/v1/competitions")
-            .json(event)
+            .request(reqwest::Method::POST, path)
+            .json(body)
             .send()
             .await
             .context("reach the operator listener")?;
@@ -401,12 +447,21 @@ pub async fn run(args: AdminArgs) -> Result<()> {
                 }
             }
             CompetitionCommand::Create(create) => {
-                let event = create.to_event()?;
-                if create.dry_run {
-                    println!("{}", serde_json::to_string_pretty(&event)?);
-                    return Ok(());
-                }
-                let id = client.create(&event).await?;
+                let id = if create.queued {
+                    let request = create.to_queued()?;
+                    if create.dry_run {
+                        println!("{}", serde_json::to_string_pretty(&request)?);
+                        return Ok(());
+                    }
+                    client.create_queued(&request).await?
+                } else {
+                    let event = create.to_event()?;
+                    if create.dry_run {
+                        println!("{}", serde_json::to_string_pretty(&event)?);
+                        return Ok(());
+                    }
+                    client.create(&event).await?
+                };
                 let competition = client.competition(id).await?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&competition)?);
@@ -504,14 +559,35 @@ pub fn show_text(c: &OperatorCompetition) -> String {
         when(terms.end_observation_date)
     );
     let _ = writeln!(out, "Signing by    {}", when(terms.signing_date));
-    let _ = writeln!(
-        out,
-        "Entries       {} of {} ({} paid, {} paid out)",
-        c.total_entries,
-        terms.total_allowed_entries,
-        c.total_paid_entries,
-        c.total_paid_out_entries
-    );
+    if let Some(queue) = &c.queue {
+        let _ = writeln!(
+            out,
+            "Queue         {} entered of at most {}; pools of {} to {} players",
+            queue.entries,
+            queue.max_entries,
+            queue.pool_rules.min_players(),
+            queue.pool_rules.max_players()
+        );
+        for pool in &queue.pools {
+            let _ = writeln!(
+                out,
+                "Pool {:<8} {} ({} players)",
+                pool.pool_index, pool.competition_id, pool.players
+            );
+        }
+    } else {
+        let _ = writeln!(
+            out,
+            "Entries       {} of {} ({} paid, {} paid out)",
+            c.total_entries,
+            terms.total_allowed_entries,
+            c.total_paid_entries,
+            c.total_paid_out_entries
+        );
+    }
+    if let Some(parent) = c.parent_id {
+        let _ = writeln!(out, "Queued in     {parent}");
+    }
     let _ = writeln!(
         out,
         "Entry fee     {} sats; pool {} sats; coordinator fee {}; {} place(s) win",
