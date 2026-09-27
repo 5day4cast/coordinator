@@ -218,6 +218,9 @@ pub struct CreateCompetitionForm {
     pub locations: Vec<String>,
     #[serde(default)]
     pub relative_locktime_block_delta: Option<u16>,
+    /// `lines` or `fixed`; lines when absent.
+    #[serde(default)]
+    pub scoring_rules: Option<String>,
 }
 
 /// Handle competition creation from HTMX form
@@ -274,6 +277,18 @@ pub async fn admin_create_competition_handler(
             Err(error) => return Html(competition_error(&error.to_string()).into_string()),
         };
 
+    let scoring_rules = match form
+        .scoring_rules
+        .as_deref()
+        .filter(|text| !text.is_empty())
+    {
+        None => crate::infra::oracle::ScoringRules::Lines,
+        Some(text) => match crate::infra::oracle::ScoringRules::parse(text) {
+            Some(rules) => rules,
+            None => return Html(competition_error("Scoring must be lines or fixed").into_string()),
+        },
+    };
+
     // Calculate total pool
     let Some(total_competition_pool) = form.entry_fee.checked_mul(form.total_allowed_entries)
     else {
@@ -297,6 +312,7 @@ pub async fn admin_create_competition_handler(
         total_competition_pool,
         relative_locktime_block_delta: form.relative_locktime_block_delta,
         unlisted: false,
+        scoring_rules: Some(scoring_rules),
     };
 
     match state.coordinator.create_competition(create_event).await {

@@ -207,6 +207,23 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
 
                             div class="column" {
                                 div class="field" {
+                                    label class="label" { "Scoring" }
+                                    div class="control" {
+                                        div class="select" {
+                                            select name="scoring_rules" {
+                                                option value="lines" selected { "Lines (10 a right pick)" }
+                                                option value="fixed" { "Fixed (Par 20, Over/Under 10)" }
+                                            }
+                                        }
+                                    }
+                                    p class="help" {
+                                        "Lines: each station's Par band, fitted on its recent forecast misses"
+                                    }
+                                }
+                            }
+
+                            div class="column" {
+                                div class="field" {
                                     label class="label" { "Block Delta" }
                                     div class="control" {
                                         input class="input" type="number"

@@ -30,12 +30,12 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use uuid::Uuid;
 
 pub use phase::Phase;
-pub use progress::{Metric, PickState, Standing};
+pub use progress::{Metric, PickState, Rule, Standing};
 
 use crate::{
     domain::{Competition, Coordinator, EntryStatus, Error, UserEntry, UserInfo},
     infra::{
-        oracle::ValueOptions,
+        oracle::{ScoringRules, ValueOptions},
         oracle_weather::{EventReadings, OracleWeather, Reading, Station, StationObservations},
         refresh_cache::{Cached, RefreshCache, RETRY_AFTER},
     },
@@ -104,6 +104,21 @@ impl CompetitionWeather {
             .iter()
             .find(|reading| reading.target == station && reading.metric == metric.id())
             .and_then(|reading| reading.baseline)
+    }
+
+    /// What a pick on `metric` at `station` is scored against: the fixed rule, or the event's
+    /// band once the oracle has the event.
+    pub fn rule(&self, rules: ScoringRules, station: &str, metric: Metric) -> Option<Rule> {
+        match rules {
+            ScoringRules::Fixed => Some(Rule::Fixed),
+            ScoringRules::Lines => self
+                .event
+                .line(station, metric.id())
+                .map(|line| Rule::Line {
+                    lower: line.lower,
+                    upper: line.upper,
+                }),
+        }
     }
 
     /// Whether the forecasts are missing because computing them failed, rather than because
@@ -185,6 +200,8 @@ pub struct PickProgress {
     pub station_id: String,
     pub metric: Metric,
     pub pick: ValueOptions,
+    /// What the pick is scored against; `None` until the oracle gives a lines event's band.
+    pub rule: Option<Rule>,
     /// What the oracle compares with; fixed once the window opens.
     pub forecast: Option<f64>,
     /// Observed over the window so far: the running high, low or peak wind.
@@ -496,6 +513,7 @@ pub fn build(
     let start = competition.event_submission.start_observation_date;
     let end = competition.event_submission.end_observation_date;
     let hours_total = (end - start).as_seconds_f64() / 3600.0;
+    let rules = competition.event_submission.scoring_rules();
     let weather_value = weather.value();
     let scored = weather_value.is_some_and(|weather| weather.event.is_final());
     // The phase says what the rows show: Scored only with the oracle's attested scores.
@@ -539,6 +557,7 @@ pub fn build(
                             &choice.stations,
                             metric,
                             pick,
+                            rules,
                             weather_value,
                             window,
                             start,
@@ -628,6 +647,7 @@ fn pick_progress(
     station: &str,
     metric: Metric,
     pick: &ValueOptions,
+    rules: ScoringRules,
     weather: Option<&CompetitionWeather>,
     window: Window,
     start: OffsetDateTime,
@@ -636,11 +656,15 @@ fn pick_progress(
 ) -> PickProgress {
     let forecast = weather.and_then(|weather| weather.forecast(station, metric));
     let observed = weather.and_then(|weather| weather.observed(station, metric));
-    let points = progress::points(pick, metric, forecast, observed);
+    let rule = match rules {
+        ScoringRules::Fixed => Some(Rule::Fixed),
+        ScoringRules::Lines => weather.and_then(|weather| weather.rule(rules, station, metric)),
+    };
+    let points = progress::points(pick, metric, rule, forecast, observed);
     let state = match window {
         Window::Scored => PickState::Final,
         Window::Closed => PickState::AwaitingResult,
-        Window::Open => progress::pick_state(pick, metric, forecast, observed),
+        Window::Open => progress::pick_state(pick, metric, rule, forecast, observed),
     };
     let latest_report = weather
         .and_then(|weather| weather.station(station))
@@ -654,6 +678,7 @@ fn pick_progress(
         station_id: station.to_owned(),
         metric,
         pick: pick.clone(),
+        rule,
         forecast,
         observed,
         state,

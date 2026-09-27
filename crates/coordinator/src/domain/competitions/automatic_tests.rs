@@ -342,6 +342,7 @@ impl Fixture {
             total_competition_pool: 100_000,
             relative_locktime_block_delta: Some(72),
             unlisted: false,
+            scoring_rules: None,
         });
         coordinator
             .competition_store
@@ -946,6 +947,7 @@ fn event(places: usize, players: usize) -> CreateEvent {
         total_competition_pool: players * 50_000,
         relative_locktime_block_delta: Some(72),
         unlisted: false,
+        scoring_rules: None,
     }
 }
 

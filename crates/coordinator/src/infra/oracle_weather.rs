@@ -2,7 +2,7 @@
 //!
 //! - `GET /oracle/events/{id}`: the event's readings, a forecast ("baseline") and an observed
 //!   value per station and metric, which the oracle refreshes about hourly and scores entries
-//!   with, and each entry's score once the window has closed.
+//!   with, each entry's score once the window has closed, and a `lines` event's Par bands.
 //! - `GET /stations/observations`: the same aggregate over the window the oracle scores (the
 //!   high and wind as maxima, the low as a minimum), as of the latest report, and that report's
 //!   time.
@@ -39,10 +39,22 @@ pub struct Reading {
     pub observed: Option<f64>,
 }
 
+/// A `lines` event's Par band for one station and metric, fixed when the oracle created the
+/// event: Par when the observed value minus the forecast is from `lower` to `upper`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct EventLine {
+    pub target: String,
+    pub metric: String,
+    pub lower: f64,
+    pub upper: f64,
+}
+
 /// What the oracle holds for a competition's event.
 #[derive(Debug, Clone, Default)]
 pub struct EventReadings {
     pub readings: Vec<Reading>,
+    /// Par bands, for events scored with lines.
+    pub lines: Vec<EventLine>,
     /// Points per oracle entry id. The oracle rescores entries on each run once the window has
     /// opened, so these are only final once the event is attested.
     pub scores: HashMap<Uuid, u64>,
@@ -55,6 +67,12 @@ impl EventReadings {
         self.readings
             .iter()
             .find(|reading| reading.target == station && reading.metric == metric)
+    }
+
+    pub fn line(&self, station: &str, metric: &str) -> Option<&EventLine> {
+        self.lines
+            .iter()
+            .find(|line| line.target == station && line.metric == metric)
     }
 
     /// Whether the oracle has attested the result, so its readings and scores are final.
@@ -140,6 +158,8 @@ impl OracleWeather {
             #[serde(default)]
             entries: Vec<Entry>,
             attestation: Option<serde_json::Value>,
+            #[serde(default)]
+            lines: Vec<EventLine>,
         }
         let url = format!("{}/oracle/events/{event_id}", self.base_url);
         let response = self.http.get(&url).send().await?;
@@ -159,6 +179,7 @@ impl OracleWeather {
                 .filter_map(|entry| Some((entry.id, u64::try_from(entry.base_score?).ok()?)))
                 .collect(),
             readings: event.readings,
+            lines: event.lines,
             attested: event.attestation.is_some_and(|value| !value.is_null()),
         })
     }

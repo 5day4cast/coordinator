@@ -6,11 +6,12 @@ use maud::{html, Markup};
 
 use crate::domain::{
     leaderboard::{
-        progress::{OVER_OR_UNDER_POINTS, PAR_POINTS},
-        Metric,
+        progress::{LINE_POINTS, OVER_OR_UNDER_POINTS, PAR_POINTS},
+        Metric, Rule,
     },
     PayoutTermsQuote, TicketStatus,
 };
+use crate::infra::oracle::ScoringRules;
 use crate::templates::{
     format::{self, ordinal, sats, MetricText},
     fragments::loading::{placeholder, Pending},
@@ -24,7 +25,9 @@ pub struct StationForecast {
     pub station_id: String,
     /// `Portland International, ME`, when the oracle knows the station.
     pub station_name: Option<String>,
-    pub forecasts: Vec<(Metric, Option<f64>)>,
+    /// Each metric's forecast and what a pick on it is scored against; the rule is `None` while
+    /// a lines competition's band is not known yet.
+    pub forecasts: Vec<(Metric, Option<f64>, Option<Rule>)>,
 }
 
 /// Where this entry's winnings (and any refund) go.
@@ -60,7 +63,7 @@ pub fn entry_form(
         Forecasts::Ready { stations, .. } => stations
             .iter()
             .flat_map(|station| &station.forecasts)
-            .filter(|(_, forecast)| forecast.is_some())
+            .filter(|(_, forecast, _)| forecast.is_some())
             .count(),
         Forecasts::Pending(_) => 0,
     };
@@ -97,9 +100,19 @@ pub fn entry_form(
             }
 
             p class="how-to-pick" {
-                "For each reading, pick whether it will come in over the forecast, under it, or on it. "
-                strong { "Par" } " means the reading matches the forecast exactly (to the whole degree for temperatures) and scores "
-                (PAR_POINTS) " points; a correct over or under scores " (OVER_OR_UNDER_POINTS) "."
+                @match competition.scoring_rules {
+                    ScoringRules::Lines => {
+                        "For each reading, pick whether it will come in over par, on par, or under par. "
+                        strong { "Par" } " is a range around the forecast, set from how that airport's forecasts "
+                        "have missed over the last 60 days, so the three are about equally likely. "
+                        "A right pick scores " (LINE_POINTS) " points."
+                    }
+                    ScoringRules::Fixed => {
+                        "For each reading, pick whether it will come in over the forecast, under it, or on it. "
+                        strong { "Par" } " means the reading matches the forecast exactly (to the whole degree for temperatures) and scores "
+                        (PAR_POINTS) " points; a correct over or under scores " (OVER_OR_UNDER_POINTS) "."
+                    }
+                }
                 @if picks_allowed < pickable {
                     " Make up to " (picks_allowed) " picks."
                 }
@@ -243,8 +256,8 @@ fn station_picks(station: &StationForecast) -> Markup {
                 }
                 span class="station-code" { (station.station_id) }
             }
-            @for (metric, forecast) in &station.forecasts {
-                (pick_row(&station.station_id, *metric, *forecast))
+            @for (metric, forecast, rule) in &station.forecasts {
+                (pick_row(&station.station_id, *metric, *forecast, *rule))
             }
         }
     }
@@ -312,7 +325,7 @@ pub fn ticket_status(url: &str, progress: TicketProgress) -> Markup {
 
 /// Over / Par / Under for one forecast, as radio buttons named `KPWM_temp_high`,
 /// with "No pick" (checked at first) to leave or take back a pick.
-fn pick_row(station_id: &str, metric: Metric, forecast: Option<f64>) -> Markup {
+fn pick_row(station_id: &str, metric: Metric, forecast: Option<f64>, rule: Option<Rule>) -> Markup {
     let name = format!("{station_id}_{}", metric.id());
     html! {
         div class="pick-row" {
@@ -321,6 +334,9 @@ fn pick_row(station_id: &str, metric: Metric, forecast: Option<f64>) -> Markup {
                 @match forecast {
                     Some(value) => { " " strong class="pick-forecast" { (metric.value(value)) } }
                     None => { " " span class="pick-forecast is-missing" { "no forecast yet" } }
+                }
+                @if let (Some(value), Some(Rule::Line { lower, upper })) = (forecast, rule) {
+                    " " span class="pick-par" { "Par " (metric.range(value + lower, value + upper)) }
                 }
             }
             div class="pick-options" role="radiogroup" aria-label=(format!("{} at {station_id}", metric.label())) {
@@ -383,9 +399,9 @@ mod tests {
             station_id: "KPWM".into(),
             station_name: Some("Portland International, ME".into()),
             forecasts: vec![
-                (Metric::TempHigh, Some(69.0)),
-                (Metric::TempLow, Some(41.0)),
-                (Metric::WindSpeed, Some(7.0)),
+                (Metric::TempHigh, Some(69.0), Some(Rule::Fixed)),
+                (Metric::TempLow, Some(41.0), Some(Rule::Fixed)),
+                (Metric::WindSpeed, Some(7.0), Some(Rule::Fixed)),
             ],
         }
     }
@@ -463,9 +479,45 @@ mod tests {
     }
 
     #[test]
+    fn lines_competitions_show_each_picks_par_range() {
+        let mut competition = view("c1", Phase::Upcoming, 60);
+        competition.scoring_rules = ScoringRules::Lines;
+        let mut station = station();
+        station.forecasts = vec![
+            (
+                Metric::TempHigh,
+                Some(69.0),
+                Some(Rule::Line {
+                    lower: -1.6,
+                    upper: 1.2,
+                }),
+            ),
+            (Metric::WindSpeed, Some(7.0), None),
+        ];
+        let html = entry_form(
+            &competition,
+            &Forecasts::Ready {
+                stations: vec![station],
+                pins: vec![],
+            },
+            None,
+            &PayoutDestination::LoggedOut,
+        )
+        .into_string();
+        assert!(html.contains("Par 67.4–70.2°F"), "{html}");
+        assert_eq!(html.matches("pick-par").count(), 1);
+        assert!(html.contains("A right pick scores 10 points."));
+        assert!(!html.contains("20 points"));
+        assert!(form(PayoutDestination::LoggedOut).contains("scores 20 points"));
+    }
+
+    #[test]
     fn a_missing_forecast_disables_its_picks() {
         let mut station = station();
-        station.forecasts = vec![(Metric::TempHigh, Some(70.0)), (Metric::WindSpeed, None)];
+        station.forecasts = vec![
+            (Metric::TempHigh, Some(70.0), Some(Rule::Fixed)),
+            (Metric::WindSpeed, None, Some(Rule::Fixed)),
+        ];
         let forecasts = Forecasts::Ready {
             stations: vec![station],
             pins: vec![],

@@ -6,7 +6,7 @@
 use maud::{html, Markup};
 use time::OffsetDateTime;
 
-use crate::domain::leaderboard::{Phase, PickProgress, PickState};
+use crate::domain::leaderboard::{Phase, PickProgress, PickState, Rule};
 use crate::infra::oracle::ValueOptions;
 use crate::templates::format::{self, MetricText};
 
@@ -153,6 +153,9 @@ fn forecast_value(pick: &PickProgress) -> Markup {
     html! {
         "Forecast "
         strong { (pick.forecast.map(|value| pick.metric.value(value)).unwrap_or_else(|| "—".into())) }
+        @if let (Some(value), Some(Rule::Line { lower, upper })) = (pick.forecast, pick.rule) {
+            " (Par " (pick.metric.range(value + lower, value + upper)) ")"
+        }
     }
 }
 
@@ -234,11 +237,12 @@ mod tests {
         observed: Option<f64>,
         state: PickState,
     ) -> PickProgress {
-        let points = points(&choice, metric, Some(forecast), observed);
+        let points = points(&choice, metric, Some(Rule::Fixed), Some(forecast), observed);
         PickProgress {
             station_id: "KJFK".into(),
             metric,
             pick: choice,
+            rule: Some(Rule::Fixed),
             forecast: Some(forecast),
             observed,
             state,

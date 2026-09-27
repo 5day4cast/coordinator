@@ -4,7 +4,8 @@ use super::*;
 use crate::{
     domain::CreateEvent,
     infra::{
-        oracle::{AddEventEntry, WeatherChoices},
+        oracle::{AddEventEntry, ScoringRules, WeatherChoices},
+        oracle_weather::EventLine,
         refresh_cache::Fetched,
     },
 };
@@ -30,6 +31,7 @@ fn competition() -> Competition {
         total_competition_pool: 18_000,
         relative_locktime_block_delta: None,
         unlisted: false,
+        scoring_rules: None,
     });
     competition.total_entries = 3;
     competition.total_paid_entries = 3;
@@ -111,6 +113,7 @@ fn weather(scores: HashMap<Uuid, u64>, entries: usize, attested: bool) -> Compet
             entry_count: entries,
             scores,
             attested,
+            lines: vec![],
         },
         observations: Some(vec![StationObservations {
             station_id: "KPWM".into(),
@@ -545,4 +548,73 @@ async fn early_forecasts_fill_in_for_an_event_the_oracle_has_not_read_yet() {
     let weather = read.value().unwrap();
     assert_eq!(weather.forecast("KPWM", Metric::TempHigh), Some(70.0));
     assert_eq!(weather.forecast("KBTV", Metric::WindSpeed), Some(8.0));
+}
+
+/// A lines competition scores the unrounded miss against the event's bands, 10 a right pick, and
+/// a pick's state follows which side of the band the running value is on.
+#[test]
+fn lines_competitions_score_picks_against_the_event_bands() {
+    let mut competition = competition();
+    competition.event_submission.scoring_rules = Some(ScoringRules::Lines);
+    let bands = [
+        ("temp_high", -2.5, 1.5),
+        ("temp_low", -0.5, 0.5),
+        ("wind_speed", -1.5, 1.5),
+    ];
+    let mut with_lines = weather(HashMap::new(), 0, false);
+    with_lines.event.lines = bands
+        .iter()
+        .map(|&(metric, lower, upper)| EventLine {
+            target: "KPWM".into(),
+            metric: metric.into(),
+            lower,
+            upper,
+        })
+        .collect();
+    // Misses three hours in: high -5.6, low -1, wind +3.
+    let entries = [
+        entry(
+            competition.id,
+            &"aa".repeat(32),
+            vec![picks("KPWM", Some(Under), Some(Under), Some(Over))],
+        ),
+        entry(
+            competition.id,
+            &"bb".repeat(32),
+            vec![picks("KPWM", Some(Par), Some(Par), Some(Par))],
+        ),
+    ];
+    let now = start() + time::Duration::hours(3);
+    let board = build(
+        &competition,
+        &entries,
+        &cached(with_lines),
+        &HashMap::new(),
+        now,
+    );
+    assert_eq!(board.rows[0].standing.score, 30);
+    let states: Vec<PickState> = board.rows[0].picks.iter().map(|pick| pick.state).collect();
+    assert_eq!(
+        states,
+        [PickState::OnTrack, PickState::LockedIn, PickState::LockedIn]
+    );
+    assert!(board.rows[0]
+        .picks
+        .iter()
+        .all(|pick| matches!(pick.rule, Some(Rule::Line { .. }))));
+    assert_eq!(board.rows[1].standing.score, 0);
+
+    // Until the oracle's event gives the bands, a lines pick scores nothing and waits.
+    let board = build(
+        &competition,
+        &entries,
+        &cached(weather(HashMap::new(), 0, false)),
+        &HashMap::new(),
+        now,
+    );
+    assert!(board.rows.iter().all(|row| row.standing.score == 0));
+    assert!(board.rows[0]
+        .picks
+        .iter()
+        .all(|pick| pick.state == PickState::Pending && pick.rule.is_none()));
 }

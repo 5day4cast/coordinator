@@ -135,6 +135,7 @@ impl Coordinator {
             total_competition_pool: 6_000 * entries,
             relative_locktime_block_delta: None,
             unlisted: false,
+            scoring_rules: None,
         });
         self.state
             .coordinator

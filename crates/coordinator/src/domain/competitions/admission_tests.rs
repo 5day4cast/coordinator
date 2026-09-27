@@ -29,6 +29,7 @@ fn competition(start: OffsetDateTime, capacity: usize) -> Competition {
         total_competition_pool: capacity * 1_000,
         relative_locktime_block_delta: None,
         unlisted: true,
+        scoring_rules: None,
     })
 }
 

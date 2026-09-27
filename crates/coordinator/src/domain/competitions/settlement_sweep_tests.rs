@@ -424,6 +424,7 @@ impl UnpaidWinners {
             total_competition_pool: funding_value.to_sat() as usize,
             relative_locktime_block_delta: Some(72),
             unlisted: false,
+            scoring_rules: None,
         });
         coordinator
             .competition_store
