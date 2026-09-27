@@ -1258,12 +1258,14 @@ impl CompetitionStore {
             .await
     }
 
-    /// Competitions with lifecycle work left, as the runners' sweep sees them.
+    /// Competitions with lifecycle work left, as the runners' sweep sees them. A queued
+    /// competition that formed its pools has none: its pools run instead.
     pub async fn active_competition_ids(&self) -> Result<Vec<Uuid>, sqlx::Error> {
         let ids = sqlx::query_scalar::<_, String>(
             "SELECT id FROM competitions
              WHERE expiry_broadcasted_at IS NULL AND completed_at IS NULL
-               AND (cancelled_at IS NULL OR funding_confirmed_at IS NOT NULL)",
+               AND (cancelled_at IS NULL OR funding_confirmed_at IS NOT NULL)
+               AND NOT (kind = 'queued' AND pools_formed_at IS NOT NULL)",
         )
         .fetch_all(self.db_connection.read())
         .await?;
@@ -1279,6 +1281,9 @@ impl CompetitionStore {
     /// escrow to refund. An Arkade ticket is paid and settled at once, since the swap service
     /// settles its invoice, so only its escrow says it still holds the player's buy-in. The
     /// escrows of a pool that a batch funded were spent into it, so they are not refunded.
+    ///
+    /// A queued competition that formed its pools keeps only the tickets no pool took, so their
+    /// escrows are refunded the same way.
     pub async fn get_competitions_pending_cleanup(
         &self,
         include_escrows: bool,
@@ -1286,7 +1291,8 @@ impl CompetitionStore {
         let ids = sqlx::query_scalar::<_, String>(
             "SELECT DISTINCT competitions.id
              FROM competitions JOIN tickets ON tickets.event_id = competitions.id
-             WHERE (competitions.failed_at IS NOT NULL OR competitions.cancelled_at IS NOT NULL)
+             WHERE (competitions.failed_at IS NOT NULL OR competitions.cancelled_at IS NOT NULL
+                    OR (competitions.kind = 'queued' AND competitions.pools_formed_at IS NOT NULL))
                AND ((tickets.paid_at IS NOT NULL AND tickets.settled_at IS NULL
                      AND tickets.invoice_cancelled_at IS NULL)
                     OR (? AND tickets.escrow_transaction IS NOT NULL
@@ -1358,7 +1364,11 @@ impl CompetitionStore {
                 completed_at as completed_at,
                 failed_at as failed_at,
                 keymeld_keygen_completed_at as keymeld_keygen_completed_at,
-                errors
+                errors,
+                competitions.kind as kind,
+                competitions.parent_id as parent_id,
+                competitions.pool_index as pool_index,
+                competitions.pools_formed_at as pools_formed_at
             FROM competitions
             LEFT JOIN payout_stats ON competitions.id = payout_stats.event_id
             LEFT JOIN entries ON entries.event_id = competitions.id
@@ -1400,6 +1410,10 @@ impl CompetitionStore {
                     failed_at,
                     keymeld_keygen_completed_at,
                     errors,
+                    competitions.kind,
+                    competitions.parent_id,
+                    competitions.pool_index,
+                    competitions.pools_formed_at,
                     payout_stats.total_paid_out_entries",
                 base_query
             )
@@ -1439,6 +1453,10 @@ impl CompetitionStore {
                     failed_at,
                     keymeld_keygen_completed_at,
                     errors,
+                    competitions.kind,
+                    competitions.parent_id,
+                    competitions.pool_index,
+                    competitions.pools_formed_at,
                     payout_stats.total_paid_out_entries",
                 base_query
             )
@@ -1499,7 +1517,11 @@ impl CompetitionStore {
                 completed_at as completed_at,
                 failed_at as failed_at,
                 keymeld_keygen_completed_at as keymeld_keygen_completed_at,
-                errors
+                errors,
+                competitions.kind as kind,
+                competitions.parent_id as parent_id,
+                competitions.pool_index as pool_index,
+                competitions.pools_formed_at as pools_formed_at
             FROM competitions
             LEFT JOIN payout_stats ON competitions.id = payout_stats.event_id
             LEFT JOIN entries ON entries.event_id = competitions.id
@@ -1537,7 +1559,11 @@ impl CompetitionStore {
                 completed_at,
                 failed_at,
                 keymeld_keygen_completed_at,
-                errors"#;
+                errors,
+                competitions.kind,
+                competitions.parent_id,
+                competitions.pool_index,
+                competitions.pools_formed_at"#;
 
         let competition = sqlx::query_as::<_, Competition>(query_str)
             .bind(competition_id.to_string())

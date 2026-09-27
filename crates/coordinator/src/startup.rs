@@ -9,16 +9,16 @@ use crate::{
         admin_send_bitcoin_handler, admin_settle_test_invoice_handler,
         admin_wallet_address_fragment, admin_wallet_balance_fragment, admin_wallet_fragment,
         admin_wallet_outputs_fragment, change_password, claim_ticket_payout, competitions_fragment,
-        create_competition, entries_fragment, entry_detail_fragment, entry_forecasts_fragment,
-        entry_form_fragment, entry_payout_fragment, forgot_password_challenge,
-        forgot_password_reset, get_aggregate_nonces, get_balance, get_competition,
-        get_competitions, get_contract_parameters, get_entries, get_estimated_fee_rates,
-        get_next_address, get_outputs, get_ticket_refund, get_ticket_status, health,
-        leaderboard_fragment, leaderboard_rows_fragment, login, login_username, not_found,
-        operator_competition, operator_competitions, operator_delete_competition, payouts_fragment,
-        public_page_handler, register, register_ticket, register_username,
-        request_competition_ticket, send_to_address, set_lightning_address,
-        submit_final_signatures, submit_public_nonces, submit_ticket_payout,
+        create_competition, create_queued_competition, entries_fragment, entry_detail_fragment,
+        entry_forecasts_fragment, entry_form_fragment, entry_payout_fragment,
+        forgot_password_challenge, forgot_password_reset, get_aggregate_nonces, get_balance,
+        get_competition, get_competitions, get_contract_parameters, get_entries,
+        get_estimated_fee_rates, get_next_address, get_outputs, get_ticket_refund,
+        get_ticket_status, health, leaderboard_fragment, leaderboard_rows_fragment, login,
+        login_username, not_found, operator_competition, operator_competitions,
+        operator_delete_competition, payouts_fragment, public_page_handler, register,
+        register_ticket, register_username, request_competition_ticket, send_to_address,
+        set_lightning_address, submit_final_signatures, submit_public_nonces, submit_ticket_payout,
         ticket_status_fragment,
     },
     config::Settings,
@@ -1025,6 +1025,10 @@ pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Ne
         .nest("/admin", admin_htmx_routes)
         .nest("/api/v1/wallet", wallet_endpoints)
         .route("/api/v1/competitions", post(create_competition))
+        .route(
+            "/api/v1/competitions/queued",
+            post(create_queued_competition),
+        )
         .route("/api/v1/admin/competitions", get(operator_competitions))
         .route(
             "/api/v1/admin/competitions/{competition_id}",
@@ -1233,6 +1237,7 @@ mod startup_tests {
         ("GET", "/api/v1/wallet/estimated_fees"),
         ("POST", "/api/v1/wallet/send"),
         ("POST", "/api/v1/competitions"),
+        ("POST", "/api/v1/competitions/queued"),
         ("GET", "/api/v1/admin/competitions"),
         ("GET", COMPETITION_PATH),
         ("DELETE", COMPETITION_PATH),

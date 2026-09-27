@@ -198,6 +198,25 @@ pub trait Bitcoin: Send + Sync {
         send_options: SendOptions,
         selected_utxos: Vec<OutPoint>,
     ) -> Result<Txid, anyhow::Error>;
+    /// Up to `count` block headers from `start` on, in height order: each block's hash and
+    /// header time. Fewer when the chain is shorter.
+    async fn block_headers(
+        &self,
+        start: u32,
+        count: u32,
+    ) -> Result<Vec<BlockSummary>, anyhow::Error> {
+        let _ = (start, count);
+        Err(anyhow!("This Bitcoin client cannot read block headers"))
+    }
+}
+
+/// A block, as a header gives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockSummary {
+    pub height: u32,
+    pub hash: bitcoin::BlockHash,
+    /// The header's time, UNIX seconds.
+    pub time: u32,
 }
 
 #[derive(Deserialize)]
@@ -1014,6 +1033,27 @@ impl Bitcoin for BitcoinClient {
 
     async fn get_current_height(&self) -> Result<u32, anyhow::Error> {
         self.lnd.block_height().await
+    }
+
+    async fn block_headers(
+        &self,
+        start: u32,
+        count: u32,
+    ) -> Result<Vec<BlockSummary>, anyhow::Error> {
+        let count = count.min(2016) as usize;
+        let headers = self
+            .with_electrum(move |client| client.block_headers(start as usize, count))
+            .await?
+            .headers;
+        Ok(headers
+            .iter()
+            .zip(start..)
+            .map(|(header, height)| BlockSummary {
+                height,
+                hash: header.block_hash(),
+                time: header.time,
+            })
+            .collect())
     }
 
     async fn get_confirmed_blockchain_time(&self, blocks: usize) -> Result<u64, anyhow::Error> {

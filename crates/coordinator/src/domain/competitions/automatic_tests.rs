@@ -56,6 +56,7 @@ fn generic_response(
                     attempt_id,
                     signing_session_id: None,
                 }),
+                keygen_session_id: None,
             },
             request_digest: [1; 32],
         },
@@ -700,6 +701,7 @@ fn session(players: [UserId; 2]) -> DlcKeygenSession {
             max_signing_sessions: None,
             encrypted_taproot_tweak: "test".into(),
             subset_definitions: vec![],
+            deposit_scope: None,
         },
         &creator.export_secret(),
     )

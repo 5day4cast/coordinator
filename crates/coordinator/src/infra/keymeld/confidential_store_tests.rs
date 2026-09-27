@@ -60,6 +60,7 @@ fn state(session: &SessionId) -> ProtocolState {
                 )
                 .unwrap(),
             subset_definitions: vec![],
+            deposit_scope: None,
         },
         &authority.export_secret(),
     )

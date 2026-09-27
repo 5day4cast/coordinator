@@ -29,6 +29,9 @@ use keymeld_sdk::{
     },
 };
 
+#[path = "deposit_sessions.rs"]
+mod deposit_sessions;
+
 /// Keeps the command journal in memory only, for work inside an Arkade batch.
 ///
 /// A batch that fails is retried with a new commitment transaction, new messages, and fresh
@@ -107,6 +110,26 @@ use zeroize::Zeroizing;
 
 fn invalid(message: impl Into<String>) -> KeymeldError {
     KeymeldError::Session(message.into())
+}
+
+/// The gateway's enclaves, sorted, for spreading participants across them.
+async fn available_enclaves(client: &KeyMeldClient) -> Result<Vec<EnclaveId>, KeymeldError> {
+    let mut available: Vec<_> = client
+        .health()
+        .list_enclaves()
+        .await?
+        .enclaves
+        .into_iter()
+        .map(|info| info.enclave_id)
+        .collect();
+    available.sort();
+    available.dedup();
+    if available.is_empty() {
+        return Err(invalid(
+            "No enclaves available for confidential registration",
+        ));
+    }
+    Ok(available)
 }
 fn encoded<T: Serialize>(value: &T) -> Result<Vec<u8>, KeymeldError> {
     serde_json::to_vec(value).map_err(|error| invalid(error.to_string()))
@@ -253,6 +276,10 @@ async fn escrow_request<T: Serialize>(
     if driver.command_was_rejected(stage, enclave) {
         driver.clear_rejected_command(stage, enclave).await?;
     }
+    // A deposit's policy names its deposit scope rather than this session, so the command
+    // names the session it acts in; a session's own policies leave it out.
+    let keygen_session_id = (policy.policy.context.keygen_session_id != session.session_id)
+        .then(|| session.session_id.clone());
     let context = RequestContext {
         keygen_session_id: None,
         schema_version: escrow::SCHEMA_VERSION,
@@ -262,6 +289,7 @@ async fn escrow_request<T: Serialize>(
         request_id: Uuid::nil(), // Template identity is excluded from semantic retries.
         action_id: action.map(str::to_owned),
         attempt,
+        keygen_session_id,
     };
     let plaintext = Zeroizing::new(encoded(request)?);
     let input = (&context, &*plaintext);
@@ -397,21 +425,7 @@ impl Keymeld for KeymeldService {
             return Ok(session);
         }
         let client = self.get_client()?;
-        let mut available: Vec<_> = client
-            .health()
-            .list_enclaves()
-            .await?
-            .enclaves
-            .into_iter()
-            .map(|info| info.enclave_id)
-            .collect();
-        available.sort();
-        available.dedup();
-        if available.is_empty() {
-            return Err(invalid(
-                "No enclaves available for confidential registration",
-            ));
-        }
+        let available = available_enclaves(client).await?;
         let credentials = SessionCredentials::generate()?;
         let authority = AuthorizationCredentials::generate()?;
         let users: Vec<_> = std::iter::once(self.coordinator_user_id.clone())
@@ -450,6 +464,7 @@ impl Keymeld for KeymeldService {
                         participants: subset.participants.clone(),
                     })
                     .collect(),
+                deposit_scope: None,
             },
             &authority.export_secret(),
         )?;
@@ -654,86 +669,71 @@ impl Keymeld for KeymeldService {
         })
     }
 
+    async fn deposit_assignment(
+        &self,
+        deposit_session_id: SessionId,
+        deposit_digest: [u8; 32],
+        user: UserId,
+    ) -> Result<RegistrationAssignment, KeymeldError> {
+        let client = self.get_client()?;
+        let available = available_enclaves(client).await?;
+        // Spread by ticket rather than by a counter, so asking again for the same ticket gives
+        // the same enclave.
+        let enclave = available[(user.uuid().as_u128() % available.len() as u128) as usize];
+        let pinned = ConfidentialTransport::new(client).attest(enclave).await?;
+        Ok(RegistrationAssignment {
+            session_id: deposit_session_id.to_string(),
+            user_id: user.uuid(),
+            manifest_hash: deposit_digest.to_vec(),
+            enclave_id: enclave.as_u32(),
+            enclave_key_epoch: pinned.key_epoch(),
+            enclave_public_key: hex::encode(pinned.public_key()),
+            gateway_url: self.settings.browser_gateway_url().to_owned(),
+            trusted_pcrs: self.settings.trusted_pcrs.clone(),
+            dangerous_trust_unattested_enclaves: self.settings.dangerous_trust_unattested_enclaves,
+            payout_policy: None,
+        })
+    }
+
     async fn bind_payout_contract(
         &self,
         session: &DlcKeygenSession,
         contract: &ContractCommitment,
         expected: &BTreeMap<UserId, PayoutPolicy>,
     ) -> Result<Vec<PayoutContractBoundResponse>, KeymeldError> {
-        let _guard = self.lock_session(&session.session_id).await;
-        let (mut state, checkpoint) = self.checkpoint(session).await?;
-        if state.policies.keys().collect::<BTreeSet<_>>() != expected.keys().collect() {
-            return Err(invalid(
-                "Accepted payout policies differ from deposited consent",
-            ));
-        }
-        for (user, policy) in expected {
-            let registered = &state
-                .registrations
-                .get(user)
-                .ok_or_else(|| invalid("Payout participant not registered"))?
-                .registration_authorization
-                .context;
-            coordinator_core::keymeld::verify_registration_policy(
-                registered,
-                Some(policy),
-                state.policies.get(user),
-            )?;
-        }
-        let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
-        let mut journal = std::mem::take(&mut state.journal);
-        let mut driver = self
-            .connect(session, &state, &credentials, &mut journal, &checkpoint)
-            .await?;
-        let roster = driver.restore_keygen(&state.registrations).await?;
-        let binding = generic::ContractBinding {
-            statement: None,
-            contract: contract.clone(),
-        };
-        let mut responses = Vec::new();
-        for (user, policy) in &state.policies {
-            let request = BindEscrowRequest {
-                schema_version: escrow::SCHEMA_VERSION,
-                policy: policy.clone(),
-                application_context: policy
-                    .policy
-                    .verifier
-                    .as_ref()
-                    .ok_or_else(|| invalid("Missing trusted verifier"))?
-                    .policy_data
-                    .clone(),
-                participant_policies: state.policies.clone(),
-                binding_data: Payload::encode(&binding)?,
-            };
-            let response = escrow_request(
-                &mut driver,
-                session,
-                &state,
-                &credentials,
-                user,
-                &format!("escrow/bind/{user}"),
-                Operation::Bind,
-                None,
-                None,
-                &request,
-            )
-            .await?;
-            responses.push(PayoutContractBoundResponse::from_response(
-                binding.clone(),
-                response,
-            )?);
-        }
-        drop(driver);
-        state.bindings = responses
-            .iter()
-            .map(|bound| (bound.user_id.clone(), bound.response.clone()))
-            .collect();
-        state.roster = Some(roster);
-        state.journal = journal;
-        checkpoint.finish(state).await?;
-        Ok(responses)
+        self.bind_contract(session, contract, expected, None).await
     }
 
+    async fn bind_payout_contract_with_statement(
+        &self,
+        session: &DlcKeygenSession,
+        contract: &ContractCommitment,
+        expected: &BTreeMap<UserId, PayoutPolicy>,
+        statement: coordinator_escrow::oracle_statement::SignedStatement,
+    ) -> Result<Vec<PayoutContractBoundResponse>, KeymeldError> {
+        self.bind_contract(session, contract, expected, Some(statement))
+            .await
+    }
+
+    async fn validate_deposit(
+        &self,
+        scope: DepositScopeRequest,
+        user: UserId,
+        registration: &ParticipantRegistrationData,
+    ) -> Result<(), KeymeldError> {
+        self.check_deposit(scope, user, registration).await
+    }
+
+    async fn init_deposit_session(
+        &self,
+        session_id: Uuid,
+        scope: DepositScopeRequest,
+        members: Vec<(UserId, EnclaveId)>,
+        subsets: DlcSubsetInfo,
+    ) -> Result<DlcKeygenSession, KeymeldError> {
+        self.create_deposit_session(session_id, scope, members, subsets)
+            .await
+    }
     async fn prepare_payout(
         &self,
         session: &DlcKeygenSession,
@@ -886,15 +886,10 @@ impl Keymeld for KeymeldService {
         let receipts = PreparedPayoutReceipts::decode(&request.state_receipt)?;
         receipts.verify(&session.recipient_authorization.recipient_public_keys[&enclave])?;
         let settlement = receipts.settlement()?;
+        // A deposit's policy names its deposit scope, and the command the session it acts in.
         if settlement.claim_id != request.claim_id
             || receipts.preimage_preparation.context.request.escrow.user_id != user
-            || receipts
-                .preimage_preparation
-                .context
-                .request
-                .escrow
-                .keygen_session_id
-                != session.session_id
+            || receipts.preimage_preparation.context.request.session_id() != &session.session_id
         {
             return Err(invalid(
                 "Prepared payout belongs to another session, participant or claim",
@@ -1230,6 +1225,91 @@ impl Keymeld for KeymeldService {
             .clone()
             .try_into()
             .map_err(|_| invalid("Invalid BIP340 signature length"))
+    }
+}
+
+impl KeymeldService {
+    /// Bind the contract for every participant. A queued competition's pool carries the oracle's
+    /// signed statement of its event, from which the verifier derives each player's contract.
+    async fn bind_contract(
+        &self,
+        session: &DlcKeygenSession,
+        contract: &ContractCommitment,
+        expected: &BTreeMap<UserId, PayoutPolicy>,
+        statement: Option<coordinator_escrow::oracle_statement::SignedStatement>,
+    ) -> Result<Vec<PayoutContractBoundResponse>, KeymeldError> {
+        let _guard = self.lock_session(&session.session_id).await;
+        let (mut state, checkpoint) = self.checkpoint(session).await?;
+        if state.policies.keys().collect::<BTreeSet<_>>() != expected.keys().collect() {
+            return Err(invalid(
+                "Accepted payout policies differ from deposited consent",
+            ));
+        }
+        for (user, policy) in expected {
+            let registered = &state
+                .registrations
+                .get(user)
+                .ok_or_else(|| invalid("Payout participant not registered"))?
+                .registration_authorization
+                .context;
+            coordinator_core::keymeld::verify_registration_policy(
+                registered,
+                Some(policy),
+                state.policies.get(user),
+            )?;
+        }
+        let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
+        let mut journal = std::mem::take(&mut state.journal);
+        let mut driver = self
+            .connect(session, &state, &credentials, &mut journal, &checkpoint)
+            .await?;
+        let roster = driver.restore_keygen(&state.registrations).await?;
+        let binding = generic::ContractBinding {
+            statement,
+            contract: contract.clone(),
+        };
+        let mut responses = Vec::new();
+        for (user, policy) in &state.policies {
+            let request = BindEscrowRequest {
+                schema_version: escrow::SCHEMA_VERSION,
+                policy: policy.clone(),
+                application_context: policy
+                    .policy
+                    .verifier
+                    .as_ref()
+                    .ok_or_else(|| invalid("Missing trusted verifier"))?
+                    .policy_data
+                    .clone(),
+                participant_policies: state.policies.clone(),
+                binding_data: Payload::encode(&binding)?,
+            };
+            let response = escrow_request(
+                &mut driver,
+                session,
+                &state,
+                &credentials,
+                user,
+                &format!("escrow/bind/{user}"),
+                Operation::Bind,
+                None,
+                None,
+                &request,
+            )
+            .await?;
+            responses.push(PayoutContractBoundResponse::from_response(
+                binding.clone(),
+                response,
+            )?);
+        }
+        drop(driver);
+        state.bindings = responses
+            .iter()
+            .map(|bound| (bound.user_id.clone(), bound.response.clone()))
+            .collect();
+        state.roster = Some(roster);
+        state.journal = journal;
+        checkpoint.finish(state).await?;
+        Ok(responses)
     }
 }
 

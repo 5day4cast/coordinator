@@ -21,9 +21,9 @@ use crate::{
         routes::ApiError,
     },
     domain::{
-        AddEntry, Competition, CreateEvent, Error as DomainError, FundedContract, PayoutClaimInfo,
-        PayoutClaimReceipt, PayoutInfo, SearchBy, TicketRefund, TicketRegistration, TicketResponse,
-        TicketStatus, UserEntry,
+        AddEntry, Competition, CreateEvent, CreateQueuedCompetition, Error as DomainError,
+        FundedContract, PayoutClaimInfo, PayoutClaimReceipt, PayoutInfo, SearchBy, TicketRefund,
+        TicketRegistration, TicketResponse, TicketStatus, UserEntry,
     },
     infra::lnurl::LightningAddress,
     startup::AppState,
@@ -43,6 +43,24 @@ pub async fn create_competition(
             ApiError::from(e)
         })?;
     // Its entry form reads forecasts from the cache; fill it before anyone opens it.
+    state.leaderboards.warm(&competition);
+    Ok(Json(competition))
+}
+
+/// Create a queued competition: players enter without a seat count, and it forms pools when
+/// registration closes. Private, like `create_competition`.
+pub async fn create_queued_competition(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateQueuedCompetition>,
+) -> Result<Json<Competition>, ApiError> {
+    let competition = state
+        .coordinator
+        .create_queued_competition(body)
+        .await
+        .map_err(|e| {
+            error!("error creating queued competition: {:?}", e);
+            ApiError::from(e)
+        })?;
     state.leaderboards.warm(&competition);
     Ok(Json(competition))
 }

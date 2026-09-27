@@ -4,6 +4,10 @@ mod ark_coordinator;
 mod automatic;
 #[path = "competition_steps.rs"]
 mod competition_steps;
+#[path = "queued_coordinator.rs"]
+mod queued_coordinator;
+#[path = "queued_kickoff.rs"]
+mod queued_kickoff;
 pub use automatic::{InvoiceFallbackRequest, PayoutAuthorizationInfo, PayoutTermsQuote};
 
 use super::{
@@ -1296,16 +1300,23 @@ impl Coordinator {
     ) -> Result<&'a mut Competition, anyhow::Error> {
         if competition.event_created_at.is_none() {
             if competition.event_announcement.is_none() {
-                let event: Event = match self
-                    .oracle_client
-                    .create_event(competition.event_submission.clone())
-                    .await
-                {
-                    Ok(event) => Ok(event),
-                    Err(OracleError::NotFound(e)) => Err(Error::NotFound(e)),
-                    Err(OracleError::BadRequest(e)) => Err(Error::BadRequest(e)),
-                    Err(e) => Err(Error::OracleFailed(e)),
-                }?;
+                let pool = self.pool_of(competition).await?;
+                let event: Event = if let Some((settings, _)) = &pool {
+                    // A pool's event copies its queued competition's lines, and is checked
+                    // against the terms its players consented to.
+                    self.create_pool_event(competition, settings).await?
+                } else {
+                    match self
+                        .oracle_client
+                        .create_event(competition.event_submission.clone())
+                        .await
+                    {
+                        Ok(event) => Ok(event),
+                        Err(OracleError::NotFound(e)) => Err(Error::NotFound(e)),
+                        Err(OracleError::BadRequest(e)) => Err(Error::BadRequest(e)),
+                        Err(e) => Err(Error::OracleFailed(e)),
+                    }?
+                };
                 debug!(
                     "Created competition's {} oracle event: {:?}",
                     competition.id, event
@@ -1428,6 +1439,10 @@ impl Coordinator {
 
         let outcome_payouts = if let Some(params) = &competition.contract_parameters {
             params.outcome_payouts.clone()
+        } else if let Some((settings, record)) = self.pool_of(competition).await? {
+            // A pool's players consented to one pool payout table, whatever pool they are in.
+            self.accepted_pool_payouts(competition, &settings, &record.members, &entries)
+                .await?
         } else if let Some(accepted) = self
             .accepted_outcome_payouts(competition.id, &entries)
             .await?
@@ -3255,13 +3270,16 @@ impl Coordinator {
     }
 
     pub async fn get_competitions(&self) -> Result<Vec<Competition>, Error> {
-        self.competition_store
+        let mut competitions = self
+            .competition_store
             .get_competitions(false)
             .map_err(|e| {
                 error!("failed to get competitions: {:?}", e);
                 Error::from(e)
             })
-            .await
+            .await?;
+        self.attach_queue_details(&mut competitions).await?;
+        Ok(competitions)
     }
 
     pub async fn request_ticket(
@@ -3285,6 +3303,12 @@ impl Coordinator {
             .competition_store
             .get_competition(competition_id)
             .await?;
+        if competition.kind == super::CompetitionKind::Queued {
+            // No seats: the ticket is made for this entry.
+            return self
+                .request_queued_ticket(pubkey, competition, btc_pubkey, payout)
+                .await;
+        }
         competition.require_ticket_admission(OffsetDateTime::now_utc())?;
         if competition.total_entries as usize >= competition.event_submission.total_allowed_entries
         {
@@ -3371,25 +3395,32 @@ impl Coordinator {
         competition: Competition,
     ) -> Result<TicketResponse, Error> {
         competition.require_ticket_admission(OffsetDateTime::now_utc())?;
-        let mut keymeld_registration = if self.is_keymeld_enabled() {
-            let stored = self
-                .competition_store
-                .get_keymeld_session(competition.id)
-                .await
-                .map_err(Error::from)?
-                .ok_or_else(|| {
-                    Error::BadRequest("Competition has no authorized Keymeld session".into())
-                })?;
-            let session = self.restore_keymeld_session(&stored)?;
-            Some(
-                self.keymeld
-                    .get_registration_assignment(&session, UserId::from(ticket.id))
+        let mut keymeld_registration =
+            if self.is_keymeld_enabled() && competition.kind == super::CompetitionKind::Queued {
+                // A queued ticket's key is deposited under the competition's terms: no session yet.
+                Some(
+                    self.queued_registration_assignment(&competition, ticket.id)
+                        .await?,
+                )
+            } else if self.is_keymeld_enabled() {
+                let stored = self
+                    .competition_store
+                    .get_keymeld_session(competition.id)
                     .await
-                    .map_err(|error| Error::Bitcoin(anyhow!(error)))?,
-            )
-        } else {
-            None
-        };
+                    .map_err(Error::from)?
+                    .ok_or_else(|| {
+                        Error::BadRequest("Competition has no authorized Keymeld session".into())
+                    })?;
+                let session = self.restore_keymeld_session(&stored)?;
+                Some(
+                    self.keymeld
+                        .get_registration_assignment(&session, UserId::from(ticket.id))
+                        .await
+                        .map_err(|error| Error::Bitcoin(anyhow!(error)))?,
+                )
+            } else {
+                None
+            };
         if let Some(assignment) = keymeld_registration.as_mut() {
             assignment.payout_policy = self
                 .competition_store
@@ -3549,7 +3580,8 @@ impl Coordinator {
     }
 
     pub async fn get_competition(&self, competition_id: Uuid) -> Result<Competition, Error> {
-        self.competition_store
+        let mut competition = self
+            .competition_store
             .get_competition(competition_id)
             .map_err(|e| {
                 error!(
@@ -3558,13 +3590,34 @@ impl Coordinator {
                 );
                 Error::from(e)
             })
-            .await
+            .await?;
+        self.attach_queue_details(std::slice::from_mut(&mut competition))
+            .await?;
+        Ok(competition)
     }
 
     /// Delete a competition by ID. Only allowed if no entries have been paid.
     pub async fn delete_competition(&self, competition_id: Uuid) -> Result<(), Error> {
         // First check if competition exists and has no paid entries
         let competition = self.get_competition(competition_id).await?;
+        if competition.kind == super::CompetitionKind::Pool
+            || competition.pools_formed_at.is_some()
+            || (competition.kind == super::CompetitionKind::Queued
+                && self
+                    .competition_store
+                    .ticket_ids(competition_id)
+                    .await?
+                    .into_iter()
+                    .next()
+                    .is_some())
+        {
+            // A queued competition's tickets hold buy-ins in escrows, paid or on their way; its
+            // pools hold its players' entries.
+            return Err(Error::BadRequest(format!(
+                "Cannot delete competition {competition_id}: it is a pool, formed pools, or has \
+                 tickets"
+            )));
+        }
 
         if competition.total_paid_entries > 0 {
             return Err(Error::BadRequest(format!(
@@ -3622,6 +3675,7 @@ impl Coordinator {
 
         competition.require_entry_admission(OffsetDateTime::now_utc())?;
         let entry_deadline = competition.event_submission.start_observation_date;
+        let kind = competition.kind;
         validate_entry_keys(&mut entry)?;
         validate_entry(entry.clone().into(), competition).await?;
 
@@ -3667,15 +3721,6 @@ impl Coordinator {
 
         let policy = self.validate_entry_payout_policy(&entry, &ticket).await?;
         if self.is_keymeld_enabled() {
-            let stored = self
-                .competition_store
-                .get_keymeld_session(entry.event_id)
-                .await
-                .map_err(Error::from)?
-                .ok_or_else(|| {
-                    Error::BadRequest("Competition has no authorized Keymeld session".into())
-                })?;
-            let session = self.restore_keymeld_session(&stored)?;
             let data = ParticipantRegistrationData {
                 encrypted_private_key: entry.encrypted_keymeld_private_key.clone().ok_or_else(
                     || Error::BadRequest("Missing authorized Keymeld registration envelope".into()),
@@ -3700,9 +3745,25 @@ impl Coordinator {
                 entry.keymeld_escrow_policy.as_ref(),
             )
             .map_err(|error| Error::BadRequest(error.to_string()))?;
-            session
-                .validate_registration(&UserId::from(ticket.id), &data)
-                .map_err(|_| Error::BadRequest("Invalid Keymeld registration context".into()))?;
+            if kind == super::CompetitionKind::Queued {
+                // A key deposit, checked by the enclave when the ticket was paid for.
+                self.check_queued_entry_registration(entry.event_id, &ticket, &entry, &data)
+                    .await?;
+            } else {
+                let stored = self
+                    .competition_store
+                    .get_keymeld_session(entry.event_id)
+                    .await
+                    .map_err(Error::from)?
+                    .ok_or_else(|| {
+                        Error::BadRequest("Competition has no authorized Keymeld session".into())
+                    })?;
+                self.restore_keymeld_session(&stored)?
+                    .validate_registration(&UserId::from(ticket.id), &data)
+                    .map_err(|_| {
+                        Error::BadRequest("Invalid Keymeld registration context".into())
+                    })?;
+            }
             // The entry must register the key the ticket was paid with, if one was sent before
             // paying: that is the key its escrow is refunded with.
             if let Some(stored) = self
@@ -3865,17 +3926,23 @@ impl Coordinator {
             data.escrow_policy.as_ref(),
         )
         .map_err(|error| Error::BadRequest(error.to_string()))?;
-        let stored = self
-            .competition_store
-            .get_keymeld_session(competition_id)
-            .await
-            .map_err(Error::from)?
-            .ok_or_else(|| {
-                Error::BadRequest("Competition has no authorized Keymeld session".into())
-            })?;
-        self.restore_keymeld_session(&stored)?
-            .validate_registration(&UserId::from(ticket.id), &data)
-            .map_err(|_| Error::BadRequest("Invalid Keymeld registration context".into()))?;
+        if competition.kind == super::CompetitionKind::Queued {
+            // A key deposit: no session exists yet, so the enclave checks it on its own.
+            self.validate_queued_deposit(&competition, ticket.id, &data)
+                .await?;
+        } else {
+            let stored = self
+                .competition_store
+                .get_keymeld_session(competition_id)
+                .await
+                .map_err(Error::from)?
+                .ok_or_else(|| {
+                    Error::BadRequest("Competition has no authorized Keymeld session".into())
+                })?;
+            self.restore_keymeld_session(&stored)?
+                .validate_registration(&UserId::from(ticket.id), &data)
+                .map_err(|_| Error::BadRequest("Invalid Keymeld registration context".into()))?;
+        }
         let json = serde_json::to_string(&registration).map_err(|e| Error::Bitcoin(e.into()))?;
         match self
             .competition_store
@@ -5283,6 +5350,7 @@ mod keymeld_authorization_tests {
                         participants: subset.participants.clone(),
                     })
                     .collect(),
+                deposit_scope: None,
             },
             &creator.export_secret(),
         )

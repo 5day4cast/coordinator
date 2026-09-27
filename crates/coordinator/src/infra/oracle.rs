@@ -465,6 +465,15 @@ impl ScoringRules {
     }
 }
 
+/// The oracle's key from `GET /oracle/pubkey`: base64 of the compressed SEC1 key.
+pub fn parse_oracle_key(base64_key: &str) -> Result<dlctix::musig2::secp256k1::PublicKey, Error> {
+    let bytes = BASE64
+        .decode(base64_key.trim())
+        .map_err(|e| Error::Request(format!("the oracle key is not base64: {e}")))?;
+    dlctix::musig2::secp256k1::PublicKey::from_slice(&bytes)
+        .map_err(|e| Error::Request(format!("the oracle key is not a public key: {e}")))
+}
+
 fn secp256k1_to_nostr_keys(secp_key: &Secp256k1SecretKey) -> Result<Keys, &'static str> {
     let key_bytes = secp_key.secret_bytes();
 
@@ -473,10 +482,103 @@ fn secp256k1_to_nostr_keys(secp_key: &Secp256k1SecretKey) -> Result<Keys, &'stat
     Ok(Keys::new(secret_key))
 }
 
+/// An oracle event with the terms the oracle signs in its statement: its window, targets,
+/// scoring and frozen lines, and the statement itself once every entry is in.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OracleEventTerms {
+    #[serde(flatten)]
+    pub event: Event,
+    #[serde(with = "time::serde::rfc3339")]
+    pub signing_date: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub start_observation_date: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub end_observation_date: time::OffsetDateTime,
+    pub locations: Vec<String>,
+    pub number_of_values_per_entry: u32,
+    pub total_allowed_entries: usize,
+    pub number_of_places_win: u32,
+    pub source: String,
+    pub scoring_fields: Vec<String>,
+    /// Oracles before 2.4.0 do not report it.
+    #[serde(default)]
+    pub scoring_rules: Option<ScoringRules>,
+    /// For `lines` events, the lines frozen when the event was created.
+    #[serde(default)]
+    pub lines: Vec<OracleLine>,
+    /// The oracle's signed statement of the event, once every entry is in. Oracles before 2.4.0
+    /// have none.
+    #[serde(default)]
+    pub statement: Option<coordinator_escrow::oracle_statement::SignedStatement>,
+}
+
+/// A line an event scores one target and metric against, as the oracle reports it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct OracleLine {
+    pub target: String,
+    pub metric: String,
+    pub lower: f64,
+    pub upper: f64,
+    pub window_hours: i64,
+}
+
+impl OracleEventTerms {
+    /// The terms the oracle's statement of this event carries, built as the oracle builds them:
+    /// lines sorted by target, then metric.
+    pub fn observation(
+        &self,
+    ) -> Result<coordinator_escrow::oracle_statement::ObservationTerms, Error> {
+        use coordinator_escrow::oracle_statement::{self as statement, LineTerms};
+        let scoring_rules = match self.scoring_rules.unwrap_or_default() {
+            ScoringRules::Fixed => statement::ScoringRules::Fixed,
+            ScoringRules::Lines => statement::ScoringRules::Lines,
+        };
+        let mut lines = self
+            .lines
+            .iter()
+            .map(|line| {
+                Ok(LineTerms {
+                    target: line.target.clone(),
+                    metric: line.metric.clone(),
+                    lower: line.lower,
+                    upper: line.upper,
+                    window_hours: u32::try_from(line.window_hours)
+                        .map_err(|_| Error::Request("a line's window is out of range".into()))?,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        lines.sort_by(|a, b| (&a.target, &a.metric).cmp(&(&b.target, &b.metric)));
+        Ok(statement::ObservationTerms {
+            source: self.source.clone(),
+            start_observation_date: self.start_observation_date.unix_timestamp(),
+            end_observation_date: self.end_observation_date.unix_timestamp(),
+            targets: self.locations.clone(),
+            scoring_fields: self.scoring_fields.clone(),
+            number_of_values_per_entry: self.number_of_values_per_entry,
+            scoring_rules,
+            lines,
+        })
+    }
+}
+
 #[async_trait::async_trait]
 pub trait Oracle: Send + Sync {
     async fn create_event(&self, event: CreateEvent) -> Result<Event, Error>;
+    /// Create an event that copies the lines `lines_from_event`, an earlier event of this
+    /// coordinator, froze, instead of the current fit: every pool of a queued competition scores
+    /// against the lines its players picked against. An oracle before 2.5.0 ignores the request,
+    /// so the caller compares the lines the new event froze.
+    async fn create_event_from_lines(
+        &self,
+        event: CreateEvent,
+        lines_from_event: Uuid,
+    ) -> Result<Event, Error>;
     async fn get_event(&self, event_id: &Uuid) -> Result<Event, Error>;
+    /// The event with the terms its statement is built from, and the statement once every entry
+    /// is in.
+    async fn get_event_terms(&self, event_id: &Uuid) -> Result<OracleEventTerms, Error>;
+    /// The oracle's signing key.
+    async fn public_key(&self) -> Result<dlctix::musig2::secp256k1::PublicKey, Error>;
     async fn submit_entries(&self, event_entries: AddEventEntries) -> Result<(), Error>;
 }
 
@@ -588,17 +690,32 @@ impl OracleClient {
     }
 }
 
-#[async_trait::async_trait]
-impl Oracle for OracleClient {
-    async fn create_event(&self, event: CreateEvent) -> Result<Event, Error> {
+impl OracleClient {
+    async fn post_event(
+        &self,
+        event: CreateEvent,
+        lines_from_event: Option<Uuid>,
+    ) -> Result<Event, Error> {
         debug!("event: {:?}", event);
         let url = self
             .base_url
             .join("/oracle/events")
             .map_err(|e| Error::Request(e.to_string()))?;
 
-        let body = serde_json::to_vec(&event)
-            .map_err(|e| Error::Request(format!("Failed to serialize event: {}", e)))?;
+        #[derive(Serialize)]
+        struct FromLines<'a> {
+            #[serde(flatten)]
+            event: &'a CreateEvent,
+            lines_from_event: Uuid,
+        }
+        let body = match lines_from_event {
+            None => serde_json::to_vec(&event),
+            Some(lines_from_event) => serde_json::to_vec(&FromLines {
+                event: &event,
+                lines_from_event,
+            }),
+        }
+        .map_err(|e| Error::Request(format!("Failed to serialize event: {}", e)))?;
         let wanted = event.scoring_rules.unwrap_or_default();
 
         let created: serde_json::Value = self
@@ -627,6 +744,56 @@ impl Oracle for OracleClient {
         }
         serde_json::from_value(created)
             .map_err(|e| Error::Request(format!("Failed to read the created event: {e}")))
+    }
+}
+
+#[async_trait::async_trait]
+impl Oracle for OracleClient {
+    async fn create_event(&self, event: CreateEvent) -> Result<Event, Error> {
+        self.post_event(event, None).await
+    }
+
+    async fn create_event_from_lines(
+        &self,
+        event: CreateEvent,
+        lines_from_event: Uuid,
+    ) -> Result<Event, Error> {
+        self.post_event(event, Some(lines_from_event)).await
+    }
+
+    async fn get_event_terms(&self, id: &Uuid) -> Result<OracleEventTerms, Error> {
+        let url = self
+            .base_url
+            .join(&format!("/oracle/events/{}", id))
+            .map_err(|e| Error::Request(e.to_string()))?;
+        self.send_authenticated_request::<OracleEventTerms>(
+            Method::GET,
+            url,
+            None,
+            format!("event with id {} not found", id),
+        )
+        .await
+    }
+
+    async fn public_key(&self) -> Result<dlctix::musig2::secp256k1::PublicKey, Error> {
+        #[derive(Deserialize)]
+        struct Base64Pubkey {
+            /// base64 of the compressed SEC1 key
+            key: String,
+        }
+        let url = self
+            .base_url
+            .join("/oracle/pubkey")
+            .map_err(|e| Error::Request(e.to_string()))?;
+        let key: Base64Pubkey = self
+            .send_authenticated_request(
+                Method::GET,
+                url,
+                None,
+                String::from("oracle public key not found"),
+            )
+            .await?;
+        parse_oracle_key(&key.key)
     }
 
     async fn get_event(&self, id: &Uuid) -> Result<Event, Error> {
