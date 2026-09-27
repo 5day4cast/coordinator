@@ -277,3 +277,105 @@ test("a refused registration never shows the invoice", async () => {
   assert.ok(!elements.errorMessage.classList.contains("hidden"), "the player is told it failed");
   assert.equal(elements.submitEntry.disabled, false);
 });
+
+// A queued competition: the form says so and shows the pool sizes, and the
+// wallet checks the entry against the oracle's reference event and key.
+const REFERENCE_EVENT = `{"id":"${COMPETITION}","lines":[{"target":"KPWM","metric":"temp_low","lower":-2.5,"upper":-0.0}],"event_announcement":{"expiry":1790259200}}`;
+
+function queuedPage() {
+  const page = entryPage();
+  Object.assign(page.elements.entryForm.dataset, { kind: "queued", poolMinPlayers: "2", poolMaxPlayers: "25" });
+  return page;
+}
+
+function queuedFetch({ kind = "queued", pool_rules = { min_players: 2, max_players: 25 } } = {}) {
+  const requests = [];
+  const fetch = async (url) => {
+    requests.push(url);
+    if (url.endsWith("/payout-terms")) {
+      return { ok: true, json: async () => ({ enabled: true, relative_locktime_block_delta: 72, max_fee_rate_sat_vb: 5, arkade: true }) };
+    }
+    if (url === "https://oracle/oracle/pubkey") {
+      return { ok: true, json: async () => ({ key: "A3oracleKeyBase64" }) };
+    }
+    if (url === `https://oracle/oracle/events/${COMPETITION}`) {
+      return { ok: true, text: async () => REFERENCE_EVENT, json: async () => JSON.parse(REFERENCE_EVENT) };
+    }
+    return { ok: true, json: async () => ({ id: COMPETITION, kind, pool_rules, event_submission: EVENT }) };
+  };
+  return { fetch, requests };
+}
+
+function queuedPlayer(wallet) {
+  return loggedIn({
+    AuthorizedClient: class {
+      async post(url) {
+        if (url.endsWith("/api/v1/users/login")) {
+          return { ok: true, json: async () => ({ lightning_address: "thor@lnurl.5day4cast.com" }) };
+        }
+        // A queued ticket's id is its entry's.
+        return { ok: true, json: async () => ({ ticket_id: "0190b6a0-0000-7000-8000-000000000001",
+          payment_request: "lnbc52500n1ticket", keymeld_session_id: COMPETITION, keymeld_registration: {
+            user_id: "0190b6a0-0000-7000-8000-000000000001", session_id: COMPETITION, payout_policy: "policy" } }) };
+      }
+    },
+    dlcWallet: {
+      entryRegistration: () => ({ ephemeral_pubkey: "pubkey", payout_hash: "hash" }),
+      keymeldPayoutRegistration: () => assert.fail("a queued entry is checked as one"),
+      keymeldRegistration: () => assert.fail("escrow must not downgrade"),
+      ...wallet,
+    },
+  });
+}
+
+test("a queued entry is checked against the oracle and the form, with no extra step", async () => {
+  const { elements, document } = queuedPage();
+  const { fetch, requests } = queuedFetch();
+  let consent;
+  const refusal = "The entry's terms differ from the competition, its oracle event or the ticket";
+  const sandbox = load(queuedPlayer({
+    keymeldQueuedRegistration: async (entry, assignment, serialized) => {
+      assert.equal(entry, "0190b6a0-0000-7000-8000-000000000001");
+      assert.equal(JSON.parse(assignment).session_id, COMPETITION);
+      consent = JSON.parse(serialized);
+      throw refusal;
+    },
+  }), document, fetch);
+  await sandbox.submitEntry();
+  assert.ok(requests.includes("https://oracle/oracle/pubkey"), "the key comes from the oracle");
+  assert.ok(requests.includes(`https://oracle/oracle/events/${COMPETITION}`));
+  assert.deepEqual(Object.keys(consent).sort(), [
+    "allow_invoice_fallback", "competition_id", "entry_fee_sats", "expected_relative_locktime_delta",
+    "lightning_address", "max_fee_rate_sat_vb", "oracle_pubkey", "pool_rules", "reference_event",
+    "release_entry_key_after_payment", "ticket_amount_sats", "ticket_invoice",
+  ]);
+  assert.equal(consent.competition_id, COMPETITION);
+  assert.equal(consent.ticket_amount_sats, 5250);
+  assert.equal(consent.entry_fee_sats, 5000);
+  assert.deepEqual(consent.pool_rules, { min_players: 2, max_players: 25 });
+  assert.equal(consent.oracle_pubkey, "A3oracleKeyBase64");
+  assert.equal(consent.lightning_address, "thor@lnurl.5day4cast.com");
+  assert.equal(consent.reference_event, REFERENCE_EVENT, "the oracle's text reaches the wallet unchanged");
+  assert.ok(consent.reference_event.includes('"upper":-0.0'));
+  assert.equal(elements.errorMessage.textContent, refusal);
+  assert.equal(elements.submitEntry.disabled, false);
+});
+
+test("a queue whose kind or pool sizes differ from the form is refused before any ticket", async () => {
+  for (const [label, page, fetchOptions] of [
+    ["the API says single", queuedPage(), { kind: null }],
+    ["the form says single", entryPage(), {}],
+    ["other pool sizes", queuedPage(), { pool_rules: { min_players: 3, max_players: 25 } }],
+    ["no pool sizes", queuedPage(), { pool_rules: null }],
+  ]) {
+    const { elements, document } = page;
+    const { fetch } = queuedFetch(fetchOptions);
+    const window = loggedIn({
+      AuthorizedClient: class { async post() { assert.fail(`no ticket when ${label}`); } },
+      dlcWallet: { entryRegistration: () => assert.fail(`no entry key when ${label}`) },
+    });
+    const sandbox = load(window, document, fetch);
+    await sandbox.submitEntry();
+    assert.match(elements.errorMessage.textContent, /terms changed/, label);
+  }
+});

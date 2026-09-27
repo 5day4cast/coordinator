@@ -62,7 +62,25 @@ class Entry {
         assignment.session_id !== this.ticket.keymeld_session_id)) {
       throw new Error("The Keymeld registration belongs to another ticket or session");
     }
-    if (assignment?.payout_policy) {
+    if (assignment?.payout_policy && this.payoutTerms.queued) {
+      // A queued entry names no pool yet: the wallet checks its terms against the
+      // oracle's reference event and key and what the form showed.
+      this.preparedRegistration = await session.dlcWallet.keymeldQueuedRegistration(
+        this.entry.id,
+        JSON.stringify(assignment),
+        JSON.stringify({
+          competition_id: this.competition.id,
+          lightning_address: this.payoutChoice.lightning_address,
+          allow_invoice_fallback: this.payoutChoice.allow_invoice_fallback,
+          release_entry_key_after_payment: this.payoutChoice.release_entry_key_after_payment,
+          ticket_invoice: this.ticket.payment_request,
+          ticket_amount_sats: this.ticketAmountSats,
+          expected_relative_locktime_delta: this.payoutTerms.quote.relative_locktime_block_delta,
+          max_fee_rate_sat_vb: this.payoutTerms.quote.max_fee_rate_sat_vb,
+          ...this.payoutTerms.queued,
+        }),
+      );
+    } else if (assignment?.payout_policy) {
       this.preparedRegistration = await session.dlcWallet.keymeldPayoutRegistration(
         this.entry.id,
         JSON.stringify(assignment),
@@ -266,6 +284,8 @@ function showLogin() {
   openModal(document.getElementById("loginModal"));
 }
 
+const TERMS_CHANGED = "This competition's terms changed since the form opened; go back to the competitions list and open it again";
+
 // The competition, its payout terms and the oracle's announcement, fetched
 // fresh for the wallet to check against what the form showed.
 async function loadEntryTerms(form) {
@@ -282,12 +302,18 @@ async function loadEntryTerms(form) {
   const competition = await competitionResponse.json();
   const quote = await quoteResponse.json();
   const event = competition.event_submission;
+  // A competition that doesn't say is a single one, and so is its form.
+  const kind = competition.kind ?? "single";
   if (competition.id !== competitionId || !event ||
+      kind !== (form.dataset.kind ?? "single") ||
       event.entry_fee !== Number(form.dataset.entryFee) ||
       ticketPriceSats(event) !== Number(form.dataset.ticketPrice) ||
       event.total_competition_pool !== Number(form.dataset.totalPool) ||
       event.number_of_places_win !== Number(form.dataset.winnerCount)) {
-    throw new Error("This competition's terms changed since the form opened; go back to the competitions list and open it again");
+    throw new Error(TERMS_CHANGED);
+  }
+  if (kind === "queued") {
+    return { competition, quote, oracle: null, queued: await loadQueueTerms(form, competition, quote) };
   }
   let oracle = null;
   if (quote.enabled) {
@@ -297,6 +323,41 @@ async function loadEntryTerms(form) {
     if (oracle.id !== competitionId || !oracle.event_announcement) throw new Error("The oracle returned a different event");
   }
   return { competition, quote, oracle };
+}
+
+// What a queued entry's terms are checked against: the entry fee and pool
+// sizes the form shows, and the competition's reference event and the
+// oracle's key, both straight from the oracle.
+async function loadQueueTerms(form, competition, quote) {
+  const oracleBase = document.body.dataset.oracleBase || "";
+  const shown = {
+    min_players: Number(form.dataset.poolMinPlayers),
+    max_players: Number(form.dataset.poolMaxPlayers),
+  };
+  if (!Number.isSafeInteger(shown.min_players) || !Number.isSafeInteger(shown.max_players) ||
+      competition.pool_rules?.min_players !== shown.min_players ||
+      competition.pool_rules?.max_players !== shown.max_players) {
+    throw new Error(TERMS_CHANGED);
+  }
+  // A queued entry is held in an escrow and paid out automatically.
+  if (!quote.enabled) throw new Error("Entries to this competition are unavailable right now; no ticket payment has been requested");
+  const [eventResponse, keyResponse] = await Promise.all([
+    fetch(`${oracleBase}/oracle/events/${competition.id}`),
+    fetch(`${oracleBase}/oracle/pubkey`),
+  ]);
+  if (!eventResponse.ok || !keyResponse.ok) {
+    throw new Error("The oracle's terms are unavailable; no ticket payment has been requested");
+  }
+  // Kept as text, so the wallet reads each line exactly as the oracle wrote it.
+  const referenceEvent = await eventResponse.text();
+  const { key } = await keyResponse.json();
+  if (typeof key !== "string") throw new Error("The oracle returned no public key");
+  return {
+    entry_fee_sats: Number(form.dataset.entryFee),
+    pool_rules: shown,
+    oracle_pubkey: key,
+    reference_event: referenceEvent,
+  };
 }
 
 // The Lightning Address on the player's account: where automatic payouts,
