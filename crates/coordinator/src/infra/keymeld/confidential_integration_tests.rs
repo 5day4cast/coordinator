@@ -1602,14 +1602,13 @@ async fn key_deposits_are_checked_alone_and_registered_into_a_pool_session() {
     }
     // A registration sealed for a session, not as a deposit, is refused.
     let mut sealed_for_session = deposits[0].1.clone();
-    sealed_for_session.encrypted_private_key =
-        UserCredentials::from_private_key(&entry_secret(0))
-            .unwrap()
-            .prepare_registration(
-                sealed_for_session.context.clone(),
-                &hex::encode(relay_state.operator.lock().unwrap().get_public_key()),
-            )
-            .unwrap();
+    sealed_for_session.encrypted_private_key = UserCredentials::from_private_key(&entry_secret(0))
+        .unwrap()
+        .prepare_registration(
+            sealed_for_session.context.clone(),
+            &hex::encode(relay_state.operator.lock().unwrap().get_public_key()),
+        )
+        .unwrap();
     assert!(service
         .validate_deposit(scope(b"refund"), players[0].clone(), &sealed_for_session)
         .await
@@ -1657,7 +1656,13 @@ async fn key_deposits_are_checked_alone_and_registered_into_a_pool_session() {
             .await
             .unwrap();
     }
-    assert!(service.get_keygen_status(&session).await.unwrap().is_completed);
+    assert!(
+        service
+            .get_keygen_status(&session)
+            .await
+            .unwrap()
+            .is_completed
+    );
     let roster = service.wait_for_keygen_completion(&session).await.unwrap();
     roster
         .verify_registrations(&session.authorization_manifest)
