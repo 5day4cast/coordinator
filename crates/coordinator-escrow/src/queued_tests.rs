@@ -21,6 +21,35 @@ fn oracle_key() -> XOnlyPublicKey {
     .0
 }
 
+/// The oracle's full public key, whichever its parity: the oracle announces locking points with it.
+fn full_oracle_key() -> Point {
+    Point::from(
+        SecretKey::from_byte_array(ORACLE_SECRET)
+            .unwrap()
+            .public_key(&Secp256k1::new()),
+    )
+}
+
+#[test]
+fn locking_points_do_not_depend_on_the_oracle_key_parity() {
+    let signed = statement_for(&[uuid7(1), uuid7(2)]);
+    for secret in 1..=8u8 {
+        let full = Point::from(
+            SecretKey::from_byte_array([secret; 32])
+                .unwrap()
+                .public_key(&Secp256k1::new()),
+        );
+        let even = Point::from((
+            XOnlyPublicKey::from_byte_array(full.serialize_xonly()).unwrap(),
+            Parity::Even,
+        ));
+        assert_eq!(
+            signed.statement.locking_points(full),
+            signed.statement.locking_points(even)
+        );
+    }
+}
+
 fn uuid7(n: u128) -> Uuid {
     Uuid::from_u128(0x01926f3a_0000_7000_8000_000000000000 | n)
 }
@@ -276,7 +305,7 @@ fn a_pool_member_gets_the_contract_the_statement_fixes() {
     assert_eq!(terms.payout_hash, entry.payout_hash);
     assert_eq!(
         terms.event.locking_points,
-        signed.statement.locking_points(oracle_key())
+        signed.statement.locking_points(full_oracle_key())
     );
     assert_eq!(terms.event.expiry, Some(entry.terms.expiry));
     assert_eq!(terms.outcome_payouts, pool_payouts(3, 1).unwrap());

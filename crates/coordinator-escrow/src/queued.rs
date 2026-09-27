@@ -22,7 +22,8 @@ use crate::{
 };
 use dlctix::{
     bitcoin::{Amount, BlockHash, FeeRate, Network},
-    musig2::secp256k1::XOnlyPublicKey,
+    musig2::secp256k1::{Parity, XOnlyPublicKey},
+    secp::Point,
     EventLockingConditions, MarketMaker, Outcome, PayoutWeights,
 };
 use serde::{Deserialize, Serialize};
@@ -113,6 +114,13 @@ impl QueuedTerms {
     pub fn oracle_key(&self) -> Result<XOnlyPublicKey, QueuedError> {
         XOnlyPublicKey::from_str(&self.oracle_pubkey)
             .map_err(|_| terms_error("invalid oracle public key"))
+    }
+
+    /// The oracle key as the point its locking points are computed with. Attestations are
+    /// BIP340-style, so the x-only key's even point gives the same locking points as either
+    /// parity of the full key.
+    pub fn oracle_point(&self) -> Result<Point, QueuedError> {
+        Ok(Point::from((self.oracle_key()?, Parity::Even)))
     }
 
     /// The deposit digest: what each deposit is sealed under instead of a session manifest.
@@ -427,7 +435,7 @@ pub fn pool_authorization(
         payout_hash: entry.payout_hash,
         market_maker: terms.market_maker.clone(),
         event: EventLockingConditions {
-            locking_points: core.locking_points(terms.oracle_key()?),
+            locking_points: core.locking_points(terms.oracle_point()?),
             expiry: Some(core.expiry),
         },
         outcome_payouts: pool_payouts(player_count, terms.number_of_places_win as usize)?,
