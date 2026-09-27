@@ -41,7 +41,12 @@ impl Phase {
             _ if competition.expiry_broadcasted_at.is_some() => Phase::Expired,
             CompetitionState::Completed => Phase::Expired,
             _ if now < event.start_observation_date => Phase::Upcoming,
-            CompetitionState::Created => Phase::Unfilled,
+            // A queued competition forms its pools at the start; it is not left unfilled.
+            CompetitionState::Created
+                if competition.kind != crate::domain::competitions::CompetitionKind::Queued =>
+            {
+                Phase::Unfilled
+            }
             _ if now < event.end_observation_date => Phase::Live,
             _ => Phase::AwaitingResult,
         }

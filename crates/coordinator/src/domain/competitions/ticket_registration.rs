@@ -211,8 +211,9 @@ impl CompetitionStore {
     ///
     /// - an unpaid ticket's, once its reservation was released or taken over;
     /// - every registration of a competition that completed or expired;
-    /// - in a competition that was cancelled or failed, a ticket's once its escrow has no refund
-    ///   left to sign, or, while unpaid, once its invoice can no longer be paid.
+    /// - in a competition that was cancelled or failed, or a queued competition that formed its
+    ///   pools, a ticket's once its escrow has no refund left to sign, or, while unpaid, once its
+    ///   invoice can no longer be paid.
     pub async fn purge_ticket_registrations(&self) -> Result<u64, DatabaseWriteError> {
         self.db_connection
             .execute_write(move |pool| async move {
@@ -226,7 +227,8 @@ impl CompetitionStore {
                                AND (t.hash != r.ticket_hash OR t.reserved_by IS NULL))
                            OR c.completed_at IS NOT NULL
                            OR c.expiry_broadcasted_at IS NOT NULL
-                           OR ((c.cancelled_at IS NOT NULL OR c.failed_at IS NOT NULL)
+                           OR ((c.cancelled_at IS NOT NULL OR c.failed_at IS NOT NULL
+                                OR (c.kind = 'queued' AND c.pools_formed_at IS NOT NULL))
                                AND NOT EXISTS (
                                    SELECT 1 FROM ticket_ark_escrows e
                                    LEFT JOIN ticket_ark_refunds f ON f.ticket_id = e.ticket_id

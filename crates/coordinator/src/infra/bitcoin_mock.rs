@@ -14,13 +14,15 @@ use std::{
 };
 use time::OffsetDateTime;
 
-use super::bitcoin::{Bitcoin, ForeignUtxo, SendOptions, WalletBalance, WalletUtxo};
+use super::bitcoin::{Bitcoin, BlockSummary, ForeignUtxo, SendOptions, WalletBalance, WalletUtxo};
 
 /// Mock Bitcoin client for E2E testing
 pub struct MockBitcoinClient {
     network: Network,
     block_height: AtomicU32,
     address_counter: AtomicU32,
+    /// Blocks a test set; otherwise one block every ten minutes up to now.
+    blocks: std::sync::Mutex<Option<Vec<BlockSummary>>>,
 }
 
 impl MockBitcoinClient {
@@ -30,7 +32,31 @@ impl MockBitcoinClient {
             network,
             block_height: AtomicU32::new(100), // Start at block 100
             address_counter: AtomicU32::new(0),
+            blocks: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Serve these blocks, from height 0, and make the last one the tip.
+    pub fn set_blocks(&self, blocks: Vec<BlockSummary>) {
+        self.block_height
+            .store(blocks.len().saturating_sub(1) as u32, Ordering::SeqCst);
+        *self.blocks.lock().unwrap() = Some(blocks);
+    }
+
+    fn chain(&self) -> Vec<BlockSummary> {
+        if let Some(blocks) = self.blocks.lock().unwrap().clone() {
+            return blocks;
+        }
+        use bitcoin::hashes::Hash;
+        let tip = self.block_height.load(Ordering::SeqCst);
+        let now = OffsetDateTime::now_utc().unix_timestamp() as u32;
+        (0..=tip)
+            .map(|height| BlockSummary {
+                height,
+                hash: bitcoin::BlockHash::hash(&height.to_be_bytes()),
+                time: now - (tip - height) * 600,
+            })
+            .collect()
     }
 }
 
@@ -207,5 +233,18 @@ impl Bitcoin for MockBitcoinClient {
         Err(anyhow::anyhow!(
             "MockBitcoinClient: send_to_address not available in mock mode"
         ))
+    }
+
+    async fn block_headers(
+        &self,
+        start: u32,
+        count: u32,
+    ) -> Result<Vec<BlockSummary>, anyhow::Error> {
+        Ok(self
+            .chain()
+            .into_iter()
+            .skip(start as usize)
+            .take(count as usize)
+            .collect())
     }
 }
