@@ -50,6 +50,13 @@ pub const REQUIRED_CONFIRMATIONS_FOR_TIME: usize = 6;
 /// Confirmation targets (in blocks) offered by `get_estimated_fee_rates`.
 const FEE_TARGETS: [u16; 12] = [1, 2, 3, 4, 5, 6, 10, 12, 24, 144, 504, 1008];
 
+/// Confirmation target (in blocks) for sweeps with no deadline: about a day.
+pub const ECONOMY_FEE_TARGET: u16 = 144;
+
+/// LND's fee rate floor, 253 sat/kWU: the 1 sat/vB relay minimum with room for rounding.
+/// No sweep can pay less, so an output that is dust after this fee is never worth sweeping.
+pub const LND_FEE_RATE_FLOOR: FeeRate = FeeRate::from_sat_per_kwu(253);
+
 /// An unspent output of the LND wallet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletUtxo {
@@ -99,6 +106,33 @@ pub fn fee_rate_from_estimate(sat_per_vb: f64) -> Result<FeeRate, anyhow::Error>
     }
     FeeRate::from_sat_per_vb((sat_per_vb.ceil() as u64).max(1))
         .ok_or_else(|| anyhow!("fee estimate {sat_per_vb} sat/vB is out of range"))
+}
+
+/// The fee rate for a sweep with no deadline: LND's estimate for [`ECONOMY_FEE_TARGET`] blocks,
+/// or its next-block estimate if it has none, never below LND's floor.
+///
+/// Unlike [`fee_rate_for_target`] this keeps the estimate's precision. LND estimates in whole
+/// sat/kWU, and its floor of 253 sat/kWU is 1.012 sat/vB, which rounding up to whole sat/vB
+/// doubles. On an output of a few hundred sats that is the difference between a sweep and dust.
+pub fn economy_fee_rate(
+    fee_rates: &std::collections::HashMap<u16, f64>,
+) -> Result<FeeRate, anyhow::Error> {
+    let sat_per_vb = fee_rates
+        .get(&ECONOMY_FEE_TARGET)
+        .or_else(|| fee_rates.get(&1))
+        .copied()
+        .ok_or_else(|| {
+            anyhow!(
+                "LND returned no fee estimate for a {ECONOMY_FEE_TARGET}-block or next-block \
+                 confirmation target"
+            )
+        })?;
+    if !sat_per_vb.is_finite() || sat_per_vb < 0.0 {
+        return Err(anyhow!("invalid fee estimate {sat_per_vb} sat/vB"));
+    }
+    // One vbyte is four weight units: sat/kWU = sat/vB * 1000 / 4.
+    let sat_per_kwu = (sat_per_vb * 250.0).round() as u64;
+    Ok(FeeRate::from_sat_per_kwu(sat_per_kwu).max(LND_FEE_RATE_FLOOR))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1188,5 +1222,47 @@ impl BitcoinSyncWatcher {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fee_rate_tests {
+    use super::*;
+
+    #[test]
+    fn economy_fee_rate_targets_a_day_at_lnds_precision() {
+        assert!(FEE_TARGETS.contains(&ECONOMY_FEE_TARGET));
+
+        // LND's floor as the client reads it: 253 sat/kWU * 4 / 1000 sat/vB.
+        let floor = 253.0 * 4.0 / 1000.0;
+        let rates = HashMap::from([(1, floor), (ECONOMY_FEE_TARGET, floor)]);
+        assert_eq!(
+            economy_fee_rate(&rates).unwrap(),
+            FeeRate::from_sat_per_kwu(253)
+        );
+        // Time-critical transactions keep rounding up to whole sat/vB.
+        assert_eq!(
+            fee_rate_for_target(&rates, 1).unwrap(),
+            FeeRate::from_sat_per_vb_u32(2)
+        );
+
+        // A day's estimate, not the next block's.
+        let rates = HashMap::from([(1, 20.0), (6, 8.0), (ECONOMY_FEE_TARGET, 3.0)]);
+        assert_eq!(
+            economy_fee_rate(&rates).unwrap(),
+            FeeRate::from_sat_per_kwu(750)
+        );
+
+        // The next-block estimate when there is no day's estimate, never below the floor.
+        assert_eq!(
+            economy_fee_rate(&HashMap::from([(1, 5.0)])).unwrap(),
+            FeeRate::from_sat_per_kwu(1_250)
+        );
+        assert_eq!(
+            economy_fee_rate(&HashMap::from([(ECONOMY_FEE_TARGET, 0.5)])).unwrap(),
+            LND_FEE_RATE_FLOOR
+        );
+        assert!(economy_fee_rate(&HashMap::from([(6, 5.0)])).is_err());
+        assert!(economy_fee_rate(&HashMap::from([(ECONOMY_FEE_TARGET, f64::NAN)])).is_err());
     }
 }

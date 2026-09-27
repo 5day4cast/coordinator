@@ -17,7 +17,10 @@ use crate::{
     api::routes::FinalSignatures,
     domain::{Competition, CreateEvent, EntryStatus, Error},
     infra::{
-        bitcoin::{fee_rate_for_target, Bitcoin, ForeignUtxo, REQUIRED_CONFIRMATIONS_FOR_TIME},
+        bitcoin::{
+            economy_fee_rate, fee_rate_for_target, Bitcoin, ForeignUtxo, LND_FEE_RATE_FLOOR,
+            REQUIRED_CONFIRMATIONS_FOR_TIME,
+        },
         db::DatabaseWriteError,
         escrow::{
             escrow_descriptor_for_output, get_escrow_outpoint, reclaim_escrow_tx,
@@ -2530,13 +2533,15 @@ impl Coordinator {
             let (close_tx_input, close_tx_prevout) =
                 signed_contract.outcome_close_tx_input_and_prevout(&outcome)?;
 
+            // The whole pot: too small to sweep only if the contract itself is dust-sized.
             let (mut close_tx, input_index) = simple_sweep_tx(
                 signed_contract.params().market_maker.pubkey,
                 close_tx_input.clone(),
                 signed_contract.close_tx_input_weight(),
                 close_tx_prevout.value,
                 fee_rate,
-            );
+            )
+            .map_err(|uneconomic| anyhow!("Cannot build the unified close: {uneconomic}"))?;
 
             let winner_seckeys: BTreeMap<Point, Scalar> = paid_winners
                 .iter()
@@ -2696,7 +2701,7 @@ impl Coordinator {
             // Handle individual cooperative closes for paid winners
             for (player_index, entry) in paid_winners {
                 // Skip if already processed
-                if entry.sellback_broadcasted_at.is_some() {
+                if entry.sellback_broadcasted_at.is_some() || entry.sweep_uneconomic_at.is_some() {
                     info!(
                         "Competition {} skipping already-closed entry {} for player {}",
                         competition.id, entry.id, player_index
@@ -2717,13 +2722,36 @@ impl Coordinator {
                 let (close_tx_input, close_tx_prevout) =
                     signed_contract.split_close_tx_input_and_prevout(&win_condition)?;
 
-                let (mut close_tx, input_index) = simple_sweep_tx(
+                let (mut close_tx, input_index) = match simple_sweep_tx(
                     signed_contract.params().market_maker.pubkey,
                     close_tx_input.clone(),
                     signed_contract.close_tx_input_weight(),
                     close_tx_prevout.value,
                     fee_rate,
-                );
+                ) {
+                    Ok(sweep) => sweep,
+                    Err(uneconomic) if uneconomic.permanent => {
+                        self.leave_uneconomic_output(
+                            competition.id,
+                            entry,
+                            player_index,
+                            "split-close",
+                            uneconomic,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    // Settlement retries this step, as after a failed broadcast; the split TX
+                    // is already out, so the retry only repeats the closes still owed.
+                    Err(uneconomic) => {
+                        return Err(anyhow!(
+                            "Split-close of entry {} (player {}) waits for lower fees: {}",
+                            entry.id,
+                            player_index,
+                            uneconomic
+                        ))
+                    }
+                };
 
                 let winner_seckey = Scalar::from_hex(entry.ephemeral_privatekey.as_ref().unwrap())
                     .map_err(|e| anyhow!("Invalid winner secret key: {}", e))?;
@@ -2754,6 +2782,33 @@ impl Coordinator {
         competition.errors = vec![];
 
         Ok(competition)
+    }
+
+    /// Leave a winner's split output on chain because sweeping it would leave less than the dust
+    /// limit at any fee rate, and record that on the entry so settlement counts the output as
+    /// handled instead of retrying a sweep the network rejects. Nothing is spent: the output stays
+    /// spendable through the winner's win path and the coordinator's reclaim path, which does not
+    /// expire.
+    async fn leave_uneconomic_output(
+        &self,
+        competition_id: Uuid,
+        entry: &UserEntry,
+        player_index: PlayerIndex,
+        sweep: &str,
+        uneconomic: UneconomicSweep,
+    ) -> Result<(), anyhow::Error> {
+        if self
+            .competition_store
+            .mark_entry_sweep_uneconomic(entry.id, OffsetDateTime::now_utc())
+            .await?
+        {
+            warn!(
+                "Competition {} left the split output of entry {} (player {}) on chain without \
+                 a {}: {}",
+                competition_id, entry.id, player_index, sweep, uneconomic
+            );
+        }
+        Ok(())
     }
 
     pub async fn publish_delta2_transactions<'a>(
@@ -2820,14 +2875,18 @@ impl Coordinator {
             .get_competition_entries(competition.id, vec![EntryStatus::Paid])
             .await?;
 
-        // Get fee rate for transactions
+        // A split-reclaim has no deadline once its delay has passed: the reclaim path does not
+        // expire, and the winner the output belongs to is the only other party who can take it.
+        // So pay for confirmation within about a day, not the next block.
         let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
-        let fee_rate = fee_rate_for_target(&fee_rates, 1)?;
+        let fee_rate = economy_fee_rate(&fee_rates)?;
 
         // The split TX was broadcast during delta, so each winner has their
         // own output. Use split-reclaim for unpaid winners who haven't been
         // closed or reclaimed yet, once the split TX's reclaim delay has passed.
         let mut split_confirmation = None;
+        // A reclaim fees make dust for now keeps the competition open for a later attempt.
+        let mut waiting_for_fees = false;
         for &player_index in winners.keys() {
             if let Some(entry) = entries.iter().find(|entry| {
                 let Ok(pubkey) = Point::from_hex(&entry.ephemeral_pubkey) else {
@@ -2839,8 +2898,10 @@ impl Coordinator {
                     false
                 }
             }) {
-                // Skip if already processed, paid out, or already closed via delta
+                // Skip if already processed, left as uneconomic, paid out, or already closed
+                // via delta
                 if entry.reclaimed_broadcasted_at.is_some()
+                    || entry.sweep_uneconomic_at.is_some()
                     || entry.paid_out_at.is_some()
                     || entry.sellback_broadcasted_at.is_some()
                 {
@@ -2883,13 +2944,35 @@ impl Coordinator {
                     }
                 }
 
-                let (mut reclaim_tx, input_index) = simple_sweep_tx(
+                let (mut reclaim_tx, input_index) = match simple_sweep_tx(
                     signed_contract.params().market_maker.pubkey,
                     reclaim_tx_input.clone(),
                     signed_contract.split_reclaim_tx_input_weight(),
                     reclaim_tx_prevout.value,
                     fee_rate,
-                );
+                ) {
+                    Ok(sweep) => sweep,
+                    Err(uneconomic) if uneconomic.permanent => {
+                        self.leave_uneconomic_output(
+                            competition.id,
+                            entry,
+                            player_index,
+                            "split-reclaim",
+                            uneconomic,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Err(uneconomic) => {
+                        info!(
+                            "Competition {} leaves the split-reclaim of entry {} (player {}) \
+                             for later: {}",
+                            competition.id, entry.id, player_index, uneconomic
+                        );
+                        waiting_for_fees = true;
+                        continue;
+                    }
+                };
 
                 signed_contract.sign_split_reclaim_tx_input(
                     &win_condition,
@@ -2923,6 +3006,9 @@ impl Coordinator {
             }
         }
 
+        if waiting_for_fees {
+            return Ok(competition);
+        }
         competition.completed_at = Some(OffsetDateTime::now_utc());
         competition.errors = vec![];
 
@@ -4841,30 +4927,85 @@ fn p2tr_script_pubkey(pubkey: Point) -> ScriptBuf {
     ScriptBuf::new_p2tr_tweaked(tweaked)
 }
 
+/// A sweep whose fee would leave less than the dust limit, so the network would reject it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UneconomicSweep {
+    /// The value of the output to sweep.
+    value: Amount,
+    /// The sweep's fee at `fee_rate`.
+    fee: Amount,
+    fee_rate: FeeRate,
+    /// The smallest output the destination script may be paid.
+    dust_limit: Amount,
+    /// Whether even LND's fee rate floor would leave dust, so no fee rate ever makes the output
+    /// worth sweeping. Otherwise fees are only high for now, and a later sweep may succeed.
+    permanent: bool,
+}
+
+impl std::fmt::Display for UneconomicSweep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sweeping {} sats at {} sat/vB costs {} sats, leaving less than the {} sat dust limit{}",
+            self.value.to_sat(),
+            self.fee_rate.to_sat_per_kwu() as f64 / 250.0,
+            self.fee.to_sat(),
+            self.dust_limit.to_sat(),
+            if self.permanent {
+                " at any fee rate"
+            } else {
+                " until fees fall"
+            }
+        )
+    }
+}
+
+impl std::error::Error for UneconomicSweep {}
+
 /// Build a single-input sweep and return the position to sign in the new transaction.
 /// The spent outpoint's `vout` identifies an output in the parent, not this input's index.
+/// Fails without building anything when the fee would leave less than the dust limit.
 fn simple_sweep_tx(
     destination_pubkey: Point,
     input: TxIn,
     input_weight: InputWeightPrediction,
     prevout_value: Amount,
     fee_rate: FeeRate,
-) -> (Transaction, usize) {
+) -> Result<(Transaction, usize), UneconomicSweep> {
     let script_pubkey = p2tr_script_pubkey(destination_pubkey);
+    let dust_limit = script_pubkey.minimal_non_dust();
+    let tx_weight = predict_weight([input_weight], [script_pubkey.len()]);
+    let fee = fee_rate
+        .checked_mul_by_weight(tx_weight)
+        .unwrap_or(Amount::MAX);
+    let leaves_dust = |fee: Amount| {
+        prevout_value
+            .checked_sub(fee)
+            .is_none_or(|value| value < dust_limit)
+    };
+    if leaves_dust(fee) {
+        let floor_fee = LND_FEE_RATE_FLOOR
+            .checked_mul_by_weight(tx_weight)
+            .unwrap_or(Amount::MAX);
+        return Err(UneconomicSweep {
+            value: prevout_value,
+            fee,
+            fee_rate,
+            dust_limit,
+            permanent: leaves_dust(floor_fee),
+        });
+    }
+    let value = prevout_value - fee;
     let transaction = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
         input: vec![input],
         output: vec![TxOut {
-            value: {
-                let tx_weight = predict_weight([input_weight], [script_pubkey.len()]);
-                let fee = tx_weight * fee_rate;
-                prevout_value - fee
-            },
+            value,
             script_pubkey,
         }],
     };
-    (transaction, 0)
+    Ok((transaction, 0))
 }
 
 #[cfg(test)]

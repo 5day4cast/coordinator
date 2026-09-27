@@ -218,6 +218,10 @@ pub struct UserEntry {
     pub sellback_broadcasted_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub reclaimed_broadcasted_at: Option<OffsetDateTime>,
+    /// When the coordinator left this entry's split output on chain because sweeping it would
+    /// leave less than the dust limit. Settlement treats the output as handled.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub sweep_uneconomic_at: Option<OffsetDateTime>,
     // If we have any pending/completed paid out lightning payments, this should be their latest one
     #[serde(with = "time::serde::rfc3339::option")]
     pub paid_out_at: Option<OffsetDateTime>,
@@ -294,6 +298,7 @@ impl FromRow<'_, SqliteRow> for UserEntry {
             paid_at: parse_optional_sqlite_datetime(row, "paid_at")?,
             sellback_broadcasted_at: parse_optional_datetime(row, "sellback_broadcasted_at")?,
             reclaimed_broadcasted_at: parse_optional_datetime(row, "reclaimed_broadcasted_at")?,
+            sweep_uneconomic_at: parse_optional_datetime(row, "sweep_uneconomic_at")?,
             paid_out_at: parse_optional_datetime(row, "paid_out_at")?,
             payout_ln_invoice: row.get("payout_ln_invoice"),
         })
@@ -364,6 +369,7 @@ impl AddEntry {
             paid_at: None,
             sellback_broadcasted_at: None,
             reclaimed_broadcasted_at: None,
+            sweep_uneconomic_at: None,
             paid_out_at: None,
             payout_ln_invoice: None,
         }

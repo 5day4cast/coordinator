@@ -309,6 +309,35 @@ impl CompetitionStore {
             .await
     }
 
+    /// Record that the entry's split output was left on chain because sweeping it would leave
+    /// less than the dust limit. The first time is kept.
+    pub async fn mark_entry_sweep_uneconomic(
+        &self,
+        entry_id: Uuid,
+        skipped_at: OffsetDateTime,
+    ) -> Result<bool, DatabaseWriteError> {
+        let skipped_at_str = skipped_at
+            .format(&Rfc3339)
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+
+        let entry_id_str = entry_id.to_string();
+
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let result = sqlx::query(
+                    "UPDATE entries
+                    SET sweep_uneconomic_at = ?
+                    WHERE id = ? AND sweep_uneconomic_at IS NULL",
+                )
+                .bind(skipped_at_str)
+                .bind(entry_id_str)
+                .execute(&pool)
+                .await?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+    }
+
     /// Update the keymeld_auth_pubkey for an entry.
     /// This is called after the keygen session is created and the user has derived their auth pubkey.
     pub async fn update_keymeld_auth_pubkey(
@@ -645,6 +674,7 @@ impl CompetitionStore {
                 tickets.settled_at AS paid_at,
                 sellback_broadcasted_at,
                 reclaimed_broadcasted_at,
+                sweep_uneconomic_at,
                 latest_payouts.latest_payout_time as paid_out_at,
                 latest_payouts.payout_payment_request as payout_ln_invoice
             FROM entries
@@ -713,6 +743,7 @@ impl CompetitionStore {
               tickets.paid_at AS paid_at,
               sellback_broadcasted_at,
               reclaimed_broadcasted_at,
+              sweep_uneconomic_at,
               latest_payouts.latest_payout_time as paid_out_at,
               latest_payouts.payout_payment_request as payout_ln_invoice
           FROM entries
@@ -2399,6 +2430,7 @@ impl CompetitionStore {
               tickets.paid_at AS paid_at,
               sellback_broadcasted_at,
               reclaimed_broadcasted_at,
+              sweep_uneconomic_at,
               latest_payouts.latest_payout_time as paid_out_at,
               latest_payouts.payout_payment_request as payout_ln_invoice
           FROM entries
