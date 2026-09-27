@@ -571,6 +571,15 @@ impl Keymeld for KeymeldService {
         let mut driver = self
             .connect(session, &state, &credentials, &mut journal, &checkpoint)
             .await?;
+        // The admission is journaled before it is sent. Only an authenticated enclave rejection
+        // lets the slot try again, with a corrected registration; otherwise one refused
+        // registration would lock the slot for good.
+        let admission = format!("admit/{user}");
+        if driver.command_was_rejected(&admission, data.context.enclave_id) {
+            driver
+                .clear_rejected_command(&admission, data.context.enclave_id)
+                .await?;
+        }
         driver.validate_registration(&native).await?;
         drop(driver);
         state.registrations.insert(user.clone(), native);
