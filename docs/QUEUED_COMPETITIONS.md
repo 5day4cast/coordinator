@@ -607,7 +607,8 @@ Pending: whether the closing sweep can board back into Arkade.
    Done for Keymeld signing inside the batch.
 7. **Browser changes.**
    The browser checks the escrow in the payout policy and shows the refund destination.
-   Pending: depositing the key against a template instead of concrete terms.
+   Done: the wallet checks a queued entry's terms against the oracle's reference event and key and the entry form (`coordinator-wasm`, `wallet/queued.rs`), checks that its Keymeld registration is scoped to the terms, and seals the key as a Keymeld deposit under that scope.
+   A queued competition shows how many entered and its pool size; once split, its page links each pool and marks the player's, and each pool links back.
 8. **Synth scenarios.**
    Done: `queued_split`, `queued_one_pool`, `queued_too_few` (refunds to a Lightning Address) and `queued_leftover_refund`; see [synthetic traffic](ops/synthetic-traffic.md).
    Pending: a kickoff failure and a missed batch, which need an operator test hook that fails a pool's batch.

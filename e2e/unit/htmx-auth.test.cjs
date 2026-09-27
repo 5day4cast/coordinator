@@ -72,6 +72,20 @@ test('a ticket status poll is signed; so is the entry form when logged in', asyn
   ]);
 });
 
+test("a queue's pools are signed when logged in, to mark the player's pool, and open to everyone", async () => {
+  const page = load();
+  await page.request('/competitions/c1/pools');
+  assert.deepEqual(page.signed.map((s) => s.url), [`${ORIGIN}/competitions/c1/pools`]);
+  const visitor = load({ loggedIn: false });
+  assert.deepEqual(await visitor.request('/competitions/c1/pools'), { sent: true });
+  assert.deepEqual(visitor.signed, []);
+  assert.deepEqual(visitor.opened, []);
+  // The leaderboard and its rows stay unsigned.
+  await page.request('/competitions/c1/leaderboard');
+  await page.request('/competitions/c1/leaderboard/rows');
+  assert.equal(page.signed.length, 1);
+});
+
 test('a signature is never sent to a URL other than the one signed', async () => {
   const page = load();
   const result = await page.request('/payouts', { sentAction: '/payouts?stolen=1' });

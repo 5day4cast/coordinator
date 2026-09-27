@@ -67,7 +67,7 @@ pub struct PoolFormation {
 
 /// What asking for a queued ticket did.
 pub enum QueuedReservation {
-    Reserved(ReservedTicket),
+    Reserved(Box<ReservedTicket>),
     /// Tickets are no longer sold.
     Closed,
     /// The queue holds its entry cap in paid and payable tickets.
@@ -396,10 +396,10 @@ impl CompetitionStore {
                     return Ok(QueuedReservation::Closed);
                 }
                 tx.commit().await?;
-                Ok(QueuedReservation::Reserved(ReservedTicket {
+                Ok(QueuedReservation::Reserved(Box::new(ReservedTicket {
                     ticket: reserved,
                     superseded_payment_hash,
-                }))
+                })))
             })
             .await
     }

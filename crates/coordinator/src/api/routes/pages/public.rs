@@ -40,7 +40,8 @@ use crate::{
                 PayoutDestination, TicketProgress,
             },
             leaderboard::{
-                leaderboard, leaderboard_scores, rows_url, LeaderboardRow, LeaderboardView,
+                leaderboard, leaderboard_scores, queue_pools, rows_url, LeaderboardRow,
+                LeaderboardView,
             },
             loading::{placeholder, Pending, MAX_ASKS},
             picks::{detail_url, picks_detail, PickView},
@@ -593,6 +594,44 @@ pub async fn leaderboard_fragment(
     };
     let view = competition_view(&state, &competition, now()).await;
     leaderboard_response(&state, &headers, &view)
+}
+
+/// A queued competition's pools, with the signed-in player's marked: loaded by its leaderboard,
+/// signed when the player is logged in (see `htmx_auth.js`).
+pub async fn queue_pools_fragment(
+    State(state): State<Arc<AppState>>,
+    Path(competition_id): Path<Uuid>,
+    MaybeAuth(auth): MaybeAuth,
+) -> Response {
+    let competition = match find_competition(&state, competition_id).await {
+        Ok(Some(competition)) => competition,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            // Not swapped: the leaderboard keeps the pools it showed.
+            error!("pools of {competition_id}: {error}");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let view = CompetitionView::new(&competition, now());
+    let Some(queue) = view.queue.queued() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mine: Vec<Uuid> = match auth {
+        Some(NostrAuth { pubkey, .. }) => state
+            .coordinator
+            .get_user_entry_views(pubkey.to_hex())
+            .await
+            .inspect_err(|error| warn!("entries for the pools of {competition_id}: {error}"))
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|entry| Uuid::parse_str(&entry.competition_id).ok())
+            .collect(),
+        None => vec![],
+    };
+    fragment(
+        queue_pools(&view.id, queue, Some(&mine)),
+        Caching::Private,
+    )
 }
 
 fn leaderboard_response(state: &AppState, headers: &HeaderMap, view: &CompetitionView) -> Response {

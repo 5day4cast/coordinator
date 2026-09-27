@@ -856,6 +856,10 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
             "/competitions/{competition_id}/leaderboard/rows",
             get(leaderboard_rows_fragment),
         )
+        .route(
+            "/competitions/{competition_id}/pools",
+            get(crate::api::routes::queue_pools_fragment),
+        )
         .route("/entries", get(entries_fragment))
         .route("/entries/{entry_id}/detail", get(entry_detail_fragment))
         .route("/payouts", get(payouts_fragment));
