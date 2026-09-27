@@ -26,7 +26,7 @@ pub enum Decided {
 pub struct Share {
     /// The player's entry key, as the contract lists it.
     pub pubkey: String,
-    /// Their share of the funding value, in percent; 0 for a player the outcome does not pay.
+    /// Their relative payout weight; 0 for a player the outcome does not pay.
     pub weight: u64,
     pub owed_sats: u64,
 }
@@ -95,9 +95,10 @@ fn attested_outcome(attestation: MaybeScalar, locking_points: &[MaybePoint]) -> 
     locking_points.iter().position(|locking| *locking == point)
 }
 
-/// Each player's share of the pot under `weights`, as the coordinator pays it: the weight is a
-/// percentage of the funding value.
+/// Each player's share of the pot under `weights`, as the coordinator pays it.
+/// Preserve the ratio in the contract, including historical percentage-based terms.
 fn shares(players: &[String], weights: Option<&BTreeMap<usize, u64>>, pot_sats: u64) -> Vec<Share> {
+    let total: u128 = weights.map_or(0, |weights| weights.values().map(|w| u128::from(*w)).sum());
     players
         .iter()
         .enumerate()
@@ -109,7 +110,9 @@ fn shares(players: &[String], weights: Option<&BTreeMap<usize, u64>>, pot_sats: 
             Share {
                 pubkey: pubkey.clone(),
                 weight,
-                owed_sats: (u128::from(pot_sats) * u128::from(weight) / 100) as u64,
+                owed_sats: (u128::from(pot_sats) * u128::from(weight))
+                    .checked_div(total)
+                    .unwrap_or(0) as u64,
             }
         })
         .collect()
@@ -151,6 +154,20 @@ mod tests {
             .map(|share| share.owed_sats)
             .collect();
         assert_eq!(owed, [0, 3000, 0]);
+    }
+
+    #[test]
+    fn equal_refunds_return_the_same_stake_for_every_player() {
+        for count in [3, 7] {
+            let players: Vec<_> = (0..count).map(|i| i.to_string()).collect();
+            let weights = (0..count).map(|i| (i, 1)).collect();
+            let refunded = shares(&players, Some(&weights), count as u64 * 1_000);
+            assert!(refunded.iter().all(|share| share.owed_sats == 1_000));
+            assert_eq!(
+                refunded.iter().map(|share| share.owed_sats).sum::<u64>(),
+                count as u64 * 1_000
+            );
+        }
     }
 
     /// The lab's tie outcome: everyone paid, unevenly, which is what "3 of 3 paid out" meant.

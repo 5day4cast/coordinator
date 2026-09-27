@@ -25,6 +25,7 @@ pub async fn start_server(
     let dashboard = routes::Dashboard {
         runner,
         scenario_config: config.scenario_config(),
+        observation_windows_secs: config.defaults.observation_windows_secs.values().to_vec(),
         rebalancer,
         tracker,
         live: live::Live::new(),

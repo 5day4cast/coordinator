@@ -20,6 +20,8 @@ pub struct StoreCounts {
     pub payouts_failed: i64,
     /// Automatic payout jobs neither completed nor failed.
     pub payout_jobs_open: i64,
+    /// All retained failed job records, including replaced jobs for entries later paid.
+    /// This is not the number of unpaid entries or currently open jobs.
     pub payout_jobs_failed: i64,
     /// Open jobs that have failed at least once and wait for another try.
     pub payout_jobs_retrying: i64,

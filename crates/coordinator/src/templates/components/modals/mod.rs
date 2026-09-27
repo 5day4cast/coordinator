@@ -23,19 +23,24 @@ pub fn auth_modals() -> Markup {
 }
 
 /// The rule `validatePasswordStrength` in modals.js enforces.
-const PASSWORD_RULE: &str =
-    "At least 10 characters, with an upper-case letter, a lower-case letter, a number and a symbol.";
+const PASSWORD_RULE: &str = "At least 10 characters, with an upper-case letter, a lower-case letter, a number and a symbol.";
 
 /// Log-in and sign-up both offer a password account or a Nostr extension.
 fn auth_tabs(username_panel: &str, extension_panel: &str) -> Markup {
     html! {
         div class="tabs is-centered is-boxed auth-tabs" {
-            ul {
-                li class="is-active" data-target=(username_panel) {
-                    a { "Username and password" }
+            ul role="tablist" aria-label="Sign-in method" {
+                li class="is-active" data-target=(username_panel) role="presentation" {
+                    a id=(format!("{username_panel}Tab")) href=(format!("#{username_panel}"))
+                        role="tab" aria-controls=(username_panel) aria-selected="true" tabindex="0" {
+                        "Username and password"
+                    }
                 }
-                li data-target=(extension_panel) {
-                    a { "Nostr extension" }
+                li data-target=(extension_panel) role="presentation" {
+                    a id=(format!("{extension_panel}Tab")) href=(format!("#{extension_panel}"))
+                        role="tab" aria-controls=(extension_panel) aria-selected="false" tabindex="-1" {
+                        "Nostr extension"
+                    }
                 }
             }
         }
@@ -62,27 +67,27 @@ fn extension_note() -> Markup {
 
 fn login_modal() -> Markup {
     html! {
-        div id="loginModal" class="modal" {
+        div id="loginModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="loginModalTitle" tabindex="-1" {
             div class="modal-background" {}
             div class="modal-card" {
                 header class="modal-card-head" {
-                    p class="modal-card-title" { "Log in" }
+                    p id="loginModalTitle" class="modal-card-title" { "Log in" }
                     button id="closeLoginModal" class="delete" aria-label="close" {}
                 }
                 section class="modal-card-body" {
                     (session_note())
                     (auth_tabs("usernameLogin", "extensionLogin"))
 
-                    div id="usernameLogin" {
+                    div id="usernameLogin" role="tabpanel" aria-labelledby="usernameLoginTab" {
                         div class="field" {
-                            label class="label" { "Username" }
+                            label class="label" for="loginUsername" { "Username" }
                             div class="control" {
-                                input class="input" type="text" id="loginUsername"
+                                input class="input" type="text" id="loginUsername" data-initial-focus
                                       placeholder="username";
                             }
                         }
                         div class="field" {
-                            label class="label" { "Password" }
+                            label class="label" for="loginPassword" { "Password" }
                             div class="control" {
                                 input class="input" type="password" id="loginPassword"
                                       placeholder="password";
@@ -103,7 +108,7 @@ fn login_modal() -> Markup {
                         }
                     }
 
-                    div id="extensionLogin" class="is-hidden" {
+                    div id="extensionLogin" role="tabpanel" aria-labelledby="extensionLoginTab" class="is-hidden" {
                         (extension_note())
                         div class="field" {
                             div class="control" {
@@ -131,7 +136,7 @@ fn login_modal() -> Markup {
 fn lightning_address_field(id: &str) -> Markup {
     html! {
         div class="field" {
-            label class="label" { "Lightning Address" }
+            label class="label" for=(id) { "Lightning Address" }
             div class="control" {
                 input class="input" type="text" id=(id) placeholder="you@cash.app"
                       autocomplete="off" spellcheck="false";
@@ -145,29 +150,29 @@ fn lightning_address_field(id: &str) -> Markup {
 
 fn register_modal() -> Markup {
     html! {
-        div id="registerModal" class="modal" {
+        div id="registerModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="registerModalTitle" tabindex="-1" {
             div class="modal-background" {}
             div class="modal-card" {
                 header class="modal-card-head" {
-                    p class="modal-card-title" { "Sign up" }
+                    p id="registerModalTitle" class="modal-card-title" { "Sign up" }
                     button id="closeResisterModal" class="delete" aria-label="close" {}
                 }
                 section class="modal-card-body" {
                     (session_note())
                     (auth_tabs("registerUsername", "registerExtension"))
 
-                    div id="registerUsername" {
+                    div id="registerUsername" role="tabpanel" aria-labelledby="registerUsernameTab" {
                         div id="usernameRegisterStep1" {
                             div class="field" {
-                                label class="label" { "Username" }
+                                label class="label" for="registerUsernameInput" { "Username" }
                                 div class="control" {
-                                    input class="input" type="text" id="registerUsernameInput"
+                                    input class="input" type="text" id="registerUsernameInput" data-initial-focus
                                           placeholder="username";
                                 }
                                 p class="help" { "3-32 characters, letters, numbers, underscores, hyphens" }
                             }
                             div class="field" {
-                                label class="label" { "Password" }
+                                label class="label" for="registerPassword" { "Password" }
                                 div class="control" {
                                     input class="input" type="password" id="registerPassword"
                                           placeholder="Choose a strong password" autocomplete="new-password";
@@ -175,7 +180,7 @@ fn register_modal() -> Markup {
                                 p class="help" { (PASSWORD_RULE) }
                             }
                             div class="field" {
-                                label class="label" { "Confirm Password" }
+                                label class="label" for="registerPasswordConfirm" { "Confirm Password" }
                                 div class="control" {
                                     input class="input" type="password" id="registerPasswordConfirm"
                                           placeholder="Confirm your password";
@@ -197,7 +202,7 @@ fn register_modal() -> Markup {
                                 }
                             }
                             div class="field mt-4" {
-                                label class="label" { "Your Recovery Key (nsec)" }
+                                label class="label" for="usernameNsecDisplay" { "Your Recovery Key (nsec)" }
                                 div class="control" {
                                     input class="input" type="text" id="usernameNsecDisplay" readonly;
                                 }
@@ -226,7 +231,7 @@ fn register_modal() -> Markup {
                         }
                     }
 
-                    div id="registerExtension" class="is-hidden" {
+                    div id="registerExtension" role="tabpanel" aria-labelledby="registerExtensionTab" class="is-hidden" {
                         (extension_note())
                         (lightning_address_field("extensionLightningAddress"))
                         div class="field" {
@@ -252,20 +257,20 @@ fn register_modal() -> Markup {
 
 fn forgot_password_modal() -> Markup {
     html! {
-        div id="forgotPasswordModal" class="modal" {
+        div id="forgotPasswordModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="forgotPasswordModalTitle" tabindex="-1" {
             div class="modal-background" {}
             div class="modal-card" {
                 header class="modal-card-head" {
-                    p class="modal-card-title" { "Reset Password" }
+                    p id="forgotPasswordModalTitle" class="modal-card-title" { "Reset Password" }
                     button class="delete" aria-label="close" id="closeForgotPasswordModal" {}
                 }
                 section class="modal-card-body" {
                     div id="forgotStep1" {
                         p { "Enter your username to start the password reset process." }
                         div class="field mt-4" {
-                            label class="label" { "Username" }
+                            label class="label" for="forgotUsername" { "Username" }
                             div class="control" {
-                                input class="input" type="text" id="forgotUsername"
+                                input class="input" type="text" id="forgotUsername" data-initial-focus
                                       placeholder="username";
                             }
                         }
@@ -280,7 +285,7 @@ fn forgot_password_modal() -> Markup {
                             p { "Enter your recovery key (nsec) to prove account ownership." }
                         }
                         div class="field mt-4" {
-                            label class="label" { "Your Recovery Key (nsec)" }
+                            label class="label" for="forgotNsec" { "Your Recovery Key (nsec)" }
                             div class="control" {
                                 input class="input" type="password" id="forgotNsec"
                                       placeholder="nsec1...";
@@ -297,7 +302,7 @@ fn forgot_password_modal() -> Markup {
                             p { "Ownership verified! Set your new password." }
                         }
                         div class="field mt-4" {
-                            label class="label" { "New Password" }
+                            label class="label" for="forgotNewPassword" { "New Password" }
                             div class="control" {
                                 input class="input" type="password" id="forgotNewPassword"
                                       placeholder="Choose a new password" autocomplete="new-password";
@@ -305,7 +310,7 @@ fn forgot_password_modal() -> Markup {
                             p class="help" { (PASSWORD_RULE) }
                         }
                         div class="field" {
-                            label class="label" { "Confirm New Password" }
+                            label class="label" for="forgotNewPasswordConfirm" { "Confirm New Password" }
                             div class="control" {
                                 input class="input" type="password" id="forgotNewPasswordConfirm"
                                       placeholder="Confirm your new password";
@@ -330,11 +335,11 @@ fn forgot_password_modal() -> Markup {
 
 fn payment_modal() -> Markup {
     html! {
-        div id="ticketPaymentModal" class="modal" {
+        div id="ticketPaymentModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="ticketPaymentModalTitle" tabindex="-1" {
             div class="modal-background" {}
             div class="modal-content" {
                 div class="box" {
-                    h3 class="title is-4" { "Entry Ticket Payment" }
+                    h3 id="ticketPaymentModalTitle" class="title is-4" { "Entry Ticket Payment" }
                     div class="content" {
                         p id="ticketPaymentAmount" { "Please pay the lightning invoice to enter the competition:" }
 
@@ -342,7 +347,7 @@ fn payment_modal() -> Markup {
                         div id="qrContainer" class="has-text-centered mb-4" {}
 
                         div class="field" {
-                            label class="label" { "Payment Request (click to copy)" }
+                            label class="label" for="paymentRequest" { "Payment Request (click to copy)" }
                             div class="control" {
                                 textarea class="textarea" id="paymentRequest" readonly {}
                             }
@@ -366,15 +371,17 @@ fn payment_modal() -> Markup {
 
 fn payout_modal() -> Markup {
     html! {
-        div id="payoutModal" class="modal" {
+        div id="payoutModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="payoutModalTitle" tabindex="-1" {
             div class="modal-background" {}
             div class="modal-content" {
                 div class="box" {
-                    h3 class="title is-4" { "Submit Lightning Invoice" }
+                    h3 id="payoutModalTitle" class="title is-4" { "Submit Lightning Invoice" }
+                    p id="payoutAmountSummary" class="mb-3" {}
                     div class="field" {
-                        label class="label" { "Lightning Invoice" }
+                        label class="label" for="lightningInvoice" { "Lightning Invoice" }
                         div class="control" {
                             textarea class="textarea" id="lightningInvoice"
+                                     data-initial-focus aria-describedby="payoutAmountSummary payoutModalError"
                                      placeholder="Enter your Lightning invoice here..." {}
                         }
                     }
@@ -386,7 +393,7 @@ fn payout_modal() -> Markup {
                             button class="button is-light" id="cancelPayoutModal" { "Cancel" }
                         }
                     }
-                    div id="payoutModalError" class="notification is-danger hidden" {}
+                    div id="payoutModalError" class="notification is-danger hidden" role="alert" {}
                 }
             }
             button class="modal-close is-large" aria-label="close" {}
@@ -396,7 +403,7 @@ fn payout_modal() -> Markup {
 
 fn entry_score_modal() -> Markup {
     html! {
-        div id="entryScore" class="modal" {
+        div id="entryScore" class="modal" role="dialog" aria-modal="true" aria-label="Entry picks" tabindex="-1" {
             div class="modal-background" {}
             div class="modal-content" {
                 div class="box" {

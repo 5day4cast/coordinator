@@ -39,7 +39,7 @@ pub enum PayoutRejection {
 }
 
 /// What the market maker owes a winner, in sats: their weight's share of the
-/// funding value. Weights sum to 100 (see `get_percentage_weights`).
+/// funding value. Weights are relative; equal refunds use one unit per player.
 pub fn winner_payout_sats(
     params: &ContractParameters,
     outcome: &Outcome,
@@ -56,7 +56,17 @@ pub fn winner_payout_sats(
         })
         .filter(|weight| *weight > 0)
         .ok_or(PayoutRejection::NotAWinner)?;
-    let amount = u128::from(params.funding_value.to_sat()) * u128::from(weight) / 100;
+    let total = weights
+        .iter()
+        .try_fold(0u64, |sum, (index, weight)| {
+            if *index >= params.players.len() || *weight == 0 {
+                return None;
+            }
+            sum.checked_add(*weight)
+        })
+        .filter(|total| *total > 0)
+        .ok_or(PayoutRejection::InvalidAmount)?;
+    let amount = u128::from(params.funding_value.to_sat()) * u128::from(weight) / u128::from(total);
     u64::try_from(amount)
         .ok()
         .filter(|amount| *amount > 0)
@@ -229,7 +239,7 @@ mod tests {
         let players = vec![player(&mut rng), player(&mut rng), player(&mut rng)];
         let oracle = Scalar::random(&mut rng).base_point_mul();
         let nonce = Scalar::random(&mut rng).base_point_mul();
-        let params = ContractParameters {
+        let mut params = ContractParameters {
             market_maker: MarketMaker {
                 pubkey: Scalar::random(&mut rng).base_point_mul(),
             },
@@ -263,6 +273,37 @@ mod tests {
         assert_eq!(
             winner_payout_sats(&params, &Outcome::Expiry, &players[0].pubkey),
             Err(PayoutRejection::NotAWinner)
+        );
+
+        // New equal refund and expiry ratios return exactly the same stake to everyone.
+        params.funding_value = Amount::from_sat(3_000);
+        for refund in [outcome, Outcome::Expiry] {
+            params
+                .outcome_payouts
+                .insert(refund, (0..3).map(|i| (i, 1)).collect());
+            for player in &players {
+                assert_eq!(
+                    winner_payout_sats(&params, &refund, &player.pubkey),
+                    Ok(1_000)
+                );
+            }
+        }
+        // Existing signed contracts retain their original economics after an upgrade.
+        params
+            .outcome_payouts
+            .insert(outcome, BTreeMap::from([(0, 34), (1, 33), (2, 33)]));
+        for (player, owed) in players.iter().zip([1_020, 990, 990]) {
+            assert_eq!(
+                winner_payout_sats(&params, &outcome, &player.pubkey),
+                Ok(owed)
+            );
+        }
+        params
+            .outcome_payouts
+            .insert(outcome, BTreeMap::from([(0, u64::MAX), (1, 1)]));
+        assert_eq!(
+            winner_payout_sats(&params, &outcome, &players[0].pubkey),
+            Err(PayoutRejection::InvalidAmount)
         );
     }
 }

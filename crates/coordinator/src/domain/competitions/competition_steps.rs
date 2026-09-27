@@ -87,7 +87,24 @@ impl Coordinator {
             info!("Auto-cancelled failed competition {competition_id}");
             return Ok(Step::Finished);
         }
-        if competition.is_expired() {
+        if competition.unfilled_admission_expired(now) {
+            let cancelled = self
+                .competition_store
+                .cancel_unfilled_at_deadline(&competition, lease)
+                .await
+                .map_err(|e| {
+                    anyhow!("Failed to close unfilled competition {competition_id}: {e}")
+                })?;
+            if !cancelled {
+                // The roster may have filled after our read. Reload before
+                // advancing; do not release its invoices from a stale snapshot.
+                return Ok(Step::Next(Wait::Now));
+            }
+            info!("Cancelled unfilled competition {competition_id} at entry close");
+            self.release_held_invoices(competition_id).await;
+            return Ok(Step::Finished);
+        }
+        if competition.is_expired_at(now) {
             competition.cancelled_at = Some(now);
             self.save_leased(competition, lease).await?;
             info!("Cancelled expired competition {competition_id}");

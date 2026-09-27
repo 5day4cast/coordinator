@@ -1,6 +1,7 @@
 //! Worker tests use real persisted competitions/contracts and a test escrow service.
 //! No browser request is made after the initial entry fixtures are stored.
 use super::*;
+use crate::domain::competitions::CompetitionState;
 use crate::infra::{
     bitcoin_mock::MockBitcoinClient,
     db::{DBConnection, DatabasePoolConfig, DatabaseType},
@@ -948,10 +949,110 @@ fn event(places: usize, players: usize) -> CreateEvent {
     }
 }
 
+#[tokio::test]
+async fn contract_generation_preserves_previously_authorized_payout_tables() {
+    let f = Fixture::new().await;
+    let store = &f.coordinator.competition_store;
+    let mut entries = Vec::new();
+    let legacy = BTreeMap::from([
+        (Outcome::Attestation(0), PayoutWeights::from([(0, 100)])),
+        (Outcome::Attestation(1), PayoutWeights::from([(1, 100)])),
+        (
+            Outcome::Attestation(2),
+            PayoutWeights::from([(0, 50), (1, 50)]),
+        ),
+        (Outcome::Expiry, PayoutWeights::from([(0, 50), (1, 50)])),
+    ]);
+    for entry_id in [f.winner, f.loser] {
+        entries.push(store.get_entry_by_id(entry_id).await.unwrap().unwrap());
+        let json = store.entry_payout_policy(entry_id).await.unwrap().unwrap();
+        let mut policy: PayoutPolicy = serde_json::from_str(&json).unwrap();
+        let mut terms: ContractAuthorization =
+            serde_json::from_str(&policy.contract_terms).unwrap();
+        terms.outcome_payouts = legacy.clone();
+        policy.contract_terms = serde_json::to_string(&terms).unwrap();
+        let json = serde_json::to_string(&policy).unwrap();
+        // Seed the economics accepted before upgrading; the normal store
+        // intentionally refuses to replace an entry's accepted authorization.
+        f.database
+            .execute_write(move |pool| async move {
+                sqlx::query("UPDATE entry_payout_policies SET policy_json = ? WHERE entry_id = ?")
+                    .bind(json)
+                    .bind(entry_id.to_string())
+                    .execute(&pool)
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+    assert_ne!(legacy, slot_payouts(2, 1).unwrap());
+    assert_eq!(
+        f.coordinator
+            .accepted_outcome_payouts(f.event_id, &entries)
+            .await
+            .unwrap(),
+        Some(legacy)
+    );
+}
+
+#[tokio::test]
+async fn contract_generation_rejects_mixed_or_missing_entry_payout_authorizations() {
+    let f = Fixture::new().await;
+    let store = &f.coordinator.competition_store;
+    let entries = vec![
+        store.get_entry_by_id(f.winner).await.unwrap().unwrap(),
+        store.get_entry_by_id(f.loser).await.unwrap().unwrap(),
+    ];
+    let json = store.entry_payout_policy(f.loser).await.unwrap().unwrap();
+    let mut policy: PayoutPolicy = serde_json::from_str(&json).unwrap();
+    let mut terms: ContractAuthorization = serde_json::from_str(&policy.contract_terms).unwrap();
+    terms.outcome_payouts = slot_payouts(2, 1).unwrap();
+    policy.contract_terms = serde_json::to_string(&terms).unwrap();
+    let json = serde_json::to_string(&policy).unwrap();
+    let entry_id = f.loser;
+    f.database
+        .execute_write(move |pool| async move {
+            sqlx::query("UPDATE entry_payout_policies SET policy_json = ? WHERE entry_id = ?")
+                .bind(json)
+                .bind(entry_id.to_string())
+                .execute(&pool)
+                .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(f
+        .coordinator
+        .accepted_outcome_payouts(f.event_id, &entries)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("different payout tables"));
+
+    f.database
+        .execute_write(move |pool| async move {
+            sqlx::query("DELETE FROM entry_payout_policies WHERE entry_id = ?")
+                .bind(entry_id.to_string())
+                .execute(&pool)
+                .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(f
+        .coordinator
+        .accepted_outcome_payouts(f.event_id, &entries)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("no accepted payout policy"));
+}
+
 #[test]
 fn canonical_ticket_slots_match_contract_payouts_despite_reordered_local_entry_ids() {
-    for player_count in [4, 7] {
-        for places in 1..=3 {
+    for player_count in [3, 4, 7] {
+        for places in 1..=3.min(player_count - 1) {
             let competition = Competition::new(&event(places, player_count));
             let mut entries: Vec<_> = (0..player_count)
                 .map(|index| {
@@ -994,8 +1095,12 @@ fn canonical_ticket_slots_match_contract_payouts_despite_reordered_local_entry_i
             );
             let refund = authorized.last_key_value().unwrap().1;
             assert_eq!(refund.len(), player_count);
-            assert_eq!(refund.values().sum::<u64>(), 100);
-            assert!(refund.values().max().unwrap() - refund.values().min().unwrap() <= 1);
+            assert!(refund.values().all(|weight| *weight == 1));
+            assert_eq!(authorized[&Outcome::Expiry], *refund);
+            let total = refund.values().sum::<u64>();
+            for weight in refund.values() {
+                assert_eq!(player_count as u64 * 1_000 * weight / total, 1_000);
+            }
         }
     }
 }

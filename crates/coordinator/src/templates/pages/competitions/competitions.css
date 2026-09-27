@@ -1,5 +1,13 @@
 /* Home page: intro, featured competition, grouped competition rows. */
 
+:root {
+  --competition-muted: #5b6170;
+}
+
+[data-theme="dark"] {
+  --competition-muted: #afb5c8;
+}
+
 .intro {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(16rem, 22rem);
@@ -10,7 +18,7 @@
 
 .intro-text p {
   max-width: 38rem;
-  color: var(--bulma-text-weak);
+  color: var(--competition-muted);
 }
 
 .featured-card {
@@ -32,7 +40,7 @@
 }
 
 .featured-window {
-  color: var(--bulma-text-weak);
+  color: var(--competition-muted);
   margin-bottom: 0.75rem;
 }
 
@@ -45,7 +53,7 @@
 
 .featured-facts dt {
   font-size: 0.75rem;
-  color: var(--bulma-text-weak);
+  color: var(--competition-muted);
 }
 
 .featured-facts dd {
@@ -71,7 +79,7 @@
 .group-help,
 .cancelled-toggle {
   font-size: 0.875rem;
-  color: var(--bulma-text-weak);
+  color: var(--competition-muted);
 }
 
 .cancelled-toggle {
@@ -98,7 +106,7 @@
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.03em;
-  color: var(--bulma-text-weak);
+  color: var(--competition-muted);
   background: var(--bulma-scheme-main-bis);
 }
 
@@ -113,9 +121,20 @@
   color: var(--bulma-text-strong);
 }
 
+.competition-row:focus-visible {
+  outline: 2px solid var(--bulma-link-text);
+  outline-offset: -2px;
+}
+
 .cell-window {
   display: flex;
   flex-direction: column;
+  min-width: 0;
+  line-height: 1.6;
+}
+
+.cell-window time {
+  white-space: nowrap;
 }
 
 /* A long status ("Didn't fill: refund pending") wraps inside its column rather than running
@@ -132,7 +151,7 @@
 
 .cell-note {
   font-size: 0.8rem;
-  color: var(--bulma-text-weak);
+  color: var(--competition-muted);
 }
 
 .cell-action {
@@ -142,7 +161,7 @@
 }
 
 .empty-state {
-  color: var(--bulma-text-weak);
+  color: var(--competition-muted);
 }
 
 .pager {
@@ -193,7 +212,7 @@
 
 .badge-quiet {
   background: var(--bulma-scheme-main-ter);
-  color: var(--bulma-text-weak);
+  color: var(--competition-muted);
 }
 
 .badge-failed {
@@ -221,8 +240,9 @@
   }
 }
 
-/* Phones: two compact lines per competition. */
-@media screen and (max-width: 768px) {
+/* Narrow layouts: status/action, then a full-width window and entry facts.
+   The desktop columns need more space than tablets provide. */
+@media screen and (max-width: 1023px) {
   .intro {
     grid-template-columns: 1fr;
     gap: 1rem;
@@ -233,12 +253,13 @@
   }
 
   .competition-row {
-    grid-template-columns: auto 1fr auto;
+    grid-template-columns: minmax(0, 1fr) auto;
     grid-template-areas:
-      "status window action"
-      "facts facts facts";
-    gap: 0.25rem 0.75rem;
-    padding: 0.6rem 0.75rem;
+      "status action"
+      "window window"
+      "facts facts";
+    gap: 0.45rem 0.75rem;
+    padding: 0.9rem 0.85rem;
   }
 
   .cell-status {
@@ -247,10 +268,12 @@
 
   .cell-window {
     grid-area: window;
+    font-weight: 600;
   }
 
   .cell-action {
     grid-area: action;
+    white-space: nowrap;
   }
 
   .cell-fee,
@@ -263,7 +286,8 @@
   .competition-row::after {
     grid-area: facts;
     content: attr(data-facts);
-    font-size: 0.8rem;
-    color: var(--bulma-text-weak);
+    font-size: 0.85rem;
+    line-height: 1.6;
+    color: var(--competition-muted);
   }
 }

@@ -27,6 +27,25 @@ use crate::settlement::Settlement;
 pub struct EntryTrace {
     pub user: String,
     pub nostr_pubkey: String,
+    /// Planned behavior and waits are saved before any ticket or payment request.
+    #[serde(default)]
+    pub behavior: Option<crate::scenarios::EntryBehavior>,
+    #[serde(default)]
+    pub waits: Vec<EntryWait>,
+    /// None on historical traces; false means this run definitely has not tried paying.
+    #[serde(default)]
+    pub payment_started: Option<bool>,
+    #[serde(default)]
+    pub ticket_registered: bool,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub ticket_requested_at: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub submission_not_before: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub submission_attempts: u32,
+    /// Expected negative requests are recorded with their actual HTTP status.
+    #[serde(default)]
+    pub rejected_submission: Option<crate::client::entries::ApiRejection>,
     #[serde(default)]
     pub entry_id: Option<Uuid>,
     #[serde(default)]
@@ -76,8 +95,19 @@ impl EntryTrace {
     /// Whether the entry reached the point of paying without recording how it ended: a payment
     /// may have gone out that the step never saw.
     pub fn may_have_paid(&self) -> bool {
-        !self.paid && !self.settled_by_test_endpoint && self.payment_hash.is_some()
+        !self.paid
+            && !self.settled_by_test_endpoint
+            && self.payment_started != Some(false)
+            && self.payment_hash.is_some()
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntryWait {
+    pub stage: String,
+    pub planned_ms: u64,
+    /// None until the wait finishes; a restart still shows what the user was waiting for.
+    pub elapsed_ms: Option<u64>,
 }
 
 /// When an entry's Arkade escrow lets its player take it back.
@@ -245,7 +275,7 @@ pub struct PayoutSeen {
     pub entry_id: Uuid,
     /// Their entry key, which is how the contract names them.
     pub pubkey: String,
-    /// Their share of the pot under the deciding outcome, in percent.
+    /// Their relative payout weight under the deciding outcome.
     pub weight: u64,
     pub owed_sats: u64,
     /// When the coordinator sent the payout, or finished it; it does not say which.

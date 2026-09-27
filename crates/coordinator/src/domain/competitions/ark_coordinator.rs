@@ -6,7 +6,9 @@
 //! See `ark_kickoff.rs` and `docs/QUEUED_COMPETITIONS.md`.
 
 use super::*;
-use crate::domain::competitions::{ArkCommitment, Arkade, KeymeldArkPool, TicketArkEscrow};
+use crate::domain::competitions::{
+    admission, ArkCommitment, Arkade, KeymeldArkPool, TicketArkEscrow,
+};
 use coordinator_escrow::authorization::ArkEscrowPolicy;
 
 impl Coordinator {
@@ -128,6 +130,7 @@ impl Coordinator {
         ark: &Arkade,
         ticket: &Ticket,
         amount_sats: u64,
+        deadline: OffsetDateTime,
     ) -> Result<(String, OffsetDateTime), Error> {
         let escrow: TicketArkEscrow = self
             .competition_store
@@ -138,6 +141,9 @@ impl Coordinator {
             .ok()
             .and_then(|bytes| bytes.try_into().ok())
             .ok_or_else(|| Error::BadRequest("Invalid ticket preimage".into()))?;
+        if !admission::before_deadline(Some(deadline)) {
+            return Err(Error::BadRequest(admission::TICKETS_CLOSED.into()));
+        }
         let swap = ark
             .swaps
             .create_swap(&escrow.escrow_address, amount_sats, &preimage)

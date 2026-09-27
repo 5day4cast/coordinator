@@ -1,0 +1,743 @@
+//! Concurrent players with recorded human delays and deliberate entry mistakes.
+//! Futures stay on the runner's task so its durable, task-local recorder is preserved.
+
+use std::time::{Duration, Instant};
+
+use anyhow::{ensure, Context, Result};
+use futures::{stream::FuturesUnordered, StreamExt};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use uuid::Uuid;
+
+use super::common::{finish_result, load_users, run_step, wait_for_state, Steps};
+use super::full_lifecycle::{self, Payer, PreparedEntry};
+use super::types::*;
+use crate::client::entries::{ApiRejection, EntrySubmission};
+use crate::client::CoordinatorClient;
+use crate::crypto::keys::SynthUser;
+use crate::db::SynthDb;
+use crate::lnd::Lnd;
+use crate::trail::{EntryTrace, EntryWait};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Scenario {
+    FullLifecycle,
+    EscrowRefund,
+    AbandonedUnpaid,
+    PaidAbandonment,
+    DuplicateSubmission,
+    LateSubmission,
+}
+
+impl Scenario {
+    fn name(self) -> &'static str {
+        match self {
+            Self::FullLifecycle => "full_lifecycle",
+            Self::EscrowRefund => "escrow_refund",
+            Self::AbandonedUnpaid => "abandoned_unpaid",
+            Self::PaidAbandonment => "paid_abandonment",
+            Self::DuplicateSubmission => "duplicate_submission",
+            Self::LateSubmission => "late_submission",
+        }
+    }
+
+    fn refunds(self) -> bool {
+        matches!(
+            self,
+            Self::EscrowRefund | Self::PaidAbandonment | Self::LateSubmission
+        )
+    }
+}
+
+macro_rules! scenario {
+    ($function:ident, $kind:ident) => {
+        pub async fn $function(
+            client: &CoordinatorClient,
+            db: &SynthDb,
+            config: &ScenarioConfig,
+        ) -> ScenarioResult {
+            run(client, db, config, Scenario::$kind).await
+        }
+    };
+}
+scenario!(run_abandoned_unpaid, AbandonedUnpaid);
+scenario!(run_paid_abandonment, PaidAbandonment);
+scenario!(run_duplicate_submission, DuplicateSubmission);
+scenario!(run_late_submission, LateSubmission);
+
+pub(super) async fn run(
+    client: &CoordinatorClient,
+    db: &SynthDb,
+    config: &ScenarioConfig,
+    scenario: Scenario,
+) -> ScenarioResult {
+    let started_at = OffsetDateTime::now_utc();
+    let started = Instant::now();
+    let mut steps = Steps::new();
+    // Refunding an Ark escrow needs an actual funding payment and a registered destination.
+    // Check both before creating a competition or requesting a ticket.
+    let setup = run_step("prepare_user_behavior", || async {
+        let config = if config.seed.is_some()
+            && config.planned_scenario.as_deref() == Some(scenario.name())
+            && config.entry_plan.len() == config.users
+        {
+            ensure!(
+                config
+                    .entry_plan
+                    .iter()
+                    .enumerate()
+                    .all(|(index, plan)| plan.user_index == index),
+                "saved plan has invalid user indexes"
+            );
+            config.clone()
+        } else {
+            config.resolve_plan(scenario.name())?
+        };
+        let lnd = if scenario.refunds() {
+            super::escrow_refund::refund_address(&config)?;
+            Some(super::escrow_refund::payer(&config)?)
+        } else {
+            config.lnd.as_ref().map(Lnd::new).transpose()?
+        };
+        Ok((config, lnd))
+    })
+    .await;
+    let (config, lnd) = match setup {
+        Ok((step, prepared)) => {
+            steps.push(step);
+            prepared
+        }
+        Err(step) => {
+            steps.push(*step);
+            return finish_result(scenario.name(), started_at, started, steps, true);
+        }
+    };
+    let payer = lnd.as_ref().map_or(Payer::TestEndpoint, Payer::Lnd);
+    let failed = match run_steps(client, db, &config, scenario, &payer, &mut steps).await {
+        Ok(()) => false,
+        Err(step) => {
+            steps.push(*step);
+            true
+        }
+    };
+    finish_result(scenario.name(), started_at, started, steps, failed)
+}
+
+async fn run_steps(
+    client: &CoordinatorClient,
+    db: &SynthDb,
+    config: &ScenarioConfig,
+    scenario: Scenario,
+    payer: &Payer<'_>,
+    steps: &mut Steps,
+) -> std::result::Result<(), Box<StepResult>> {
+    let arrival_anchor = Instant::now();
+    let (mut created, competition_id) = run_step("create_competition", || async {
+        if scenario == Scenario::EscrowRefund {
+            super::escrow_refund::create_competition(client, config).await
+        } else {
+            full_lifecycle::create_competition(client, config).await
+        }
+    })
+    .await?;
+    created.details = Some(serde_json::json!({ "competition_id": competition_id }));
+    steps.push(created);
+    let (deadline_step, deadline) = run_step("entry_deadline", || async {
+        let competition = client.get_competition(&competition_id).await?;
+        let value = competition
+            .event_submission
+            .get("start_observation_date")
+            .and_then(|value| value.as_str())
+            .context("Competition omitted its entry deadline")?;
+        OffsetDateTime::parse(value, &Rfc3339).context("Invalid competition entry deadline")
+    })
+    .await?;
+    steps.push(deadline_step);
+    let extra = usize::from(matches!(
+        scenario,
+        Scenario::AbandonedUnpaid | Scenario::PaidAbandonment
+    ));
+    let (loaded, users) = run_step("load_users", || load_users(db, config.users + extra)).await?;
+    steps.push(loaded);
+
+    let mut actors = FuturesUnordered::new();
+    for plan in &config.entry_plan {
+        let user = &users[plan.user_index];
+        actors.push(run_actor(
+            client,
+            user,
+            &competition_id,
+            config,
+            payer,
+            plan,
+            arrival_anchor,
+            deadline,
+        ));
+    }
+    let mut traces = Vec::new();
+    let mut failure = None;
+    // A failed actor must not cancel another actor in the middle of paying.
+    while let Some((step, trace)) = actors.next().await {
+        if step.status == StepStatus::Failed {
+            failure = Some(step.error.clone().unwrap_or_default());
+        }
+        steps.push(step);
+        traces.push(trace);
+    }
+    if let Some(error) = failure {
+        return Err(Box::new(StepResult {
+            name: "entry_wave".into(),
+            status: StepStatus::Failed,
+            duration_ms: 0,
+            details: None,
+            error: Some(error),
+        }));
+    }
+
+    if scenario == Scenario::AbandonedUnpaid {
+        let abandoned = traces
+            .iter()
+            .find(|trace| trace.behavior == Some(EntryBehavior::AbandonUnpaid))
+            .expect("resolved abandonment plan");
+        let user = &users[config.users];
+        let name = format!("user_{}_enter", user.name);
+        let mut trace = planned_trace(
+            user,
+            &EntryPlan {
+                user_index: config.users,
+                arrival_secs: 0,
+                before_payment_secs: 0,
+                before_submit_secs: 0,
+                behavior: EntryBehavior::Complete,
+            },
+        );
+        trace.waits.push(EntryWait {
+            stage: "reservation_release".into(),
+            planned_ms: 600_000,
+            elapsed_ms: None,
+        });
+        let result = run_step(&name, || async {
+            crate::runner::step_progress(&name, serde_json::to_value(&trace)?).await?;
+            let waiting = Instant::now();
+            loop {
+                ensure_payment_time(deadline, config)?;
+                match full_lifecycle::request_entry(
+                    client,
+                    user,
+                    &competition_id,
+                    config.lightning_address.as_deref(),
+                    &name,
+                    &mut trace,
+                )
+                .await
+                {
+                    Ok(requested) => {
+                        ensure!(
+                            Some(requested.ticket.ticket_id) == abandoned.ticket_id,
+                            "replacement did not reclaim the abandoned seat"
+                        );
+                        ensure!(
+                            Some(&requested.ticket.payment_hash) != abandoned.payment_hash.as_ref(),
+                            "recycled unpaid ticket retained its old invoice hash"
+                        );
+                        trace.waits[3].elapsed_ms = Some(elapsed_ms(waiting));
+                        let prepared = full_lifecycle::register_entry(
+                            client,
+                            user,
+                            &competition_id,
+                            config,
+                            config.users,
+                            requested,
+                            &name,
+                            &mut trace,
+                        )
+                        .await?;
+                        ensure_payment_time(deadline, config)?;
+                        full_lifecycle::pay_entry(
+                            client,
+                            user,
+                            &competition_id,
+                            &prepared,
+                            payer,
+                            &name,
+                            &mut trace,
+                        )
+                        .await?;
+                        ensure_submission_time(deadline, config)?;
+                        return full_lifecycle::submit_entry(
+                            client, user, &prepared, &name, &mut trace,
+                        )
+                        .await;
+                    }
+                    Err(error)
+                        if error
+                            .downcast_ref::<ApiRejection>()
+                            .is_some_and(ApiRejection::is_no_capacity) =>
+                    {
+                        crate::runner::step_progress(&name, serde_json::to_value(&trace)?).await?;
+                        tokio::time::sleep(Duration::from_secs(config.poll_interval_secs.max(1)))
+                            .await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        })
+        .await;
+        let step = match result {
+            Ok((step, ())) => trace.attach(step),
+            Err(step) => {
+                return Err(Box::new(trace.attach(*step)));
+            }
+        };
+        steps.push(step);
+        traces.push(trace);
+    }
+
+    if scenario == Scenario::PaidAbandonment {
+        let user = &users[config.users];
+        let name = format!("user_{}_replacement_blocked", user.name);
+        let mut trace = EntryTrace::new(user);
+        trace.payment_started = Some(false);
+        let abandoned = traces
+            .iter()
+            .find(|trace| trace.behavior == Some(EntryBehavior::AbandonPaid))
+            .expect("resolved abandonment plan");
+        let wait_ms = reservation_hold_ms(
+            abandoned
+                .ticket_requested_at
+                .expect("abandoned ticket timestamp"),
+            OffsetDateTime::now_utc(),
+        );
+        trace.waits.push(EntryWait {
+            stage: "paid_reservation_hold".into(),
+            planned_ms: wait_ms,
+            elapsed_ms: None,
+        });
+        let result = run_step(&name, || async {
+            wait_until(&name, &mut trace, 0, Instant::now() + Duration::from_millis(wait_ms)).await?;
+            ensure_payment_time(deadline, config)?;
+            let result = full_lifecycle::request_entry(client, user, &competition_id, config.lightning_address.as_deref(), &name, &mut trace).await;
+            match result {
+                Err(error) if error.downcast_ref::<ApiRejection>().is_some_and(ApiRejection::is_no_capacity) => Ok(()),
+                Err(error) => Err(error),
+                Ok(_) => anyhow::bail!("paid abandoned ticket unexpectedly released capacity; replacement was not paid"),
+            }
+        }).await;
+        match result {
+            Ok((step, ())) => steps.push(trace.attach(step)),
+            Err(step) => return Err(Box::new(trace.attach(*step))),
+        }
+    }
+
+    if scenario.refunds() {
+        let mut cancellation = config.clone();
+        cancellation.state_timeout_secs = cancellation_budget_secs(
+            config.state_timeout_secs,
+            deadline,
+            OffsetDateTime::now_utc(),
+        );
+        let (step, ()) = run_step("wait_cancelled", || {
+            wait_for_state(client, &competition_id, "cancelled", &cancellation)
+        })
+        .await?;
+        steps.push(step);
+        collect_refunds(client, &users, &competition_id, config, &traces, steps).await?;
+    } else {
+        for state in [
+            "collecting_entries",
+            "escrow_confirmed",
+            "event_created",
+            "entries_submitted",
+            "contract_created",
+            "signing_complete",
+            "funding_broadcasted",
+            "funding_confirmed",
+            "awaiting_attestation",
+        ] {
+            let (step, ()) = run_step(&format!("wait_{state}"), || {
+                wait_for_state(client, &competition_id, state, config)
+            })
+            .await?;
+            steps.push(step);
+        }
+    }
+    Ok(())
+}
+
+fn reservation_hold_ms(requested_at: OffsetDateTime, now: OffsetDateTime) -> u64 {
+    (requested_at + time::Duration::seconds(601) - now)
+        .whole_milliseconds()
+        .max(0) as u64
+}
+
+fn cancellation_budget_secs(timeout: u64, deadline: OffsetDateTime, now: OffsetDateTime) -> u64 {
+    timeout.saturating_add((deadline - now).whole_seconds().max(0) as u64 + 1)
+}
+
+async fn collect_refunds(
+    client: &CoordinatorClient,
+    users: &[SynthUser],
+    competition_id: &Uuid,
+    config: &ScenarioConfig,
+    traces: &[EntryTrace],
+    steps: &mut Steps,
+) -> std::result::Result<(), Box<StepResult>> {
+    // One absent entry prevents the competition filling. Every paid ticket needs
+    // a refund, including tickets that were never submitted. Check them all even
+    // if one request fails, preserving each result for the restart tracker.
+    let mut refunds = FuturesUnordered::new();
+    for trace in traces.iter().filter(|trace| trace.paid) {
+        let user = users
+            .iter()
+            .find(|user| user.name == trace.user)
+            .expect("scenario user");
+        let ticket = trace.ticket_id.expect("paid ticket");
+        refunds.push(async move {
+            let (mut step, refund) = run_step(&format!("refund_{}", user.name), || {
+                super::escrow_refund::wait_for_refund(client, user, competition_id, &ticket, config)
+            })
+            .await?;
+            step.details = Some(refund);
+            Ok::<_, Box<StepResult>>(step)
+        });
+    }
+    let mut failed = 0;
+    while let Some(result) = refunds.next().await {
+        match result {
+            Ok(step) => steps.push(step),
+            Err(step) => {
+                failed += 1;
+                steps.push(*step);
+            }
+        }
+    }
+    if failed > 0 {
+        return Err(Box::new(StepResult {
+            name: "verify_refunds".into(),
+            status: StepStatus::Failed,
+            duration_ms: 0,
+            details: None,
+            error: Some(format!(
+                "{failed} paid ticket refunds could not be confirmed"
+            )),
+        }));
+    }
+    Ok(())
+}
+
+fn planned_trace(user: &SynthUser, plan: &EntryPlan) -> EntryTrace {
+    let mut trace = EntryTrace::new(user);
+    trace.behavior = Some(plan.behavior);
+    trace.payment_started = Some(false);
+    trace.waits = [
+        ("arrival", plan.arrival_secs),
+        ("before_payment", plan.before_payment_secs),
+        ("before_submit", plan.before_submit_secs),
+    ]
+    .into_iter()
+    .map(|(stage, seconds)| EntryWait {
+        stage: stage.into(),
+        planned_ms: seconds.saturating_mul(1000),
+        elapsed_ms: None,
+    })
+    .collect();
+    trace
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+async fn wait_until(
+    step: &str,
+    trace: &mut EntryTrace,
+    index: usize,
+    target: Instant,
+) -> Result<()> {
+    crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
+    let start = Instant::now();
+    tokio::time::sleep(target.saturating_duration_since(start)).await;
+    trace.waits[index].elapsed_ms = Some(elapsed_ms(start));
+    crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
+    Ok(())
+}
+
+fn ensure_payment_time(deadline: OffsetDateTime, config: &ScenarioConfig) -> Result<()> {
+    let margin = config.entry_timing.deadline_margin_secs.max(60);
+    ensure!(
+        OffsetDateTime::now_utc() < deadline - time::Duration::seconds(margin as i64),
+        "planned user missed the safe invoice payment deadline; no payment sent"
+    );
+    Ok(())
+}
+
+fn ensure_submission_time(deadline: OffsetDateTime, config: &ScenarioConfig) -> Result<()> {
+    ensure!(
+        OffsetDateTime::now_utc()
+            < deadline - time::Duration::seconds(config.entry_timing.deadline_margin_secs as i64),
+        "planned user missed the entry submission margin"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_actor(
+    client: &CoordinatorClient,
+    user: &SynthUser,
+    competition_id: &Uuid,
+    config: &ScenarioConfig,
+    payer: &Payer<'_>,
+    plan: &EntryPlan,
+    arrival_anchor: Instant,
+    deadline: OffsetDateTime,
+) -> (StepResult, EntryTrace) {
+    let name = format!("user_{}_enter", user.name);
+    let mut trace = planned_trace(user, plan);
+    if plan.behavior == EntryBehavior::LateSubmission {
+        let target = deadline + time::Duration::milliseconds(250);
+        trace.submission_not_before = Some(target);
+        let other_waits = plan
+            .arrival_secs
+            .saturating_add(plan.before_payment_secs)
+            .saturating_add(plan.before_submit_secs)
+            .saturating_mul(1000);
+        let planned_ms = (target - OffsetDateTime::now_utc())
+            .whole_milliseconds()
+            .max(0) as u64;
+        trace.waits.push(EntryWait {
+            stage: "after_entry_close".into(),
+            planned_ms: planned_ms.saturating_sub(other_waits),
+            elapsed_ms: None,
+        });
+    }
+    let result = run_step(&name, || async {
+        wait_until(
+            &name,
+            &mut trace,
+            0,
+            arrival_anchor + Duration::from_secs(plan.arrival_secs),
+        )
+        .await?;
+        ensure_payment_time(deadline, config)?;
+        let requested = full_lifecycle::request_entry(
+            client,
+            user,
+            competition_id,
+            config.lightning_address.as_deref(),
+            &name,
+            &mut trace,
+        )
+        .await?;
+        if plan.behavior == EntryBehavior::AbandonUnpaid {
+            return Ok(());
+        }
+        let prepared = full_lifecycle::register_entry(
+            client,
+            user,
+            competition_id,
+            config,
+            plan.user_index,
+            requested,
+            &name,
+            &mut trace,
+        )
+        .await?;
+        wait_until(
+            &name,
+            &mut trace,
+            1,
+            Instant::now() + Duration::from_secs(plan.before_payment_secs),
+        )
+        .await?;
+        ensure_payment_time(deadline, config)?;
+        full_lifecycle::pay_entry(
+            client,
+            user,
+            competition_id,
+            &prepared,
+            payer,
+            &name,
+            &mut trace,
+        )
+        .await?;
+        if plan.behavior == EntryBehavior::AbandonPaid {
+            return Ok(());
+        }
+        finish_entry(
+            client,
+            user,
+            competition_id,
+            config,
+            &prepared,
+            plan,
+            deadline,
+            &name,
+            &mut trace,
+        )
+        .await
+    })
+    .await;
+    let step = match result {
+        Ok((step, ())) => step,
+        Err(step) => *step,
+    };
+    (trace.attach(step), trace)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_entry(
+    client: &CoordinatorClient,
+    user: &SynthUser,
+    competition_id: &Uuid,
+    config: &ScenarioConfig,
+    prepared: &PreparedEntry,
+    plan: &EntryPlan,
+    deadline: OffsetDateTime,
+    step: &str,
+    trace: &mut EntryTrace,
+) -> Result<()> {
+    wait_until(
+        step,
+        trace,
+        2,
+        Instant::now() + Duration::from_secs(plan.before_submit_secs),
+    )
+    .await?;
+    if plan.behavior == EntryBehavior::LateSubmission {
+        let target = trace
+            .submission_not_before
+            .context("late entry omitted its planned deadline")?;
+        let remaining = (target - OffsetDateTime::now_utc())
+            .whole_milliseconds()
+            .max(0) as u64;
+        wait_until(
+            step,
+            trace,
+            3,
+            Instant::now() + Duration::from_millis(remaining),
+        )
+        .await?;
+        return assert_rejected_submission(
+            client,
+            user,
+            competition_id,
+            prepared,
+            step,
+            trace,
+            false,
+        )
+        .await;
+    }
+    ensure_submission_time(deadline, config)?;
+    if plan.behavior == EntryBehavior::DuplicateSubmission {
+        // Double-clicks send the same body twice. Drain both responses and preserve
+        // the accepted entry even when the other request has an unexpected failure.
+        trace.submission_attempts += 2;
+        crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
+        let (first, second) = tokio::join!(
+            client.attempt_submit_entry(&user.nostr_keys, &prepared.entry),
+            client.attempt_submit_entry(&user.nostr_keys, &prepared.entry),
+        );
+        let mut accepted = 0;
+        let mut rejections = Vec::new();
+        let mut errors = Vec::new();
+        for response in [first, second] {
+            match response {
+                Ok(EntrySubmission::Accepted(entry)) => {
+                    accepted += 1;
+                    trace.entry_id = Some(entry.id);
+                    trace.entry_submitted = true;
+                }
+                Ok(EntrySubmission::Rejected(error)) => {
+                    trace.rejected_submission = Some(error.clone());
+                    rejections.push(error);
+                }
+                Err(error) => errors.push(error),
+            }
+        }
+        crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
+        ensure!(
+            errors.is_empty(),
+            "duplicate request transport failure: {:?}",
+            errors
+        );
+        ensure!(
+            accepted == 1 && rejections.len() == 1,
+            "double submission returned {accepted} acceptances and {} rejections",
+            rejections.len()
+        );
+        ensure!(
+            expected_rejection(&rejections[0], true),
+            "unexpected duplicate rejection: {}",
+            rejections[0]
+        );
+        // A later retry must also stay rejected and leave just one stored entry.
+        return assert_rejected_submission(
+            client,
+            user,
+            competition_id,
+            prepared,
+            step,
+            trace,
+            true,
+        )
+        .await;
+    }
+    full_lifecycle::submit_entry(client, user, prepared, step, trace).await
+}
+
+fn expected_rejection(rejection: &ApiRejection, duplicate: bool) -> bool {
+    rejection.status == 400
+        && (rejection.message == "Competition is no longer accepting entries"
+            || (duplicate && rejection.message == "Ticket has already been used"))
+}
+
+async fn assert_rejected_submission(
+    client: &CoordinatorClient,
+    user: &SynthUser,
+    competition_id: &Uuid,
+    prepared: &PreparedEntry,
+    step: &str,
+    trace: &mut EntryTrace,
+    duplicate: bool,
+) -> Result<()> {
+    trace.submission_attempts += 1;
+    crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
+    let rejection = match client
+        .attempt_submit_entry(&user.nostr_keys, &prepared.entry)
+        .await?
+    {
+        EntrySubmission::Accepted(entry) => {
+            trace.entry_id = Some(entry.id);
+            trace.entry_submitted = true;
+            crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
+            anyhow::bail!(
+                "{} submission unexpectedly accepted",
+                if duplicate { "duplicate" } else { "late" }
+            );
+        }
+        EntrySubmission::Rejected(rejection) => rejection,
+    };
+    trace.rejected_submission = Some(rejection.clone());
+    crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
+    ensure!(
+        expected_rejection(&rejection, duplicate),
+        "unexpected rejection: {rejection}"
+    );
+    let entries = client
+        .list_entries(&user.nostr_keys, Some(competition_id))
+        .await?;
+    let count = entries
+        .iter()
+        .filter(|entry| entry.ticket_id == prepared.ticket.ticket_id)
+        .count();
+    ensure!(
+        count == usize::from(duplicate),
+        "expected {} accepted entries for this ticket; found {count}",
+        usize::from(duplicate)
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "user_behavior_tests.rs"]
+mod tests;

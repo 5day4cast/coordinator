@@ -92,11 +92,13 @@ pub struct StationPin {
 pub fn station_map(pins: &[StationPin]) -> Markup {
     html! {
         figure class="station-map" {
-            img src=(crate::templates::assets::USA_MAP_SVG.url) alt="" class="usa-map" width="600" height="327";
-            svg class="station-pins" viewBox="0 0 599.96 327.28" role="img"
-                aria-label="Where this competition's stations are" {
+            svg class="usa-map" viewBox="0 0 599.96 327.28" aria-hidden="true" {
+                use href=(format!("{}#Layer_1", crate::templates::assets::USA_MAP_SVG.url)) {}
+            }
+            svg class="station-pins" viewBox="0 0 599.96 327.28" role="group"
+                aria-label="Choose a station to jump to its picks" {
                 @for pin in pins {
-                    a href=(format!("#station-{}", pin.station_id)) {
+                    a href=(format!("#station-{}", pin.station_id)) aria-label=(format!("{}: jump to picks", pin.name)) {
                         title { (pin.name) }
                         circle class="station-pin" cx=(format!("{:.1}", pin.svg_x)) cy=(format!("{:.1}", pin.svg_y)) r="6" {}
                         text class="station-pin-label"

@@ -1,0 +1,27 @@
+/* Long Lightning Addresses must fit both desktop tables and phone cards. */
+#payoutAddressPanel {
+  overflow-wrap: anywhere;
+}
+
+.payout-actions {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+#payoutLightningAddress {
+  min-width: 0;
+}
+
+#payouts .table {
+  table-layout: fixed;
+}
+
+@media screen and (max-width: 768px) {
+  #payouts td[data-label="Action"] {
+    align-items: flex-start;
+  }
+
+  #payouts .payout-actions {
+    flex: 1;
+  }
+}

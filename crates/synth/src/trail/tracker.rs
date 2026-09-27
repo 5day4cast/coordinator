@@ -906,7 +906,12 @@ impl Tracker {
         gaps: &mut Vec<String>,
     ) -> Vec<PayoutSeen> {
         let mut payouts = Vec::new();
-        for entry in entries.iter().filter(|entry| entry.entry_submitted) {
+        // An interrupted HTTP request can have reached the coordinator before synth saved
+        // its response. Check durable submission intent without claiming it was accepted.
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.entry_submitted || entry.submission_attempts > 0)
+        {
             let (Some(entry_id), Some(player)) = (entry.entry_id, players.get(&entry.user)) else {
                 continue;
             };
@@ -927,9 +932,13 @@ impl Tracker {
                     continue;
                 }
             };
-            let Some(listed) = listed.into_iter().find(|listed| listed.id == entry_id) else {
+            let Some(listed) = listed.into_iter().find(|listed| {
+                listed.event_id == competition_id
+                    && (listed.id == entry_id || Some(listed.ticket_id) == entry.ticket_id)
+            }) else {
                 continue;
             };
+            let entry_id = listed.id;
             let share = settlement.and_then(|settlement| {
                 settlement
                     .shares
@@ -1536,6 +1545,80 @@ mod tests {
             .unwrap()
             .extend(json.as_object().unwrap().clone());
         serde_json::from_value(base).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_lost_submission_response_is_recovered_by_ticket_without_assuming_acceptance() {
+        let competition_id = Uuid::now_v7();
+        let ticket_id = Uuid::now_v7();
+        let accepted_id = Uuid::now_v7();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let fixture = fixture(
+            Router::new().route(
+                "/api/v1/entries",
+                get(move || {
+                    let counted = counted.clone();
+                    async move {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!([{
+                            "id": accepted_id,
+                            "event_id": competition_id,
+                            "ticket_id": ticket_id,
+                            "pubkey": "player",
+                            "ephemeral_pubkey": "entry-key",
+                            "signed_at": null,
+                            "paid_at": null,
+                            "paid_out_at": null
+                        }]))
+                    }
+                }),
+            ),
+            false,
+            false,
+        )
+        .await;
+        let players =
+            HashMap::from([("alice".to_string(), SynthUser::new_random("alice").unwrap())]);
+        let interrupted = EntryTrace {
+            user: "alice".into(),
+            entry_id: Some(Uuid::now_v7()),
+            ticket_id: Some(ticket_id),
+            paid: true,
+            submission_attempts: 1,
+            ..EntryTrace::default()
+        };
+        let never_submitted = EntryTrace {
+            submission_attempts: 0,
+            ..interrupted.clone()
+        };
+        let rejected = EntryTrace {
+            ticket_id: Some(Uuid::now_v7()),
+            ..interrupted.clone()
+        };
+        let mut gaps = Vec::new();
+        let payouts = fixture
+            .tracker
+            .payouts(
+                competition_id,
+                &[interrupted.clone(), never_submitted, rejected],
+                &players,
+                None,
+                None,
+                &mut gaps,
+            )
+            .await;
+
+        assert!(gaps.is_empty());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "only attempted submissions"
+        );
+        assert_eq!(payouts.len(), 1, "unaccepted attempts do not gain a payout");
+        assert_eq!(payouts[0].entry_id, accepted_id, "use the coordinator's id");
+        assert_eq!(payouts[0].pubkey, "entry-key");
+        assert!(!interrupted.entry_submitted, "intent is not acceptance");
     }
 
     #[tokio::test]

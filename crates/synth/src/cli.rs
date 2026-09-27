@@ -31,7 +31,7 @@ pub struct Cli {
 pub enum Command {
     /// Start a run on a running synth. It pays for entries from synth's node, so it asks first
     /// unless --yes is given.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Runs synth has recorded.
     Runs {
         #[command(flatten)]
@@ -72,12 +72,14 @@ pub struct ApiArgs {
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
-    /// What to run: full-lifecycle or escrow-refund.
+    /// Scenario name (hyphens or underscores); see the supported cases in --help errors.
     #[arg(value_parser = parse_kind)]
     pub kind: String,
     /// Synthetic players; synth's configured number if unset.
     #[arg(long)]
     pub users: Option<usize>,
+    #[command(flatten)]
+    pub timing: EntryTimingArgs,
     /// Follow the run: print each step as it changes, then wait for its money to settle. Exits
     /// 1 if the run fails, 3 if its money is stuck, 4 on --timeout.
     #[arg(long)]
@@ -93,6 +95,99 @@ pub struct RunArgs {
     pub yes: bool,
     #[command(flatten)]
     pub api: ApiArgs,
+}
+
+/// Optional per-run overrides shared by the remote and direct operator CLIs.
+#[derive(Debug, Clone, Default, Args)]
+pub struct EntryTimingArgs {
+    /// Reproduce this run's randomized timing and picks.
+    #[arg(long)]
+    pub seed: Option<u64>,
+    #[arg(long)]
+    pub entry_window_secs: Option<u64>,
+    /// Fix the observation window when replaying a recorded run.
+    #[arg(long)]
+    pub observation_window_secs: Option<u64>,
+    #[arg(long)]
+    pub arrival_min_secs: Option<u64>,
+    #[arg(long)]
+    pub arrival_max_secs: Option<u64>,
+    #[arg(long)]
+    pub before_payment_min_secs: Option<u64>,
+    #[arg(long)]
+    pub before_payment_max_secs: Option<u64>,
+    #[arg(long)]
+    pub before_submit_min_secs: Option<u64>,
+    #[arg(long)]
+    pub before_submit_max_secs: Option<u64>,
+    #[arg(long)]
+    pub deadline_margin_secs: Option<u64>,
+}
+
+impl EntryTimingArgs {
+    pub fn apply(&self, config: &mut crate::scenarios::ScenarioConfig) {
+        if let Some(window) = self.observation_window_secs {
+            config.observation_window_secs = window;
+            config.observation_window_choices.clear();
+        }
+        if let Some(seed) = self.seed {
+            config.seed = Some(seed);
+        }
+        for (target, value) in [
+            (&mut config.entry_window_secs, self.entry_window_secs),
+            (
+                &mut config.entry_timing.arrival.min_secs,
+                self.arrival_min_secs,
+            ),
+            (
+                &mut config.entry_timing.arrival.max_secs,
+                self.arrival_max_secs,
+            ),
+            (
+                &mut config.entry_timing.before_payment.min_secs,
+                self.before_payment_min_secs,
+            ),
+            (
+                &mut config.entry_timing.before_payment.max_secs,
+                self.before_payment_max_secs,
+            ),
+            (
+                &mut config.entry_timing.before_submit.min_secs,
+                self.before_submit_min_secs,
+            ),
+            (
+                &mut config.entry_timing.before_submit.max_secs,
+                self.before_submit_max_secs,
+            ),
+            (
+                &mut config.entry_timing.deadline_margin_secs,
+                self.deadline_margin_secs,
+            ),
+        ] {
+            if let Some(value) = value {
+                *target = value;
+            }
+        }
+    }
+
+    fn append_query(&self, path: &mut String) {
+        for (key, value) in [
+            ("seed", self.seed),
+            ("entry_window_secs", self.entry_window_secs),
+            ("observation_window_secs", self.observation_window_secs),
+            ("arrival_min_secs", self.arrival_min_secs),
+            ("arrival_max_secs", self.arrival_max_secs),
+            ("before_payment_min_secs", self.before_payment_min_secs),
+            ("before_payment_max_secs", self.before_payment_max_secs),
+            ("before_submit_min_secs", self.before_submit_min_secs),
+            ("before_submit_max_secs", self.before_submit_max_secs),
+            ("deadline_margin_secs", self.deadline_margin_secs),
+        ] {
+            if let Some(value) = value {
+                let _ = write!(path, "&{key}={value}");
+            }
+        }
+    }
 }
 
 /// A scenario name as synth knows it, from either spelling.
@@ -184,10 +279,21 @@ impl SynthApi {
     }
 
     pub async fn start(&self, kind: &str, users: Option<usize>) -> Result<Started> {
+        self.start_with_options(kind, users, &EntryTimingArgs::default())
+            .await
+    }
+
+    pub async fn start_with_options(
+        &self,
+        kind: &str,
+        users: Option<usize>,
+        timing: &EntryTimingArgs,
+    ) -> Result<Started> {
         let mut path = format!("/api/run?scenario={kind}");
         if let Some(users) = users {
             let _ = write!(path, "&users={users}");
         }
+        timing.append_query(&mut path);
         let started: Value = self.post(&path).await?.json().await?;
         if started.get("run_id").is_none() {
             bail!("synth started the run but did not say its id; it needs a newer synth");
@@ -379,7 +485,9 @@ pub async fn run(command: Command) -> Result<i32> {
                 ),
                 args.yes,
             )?;
-            let started = api.start(&args.kind, args.users).await?;
+            let started = api
+                .start_with_options(&args.kind, args.users, &args.timing)
+                .await?;
             if args.api.json && !args.wait {
                 println!(
                     "{}",
@@ -633,6 +741,62 @@ pub fn show_run(view: &RunView, trail: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_cases_accept_reproducible_timing_overrides() {
+        for scenario in [
+            "abandoned-unpaid",
+            "paid-abandonment",
+            "duplicate-submission",
+            "late-submission",
+        ] {
+            let cli = Cli::try_parse_from([
+                "synth",
+                "run",
+                scenario,
+                "--seed",
+                "42",
+                "--entry-window-secs",
+                "1200",
+                "--observation-window-secs",
+                "10800",
+                "--arrival-min-secs",
+                "1",
+                "--arrival-max-secs",
+                "90",
+                "--before-payment-min-secs",
+                "5",
+                "--before-payment-max-secs",
+                "60",
+                "--before-submit-min-secs",
+                "10",
+                "--before-submit-max-secs",
+                "120",
+                "--deadline-margin-secs",
+                "60",
+                "--yes",
+            ])
+            .unwrap();
+            let Some(Command::Run(args)) = cli.command else {
+                panic!("run command expected")
+            };
+            let mut config = crate::scenarios::ScenarioConfig {
+                observation_window_choices: vec![600],
+                ..Default::default()
+            };
+            args.timing.apply(&mut config);
+            let planned = config.resolve_plan(&args.kind).unwrap();
+            assert_eq!(planned.seed, Some(42));
+            assert_eq!(planned.entry_window_secs, 1200);
+            assert_eq!(planned.observation_window_secs, 10800);
+            assert!(planned.observation_window_choices.is_empty());
+            let mut query = String::new();
+            args.timing.append_query(&mut query);
+            assert!(query.contains("&seed=42"));
+            assert!(query.contains("&observation_window_secs=10800"));
+            assert!(query.contains("&before_submit_max_secs=120"));
+        }
+    }
 
     fn run(status: &str, competition: Option<&str>, money: Option<&str>) -> TestRun {
         TestRun {

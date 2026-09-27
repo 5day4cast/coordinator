@@ -9,150 +9,26 @@ use crate::db::SynthDb;
 use crate::lnd::Lnd;
 use crate::trail::{EntryPayment, EntryTrace, EscrowTerms, RouteHop};
 use anyhow::{Context, Result};
-use log::{info, warn};
+use log::warn;
 use rand::Rng;
-use std::time::Instant;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::common::{finish_result, load_users, run_step, wait_for_state, Steps};
 use super::types::*;
 
-/// Run the full competition lifecycle scenario:
-/// 1. Create competition
-/// 2. Generate/load synthetic users
-/// 3. Each user: request ticket → settle → submit entry
-/// 4. Wait for state transitions through to completion
+/// Run staggered players through the funded competition lifecycle.
 pub async fn run_full_lifecycle(
     client: &CoordinatorClient,
     db: &SynthDb,
     config: &ScenarioConfig,
 ) -> ScenarioResult {
-    let started_at = OffsetDateTime::now_utc();
-    let scenario_start = Instant::now();
-    let mut steps = Steps::new();
-    // Step 1: Create competition
-    let comp_id = match run_step("create_competition", || async {
-        create_competition(client, config).await
-    })
+    super::user_behavior::run(
+        client,
+        db,
+        config,
+        super::user_behavior::Scenario::FullLifecycle,
+    )
     .await
-    {
-        Ok((mut step, comp_id)) => {
-            step.details = Some(serde_json::json!({ "competition_id": comp_id }));
-            steps.push(step);
-            comp_id
-        }
-        Err(step) => {
-            steps.push(*step);
-            return finish_result("full_lifecycle", started_at, scenario_start, steps, true);
-        }
-    };
-    info!("Created competition: {}", comp_id);
-
-    // Step 2: Load/create synthetic users
-    let users = match run_step("load_users", || async {
-        load_users(db, config.users).await
-    })
-    .await
-    {
-        Ok((step, users)) => {
-            steps.push(step);
-            users
-        }
-        Err(step) => {
-            steps.push(*step);
-            return finish_result("full_lifecycle", started_at, scenario_start, steps, true);
-        }
-    };
-
-    info!("Loaded {} synthetic users", users.len());
-
-    // An Arkade coordinator funds each escrow from a real payment, so pay for real when a node
-    // is configured and fall back to the coordinator's test endpoint when not.
-    let lnd = match run_step("open_payer", || async {
-        config.lnd.as_ref().map(Lnd::new).transpose()
-    })
-    .await
-    {
-        Ok((step, lnd)) => {
-            steps.push(step);
-            lnd
-        }
-        Err(step) => {
-            steps.push(*step);
-            return finish_result("full_lifecycle", started_at, scenario_start, steps, true);
-        }
-    };
-    let payer = lnd.as_ref().map_or(Payer::TestEndpoint, Payer::Lnd);
-
-    // Step 3: Each user requests a ticket and submits an entry
-    for user in &users {
-        let step_name = format!("user_{}_enter", user.name);
-        let mut trace = EntryTrace::new(user);
-        let entered = run_step(&step_name, || {
-            enter_competition_with(
-                client,
-                user,
-                &comp_id,
-                config,
-                config.lightning_address.as_deref(),
-                &payer,
-                &step_name,
-                &mut trace,
-            )
-        })
-        .await;
-        match entered {
-            Ok((step, _)) => steps.push(trace.attach(step)),
-            Err(step) => {
-                steps.push(trace.attach(*step));
-                return finish_result("full_lifecycle", started_at, scenario_start, steps, true);
-            }
-        }
-        info!("User {} entered competition", user.name);
-    }
-
-    // Step 4: Wait for state transitions
-    let target_states = vec![
-        "collecting_entries",
-        "escrow_confirmed",
-        "event_created",
-        "entries_submitted",
-        "contract_created",
-        "signing_complete",
-        "funding_broadcasted",
-        "funding_confirmed",
-        "awaiting_attestation",
-    ];
-
-    for target_state in &target_states {
-        let step_name = format!("wait_{}", target_state);
-        match run_step(&step_name, || async {
-            wait_for_state(client, &comp_id, target_state, config).await
-        })
-        .await
-        {
-            Ok((step, _)) => {
-                steps.push(step);
-                info!("Competition reached state: {}", target_state);
-            }
-            Err(step) => {
-                steps.push(*step);
-                warn!(
-                    "Competition did not reach state: {} - stopping at current state",
-                    target_state
-                );
-                return finish_result("full_lifecycle", started_at, scenario_start, steps, true);
-            }
-        }
-    }
-
-    // Reaching awaiting_attestation means the full lifecycle (creation, entry,
-    // escrow, signing, funding) succeeded.  Completion requires oracle attestation
-    // which normally takes over a day, so we treat awaiting_attestation as success.
-    info!("Competition reached awaiting_attestation — lifecycle test passed");
-
-    finish_result("full_lifecycle", started_at, scenario_start, steps, false)
 }
 
 pub(super) async fn create_competition(
@@ -196,22 +72,29 @@ pub(super) enum Payer<'a> {
     Lnd(&'a crate::lnd::Lnd),
 }
 
-/// Enter, paying with `payer` and registering `lightning_address` for payouts and refunds.
-///
-/// Returns the ticket, which a refund is later read from. `trace` records each stage as it
-/// completes, and is saved as `step`'s details before the entry pays, so a restart mid-payment
-/// still leaves the ticket and payment hash to trace.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn enter_competition_with(
+/// A ticket and its private registration material, held only until registration.
+pub(super) struct RequestedEntry {
+    pub ticket: crate::client::entries::TicketResponse,
+    entry_id: Uuid,
+    ephemeral: crate::crypto::keys::EphemeralKey,
+    payout_preimage: String,
+    payout_choice: coordinator_core::PayoutRegistrationRequest,
+}
+
+/// The exact entry body can be retried to test duplicate submission safely.
+pub(super) struct PreparedEntry {
+    pub ticket: crate::client::entries::TicketResponse,
+    pub entry: AddEntry,
+}
+
+pub(super) async fn request_entry(
     client: &CoordinatorClient,
     user: &SynthUser,
     competition_id: &Uuid,
-    config: &ScenarioConfig,
     lightning_address: Option<&str>,
-    payer: &Payer<'_>,
     step: &str,
     trace: &mut EntryTrace,
-) -> Result<Uuid> {
+) -> Result<RequestedEntry> {
     let entry_id = Uuid::now_v7();
     trace.entry_id = Some(entry_id);
     let ephemeral = user.derive_ephemeral_key(&entry_id)?;
@@ -219,13 +102,11 @@ pub(super) async fn enter_competition_with(
         crypto::payout::generate_payout_pair(&ephemeral.secret_bytes);
     let payout_choice = coordinator_core::PayoutRegistrationRequest {
         entry_id,
-        payout_hash: payout_hash.clone(),
+        payout_hash,
         lightning_address: lightning_address.map(str::to_string),
         allow_invoice_fallback: true,
         release_entry_key_after_payment: true,
     };
-    // Payouts and refunds go to the Lightning Address when one is configured, and to a
-    // signed invoice from the player otherwise.
     let ticket = client
         .request_ticket(
             &user.nostr_keys,
@@ -235,18 +116,43 @@ pub(super) async fn enter_competition_with(
         )
         .await
         .context("Failed to request ticket")?;
+    trace.ticket_requested_at = Some(OffsetDateTime::now_utc());
     trace.ticket_id = Some(ticket.ticket_id);
     trace.amount_sats = Some(ticket.amount_sats);
     trace.payment_hash = Some(ticket.payment_hash.clone());
     trace.invoice = Some(ticket.payment_request.clone());
     trace.lightning_address = lightning_address.map(str::to_string);
     trace.escrow = escrow_terms(&ticket);
+    trace.payment_started = Some(false);
+    crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
+    Ok(RequestedEntry {
+        ticket,
+        entry_id,
+        ephemeral,
+        payout_preimage,
+        payout_choice,
+    })
+}
 
-    info!(
-        "  {} got ticket {} ({}sats)",
-        user.name, ticket.ticket_id, ticket.amount_sats
-    );
-
+// Keep registration's protocol context explicit, matching the surrounding actor helpers.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn register_entry(
+    client: &CoordinatorClient,
+    user: &SynthUser,
+    competition_id: &Uuid,
+    config: &ScenarioConfig,
+    user_index: usize,
+    requested: RequestedEntry,
+    step: &str,
+    trace: &mut EntryTrace,
+) -> Result<PreparedEntry> {
+    let RequestedEntry {
+        ticket,
+        entry_id,
+        ephemeral,
+        payout_preimage,
+        payout_choice,
+    } = requested;
     if ticket.keymeld_session_id.is_some() && ticket.keymeld_registration.is_none() {
         anyhow::bail!("Ticket is missing authorized Keymeld registration context");
     }
@@ -264,8 +170,7 @@ pub(super) async fn enter_competition_with(
         ),
         None => None,
     };
-    // As the browser does, the registration goes before the invoice is paid, so a ticket paid
-    // for but never entered can still be refunded.
+    // Refund authorization must reach the coordinator before any payment leaves.
     if let Some(data) = &registration {
         client
             .register_ticket(
@@ -282,9 +187,10 @@ pub(super) async fn enter_competition_with(
             )
             .await
             .context("Failed to register the ticket before paying")?;
+        trace.ticket_registered = true;
     }
     let (
-        encrypted_keymeld_key,
+        encrypted_keymeld_private_key,
         keymeld_auth_pubkey,
         keymeld_registration_context,
         keymeld_escrow_policy,
@@ -297,79 +203,90 @@ pub(super) async fn enter_competition_with(
         ),
         None => (None, None, None, None),
     };
+    let entry = AddEntry {
+        id: entry_id,
+        ticket_id: ticket.ticket_id,
+        ephemeral_pubkey: ephemeral.public_key,
+        payout_hash: payout_choice.payout_hash,
+        event_id: *competition_id,
+        expected_observations: generate_predictions(&config.stations, config.seed, user_index),
+        encrypted_keymeld_private_key,
+        keymeld_auth_pubkey,
+        keymeld_registration_context,
+        keymeld_escrow_policy,
+    };
+    crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
+    Ok(PreparedEntry { ticket, entry })
+}
 
-    // Once the payment goes out, a restart must still find the ticket and the payment hash.
-    crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await;
+pub(super) async fn pay_entry(
+    client: &CoordinatorClient,
+    user: &SynthUser,
+    competition_id: &Uuid,
+    prepared: &PreparedEntry,
+    payer: &Payer<'_>,
+    step: &str,
+    trace: &mut EntryTrace,
+) -> Result<()> {
+    trace.payment_started = Some(true);
+    // Persist both the ticket and the intent before payment: a restart can distinguish
+    // an unpaid dropout from an interrupted Lightning request.
+    crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
     match payer {
         Payer::TestEndpoint => {
             client
-                .test_settle_invoice(&ticket.ticket_id)
+                .test_settle_invoice(&prepared.ticket.ticket_id)
                 .await
                 .context("Failed to settle invoice")?;
             trace.settled_by_test_endpoint = true;
-            info!("  {} invoice settled", user.name);
         }
         Payer::Lnd(lnd) => {
             let paid = lnd
-                .pay(&ticket.payment_request)
+                .pay(&prepared.ticket.payment_request)
                 .await
                 .context("Failed to pay the entry invoice")?;
-            info!(
-                "  {} paid {} sats, {} msat in fees",
-                user.name, ticket.amount_sats, paid.fee_msat
-            );
             trace.payment = Some(entry_payment(lnd, paid).await);
         }
     }
     trace.paid = true;
-    crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await;
-
-    // Wait for ticket payment to propagate (SQLite WAL read/write pool sync)
-    let mut retries = 0;
-    loop {
+    crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
+    for attempt in 0..=30 {
         let status = client
-            .check_ticket_status(&user.nostr_keys, competition_id, &ticket.ticket_id)
+            .check_ticket_status(&user.nostr_keys, competition_id, &prepared.ticket.ticket_id)
             .await
             .context("Failed to check ticket status")?;
         if status == TicketStatus::Paid || status == TicketStatus::Settled {
-            break;
+            return Ok(());
         }
-        retries += 1;
-        if retries > 30 {
+        if attempt == 30 {
             anyhow::bail!(
                 "Ticket {} still not paid after settle (status: {:?})",
-                ticket.ticket_id,
+                prepared.ticket.ticket_id,
                 status
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+    unreachable!()
+}
 
-    // Generate random weather predictions
-    let predictions = generate_random_predictions(&config.stations);
-
-    // Submit entry
-    let entry = AddEntry {
-        id: entry_id,
-        ticket_id: ticket.ticket_id,
-        ephemeral_pubkey: ephemeral.public_key,
-        payout_hash,
-        event_id: *competition_id,
-        expected_observations: predictions,
-        encrypted_keymeld_private_key: encrypted_keymeld_key,
-        keymeld_auth_pubkey,
-        keymeld_registration_context,
-        keymeld_escrow_policy,
-    };
-
-    client
-        .submit_entry(&user.nostr_keys, &entry)
+pub(super) async fn submit_entry(
+    client: &CoordinatorClient,
+    user: &SynthUser,
+    prepared: &PreparedEntry,
+    step: &str,
+    trace: &mut EntryTrace,
+) -> Result<()> {
+    trace.submission_attempts += 1;
+    crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
+    let response = client
+        .submit_entry(&user.nostr_keys, &prepared.entry)
         .await
         .context("Failed to submit entry")?;
+    trace.entry_id = Some(response.id);
     trace.entry_submitted = true;
-
-    info!("  {} entry submitted", user.name);
-    Ok(ticket.ticket_id)
+    crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
+    Ok(())
 }
 
 /// The terms of the ticket's Arkade escrow, from the payout policy the player signs. None for a
@@ -409,8 +326,16 @@ async fn entry_payment(lnd: &Lnd, paid: crate::lnd::Paid) -> EntryPayment {
     }
 }
 
-fn generate_random_predictions(stations: &[String]) -> Vec<WeatherChoices> {
-    let mut rng = rand::rng();
+pub(super) fn generate_predictions(
+    stations: &[String],
+    seed: Option<u64>,
+    user_index: usize,
+) -> Vec<WeatherChoices> {
+    use rand::SeedableRng;
+    // Separate each user's picks from the timing RNG and from every other user.
+    let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(
+        seed.unwrap_or(0) ^ (user_index as u64).wrapping_mul(0x9e3779b97f4a7c15),
+    );
     stations
         .iter()
         .map(|station| {

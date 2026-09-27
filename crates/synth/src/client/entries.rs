@@ -8,6 +8,41 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+/// A protocol rejection, distinct from a network, decoding, or server failure.
+#[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
+#[error("HTTP {status}: {message}")]
+pub struct ApiRejection {
+    pub status: u16,
+    pub message: String,
+}
+
+impl ApiRejection {
+    fn new(status: reqwest::StatusCode, body: String) -> Self {
+        let message = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(|error| error.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or(body);
+        Self {
+            status: status.as_u16(),
+            message,
+        }
+    }
+
+    pub fn is_no_capacity(&self) -> bool {
+        self.status == 400 && self.message == "No ticket available for competition"
+    }
+}
+
+pub enum EntrySubmission {
+    Accepted(EntryResponse),
+    Rejected(ApiRejection),
+}
+
 /// Request body for requesting a competition ticket
 #[derive(Debug, Clone, Serialize)]
 pub struct TicketRequest {
@@ -161,7 +196,7 @@ impl CoordinatorClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Request ticket failed ({}): {}", status, body);
+            return Err(ApiRejection::new(status, body).into());
         }
 
         resp.json().await.context("Failed to parse ticket response")
@@ -272,6 +307,19 @@ impl CoordinatorClient {
 
     /// Submit an entry (requires Nostr auth)
     pub async fn submit_entry(&self, keys: &Keys, entry: &AddEntry) -> Result<EntryResponse> {
+        match self.attempt_submit_entry(keys, entry).await? {
+            EntrySubmission::Accepted(entry) => Ok(entry),
+            EntrySubmission::Rejected(error) => Err(error.into()),
+        }
+    }
+
+    /// Negative scenarios must inspect a real rejection, never count a transport error
+    /// or an unreadable successful response as proof that an entry was refused.
+    pub async fn attempt_submit_entry(
+        &self,
+        keys: &Keys,
+        entry: &AddEntry,
+    ) -> Result<EntrySubmission> {
         let url = format!("{}/api/v1/entries", self.base_url());
 
         let body = serde_json::to_vec(entry)?;
@@ -290,10 +338,14 @@ impl CoordinatorClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Submit entry failed ({}): {}", status, body);
+            return Ok(EntrySubmission::Rejected(ApiRejection::new(status, body)));
         }
 
-        resp.json().await.context("Failed to parse entry response")
+        Ok(EntrySubmission::Accepted(
+            resp.json()
+                .await
+                .context("Failed to parse entry response")?,
+        ))
     }
 
     /// List entries for a user (requires Nostr auth)

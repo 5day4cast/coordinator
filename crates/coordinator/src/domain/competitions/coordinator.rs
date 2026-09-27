@@ -8,10 +8,10 @@ pub use automatic::{InvoiceFallbackRequest, PayoutAuthorizationInfo, PayoutTerms
 
 use super::{
     parse_invoice, states::CompetitionStatus, store::ReservedTicket, verify_entry_key,
-    verify_payout_preimage, winner_payout_sats, AddEntry, CompetitionError, CompetitionState,
-    CompetitionStore, FundedContract, KeymeldSigningInfo, PayoutClaimInfo, PayoutClaimReceipt,
-    PayoutInfo, PayoutRejection, RegistrationStored, SearchBy, Ticket, TicketRegistration,
-    TicketStatus, UserEntry, UserEntryView,
+    verify_payout_preimage, winner_payout_sats, AddEntry, CompetitionError, CompetitionStore,
+    FundedContract, KeymeldSigningInfo, PayoutClaimInfo, PayoutClaimReceipt, PayoutInfo,
+    PayoutRejection, RegistrationStored, SearchBy, Ticket, TicketRegistration, TicketStatus,
+    UserEntry, UserEntryView,
 };
 use crate::{
     api::routes::FinalSignatures,
@@ -1423,7 +1423,16 @@ impl Coordinator {
             );
         }
 
-        let outcome_payouts = generate_payouts(competition, &entries, &players)?;
+        let outcome_payouts = if let Some(params) = &competition.contract_parameters {
+            params.outcome_payouts.clone()
+        } else if let Some(accepted) = self
+            .accepted_outcome_payouts(competition.id, &entries)
+            .await?
+        {
+            accepted
+        } else {
+            generate_payouts(competition, &entries, &players)?
+        };
         debug!("Generated outcome payouts:");
         for (outcome, weights) in &outcome_payouts {
             debug!("Outcome {:?}: weights={:?}", outcome, weights);
@@ -2521,7 +2530,7 @@ impl Coordinator {
             let (close_tx_input, close_tx_prevout) =
                 signed_contract.outcome_close_tx_input_and_prevout(&outcome)?;
 
-            let mut close_tx = simple_sweep_tx(
+            let (mut close_tx, input_index) = simple_sweep_tx(
                 signed_contract.params().market_maker.pubkey,
                 close_tx_input.clone(),
                 signed_contract.close_tx_input_weight(),
@@ -2544,8 +2553,6 @@ impl Coordinator {
                 winner_seckeys.len(),
                 close_tx_prevout.value
             );
-
-            let input_index = close_tx_input.previous_output.vout as usize;
 
             signed_contract.sign_outcome_close_tx_input(
                 &outcome,
@@ -2710,7 +2717,7 @@ impl Coordinator {
                 let (close_tx_input, close_tx_prevout) =
                     signed_contract.split_close_tx_input_and_prevout(&win_condition)?;
 
-                let mut close_tx = simple_sweep_tx(
+                let (mut close_tx, input_index) = simple_sweep_tx(
                     signed_contract.params().market_maker.pubkey,
                     close_tx_input.clone(),
                     signed_contract.close_tx_input_weight(),
@@ -2720,8 +2727,6 @@ impl Coordinator {
 
                 let winner_seckey = Scalar::from_hex(entry.ephemeral_privatekey.as_ref().unwrap())
                     .map_err(|e| anyhow!("Invalid winner secret key: {}", e))?;
-
-                let input_index = close_tx_input.previous_output.vout as usize;
 
                 signed_contract.sign_split_close_tx_input(
                     &win_condition,
@@ -2878,15 +2883,13 @@ impl Coordinator {
                     }
                 }
 
-                let mut reclaim_tx = simple_sweep_tx(
+                let (mut reclaim_tx, input_index) = simple_sweep_tx(
                     signed_contract.params().market_maker.pubkey,
                     reclaim_tx_input.clone(),
                     signed_contract.split_reclaim_tx_input_weight(),
                     reclaim_tx_prevout.value,
                     fee_rate,
                 );
-
-                let input_index = reclaim_tx_input.previous_output.vout as usize;
 
                 signed_contract.sign_split_reclaim_tx_input(
                     &win_condition,
@@ -3192,11 +3195,7 @@ impl Coordinator {
             .competition_store
             .get_competition(competition_id)
             .await?;
-        if !matches!(competition.get_state(), CompetitionState::Created) {
-            return Err(Error::BadRequest(
-                "Competition is no longer accepting entries".into(),
-            ));
-        }
+        competition.require_ticket_admission(OffsetDateTime::now_utc())?;
         if competition.total_entries as usize >= competition.event_submission.total_allowed_entries
         {
             return Err(Error::CompetitionFull);
@@ -3219,16 +3218,18 @@ impl Coordinator {
             superseded_payment_hash,
         } = self
             .competition_store
-            .get_and_reserve_ticket(competition_id, &pubkey)
+            .get_and_reserve_ticket_before(competition_id, &pubkey, competition.ticket_deadline())
             .await
             .map_err(|e| match e {
                 DatabaseWriteError::Sqlx(sqlx::Error::RowNotFound) => Error::NoAvailableTickets,
                 e => Error::from(e),
-            })?;
+            })?
+            .ok_or_else(|| Error::BadRequest(super::admission::TICKETS_CLOSED.into()))?;
         if let Some(old_hash) = superseded_payment_hash {
             self.cancel_superseded_invoice(ticket.id, old_hash).await;
         }
         let result = async {
+            competition.require_ticket_admission(OffsetDateTime::now_utc())?;
             if automatic {
                 self.prepare_ticket_payout_policy(
                     &competition,
@@ -3279,6 +3280,7 @@ impl Coordinator {
         btc_pubkey: BitcoinPublicKey,
         competition: Competition,
     ) -> Result<TicketResponse, Error> {
+        competition.require_ticket_admission(OffsetDateTime::now_utc())?;
         let mut keymeld_registration = if self.is_keymeld_enabled() {
             let stored = self
                 .competition_store
@@ -3315,6 +3317,7 @@ impl Coordinator {
         // invoice is accepted (see the invoice watcher): handing it out earlier
         // let anyone lock the coordinator's funds without paying. Only the key
         // the escrow will be locked to is recorded now.
+        competition.require_ticket_admission(OffsetDateTime::now_utc())?;
         if self.escrow_enabled {
             let stored = self
                 .competition_store
@@ -3354,8 +3357,12 @@ impl Coordinator {
             // An Arkade competition's invoice comes from the swap into the ticket's escrow.
             let (payment_request, expires_at) =
                 if let Some(ark) = self.ark_for(ticket.competition_id).await? {
-                    self.ticket_ark_invoice(ark, &ticket, full_fee).await?
+                    competition.require_ticket_admission(OffsetDateTime::now_utc())?;
+                    self.ticket_ark_invoice(ark, &ticket, full_fee, competition.ticket_deadline())
+                        .await?
                 } else {
+                    // Awaited lookups must not extend the invoice admission window.
+                    competition.require_ticket_admission(OffsetDateTime::now_utc())?;
                     // Create new HODL invoice
                     let invoice = self
                         .ln
@@ -3523,11 +3530,8 @@ impl Coordinator {
                 }
             })?;
 
-        if !matches!(competition.get_state(), CompetitionState::Created) {
-            return Err(Error::BadRequest(
-                "Competition is no longer accepting entries".into(),
-            ));
-        }
+        competition.require_entry_admission(OffsetDateTime::now_utc())?;
+        let entry_deadline = competition.event_submission.start_observation_date;
         validate_entry_keys(&mut entry)?;
         validate_entry(entry.clone().into(), competition).await?;
 
@@ -3639,25 +3643,33 @@ impl Coordinator {
         if policy.is_some() {
             user_entry.entry_submission.id = ticket.id;
         }
-        let user_entry = self
+        let user_entry = match self
             .competition_store
-            .add_entry_with_policy(user_entry, ticket.id, policy)
+            .add_entry_with_policy_before(user_entry, ticket.id, policy, entry_deadline)
             .await
-            .map_err(|e| match e {
-                DatabaseWriteError::Sqlx(sqlx::Error::RowNotFound) => {
-                    Error::BadRequest(
-                        "Failed to claim ticket - may have expired or been claimed by another entry"
-                            .into(),
-                    )
-                }
-                e => {
+        {
+            Ok(entry) => {
+                entry.ok_or_else(|| Error::BadRequest(super::admission::ENTRIES_CLOSED.into()))?
+            }
+            Err(error) => {
+                let unique_conflict = matches!(&error,
+                    DatabaseWriteError::Sqlx(sqlx::Error::Database(error)) if error.is_unique_violation());
+                let ticket_has_entry = unique_conflict
+                    && self
+                        .competition_store
+                        .get_ticket(ticket.id)
+                        .await?
+                        .entry_id
+                        .is_some();
+                if !ticket_has_entry {
                     error!(
-                        "entry added to oracle, but failed to be saved: entry_id {}, event_id {} {:?}",
-                        entry.id, entry.event_id, e
+                        "Failed to save entry {} for competition {}: {}",
+                        entry.id, entry.event_id, error
                     );
-                    Error::from(e)
                 }
-            })?;
+                return Err(super::admission::entry_write_error(error, ticket_has_entry));
+            }
+        };
 
         self.wake_competition(user_entry.event_id);
         Ok(user_entry)
@@ -3687,11 +3699,7 @@ impl Coordinator {
                 sqlx::Error::RowNotFound => Error::NotFound("Competition not found".into()),
                 e => Error::from(e),
             })?;
-        if !matches!(competition.get_state(), CompetitionState::Created) {
-            return Err(Error::BadRequest(
-                "Competition is no longer accepting entries".into(),
-            ));
-        }
+        competition.require_entry_admission(OffsetDateTime::now_utc())?;
         let ticket = self
             .competition_store
             .get_ticket(ticket_id)
@@ -3781,8 +3789,15 @@ impl Coordinator {
         let json = serde_json::to_string(&registration).map_err(|e| Error::Bitcoin(e.into()))?;
         match self
             .competition_store
-            .store_ticket_registration(ticket.id, ticket.hash.clone(), pubkey, json)
+            .store_ticket_registration_before(
+                ticket.id,
+                ticket.hash.clone(),
+                pubkey,
+                json,
+                competition.event_submission.start_observation_date,
+            )
             .await?
+            .ok_or_else(|| Error::BadRequest(super::admission::ENTRIES_CLOSED.into()))?
         {
             RegistrationStored::Stored | RegistrationStored::Unchanged => Ok(()),
             RegistrationStored::ReservationChanged => Err(Error::BadRequest(
@@ -4458,24 +4473,8 @@ fn generate_payouts(
         if winner_indices.len() == entries.len() {
             debug!("Processing special 'all players' outcome for equal refunds");
 
-            // Create equal weights for all players (everyone gets their entry fee back)
-            let mut equal_weights: BTreeMap<PlayerIndex, u64> = BTreeMap::new();
-            let weight_per_player = 100 / players.len() as u64;
-            let remainder = 100 % players.len() as u64;
-
-            for i in 0..players.len() {
-                // Distribute remainder to maintain total of 100
-                let player_weight = if (i as u64) < remainder {
-                    weight_per_player + 1
-                } else {
-                    weight_per_player
-                };
-                equal_weights.insert(i, player_weight);
-                debug!(
-                    "Assigning equal weight {} to player index {} for refund outcome",
-                    player_weight, i
-                );
-            }
+            // Ratios preserve equality even when the player count does not divide 100.
+            let equal_weights: PayoutWeights = (0..players.len()).map(|i| (i, 1)).collect();
 
             debug!(
                 "Final weights for refund outcome {}: {:?}",
@@ -4534,21 +4533,8 @@ fn generate_payouts(
         payouts.insert(Outcome::Attestation(outcome_index), payout_weights);
     }
 
-    // Add expiry outcome with equal distribution
-    let mut expiry_weights = BTreeMap::new();
-    let player_count = players.len() as u64;
-    let base_weight = 100 / player_count;
-    let remainder = 100 % player_count;
-
-    for i in 0..players.len() {
-        // Distribute remainder one point at a time to early indices
-        let weight = if (i as u64) < remainder {
-            base_weight + 1
-        } else {
-            base_weight
-        };
-        expiry_weights.insert(i, weight);
-    }
+    // Expiry refunds the same stake to every player too.
+    let expiry_weights = (0..players.len()).map(|i| (i, 1)).collect();
     payouts.insert(Outcome::Expiry, expiry_weights);
 
     debug!("Generated {} total outcomes", payouts.len());
@@ -4855,15 +4841,17 @@ fn p2tr_script_pubkey(pubkey: Point) -> ScriptBuf {
     ScriptBuf::new_p2tr_tweaked(tweaked)
 }
 
+/// Build a single-input sweep and return the position to sign in the new transaction.
+/// The spent outpoint's `vout` identifies an output in the parent, not this input's index.
 fn simple_sweep_tx(
     destination_pubkey: Point,
     input: TxIn,
     input_weight: InputWeightPrediction,
     prevout_value: Amount,
     fee_rate: FeeRate,
-) -> Transaction {
+) -> (Transaction, usize) {
     let script_pubkey = p2tr_script_pubkey(destination_pubkey);
-    Transaction {
+    let transaction = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
         input: vec![input],
@@ -4875,8 +4863,13 @@ fn simple_sweep_tx(
             },
             script_pubkey,
         }],
-    }
+    };
+    (transaction, 0)
 }
+
+#[cfg(test)]
+#[path = "settlement_sweep_tests.rs"]
+mod settlement_sweep_tests;
 
 /// Seed for the market maker's MuSig2 nonces.
 ///
@@ -5018,7 +5011,7 @@ mod oracle_payout_order_tests {
         }
         assert_eq!(
             payouts[&Outcome::Attestation(6)],
-            BTreeMap::from([(0, 34), (1, 33), (2, 33)]),
+            BTreeMap::from([(0, 1), (1, 1), (2, 1)]),
         );
         assert_eq!(entries[0].ticket_id, tickets[0]);
     }

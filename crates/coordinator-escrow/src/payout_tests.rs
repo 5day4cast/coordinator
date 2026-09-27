@@ -168,11 +168,6 @@ fn economics_escrow_and_slot_are_fixed_while_future_funding_outpoint_can_bind() 
             "mutation {field}"
         );
     }
-    let mut invalid = terms.clone();
-    invalid
-        .outcome_payouts
-        .insert(Outcome::Attestation(0), BTreeMap::from([(0, 101)]));
-    assert!(ContractAuthorization::from_policy(&policy(&invalid)).is_err());
     let mut relative_expiry = terms.clone();
     relative_expiry
         .outcome_payouts
@@ -182,6 +177,131 @@ fn economics_escrow_and_slot_are_fixed_while_future_funding_outpoint_can_bind() 
     denied.release_entry_key_after_payment = false;
     assert!(ContractAuthorization::from_policy(&denied).is_err());
 }
+
+fn ratio_fixture(
+    weights: &[u64],
+    funding_sats: u64,
+) -> (ContractCommitment, ContractAuthorization) {
+    let (mut contract, mut terms) = fixture();
+    let params = &mut contract.contract_parameters;
+    params.players = weights
+        .iter()
+        .enumerate()
+        .map(|(index, _)| Player {
+            pubkey: Scalar::from_slice(&[index as u8 + 2; 32])
+                .unwrap()
+                .base_point_mul(),
+            ticket_hash: sha256(&[index as u8 + 20; 32]),
+            payout_hash: sha256(&[index as u8 + 40; 32]),
+        })
+        .collect();
+    let payouts: PayoutWeights = weights.iter().copied().enumerate().collect();
+    params.outcome_payouts = BTreeMap::from([
+        (Outcome::Attestation(0), payouts.clone()),
+        (Outcome::Expiry, payouts),
+    ]);
+    params.funding_value = Amount::from_sat(funding_sats);
+    terms.player_count = params.players.len();
+    terms.ticket_hash = params.players[0].ticket_hash;
+    terms.payout_hash = params.players[0].payout_hash;
+    terms.outcome_payouts = params.outcome_payouts.clone();
+    terms.funding_value = params.funding_value;
+    (contract, terms)
+}
+
+#[test]
+fn equal_refund_ratios_pay_equal_amounts_for_three_and_seven_players() {
+    for player_count in [3, 7] {
+        let (contract, terms) = ratio_fixture(&vec![1; player_count], player_count as u64 * 1_000);
+        let authorized = ContractAuthorization::from_policy(&policy(&terms)).unwrap();
+        assert_eq!(authorized, terms);
+        let params = &contract.contract_parameters;
+        authorized
+            .verify_contract(&contract, &params.players[0].pubkey.serialize())
+            .unwrap();
+        for outcome in [Outcome::Attestation(0), Outcome::Expiry] {
+            for player in &params.players {
+                assert_eq!(
+                    owed_sats(params, &outcome, &player.pubkey.serialize()).unwrap(),
+                    1_000
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn legacy_percentage_refunds_keep_their_authorized_amounts() {
+    let (contract, terms) = ratio_fixture(&[34, 33, 33], 3_000);
+    assert_eq!(
+        ContractAuthorization::from_policy(&policy(&terms)).unwrap(),
+        terms
+    );
+    let params = &contract.contract_parameters;
+    for outcome in [Outcome::Attestation(0), Outcome::Expiry] {
+        for (player, expected) in params.players.iter().zip([1_020, 990, 990]) {
+            assert_eq!(
+                owed_sats(params, &outcome, &player.pubkey.serialize()).unwrap(),
+                expected
+            );
+        }
+    }
+    let (changed, _) = ratio_fixture(&[1, 1, 1], 3_000);
+    assert!(terms
+        .verify_contract(&changed, &params.players[0].pubkey.serialize())
+        .is_err());
+}
+
+#[test]
+fn ratios_use_the_actual_total_and_round_down_without_overflow() {
+    for (weights, funding_sats, amounts) in [
+        (vec![2, 1], 100_000, vec![66_666, 33_333]),
+        (vec![101, 101], 100_000, vec![50_000, 50_000]),
+        (vec![u64::MAX - 1, 1], u64::MAX, vec![u64::MAX - 1, 1]),
+    ] {
+        let (contract, terms) = ratio_fixture(&weights, funding_sats);
+        ContractAuthorization::from_policy(&policy(&terms)).unwrap();
+        let params = &contract.contract_parameters;
+        for outcome in [Outcome::Attestation(0), Outcome::Expiry] {
+            for (player, expected) in params.players.iter().zip(&amounts) {
+                assert_eq!(
+                    owed_sats(params, &outcome, &player.pubkey.serialize()).unwrap(),
+                    *expected
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_ratio_maps_are_rejected_by_policy_and_payout_verification() {
+    for outcome in [Outcome::Attestation(0), Outcome::Expiry] {
+        for weights in [
+            BTreeMap::new(),
+            BTreeMap::from([(0, 0)]),
+            BTreeMap::from([(0, 1), (1, 0)]),
+            BTreeMap::from([(0, 1), (2, 1)]),
+            BTreeMap::from([(0, u64::MAX), (1, 1)]),
+        ] {
+            let (mut contract, mut terms) = fixture();
+            terms.outcome_payouts.insert(outcome, weights.clone());
+            contract
+                .contract_parameters
+                .outcome_payouts
+                .insert(outcome, weights);
+            assert!(matches!(
+                ContractAuthorization::from_policy(&policy(&terms)),
+                Err(PayoutError::InvalidPolicy(_))
+            ));
+            let params = &contract.contract_parameters;
+            assert!(matches!(
+                owed_sats(params, &outcome, &params.players[0].pubkey.serialize()),
+                Err(PayoutError::InvalidPolicy(_))
+            ));
+        }
+    }
+}
+
 #[test]
 fn signing_context_covers_expiry_and_all_adaptor_and_subset_requirements() {
     let (contract, _) = fixture();

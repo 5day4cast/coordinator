@@ -609,14 +609,9 @@ fn expected_payouts(
         }
     }
     ranks(players, weights, &mut Vec::new(), &mut result);
-    let equal: dlctix::PayoutWeights = (0..players)
-        .map(|i| {
-            (
-                i,
-                100 / players as u64 + u64::from((i as u64) < 100 % players as u64),
-            )
-        })
-        .collect();
+    // These are relative weights. Equal stakes must receive equal refunds,
+    // including when the player count does not divide 100.
+    let equal: dlctix::PayoutWeights = (0..players).map(|i| (i, 1)).collect();
     result.insert(Outcome::Attestation(result.len()), equal.clone());
     result.insert(Outcome::Expiry, equal);
     Ok(result)
@@ -1185,6 +1180,70 @@ mod tests {
                     .validate_payout_registration(f.entry_id, &bad, &consent)
                     .is_err(),
                 "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn payout_registration_requires_equal_refunds_for_three_equal_stakes() {
+        let f = fixture();
+        let (mut assignment, mut consent) = payout_assignment(&f);
+        consent.expected_player_count = 3;
+        consent.expected_funding_sats = 3_000;
+        consent.ticket_amount_sats = 1_100;
+        consent.ticket_invoice = test_invoice(1_100_000).to_string();
+        consent
+            .oracle_announcement
+            .locking_points
+            .push(MaybePoint::Valid(
+                Scalar::from_slice(&[9; 32]).unwrap().base_point_mul(),
+            ));
+        let mut policy: PayoutPolicy =
+            serde_json::from_str(assignment.payout_policy.as_deref().unwrap()).unwrap();
+        let mut terms: payout::ContractAuthorization =
+            serde_json::from_str(&policy.contract_terms).unwrap();
+        terms.player_count = 3;
+        terms.funding_value = Amount::from_sat(3_000);
+        terms.event = consent.oracle_announcement.clone();
+        terms.outcome_payouts = expected_payouts(3, 1).unwrap();
+        policy.contract_terms = serde_json::to_string(&terms).unwrap();
+        assignment.payout_policy = Some(serde_json::to_string(&policy).unwrap());
+        f.wallet
+            .validate_payout_registration(f.entry_id, &assignment, &consent)
+            .unwrap();
+
+        // The old 34/33/33 percentages paid 1,020/990/990 sats. Reject them
+        // before asking the player to authorize a newly purchased ticket.
+        for outcome in [Outcome::Attestation(3), Outcome::Expiry] {
+            let mut unequal = terms.clone();
+            unequal
+                .outcome_payouts
+                .insert(outcome, BTreeMap::from([(0, 34), (1, 33), (2, 33)]));
+            policy.contract_terms = serde_json::to_string(&unequal).unwrap();
+            assignment.payout_policy = Some(serde_json::to_string(&policy).unwrap());
+            assert!(f
+                .wallet
+                .validate_payout_registration(f.entry_id, &assignment, &consent)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn every_player_count_has_equal_refund_and_expiry_shares() {
+        for players in 2..=100 {
+            let payouts = expected_payouts(players, 1).unwrap();
+            for outcome in [Outcome::Attestation(players), Outcome::Expiry] {
+                let weights = &payouts[&outcome];
+                let total: u64 = weights.values().sum();
+                assert_eq!(weights.len(), players);
+                for weight in weights.values() {
+                    assert_eq!(players as u64 * 1_000 * weight / total, 1_000);
+                }
+            }
+            // The ranked winner keeps the whole pot.
+            assert_eq!(
+                payouts[&Outcome::Attestation(0)],
+                BTreeMap::from([(0, 100)])
             );
         }
     }

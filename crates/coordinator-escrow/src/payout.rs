@@ -71,6 +71,25 @@ impl fmt::Display for PayoutError {
 }
 impl std::error::Error for PayoutError {}
 
+fn payout_weight_total(weights: &PayoutWeights, player_count: usize) -> Result<u64, PayoutError> {
+    weights
+        .iter()
+        .try_fold(0u64, |total, (index, weight)| {
+            if *index >= player_count || *weight == 0 {
+                None
+            } else {
+                total.checked_add(*weight)
+            }
+        })
+        .filter(|total| *total > 0)
+        .ok_or_else(|| {
+            PayoutError::InvalidPolicy(
+                "Payouts need valid player slots and positive weights with a nonoverflowing total"
+                    .into(),
+            )
+        })
+}
+
 impl ContractAuthorization {
     pub fn from_policy(policy: &PayoutPolicy) -> Result<Self, PayoutError> {
         if policy.contract_terms.len() > MAX_CONTRACT_BYTES {
@@ -101,21 +120,13 @@ impl ContractAuthorization {
                 "BOLT11 has no Testnet4 currency".into(),
             ));
         }
-        if terms.outcome_payouts.is_empty()
-            || terms.outcome_payouts.iter().any(|(outcome, weights)| {
-                let total = weights
-                    .values()
-                    .try_fold(0u64, |sum, value| sum.checked_add(*value));
-                weights.keys().any(|index| *index >= terms.player_count)
-                    || match outcome {
-                        Outcome::Attestation(_) => total != Some(100),
-                        Outcome::Expiry => total.is_none_or(|total| total == 0),
-                    }
-            })
-        {
+        if terms.outcome_payouts.is_empty() {
             return Err(PayoutError::InvalidPolicy(
-                "Attested outcomes must allocate 100 percent; all outcomes need valid player slots and nonzero weights".into(),
+                "At least one payout outcome is required".into(),
             ));
+        }
+        for weights in terms.outcome_payouts.values() {
+            payout_weight_total(weights, terms.player_count)?;
         }
         Ok(terms)
     }
@@ -366,7 +377,7 @@ pub fn attested_outcome(
 
 /// What the market maker owes the player with `player_pubkey` (compressed
 /// secp256k1) under `outcome`: their weight's share of the funding value.
-/// Weights sum to 100.
+/// Weights are relative ratios; each share is rounded down to whole sats.
 pub fn owed_sats(
     params: &ContractParameters,
     outcome: &Outcome,
@@ -377,24 +388,17 @@ pub fn owed_sats(
         .iter()
         .position(|player| player.pubkey.serialize().as_slice() == player_pubkey)
         .ok_or(PayoutError::NotAPlayer)?;
-    let weight = params
+    let weights = params
         .outcome_payouts
         .get(outcome)
-        .and_then(|weights| weights.get(&index))
-        .copied()
-        .filter(|weight| *weight > 0)
         .ok_or(PayoutError::NotAWinner)?;
-    let weights = &params.outcome_payouts[outcome];
-    if weights
-        .values()
-        .try_fold(0u64, |sum, value| sum.checked_add(*value))
-        != Some(100)
-    {
-        return Err(PayoutError::InvalidPolicy(
-            "Payout weights must sum to 100".into(),
-        ));
-    }
-    let amount = (u128::from(params.funding_value.to_sat()) * u128::from(weight)) / 100;
+    let total = payout_weight_total(weights, params.players.len())?;
+    let weight = weights
+        .get(&index)
+        .copied()
+        .ok_or(PayoutError::NotAWinner)?;
+    let amount =
+        (u128::from(params.funding_value.to_sat()) * u128::from(weight)) / u128::from(total);
     u64::try_from(amount)
         .ok()
         .filter(|amount| *amount > 0)

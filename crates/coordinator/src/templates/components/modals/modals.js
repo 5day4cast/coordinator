@@ -81,10 +81,10 @@ function resetForgotPasswordModal() {
 // Log-in and sign-up buttons anywhere on the page, including ones htmx
 // swaps in later, carry data-open-modal. Opening either starts loading the
 // wallet, so it is ready by the time the form is filled in.
-function openAuthModal(id) {
+function openAuthModal(id, opener = document.activeElement) {
   if (id === "loginModal") resetLoginModal();
   if (id === "registerModal") resetRegisterModal();
-  openModal(document.getElementById(id));
+  openModal(document.getElementById(id), opener);
   initWasm().catch(() => {});
 }
 
@@ -93,7 +93,7 @@ function setupAuthModals(authManager) {
     const opener = event.target.closest?.("[data-open-modal]");
     if (!opener) return;
     event.preventDefault();
-    openAuthModal(opener.dataset.openModal);
+    openAuthModal(opener.dataset.openModal, opener);
   });
 
   document.getElementById("closeLoginModal")?.addEventListener("click", () => {
@@ -116,13 +116,15 @@ function setupAuthModals(authManager) {
 
   document
     .getElementById("showRegisterButton")
-    ?.addEventListener("click", () => {
+    ?.addEventListener("click", (event) => {
+      event.preventDefault();
       closeModal(document.getElementById("loginModal"));
       resetRegisterModal();
       openModal(document.getElementById("registerModal"));
     });
 
-  document.getElementById("goToLoginButton")?.addEventListener("click", () => {
+  document.getElementById("goToLoginButton")?.addEventListener("click", (event) => {
+    event.preventDefault();
     closeModal(document.getElementById("registerModal"));
     openModal(document.getElementById("loginModal"));
   });
@@ -202,14 +204,29 @@ class AuthManager {
       .getElementById("forgotStep3Button")
       ?.addEventListener("click", () => this.handleForgotStep3());
 
-    document.querySelectorAll(".tabs li").forEach((tab) => {
-      tab.addEventListener("click", () => {
+    document.querySelectorAll(".auth-tabs li").forEach((tab) => {
+      tab.addEventListener("click", (event) => {
+        event.preventDefault();
         const modal = tab.closest(".modal");
         if (modal?.id === "loginModal") {
           this.switchLoginTab(tab);
         } else if (modal?.id === "registerModal") {
           this.switchRegisterTab(tab);
         }
+      });
+    });
+    document.querySelectorAll('.auth-tabs [role="tab"]').forEach((tab) => {
+      tab.addEventListener("keydown", (event) => {
+        const tabs = Array.from(tab.closest('[role="tablist"]').querySelectorAll('[role="tab"]'));
+        let next;
+        if (event.key === "ArrowRight") next = tabs[(tabs.indexOf(tab) + 1) % tabs.length];
+        if (event.key === "ArrowLeft") next = tabs[(tabs.indexOf(tab) + tabs.length - 1) % tabs.length];
+        if (event.key === "Home") next = tabs[0];
+        if (event.key === "End") next = tabs.at(-1);
+        if (!next) return;
+        event.preventDefault();
+        next.click();
+        next.focus();
       });
     });
   }
@@ -786,8 +803,7 @@ class AuthManager {
   switchLoginTab(tab) {
     document
       .querySelectorAll("#loginModal .tabs li")
-      .forEach((t) => t.classList.remove("is-active"));
-    tab.classList.add("is-active");
+      .forEach((t) => this.updateAuthTab(t, t === tab));
 
     const target = tab.dataset.target;
     document
@@ -801,8 +817,7 @@ class AuthManager {
   switchRegisterTab(tab) {
     document
       .querySelectorAll("#registerModal .tabs li")
-      .forEach((t) => t.classList.remove("is-active"));
-    tab.classList.add("is-active");
+      .forEach((t) => this.updateAuthTab(t, t === tab));
 
     const target = tab.dataset.target;
     document
@@ -811,6 +826,14 @@ class AuthManager {
     document
       .getElementById("registerExtension")
       ?.classList.toggle("is-hidden", target !== "registerExtension");
+  }
+
+  updateAuthTab(tab, selected) {
+    tab.classList.toggle("is-active", selected);
+    const button = tab.querySelector('[role="tab"]');
+    if (!button) return;
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
   }
 }
 
@@ -835,4 +858,3 @@ function validateLightningAddress(address) {
   }
   return null;
 }
-

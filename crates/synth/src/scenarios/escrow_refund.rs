@@ -2,7 +2,7 @@
 //!
 //! 1. Create a competition with room for more players than will enter, so it cannot fill.
 //! 2. Enter with the players it has, each paying for real and naming where a refund goes.
-//! 3. Wait for the competition to be cancelled, once its event expires unfilled.
+//! 3. Wait for the competition to be cancelled, once its entry window closes unfilled.
 //! 4. Wait for every ticket's refund to settle.
 //!
 //! This is the whole Arkade path end to end: a Lightning payment swapped into an escrow VTXO, an
@@ -21,115 +21,35 @@ use log::info;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::common::{finish_result, load_users, run_step, wait_for_state, Steps};
-use super::full_lifecycle::{enter_competition_with, Payer};
 use super::types::*;
 use crate::client::competitions::CreateCompetition;
 use crate::client::CoordinatorClient;
 use crate::crypto::keys::SynthUser;
 use crate::db::SynthDb;
 use crate::lnd::Lnd;
-use crate::trail::EntryTrace;
-
-const SCENARIO: &str = "escrow_refund";
 
 pub async fn run_escrow_refund(
     client: &CoordinatorClient,
     db: &SynthDb,
     config: &ScenarioConfig,
 ) -> ScenarioResult {
-    let started_at = OffsetDateTime::now_utc();
-    let scenario_start = Instant::now();
-    let mut steps = Steps::new();
-
-    // A step, and optionally what to record with it: from what it returned, or whether or not
-    // it succeeds. Steps are saved as they are pushed, so details go on before.
-    macro_rules! step {
-        ($name:expr, $work:expr) => {
-            step!($name, $work, |step| step)
-        };
-        ($name:expr, $work:expr, details = $details:expr) => {
-            match run_step($name, || async { $work }).await {
-                Ok((mut step, value)) => {
-                    step.details = Some($details(&value));
-                    steps.push(step);
-                    value
-                }
-                Err(step) => {
-                    steps.push(*step);
-                    return finish_result(SCENARIO, started_at, scenario_start, steps, true);
-                }
-            }
-        };
-        ($name:expr, $work:expr, $attach:expr) => {
-            match run_step($name, || async { $work }).await {
-                Ok((step, value)) => {
-                    steps.push($attach(step));
-                    value
-                }
-                Err(step) => {
-                    steps.push($attach(*step));
-                    return finish_result(SCENARIO, started_at, scenario_start, steps, true);
-                }
-            }
-        };
-    }
-
-    let address = step!("refund_address", refund_address(config));
-    let lnd = step!("open_payer", payer(config));
-    let comp_id = step!(
-        "create_unfillable_competition",
-        create_competition(client, config).await,
-        details = |id: &Uuid| serde_json::json!({ "competition_id": id })
-    );
-    info!("Created competition {comp_id}, which cannot fill");
-    let users = step!("load_users", load_users(db, config.users).await);
-
-    let mut tickets = Vec::new();
-    for user in &users {
-        let mut trace = EntryTrace::new(user);
-        let step_name = format!("user_{}_enter", user.name);
-        let ticket = step!(
-            &step_name,
-            enter_competition_with(
-                client,
-                user,
-                &comp_id,
-                config,
-                Some(&address),
-                &Payer::Lnd(&lnd),
-                &step_name,
-                &mut trace,
-            )
-            .await,
-            |step| trace.attach(step)
-        );
-        tickets.push((user.clone(), ticket));
-    }
-
-    step!(
-        "wait_cancelled",
-        wait_for_state(client, &comp_id, "cancelled", config).await
-    );
-    for (user, ticket) in &tickets {
-        step!(
-            &format!("refund_{}", user.name),
-            wait_for_refund(client, user, &comp_id, ticket, config).await,
-            details = |refund: &serde_json::Value| refund.clone()
-        );
-    }
-
-    finish_result(SCENARIO, started_at, scenario_start, steps, false)
+    super::user_behavior::run(
+        client,
+        db,
+        config,
+        super::user_behavior::Scenario::EscrowRefund,
+    )
+    .await
 }
 
-fn refund_address(config: &ScenarioConfig) -> Result<String> {
+pub(super) fn refund_address(config: &ScenarioConfig) -> Result<String> {
     config.lightning_address.clone().context(
         "set lightning_address: a refund pays the player's own address, and the \
          enclave resolves it before signing",
     )
 }
 
-fn payer(config: &ScenarioConfig) -> Result<Lnd> {
+pub(super) fn payer(config: &ScenarioConfig) -> Result<Lnd> {
     let lnd = config.lnd.as_ref().context(
         "set lnd: an escrow is funded by ark-swapd swapping a real payment, so entries \
          cannot be settled through the coordinator's test endpoint",
@@ -168,7 +88,7 @@ pub(super) async fn create_competition(
 }
 
 /// Wait for a ticket's refund to settle, which is the swap service claiming what it paid for.
-async fn wait_for_refund(
+pub(super) async fn wait_for_refund(
     client: &CoordinatorClient,
     user: &SynthUser,
     competition_id: &Uuid,

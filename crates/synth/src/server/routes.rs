@@ -22,6 +22,8 @@ use time::OffsetDateTime;
 pub struct Dashboard {
     pub runner: Runner,
     pub scenario_config: ScenarioConfig,
+    /// Choose a fresh observation duration for each manual trigger.
+    pub observation_windows_secs: Vec<u64>,
     /// Absent when no rebalancing is configured.
     pub rebalancer: Option<Rebalancer>,
     /// Follows each run's money after its steps.
@@ -50,6 +52,7 @@ impl Dashboard {
         Self {
             runner: Runner::new(client, db, events),
             scenario_config: ScenarioConfig::default(),
+            observation_windows_secs: crate::scenarios::types::default_observation_windows(),
             rebalancer: None,
             tracker,
             live: Live::new(),
@@ -82,6 +85,16 @@ pub fn router(state: Dashboard) -> Router {
 struct RunParams {
     scenario: Option<String>,
     users: Option<usize>,
+    entry_window_secs: Option<u64>,
+    observation_window_secs: Option<u64>,
+    seed: Option<u64>,
+    arrival_min_secs: Option<u64>,
+    arrival_max_secs: Option<u64>,
+    before_payment_min_secs: Option<u64>,
+    before_payment_max_secs: Option<u64>,
+    before_submit_min_secs: Option<u64>,
+    before_submit_max_secs: Option<u64>,
+    deadline_margin_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -316,13 +329,11 @@ pub(super) async fn dashboard_live(
 
         section.actions {
             h2 { "Actions" }
-            button hx-post="/api/run" hx-target="#action-result"
-                hx-confirm="Start a full lifecycle run? It pays real entries from the payer's node." {
-                "Run Full Lifecycle"
-            }
-            button hx-post="/api/run?scenario=escrow_refund" hx-target="#action-result"
-                hx-confirm="Start an escrow refund run? It pays real entries and waits for their refunds." {
-                "Run Escrow Refund"
+            @for scenario in crate::runner::SCENARIOS {
+                button hx-post=(format!("/api/run?scenario={scenario}")) hx-target="#action-result"
+                    hx-confirm=(format!("Start {scenario}? It can pay real entries from the payer's node.")) {
+                    "Run " (scenario.replace('_', " "))
+                }
             }
             @if rebalancer.is_some() {
                 // A payment and an on-chain send can outlast htmx 4's 60 s default timeout.
@@ -469,6 +480,7 @@ async fn trigger_run(
     State(Dashboard {
         runner,
         scenario_config,
+        observation_windows_secs,
         ..
     }): State<Dashboard>,
     Query(params): Query<RunParams>,
@@ -478,8 +490,51 @@ async fn trigger_run(
         .scenario
         .unwrap_or_else(|| "full_lifecycle".to_string());
     let mut config = scenario_config;
+    config.observation_window_choices = observation_windows_secs;
+    if let Some(window) = params.observation_window_secs {
+        config.observation_window_secs = window;
+        config.observation_window_choices.clear();
+    }
     if let Some(users) = params.users {
         config.users = users;
+    }
+    if let Some(seed) = params.seed {
+        config.seed = Some(seed);
+    }
+    for (target, value) in [
+        (&mut config.entry_window_secs, params.entry_window_secs),
+        (
+            &mut config.entry_timing.arrival.min_secs,
+            params.arrival_min_secs,
+        ),
+        (
+            &mut config.entry_timing.arrival.max_secs,
+            params.arrival_max_secs,
+        ),
+        (
+            &mut config.entry_timing.before_payment.min_secs,
+            params.before_payment_min_secs,
+        ),
+        (
+            &mut config.entry_timing.before_payment.max_secs,
+            params.before_payment_max_secs,
+        ),
+        (
+            &mut config.entry_timing.before_submit.min_secs,
+            params.before_submit_min_secs,
+        ),
+        (
+            &mut config.entry_timing.before_submit.max_secs,
+            params.before_submit_max_secs,
+        ),
+        (
+            &mut config.entry_timing.deadline_margin_secs,
+            params.deadline_margin_secs,
+        ),
+    ] {
+        if let Some(value) = value {
+            *target = value;
+        }
     }
 
     // Recorded before the response, so the caller learns the run's id and can follow it.
@@ -502,7 +557,7 @@ async fn trigger_run(
     let runner_clone = runner.clone();
     let started = run_id.clone();
     tokio::spawn(async move {
-        if let Err(e) = runner_clone.run_recorded(started, &scenario, config).await {
+        if let Err(e) = runner_clone.run_recorded(started, &scenario).await {
             log::error!("Triggered run failed: {}", e);
         }
     });
@@ -800,6 +855,45 @@ mod tests {
         assert!(badge("passed", None).contains(r#"class="badge passed""#));
         assert!(badge("failed", Some("stuck")).contains(r#"class="badge failed""#));
         assert!(badge("passed", Some("stuck")).contains("money stuck"));
+    }
+
+    /// A manual trigger resolves its duration from the current choices, not the duration
+    /// cached when the dashboard was started. Only an unreachable test client is used.
+    #[tokio::test]
+    async fn manual_runs_save_the_selected_observation_window() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (mut dashboard, _) = stuck_dashboard(&directory).await;
+        dashboard.scenario_config.observation_window_secs = 42;
+        for duration in [7200, 10800, 14400, 600] {
+            dashboard.observation_windows_secs = vec![duration];
+            let response = router(dashboard.clone())
+                .oneshot(
+                    Request::post("/api/run?scenario=full_lifecycle")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let started: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let run = dashboard
+                .runner
+                .db()
+                .get_run(started["run_id"].as_str().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            let saved: ScenarioConfig =
+                serde_json::from_str(run.config_json.as_deref().unwrap()).unwrap();
+            assert_eq!(saved.observation_window_secs, duration);
+        }
     }
 
     /// `GET /api/runs/{id}` gives a run and its steps as JSON, and 404s for a run it lacks;

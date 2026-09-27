@@ -139,17 +139,12 @@ pub fn validate_competition_capacity(
         };
         payouts.insert(
             Outcome::Attestation(index),
-            (players - count..players)
-                .enumerate()
-                .map(|(rank, slot)| (slot, if rank == 0 { 100 } else { 0 }))
-                .collect(),
+            (players - count..players).map(|slot| (slot, 100)).collect(),
         );
     }
     payouts.insert(
         Outcome::Expiry,
-        (0..players)
-            .map(|slot| (slot, if slot == 0 { 100 } else { 0 }))
-            .collect(),
+        (0..players).map(|slot| (slot, 100)).collect(),
     );
     let params = ContractParameters {
         market_maker: MarketMaker { pubkey: point },
@@ -184,11 +179,10 @@ pub fn validate_competition_capacity(
         relative_locktime_block_delta: u16::MAX,
         max_fee_rate: params.fee_rate,
     };
-    let mut contract_terms = serde_json::to_string(&terms)
+    // Generated weights are at most 100. Every modeled recipient gets three
+    // digits, including the refund and expiry recipients whose real weight is 1.
+    let contract_terms = serde_json::to_string(&terms)
         .map_err(|e| KeyMeldError::SerializationError(e.to_string()))?;
-    // Valid synthetic weights use 0/100. Reserve two additional digits for each
-    // weight so arbitrary accepted percentage distributions cannot be larger.
-    contract_terms.push_str(&" ".repeat(2 * (permutations * winning_places + 2 * players)));
     let app_policy = PayoutPolicy {
         automatic_lightning_address: Some("x".repeat(320)),
         allow_invoice_fallback: false,
@@ -369,12 +363,14 @@ mod tests {
         }
     }
     #[test]
-    fn minimal_event_reserves_both_invoice_receipts_and_signing_retry() {
-        let capacity = validate_competition_capacity(2, 1).unwrap();
-        assert_eq!(capacity.signing_items, 10);
-        assert!(capacity.settlement_request_bytes > capacity.bind_request_bytes);
-        assert!(capacity.signing_request_bytes > 0);
-        assert!(capacity.largest_receipt_bytes < escrow::MAX_PAYLOAD_BYTES);
+    fn small_events_reserve_both_invoice_receipts_and_signing_retry() {
+        for players in [2, 3, 7] {
+            let capacity = validate_competition_capacity(players, 1).unwrap();
+            assert_eq!(capacity.signing_items, 4 * players + 2);
+            assert!(capacity.settlement_request_bytes > capacity.bind_request_bytes);
+            assert!(capacity.signing_request_bytes > 0);
+            assert!(capacity.largest_receipt_bytes < escrow::MAX_PAYLOAD_BYTES);
+        }
     }
 }
 

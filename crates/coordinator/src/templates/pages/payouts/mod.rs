@@ -39,27 +39,29 @@ pub fn payouts_page(payouts: &[EligiblePayout], lightning_address: Option<&str>)
                                         td data-label="Amount" { (sats(payout.amount_sats)) }
                                         td data-label="Status" { (payout.status) }
                                         td data-label="Action" {
-                                            @if let Some(address) = &payout.automatic_lightning_address {
-                                                p class="is-size-7 mb-2" { "Automatic payout to " (address) }
-                                            }
-                                            @if payout.escrow_enabled {
-                                                @if payout.allow_invoice_fallback && matches!(payout.status.as_str(), "Awaiting invoice" | "Queued automatically" | "Retrying automatically") {
-                                                    button class="button is-light is-small"
+                                            div class="payout-actions" {
+                                                @if let Some(address) = &payout.automatic_lightning_address {
+                                                    p class="is-size-7 mb-2" { "Automatic payout to " (address) }
+                                                }
+                                                @if payout.escrow_enabled {
+                                                    @if payout.allow_invoice_fallback && matches!(payout.status.as_str(), "Awaiting invoice" | "Queued automatically" | "Retrying automatically") {
+                                                        button class="button is-light is-small"
+                                                            data-entry-id=(payout.entry_id)
+                                                            data-competition-id=(payout.competition_id)
+                                                            data-payout-amount=(payout.amount_sats)
+                                                            data-payout-action="invoice" {
+                                                            "Use invoice"
+                                                        }
+                                                    }
+                                                } @else if payout.allow_invoice_fallback {
+                                                    button class="button is-warning is-light is-small"
                                                         data-entry-id=(payout.entry_id)
                                                         data-competition-id=(payout.competition_id)
                                                         data-payout-amount=(payout.amount_sats)
+                                                        data-legacy="true"
                                                         data-payout-action="invoice" {
-                                                        "Use invoice"
+                                                        "Legacy recovery"
                                                     }
-                                                }
-                                            } @else {
-                                                button class="button is-warning is-light is-small"
-                                                    data-entry-id=(payout.entry_id)
-                                                    data-competition-id=(payout.competition_id)
-                                                    data-payout-amount=(payout.amount_sats)
-                                                    data-legacy="true"
-                                                    data-payout-action="invoice" {
-                                                    "Legacy recovery"
                                                 }
                                             }
                                         }
@@ -84,13 +86,13 @@ fn lightning_address_panel(lightning_address: Option<&str>) -> Markup {
                 Some(address) => {
                     p id="payoutAddress" {
                         "Default address for new entries: " strong { (address) } ". "
-                        button type="button" class="button is-text is-small" data-payout-action="edit-address" { "Change" }
+                        button type="button" class="button is-text is-small" data-payout-action="edit-address" aria-controls="lightningAddressForm" aria-expanded="false" { "Change" }
                     }
                 }
                 None => {
                     p id="payoutAddress" class="has-text-danger" {
                         "Add a Lightning Address to receive automatic payouts on new entries. "
-                        button type="button" class="button is-text is-small" data-payout-action="edit-address" { "Add" }
+                        button type="button" class="button is-text is-small" data-payout-action="edit-address" aria-controls="lightningAddressForm" aria-expanded="false" { "Add" }
                     }
                 }
             }
@@ -98,18 +100,21 @@ fn lightning_address_panel(lightning_address: Option<&str>) -> Markup {
                 "Automatic payouts run after finalization; you do not need to click Claim or keep this page open. "
                 "An address change applies to future entries. Existing entries keep the address you authorized."
             }
-            div id="lightningAddressForm" class="field has-addons is-hidden" {
-                div class="control is-expanded" {
-                    input class="input" type="text" id="payoutLightningAddress"
-                          placeholder="you@cash.app" value=[lightning_address]
-                          autocomplete="off" spellcheck="false";
-                }
-                div class="control" {
-                    button type="button" class="button is-primary" id="saveLightningAddress"
-                           data-payout-action="save-address" { "Save" }
+            div id="lightningAddressForm" class="is-hidden" {
+                label class="label" for="payoutLightningAddress" { "Lightning Address" }
+                div class="field has-addons" {
+                    div class="control is-expanded" {
+                        input class="input" type="text" id="payoutLightningAddress"
+                              placeholder="you@cash.app" value=[lightning_address]
+                              autocomplete="off" spellcheck="false" aria-describedby="lightningAddressError";
+                    }
+                    div class="control" {
+                        button type="button" class="button is-primary" id="saveLightningAddress"
+                               data-payout-action="save-address" { "Save" }
+                    }
                 }
             }
-            p class="help is-danger" id="lightningAddressError" {}
+            p class="help is-danger" id="lightningAddressError" role="alert" {}
         }
     }
 }
@@ -118,7 +123,7 @@ fn lightning_address_panel(lightning_address: Option<&str>) -> Markup {
 pub fn no_payouts() -> Markup {
     html! {
         div id="noPayoutsMessage" class="empty-state-box" {
-            "Nothing to collect right now. Winnings appear here after a competition you placed in finishes."
+            "Nothing to collect right now. Winnings and pot returns appear here after the competition settles."
         }
     }
 }
@@ -145,5 +150,25 @@ mod tests {
         assert!(html.contains(r#"data-payout-action="edit-address""#));
         assert!(html.contains(r#"data-payout-action="save-address""#));
         assert!(html.contains("10,500 sats"));
+    }
+
+    #[test]
+    fn closed_legacy_payouts_do_not_offer_recovery() {
+        let mut payout = EligiblePayout {
+            competition_id: uuid::Uuid::now_v7(),
+            entry_id: uuid::Uuid::now_v7(),
+            status: "On-chain settlement".into(),
+            amount_sats: 1_000,
+            automatic_lightning_address: None,
+            allow_invoice_fallback: false,
+            escrow_enabled: false,
+        };
+        let closed = payouts_page(&[payout.clone()], None).into_string();
+        assert!(!closed.contains("Legacy recovery"));
+        payout.status = "Awaiting invoice".into();
+        payout.allow_invoice_fallback = true;
+        assert!(payouts_page(&[payout], None)
+            .into_string()
+            .contains("Legacy recovery"));
     }
 }
