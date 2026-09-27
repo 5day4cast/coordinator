@@ -202,14 +202,22 @@ async fn prepare_registration_inner(
                 )
                 .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
             let signed = escrow.policy.clone();
-            (
+            // A queued entry's key is deposited under its competition's terms, and a
+            // deposit-scoped session takes only envelopes sealed as deposits.
+            let sealed = if matches!(terms, queued::EntryConsent::Queued(_)) {
+                credentials.prepare_deposit_registration_with_escrow(
+                    context.clone(),
+                    &enclave.public_key,
+                    escrow,
+                )?
+            } else {
                 credentials.prepare_registration_with_escrow(
                     context.clone(),
                     &enclave.public_key,
                     escrow,
-                )?,
-                Some(signed),
-            )
+                )?
+            };
+            (sealed, Some(signed))
         }
         None => (
             credentials.prepare_registration(context.clone(), &enclave.public_key)?,
@@ -448,6 +456,121 @@ mod tests {
             assignment.enclave_key_epoch
         );
         assert!(!prepared.encrypted_private_key.is_empty());
+    }
+
+    fn queued_policy(ticket: Uuid) -> (PayoutPolicy, SessionId, [u8; 32]) {
+        use oracle_statement::{LineTerms, ObservationTerms, ScoringRules};
+        use payout::dlctix::{
+            bitcoin::{FeeRate, Network},
+            secp::Scalar,
+            MarketMaker,
+        };
+        use queued::{QueuedEntryTerms, QueuedTerms};
+        const START: i64 = 1_790_000_000;
+        let entry = QueuedEntryTerms {
+            terms: QueuedTerms {
+                competition_id: Uuid::now_v7(),
+                network: Network::Regtest,
+                market_maker: MarketMaker {
+                    pubkey: Scalar::from_slice(&[3; 32]).unwrap().base_point_mul(),
+                },
+                oracle_pubkey: "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                    .into(),
+                signing_date: START + 2 * 86_400,
+                expiry: (START + 3 * 86_400) as u32,
+                observation: ObservationTerms {
+                    source: "noaa_weather".into(),
+                    start_observation_date: START,
+                    end_observation_date: START + 86_400,
+                    targets: vec!["KORD".into()],
+                    scoring_fields: vec!["temp_high".into()],
+                    number_of_values_per_entry: 1,
+                    scoring_rules: ScoringRules::Lines,
+                    lines: vec![LineTerms {
+                        target: "KORD".into(),
+                        metric: "temp_high".into(),
+                        lower: -1.5,
+                        upper: 1.5,
+                        window_hours: 24,
+                    }],
+                },
+                number_of_places_win: 1,
+                pool_rules: pools::PoolRules::new(2, 25).unwrap(),
+                stake_sats: 1_000,
+                relative_locktime_block_delta: 72,
+                max_fee_rate: FeeRate::from_sat_per_vb_u32(10),
+            },
+            entry_id: ticket,
+            ticket_hash: [5; 32],
+            payout_hash: coordinator_escrow::escrow::sha256(&[6; 32]),
+        };
+        let (session, digest) = queued::deposit_scope(&entry.terms).unwrap();
+        let policy = PayoutPolicy {
+            queued_entry: Some(entry.to_json().unwrap()),
+            automatic_lightning_address: Some("player@example.org".into()),
+            allow_invoice_fallback: true,
+            release_entry_key_after_payment: true,
+            contract_terms: String::new(),
+            ark_escrow: Some(ArkEscrowPolicy {
+                escrow_tap_tree: "00".into(),
+                max_fee_sats: 150,
+                max_refund_fee_sats: 100,
+                checkpoint_exit_script: "00".into(),
+            }),
+        };
+        (policy, session, digest)
+    }
+
+    #[tokio::test]
+    async fn a_queued_entry_is_sealed_as_a_deposit_and_a_single_entry_is_not() {
+        let (enclave_secret, enclave_public) =
+            keymeld_sdk::SecureCrypto::generate_enclave_keypair().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway_url = format!("http://{}", listener.local_addr().unwrap());
+        let app = simulated_enclave(enclave_public.to_string());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // What the enclave reads: the envelope's `deposit` flag, which its possession proof
+        // commits to.
+        let sealed_as_deposit = |prepared: &PreparedRegistration| {
+            let ciphertext = hex::decode(&prepared.encrypted_private_key).unwrap();
+            let plaintext =
+                keymeld_sdk::SecureCrypto::ecies_decrypt(&enclave_secret, &ciphertext).unwrap();
+            let envelope: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+            assert!(envelope["escrow"].is_object(), "the escrow consent is sealed too");
+            envelope["deposit"].as_bool().unwrap_or(false)
+        };
+        let seal = |assignment: RegistrationAssignment| async move {
+            timeout(
+                Duration::from_secs(5),
+                prepare_payout_registration(&[2; 32], &[6; 32], &assignment),
+            )
+            .await
+            .expect("registration preparation timed out")
+            .unwrap()
+        };
+
+        let ticket = Uuid::now_v7();
+        let (policy, session, digest) = queued_policy(ticket);
+        let mut queued = assignment(gateway_url.clone());
+        queued.session_id = session.as_string();
+        queued.user_id = ticket;
+        queued.manifest_hash = digest.to_vec();
+        queued.enclave_public_key = enclave_public.to_string();
+        queued.dangerous_trust_unattested_enclaves = true;
+        queued.payout_policy = Some(serde_json::to_string(&policy).unwrap());
+        let prepared = seal(queued).await;
+        assert_eq!(prepared.context.keygen_session_id, session);
+        assert!(sealed_as_deposit(&prepared));
+
+        let (_, policy, _) = escrow_consent_fixture();
+        let mut single = assignment(gateway_url);
+        single.enclave_public_key = enclave_public.to_string();
+        single.dangerous_trust_unattested_enclaves = true;
+        single.payout_policy = Some(serde_json::to_string(&policy).unwrap());
+        assert!(!sealed_as_deposit(&seal(single).await));
+
+        server.abort();
     }
 
     #[tokio::test]

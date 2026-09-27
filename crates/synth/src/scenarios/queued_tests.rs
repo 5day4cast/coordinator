@@ -356,19 +356,23 @@ impl Run {
         self.mock.state.lock().unwrap().refunded.extend(tickets);
     }
 
+    /// Every wait is bounded by the config's short timeouts; this bounds the run as a whole too.
     async fn after_entries(&self) -> (Steps, std::result::Result<(), Box<StepResult>>) {
         let mut steps = Steps::new();
-        let result = after_entries(
+        let queue = self.queue();
+        let run = after_entries(
             &self.mock.client,
             &self.users,
-            &self.queue(),
+            &queue,
             &self.config,
             &self.shape,
             OffsetDateTime::now_utc(),
             &self.traces,
             &mut steps,
-        )
-        .await;
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), run)
+            .await
+            .expect("a queued run against the mock finishes");
         (steps, result)
     }
 }
@@ -404,9 +408,11 @@ async fn a_leftover_ticket_is_refunded_from_the_queue_while_its_pool_runs() {
     assert!(result.is_ok(), "{:?}", result.err());
     assert!(steps.names().contains(&"wait_pools_awaiting_attestation"));
     let leftover = run.traces.last().unwrap();
+    let queue = run.queue();
+    let lookups = run.mock.state.lock().unwrap().refund_lookups.clone();
     assert_eq!(
-        run.mock.state.lock().unwrap().refund_lookups,
-        [(run.queue(), leftover.ticket_id.unwrap())],
+        lookups,
+        [(queue, leftover.ticket_id.unwrap())],
         "only the ticket without an entry is refunded, from the queue"
     );
 }
