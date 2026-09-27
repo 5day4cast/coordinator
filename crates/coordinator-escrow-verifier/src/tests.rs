@@ -42,6 +42,7 @@ fn fixture_with(automatic: bool, ark_escrow: Option<ArkEscrowPolicy>) -> Fixture
     let maker = UserId::new_v7();
     let manifest = SignedSessionManifest::sign(
         SessionAuthorizationManifest {
+            deposit_scope: None,
             keygen_session_id: SessionId::new_v7(),
             coordinator_user_id: maker.clone(),
             creator_pubkey: public(11),
