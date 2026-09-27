@@ -184,6 +184,7 @@ pub fn validate_competition_capacity(
     let contract_terms = serde_json::to_string(&terms)
         .map_err(|e| KeyMeldError::SerializationError(e.to_string()))?;
     let app_policy = PayoutPolicy {
+        queued_entry: None,
         automatic_lightning_address: Some("x".repeat(320)),
         allow_invoice_fallback: false,
         release_entry_key_after_payment: true,
@@ -222,6 +223,7 @@ pub fn validate_competition_capacity(
         funding_outpoint: OutPoint::null(),
     };
     let binding_data = Payload::encode(&generic::ContractBinding {
+        statement: None,
         contract: contract.clone(),
     })?;
     let request = BindEscrowRequest {

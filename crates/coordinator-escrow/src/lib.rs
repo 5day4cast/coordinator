@@ -7,7 +7,9 @@ pub mod escrow_lightning;
 pub mod generic;
 #[cfg(feature = "networking")]
 pub mod lnurl_relay;
+pub mod oracle_statement;
 pub mod payout;
 pub mod payout_capabilities;
 pub mod payout_protocol;
 pub mod pools;
+pub mod queued;

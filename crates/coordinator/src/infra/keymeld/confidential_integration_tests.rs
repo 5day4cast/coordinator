@@ -249,6 +249,7 @@ async fn coordinator_service_executes_confidential_dlc_and_recovers_late_paid_ca
         max_fee_rate: params.fee_rate,
     };
     let policy = PayoutPolicy {
+        queued_entry: None,
         automatic_lightning_address: None,
         allow_invoice_fallback: true,
         release_entry_key_after_payment: true,
@@ -629,6 +630,7 @@ impl PoolHarness {
                 max_fee_rate: params.fee_rate,
             };
             let policy = PayoutPolicy {
+                queued_entry: None,
                 automatic_lightning_address: lightning_address.clone(),
                 allow_invoice_fallback: true,
                 release_entry_key_after_payment: true,

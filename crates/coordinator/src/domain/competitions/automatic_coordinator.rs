@@ -330,6 +330,7 @@ impl Coordinator {
             max_fee_rate: self.automatic_payout_max_fee_rate,
         };
         let policy = PayoutPolicy {
+            queued_entry: None,
             automatic_lightning_address: address,
             allow_invoice_fallback: choice.allow_invoice_fallback,
             release_entry_key_after_payment: choice.release_entry_key_after_payment,

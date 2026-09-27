@@ -1101,6 +1101,7 @@ mod tests {
             max_fee_rate: f.params.fee_rate,
         };
         let policy = PayoutPolicy {
+            queued_entry: None,
             automatic_lightning_address: consent.lightning_address.clone(),
             allow_invoice_fallback: true,
             release_entry_key_after_payment: true,

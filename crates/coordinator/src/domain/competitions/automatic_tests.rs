@@ -403,6 +403,7 @@ impl Fixture {
                 max_fee_rate: params.fee_rate,
             };
             let policy = PayoutPolicy {
+                queued_entry: None,
                 automatic_lightning_address: Some("winner@example.org".into()),
                 allow_invoice_fallback: true,
                 release_entry_key_after_payment: true,
@@ -480,6 +481,7 @@ impl Fixture {
             .await
             .unwrap();
         let binding_data = coordinator_escrow::generic::ContractBinding {
+            statement: None,
             contract: bound_contract,
         };
         let policies = escrow.policies.lock().unwrap().clone();

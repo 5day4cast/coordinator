@@ -675,6 +675,7 @@ impl Fixture {
             checkpoint_exit_script: hex::encode(self.server.info().checkpoint_tapscript.as_bytes()),
         };
         let policy = PayoutPolicy {
+            queued_entry: None,
             automatic_lightning_address: Some(format!("player{player}@mock-wallet.dev")),
             allow_invoice_fallback: true,
             release_entry_key_after_payment: true,

@@ -6,7 +6,7 @@ pub use coordinator_escrow::{
     ark,
     authorization::{ArkEscrowPolicy, PayoutPolicy},
     escrow::SignedEscrowPolicy,
-    payout, payout_protocol,
+    oracle_statement, payout, payout_protocol, pools, queued,
 };
 use coordinator_escrow::{
     escrow::{ApplicationContext, EscrowContext, PublicKeyBytes, Recipient},
@@ -76,13 +76,13 @@ pub fn verify_registration_policy(
             ))
         }
     };
-    let terms = payout::ContractAuthorization::from_policy(expected)
+    let terms = queued::EntryConsent::from_policy(expected)
         .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
     let expected_policy = generic::participant_policy(
         EscrowContext {
             keygen_session_id: context.keygen_session_id.clone(),
             user_id: context.user_id.clone(),
-            escrow_id: terms.entry_id,
+            escrow_id: terms.entry_id(),
             manifest_digest: context.manifest_hash.as_slice().try_into().map_err(|_| {
                 SdkError::InvalidInput("Invalid registration manifest digest".into())
             })?,
@@ -97,7 +97,7 @@ pub fn verify_registration_policy(
             .map_err(|error| SdkError::InvalidInput(error.to_string()))?,
         expected.clone(),
         Recipient {
-            encryption_public_key: PublicKeyBytes::new(&terms.market_maker.pubkey.serialize())
+            encryption_public_key: PublicKeyBytes::new(&terms.market_maker().pubkey.serialize())
                 .map_err(|error| SdkError::InvalidInput(error.to_string()))?,
         },
     )
@@ -172,14 +172,14 @@ async fn prepare_registration_inner(
     };
     let (encrypted_private_key, escrow_policy) = match payout {
         Some((policy, preimage)) => {
-            let terms = payout::ContractAuthorization::from_policy(&policy)
+            let terms = queued::EntryConsent::from_policy(&policy)
                 .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
             let escrow =
                 generic::registration(
                     EscrowContext {
                         keygen_session_id: context.keygen_session_id.clone(),
                         user_id: context.user_id.clone(),
-                        escrow_id: terms.entry_id,
+                        escrow_id: terms.entry_id(),
                         manifest_digest: assignment.manifest_hash.as_slice().try_into().map_err(
                             |_| SdkError::InvalidInput("Invalid manifest digest".into()),
                         )?,
@@ -195,7 +195,7 @@ async fn prepare_registration_inner(
                     preimage,
                     Recipient {
                         encryption_public_key: PublicKeyBytes::new(
-                            &terms.market_maker.pubkey.serialize(),
+                            &terms.market_maker().pubkey.serialize(),
                         )
                         .map_err(|error| SdkError::InvalidInput(error.to_string()))?,
                     },
@@ -297,6 +297,7 @@ mod tests {
             max_fee_rate: FeeRate::from_sat_per_vb_u32(1),
         };
         let policy = PayoutPolicy {
+            queued_entry: None,
             automatic_lightning_address: None,
             allow_invoice_fallback: true,
             release_entry_key_after_payment: true,

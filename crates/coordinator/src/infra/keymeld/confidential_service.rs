@@ -685,6 +685,7 @@ impl Keymeld for KeymeldService {
             .await?;
         let roster = driver.restore_keygen(&state.registrations).await?;
         let binding = generic::ContractBinding {
+            statement: None,
             contract: contract.clone(),
         };
         let mut responses = Vec::new();

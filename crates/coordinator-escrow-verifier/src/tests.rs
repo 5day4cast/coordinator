@@ -112,6 +112,7 @@ fn fixture_with(automatic: bool, ark_escrow: Option<ArkEscrowPolicy>) -> Fixture
         context,
         &[14; 32],
         PayoutPolicy {
+            queued_entry: None,
             automatic_lightning_address: automatic.then(|| "alice+prize@wallet.example".into()),
             allow_invoice_fallback: true,
             release_entry_key_after_payment: true,
@@ -150,6 +151,7 @@ impl Fixture {
                     participant_public_keys: &self.keys,
                 },
                 &Payload::encode(&ContractBinding {
+                    statement: None,
                     contract: self.contract.clone(),
                 })
                 .unwrap(),
@@ -489,6 +491,7 @@ fn binding_rejects_missing_policies_changed_economics_and_wrong_roster() {
     let verifier = CoordinatorVerifier::default();
     let f = fixture(false);
     let data = Payload::encode(&ContractBinding {
+        statement: None,
         contract: f.contract.clone(),
     })
     .unwrap();
@@ -514,7 +517,7 @@ fn binding_rejects_missing_policies_changed_economics_and_wrong_roster() {
                 participant_policies: &f.policies,
                 participant_public_keys: &f.keys
             },
-            &Payload::encode(&ContractBinding { contract: changed }).unwrap()
+            &Payload::encode(&ContractBinding { contract: changed, statement: None }).unwrap()
         )
         .is_err());
     let mut keys = f.keys.clone();
