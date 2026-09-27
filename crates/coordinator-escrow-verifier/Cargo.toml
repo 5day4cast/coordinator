@@ -13,8 +13,8 @@ test-support = ["lnurl", "dep:rcgen"]
 [dependencies]
 coordinator-escrow = { path = "../coordinator-escrow", features = ["networking"] }
 coordinator-ark-escrow = { path = "../coordinator-ark-escrow" }
-keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "0e2123cd6f9141c50b3b2e4cbf85226ede4a3e6e", default-features = false, features = ["escrow", "enclave"] }
-keymeld-enclave = { git = "https://github.com/tee8z/keymeld", rev = "0e2123cd6f9141c50b3b2e4cbf85226ede4a3e6e", default-features = false, features = ["escrow"] }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "425508fd6cca2deec64543098e15e907507d514e", default-features = false, features = ["escrow", "enclave"] }
+keymeld-enclave = { git = "https://github.com/tee8z/keymeld", rev = "425508fd6cca2deec64543098e15e907507d514e", default-features = false, features = ["escrow"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
