@@ -505,6 +505,15 @@ impl DlcKeygenSession {
         Ok(())
     }
 
+    /// The session id and digest this session's registrations and escrow policies name: its
+    /// own, or for a session of key deposits, their deposit scope's.
+    pub fn registration_scope(&self) -> Result<(SessionId, Vec<u8>), KeymeldError> {
+        Ok(self
+            .authorization_manifest
+            .registration_scope()
+            .map_err(SdkError::from)?)
+    }
+
     pub fn validate_registration(
         &self,
         user_id: &UserId,
@@ -515,13 +524,10 @@ impl DlcKeygenSession {
             hex::decode(&data.public_key).map_err(|e| KeymeldError::Session(e.to_string()))?;
         let expected_auth =
             hex::decode(&data.auth_pubkey).map_err(|e| KeymeldError::Session(e.to_string()))?;
-        if context.keygen_session_id != self.session_id
+        let (scope_session_id, scope_digest) = self.registration_scope()?;
+        if context.keygen_session_id != scope_session_id
             || &context.user_id != user_id
-            || context.manifest_hash
-                != self
-                    .authorization_manifest
-                    .digest()
-                    .map_err(SdkError::from)?
+            || context.manifest_hash != scope_digest
             || self
                 .recipient_authorization
                 .user_enclave_assignments
@@ -572,7 +578,13 @@ fn verify_prepared_payout_origin(
             KeymeldError::Session("Payout participant has no authorized enclave".into())
         })?;
     if response.enclave_id != *enclave_id
-        || response.keygen_session_id != session.session_id
+        || response.keygen_session_id != session.registration_scope()?.0
+        || response
+            .preimage_preparation
+            .context
+            .request
+            .session_id()
+            != &session.session_id
         || &response.user_id != user_id
     {
         return Err(KeymeldError::Session(
@@ -757,6 +769,7 @@ mod tests {
         ]);
         let manifest = SignedSessionManifest::sign(
             SessionAuthorizationManifest {
+                deposit_scope: None,
                 keygen_session_id: session_id.clone(),
                 coordinator_user_id: coordinator.clone(),
                 creator_pubkey: creator.public_key_bytes(),
@@ -770,6 +783,7 @@ mod tests {
                 max_signing_sessions: None,
                 encrypted_taproot_tweak: "unused-in-persistence-test".into(),
                 subset_definitions: vec![],
+                deposit_scope: None,
             },
             &creator.export_secret(),
         )

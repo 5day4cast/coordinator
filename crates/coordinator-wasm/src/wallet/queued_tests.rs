@@ -504,9 +504,6 @@ fn the_policy_must_hold_a_queued_entry_in_a_consented_escrow() {
         ("fee beyond the ticket", |p| {
             p.ark_escrow.as_mut().unwrap().max_fee_sats = COORDINATOR_FEE + 1
         }),
-        ("refund fee beyond the fee", |p| {
-            p.ark_escrow.as_mut().unwrap().max_refund_fee_sats = COORDINATOR_FEE + 1
-        }),
         ("escrow for another key", |p| {
             p.ark_escrow = Some(escrow_policy(
                 point(6),
@@ -539,8 +536,8 @@ fn the_policy_must_hold_a_queued_entry_in_a_consented_escrow() {
     }
 }
 
-/// A refund may cost the swap service up to the coordinator's fee, but never more than the stake
-/// it returns.
+/// A refund may cost the swap service more than the coordinator's fee, even a zero one, but never
+/// more than the stake it returns.
 #[test]
 fn a_refund_fee_beyond_the_stake_is_refused() {
     let mut small = Fixture::generated().with_terms(|t| t.stake_sats = 50);
@@ -550,6 +547,14 @@ fn a_refund_fee_beyond_the_stake_is_refused() {
     assert!(small.check().is_err());
     small
         .with_policy(|p| p.ark_escrow.as_mut().unwrap().max_refund_fee_sats = 50)
+        .check()
+        .unwrap();
+    Fixture::generated()
+        .with_policy(|p| p.ark_escrow.as_mut().unwrap().max_refund_fee_sats = COORDINATOR_FEE + 1)
+        .check()
+        .unwrap();
+    Fixture::generated()
+        .with_policy(|p| p.ark_escrow.as_mut().unwrap().max_fee_sats = 0)
         .check()
         .unwrap();
 }

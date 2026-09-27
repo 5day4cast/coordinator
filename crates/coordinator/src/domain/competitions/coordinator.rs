@@ -1439,9 +1439,9 @@ impl Coordinator {
 
         let outcome_payouts = if let Some(params) = &competition.contract_parameters {
             params.outcome_payouts.clone()
-        } else if let Some((settings, _)) = self.pool_of(competition).await? {
+        } else if let Some((settings, record)) = self.pool_of(competition).await? {
             // A pool's players consented to one pool payout table, whatever pool they are in.
-            self.accepted_pool_payouts(competition, &settings, &entries)
+            self.accepted_pool_payouts(competition, &settings, &record.members, &entries)
                 .await?
         } else if let Some(accepted) = self
             .accepted_outcome_payouts(competition.id, &entries)
@@ -5329,6 +5329,7 @@ mod keymeld_authorization_tests {
             compute_dlc_subset_definitions(coordinator.clone(), std::slice::from_ref(&player), 1);
         let manifest = keymeld_sdk::SignedSessionManifest::sign(
             SessionAuthorizationManifest {
+                deposit_scope: None,
                 keygen_session_id: session_id.clone(),
                 coordinator_user_id: coordinator.clone(),
                 creator_pubkey: creator.public_key_bytes(),
@@ -5349,6 +5350,7 @@ mod keymeld_authorization_tests {
                         participants: subset.participants.clone(),
                     })
                     .collect(),
+                deposit_scope: None,
             },
             &creator.export_secret(),
         )

@@ -360,6 +360,39 @@ Gaps:
   A competition must kick off within 7 days of its first paid ticket.
 - If the process stops inside a batch that then completes, the next attempt fails on spent escrows until an operator records the commitment.
 
+### Queued competitions in the coordinator
+
+A queued competition is a `competitions` row of kind `queued`; its pools are rows of kind `pool` that name it as their parent.
+Each pool runs the lifecycle of [In the coordinator](#in-the-coordinator) from escrow confirmation on.
+
+1. **Creation.**
+   The admin sets the stations, window, entry fee, coordinator fee, pool sizes (minimum, and a maximum of at most 25), and an optional entry cap.
+   The coordinator creates a reference oracle event with the competition's id.
+   The reference event takes no entries and freezes the lines players see.
+   `QueuedTerms` are built from that event and stored with the competition.
+   No tickets, Keymeld session, or pool events exist yet.
+2. **Entry.**
+   A ticket is created when a player asks for one, up to the entry cap.
+   Its payout policy carries the player's template, and its escrow refunds no later than the pool events' expiry.
+   The wallet checks the template against the oracle's reference event and key, and against the entry form.
+   It then seals the entry key as a Keymeld deposit under the competition's scope.
+   The coordinator has the enclave validate the deposit before it shows the invoice.
+3. **Kickoff.**
+   When observation starts, the coordinator finds the first block at or after the close.
+   It takes the complete tickets: paid into their escrows, with an entry and a deposit.
+   Then it forms the pools from the seed.
+   One database write creates each pool, moves its tickets and entries to it, and records the formation: close height, block hash, and every ticket placed.
+   Each pool then gets a Keymeld session made from its members' deposits, with the formation as evidence, and starts.
+4. **Pools.**
+   A pool's oracle event is created with the pool's size and `lines_from_event` naming the reference event.
+   The coordinator checks that the event's lines equal the reference event's.
+   The pool funds `n` stakes.
+   Its binding carries the oracle's signed statement of the pool event, from which the verifier derives every member's contract.
+5. **Refunds.**
+   If too few tickets are complete, the queued competition is cancelled.
+   Its escrows, and any paid tickets no pool took, are refunded through a session made only for refunds, with refund evidence, under which nothing can be bound.
+   A pool that fails to kick off refunds through its own session.
+
 ### Live run on Mutinynet, 2026-09-21
 
 `crates/coordinator-ark/examples/mutinynet_kickoff.rs` ran the whole path against `https://mutinynet.arkade.sh`.

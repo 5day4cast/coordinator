@@ -44,6 +44,7 @@ fn state(session: &SessionId) -> ProtocolState {
     let enclave = EnclaveId::new(1);
     let manifest = SignedSessionManifest::sign(
         SessionAuthorizationManifest {
+            deposit_scope: None,
             keygen_session_id: session.clone(),
             coordinator_user_id: user.clone(),
             creator_pubkey: authority.public_key_bytes(),
@@ -59,6 +60,7 @@ fn state(session: &SessionId) -> ProtocolState {
                 )
                 .unwrap(),
             subset_definitions: vec![],
+            deposit_scope: None,
         },
         &authority.export_secret(),
     )
