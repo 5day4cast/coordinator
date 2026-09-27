@@ -229,14 +229,13 @@ pub(super) fn validate_registration(
     )
     .map_err(|_| reject())?;
     // The escrow pays the stake into the pool and at most the coordinator's fee, together no more
-    // than the ticket. A refund costs no more than entering did, no more than the stake, and never
-    // the whole ticket.
+    // than the ticket. A refund costs the swap service no more than the stake, and never the whole
+    // ticket; its cap is the swap's, so it may exceed the coordinator's fee, which may be zero.
     let spent = escrow
         .max_fee_sats
         .checked_add(terms.stake_sats)
         .ok_or_else(reject)?;
     if spent > consent.ticket_amount_sats
-        || escrow.max_refund_fee_sats > escrow.max_fee_sats
         || escrow.max_refund_fee_sats > terms.stake_sats
         || escrow.max_refund_fee_sats >= consent.ticket_amount_sats
     {
