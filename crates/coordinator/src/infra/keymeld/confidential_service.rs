@@ -281,7 +281,6 @@ async fn escrow_request<T: Serialize>(
     let keygen_session_id = (policy.policy.context.keygen_session_id != session.session_id)
         .then(|| session.session_id.clone());
     let context = RequestContext {
-        keygen_session_id: None,
         schema_version: escrow::SCHEMA_VERSION,
         operation,
         escrow: policy.policy.context.clone(),
