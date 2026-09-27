@@ -442,7 +442,6 @@ impl Keymeld for KeymeldService {
         }
         let manifest = SignedSessionManifest::sign(
             SessionAuthorizationManifest {
-                deposit_scope: None,
                 keygen_session_id: id.clone(),
                 coordinator_user_id: self.coordinator_user_id.clone(),
                 creator_pubkey: authority.public_key_bytes(),
