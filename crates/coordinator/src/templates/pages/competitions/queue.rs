@@ -3,10 +3,10 @@
 //! its own.
 //!
 //! The competition API describes them with `kind` (`single`, `queued` or `pool`); a queue's
-//! `pool_rules` (`min_players`, `max_players`), `max_entries` and, once formed, `pools` (each
-//! pool's `id` and `size`); and a pool's `parent_id` and `pool_index`. The pages read the same
-//! fields from the competition's serialized form, so they need nothing more from the domain, and
-//! a competition without them shows as a single one.
+//! `pool_rules` (`min_players`, `max_players`), `entries`, `max_entries` and, once formed, `pools`
+//! (each pool's `competition_id`, `pool_index` and `players`); and a pool's `parent_id` and
+//! `pool_index`. The pages read the same fields from the competition's serialized form, so they
+//! need nothing more from the domain, and a competition without them shows as a single one.
 
 use serde::{ser, Serialize};
 use serde_json::{Map, Value};
@@ -32,6 +32,8 @@ pub struct QueueView {
     /// The fewest players a pool starts with, if the competition says.
     pub min_players: Option<u64>,
     pub max_players: u64,
+    /// Paid entries, in the queue and in its pools, if the competition says.
+    pub entries: Option<u64>,
     /// The most entries the queue takes, if it has a cap.
     pub max_entries: Option<u64>,
     /// Its pools, in order, once they are formed.
@@ -42,6 +44,8 @@ pub struct QueueView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolLink {
     pub id: String,
+    /// Where the pool is in its competition's pools, from 0, if the competition says.
+    pub index: Option<u64>,
     /// Its players, if the competition says.
     pub size: Option<u64>,
 }
@@ -58,6 +62,7 @@ pub struct PoolOf {
 const FIELDS: &[&str] = &[
     "kind",
     "pool_rules",
+    "entries",
     "max_entries",
     "pools",
     "parent_id",
@@ -81,11 +86,18 @@ impl Queue {
                     min_players: number(rules.and_then(|rules| rules.get("min_players"))),
                     max_players: number(rules.and_then(|rules| rules.get("max_players")))
                         .unwrap_or(MAX_POOL_PLAYERS),
+                    entries: number(fields.get("entries")),
                     max_entries: number(fields.get("max_entries")),
                     pools: fields
                         .get("pools")
                         .and_then(Value::as_array)
-                        .map(|pools| pools.iter().filter_map(PoolLink::from_value).collect())
+                        .map(|pools| {
+                            let mut pools: Vec<_> =
+                                pools.iter().filter_map(PoolLink::from_value).collect();
+                            // By index; a pool that doesn't say keeps its place after them.
+                            pools.sort_by_key(|pool| pool.index.unwrap_or(u64::MAX));
+                            pools
+                        })
                         .unwrap_or_default(),
                 })
             }
@@ -119,15 +131,25 @@ impl QueueView {
 }
 
 impl PoolLink {
+    /// A pool as the API lists it: its `competition_id`, `pool_index` and `players` (`id` and
+    /// `size` are read too).
     fn from_value(pool: &Value) -> Option<Self> {
+        let field = |names: [&str; 2]| names.into_iter().find_map(|name| pool.get(name));
         Some(Self {
-            id: pool.get("id").and_then(competition_id)?,
-            size: pool.get("size").and_then(Value::as_u64),
+            id: field(["competition_id", "id"]).and_then(competition_id)?,
+            index: pool.get("pool_index").and_then(Value::as_u64),
+            size: field(["players", "size"]).and_then(Value::as_u64),
         })
     }
 
     pub fn url(&self) -> String {
         format!("/competitions/{}/leaderboard", self.id)
+    }
+
+    /// `Pool 2`, from its index, or from `position` in the list when it has none.
+    pub fn label(&self, position: usize) -> String {
+        let index = self.index.unwrap_or(position as u64);
+        format!("Pool {}", index.saturating_add(1))
     }
 }
 
@@ -339,15 +361,19 @@ mod tests {
     }
 
     #[test]
-    fn a_queue_reads_its_rules_cap_and_pools() {
+    fn a_queue_reads_its_rules_entries_cap_and_pools() {
         let queue = Queue::from_fields(&fields(json!({
             "kind": "queued",
             "pool_rules": { "min_players": 3, "max_players": 20 },
+            "entries": 42,
             "max_entries": 200,
+            "stake_sats": 5000,
+            "terms_digest": "00",
             "pools": [
-                { "id": POOL, "size": 17 },
-                { "id": "../admin", "size": 18 },
-                { "id": PARENT },
+                { "competition_id": PARENT, "pool_index": 1, "players": 21 },
+                { "competition_id": "../admin", "pool_index": 2, "players": 18 },
+                { "competition_id": POOL, "pool_index": 0, "players": 21 },
+                { "id": POOL, "size": 3 },
             ],
         })));
         assert_eq!(
@@ -355,25 +381,39 @@ mod tests {
             Queue::Queued(QueueView {
                 min_players: Some(3),
                 max_players: 20,
+                entries: Some(42),
                 max_entries: Some(200),
                 pools: vec![
                     PoolLink {
                         id: POOL.into(),
-                        size: Some(17)
+                        index: Some(0),
+                        size: Some(21)
                     },
                     PoolLink {
                         id: PARENT.into(),
-                        size: None
+                        index: Some(1),
+                        size: Some(21)
+                    },
+                    PoolLink {
+                        id: POOL.into(),
+                        index: None,
+                        size: Some(3)
                     },
                 ],
             })
         );
+        let Queue::Queued(read) = &queue else {
+            unreachable!()
+        };
+        assert_eq!(read.pools[1].label(1), "Pool 2");
+        assert_eq!(read.pools[2].label(2), "Pool 3");
         let bare = Queue::from_fields(&fields(json!({ "kind": "queued", "pools": null })));
         assert_eq!(
             bare,
             Queue::Queued(QueueView {
                 min_players: None,
                 max_players: 25,
+                entries: None,
                 max_entries: None,
                 pools: vec![],
             })

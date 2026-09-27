@@ -19,7 +19,11 @@ const AUTH_REQUIRED = [
   /^\/payouts$/,
   /^\/competitions\/[^/]+\/tickets\/[^/]+\/status$/,
 ];
-const AUTH_OPTIONAL = [/^\/competitions\/[^/]+\/entry-form(\/payout)?$/];
+const AUTH_OPTIONAL = [
+  /^\/competitions\/[^/]+\/entry-form(\/payout)?$/,
+  // A queued competition's pools, with the player's own marked.
+  /^\/competitions\/[^/]+\/pools$/,
+];
 
 function authMode(url) {
   if (AUTH_REQUIRED.some((pattern) => pattern.test(url.pathname))) return "required";
