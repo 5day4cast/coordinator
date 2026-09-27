@@ -202,14 +202,22 @@ async fn prepare_registration_inner(
                 )
                 .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
             let signed = escrow.policy.clone();
-            (
+            // A queued entry's key is deposited under its competition's terms, and a
+            // deposit-scoped session takes only envelopes sealed as deposits.
+            let sealed = if matches!(terms, queued::EntryConsent::Queued(_)) {
+                credentials.prepare_deposit_registration_with_escrow(
+                    context.clone(),
+                    &enclave.public_key,
+                    escrow,
+                )?
+            } else {
                 credentials.prepare_registration_with_escrow(
                     context.clone(),
                     &enclave.public_key,
                     escrow,
-                )?,
-                Some(signed),
-            )
+                )?
+            };
+            (sealed, Some(signed))
         }
         None => (
             credentials.prepare_registration(context.clone(), &enclave.public_key)?,
