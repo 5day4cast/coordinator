@@ -487,7 +487,10 @@ mod tests {
         for players in [2, 3, 7] {
             let capacity = validate_competition_capacity(players, 1).unwrap();
             assert_eq!(capacity.signing_items, 4 * players + 2);
-            assert!(capacity.settlement_request_bytes > capacity.bind_request_bytes);
+            // A pool's bind request carries its oracle statement at the largest terms, so it
+            // may outgrow the settlement request; each still fits one payload.
+            assert!(capacity.bind_request_bytes <= escrow::MAX_PAYLOAD_BYTES);
+            assert!(capacity.settlement_request_bytes <= escrow::MAX_PAYLOAD_BYTES);
             assert!(capacity.signing_request_bytes > 0);
             assert!(capacity.largest_receipt_bytes < escrow::MAX_PAYLOAD_BYTES);
         }

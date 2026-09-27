@@ -579,12 +579,7 @@ fn verify_prepared_payout_origin(
         })?;
     if response.enclave_id != *enclave_id
         || response.keygen_session_id != session.registration_scope()?.0
-        || response
-            .preimage_preparation
-            .context
-            .request
-            .session_id()
-            != &session.session_id
+        || response.preimage_preparation.context.request.session_id() != &session.session_id
         || &response.user_id != user_id
     {
         return Err(KeymeldError::Session(

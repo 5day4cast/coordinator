@@ -333,7 +333,8 @@ pub(crate) mod tests {
             &Secp256k1::new(),
             &SecretKey::from_byte_array(secret).unwrap(),
         );
-        let signature = Secp256k1::new().sign_schnorr_no_aux_rand(&statement.digest().unwrap(), &keypair);
+        let signature =
+            Secp256k1::new().sign_schnorr_no_aux_rand(&statement.digest().unwrap(), &keypair);
         SignedStatement {
             statement,
             signature: signature.to_string(),
