@@ -99,7 +99,7 @@ impl CoordinatorFee {
         let whole = self.basis_points / 100;
         match self.basis_points % 100 {
             0 => whole.to_string(),
-            hundredths if hundredths % 10 == 0 => format!("{whole}.{}", hundredths / 10),
+            hundredths if hundredths.is_multiple_of(10) => format!("{whole}.{}", hundredths / 10),
             hundredths => format!("{whole}.{hundredths:02}"),
         }
     }
@@ -116,7 +116,7 @@ impl Serialize for CoordinatorFee {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(2))?;
         map.serialize_entry("coordinator_fee_basis_points", &self.basis_points)?;
-        if self.basis_points % 100 == 0 {
+        if self.basis_points.is_multiple_of(100) {
             // A whole number, so clients that read an integer percent still work.
             map.serialize_entry("coordinator_fee_percentage", &(self.basis_points / 100))?;
         } else {
