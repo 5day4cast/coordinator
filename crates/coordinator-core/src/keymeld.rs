@@ -537,7 +537,10 @@ mod tests {
             let plaintext =
                 keymeld_sdk::SecureCrypto::ecies_decrypt(&enclave_secret, &ciphertext).unwrap();
             let envelope: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
-            assert!(envelope["escrow"].is_object(), "the escrow consent is sealed too");
+            assert!(
+                envelope["escrow"].is_object(),
+                "the escrow consent is sealed too"
+            );
             envelope["deposit"].as_bool().unwrap_or(false)
         };
         let seal = |assignment: RegistrationAssignment| async move {
