@@ -12,7 +12,7 @@
 
 .leaderboard-window {
   margin: 0.25rem 0 1rem;
-  color: var(--bulma-text-weak);
+  color: var(--competition-muted);
 }
 
 .leaderboard-facts,
@@ -26,7 +26,7 @@
 .leaderboard-facts dt,
 .entry-facts dt {
   font-size: 0.75rem;
-  color: var(--bulma-text-weak);
+  color: var(--competition-muted);
 }
 
 .leaderboard-facts dd,
@@ -43,7 +43,19 @@
   display: block;
   font-size: 0.75rem;
   font-weight: 400;
-  color: var(--bulma-text-weak);
+  color: var(--competition-muted);
+}
+
+.refund-share {
+  display: block;
+}
+
+.leaderboard .help {
+  color: var(--competition-muted);
+}
+
+.leaderboard-facts .refund-fact {
+  max-width: 100%;
 }
 
 .leaderboard-table td {
@@ -52,7 +64,7 @@
 
 /* Shown until the rows arrive. */
 .rows-loading td {
-  color: var(--bulma-text-weak);
+  color: var(--competition-muted);
 }
 
 .spinner {

@@ -8,7 +8,7 @@ use coordinator_synth::rebalance::Rebalancer;
 use coordinator_synth::runner::Runner;
 use coordinator_synth::server;
 use coordinator_synth::trail::tracker::{self, Tracker};
-use log::{info, warn};
+use log::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -105,13 +105,16 @@ async fn main() -> anyhow::Result<()> {
     // Start scheduled runner if enabled
     if config.scheduler.enabled {
         let scheduler_runner = runner.clone();
-        let interval = config.scheduler.interval_secs;
-        let scenario = config.scheduler.scenario.clone();
+        let scheduler = config.scheduler.clone();
         let scenario_config = config.scenario_config();
+        let windows = config.defaults.observation_windows_secs.values().to_vec();
         tokio::spawn(async move {
-            scheduler_runner
-                .run_scheduled(interval, &scenario, scenario_config)
-                .await;
+            if let Err(error) = scheduler_runner
+                .run_scheduled(&scheduler, scenario_config, windows)
+                .await
+            {
+                error!("Scheduled runner stopped: {error:#}");
+            }
         });
     }
 

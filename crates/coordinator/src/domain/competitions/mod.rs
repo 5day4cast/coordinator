@@ -1,3 +1,6 @@
+mod admission;
+#[cfg(test)]
+mod admission_tests;
 mod ark_kickoff;
 mod ark_refund;
 pub use ark_refund::TicketRefund;
@@ -1522,7 +1525,16 @@ impl Competition {
     }
 
     pub fn is_expired(&self) -> bool {
-        let now = OffsetDateTime::now_utc();
+        self.is_expired_at(OffsetDateTime::now_utc())
+    }
+
+    pub(super) fn is_expired_at(&self, now: OffsetDateTime) -> bool {
+        // An unfilled competition closes when observations begin, even before
+        // its worker changes state or an oracle announcement is available.
+        // A fully collected roster may continue funding/signing after close.
+        if self.unfilled_admission_expired(now) {
+            return true;
+        }
         let Some(ref event_announcement) = self.event_announcement else {
             return false;
         };

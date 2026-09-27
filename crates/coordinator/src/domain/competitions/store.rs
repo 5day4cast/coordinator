@@ -14,7 +14,7 @@ use crate::{
     },
 };
 
-use super::{Competition, EntryStatus, SearchBy, Ticket, UserEntry};
+use super::{admission::before_deadline, Competition, EntryStatus, SearchBy, Ticket, UserEntry};
 
 /// A ticket reserved for a caller. When a stale reservation was taken over,
 /// the ticket has already been given a fresh preimage and hash, and
@@ -87,6 +87,32 @@ impl CompetitionStore {
         ticket_id: Uuid,
         payout_policy: Option<String>,
     ) -> Result<UserEntry, DatabaseWriteError> {
+        // Unbounded callers are internal storage operations; HTTP admission uses the
+        // deadline-bearing variant so queueing cannot admit a late entry.
+        Ok(self
+            .insert_entry(entry, ticket_id, payout_policy, None)
+            .await?
+            .expect("unbounded entry write"))
+    }
+
+    pub(super) async fn add_entry_with_policy_before(
+        &self,
+        entry: UserEntry,
+        ticket_id: Uuid,
+        payout_policy: Option<String>,
+        deadline: OffsetDateTime,
+    ) -> Result<Option<UserEntry>, DatabaseWriteError> {
+        self.insert_entry(entry, ticket_id, payout_policy, Some(deadline))
+            .await
+    }
+
+    async fn insert_entry(
+        &self,
+        entry: UserEntry,
+        ticket_id: Uuid,
+        payout_policy: Option<String>,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<Option<UserEntry>, DatabaseWriteError> {
         debug!("adding entry {} for ticket {}", entry.id, ticket_id);
 
         let entry_submission = serde_json::to_string(&entry.entry_submission)
@@ -114,9 +140,14 @@ impl CompetitionStore {
             .transpose()
             .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
 
-        self.db_connection
+        let admitted = self
+            .db_connection
             .execute_write(move |pool| async move {
                 let mut tx = pool.begin().await?;
+                if !before_deadline(deadline) {
+                    tx.rollback().await?;
+                    return Ok(false);
+                }
                 sqlx::query(
                     "INSERT INTO entries (
                         id,
@@ -154,12 +185,16 @@ impl CompetitionStore {
                     .execute(&mut *tx)
                     .await?;
                 }
+                if !before_deadline(deadline) {
+                    tx.rollback().await?;
+                    return Ok(false);
+                }
                 tx.commit().await?;
-                Ok(())
+                Ok(true)
             })
             .await?;
 
-        Ok(entry)
+        Ok(admitted.then_some(entry))
     }
 
     pub async fn add_final_signatures(
@@ -1487,6 +1522,28 @@ impl CompetitionStore {
         competition_id: Uuid,
         pubkey: &str,
     ) -> Result<ReservedTicket, DatabaseWriteError> {
+        Ok(self
+            .reserve_ticket(competition_id, pubkey, None)
+            .await?
+            .expect("unbounded ticket reservation"))
+    }
+
+    pub(super) async fn get_and_reserve_ticket_before(
+        &self,
+        competition_id: Uuid,
+        pubkey: &str,
+        deadline: OffsetDateTime,
+    ) -> Result<Option<ReservedTicket>, DatabaseWriteError> {
+        self.reserve_ticket(competition_id, pubkey, Some(deadline))
+            .await
+    }
+
+    async fn reserve_ticket(
+        &self,
+        competition_id: Uuid,
+        pubkey: &str,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<Option<ReservedTicket>, DatabaseWriteError> {
         let competition_id_str = competition_id.to_string();
         let pubkey_owned = pubkey.to_string();
         // Used only if a stale reservation is taken over: the ticket then gets
@@ -1499,6 +1556,10 @@ impl CompetitionStore {
         self.db_connection
             .execute_write(move |pool| async move {
                 let mut tx = pool.begin().await?;
+                if !before_deadline(deadline) {
+                    tx.rollback().await?;
+                    return Ok(None);
+                }
 
                 // First, check if this user already has a reserved ticket for this competition
                 // (that hasn't been used for an entry yet)
@@ -1533,11 +1594,15 @@ impl CompetitionStore {
 
                 if let Some(ticket) = existing_ticket {
                     debug!("Found existing reserved ticket {} for user", ticket.id);
+                    if !before_deadline(deadline) {
+                        tx.rollback().await?;
+                        return Ok(None);
+                    }
                     tx.commit().await?;
-                    return Ok(ReservedTicket {
+                    return Ok(Some(ReservedTicket {
                         ticket,
                         superseded_payment_hash: None,
-                    });
+                    }));
                 }
 
                 // No existing ticket, find an available one
@@ -1653,14 +1718,18 @@ impl CompetitionStore {
                 .bind(&ticket_id)
                 .fetch_one(&mut *tx)
                 .await?;
+                if !before_deadline(deadline) {
+                    tx.rollback().await?;
+                    return Ok(None);
+                }
                 tx.commit().await?;
 
                 debug!("Successfully reserved ticket {}", ticket_id);
 
-                Ok(ReservedTicket {
+                Ok(Some(ReservedTicket {
                     ticket,
                     superseded_payment_hash,
-                })
+                }))
             })
             .await
     }

@@ -394,6 +394,56 @@ impl Coordinator {
         Ok(Some(json))
     }
 
+    /// Entries authorize their payout table before paying. Preserve those
+    /// exact weights across upgrades; changing them would invalidate consent
+    /// and prevent the enclave from binding the funded contract.
+    pub(super) async fn accepted_outcome_payouts(
+        &self,
+        competition_id: Uuid,
+        entries: &[UserEntry],
+    ) -> Result<Option<BTreeMap<Outcome, PayoutWeights>>, anyhow::Error> {
+        if !self
+            .competition_store
+            .has_automatic_payouts(competition_id)
+            .await?
+        {
+            return Ok(None);
+        }
+        if entries.is_empty() {
+            return Err(anyhow!("Automatic competition has no paid entry policies"));
+        }
+        let mut accepted = None;
+        for entry in entries {
+            let json = self
+                .competition_store
+                .entry_payout_policy(entry.id)
+                .await?
+                .ok_or_else(|| anyhow!("Entry {} has no accepted payout policy", entry.id))?;
+            let policy: PayoutPolicy = serde_json::from_str(&json)?;
+            let terms = ContractAuthorization::from_policy(&policy)?;
+            if entry.event_id != competition_id
+                || terms.competition_id != competition_id
+                || terms.entry_id != entry.id
+                || terms.player_count != entries.len()
+            {
+                return Err(anyhow!(
+                    "Entry {} payout authorization differs from the competition roster",
+                    entry.id
+                ));
+            }
+            if let Some(weights) = &accepted {
+                if *weights != terms.outcome_payouts {
+                    return Err(anyhow!(
+                        "Competition entries authorized different payout tables"
+                    ));
+                }
+            } else {
+                accepted = Some(terms.outcome_payouts);
+            }
+        }
+        Ok(accepted)
+    }
+
     pub(super) async fn bind_automatic_contract(
         &self,
         competition: &Competition,
@@ -752,14 +802,8 @@ fn slot_payouts(players: usize, places: usize) -> Result<BTreeMap<Outcome, Payou
             "Invalid payout player or winner count".into(),
         ));
     }
-    let equal: PayoutWeights = (0..players)
-        .map(|i| {
-            (
-                i,
-                100 / players as u64 + u64::from((i as u64) < 100 % players as u64),
-            )
-        })
-        .collect();
+    // Weights are ratios, not percentages. Equal stakes must have exactly equal shares.
+    let equal: PayoutWeights = (0..players).map(|i| (i, 1)).collect();
     let percentages = get_percentage_weights(places);
     let mut payouts = BTreeMap::new();
     for (index, winners) in generate_ranking_permutations(players, places)

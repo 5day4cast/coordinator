@@ -1,4 +1,5 @@
 use crate::client::CoordinatorClient;
+use crate::config::SchedulerConfig;
 use crate::db::SynthDb;
 use crate::events::{Event, Events};
 use crate::scenarios::{
@@ -12,7 +13,22 @@ use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 /// The scenarios synth runs, by the names runs are started with.
-pub const SCENARIOS: &[&str] = &["full_lifecycle", "escrow_refund"];
+pub const SCENARIOS: &[&str] = &[
+    "full_lifecycle",
+    "escrow_refund",
+    "abandoned_unpaid",
+    "paid_abandonment",
+    "duplicate_submission",
+    "late_submission",
+];
+
+/// Cover every case/window pair instead of coupling two cycles of equal length.
+fn scheduled_selection<'a>(scenarios: &[&'a str], windows: &[u64], cycle: usize) -> (&'a str, u64) {
+    (
+        scenarios[cycle % scenarios.len()],
+        windows[(cycle / scenarios.len()) % windows.len()],
+    )
+}
 
 /// The run in progress, and the step it is on.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -54,7 +70,7 @@ enum Record {
     Progress {
         step: String,
         details: serde_json::Value,
-        saved: oneshot::Sender<()>,
+        saved: oneshot::Sender<std::result::Result<(), String>>,
     },
     Finished(StepResult),
 }
@@ -82,19 +98,25 @@ pub(crate) fn step_finished(step: &StepResult) {
 /// Save what the running scenario's `step` has done so far, and wait until it is saved: for a
 /// step about to do something a restart must not lose track of, such as paying. The step shows
 /// as running until it finishes. Does nothing outside a run.
-pub(crate) async fn step_progress(step: &str, details: serde_json::Value) {
+pub(crate) async fn step_progress(step: &str, details: serde_json::Value) -> Result<()> {
     let Ok(saved) = RECORDER.try_with(|recorder| {
         let (saved, is_saved) = oneshot::channel();
-        let _ = recorder.steps.send(Record::Progress {
-            step: step.to_string(),
-            details,
-            saved,
-        });
-        is_saved
+        recorder
+            .steps
+            .send(Record::Progress {
+                step: step.to_string(),
+                details,
+                saved,
+            })
+            .map_err(|_| anyhow::anyhow!("Run recorder stopped before progress could be saved"))?;
+        Ok::<_, anyhow::Error>(is_saved)
     }) else {
-        return;
+        return Ok(());
     };
-    let _ = saved.await;
+    saved?
+        .await
+        .map_err(|_| anyhow::anyhow!("Run recorder stopped before acknowledging progress"))?
+        .map_err(anyhow::Error::msg)
 }
 
 /// Save each step in the order recorded, announcing each once it is saved.
@@ -125,10 +147,10 @@ async fn save_steps(
                     }
                     Err(e) => Err(e),
                 };
-                if let Err(e) = written {
+                if let Err(e) = &written {
                     error!("Cannot save step {step} of run {run_id} so far: {e:#}");
                 }
-                let _ = saved.send(());
+                let _ = saved.send(written.map_err(|error| error.to_string()));
                 events.send(Event::StepStarted {
                     run_id: run_id.clone(),
                     step,
@@ -183,7 +205,7 @@ impl Runner {
         config: ScenarioConfig,
     ) -> Result<ScenarioResult> {
         let run_id = self.record_run(scenario, &config).await?;
-        self.run_recorded(run_id, scenario, config).await
+        self.run_recorded(run_id, scenario).await
     }
 
     /// Check `scenario` is one synth runs, and record a run of it, returning the run's id. Run
@@ -196,17 +218,35 @@ impl Runner {
                 SCENARIOS.join(", ")
             ));
         }
-        let config_json = serde_json::to_string(config)?;
+        let config_json = serde_json::to_string(&config.resolve_plan(scenario)?)?;
         self.db.create_run(scenario, Some(&config_json)).await
     }
 
     /// Run the scenario of a run [`Runner::record_run`] recorded.
-    pub async fn run_recorded(
-        &self,
-        run_id: String,
-        scenario: &str,
-        config: ScenarioConfig,
-    ) -> Result<ScenarioResult> {
+    pub async fn run_recorded(&self, run_id: String, scenario: &str) -> Result<ScenarioResult> {
+        // Execute precisely the plan already on disk, never a newly sampled caller config.
+        let run = self
+            .db
+            .get_run(&run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Recorded run not found"))?;
+        anyhow::ensure!(
+            run.scenario == scenario,
+            "Recorded scenario does not match requested execution"
+        );
+        let config: ScenarioConfig = serde_json::from_str(
+            run.config_json
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Recorded run has no resolved plan"))?,
+        )?;
+        anyhow::ensure!(
+            config.seed.is_some() && config.entry_plan.len() == config.users,
+            "Recorded run has no resolved entry plan"
+        );
+        anyhow::ensure!(
+            config.planned_scenario.as_deref() == Some(scenario),
+            "Recorded plan belongs to another scenario"
+        );
         info!("Starting scenario '{}' (run: {})", scenario, run_id);
         *self.live.lock().expect("live run lock") = Some(LiveRun {
             run_id: run_id.clone(),
@@ -238,7 +278,22 @@ impl Runner {
                     "full_lifecycle" => {
                         scenarios::run_full_lifecycle(&self.client, &self.db, &config).await
                     }
-                    _ => scenarios::run_escrow_refund(&self.client, &self.db, &config).await,
+                    "escrow_refund" => {
+                        scenarios::run_escrow_refund(&self.client, &self.db, &config).await
+                    }
+                    "abandoned_unpaid" => {
+                        scenarios::run_abandoned_unpaid(&self.client, &self.db, &config).await
+                    }
+                    "paid_abandonment" => {
+                        scenarios::run_paid_abandonment(&self.client, &self.db, &config).await
+                    }
+                    "duplicate_submission" => {
+                        scenarios::run_duplicate_submission(&self.client, &self.db, &config).await
+                    }
+                    "late_submission" => {
+                        scenarios::run_late_submission(&self.client, &self.db, &config).await
+                    }
+                    _ => unreachable!("record_run validates scenario names"),
                 }
             })
             .await;
@@ -297,17 +352,33 @@ impl Runner {
     }
 
     /// Start the scheduled runner loop
-    pub async fn run_scheduled(&self, interval_secs: u64, scenario: &str, config: ScenarioConfig) {
+    pub async fn run_scheduled(
+        &self,
+        scheduler: &SchedulerConfig,
+        config: ScenarioConfig,
+        windows: Vec<u64>,
+    ) -> Result<()> {
+        scheduler.validate(&windows)?;
         info!(
-            "Starting scheduled runner: '{}' every {}s",
-            scenario, interval_secs
+            "Starting scheduled runner: {:?} every {}s, observation windows {:?}s",
+            scheduler.scenario_names(),
+            scheduler.interval_secs,
+            windows
         );
+        let scenarios = scheduler.scenario_names();
+        let mut cycle = 0usize;
 
         loop {
-            if let Err(e) = self.run_scenario(scenario, config.clone()).await {
+            let mut next = config.clone();
+            next.observation_window_choices.clear();
+            let (scenario, window) = scheduled_selection(&scenarios, &windows, cycle);
+            next.observation_window_secs = window;
+            next.seed = config.seed.map(|seed| seed.wrapping_add(cycle as u64));
+            if let Err(e) = self.run_scenario(scenario, next).await {
                 error!("Scheduled run failed: {:?}", e);
             }
-            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+            cycle = cycle.wrapping_add(1);
+            tokio::time::sleep(std::time::Duration::from_secs(scheduler.interval_secs)).await;
         }
     }
 }
@@ -315,6 +386,173 @@ impl Runner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_progress_write_stops_work_before_payment() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synth.db");
+        let db = SynthDb::new(path.to_str().unwrap()).await.unwrap();
+        let run_id = db.create_run("full_lifecycle", None).await.unwrap();
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", path.display()))
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE test_steps")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let events = Events::new();
+        let (steps, records) = mpsc::unbounded_channel();
+        let saving = tokio::spawn(save_steps(db, events.clone(), run_id.clone(), records));
+        let recorder = Recorder {
+            run_id,
+            events,
+            live: Arc::new(std::sync::Mutex::new(None)),
+            steps,
+        };
+        let mut paid = false;
+        let result = RECORDER
+            .scope(recorder, async {
+                step_progress(
+                    "entry_before_payment",
+                    serde_json::json!({"ticket_id":"fixture"}),
+                )
+                .await?;
+                paid = true;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(!paid, "a missing durable trace must not allow payment");
+        saving.await.unwrap();
+    }
+
+    #[test]
+    fn each_scheduled_case_receives_every_window_and_legacy_keeps_rotation() {
+        let cases = ["full_lifecycle", "late_submission"];
+        let windows = [7200, 10800, 14400, 600];
+        let selected: Vec<_> = (0..8)
+            .map(|index| scheduled_selection(&cases, &windows, index))
+            .collect();
+        for case in cases {
+            assert_eq!(
+                selected
+                    .iter()
+                    .filter_map(|(name, window)| (*name == case).then_some(*window))
+                    .collect::<Vec<_>>(),
+                windows
+            );
+        }
+        assert_eq!(
+            scheduled_selection(&cases, &windows, 8),
+            ("full_lifecycle", 7200)
+        );
+        assert_eq!(
+            (0..5)
+                .map(|index| scheduled_selection(&["full_lifecycle"], &windows, index).1)
+                .collect::<Vec<_>>(),
+            vec![7200, 10800, 14400, 600, 7200]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_seed_and_entry_plan_are_persisted_before_execution() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = SynthDb::new(directory.path().join("synth.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let runner = Runner::new(
+            CoordinatorClient::new("http://127.0.0.1:1", None),
+            db.clone(),
+            Events::new(),
+        );
+        let config = ScenarioConfig::default();
+        let id = runner.record_run("late_submission", &config).await.unwrap();
+        let saved = db.get_run(&id).await.unwrap().unwrap();
+        let plan: ScenarioConfig =
+            serde_json::from_str(saved.config_json.as_deref().unwrap()).unwrap();
+        assert!(plan.seed.is_some());
+        assert_eq!(plan.entry_plan.len(), config.users);
+        assert_eq!(plan.planned_scenario.as_deref(), Some("late_submission"));
+        assert!(saved.competition_id.is_none());
+        let mut invalid = config;
+        invalid.entry_timing.arrival.max_secs = u64::MAX;
+        assert!(runner.record_run("full_lifecycle", &invalid).await.is_err());
+        assert_eq!(db.list_runs(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scheduled_competitions_rotate_windows_and_reject_invalid_cycles_before_recording() {
+        use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+        use time::format_description::well_known::Rfc3339;
+
+        // Reject creation at a local fake coordinator; no users or payments are needed.
+        async fn create(
+            State(posted): State<mpsc::UnboundedSender<serde_json::Value>>,
+            Json(body): Json<serde_json::Value>,
+        ) -> StatusCode {
+            posted.send(body).unwrap();
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let db = SynthDb::new(directory.path().join("synth.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let (posted, mut requests) = mpsc::unbounded_channel();
+        let app = Router::new()
+            .route("/api/v1/competitions", post(create))
+            .with_state(posted);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let runner = Runner::new(
+            CoordinatorClient::new(&url, None),
+            db.clone(),
+            Events::new(),
+        );
+        let scheduler = SchedulerConfig {
+            enabled: true,
+            interval_secs: 1,
+            scenario: "full_lifecycle".into(),
+            scenarios: None,
+        };
+        assert!(runner
+            .run_scheduled(&scheduler, ScenarioConfig::default(), vec![7200, 0])
+            .await
+            .is_err());
+        assert!(db.list_runs(10).await.unwrap().is_empty());
+        assert!(requests.try_recv().is_err());
+
+        let running = tokio::spawn(async move {
+            runner
+                .run_scheduled(
+                    &scheduler,
+                    ScenarioConfig::default(),
+                    vec![7200, 10800, 14400, 600],
+                )
+                .await
+        });
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut windows = Vec::new();
+            for _ in 0..5 {
+                let body = requests.recv().await.unwrap();
+                let start = OffsetDateTime::parse(
+                    body["start_observation_date"].as_str().unwrap(),
+                    &Rfc3339,
+                )
+                .unwrap();
+                let end =
+                    OffsetDateTime::parse(body["end_observation_date"].as_str().unwrap(), &Rfc3339)
+                        .unwrap();
+                windows.push((end - start).whole_seconds());
+            }
+            windows
+        })
+        .await;
+        running.abort();
+        server.abort();
+        assert_eq!(observed.unwrap(), vec![7200, 10800, 14400, 600, 7200]);
+    }
 
     /// A page watching a run sees each step as soon as it is recorded, not when the run ends.
     #[tokio::test]
@@ -382,7 +620,9 @@ mod tests {
                     .contains("competition_id"));
 
                 // A step saves what it has done before paying, and finishes in the same row.
-                step_progress("user_alice_enter", serde_json::json!({ "ticket_id": "t" })).await;
+                step_progress("user_alice_enter", serde_json::json!({ "ticket_id": "t" }))
+                    .await
+                    .unwrap();
                 let saved = db.get_steps(&run_id).await.unwrap();
                 assert_eq!(saved.len(), 2, "saved before the step finishes");
                 assert_eq!(saved[1].status, "running");

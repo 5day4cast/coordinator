@@ -4,7 +4,9 @@
 use maud::{html, Markup};
 use time::OffsetDateTime;
 
-use crate::domain::{get_percentage_weights, leaderboard::Phase, Competition, RefundProgress};
+use crate::domain::{
+    get_percentage_weights, leaderboard::Phase, winner_payout_sats, Competition, RefundProgress,
+};
 use crate::templates::format::{self, sats, thousands};
 
 /// Finished competitions shown per page.
@@ -29,9 +31,12 @@ pub struct CompetitionView {
     pub locations: Vec<String>,
     /// Its Arkade escrows and how many have been refunded; none until the page adds them.
     pub refunds: RefundProgress,
-    /// The oracle attested the contract's refund outcome (no station reported inside the
-    /// window), so the pot went back to every entry in equal shares instead of to winners.
+    /// The oracle attested the contract's all-entry, no-score outcome.
+    /// This identifies the allocation; it does not confirm that payments were sent.
     pub pot_refunded: bool,
+    /// Pot-return allocation in contract player order, from the attested or expiry outcome.
+    /// Older contracts can have unequal shares. None means the amounts cannot be verified.
+    pub refund_shares: Option<Vec<u64>>,
 }
 
 /// Where the entry fees of a competition that didn't run stand.
@@ -47,6 +52,7 @@ impl CompetitionView {
     pub fn new(competition: &Competition, now: OffsetDateTime) -> Self {
         let event = &competition.event_submission;
         let phase = Phase::of(competition, now);
+        let pot_refunded = phase == Phase::Scored && competition.refunds_every_entry();
         Self {
             id: competition.id.to_string(),
             phase,
@@ -63,7 +69,10 @@ impl CompetitionView {
             number_of_values_per_entry: event.number_of_values_per_entry,
             locations: event.locations.clone(),
             refunds: RefundProgress::default(),
-            pot_refunded: phase == Phase::Scored && competition.refunds_every_entry(),
+            pot_refunded,
+            refund_shares: (pot_refunded || phase == Phase::Expired)
+                .then(|| refund_shares(competition, phase))
+                .flatten(),
         }
     }
 
@@ -73,6 +82,15 @@ impl CompetitionView {
             .into_iter()
             .map(|percent| (percent, self.total_pool * percent / 100))
             .collect()
+    }
+
+    /// Ranked prizes apply to active competitions and scored winner outcomes.
+    pub fn has_ranked_prizes(&self) -> bool {
+        !self.pot_refunded
+            && !matches!(
+                self.phase,
+                Phase::Unfilled | Phase::Cancelled | Phase::Failed | Phase::Expired
+            )
     }
 
     /// A competition whose window started before it filled: cancelled, or
@@ -111,6 +129,23 @@ impl CompetitionView {
     }
 }
 
+fn refund_shares(competition: &Competition, phase: Phase) -> Option<Vec<u64>> {
+    let params = competition.contract_parameters.as_ref()?;
+    let outcome = if phase == Phase::Expired {
+        dlctix::Outcome::Expiry
+    } else {
+        competition.get_current_outcome().ok()?
+    };
+    if params.players.is_empty() {
+        return None;
+    }
+    params
+        .players
+        .iter()
+        .map(|player| winner_payout_sats(params, &outcome, &player.pubkey).ok())
+        .collect()
+}
+
 /// The badge for a competition's phase. Live is the loudest thing on the page;
 /// finished and cancelled competitions stay quiet.
 pub fn phase_badge(competition: &CompetitionView) -> Markup {
@@ -120,9 +155,9 @@ pub fn phase_badge(competition: &CompetitionView) -> Markup {
         Phase::Unfilled => ("badge badge-quiet", unfilled_label(competition)),
         Phase::Live => ("badge badge-live", "Live"),
         Phase::AwaitingResult => ("badge badge-waiting", "Awaiting results"),
-        Phase::Scored if competition.pot_refunded => ("badge badge-quiet", "Refunded"),
+        Phase::Scored if competition.pot_refunded => ("badge badge-quiet", "Pot return"),
         Phase::Scored => ("badge badge-quiet", "Finished"),
-        Phase::Expired => ("badge badge-quiet", "Refunded"),
+        Phase::Expired => ("badge badge-quiet", "Contract expired"),
         Phase::Cancelled if competition.did_not_fill() => {
             ("badge badge-quiet", unfilled_label(competition))
         }
@@ -384,20 +419,26 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
     } else {
         "Leaderboard"
     };
-    // Phones show these facts as one line under the status and window.
-    let facts = format!(
-        "Entry {} · Pot {} · {} of {} entries · {} paid {}",
+    // Phones show these facts below the window. Cancelled and refunded competitions
+    // never advertise paid places: those were only their planned winner prizes.
+    let mut facts = format!(
+        "Entry {} · Pot {} · {} of {} entries",
         sats(competition.ticket_price),
         sats(competition.total_pool),
         competition.total_entries,
         competition.total_allowed_entries,
-        competition.paid_places,
-        if competition.paid_places == 1 {
-            "place"
-        } else {
-            "places"
-        },
     );
+    if competition.has_ranked_prizes() {
+        facts.push_str(&format!(
+            " · {} paid {}",
+            competition.paid_places,
+            if competition.paid_places == 1 {
+                "place"
+            } else {
+                "places"
+            },
+        ));
+    }
     html! {
         a class="competition-row" data-competition-id=(competition.id) data-facts=(facts)
           href=(competition.url()) hx-get=(competition.url())
@@ -416,7 +457,9 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
             span class="cell-entries" data-label="Entries" {
                 (competition.total_entries) " of " (competition.total_allowed_entries)
             }
-            span class="cell-places" data-label="Paid places" { (competition.paid_places) }
+            span class="cell-places" data-label="Paid places" {
+                @if competition.has_ranked_prizes() { (competition.paid_places) } @else { "—" }
+            }
             span class="cell-action" { (action) " →" }
         }
     }
@@ -458,6 +501,7 @@ pub(crate) mod tests {
             locations: vec!["KPWM".into()],
             refunds: RefundProgress::default(),
             pot_refunded: false,
+            refund_shares: None,
         }
     }
 
@@ -616,5 +660,130 @@ pub(crate) mod tests {
         assert!(html.starts_with("<a class=\"competition-row\""));
         assert!(html.contains(r#"href="/competitions/live/leaderboard""#));
         assert!(html.contains("ends in 5 min"));
+    }
+
+    #[test]
+    fn refunded_and_cancelled_rows_do_not_advertise_winner_prizes() {
+        let mut refunded = view("refunded", Phase::Scored, -60);
+        refunded.pot_refunded = true;
+        for competition in [refunded, view("cancelled", Phase::Cancelled, -60)] {
+            let html = competition_row(&competition, NOW).into_string();
+            assert!(!html.contains("1 paid place"));
+            assert!(html.contains(r#"data-label="Paid places">—</span>"#));
+        }
+    }
+
+    #[test]
+    fn refund_amounts_use_the_attested_contract_and_preserve_historical_shares() {
+        use crate::domain::CreateEvent;
+        use dlctix::{
+            bitcoin::{Amount, FeeRate},
+            hashlock,
+            secp::Scalar,
+            ContractParameters, EventLockingConditions, MarketMaker, Outcome, PayoutWeights,
+            Player,
+        };
+        let point = |byte: u8| Scalar::from_slice(&[byte; 32]).unwrap().base_point_mul();
+        let attestation = Scalar::from_slice(&[20; 32]).unwrap();
+        let event = EventLockingConditions {
+            locking_points: vec![attestation.base_point_mul().into()],
+            expiry: None,
+        };
+        let mut competition = Competition::new(&CreateEvent {
+            id: uuid::Uuid::now_v7(),
+            signing_date: NOW,
+            start_observation_date: NOW - time::Duration::hours(2),
+            end_observation_date: NOW - time::Duration::hours(1),
+            locations: vec!["KPWM".into()],
+            number_of_values_per_entry: 1,
+            number_of_places_win: 1,
+            total_allowed_entries: 3,
+            entry_fee: 1_000,
+            coordinator_fee_percentage: 10,
+            // Intentionally different: the signed funding value controls the refund.
+            total_competition_pool: 6_000,
+            relative_locktime_block_delta: None,
+            unlisted: false,
+        });
+        competition.total_entries = 3;
+        competition.event_announcement = Some(event.clone());
+        competition.attestation = Some(attestation.into());
+        assert!(CompetitionView::new(&competition, NOW)
+            .refund_shares
+            .is_none());
+
+        competition.contract_parameters = Some(ContractParameters {
+            market_maker: MarketMaker { pubkey: point(5) },
+            players: (1u8..=3)
+                .map(|key| Player {
+                    pubkey: point(key),
+                    ticket_hash: hashlock::sha256(&[key + 10; 32]),
+                    payout_hash: hashlock::sha256(&[key + 1; 32]),
+                })
+                .collect(),
+            event,
+            outcome_payouts: [(
+                Outcome::Attestation(0),
+                PayoutWeights::from([(0, 34), (1, 33), (2, 33)]),
+            )]
+            .into(),
+            fee_rate: FeeRate::from_sat_per_vb_u32(1),
+            funding_value: Amount::from_sat(3_000),
+            relative_locktime_block_delta: 72,
+        });
+        let historical = CompetitionView::new(&competition, NOW);
+        assert!(historical.pot_refunded);
+        assert_eq!(historical.refund_shares, Some(vec![1_020, 990, 990]));
+
+        competition
+            .contract_parameters
+            .as_mut()
+            .unwrap()
+            .outcome_payouts
+            .insert(
+                Outcome::Attestation(0),
+                PayoutWeights::from([(0, 1), (1, 1), (2, 1)]),
+            );
+        assert_eq!(
+            CompetitionView::new(&competition, NOW).refund_shares,
+            Some(vec![1_000; 3])
+        );
+
+        // Invalid player indexes cannot be displayed as a plausible allocation.
+        competition
+            .contract_parameters
+            .as_mut()
+            .unwrap()
+            .outcome_payouts
+            .insert(
+                Outcome::Attestation(0),
+                PayoutWeights::from([(0, 1), (1, 1), (9, 1)]),
+            );
+        assert!(CompetitionView::new(&competition, NOW)
+            .refund_shares
+            .is_none());
+        competition.attestation = None;
+        assert!(CompetitionView::new(&competition, NOW)
+            .refund_shares
+            .is_none());
+
+        // Expiry has its own signed allocation, independent of the attested outcome.
+        competition.expiry_broadcasted_at = Some(NOW);
+        competition
+            .contract_parameters
+            .as_mut()
+            .unwrap()
+            .outcome_payouts
+            .insert(
+                Outcome::Expiry,
+                PayoutWeights::from([(0, 1), (1, 1), (2, 1)]),
+            );
+        let expired = CompetitionView::new(&competition, NOW);
+        assert_eq!(expired.phase, Phase::Expired);
+        assert!(!expired.pot_refunded);
+        assert_eq!(expired.refund_shares, Some(vec![1_000; 3]));
+        assert!(phase_badge(&expired)
+            .into_string()
+            .contains("Contract expired"));
     }
 }

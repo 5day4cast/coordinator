@@ -160,7 +160,7 @@ impl Metrics {
             )?,
             payout_jobs_failed: gauge(
                 "coordinator_payout_jobs_failed",
-                "Automatic payout jobs that gave up",
+                "Retained failed automatic payout job records, including replaced jobs; not a count of unpaid entries",
             )?,
             payout_jobs_retrying: gauge(
                 "coordinator_payout_jobs_retrying",

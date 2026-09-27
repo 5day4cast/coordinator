@@ -21,9 +21,31 @@ use super::routes::{self, Dashboard};
 use super::stuck;
 use crate::client::competitions::CompetitionResponse;
 use crate::db::{TestRun, TestStep};
+use crate::scenarios::EntryBehavior;
 use crate::settlement::{Decided, Settlement};
 use crate::trail::tracker::entries_of;
 use crate::trail::{payout_states, EntryTrace, PayoutSeen, PayoutState, Trail};
+
+/// The all-entry outcome has positive, equal relative weights, including the
+/// older 34/33/33 rounding. A ranked outcome leaves other entries unpaid.
+/// This mirrors the coordinator's return classification without changing amounts.
+fn is_pot_return(settlement: &Settlement) -> bool {
+    match &settlement.decided {
+        Some(Decided::Expired) => true,
+        Some(Decided::Attested(_)) => {
+            settlement.shares.len() > 1
+                && settlement.shares.iter().all(|share| share.weight > 0)
+                && settlement
+                    .shares
+                    .iter()
+                    .map(|share| share.weight)
+                    .max()
+                    .zip(settlement.shares.iter().map(|share| share.weight).min())
+                    .is_some_and(|(max, min)| max - min <= 1)
+        }
+        None => false,
+    }
+}
 
 /// How the competition settled, in words, naming players by the scenario's names.
 fn outcome_words(settlement: &Settlement, payouts: &[PayoutSeen]) -> String {
@@ -40,13 +62,16 @@ fn outcome_words(settlement: &Settlement, payouts: &[PayoutSeen]) -> String {
     match (&settlement.decided, winners.as_slice()) {
         (None, _) => "waiting for the oracle's attestation".to_string(),
         (Some(Decided::Expired), _) => {
-            "the oracle never attested: the contract expired and paid its expiry split".to_string()
+            "Contract expired: pot return follows the signed expiry terms".to_string()
         }
+        (Some(Decided::Attested(index)), _) if is_pot_return(settlement) => format!(
+            "No-score outcome: no entry scored any points; each entry receives its signed share of the pot (outcome {index})"
+        ),
         (Some(Decided::Attested(index)), [winner]) => format!("{winner} won (outcome {index})"),
-        (Some(Decided::Attested(index)), []) => format!("outcome {index} paid nobody"),
+        (Some(Decided::Attested(index)), []) => format!("outcome {index} allocates no payouts"),
         (Some(Decided::Attested(index)), winners) => {
             format!(
-                "tie: split between {} (outcome {index})",
+                "Ranked payouts to {} (outcome {index})",
                 winners.join(", ")
             )
         }
@@ -88,6 +113,66 @@ fn short(id: &str) -> String {
     }
 }
 
+fn deliberately_unpaid(entry: &EntryTrace, paid: bool) -> bool {
+    entry.behavior == Some(EntryBehavior::AbandonUnpaid)
+        && entry.ticket_id.is_some()
+        && entry.payment_started == Some(false)
+        && !paid
+}
+
+fn entry_line(entry: &EntryTrace, paid: bool, run_failed: bool) -> Line {
+    let incomplete = if run_failed {
+        Status::Failed
+    } else {
+        Status::Active
+    };
+    let expected_rejection = entry.rejected_submission.as_ref().is_some_and(|rejection| {
+        rejection.status == 400
+            && (rejection.message == "Competition is no longer accepting entries"
+                || (entry.behavior == Some(EntryBehavior::DuplicateSubmission)
+                    && rejection.message == "Ticket has already been used"))
+    });
+    let (value, status) = match entry.behavior {
+        Some(EntryBehavior::LateSubmission) if entry.entry_submitted => {
+            ("late entry unexpectedly accepted", Status::Failed)
+        }
+        Some(EntryBehavior::AbandonUnpaid) if paid || entry.entry_submitted => {
+            ("unpaid abandonment unexpectedly advanced", Status::Failed)
+        }
+        Some(EntryBehavior::DuplicateSubmission) if entry.entry_submitted => {
+            if expected_rejection {
+                ("entered; duplicate rejected", Status::Done)
+            } else if entry.rejected_submission.is_some() {
+                ("entered; duplicate check failed", Status::Failed)
+            } else {
+                ("entered; duplicate check incomplete", incomplete)
+            }
+        }
+        _ if entry.entry_submitted => ("entered", Status::Done),
+        _ if deliberately_unpaid(entry, paid) => ("left before payment (planned)", Status::Done),
+        Some(EntryBehavior::AbandonPaid) if paid => {
+            ("left before submitting (planned)", Status::Done)
+        }
+        Some(EntryBehavior::LateSubmission) if paid => {
+            if expected_rejection {
+                ("late submission rejected", Status::Done)
+            } else if entry.rejected_submission.is_some() {
+                ("late submission check failed", Status::Failed)
+            } else {
+                ("waiting to submit after entry closes", incomplete)
+            }
+        }
+        Some(_) if paid && !run_failed => ("waiting to submit", Status::Active),
+        _ if paid || run_failed => ("not entered", Status::Failed),
+        _ => ("not entered yet", Status::Waiting),
+    };
+    Line {
+        label: entry.user.clone(),
+        value: value.into(),
+        status,
+    }
+}
+
 /// Where each part of the run's money flow got to: the players' payments, their escrows and
 /// entries, the funding, the contract, and how it settled. The ids are in the hops below it.
 fn flow(
@@ -95,6 +180,8 @@ fn flow(
     refunds: &[(String, ScenarioRefund)],
     trail: Option<&Trail>,
     run_failed: bool,
+    scenario: &str,
+    failed_entries: &[&str],
 ) -> Vec<FlowBox> {
     let competition = trail.and_then(|trail| trail.competition.as_ref());
     // Once the run has failed, whatever an entry had not done it never will.
@@ -107,6 +194,30 @@ fn flow(
     let paid = |entry: &EntryTrace| {
         entry.paid || trail.is_some_and(|trail| trail.late_payment(entry).is_some())
     };
+    let expects_refund = matches!(
+        scenario,
+        "escrow_refund" | "paid_abandonment" | "late_submission"
+    );
+    let refunded_entry = |entry: &EntryTrace| {
+        trail
+            .and_then(|trail| trail.refund_of(entry))
+            .is_some_and(|refund| refund.is_settled())
+            || refunds.iter().any(|(user, _)| *user == entry.user)
+    };
+    let planned_unfilled = expects_refund
+        && !entries.iter().any(|entry| {
+            matches!(
+                entry.behavior,
+                Some(EntryBehavior::LateSubmission | EntryBehavior::AbandonPaid)
+            ) && entry.entry_submitted
+        })
+        && competition.is_some_and(|competition| {
+            competition.failed_at.is_none()
+                && competition.contracted_at.is_none()
+                && competition.signed_at.is_none()
+                && competition.funding_broadcasted_at.is_none()
+                && competition.funding_confirmed_at.is_none()
+        });
 
     let payments = entries
         .iter()
@@ -115,9 +226,15 @@ fn flow(
                 .payment
                 .as_ref()
                 .or_else(|| trail?.late_payment(entry));
+            let intentional = deliberately_unpaid(entry, paid(entry));
+            let unexpected = entry.behavior == Some(EntryBehavior::AbandonUnpaid) && paid(entry);
             Line {
                 label: entry.user.clone(),
                 value: match (entry.amount_sats, payment) {
+                    _ if intentional => "no payment (planned abandonment)".to_string(),
+                    (Some(sats), _) if unexpected => {
+                        format!("{} sats unexpectedly paid", format::sats(sats))
+                    }
                     (Some(sats), Some(payment)) if paid(entry) => format!(
                         "{} sats, {} fee",
                         format::sats(sats),
@@ -127,8 +244,12 @@ fn flow(
                     (Some(sats), _) => format!("{} sats unpaid", format::sats(sats)),
                     (None, _) => "no ticket yet".to_string(),
                 },
-                status: if paid(entry) {
+                status: if unexpected {
+                    Status::Failed
+                } else if paid(entry) || intentional {
                     Status::Done
+                } else if !run_failed && entry.behavior.is_some() && entry.ticket_id.is_some() {
+                    Status::Active
                 } else {
                     unfinished
                 },
@@ -141,9 +262,20 @@ fn flow(
         .iter()
         .map(|entry| {
             let swap = trail.and_then(|trail| trail.swap_of(entry));
+            let intentional = deliberately_unpaid(entry, paid(entry));
+            let refunded = paid(entry) && refunded_entry(entry);
+            let awaiting_refund = paid(entry) && planned_unfilled;
             Line {
                 label: entry.user.clone(),
                 value: match swap {
+                    _ if intentional => "not funded (planned abandonment)".to_string(),
+                    _ if refunded => "escrow refunded".to_string(),
+                    _ if awaiting_refund => if ended {
+                        "awaiting escrow refund"
+                    } else {
+                        "held for planned cancellation"
+                    }
+                    .to_string(),
                     Some(swap) if swap.funded_without_vtxo() => {
                         format!(
                             "{} sats, swap {}, no output",
@@ -162,6 +294,18 @@ fn flow(
                     None => "-".to_string(),
                 },
                 status: match (paid(entry), escrows_confirmed) {
+                    _ if intentional || refunded => Status::Done,
+                    _ if awaiting_refund => {
+                        if (run_failed && ended)
+                            || trail.is_some_and(|trail| {
+                                matches!(trail.money, crate::trail::Money::Stuck { .. })
+                            })
+                        {
+                            Status::Failed
+                        } else {
+                            Status::Active
+                        }
+                    }
                     (true, true) => Status::Done,
                     (true, false) if ended => Status::Failed,
                     (true, false) => Status::Active,
@@ -173,21 +317,26 @@ fn flow(
 
     let submitted = entries
         .iter()
-        .map(|entry| Line {
-            label: entry.user.clone(),
-            value: if entry.entry_submitted {
-                "entered".to_string()
-            } else {
-                "not entered".to_string()
-            },
-            status: if entry.entry_submitted {
-                Status::Done
-            } else if paid(entry) {
-                // Paid for, but never entered: the money is in an escrow the run left behind.
-                Status::Failed
-            } else {
-                unfinished
-            },
+        .map(|entry| {
+            let mut line = entry_line(entry, paid(entry), run_failed);
+            // A recorded rejection is evidence from one request. The actor may still
+            // fail its count check or later retry, so preserve the actual step result.
+            if failed_entries.contains(&entry.user.as_str())
+                && matches!(
+                    entry.behavior,
+                    Some(
+                        EntryBehavior::DuplicateSubmission
+                            | EntryBehavior::LateSubmission
+                            | EntryBehavior::AbandonUnpaid
+                            | EntryBehavior::AbandonPaid
+                    )
+                )
+                && line.status != Status::Failed
+            {
+                line.status = Status::Failed;
+                line.value.push_str("; entry check failed");
+            }
+            line
         })
         .collect();
 
@@ -221,6 +370,8 @@ fn flow(
 
     let funding_status = if competition.funding_confirmed_at.is_some() {
         Status::Done
+    } else if planned_unfilled {
+        Status::Waiting
     } else if ended {
         Status::Failed
     } else if competition.signed_at.is_some() || competition.funding_broadcasted_at.is_some() {
@@ -231,7 +382,12 @@ fn flow(
     let funding = trail.and_then(|trail| trail.funding_tx.as_ref());
     boxes.push(FlowBox {
         title: "Funding",
-        subtitle: "one transaction funds the contract on-chain".to_string(),
+        subtitle: if planned_unfilled {
+            "not required: this scenario leaves the competition unfilled"
+        } else {
+            "one transaction funds the contract on-chain"
+        }
+        .to_string(),
         status: funding_status,
         lines: funding
             .map(|funding| Line {
@@ -249,8 +405,15 @@ fn flow(
     let attested = competition.state.as_deref() == Some("attested")
         || competition.outcome_broadcasted_at.is_some()
         || competition.completed_at.is_some();
-    let contract_status = if attested {
+    let contract_decided = attested
+        || competition.expiry_broadcasted_at.is_some()
+        || trail
+            .and_then(|trail| trail.settlement.as_ref())
+            .is_some_and(|settlement| settlement.decided.is_some());
+    let contract_status = if contract_decided {
         Status::Done
+    } else if planned_unfilled {
+        Status::Waiting
     } else if ended {
         Status::Failed
     } else if competition.contracted_at.is_some() {
@@ -260,7 +423,12 @@ fn flow(
     };
     boxes.push(FlowBox {
         title: "Contract",
-        subtitle: "signed, then settled by the oracle's attestation".to_string(),
+        subtitle: if planned_unfilled {
+            "not created: this scenario tests cancellation and escrow refunds"
+        } else {
+            "signed; the oracle's attestation or contract expiry determines its outcome"
+        }
+        .to_string(),
         status: contract_status,
         lines: vec![Line {
             label: "state".to_string(),
@@ -274,11 +442,13 @@ fn flow(
 
     let refunded = trail.is_some_and(|trail| !trail.refunds.is_empty()) || !refunds.is_empty();
     // A competition that ended before its outcome gives the escrows back instead of paying out.
-    boxes.push(if (ended || refunded) && !attested {
-        refunds_box(entries, refunds, trail, unfinished)
-    } else {
-        payouts_box(trail)
-    });
+    boxes.push(
+        if (ended || refunded || planned_unfilled) && !contract_decided {
+            refunds_box(entries, refunds, trail, unfinished)
+        } else {
+            payouts_box(trail)
+        },
+    );
     boxes
 }
 
@@ -315,8 +485,8 @@ fn refunds_box(
         })
         .collect();
     FlowBox::of_lines(
-        "Refunds",
-        "cancelled: each escrow goes back to its player",
+        "Escrow refunds",
+        "refunds of entry funds held in each player's escrow",
         lines,
     )
 }
@@ -367,7 +537,11 @@ fn payouts_box(trail: Option<&Trail>) -> FlowBox {
         .map(|state| Status::from(*state))
         .collect();
     FlowBox {
-        title: "Payouts",
+        title: if settlement.is_some_and(is_pot_return) {
+            "Pot return"
+        } else {
+            "Payouts"
+        },
         subtitle,
         // Until every winner has a payout record, one confirmed share does not settle the rest.
         status: if owed.contains(&Status::Failed) {
@@ -612,6 +786,12 @@ fn run_section(
 
 fn money_section(view: &RunView, now: OffsetDateTime) -> Markup {
     let trail = view.trail.as_ref();
+    let failed_entries: Vec<_> = view
+        .steps
+        .iter()
+        .filter(|step| step.status == "failed")
+        .filter_map(|step| step.step_name.strip_prefix("user_")?.strip_suffix("_enter"))
+        .collect();
     html! {
         section {
             h2 { "Where the money went" }
@@ -627,7 +807,7 @@ fn money_section(view: &RunView, now: OffsetDateTime) -> Markup {
                 None if view.competition_id.is_some() => p.note { "Looking the money up; this page updates when it has." },
                 None => p.note { "The run made no competition, so no money moved past the payments." },
             }
-            (flow_diagram(&flow(&view.entries, &view.scenario_refunds, trail, view.run.status == "failed")))
+            (flow_diagram(&flow(&view.entries, &view.scenario_refunds, trail, view.run.status == "failed", &view.run.scenario, &failed_entries)))
         }
     }
 }
@@ -810,7 +990,16 @@ fn ledger_table(ledger: &Ledger, trail: Option<&Trail>) -> Markup {
     let stopped = trail.is_some_and(|trail| {
         trail.money.is_final() || matches!(trail.money, crate::trail::Money::Stuck { .. })
     });
+    let pot_return = trail
+        .and_then(|trail| trail.settlement.as_ref())
+        .is_some_and(is_pot_return);
     html! {
+        @if pot_return {
+            p.note {
+                "Pot returns follow the signed allocation. Ticket charges outside the pot are "
+                "not included in the return; entry routing fees are shown separately."
+            }
+        }
         div.scroll { table.ledger {
             thead { tr { th { "" } th.num { "Sats" } th { "" } } }
             tbody {
@@ -825,10 +1014,10 @@ fn ledger_table(ledger: &Ledger, trail: Option<&Trail>) -> Markup {
                     td.note { "what ark-swapd put in them; the rest is its fee" }
                 }
                 tr { td { "→ into the pot (the contract)" } td.num { (sats(ledger.pot)) } td {} }
-                tr { td { "→ coordinator's fee" } td.num { (sats(ledger.coordinator_fee)) } td.note { "what players paid beyond the pot" } }
+                tr { td { "→ ticket charges outside the pot" } td.num { (sats(ledger.coordinator_fee)) } td.note { "what players paid beyond the pot, including entry swap fees" } }
                 @if ledger.pot.is_some() {
                     tr.total { td { "Pot" } td.num { (sats(ledger.pot)) } td {} }
-                    tr { td { "→ owed to winners" } td.num { (format::sats(ledger.owed)) } td.note { "their shares under the outcome" } }
+                    tr { td { @if pot_return { "→ allocated for pot return" } @else { "→ owed to winners" } } td.num { (format::sats(ledger.owed)) } td.note { "their shares under the outcome" } }
                     tr { td { "→ confirmed paid over Lightning" } td.num { (format::sats(ledger.paid_out)) } td.note { (ledger.confirmed_payouts) " payouts" } }
                     tr class=(if stopped && ledger.unpaid > 0 { "flag" } else { "" }) {
                         td { "→ owed, not confirmed paid" } td.num { (format::sats(ledger.unpaid)) }
@@ -839,7 +1028,7 @@ fn ledger_table(ledger: &Ledger, trail: Option<&Trail>) -> Markup {
                     }
                 }
                 @if ledger.refunded > 0 {
-                    tr { td { "Refunded" } td.num { (format::sats(ledger.refunded)) } td.note {
+                    tr { td { "Escrow refunds" } td.num { (format::sats(ledger.refunded)) } td.note {
                         @if let Some(fees) = ledger.refund_fees { (format::sats(fees)) " sats kept by the refunds' swaps and payments" }
                     } }
                 }
@@ -945,7 +1134,7 @@ mod tests {
             "funding_outpoint": "803c8ce3:0",
         }));
         let trail = trail_of(competition, None);
-        let boxes = flow(&entries, &[], Some(&trail), false);
+        let boxes = flow(&entries, &[], Some(&trail), false, "full_lifecycle", &[]);
         assert_eq!(
             statuses(&boxes),
             [
@@ -965,7 +1154,7 @@ mod tests {
     fn a_paid_entry_that_never_went_in_shows_where_the_money_stopped() {
         let entries = [entry("alice", true, false)];
         let trail = trail_of(competition(serde_json::json!({})), None);
-        let boxes = flow(&entries, &[], Some(&trail), true);
+        let boxes = flow(&entries, &[], Some(&trail), true, "full_lifecycle", &[]);
         let entered = boxes.iter().find(|b| b.title == "Entries").unwrap();
         assert_eq!(entered.status, Status::Failed);
         assert_eq!(
@@ -976,9 +1165,177 @@ mod tests {
     }
 
     #[test]
+    fn deliberate_unpaid_abandonment_is_complete_without_claiming_a_payment() {
+        let mut dropout = entry("alice", false, false);
+        dropout.behavior = Some(EntryBehavior::AbandonUnpaid);
+        dropout.payment_started = Some(false);
+        dropout.payment = None;
+        let boxes = flow(
+            std::slice::from_ref(&dropout),
+            &[],
+            None,
+            false,
+            "abandoned_unpaid",
+            &[],
+        );
+        assert!(boxes[..3].iter().all(|stage| stage.status == Status::Done));
+        let rendered = flow_diagram(&boxes).into_string();
+        assert!(rendered.contains("no payment (planned abandonment)"));
+        assert!(rendered.contains("not funded (planned abandonment)"));
+        assert!(!rendered.contains("1,100 sats"));
+
+        dropout.paid = true;
+        let unexpected = flow(&[dropout], &[], None, true, "abandoned_unpaid", &[]);
+        assert_eq!(unexpected[0].status, Status::Failed);
+        assert_eq!(unexpected[2].status, Status::Failed);
+        assert!(flow_diagram(&unexpected)
+            .into_string()
+            .contains("1,100 sats unexpectedly paid"));
+    }
+
+    #[test]
+    fn planned_paid_abandonment_tracks_refund_progress_without_failed_entry_or_contract() {
+        let mut dropout = entry("alice", true, false);
+        dropout.behavior = Some(EntryBehavior::AbandonPaid);
+        let mut trail = trail_of(competition(serde_json::json!({})), None);
+        let pending = flow(
+            std::slice::from_ref(&dropout),
+            &[],
+            Some(&trail),
+            false,
+            "paid_abandonment",
+            &[],
+        );
+        assert_eq!(pending[1].status, Status::Active);
+        assert_eq!(pending[2].status, Status::Done);
+        assert_eq!(pending.last().unwrap().title, "Escrow refunds");
+        assert_ne!(pending.last().unwrap().status, Status::Done);
+        assert!(flow_diagram(&pending)
+            .into_string()
+            .contains("left before submitting (planned)"));
+
+        trail.competition.as_mut().unwrap().cancelled_at = Some(OffsetDateTime::now_utc());
+        let failed = flow(
+            std::slice::from_ref(&dropout),
+            &[],
+            Some(&trail),
+            true,
+            "paid_abandonment",
+            &[],
+        );
+        assert_eq!(
+            failed[1].status,
+            Status::Failed,
+            "an unfinished refund remains a failure"
+        );
+        assert_eq!(failed.last().unwrap().status, Status::Failed);
+        let refunds = [(
+            "alice".into(),
+            ScenarioRefund {
+                paid_sats: 1000,
+                ark_txid: None,
+            },
+        )];
+        let returned = flow(
+            &[dropout],
+            &refunds,
+            Some(&trail),
+            false,
+            "paid_abandonment",
+            &[],
+        );
+        assert_eq!(
+            statuses(&returned),
+            [
+                ("Payments", Status::Done),
+                ("Escrows", Status::Done),
+                ("Entries", Status::Done),
+                ("Funding", Status::Waiting),
+                ("Contract", Status::Waiting),
+                ("Escrow refunds", Status::Done),
+            ]
+        );
+        let rendered = flow_diagram(&returned).into_string();
+        assert!(rendered.contains("escrow refunded"));
+        assert!(rendered.contains("1,000 sats back"));
+        assert!(rendered.contains("not required: this scenario leaves the competition unfilled"));
+    }
+
+    #[test]
+    fn late_entry_flow_distinguishes_wait_rejection_and_unexpected_acceptance() {
+        let mut late = entry("alice", true, false);
+        late.behavior = Some(EntryBehavior::LateSubmission);
+        let pending = entry_line(&late, true, false);
+        assert_eq!(pending.status, Status::Active);
+        assert_eq!(pending.value, "waiting to submit after entry closes");
+        for (status, expected) in [(400, Status::Done), (500, Status::Failed)] {
+            late.rejected_submission = Some(crate::client::entries::ApiRejection {
+                status,
+                message: "Competition is no longer accepting entries".into(),
+            });
+            assert_eq!(entry_line(&late, true, false).status, expected);
+        }
+        late.entry_submitted = true;
+        let accepted = entry_line(&late, true, true);
+        assert_eq!(accepted.status, Status::Failed);
+        assert_eq!(accepted.value, "late entry unexpectedly accepted");
+        let funded = trail_of(
+            competition(serde_json::json!({
+                "contracted_at": "2026-09-23T03:02:00Z",
+                "funding_confirmed_at": "2026-09-23T03:04:00Z",
+            })),
+            None,
+        );
+        let actual = flow(
+            &[late],
+            &[],
+            Some(&funded),
+            true,
+            "late_submission",
+            &["alice"],
+        );
+        assert_eq!(
+            actual.last().unwrap().title,
+            "Payouts",
+            "follow the actual funded contract after an unexpected acceptance"
+        );
+    }
+
+    #[test]
+    fn timed_normal_entries_and_duplicate_checks_remain_pending_until_completed() {
+        let mut trace = entry("alice", true, false);
+        trace.behavior = Some(EntryBehavior::Complete);
+        assert_eq!(entry_line(&trace, true, false).status, Status::Active);
+        assert_eq!(entry_line(&trace, true, true).status, Status::Failed);
+        trace.entry_submitted = true;
+        trace.behavior = Some(EntryBehavior::DuplicateSubmission);
+        assert_eq!(entry_line(&trace, true, false).status, Status::Active);
+        assert_eq!(entry_line(&trace, true, true).status, Status::Failed);
+        trace.rejected_submission = Some(crate::client::entries::ApiRejection {
+            status: 400,
+            message: "Ticket has already been used".into(),
+        });
+        assert_eq!(entry_line(&trace, true, false).status, Status::Done);
+        let failed_retry = flow(
+            std::slice::from_ref(&trace),
+            &[],
+            None,
+            true,
+            "duplicate_submission",
+            &["alice"],
+        );
+        assert_eq!(failed_retry[2].status, Status::Failed);
+        assert!(flow_diagram(&failed_retry)
+            .into_string()
+            .contains("entry check failed"));
+        trace.rejected_submission.as_mut().unwrap().status = 500;
+        assert_eq!(entry_line(&trace, true, false).status, Status::Failed);
+    }
+
+    #[test]
     fn a_run_not_traced_yet_still_shows_its_payments() {
         let entries = [entry("alice", true, true)];
-        let boxes = flow(&entries, &[], None, false);
+        let boxes = flow(&entries, &[], None, false, "full_lifecycle", &[]);
         assert_eq!(boxes.last().unwrap().title, "Competition");
         assert_eq!(boxes[0].status, Status::Done);
     }
@@ -1025,9 +1382,10 @@ mod tests {
         trail
     }
 
-    /// What "3 of 3 paid out" was: a tie, paying each player their share.
+    /// Historical all-entry allocations retain their signed amounts but are not
+    /// presented as an ordinary tie or proof that every payment completed.
     #[test]
-    fn a_tie_pays_everyone_and_says_so() {
+    fn a_no_score_outcome_preserves_historical_amounts_and_tracks_payment_separately() {
         let completed = competition(serde_json::json!({ "completed_at": "2026-09-23T03:30:00Z" }));
         let split = settlement(Some(Decided::Attested(3)), [1020, 990, 990]);
         let payouts = [
@@ -1036,6 +1394,7 @@ mod tests {
             payout("charlie", "c", 990, true),
         ];
         let paid = payouts_box(Some(&settled(completed.clone(), split.clone(), &payouts)));
+        assert_eq!(paid.title, "Pot return");
         assert_eq!(paid.status, Status::Done);
         assert_eq!(
             payouts_box(Some(&settled(completed, split, &payouts[..1]))).status,
@@ -1044,9 +1403,86 @@ mod tests {
         );
         assert_eq!(
             paid.subtitle,
-            "tie: split between alice, bob, charlie (outcome 3)"
+            "No-score outcome: no entry scored any points; each entry receives its signed share of the pot (outcome 3)"
         );
         assert_eq!(paid.lines[0].value, "1,020 sats paid");
+        assert_eq!(paid.lines[1].value, "990 sats paid");
+        assert_eq!(paid.lines[2].value, "990 sats paid");
+    }
+
+    #[test]
+    fn multiple_ranked_winners_are_not_mislabeled_as_a_tie_or_pot_return() {
+        let completed = competition(serde_json::json!({ "completed_at": "2026-09-23T03:30:00Z" }));
+        let payouts = [
+            payout("alice", "a", 2100, true),
+            payout("bob", "b", 900, true),
+            payout("charlie", "c", 0, false),
+        ];
+        let paid = payouts_box(Some(&settled(
+            completed,
+            settlement(Some(Decided::Attested(0)), [2100, 900, 0]),
+            &payouts,
+        )));
+        assert_eq!(paid.title, "Payouts");
+        assert_eq!(paid.subtitle, "Ranked payouts to alice, bob (outcome 0)");
+        assert_eq!(paid.status, Status::Done);
+    }
+
+    #[test]
+    fn contract_expiry_awaiting_payments_shows_a_pot_return_not_escrow_refunds() {
+        let expired = competition(serde_json::json!({
+            "expiry_broadcasted_at": "2026-09-23T03:30:00Z",
+        }));
+        let payouts = [
+            payout("alice", "a", 1000, false),
+            payout("bob", "b", 1000, false),
+            payout("charlie", "c", 1000, false),
+        ];
+        let trail = settled(
+            expired,
+            settlement(Some(Decided::Expired), [1000; 3]),
+            &payouts,
+        );
+        let entries = [entry("alice", true, true)];
+        let boxes = flow(&entries, &[], Some(&trail), false, "full_lifecycle", &[]);
+        let returned = boxes.last().unwrap();
+        assert_eq!(returned.title, "Pot return");
+        assert_eq!(
+            returned.subtitle,
+            "Contract expired: pot return follows the signed expiry terms"
+        );
+        assert_eq!(returned.status, Status::Active);
+        assert_eq!(returned.lines[0].value, "1,000 sats owed");
+        assert!(!returned.subtitle.contains("paid"));
+        assert!(!boxes
+            .iter()
+            .any(|flow_box| flow_box.title == "Escrow refunds"));
+    }
+
+    #[test]
+    fn pot_return_ledger_distinguishes_allocation_ticket_charges_and_routing_fees() {
+        let trail = trail_of(
+            competition(serde_json::json!({})),
+            Some(settlement(Some(Decided::Attested(3)), [1000; 3])),
+        );
+        let ledger = Ledger {
+            entries_paid: 3,
+            paid_in: 3300,
+            pot: Some(3000),
+            coordinator_fee: Some(300),
+            owed: 3000,
+            entry_routing_fee_msat: Some(3003),
+            ..Ledger::default()
+        };
+        let html = ledger_table(&ledger, Some(&trail)).into_string();
+        assert!(html.contains("Ticket charges outside the pot are not included in the return"));
+        assert!(html.contains("including entry swap fees"));
+        assert!(html.contains("→ allocated for pot return</td><td class=\"num\">3,000"));
+        assert!(html.contains("→ ticket charges outside the pot</td><td class=\"num\">300"));
+        assert!(html.contains("entry routing, paid by the payer"));
+        assert!(html.contains("<td class=\"num\">3.003</td>"));
+        assert!(!html.contains("→ owed to winners"));
+        assert!(!html.contains("→ coordinator"));
     }
 
     #[test]
@@ -1110,12 +1546,12 @@ mod tests {
         assert_eq!(paid.lines[0].value, "1,020 sats never sent");
         let entries = [entry("alice", true, true)];
         assert_eq!(
-            flow(&entries, &[], Some(&trail), false)
+            flow(&entries, &[], Some(&trail), false, "full_lifecycle", &[])
                 .last()
                 .unwrap()
                 .title,
-            "Payouts",
-            "a contract that reached its outcome settles by payouts, not refunds"
+            "Pot return",
+            "a signed all-entry outcome uses contract payouts, not escrow refunds"
         );
     }
 
@@ -1146,9 +1582,16 @@ mod tests {
             fee_msat: None,
             paid_by: None,
         });
-        let boxes = flow(&entries, &refunds, Some(&trail), false);
+        let boxes = flow(
+            &entries,
+            &refunds,
+            Some(&trail),
+            false,
+            "escrow_refund",
+            &[],
+        );
         let settled = boxes.last().unwrap();
-        assert_eq!(settled.title, "Refunds");
+        assert_eq!(settled.title, "Escrow refunds");
         assert_eq!(
             settled.status,
             Status::Active,

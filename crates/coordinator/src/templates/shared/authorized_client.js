@@ -5,15 +5,23 @@ class AuthorizedClient {
     }
 
     async _request(url, method, body, options = {}) {
+        const { isActive, ...requestOptions } = options;
+        const checkActive = () => {
+            if (isActive && !isActive()) throw new Error("Request cancelled");
+        };
+        checkActive();
         // Serialize once: the NIP-98 payload hash must cover the exact bytes sent.
         const payload = body ? JSON.stringify(body) : null;
         const authHeader = await this.wasmInstance.getAuthHeader(url, method, payload);
+        // Extension signing can wait for user input. Recheck immediately before
+        // dispatch; cancelling a dialog must not send a delayed signed request.
+        checkActive();
         const response = await fetch(url, {
-            ...options,
+            ...requestOptions,
             method,
             headers: {
                 'Content-Type': 'application/json',
-                ...options.headers,
+                ...requestOptions.headers,
                 'Authorization': authHeader,
             },
             body: payload ?? undefined,
@@ -43,4 +51,3 @@ class AuthorizedClient {
         return this._request(url, 'DELETE', body, options);
     }
 }
-

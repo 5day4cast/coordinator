@@ -6,7 +6,9 @@ use coordinator_synth::client::competitions::CreateCompetition;
 use coordinator_synth::client::CoordinatorClient;
 use coordinator_synth::db::SynthDb;
 use coordinator_synth::runner::Runner;
-use coordinator_synth::scenarios::ScenarioConfig;
+use coordinator_synth::scenarios::{
+    choose_observation_window, default_observation_windows, ScenarioConfig,
+};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -76,9 +78,9 @@ enum CompetitionCommands {
         /// Max entries
         #[arg(long, default_value = "5")]
         max_entries: usize,
-        /// Observation window in minutes
-        #[arg(long, default_value = "5")]
-        observation_window: u64,
+        /// Observation window in minutes (otherwise varies among 120, 180, 240 and 10)
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        observation_window: Option<u64>,
         /// List the competition's event on the oracle's public events list. Test competitions
         /// are unlisted by default.
         #[arg(long)]
@@ -104,9 +106,11 @@ enum SynthCommands {
         /// Number of synthetic users
         #[arg(long, default_value = "3")]
         users: usize,
-        /// Observation window in minutes
-        #[arg(long, default_value = "5")]
-        observation_window: u64,
+        /// Observation window in minutes (otherwise varies among 120, 180, 240 and 10)
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        observation_window: Option<u64>,
+        #[command(flatten)]
+        timing: coordinator_synth::cli::EntryTimingArgs,
     },
     /// Show status of last run
     Status,
@@ -178,7 +182,8 @@ async fn main() -> Result<()> {
                 let station_list: Vec<String> =
                     stations.split(',').map(|s| s.trim().to_string()).collect();
                 let now = OffsetDateTime::now_utc();
-                let window = time::Duration::minutes(observation_window as i64);
+                let window =
+                    time::Duration::seconds(observation_window_secs(observation_window) as i64);
 
                 let competition = CreateCompetition {
                     id: Uuid::now_v7(),
@@ -222,16 +227,28 @@ async fn main() -> Result<()> {
                     scenario,
                     users,
                     observation_window,
+                    timing,
                 } => {
-                    let config = ScenarioConfig {
+                    let mut config = ScenarioConfig {
                         users,
-                        observation_window_secs: observation_window * 60,
+                        observation_window_secs: observation_window_secs(observation_window),
+                        observation_window_choices: if observation_window.is_none() {
+                            default_observation_windows()
+                        } else {
+                            vec![]
+                        },
                         ..Default::default()
                     };
+                    timing.apply(&mut config);
+                    let config = config.resolve_plan(&scenario)?;
 
                     println!("Running scenario: {}", scenario);
                     println!("  Users: {}", users);
-                    println!("  Observation window: {} min", observation_window);
+                    println!("  Seed: {}", config.seed.expect("resolved seed"));
+                    println!(
+                        "  Observation window: {} min",
+                        config.observation_window_secs / 60
+                    );
                     println!();
 
                     let result = runner.run_scenario(&scenario, config).await?;
@@ -319,6 +336,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn observation_window_secs(minutes: Option<u64>) -> u64 {
+    minutes
+        .map(|value| value * 60)
+        .unwrap_or_else(|| choose_observation_window(&default_observation_windows()))
+}
+
 fn setup_logging() {
     fern::Dispatch::new()
         .format(|out, message, record| {
@@ -334,4 +357,44 @@ fn setup_logging() {
         .chain(std::io::stderr())
         .apply()
         .expect("Failed to initialize logging");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observation_defaults_vary_and_explicit_short_tests_are_preserved() {
+        for command in ["synth", "competitions"] {
+            let action = if command == "synth" { "run" } else { "create" };
+            for (extra, expected) in [(vec![], None), (vec!["--observation-window", "5"], Some(5))]
+            {
+                let mut args = vec!["coord", command, action];
+                args.extend(extra);
+                let cli = Cli::try_parse_from(args).unwrap();
+                let window = match cli.command {
+                    Commands::Synth {
+                        action:
+                            SynthCommands::Run {
+                                observation_window, ..
+                            },
+                    }
+                    | Commands::Competitions {
+                        action:
+                            CompetitionCommands::Create {
+                                observation_window, ..
+                            },
+                    } => observation_window,
+                    _ => unreachable!(),
+                };
+                assert_eq!(window, expected);
+                let seconds = observation_window_secs(window);
+                if expected.is_some() {
+                    assert_eq!(seconds, 300);
+                } else {
+                    assert!(default_observation_windows().contains(&seconds));
+                }
+            }
+        }
+    }
 }

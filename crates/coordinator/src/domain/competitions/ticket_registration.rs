@@ -9,12 +9,13 @@
 //! took the ticket over. Only a paid ticket's registration is ever given to Keymeld, and all of a
 //! competition's are deleted once it ends and has no refund left to sign.
 
-use super::CompetitionStore;
+use super::{admission::before_deadline, CompetitionStore};
 use crate::infra::db::DatabaseWriteError;
 use coordinator_escrow::escrow::SignedEscrowPolicy;
 use keymeld_sdk::types::RegistrationContext;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 /// A player's Keymeld registration for their ticket, as their browser sealed it.
@@ -72,9 +73,39 @@ impl CompetitionStore {
         player: String,
         registration: String,
     ) -> Result<RegistrationStored, DatabaseWriteError> {
+        Ok(self
+            .write_ticket_registration(ticket_id, ticket_hash, player, registration, None)
+            .await?
+            .expect("unbounded ticket registration"))
+    }
+
+    pub(super) async fn store_ticket_registration_before(
+        &self,
+        ticket_id: Uuid,
+        ticket_hash: String,
+        player: String,
+        registration: String,
+        deadline: OffsetDateTime,
+    ) -> Result<Option<RegistrationStored>, DatabaseWriteError> {
+        self.write_ticket_registration(ticket_id, ticket_hash, player, registration, Some(deadline))
+            .await
+    }
+
+    async fn write_ticket_registration(
+        &self,
+        ticket_id: Uuid,
+        ticket_hash: String,
+        player: String,
+        registration: String,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<Option<RegistrationStored>, DatabaseWriteError> {
         self.db_connection
             .execute_write(move |pool| async move {
                 let mut tx = pool.begin().await?;
+                if !before_deadline(deadline) {
+                    tx.rollback().await?;
+                    return Ok(None);
+                }
                 let ticket = sqlx::query(
                     "SELECT paid_at IS NOT NULL AS paid FROM tickets
                      WHERE id = ? AND hash = ? AND reserved_by = ?",
@@ -85,7 +116,7 @@ impl CompetitionStore {
                 .fetch_optional(&mut *tx)
                 .await?;
                 let Some(ticket) = ticket else {
-                    return Ok(RegistrationStored::ReservationChanged);
+                    return Ok(Some(RegistrationStored::ReservationChanged));
                 };
                 let paid: bool = ticket.try_get("paid")?;
                 sqlx::query(
@@ -120,8 +151,12 @@ impl CompetitionStore {
                         RegistrationStored::Stored
                     }
                 };
+                if !before_deadline(deadline) {
+                    tx.rollback().await?;
+                    return Ok(None);
+                }
                 tx.commit().await?;
-                Ok(outcome)
+                Ok(Some(outcome))
             })
             .await
     }

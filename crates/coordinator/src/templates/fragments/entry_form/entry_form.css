@@ -1,7 +1,22 @@
 /* Entry form: terms, compact station map, pick buttons. */
 
 .entry-form {
+  --entry-muted: #5b6170;
   max-width: 48rem;
+}
+
+[data-theme="dark"] .entry-form {
+  --entry-muted: #afb5c8;
+}
+
+.entry-form .entry-facts dt,
+.entry-form .fact-note,
+.entry-form .station-code,
+.entry-form .pick-forecast.is-missing,
+.entry-form .pick-option.is-none span,
+.entry-form .pick-option.is-none input:checked + span,
+.entry-form .entry-advanced summary {
+  color: var(--entry-muted);
 }
 
 .how-to-pick {
@@ -11,27 +26,43 @@
 
 /* The map only shows where the stations are; keep it small. */
 .station-map {
+  --station-map-land: #d8e3ee;
+  --station-map-border: #74879b;
   position: relative;
   max-width: 26rem;
   margin: 0 0 1.25rem;
+  padding: 0.5rem;
+  border: 1px solid #9aadc0;
+  border-radius: 0.65rem;
+  background: #f2f6fb;
+}
+
+[data-theme="dark"] .station-map {
+  --station-map-land: #3d5168;
+  --station-map-border: #a5b6c8;
+  border-color: #637b96;
+  background: #162538;
 }
 
 .station-map .usa-map {
   display: block;
   width: 100%;
   height: auto;
-  opacity: 0.8;
+  opacity: 1;
+  fill: var(--station-map-land);
+  stroke: var(--station-map-border);
+  stroke-width: 0.75;
 }
 
 [data-theme="dark"] .station-map .usa-map {
-  filter: invert(0.85);
+  filter: none;
 }
 
 .station-pins {
   position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
+  inset: 0.5rem;
+  width: calc(100% - 1rem);
+  height: calc(100% - 1rem);
   overflow: visible;
 }
 
@@ -39,6 +70,7 @@
   fill: hsl(204, 71%, 45%);
   stroke: #fff;
   stroke-width: 2;
+  vector-effect: non-scaling-stroke;
 }
 
 .station-pins a:hover .station-pin,
@@ -47,12 +79,18 @@
 }
 
 .station-pin-label {
-  font-size: 15px;
+  font-size: 20px;
   font-weight: 700;
   fill: var(--bulma-text-strong);
   paint-order: stroke;
   stroke: var(--bulma-scheme-main);
   stroke-width: 3px;
+}
+
+@media screen and (max-width: 480px) {
+  .station-pin-label {
+    font-size: 26px;
+  }
 }
 
 .station-picks {
