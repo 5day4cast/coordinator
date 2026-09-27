@@ -17,6 +17,9 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use time::format_description::well_known::Rfc3339;
 
+/// A named change to one input, which the check must refuse.
+type Change<T> = (&'static str, fn(&mut T));
+
 const START: i64 = 1_790_000_000;
 const DAY: i64 = 86_400;
 const ENTRY_FEE: u64 = 5_000;
@@ -307,7 +310,7 @@ fn an_entry_matching_the_competition_its_oracle_and_the_ticket_is_accepted() {
 
 #[test]
 fn every_term_differing_from_the_oracle_or_the_form_is_refused() {
-    let terms: &[(&str, fn(&mut queued::QueuedTerms))] = &[
+    let terms: &[Change<queued::QueuedTerms>] = &[
         ("competition", |t| t.competition_id = Uuid::now_v7()),
         ("network", |t| t.network = Network::Regtest),
         ("oracle key", |t| {
@@ -361,7 +364,7 @@ fn every_term_differing_from_the_oracle_or_the_form_is_refused() {
 
 #[test]
 fn another_entry_ticket_or_payout_hash_is_refused() {
-    let entries: &[(&str, fn(&mut QueuedEntryTerms))] = &[
+    let entries: &[Change<QueuedEntryTerms>] = &[
         ("entry", |e| e.entry_id = Uuid::now_v7()),
         ("ticket hash", |e| e.ticket_hash = [9; 32]),
         ("payout hash", |e| e.payout_hash = [9; 32]),
@@ -376,7 +379,7 @@ fn another_entry_ticket_or_payout_hash_is_refused() {
 
 #[test]
 fn a_reference_event_differing_from_the_terms_is_refused() {
-    let events: &[(&str, fn(&mut Value))] = &[
+    let events: &[Change<Value>] = &[
         ("event id", |e| e["id"] = json!(Uuid::now_v7())),
         ("signing date", |e| {
             e["signing_date"] = json!(rfc3339(START + 2 * DAY + 1))
@@ -434,7 +437,7 @@ fn a_reference_event_differing_from_the_terms_is_refused() {
 
 #[test]
 fn a_ticket_or_choice_differing_from_the_form_is_refused() {
-    let consents: &[(&str, fn(&mut QueuedConsent))] = &[
+    let consents: &[Change<QueuedConsent>] = &[
         ("competition", |c| c.competition_id = Uuid::now_v7()),
         ("address", |c| {
             c.lightning_address = Some("mallory@wallet.example".into())
@@ -473,7 +476,7 @@ fn a_ticket_or_choice_differing_from_the_form_is_refused() {
 
 #[test]
 fn the_deposit_must_be_scoped_to_the_competition_terms_and_ticket() {
-    let assignments: &[(&str, fn(&mut RegistrationAssignment))] = &[
+    let assignments: &[Change<RegistrationAssignment>] = &[
         ("session", |a| a.session_id = Uuid::now_v7().to_string()),
         ("session spelling", |a| {
             a.session_id = a.session_id.to_uppercase()
@@ -491,7 +494,7 @@ fn the_deposit_must_be_scoped_to_the_competition_terms_and_ticket() {
 
 #[test]
 fn the_policy_must_hold_a_queued_entry_in_a_consented_escrow() {
-    let policies: &[(&str, fn(&mut PayoutPolicy))] = &[
+    let policies: &[Change<PayoutPolicy>] = &[
         ("address", |p| {
             p.automatic_lightning_address = Some("mallory@wallet.example".into())
         }),

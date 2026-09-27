@@ -410,7 +410,11 @@ fn listed(competitions: &[CompetitionView]) -> Vec<CompetitionView> {
         .filter(|competition| !listed_parent(competition))
         .map(|competition| {
             let mut shown = competition.clone();
-            if competition.queue.queued().is_some_and(|queue| !queue.pools.is_empty()) {
+            if competition
+                .queue
+                .queued()
+                .is_some_and(|queue| !queue.pools.is_empty())
+            {
                 if let Some(phase) = pools_of(competitions, &competition.id)
                     .map(|pool| pool.phase)
                     .min_by_key(|phase| progress(*phase))

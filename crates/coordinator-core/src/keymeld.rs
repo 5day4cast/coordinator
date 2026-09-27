@@ -476,7 +476,10 @@ mod tests {
             let error = prepare_payout_registration(&[1; 32], &[6; 32], &changed)
                 .await
                 .unwrap_err();
-            assert!(error.to_string().contains("deposited under"), "{label}: {error}");
+            assert!(
+                error.to_string().contains("deposited under"),
+                "{label}: {error}"
+            );
         }
         // In scope, the key is sealed under the competition's id and terms digest, with the
         // competition's auth key and the entry's exact escrow consent.
@@ -493,7 +496,10 @@ mod tests {
         .unwrap();
         server.abort();
         let competition = entry.terms.competition_id.to_string();
-        assert_eq!(prepared.context.keygen_session_id, SessionId::new(&competition));
+        assert_eq!(
+            prepared.context.keygen_session_id,
+            SessionId::new(&competition)
+        );
         assert_eq!(prepared.context.manifest_hash, digest.to_vec());
         assert_eq!(prepared.context.user_id, UserId::from(entry_id));
         assert_eq!(
@@ -599,7 +605,7 @@ mod tests {
         assert!(!prepared.encrypted_private_key.is_empty());
     }
 
-    fn queued_policy(ticket: Uuid) -> (PayoutPolicy, SessionId, [u8; 32]) {
+    fn queued_policy_with_scope(ticket: Uuid) -> (PayoutPolicy, SessionId, [u8; 32]) {
         use oracle_statement::{LineTerms, ObservationTerms, ScoringRules};
         use payout::dlctix::{
             bitcoin::{FeeRate, Network},
@@ -695,7 +701,7 @@ mod tests {
         };
 
         let ticket = Uuid::now_v7();
-        let (policy, session, digest) = queued_policy(ticket);
+        let (policy, session, digest) = queued_policy_with_scope(ticket);
         let mut queued = assignment(gateway_url.clone());
         queued.session_id = session.as_string();
         queued.user_id = ticket;

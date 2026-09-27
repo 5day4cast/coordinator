@@ -628,10 +628,7 @@ pub async fn queue_pools_fragment(
             .collect(),
         None => vec![],
     };
-    fragment(
-        queue_pools(&view.id, queue, Some(&mine)),
-        Caching::Private,
-    )
+    fragment(queue_pools(&view.id, queue, Some(&mine)), Caching::Private)
 }
 
 fn leaderboard_response(state: &AppState, headers: &HeaderMap, view: &CompetitionView) -> Response {

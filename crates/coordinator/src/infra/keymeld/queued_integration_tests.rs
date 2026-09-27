@@ -206,7 +206,10 @@ fn refused<T>(what: &str, result: Result<T, KeymeldError>) {
 async fn a_queued_pool_registers_deposits_binds_its_statement_and_signs() {
     let started = std::time::Instant::now();
     let enclaves = Enclaves(Arc::new(
-        ENCLAVES.iter().map(|id| (EnclaveId::new(*id), operator(*id))).collect(),
+        ENCLAVES
+            .iter()
+            .map(|id| (EnclaveId::new(*id), operator(*id)))
+            .collect(),
     ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -497,15 +500,17 @@ async fn a_queued_pool_registers_deposits_binds_its_statement_and_signs() {
     // Every member's deposit registers, and keygen completes.
     for ticket in &members {
         service
-            .register_participant(
-                &session,
-                UserId::from(*ticket),
-                &by_ticket[ticket].deposit,
-            )
+            .register_participant(&session, UserId::from(*ticket), &by_ticket[ticket].deposit)
             .await
             .unwrap();
     }
-    assert!(service.get_keygen_status(&session).await.unwrap().is_completed);
+    assert!(
+        service
+            .get_keygen_status(&session)
+            .await
+            .unwrap()
+            .is_completed
+    );
     let roster = service.wait_for_keygen_completion(&session).await.unwrap();
     roster
         .verify_registrations(&session.authorization_manifest)

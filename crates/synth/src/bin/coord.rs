@@ -110,7 +110,7 @@ enum SynthCommands {
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         observation_window: Option<u64>,
         #[command(flatten)]
-        timing: coordinator_synth::cli::EntryTimingArgs,
+        timing: Box<coordinator_synth::cli::EntryTimingArgs>,
     },
     /// Show status of last run
     Status,

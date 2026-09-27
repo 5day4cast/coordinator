@@ -187,9 +187,7 @@ pub fn queue_pools(competition_id: &str, queue: &QueueView, mine: Option<&[Uuid]
         Some(_) => "fw:login from:body, fw:logout from:body",
     };
     let own = |pool: &PoolLink| {
-        mine.is_some_and(|mine| {
-            Uuid::parse_str(&pool.id).is_ok_and(|id| mine.contains(&id))
-        })
+        mine.is_some_and(|mine| Uuid::parse_str(&pool.id).is_ok_and(|id| mine.contains(&id)))
     };
     html! {
         section id="queuePools" class="queue-pools"
