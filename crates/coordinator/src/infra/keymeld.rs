@@ -11,6 +11,8 @@ use keymeld_core::escrow::SignedEscrowPolicy;
 mod confidential_integration_tests;
 mod confidential_service;
 mod confidential_store;
+#[cfg(test)]
+mod queued_integration_tests;
 pub use coordinator_escrow::{
     payout::ContractCommitment,
     payout_capabilities::PayoutCapabilities,
