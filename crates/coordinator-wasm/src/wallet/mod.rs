@@ -13,6 +13,7 @@ mod core;
 mod keymeld_trust;
 mod keys;
 mod qr;
+mod queued;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm;

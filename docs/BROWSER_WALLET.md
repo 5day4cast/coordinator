@@ -128,6 +128,12 @@ that module, and the pins it was built from are in the tagged source.
 The browser checks its selected address, ticket, entry key, payout hash, and economic terms before encrypting the registration.
 The actual funding contract is bound inside Keymeld before signing.
 
+An entry in a [queued competition](QUEUED_COMPETITIONS.md) names no pool or oracle event yet, so the wallet checks its terms instead (`wallet/queued.rs`).
+The page fetches the competition's reference event and the oracle's key from the oracle itself.
+The wallet rebuilds the observation terms from that event, lines included, and requires the terms' oracle key, signing date, expiry and single winner to match.
+The stake must equal the entry fee the form showed, the pool sizes must match the form, and the escrow and fee caps are checked as for any Arkade entry.
+The deposit must be scoped to the competition and the digest of exactly these terms, for this entry's ticket.
+
 An ordinary invoice fallback signs the exact invoice and completed contract context.
 It never sends entry secrets before payment.
 The browser does not silently downgrade to legacy recovery when an authorization lookup fails.

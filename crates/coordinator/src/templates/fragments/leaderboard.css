@@ -50,6 +50,20 @@
   display: block;
 }
 
+/* A pool's link back to its queued competition, and a queue's pools. */
+.pool-of {
+  margin-top: 0.25rem;
+  color: var(--competition-muted);
+}
+
+.queue-pools {
+  margin-bottom: 1.25rem;
+}
+
+.queue-pools ul {
+  margin-top: 0.5rem;
+}
+
 .leaderboard .help {
   color: var(--competition-muted);
 }

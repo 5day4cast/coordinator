@@ -1,5 +1,6 @@
 use super::{
     core::{PayoutConsent, PayoutInvoiceConsent},
+    queued::QueuedConsent,
     DlcWalletCore, WalletError,
 };
 use crate::nostr::NostrClientWrapper;
@@ -90,6 +91,28 @@ impl DlcWallet {
         let prepared = self
             .inner
             .keymeld_payout_registration(parse_entry_id(entry_id)?, &assignment, &consent)
+            .await?;
+        prepared
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// `keymeldPayoutRegistration` for an entry in a queued competition. `consent_json` carries
+    /// what the form showed and the oracle's key and reference event (see `wallet::queued`).
+    #[wasm_bindgen(js_name = "keymeldQueuedRegistration")]
+    pub async fn keymeld_queued_registration(
+        &self,
+        entry_id: &str,
+        assignment_json: &str,
+        consent_json: &str,
+    ) -> Result<JsValue, JsValue> {
+        let assignment: RegistrationAssignment = serde_json::from_str(assignment_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid Keymeld assignment: {e}")))?;
+        let consent: QueuedConsent = serde_json::from_str(consent_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid entry consent: {e}")))?;
+        let prepared = self
+            .inner
+            .keymeld_queued_registration(parse_entry_id(entry_id)?, &assignment, &consent)
             .await?;
         prepared
             .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
