@@ -523,6 +523,8 @@ impl Coordinator {
         let expected_set =
             coordinator_escrow::payout_protocol::accepted_policy_set_digest(&signed_digests)?;
         let expected_contract = coordinator_escrow::payout::contract_digest(&contract)?;
+        // A pool's policies name its queue's deposit scope; each command names the pool's session.
+        let (scope_session_id, _) = session.registration_scope()?;
         let mut seen = std::collections::BTreeSet::new();
         for binding in &bindings {
             let registration = registrations
@@ -535,7 +537,8 @@ impl Coordinator {
                 .ok_or_else(|| anyhow!("Binding enclave has no pinned recipient key"))?;
             binding.verify(key)?;
             if !seen.insert(binding.user_id.clone())
-                || binding.keygen_session_id != session.session_id
+                || binding.keygen_session_id != scope_session_id
+                || binding.response.context.request.session_id() != &session.session_id
                 || binding.enclave_id != registration.enclave_id
                 || binding.enclave_key_epoch != registration.enclave_key_epoch
                 || binding.policy_set_digest != expected_set

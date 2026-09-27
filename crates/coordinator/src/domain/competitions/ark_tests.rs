@@ -835,6 +835,7 @@ fn session_for(players: &[UserId]) -> DlcKeygenSession {
             max_signing_sessions: None,
             encrypted_taproot_tweak: "test".into(),
             subset_definitions: vec![],
+            deposit_scope: None,
         },
         &creator.export_secret(),
     )
