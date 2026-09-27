@@ -34,11 +34,24 @@ pub const SEED_TAG: &[u8] = b"5day4cast/pool-seed/v1";
 /// A pool needs a winner and someone to beat.
 pub const MIN_POOL_PLAYERS: usize = 2;
 
+/// The most players a pool can hold: [`MAX_COMPETITION_PLAYERS`], 25.
+///
+/// - Keymeld signs a pool's whole contract after the Arkade batch fixes the funding outpoint and
+///   before the batch session ends; otherwise the batch fails. A contract has about 3n MuSig2
+///   items with n + 1 signers each, so signing time grows faster than the player count. 25
+///   players took 28.4 s in a release build, and the Arkade test server's session lasts 60 s.
+/// - The confidential payout path admits at most 25 players. Above that, its bind and signing
+///   requests approach Keymeld's payload limit.
+/// - The oracle accepts at most 25 entries per event.
+///
+/// Raising it needs all three to move.
+pub const MAX_POOL_PLAYERS: usize = MAX_COMPETITION_PLAYERS;
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PoolError {
     #[error("pools need at least {MIN_POOL_PLAYERS} players each")]
     MinimumTooSmall,
-    #[error("pools hold at most {MAX_COMPETITION_PLAYERS} players each")]
+    #[error("pools hold at most {MAX_POOL_PLAYERS} players each")]
     MaximumTooLarge,
     #[error("the largest pool must hold at least twice the smallest, less one, so any queue at the minimum or above splits evenly")]
     RangeTooNarrow,
@@ -73,13 +86,14 @@ impl TryFrom<UncheckedPoolRules> for PoolRules {
 }
 
 impl PoolRules {
-    /// `max_players` must be at least `2 * min_players - 1`. Then the even split of any count from
-    /// `min_players` up never leaves a pool below `min_players`.
+    /// `min_players` is at least [`MIN_POOL_PLAYERS`] and `max_players` at most
+    /// [`MAX_POOL_PLAYERS`]. `max_players` must also be at least `2 * min_players - 1`: then the
+    /// even split of any count from `min_players` up never leaves a pool below `min_players`.
     pub fn new(min_players: usize, max_players: usize) -> Result<Self, PoolError> {
         if min_players < MIN_POOL_PLAYERS {
             return Err(PoolError::MinimumTooSmall);
         }
-        if max_players > MAX_COMPETITION_PLAYERS {
+        if max_players > MAX_POOL_PLAYERS {
             return Err(PoolError::MaximumTooLarge);
         }
         if max_players < min_players.saturating_mul(2) - 1 {
