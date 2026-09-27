@@ -391,11 +391,14 @@ pub fn competitions_page(
 /// links: a pool whose competition is listed isn't, and a queue split into pools is listed where
 /// its least advanced pool is, since it has no lifecycle of its own after the split.
 fn listed(competitions: &[CompetitionView]) -> Vec<CompetitionView> {
-    let pools_of = |parent: &str| {
+    fn pools_of<'a>(
+        competitions: &'a [CompetitionView],
+        parent: &'a str,
+    ) -> impl Iterator<Item = &'a CompetitionView> {
         competitions.iter().filter(move |competition| {
             matches!(&competition.queue, Queue::Pool(pool) if pool.parent_id == parent)
         })
-    };
+    }
     let listed_parent = |competition: &CompetitionView| match &competition.queue {
         Queue::Pool(pool) => competitions
             .iter()
@@ -408,7 +411,7 @@ fn listed(competitions: &[CompetitionView]) -> Vec<CompetitionView> {
         .map(|competition| {
             let mut shown = competition.clone();
             if competition.queue.queued().is_some_and(|queue| !queue.pools.is_empty()) {
-                if let Some(phase) = pools_of(&competition.id)
+                if let Some(phase) = pools_of(competitions, &competition.id)
                     .map(|pool| pool.phase)
                     .min_by_key(|phase| progress(*phase))
                 {
@@ -905,9 +908,9 @@ pub(crate) mod tests {
             pool(POOL, 0, Phase::Scored),
             pool(OTHER_POOL, 1, Phase::Live),
         ];
-        let listed = listed(&all);
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].phase, Phase::Live);
+        let shown = listed(&all);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].phase, Phase::Live);
         let page = competitions_page(&all, ListOptions::default(), NOW).into_string();
         assert!(!page.contains("Awaiting results"));
         assert!(!page.contains("Pool 1") && !page.contains("Pool 2"));
