@@ -194,6 +194,14 @@ struct Ticket {
     deposit: ParticipantRegistrationData,
 }
 
+/// Show why the enclave refused, so a refusal for the wrong reason is visible in the output.
+fn refused<T>(what: &str, result: Result<T, KeymeldError>) {
+    match result {
+        Ok(_) => panic!("{what} was accepted"),
+        Err(error) => println!("refused, {what}: {error}"),
+    }
+}
+
 #[tokio::test]
 async fn a_queued_pool_registers_deposits_binds_its_statement_and_signs() {
     let started = std::time::Instant::now();
@@ -441,38 +449,50 @@ async fn a_queued_pool_registers_deposits_binds_its_statement_and_signs() {
         queued::pool_payouts(members.len(), 1).unwrap()
     );
 
-    // A member's single-competition registration, sealed for this session rather than as a
-    // deposit, is refused by the deposit-scoped session.
-    let mut assignment = service
-        .get_registration_assignment(&session, players[0].clone())
-        .await
-        .unwrap();
+    // A member's single-competition registration is not a deposit, so the deposit-scoped
+    // session refuses it: sealed for this session, the coordinator refuses its context; sealed
+    // under the deposit scope, the enclave refuses it.
+    let member = &by_ticket[&members[0]];
     let single_policy = PayoutPolicy {
         queued_entry: None,
         contract_terms: serde_json::to_string(&first).unwrap(),
-        ..by_ticket[&members[0]].policy.clone()
+        ..member.policy.clone()
     };
-    assignment.payout_policy = Some(serde_json::to_string(&single_policy).unwrap());
-    let member = &by_ticket[&members[0]];
-    let prepared = coordinator_core::keymeld::prepare_payout_registration(
-        &entry_secret(member.slot),
-        &preimage(member.slot),
-        &assignment,
-    )
-    .await
-    .unwrap();
-    let single = ParticipantRegistrationData {
-        encrypted_private_key: prepared.encrypted_private_key,
-        public_key: hex::encode(&prepared.context.public_key),
-        auth_pubkey: prepared.auth_pubkey,
-        context: prepared.context,
-        payout_policy: Some(single_policy),
-        escrow_policy: prepared.escrow_policy,
-    };
-    assert!(service
-        .register_participant(&session, players[0].clone(), &single)
+    let for_session = service
+        .get_registration_assignment(&session, players[0].clone())
         .await
-        .is_err());
+        .unwrap();
+    let for_scope = service
+        .deposit_assignment(scope_id.clone(), digest, players[0].clone())
+        .await
+        .unwrap();
+    for (what, mut assignment) in [
+        ("single-competition registration for the session", for_session),
+        ("single-competition registration under the scope", for_scope),
+    ] {
+        assignment.payout_policy = Some(serde_json::to_string(&single_policy).unwrap());
+        let prepared = coordinator_core::keymeld::prepare_payout_registration(
+            &entry_secret(member.slot),
+            &preimage(member.slot),
+            &assignment,
+        )
+        .await
+        .unwrap();
+        let single = ParticipantRegistrationData {
+            encrypted_private_key: prepared.encrypted_private_key,
+            public_key: hex::encode(&prepared.context.public_key),
+            auth_pubkey: prepared.auth_pubkey,
+            context: prepared.context,
+            payout_policy: Some(single_policy.clone()),
+            escrow_policy: prepared.escrow_policy,
+        };
+        refused(
+            what,
+            service
+                .register_participant(&session, players[0].clone(), &single)
+                .await,
+        );
+    }
 
     // Every member's deposit registers, and keygen completes.
     for ticket in &members {
@@ -502,20 +522,24 @@ async fn a_queued_pool_registers_deposits_binds_its_statement_and_signs() {
         funding_outpoint: OutPoint::null(),
     };
     // 5. A statement of the other pool's entries, even under this pool's event, is refused.
-    assert!(service
+    refused(
+        "statement of the other pool",
+        service
         .bind_payout_contract_with_statement(
             &session,
             &contract,
             &policies,
             oracle_statement(&terms, pool_id, &others),
         )
-        .await
-        .is_err());
+        .await,
+    );
     // So is a binding without the oracle's statement.
-    assert!(service
+    refused(
+        "binding without a statement",
+        service
         .bind_payout_contract(&session, &contract, &policies)
-        .await
-        .is_err());
+        .await,
+    );
     let bindings = service
         .bind_payout_contract_with_statement(&session, &contract, &policies, statement.clone())
         .await
@@ -582,10 +606,12 @@ async fn a_queued_pool_registers_deposits_binds_its_statement_and_signs() {
         .await
         .unwrap();
     for ticket in &mixed {
-        assert!(service
+        refused(
+        "session unlike its pool",
+        service
             .register_participant(&wrong, UserId::from(*ticket), &by_ticket[ticket].deposit)
-            .await
-            .is_err());
+            .await,
+    );
     }
 
     // 6. A ticket no pool took registers into a session made only for refunds, under which
@@ -616,19 +642,23 @@ async fn a_queued_pool_registers_deposits_binds_its_statement_and_signs() {
     let leftover_policies =
         BTreeMap::from([(UserId::from(leftover), by_ticket[&leftover].policy.clone())]);
     let other_statement = oracle_statement(&terms, refund_id, &others);
-    assert!(service
+    refused(
+        "refund-only binding with a statement",
+        service
         .bind_payout_contract_with_statement(
             &refunds,
             &contract,
             &leftover_policies,
             other_statement,
         )
-        .await
-        .is_err());
-    assert!(service
+        .await,
+    );
+    refused(
+        "refund-only binding without a statement",
+        service
         .bind_payout_contract(&refunds, &contract, &leftover_policies)
-        .await
-        .is_err());
+        .await,
+    );
 
     println!(
         "queued pool of {} on {} enclaves: {:.2}s",
