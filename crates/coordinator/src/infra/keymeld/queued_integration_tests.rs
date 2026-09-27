@@ -470,7 +470,10 @@ async fn a_queued_pool_registers_deposits_binds_its_statement_and_signs() {
         .await
         .unwrap();
     for (what, mut assignment) in [
-        ("single-competition registration for the session", for_session),
+        (
+            "single-competition registration for the session",
+            for_session,
+        ),
         ("single-competition registration under the scope", for_scope),
     ] {
         assignment.payout_policy = Some(serde_json::to_string(&single_policy).unwrap());
@@ -530,20 +533,20 @@ async fn a_queued_pool_registers_deposits_binds_its_statement_and_signs() {
     refused(
         "statement of the other pool",
         service
-        .bind_payout_contract_with_statement(
-            &session,
-            &contract,
-            &policies,
-            oracle_statement(&terms, pool_id, &others),
-        )
-        .await,
+            .bind_payout_contract_with_statement(
+                &session,
+                &contract,
+                &policies,
+                oracle_statement(&terms, pool_id, &others),
+            )
+            .await,
     );
     // So is a binding without the oracle's statement.
     refused(
         "binding without a statement",
         service
-        .bind_payout_contract(&session, &contract, &policies)
-        .await,
+            .bind_payout_contract(&session, &contract, &policies)
+            .await,
     );
     let bindings = service
         .bind_payout_contract_with_statement(&session, &contract, &policies, statement.clone())
@@ -612,11 +615,11 @@ async fn a_queued_pool_registers_deposits_binds_its_statement_and_signs() {
         .unwrap();
     for ticket in &mixed {
         refused(
-        "session unlike its pool",
-        service
-            .register_participant(&wrong, UserId::from(*ticket), &by_ticket[ticket].deposit)
-            .await,
-    );
+            "session unlike its pool",
+            service
+                .register_participant(&wrong, UserId::from(*ticket), &by_ticket[ticket].deposit)
+                .await,
+        );
     }
 
     // 6. A ticket no pool took registers into a session made only for refunds, under which
@@ -650,19 +653,19 @@ async fn a_queued_pool_registers_deposits_binds_its_statement_and_signs() {
     refused(
         "refund-only binding with a statement",
         service
-        .bind_payout_contract_with_statement(
-            &refunds,
-            &contract,
-            &leftover_policies,
-            other_statement,
-        )
-        .await,
+            .bind_payout_contract_with_statement(
+                &refunds,
+                &contract,
+                &leftover_policies,
+                other_statement,
+            )
+            .await,
     );
     refused(
         "refund-only binding without a statement",
         service
-        .bind_payout_contract(&refunds, &contract, &leftover_policies)
-        .await,
+            .bind_payout_contract(&refunds, &contract, &leftover_policies)
+            .await,
     );
 
     println!(
