@@ -59,6 +59,7 @@ fn fixture_with(automatic: bool, ark_escrow: Option<ArkEscrowPolicy>) -> Fixture
                 subset_id: Uuid::from_u128(1),
                 participants: vec![user.clone()],
             }],
+            deposit_scope: None,
         },
         &[11; 32],
     )
@@ -167,15 +168,15 @@ impl Fixture {
         attempt: &ActionAttempt,
         invoice: String,
     ) -> Payload {
-        let (_, terms) = policy(&self.policy).unwrap();
+        let (_, consent) = policy(&self.policy).unwrap();
         let authorization = SignedInvoiceAuthorization::sign(
             &[14; 32],
             InvoiceAuthorizationContext {
                 keygen_session_id: self.manifest.manifest.keygen_session_id.clone(),
                 user_id: self.policy.policy.context.user_id.clone(),
                 claim_id: attempt.attempt_id,
-                competition_id: terms.competition_id,
-                entry_id: terms.entry_id,
+                competition_id: consent.competition_id(),
+                entry_id: consent.entry_id(),
                 contract_digest: payout::contract_digest(&self.contract).unwrap(),
                 invoice_digest: payout::invoice_digest(&invoice),
                 amount_msat: 100_000_000,
@@ -518,7 +519,11 @@ fn binding_rejects_missing_policies_changed_economics_and_wrong_roster() {
                 participant_policies: &f.policies,
                 participant_public_keys: &f.keys
             },
-            &Payload::encode(&ContractBinding { contract: changed, statement: None }).unwrap()
+            &Payload::encode(&ContractBinding {
+                contract: changed,
+                statement: None
+            })
+            .unwrap()
         )
         .is_err());
     let mut keys = f.keys.clone();
@@ -973,6 +978,9 @@ async fn renewed_invoice_keeps_late_paid_candidate_and_freezes_both_releases() {
         .unwrap();
 }
 
+#[path = "queued_tests.rs"]
+mod queued_pools;
+
 mod ark_escrow {
     use super::*;
     use coordinator_ark_escrow::{
@@ -992,15 +1000,15 @@ mod ark_escrow {
         "20aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac";
     /// A refunded escrow's value. The shared LNURL fixture answers one exact amount, so this
     /// leaves the player the 100,000 sats it expects to be asked for.
-    const REFUNDED_SATS: u64 = 100_000 + MAX_REFUND_FEE_SATS;
-    const MAX_FEE_SATS: u64 = 500;
-    const MAX_REFUND_FEE_SATS: u64 = 100;
+    pub(super) const REFUNDED_SATS: u64 = 100_000 + MAX_REFUND_FEE_SATS;
+    pub(super) const MAX_FEE_SATS: u64 = 500;
+    pub(super) const MAX_REFUND_FEE_SATS: u64 = 100;
 
     fn xonly(secret: u8) -> XOnlyPublicKey {
         XOnlyPublicKey::from_slice(&public(secret)[1..]).unwrap()
     }
     /// The entry key 14's escrow, with the market maker 18 as its coordinator.
-    fn escrow_with(player: u8, coordinator: u8) -> EntryEscrow {
+    pub(super) fn escrow_with(player: u8, coordinator: u8) -> EntryEscrow {
         EntryEscrow::new(EscrowTerms {
             player: xonly(player),
             coordinator: xonly(coordinator),
@@ -1011,7 +1019,7 @@ mod ark_escrow {
         })
         .unwrap()
     }
-    fn policy_for(escrow: &EntryEscrow) -> ArkEscrowPolicy {
+    pub(super) fn policy_for(escrow: &EntryEscrow) -> ArkEscrowPolicy {
         ArkEscrowPolicy {
             escrow_tap_tree: hex::encode(escrow.vtxo_script().encode_tap_tree()),
             max_fee_sats: MAX_FEE_SATS,
@@ -1023,7 +1031,7 @@ mod ark_escrow {
         let escrow = escrow_with(14, 18);
         (fixture_with(false, Some(policy_for(&escrow))), escrow)
     }
-    fn p2tr(secret: u8) -> ScriptBuf {
+    pub(super) fn p2tr(secret: u8) -> ScriptBuf {
         ScriptBuf::new_p2tr_tweaked(
             dlctix::bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(xonly(secret)),
         )
@@ -1041,7 +1049,7 @@ mod ark_escrow {
         OutPoint::new(Txid::from_byte_array([byte; 32]), 0)
     }
     /// A BIP322-style proof: the message input, this escrow, and another player's escrow.
-    fn intent_proof(escrow: &EntryEscrow, outputs: Vec<TxOut>) -> Psbt {
+    pub(super) fn intent_proof(escrow: &EntryEscrow, outputs: Vec<TxOut>) -> Psbt {
         let mut psbt = Psbt::from_unsigned_tx(Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
@@ -1071,16 +1079,16 @@ mod ark_escrow {
         spend_leaf(&mut psbt.inputs[1], escrow);
         psbt
     }
-    fn funding_output(f: &Fixture) -> TxOut {
+    pub(super) fn funding_output(f: &Fixture) -> TxOut {
         f.contract.contract_parameters.funding_output().unwrap()
     }
-    fn attempt() -> ActionAttempt {
+    pub(super) fn attempt() -> ActionAttempt {
         ActionAttempt {
             attempt_id: Uuid::now_v7(),
             signing_session_id: None,
         }
     }
-    async fn prepare(
+    pub(super) async fn prepare(
         verifier: &CoordinatorVerifier,
         f: &Fixture,
         bound: &Payload,
@@ -1097,7 +1105,7 @@ mod ark_escrow {
             .await?;
         Ok((prepared, attempt))
     }
-    fn digests(action: &Action) -> Vec<[u8; 32]> {
+    pub(super) fn digests(action: &Action) -> Vec<[u8; 32]> {
         let Action::SignBip340 { scope } = action else {
             panic!("expected a BIP340 action")
         };
@@ -1466,7 +1474,7 @@ mod ark_escrow {
     }
 
     /// The swap a refund pays, committing to the invoice `preimage` settles.
-    fn refund_swap(preimage: [u8; 32]) -> RefundSwap {
+    pub(super) fn refund_swap(preimage: [u8; 32]) -> RefundSwap {
         let deadline = LockTime::from_consensus(now().unwrap() as u32 + 3_600);
         let exit_delay = RelativeTimelock::Seconds(2048);
         RefundSwap::new(SwapTerms {
@@ -1482,7 +1490,7 @@ mod ark_escrow {
     }
 
     /// The Ark transaction is signed first, before the server co-signs it; the checkpoint after.
-    fn refund_of(escrow: &EntryEscrow, swap: &RefundSwap) -> ArkEscrowSpend {
+    pub(super) fn refund_of(escrow: &EntryEscrow, swap: &RefundSwap) -> ArkEscrowSpend {
         refund_signing(escrow, swap, RefundPurpose::ArkTransaction)
     }
 
@@ -1500,7 +1508,11 @@ mod ark_escrow {
         }
     }
 
-    fn refund_parameters(spend: ArkEscrowSpend, invoice: String, fee_sats: u64) -> Payload {
+    pub(super) fn refund_parameters(
+        spend: ArkEscrowSpend,
+        invoice: String,
+        fee_sats: u64,
+    ) -> Payload {
         Payload::encode(&ActionParameters::RefundArkEscrow {
             spend,
             invoice,

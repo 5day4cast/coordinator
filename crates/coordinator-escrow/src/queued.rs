@@ -14,7 +14,10 @@
 
 use crate::{
     authorization::{authorization_digest, PayoutPolicy},
-    capacity::{MAX_COMPETITION_PLAYERS, MAX_COMPETITION_WINNING_PLACES},
+    capacity::{
+        MAX_COMPETITION_PLAYERS, MAX_COMPETITION_WINNING_PLACES, MAX_QUEUED_LINES,
+        MAX_QUEUED_NAME_BYTES, MAX_QUEUED_SCORING_FIELDS, MAX_QUEUED_TARGETS,
+    },
     oracle_statement::{ObservationTerms, Outcomes, SignedStatement, Terms},
     payout::{ContractAuthorization, MAX_CONTRACT_BYTES},
     pools::{self, PoolRules},
@@ -108,7 +111,7 @@ impl QueuedTerms {
             .checked_mul(self.pool_rules.max_players() as u64)
             .filter(|total| Amount::from_sat(*total) <= Amount::MAX_MONEY)
             .ok_or_else(|| terms_error("a full pool's funding value overflows"))?;
-        Ok(())
+        check_observation_size(&self.observation)
     }
 
     pub fn oracle_key(&self) -> Result<XOnlyPublicKey, QueuedError> {
@@ -128,6 +131,37 @@ impl QueuedTerms {
         authorization_digest("5day4cast/queued-terms/v1", self)
             .map_err(|error| terms_error(error.to_string()))
     }
+}
+
+/// Refuse observation terms larger than the capacity model charges for. Every consent and each
+/// pool's statement repeat them, so larger terms could leave a formed pool unable to bind; they
+/// are refused when the deposit is validated, before the player pays.
+pub(crate) fn check_observation_size(observation: &ObservationTerms) -> Result<(), QueuedError> {
+    let fits = |name: &String| {
+        name.len() <= MAX_QUEUED_NAME_BYTES
+            && !name
+                .bytes()
+                .any(|byte| byte < 0x20 || byte == b'"' || byte == b'\\')
+    };
+    if observation.targets.len() > MAX_QUEUED_TARGETS
+        || observation.scoring_fields.len() > MAX_QUEUED_SCORING_FIELDS
+        || observation.lines.len() > MAX_QUEUED_LINES
+        || !std::iter::once(&observation.source)
+            .chain(&observation.targets)
+            .chain(&observation.scoring_fields)
+            .chain(
+                observation
+                    .lines
+                    .iter()
+                    .flat_map(|line| [&line.target, &line.metric]),
+            )
+            .all(fits)
+    {
+        return Err(terms_error(
+            "observation terms exceed what a pool's session can carry",
+        ));
+    }
+    Ok(())
 }
 
 /// The Keymeld registration scope a queued competition's deposits are sealed under: the
