@@ -63,6 +63,7 @@ fn entry(event_id: Uuid, pubkey: &str, picks: Vec<WeatherChoices>) -> UserEntry 
         paid_at: Some(start()),
         sellback_broadcasted_at: None,
         reclaimed_broadcasted_at: None,
+        sweep_uneconomic_at: None,
         paid_out_at: None,
         payout_ln_invoice: None,
     }
