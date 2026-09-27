@@ -14,7 +14,7 @@
     # Finalize this immutable pin with Cargo.toml after committing Keymeld payout support.
     # Local verification: --override-input keymeld git+file:///path/to/keymeld-auto
     keymeld = {
-      url = "github:tee8z/keymeld/v0.5.0";
+      url = "github:tee8z/keymeld/v0.6.0";
     };
   };
 
