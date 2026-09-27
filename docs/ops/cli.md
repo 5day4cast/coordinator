@@ -68,13 +68,17 @@ Synth's API has no authentication of its own: anyone who can reach its port can 
 which pay for entries, and call its rebalance endpoint, which moves money. Keep it on a network
 that admits operators alone, or behind a proxy that does. These commands send no credentials.
 
-Run kinds: `full-lifecycle` and `escrow-refund` (`full_lifecycle` and `escrow_refund` work too).
+Run kinds: `full-lifecycle` and `escrow-refund` (`full_lifecycle` and `escrow_refund` work too),
+and the other cases in [synthetic traffic](synthetic-traffic.md), including the queued ones:
+`queued-split`, `queued-one-pool`, `queued-too-few` and `queued-leftover-refund`.
 
 ```sh
 # Start a run. It pays for entries from synth's node, so it asks first; --yes skips that.
 # Prints the run id.
 synth run full-lifecycle --yes
 synth run escrow-refund --users 2 --yes
+# A queued competition that splits into two pools, with 5 players and pools of up to 3.
+synth run queued-split --queue-players 5 --max-pool-players 3 --yes
 
 # Start and follow: prints each step as it changes, then waits for the money to settle.
 synth run full-lifecycle --yes --wait

@@ -244,7 +244,7 @@ async fn main() -> Result<()> {
                     let config = config.resolve_plan(&scenario)?;
 
                     println!("Running scenario: {}", scenario);
-                    println!("  Users: {}", users);
+                    println!("  Users: {}", config.users);
                     println!("  Seed: {}", config.seed.expect("resolved seed"));
                     println!(
                         "  Observation window: {} min",

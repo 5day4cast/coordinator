@@ -185,6 +185,48 @@ fn terms_validate_and_every_field_changes_the_digest() {
     }
 }
 
+/// Terms with the most stations, metrics and lines, each name at its longest.
+fn terms_at_the_size_bounds() -> QueuedTerms {
+    let name = "x".repeat(MAX_QUEUED_NAME_BYTES);
+    let mut terms = terms();
+    let observation = &mut terms.observation;
+    observation.source = name.clone();
+    observation.targets = vec![name.clone(); MAX_QUEUED_TARGETS];
+    observation.scoring_fields = vec![name.clone(); MAX_QUEUED_SCORING_FIELDS];
+    observation.lines = (0..MAX_QUEUED_LINES)
+        .map(|_| LineTerms {
+            target: name.clone(),
+            metric: name.clone(),
+            lower: -1.0,
+            upper: 1.0,
+            window_hours: 24,
+        })
+        .collect();
+    terms
+}
+
+#[test]
+fn terms_larger_than_a_pool_session_carries_are_refused() {
+    terms_at_the_size_bounds().validate().unwrap();
+    let larger: &[fn(&mut ObservationTerms)] = &[
+        |o| o.source.push('x'),
+        |o| o.targets.push("KORD".into()),
+        |o| o.scoring_fields.push("temp_low".into()),
+        |o| o.lines.push(o.lines[0].clone()),
+        |o| o.lines[0].target.push('x'),
+        |o| o.lines[0].metric.push('x'),
+        // Characters JSON escapes grow in every encoding that repeats them.
+        |o| o.targets[0] = "KORD\"".into(),
+        |o| o.lines[0].target = "KORD\\".into(),
+        |o| o.scoring_fields[0] = "temp\nhigh".into(),
+    ];
+    for change in larger {
+        let mut changed = terms_at_the_size_bounds();
+        change(&mut changed.observation);
+        assert!(changed.validate().is_err());
+    }
+}
+
 #[test]
 fn a_queued_policy_names_no_contract_and_needs_an_escrow() {
     let entry = entry(1);

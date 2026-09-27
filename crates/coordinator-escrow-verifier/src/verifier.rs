@@ -1,12 +1,14 @@
 //! Application semantics only. Custody keys, deposits, sealing and execution
 //! remain in Keymeld; this verifier can only propose participant-authorized actions.
-use coordinator_escrow::payout::dlctix::ContractSignatures;
+use coordinator_escrow::payout::dlctix::{ContractSignatures, MarketMaker};
 use coordinator_escrow::{
     ark::{self, ArkEscrowSpend, ArkFunding},
     authorization::PayoutPolicy,
     generic::{self, ActionParameters, ContractBinding, PaymentEvidence, PreparedSettlement},
+    oracle_statement::SignedStatement,
     payout::{self, ContractAuthorization, ContractCommitment},
     payout_protocol::{InvoiceAuthorizationContext, PayoutMethod},
+    queued::{self, DepositEvidence, EntryConsent, QueuedEntryTerms},
 };
 use keymeld_core::{
     authorization::SignedSessionManifest,
@@ -116,6 +118,10 @@ struct BoundContract {
     policy_digest: [u8; 32],
     manifest_digest: [u8; 32],
     participant_public_keys: BTreeMap<UserId, PublicKeyBytes>,
+    /// For a pool of a queued competition: the oracle's signed statement of the pool's event,
+    /// from which every later action derives the entry's contract terms again. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    statement: Option<SignedStatement>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -158,9 +164,7 @@ fn hex32(value: &str) -> Result<[u8; 32], VerificationError> {
         .try_into()
         .map_err(|_| invalid("Expected exactly 32 bytes"))
 }
-fn policy(
-    signed: &SignedEscrowPolicy,
-) -> Result<(PayoutPolicy, ContractAuthorization), VerificationError> {
+fn policy(signed: &SignedEscrowPolicy) -> Result<(PayoutPolicy, EntryConsent), VerificationError> {
     let selection = signed
         .policy
         .verifier
@@ -179,12 +183,12 @@ fn policy(
         ));
     }
     let value: PayoutPolicy = selection.policy_data.decode().map_err(invalid)?;
-    let terms = ContractAuthorization::from_policy(&value).map_err(invalid)?;
-    Ok((value, terms))
+    let consent = EntryConsent::from_policy(&value).map_err(invalid)?;
+    Ok((value, consent))
 }
 fn check_permissions(
     signed: &SignedEscrowPolicy,
-    terms: &ContractAuthorization,
+    consent: &EntryConsent,
     ark_escrow: bool,
 ) -> Result<(), VerificationError> {
     let mut expected: BTreeSet<_> = [
@@ -264,7 +268,7 @@ fn check_permissions(
             (generic::RELEASE_PREIMAGE, Permission::ReleaseSecret { name, recipient })
                 if name == generic::PREIMAGE_SECRET
                     && recipient.encryption_public_key.as_bytes()
-                        == terms.market_maker.pubkey.serialize() => {}
+                        == consent.market_maker().pubkey.serialize() => {}
             (
                 generic::RELEASE_ENTRY_KEY,
                 Permission::ReleaseSigningKey {
@@ -273,7 +277,7 @@ fn check_permissions(
                 },
             ) if public_key == &signed.policy.participant_public_key
                 && recipient.encryption_public_key.as_bytes()
-                    == terms.market_maker.pubkey.serialize() => {}
+                    == consent.market_maker().pubkey.serialize() => {}
             _ => return Err(invalid("Coordinator permission operation differs")),
         }
     }
@@ -282,7 +286,7 @@ fn check_permissions(
             .policy
             .secrets
             .get(generic::PREIMAGE_SECRET)
-            .is_none_or(|secret| secret.length != 32 || secret.sha256 != terms.payout_hash)
+            .is_none_or(|secret| secret.length != 32 || secret.sha256 != consent.payout_hash())
     {
         return Err(invalid(
             "Entry preimage commitment differs from authorized contract",
@@ -293,7 +297,7 @@ fn check_permissions(
 fn validate_static(
     manifest: &SignedSessionManifest,
     signed: &SignedEscrowPolicy,
-) -> Result<(PayoutPolicy, ContractAuthorization), VerificationError> {
+) -> Result<(PayoutPolicy, EntryConsent), VerificationError> {
     signed
         .verify(
             &signed.policy.context,
@@ -301,9 +305,11 @@ fn validate_static(
         )
         .map_err(invalid)?;
     manifest.verify().map_err(invalid)?;
-    if signed.policy.context.keygen_session_id != manifest.manifest.keygen_session_id
-        || signed.policy.context.manifest_digest.as_slice()
-            != manifest.digest().map_err(invalid)?.as_slice()
+    // The session's own id and digest, or for a session formed from key deposits, the scope the
+    // deposits were sealed under. `check_deposit_scope` decides which entries may use the latter.
+    let (scope_session_id, scope_digest) = manifest.registration_scope().map_err(invalid)?;
+    if signed.policy.context.keygen_session_id != scope_session_id
+        || signed.policy.context.manifest_digest.as_slice() != scope_digest.as_slice()
         || signed.policy.context.user_id == manifest.manifest.coordinator_user_id
         || !manifest
             .manifest
@@ -314,15 +320,16 @@ fn validate_static(
             "Coordinator escrow policy has invalid participant or manifest scope",
         ));
     }
-    let (policy, terms) = policy(signed)?;
-    if signed.policy.context.escrow_id != terms.entry_id {
+    let (policy, consent) = policy(signed)?;
+    if signed.policy.context.escrow_id != consent.entry_id() {
         return Err(invalid(
             "Escrow identifier differs from the authorized entry",
         ));
     }
-    check_permissions(signed, &terms, policy.ark_escrow.is_some())?;
+    check_deposit_scope(manifest, signed, &consent)?;
+    check_permissions(signed, &consent, policy.ark_escrow.is_some())?;
     if let Some(ark_policy) = &policy.ark_escrow {
-        ark_escrow(signed, &terms, ark_policy)?;
+        ark_escrow(signed, consent.market_maker(), ark_policy)?;
     }
     if let Some(address) = &policy.automatic_lightning_address {
         #[cfg(feature = "lnurl")]
@@ -336,14 +343,127 @@ fn validate_static(
             return Err(invalid("Invalid Lightning Address"));
         }
     }
-    Ok((policy, terms))
+    Ok((policy, consent))
+}
+/// Which sessions an entry may join. A single competition's entry joins only its own session,
+/// never one formed from key deposits. A queued entry joins only a session formed from its
+/// competition's deposits, as itself, and under pool evidence only the session of its own pool.
+fn check_deposit_scope(
+    manifest: &SignedSessionManifest,
+    signed: &SignedEscrowPolicy,
+    consent: &EntryConsent,
+) -> Result<(), VerificationError> {
+    match consent {
+        EntryConsent::Contract(_) => {
+            if manifest.manifest.deposit_scope.is_some() {
+                return Err(invalid(
+                    "A single competition's entry cannot join a session of key deposits",
+                ));
+            }
+        }
+        EntryConsent::Queued(entry) => {
+            if signed.policy.context.user_id != UserId::from(entry.entry_id) {
+                return Err(invalid("A queued entry registers as its own entry"));
+            }
+            queued_pool(manifest, entry)?;
+        }
+    }
+    Ok(())
+}
+/// The pool a session of a queued competition's deposits was formed as: its members, sorted by
+/// entry id, recomputed from the manifest's evidence, or `None` for deposits registered only to
+/// be refunded. The deposit scope must be the one every entry of the competition was sealed
+/// under, and the session's players exactly the pool's members, this entry among them.
+fn queued_pool(
+    manifest: &SignedSessionManifest,
+    entry: &QueuedEntryTerms,
+) -> Result<Option<Vec<Uuid>>, VerificationError> {
+    let scope = manifest.manifest.deposit_scope.as_ref().ok_or_else(|| {
+        invalid("A queued entry joins only a session of its competition's deposits")
+    })?;
+    let (session_id, digest) = queued::deposit_scope(&entry.terms).map_err(invalid)?;
+    if scope.deposit_session_id != session_id
+        || scope.deposit_digest.as_slice() != digest.as_slice()
+    {
+        return Err(invalid(
+            "Deposit scope differs from the queued competition and its terms",
+        ));
+    }
+    let evidence = DepositEvidence::decode(&scope.evidence).map_err(invalid)?;
+    if evidence.competition_id() != entry.terms.competition_id {
+        return Err(invalid("Deposit evidence belongs to another competition"));
+    }
+    let Some(members) = evidence
+        .pool_members(&entry.terms.pool_rules)
+        .map_err(invalid)?
+    else {
+        return Ok(None);
+    };
+    let players = manifest
+        .manifest
+        .participant_verifiers
+        .keys()
+        .filter(|id| **id != manifest.manifest.coordinator_user_id)
+        .map(UserId::uuid)
+        .collect::<BTreeSet<_>>();
+    // Formation refuses duplicate tickets, so equal sizes and inclusion make equal sets.
+    if players.len() != members.len()
+        || members.iter().any(|member| !players.contains(member))
+        || !members.contains(&entry.entry_id)
+    {
+        return Err(invalid(
+            "Session players differ from the pool its formation gives",
+        ));
+    }
+    Ok(Some(members))
+}
+/// The digest of the queued competition's terms an entry consented to, or `None` for a single
+/// competition's entry.
+fn queued_terms_digest(consent: &EntryConsent) -> Result<Option<[u8; 32]>, VerificationError> {
+    match consent {
+        EntryConsent::Contract(_) => Ok(None),
+        EntryConsent::Queued(entry) => entry.terms.digest().map(Some).map_err(invalid),
+    }
+}
+/// The concrete contract terms an entry is held to in this session: those it consented to, or
+/// for a queued entry, those derived from its pool's formation and the oracle's signed statement
+/// of the pool's event. Only a pool of a queued competition carries a statement.
+fn contract_terms(
+    manifest: &SignedSessionManifest,
+    consent: &EntryConsent,
+    statement: Option<&SignedStatement>,
+) -> Result<ContractAuthorization, VerificationError> {
+    match consent {
+        EntryConsent::Contract(terms) => match statement {
+            None => Ok(terms.clone()),
+            Some(_) => Err(invalid(
+                "Only a pool of a queued competition binds an oracle statement",
+            )),
+        },
+        EntryConsent::Queued(entry) => {
+            let statement = statement.ok_or_else(|| {
+                invalid("A queued competition's pool binds the oracle's statement of its event")
+            })?;
+            let members = queued_pool(manifest, entry)?.ok_or_else(|| {
+                invalid("Deposits registered to be refunded cannot bind a contract")
+            })?;
+            // A pool's session is its oracle event's: one statement binds one session.
+            if manifest.manifest.keygen_session_id != SessionId::from(statement.statement.event_id)
+            {
+                return Err(invalid(
+                    "The oracle statement is of another pool's event than this session",
+                ));
+            }
+            queued::pool_authorization(entry, &members, statement).map_err(invalid)
+        }
+    }
 }
 fn restore_binding(
     manifest: &SignedSessionManifest,
     signed: &SignedEscrowPolicy,
     payload: &Payload,
 ) -> Result<(BoundContract, PayoutPolicy, ContractAuthorization), VerificationError> {
-    let (policy, terms) = validate_static(manifest, signed)?;
+    let (policy, consent) = validate_static(manifest, signed)?;
     let bound: BoundContract = payload.decode().map_err(invalid)?;
     if bound.policy_digest != signed.policy.digest().map_err(invalid)?
         || bound.manifest_digest.as_slice() != manifest.digest().map_err(invalid)?.as_slice()
@@ -353,6 +473,7 @@ fn restore_binding(
             "Bound application state differs from policy, manifest or contract",
         ));
     }
+    let terms = contract_terms(manifest, &consent, bound.statement.as_ref())?;
     terms
         .verify_contract(
             &bound.contract,
@@ -371,13 +492,13 @@ fn xonly(compressed: &[u8]) -> Result<ark::XOnlyPublicKey, VerificationError> {
 /// The entry's escrow, checked against its entry key and the pool's market maker.
 fn ark_escrow(
     signed: &SignedEscrowPolicy,
-    terms: &ContractAuthorization,
+    market_maker: &MarketMaker,
     policy: &coordinator_escrow::authorization::ArkEscrowPolicy,
 ) -> Result<coordinator_ark_escrow::EntryEscrow, VerificationError> {
     ark::escrow(
         policy,
         xonly(signed.policy.participant_public_key.as_bytes())?,
-        xonly(&terms.market_maker.pubkey.serialize())?,
+        xonly(&market_maker.pubkey.serialize())?,
     )
     .map_err(invalid)
 }
@@ -409,7 +530,7 @@ fn ark_escrow_action(
         .ark_escrow
         .as_ref()
         .ok_or_else(|| invalid("This ticket has no Arkade escrow"))?;
-    let escrow = ark_escrow(signed, terms, ark_policy)?;
+    let escrow = ark_escrow(signed, &terms.market_maker, ark_policy)?;
     let digests =
         ark::spend_digests(&escrow, ark_policy, &bound.contract, spend).map_err(invalid)?;
     let inputs = digests.iter().map(|(input, _)| *input).collect();
@@ -448,8 +569,8 @@ fn check_refund(
     {
         return Err(invalid("Escrow refund permission differs"));
     }
-    let (policy, terms) = validate_static(context.manifest, context.policy)?;
-    let (action, swap, refund) = ark_refund_action(context.policy, &policy, &terms, spend)?;
+    let (policy, consent) = validate_static(context.manifest, context.policy)?;
+    let (action, swap, refund) = ark_refund_action(context.policy, &policy, &consent, spend)?;
     if prepared.action != action {
         return Err(invalid("Prepared refund differs from its transactions"));
     }
@@ -466,7 +587,7 @@ fn check_refund(
             "Prepared refund pays the player a different amount",
         ));
     }
-    let parsed = payout::validate_prepared_invoice(invoice, owed_sats, terms.network)
+    let parsed = payout::validate_prepared_invoice(invoice, owed_sats, consent.network())
         .map_err(|_| invalid("Prepared refund invoice is invalid"))?;
     let payment_hash = *(parsed.payment_hash().as_ref() as &[u8; 32]);
     ark::check_refund_invoice(&swap, payment_hash).map_err(invalid)
@@ -476,18 +597,19 @@ fn check_refund(
 ///
 /// A refund acts without a binding: its pool never formed, so there is no contract and possibly
 /// no completed keygen session. Everything it needs comes from the participant's own signed
-/// policy: the escrow's terms, and the cap on what a swap may keep.
+/// policy: the escrow's terms, and the cap on what a swap may keep. A queued entry's consent
+/// names no contract at all, so a refund reads only the entry-level fields they share.
 fn ark_refund_action(
     signed: &SignedEscrowPolicy,
     policy: &PayoutPolicy,
-    terms: &ContractAuthorization,
+    consent: &EntryConsent,
     spend: &ArkEscrowSpend,
 ) -> Result<(Action, coordinator_ark_escrow::RefundSwap, ark::RefundSpend), VerificationError> {
     let ark_policy = policy
         .ark_escrow
         .as_ref()
         .ok_or_else(|| invalid("This ticket has no Arkade escrow"))?;
-    let escrow = ark_escrow(signed, terms, ark_policy)?;
+    let escrow = ark_escrow(signed, consent.market_maker(), ark_policy)?;
     let (swap, refund) = ark::refund_from(&escrow, ark_policy, spend).map_err(invalid)?;
     let action = Action::SignBip340 {
         scope: Bip340Scope {
@@ -711,8 +833,8 @@ impl CoordinatorVerifier {
         {
             return Err(invalid("Escrow refund permission differs"));
         }
-        let (policy, terms) = validate_static(context.manifest, context.policy)?;
-        let (action, swap, refund) = ark_refund_action(context.policy, &policy, &terms, &spend)?;
+        let (policy, consent) = validate_static(context.manifest, context.policy)?;
+        let (action, swap, refund) = ark_refund_action(context.policy, &policy, &consent, &spend)?;
         let ark_policy = policy
             .ark_escrow
             .as_ref()
@@ -726,8 +848,8 @@ impl CoordinatorVerifier {
             .as_ref()
             .ok_or_else(|| invalid("This entry has no Lightning Address to refund"))?;
         let now = now()?;
-        let parsed =
-            payout::validate_invoice(&invoice, owed_sats, terms.network, now).map_err(invalid)?;
+        let parsed = payout::validate_invoice(&invoice, owed_sats, consent.network(), now)
+            .map_err(invalid)?;
         // The invoice is the caller's, so it is checked against the address the player signed.
         let binding = self.invoice_binding(address, amount_msat).await?;
         payout::validate_address_invoice(&parsed, binding).map_err(invalid)?;
@@ -789,8 +911,10 @@ impl EscrowVerifier for CoordinatorVerifier {
         context: BindView<'_>,
         binding_data: &Payload,
     ) -> Result<Payload, VerificationError> {
-        let (_, terms) = validate_static(context.manifest, context.policy)?;
+        let (_, consent) = validate_static(context.manifest, context.policy)?;
         let binding: ContractBinding = binding_data.decode().map_err(invalid)?;
+        let terms = contract_terms(context.manifest, &consent, binding.statement.as_ref())?;
+        let terms_digest = queued_terms_digest(&consent)?;
         let manifest = &context.manifest.manifest;
         if context.participant_public_keys.keys().collect::<Vec<_>>()
             != manifest.participant_verifiers.keys().collect::<Vec<_>>()
@@ -828,12 +952,31 @@ impl EscrowVerifier for CoordinatorVerifier {
                 "Contract slots differ from the authenticated participant roster",
             ));
         }
+        if let EntryConsent::Queued(entry) = &consent {
+            // A pool member's slot is its entry id's rank in the pool, which the oracle's
+            // outcomes follow, so the roster must list the players in entry id order.
+            let members = queued_pool(context.manifest, entry)?
+                .ok_or_else(|| invalid("Deposits registered to be refunded cannot bind"))?;
+            if players.iter().map(|(id, _)| id.uuid()).collect::<Vec<_>>() != members {
+                return Err(invalid("Contract slots differ from the pool's entry order"));
+            }
+        }
         for (index, (user, key)) in players.iter().enumerate() {
             let accepted = context
                 .participant_policies
                 .get(*user)
                 .ok_or_else(|| invalid("Missing player policy"))?;
-            let (_, accepted_terms) = validate_static(context.manifest, accepted)?;
+            let (_, accepted_consent) = validate_static(context.manifest, accepted)?;
+            if queued_terms_digest(&accepted_consent)? != terms_digest {
+                return Err(invalid(
+                    "Every player of a session consents to the same competition terms",
+                ));
+            }
+            let accepted_terms = contract_terms(
+                context.manifest,
+                &accepted_consent,
+                binding.statement.as_ref(),
+            )?;
             if accepted.policy.context.user_id != **user
                 || accepted.policy.participant_public_key != **key
                 || accepted_terms.player_index != index
@@ -874,6 +1017,7 @@ impl EscrowVerifier for CoordinatorVerifier {
                 .try_into()
                 .map_err(|_| invalid("Invalid manifest digest"))?,
             participant_public_keys: context.participant_public_keys.clone(),
+            statement: binding.statement,
         })
         .map_err(invalid)
     }

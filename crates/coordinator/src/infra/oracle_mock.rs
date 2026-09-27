@@ -13,7 +13,7 @@ use dlctix::{
 use itertools::Itertools;
 use uuid::Uuid;
 
-use super::oracle::{AddEventEntries, Error, Event, Oracle};
+use super::oracle::{AddEventEntries, Error, Event, Oracle, OracleEventTerms, OracleLine};
 use crate::domain::CreateEvent;
 
 #[derive(Debug, Clone)]
@@ -41,11 +41,17 @@ impl Outcome {
 }
 
 struct MockEvent {
+    config: CreateEvent,
     nonce: Scalar,
     locking_conditions: EventLockingConditions,
     entries: Vec<AddEventEntries>,
     attestation: Option<MaybeScalar>,
+    /// For a `lines` event, the lines frozen when it was created.
+    lines: Vec<OracleLine>,
 }
+
+/// The metrics the mock scores, as NOAA's oracle does.
+const SCORING_FIELDS: [&str; 3] = ["temp_high", "temp_low", "wind_speed"];
 
 pub struct MockOracle {
     seed: [u8; 32],
@@ -114,8 +120,142 @@ impl MockOracle {
         self.generate_scalar(event_id.as_bytes())
     }
 
+    /// The oracle's key, with an even Y, as a BIP340 key: the locking points a signed
+    /// statement gives under the x-only key are the ones the mock announces.
     fn generate_oracle_key(&self) -> Scalar {
-        self.generate_scalar(b"oracle_key")
+        let key = self.generate_scalar(b"oracle_key");
+        let (_, parity): (
+            dlctix::musig2::secp256k1::XOnlyPublicKey,
+            dlctix::musig2::secp256k1::Parity,
+        ) = key.base_point_mul().into();
+        match parity {
+            dlctix::musig2::secp256k1::Parity::Even => key,
+            dlctix::musig2::secp256k1::Parity::Odd => -key,
+        }
+    }
+
+    /// The lines a `lines` event of the mock freezes: one per location and metric.
+    fn generate_lines(&self, config: &CreateEvent) -> Vec<OracleLine> {
+        let window_hours =
+            (config.end_observation_date - config.start_observation_date).whole_hours();
+        config
+            .locations
+            .iter()
+            .flat_map(|location| {
+                SCORING_FIELDS.iter().map(move |metric| {
+                    let spread = self.hash_with_context(format!("{location}/{metric}").as_bytes())
+                        [0] as f64
+                        / 64.0;
+                    OracleLine {
+                        target: location.clone(),
+                        metric: (*metric).to_string(),
+                        lower: -1.0 - spread,
+                        upper: 1.0 + spread,
+                        window_hours,
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// The oracle's signed statement of an event, once every entry is in.
+    fn statement(
+        &self,
+        event_id: &Uuid,
+        event: &MockEvent,
+        terms: &OracleEventTerms,
+    ) -> Result<Option<coordinator_escrow::oracle_statement::SignedStatement>, Error> {
+        use coordinator_escrow::oracle_statement::{
+            Outcomes, RankingOutcomes, SignedStatement, Statement, Terms,
+        };
+        use dlctix::musig2::secp256k1::{Keypair, Secp256k1, SecretKey};
+        let mut entry_ids: Vec<Uuid> = event
+            .entries
+            .iter()
+            .flat_map(|submission| submission.entries.iter().map(|entry| entry.id))
+            .collect();
+        if entry_ids.len() != event.config.total_allowed_entries {
+            return Ok(None);
+        }
+        entry_ids.sort_unstable();
+        let statement = Statement {
+            event_id: *event_id,
+            signing_date: event.config.signing_date.unix_timestamp(),
+            expiry: event
+                .locking_conditions
+                .expiry
+                .ok_or_else(|| Error::Request("mock event has no expiry".into()))?,
+            nonce_point: event.nonce.base_point_mul(),
+            outcomes: Outcomes::Ranking(RankingOutcomes {
+                number_of_places_win: event.config.number_of_places_win as u32,
+                entry_ids,
+            }),
+            terms: Terms::Observation(terms.observation()?),
+        };
+        let digest = statement
+            .digest()
+            .map_err(|e| Error::Request(e.to_string()))?;
+        let secret = SecretKey::from_byte_array(self.generate_oracle_key().serialize())
+            .map_err(|e| Error::Request(e.to_string()))?;
+        let keypair = Keypair::from_secret_key(&Secp256k1::new(), &secret);
+        let signature = Secp256k1::new().sign_schnorr_no_aux_rand(&digest, &keypair);
+        Ok(Some(SignedStatement {
+            statement,
+            signature: signature.to_string(),
+        }))
+    }
+
+    fn event_terms(&self, event_id: &Uuid, event: &MockEvent) -> Result<OracleEventTerms, Error> {
+        let config = &event.config;
+        let mut terms = OracleEventTerms {
+            event: Event {
+                id: *event_id,
+                nonce_point: event.nonce.base_point_mul(),
+                event_announcement: event.locking_conditions.clone(),
+                attestation: event.attestation,
+            },
+            signing_date: config.signing_date,
+            start_observation_date: config.start_observation_date,
+            end_observation_date: config.end_observation_date,
+            locations: config.locations.clone(),
+            number_of_values_per_entry: config.number_of_values_per_entry as u32,
+            total_allowed_entries: config.total_allowed_entries,
+            number_of_places_win: config.number_of_places_win as u32,
+            source: "noaa_weather".into(),
+            scoring_fields: SCORING_FIELDS
+                .iter()
+                .map(|field| field.to_string())
+                .collect(),
+            scoring_rules: Some(config.scoring_rules()),
+            lines: event.lines.clone(),
+            statement: None,
+        };
+        terms.statement = self.statement(event_id, event, &terms)?;
+        Ok(terms)
+    }
+
+    fn add_event(&self, config: CreateEvent, lines: Vec<OracleLine>) -> Result<Event, Error> {
+        config
+            .validate_oracle_settings()
+            .map_err(|reason| Error::BadRequest(reason.into()))?;
+        let nonce = self.generate_nonce(&config.id);
+        let locking_conditions = self.generate_locking_conditions(&config, &nonce);
+        let id = config.id;
+        let event = MockEvent {
+            config,
+            nonce,
+            locking_conditions: locking_conditions.clone(),
+            entries: vec![],
+            attestation: None,
+            lines,
+        };
+        self.events.write().unwrap().insert(id, event);
+        Ok(Event {
+            id,
+            nonce_point: nonce.base_point_mul(),
+            event_announcement: locking_conditions,
+            attestation: None,
+        })
     }
 
     fn generate_locking_conditions(
@@ -157,27 +297,47 @@ impl MockOracle {
 #[async_trait]
 impl Oracle for MockOracle {
     async fn create_event(&self, config: CreateEvent) -> Result<Event, Error> {
-        config
-            .validate_oracle_settings()
-            .map_err(|reason| Error::BadRequest(reason.into()))?;
-        let nonce = self.generate_nonce(&config.id);
-        let locking_conditions = self.generate_locking_conditions(&config, &nonce);
-
-        let event = MockEvent {
-            nonce,
-            locking_conditions: locking_conditions.clone(),
-            entries: vec![],
-            attestation: None,
+        let lines = match config.scoring_rules() {
+            crate::infra::oracle::ScoringRules::Lines => self.generate_lines(&config),
+            crate::infra::oracle::ScoringRules::Fixed => vec![],
         };
+        self.add_event(config, lines)
+    }
 
-        self.events.write().unwrap().insert(config.id, event);
+    async fn create_event_from_lines(
+        &self,
+        config: CreateEvent,
+        lines_from_event: Uuid,
+    ) -> Result<Event, Error> {
+        if config.scoring_rules() != crate::infra::oracle::ScoringRules::Lines {
+            return Err(Error::BadRequest(
+                "lines_from_event needs lines scoring rules".into(),
+            ));
+        }
+        let lines = self
+            .events
+            .read()
+            .unwrap()
+            .get(&lines_from_event)
+            .map(|earlier| earlier.lines.clone())
+            .ok_or_else(|| {
+                Error::BadRequest(format!(
+                    "lines_from_event {lines_from_event} is not an event on this oracle"
+                ))
+            })?;
+        self.add_event(config, lines)
+    }
 
-        Ok(Event {
-            id: config.id,
-            nonce_point: nonce.base_point_mul(),
-            event_announcement: locking_conditions,
-            attestation: None,
-        })
+    async fn get_event_terms(&self, event_id: &Uuid) -> Result<OracleEventTerms, Error> {
+        let events = self.events.read().unwrap();
+        let event = events
+            .get(event_id)
+            .ok_or_else(|| Error::NotFound(format!("Event {} not found", event_id)))?;
+        self.event_terms(event_id, event)
+    }
+
+    async fn public_key(&self) -> Result<dlctix::musig2::secp256k1::PublicKey, Error> {
+        Ok(self.generate_oracle_key().base_point_mul().into())
     }
 
     async fn get_event(&self, event_id: &Uuid) -> Result<Event, Error> {

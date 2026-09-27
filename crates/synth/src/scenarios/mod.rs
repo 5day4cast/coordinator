@@ -1,6 +1,7 @@
 mod common;
 pub mod escrow_refund;
 pub mod full_lifecycle;
+pub mod queued;
 pub mod types;
 pub mod user_behavior;
 
@@ -9,6 +10,7 @@ pub use full_lifecycle::run_full_lifecycle;
 pub use types::*;
 pub use user_behavior::{
     run_abandoned_unpaid, run_duplicate_submission, run_late_submission, run_paid_abandonment,
+    run_queued_leftover_refund, run_queued_one_pool, run_queued_split, run_queued_too_few,
 };
 
 #[cfg(test)]

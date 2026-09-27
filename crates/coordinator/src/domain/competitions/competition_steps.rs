@@ -64,6 +64,10 @@ impl Coordinator {
             .await
             .map_err(|e| anyhow!("Failed to load competition {competition_id}: {e}"))?;
         let now = OffsetDateTime::now_utc();
+        if competition.kind == crate::domain::competitions::CompetitionKind::Queued {
+            // Registration, then pools: a queued competition runs no contract of its own.
+            return self.advance_queued_competition(competition, lease).await;
+        }
 
         if competition.resume_stranded_settlement() {
             warn!(
@@ -110,6 +114,28 @@ impl Coordinator {
             info!("Cancelled expired competition {competition_id}");
             self.release_held_invoices(competition_id).await;
             return Ok(Step::Finished);
+        }
+        if competition.kind == crate::domain::competitions::CompetitionKind::Pool
+            && competition.event_created_at.is_none()
+        {
+            // A pool registers its players' deposits in a session made for it at kickoff, and
+            // creates its oracle event from the queue's frozen lines. One that cannot get both
+            // in time fails, and its escrows are refunded.
+            if let Err(e) = self.prepare_pool(&mut competition).await {
+                if now - competition.created_at < super::queued_kickoff::POOL_SETUP_DEADLINE {
+                    return Err(StepError::Failed(e));
+                }
+                error!(
+                    "Pool {competition_id} has no Keymeld session or oracle event and fails: {e:#}"
+                );
+                let failed_at = now;
+                competition.failed_at = Some(failed_at);
+                competition
+                    .errors
+                    .push(CompetitionError::FailedCreateTransaction(e.to_string()));
+                self.save_leased(competition, lease).await?;
+                return Ok(Step::Next(Wait::Until(failed_at + FAILED_EXPIRY)));
+            }
         }
         self.renew_funding_reservation(&competition)
             .await

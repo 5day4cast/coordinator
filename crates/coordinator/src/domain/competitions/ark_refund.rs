@@ -344,15 +344,49 @@ impl Coordinator {
             )
             .into());
         }
-        let stored = self
+        let mut stored = self
             .competition_store
             .get_keymeld_session(competition_id)
             .await
-            .map_err(|e| anyhow!("Cannot load the competition's Keymeld session: {e}"))?
-            .context("the competition has no Keymeld session")?;
+            .map_err(|e| anyhow!("Cannot load the competition's Keymeld session: {e}"))?;
+        if stored.is_none() {
+            // A queued competition, or a pool that never got its session, has its players'
+            // deposits registered in a session made for their refunds. Every ticket that can be
+            // paid is paid by now, so its members are final.
+            let members = players
+                .iter()
+                .filter_map(|player| {
+                    let registration = player.registration.as_ref().ok()?;
+                    Some((player.ticket_id, registration.context.enclave_id))
+                })
+                .collect();
+            if self
+                .make_queued_refund_session(competition_id, members)
+                .await?
+                .is_some()
+            {
+                stored = self
+                    .competition_store
+                    .get_keymeld_session(competition_id)
+                    .await
+                    .map_err(|e| anyhow!("Cannot load the competition's Keymeld session: {e}"))?;
+            }
+        }
+        let stored = stored.context("the competition has no Keymeld session")?;
         let session = self.restore_keymeld_session(&stored)?;
+        let manifest = &session.authorization_manifest.manifest;
         let mut late = BTreeSet::new();
         for player in players {
+            // A session of key deposits names its members when it is made, so a ticket it
+            // does not name cannot join it; it cannot sign for this ticket.
+            if manifest.deposit_scope.is_some()
+                && !manifest
+                    .participant_verifiers
+                    .contains_key(&keymeld_sdk::UserId::from(player.ticket_id))
+            {
+                late.insert(player.ticket_id);
+                continue;
+            }
             match self
                 .keymeld
                 .register_participant(
