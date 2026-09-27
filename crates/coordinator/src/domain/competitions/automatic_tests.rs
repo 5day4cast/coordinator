@@ -1170,7 +1170,10 @@ async fn oversized_automatic_competition_is_refused_before_any_oracle_or_ticket_
     let coordinator = Fixture::coordinator(database.clone(), Arc::new(Escrow::new())).await;
     // Three winning places is past the confidential admission cap, though the
     // Oracle would happily announce the event.
-    let oversized = event(3, 10);
+    let mut oversized = event(3, 10);
+    // A full-day window, so the capacity check is what refuses it.
+    oversized.end_observation_date = oversized.start_observation_date + time::Duration::days(1);
+    oversized.signing_date = oversized.end_observation_date + time::Duration::hours(1);
     let event_id = oversized.id;
     let error = coordinator.create_competition(oversized).await.unwrap_err();
     let Error::BadRequest(message) = &error else {

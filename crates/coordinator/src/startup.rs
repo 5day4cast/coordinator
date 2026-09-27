@@ -1598,7 +1598,7 @@ mod startup_tests {
             id: uuid::Uuid::now_v7(),
             signing_date: now + time::Duration::hours(33),
             start_observation_date: now + time::Duration::hours(6),
-            end_observation_date: now + time::Duration::hours(24),
+            end_observation_date: now + time::Duration::hours(30),
             locations: vec!["KDEN".into()],
             number_of_values_per_entry: 1,
             number_of_places_win: 1,
