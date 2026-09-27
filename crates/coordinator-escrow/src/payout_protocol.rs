@@ -399,6 +399,7 @@ mod tests {
             self, protocol::RequestContext, ApplicationContext, EscrowContext,
         };
         RequestContext {
+            keygen_session_id: None,
             schema_version: escrow::SCHEMA_VERSION,
             operation,
             escrow: EscrowContext {

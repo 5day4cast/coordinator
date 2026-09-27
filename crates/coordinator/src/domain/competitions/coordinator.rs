@@ -5262,6 +5262,7 @@ mod keymeld_authorization_tests {
             compute_dlc_subset_definitions(coordinator.clone(), std::slice::from_ref(&player), 1);
         let manifest = keymeld_sdk::SignedSessionManifest::sign(
             SessionAuthorizationManifest {
+                deposit_scope: None,
                 keygen_session_id: session_id.clone(),
                 coordinator_user_id: coordinator.clone(),
                 creator_pubkey: creator.public_key_bytes(),
