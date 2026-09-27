@@ -1609,6 +1609,7 @@ mod startup_tests {
             relative_locktime_block_delta: None,
             unlisted: true,
             scoring_rules: None,
+            scoring_fields: None,
         };
         let id = client.create(&event).await.unwrap();
         assert_eq!(id, event.id);

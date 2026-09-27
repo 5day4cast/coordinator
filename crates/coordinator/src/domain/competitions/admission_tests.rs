@@ -30,6 +30,7 @@ fn competition(start: OffsetDateTime, capacity: usize) -> Competition {
         relative_locktime_block_delta: None,
         unlisted: true,
         scoring_rules: None,
+        scoring_fields: None,
     })
 }
 

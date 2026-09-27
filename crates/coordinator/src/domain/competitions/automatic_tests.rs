@@ -344,6 +344,7 @@ impl Fixture {
             relative_locktime_block_delta: Some(72),
             unlisted: false,
             scoring_rules: None,
+            scoring_fields: None,
         });
         coordinator
             .competition_store
@@ -952,6 +953,7 @@ fn event(places: usize, players: usize) -> CreateEvent {
         relative_locktime_block_delta: Some(72),
         unlisted: false,
         scoring_rules: None,
+        scoring_fields: None,
     }
 }
 

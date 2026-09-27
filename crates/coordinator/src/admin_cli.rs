@@ -242,6 +242,7 @@ impl CreateArgs {
             relative_locktime_block_delta: self.locktime_delta,
             unlisted: self.unlisted,
             scoring_rules: Some(self.scoring_rules),
+            scoring_fields: None,
         })
     }
 }

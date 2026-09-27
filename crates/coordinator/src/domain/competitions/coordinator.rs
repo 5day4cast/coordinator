@@ -19,7 +19,7 @@ use super::{
 };
 use crate::{
     api::routes::FinalSignatures,
-    domain::{Competition, CreateEvent, EntryStatus, Error},
+    domain::{leaderboard::Metric, Competition, CreateEvent, EntryStatus, Error},
     infra::{
         bitcoin::{
             economy_fee_rate, fee_rate_for_target, Bitcoin, ForeignUtxo, LND_FEE_RATE_FLOOR,
@@ -3166,6 +3166,10 @@ impl Coordinator {
         create_event
             .scoring_rules
             .get_or_insert(crate::infra::oracle::ScoringRules::Lines);
+        // The oracle attests full days and day or night halves; the window sets the metrics.
+        create_event
+            .fix_window_metrics()
+            .map_err(|reason| Error::BadRequest(reason.into()))?;
         create_event
             .validate_oracle_settings()
             .map_err(|reason| Error::BadRequest(reason.into()))?;
@@ -5121,15 +5125,25 @@ async fn validate_entry(entry: AddEventEntry, competition: Competition) -> Resul
         )));
     }
 
+    let metrics = competition.event_submission.metrics();
     let mut choice_count = 0;
     for weather_choice in &entry.expected_observations {
-        if weather_choice.temp_high.is_some() {
-            choice_count += 1;
-        }
-        if weather_choice.temp_low.is_some() {
-            choice_count += 1;
-        }
-        if weather_choice.wind_speed.is_some() {
+        for (metric, pick) in [
+            (Metric::TempHigh, &weather_choice.temp_high),
+            (Metric::TempLow, &weather_choice.temp_low),
+            (Metric::WindSpeed, &weather_choice.wind_speed),
+        ] {
+            if pick.is_none() {
+                continue;
+            }
+            // The oracle refuses every entry of an event when one picks a metric it doesn't score.
+            if !metrics.contains(&metric) {
+                return Err(Error::BadRequest(format!(
+                    "entry_id {} not valid, this competition does not score {}",
+                    entry.id,
+                    metric.id()
+                )));
+            }
             choice_count += 1;
         }
 
@@ -5181,6 +5195,7 @@ mod oracle_payout_order_tests {
             relative_locktime_block_delta: None,
             unlisted: false,
             scoring_rules: None,
+            scoring_fields: None,
         });
         let entry_ids = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
         let tickets = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
@@ -5261,6 +5276,7 @@ mod funding_lifecycle_tests {
             relative_locktime_block_delta: None,
             unlisted: false,
             scoring_rules: None,
+            scoring_fields: None,
         });
         assert_eq!(
             competition.funding_reservation_deadline(now).unwrap(),

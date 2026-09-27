@@ -68,14 +68,14 @@ pub struct CompetitionDefaults {
 impl Default for CompetitionDefaults {
     fn default() -> Self {
         let now = OffsetDateTime::now_utc();
+        // A full-day window starting in 6 hours, signed an hour after it ends.
+        let start = now + time::Duration::hours(6);
+        let end = start + time::Duration::DAY;
         Self {
             id: Uuid::now_v7(),
-            // Start observation: 6 hours from now
-            start_observation_date: now + time::Duration::hours(6),
-            // End observation: 24 hours from now
-            end_observation_date: now + time::Duration::hours(24),
-            // Signing: 33 hours from now
-            signing_date: now + time::Duration::hours(33),
+            start_observation_date: start,
+            end_observation_date: end,
+            signing_date: end + time::Duration::HOUR,
         }
     }
 }
@@ -112,6 +112,11 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
                     // Timing parameters
                     div class="box" {
                         h3 class="subtitle is-5" { "Timing (local)" }
+                        p class="help mb-3" {
+                            "The window must be a full day (24 hours or more, any start), which scores highs, lows and wind; "
+                            "a day half, 12:00–24:00 UTC, which scores highs and wind; "
+                            "or a night half, 00:00–12:00 UTC, which scores lows and wind."
+                        }
                         div class="columns" {
                             div class="column" {
                                 div class="field" {

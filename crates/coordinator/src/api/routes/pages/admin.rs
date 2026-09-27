@@ -358,6 +358,7 @@ pub async fn admin_create_competition_handler(
         relative_locktime_block_delta: form.relative_locktime_block_delta,
         unlisted: false,
         scoring_rules: Some(scoring_rules),
+        scoring_fields: None,
     };
 
     match state.coordinator.create_competition(create_event).await {
