@@ -576,7 +576,8 @@ Pending: whether the closing sweep can board back into Arkade.
    The browser checks the escrow in the payout policy and shows the refund destination.
    Pending: depositing the key against a template instead of concrete terms.
 8. **Synth scenarios.**
-   Add scenarios for a full queue, uneven demand, a kickoff failure, a missed batch, and refunds to a Lightning Address.
+   Done: `queued_split`, `queued_one_pool`, `queued_too_few` (refunds to a Lightning Address) and `queued_leftover_refund`; see [synthetic traffic](ops/synthetic-traffic.md).
+   Pending: a kickoff failure and a missed batch, which need an operator test hook that fails a pool's batch.
 
 ## Alternatives considered
 
