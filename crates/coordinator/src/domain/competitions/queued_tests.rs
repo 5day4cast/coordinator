@@ -971,7 +971,10 @@ async fn a_pool_that_cannot_get_its_session_retries_then_fails_to_be_refunded() 
     assert!(advance_pool().await.is_err());
     let pool = queue.store().get_competition(pool_id).await.unwrap();
     assert!(pool.failed_at.is_none());
-    assert!(pool.event_announcement.is_none(), "no event before its session");
+    assert!(
+        pool.event_announcement.is_none(),
+        "no event before its session"
+    );
 
     // Past the deadline it fails, and cleanup refunds its escrows.
     let long_ago = (OffsetDateTime::now_utc() - Duration::hours(2))

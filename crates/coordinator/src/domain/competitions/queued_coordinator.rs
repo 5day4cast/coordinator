@@ -545,8 +545,7 @@ impl Coordinator {
     ) -> Result<BTreeMap<Outcome, PayoutWeights>, anyhow::Error> {
         let mut roster: Vec<Uuid> = entries.iter().map(|entry| entry.ticket_id).collect();
         roster.sort_unstable();
-        if entries.len() != competition.event_submission.total_allowed_entries
-            || roster != members
+        if entries.len() != competition.event_submission.total_allowed_entries || roster != members
         {
             return Err(anyhow!(
                 "Pool {} has {} entries, not its {} members",
