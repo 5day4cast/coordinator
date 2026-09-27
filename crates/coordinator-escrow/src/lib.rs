@@ -10,3 +10,4 @@ pub mod lnurl_relay;
 pub mod payout;
 pub mod payout_capabilities;
 pub mod payout_protocol;
+pub mod pools;
