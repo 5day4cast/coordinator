@@ -9,7 +9,7 @@ pub use coordinator_escrow::{
     oracle_statement, payout, payout_protocol, pools, queued,
 };
 use coordinator_escrow::{
-    escrow::{ApplicationContext, EscrowContext, EscrowRegistration, PublicKeyBytes, Recipient},
+    escrow::{ApplicationContext, EscrowContext, PublicKeyBytes, Recipient},
     generic,
 };
 use keymeld_sdk::{
@@ -125,7 +125,7 @@ async fn prepare_registration_inner(
     // A queued entry's key is a deposit: sealed under the competition's terms, before the session
     // of the pool it will play in exists. Its context names that scope, never a session; checked
     // before any request.
-    let queued = match &payout {
+    let queued_entry = match &payout {
         Some((policy, _)) => match queued::EntryConsent::from_policy(policy)
             .map_err(|error| SdkError::InvalidInput(error.to_string()))?
         {
@@ -134,7 +134,7 @@ async fn prepare_registration_inner(
         },
         None => None,
     };
-    if let Some(entry) = &queued {
+    if let Some(entry) = &queued_entry {
         let (deposit_session, deposit_digest) = queued::deposit_scope(&entry.terms)
             .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
         if assignment.session_id != deposit_session.as_string()
@@ -227,8 +227,14 @@ async fn prepare_registration_inner(
                 )
                 .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
             let signed = escrow.policy.clone();
-            let encrypted = if queued.is_some() {
-                seal_deposit(&credentials, context.clone(), &enclave.public_key, escrow)?
+            // A queued entry's key is deposited under its competition's terms, and a
+            // deposit-scoped session takes only envelopes sealed as deposits.
+            let sealed = if matches!(terms, queued::EntryConsent::Queued(_)) {
+                credentials.prepare_deposit_registration_with_escrow(
+                    context.clone(),
+                    &enclave.public_key,
+                    escrow,
+                )?
             } else {
                 credentials.prepare_registration_with_escrow(
                     context.clone(),
@@ -236,7 +242,7 @@ async fn prepare_registration_inner(
                     escrow,
                 )?
             };
-            (encrypted, Some(signed))
+            (sealed, Some(signed))
         }
         None => (
             credentials.prepare_registration(context.clone(), &enclave.public_key)?,
@@ -249,24 +255,6 @@ async fn prepare_registration_inner(
         context,
         escrow_policy,
     })
-}
-
-/// Seal a queued entry's key as a Keymeld deposit, whose envelope has its own proof domain: a
-/// deposit-scoped session takes only deposits, and a deposit is valid in no other session.
-///
-/// TODO(keymeld-deposits): once Keymeld is repinned to `feat/deposit-registrations`, replace the
-/// body with
-/// `credentials.prepare_deposit_registration_with_escrow(context, enclave_public_key, escrow)`.
-/// Until then a queued entry is refused rather than sealed as an ordinary registration.
-fn seal_deposit(
-    _credentials: &UserCredentials,
-    _context: RegistrationContext,
-    _enclave_public_key: &str,
-    _escrow: EscrowRegistration,
-) -> Result<String, SdkError> {
-    Err(SdkError::InvalidInput(
-        "Queued entries need a Keymeld release with key deposits".into(),
-    ))
 }
 
 #[cfg(test)]
@@ -490,15 +478,38 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains("deposited under"), "{label}: {error}");
         }
-        // In scope, only the unreachable gateway is left to fail.
-        let error = timeout(
+        // In scope, the key is sealed under the competition's id and terms digest, with the
+        // competition's auth key and the entry's exact escrow consent.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        scoped.gateway_url = format!("http://{}", listener.local_addr().unwrap());
+        let app = simulated_enclave(scoped.enclave_public_key.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let prepared = timeout(
             Duration::from_secs(5),
             prepare_payout_registration(&[1; 32], &[6; 32], &scoped),
         )
         .await
         .unwrap()
-        .unwrap_err();
-        assert!(!error.to_string().contains("deposited under"), "{error}");
+        .unwrap();
+        server.abort();
+        let competition = entry.terms.competition_id.to_string();
+        assert_eq!(prepared.context.keygen_session_id, SessionId::new(&competition));
+        assert_eq!(prepared.context.manifest_hash, digest.to_vec());
+        assert_eq!(prepared.context.user_id, UserId::from(entry_id));
+        assert_eq!(
+            prepared.context.auth_pubkey,
+            UserCredentials::from_private_key(&[1; 32])
+                .unwrap()
+                .derive_session_auth_pubkey(&competition)
+                .unwrap()
+        );
+        assert!(!prepared.encrypted_private_key.is_empty());
+        verify_registration_policy(
+            &prepared.context,
+            Some(&policy),
+            prepared.escrow_policy.as_ref(),
+        )
+        .unwrap();
     }
 
     fn simulated_enclave(public_key: String) -> Router {
