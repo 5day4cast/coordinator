@@ -126,10 +126,10 @@ pub fn check_ticket_policy(
 mod tests {
     use super::*;
     use coordinator_core::keymeld::{
-        authorization::ArkEscrowPolicy,
         oracle_statement::{LineTerms, ObservationTerms, ScoringRules},
         pools::PoolRules,
         queued::{QueuedEntryTerms, QueuedTerms},
+        ArkEscrowPolicy,
     };
     use dlctix::{
         bitcoin::{FeeRate, Network},
