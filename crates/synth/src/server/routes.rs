@@ -95,6 +95,8 @@ struct RunParams {
     before_submit_min_secs: Option<u64>,
     before_submit_max_secs: Option<u64>,
     deadline_margin_secs: Option<u64>,
+    queue_players: Option<usize>,
+    max_pool_players: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -500,6 +502,12 @@ async fn trigger_run(
     }
     if let Some(seed) = params.seed {
         config.seed = Some(seed);
+    }
+    if params.queue_players.is_some() {
+        config.queue_players = params.queue_players;
+    }
+    if params.max_pool_players.is_some() {
+        config.max_pool_players = params.max_pool_players;
     }
     for (target, value) in [
         (&mut config.entry_window_secs, params.entry_window_secs),
