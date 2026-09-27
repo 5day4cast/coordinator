@@ -396,6 +396,9 @@ mod tests {
         );
     }
 
+    /// A named change to one input, which the check must refuse.
+    type Change<T> = (&'static str, fn(&mut T));
+
     /// A queued entry's payout policy, as a coordinator makes it.
     fn queued_policy(entry_id: Uuid) -> PayoutPolicy {
         use oracle_statement::{ObservationTerms, ScoringRules};
@@ -464,7 +467,7 @@ mod tests {
         scoped.session_id = session.as_string();
         scoped.manifest_hash = digest.to_vec();
         scoped.payout_policy = Some(serde_json::to_string(&policy).unwrap());
-        let changes: [(&str, fn(&mut RegistrationAssignment)); 4] = [
+        let changes: [Change<RegistrationAssignment>; 4] = [
             ("session", |a| a.session_id = Uuid::now_v7().to_string()),
             ("digest", |a| a.manifest_hash[0] ^= 1),
             ("ticket", |a| a.user_id = Uuid::now_v7()),
