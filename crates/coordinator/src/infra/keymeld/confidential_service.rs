@@ -108,6 +108,26 @@ use zeroize::Zeroizing;
 fn invalid(message: impl Into<String>) -> KeymeldError {
     KeymeldError::Session(message.into())
 }
+
+/// The gateway's enclaves, sorted, for spreading participants across them.
+async fn available_enclaves(client: &KeyMeldClient) -> Result<Vec<EnclaveId>, KeymeldError> {
+    let mut available: Vec<_> = client
+        .health()
+        .list_enclaves()
+        .await?
+        .enclaves
+        .into_iter()
+        .map(|info| info.enclave_id)
+        .collect();
+    available.sort();
+    available.dedup();
+    if available.is_empty() {
+        return Err(invalid(
+            "No enclaves available for confidential registration",
+        ));
+    }
+    Ok(available)
+}
 fn encoded<T: Serialize>(value: &T) -> Result<Vec<u8>, KeymeldError> {
     serde_json::to_vec(value).map_err(|error| invalid(error.to_string()))
 }
@@ -642,6 +662,32 @@ impl Keymeld for KeymeldService {
             session_id: session.session_id.to_string(),
             user_id: user.uuid(),
             manifest_hash: session.authorization_manifest.digest()?,
+            enclave_id: enclave.as_u32(),
+            enclave_key_epoch: pinned.key_epoch(),
+            enclave_public_key: hex::encode(pinned.public_key()),
+            gateway_url: self.settings.browser_gateway_url().to_owned(),
+            trusted_pcrs: self.settings.trusted_pcrs.clone(),
+            dangerous_trust_unattested_enclaves: self.settings.dangerous_trust_unattested_enclaves,
+            payout_policy: None,
+        })
+    }
+
+    async fn deposit_assignment(
+        &self,
+        deposit_session_id: SessionId,
+        deposit_digest: [u8; 32],
+        user: UserId,
+    ) -> Result<RegistrationAssignment, KeymeldError> {
+        let client = self.get_client()?;
+        let available = available_enclaves(client).await?;
+        // Spread by ticket rather than by a counter, so asking again for the same ticket gives
+        // the same enclave.
+        let enclave = available[(user.uuid().as_u128() % available.len() as u128) as usize];
+        let pinned = ConfidentialTransport::new(client).attest(enclave).await?;
+        Ok(RegistrationAssignment {
+            session_id: deposit_session_id.to_string(),
+            user_id: user.uuid(),
+            manifest_hash: deposit_digest.to_vec(),
             enclave_id: enclave.as_u32(),
             enclave_key_epoch: pinned.key_epoch(),
             enclave_public_key: hex::encode(pinned.public_key()),
