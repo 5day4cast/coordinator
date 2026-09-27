@@ -9,7 +9,7 @@ pub use coordinator_escrow::{
     oracle_statement, payout, payout_protocol, pools, queued,
 };
 use coordinator_escrow::{
-    escrow::{ApplicationContext, EscrowContext, PublicKeyBytes, Recipient},
+    escrow::{ApplicationContext, EscrowContext, EscrowRegistration, PublicKeyBytes, Recipient},
     generic,
 };
 use keymeld_sdk::{
@@ -122,6 +122,31 @@ async fn prepare_registration_inner(
             "Invalid session manifest digest".into(),
         ));
     }
+    // A queued entry's key is a deposit: sealed under the competition's terms, before the session
+    // of the pool it will play in exists. Its context names that scope, never a session; checked
+    // before any request.
+    let queued = match &payout {
+        Some((policy, _)) => match queued::EntryConsent::from_policy(policy)
+            .map_err(|error| SdkError::InvalidInput(error.to_string()))?
+        {
+            queued::EntryConsent::Queued(entry) => Some(entry),
+            queued::EntryConsent::Contract(_) => None,
+        },
+        None => None,
+    };
+    if let Some(entry) = &queued {
+        let (deposit_session, deposit_digest) = queued::deposit_scope(&entry.terms)
+            .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
+        if assignment.session_id != deposit_session.as_string()
+            || assignment.manifest_hash != deposit_digest
+            || assignment.user_id != entry.entry_id
+        {
+            return Err(SdkError::InvalidInput(
+                "A queued entry's key is deposited under its competition's terms, for its ticket"
+                    .into(),
+            ));
+        }
+    }
     let user_id = UserId::from(assignment.user_id);
     let builder = KeyMeldClient::builder(&assignment.gateway_url, user_id.clone());
     let client = if assignment.dangerous_trust_unattested_enclaves {
@@ -202,14 +227,16 @@ async fn prepare_registration_inner(
                 )
                 .map_err(|error| SdkError::InvalidInput(error.to_string()))?;
             let signed = escrow.policy.clone();
-            (
+            let encrypted = if queued.is_some() {
+                seal_deposit(&credentials, context.clone(), &enclave.public_key, escrow)?
+            } else {
                 credentials.prepare_registration_with_escrow(
                     context.clone(),
                     &enclave.public_key,
                     escrow,
-                )?,
-                Some(signed),
-            )
+                )?
+            };
+            (encrypted, Some(signed))
         }
         None => (
             credentials.prepare_registration(context.clone(), &enclave.public_key)?,
@@ -222,6 +249,24 @@ async fn prepare_registration_inner(
         context,
         escrow_policy,
     })
+}
+
+/// Seal a queued entry's key as a Keymeld deposit, whose envelope has its own proof domain: a
+/// deposit-scoped session takes only deposits, and a deposit is valid in no other session.
+///
+/// TODO(keymeld-deposits): once Keymeld is repinned to `feat/deposit-registrations`, replace the
+/// body with
+/// `credentials.prepare_deposit_registration_with_escrow(context, enclave_public_key, escrow)`.
+/// Until then a queued entry is refused rather than sealed as an ordinary registration.
+fn seal_deposit(
+    _credentials: &UserCredentials,
+    _context: RegistrationContext,
+    _enclave_public_key: &str,
+    _escrow: EscrowRegistration,
+) -> Result<String, SdkError> {
+    Err(SdkError::InvalidInput(
+        "Queued entries need a Keymeld release with key deposits".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -361,6 +406,99 @@ mod tests {
         assert!(
             verify_registration_policy(&changed_context, Some(&policy), Some(&signed)).is_err()
         );
+    }
+
+    /// A queued entry's payout policy, as a coordinator makes it.
+    fn queued_policy(entry_id: Uuid) -> PayoutPolicy {
+        use oracle_statement::{ObservationTerms, ScoringRules};
+        use payout::dlctix::{
+            bitcoin::{FeeRate, Network},
+            secp::Scalar,
+            MarketMaker,
+        };
+        let point = |byte: u8| Scalar::from_slice(&[byte; 32]).unwrap().base_point_mul();
+        let entry = queued::QueuedEntryTerms {
+            terms: queued::QueuedTerms {
+                competition_id: Uuid::now_v7(),
+                network: Network::Signet,
+                market_maker: MarketMaker { pubkey: point(3) },
+                oracle_pubkey: hex::encode(point(7).serialize_xonly()),
+                signing_date: 1_790_172_800,
+                expiry: 1_790_259_200,
+                observation: ObservationTerms {
+                    source: "noaa_weather".into(),
+                    start_observation_date: 1_790_000_000,
+                    end_observation_date: 1_790_086_400,
+                    targets: vec!["KORD".into()],
+                    scoring_fields: vec!["temp_high".into()],
+                    number_of_values_per_entry: 1,
+                    scoring_rules: ScoringRules::Fixed,
+                    lines: vec![],
+                },
+                number_of_places_win: 1,
+                pool_rules: pools::PoolRules::new(2, 25).unwrap(),
+                stake_sats: 5_000,
+                relative_locktime_block_delta: 72,
+                max_fee_rate: FeeRate::from_sat_per_vb_u32(10),
+            },
+            entry_id,
+            ticket_hash: [5; 32],
+            payout_hash: coordinator_escrow::escrow::sha256(&[6; 32]),
+        };
+        PayoutPolicy {
+            queued_entry: Some(entry.to_json().unwrap()),
+            automatic_lightning_address: Some("alice@wallet.example".into()),
+            allow_invoice_fallback: true,
+            release_entry_key_after_payment: true,
+            contract_terms: String::new(),
+            ark_escrow: Some(ArkEscrowPolicy {
+                escrow_tap_tree: String::new(),
+                max_fee_sats: 150,
+                max_refund_fee_sats: 100,
+                checkpoint_exit_script: String::new(),
+            }),
+        }
+    }
+
+    /// A queued entry's key is deposited under its competition's id and terms, for its ticket,
+    /// and never sealed for any other scope.
+    #[tokio::test]
+    async fn a_queued_entry_is_deposited_only_under_its_competitions_terms() {
+        let entry_id = Uuid::now_v7();
+        let policy = queued_policy(entry_id);
+        let entry = queued::QueuedEntryTerms::from_policy(&policy)
+            .unwrap()
+            .unwrap();
+        let (session, digest) = queued::deposit_scope(&entry.terms).unwrap();
+        let mut scoped = assignment("http://127.0.0.1:1".into());
+        scoped.dangerous_trust_unattested_enclaves = true;
+        scoped.user_id = entry_id;
+        scoped.session_id = session.as_string();
+        scoped.manifest_hash = digest.to_vec();
+        scoped.payout_policy = Some(serde_json::to_string(&policy).unwrap());
+        let changes: [(&str, fn(&mut RegistrationAssignment)); 4] = [
+            ("session", |a| a.session_id = Uuid::now_v7().to_string()),
+            ("digest", |a| a.manifest_hash[0] ^= 1),
+            ("ticket", |a| a.user_id = Uuid::now_v7()),
+            ("spelling", |a| a.session_id = a.session_id.to_uppercase()),
+        ];
+        for (label, change) in changes {
+            let mut changed = scoped.clone();
+            change(&mut changed);
+            let error = prepare_payout_registration(&[1; 32], &[6; 32], &changed)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("deposited under"), "{label}: {error}");
+        }
+        // In scope, only the unreachable gateway is left to fail.
+        let error = timeout(
+            Duration::from_secs(5),
+            prepare_payout_registration(&[1; 32], &[6; 32], &scoped),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(!error.to_string().contains("deposited under"), "{error}");
     }
 
     fn simulated_enclave(public_key: String) -> Router {
