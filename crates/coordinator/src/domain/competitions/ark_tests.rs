@@ -822,7 +822,6 @@ fn session_for(players: &[UserId]) -> DlcKeygenSession {
     let session_id = SessionId::new_v7();
     let manifest = SignedSessionManifest::sign(
         SessionAuthorizationManifest {
-            deposit_scope: None,
             keygen_session_id: session_id.clone(),
             coordinator_user_id: coordinator,
             creator_pubkey: creator.public_key_bytes(),

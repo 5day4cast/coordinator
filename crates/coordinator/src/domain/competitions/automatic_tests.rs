@@ -45,7 +45,6 @@ fn generic_response(
             enclave_id: EnclaveId::new(1),
             enclave_key_epoch: 1,
             request: RequestContext {
-                keygen_session_id: None,
                 schema_version: escrow::SCHEMA_VERSION,
                 operation,
                 escrow: policy.policy.context.clone(),
@@ -687,7 +686,6 @@ fn session(players: [UserId; 2]) -> DlcKeygenSession {
     let session_id = SessionId::new_v7();
     let manifest = SignedSessionManifest::sign(
         SessionAuthorizationManifest {
-            deposit_scope: None,
             keygen_session_id: session_id.clone(),
             coordinator_user_id: coordinator,
             creator_pubkey: creator.public_key_bytes(),

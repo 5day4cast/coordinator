@@ -500,7 +500,10 @@ mod tests {
             protocol::{BindingOutput, Operation, Payload},
         };
         let (contract, _) = crate::payout::tests::fixture();
-        let binding = crate::generic::ContractBinding { contract, statement: None };
+        let binding = crate::generic::ContractBinding {
+            contract,
+            statement: None,
+        };
         let context = context(Operation::Bind);
         let output = Payload::encode(&BindingOutput {
             binding_data_digest: escrow::sha256(Payload::encode(&binding).unwrap().as_bytes()),

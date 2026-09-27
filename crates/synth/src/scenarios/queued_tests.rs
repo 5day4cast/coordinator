@@ -1,0 +1,433 @@
+use super::*;
+
+fn listed(sizes: &[usize]) -> Vec<PoolSummary> {
+    sizes
+        .iter()
+        .enumerate()
+        .map(|(index, players)| PoolSummary {
+            competition_id: Uuid::now_v7(),
+            pool_index: index as u32,
+            players: *players,
+        })
+        .collect()
+}
+
+/// Place `tickets` into `pools` in order, filling each to its listed size.
+fn place(pools: &[PoolSummary], tickets: &[Uuid]) -> BTreeMap<Uuid, Uuid> {
+    let mut rest = tickets.iter();
+    pools
+        .iter()
+        .flat_map(|pool| {
+            rest.by_ref()
+                .take(pool.players)
+                .map(|ticket| (*ticket, pool.competition_id))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn fresh(count: usize) -> Vec<Uuid> {
+    (0..count).map(|_| Uuid::now_v7()).collect()
+}
+
+fn rules() -> PoolRules {
+    PoolRules::new(2, 25).unwrap()
+}
+
+#[test]
+fn twenty_seven_entries_split_into_two_even_pools_holding_each_once() {
+    let tickets = fresh(27);
+    let pools = listed(&[14, 13]);
+    check_split(&rules(), &pools, &tickets, &place(&pools, &tickets)).unwrap();
+    // The coordinator may list the larger pool second.
+    let pools = listed(&[13, 14]);
+    check_split(&rules(), &pools, &tickets, &place(&pools, &tickets)).unwrap();
+    let tickets = fresh(51);
+    let pools = listed(&[17, 17, 17]);
+    check_split(&rules(), &pools, &tickets, &place(&pools, &tickets)).unwrap();
+}
+
+#[test]
+fn a_small_queue_forms_one_pool_of_everyone() {
+    let tickets = fresh(5);
+    let pools = listed(&[5]);
+    check_split(&rules(), &pools, &tickets, &place(&pools, &tickets)).unwrap();
+}
+
+#[test]
+fn uneven_or_too_many_or_too_few_pools_are_refused() {
+    let tickets = fresh(27);
+    let cases: [&[usize]; 4] = [&[15, 12], &[25, 2], &[9, 9, 9], &[27]];
+    for sizes in cases {
+        let pools = listed(sizes);
+        assert!(
+            check_split(&rules(), &pools, &tickets, &place(&pools, &tickets)).is_err(),
+            "{sizes:?}"
+        );
+    }
+    let pools = listed(&[1]);
+    assert!(check_split(&rules(), &pools, &tickets[..1], &place(&pools, &tickets)).is_err());
+}
+
+#[test]
+fn every_entry_must_be_in_exactly_one_listed_pool() {
+    let tickets = fresh(27);
+    let pools = listed(&[14, 13]);
+    let placed = place(&pools, &tickets);
+
+    let mut missing = placed.clone();
+    missing.remove(&tickets[0]);
+    assert!(check_split(&rules(), &pools, &tickets, &missing).is_err());
+
+    let mut elsewhere = placed.clone();
+    elsewhere.insert(tickets[0], Uuid::now_v7());
+    assert!(check_split(&rules(), &pools, &tickets, &elsewhere).is_err());
+
+    // Right sizes in the listing, but one pool holds an entry of the other.
+    let mut crowded = placed.clone();
+    crowded.insert(tickets[26], pools[0].competition_id);
+    assert!(check_split(&rules(), &pools, &tickets, &crowded).is_err());
+
+    let mut stray = placed.clone();
+    stray.insert(Uuid::now_v7(), pools[0].competition_id);
+    assert!(check_split(&rules(), &pools, &tickets, &stray).is_err());
+
+    let mut duplicated = tickets.clone();
+    duplicated[1] = duplicated[0];
+    assert!(check_split(&rules(), &pools, &duplicated, &placed).is_err());
+}
+
+#[test]
+fn pool_indexes_must_count_from_zero() {
+    let tickets = fresh(27);
+    let mut pools = listed(&[14, 13]);
+    pools[1].pool_index = 2;
+    assert!(check_split(&rules(), &pools, &tickets, &place(&pools, &tickets)).is_err());
+    pools[1].pool_index = 0;
+    assert!(check_split(&rules(), &pools, &tickets, &place(&pools, &tickets)).is_err());
+}
+
+fn shape(scenario: &str, players: Option<usize>, max: Option<usize>) -> Result<QueueShape> {
+    let config = ScenarioConfig {
+        queue_players: players,
+        max_pool_players: max,
+        ..Default::default()
+    };
+    Ok(QueueShape::of(scenario, &config)?.expect("a queued scenario"))
+}
+
+#[test]
+fn each_queued_scenario_has_its_own_shape_and_refuses_one_that_defeats_it() {
+    let split = shape(QUEUED_SPLIT, None, None).unwrap();
+    assert_eq!((split.players, split.abandoned), (27, 0));
+    assert_eq!(split.sizes(), Some(vec![14, 13]));
+    assert_eq!(
+        shape(QUEUED_SPLIT, Some(5), Some(3)).unwrap().sizes(),
+        Some(vec![3, 2])
+    );
+    assert!(shape(QUEUED_SPLIT, Some(25), None).is_err());
+    assert!(shape(QUEUED_SPLIT, Some(101), None).is_err());
+
+    let one = shape(QUEUED_ONE_POOL, None, None).unwrap();
+    assert_eq!(one.sizes(), Some(vec![5]));
+    assert!(shape(QUEUED_ONE_POOL, Some(26), None).is_err());
+
+    let too_few = shape(QUEUED_TOO_FEW, None, None).unwrap();
+    assert_eq!(too_few.rules.min_players(), 3);
+    assert_eq!((too_few.players, too_few.sizes()), (2, None));
+    assert!(shape(QUEUED_TOO_FEW, Some(3), None).is_err());
+
+    let leftover = shape(QUEUED_LEFTOVER_REFUND, None, None).unwrap();
+    assert_eq!((leftover.users(), leftover.sizes()), (4, Some(vec![3])));
+    assert!(shape(QUEUED_LEFTOVER_REFUND, Some(1), None).is_err());
+
+    assert!(
+        shape(QUEUED_SPLIT, None, Some(26)).is_err(),
+        "pools hold 25"
+    );
+    assert!(QueueShape::of("full_lifecycle", &ScenarioConfig::default())
+        .unwrap()
+        .is_none());
+}
+
+/// A coordinator whose queue has already closed: it formed `pools` from the tickets, in order,
+/// or was cancelled if `pools` is empty. Its pools are already awaiting their attestation.
+mod mock {
+    use crate::client::CoordinatorClient;
+    use axum::{
+        extract::{Path, State},
+        http::StatusCode,
+        routing::get,
+        Json, Router,
+    };
+    use serde_json::{json, Value};
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex};
+    use uuid::Uuid;
+
+    #[derive(Default)]
+    pub struct Queue {
+        pub id: Uuid,
+        /// Each pool's id and tickets, by index.
+        pub pools: Vec<(Uuid, Vec<Uuid>)>,
+        /// Every entry's ticket and competition.
+        pub entries: Vec<(Uuid, Uuid)>,
+        /// Tickets whose refund has settled.
+        pub refunded: BTreeSet<Uuid>,
+        /// Refunds asked about, by competition and ticket.
+        pub refund_lookups: Vec<(Uuid, Uuid)>,
+    }
+
+    type Shared = Arc<Mutex<Queue>>;
+
+    pub struct Mock {
+        pub client: CoordinatorClient,
+        pub state: Shared,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for Mock {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl Mock {
+        pub async fn new(queue: Queue) -> Self {
+            let state = Arc::new(Mutex::new(queue));
+            let app = Router::new()
+                .route("/api/v1/competitions/{id}", get(competition))
+                .route(
+                    "/api/v1/competitions/{id}/tickets/{ticket}/refund",
+                    get(refund),
+                )
+                .route("/api/v1/entries", get(entries))
+                .with_state(state.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client =
+                CoordinatorClient::new(&format!("http://{}", listener.local_addr().unwrap()), None);
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            Self {
+                client,
+                state,
+                task,
+            }
+        }
+    }
+
+    async fn competition(
+        State(state): State<Shared>,
+        Path(id): Path<Uuid>,
+    ) -> (StatusCode, Json<Value>) {
+        const AT: &str = "2026-09-27T00:00:00Z";
+        let state = state.lock().unwrap();
+        if id == state.id {
+            let pools: Vec<Value> = state
+                .pools
+                .iter()
+                .enumerate()
+                .map(|(index, (pool, tickets))| {
+                    json!({"competition_id": pool, "pool_index": index, "players": tickets.len()})
+                })
+                .collect();
+            let formed = !pools.is_empty();
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "id": id, "created_at": AT, "event_submission": {}, "kind": "queued",
+                    "pool_rules": {"min_players": 2, "max_players": 25},
+                    "pools_formed_at": formed.then_some(AT),
+                    "cancelled_at": (!formed).then_some(AT),
+                    "pools": pools,
+                })),
+            );
+        }
+        match state.pools.iter().position(|(pool, _)| *pool == id) {
+            Some(index) => (
+                StatusCode::OK,
+                Json(json!({
+                    "id": id, "created_at": AT, "event_submission": {}, "kind": "pool",
+                    "parent_id": state.id, "pool_index": index,
+                    "escrow_funds_confirmed_at": AT, "awaiting_attestation_at": AT,
+                })),
+            ),
+            None => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))),
+        }
+    }
+
+    /// Every player's entries: the scenario looks each ticket up by id.
+    async fn entries(State(state): State<Shared>) -> Json<Value> {
+        let state = state.lock().unwrap();
+        Json(json!(state
+            .entries
+            .iter()
+            .map(|(ticket, event)| json!({
+                "id": ticket, "event_id": event, "ticket_id": ticket, "pubkey": "mock",
+                "ephemeral_pubkey": "mock", "signed_at": null, "paid_at": null,
+                "paid_out_at": null,
+            }))
+            .collect::<Vec<_>>()))
+    }
+
+    async fn refund(
+        State(state): State<Shared>,
+        Path((competition, ticket)): Path<(Uuid, Uuid)>,
+    ) -> Json<Value> {
+        let mut state = state.lock().unwrap();
+        state.refund_lookups.push((competition, ticket));
+        Json(if state.refunded.contains(&ticket) {
+            json!({"state": "settled", "paid_sats": 1000, "ark_txid": "mock", "updated_at": 0})
+        } else {
+            Value::Null
+        })
+    }
+}
+
+struct Run {
+    mock: mock::Mock,
+    users: Vec<SynthUser>,
+    traces: Vec<EntryTrace>,
+    config: ScenarioConfig,
+    shape: QueueShape,
+}
+
+impl Run {
+    /// `scenario`'s players have paid and entered, or paid and left, and its queue has closed
+    /// into `pools` of the complete tickets, in order.
+    async fn new(scenario: &str, pools: &[usize]) -> Self {
+        let config = ScenarioConfig {
+            poll_interval_secs: 0,
+            state_timeout_secs: 2,
+            refund_timeout_secs: 2,
+            ..Default::default()
+        };
+        let shape = QueueShape::of(scenario, &config).unwrap().unwrap();
+        let users: Vec<SynthUser> = (0..shape.users())
+            .map(|index| SynthUser::new_random(&format!("user_{index}")).unwrap())
+            .collect();
+        let traces: Vec<EntryTrace> = users
+            .iter()
+            .enumerate()
+            .map(|(index, user)| {
+                let mut trace = EntryTrace::new(user);
+                trace.ticket_id = Some(Uuid::now_v7());
+                trace.paid = true;
+                trace.entry_submitted = index < shape.players;
+                trace
+            })
+            .collect();
+        let queue = Uuid::now_v7();
+        let mut complete = traces
+            .iter()
+            .filter(|trace| trace.entry_submitted)
+            .map(|trace| trace.ticket_id.unwrap());
+        let pools: Vec<(Uuid, Vec<Uuid>)> = pools
+            .iter()
+            .map(|size| (Uuid::now_v7(), complete.by_ref().take(*size).collect()))
+            .collect();
+        let mut entries: Vec<(Uuid, Uuid)> = pools
+            .iter()
+            .flat_map(|(pool, tickets)| tickets.iter().map(move |ticket| (*ticket, *pool)))
+            .collect();
+        // Entries no pool took stay on the queue.
+        entries.extend(complete.map(|ticket| (ticket, queue)));
+        let mock = mock::Mock::new(mock::Queue {
+            id: queue,
+            pools,
+            entries,
+            ..Default::default()
+        })
+        .await;
+        Self {
+            mock,
+            users,
+            traces,
+            config,
+            shape,
+        }
+    }
+
+    fn queue(&self) -> Uuid {
+        self.mock.state.lock().unwrap().id
+    }
+
+    fn refund_everyone(&self) {
+        let tickets = self.traces.iter().filter_map(|trace| trace.ticket_id);
+        self.mock.state.lock().unwrap().refunded.extend(tickets);
+    }
+
+    async fn after_entries(&self) -> (Steps, std::result::Result<(), Box<StepResult>>) {
+        let mut steps = Steps::new();
+        let result = after_entries(
+            &self.mock.client,
+            &self.users,
+            &self.queue(),
+            &self.config,
+            &self.shape,
+            OffsetDateTime::now_utc(),
+            &self.traces,
+            &mut steps,
+        )
+        .await;
+        (steps, result)
+    }
+}
+
+#[tokio::test]
+async fn a_split_queue_is_checked_and_each_pool_followed_to_its_attestation() {
+    let run = Run::new(QUEUED_SPLIT, &[14, 13]).await;
+    let (steps, result) = run.after_entries().await;
+    assert!(result.is_ok(), "{:?}", result.err());
+    let names = steps.names();
+    assert_eq!(&names[..2], ["wait_pools_formed", "verify_pools"]);
+    assert_eq!(names.last(), Some(&"wait_pools_awaiting_attestation"));
+    assert!(
+        run.mock.state.lock().unwrap().refund_lookups.is_empty(),
+        "every ticket found a pool"
+    );
+}
+
+#[tokio::test]
+async fn an_entry_left_on_the_queue_fails_the_split() {
+    // 27 complete tickets, but the pools the queue lists hold only 26 of them.
+    let run = Run::new(QUEUED_SPLIT, &[13, 13]).await;
+    let (_, result) = run.after_entries().await;
+    let failed = result.unwrap_err();
+    assert_eq!(failed.name, "verify_pools");
+}
+
+#[tokio::test]
+async fn a_leftover_ticket_is_refunded_from_the_queue_while_its_pool_runs() {
+    let run = Run::new(QUEUED_LEFTOVER_REFUND, &[3]).await;
+    run.refund_everyone();
+    let (steps, result) = run.after_entries().await;
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert!(steps.names().contains(&"wait_pools_awaiting_attestation"));
+    let leftover = run.traces.last().unwrap();
+    assert_eq!(
+        run.mock.state.lock().unwrap().refund_lookups,
+        [(run.queue(), leftover.ticket_id.unwrap())],
+        "only the ticket without an entry is refunded, from the queue"
+    );
+}
+
+#[tokio::test]
+async fn a_queue_too_small_for_a_pool_is_cancelled_and_refunds_everyone() {
+    let run = Run::new(QUEUED_TOO_FEW, &[]).await;
+    run.refund_everyone();
+    let (steps, result) = run.after_entries().await;
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(&steps.names()[..2], ["wait_cancelled", "verify_no_pools"]);
+    let lookups = run.mock.state.lock().unwrap().refund_lookups.clone();
+    assert_eq!(lookups.len(), 2);
+    assert!(lookups
+        .iter()
+        .all(|(competition, _)| *competition == run.queue()));
+}
+
+#[tokio::test]
+async fn a_queue_that_forms_pools_when_it_should_be_cancelled_fails() {
+    let run = Run::new(QUEUED_TOO_FEW, &[2]).await;
+    let (_, result) = run.after_entries().await;
+    assert_eq!(result.unwrap_err().name, "wait_cancelled");
+}

@@ -59,6 +59,7 @@ pub fn entry_form(
     destination: &PayoutDestination,
 ) -> Markup {
     let picks_allowed = competition.number_of_values_per_entry;
+    let queue = competition.queue.queued();
     let pickable = match forecasts {
         Forecasts::Ready { stations, .. } => stations
             .iter()
@@ -87,16 +88,28 @@ pub fn entry_form(
                 div {
                     dt { "Pot" }
                     dd {
-                        (sats(competition.total_pool))
+                        (competition.pot())
                         span class="fact-note" {
-                            @for (place, (percent, _)) in competition.prizes().iter().enumerate() {
-                                @if place > 0 { ", " }
-                                (ordinal(place + 1)) " " (percent) "%"
+                            @if queue.is_some() {
+                                "per pool, to its winner"
+                            } @else {
+                                @for (place, (percent, _)) in competition.prizes().iter().enumerate() {
+                                    @if place > 0 { ", " }
+                                    (ordinal(place + 1)) " " (percent) "%"
+                                }
                             }
                         }
                     }
                 }
-                div { dt { "Entries" } dd { (competition.total_entries) " of " (competition.total_allowed_entries) } }
+                div {
+                    dt { "Entries" }
+                    dd {
+                        (competition.entries())
+                        @if let Some(queue) = queue {
+                            span class="fact-note" { (queue.pool_note()) }
+                        }
+                    }
+                }
             }
 
             p class="how-to-pick" {
@@ -118,12 +131,16 @@ pub fn entry_form(
                 }
             }
 
+            // What the wallet checks the entry's terms against: what this form shows.
             form id="entryForm" data-competition-id=(competition.id)
                  data-entry-fee=(competition.entry_fee)
                  data-ticket-price=(competition.ticket_price)
                  data-total-pool=(competition.total_pool)
                  data-winner-count=(competition.paid_places)
-                 data-max-values=(picks_allowed) {
+                 data-max-values=(picks_allowed)
+                 data-kind=[queue.map(|_| "queued")]
+                 data-pool-min-players=[queue.and_then(|queue| queue.min_players)]
+                 data-pool-max-players=[queue.map(|queue| queue.max_players)] {
                 (forecast_choices(&competition.id, forecasts, 0))
             }
 
@@ -133,7 +150,9 @@ pub fn entry_form(
                 summary { "Advanced: how the entry is held and paid" }
                 ul {
                     li {
-                        "Your picks and ticket are locked into a Bitcoin contract with the other entries. "
+                        "Your picks and ticket are locked into a Bitcoin contract with the other entries"
+                        @if queue.is_some() { " in your pool" }
+                        ". "
                         "A Keymeld enclave signs it for you, so you don't need to stay online."
                     }
                     @if let Some(terms) = terms {
@@ -229,7 +248,7 @@ pub fn payout_line(
                 }
                 (_, PayoutDestination::Address(address)) => {
                     "Winnings"
-                    @if refunds { ", and your refund if this competition doesn't fill," }
+                    @if refunds { ", and your refund if this competition doesn't start," }
                     " go to " strong { (address) } "."
                 }
                 (_, PayoutDestination::NoAddress) => {
@@ -445,10 +464,43 @@ mod tests {
         assert!(!html.contains(r#"type="checkbox""#));
         assert!(!html.contains("I authorize"));
         assert!(
-            html.contains("and your refund if this competition doesn&#39;t fill")
-                || html.contains("and your refund if this competition doesn't fill")
+            html.contains("and your refund if this competition doesn&#39;t start")
+                || html.contains("and your refund if this competition doesn't start")
         );
+        assert_eq!(html.matches("refund").count(), 1, "one line about refunds");
         assert!(html.contains("<strong>freya@lnurl.example</strong>"));
+    }
+
+    /// A queue's form shows how many entered and the pool size, and carries what the wallet
+    /// checks the entry's terms against. Entering is still the only consent.
+    #[test]
+    fn a_queue_form_shows_entries_and_pools_and_carries_them_for_the_wallet() {
+        use crate::templates::pages::competitions::tests::queued;
+        let html = entry_form(
+            &queued("q", 40),
+            &Forecasts::Ready {
+                stations: vec![station()],
+                pins: vec![],
+            },
+            Some(&terms(true)),
+            &PayoutDestination::Address("freya@lnurl.example".into()),
+        )
+        .into_string();
+        assert!(html.contains("40 entered"));
+        assert!(html.contains("Players are split into pools of up to 25 at the start"));
+        assert!(html.contains("up to 125,000 sats"));
+        assert!(html.contains("per pool, to its winner"));
+        assert!(!html.contains(" of 3"));
+        assert!(html.contains(r#"data-kind="queued""#));
+        assert!(html.contains(r#"data-pool-min-players="2""#));
+        assert!(html.contains(r#"data-pool-max-players="25""#));
+        assert!(html.contains(r#"data-entry-fee="5000""#));
+        assert!(html.contains("with the other entries in your pool."));
+        assert!(!html.contains(r#"type="checkbox""#));
+        assert_eq!(html.matches("refund").count(), 1, "one line about refunds");
+
+        let single = form(PayoutDestination::LoggedOut);
+        assert!(!single.contains("data-kind") && !single.contains("data-pool-"));
     }
 
     #[test]

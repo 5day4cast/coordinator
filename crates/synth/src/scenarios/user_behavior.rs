@@ -26,6 +26,10 @@ pub(super) enum Scenario {
     PaidAbandonment,
     DuplicateSubmission,
     LateSubmission,
+    QueuedSplit,
+    QueuedOnePool,
+    QueuedTooFew,
+    QueuedLeftoverRefund,
 }
 
 impl Scenario {
@@ -37,14 +41,28 @@ impl Scenario {
             Self::PaidAbandonment => "paid_abandonment",
             Self::DuplicateSubmission => "duplicate_submission",
             Self::LateSubmission => "late_submission",
+            Self::QueuedSplit => super::queued::QUEUED_SPLIT,
+            Self::QueuedOnePool => super::queued::QUEUED_ONE_POOL,
+            Self::QueuedTooFew => super::queued::QUEUED_TOO_FEW,
+            Self::QueuedLeftoverRefund => super::queued::QUEUED_LEFTOVER_REFUND,
         }
     }
 
     fn refunds(self) -> bool {
         matches!(
             self,
-            Self::EscrowRefund | Self::PaidAbandonment | Self::LateSubmission
+            Self::EscrowRefund
+                | Self::PaidAbandonment
+                | Self::LateSubmission
+                | Self::QueuedTooFew
+                | Self::QueuedLeftoverRefund
         )
+    }
+
+    /// Every queued entry waits in an Arkade escrow, which only a real payment funds, and names
+    /// the Lightning Address it is refunded to if its queue never starts.
+    fn queued(self) -> bool {
+        super::queued::is_queued(self.name())
     }
 }
 
@@ -63,6 +81,10 @@ scenario!(run_abandoned_unpaid, AbandonedUnpaid);
 scenario!(run_paid_abandonment, PaidAbandonment);
 scenario!(run_duplicate_submission, DuplicateSubmission);
 scenario!(run_late_submission, LateSubmission);
+scenario!(run_queued_split, QueuedSplit);
+scenario!(run_queued_one_pool, QueuedOnePool);
+scenario!(run_queued_too_few, QueuedTooFew);
+scenario!(run_queued_leftover_refund, QueuedLeftoverRefund);
 
 pub(super) async fn run(
     client: &CoordinatorClient,
@@ -92,7 +114,7 @@ pub(super) async fn run(
         } else {
             config.resolve_plan(scenario.name())?
         };
-        let lnd = if scenario.refunds() {
+        let lnd = if scenario.refunds() || scenario.queued() {
             super::escrow_refund::refund_address(&config)?;
             Some(super::escrow_refund::payer(&config)?)
         } else {
@@ -131,8 +153,19 @@ async fn run_steps(
     steps: &mut Steps,
 ) -> std::result::Result<(), Box<StepResult>> {
     let arrival_anchor = Instant::now();
+    let queue = super::queued::QueueShape::of(scenario.name(), config).map_err(|error| {
+        Box::new(StepResult {
+            name: "create_competition".into(),
+            status: StepStatus::Failed,
+            duration_ms: 0,
+            details: None,
+            error: Some(format!("{error:#}")),
+        })
+    })?;
     let (mut created, competition_id) = run_step("create_competition", || async {
-        if scenario == Scenario::EscrowRefund {
+        if let Some(shape) = &queue {
+            super::queued::create_queue(client, config, shape).await
+        } else if scenario == Scenario::EscrowRefund {
             super::escrow_refund::create_competition(client, config).await
         } else {
             full_lifecycle::create_competition(client, config).await
@@ -142,6 +175,9 @@ async fn run_steps(
     created.details = Some(serde_json::json!({ "competition_id": competition_id }));
     steps.push(created);
     let (deadline_step, deadline) = run_step("entry_deadline", || async {
+        if let Some(shape) = &queue {
+            super::queued::check_queue(client, &competition_id, shape).await?;
+        }
         let competition = client.get_competition(&competition_id).await?;
         let value = competition
             .event_submission
@@ -328,6 +364,20 @@ async fn run_steps(
         }
     }
 
+    if let Some(shape) = &queue {
+        return super::queued::after_entries(
+            client,
+            &users,
+            &competition_id,
+            config,
+            shape,
+            deadline,
+            &traces,
+            steps,
+        )
+        .await;
+    }
+
     if scenario.refunds() {
         let mut cancellation = config.clone();
         cancellation.state_timeout_secs = cancellation_budget_secs(
@@ -369,11 +419,15 @@ fn reservation_hold_ms(requested_at: OffsetDateTime, now: OffsetDateTime) -> u64
         .max(0) as u64
 }
 
-fn cancellation_budget_secs(timeout: u64, deadline: OffsetDateTime, now: OffsetDateTime) -> u64 {
+pub(super) fn cancellation_budget_secs(
+    timeout: u64,
+    deadline: OffsetDateTime,
+    now: OffsetDateTime,
+) -> u64 {
     timeout.saturating_add((deadline - now).whole_seconds().max(0) as u64 + 1)
 }
 
-async fn collect_refunds(
+pub(super) async fn collect_refunds(
     client: &CoordinatorClient,
     users: &[SynthUser],
     competition_id: &Uuid,
@@ -541,6 +595,16 @@ async fn run_actor(
             &mut trace,
         )
         .await?;
+        if config
+            .planned_scenario
+            .as_deref()
+            .is_some_and(super::queued::is_queued)
+        {
+            ensure!(
+                prepared.queued,
+                "the queued competition's ticket asked for a single competition's contract terms"
+            );
+        }
         wait_until(
             &name,
             &mut trace,

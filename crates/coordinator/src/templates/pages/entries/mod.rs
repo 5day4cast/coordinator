@@ -7,7 +7,7 @@ use crate::domain::UserEntryView;
 use crate::templates::{
     format,
     fragments::picks::detail_url,
-    pages::competitions::{phase_badge, CompetitionView},
+    pages::competitions::{phase_badge, CompetitionView, Queue},
 };
 
 /// An entry with its competition, when the competition could be loaded.
@@ -59,7 +59,17 @@ fn entry_row(row: &EntryRow) -> Markup {
            "hx-status:500"="swap:innerHTML" {
             td data-label="Competition" {
                 @match row.competition {
-                    Some(competition) => { (format::window(competition.start, competition.end)) }
+                    Some(competition) => {
+                        (format::window(competition.start, competition.end))
+                        // Which pool of a queued competition the entry plays in.
+                        @match &competition.queue {
+                            Queue::Pool(pool) => { span class="cell-note" { " · " (pool.label()) } }
+                            Queue::Queued(queue) if queue.pools.is_empty() => {
+                                span class="cell-note" { " · pools form at the start" }
+                            }
+                            _ => {}
+                        }
+                    }
                     None => { (row.entry.start_time) }
                 }
             }
@@ -156,6 +166,38 @@ mod tests {
         );
         assert!(html.contains("…7169fc2e"));
         assert!(html.contains("badge-live"));
+    }
+
+    #[test]
+    fn an_entry_in_a_pool_says_which() {
+        use crate::templates::pages::competitions::{tests::queued, PoolOf};
+        let entry = entry();
+        let mut pool = view("c1", Phase::Live, -5);
+        pool.queue = Queue::Pool(PoolOf {
+            parent_id: "q".into(),
+            index: Some(2),
+        });
+        let html = entries_page(
+            &[EntryRow {
+                entry: &entry,
+                competition: Some(&pool),
+            }],
+            None,
+        )
+        .into_string();
+        assert!(html.contains(" · Pool 3"));
+        assert!(html.contains(r#"href="/competitions/c1/leaderboard""#));
+
+        let waiting = queued("c1", 4);
+        let html = entries_page(
+            &[EntryRow {
+                entry: &entry,
+                competition: Some(&waiting),
+            }],
+            None,
+        )
+        .into_string();
+        assert!(html.contains("pools form at the start"));
     }
 
     #[test]

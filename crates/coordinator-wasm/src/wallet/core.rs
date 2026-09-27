@@ -1,6 +1,7 @@
 use super::{
     keymeld_trust::trusted_assignment,
     keys::{EntryKey, WalletSeed},
+    queued::{self, QueuedConsent},
     EncryptedWalletBackup, EntryRegistration, PayoutRelease, WalletError,
 };
 use crate::nostr::{CustomSigner, NostrClientCore};
@@ -255,6 +256,35 @@ impl DlcWalletCore {
         consent: &PayoutConsent,
     ) -> Result<PreparedRegistration, WalletError> {
         self.validate_payout_registration(entry_id, assignment, consent)?;
+        self.seal_payout_registration(entry_id, assignment).await
+    }
+
+    /// [`Self::keymeld_payout_registration`] for an entry in a queued competition: check the
+    /// entry's terms against the competition, its oracle and the ticket (see [`super::queued`]),
+    /// then deposit both secrets with the policy.
+    pub async fn keymeld_queued_registration(
+        &self,
+        entry_id: Uuid,
+        assignment: &RegistrationAssignment,
+        consent: &QueuedConsent,
+    ) -> Result<PreparedRegistration, WalletError> {
+        queued::validate_registration(
+            self.network,
+            &self.entry_key(entry_id)?,
+            entry_id,
+            assignment,
+            consent,
+        )?;
+        self.seal_payout_registration(entry_id, assignment).await
+    }
+
+    /// Seal the entry key and payout preimage, with the assignment's already checked payout
+    /// policy, to its attested enclave.
+    async fn seal_payout_registration(
+        &self,
+        entry_id: Uuid,
+        assignment: &RegistrationAssignment,
+    ) -> Result<PreparedRegistration, WalletError> {
         let assignment = trusted_assignment(assignment, self.network)?;
         let key = self.entry_key(entry_id)?;
         let mut preimage = Zeroizing::new([0u8; 32]);

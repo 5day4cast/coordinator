@@ -122,6 +122,13 @@ pub struct EntryTimingArgs {
     pub before_submit_max_secs: Option<u64>,
     #[arg(long)]
     pub deadline_margin_secs: Option<u64>,
+    /// Players who enter a queued scenario completely, instead of its own number (27 for
+    /// queued-split).
+    #[arg(long)]
+    pub queue_players: Option<usize>,
+    /// The largest pool of a queued scenario, instead of 25.
+    #[arg(long)]
+    pub max_pool_players: Option<usize>,
 }
 
 impl EntryTimingArgs {
@@ -132,6 +139,12 @@ impl EntryTimingArgs {
         }
         if let Some(seed) = self.seed {
             config.seed = Some(seed);
+        }
+        if self.queue_players.is_some() {
+            config.queue_players = self.queue_players;
+        }
+        if self.max_pool_players.is_some() {
+            config.max_pool_players = self.max_pool_players;
         }
         for (target, value) in [
             (&mut config.entry_window_secs, self.entry_window_secs),
@@ -182,6 +195,8 @@ impl EntryTimingArgs {
             ("before_submit_min_secs", self.before_submit_min_secs),
             ("before_submit_max_secs", self.before_submit_max_secs),
             ("deadline_margin_secs", self.deadline_margin_secs),
+            ("queue_players", self.queue_players.map(|n| n as u64)),
+            ("max_pool_players", self.max_pool_players.map(|n| n as u64)),
         ] {
             if let Some(value) = value {
                 let _ = write!(path, "&{key}={value}");

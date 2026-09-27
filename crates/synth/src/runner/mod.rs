@@ -20,6 +20,10 @@ pub const SCENARIOS: &[&str] = &[
     "paid_abandonment",
     "duplicate_submission",
     "late_submission",
+    scenarios::queued::QUEUED_SPLIT,
+    scenarios::queued::QUEUED_ONE_POOL,
+    scenarios::queued::QUEUED_TOO_FEW,
+    scenarios::queued::QUEUED_LEFTOVER_REFUND,
 ];
 
 /// Cover every case/window pair instead of coupling two cycles of equal length.
@@ -292,6 +296,18 @@ impl Runner {
                     }
                     "late_submission" => {
                         scenarios::run_late_submission(&self.client, &self.db, &config).await
+                    }
+                    scenarios::queued::QUEUED_SPLIT => {
+                        scenarios::run_queued_split(&self.client, &self.db, &config).await
+                    }
+                    scenarios::queued::QUEUED_ONE_POOL => {
+                        scenarios::run_queued_one_pool(&self.client, &self.db, &config).await
+                    }
+                    scenarios::queued::QUEUED_TOO_FEW => {
+                        scenarios::run_queued_too_few(&self.client, &self.db, &config).await
+                    }
+                    scenarios::queued::QUEUED_LEFTOVER_REFUND => {
+                        scenarios::run_queued_leftover_refund(&self.client, &self.db, &config).await
                     }
                     _ => unreachable!("record_run validates scenario names"),
                 }
