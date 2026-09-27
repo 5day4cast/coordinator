@@ -11,6 +11,8 @@ use keymeld_core::escrow::SignedEscrowPolicy;
 mod confidential_integration_tests;
 mod confidential_service;
 mod confidential_store;
+#[cfg(test)]
+mod queued_integration_tests;
 pub use coordinator_escrow::{
     payout::ContractCommitment,
     payout_capabilities::PayoutCapabilities,
@@ -85,6 +87,16 @@ pub struct ParticipantRegistrationData {
     /// Accepted policy from durable entry storage, checked against the sealed envelope.
     pub payout_policy: Option<PayoutPolicy>,
     pub escrow_policy: Option<SignedEscrowPolicy>,
+}
+
+/// The scope key deposits were sealed under before their session existed: a queued
+/// competition's id and the digest of its terms, with evidence of why the session's members were
+/// chosen (`coordinator_escrow::queued::DepositEvidence`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepositScopeRequest {
+    pub deposit_session_id: SessionId,
+    pub deposit_digest: [u8; 32],
+    pub evidence: Vec<u8>,
 }
 
 /// Pre-computed DLC subset definitions for keygen session creation.
@@ -300,6 +312,66 @@ pub trait Keymeld: Send + Sync {
         session: &DlcKeygenSession,
         user_id: UserId,
     ) -> Result<RegistrationAssignment, KeymeldError>;
+
+    /// Where a player deposits their entry key before any session exists: the deposit scope in
+    /// place of a session and manifest, and an available enclave, with its current key.
+    async fn deposit_assignment(
+        &self,
+        deposit_session_id: SessionId,
+        deposit_digest: [u8; 32],
+        user_id: UserId,
+    ) -> Result<RegistrationAssignment, KeymeldError> {
+        let _ = (deposit_session_id, deposit_digest, user_id);
+        Err(KeymeldError::Session(
+            "Key deposits are not supported".into(),
+        ))
+    }
+
+    /// Have the enclave a key deposit was sealed to check it, under a manifest made only for
+    /// that check, whose deposit scope is `scope`. Nothing is registered or kept.
+    async fn validate_deposit(
+        &self,
+        scope: DepositScopeRequest,
+        user_id: UserId,
+        registration: &ParticipantRegistrationData,
+    ) -> Result<(), KeymeldError> {
+        let _ = (scope, user_id, registration);
+        Err(KeymeldError::Session(
+            "Key deposits are not supported".into(),
+        ))
+    }
+
+    /// Create a session whose participants' registrations are key deposits sealed under
+    /// `scope`: the coordinator and `members`, each on the enclave its deposit was sealed to, in
+    /// player order. Retrying with the same session id, scope, members and subsets returns the
+    /// session made first.
+    async fn init_deposit_session(
+        &self,
+        session_id: Uuid,
+        scope: DepositScopeRequest,
+        members: Vec<(UserId, EnclaveId)>,
+        subset_info: DlcSubsetInfo,
+    ) -> Result<DlcKeygenSession, KeymeldError> {
+        let _ = (session_id, scope, members, subset_info);
+        Err(KeymeldError::Session(
+            "Key deposits are not supported".into(),
+        ))
+    }
+
+    /// Bind a queued competition's pool, whose players consented to terms rather than this
+    /// contract: the verifier derives each one's contract from the oracle's signed statement.
+    async fn bind_payout_contract_with_statement(
+        &self,
+        session: &DlcKeygenSession,
+        contract: &ContractCommitment,
+        expected_policies: &BTreeMap<UserId, PayoutPolicy>,
+        statement: coordinator_escrow::oracle_statement::SignedStatement,
+    ) -> Result<Vec<PayoutContractBoundResponse>, KeymeldError> {
+        let _ = (session, contract, expected_policies, statement);
+        Err(KeymeldError::Session(
+            "Queued competitions' pools are not supported".into(),
+        ))
+    }
 }
 
 /// Holds private authority credentials; never format or serialize the live session.
@@ -435,6 +507,15 @@ impl DlcKeygenSession {
         Ok(())
     }
 
+    /// The session id and digest this session's registrations and escrow policies name: its
+    /// own, or for a session of key deposits, their deposit scope's.
+    pub fn registration_scope(&self) -> Result<(SessionId, Vec<u8>), KeymeldError> {
+        Ok(self
+            .authorization_manifest
+            .registration_scope()
+            .map_err(SdkError::from)?)
+    }
+
     pub fn validate_registration(
         &self,
         user_id: &UserId,
@@ -445,13 +526,10 @@ impl DlcKeygenSession {
             hex::decode(&data.public_key).map_err(|e| KeymeldError::Session(e.to_string()))?;
         let expected_auth =
             hex::decode(&data.auth_pubkey).map_err(|e| KeymeldError::Session(e.to_string()))?;
-        if context.keygen_session_id != self.session_id
+        let (scope_session_id, scope_digest) = self.registration_scope()?;
+        if context.keygen_session_id != scope_session_id
             || &context.user_id != user_id
-            || context.manifest_hash
-                != self
-                    .authorization_manifest
-                    .digest()
-                    .map_err(SdkError::from)?
+            || context.manifest_hash != scope_digest
             || self
                 .recipient_authorization
                 .user_enclave_assignments
@@ -502,7 +580,8 @@ fn verify_prepared_payout_origin(
             KeymeldError::Session("Payout participant has no authorized enclave".into())
         })?;
     if response.enclave_id != *enclave_id
-        || response.keygen_session_id != session.session_id
+        || response.keygen_session_id != session.registration_scope()?.0
+        || response.preimage_preparation.context.request.session_id() != &session.session_id
         || &response.user_id != user_id
     {
         return Err(KeymeldError::Session(
@@ -700,6 +779,7 @@ mod tests {
                 max_signing_sessions: None,
                 encrypted_taproot_tweak: "unused-in-persistence-test".into(),
                 subset_definitions: vec![],
+                deposit_scope: None,
             },
             &creator.export_secret(),
         )

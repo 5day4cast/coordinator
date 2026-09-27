@@ -221,6 +221,18 @@ pub struct CreateCompetitionForm {
     /// `lines` or `fixed`; lines when absent.
     #[serde(default)]
     pub scoring_rules: Option<String>,
+    /// Set to create a queued competition: no seat count, pools formed when registration closes.
+    #[serde(default)]
+    pub queued: Option<String>,
+    /// A queued competition's smallest pool.
+    #[serde(default)]
+    pub min_players: Option<usize>,
+    /// A queued competition's largest pool.
+    #[serde(default)]
+    pub max_pool_size: Option<usize>,
+    /// A queued competition's entry cap.
+    #[serde(default)]
+    pub max_entries: Option<u32>,
 }
 
 /// Handle competition creation from HTMX form
@@ -276,6 +288,39 @@ pub async fn admin_create_competition_handler(
             Ok(fee) => fee,
             Err(error) => return Html(competition_error(&error.to_string()).into_string()),
         };
+
+    if form
+        .queued
+        .as_deref()
+        .is_some_and(|queued| !queued.is_empty() && queued != "false")
+    {
+        // Pools score lines and pay one winner; the seat count comes from demand.
+        let request = crate::domain::CreateQueuedCompetition {
+            id: form.id,
+            signing_date,
+            start_observation_date,
+            end_observation_date,
+            locations: form.locations,
+            number_of_values_per_entry: form.number_of_values_per_entry,
+            entry_fee: form.entry_fee,
+            coordinator_fee,
+            relative_locktime_block_delta: form.relative_locktime_block_delta,
+            min_players: form
+                .min_players
+                .unwrap_or(crate::domain::DEFAULT_MIN_PLAYERS),
+            max_pool_size: form
+                .max_pool_size
+                .unwrap_or(coordinator_escrow::pools::MAX_POOL_PLAYERS),
+            max_entries: form.max_entries,
+        };
+        return match state.coordinator.create_queued_competition(request).await {
+            Ok(competition) => {
+                state.leaderboards.warm(&competition);
+                Html(competition_success(&competition.id).into_string())
+            }
+            Err(e) => Html(competition_error(&e.to_string()).into_string()),
+        };
+    }
 
     let scoring_rules = match form
         .scoring_rules

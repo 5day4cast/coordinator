@@ -10,6 +10,9 @@ use crate::domain::{
 use crate::infra::oracle::ScoringRules;
 use crate::templates::format::{self, sats, thousands};
 
+mod queue;
+pub use queue::{PoolLink, PoolOf, Queue, QueueView};
+
 /// Finished competitions shown per page.
 pub const PAGE_SIZE: usize = 10;
 
@@ -40,6 +43,8 @@ pub struct CompetitionView {
     /// Pot-return allocation in contract player order, from the attested or expiry outcome.
     /// Older contracts can have unequal shares. None means the amounts cannot be verified.
     pub refund_shares: Option<Vec<u64>>,
+    /// A queue split into pools at the start, one of its pools, or a single competition.
+    pub queue: Queue,
 }
 
 /// Where the entry fees of a competition that didn't run stand.
@@ -56,6 +61,19 @@ impl CompetitionView {
         let event = &competition.event_submission;
         let phase = Phase::of(competition, now);
         let pot_refunded = phase == Phase::Scored && competition.refunds_every_entry();
+        let queue = Queue::of(competition);
+        let can_enter = phase == Phase::Upcoming
+            && match &queue {
+                Queue::Single => competition.total_entries < event.total_allowed_entries as u64,
+                Queue::Queued(queue) => {
+                    queue.pools.is_empty()
+                        && queue.max_entries.is_none_or(|max| {
+                            queue.entries.unwrap_or(competition.total_entries) < max
+                        })
+                }
+                // A pool's players come from its competition's queue.
+                Queue::Pool(_) => false,
+            };
         Self {
             id: competition.id.to_string(),
             phase,
@@ -67,8 +85,7 @@ impl CompetitionView {
             total_entries: competition.total_entries,
             total_allowed_entries: event.total_allowed_entries as u64,
             paid_places: event.number_of_places_win as u64,
-            can_enter: phase == Phase::Upcoming
-                && competition.total_entries < event.total_allowed_entries as u64,
+            can_enter,
             number_of_values_per_entry: event.number_of_values_per_entry,
             locations: event.locations.clone(),
             scoring_rules: event.scoring_rules(),
@@ -77,6 +94,31 @@ impl CompetitionView {
             refund_shares: (pot_refunded || phase == Phase::Expired)
                 .then(|| refund_shares(competition, phase))
                 .flatten(),
+            queue,
+        }
+    }
+
+    /// `3 of 25`, or `40 entered` for a queue, which has no seat count.
+    pub fn entries(&self) -> String {
+        match &self.queue {
+            Queue::Queued(queue) => format!("{} entered", self.entry_count(queue)),
+            _ => format!("{} of {}", self.total_entries, self.total_allowed_entries),
+        }
+    }
+
+    /// A queue's paid entries, those already moved to its pools included.
+    fn entry_count(&self, queue: &QueueView) -> u64 {
+        queue.entries.unwrap_or(self.total_entries)
+    }
+
+    /// The pot, or for a queue the pot of a full pool, which each pool's winner takes.
+    pub fn pot(&self) -> String {
+        match &self.queue {
+            Queue::Queued(queue) => format!(
+                "up to {}",
+                sats(self.entry_fee.saturating_mul(queue.max_players))
+            ),
+            _ => sats(self.total_pool),
         }
     }
 
@@ -98,10 +140,23 @@ impl CompetitionView {
     }
 
     /// A competition whose window started before it filled: cancelled, or
-    /// about to be, with every entry fee returned.
+    /// about to be, with every entry fee returned. For a queue: too few entries for a pool.
     pub fn did_not_fill(&self) -> bool {
-        self.phase == Phase::Unfilled
-            || (self.phase == Phase::Cancelled && self.total_entries < self.total_allowed_entries)
+        match &self.queue {
+            Queue::Queued(queue) if !queue.pools.is_empty() => false,
+            Queue::Queued(queue) => {
+                self.phase == Phase::Unfilled
+                    || (self.phase == Phase::Cancelled
+                        && queue
+                            .min_players
+                            .is_none_or(|min| self.entry_count(queue) < min))
+            }
+            _ => {
+                self.phase == Phase::Unfilled
+                    || (self.phase == Phase::Cancelled
+                        && self.total_entries < self.total_allowed_entries)
+            }
+        }
     }
 
     /// Where the entry fees of a competition that didn't fill stand. Escrowed fees are returned
@@ -153,7 +208,15 @@ fn refund_shares(competition: &Competition, phase: Phase) -> Option<Vec<u64>> {
 /// The badge for a competition's phase. Live is the loudest thing on the page;
 /// finished and cancelled competitions stay quiet.
 pub fn phase_badge(competition: &CompetitionView) -> Markup {
+    let queue = competition.queue.queued();
     let (class, label) = match competition.phase {
+        // Its pools carry on as competitions of their own.
+        _ if queue.is_some_and(|queue| !queue.pools.is_empty()) => {
+            ("badge badge-quiet", "Split into pools")
+        }
+        Phase::Upcoming if !competition.can_enter && queue.is_some() => {
+            ("badge badge-open", "Entries closed")
+        }
         Phase::Upcoming if !competition.can_enter => ("badge badge-open", "Full"),
         Phase::Upcoming => ("badge badge-open", "Open"),
         Phase::Unfilled => ("badge badge-quiet", unfilled_label(competition)),
@@ -178,10 +241,13 @@ pub fn phase_badge(competition: &CompetitionView) -> Markup {
 }
 
 fn unfilled_label(competition: &CompetitionView) -> &'static str {
-    match competition.refunds() {
-        Refunds::Nothing => "Didn't fill",
-        Refunds::Pending => "Didn't fill: refund pending",
-        Refunds::Done => "Didn't fill: refunded",
+    match (competition.refunds(), competition.queue.queued().is_some()) {
+        (Refunds::Nothing, false) => "Didn't fill",
+        (Refunds::Pending, false) => "Didn't fill: refund pending",
+        (Refunds::Done, false) => "Didn't fill: refunded",
+        (Refunds::Nothing, true) => "Too few entries",
+        (Refunds::Pending, true) => "Too few entries: refund pending",
+        (Refunds::Done, true) => "Too few entries: refunded",
     }
 }
 
@@ -228,6 +294,7 @@ pub fn competitions_page(
     options: ListOptions,
     now: OffsetDateTime,
 ) -> Markup {
+    let competitions = &listed(competitions);
     let mut live = by_phase(competitions, &[Phase::Live]);
     let mut open = by_phase(competitions, &[Phase::Upcoming]);
     let mut waiting = by_phase(competitions, &[Phase::AwaitingResult]);
@@ -320,6 +387,60 @@ pub fn competitions_page(
     }
 }
 
+/// The competitions the list shows. A queued competition stands for its pools, which its page
+/// links: a pool whose competition is listed isn't, and a queue split into pools is listed where
+/// its least advanced pool is, since it has no lifecycle of its own after the split.
+fn listed(competitions: &[CompetitionView]) -> Vec<CompetitionView> {
+    fn pools_of<'a>(
+        competitions: &'a [CompetitionView],
+        parent: &'a str,
+    ) -> impl Iterator<Item = &'a CompetitionView> {
+        competitions.iter().filter(move |competition| {
+            matches!(&competition.queue, Queue::Pool(pool) if pool.parent_id == parent)
+        })
+    }
+    let listed_parent = |competition: &CompetitionView| match &competition.queue {
+        Queue::Pool(pool) => competitions
+            .iter()
+            .any(|parent| parent.id == pool.parent_id),
+        _ => false,
+    };
+    competitions
+        .iter()
+        .filter(|competition| !listed_parent(competition))
+        .map(|competition| {
+            let mut shown = competition.clone();
+            if competition
+                .queue
+                .queued()
+                .is_some_and(|queue| !queue.pools.is_empty())
+            {
+                if let Some(phase) = pools_of(competitions, &competition.id)
+                    .map(|pool| pool.phase)
+                    .min_by_key(|phase| progress(*phase))
+                {
+                    shown.phase = phase;
+                }
+            }
+            shown
+        })
+        .collect()
+}
+
+/// How far along a competition in `phase` is, for listing a queue with its least advanced pool.
+fn progress(phase: Phase) -> u8 {
+    match phase {
+        Phase::Upcoming => 0,
+        Phase::Live => 1,
+        Phase::AwaitingResult => 2,
+        Phase::Scored => 3,
+        Phase::Expired => 4,
+        Phase::Unfilled => 5,
+        Phase::Failed => 6,
+        Phase::Cancelled => 7,
+    }
+}
+
 fn by_phase<'a>(competitions: &'a [CompetitionView], phases: &[Phase]) -> Vec<&'a CompetitionView> {
     competitions
         .iter()
@@ -347,7 +468,13 @@ fn intro(featured: Option<&CompetitionView>, now: OffsetDateTime) -> Markup {
 }
 
 fn featured_card(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
-    let prize = competition.prizes().first().map(|(_, amount)| *amount);
+    // A queue's prize is its pools' pots, which depend on how many enter.
+    let prize = competition
+        .queue
+        .queued()
+        .is_none()
+        .then(|| competition.prizes().first().map(|(_, amount)| *amount))
+        .flatten();
     html! {
         div class="featured-card" {
             div class="featured-status" {
@@ -363,11 +490,14 @@ fn featured_card(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
             p class="featured-window" { (format::window(competition.start, competition.end)) }
             dl class="featured-facts" {
                 div { dt { "Entry" } dd { (sats(competition.ticket_price)) } }
-                div { dt { "Pot" } dd { (sats(competition.total_pool)) } }
+                div { dt { "Pot" } dd { (competition.pot()) } }
                 @if let Some(prize) = prize {
                     div { dt { "1st place" } dd { (sats(prize)) } }
                 }
-                div { dt { "Entries" } dd { (competition.total_entries) " of " (competition.total_allowed_entries) } }
+                div { dt { "Entries" } dd { (competition.entries()) } }
+            }
+            @if let Some(queue) = competition.queue.queued() {
+                p class="featured-note" { (queue.pool_note()) "." }
             }
             a class=(if competition.can_enter { "button is-primary is-fullwidth" } else { "button is-fullwidth" })
               href=(competition.url()) hx-get=(competition.url())
@@ -426,11 +556,13 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
     // Phones show these facts below the window. Cancelled and refunded competitions
     // never advertise paid places: those were only their planned winner prizes.
     let mut facts = format!(
-        "Entry {} · Pot {} · {} of {} entries",
+        "Entry {} · Pot {} · {}",
         sats(competition.ticket_price),
-        sats(competition.total_pool),
-        competition.total_entries,
-        competition.total_allowed_entries,
+        competition.pot(),
+        match competition.queue {
+            Queue::Queued(_) => competition.entries(),
+            _ => format!("{} entries", competition.entries()),
+        },
     );
     if competition.has_ranked_prizes() {
         facts.push_str(&format!(
@@ -455,12 +587,18 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
                     Phase::Live => { span class="cell-note" { "ends in " (format::duration(competition.end - now)) } }
                     _ => {}
                 }
+                @match &competition.queue {
+                    Queue::Queued(queue) if queue.pools.is_empty() => {
+                        span class="cell-note" { "pools of up to " (queue.max_players) }
+                    }
+                    Queue::Queued(queue) => { span class="cell-note" { (queue.pools.len()) " pools" } }
+                    Queue::Pool(pool) => { span class="cell-note" { (pool.label()) } }
+                    Queue::Single => {}
+                }
             }
             span class="cell-fee" data-label="Entry" { (sats(competition.ticket_price)) }
-            span class="cell-pot" data-label="Pot" { (sats(competition.total_pool)) }
-            span class="cell-entries" data-label="Entries" {
-                (competition.total_entries) " of " (competition.total_allowed_entries)
-            }
+            span class="cell-pot" data-label="Pot" { (competition.pot()) }
+            span class="cell-entries" data-label="Entries" { (competition.entries()) }
             span class="cell-places" data-label="Paid places" {
                 @if competition.has_ranked_prizes() { (competition.paid_places) } @else { "—" }
             }
@@ -507,7 +645,24 @@ pub(crate) mod tests {
             refunds: RefundProgress::default(),
             pot_refunded: false,
             refund_shares: None,
+            queue: Queue::Single,
         }
+    }
+
+    pub(crate) const POOL: &str = "01a0c226-0000-7000-8000-000000000001";
+
+    /// A queue taking entries, with `entries` so far.
+    pub(crate) fn queued(id: &str, entries: u64) -> CompetitionView {
+        let mut queue = view(id, Phase::Upcoming, 60);
+        queue.total_entries = entries;
+        queue.queue = Queue::Queued(QueueView {
+            min_players: Some(2),
+            max_players: 25,
+            entries: Some(entries),
+            max_entries: None,
+            pools: vec![],
+        });
+        queue
     }
 
     fn position(html: &str, needle: &str) -> usize {
@@ -676,6 +831,118 @@ pub(crate) mod tests {
             assert!(!html.contains("1 paid place"));
             assert!(html.contains(r#"data-label="Paid places">—</span>"#));
         }
+    }
+
+    /// A queue has no seat count: it shows how many entered, never "X of Y" or "Full", and how
+    /// its entries are grouped.
+    #[test]
+    fn a_queue_shows_how_many_entered_and_its_pool_size() {
+        let queue = queued("q", 40);
+        let row = competition_row(&queue, NOW).into_string();
+        assert!(
+            row.contains(r#"data-label="Entries">40 entered</span>"#),
+            "{row}"
+        );
+        assert!(row.contains("pools of up to 25"));
+        assert!(row.contains("Pot up to 125,000 sats · 40 entered"));
+        assert!(row.contains(r#"href="/competitions/q/entry-form""#));
+        assert!(!row.contains(" of 3"));
+        assert!(phase_badge(&queue).into_string().contains(">Open</span>"));
+
+        let page = competitions_page(std::slice::from_ref(&queue), ListOptions::default(), NOW)
+            .into_string();
+        assert!(page.contains("Players are split into pools of up to 25 at the start."));
+        assert!(!page.contains("1st place"));
+        assert!(!page.contains("Full"));
+
+        let mut closed = queued("q", 200);
+        closed.can_enter = false;
+        let badge = phase_badge(&closed).into_string();
+        assert!(badge.contains("Entries closed") && !badge.contains("Full"));
+    }
+
+    #[test]
+    fn a_queue_split_into_pools_says_so_and_each_pool_says_which() {
+        const PARENT: &str = "01a0c225-f3c4-71f3-9f62-4b74859cfc25";
+        const OTHER_POOL: &str = "01a0c226-0000-7000-8000-000000000002";
+        let mut split = queued(PARENT, 30);
+        split.phase = Phase::AwaitingResult;
+        split.can_enter = false;
+        split.queue = Queue::Queued(QueueView {
+            min_players: Some(2),
+            max_players: 25,
+            entries: Some(30),
+            max_entries: None,
+            pools: vec![
+                PoolLink {
+                    id: POOL.into(),
+                    index: Some(0),
+                    size: Some(15),
+                },
+                PoolLink {
+                    id: OTHER_POOL.into(),
+                    index: Some(1),
+                    size: Some(15),
+                },
+            ],
+        });
+        assert!(phase_badge(&split)
+            .into_string()
+            .contains(">Split into pools</span>"));
+        assert!(!split.did_not_fill());
+        assert!(competition_row(&split, NOW)
+            .into_string()
+            .contains(r#"<span class="cell-note">2 pools</span>"#));
+
+        let pool = |id: &str, index, phase| {
+            let mut pool = view(id, phase, -5);
+            pool.queue = Queue::Pool(PoolOf {
+                parent_id: PARENT.into(),
+                index: Some(index),
+            });
+            pool
+        };
+        let row = competition_row(&pool(OTHER_POOL, 1, Phase::Live), NOW).into_string();
+        assert!(row.contains(r#"<span class="cell-note">Pool 2</span>"#));
+        assert!(row.contains(r#"data-label="Entries">1 of 3</span>"#));
+
+        // The list shows the queue once, with its least advanced pool, and not its pools.
+        let all = [
+            split.clone(),
+            pool(POOL, 0, Phase::Scored),
+            pool(OTHER_POOL, 1, Phase::Live),
+        ];
+        let shown = listed(&all);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].phase, Phase::Live);
+        let page = competitions_page(&all, ListOptions::default(), NOW).into_string();
+        assert!(!page.contains("Awaiting results"));
+        assert!(!page.contains("Pool 1") && !page.contains("Pool 2"));
+        assert!(page.contains("2 pools"));
+
+        // A pool whose queue isn't listed is listed itself.
+        let orphan = [pool(POOL, 0, Phase::Scored)];
+        assert_eq!(listed(&orphan).len(), 1);
+    }
+
+    #[test]
+    fn a_queue_too_small_for_a_pool_is_refunded() {
+        let mut small = queued("q", 1);
+        small.phase = Phase::Unfilled;
+        small.can_enter = false;
+        small.refunds = RefundProgress {
+            escrowed: 1,
+            refunded: 0,
+        };
+        assert!(small.did_not_fill());
+        assert!(phase_badge(&small)
+            .into_string()
+            .contains("Too few entries: refund pending"));
+        small.phase = Phase::Cancelled;
+        if let Queue::Queued(queue) = &mut small.queue {
+            queue.entries = Some(5);
+        }
+        assert!(!small.did_not_fill(), "a queue big enough was cancelled");
     }
 
     #[test]

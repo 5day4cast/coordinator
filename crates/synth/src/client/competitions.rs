@@ -30,6 +30,51 @@ pub struct CreateCompetition {
     pub unlisted: bool,
 }
 
+/// Request body for a queued competition: entries without a seat count, split into pools of
+/// `min_players` to `max_pool_size` when registration closes at the observation start. Each pool
+/// pays one winner and is its own competition.
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateQueuedCompetition {
+    pub id: Uuid,
+    #[serde(with = "time::serde::rfc3339")]
+    pub signing_date: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub start_observation_date: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub end_observation_date: OffsetDateTime,
+    pub locations: Vec<String>,
+    pub number_of_values_per_entry: usize,
+    /// Each player's stake: a pool of `n` players funds `n` stakes.
+    pub entry_fee: usize,
+    pub coordinator_fee_basis_points: u32,
+    pub coordinator_fee_percentage: u32,
+    pub min_players: usize,
+    pub max_pool_size: usize,
+    /// The most entries the queue takes; the coordinator's default if unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_entries: Option<u32>,
+}
+
+/// What a `competitions` row is: a single competition, a queue, or one of a queue's pools.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompetitionKind {
+    /// A fixed seat count; coordinators before queued competitions only have these.
+    #[default]
+    Single,
+    Queued,
+    Pool,
+}
+
+/// One pool a queued competition formed when its registration closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolSummary {
+    /// The pool's own competition, which is also its oracle event.
+    pub competition_id: Uuid,
+    pub pool_index: u32,
+    pub players: usize,
+}
+
 /// Competition response from the API
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompetitionResponse {
@@ -97,6 +142,32 @@ pub struct CompetitionResponse {
     /// The transaction settling the contract on the attested outcome, once broadcast.
     #[serde(default)]
     pub outcome_transaction: Option<serde_json::Value>,
+    #[serde(default)]
+    pub kind: CompetitionKind,
+    /// A pool's queued competition.
+    #[serde(default)]
+    pub parent_id: Option<Uuid>,
+    /// A pool's index among its queue's pools.
+    #[serde(default)]
+    pub pool_index: Option<u32>,
+    /// When a queued competition split its entries into pools.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub pools_formed_at: Option<OffsetDateTime>,
+    /// A queued competition's pool sizes.
+    #[serde(default)]
+    pub pool_rules: Option<coordinator_core::keymeld::pools::PoolRules>,
+    /// A queued competition's paid entries, in the queue and in its pools.
+    #[serde(default)]
+    pub entries: Option<u64>,
+    /// The most entries a queued competition takes.
+    #[serde(default)]
+    pub max_entries: Option<u32>,
+    /// A queued competition's stake per player.
+    #[serde(default)]
+    pub stake_sats: Option<u64>,
+    /// A queued competition's pools, by index; empty until they form.
+    #[serde(default)]
+    pub pools: Vec<PoolSummary>,
 }
 
 impl CompetitionResponse {
@@ -133,6 +204,9 @@ impl CompetitionResponse {
             "failed"
         } else if self.cancelled_at.is_some() {
             "cancelled"
+        } else if self.pools_formed_at.is_some() {
+            // A queue's pools run the lifecycle from here; the queue itself has none.
+            "pools_formed"
         } else if self.delta_broadcasted_at.is_some() {
             "delta_broadcasted"
         } else if self.outcome_broadcasted_at.is_some() {
@@ -181,6 +255,30 @@ impl CoordinatorClient {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("Create competition failed ({}): {}", status, body);
+        }
+
+        resp.json()
+            .await
+            .context("Failed to parse competition response")
+    }
+
+    /// Create a queued competition via the admin API
+    pub async fn create_queued_competition(
+        &self,
+        competition: &CreateQueuedCompetition,
+    ) -> Result<CompetitionResponse> {
+        let url = format!("{}/api/v1/competitions/queued", self.admin_url());
+        let resp = self
+            .admin_post(&url)
+            .json(competition)
+            .send()
+            .await
+            .context("Failed to create queued competition")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Create queued competition failed ({}): {}", status, body);
         }
 
         resp.json()

@@ -14,8 +14,9 @@ use crate::domain::leaderboard::Phase;
 use crate::templates::{
     format::{self, ordinal, sats},
     fragments::picks::{detail_url, LIVE_REFRESH},
-    pages::competitions::{phase_badge, CompetitionView, Refunds},
+    pages::competitions::{phase_badge, CompetitionView, PoolLink, Queue, QueueView, Refunds},
 };
+use uuid::Uuid;
 
 /// One leaderboard row as shown.
 #[derive(Debug, Clone)]
@@ -57,6 +58,9 @@ pub fn ran(phase: Phase) -> bool {
 /// [`leaderboard_scores`]), so the page shows at once.
 pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
     let prizes = competition.prizes();
+    let queue = competition.queue.queued();
+    // A queue's entries move to its pools, whose pages show their scores.
+    let split = queue.is_some_and(|queue| !queue.pools.is_empty());
     html! {
         div id="competitionLeaderboard" class="leaderboard" {
             a class="back-link" href="/competitions" hx-get="/competitions"
@@ -65,6 +69,14 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
             div class="leaderboard-heading" {
                 h1 class="title is-4" { "Leaderboard" }
                 (phase_badge(competition))
+            }
+            @if let Queue::Pool(pool) = &competition.queue {
+                p class="pool-of" {
+                    (pool.label()) " of a queued competition. "
+                    a href=(pool.url()) hx-get=(pool.url()) hx-target="#main-content" hx-push-url="true" {
+                        "See all its pools"
+                    }
+                }
             }
             p class="leaderboard-window" {
                 (format::window(competition.start, competition.end))
@@ -76,8 +88,10 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
             }
 
             dl class="leaderboard-facts" {
-                div { dt { "Pot" } dd { (sats(competition.total_pool)) } }
-                @if competition.pot_refunded || competition.phase == Phase::Expired {
+                div { dt { "Pot" } dd { (competition.pot()) } }
+                @if queue.is_some() {
+                    div { dt { "Paid places" } dd { "The winner of each pool takes its pot" } }
+                } @else if competition.pot_refunded || competition.phase == Phase::Expired {
                     div class="refund-fact" {
                         dt { "Pot return allocation" }
                         dd { (refund_allocation(competition)) }
@@ -92,8 +106,15 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
                         }
                     }
                 }
-                div { dt { "Entries" } dd { (competition.total_entries) " of " (competition.total_allowed_entries) } }
+                div { dt { "Entries" } dd { (competition.entries()) } }
                 div { dt { "Entry" } dd { (sats(competition.ticket_price)) } }
+            }
+            @if let Some(queue) = queue {
+                @if split {
+                    (queue_pools(&competition.id, queue, None))
+                } @else {
+                    p class="notice" { (queue.pool_note()) "." }
+                }
             }
 
             @if competition.pot_refunded || competition.phase == Phase::Expired {
@@ -114,15 +135,21 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
             }
             @if competition.did_not_fill() {
                 p class="notice" {
-                    "Not enough entries arrived before the window started, so this competition "
+                    @if queue.is_some() {
+                        "Too few players entered to make a pool, so this competition "
+                    } @else {
+                        "Not enough entries arrived before the window started, so this competition "
+                    }
                     "doesn't run and nothing is scored. "
                     (refund_note(competition))
                 }
-            } @else if !ran(competition.phase) {
+            } @else if !split && !ran(competition.phase) {
                 p class="notice" { "This competition did not run, so nothing is scored." }
             }
 
-            @if competition.total_entries == 0 {
+            @if split {
+                // Each pool's page has its scores.
+            } @else if competition.total_entries == 0 {
                 p class="empty-state" { "No entries yet." }
             } @else {
                 div id="leaderboardScores" class="leaderboard-scores"
@@ -140,6 +167,46 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
                             }
                         },
                     ))
+                }
+            }
+        }
+    }
+}
+
+/// The address a queue's pools load from, with the signed-in player's marked.
+pub fn pools_url(competition_id: &str) -> String {
+    format!("/competitions/{competition_id}/pools")
+}
+
+/// A queue's pools, each a competition with its own leaderboard. The page shows them to everyone
+/// (`mine` is `None`), then loads them again from [`pools_url`], signed when the player is logged
+/// in, with `mine` naming the pools that hold the player's entries; logging in or out reloads them.
+pub fn queue_pools(competition_id: &str, queue: &QueueView, mine: Option<&[Uuid]>) -> Markup {
+    let trigger = match mine {
+        None => "load, fw:login from:body, fw:logout from:body",
+        Some(_) => "fw:login from:body, fw:logout from:body",
+    };
+    let own = |pool: &PoolLink| {
+        mine.is_some_and(|mine| Uuid::parse_str(&pool.id).is_ok_and(|id| mine.contains(&id)))
+    };
+    html! {
+        section id="queuePools" class="queue-pools"
+            hx-get=(pools_url(competition_id)) hx-trigger=(trigger) hx-swap="outerHTML" {
+            h2 class="title is-6" { "Pools" }
+            p class="help" { "Entries were split into these pools at the start. Each pool's winner takes its pot." }
+            ul {
+                @for (position, pool) in queue.pools.iter().enumerate() {
+                    li class=[own(pool).then_some("is-own")] {
+                        a href=(pool.url()) hx-get=(pool.url()) hx-target="#main-content" hx-push-url="true" {
+                            (pool.label(position))
+                        }
+                        @if let Some(size) = pool.size {
+                            " · " (size) " players"
+                        }
+                        @if own(pool) {
+                            span class="you-badge" { "Your pool" }
+                        }
+                    }
                 }
             }
         }
@@ -358,6 +425,92 @@ mod tests {
         );
         assert!(html.contains("Loading scores"));
         assert!(html.contains("tie-break"));
+    }
+
+    #[test]
+    fn a_queue_shows_how_many_entered_and_links_its_pools_once_split() {
+        use crate::templates::pages::competitions::{
+            tests::{queued, POOL},
+            PoolLink,
+        };
+        let queue = queued("q", 40);
+        let waiting = leaderboard(&queue, NOW).into_string();
+        assert!(waiting.contains("40 entered"));
+        assert!(waiting.contains("up to 125,000 sats"));
+        assert!(waiting.contains("Players are split into pools of up to 25 at the start."));
+        assert!(waiting.contains("The winner of each pool takes its pot"));
+        assert!(!waiting.contains(" of 3"));
+        assert!(waiting.contains("/competitions/q/leaderboard/rows"));
+
+        let mut split = queue;
+        split.phase = Phase::Unfilled;
+        split.can_enter = false;
+        if let Queue::Queued(queue) = &mut split.queue {
+            queue.pools = vec![PoolLink {
+                id: POOL.into(),
+                index: Some(0),
+                size: Some(20),
+            }];
+        }
+        let html = leaderboard(&split, NOW).into_string();
+        assert!(html.contains(&format!(r#"href="/competitions/{POOL}/leaderboard""#)));
+        assert!(html.contains("Pool 1</a> · 20 players"), "{html}");
+        // Loaded again, signed when logged in, to mark the player's pool.
+        assert!(html.contains(r#"hx-get="/competitions/q/pools""#));
+        assert!(html.contains(r#"hx-trigger="load, fw:login from:body, fw:logout from:body""#));
+        assert!(!html.contains("Your pool"));
+        assert!(
+            !html.contains("leaderboard/rows"),
+            "the scores are the pools'"
+        );
+        assert!(!html.contains("did not run") && !html.contains("Too few"));
+    }
+
+    #[test]
+    fn the_players_pool_is_marked_and_the_marked_list_does_not_reload_itself() {
+        use crate::templates::pages::competitions::tests::POOL;
+        const OTHER: &str = "01a0c226-0000-7000-8000-000000000002";
+        let queue = QueueView {
+            min_players: Some(2),
+            max_players: 25,
+            entries: Some(40),
+            max_entries: None,
+            pools: [POOL, OTHER]
+                .into_iter()
+                .enumerate()
+                .map(|(index, id)| PoolLink {
+                    id: id.into(),
+                    index: Some(index as u64),
+                    size: Some(20),
+                })
+                .collect(),
+        };
+        let mine = [Uuid::parse_str(OTHER).unwrap()];
+        let html = queue_pools("q", &queue, Some(&mine)).into_string();
+        assert_eq!(html.matches("Your pool").count(), 1);
+        assert!(
+            html.contains(r#"<li class="is-own"><a href="/competitions/01a0c226-0000-7000-8000-000000000002/leaderboard""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"hx-trigger="fw:login from:body, fw:logout from:body""#));
+        assert!(!html.contains("load,"));
+        let none = queue_pools("q", &queue, Some(&[])).into_string();
+        assert!(!none.contains("Your pool") && !none.contains("is-own"));
+    }
+
+    #[test]
+    fn a_pool_links_back_to_its_competition() {
+        use crate::templates::pages::competitions::PoolOf;
+        let mut pool = view("p", Phase::Live, -5);
+        pool.queue = Queue::Pool(PoolOf {
+            parent_id: "q".into(),
+            index: Some(0),
+        });
+        let html = leaderboard(&pool, NOW).into_string();
+        assert!(html.contains("Pool 1 of a queued competition."));
+        assert!(html.contains(r#"href="/competitions/q/leaderboard""#));
+        assert!(html.contains("1 of 3"));
+        assert!(html.contains("/competitions/p/leaderboard/rows"));
     }
 
     #[test]

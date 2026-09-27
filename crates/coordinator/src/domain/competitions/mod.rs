@@ -14,6 +14,10 @@ mod eligible_payouts;
 mod lease_store;
 mod metrics_store;
 mod payout;
+mod queued;
+mod queued_store;
+#[cfg(test)]
+mod queued_tests;
 mod reported;
 mod runners;
 pub mod states;
@@ -45,6 +49,11 @@ pub use lease_store::*;
 use log::{debug, error};
 pub use metrics_store::*;
 pub use payout::*;
+pub use queued::{
+    CompetitionKind, CreateQueuedCompetition, PoolSummary, QueueSummary, DEFAULT_MAX_ENTRIES,
+    DEFAULT_MIN_PLAYERS,
+};
+pub use queued_store::{PoolRecord, QueueSettings};
 pub(crate) use reported::Reported;
 pub use runners::*;
 use serde::{Deserialize, Serialize};
@@ -974,6 +983,23 @@ pub struct Competition {
     #[serde(with = "time::serde::rfc3339::option")]
     pub keymeld_keygen_completed_at: Option<OffsetDateTime>,
     pub errors: Vec<CompetitionError>,
+    /// A single competition, a queued competition that takes entries without a seat count, or
+    /// one of the pools a queued competition formed. See `queued.rs`.
+    #[serde(default)]
+    pub kind: CompetitionKind,
+    /// A pool's queued competition.
+    #[serde(default)]
+    pub parent_id: Option<Uuid>,
+    /// A pool's index among its queued competition's pools.
+    #[serde(default)]
+    pub pool_index: Option<u32>,
+    /// When a queued competition formed its pools. It has no lifecycle of its own after that.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub pools_formed_at: Option<OffsetDateTime>,
+    /// A queued competition's settings, entries and pools. Not stored on the row; the
+    /// coordinator fills it in for the API.
+    #[serde(flatten)]
+    pub queue: Option<QueueSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1042,6 +1068,25 @@ pub struct ExtendCompetition {
     pub keymeld_keygen_completed_at: Option<OffsetDateTime>,
     pub errors: Vec<CompetitionError>,
     pub state: String,
+    /// `single`, `queued` or `pool`.
+    #[serde(default)]
+    pub kind: CompetitionKind,
+    /// A pool's queued competition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<Uuid>,
+    /// A pool's index among its queued competition's pools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_index: Option<u32>,
+    /// When a queued competition formed its pools.
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pools_formed_at: Option<OffsetDateTime>,
+    /// A queued competition's `pool_rules`, `entries`, `max_entries`, `stake_sats` and `pools`.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<QueueSummary>,
 }
 
 impl From<Competition> for ExtendCompetition {
@@ -1085,6 +1130,11 @@ impl From<Competition> for ExtendCompetition {
             keymeld_keygen_completed_at: competition.keymeld_keygen_completed_at,
             errors: competition.errors,
             state,
+            kind: competition.kind,
+            parent_id: competition.parent_id,
+            pool_index: competition.pool_index,
+            pools_formed_at: competition.pools_formed_at,
+            queue: competition.queue,
         }
     }
 }
@@ -1381,6 +1431,8 @@ pub enum CompetitionState {
     Completed,
     Failed,
     Cancelled,
+    /// A queued competition split its entries into pools, which each run on their own.
+    PoolsFormed,
 }
 
 impl fmt::Display for CompetitionState {
@@ -1405,6 +1457,7 @@ impl fmt::Display for CompetitionState {
             CompetitionState::Completed => write!(f, "completed"),
             CompetitionState::Failed => write!(f, "failed"),
             CompetitionState::Cancelled => write!(f, "cancelled"),
+            CompetitionState::PoolsFormed => write!(f, "pools_formed"),
         }
     }
 }
@@ -1449,6 +1502,11 @@ impl Competition {
             failed_at: None,
             keymeld_keygen_completed_at: None,
             errors: vec![],
+            kind: CompetitionKind::Single,
+            parent_id: None,
+            pool_index: None,
+            pools_formed_at: None,
+            queue: None,
         }
     }
     pub fn has_full_entries(&self) -> bool {
@@ -1602,6 +1660,18 @@ impl Competition {
     }
     // States change bottom up, so a state that doesn't match any of the conditionals is the first state (ie. Created)
     pub fn get_state(&self) -> CompetitionState {
+        if self.kind == CompetitionKind::Queued {
+            // A queued competition only takes entries: its pools run the lifecycle.
+            return if self.is_cancelled() {
+                CompetitionState::Cancelled
+            } else if self.is_failed() {
+                CompetitionState::Failed
+            } else if self.pools_formed_at.is_some() {
+                CompetitionState::PoolsFormed
+            } else {
+                CompetitionState::Created
+            };
+        }
         if self.is_cancelled() {
             return CompetitionState::Cancelled;
         }
@@ -1709,6 +1779,41 @@ impl FromRow<'_, SqliteRow> for Competition {
                 "keymeld_keygen_completed_at",
             )?,
             errors: parse_optional_blob_json(row, "errors")?.unwrap_or_default(),
+            kind: queued::optional_column::<String>(row, "kind")?
+                .map(|kind| {
+                    CompetitionKind::parse(&kind).ok_or_else(|| sqlx::Error::ColumnDecode {
+                        index: "kind".into(),
+                        source: format!("unknown competition kind {kind}").into(),
+                    })
+                })
+                .transpose()?
+                .unwrap_or_default(),
+            parent_id: queued::optional_column::<String>(row, "parent_id")?
+                .map(|id| {
+                    Uuid::parse_str(&id).map_err(|e| sqlx::Error::ColumnDecode {
+                        index: "parent_id".into(),
+                        source: Box::new(e),
+                    })
+                })
+                .transpose()?,
+            pool_index: queued::optional_column::<i64>(row, "pool_index")?
+                .map(|index| {
+                    u32::try_from(index).map_err(|e| sqlx::Error::ColumnDecode {
+                        index: "pool_index".into(),
+                        source: Box::new(e),
+                    })
+                })
+                .transpose()?,
+            pools_formed_at: queued::optional_column::<String>(row, "pools_formed_at")?
+                .map(|at| {
+                    OffsetDateTime::parse(&at, &time::format_description::well_known::Rfc3339)
+                        .map_err(|e| sqlx::Error::ColumnDecode {
+                            index: "pools_formed_at".into(),
+                            source: Box::new(e),
+                        })
+                })
+                .transpose()?,
+            queue: None,
         })
     }
 }

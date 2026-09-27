@@ -55,6 +55,7 @@ fn generic_response(
                     attempt_id,
                     signing_session_id: None,
                 }),
+                keygen_session_id: None,
             },
             request_digest: [1; 32],
         },
@@ -403,6 +404,7 @@ impl Fixture {
                 max_fee_rate: params.fee_rate,
             };
             let policy = PayoutPolicy {
+                queued_entry: None,
                 automatic_lightning_address: Some("winner@example.org".into()),
                 allow_invoice_fallback: true,
                 release_entry_key_after_payment: true,
@@ -480,6 +482,7 @@ impl Fixture {
             .await
             .unwrap();
         let binding_data = coordinator_escrow::generic::ContractBinding {
+            statement: None,
             contract: bound_contract,
         };
         let policies = escrow.policies.lock().unwrap().clone();
@@ -696,6 +699,7 @@ fn session(players: [UserId; 2]) -> DlcKeygenSession {
             max_signing_sessions: None,
             encrypted_taproot_tweak: "test".into(),
             subset_definitions: vec![],
+            deposit_scope: None,
         },
         &creator.export_secret(),
     )

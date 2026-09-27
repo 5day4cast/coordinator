@@ -16,6 +16,12 @@ pub struct PayoutPolicy {
     /// Absent for tickets funded any other way, so their signed policies are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ark_escrow: Option<ArkEscrowPolicy>,
+    /// For a queued competition: the player's template, a JSON
+    /// [`QueuedEntryTerms`](crate::queued::QueuedEntryTerms), with `contract_terms` empty. The
+    /// contract is derived when the entry's pool forms. Absent otherwise, so other signed
+    /// policies are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_entry: Option<String>,
 }
 
 /// Consent to spend the entry's Arkade escrow into its pool's contract.

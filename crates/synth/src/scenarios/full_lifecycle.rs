@@ -86,6 +86,8 @@ pub(super) struct RequestedEntry {
 pub(super) struct PreparedEntry {
     pub ticket: crate::client::entries::TicketResponse,
     pub entry: AddEntry,
+    /// The ticket's policy is a queued competition's template, not a concrete contract.
+    pub queued: bool,
 }
 
 pub(super) async fn request_entry(
@@ -157,20 +159,25 @@ pub(super) async fn register_entry(
     if ticket.keymeld_session_id.is_some() && ticket.keymeld_registration.is_none() {
         anyhow::bail!("Ticket is missing authorized Keymeld registration context");
     }
-    let registration = match &ticket.keymeld_registration {
-        Some(assignment) => Some(
-            crypto::keymeld::prepare_for_ticket(
+    let (registration, consent) = match &ticket.keymeld_registration {
+        Some(assignment) => {
+            let prepared = crypto::keymeld::prepare_for_ticket(
                 &ephemeral.private_key_hex,
                 assignment,
                 &payout_choice,
                 *competition_id,
+                ticket.ticket_id,
                 &ticket.payment_hash,
                 &payout_preimage,
             )
-            .await?,
-        ),
-        None => None,
+            .await?;
+            (Some(prepared.registration), Some(prepared.consent))
+        }
+        None => (None, None),
     };
+    // A queued entry is its ticket: it is submitted under the ticket's id.
+    let entry_id = consent.map_or(entry_id, |consent| consent.entry_id);
+    trace.entry_id = Some(entry_id);
     // Refund authorization must reach the coordinator before any payment leaves.
     if let Some(data) = &registration {
         client
@@ -217,7 +224,11 @@ pub(super) async fn register_entry(
         keymeld_escrow_policy,
     };
     crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
-    Ok(PreparedEntry { ticket, entry })
+    Ok(PreparedEntry {
+        ticket,
+        entry,
+        queued: consent.is_some_and(|consent| consent.queued),
+    })
 }
 
 pub(super) async fn pay_entry(

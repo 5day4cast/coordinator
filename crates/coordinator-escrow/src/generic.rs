@@ -2,6 +2,7 @@
 use crate::{
     ark::{ArkEscrowSpend, ArkFunding},
     authorization::PayoutPolicy,
+    oracle_statement::SignedStatement,
     payout::ContractCommitment,
     payout_protocol::PayoutMethod,
 };
@@ -37,6 +38,10 @@ pub const ARK_REFUND_RULE: &str = "ark_refund_allowed";
 #[serde(deny_unknown_fields)]
 pub struct ContractBinding {
     pub contract: ContractCommitment,
+    /// For a pool of a queued competition: the oracle's signed statement of the pool's event.
+    /// The verifier derives every member's contract terms from it. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statement: Option<SignedStatement>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,7 +117,7 @@ pub fn registration(
     payout_preimage: &[u8; 32],
     recipient: Recipient,
 ) -> Result<EscrowRegistration, KeyMeldError> {
-    let terms = crate::payout::ContractAuthorization::from_policy(&policy)
+    let terms = crate::queued::EntryConsent::from_policy(&policy)
         .map_err(|error| KeyMeldError::ValidationError(error.to_string()))?;
     terms
         .verify_preimage(payout_preimage)
@@ -138,7 +143,7 @@ pub fn participant_policy(
     policy: PayoutPolicy,
     recipient: Recipient,
 ) -> Result<EscrowPolicy, KeyMeldError> {
-    let terms = crate::payout::ContractAuthorization::from_policy(&policy)
+    let terms = crate::queued::EntryConsent::from_policy(&policy)
         .map_err(|error| KeyMeldError::ValidationError(error.to_string()))?;
     let ark_escrow = policy.ark_escrow.is_some();
     let policy_data = Payload::encode(&policy)?;
@@ -235,7 +240,7 @@ pub fn participant_policy(
         secrets: BTreeMap::from([(
             PREIMAGE_SECRET.into(),
             SecretCommitment {
-                sha256: terms.payout_hash,
+                sha256: terms.payout_hash(),
                 length: 32,
             },
         )]),

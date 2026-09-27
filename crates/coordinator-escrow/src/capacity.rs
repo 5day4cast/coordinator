@@ -4,13 +4,19 @@
 //! size models, never registration or signing inputs.
 use crate::payout::dlctix::{
     bitcoin::{Amount, FeeRate, Network, OutPoint},
-    secp::Scalar,
+    secp::{Point, Scalar},
     ContractParameters, EventLockingConditions, MarketMaker, Outcome, Player,
 };
 use crate::{
-    authorization::PayoutPolicy,
+    authorization::{ArkEscrowPolicy, PayoutPolicy},
     generic,
+    oracle_statement::{
+        LineTerms, ObservationTerms, Outcomes, RankingOutcomes, ScoringRules, SignedStatement,
+        Statement, Terms,
+    },
     payout::{ContractAuthorization, ContractCommitment, MAX_INVOICE_BYTES},
+    pools::PoolRules,
+    queued::{QueuedEntryTerms, QueuedTerms},
     KeyMeldError, SessionId, UserId,
 };
 use keymeld_core::{
@@ -31,6 +37,20 @@ use uuid::Uuid;
 /// signing item per winning place, so the place count dominates the batch size.
 pub const MAX_COMPETITION_PLAYERS: usize = 25;
 pub const MAX_COMPETITION_WINNING_PLACES: usize = 1;
+
+/// The largest observation terms a queued competition may carry. Every entry's consent and each
+/// pool's oracle statement repeat them, so [`validate_competition_capacity`] charges them at these
+/// bounds, and [`crate::queued::QueuedTerms::validate`] refuses larger terms before anyone pays.
+/// An event covers at most 50 stations, each scored on three metrics against one line each.
+pub const MAX_QUEUED_TARGETS: usize = 50;
+pub const MAX_QUEUED_SCORING_FIELDS: usize = 3;
+pub const MAX_QUEUED_LINES: usize = MAX_QUEUED_TARGETS * MAX_QUEUED_SCORING_FIELDS;
+/// The longest source, station or metric name, in bytes. Names hold no character JSON escapes,
+/// so each costs at most this many bytes wherever it is encoded.
+pub const MAX_QUEUED_NAME_BYTES: usize = 32;
+/// Longer than an Arkade escrow's tap tree and checkpoint exit script in hex.
+const MODELED_TAP_TREE_HEX_CHARS: usize = 4096;
+const MODELED_EXIT_SCRIPT_HEX_CHARS: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompetitionCapacity {
@@ -88,6 +108,75 @@ fn worst(value: &impl Serialize) -> Result<Value, KeyMeldError> {
         serde_json::to_value(value).map_err(|e| KeyMeldError::SerializationError(e.to_string()))?;
     worst_bytes(&mut value);
     Ok(value)
+}
+fn modeled_name() -> String {
+    "x".repeat(MAX_QUEUED_NAME_BYTES)
+}
+/// A double with the longest JSON encoding: 17 significant digits and a three-digit negative
+/// exponent.
+const MODELED_LINE_BOUND: f64 = -f64::MIN_POSITIVE;
+/// The largest observation terms a queued competition may carry, each field at its longest
+/// encoding.
+fn modeled_observation() -> ObservationTerms {
+    ObservationTerms {
+        source: modeled_name(),
+        start_observation_date: i64::MIN,
+        end_observation_date: i64::MIN,
+        targets: vec![modeled_name(); MAX_QUEUED_TARGETS],
+        scoring_fields: vec![modeled_name(); MAX_QUEUED_SCORING_FIELDS],
+        number_of_values_per_entry: u32::MAX,
+        scoring_rules: ScoringRules::Lines,
+        lines: (0..MAX_QUEUED_LINES)
+            .map(|_| LineTerms {
+                target: modeled_name(),
+                metric: modeled_name(),
+                lower: MODELED_LINE_BOUND,
+                upper: MODELED_LINE_BOUND,
+                window_hours: u32::MAX,
+            })
+            .collect(),
+    }
+}
+/// The oracle's signed statement of a pool's event, which a queued competition's pool binds.
+fn modeled_statement(players: usize, point: Point) -> SignedStatement {
+    SignedStatement {
+        statement: Statement {
+            event_id: Uuid::max(),
+            signing_date: i64::MIN,
+            expiry: u32::MAX,
+            nonce_point: point,
+            outcomes: Outcomes::Ranking(RankingOutcomes {
+                number_of_places_win: u32::MAX,
+                entry_ids: vec![Uuid::max(); players],
+            }),
+            terms: Terms::Observation(modeled_observation()),
+        },
+        signature: "f".repeat(128),
+    }
+}
+/// A queued entry's consent, which names the competition's terms instead of a contract.
+fn modeled_queued_entry(market_maker: MarketMaker) -> Result<String, KeyMeldError> {
+    let entry = QueuedEntryTerms {
+        terms: QueuedTerms {
+            competition_id: Uuid::max(),
+            network: Network::Regtest,
+            market_maker,
+            oracle_pubkey: "f".repeat(64),
+            signing_date: i64::MIN,
+            expiry: u32::MAX,
+            observation: modeled_observation(),
+            number_of_places_win: u32::MAX,
+            pool_rules: PoolRules::new(10, MAX_COMPETITION_PLAYERS)
+                .map_err(|e| invalid(e.to_string()))?,
+            stake_sats: u64::MAX,
+            relative_locktime_block_delta: u16::MAX,
+            max_fee_rate: FeeRate::from_sat_per_kwu(u64::MAX),
+        },
+        entry_id: Uuid::max(),
+        ticket_hash: [255; 32],
+        payout_hash: [255; 32],
+    };
+    serde_json::to_string(&entry).map_err(|e| KeyMeldError::SerializationError(e.to_string()))
 }
 
 /// Bound a Coordinator ranking event independently of its future participant
@@ -184,12 +273,25 @@ pub fn validate_competition_capacity(
     let contract_terms = serde_json::to_string(&terms)
         .map_err(|e| KeyMeldError::SerializationError(e.to_string()))?;
     let app_policy = PayoutPolicy {
+        queued_entry: None,
         automatic_lightning_address: Some("x".repeat(320)),
         allow_invoice_fallback: false,
         release_entry_key_after_payment: true,
         contract_terms,
-        ark_escrow: None,
+        // An Arkade escrow adds its terms and two permissions to every policy.
+        ark_escrow: Some(ArkEscrowPolicy {
+            escrow_tap_tree: "f".repeat(MODELED_TAP_TREE_HEX_CHARS),
+            max_fee_sats: u64::MAX,
+            max_refund_fee_sats: u64::MAX,
+            checkpoint_exit_script: "f".repeat(MODELED_EXIT_SCRIPT_HEX_CHARS),
+        }),
     };
+    // A queued entry's policy names its competition's terms instead of a contract.
+    let queued_policy = Payload::encode(&PayoutPolicy {
+        contract_terms: String::new(),
+        queued_entry: Some(modeled_queued_entry(params.market_maker.clone())?),
+        ..app_policy.clone()
+    })?;
     let context = EscrowContext {
         keygen_session_id: SessionId::from(id),
         user_id: user.clone(),
@@ -209,6 +311,12 @@ pub fn validate_competition_capacity(
             encryption_public_key: key.clone(),
         },
     )?;
+    // Model whichever kind of consent is larger.
+    if let Some(verifier) = policy.verifier.as_mut() {
+        if queued_policy.as_bytes().len() > verifier.policy_data.as_bytes().len() {
+            verifier.policy_data = queued_policy;
+        }
+    }
     policy.context.application.commitment = [255; 32];
     let signed = SignedEscrowPolicy {
         policy,
@@ -221,7 +329,10 @@ pub fn validate_competition_capacity(
         contract_parameters: params,
         funding_outpoint: OutPoint::null(),
     };
+    // A queued competition's pool also binds the oracle's statement of its event.
+    let statement = modeled_statement(players, point);
     let binding_data = Payload::encode(&generic::ContractBinding {
+        statement: Some(statement.clone()),
         contract: contract.clone(),
     })?;
     let request = BindEscrowRequest {
@@ -239,7 +350,7 @@ pub fn validate_competition_capacity(
         .map(|index| (UserId::from(Uuid::from_u128(index as u128)), key.clone()))
         .collect();
     let app_bound = worst(
-        &json!({"contract":contract,"contract_digest":"f".repeat(64),"policy_digest":vec![255u8;32],"manifest_digest":vec![255u8;32],"participant_public_keys":keys}),
+        &json!({"contract":contract,"contract_digest":"f".repeat(64),"policy_digest":vec![255u8;32],"manifest_digest":vec![255u8;32],"participant_public_keys":keys,"statement":statement}),
     )?;
     let digests: BTreeMap<_, _> = (1..=players)
         .map(|index| (UserId::from(Uuid::from_u128(index as u128)), [255; 32]))
@@ -363,11 +474,23 @@ mod tests {
         }
     }
     #[test]
+    fn queued_terms_are_modeled_at_the_largest_the_enclave_accepts() {
+        crate::queued::check_observation_size(&modeled_observation()).unwrap();
+        let longest = serde_json::to_string(&MODELED_LINE_BOUND).unwrap().len();
+        assert_eq!(longest, 24);
+        for value in [f64::MIN, f64::MAX, -f64::EPSILON, -1.2345678901234567e-300] {
+            assert!(serde_json::to_string(&value).unwrap().len() <= longest);
+        }
+    }
+    #[test]
     fn small_events_reserve_both_invoice_receipts_and_signing_retry() {
         for players in [2, 3, 7] {
             let capacity = validate_competition_capacity(players, 1).unwrap();
             assert_eq!(capacity.signing_items, 4 * players + 2);
-            assert!(capacity.settlement_request_bytes > capacity.bind_request_bytes);
+            // A pool's bind request carries its oracle statement at the largest terms, so it
+            // may outgrow the settlement request; each still fits one payload.
+            assert!(capacity.bind_request_bytes <= escrow::MAX_PAYLOAD_BYTES);
+            assert!(capacity.settlement_request_bytes <= escrow::MAX_PAYLOAD_BYTES);
             assert!(capacity.signing_request_bytes > 0);
             assert!(capacity.largest_receipt_bytes < escrow::MAX_PAYLOAD_BYTES);
         }

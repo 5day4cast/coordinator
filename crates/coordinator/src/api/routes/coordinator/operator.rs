@@ -14,7 +14,10 @@ use uuid::Uuid;
 
 use crate::{
     api::routes::ApiError,
-    domain::{Competition, CompetitionError, CreateEvent, Error, RefundProgress},
+    domain::{
+        Competition, CompetitionError, CompetitionKind, CreateEvent, Error, QueueSummary,
+        RefundProgress,
+    },
     startup::AppState,
 };
 
@@ -37,6 +40,15 @@ pub struct OperatorCompetition {
     pub errors: Vec<CompetitionError>,
     /// Its funded Arkade escrows and how many have been refunded; None when it has none.
     pub refunds: Option<RefundProgress>,
+    /// `single`, `queued` or `pool`.
+    #[serde(default)]
+    pub kind: CompetitionKind,
+    /// A pool's queued competition.
+    #[serde(default)]
+    pub parent_id: Option<Uuid>,
+    /// A queued competition's settings, entries and pools.
+    #[serde(default)]
+    pub queue: Option<QueueSummary>,
 }
 
 /// A step a competition has reached, and when.
@@ -52,6 +64,7 @@ impl OperatorCompetition {
         let c = competition;
         let mut milestones: Vec<Milestone> = [
             ("created", Some(c.created_at)),
+            ("pools_formed", c.pools_formed_at),
             ("event_created", c.event_created_at),
             ("entries_submitted", c.entries_submitted_at),
             ("escrow_funds_confirmed", c.escrow_funds_confirmed_at),
@@ -91,6 +104,9 @@ impl OperatorCompetition {
             milestones,
             errors: c.errors.clone(),
             refunds,
+            kind: c.kind,
+            parent_id: c.parent_id,
+            queue: c.queue.clone(),
         }
     }
 }

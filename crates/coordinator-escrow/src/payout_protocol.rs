@@ -399,6 +399,7 @@ mod tests {
             self, protocol::RequestContext, ApplicationContext, EscrowContext,
         };
         RequestContext {
+            keygen_session_id: None,
             schema_version: escrow::SCHEMA_VERSION,
             operation,
             escrow: EscrowContext {
@@ -499,7 +500,10 @@ mod tests {
             protocol::{BindingOutput, Operation, Payload},
         };
         let (contract, _) = crate::payout::tests::fixture();
-        let binding = crate::generic::ContractBinding { contract };
+        let binding = crate::generic::ContractBinding {
+            contract,
+            statement: None,
+        };
         let context = context(Operation::Bind);
         let output = Payload::encode(&BindingOutput {
             binding_data_digest: escrow::sha256(Payload::encode(&binding).unwrap().as_bytes()),

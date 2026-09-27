@@ -43,6 +43,8 @@ hex.workspace = true
 
 # Utilities
 thiserror.workspace = true
+# The oracle's RFC 3339 event dates, read when checking a queued entry's terms.
+time.workspace = true
 # `js`: UUIDv7 entry ids take their time from the browser's clock.
 uuid = { workspace = true, features = ["js"] }
 # The ticket invoice's QR code, drawn from the invoice the wallet checked.

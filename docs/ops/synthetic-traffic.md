@@ -62,10 +62,20 @@ The example's 1,200-second entry window exceeds its 1,050-second minimum. The sa
 | `duplicate_submission` | One player repeats the same entry submission. The duplicate must not create another entry. |
 | `late_submission` | One player pays, then submits after entry closes. The submission must fail; cancellation must refund paid tickets. |
 | `escrow_refund` | An intentionally unfilled competition cancels and refunds its paid tickets. |
+| `queued_split` | 27 players enter a queued competition with pools of 2 to 25. When registration closes it must form `ceil(27 / 25)` pools whose sizes differ by at most one and which hold every entry exactly once. Each pool is then followed to funding and on to awaiting its attestation. |
+| `queued_one_pool` | 5 players enter a queued competition. It must form one pool of all 5, which is followed like a split's pools. |
+| `queued_too_few` | 2 players enter a queued competition that needs 3 per pool. It must be cancelled without pools and refund both escrows to the players' Lightning Address. |
+| `queued_leftover_refund` | 4 players pay into a queued competition and one never submits an entry. The pool must form from the 3 complete tickets and run, and the incomplete ticket must be refunded from the queue. |
 
 The planner chooses one exceptional player for each named behavior case. Other players follow the complete-entry plan.
 
 Cases that require escrow refunds need a configured payer and a Lightning Address. These prerequisites are checked before competition creation.
+
+Queued cases need both too, since every queued entry waits in an Arkade escrow and names the Lightning Address it is refunded to. Each queued case sets its own player count; `--queue-players` changes how many players enter completely, and `--max-pool-players` the largest pool. For example, `--queue-players 5 --max-pool-players 3` splits into pools of 3 and 2 with five payments instead of 27. Queued cases keep an entry window of at least 300 seconds, and 600 for `queued_split`.
+
+A pool whose kickoff batch fails is not covered yet. It needs an operator test hook on the coordinator that fails one pool's batch.
+
+The money tracker follows the competition a run created, which for a queued case is the queue. It confirms a cancelled queue's refunds, but does not follow pools yet: a run whose queue formed pools ends with its money unverified, and its pools' payouts are checked by hand.
 
 Scheduled runs cycle through every scenario at one observation duration, then advance to the next duration. Every configured case receives every configured duration.
 

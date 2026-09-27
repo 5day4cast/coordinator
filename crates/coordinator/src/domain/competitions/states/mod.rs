@@ -349,6 +349,10 @@ impl From<Competition> for CompetitionStatus {
             super::CompetitionState::Cancelled => {
                 CompetitionStatus::Cancelled(Cancelled::from_competition(competition))
             }
+            // A queued competition that formed its pools has no lifecycle left; its pools run.
+            super::CompetitionState::PoolsFormed => {
+                CompetitionStatus::Completed(Completed::from_competition(competition))
+            }
         }
     }
 }

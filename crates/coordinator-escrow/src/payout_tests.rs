@@ -65,6 +65,7 @@ pub(crate) fn fixture() -> (ContractCommitment, ContractAuthorization) {
 }
 fn policy(terms: &ContractAuthorization) -> PayoutPolicy {
     PayoutPolicy {
+        queued_entry: None,
         automatic_lightning_address: Some("alice@example.com".into()),
         allow_invoice_fallback: true,
         release_entry_key_after_payment: true,

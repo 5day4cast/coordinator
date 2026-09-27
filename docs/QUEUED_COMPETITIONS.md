@@ -1,9 +1,8 @@
 # Queued competitions on Arkade
 
-Status: partly built.
-One competition funds as one Arkade pool; see [In the coordinator](#in-the-coordinator).
-The rule for forming pools is `coordinator-escrow::pools`.
-Queued registration, forming pools at kickoff, session-free key deposits, and template checks are not built yet; see [Implementation phases](#implementation-phases).
+Status: built.
+A queued competition sells entries without a seat count and splits them into pools at kickoff; see [Queued competitions in the coordinator](#queued-competitions-in-the-coordinator).
+The rule for forming pools is `coordinator-escrow::pools`, and the template each player consents to is `coordinator-escrow::queued`.
 Items marked "Pending" still need confirmation against arkd, Keymeld, or the oracle.
 
 Players join a queue until registration closes.
@@ -194,6 +193,7 @@ Paying the invoice still reveals the ticket preimage to the player, as a ticket'
 At entry the browser encrypts the entry key and payout preimage to the attested enclave.
 The encryption context names the competition, the ticket, and the template digest.
 It names no session or manifest, because neither exists yet.
+In Keymeld terms it is a registration under a deposit scope: the competition id stands in for the session id, and the digest of the competition's terms (`QueuedTerms::digest`) for the manifest digest.
 Nothing is signed for a specific contract at entry.
 The coordinator keeps the sealed deposit, as it keeps each ticket's sealed registration today, and registers it into the pool's session at kickoff.
 So the enclave needs no deposit store; see [Keymeld changes](#keymeld-changes).
@@ -216,6 +216,13 @@ The entry form shows one line saying where a refund goes if the competition does
 The template does not fix the player slot, the player count, the funding value, the oracle locking points, or the funding outpoint.
 They do not exist until kickoff.
 The enclave checks at kickoff that each of these follows from the template.
+
+In the payout policy the template is `queued_entry`, a `QueuedEntryTerms`: the competition's `QueuedTerms`, identical for every player, plus the player's entry id, ticket hash, and payout hash.
+`contract_terms` stays empty.
+`QueuedTerms` holds the network, the market maker key, the oracle key, the pool events' signing date and expiry, the observation terms exactly as the oracle signs them (lines included), the places paid, the pool rules, each player's stake, the relative locktime, and the fee ceiling.
+The wallet checks each of these against the competition page and the competition's oracle event, which it fetches from the oracle itself.
+`queued::pool_authorization` derives a member's concrete contract terms from the template, the pool's members, and the pool event's signed statement.
+A pool of `n` players funds `n` stakes, and the payout table follows the oracle's outcome order.
 
 ## Forming pools
 
@@ -267,15 +274,20 @@ A locking point is derived only from the oracle's key, the event's nonce point, 
 An outcome message names no event.
 So without more evidence, a coordinator could build a pool on another event's nonce point, such as an event already attested, or the event of another pool in the same competition, and so decide the pool's winner.
 
-Pending in the oracle (tee8z/noaa-oracle#75): a signed statement of each event.
-Once the coordinator has submitted a pool's entries, the oracle serves a statement it signs, in three parts:
+The oracle signs a statement of each event (noaa-oracle 2.4.0).
+Once the coordinator has submitted a pool's entries, the oracle serves the statement, in three parts:
 
 - The core: the event id, signing date, expiry, and nonce point.
 - The outcomes: the winning places and the entry ids in id order, which fix each player's outcome index.
-- The terms: the source, observation window, stations, scoring fields, and values per entry.
+- The terms: the source, observation window, stations, scoring fields, values per entry, scoring rules, and the lines as exact doubles.
 
-The verifier checks the signature with the template's oracle key, the terms against the template, and the entries against the pool's tickets.
+The verifier checks the signature with the template's oracle key, the terms against the template bit for bit, and the entries against the pool's tickets.
 It then derives the locking points from the statement.
+`coordinator-escrow::oracle_statement` implements the encoding, with the oracle's test vector, because the enclave cannot build the oracle's crate.
+
+Players pick against the lines shown when they enter, and the oracle refits its lines once or twice a day.
+So a queued competition creates a reference event when it opens, with the competition's id, which freezes the lines and never takes entries.
+Each pool event is created with `lines_from_event` naming it, and copies those lines exactly (noaa-oracle 2.5.0).
 
 ## Funding in an Arkade batch
 
@@ -347,6 +359,39 @@ Gaps:
 - Escrow VTXOs expire 7 days after they are created, and nothing renews them yet.
   A competition must kick off within 7 days of its first paid ticket.
 - If the process stops inside a batch that then completes, the next attempt fails on spent escrows until an operator records the commitment.
+
+### Queued competitions in the coordinator
+
+A queued competition is a `competitions` row of kind `queued`; its pools are rows of kind `pool` that name it as their parent.
+Each pool runs the lifecycle of [In the coordinator](#in-the-coordinator) from escrow confirmation on.
+
+1. **Creation.**
+   The admin sets the stations, window, entry fee, coordinator fee, pool sizes (minimum, and a maximum of at most 25), and an optional entry cap.
+   The coordinator creates a reference oracle event with the competition's id.
+   The reference event takes no entries and freezes the lines players see.
+   `QueuedTerms` are built from that event and stored with the competition.
+   No tickets, Keymeld session, or pool events exist yet.
+2. **Entry.**
+   A ticket is created when a player asks for one, up to the entry cap.
+   Its payout policy carries the player's template, and its escrow refunds no later than the pool events' expiry.
+   The wallet checks the template against the oracle's reference event and key, and against the entry form.
+   It then seals the entry key as a Keymeld deposit under the competition's scope.
+   The coordinator has the enclave validate the deposit before it shows the invoice.
+3. **Kickoff.**
+   When observation starts, the coordinator finds the first block at or after the close.
+   It takes the complete tickets: paid into their escrows, with an entry and a deposit.
+   Then it forms the pools from the seed.
+   One database write creates each pool, moves its tickets and entries to it, and records the formation: close height, block hash, and every ticket placed.
+   Each pool then gets a Keymeld session made from its members' deposits, with the formation as evidence, and starts.
+4. **Pools.**
+   A pool's oracle event is created with the pool's size and `lines_from_event` naming the reference event.
+   The coordinator checks that the event's lines equal the reference event's.
+   The pool funds `n` stakes.
+   Its binding carries the oracle's signed statement of the pool event, from which the verifier derives every member's contract.
+5. **Refunds.**
+   If too few tickets are complete, the queued competition is cancelled.
+   Its escrows, and any paid tickets no pool took, are refunded through a session made only for refunds, with refund evidence, under which nothing can be bound.
+   A pool that fails to kick off refunds through its own session.
 
 ### Live run on Mutinynet, 2026-09-21
 
@@ -562,9 +607,11 @@ Pending: whether the closing sweep can board back into Arkade.
    Done for Keymeld signing inside the batch.
 7. **Browser changes.**
    The browser checks the escrow in the payout policy and shows the refund destination.
-   Pending: depositing the key against a template instead of concrete terms.
+   Done: the wallet checks a queued entry's terms against the oracle's reference event and key and the entry form (`coordinator-wasm`, `wallet/queued.rs`), checks that its Keymeld registration is scoped to the terms, and seals the key as a Keymeld deposit under that scope.
+   A queued competition shows how many entered and its pool size; once split, its page links each pool and marks the player's, and each pool links back.
 8. **Synth scenarios.**
-   Add scenarios for a full queue, uneven demand, a kickoff failure, a missed batch, and refunds to a Lightning Address.
+   Done: `queued_split`, `queued_one_pool`, `queued_too_few` (refunds to a Lightning Address) and `queued_leftover_refund`; see [synthetic traffic](ops/synthetic-traffic.md).
+   Pending: a kickoff failure and a missed batch, which need an operator test hook that fails a pool's batch.
 
 ## Alternatives considered
 

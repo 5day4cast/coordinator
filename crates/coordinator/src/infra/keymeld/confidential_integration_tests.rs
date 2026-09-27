@@ -249,6 +249,7 @@ async fn coordinator_service_executes_confidential_dlc_and_recovers_late_paid_ca
         max_fee_rate: params.fee_rate,
     };
     let policy = PayoutPolicy {
+        queued_entry: None,
         automatic_lightning_address: None,
         allow_invoice_fallback: true,
         release_entry_key_after_payment: true,
@@ -629,6 +630,7 @@ impl PoolHarness {
                 max_fee_rate: params.fee_rate,
             };
             let policy = PayoutPolicy {
+                queued_entry: None,
                 automatic_lightning_address: lightning_address.clone(),
                 allow_invoice_fallback: true,
                 release_entry_key_after_payment: true,
@@ -1503,4 +1505,168 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_filled() {
     ));
     assert!(sign(1, RefundPurpose::ArkTransaction).await.is_err());
     harness.stop().await;
+}
+
+/// A player's key deposit for a queued competition: sealed to the enclave under the deposit
+/// scope, before any session exists, as the player's browser seals it.
+fn deposit(
+    assignment: &coordinator_core::RegistrationAssignment,
+    secret: [u8; 32],
+) -> ParticipantRegistrationData {
+    let credentials = UserCredentials::from_private_key(&secret).unwrap();
+    let context = RegistrationContext {
+        keygen_session_id: SessionId::new(&assignment.session_id),
+        manifest_hash: assignment.manifest_hash.clone(),
+        user_id: UserId::from(assignment.user_id),
+        enclave_id: EnclaveId::new(assignment.enclave_id),
+        enclave_key_epoch: assignment.enclave_key_epoch,
+        public_key: credentials.public_key_bytes(),
+        auth_pubkey: credentials
+            .derive_session_auth_pubkey(&assignment.session_id)
+            .unwrap(),
+        require_signing_approval: false,
+    };
+    ParticipantRegistrationData {
+        encrypted_private_key: credentials
+            .prepare_deposit_registration(context.clone(), &assignment.enclave_public_key)
+            .unwrap(),
+        public_key: hex::encode(&context.public_key),
+        auth_pubkey: hex::encode(&context.auth_pubkey),
+        context,
+        payout_policy: None,
+        escrow_policy: None,
+    }
+}
+
+#[tokio::test]
+async fn key_deposits_are_checked_alone_and_registered_into_a_pool_session() {
+    let relay_state = Relay {
+        operator: Arc::new(Mutex::new(operator())),
+        requests: Default::default(),
+        responses: Default::default(),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new()
+        .route("/api/v1/confidential", post(relay))
+        .route("/api/v1/enclaves/1/public-key", get(public_key))
+        .route("/api/v1/enclaves", get(enclaves))
+        .with_state(relay_state.clone())
+        .layer(tower_http::decompression::RequestDecompressionLayer::new());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let directory = tempfile::tempdir().unwrap();
+    let db = DBConnection::new(
+        directory.path().to_str().unwrap(),
+        "confidential-deposits",
+        DatabasePoolConfig::default(),
+        DatabaseType::Competitions,
+    )
+    .await
+    .unwrap();
+    let maker = Uuid::now_v7();
+    let settings = KeymeldSettings {
+        enabled: true,
+        dangerous_trust_unattested_enclaves: true,
+        gateway_url: url,
+        initial_polling_delay_ms: 1,
+        max_polling_delay_ms: 10,
+        ..Default::default()
+    };
+    let service = create_keymeld_service(settings, maker, &[18; 32], db).unwrap();
+
+    // The queued competition's deposit scope: its id and the digest of its terms.
+    let queue = Uuid::now_v7();
+    let scope_id = SessionId::from(queue);
+    let digest = [9; 32];
+    let scope = |evidence: &[u8]| DepositScopeRequest {
+        deposit_session_id: scope_id.clone(),
+        deposit_digest: digest,
+        evidence: evidence.to_vec(),
+    };
+    let players: Vec<UserId> = (0..2).map(|_| UserId::new_v7()).collect();
+    let mut deposits = Vec::new();
+    for (index, player) in players.iter().enumerate() {
+        let assignment = service
+            .deposit_assignment(scope_id.clone(), digest, player.clone())
+            .await
+            .unwrap();
+        assert_eq!(assignment.session_id, scope_id.to_string());
+        assert_eq!(assignment.manifest_hash, digest.to_vec());
+        let data = deposit(&assignment, entry_secret(index));
+        // The enclave checks each deposit on its own before its ticket is paid.
+        service
+            .validate_deposit(scope(b"refund"), player.clone(), &data)
+            .await
+            .unwrap();
+        deposits.push((player.clone(), data));
+    }
+    // A registration sealed for a session, not as a deposit, is refused.
+    let mut sealed_for_session = deposits[0].1.clone();
+    sealed_for_session.encrypted_private_key = UserCredentials::from_private_key(&entry_secret(0))
+        .unwrap()
+        .prepare_registration(
+            sealed_for_session.context.clone(),
+            &hex::encode(relay_state.operator.lock().unwrap().get_public_key()),
+        )
+        .unwrap();
+    assert!(service
+        .validate_deposit(scope(b"refund"), players[0].clone(), &sealed_for_session)
+        .await
+        .is_err());
+    // A deposit under other terms is refused.
+    let mut other_terms = scope(b"refund");
+    other_terms.deposit_digest = [8; 32];
+    assert!(service
+        .validate_deposit(other_terms, players[0].clone(), &deposits[0].1)
+        .await
+        .is_err());
+
+    // At kickoff the pool's session registers the same deposits and runs keygen.
+    let pool = Uuid::now_v7();
+    let members: Vec<(UserId, EnclaveId)> = deposits
+        .iter()
+        .map(|(player, data)| (player.clone(), data.context.enclave_id))
+        .collect();
+    let subsets = crate::domain::compute_dlc_subset_definitions(UserId::from(maker), &players, 1);
+    let session = service
+        .init_deposit_session(pool, scope(b"pool"), members.clone(), subsets.clone())
+        .await
+        .unwrap();
+    assert_eq!(session.session_id, SessionId::from(pool));
+    assert_eq!(
+        session.registration_scope().unwrap(),
+        (scope_id.clone(), digest.to_vec())
+    );
+    // A retry gets the same session; one that changes its members does not.
+    let again = service
+        .init_deposit_session(pool, scope(b"pool"), members.clone(), subsets.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        again.authorization_manifest.digest().unwrap(),
+        session.authorization_manifest.digest().unwrap()
+    );
+    assert!(service
+        .init_deposit_session(pool, scope(b"pool"), members[..1].to_vec(), subsets.clone())
+        .await
+        .is_err());
+    for (player, data) in &deposits {
+        service
+            .register_participant(&session, player.clone(), data)
+            .await
+            .unwrap();
+    }
+    assert!(
+        service
+            .get_keygen_status(&session)
+            .await
+            .unwrap()
+            .is_completed
+    );
+    let roster = service.wait_for_keygen_completion(&session).await.unwrap();
+    roster
+        .verify_registrations(&session.authorization_manifest)
+        .unwrap();
+    assert_eq!(roster.roster.participants.len(), 3);
+    server.abort();
 }

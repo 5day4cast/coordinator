@@ -61,6 +61,7 @@ impl Competition {
 impl CompetitionStore {
     /// Close an unfilled roster under the worker lease. Count entries in the
     /// serialized write, since the worker's snapshot can predate the final entry.
+    /// A queued competition has no roster to fill: its kickoff decides at the start.
     pub(super) async fn cancel_unfilled_at_deadline(
         &self,
         competition: &Competition,
@@ -80,7 +81,7 @@ impl CompetitionStore {
                     .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
                 let changed = sqlx::query(
                     "UPDATE competitions SET cancelled_at = ?
-                     WHERE id = ?
+                     WHERE id = ? AND kind != 'queued'
                        AND cancelled_at IS NULL AND failed_at IS NULL AND completed_at IS NULL
                        AND escrow_funds_confirmed_at IS NULL AND event_created_at IS NULL
                        AND entries_submitted_at IS NULL AND contract_parameters IS NULL

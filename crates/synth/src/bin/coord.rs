@@ -110,7 +110,7 @@ enum SynthCommands {
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         observation_window: Option<u64>,
         #[command(flatten)]
-        timing: coordinator_synth::cli::EntryTimingArgs,
+        timing: Box<coordinator_synth::cli::EntryTimingArgs>,
     },
     /// Show status of last run
     Status,
@@ -244,7 +244,7 @@ async fn main() -> Result<()> {
                     let config = config.resolve_plan(&scenario)?;
 
                     println!("Running scenario: {}", scenario);
-                    println!("  Users: {}", users);
+                    println!("  Users: {}", config.users);
                     println!("  Seed: {}", config.seed.expect("resolved seed"));
                     println!(
                         "  Observation window: {} min",
