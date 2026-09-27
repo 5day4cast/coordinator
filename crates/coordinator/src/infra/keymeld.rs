@@ -687,6 +687,7 @@ mod tests {
         ]);
         let manifest = SignedSessionManifest::sign(
             SessionAuthorizationManifest {
+                deposit_scope: None,
                 keygen_session_id: session_id.clone(),
                 coordinator_user_id: coordinator.clone(),
                 creator_pubkey: creator.public_key_bytes(),
