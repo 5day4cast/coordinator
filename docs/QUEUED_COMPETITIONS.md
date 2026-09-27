@@ -267,11 +267,15 @@ A locking point is derived only from the oracle's key, the event's nonce point, 
 An outcome message names no event.
 So without more evidence, a coordinator could build a pool on another event's nonce point, such as an event already attested, or the event of another pool in the same competition, and so decide the pool's winner.
 
-Pending: the oracle signs each announcement.
-The coordinator creates a pool's event together with its entries, in entry id order.
-The oracle returns an announcement that it signs, covering the event id, the event specification, the nonce point, and the ordered entry ids.
-The verifier checks the signature with the template's oracle key, the specification against the template, and the entries against the pool's tickets.
-It then derives the locking points itself.
+Pending in the oracle (tee8z/noaa-oracle#75): a signed statement of each event.
+Once the coordinator has submitted a pool's entries, the oracle serves a statement it signs, in three parts:
+
+- The core: the event id, signing date, expiry, and nonce point.
+- The outcomes: the winning places and the entry ids in id order, which fix each player's outcome index.
+- The terms: the source, observation window, stations, scoring fields, and values per entry.
+
+The verifier checks the signature with the template's oracle key, the terms against the template, and the entries against the pool's tickets.
+It then derives the locking points from the statement.
 
 ## Funding in an Arkade batch
 
