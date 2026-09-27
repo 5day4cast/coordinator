@@ -464,27 +464,53 @@ impl Coordinator {
     /// Create a pool's oracle event from its queued competition's reference event, copying the
     /// lines that event froze. An oracle that ignored the request froze its own lines, so the
     /// event is checked against the terms players consented to, and refused if it differs.
+    ///
+    /// The pool's id is its event's, so an event created before a restart is found and checked
+    /// rather than created twice.
     pub(super) async fn create_pool_event(
         &self,
         competition: &Competition,
         settings: &QueueSettings,
     ) -> Result<Event, anyhow::Error> {
-        let event = match self
-            .oracle_client
-            .create_event_from_lines(
-                competition.event_submission.clone(),
-                settings.competition_id,
-            )
-            .await
-        {
-            Ok(event) => event,
-            Err(OracleError::NotFound(e)) => return Err(Error::NotFound(e).into()),
-            Err(OracleError::BadRequest(e)) => return Err(Error::BadRequest(e).into()),
+        let event = match self.oracle_client.get_event_terms(&competition.id).await {
+            Ok(existing) => existing.event,
+            Err(OracleError::NotFound(_)) => match self
+                .oracle_client
+                .create_event_from_lines(
+                    competition.event_submission.clone(),
+                    settings.competition_id,
+                )
+                .await
+            {
+                Ok(event) => event,
+                Err(OracleError::NotFound(e)) => return Err(Error::NotFound(e).into()),
+                Err(OracleError::BadRequest(e)) => return Err(Error::BadRequest(e).into()),
+                Err(e) => return Err(Error::OracleFailed(e).into()),
+            },
             Err(e) => return Err(Error::OracleFailed(e).into()),
         };
         let created = self.oracle_client.get_event_terms(&competition.id).await?;
         check_pool_event(competition, settings, &event, &created)?;
         Ok(event)
+    }
+
+    /// What a pool needs before its lifecycle can run: its Keymeld session and its oracle event.
+    /// Both are made after the pool formed, so a pool that cannot get them in time fails, and
+    /// its escrows are refunded; until then each step tries again.
+    pub(super) async fn prepare_pool(
+        &self,
+        competition: &mut Competition,
+    ) -> Result<(), anyhow::Error> {
+        self.ensure_pool_session(competition).await?;
+        if competition.event_announcement.is_none() {
+            let (settings, _) = self
+                .pool_of(competition)
+                .await?
+                .ok_or_else(|| anyhow!("Competition {} is not a pool", competition.id))?;
+            let event = self.create_pool_event(competition, &settings).await?;
+            competition.event_announcement = Some(event.event_announcement);
+        }
+        Ok(())
     }
 
     /// The oracle's signed statement of a pool's event, checked against what the coordinator
@@ -508,17 +534,22 @@ impl Coordinator {
     }
 
     /// A pool's payout table: its players consented to `queued::pool_payouts` for whatever pool
-    /// they were placed in. Every entry must be a queued entry of this pool's competition, with
-    /// its terms exactly.
+    /// they were placed in. The entries must be exactly the pool's members, and each a queued
+    /// entry of this pool's competition, with its terms exactly.
     pub(super) async fn accepted_pool_payouts(
         &self,
         competition: &Competition,
         settings: &QueueSettings,
+        members: &[Uuid],
         entries: &[UserEntry],
     ) -> Result<BTreeMap<Outcome, PayoutWeights>, anyhow::Error> {
-        if entries.len() != competition.event_submission.total_allowed_entries {
+        let mut roster: Vec<Uuid> = entries.iter().map(|entry| entry.ticket_id).collect();
+        roster.sort_unstable();
+        if entries.len() != competition.event_submission.total_allowed_entries
+            || roster != members
+        {
             return Err(anyhow!(
-                "Pool {} has {} entries, not its {} players",
+                "Pool {} has {} entries, not its {} members",
                 competition.id,
                 entries.len(),
                 competition.event_submission.total_allowed_entries

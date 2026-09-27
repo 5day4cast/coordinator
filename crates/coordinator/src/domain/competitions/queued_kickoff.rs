@@ -36,8 +36,9 @@ use keymeld_sdk::prelude::EnclaveId;
 const CLOSE_BLOCK_POLL: time::Duration = time::Duration::seconds(30);
 /// Headers read at a time while looking for the closing block: about a day of blocks.
 const HEADER_CHUNK: u32 = 144;
-/// How long a pool may wait for its Keymeld session before it fails, and is refunded.
-pub(super) const POOL_SESSION_DEADLINE: time::Duration = time::Duration::hours(1);
+/// How long a pool may wait for its Keymeld session and oracle event before it fails, and is
+/// refunded.
+pub(super) const POOL_SETUP_DEADLINE: time::Duration = time::Duration::hours(1);
 
 /// The first block at or after registration closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

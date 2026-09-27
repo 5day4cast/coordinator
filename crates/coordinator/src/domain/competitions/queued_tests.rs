@@ -934,3 +934,72 @@ async fn a_formation_that_does_not_match_the_tickets_writes_nothing() {
         .unwrap();
     assert_eq!(pools, 0);
 }
+
+#[tokio::test]
+async fn a_pool_that_cannot_get_its_session_retries_then_fails_to_be_refunded() {
+    let start = OffsetDateTime::now_utc() - Duration::minutes(10);
+    let queue = Queue::new(start, PoolRules::new(2, 3).unwrap(), 100).await;
+    queue.chain_closing_at(20, 30);
+    for player in ["a", "b"] {
+        queue.ticket(player, true).await;
+    }
+    assert_eq!(queue.advance().await, Step::Finished);
+    let pool_id = queue
+        .store()
+        .competition_pools(queue.competition.id)
+        .await
+        .unwrap()[0]
+        .competition_id;
+    let advance_pool = || async {
+        let lease = queue
+            .store()
+            .acquire_lease(
+                &Lease::competition_resource(pool_id),
+                "queued-test",
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        queue
+            .coordinator
+            .advance_competition(pool_id, &lease, &Pacing::default())
+            .await
+    };
+
+    // Keymeld is unavailable here, so the pool has no session: it tries again later.
+    assert!(advance_pool().await.is_err());
+    let pool = queue.store().get_competition(pool_id).await.unwrap();
+    assert!(pool.failed_at.is_none());
+    assert!(pool.event_announcement.is_none(), "no event before its session");
+
+    // Past the deadline it fails, and cleanup refunds its escrows.
+    let long_ago = (OffsetDateTime::now_utc() - Duration::hours(2))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let id = pool_id.to_string();
+    queue
+        .db
+        .execute_write(move |pool| async move {
+            sqlx::query("UPDATE competitions SET created_at = ? WHERE id = ?")
+                .bind(long_ago)
+                .bind(id)
+                .execute(&pool)
+                .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        advance_pool().await.unwrap(),
+        Step::Next(Wait::Until(_))
+    ));
+    let pool = queue.store().get_competition(pool_id).await.unwrap();
+    assert!(pool.failed_at.is_some());
+    assert!(queue
+        .store()
+        .get_competitions_pending_cleanup(false)
+        .await
+        .unwrap()
+        .contains(&pool_id));
+}

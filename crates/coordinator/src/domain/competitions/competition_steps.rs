@@ -115,14 +115,19 @@ impl Coordinator {
             self.release_held_invoices(competition_id).await;
             return Ok(Step::Finished);
         }
-        if competition.kind == crate::domain::competitions::CompetitionKind::Pool {
-            // A pool registers its players' deposits in a session made for it at kickoff. One
-            // that cannot get it fails, and its escrows are refunded.
-            if let Err(e) = self.ensure_pool_session(&competition).await {
-                if now - competition.created_at < super::queued_kickoff::POOL_SESSION_DEADLINE {
+        if competition.kind == crate::domain::competitions::CompetitionKind::Pool
+            && competition.event_created_at.is_none()
+        {
+            // A pool registers its players' deposits in a session made for it at kickoff, and
+            // creates its oracle event from the queue's frozen lines. One that cannot get both
+            // in time fails, and its escrows are refunded.
+            if let Err(e) = self.prepare_pool(&mut competition).await {
+                if now - competition.created_at < super::queued_kickoff::POOL_SETUP_DEADLINE {
                     return Err(StepError::Failed(e));
                 }
-                error!("Pool {competition_id} has no Keymeld session and fails: {e:#}");
+                error!(
+                    "Pool {competition_id} has no Keymeld session or oracle event and fails: {e:#}"
+                );
                 let failed_at = now;
                 competition.failed_at = Some(failed_at);
                 competition

@@ -374,14 +374,16 @@ impl Coordinator {
         }
         let stored = stored.context("the competition has no Keymeld session")?;
         let session = self.restore_keymeld_session(&stored)?;
-        let authorized = &session
-            .authorization_manifest
-            .manifest
-            .participant_verifiers;
+        let manifest = &session.authorization_manifest.manifest;
         let mut late = BTreeSet::new();
         for player in players {
-            if !authorized.contains_key(&keymeld_sdk::UserId::from(player.ticket_id)) {
-                // Not a participant of the session: it cannot sign for this ticket.
+            // A session of key deposits names its members when it is made, so a ticket it
+            // does not name cannot join it; it cannot sign for this ticket.
+            if manifest.deposit_scope.is_some()
+                && !manifest
+                    .participant_verifiers
+                    .contains_key(&keymeld_sdk::UserId::from(player.ticket_id))
+            {
                 late.insert(player.ticket_id);
                 continue;
             }

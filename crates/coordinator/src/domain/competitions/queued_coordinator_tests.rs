@@ -144,16 +144,22 @@ async fn a_pool_pays_one_winner_from_its_players_consent() {
         members
     );
     let payouts = coordinator
-        .accepted_pool_payouts(&pool, &queue.settings, &entries)
+        .accepted_pool_payouts(&pool, &queue.settings, &members, &entries)
         .await
         .unwrap();
     assert_eq!(
         payouts,
         coordinator_escrow::queued::pool_payouts(members.len(), 1).unwrap()
     );
-    // Missing a player, the pool's funding value is not its stakes.
+    // Missing a player, or with another pool's, the roster is not the pool's.
     assert!(coordinator
-        .accepted_pool_payouts(&pool, &queue.settings, &entries[1..])
+        .accepted_pool_payouts(&pool, &queue.settings, &members, &entries[1..])
+        .await
+        .is_err());
+    let mut others = members.clone();
+    others[0] = Uuid::now_v7();
+    assert!(coordinator
+        .accepted_pool_payouts(&pool, &queue.settings, &others, &entries)
         .await
         .is_err());
     // Terms other than the queue's are refused.
@@ -161,7 +167,26 @@ async fn a_pool_pays_one_winner_from_its_players_consent() {
     other.terms.stake_sats += 1;
     other.terms_digest = other.terms.digest().unwrap();
     assert!(coordinator
-        .accepted_pool_payouts(&pool, &other, &entries)
+        .accepted_pool_payouts(&pool, &other, &members, &entries)
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn a_pool_event_made_before_a_restart_is_found_not_made_again() {
+    let (queue, pool, _) = formed().await;
+    let coordinator = &queue.coordinator;
+    let first = coordinator
+        .create_pool_event(&pool, &queue.settings)
+        .await
+        .unwrap();
+    let again = coordinator
+        .create_pool_event(&pool, &queue.settings)
+        .await
+        .unwrap();
+    assert_eq!(first.id, pool.id);
+    assert_eq!(
+        (again.nonce_point, again.event_announcement),
+        (first.nonce_point, first.event_announcement)
+    );
 }
