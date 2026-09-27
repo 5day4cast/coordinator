@@ -445,9 +445,12 @@ function showKeymeldTrust() {
 }
 
 // What the server charges for a ticket: the entry fee plus the coordinator fee,
-// rounded the same way as Competition::calculate_invoice_amount.
+// in basis points (250 = 2.5%), with exact halves rounded up like
+// CoordinatorFee::fee_for. Older responses only carry a whole percent.
 function ticketPriceSats(event) {
-  return event.entry_fee + Math.round(event.entry_fee * (event.coordinator_fee_percentage / 100));
+  const basisPoints =
+    event.coordinator_fee_basis_points ?? Math.round(event.coordinator_fee_percentage * 100);
+  return event.entry_fee + Math.floor((event.entry_fee * basisPoints + 5000) / 10000);
 }
 
 function setupEntryForm() {

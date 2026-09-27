@@ -9,6 +9,7 @@ mod ark_store;
 mod ark_tests;
 mod automatic_store;
 mod coordinator;
+mod coordinator_fee;
 mod eligible_payouts;
 mod lease_store;
 mod metrics_store;
@@ -30,6 +31,7 @@ pub use ark_kickoff::*;
 pub use ark_store::*;
 pub use automatic_store::*;
 pub use coordinator::*;
+pub use coordinator_fee::*;
 use dlctix::{
     bitcoin::{hex::DisplayHex, OutPoint, Transaction},
     hashlock,
@@ -610,8 +612,10 @@ pub struct CreateEvent {
     pub total_allowed_entries: usize,
     /// Total sats required per entry for ticket
     pub entry_fee: usize,
-    /// Percentage of entry fee that goes to the coordinator
-    pub coordinator_fee_percentage: usize,
+    /// The coordinator's fee on each entry, added to the ticket price and not
+    /// part of the pool. Stored in basis points; see [`CoordinatorFee`].
+    #[serde(flatten)]
+    pub coordinator_fee: CoordinatorFee,
     /// Total sats in competition pool to be won
     pub total_competition_pool: usize,
     /// Relative locktime block delta for this competition.
@@ -706,11 +710,34 @@ mod oracle_event_validation_tests {
             number_of_places_win: 1,
             total_allowed_entries: 2,
             entry_fee: 1_000,
-            coordinator_fee_percentage: 10,
+            coordinator_fee: crate::domain::CoordinatorFee::whole_percent(10),
             total_competition_pool: 1_800,
             relative_locktime_block_delta: None,
             unlisted: false,
         }
+    }
+
+    #[test]
+    fn stored_whole_percent_events_still_load() {
+        // An event stored before basis points carries only a whole percent.
+        let mut stored = serde_json::to_value(event()).unwrap();
+        let fields = stored.as_object_mut().unwrap();
+        fields.remove("coordinator_fee_basis_points");
+        fields.insert("coordinator_fee_percentage".into(), 10.into());
+        let loaded: CreateEvent = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded.coordinator_fee.basis_points(), 1000);
+        let written = serde_json::to_value(&loaded).unwrap();
+        assert_eq!(written["coordinator_fee_basis_points"], 1000);
+        assert_eq!(written["coordinator_fee_percentage"], 10);
+    }
+
+    #[test]
+    fn ticket_price_adds_a_fractional_percent_fee() {
+        let mut create = event();
+        create.coordinator_fee = CoordinatorFee::parse_percent("2.5").unwrap();
+        assert_eq!(Competition::new(&create).calculate_invoice_amount(), 1_025);
+        create.coordinator_fee = CoordinatorFee::whole_percent(10);
+        assert_eq!(Competition::new(&create).calculate_invoice_amount(), 1_100);
     }
 
     #[test]
@@ -1231,11 +1258,8 @@ impl Competition {
     }
 
     pub fn calculate_invoice_amount(&self) -> u64 {
-        let fee_multiplier = self.event_submission.coordinator_fee_percentage as f64 / 100.0;
-        let coordinator_fee =
-            (self.event_submission.entry_fee as f64 * fee_multiplier).round() as u64;
-
-        (self.event_submission.entry_fee as u64) + coordinator_fee
+        let entry_fee = self.event_submission.entry_fee as u64;
+        entry_fee + self.event_submission.coordinator_fee.fee_for(entry_fee)
     }
 
     // We add the fee for the coordinator's service at this point in the process,

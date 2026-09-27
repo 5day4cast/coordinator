@@ -211,7 +211,8 @@ pub struct CreateCompetitionForm {
     pub number_of_values_per_entry: usize,
     pub total_allowed_entries: usize,
     pub entry_fee: usize,
-    pub coordinator_fee_percentage: usize,
+    /// A percentage with up to two decimals, such as 2.5.
+    pub coordinator_fee_percentage: String,
     pub number_of_places_win: usize,
     #[serde(default)]
     pub locations: Vec<String>,
@@ -267,6 +268,12 @@ pub async fn admin_create_competition_handler(
         );
     }
 
+    let coordinator_fee =
+        match crate::domain::CoordinatorFee::parse_percent(&form.coordinator_fee_percentage) {
+            Ok(fee) => fee,
+            Err(error) => return Html(competition_error(&error.to_string()).into_string()),
+        };
+
     // Calculate total pool
     let Some(total_competition_pool) = form.entry_fee.checked_mul(form.total_allowed_entries)
     else {
@@ -286,7 +293,7 @@ pub async fn admin_create_competition_handler(
         number_of_places_win: form.number_of_places_win,
         total_allowed_entries: form.total_allowed_entries,
         entry_fee: form.entry_fee,
-        coordinator_fee_percentage: form.coordinator_fee_percentage,
+        coordinator_fee,
         total_competition_pool,
         relative_locktime_block_delta: form.relative_locktime_block_delta,
         unlisted: false,

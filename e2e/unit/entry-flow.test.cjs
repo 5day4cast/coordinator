@@ -100,6 +100,11 @@ test("ticket price matches the server's rounding of the coordinator fee", () => 
   assert.equal(entryForm.ticketPriceSats({ entry_fee: 5000, coordinator_fee_percentage: 5 }), 5250);
   assert.equal(entryForm.ticketPriceSats({ entry_fee: 333, coordinator_fee_percentage: 5 }), 350);
   assert.equal(entryForm.ticketPriceSats({ entry_fee: 1000, coordinator_fee_percentage: 0 }), 1000);
+  // Basis points, as the coordinator now sends them: 2.5% of 5000 is 125.
+  assert.equal(entryForm.ticketPriceSats({ entry_fee: 5000, coordinator_fee_basis_points: 250 }), 5125);
+  // Exact halves round up, matching CoordinatorFee::fee_for (0.5 and 1.5 sats).
+  assert.equal(entryForm.ticketPriceSats({ entry_fee: 20, coordinator_fee_basis_points: 250 }), 21);
+  assert.equal(entryForm.ticketPriceSats({ entry_fee: 50, coordinator_fee_percentage: 3 }), 52);
 });
 
 test("picks come from the checked radios, grouped by station", () => {
