@@ -123,6 +123,13 @@ pub struct ScenarioConfig {
     /// Max time to wait for a refund to settle (seconds), which includes its escrow's locktime.
     #[serde(default = "default_refund_timeout_secs")]
     pub refund_timeout_secs: u64,
+    /// Players who enter a queued scenario completely, instead of the scenario's own number; see
+    /// [`super::queued::QueueShape`]. `users` follows from it.
+    #[serde(default)]
+    pub queue_players: Option<usize>,
+    /// The largest pool of a queued scenario, instead of 25.
+    #[serde(default)]
+    pub max_pool_players: Option<usize>,
 }
 
 fn default_refund_timeout_secs() -> u64 {
@@ -148,6 +155,8 @@ impl Default for ScenarioConfig {
             lightning_address: None,
             lnd: None,
             refund_timeout_secs: default_refund_timeout_secs(),
+            queue_players: None,
+            max_pool_players: None,
         }
     }
 }
@@ -160,6 +169,11 @@ impl ScenarioConfig {
             "users must be between 1 and 100"
         );
         let mut config = self.clone();
+        if let Some(shape) = super::queued::QueueShape::of(scenario, self)? {
+            // A queued scenario's player count is part of what it tests.
+            config.users = shape.users();
+            config.entry_window_secs = shape.entry_window_secs(scenario, config.entry_window_secs);
+        }
         if matches!(scenario, "abandoned_unpaid" | "paid_abandonment") {
             // The replacement cannot reserve this seat until the unpaid ticket's 10-minute
             // reservation expires; paid abandonment probes that the paid seat still cannot
@@ -199,16 +213,21 @@ impl ScenarioConfig {
         );
         let behavior = match scenario {
             "full_lifecycle" | "escrow_refund" => EntryBehavior::Complete,
+            super::queued::QUEUED_SPLIT
+            | super::queued::QUEUED_ONE_POOL
+            | super::queued::QUEUED_TOO_FEW => EntryBehavior::Complete,
             "abandoned_unpaid" => EntryBehavior::AbandonUnpaid,
-            "paid_abandonment" => EntryBehavior::AbandonPaid,
+            "paid_abandonment" | super::queued::QUEUED_LEFTOVER_REFUND => {
+                EntryBehavior::AbandonPaid
+            }
             "duplicate_submission" => EntryBehavior::DuplicateSubmission,
             "late_submission" => EntryBehavior::LateSubmission,
             _ => anyhow::bail!("Unknown scenario: {scenario}"),
         };
-        let exceptional_user = rng.random_range(0..self.users);
+        let exceptional_user = rng.random_range(0..config.users);
         config.seed = Some(seed);
         config.planned_scenario = Some(scenario.to_string());
-        config.entry_plan = (0..self.users)
+        config.entry_plan = (0..config.users)
             .map(|user_index| EntryPlan {
                 user_index,
                 arrival_secs: rng.random_range(
@@ -334,6 +353,47 @@ mod plan_tests {
                 .filter(|plan| plan.behavior == EntryBehavior::AbandonUnpaid)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn queued_scenarios_plan_their_own_players_and_a_longer_entry_window() {
+        let config = ScenarioConfig::default();
+        let split = config.resolve_plan("queued_split").unwrap();
+        assert_eq!((split.users, split.entry_plan.len()), (27, 27));
+        assert_eq!(split.entry_window_secs, 600);
+        assert!(split
+            .entry_plan
+            .iter()
+            .all(|plan| plan.behavior == EntryBehavior::Complete));
+        assert_eq!(
+            split.resolve_plan("queued_split").unwrap().entry_plan,
+            split.entry_plan,
+            "a recorded plan resolves to itself"
+        );
+
+        let leftover = config.resolve_plan("queued_leftover_refund").unwrap();
+        assert_eq!((leftover.users, leftover.entry_window_secs), (4, 300));
+        assert_eq!(
+            leftover
+                .entry_plan
+                .iter()
+                .filter(|plan| plan.behavior == EntryBehavior::AbandonPaid)
+                .count(),
+            1
+        );
+
+        let smaller = ScenarioConfig {
+            queue_players: Some(5),
+            max_pool_players: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(smaller.resolve_plan("queued_split").unwrap().users, 5);
+        assert!(smaller.resolve_plan("queued_one_pool").is_err());
+        assert_eq!(
+            smaller.resolve_plan("full_lifecycle").unwrap().users,
+            3,
+            "queue overrides leave single competitions alone"
         );
     }
 

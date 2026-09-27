@@ -2,12 +2,13 @@
 
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::types::*;
+use crate::client::competitions::PoolSummary;
 use crate::client::CoordinatorClient;
 use crate::crypto::keys::SynthUser;
 use crate::db::SynthDb;
@@ -61,9 +62,50 @@ pub(super) async fn wait_for_state(
                 target_state
             );
         }
+        if current == "pools_formed" {
+            // A queue has no lifecycle of its own after this; its pools do.
+            anyhow::bail!(
+                "Queued competition formed its pools while waiting for '{}'",
+                target_state
+            );
+        }
 
         tokio::time::sleep(std::time::Duration::from_secs(config.poll_interval_secs)).await;
     }
+}
+
+/// Wait until a queued competition has split its entries into pools, and return the pools in
+/// index order. Fails if the queue was cancelled or failed instead.
+pub(super) async fn wait_for_pools(
+    client: &CoordinatorClient,
+    queue_id: &Uuid,
+    config: &ScenarioConfig,
+) -> Result<Vec<PoolSummary>> {
+    wait_for_state(client, queue_id, "pools_formed", config).await?;
+    let mut pools = client.get_competition(queue_id).await?.pools;
+    anyhow::ensure!(
+        !pools.is_empty(),
+        "Queued competition formed its pools but lists none"
+    );
+    pools.sort_by_key(|pool| pool.pool_index);
+    Ok(pools)
+}
+
+/// Wait until every pool is at `target_state` or past it. Each pool runs on its own, so they are
+/// followed together; the first to fail or time out fails the wait, naming the pool.
+pub(super) async fn wait_for_pools_state(
+    client: &CoordinatorClient,
+    pools: &[PoolSummary],
+    target_state: &str,
+    config: &ScenarioConfig,
+) -> Result<()> {
+    futures::future::try_join_all(pools.iter().map(|pool| async move {
+        wait_for_state(client, &pool.competition_id, target_state, config)
+            .await
+            .with_context(|| format!("pool {} ({})", pool.pool_index, pool.competition_id))
+    }))
+    .await?;
+    Ok(())
 }
 
 /// Check if `current` is a later state than `target` in the lifecycle
@@ -107,6 +149,11 @@ impl Steps {
     pub(super) fn push(&mut self, step: StepResult) {
         crate::runner::step_finished(&step);
         self.0.push(step);
+    }
+
+    #[cfg(test)]
+    pub(super) fn names(&self) -> Vec<&str> {
+        self.0.iter().map(|step| step.name.as_str()).collect()
     }
 }
 
