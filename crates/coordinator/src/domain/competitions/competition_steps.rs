@@ -331,6 +331,7 @@ mod tests {
             relative_locktime_block_delta: Some(72),
             unlisted: false,
             scoring_rules: None,
+            scoring_fields: None,
         });
         competition.total_entries = 2;
         competition.total_paid_entries = 2;
@@ -403,6 +404,7 @@ mod tests {
             relative_locktime_block_delta: Some(72),
             unlisted: false,
             scoring_rules: None,
+            scoring_fields: None,
         });
         competition.total_entries = 2;
         competition.total_paid_entries = 2;

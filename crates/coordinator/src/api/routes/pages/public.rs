@@ -444,6 +444,7 @@ async fn forecasts(state: &AppState, competition: &Competition, wait: Duration) 
             Forecasts::Ready {
                 stations: station_forecasts(
                     locations,
+                    &competition.event_submission.metrics(),
                     competition.event_submission.scoring_rules(),
                     value,
                     &stations,

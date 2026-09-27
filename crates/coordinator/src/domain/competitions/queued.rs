@@ -173,7 +173,7 @@ impl CreateQueuedCompetition {
             .entry_fee
             .checked_mul(entries)
             .ok_or("the entry fee is too large")?;
-        Ok(CreateEvent {
+        let mut event = CreateEvent {
             id: self.id,
             signing_date: self.signing_date,
             start_observation_date: self.start_observation_date,
@@ -188,7 +188,11 @@ impl CreateQueuedCompetition {
             relative_locktime_block_delta: self.relative_locktime_block_delta,
             unlisted: true,
             scoring_rules: Some(ScoringRules::Lines),
-        })
+            scoring_fields: None,
+        };
+        // Pools copy the reference event, so every pool scores the metrics its window holds.
+        event.fix_window_metrics()?;
+        Ok(event)
     }
 
     /// Registration may not outlast an escrow VTXO.

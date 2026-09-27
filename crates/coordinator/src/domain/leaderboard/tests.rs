@@ -32,6 +32,7 @@ fn competition() -> Competition {
         relative_locktime_block_delta: None,
         unlisted: false,
         scoring_rules: None,
+        scoring_fields: None,
     });
     competition.total_entries = 3;
     competition.total_paid_entries = 3;

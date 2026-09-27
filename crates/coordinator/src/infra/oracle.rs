@@ -141,7 +141,12 @@ impl OracleWrite {
                     && stored.total_allowed_entries == event.total_allowed_entries
                     && stored.number_of_places_win == event.number_of_places_win
                     && stored.source == "noaa_weather"
-                    && stored.scoring_fields == ["temp_high", "temp_low", "wind_speed"]
+                    && stored.scoring_fields
+                        == event
+                            .metrics()
+                            .iter()
+                            .map(|metric| metric.id())
+                            .collect::<Vec<_>>()
                     && stored
                         .unlisted
                         .is_none_or(|unlisted| unlisted == event.unlisted)
@@ -874,6 +879,7 @@ mod tests {
             relative_locktime_block_delta: None,
             unlisted: false,
             scoring_rules: None,
+            scoring_fields: None,
         }
     }
 
@@ -1291,6 +1297,7 @@ mod tests {
         let unlisted = CreateEvent {
             unlisted: true,
             scoring_rules: Some(ScoringRules::Lines),
+            scoring_fields: None,
             ..event_config()
         };
         client.create_event(listed).await.unwrap();
@@ -1331,6 +1338,7 @@ mod tests {
 
         let lines = CreateEvent {
             scoring_rules: Some(ScoringRules::Lines),
+            scoring_fields: None,
             ..event_config()
         };
         match client.create_event(lines).await {
@@ -1360,6 +1368,7 @@ mod tests {
         let config = CreateEvent {
             unlisted: true,
             scoring_rules: None,
+            scoring_fields: None,
             ..event_config()
         };
         let (client, state, server, _directory) = recovery_fixture(&config).await;

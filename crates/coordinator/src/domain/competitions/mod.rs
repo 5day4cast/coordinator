@@ -62,6 +62,8 @@ use std::fmt;
 pub use store::*;
 pub use ticket_registration::*;
 use time::{Duration, OffsetDateTime};
+
+use crate::domain::leaderboard::Metric;
 use uuid::Uuid;
 
 use super::Error;
@@ -648,12 +650,101 @@ pub struct CreateEvent {
     /// lines have none and were created with `fixed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scoring_rules: Option<ScoringRules>,
+    /// The oracle metric ids the competition scores, set from its window when it is created
+    /// (see [`WindowShape`]). Competitions stored before have none and score all three.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoring_fields: Option<Vec<String>>,
 }
 
 impl CreateEvent {
     /// The rules the oracle scores this competition's picks with.
     pub fn scoring_rules(&self) -> ScoringRules {
         self.scoring_rules.unwrap_or_default()
+    }
+
+    /// The shape of the observation window, or `None` for one NOAA Oracle cannot attest.
+    pub fn window_shape(&self) -> Option<WindowShape> {
+        WindowShape::of(self.start_observation_date, self.end_observation_date)
+    }
+
+    /// The metrics the competition scores, in [`Metric::ALL`] order.
+    pub fn metrics(&self) -> Vec<Metric> {
+        match &self.scoring_fields {
+            Some(fields) => Metric::ALL
+                .into_iter()
+                .filter(|metric| fields.iter().any(|field| field == metric.id()))
+                .collect(),
+            None => Metric::ALL.to_vec(),
+        }
+    }
+
+    /// Checks the window is one the oracle attests and records the metrics it holds. Called
+    /// when a competition is created.
+    pub(crate) fn fix_window_metrics(&mut self) -> Result<WindowShape, &'static str> {
+        let shape = self.window_shape().ok_or(WindowShape::RULE)?;
+        self.scoring_fields = Some(
+            shape
+                .metrics()
+                .iter()
+                .map(|metric| metric.id().to_owned())
+                .collect(),
+        );
+        Ok(shape)
+    }
+}
+
+/// What a competition's window holds, as NOAA Oracle attests it (2.5.0 and later). NOAA
+/// forecasts one daytime high and one overnight low a day, and the oracle counts a forecast
+/// period in the window holding its midpoint. For every US state, highs are centred between
+/// 17:00 and 23:00 UTC and lows between 05:30 and 11:30 UTC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowShape {
+    /// 24 hours or more, any start: highs, lows and wind.
+    FullDay,
+    /// 12:00–24:00 UTC: every station's daytime high, and wind.
+    Day,
+    /// 00:00–12:00 UTC: every station's overnight low, and wind.
+    Night,
+}
+
+impl WindowShape {
+    pub const RULE: &'static str =
+        "the window must be a full day (24 hours or more), or a day (12:00–24:00 UTC) or night (00:00–12:00 UTC) half";
+
+    pub fn of(start: OffsetDateTime, end: OffsetDateTime) -> Option<Self> {
+        let length = end - start;
+        if length >= Duration::DAY {
+            return Some(Self::FullDay);
+        }
+        let start = start.to_offset(time::UtcOffset::UTC);
+        if length != Duration::hours(12)
+            || start.minute() != 0
+            || start.second() != 0
+            || start.nanosecond() != 0
+        {
+            return None;
+        }
+        match start.hour() {
+            12 => Some(Self::Day),
+            0 => Some(Self::Night),
+            _ => None,
+        }
+    }
+
+    pub fn metrics(self) -> &'static [Metric] {
+        match self {
+            Self::FullDay => &Metric::ALL,
+            Self::Day => &[Metric::TempHigh, Metric::WindSpeed],
+            Self::Night => &[Metric::TempLow, Metric::WindSpeed],
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FullDay => "Full day",
+            Self::Day => "Day (12:00–24:00 UTC)",
+            Self::Night => "Night (00:00–12:00 UTC)",
+        }
     }
 }
 
@@ -712,9 +803,11 @@ impl CreateEvent {
                 return Err("event locations must be distinct");
             }
         }
-        if !(1..=self.locations.len() * 3).contains(&self.number_of_values_per_entry) {
+        if !(1..=self.locations.len() * self.metrics().len())
+            .contains(&self.number_of_values_per_entry)
+        {
             return Err(
-                "number_of_values_per_entry must be between 1 and three times the location count",
+                "number_of_values_per_entry must be between 1 and the location count times the metrics scored",
             );
         }
         Ok(())
@@ -742,6 +835,7 @@ mod oracle_event_validation_tests {
             relative_locktime_block_delta: None,
             unlisted: false,
             scoring_rules: None,
+            scoring_fields: None,
         }
     }
 
@@ -757,6 +851,60 @@ mod oracle_event_validation_tests {
         let written = serde_json::to_value(&loaded).unwrap();
         assert_eq!(written["coordinator_fee_basis_points"], 1000);
         assert_eq!(written["coordinator_fee_percentage"], 10);
+    }
+
+    #[test]
+    fn windows_are_full_days_or_day_and_night_halves() {
+        use time::macros::datetime;
+        let noon = datetime!(2030-03-01 12:00 UTC);
+        let midnight = datetime!(2030-03-01 00:00 UTC);
+        let shape =
+            |start: OffsetDateTime, hours| WindowShape::of(start, start + Duration::hours(hours));
+        assert_eq!(
+            shape(datetime!(2030-03-01 05:17 UTC), 24),
+            Some(WindowShape::FullDay)
+        );
+        assert_eq!(shape(midnight, 72), Some(WindowShape::FullDay));
+        assert_eq!(shape(noon, 12), Some(WindowShape::Day));
+        assert_eq!(shape(midnight, 12), Some(WindowShape::Night));
+        assert_eq!(
+            WindowShape::of(
+                datetime!(2030-03-01 08:00 -4),
+                datetime!(2030-03-01 20:00 -4)
+            ),
+            Some(WindowShape::Day),
+            "the halves are UTC"
+        );
+        for (start, hours) in [(datetime!(2030-03-01 13:00 UTC), 12), (noon, 13), (noon, 2)] {
+            assert_eq!(shape(start, hours), None, "{start} for {hours} h");
+        }
+
+        let mut day = event();
+        day.start_observation_date = noon;
+        day.end_observation_date = noon + Duration::hours(12);
+        day.signing_date = day.end_observation_date + Duration::hours(1);
+        assert_eq!(
+            day.metrics(),
+            Metric::ALL,
+            "stored competitions score all three"
+        );
+        assert_eq!(day.fix_window_metrics(), Ok(WindowShape::Day));
+        assert_eq!(
+            day.scoring_fields.as_deref(),
+            Some(&["temp_high".to_owned(), "wind_speed".to_owned()][..])
+        );
+        assert_eq!(day.metrics(), [Metric::TempHigh, Metric::WindSpeed]);
+        day.number_of_values_per_entry = 2;
+        assert_eq!(day.validate_oracle_settings(), Ok(()));
+        day.number_of_values_per_entry = 3;
+        assert!(
+            day.validate_oracle_settings().is_err(),
+            "one station, two metrics"
+        );
+
+        let mut short = event();
+        short.end_observation_date = short.start_observation_date + Duration::hours(2);
+        assert_eq!(short.fix_window_metrics(), Err(WindowShape::RULE));
     }
 
     #[test]

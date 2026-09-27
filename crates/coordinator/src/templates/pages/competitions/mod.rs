@@ -5,7 +5,9 @@ use maud::{html, Markup};
 use time::OffsetDateTime;
 
 use crate::domain::{
-    get_percentage_weights, leaderboard::Phase, winner_payout_sats, Competition, RefundProgress,
+    get_percentage_weights,
+    leaderboard::{Metric, Phase},
+    winner_payout_sats, Competition, RefundProgress, WindowShape,
 };
 use crate::infra::oracle::ScoringRules;
 use crate::templates::format::{self, sats, thousands};
@@ -35,6 +37,10 @@ pub struct CompetitionView {
     pub locations: Vec<String>,
     /// How the oracle scores the picks.
     pub scoring_rules: ScoringRules,
+    /// The metrics each station offers picks on, from the window's shape.
+    pub metrics: Vec<Metric>,
+    /// Full day, day or night; `None` for windows from before the oracle attested only these.
+    pub window_shape: Option<WindowShape>,
     /// Its Arkade escrows and how many have been refunded; none until the page adds them.
     pub refunds: RefundProgress,
     /// The oracle attested the contract's all-entry, no-score outcome.
@@ -89,6 +95,11 @@ impl CompetitionView {
             number_of_values_per_entry: event.number_of_values_per_entry,
             locations: event.locations.clone(),
             scoring_rules: event.scoring_rules(),
+            metrics: event.metrics(),
+            window_shape: event
+                .scoring_fields
+                .as_ref()
+                .and_then(|_| event.window_shape()),
             refunds: RefundProgress::default(),
             pot_refunded,
             refund_shares: (pot_refunded || phase == Phase::Expired)
@@ -642,6 +653,8 @@ pub(crate) mod tests {
             number_of_values_per_entry: 9,
             locations: vec!["KPWM".into()],
             scoring_rules: ScoringRules::Fixed,
+            metrics: Metric::ALL.to_vec(),
+            window_shape: None,
             refunds: RefundProgress::default(),
             pot_refunded: false,
             refund_shares: None,
@@ -977,6 +990,7 @@ pub(crate) mod tests {
             relative_locktime_block_delta: None,
             unlisted: false,
             scoring_rules: None,
+            scoring_fields: None,
         });
         competition.total_entries = 3;
         competition.event_announcement = Some(event.clone());

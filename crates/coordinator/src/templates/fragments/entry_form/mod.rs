@@ -9,7 +9,7 @@ use crate::domain::{
         progress::{LINE_POINTS, OVER_OR_UNDER_POINTS, PAR_POINTS},
         Metric, Rule,
     },
-    PayoutTermsQuote, TicketStatus,
+    PayoutTermsQuote, TicketStatus, WindowShape,
 };
 use crate::infra::oracle::ScoringRules;
 use crate::templates::{
@@ -75,7 +75,21 @@ pub fn entry_form(
             h1 class="title is-4" { "Enter this competition" }
 
             dl class="entry-facts" {
-                div { dt { "Window" } dd { (format::window(competition.start, competition.end)) } }
+                div {
+                    dt { "Window" }
+                    dd {
+                        (format::window(competition.start, competition.end))
+                        @match competition.window_shape {
+                            Some(WindowShape::Day) => {
+                                span class="fact-note" { "Day: each airport's high and wind, no lows" }
+                            }
+                            Some(WindowShape::Night) => {
+                                span class="fact-note" { "Night: each airport's low and wind, no highs" }
+                            }
+                            Some(WindowShape::FullDay) | None => {}
+                        }
+                    }
+                }
                 div {
                     dt { "Ticket" }
                     dd {
@@ -561,6 +575,34 @@ mod tests {
         assert!(html.contains("A right pick scores 10 points."));
         assert!(!html.contains("20 points"));
         assert!(form(PayoutDestination::LoggedOut).contains("scores 20 points"));
+    }
+
+    #[test]
+    fn a_day_competition_offers_highs_and_wind_only() {
+        let mut competition = view("c1", Phase::Upcoming, 60);
+        competition.window_shape = Some(WindowShape::Day);
+        let mut station = station();
+        station.forecasts = vec![
+            (Metric::TempHigh, Some(69.0), Some(Rule::Fixed)),
+            (Metric::WindSpeed, Some(7.0), Some(Rule::Fixed)),
+        ];
+        let html = entry_form(
+            &competition,
+            &Forecasts::Ready {
+                stations: vec![station],
+                pins: vec![],
+            },
+            None,
+            &PayoutDestination::LoggedOut,
+        )
+        .into_string();
+        assert!(
+            html.contains("Day: each airport&#39;s high and wind")
+                || html.contains("Day: each airport's high and wind"),
+            "{html}"
+        );
+        assert!(html.contains("KPWM_temp_high") && html.contains("KPWM_wind_speed"));
+        assert!(!html.contains("KPWM_temp_low"));
     }
 
     #[test]

@@ -130,6 +130,7 @@ impl Fixture {
             relative_locktime_block_delta: Some(72),
             unlisted: false,
             scoring_rules: None,
+            scoring_fields: None,
         });
         let tickets = (1..=2u8)
             .map(|byte| Ticket {

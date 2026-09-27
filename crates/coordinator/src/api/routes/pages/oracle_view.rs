@@ -25,6 +25,7 @@ pub fn stations_by_id(stations: &[Station]) -> StationsById {
 /// scored against under `rules`.
 pub fn station_forecasts(
     locations: &[String],
+    metrics: &[Metric],
     rules: ScoringRules,
     weather: &CompetitionWeather,
     stations: &StationsById,
@@ -34,7 +35,7 @@ pub fn station_forecasts(
         .map(|station_id| StationForecast {
             station_id: station_id.clone(),
             station_name: station_name(stations, station_id),
-            forecasts: Metric::ALL
+            forecasts: metrics
                 .iter()
                 .map(|metric| {
                     (
