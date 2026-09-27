@@ -17,6 +17,7 @@ use zeroize::Zeroizing;
 use crate::{
     api::routes::OperatorCompetition,
     domain::{CoordinatorFee, CreateEvent},
+    infra::oracle::ScoringRules,
 };
 
 #[derive(Debug, Args)]
@@ -113,6 +114,10 @@ pub struct CreateArgs {
     /// Keep the event off the oracle's public events list.
     #[arg(long)]
     pub unlisted: bool,
+    /// How picks score: `lines` (a Par band per station fitted on recent forecast misses,
+    /// 10 points a right pick) or `fixed` (exact Par 20, Over or Under 10).
+    #[arg(long, default_value = "lines", value_parser = parse_scoring_rules)]
+    pub scoring_rules: ScoringRules,
     /// The competition's id; a new one if unset.
     #[arg(long)]
     pub id: Option<Uuid>,
@@ -221,8 +226,13 @@ impl CreateArgs {
             total_competition_pool,
             relative_locktime_block_delta: self.locktime_delta,
             unlisted: self.unlisted,
+            scoring_rules: Some(self.scoring_rules),
         })
     }
+}
+
+fn parse_scoring_rules(text: &str) -> Result<ScoringRules, String> {
+    ScoringRules::parse(text).ok_or_else(|| format!("{text:?} is not `lines` or `fixed`"))
 }
 
 fn parse_coordinator_fee(text: &str) -> Result<CoordinatorFee, String> {
@@ -515,6 +525,7 @@ pub fn show_text(c: &OperatorCompetition) -> String {
         "Listed        {}",
         if terms.unlisted { "no" } else { "yes" }
     );
+    let _ = writeln!(out, "Scoring       {}", terms.scoring_rules().as_str());
     let refunds = match c.refunds {
         Some(p) if p.refunded >= p.escrowed => format!("all {} escrows refunded", p.escrowed),
         Some(p) => format!(

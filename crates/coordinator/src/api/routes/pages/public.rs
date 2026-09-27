@@ -441,7 +441,12 @@ async fn forecasts(state: &AppState, competition: &Competition, wait: Duration) 
             let stations = stations_by_id(stations.value().map(Vec::as_slice).unwrap_or_default());
             let locations = &competition.event_submission.locations;
             Forecasts::Ready {
-                stations: station_forecasts(locations, value, &stations),
+                stations: station_forecasts(
+                    locations,
+                    competition.event_submission.scoring_rules(),
+                    value,
+                    &stations,
+                ),
                 pins: station_pins(locations, &stations),
             }
         }

@@ -1599,6 +1599,7 @@ mod startup_tests {
             total_competition_pool: 15000,
             relative_locktime_block_delta: None,
             unlisted: true,
+            scoring_rules: None,
         };
         let id = client.create(&event).await.unwrap();
         assert_eq!(id, event.id);

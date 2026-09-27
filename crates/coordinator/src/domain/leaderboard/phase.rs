@@ -73,6 +73,7 @@ mod tests {
             total_competition_pool: 2_000,
             relative_locktime_block_delta: None,
             unlisted: false,
+            scoring_rules: None,
         })
     }
 

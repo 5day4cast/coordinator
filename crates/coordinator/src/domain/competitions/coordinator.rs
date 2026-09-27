@@ -3145,8 +3145,12 @@ impl Coordinator {
 
     pub async fn create_competition(
         &self,
-        create_event: CreateEvent,
+        mut create_event: CreateEvent,
     ) -> Result<Competition, Error> {
+        // New competitions score against the oracle's lines unless they ask for fixed rules.
+        create_event
+            .scoring_rules
+            .get_or_insert(crate::infra::oracle::ScoringRules::Lines);
         create_event
             .validate_oracle_settings()
             .map_err(|reason| Error::BadRequest(reason.into()))?;
@@ -5109,6 +5113,7 @@ mod oracle_payout_order_tests {
             total_competition_pool: 2_700,
             relative_locktime_block_delta: None,
             unlisted: false,
+            scoring_rules: None,
         });
         let entry_ids = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
         let tickets = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
@@ -5188,6 +5193,7 @@ mod funding_lifecycle_tests {
             total_competition_pool: 900,
             relative_locktime_block_delta: None,
             unlisted: false,
+            scoring_rules: None,
         });
         assert_eq!(
             competition.funding_reservation_deadline(now).unwrap(),

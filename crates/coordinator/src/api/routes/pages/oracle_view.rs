@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use crate::domain::leaderboard::{CompetitionWeather, Metric};
+use crate::infra::oracle::ScoringRules;
 use crate::infra::oracle_weather::Station;
 use crate::templates::{
     fragments::entry_form::StationForecast,
@@ -20,9 +21,11 @@ pub fn stations_by_id(stations: &[Station]) -> StationsById {
         .collect()
 }
 
-/// Each of `locations` with the forecasts the oracle compares picks with.
+/// Each of `locations` with the forecasts the oracle compares picks with, and what each pick is
+/// scored against under `rules`.
 pub fn station_forecasts(
     locations: &[String],
+    rules: ScoringRules,
     weather: &CompetitionWeather,
     stations: &StationsById,
 ) -> Vec<StationForecast> {
@@ -33,7 +36,13 @@ pub fn station_forecasts(
             station_name: station_name(stations, station_id),
             forecasts: Metric::ALL
                 .iter()
-                .map(|metric| (*metric, weather.forecast(station_id, *metric)))
+                .map(|metric| {
+                    (
+                        *metric,
+                        weather.forecast(station_id, *metric),
+                        weather.rule(rules, station_id, *metric),
+                    )
+                })
                 .collect(),
         })
         .collect()

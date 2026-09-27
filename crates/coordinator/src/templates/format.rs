@@ -76,6 +76,8 @@ pub trait MetricText {
     fn so_far(self) -> &'static str;
     /// A value in the metric's unit, as the oracle reads it.
     fn value(self, value: f64) -> String;
+    /// A Par range in the metric's unit: `67.4–70.2°F`.
+    fn range(self, low: f64, high: f64) -> String;
 }
 
 impl MetricText for Metric {
@@ -100,6 +102,13 @@ impl MetricText for Metric {
             Metric::TempHigh | Metric::TempLow => format!("{:.0}°F", value.round()),
             Metric::WindSpeed if value.fract() == 0.0 => format!("{value:.0} knots"),
             Metric::WindSpeed => format!("{value:.1} knots"),
+        }
+    }
+
+    fn range(self, low: f64, high: f64) -> String {
+        match self {
+            Metric::TempHigh | Metric::TempLow => format!("{low:.1}–{high:.1}°F"),
+            Metric::WindSpeed => format!("{low:.1}–{high:.1} knots"),
         }
     }
 }

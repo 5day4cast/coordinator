@@ -24,7 +24,7 @@ use crate::infra::{
         parse_optional_blob_json, parse_optional_datetime, parse_optional_sqlite_datetime,
         parse_required_blob_json, parse_required_datetime,
     },
-    oracle::{AddEventEntry, WeatherChoices},
+    oracle::{AddEventEntry, ScoringRules, WeatherChoices},
 };
 use anyhow::anyhow;
 pub use ark_kickoff::*;
@@ -634,6 +634,18 @@ pub struct CreateEvent {
     /// 2.3.0 ignore it.
     #[serde(default)]
     pub unlisted: bool,
+    /// How the oracle scores picks. New competitions use `lines` unless they ask for `fixed`
+    /// (see [`crate::domain::Coordinator::create_competition`]); competitions stored before
+    /// lines have none and were created with `fixed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoring_rules: Option<ScoringRules>,
+}
+
+impl CreateEvent {
+    /// The rules the oracle scores this competition's picks with.
+    pub fn scoring_rules(&self) -> ScoringRules {
+        self.scoring_rules.unwrap_or_default()
+    }
 }
 
 impl CreateEvent {
@@ -720,6 +732,7 @@ mod oracle_event_validation_tests {
             total_competition_pool: 1_800,
             relative_locktime_block_delta: None,
             unlisted: false,
+            scoring_rules: None,
         }
     }
 

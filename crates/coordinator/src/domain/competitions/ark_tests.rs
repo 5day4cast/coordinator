@@ -406,6 +406,7 @@ impl Fixture {
             total_competition_pool: 15_000,
             relative_locktime_block_delta: Some(72),
             unlisted: false,
+            scoring_rules: None,
         });
         assert_eq!(competition.calculate_invoice_amount(), PRICE);
         let competition_id = competition.id;

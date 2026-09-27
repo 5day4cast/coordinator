@@ -101,6 +101,9 @@ struct StoredEvent {
     /// Oracles before 2.3.0 do not report it.
     #[serde(default)]
     unlisted: Option<bool>,
+    /// Oracles before 2.4.0 do not report it.
+    #[serde(default)]
+    scoring_rules: Option<ScoringRules>,
 }
 
 #[derive(Deserialize)]
@@ -142,6 +145,9 @@ impl OracleWrite {
                     && stored
                         .unlisted
                         .is_none_or(|unlisted| unlisted == event.unlisted)
+                    && stored
+                        .scoring_rules
+                        .is_none_or(|rules| rules == event.scoring_rules.unwrap_or_default())
             }
             Self::Entries(submission) => {
                 let ids: std::collections::HashSet<_> =
@@ -428,6 +434,37 @@ impl TryFrom<String> for ValueOptions {
     }
 }
 
+/// How the oracle scores an event's picks. Chosen when the event is created.
+///
+/// - `Lines`: each station and metric has a Par band on the miss (observed minus forecast),
+///   fitted on how that station's forecasts missed over the last 60 days so Over, Par, and Under
+///   each happened about a third of the time. The oracle copies the bands into the event when it
+///   is created. Every right pick earns 10 points.
+/// - `Fixed`: each metric's fixed Par rule (temperatures to the whole degree, exact knots). Par
+///   earns 20 points, a right Over or Under 10. Competitions created before lines keep it.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoringRules {
+    #[default]
+    Fixed,
+    Lines,
+}
+
+impl ScoringRules {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Lines => "lines",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        [Self::Fixed, Self::Lines]
+            .into_iter()
+            .find(|rules| rules.as_str() == text.trim())
+    }
+}
+
 fn secp256k1_to_nostr_keys(secp_key: &Secp256k1SecretKey) -> Result<Keys, &'static str> {
     let key_bytes = secp_key.secret_bytes();
 
@@ -562,18 +599,34 @@ impl Oracle for OracleClient {
 
         let body = serde_json::to_vec(&event)
             .map_err(|e| Error::Request(format!("Failed to serialize event: {}", e)))?;
+        let wanted = event.scoring_rules.unwrap_or_default();
 
-        self.send_authenticated_request_internal(
-            Method::POST,
-            url,
-            Some(body),
-            String::from("event not found"),
-            Some(OracleWrite::Create(event)),
-        )
-        .await?
-        .json()
-        .await
-        .map_err(Into::into)
+        let created: serde_json::Value = self
+            .send_authenticated_request_internal(
+                Method::POST,
+                url,
+                Some(body),
+                String::from("event not found"),
+                Some(OracleWrite::Create(event)),
+            )
+            .await?
+            .json()
+            .await?;
+        // An oracle before lines ignores `scoring_rules` and scores with fixed rules; the
+        // competition must not show lines it will not be scored with.
+        let rules = created
+            .get("scoring_rules")
+            .and_then(|rules| serde_json::from_value::<ScoringRules>(rules.clone()).ok())
+            .unwrap_or_default();
+        if rules != wanted {
+            return Err(Error::BadRequest(format!(
+                "the oracle created the event with {} scoring rules, not {}; it may not support lines yet",
+                rules.as_str(),
+                wanted.as_str()
+            )));
+        }
+        serde_json::from_value(created)
+            .map_err(|e| Error::Request(format!("Failed to read the created event: {e}")))
     }
 
     async fn get_event(&self, id: &Uuid) -> Result<Event, Error> {
@@ -653,6 +706,7 @@ mod tests {
             total_competition_pool: 1_800,
             relative_locktime_block_delta: None,
             unlisted: false,
+            scoring_rules: None,
         }
     }
 
@@ -1034,8 +1088,12 @@ mod tests {
         Json(body): Json<serde_json::Value>,
     ) -> (StatusCode, Json<serde_json::Value>) {
         let id: Uuid = serde_json::from_value(body["id"].clone()).unwrap();
+        let mut response = event_response(id);
+        if let Some(rules) = body.get("scoring_rules") {
+            response["scoring_rules"] = rules.clone();
+        }
         state.posted.lock().unwrap().push(body);
-        (StatusCode::OK, Json(event_response(id)))
+        (StatusCode::OK, Json(response))
     }
 
     /// The oracle keeps an event off its public list only when asked: the coordinator passes
@@ -1065,6 +1123,7 @@ mod tests {
         let listed = event_config();
         let unlisted = CreateEvent {
             unlisted: true,
+            scoring_rules: Some(ScoringRules::Lines),
             ..event_config()
         };
         client.create_event(listed).await.unwrap();
@@ -1073,6 +1132,46 @@ mod tests {
         let posted = posted.lock().unwrap();
         assert_eq!(posted[0]["unlisted"], serde_json::json!(false));
         assert_eq!(posted[1]["unlisted"], serde_json::json!(true));
+        // Scoring rules pass through when set; a stored competition without them asks for
+        // nothing, which the oracle scores with fixed rules.
+        assert!(posted[0].get("scoring_rules").is_none());
+        assert_eq!(posted[1]["scoring_rules"], serde_json::json!("lines"));
+    }
+
+    /// An oracle before lines ignores `scoring_rules` and scores with fixed rules, so a lines
+    /// event it creates is refused rather than shown with lines it will not be scored with.
+    #[tokio::test]
+    async fn a_lines_event_needs_an_oracle_that_scores_lines() {
+        async fn without_lines(
+            Json(body): Json<serde_json::Value>,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            let id: Uuid = serde_json::from_value(body["id"].clone()).unwrap();
+            (StatusCode::OK, Json(event_response(id)))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let app = Router::new().route("/oracle/events", post(without_lines));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let directory = tempfile::tempdir().unwrap();
+        let key = directory.path().join("coordinator.pem");
+        let _: Secp256k1SecretKey = get_key(key.to_str().unwrap()).unwrap();
+        let client = OracleClient::new(
+            ClientBuilder::new(reqwest::Client::new()).build(),
+            &base,
+            key.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let lines = CreateEvent {
+            scoring_rules: Some(ScoringRules::Lines),
+            ..event_config()
+        };
+        match client.create_event(lines).await {
+            Err(Error::BadRequest(message)) => assert!(message.contains("not lines"), "{message}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        client.create_event(event_config()).await.unwrap();
+        server.abort();
     }
 
     /// An admin request that leaves `unlisted` out creates a listed event.
@@ -1093,6 +1192,7 @@ mod tests {
     async fn a_recovered_event_must_have_the_listing_asked_for() {
         let config = CreateEvent {
             unlisted: true,
+            scoring_rules: None,
             ..event_config()
         };
         let (client, state, server, _directory) = recovery_fixture(&config).await;

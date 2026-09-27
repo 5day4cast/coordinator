@@ -7,6 +7,7 @@ use time::OffsetDateTime;
 use crate::domain::{
     get_percentage_weights, leaderboard::Phase, winner_payout_sats, Competition, RefundProgress,
 };
+use crate::infra::oracle::ScoringRules;
 use crate::templates::format::{self, sats, thousands};
 
 /// Finished competitions shown per page.
@@ -29,6 +30,8 @@ pub struct CompetitionView {
     pub can_enter: bool,
     pub number_of_values_per_entry: usize,
     pub locations: Vec<String>,
+    /// How the oracle scores the picks.
+    pub scoring_rules: ScoringRules,
     /// Its Arkade escrows and how many have been refunded; none until the page adds them.
     pub refunds: RefundProgress,
     /// The oracle attested the contract's all-entry, no-score outcome.
@@ -68,6 +71,7 @@ impl CompetitionView {
                 && competition.total_entries < event.total_allowed_entries as u64,
             number_of_values_per_entry: event.number_of_values_per_entry,
             locations: event.locations.clone(),
+            scoring_rules: event.scoring_rules(),
             refunds: RefundProgress::default(),
             pot_refunded,
             refund_shares: (pot_refunded || phase == Phase::Expired)
@@ -499,6 +503,7 @@ pub(crate) mod tests {
             can_enter: phase == Phase::Upcoming,
             number_of_values_per_entry: 9,
             locations: vec!["KPWM".into()],
+            scoring_rules: ScoringRules::Fixed,
             refunds: RefundProgress::default(),
             pot_refunded: false,
             refund_shares: None,
@@ -704,6 +709,7 @@ pub(crate) mod tests {
             total_competition_pool: 6_000,
             relative_locktime_block_delta: None,
             unlisted: false,
+            scoring_rules: None,
         });
         competition.total_entries = 3;
         competition.event_announcement = Some(event.clone());
