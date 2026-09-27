@@ -420,7 +420,7 @@ impl UnpaidWinners {
             number_of_places_win: 3,
             total_allowed_entries: 3,
             entry_fee: 1_000,
-            coordinator_fee_percentage: 0,
+            coordinator_fee: crate::domain::CoordinatorFee::whole_percent(0),
             total_competition_pool: funding_value.to_sat() as usize,
             relative_locktime_block_delta: Some(72),
             unlisted: false,
@@ -611,7 +611,7 @@ async fn split_reclaims_dust_at_any_fee_are_recorded_once_and_the_competition_co
 /// estimate here would make every reclaim dust; the day's estimate, LND's floor, does not.
 #[tokio::test]
 async fn split_reclaims_pay_the_economy_fee_rate() {
-    let mut settlement = UnpaidWinners::new(
+    let settlement = UnpaidWinners::new(
         Amount::from_sat(10_000),
         HashMap::from([(1, 60.0), (ECONOMY_FEE_TARGET, LND_FLOOR_SAT_PER_VB)]),
     )
