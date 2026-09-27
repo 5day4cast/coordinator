@@ -125,7 +125,7 @@ impl Fixture {
             number_of_places_win: 1,
             total_allowed_entries: 2,
             entry_fee: 50_000,
-            coordinator_fee_percentage: 0,
+            coordinator_fee: crate::domain::CoordinatorFee::whole_percent(0),
             total_competition_pool: 100_000,
             relative_locktime_block_delta: Some(72),
             unlisted: false,

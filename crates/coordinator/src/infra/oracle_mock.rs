@@ -237,7 +237,7 @@ mod tests {
             number_of_places_win: 1,
             total_allowed_entries: 10,
             entry_fee: 1000,
-            coordinator_fee_percentage: 10,
+            coordinator_fee: crate::domain::CoordinatorFee::whole_percent(10),
             total_competition_pool: 9000,
             relative_locktime_block_delta: None,
             unlisted: false,

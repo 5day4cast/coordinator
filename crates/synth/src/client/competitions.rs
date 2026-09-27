@@ -19,7 +19,11 @@ pub struct CreateCompetition {
     pub number_of_places_win: usize,
     pub total_allowed_entries: usize,
     pub entry_fee: usize,
-    pub coordinator_fee_percentage: usize,
+    /// The coordinator fee in basis points (1000 = 10%).
+    pub coordinator_fee_basis_points: u32,
+    /// The same fee as a whole percent, for coordinators before basis points;
+    /// newer ones check that it agrees.
+    pub coordinator_fee_percentage: u32,
     pub total_competition_pool: usize,
     /// Keep the competition's oracle event off the oracle's public list. Set for the test
     /// competitions synth makes.

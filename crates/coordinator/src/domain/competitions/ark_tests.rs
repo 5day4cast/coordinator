@@ -402,7 +402,7 @@ impl Fixture {
             number_of_places_win: 1,
             total_allowed_entries: 3,
             entry_fee: 5_000,
-            coordinator_fee_percentage: 10,
+            coordinator_fee: crate::domain::CoordinatorFee::whole_percent(10),
             total_competition_pool: 15_000,
             relative_locktime_block_delta: Some(72),
             unlisted: false,

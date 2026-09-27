@@ -14,7 +14,10 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::{api::routes::OperatorCompetition, domain::CreateEvent};
+use crate::{
+    api::routes::OperatorCompetition,
+    domain::{CoordinatorFee, CreateEvent},
+};
 
 #[derive(Debug, Args)]
 pub struct AdminArgs {
@@ -98,9 +101,9 @@ pub struct CreateArgs {
     /// Entry fee in sats.
     #[arg(long, default_value_t = 5000)]
     pub entry_fee: usize,
-    /// The coordinator's share of each entry fee, in percent.
-    #[arg(long, default_value_t = 5)]
-    pub coordinator_fee_percentage: usize,
+    /// The coordinator's fee on each entry, in percent with up to two decimals (2.5).
+    #[arg(long, default_value = "5", value_parser = parse_coordinator_fee)]
+    pub coordinator_fee_percentage: CoordinatorFee,
     /// How many places win.
     #[arg(long, default_value_t = 1)]
     pub places_win: usize,
@@ -214,12 +217,16 @@ impl CreateArgs {
             number_of_places_win: self.places_win,
             total_allowed_entries: self.max_entries,
             entry_fee: self.entry_fee,
-            coordinator_fee_percentage: self.coordinator_fee_percentage,
+            coordinator_fee: self.coordinator_fee_percentage,
             total_competition_pool,
             relative_locktime_block_delta: self.locktime_delta,
             unlisted: self.unlisted,
         })
     }
+}
+
+fn parse_coordinator_fee(text: &str) -> Result<CoordinatorFee, String> {
+    CoordinatorFee::parse_percent(text).map_err(|error| error.to_string())
 }
 
 /// A client of the operator listener.
@@ -497,10 +504,10 @@ pub fn show_text(c: &OperatorCompetition) -> String {
     );
     let _ = writeln!(
         out,
-        "Entry fee     {} sats; pool {} sats; coordinator fee {}%; {} place(s) win",
+        "Entry fee     {} sats; pool {} sats; coordinator fee {}; {} place(s) win",
         terms.entry_fee,
         terms.total_competition_pool,
-        terms.coordinator_fee_percentage,
+        terms.coordinator_fee,
         terms.number_of_places_win
     );
     let _ = writeln!(
@@ -645,13 +652,49 @@ mod tests {
         assert_eq!(event.entry_fee, 5000);
         assert_eq!(event.total_allowed_entries, 3);
         assert_eq!(event.total_competition_pool, 15000);
-        assert_eq!(event.coordinator_fee_percentage, 5);
+        assert_eq!(event.coordinator_fee.basis_points(), 500);
         assert_eq!(event.number_of_values_per_entry, 1);
         assert_eq!(event.number_of_places_win, 1);
         assert!(event.unlisted);
         assert!(event.start_observation_date < event.end_observation_date);
         assert!(event.end_observation_date < event.signing_date);
         assert!(Cli::try_parse_from(["coordinator", "admin", "competitions", "create"]).is_err());
+    }
+
+    #[test]
+    fn create_takes_a_decimal_coordinator_fee() {
+        let fee = |fee: &str| {
+            let args = parse(&[
+                "competitions",
+                "create",
+                "--stations",
+                "KDEN",
+                "--coordinator-fee-percentage",
+                fee,
+            ]);
+            let AdminCommand::Competitions {
+                action: CompetitionCommand::Create(create),
+            } = args.command
+            else {
+                panic!("expected create");
+            };
+            create.to_event().unwrap().coordinator_fee.basis_points()
+        };
+        assert_eq!(fee("2.5"), 250);
+        assert_eq!(fee("3"), 300);
+        for bad in ["2.555", "101", "-1"] {
+            assert!(Cli::try_parse_from([
+                "coordinator",
+                "admin",
+                "competitions",
+                "create",
+                "--stations",
+                "KDEN",
+                "--coordinator-fee-percentage",
+                bad,
+            ])
+            .is_err());
+        }
     }
 
     #[test]

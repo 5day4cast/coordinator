@@ -190,7 +190,7 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
                                     label class="label" { "Coordinator Fee (%)" }
                                     div class="control" {
                                         input class="input" type="number" name="coordinator_fee_percentage"
-                                              value="5" min="0" max="100";
+                                              value="5" min="0" max="100" step="0.01";
                                     }
                                 }
                             }
