@@ -321,6 +321,59 @@ pub struct ScenarioConfig {
     /// competitions. Set before the run is recorded.
     #[serde(default)]
     pub min_players: Option<usize>,
+    /// The competition's id, chosen when the run is planned, so a run is known by its
+    /// competition from its first step.
+    #[serde(default)]
+    pub competition_id: Option<uuid::Uuid>,
+    /// When observations start and entries close. Unset, `entry_window_secs` after the
+    /// competition is created; set for a window that must start on the hour, such as a day or
+    /// night half.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub observation_start: Option<OffsetDateTime>,
+}
+
+/// What an observation window can score, as the oracle attests it: a window of 24 hours or more
+/// holds every station's daytime high and overnight low; the day half, 12:00-24:00 UTC, only
+/// highs; the night half, 00:00-12:00 UTC, only lows. Wind counts in all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowShape {
+    FullDay,
+    Day,
+    Night,
+}
+
+impl WindowShape {
+    pub fn of(start: OffsetDateTime, seconds: u64) -> Self {
+        let start = start.to_offset(time::UtcOffset::UTC);
+        let on_the_hour = start.minute() == 0 && start.second() == 0 && start.nanosecond() == 0;
+        match (seconds, start.hour()) {
+            (43_200, 12) if on_the_hour => Self::Day,
+            (43_200, 0) if on_the_hour => Self::Night,
+            _ => Self::FullDay,
+        }
+    }
+
+    /// Whether it scores the daytime high, the overnight low and wind.
+    pub fn scores(self) -> [bool; 3] {
+        match self {
+            Self::FullDay => [true, true, true],
+            Self::Day => [true, false, true],
+            Self::Night => [false, true, true],
+        }
+    }
+
+    pub fn metrics(self) -> usize {
+        self.scores().into_iter().filter(|scored| *scored).count()
+    }
+}
+
+/// When a competition's entries close, its observations end and its contract must be signed.
+#[derive(Debug, Clone, Copy)]
+pub struct CompetitionTimes {
+    pub id: uuid::Uuid,
+    pub start: OffsetDateTime,
+    pub end: OffsetDateTime,
+    pub signing: OffsetDateTime,
 }
 
 fn default_refund_timeout_secs() -> u64 {
@@ -350,11 +403,40 @@ impl Default for ScenarioConfig {
             max_pool_players: None,
             player_mix: None,
             min_players: None,
+            competition_id: None,
+            observation_start: None,
         }
     }
 }
 
 impl ScenarioConfig {
+    /// The planned competition's id and times, for a competition created `now`.
+    pub fn competition_times(&self, now: OffsetDateTime) -> CompetitionTimes {
+        let start = self
+            .observation_start
+            .unwrap_or(now + time::Duration::seconds(self.entry_window_secs as i64));
+        let end = start + time::Duration::seconds(self.observation_window_secs as i64);
+        CompetitionTimes {
+            id: self.competition_id.unwrap_or_else(uuid::Uuid::now_v7),
+            start,
+            end,
+            signing: end + time::Duration::seconds(self.signing_delay_secs as i64),
+        }
+    }
+
+    /// What the planned window scores.
+    pub fn window_shape(&self) -> WindowShape {
+        match self.observation_start {
+            Some(start) => WindowShape::of(start, self.observation_window_secs),
+            None => WindowShape::FullDay,
+        }
+    }
+
+    /// Picks each entry makes: one per station and metric the window scores.
+    pub fn values_per_entry(&self) -> usize {
+        self.stations.len() * self.window_shape().metrics()
+    }
+
     pub fn resolve_plan(&self, scenario: &str) -> anyhow::Result<Self> {
         use rand::{Rng, SeedableRng};
         anyhow::ensure!(
@@ -363,6 +445,7 @@ impl ScenarioConfig {
         );
         let seed = self.seed.unwrap_or_else(rand::random);
         let mut config = self.clone();
+        config.competition_id.get_or_insert_with(uuid::Uuid::now_v7);
         if let Some(mix) = &self.player_mix {
             mix.validate()?;
             let max_pool = self

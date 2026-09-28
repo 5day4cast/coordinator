@@ -694,8 +694,9 @@ impl SynthDb {
         let now =
             OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
 
+        // Runs overlap, so another may create the same player first: keep whichever was saved.
         sqlx::query(
-            "INSERT INTO synth_users (id, name, nostr_secret_key, nostr_pubkey, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO synth_users (id, name, nostr_secret_key, nostr_pubkey, created_at) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(name)
@@ -705,13 +706,12 @@ impl SynthDb {
         .execute(&self.pool)
         .await?;
 
-        Ok(SynthUserRecord {
-            id,
-            name: name.to_string(),
-            nostr_secret_key: user.nostr_secret_key_hex(),
-            nostr_pubkey: user.nostr_pubkey_hex(),
-            created_at: now,
-        })
+        Ok(
+            sqlx::query_as::<_, SynthUserRecord>("SELECT * FROM synth_users WHERE name = ?")
+                .bind(name)
+                .fetch_one(&self.pool)
+                .await?,
+        )
     }
 
     pub async fn list_users(&self) -> Result<Vec<SynthUserRecord>> {

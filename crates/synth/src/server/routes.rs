@@ -152,7 +152,7 @@ pub(super) async fn dashboard_live(
         )
     });
     let runs = runner.db().list_runs(10).await.unwrap_or_default();
-    let live = runner.live();
+    let live = runner.live_runs();
     let health = runner
         .db()
         .scenario_health(HEALTH_WINDOW)
@@ -162,10 +162,17 @@ pub(super) async fn dashboard_live(
     let unrecorded = tracker.unrecorded_swaps();
 
     html! {
-        @if let Some(live) = &live {
-            p.running {
-                "Running now: " a href=(format!("/runs/{}", live.run_id)) { (live.scenario) }
-                " — " strong { (live.current_step.as_deref().unwrap_or("starting")) }
+        @if !live.is_empty() {
+            section.running {
+                p { "Running now: " (live.len()) }
+                ul {
+                    @for run in &live {
+                        li {
+                            a href=(format!("/runs/{}", run.run_id)) { (run.scenario) }
+                            " — " strong { (run.current_step.as_deref().unwrap_or("starting")) }
+                        }
+                    }
+                }
             }
         }
 
@@ -252,7 +259,7 @@ pub(super) async fn dashboard_live(
                             td {
                                 @if let Some(ref completed) = run.completed_at {
                                     (format::time_text(completed, now))
-                                } @else if let Some(live) = live.as_ref().filter(|live| live.run_id == run.id) {
+                                } @else if let Some(live) = live.iter().find(|live| live.run_id == run.id) {
                                     span.running { "running: " (live.current_step.as_deref().unwrap_or("starting")) }
                                 } @else {
                                     "not yet"
@@ -611,10 +618,7 @@ async fn run_json(State(runner): State<Runner>, Path(id): Path<String>) -> Respo
         Ok(steps) => steps,
         Err(e) => return failed(e),
     };
-    let current_step = runner
-        .live()
-        .filter(|live| live.run_id == id)
-        .and_then(|live| live.current_step);
+    let current_step = runner.live_run(&id).and_then(|live| live.current_step);
     Json(serde_json::json!({
         "run": run,
         "steps": steps,

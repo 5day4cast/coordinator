@@ -369,6 +369,68 @@ async fn seats_taken_by_other_players_do_not_fail_the_run() {
     }
 }
 
+/// Two runs at once, each tracked by its own competition. The mock's competition awaits its
+/// attestation only once four players have entered, two from each run, so runs made one after the
+/// other would never finish.
+#[tokio::test]
+async fn overlapping_runs_are_each_tracked_by_their_competition() {
+    let (_directory, db) = db().await;
+    let mock = Mock::new(Protocol {
+        capacity: 4,
+        ..Default::default()
+    })
+    .await;
+    let runner = crate::runner::Runner::new(
+        mock.client.clone(),
+        db.clone(),
+        crate::events::Events::new(),
+    );
+    let plan = |seed| {
+        let mut config = config(2);
+        config.seed = Some(seed);
+        config.competition_id = None;
+        config.resolve_plan("full_lifecycle").unwrap()
+    };
+    let (first, second) = (plan(1), plan(2));
+    let competitions = [
+        first.competition_id.unwrap(),
+        second.competition_id.unwrap(),
+    ];
+    assert_ne!(competitions[0], competitions[1]);
+    let watching = runner.clone();
+    let seen = tokio::spawn(async move {
+        loop {
+            let live = watching.live_runs();
+            if live.len() == 2 {
+                return live
+                    .into_iter()
+                    .map(|run| run.competition_id)
+                    .collect::<Vec<_>>();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    let (a, b) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            runner.run_scenario("full_lifecycle", first),
+            runner.run_scenario("full_lifecycle", second)
+        )
+    })
+    .await
+    .expect("overlapping runs finish together");
+    assert_eq!(a.unwrap().status, ScenarioStatus::Passed);
+    assert_eq!(b.unwrap().status, ScenarioStatus::Passed);
+    let mut seen = seen.await.unwrap();
+    seen.sort();
+    let mut expected = competitions.to_vec();
+    expected.sort();
+    assert_eq!(seen, expected);
+    assert!(
+        runner.live_runs().is_empty(),
+        "each leaves the map when it ends"
+    );
+}
+
 #[test]
 fn only_cancellations_synth_did_not_cause_are_expected() {
     let competition = |json: Value| -> CompetitionResponse {
@@ -735,17 +797,37 @@ fn restart_markers_keep_legacy_uncertainty_but_distinguish_deliberate_nonpayment
 #[test]
 fn weather_picks_replay_per_seed_and_user() {
     let stations = vec!["KDEN".into(), "KORD".into(), "KJFK".into()];
-    let picks = |seed, index| {
+    let picks_in = |seed, index, shape| {
         serde_json::to_value(full_lifecycle::generate_predictions(
             &stations,
             Some(seed),
             index,
+            shape,
         ))
         .unwrap()
     };
+    let picks = |seed, index| picks_in(seed, index, WindowShape::FullDay);
     assert_eq!(picks(19, 0), picks(19, 0));
     assert_ne!(picks(19, 0), picks(19, 1));
     assert_ne!(picks(19, 0), picks(20, 0));
+    // A half picks only what it scores, and the same as a full day for those.
+    let full = picks(19, 0);
+    for (shape, kept, dropped) in [
+        (WindowShape::Day, "temp_high", "temp_low"),
+        (WindowShape::Night, "temp_low", "temp_high"),
+    ] {
+        let half = picks_in(19, 0, shape);
+        for (half, full) in half
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(full.as_array().unwrap())
+        {
+            assert!(half[dropped].is_null(), "{shape:?}");
+            assert_eq!(half[kept], full[kept]);
+            assert_eq!(half["wind_speed"], full["wind_speed"]);
+        }
+    }
 }
 
 #[test]

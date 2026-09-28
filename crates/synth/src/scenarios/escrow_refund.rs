@@ -62,20 +62,15 @@ pub(super) async fn create_competition(
     client: &CoordinatorClient,
     config: &ScenarioConfig,
 ) -> Result<Uuid> {
-    let now = OffsetDateTime::now_utc();
-    let entry_window = time::Duration::seconds(config.entry_window_secs as i64);
-    let observation_window = time::Duration::seconds(config.observation_window_secs as i64);
+    let times = config.competition_times(OffsetDateTime::now_utc());
     let seats = config.users + 1;
     let competition = CreateCompetition {
-        id: Uuid::now_v7(),
-        signing_date: now
-            + entry_window
-            + observation_window
-            + time::Duration::seconds(config.signing_delay_secs as i64),
-        start_observation_date: now + entry_window,
-        end_observation_date: now + entry_window + observation_window,
+        id: times.id,
+        signing_date: times.signing,
+        start_observation_date: times.start,
+        end_observation_date: times.end,
         locations: config.stations.clone(),
-        number_of_values_per_entry: config.stations.len() * 3,
+        number_of_values_per_entry: config.values_per_entry(),
         number_of_places_win: 1,
         total_allowed_entries: seats,
         entry_fee: config.entry_fee,

@@ -71,6 +71,10 @@ pub struct SchedulerConfig {
     /// Rotate these cases when configured; otherwise keep the legacy single scenario.
     #[serde(default)]
     pub scenarios: Option<Vec<String>>,
+    /// Streams of competitions run side by side, each on its own cadence, their runs
+    /// overlapping. When set, `interval_secs` and the scenarios above are not used.
+    #[serde(default)]
+    pub lanes: Vec<crate::runner::lanes::LaneConfig>,
 }
 
 fn default_scenario() -> String {
@@ -213,6 +217,7 @@ impl Default for SynthConfig {
                 interval_secs: 3600,
                 scenario: "full_lifecycle".to_string(),
                 scenarios: None,
+                lanes: Vec::new(),
             },
             trail: Default::default(),
             defaults: DefaultsConfig {
@@ -302,6 +307,10 @@ pub fn load_config(path: Option<&str>) -> anyhow::Result<SynthConfig> {
         config
             .scheduler
             .validate(config.defaults.observation_windows_secs.values())?;
+        let base = config.scenario_config();
+        for lane in &config.scheduler.lanes {
+            lane.validate(&base)?;
+        }
     }
     Ok(config)
 }
@@ -347,6 +356,57 @@ before_submit = { min_secs = 10, max_secs = 120 }
             std::fs::write(&path, format!("[scheduler]\nenabled = true\nscenarios = {cases}\n[defaults]\nstations = [\"KDEN\"]\n")).unwrap();
             assert!(load_config(Some(path.to_str().unwrap())).is_err());
         }
+    }
+
+    #[test]
+    fn lanes_load_and_are_checked_against_the_oracles_windows() {
+        let _environment = CONFIG_ENV.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synth.toml");
+        let lanes = |half_window: &str| {
+            format!(
+                r#"
+[scheduler]
+enabled = true
+
+[[scheduler.lanes]]
+name = "open"
+interval_secs = 3600
+entry_window_secs = 3600
+scenarios = ["full_lifecycle", "duplicate_submission"]
+observation_windows_secs = [86400, 172800]
+stations_per_run = 2
+
+[[scheduler.lanes]]
+name = "halves"
+align = "utc_half"
+entry_window_secs = 3600
+scenarios = ["full_lifecycle"]
+observation_windows_secs = [{half_window}]
+
+[defaults]
+stations = ["KDEN", "KJFK", "KORD"]
+observation_windows_secs = [86400]
+entry_window_secs = 3600
+[defaults.entry_timing]
+arrival_pattern = "spread"
+before_payment = {{ min_secs = 5, max_secs = 60 }}
+before_submit = {{ min_secs = 10, max_secs = 120 }}
+deadline_margin_secs = 60
+"#
+            )
+        };
+        std::fs::write(&path, lanes("43200")).unwrap();
+        let config = load_config(Some(path.to_str().unwrap())).unwrap();
+        assert_eq!(config.scheduler.lanes.len(), 2);
+        assert_eq!(
+            config.scheduler.lanes[1].align,
+            crate::runner::lanes::Align::UtcHalf
+        );
+        assert_eq!(config.defaults.users, None, "counts are drawn");
+        // A 12-hour window starting whenever a run happens to is refused.
+        std::fs::write(&path, lanes("43200").replace("align = \"utc_half\"\n", "")).unwrap();
+        assert!(load_config(Some(path.to_str().unwrap())).is_err());
     }
 
     #[test]
