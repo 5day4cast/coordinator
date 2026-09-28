@@ -128,6 +128,12 @@
   font-style: italic;
 }
 
+/* Which way the station's forecasts have leaned lately, beside the Par range. */
+.pick-lean {
+  color: var(--bulma-text-weak);
+  font-size: 0.85em;
+}
+
 .pick-options {
   display: inline-flex;
   border: 1px solid var(--bulma-border);

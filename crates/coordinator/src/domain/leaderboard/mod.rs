@@ -259,6 +259,28 @@ impl Leaderboards {
         ))
     }
 
+    /// `entry`'s picks before the window opens, against the forecasts so far: what the
+    /// leaderboard withholds from everyone, for the player who made them.
+    pub async fn own_picks(
+        &self,
+        competition: &Competition,
+        entry: &UserEntry,
+        wait: Duration,
+    ) -> Vec<PickProgress> {
+        let weather = self.weather.weather(competition, wait).await;
+        let event = &competition.event_submission;
+        let (start, end) = (event.start_observation_date, event.end_observation_date);
+        entry_picks(
+            entry,
+            event.scoring_rules(),
+            weather.value(),
+            Window::Open,
+            start,
+            end,
+            (end - start).as_seconds_f64() / 3600.0,
+        )
+    }
+
     /// The oracle's weather for `competition`, possibly a few minutes old. With nothing cached
     /// yet, or only weather whose forecasts failed and are being fetched again, this waits up
     /// to `wait` for that fetch.
@@ -540,34 +562,7 @@ pub fn build(
             if now < start {
                 return vec![];
             }
-            entry
-                .entry_submission
-                .expected_observations
-                .iter()
-                .flat_map(|choice| {
-                    [
-                        (Metric::TempHigh, &choice.temp_high),
-                        (Metric::TempLow, &choice.temp_low),
-                        (Metric::WindSpeed, &choice.wind_speed),
-                    ]
-                    .into_iter()
-                    .filter_map(|(metric, pick)| Some((metric, pick.as_ref()?)))
-                    .map(|(metric, pick)| {
-                        pick_progress(
-                            &choice.stations,
-                            metric,
-                            pick,
-                            rules,
-                            weather_value,
-                            window,
-                            start,
-                            end,
-                            hours_total,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                })
-                .collect()
+            entry_picks(entry, rules, weather_value, window, start, end, hours_total)
         })
         .collect();
 
@@ -640,6 +635,46 @@ enum Window {
     Closed,
     /// The oracle has attested the result.
     Scored,
+}
+
+/// An entry's picks against `weather`, in the entry's order.
+fn entry_picks(
+    entry: &UserEntry,
+    rules: ScoringRules,
+    weather: Option<&CompetitionWeather>,
+    window: Window,
+    start: OffsetDateTime,
+    end: OffsetDateTime,
+    hours_total: f64,
+) -> Vec<PickProgress> {
+    entry
+        .entry_submission
+        .expected_observations
+        .iter()
+        .flat_map(|choice| {
+            [
+                (Metric::TempHigh, &choice.temp_high),
+                (Metric::TempLow, &choice.temp_low),
+                (Metric::WindSpeed, &choice.wind_speed),
+            ]
+            .into_iter()
+            .filter_map(|(metric, pick)| Some((metric, pick.as_ref()?)))
+            .map(|(metric, pick)| {
+                pick_progress(
+                    &choice.stations,
+                    metric,
+                    pick,
+                    rules,
+                    weather,
+                    window,
+                    start,
+                    end,
+                    hours_total,
+                )
+            })
+            .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]

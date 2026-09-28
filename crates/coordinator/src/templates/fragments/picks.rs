@@ -1,7 +1,9 @@
 //! An entry's picks with the oracle's forecast and reading for each, and
 //! whether the pick scored. While the competition's window is open each pick
 //! shows the reading so far and how it stands, and the dialog refreshes
-//! itself every minute until the window closes.
+//! itself every minute until the window closes. Before the window opens the
+//! picks are withheld from everyone but the player who made them, who loads
+//! their own from [`own_detail_url`].
 
 use maud::{html, Markup};
 use time::OffsetDateTime;
@@ -13,6 +15,8 @@ use crate::templates::format::{self, MetricText};
 /// How often an open window's picks and leaderboard refresh.
 pub const LIVE_REFRESH: &str = "every 60s";
 
+const WITHHELD: &str = "Picks become public when entries close.";
+
 /// One pick as the leaderboard computed it, with its station's name as
 /// players know it.
 #[derive(Debug, Clone)]
@@ -21,18 +25,63 @@ pub struct PickView<'a> {
     pub station_name: Option<String>,
 }
 
-/// The badge for how a pick stands. "Final" is the oracle's attested result
-/// only; a closed window without it is still awaiting that result.
-fn badge(state: PickState) -> (&'static str, &'static str) {
+/// Who is looking at an entry's picks before its window opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Viewer {
+    /// Not known: the public dialog, which then asks for the viewer's own.
+    Unknown,
+    /// The player who made the entry.
+    Owner,
+    /// Anyone else, or the owner logged out.
+    Other,
+}
+
+/// The badge for how a pick stands, and what that means on hover. "Final"
+/// is the oracle's attested result only; a closed window without it is
+/// still awaiting that result.
+fn badge(state: PickState) -> (&'static str, &'static str, &'static str) {
     match state {
-        PickState::Pending => ("pick-state", "Waiting for readings"),
-        PickState::LockedIn => ("pick-state is-locked-in", "Locked in"),
-        PickState::OnTrack => ("pick-state is-on-track", "On track"),
-        PickState::OffTrack => ("pick-state is-off-track", "Off track"),
-        PickState::Out => ("pick-state is-out", "Out"),
-        PickState::AwaitingResult => ("pick-state is-awaiting", "Awaiting the oracle's result"),
-        PickState::Final => ("pick-state is-final", "Final"),
+        PickState::Pending => (
+            "pick-state",
+            "Waiting for readings",
+            "No reading from the window yet",
+        ),
+        PickState::LockedIn => (
+            "pick-state is-locked-in",
+            "Locked in",
+            "Right, and the rest of the window can't change that",
+        ),
+        PickState::OnTrack => (
+            "pick-state is-on-track",
+            "On track",
+            "Right if the window ended now, but the reading can still move against it",
+        ),
+        PickState::OffTrack => (
+            "pick-state is-off-track",
+            "Off track",
+            "Wrong if the window ended now, but the reading can still come its way",
+        ),
+        PickState::Out => (
+            "pick-state is-out",
+            "Out",
+            "Wrong, and the rest of the window can't change that",
+        ),
+        PickState::AwaitingResult => (
+            "pick-state is-awaiting",
+            "Awaiting the oracle's result",
+            "The window has closed; the oracle's own reading decides",
+        ),
+        PickState::Final => (
+            "pick-state is-final",
+            "Final",
+            "The oracle's attested result",
+        ),
     }
+}
+
+fn state_badge(state: PickState) -> Markup {
+    let (class, text, title) = badge(state);
+    html! { span class=(class) title=(title) { (text) } }
 }
 
 fn pick_label(pick: &ValueOptions) -> &'static str {
@@ -48,6 +97,12 @@ pub fn detail_url(entry_id: &str) -> String {
     format!("/entries/{entry_id}/detail")
 }
 
+/// Where a player's own picks load from before the window opens: signed when
+/// the player is logged in, so the server can tell the entry's owner.
+pub fn own_detail_url(entry_id: &str) -> String {
+    format!("/entries/{entry_id}/detail/mine")
+}
+
 /// The picks dialog's content. While the window is open it reloads itself
 /// every minute; the reload after the window closes, or after the
 /// competition is cancelled, carries no trigger, so the polling stops there.
@@ -58,6 +113,28 @@ pub fn picks_detail(
     phase: Phase,
     updated_at: Option<OffsetDateTime>,
     now: OffsetDateTime,
+) -> Markup {
+    detail(entry_id, picks, phase, updated_at, now, Viewer::Unknown)
+}
+
+/// The dialog's content for the entry's owner before the window opens, with
+/// the forecasts so far: what [`picks_detail`] withholds until then.
+pub fn own_picks_detail(entry_id: &str, picks: &[PickView], now: OffsetDateTime) -> Markup {
+    detail(entry_id, picks, Phase::Upcoming, None, now, Viewer::Owner)
+}
+
+/// What anyone but the owner gets from [`own_detail_url`].
+pub fn withheld_picks_detail(entry_id: &str, now: OffsetDateTime) -> Markup {
+    detail(entry_id, &[], Phase::Upcoming, None, now, Viewer::Other)
+}
+
+fn detail(
+    entry_id: &str,
+    picks: &[PickView],
+    phase: Phase,
+    updated_at: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+    viewer: Viewer,
 ) -> Markup {
     let live = phase == Phase::Live;
     let any_observed = picks.iter().any(|view| view.pick.observed.is_some());
@@ -75,7 +152,9 @@ pub fn picks_detail(
             hx-target=[live.then_some("this")] hx-swap=[live.then_some("outerHTML")] {
             div class="entry-detail-header" {
                 div {
-                    h2 class="title is-5 mb-1" { "Picks" }
+                    h2 class="title is-5 mb-1" {
+                        @if viewer == Viewer::Owner { "Your picks" } @else { "Picks" }
+                    }
                     span class="entry-id" { "Entry " (format::copyable_id(entry_id)) }
                 }
                 @if any_observed {
@@ -99,6 +178,11 @@ pub fn picks_detail(
                         }
                         "."
                     }
+                    p class="picks-legend" {
+                        strong { "On track" } " and " strong { "off track" } " say how a pick stands if the "
+                        "window ended now. Highs and winds only rise through the window and lows only fall, "
+                        "so once the reading has settled a pick it is " strong { "locked in" } " or " strong { "out" } "."
+                    }
                 }
                 Phase::AwaitingResult => {
                     p class="provisional-note" {
@@ -118,9 +202,14 @@ pub fn picks_detail(
                 Phase::Upcoming | Phase::Scored => {}
             }
             @if picks.is_empty() {
-                p class="empty-state" {
-                    @if phase == Phase::Upcoming { "Picks become public when entries close." }
-                    @else { "No picks recorded." }
+                @match (phase, viewer) {
+                    // Asks for the viewer's own picks; the request is signed when they are logged in.
+                    (Phase::Upcoming, Viewer::Unknown) => {
+                        p class="empty-state" hx-get=(own_detail_url(entry_id)) hx-trigger="load"
+                          hx-target="#entryValues" hx-swap="innerHTML" { (WITHHELD) }
+                    }
+                    (Phase::Upcoming, Viewer::Other) => { p class="empty-state" { (WITHHELD) } }
+                    _ => { p class="empty-state" { "No picks recorded." } }
                 }
             } @else if !any_observed {
                 p class="entry-pending-msg mb-3" {
@@ -155,6 +244,9 @@ fn forecast_value(pick: &PickProgress) -> Markup {
         strong { (pick.forecast.map(|value| pick.metric.value(value)).unwrap_or_else(|| "—".into())) }
         @if let (Some(value), Some(Rule::Line { lower, upper })) = (pick.forecast, pick.rule) {
             " (Par " (pick.metric.range(value + lower, value + upper)) ")"
+            @if let Some(lean) = pick.metric.lean(lower, upper) {
+                " · " (lean)
+            }
         }
     }
 }
@@ -168,7 +260,6 @@ fn pick_row(pick: &PickProgress) -> Markup {
         (true, false) => "scored-pick is-miss",
         (false, _) => "scored-pick",
     };
-    let (badge_class, badge_text) = badge(pick.state);
     html! {
         div class=(class) {
             span class="pick-metric" { (pick.metric.label()) }
@@ -182,16 +273,16 @@ fn pick_row(pick: &PickProgress) -> Markup {
             span class="pick-result" {
                 @if scored {
                     @if pick.hit { "✓ +" (pick.points) } @else { "✗ 0" }
-                    span class=(badge_class) { (badge_text) }
+                    (state_badge(pick.state))
                 }
             }
         }
     }
 }
 
-/// `Forecast 69°F · High so far 71°F · 9 of 24 h`, and how the pick stands.
+/// `Forecast 69°F · High so far 71°F · 9 of 24 h`, the points the pick
+/// earns if the window ended now, and how it stands.
 fn live_pick_row(pick: &PickProgress) -> Markup {
-    let (badge_class, badge_text) = badge(pick.state);
     let row_class = match pick.state {
         PickState::LockedIn => "scored-pick is-live is-locked-in",
         PickState::Out => "scored-pick is-live is-out",
@@ -215,7 +306,8 @@ fn live_pick_row(pick: &PickProgress) -> Markup {
             span class="pick-choice" { (pick_label(&pick.pick)) }
             span class="pick-result" {
                 @if pick.observed.is_some() {
-                    span class=(badge_class) { (badge_text) }
+                    span class="pick-points" { @if pick.hit { "+" (pick.points) } @else { "0" } }
+                    (state_badge(pick.state))
                 }
             }
         }
@@ -338,6 +430,28 @@ mod tests {
         assert!(over.contains("No readings were recorded"));
         let before = picks_detail("e", &[], Phase::Upcoming, None, NOW).into_string();
         assert!(before.contains("Picks become public when entries close."));
+        assert!(before.contains(r#"hx-get="/entries/e/detail/mine" hx-trigger="load""#));
+    }
+
+    /// Before the window opens the owner sees their own picks with the forecasts;
+    /// anyone else gets the same message as the public dialog, without asking again.
+    #[test]
+    fn the_owner_sees_their_own_picks_before_the_window_opens() {
+        let picks = [pick(
+            Metric::TempHigh,
+            ValueOptions::Over,
+            69.0,
+            None,
+            PickState::Pending,
+        )];
+        let own = own_picks_detail("e", &views(&picks), NOW).into_string();
+        assert!(own.contains("Your picks"));
+        assert!(own.contains("Forecast <strong>69°F</strong>"));
+        assert!(own.contains("Readings appear here once the window opens."));
+        assert!(!own.contains("hx-"));
+        let withheld = withheld_picks_detail("e", NOW).into_string();
+        assert!(withheld.contains("Picks become public when entries close."));
+        assert!(!withheld.contains("hx-"));
     }
 
     #[test]
@@ -382,8 +496,19 @@ mod tests {
         for badge in ["Locked in", "On track", "Out", "Off track"] {
             assert!(html.contains(badge), "{badge}");
         }
-        // Locked in (10) and on track (par, 20), as if the window ended now.
+        assert!(html.contains(
+            r#"title="Wrong if the window ended now, but the reading can still come its way""#
+        ));
+        assert!(html.contains("say how a pick stands if the window ended now"));
+        // Locked in (10) and on track (par, 20), as if the window ended now, pick by pick.
         assert!(html.contains("30 pts"));
+        assert!(html.contains(r#"<span class="pick-points">+10</span>"#));
+        assert!(html.contains(r#"<span class="pick-points">+20</span>"#));
+        assert_eq!(
+            html.matches(r#"<span class="pick-points">0</span>"#)
+                .count(),
+            2
+        );
         assert!(html.contains("Provisional: scored as if the window ended now · updated"));
         assert!(html.contains("12 min ago"));
         assert!(html.contains(r#"hx-get="/entries/e1/detail""#));
