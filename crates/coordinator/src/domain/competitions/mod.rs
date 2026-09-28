@@ -1148,6 +1148,10 @@ pub struct Competition {
     /// coordinator fills it in for the API.
     #[serde(flatten)]
     pub queue: Option<QueueSummary>,
+    /// An Arkade competition's latest kickoff check. Not stored on the row; the coordinator
+    /// fills it in for the API.
+    #[serde(default)]
+    pub kickoff_check: Option<KickoffCheck>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1235,6 +1239,9 @@ pub struct ExtendCompetition {
     /// A queued competition's `pool_rules`, `entries`, `max_entries`, `stake_sats` and `pools`.
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub queue: Option<QueueSummary>,
+    /// Why an Arkade competition was built or cancelled at kickoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kickoff_check: Option<KickoffCheck>,
 }
 
 impl From<Competition> for ExtendCompetition {
@@ -1283,6 +1290,7 @@ impl From<Competition> for ExtendCompetition {
             pool_index: competition.pool_index,
             pools_formed_at: competition.pools_formed_at,
             queue: competition.queue,
+            kickoff_check: competition.kickoff_check,
         }
     }
 }
@@ -1655,6 +1663,7 @@ impl Competition {
             pool_index: None,
             pools_formed_at: None,
             queue: None,
+            kickoff_check: None,
         }
     }
     pub fn has_full_entries(&self) -> bool {
@@ -1962,6 +1971,7 @@ impl FromRow<'_, SqliteRow> for Competition {
                 })
                 .transpose()?,
             queue: None,
+            kickoff_check: None,
         })
     }
 }

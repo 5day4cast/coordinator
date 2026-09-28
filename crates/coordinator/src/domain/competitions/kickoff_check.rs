@@ -15,9 +15,11 @@
 
 use super::*;
 use crate::config::{KickoffCheckSettings, NetworkFeeSettings};
+use crate::domain::competitions::CompetitionKind;
 use crate::infra::bitcoin::fee_rate_for_target;
 use bitcoin::{Amount, FeeRate};
 use log::{info, warn};
+use serde::{Deserialize, Serialize};
 
 /// What the check found, kept for the competition's API so operators can see why a pool was
 /// cancelled.
@@ -364,14 +366,19 @@ impl Coordinator {
         check.fee_rate()
     }
 
-    /// Fill in each competition's latest kickoff check, for the API.
+    /// Fill in each competition's latest kickoff check, for the API, in one query.
     pub(super) async fn attach_kickoff_checks(
         &self,
         competitions: &mut [Competition],
     ) -> Result<(), Error> {
-        for competition in competitions.iter_mut() {
+        if let [competition] = competitions {
             competition.kickoff_check =
                 self.competition_store.kickoff_check(competition.id).await?;
+            return Ok(());
+        }
+        let mut checks = self.competition_store.kickoff_checks().await?;
+        for competition in competitions.iter_mut() {
+            competition.kickoff_check = checks.remove(&competition.id);
         }
         Ok(())
     }
