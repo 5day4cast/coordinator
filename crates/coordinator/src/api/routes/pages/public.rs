@@ -37,7 +37,7 @@ use crate::{
         fragments::{
             entry_form::{
                 entry_form, forecast_choices, forecasts_url, payout_line, ticket_status, Forecasts,
-                PayoutDestination, TicketProgress,
+                NetworkFee, PayoutDestination, TicketProgress,
             },
             leaderboard::{
                 leaderboard, leaderboard_scores, queue_pools, rows_url, LeaderboardRow,
@@ -487,7 +487,11 @@ pub async fn entry_form_fragment(
         .inspect_err(|error| warn!("payout terms for {competition_id}: {error}"))
         .ok();
     // Logged where the estimate failed; the form says it is unavailable.
-    let network_fee = network_fee.ok().map(|quote| quote.network_fee_sats);
+    let network_fee = match network_fee {
+        Ok(quote) if quote.pauses(view.entry_fee) => NetworkFee::Paused(quote.network_fee_sats),
+        Ok(quote) => NetworkFee::Estimate(quote.network_fee_sats),
+        Err(_) => NetworkFee::Unavailable,
+    };
     let content = entry_form(&view, &forecasts, terms.as_ref(), &destination, network_fee);
     page(
         &headers,

@@ -539,7 +539,8 @@ pub async fn build_app(
         config.keymeld_settings.automatic_payout_max_fee_rate_sat_vb,
     )?
     .with_ark(arkade(&config.ark_settings).await?)?
-    .with_network_fee(config.network_fee_settings.clone())?;
+    .with_network_fee(config.network_fee_settings.clone())?
+    .with_kickoff_check(config.kickoff_check_settings.clone())?;
     let (wakes, wake_requests) = CompetitionWakes::new();
     let coordinator = Arc::new(
         coordinator

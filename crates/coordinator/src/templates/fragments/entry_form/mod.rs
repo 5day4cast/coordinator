@@ -9,7 +9,7 @@ use crate::domain::{
         progress::{LINE_POINTS, OVER_OR_UNDER_POINTS, PAR_POINTS},
         Metric, Rule,
     },
-    PayoutTermsQuote, TicketStatus, WindowShape,
+    PayoutTermsQuote, TicketStatus, WindowShape, ENTRIES_PAUSED,
 };
 use crate::infra::oracle::ScoringRules;
 use crate::templates::{
@@ -55,16 +55,35 @@ pub enum Forecasts {
 pub const NETWORK_FEE_NOTE: &str =
     "Your share of the Bitcoin network fees for a full pool, fixed when your ticket is issued.";
 
-/// Entry form for a competition. `network_fee` is the network fee a ticket issued now would
-/// carry, `None` while the fee estimate is unavailable; a ticket's own fee replaces it once the
-/// ticket is issued (`entry_form.js`).
+/// The network fee the form shows: what a ticket issued now would carry. A ticket's own fee
+/// replaces it once the ticket is issued (`entry_form.js`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkFee {
+    Estimate(u64),
+    /// No ticket is issued while the fee is this high a share of the entry.
+    Paused(u64),
+    /// No fee estimate, so no ticket either.
+    Unavailable,
+}
+
+impl NetworkFee {
+    fn sats(self) -> Option<u64> {
+        match self {
+            NetworkFee::Estimate(fee) | NetworkFee::Paused(fee) => Some(fee),
+            NetworkFee::Unavailable => None,
+        }
+    }
+}
+
+/// Entry form for a competition.
 pub fn entry_form(
     competition: &CompetitionView,
     forecasts: &Forecasts,
     terms: Option<&PayoutTermsQuote>,
     destination: &PayoutDestination,
-    network_fee: Option<u64>,
+    network_fee: NetworkFee,
 ) -> Markup {
+    let paused = matches!(network_fee, NetworkFee::Paused(_));
     let picks_allowed = competition.number_of_values_per_entry;
     let queue = competition.queue.queued();
     let pickable = match forecasts {
@@ -151,7 +170,7 @@ pub fn entry_form(
             form id="entryForm" data-competition-id=(competition.id)
                  data-entry-fee=(competition.entry_fee)
                  data-ticket-price=(competition.ticket_price)
-                 data-network-fee=[network_fee]
+                 data-network-fee=[network_fee.sats()]
                  data-total-pool=(competition.total_pool)
                  data-winner-count=(competition.paid_places)
                  data-max-values=(picks_allowed)
@@ -201,10 +220,17 @@ pub fn entry_form(
             }
 
             div class="entry-submit" {
-                button type="button" id="submitEntry" class="button is-primary is-medium" {
-                    @match network_fee {
-                        Some(fee) => { "Pay " (sats(competition.ticket_price + fee)) " and enter" }
-                        None => { "Pay and enter" }
+                @if paused {
+                    div id="entriesPaused" class="notification is-warning" {
+                        (ENTRIES_PAUSED) ". Entries already taken are unaffected; check back later."
+                    }
+                }
+                button type="button" id="submitEntry" class="button is-primary is-medium"
+                       disabled[paused] {
+                    @match (paused, network_fee.sats()) {
+                        (true, _) => { "Entries paused" }
+                        (false, Some(fee)) => { "Pay " (sats(competition.ticket_price + fee)) " and enter" }
+                        (false, None) => { "Pay and enter" }
                     }
                 }
                 div id="successMessage" class="notification is-success hidden" {
@@ -220,7 +246,8 @@ pub fn entry_form(
 /// The ticket's price and its lines: the entry fee, the service fee, and the network fee with
 /// what it is. The total and the network fee carry ids, so the ticket's own fee can replace the
 /// estimate once the ticket is issued.
-fn price_lines(competition: &CompetitionView, network_fee: Option<u64>) -> Markup {
+fn price_lines(competition: &CompetitionView, network_fee: NetworkFee) -> Markup {
+    let network_fee = network_fee.sats();
     let service = competition
         .ticket_price
         .saturating_sub(competition.entry_fee);
@@ -489,7 +516,7 @@ mod tests {
             },
             Some(&terms(true)),
             &destination,
-            Some(50),
+            NetworkFee::Estimate(50),
         )
         .into_string()
     }
@@ -524,7 +551,7 @@ mod tests {
             &Forecasts::Pending(Pending::Loading),
             Some(&terms(true)),
             &PayoutDestination::LoggedOut,
-            None,
+            NetworkFee::Unavailable,
         )
         .into_string();
         assert!(unavailable.contains("5,250 sats + network fee"));
@@ -538,12 +565,31 @@ mod tests {
             &Forecasts::Pending(Pending::Loading),
             Some(&terms(true)),
             &PayoutDestination::LoggedOut,
-            Some(0),
+            NetworkFee::Estimate(0),
         )
         .into_string();
         assert!(off.contains("entry 5,000 sats · service 5% 250 sats</span>"));
         assert!(!off.contains("networkFee") && !off.contains(NETWORK_FEE_NOTE));
         assert!(off.contains("Pay 5,250 sats and enter"));
+    }
+
+    /// While entries are paused the form says so before any picks are made, and cannot be
+    /// submitted.
+    #[test]
+    fn entry_form_says_when_entries_are_paused() {
+        let html = entry_form(
+            &view("c1", Phase::Upcoming, 60),
+            &Forecasts::Pending(Pending::Loading),
+            Some(&terms(true)),
+            &PayoutDestination::LoggedOut,
+            NetworkFee::Paused(600),
+        )
+        .into_string();
+        assert!(html.contains(ENTRIES_PAUSED));
+        assert!(html.contains(r#"<span id="networkFee">600 sats</span>"#));
+        assert!(html.contains(r#"id="submitEntry" class="button is-primary is-medium" disabled"#));
+        assert!(html.contains("Entries paused"));
+        assert!(!html.contains("and enter"));
     }
 
     #[test]
@@ -583,7 +629,7 @@ mod tests {
             },
             Some(&terms(true)),
             &PayoutDestination::Address("freya@lnurl.example".into()),
-            Some(50),
+            NetworkFee::Estimate(50),
         )
         .into_string();
         assert!(html.contains("40 entered"));
@@ -654,7 +700,7 @@ mod tests {
             },
             None,
             &PayoutDestination::LoggedOut,
-            Some(50),
+            NetworkFee::Estimate(50),
         )
         .into_string();
         assert!(html.contains("Par 67.4–70.2°F"), "{html}");
@@ -681,7 +727,7 @@ mod tests {
             },
             None,
             &PayoutDestination::LoggedOut,
-            Some(50),
+            NetworkFee::Estimate(50),
         )
         .into_string();
         assert!(
@@ -709,7 +755,7 @@ mod tests {
             &forecasts,
             None,
             &PayoutDestination::LoggedOut,
-            Some(50),
+            NetworkFee::Estimate(50),
         )
         .into_string();
         assert!(html.contains("no forecast yet"));
