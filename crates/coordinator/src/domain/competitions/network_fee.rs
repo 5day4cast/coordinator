@@ -329,15 +329,9 @@ mod tests {
         );
         settings.validate().unwrap();
         // A config without the sections gets the defaults.
-        let parsed: crate::config::Settings = toml::from_str(
-            &toml::to_string(&crate::config::Settings::default())
-                .unwrap()
-                .split("[network_fee_settings]")
-                .next()
-                .unwrap()
-                .to_string(),
-        )
-        .unwrap();
+        let config = toml::to_string(&crate::config::Settings::default()).unwrap();
+        let parsed: crate::config::Settings =
+            toml::from_str(config.split("[network_fee_settings]").next().unwrap()).unwrap();
         assert_eq!(parsed.network_fee_settings, settings);
         assert_eq!(
             parsed.kickoff_check_settings,
