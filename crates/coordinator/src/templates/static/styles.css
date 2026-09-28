@@ -638,12 +638,6 @@ tr.is-clickable:hover {
         display: block;
     }
 
-    /* Payment request textarea */
-    #paymentRequest {
-        font-size: 0.75rem;
-        word-break: break-all;
-    }
-
     /* Checkbox improvements */
     .checkbox {
         display: flex;

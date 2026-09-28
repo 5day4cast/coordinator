@@ -343,17 +343,19 @@ fn payment_modal() -> Markup {
                     div class="content" {
                         p id="ticketPaymentAmount" { "Please pay the lightning invoice to enter the competition:" }
 
-                        // QR Code container
-                        div id="qrContainer" class="has-text-centered mb-4" {}
+                        // QR code; tapping it copies the invoice (entry_form.js),
+                        // so the invoice text itself is not shown.
+                        div id="qrContainer" class="has-text-centered mb-2" {}
+                        p id="copyFeedback" class="has-text-centered has-text-weight-semibold mb-3" role="status" aria-live="polite" {
+                            "Tap the QR code to copy the invoice"
+                        }
 
-                        div class="field" {
-                            label class="label" for="paymentRequest" { "Payment Request (click to copy)" }
-                            div class="control" {
-                                textarea class="textarea" id="paymentRequest" readonly {}
-                            }
-                            p class="help is-success is-hidden" id="copyFeedback" {
-                                "✓ Copied to clipboard"
-                            }
+                        // Links that hand the invoice to a wallet app on this
+                        // device; entry_form.js fills in their hrefs.
+                        div id="walletLinks" class="buttons is-centered mb-4" {
+                            a id="walletLinkLightning" class="button is-link is-light" { "Open in wallet" }
+                            a id="walletLinkZeus" class="button is-light" { "Pay with Zeus" }
+                            a id="walletLinkCashApp" class="button is-light" target="_blank" rel="noopener noreferrer" { "Pay with Cash App" }
                         }
 
                         div id="paymentStatus" class="mt-4" {

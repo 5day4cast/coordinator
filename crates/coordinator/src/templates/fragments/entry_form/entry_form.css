@@ -219,4 +219,52 @@
 .payment-qr {
   max-width: 100%;
   height: auto;
+  /* No iOS long-press "Save/Copy image" menu: a tap copies the invoice. */
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* The QR code is a button that copies the invoice; the badge and outline
+   say so, since the invoice text itself is not shown. */
+.payment-qr-button {
+  position: relative;
+  display: inline-block;
+  padding: 0;
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background: none;
+  cursor: copy;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.payment-qr-button:hover,
+.payment-qr-button:focus-visible {
+  border-color: var(--bulma-link);
+  outline: none;
+}
+
+.payment-qr-button:active {
+  transform: scale(0.98);
+}
+
+.payment-qr-badge {
+  position: absolute;
+  right: 0.5rem;
+  bottom: 0.5rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  background: var(--bulma-link);
+  color: #fff;
+  font-size: 0.75rem;
+  font-weight: 600;
+  pointer-events: none;
+}
+
+/* Off-screen textarea for the older-Safari copy fallback. */
+.payment-copy-buffer {
+  position: fixed;
+  top: 0;
+  left: -9999px;
+  opacity: 0;
 }

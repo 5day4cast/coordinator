@@ -142,32 +142,69 @@ class Entry {
   // polling, hidden, for up to 5 minutes, since a payment may be in flight.
   async showPaymentModal() {
     const $modal = document.getElementById("ticketPaymentModal");
-    const $paymentRequest = document.getElementById("paymentRequest");
     const $copyFeedback = document.getElementById("copyFeedback");
     const $error = document.getElementById("ticketPaymentError");
     const $qrContainer = document.getElementById("qrContainer");
 
     // The wallet draws the QR code from the invoice after checking that it
     // charges the ticket price on this network; an <img> of it can run nothing.
+    const invoice = this.ticket.payment_request.trim();
     const $qrCode = document.createElement("img");
     $qrCode.id = "paymentQR";
     $qrCode.className = "payment-qr";
     $qrCode.width = 300;
     $qrCode.height = 300;
     $qrCode.alt = "QR code of the Lightning invoice";
-    $qrCode.src = session.dlcWallet.invoiceQr(this.ticket.payment_request, this.ticketAmountSats);
-    $qrContainer.replaceChildren($qrCode);
+    $qrCode.src = session.dlcWallet.invoiceQr(invoice, this.ticketAmountSats);
+    $qrCode.draggable = false;
+    // Tapping the code copies the invoice itself, not the image (which on
+    // iOS would hand over the SVG data URL).
+    const $qrButton = document.createElement("button");
+    $qrButton.type = "button";
+    $qrButton.className = "payment-qr-button";
+    $qrButton.setAttribute("aria-label", "Copy the Lightning invoice");
+    const $qrBadge = document.createElement("span");
+    $qrBadge.className = "payment-qr-badge";
+    $qrBadge.textContent = "Tap to copy";
+    $qrButton.append($qrCode, $qrBadge);
+    $qrContainer.replaceChildren($qrButton);
 
-    $paymentRequest.value = this.ticket.payment_request;
-    $paymentRequest.onclick = async () => {
+    // Deep links into wallet apps, set only after the invoice was checked above.
+    document.getElementById("walletLinkLightning").href = `lightning:${invoice}`;
+    document.getElementById("walletLinkZeus").href = `zeusln:lightning:${invoice}`;
+    // Cash App pays only mainnet invoices (lnbc…, but lnbcrt… is regtest):
+    // https://docs.voltageapi.com/wallet-deep-linking
+    const $cashApp = document.getElementById("walletLinkCashApp");
+    const mainnet = /^lnbc(?!rt)/i.test(invoice);
+    $cashApp.classList.toggle("is-hidden", !mainnet);
+    if (mainnet) $cashApp.href = `https://cash.app/launch/lightning/${invoice}`;
+
+    const hint = "Tap the QR code to copy the invoice";
+    $copyFeedback.textContent = hint;
+    const copyInvoice = async () => {
       try {
-        await navigator.clipboard.writeText($paymentRequest.value);
-        $copyFeedback.classList.remove("is-hidden");
-        setTimeout(() => $copyFeedback.classList.add("is-hidden"), 2000);
+        await navigator.clipboard.writeText(invoice);
       } catch (err) {
-        console.error("Failed to copy:", err);
+        // Older iOS Safari: copy from a hidden textarea instead. It goes in
+        // the modal so focus stays inside the dialog.
+        const $text = document.createElement("textarea");
+        $text.value = invoice;
+        $text.readOnly = true;
+        $text.className = "payment-copy-buffer";
+        $modal.append($text);
+        $text.select();
+        const copied = document.execCommand("copy");
+        $text.remove();
+        if (!copied) {
+          console.error("Failed to copy:", err);
+          $copyFeedback.textContent = "Could not copy; use a wallet button below";
+          return;
+        }
       }
+      $copyFeedback.textContent = "✓ Invoice copied";
+      setTimeout(() => ($copyFeedback.textContent = hint), 2000);
     };
+    $qrButton.onclick = copyInvoice;
     const networkFee = this.ticketAmountSats - this.shownPrice.ticketPrice;
     document.getElementById("ticketPaymentAmount").textContent =
       `Pay ${formatSats(this.ticketAmountSats)} by Lightning to enter this competition` +
@@ -195,6 +232,7 @@ class Entry {
         idle.id = "paymentStatus";
         document.getElementById("paymentStatus")?.replaceWith(idle);
         $qrContainer.replaceChildren();
+        document.querySelectorAll("#walletLinks a").forEach((a) => a.removeAttribute("href"));
         $modal.classList.remove("is-active");
         if (error) {
           $error.textContent = error.message;
