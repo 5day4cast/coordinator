@@ -149,25 +149,51 @@ class Entry {
 
     // The wallet draws the QR code from the invoice after checking that it
     // charges the ticket price on this network; an <img> of it can run nothing.
+    const invoice = this.ticket.payment_request.trim();
     const $qrCode = document.createElement("img");
     $qrCode.id = "paymentQR";
     $qrCode.className = "payment-qr";
     $qrCode.width = 300;
     $qrCode.height = 300;
     $qrCode.alt = "QR code of the Lightning invoice";
-    $qrCode.src = session.dlcWallet.invoiceQr(this.ticket.payment_request, this.ticketAmountSats);
-    $qrContainer.replaceChildren($qrCode);
+    $qrCode.src = session.dlcWallet.invoiceQr(invoice, this.ticketAmountSats);
+    $qrCode.draggable = false;
+    // Tapping the code copies the invoice itself, not the image (which on
+    // iOS would hand over the SVG data URL).
+    const $qrButton = document.createElement("button");
+    $qrButton.type = "button";
+    $qrButton.className = "payment-qr-button";
+    $qrButton.setAttribute("aria-label", "Copy the Lightning invoice");
+    $qrButton.append($qrCode);
+    $qrContainer.replaceChildren($qrButton);
 
-    $paymentRequest.value = this.ticket.payment_request;
-    $paymentRequest.onclick = async () => {
+    // Deep links into wallet apps, set only after the invoice was checked above.
+    document.getElementById("walletLinkLightning").href = `lightning:${invoice}`;
+    document.getElementById("walletLinkZeus").href = `zeusln:lightning:${invoice}`;
+    // Cash App pays only mainnet invoices (lnbc…, but lnbcrt… is regtest):
+    // https://docs.voltageapi.com/wallet-deep-linking
+    const $cashApp = document.getElementById("walletLinkCashApp");
+    const mainnet = /^lnbc(?!rt)/i.test(invoice);
+    $cashApp.classList.toggle("is-hidden", !mainnet);
+    if (mainnet) $cashApp.href = `https://cash.app/launch/lightning/${invoice}`;
+
+    $paymentRequest.value = invoice;
+    const copyInvoice = async () => {
       try {
-        await navigator.clipboard.writeText($paymentRequest.value);
-        $copyFeedback.classList.remove("is-hidden");
-        setTimeout(() => $copyFeedback.classList.add("is-hidden"), 2000);
+        await navigator.clipboard.writeText(invoice);
       } catch (err) {
-        console.error("Failed to copy:", err);
+        // Older iOS Safari: fall back to selecting and copying the textarea.
+        $paymentRequest.select();
+        if (!document.execCommand("copy")) {
+          console.error("Failed to copy:", err);
+          return;
+        }
       }
+      $copyFeedback.classList.remove("is-hidden");
+      setTimeout(() => $copyFeedback.classList.add("is-hidden"), 2000);
     };
+    $paymentRequest.onclick = copyInvoice;
+    $qrButton.onclick = copyInvoice;
     const networkFee = this.ticketAmountSats - this.shownPrice.ticketPrice;
     document.getElementById("ticketPaymentAmount").textContent =
       `Pay ${formatSats(this.ticketAmountSats)} by Lightning to enter this competition` +
@@ -195,6 +221,7 @@ class Entry {
         idle.id = "paymentStatus";
         document.getElementById("paymentStatus")?.replaceWith(idle);
         $qrContainer.replaceChildren();
+        document.querySelectorAll("#walletLinks a").forEach((a) => a.removeAttribute("href"));
         $modal.classList.remove("is-active");
         if (error) {
           $error.textContent = error.message;

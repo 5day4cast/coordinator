@@ -219,4 +219,16 @@
 .payment-qr {
   max-width: 100%;
   height: auto;
+  /* No iOS long-press "Save/Copy image" menu: a tap copies the invoice. */
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.payment-qr-button {
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: copy;
+  -webkit-tap-highlight-color: transparent;
 }
