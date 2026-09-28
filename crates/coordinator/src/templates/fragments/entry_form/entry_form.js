@@ -142,7 +142,6 @@ class Entry {
   // polling, hidden, for up to 5 minutes, since a payment may be in flight.
   async showPaymentModal() {
     const $modal = document.getElementById("ticketPaymentModal");
-    const $paymentRequest = document.getElementById("paymentRequest");
     const $copyFeedback = document.getElementById("copyFeedback");
     const $error = document.getElementById("ticketPaymentError");
     const $qrContainer = document.getElementById("qrContainer");
@@ -164,7 +163,10 @@ class Entry {
     $qrButton.type = "button";
     $qrButton.className = "payment-qr-button";
     $qrButton.setAttribute("aria-label", "Copy the Lightning invoice");
-    $qrButton.append($qrCode);
+    const $qrBadge = document.createElement("span");
+    $qrBadge.className = "payment-qr-badge";
+    $qrBadge.textContent = "Tap to copy";
+    $qrButton.append($qrCode, $qrBadge);
     $qrContainer.replaceChildren($qrButton);
 
     // Deep links into wallet apps, set only after the invoice was checked above.
@@ -177,22 +179,31 @@ class Entry {
     $cashApp.classList.toggle("is-hidden", !mainnet);
     if (mainnet) $cashApp.href = `https://cash.app/launch/lightning/${invoice}`;
 
-    $paymentRequest.value = invoice;
+    const hint = "Tap the QR code to copy the invoice";
+    $copyFeedback.textContent = hint;
     const copyInvoice = async () => {
       try {
         await navigator.clipboard.writeText(invoice);
       } catch (err) {
-        // Older iOS Safari: fall back to selecting and copying the textarea.
-        $paymentRequest.select();
-        if (!document.execCommand("copy")) {
+        // Older iOS Safari: copy from a hidden textarea instead. It goes in
+        // the modal so focus stays inside the dialog.
+        const $text = document.createElement("textarea");
+        $text.value = invoice;
+        $text.readOnly = true;
+        $text.className = "payment-copy-buffer";
+        $modal.append($text);
+        $text.select();
+        const copied = document.execCommand("copy");
+        $text.remove();
+        if (!copied) {
           console.error("Failed to copy:", err);
+          $copyFeedback.textContent = "Could not copy; use a wallet button below";
           return;
         }
       }
-      $copyFeedback.classList.remove("is-hidden");
-      setTimeout(() => $copyFeedback.classList.add("is-hidden"), 2000);
+      $copyFeedback.textContent = "✓ Invoice copied";
+      setTimeout(() => ($copyFeedback.textContent = hint), 2000);
     };
-    $paymentRequest.onclick = copyInvoice;
     $qrButton.onclick = copyInvoice;
     const networkFee = this.ticketAmountSats - this.shownPrice.ticketPrice;
     document.getElementById("ticketPaymentAmount").textContent =

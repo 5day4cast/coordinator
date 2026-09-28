@@ -132,7 +132,7 @@ test.describe("Full Entry Submission Flow", () => {
         }),
     ]);
 
-    await expect(page.locator("#paymentRequest")).toBeVisible();
+    await expect(page.locator("#paymentQR")).toBeVisible();
 
     await expect(page.locator("#ticketPaymentModal")).not.toHaveClass(
       /is-active/,
@@ -205,7 +205,8 @@ test.describe("Full Entry Submission Flow", () => {
     await page.locator("#submitEntry").click();
     await expect(page.locator("#errorMessage")).toContainText("The ticket omitted the approved payout escrow policy");
     await expect(page.locator("#ticketPaymentModal")).not.toHaveClass(/is-active/);
-    await expect(page.locator("#paymentRequest")).not.toHaveValue("invoice-that-must-never-be-displayed");
+    await expect(page.locator("#paymentQR")).toHaveCount(0);
+    await expect(page.locator("#walletLinks a[href*='invoice-that-must-never-be-displayed']")).toHaveCount(0);
     expect(ticketRequest?.payout.lightning_address).toBe(profileAddress);
     expect(ticketRequest?.payout.payout_hash).toMatch(/^[0-9a-f]{64}$/);
   });
