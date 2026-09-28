@@ -39,6 +39,13 @@ pub enum Error {
     TooLateToSign(OffsetDateTime, OffsetDateTime),
     #[error("Payout payment failed: {0}")]
     PaymentFailed(String),
+    /// Retryable: a ticket is never priced without a network fee estimate.
+    #[error("{}", competitions::FEE_ESTIMATE_UNAVAILABLE)]
+    FeeEstimateUnavailable,
+    /// Retryable later: no ticket is issued while the network fee would be too large a share of
+    /// the entry.
+    #[error("{}", competitions::ENTRIES_PAUSED)]
+    EntriesPaused,
 }
 
 impl Error {

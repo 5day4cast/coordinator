@@ -562,6 +562,56 @@ fn a_refund_fee_beyond_the_stake_is_refused() {
         .unwrap();
 }
 
+/// A ticket's network fee, fixed when it is issued, is part of its price: the form hands the
+/// wallet the price it showed plus that fee, the invoice charges it, and the escrow may pay it out
+/// with the coordinator's fee, but never more than the ticket above the stake.
+#[test]
+fn a_network_fee_is_part_of_the_ticket_price() {
+    const NETWORK_FEE: u64 = 50;
+    const PRICED: u64 = TICKET + NETWORK_FEE;
+    let priced = |max_fee_sats: u64, amount_sats: u64, invoiced_sats: u64| {
+        let mut fixture = Fixture::generated()
+            .with_policy(|p| p.ark_escrow.as_mut().unwrap().max_fee_sats = max_fee_sats);
+        fixture.consent.ticket_amount_sats = amount_sats;
+        fixture.consent.ticket_invoice = invoice(invoiced_sats).to_string();
+        fixture.check()
+    };
+    priced(COORDINATOR_FEE + NETWORK_FEE, PRICED, PRICED).unwrap();
+    // A network fee the escrow does not claim is the coordinator's loss, not the player's.
+    priced(COORDINATOR_FEE, PRICED, PRICED).unwrap();
+    for (label, max_fee_sats, amount_sats, invoiced_sats) in [
+        (
+            "escrow fee beyond the ticket",
+            COORDINATOR_FEE + NETWORK_FEE + 1,
+            PRICED,
+            PRICED,
+        ),
+        (
+            "the fee without the price",
+            COORDINATOR_FEE + NETWORK_FEE,
+            TICKET,
+            TICKET,
+        ),
+        (
+            "an invoice without the fee",
+            COORDINATOR_FEE + NETWORK_FEE,
+            PRICED,
+            TICKET,
+        ),
+        (
+            "an invoice above the price",
+            COORDINATOR_FEE + NETWORK_FEE,
+            PRICED,
+            PRICED + 1,
+        ),
+    ] {
+        assert!(
+            priced(max_fee_sats, amount_sats, invoiced_sats).is_err(),
+            "{label}"
+        );
+    }
+}
+
 #[test]
 fn a_concrete_contract_policy_is_not_a_queued_entry() {
     let fixture = Fixture::generated();

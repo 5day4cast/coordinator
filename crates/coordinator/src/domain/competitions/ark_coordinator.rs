@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::domain::competitions::{
-    admission, ArkCommitment, Arkade, KeymeldArkPool, TicketArkEscrow,
+    admission, ArkCommitment, Arkade, KeymeldArkPool, TicketArkEscrow, TicketPrice,
 };
 use coordinator_escrow::authorization::ArkEscrowPolicy;
 
@@ -110,16 +110,47 @@ impl Coordinator {
                     .escrow_tap_tree
             }
         };
-        let fee =
-            competition.calculate_invoice_amount() - competition.event_submission.entry_fee as u64;
+        // The escrow holds the ticket's price: the stake, and the coordinator and network fees.
+        let price = self.ticket_price(competition, ticket).await?;
         Ok(Some(ArkEscrowPolicy {
             escrow_tap_tree,
-            max_fee_sats: fee,
+            max_fee_sats: price.escrow_fee_sats(),
             max_refund_fee_sats: ark.max_refund_fee_sats,
             // A refund's transactions pass through this server's checkpoint outputs, so the
             // player consents to the script that makes them.
             checkpoint_exit_script: hex::encode(ark.server.info().checkpoint_tapscript.as_bytes()),
         }))
+    }
+
+    /// The most a pool's kickoff may pay the coordinator: the verifier signs an escrow into a
+    /// batch only if the fee output is at most that escrow's `max_fee_sats` times the escrows
+    /// in it, so the lowest cap among the entries, times their number.
+    pub(super) async fn pool_fee_cap(
+        &self,
+        entries: &[UserEntry],
+    ) -> Result<Amount, anyhow::Error> {
+        let mut lowest: Option<u64> = None;
+        for entry in entries {
+            let json = self
+                .competition_store
+                .entry_payout_policy(entry.id)
+                .await?
+                .ok_or_else(|| anyhow!("Entry {} has no payout policy", entry.id))?;
+            let policy: coordinator_escrow::authorization::PayoutPolicy =
+                serde_json::from_str(&json)?;
+            let cap = policy
+                .ark_escrow
+                .ok_or_else(|| anyhow!("Entry {} consented to no Arkade escrow", entry.id))?
+                .max_fee_sats;
+            lowest = Some(lowest.map_or(cap, |lowest| lowest.min(cap)));
+        }
+        let players = entries.len() as u64;
+        Ok(Amount::from_sat(
+            lowest
+                .unwrap_or(0)
+                .checked_mul(players)
+                .ok_or_else(|| anyhow!("Fee cap overflows"))?,
+        ))
     }
 
     /// The swap invoice that pays the ticket's escrow, and when it expires.
@@ -278,14 +309,37 @@ impl Coordinator {
                 return None;
             }
         };
-        let price = match self
+        let competition = match self
             .competition_store
             .get_competition(pending.competition_id)
             .await
         {
-            Ok(competition) => competition.calculate_invoice_amount(),
+            Ok(competition) => competition,
             Err(e) => {
                 self.report_swap(pending, format!("cannot read its competition: {e}"));
+                return None;
+            }
+        };
+        // The ticket's own price: its network fee was fixed before its swap was made. A ticket
+        // swapped before network fees existed has none.
+        let network_fee = match self
+            .competition_store
+            .fixed_ticket_network_fee(pending.ticket_id, &pending.ticket_hash)
+            .await
+        {
+            Ok(fee) => fee.unwrap_or(0),
+            Err(e) => {
+                self.report_swap(
+                    pending,
+                    format!("cannot read its ticket's network fee: {e}"),
+                );
+                return None;
+            }
+        };
+        let price = match TicketPrice::new(&competition, network_fee) {
+            Ok(price) => price.ticket_price_sats,
+            Err(e) => {
+                self.report_swap(pending, format!("cannot price its ticket: {e}"));
                 return None;
             }
         };
@@ -426,6 +480,19 @@ impl Coordinator {
         let fee = escrowed
             .checked_sub(hooks.funding_output().value)
             .ok_or_else(|| anyhow!("The escrows hold less than the pool"))?;
+        // Each escrow's signer takes a fee output of at most its own cap per escrow, and tickets
+        // issued at different fee rates have different caps, so the lowest binds them all.
+        let cap = self.pool_fee_cap(&entries).await?;
+        let fee = if fee > cap {
+            warn!(
+                "Competition {}: the escrows hold {fee} beyond the pool, but their lowest fee cap \
+                 allows {cap}; the rest goes to the Arkade server",
+                competition.id
+            );
+            cap
+        } else {
+            fee
+        };
         let mut pool = PoolFunding::new(
             inputs,
             hooks.funding_output().clone(),

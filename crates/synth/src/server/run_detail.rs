@@ -1014,7 +1014,7 @@ fn ledger_table(ledger: &Ledger, trail: Option<&Trail>) -> Markup {
                     td.note { "what ark-swapd put in them; the rest is its fee" }
                 }
                 tr { td { "→ into the pot (the contract)" } td.num { (sats(ledger.pot)) } td {} }
-                tr { td { "→ ticket charges outside the pot" } td.num { (sats(ledger.coordinator_fee)) } td.note { "what players paid beyond the pot, including entry swap fees" } }
+                tr { td { "→ ticket charges outside the pot" } td.num { (sats(ledger.coordinator_fee)) } td.note { "what players paid beyond the pot, including network and entry swap fees" } }
                 @if ledger.pot.is_some() {
                     tr.total { td { "Pot" } td.num { (sats(ledger.pot)) } td {} }
                     tr { td { @if pot_return { "→ allocated for pot return" } @else { "→ owed to winners" } } td.num { (format::sats(ledger.owed)) } td.note { "their shares under the outcome" } }
@@ -1476,7 +1476,7 @@ mod tests {
         };
         let html = ledger_table(&ledger, Some(&trail)).into_string();
         assert!(html.contains("Ticket charges outside the pot are not included in the return"));
-        assert!(html.contains("including entry swap fees"));
+        assert!(html.contains("including network and entry swap fees"));
         assert!(html.contains("→ allocated for pot return</td><td class=\"num\">3,000"));
         assert!(html.contains("→ ticket charges outside the pot</td><td class=\"num\">300"));
         assert!(html.contains("entry routing, paid by the payer"));

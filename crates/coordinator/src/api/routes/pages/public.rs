@@ -37,7 +37,7 @@ use crate::{
         fragments::{
             entry_form::{
                 entry_form, forecast_choices, forecasts_url, payout_line, ticket_status, Forecasts,
-                PayoutDestination, TicketProgress,
+                NetworkFee, PayoutDestination, TicketProgress,
             },
             leaderboard::{
                 leaderboard, leaderboard_scores, queue_pools, rows_url, LeaderboardRow,
@@ -477,15 +477,22 @@ pub async fn entry_form_fragment(
         // Entries are closed; the leaderboard is what there is to see.
         return leaderboard_response(&state, &headers, &view);
     }
-    let (forecasts, terms, destination) = tokio::join!(
+    let (forecasts, terms, destination, network_fee) = tokio::join!(
         forecasts(&state, &competition, FIRST_READ_WAIT),
         state.coordinator.payout_terms_quote(competition_id),
         payout_destination(&state, auth.as_ref()),
+        state.coordinator.network_fee_quote(),
     );
     let terms = terms
         .inspect_err(|error| warn!("payout terms for {competition_id}: {error}"))
         .ok();
-    let content = entry_form(&view, &forecasts, terms.as_ref(), &destination);
+    // Logged where the estimate failed; the form says it is unavailable.
+    let network_fee = match network_fee {
+        Ok(quote) if quote.pauses(view.entry_fee) => NetworkFee::Paused(quote.network_fee_sats),
+        Ok(quote) => NetworkFee::Estimate(quote.network_fee_sats),
+        Err(_) => NetworkFee::Unavailable,
+    };
+    let content = entry_form(&view, &forecasts, terms.as_ref(), &destination, network_fee);
     page(
         &headers,
         &state,

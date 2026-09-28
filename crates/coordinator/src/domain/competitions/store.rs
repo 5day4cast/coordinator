@@ -2237,6 +2237,128 @@ impl CompetitionStore {
             .await
     }
 
+    /// The network fee fixed for the ticket's `hash`, if one is.
+    pub async fn fixed_ticket_network_fee(
+        &self,
+        ticket_id: Uuid,
+        hash: &str,
+    ) -> Result<Option<u64>, sqlx::Error> {
+        let fee: Option<i64> = sqlx::query_scalar(
+            "SELECT network_fee_sats FROM tickets
+             WHERE id = ? AND hash = ? AND network_fee_hash = hash",
+        )
+        .bind(ticket_id.to_string())
+        .bind(hash)
+        .fetch_optional(self.db_connection.read())
+        .await?;
+        fee.map(|fee| u64::try_from(fee).map_err(|e| sqlx::Error::Decode(Box::new(e))))
+            .transpose()
+    }
+
+    /// Fix `network_fee_sats` for the ticket's current hash, unless a fee is already fixed for
+    /// it, and return the fee that is. `None` if the ticket's hash or invoice changed.
+    pub async fn fix_ticket_network_fee(
+        &self,
+        ticket: &Ticket,
+        network_fee_sats: u64,
+    ) -> Result<Option<u64>, DatabaseWriteError> {
+        let ticket_id = ticket.id.to_string();
+        let hash = ticket.hash.clone();
+        let fee = i64::try_from(network_fee_sats)
+            .map_err(|e| DatabaseWriteError::Sqlx(sqlx::Error::Encode(Box::new(e))))?;
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let mut tx = pool.begin().await?;
+                sqlx::query(
+                    "UPDATE tickets SET network_fee_sats = ?, network_fee_hash = hash
+                     WHERE id = ? AND hash = ? AND network_fee_hash IS NOT hash
+                       AND payment_request IS NULL AND paid_at IS NULL
+                       AND reserved_by IS NOT NULL",
+                )
+                .bind(fee)
+                .bind(&ticket_id)
+                .bind(&hash)
+                .execute(&mut *tx)
+                .await?;
+                let fixed: Option<i64> = sqlx::query_scalar(
+                    "SELECT network_fee_sats FROM tickets
+                     WHERE id = ? AND hash = ? AND network_fee_hash = hash",
+                )
+                .bind(&ticket_id)
+                .bind(&hash)
+                .fetch_optional(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                fixed
+                    .map(|fee| u64::try_from(fee).map_err(|e| sqlx::Error::Decode(Box::new(e))))
+                    .transpose()
+            })
+            .await
+    }
+
+    /// Keep a competition's latest kickoff check, replacing any earlier one.
+    pub async fn store_kickoff_check(
+        &self,
+        competition_id: Uuid,
+        check: &super::KickoffCheck,
+    ) -> Result<(), DatabaseWriteError> {
+        let competition_id = competition_id.to_string();
+        let check_json = serde_json::to_string(check)
+            .map_err(|e| DatabaseWriteError::Sqlx(sqlx::Error::Encode(Box::new(e))))?;
+        let checked_at = check
+            .checked_at
+            .format(&Rfc3339)
+            .map_err(|e| DatabaseWriteError::Sqlx(sqlx::Error::Encode(Box::new(e))))?;
+        self.db_connection
+            .execute_write(move |pool| async move {
+                sqlx::query(
+                    "INSERT INTO competition_kickoff_checks(competition_id, check_json, checked_at)
+                     VALUES (?, ?, ?)
+                     ON CONFLICT(competition_id) DO UPDATE
+                     SET check_json = excluded.check_json, checked_at = excluded.checked_at",
+                )
+                .bind(&competition_id)
+                .bind(&check_json)
+                .bind(&checked_at)
+                .execute(&pool)
+                .await?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// A competition's latest kickoff check, if it had one.
+    pub async fn kickoff_check(
+        &self,
+        competition_id: Uuid,
+    ) -> Result<Option<super::KickoffCheck>, sqlx::Error> {
+        let check_json: Option<String> = sqlx::query_scalar(
+            "SELECT check_json FROM competition_kickoff_checks WHERE competition_id = ?",
+        )
+        .bind(competition_id.to_string())
+        .fetch_optional(self.db_connection.read())
+        .await?;
+        check_json
+            .map(|json| serde_json::from_str(&json).map_err(|e| sqlx::Error::Decode(Box::new(e))))
+            .transpose()
+    }
+
+    /// Every competition's latest kickoff check.
+    pub async fn kickoff_checks(&self) -> Result<HashMap<Uuid, super::KickoffCheck>, sqlx::Error> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT competition_id, check_json FROM competition_kickoff_checks")
+                .fetch_all(self.db_connection.read())
+                .await?;
+        rows.into_iter()
+            .map(|(id, json)| {
+                let id = Uuid::parse_str(&id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+                let check =
+                    serde_json::from_str(&json).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+                Ok((id, check))
+            })
+            .collect()
+    }
+
     pub async fn clear_ticket_reservation(
         &self,
         ticket: &Ticket,

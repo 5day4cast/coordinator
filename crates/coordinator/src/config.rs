@@ -53,6 +53,10 @@ pub struct Settings {
     pub ark_settings: ArkSettings,
     #[serde(default)]
     pub metrics_settings: MetricsSettings,
+    #[serde(default)]
+    pub network_fee_settings: NetworkFeeSettings,
+    #[serde(default)]
+    pub kickoff_check_settings: KickoffCheckSettings,
 }
 
 /// Environment variable that sets `metrics_settings.listen_addr`, overriding the file.
@@ -131,6 +135,123 @@ mod metrics_settings_tests {
         assert!(settings
             .apply_env_override(Some("not an address".into()))
             .is_err());
+    }
+}
+
+/// Each ticket's share of the Bitcoin network fees, added to its price as its own line.
+///
+/// A game's chain cost is `base_vbytes + vbytes_per_player × players` vbytes. Each entry pays
+/// its share of that for a pool of `pool_players`, at the current estimate for `conf_target`
+/// blocks (at least `min_sat_per_vb`) times `multiplier_percent`. The fee is fixed on a ticket
+/// when it is issued; the coordinator keeps any surplus and absorbs any shortfall. While the fee
+/// would be more than `pause_above_entry_bps` of the entry fee, no ticket is issued (0: never).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworkFeeSettings {
+    pub enabled: bool,
+    pub pool_players: u64,
+    pub multiplier_percent: u64,
+    pub base_vbytes: u64,
+    pub vbytes_per_player: u64,
+    pub conf_target: u16,
+    pub min_sat_per_vb: u64,
+    pub pause_above_entry_bps: u64,
+}
+
+impl Default for NetworkFeeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            pool_players: 5,
+            multiplier_percent: 150,
+            base_vbytes: 342,
+            vbytes_per_player: 26,
+            conf_target: 2,
+            min_sat_per_vb: 1,
+            pause_above_entry_bps: 1_000,
+        }
+    }
+}
+
+impl NetworkFeeSettings {
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.pool_players == 0
+            || self.conf_target == 0
+            || self.min_sat_per_vb == 0
+            || self.multiplier_percent == 0
+        {
+            return Err(anyhow::anyhow!(
+                "network_fee_settings.pool_players, multiplier_percent, conf_target and \
+                 min_sat_per_vb must be at least 1"
+            ));
+        }
+        if self.base_vbytes == 0 && self.vbytes_per_player == 0 {
+            return Err(anyhow::anyhow!(
+                "network_fee_settings needs base_vbytes or vbytes_per_player"
+            ));
+        }
+        // The largest fee it can compute must not overflow, at any rate LND could report.
+        crate::domain::network_fee_sats(self, 1_000_000.0)?;
+        Ok(())
+    }
+
+    /// Whether a ticket with `network_fee_sats` for an `entry_fee_sats` entry is refused: the fee
+    /// is more than `pause_above_entry_bps` of the entry.
+    pub fn pauses(&self, network_fee_sats: u64, entry_fee_sats: u64) -> bool {
+        self.enabled
+            && self.pause_above_entry_bps > 0
+            && u128::from(network_fee_sats) * 10_000
+                > u128::from(entry_fee_sats) * u128::from(self.pause_above_entry_bps)
+    }
+}
+
+/// The check an Arkade pool passes before its contract is built: what its entries paid beyond
+/// the pot, service and network fees, must cover the game's chain cost at the kickoff fee rate
+/// (the weights in `network_fee_settings`) plus `routing_and_liquidity_bps` of the pot, and the
+/// rate must be within the fee ceiling the players consented to. A pool also needs
+/// `min_players` unless the kickoff rate is at most `small_pools_max_sat_per_vb`, when its
+/// terms' own minimum holds. A pool that fails is cancelled and every entry refunded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KickoffCheckSettings {
+    pub enabled: bool,
+    pub routing_and_liquidity_bps: u64,
+    pub min_players: u64,
+    pub small_pools_max_sat_per_vb: u64,
+}
+
+impl Default for KickoffCheckSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            routing_and_liquidity_bps: 50,
+            min_players: 5,
+            small_pools_max_sat_per_vb: 2,
+        }
+    }
+}
+
+impl KickoffCheckSettings {
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        if self.routing_and_liquidity_bps > 10_000 {
+            return Err(anyhow::anyhow!(
+                "kickoff_check_settings.routing_and_liquidity_bps exceeds the pot"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The fewest players a pool may start with at `sat_per_vb`: its terms' `template_min` while
+    /// fees are at most `small_pools_max_sat_per_vb`, otherwise at least `min_players`.
+    pub fn min_players_at(&self, template_min: u64, sat_per_vb: u64) -> u64 {
+        if !self.enabled || sat_per_vb <= self.small_pools_max_sat_per_vb {
+            template_min
+        } else {
+            template_min.max(self.min_players)
+        }
     }
 }
 
@@ -413,6 +534,8 @@ impl Settings {
         self.coordinator_settings.validate(network)?;
         self.admin_settings.validate(network)?;
         self.ark_settings.validate(&self.keymeld_settings)?;
+        self.network_fee_settings.validate()?;
+        self.kickoff_check_settings.validate()?;
         self.keymeld_settings.validate(network)
     }
 }

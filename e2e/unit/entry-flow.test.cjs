@@ -37,6 +37,7 @@ function entryPage(checked = [{ name: "KPWM_temp_high", value: "over" }]) {
         competitionId: COMPETITION,
         entryFee: "5000",
         ticketPrice: "5250",
+        networkFee: "50",
         totalPool: "15000",
         winnerCount: "1",
         maxValues: "2",
@@ -86,6 +87,14 @@ function termsFetch(event = EVENT, quote = {}) {
   };
 }
 
+// A ticket's price as the coordinator reports it: the form's entry and service fees, and a
+// network fee fixed when it was issued.
+function price(network_fee_sats = 50, extra = {}) {
+  const total = 5250 + network_fee_sats;
+  return { entry_fee_sats: 5000, coordinator_fee_sats: 250, network_fee_sats,
+    ticket_price_sats: total, amount_sats: total, ...extra };
+}
+
 function loggedIn(extra = {}) {
   return {
     isLoggedIn: () => true,
@@ -130,8 +139,8 @@ test("entering is the consent: the ticket carries the full price and the account
         if (url.endsWith("/api/v1/users/login")) {
           return { ok: true, json: async () => ({ lightning_address: "thor@lnurl.5day4cast.com" }) };
         }
-        return { ok: true, json: async () => ({ ticket_id: "ticket", payment_request: "lnbc52500n1ticket",
-          keymeld_session_id: "session", keymeld_registration: {
+        return { ok: true, json: async () => ({ ticket_id: "ticket", payment_request: "lnbc53000n1ticket",
+          ...price(), keymeld_session_id: "session", keymeld_registration: {
             user_id: "ticket", session_id: "session", payout_policy: "policy" } }) };
       }
     },
@@ -147,7 +156,7 @@ test("entering is the consent: the ticket carries the full price and the account
   });
   const sandbox = load(window, document, termsFetch());
   await sandbox.submitEntry();
-  assert.equal(consent.ticket_amount_sats, 5250, "the approved amount includes the coordinator fee");
+  assert.equal(consent.ticket_amount_sats, 5300, "the approved amount includes the coordinator and network fees");
   assert.equal(consent.lightning_address, "thor@lnurl.5day4cast.com");
   assert.equal(consent.max_fee_rate_sat_vb, 5);
   assert.equal(elements.errorMessage.textContent, refusal);
@@ -237,8 +246,8 @@ function registeringPlayer({ refuseRegistration = false } = {}) {
           }
           return { ok: true, status: 204 };
         }
-        return { ok: true, json: async () => ({ ticket_id: "ticket", payment_request: "lnbc52500n1ticket",
-          keymeld_session_id: "session", keymeld_registration: {
+        return { ok: true, json: async () => ({ ticket_id: "ticket", payment_request: "lnbc53000n1ticket",
+          ...price(), keymeld_session_id: "session", keymeld_registration: {
             user_id: "ticket", session_id: "session", payout_policy: "policy" } }) };
       }
     },
@@ -315,7 +324,7 @@ function queuedPlayer(wallet) {
         }
         // A queued ticket's id is its entry's.
         return { ok: true, json: async () => ({ ticket_id: "0190b6a0-0000-7000-8000-000000000001",
-          payment_request: "lnbc52500n1ticket", keymeld_session_id: COMPETITION, keymeld_registration: {
+          payment_request: "lnbc53000n1ticket", ...price(), keymeld_session_id: COMPETITION, keymeld_registration: {
             user_id: "0190b6a0-0000-7000-8000-000000000001", session_id: COMPETITION, payout_policy: "policy" } }) };
       }
     },
@@ -350,7 +359,7 @@ test("a queued entry is checked against the oracle and the form, with no extra s
     "release_entry_key_after_payment", "ticket_amount_sats", "ticket_invoice",
   ]);
   assert.equal(consent.competition_id, COMPETITION);
-  assert.equal(consent.ticket_amount_sats, 5250);
+  assert.equal(consent.ticket_amount_sats, 5300);
   assert.equal(consent.entry_fee_sats, 5000);
   assert.deepEqual(consent.pool_rules, { min_players: 2, max_players: 25 });
   assert.equal(consent.oracle_pubkey, "A3oracleKeyBase64");
@@ -378,4 +387,89 @@ test("a queue whose kind or pool sizes differ from the form is refused before an
     await sandbox.submitEntry();
     assert.match(elements.errorMessage.textContent, /terms changed/, label);
   }
+});
+
+// The ticket's network fee is fixed when it is issued. The wallet is handed the form's price plus
+// that fee, and the form shows the ticket's own fee in place of the estimate.
+function pricedPlayer(ticketPrice) {
+  const { elements, document } = entryPage();
+  elements.networkFee = element({ textContent: "50 sats" });
+  elements.ticketTotal = element({ textContent: "5,300 sats" });
+  let consent = null;
+  const refusal = "stop before sealing";
+  const window = loggedIn({
+    AuthorizedClient: class {
+      async post(url) {
+        if (url.endsWith("/api/v1/users/login")) {
+          return { ok: true, json: async () => ({ lightning_address: "thor@lnurl.5day4cast.com" }) };
+        }
+        return { ok: true, json: async () => ({ ticket_id: "ticket", payment_request: "lnbc1ticket",
+          ...ticketPrice, keymeld_session_id: "session", keymeld_registration: {
+            user_id: "ticket", session_id: "session", payout_policy: "policy" } }) };
+      }
+    },
+    dlcWallet: {
+      entryRegistration: () => ({ ephemeral_pubkey: "pubkey", payout_hash: "hash" }),
+      keymeldPayoutRegistration: async (_entry, _assignment, serialized) => {
+        consent = JSON.parse(serialized);
+        throw refusal;
+      },
+    },
+  });
+  const sandbox = load(window, document, termsFetch());
+  return { sandbox, elements, consent: () => consent, refusal };
+}
+
+test("the ticket's own network fee is what the wallet approves and the form shows", async () => {
+  const { sandbox, elements, consent, refusal } = pricedPlayer(price(62));
+  await sandbox.submitEntry();
+  assert.equal(consent().ticket_amount_sats, 5312);
+  assert.equal(elements.networkFee.textContent, "62 sats");
+  assert.equal(elements.ticketTotal.textContent, "5,312 sats");
+  assert.equal(elements.errorMessage.textContent, refusal);
+});
+
+test("a ticket priced other than the form showed never reaches the wallet", async () => {
+  for (const [label, ticketPrice] of [
+    ["another entry fee", price(50, { entry_fee_sats: 5001 })],
+    ["another service fee", price(50, { coordinator_fee_sats: 251 })],
+    ["a total that is not the sum", price(50, { ticket_price_sats: 5301 })],
+    ["an invoice for another amount", price(50, { amount_sats: 5301 })],
+    ["no breakdown", { amount_sats: 5300 }],
+    ["a negative network fee", price(-1)],
+  ]) {
+    const { sandbox, elements, consent } = pricedPlayer(ticketPrice);
+    await sandbox.submitEntry();
+    assert.equal(consent(), null, label);
+    assert.match(elements.errorMessage.textContent, /terms changed/, label);
+  }
+});
+
+test("a network fee more than twice the form's estimate is refused", async () => {
+  const within = pricedPlayer(price(100));
+  await within.sandbox.submitEntry();
+  assert.equal(within.consent().ticket_amount_sats, 5350);
+
+  const { sandbox, elements, consent } = pricedPlayer(price(101));
+  await sandbox.submitEntry();
+  assert.equal(consent(), null);
+  assert.match(elements.errorMessage.textContent, /network fee rose to 101 sats/);
+  assert.doesNotMatch(elements.errorMessage.textContent, /reload/i);
+});
+
+test("without a network fee estimate no ticket is requested", async () => {
+  const { elements, document } = entryPage();
+  delete elements.entryForm.dataset.networkFee;
+  const window = loggedIn({
+    AuthorizedClient: class {
+      async post(url) {
+        assert.ok(url.endsWith("/api/v1/users/login"), "no ticket without an estimate");
+        return { ok: true, json: async () => ({ lightning_address: "thor@lnurl.5day4cast.com" }) };
+      }
+    },
+    dlcWallet: { entryRegistration: () => assert.fail("no entry key without an estimate") },
+  });
+  const sandbox = load(window, document, termsFetch());
+  await sandbox.submitEntry();
+  assert.match(elements.errorMessage.textContent, /network fee estimate is unavailable/);
 });

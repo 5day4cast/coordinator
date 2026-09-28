@@ -62,6 +62,10 @@ class Entry {
         assignment.session_id !== this.ticket.keymeld_session_id)) {
       throw new Error("The Keymeld registration belongs to another ticket or session");
     }
+    // What the wallet checks the invoice and the escrow against: the price the form showed,
+    // plus the network fee fixed on this ticket.
+    this.ticketAmountSats = ticketTotalSats(ticketData, this.shownPrice);
+    showNetworkFee(ticketData.network_fee_sats, this.ticketAmountSats);
     if (assignment?.payout_policy && this.payoutTerms.queued) {
       // A queued entry names no pool yet: the wallet checks its terms against the
       // oracle's reference event and key and what the form showed.
@@ -164,8 +168,10 @@ class Entry {
         console.error("Failed to copy:", err);
       }
     };
+    const networkFee = this.ticketAmountSats - this.shownPrice.ticketPrice;
     document.getElementById("ticketPaymentAmount").textContent =
-      `Pay ${this.ticketAmountSats.toLocaleString("en-US")} sats by Lightning to enter this competition:`;
+      `Pay ${formatSats(this.ticketAmountSats)} by Lightning to enter this competition` +
+      (networkFee > 0 ? `, including its ${formatSats(networkFee)} network fee:` : ":");
 
     const status = document.createElement("div");
     status.id = "paymentStatus";
@@ -431,10 +437,18 @@ async function submitEntry() {
     if (address && (address.length > 320 || !/^[a-z0-9_+.-]+@[a-z0-9.-]+$/.test(address))) {
       throw new Error("The Lightning Address on your account is not valid; update it on the Payouts page");
     }
-    // The price shown on the form; the wallet refuses an invoice for any other amount.
-    const ticketAmountSats = Number(form.dataset.ticketPrice);
-    if (!Number.isSafeInteger(ticketAmountSats) || ticketAmountSats <= 0) {
+    // The price shown on the form; the wallet refuses an invoice for anything but it and the
+    // ticket's network fee.
+    const shownPrice = {
+      entryFee: Number(form.dataset.entryFee),
+      ticketPrice: Number(form.dataset.ticketPrice),
+      networkFee: Number(form.dataset.networkFee),
+    };
+    if (!Number.isSafeInteger(shownPrice.ticketPrice) || shownPrice.ticketPrice <= 0) {
       throw new Error("The competition is missing its ticket price");
+    }
+    if (!("networkFee" in form.dataset) || !Number.isSafeInteger(shownPrice.networkFee)) {
+      throw new Error("The network fee estimate is unavailable right now; go back to the competitions list and open this competition again in a moment");
     }
 
     const body = document.body;
@@ -443,7 +457,7 @@ async function submitEntry() {
     });
     await currentEntry.init();
     currentEntry.payoutTerms = payoutTerms;
-    currentEntry.ticketAmountSats = ticketAmountSats;
+    currentEntry.shownPrice = shownPrice;
     currentEntry.payoutChoice = {
       entry_id: currentEntry.entry.id,
       payout_hash: currentEntry.entry.payout_hash,
@@ -512,6 +526,37 @@ function ticketPriceSats(event) {
   const basisPoints =
     event.coordinator_fee_basis_points ?? Math.round(event.coordinator_fee_percentage * 100);
   return event.entry_fee + Math.floor((event.entry_fee * basisPoints + 5000) / 10000);
+}
+
+function formatSats(value) {
+  return `${value.toLocaleString("en-US")} sats`;
+}
+
+// The ticket's total. Its entry and service fees must be the ones the form showed, and its
+// network fee, fixed when the ticket was issued, at most twice the estimate the form showed:
+// fee rates move, but the coordinator does not get to name any fee.
+function ticketTotalSats(ticket, shown) {
+  const fee = ticket.network_fee_sats;
+  const total = shown.ticketPrice + fee;
+  if (!Number.isSafeInteger(fee) || fee < 0 ||
+      ticket.entry_fee_sats !== shown.entryFee ||
+      ticket.entry_fee_sats + ticket.coordinator_fee_sats !== shown.ticketPrice ||
+      ticket.ticket_price_sats !== total ||
+      ticket.amount_sats !== total) {
+    throw new Error(TERMS_CHANGED);
+  }
+  if (fee > 2 * shown.networkFee) {
+    throw new Error(`The network fee rose to ${formatSats(fee)} since the form opened; go back to the competitions list and open this competition again to see the new price`);
+  }
+  return total;
+}
+
+// Replace the form's estimate with the ticket's own network fee.
+function showNetworkFee(fee, total) {
+  const $fee = document.getElementById("networkFee");
+  if ($fee) $fee.textContent = formatSats(fee);
+  const $total = document.getElementById("ticketTotal");
+  if ($total) $total.textContent = formatSats(total);
 }
 
 function setupEntryForm() {

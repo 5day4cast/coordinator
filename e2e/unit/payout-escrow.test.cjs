@@ -31,17 +31,20 @@ for (const rejection of ["missing policy", "wrong ticket", "wrong session", "wal
         }
         request = body;
         return { ok: true, json: async () => ({ ticket_id: "ticket", payment_request: "ticket-invoice",
+          entry_fee_sats: 20, coordinator_fee_sats: 1, network_fee_sats: 2, ticket_price_sats: 23, amount_sats: 23,
           keymeld_session_id: "session", keymeld_registration: {
             user_id: rejection === "wrong ticket" ? "another-ticket" : "ticket",
             session_id: rejection === "wrong session" ? "another-session" : "session",
             payout_policy: rejection === "missing policy" ? null : "policy" } }) };
       } },
+      document: { getElementById: () => null },
       dlcWallet: {
         keymeldRegistration: () => { ordinaryRegistrations++; },
         keymeldPayoutRegistration: async (entry, assignment, serialized) => {
           const consent = JSON.parse(serialized);
           assert.equal(consent.lightning_address, "alice+prize@wallet.com");
           assert.equal(consent.ticket_invoice, "ticket-invoice");
+          assert.equal(consent.ticket_amount_sats, 23, "the form's price and the ticket's network fee");
           assert.equal(consent.expected_funding_sats, 1000);
           assert.equal(consent.max_fee_rate_sat_vb, 5);
           if (rejection) throw new Error("wallet refused substituted policy");
@@ -53,7 +56,7 @@ for (const rejection of ["missing policy", "wrong ticket", "wrong session", "wal
     entry.entry = { id: "entry" };
     entry.payoutChoice = { entry_id: "entry", payout_hash: "own hash", lightning_address: "alice+prize@wallet.com",
       allow_invoice_fallback: true, release_entry_key_after_payment: true };
-    entry.ticketAmountSats = 21;
+    entry.shownPrice = { entryFee: 20, ticketPrice: 21, networkFee: 2 };
     entry.payoutTerms = { competition: { event_submission: { total_competition_pool: 1000, total_allowed_entries: 2, number_of_places_win: 1 } },
       quote: { enabled: true, relative_locktime_block_delta: 72, max_fee_rate_sat_vb: 5 },
       oracle: { event_announcement: {} } };
