@@ -86,9 +86,8 @@ impl WalletBalance {
     }
 }
 
-/// The fee rate for confirmation within `conf_target` blocks from LND's
-/// estimates, rounded up to whole sat/vB and never below the 1 sat/vB relay
-/// minimum.
+/// The fee rate for confirmation within `conf_target` blocks from LND's estimates, with the
+/// margin of [`fee_rate_from_estimate`].
 pub fn fee_rate_for_target(
     fee_rates: &std::collections::HashMap<u16, f64>,
     conf_target: u16,
@@ -99,13 +98,31 @@ pub fn fee_rate_for_target(
     fee_rate_from_estimate(*estimate)
 }
 
-/// A whole-sat/vB fee rate from an LND estimate, never below 1 sat/vB.
+/// Above an estimate, what a time-critical rate adds: this share of it in percent, and at least
+/// [`FEE_MARGIN_MIN_SAT_PER_KWU`].
+pub const FEE_MARGIN_PERCENT: u64 = 10;
+/// 0.25 sat/vB.
+pub const FEE_MARGIN_MIN_SAT_PER_KWU: u64 = 63;
+
+/// The rate for a time-critical transaction from an LND estimate: the estimate plus the larger of
+/// [`FEE_MARGIN_PERCENT`] and 0.25 sat/vB, at LND's sat/kWU precision, never below LND's floor.
+/// The contract's outcome and closing transactions confirm a day or more after it is built, so
+/// the margin covers some rise in fees. Rounding up to whole sat/vB instead doubled the rate at
+/// LND's floor, 1.012 sat/vB.
 pub fn fee_rate_from_estimate(sat_per_vb: f64) -> Result<FeeRate, anyhow::Error> {
     if !sat_per_vb.is_finite() || sat_per_vb < 0.0 {
         return Err(anyhow!("invalid fee estimate {sat_per_vb} sat/vB"));
     }
-    FeeRate::from_sat_per_vb((sat_per_vb.ceil() as u64).max(1))
-        .ok_or_else(|| anyhow!("fee estimate {sat_per_vb} sat/vB is out of range"))
+    // One vbyte is four weight units: sat/kWU = sat/vB * 1000 / 4.
+    let estimate = (sat_per_vb * 250.0).round();
+    if estimate > (u64::MAX / 2) as f64 {
+        return Err(anyhow!("fee estimate {sat_per_vb} sat/vB is out of range"));
+    }
+    let estimate = estimate as u64;
+    let margin = (estimate * FEE_MARGIN_PERCENT)
+        .div_ceil(100)
+        .max(FEE_MARGIN_MIN_SAT_PER_KWU);
+    Ok(FeeRate::from_sat_per_kwu(estimate + margin).max(LND_FEE_RATE_FLOOR))
 }
 
 /// The fee rate for a sweep with no deadline: LND's estimate for [`ECONOMY_FEE_TARGET`] blocks,
@@ -1276,6 +1293,22 @@ mod fee_rate_tests {
     use super::*;
 
     #[test]
+    fn time_critical_rates_add_ten_percent_or_a_quarter_sat_per_vb() {
+        let kwu = |sat_per_vb| fee_rate_from_estimate(sat_per_vb).unwrap().to_sat_per_kwu();
+        // At LND's floor the quarter sat/vB is the larger: 1.264 sat/vB, not 2.
+        assert_eq!(kwu(1.012), 253 + 63);
+        assert_eq!(kwu(2.2), 550 + 63);
+        // Above 2.5 sat/vB, ten percent is.
+        assert_eq!(kwu(3.0), 750 + 75);
+        assert_eq!(kwu(20.0), 5_000 + 500);
+        // Never below LND's floor, and nothing invalid.
+        assert_eq!(kwu(0.0), 253);
+        assert!(fee_rate_from_estimate(f64::NAN).is_err());
+        assert!(fee_rate_from_estimate(-1.0).is_err());
+        assert!(fee_rate_from_estimate(f64::MAX).is_err());
+    }
+
+    #[test]
     fn economy_fee_rate_targets_a_day_at_lnds_precision() {
         assert!(FEE_TARGETS.contains(&ECONOMY_FEE_TARGET));
 
@@ -1286,10 +1319,10 @@ mod fee_rate_tests {
             economy_fee_rate(&rates).unwrap(),
             FeeRate::from_sat_per_kwu(253)
         );
-        // Time-critical transactions keep rounding up to whole sat/vB.
+        // Time-critical transactions add a margin: 0.25 sat/vB at the floor.
         assert_eq!(
             fee_rate_for_target(&rates, 1).unwrap(),
-            FeeRate::from_sat_per_vb_u32(2)
+            FeeRate::from_sat_per_kwu(253 + 63)
         );
 
         // A day's estimate, not the next block's.

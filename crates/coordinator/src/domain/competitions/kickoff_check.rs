@@ -27,8 +27,13 @@ use serde::{Deserialize, Serialize};
 pub struct KickoffCheck {
     pub players: u64,
     pub paid_places: u64,
-    /// The kickoff fee rate, which the contract is built at.
+    /// The kickoff fee rate, which the contract is built at, rounded up to whole sat/vB for
+    /// display and the small-pool threshold.
     pub sat_per_vb: u64,
+    /// The same rate exactly. Zero on checks stored before it was kept, which were built at
+    /// `sat_per_vb`.
+    #[serde(default)]
+    pub sat_per_kwu: u64,
     /// The fee ceiling the players consented to, in whole sat/vB, rounded down.
     pub max_sat_per_vb: u64,
     /// What the entries paid beyond the pot, as the kickoff can collect it: service and network
@@ -102,11 +107,13 @@ impl KickoffCheck {
             i64::try_from(i128::from(pool.paid_sats) - i128::from(cost)).map_err(|_| overflow())?;
         let sat_per_vb = rate.to_sat_per_vb_ceil();
         let min_players = settings.min_players_at(pool.template_min_players, sat_per_vb);
+        let sat_per_kwu = rate.to_sat_per_kwu();
         let within_ceiling = rate <= ceiling;
         Ok(Self {
             players: pool.players,
             paid_places: pool.paid_places,
             sat_per_vb,
+            sat_per_kwu,
             max_sat_per_vb: ceiling.to_sat_per_vb_floor(),
             paid_sats: pool.paid_sats,
             chain_vbytes,
@@ -157,6 +164,9 @@ impl KickoffCheck {
 
     /// The rate the contract is built at once the check passed.
     pub fn fee_rate(&self) -> Result<FeeRate, anyhow::Error> {
+        if self.sat_per_kwu > 0 {
+            return Ok(FeeRate::from_sat_per_kwu(self.sat_per_kwu));
+        }
         FeeRate::from_sat_per_vb(self.sat_per_vb)
             .ok_or_else(|| anyhow!("kickoff rate {} sat/vB is out of range", self.sat_per_vb))
     }
@@ -172,7 +182,8 @@ impl Coordinator {
         Ok(self)
     }
 
-    /// The rate a contract is built at: LND's next-block estimate, in whole sat/vB.
+    /// The rate a contract is built at: LND's next-block estimate with its margin (see
+    /// [`fee_rate_for_target`]).
     pub(super) async fn contract_fee_rate(&self) -> Result<FeeRate, anyhow::Error> {
         let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
         info!("Fee rates: {:?}", fee_rates);
@@ -575,6 +586,27 @@ mod tests {
         let mut strict = small(5);
         strict.template_min_players = 6;
         assert!(!check_at(strict, 1).passed);
+    }
+
+    /// The contract is built at the rate the check ran at, exactly; checks stored before the
+    /// exact rate was kept are built at their whole sat/vB.
+    #[test]
+    fn the_contract_is_built_at_the_checked_rate_exactly() {
+        let exact = KickoffCheck::evaluate(
+            &NetworkFeeSettings::default(),
+            &KickoffCheckSettings::default(),
+            full_pool(142),
+            FeeRate::from_sat_per_kwu(316),
+            rate(100),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!((exact.sat_per_vb, exact.sat_per_kwu), (2, 316));
+        assert_eq!(exact.fee_rate().unwrap(), FeeRate::from_sat_per_kwu(316));
+        let mut old = serde_json::to_value(&exact).unwrap();
+        old.as_object_mut().unwrap().remove("sat_per_kwu");
+        let old: KickoffCheck = serde_json::from_value(old).unwrap();
+        assert_eq!(old.fee_rate().unwrap(), rate(2));
     }
 
     /// A failing pool waits an hour after registration closes for fees to fall, then is
