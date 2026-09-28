@@ -44,7 +44,7 @@ use crate::{
                 LeaderboardView,
             },
             loading::{placeholder, Pending, MAX_ASKS},
-            picks::{detail_url, picks_detail, PickView},
+            picks::{detail_url, own_picks_detail, picks_detail, withheld_picks_detail, PickView},
         },
         layouts::base::{base, PageConfig},
         pages::{
@@ -823,6 +823,54 @@ pub async fn entry_detail_fragment(
         content,
         Caching::Public,
     )
+}
+
+/// A player's own picks before the window opens, signed when they are logged
+/// in (see `htmx_auth.js`): the public dialog asks here for what the
+/// leaderboard withholds. Anyone else gets the dialog's message again.
+pub async fn own_entry_detail_fragment(
+    State(state): State<Arc<AppState>>,
+    Path(entry_id): Path<Uuid>,
+    MaybeAuth(auth): MaybeAuth,
+) -> Response {
+    let entry = match state.coordinator.get_entry_by_id(entry_id).await {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            // Not swapped: the dialog keeps its message.
+            error!("entry {entry_id}: {error}");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let competition = match find_competition(&state, entry.event_id).await {
+        Ok(Some(competition)) => competition,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            error!("competition of entry {entry_id}: {error}");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let now = now();
+    let id = entry_id.to_string();
+    let owner = auth.is_some_and(|auth| auth.pubkey.to_hex() == entry.pubkey);
+    if !owner || Phase::of(&competition, now) != Phase::Upcoming {
+        return fragment(withheld_picks_detail(&id, now), Caching::Private);
+    }
+    let (picks, stations) = tokio::join!(
+        state
+            .leaderboards
+            .own_picks(&competition, &entry, FIRST_READ_WAIT),
+        state.leaderboards.stations(FIRST_READ_WAIT),
+    );
+    let stations = stations_by_id(stations.value().map(Vec::as_slice).unwrap_or_default());
+    let views: Vec<PickView> = picks
+        .iter()
+        .map(|pick| PickView {
+            pick,
+            station_name: station_name(&stations, &pick.station_id),
+        })
+        .collect();
+    fragment(own_picks_detail(&id, &views, now), Caching::Private)
 }
 
 #[cfg(test)]

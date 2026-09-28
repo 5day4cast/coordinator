@@ -72,6 +72,18 @@ test('a ticket status poll is signed; so is the entry form when logged in', asyn
   ]);
 });
 
+test("a player's own picks are signed when logged in, and the public dialog never is", async () => {
+  const page = load();
+  await page.request('/entries/e1/detail/mine');
+  assert.deepEqual(page.signed.map((s) => s.url), [`${ORIGIN}/entries/e1/detail/mine`]);
+  await page.request('/entries/e1/detail');
+  assert.equal(page.signed.length, 1);
+  const visitor = load({ loggedIn: false });
+  assert.deepEqual(await visitor.request('/entries/e1/detail/mine'), { sent: true });
+  assert.deepEqual(visitor.signed, []);
+  assert.deepEqual(visitor.opened, []);
+});
+
 test("a queue's pools are signed when logged in, to mark the player's pool, and open to everyone", async () => {
   const page = load();
   await page.request('/competitions/c1/pools');

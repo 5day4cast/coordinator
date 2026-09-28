@@ -104,3 +104,14 @@
     animation-duration: 2s;
   }
 }
+
+/* The rows the final result pays, after their rank. */
+.paid-badge {
+  padding: 0 0.4rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  white-space: nowrap;
+  background: hsla(141, 53%, 42%, 0.18);
+  color: hsl(141, 53%, 30%);
+}

@@ -864,6 +864,10 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
         )
         .route("/entries", get(entries_fragment))
         .route("/entries/{entry_id}/detail", get(entry_detail_fragment))
+        .route(
+            "/entries/{entry_id}/detail/mine",
+            get(crate::api::routes::own_entry_detail_fragment),
+        )
         .route("/payouts", get(payouts_fragment));
 
     let api_routes = Router::new()

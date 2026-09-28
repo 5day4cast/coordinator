@@ -23,6 +23,9 @@ const AUTH_OPTIONAL = [
   /^\/competitions\/[^/]+\/entry-form(\/payout)?$/,
   // A queued competition's pools, with the player's own marked.
   /^\/competitions\/[^/]+\/pools$/,
+  // A player's own picks before the window opens; the public dialog's
+  // refreshes stay unsigned.
+  /^\/entries\/[^/]+\/detail\/mine$/,
 ];
 
 function authMode(url) {

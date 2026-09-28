@@ -220,14 +220,26 @@ fn refund_shares(competition: &Competition, phase: Phase) -> Option<Vec<u64>> {
 }
 
 /// The badge for a competition's phase. Live is the loudest thing on the page;
-/// finished and cancelled competitions stay quiet.
+/// finished and cancelled competitions stay quiet. A queue split into pools
+/// says so: its pools carry on as competitions of their own.
 pub fn phase_badge(competition: &CompetitionView) -> Markup {
+    let split = competition
+        .queue
+        .queued()
+        .is_some_and(|queue| !queue.pools.is_empty());
+    badge(competition, split)
+}
+
+/// The badge in the list, where a split queue stands for its pools and shows
+/// their phase (see [`listed`]).
+fn list_badge(competition: &CompetitionView) -> Markup {
+    badge(competition, false)
+}
+
+fn badge(competition: &CompetitionView, split: bool) -> Markup {
     let queue = competition.queue.queued();
     let (class, label) = match competition.phase {
-        // Its pools carry on as competitions of their own.
-        _ if queue.is_some_and(|queue| !queue.pools.is_empty()) => {
-            ("badge badge-quiet", "Split into pools")
-        }
+        _ if split => ("badge badge-quiet", "Split into pools"),
         Phase::Upcoming if !competition.can_enter && queue.is_some() => {
             ("badge badge-open", "Entries closed")
         }
@@ -359,11 +371,11 @@ pub fn competitions_page(
             hx-swap="outerHTML" {
             (intro(featured, now))
 
-            @if !live.is_empty() {
-                (group("Live", "Readings are being recorded now.", &live, now))
-            }
             @if !open.is_empty() {
                 (group("Upcoming", "Taking entries until the window starts.", &open, now))
+            }
+            @if !live.is_empty() {
+                (group("Live", "Readings are being recorded now.", &live, now))
             }
             @if !waiting.is_empty() {
                 (group("Awaiting results", "The window is over; the result and payouts follow.", &waiting, now))
@@ -469,9 +481,9 @@ fn intro(featured: Option<&CompetitionView>, now: OffsetDateTime) -> Markup {
             div class="intro-text" {
                 h1 class="title is-4" { "Call the weather, win the pot" }
                 p {
-                    "Each competition covers a few airport weather stations. For each reading, pick whether "
-                    "it will come in over the forecast, on it (par) or under it. Pay the entry fee in sats; "
-                    "when the window closes, the best scores take the pot."
+                    "Each competition covers a few airport weather stations. For each reading — high, low, "
+                    "wind — call it " strong { "Over" } ", " strong { "Par" } " or " strong { "Under" }
+                    " the forecast. Entry is paid in sats; when the window closes, the top scores take the pot."
                 }
             }
             @if let Some(competition) = featured {
@@ -492,7 +504,7 @@ fn featured_card(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
     html! {
         div class="featured-card" {
             div class="featured-status" {
-                (phase_badge(competition))
+                (list_badge(competition))
                 span class="countdown" {
                     @if competition.phase == Phase::Live {
                         "Results in " (format::duration(competition.end - now))
@@ -593,7 +605,7 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
         a class="competition-row" data-competition-id=(competition.id) data-facts=(facts)
           href=(competition.url()) hx-get=(competition.url())
           hx-target="#main-content" hx-push-url="true" {
-            span class="cell-status" { (phase_badge(competition)) }
+            span class="cell-status" { (list_badge(competition)) }
             span class="cell-window" {
                 (format::window(competition.start, competition.end))
                 @match competition.phase {
@@ -605,6 +617,7 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
                     Queue::Queued(queue) if queue.pools.is_empty() => {
                         span class="cell-note" { "pools of up to " (queue.max_players) }
                     }
+                    Queue::Queued(queue) if queue.pools.len() == 1 => { span class="cell-note" { "1 pool" } }
                     Queue::Queued(queue) => { span class="cell-note" { (queue.pools.len()) " pools" } }
                     Queue::Pool(pool) => { span class="cell-note" { (pool.label()) } }
                     Queue::Single => {}
@@ -678,6 +691,7 @@ pub(crate) mod tests {
 
     #[test]
     fn groups_come_in_order_with_the_newest_finished_first() {
+        // Upcoming first: entering is the thing to do on this page.
         let competitions = vec![
             view("finished-old", Phase::Scored, -300),
             view("open", Phase::Upcoming, 60),
@@ -691,7 +705,7 @@ pub(crate) mod tests {
         let waiting = position(&html, r#"data-competition-id="waiting""#);
         let newer = position(&html, r#"data-competition-id="finished-new""#);
         let older = position(&html, r#"data-competition-id="finished-old""#);
-        assert!(live < open && open < waiting && waiting < newer && newer < older);
+        assert!(open < live && live < waiting && waiting < newer && newer < older);
     }
 
     #[test]
@@ -896,9 +910,18 @@ pub(crate) mod tests {
             .into_string()
             .contains(">Split into pools</span>"));
         assert!(!split.did_not_fill());
-        assert!(competition_row(&split, NOW)
+        // The list shows the phase the queue is listed with, not the split.
+        let row = competition_row(&split, NOW).into_string();
+        assert!(row.contains(r#"<span class="cell-note">2 pools</span>"#));
+        assert!(row.contains(">Awaiting results</span>"));
+        assert!(!row.contains("Split into pools"));
+        let mut one_pool = split.clone();
+        if let Queue::Queued(queue) = &mut one_pool.queue {
+            queue.pools.truncate(1);
+        }
+        assert!(competition_row(&one_pool, NOW)
             .into_string()
-            .contains(r#"<span class="cell-note">2 pools</span>"#));
+            .contains(r#"<span class="cell-note">1 pool</span>"#));
 
         let pool = |id: &str, index, phase| {
             let mut pool = view(id, phase, -5);
@@ -923,6 +946,8 @@ pub(crate) mod tests {
         assert_eq!(shown[0].phase, Phase::Live);
         let page = competitions_page(&all, ListOptions::default(), NOW).into_string();
         assert!(!page.contains("Awaiting results"));
+        assert!(!page.contains("Split into pools"));
+        assert!(page.contains(">Live</span>"));
         assert!(!page.contains("Pool 1") && !page.contains("Pool 2"));
         assert!(page.contains("2 pools"));
 

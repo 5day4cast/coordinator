@@ -21,6 +21,13 @@
   margin-bottom: 0.75rem;
 }
 
+/* What the badges on an open window's picks mean. */
+.picks-legend {
+  font-size: 0.8rem;
+  color: var(--bulma-text-weak);
+  margin-bottom: 0.75rem;
+}
+
 .entry-pending-msg {
   color: var(--bulma-text-weak);
 }
@@ -73,8 +80,19 @@
   color: var(--bulma-text-weak);
 }
 
-/* While the window is open: how each pick stands on the readings so far.
-   Settled states (locked in, out) are filled; open ones are outlined. */
+/* While the window is open: the points as if it ended now, over how the
+   pick stands. Settled states (locked in, out) are filled; open ones are outlined. */
+.scored-pick.is-live .pick-result {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.15rem;
+}
+
+.pick-points {
+  font-size: 0.85rem;
+}
+
 .scored-pick.is-locked-in {
   background: hsla(141, 53%, 42%, 0.12);
 }

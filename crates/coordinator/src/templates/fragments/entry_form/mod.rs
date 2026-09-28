@@ -150,20 +150,24 @@ pub fn entry_form(
             p class="how-to-pick" {
                 @match competition.scoring_rules {
                     ScoringRules::Lines => {
-                        "For each reading, pick whether it will come in over par, on par, or under par. "
-                        strong { "Par" } " is a range around the forecast, set from how that airport's forecasts "
-                        "have missed over the last 60 days, so the three are about equally likely. "
+                        "For each reading, call it " strong { "Over" } ", " strong { "Par" } " or " strong { "Under" } ". "
+                        "Par is the range beside each forecast, set from how that airport's forecasts have "
+                        "missed over the last 60 days so the three are about equally likely; when its forecasts "
+                        "have been running hot or cold, the range says so. "
                         "A right pick scores " (LINE_POINTS) " points."
                     }
                     ScoringRules::Fixed => {
-                        "For each reading, pick whether it will come in over the forecast, under it, or on it. "
-                        strong { "Par" } " means the reading matches the forecast exactly (to the whole degree for temperatures) and scores "
-                        (PAR_POINTS) " points; a correct over or under scores " (OVER_OR_UNDER_POINTS) "."
+                        "For each reading, call it " strong { "Over" } ", " strong { "Par" } " or " strong { "Under" } " the forecast. "
+                        "Par means the reading matches the forecast exactly (to the whole degree for temperatures) and scores "
+                        (PAR_POINTS) " points; a right Over or Under scores " (OVER_OR_UNDER_POINTS) "."
                     }
                 }
                 @if picks_allowed < pickable {
-                    " Make up to " (picks_allowed) " picks."
+                    " Make up to " (picks_allowed) " picks; "
+                } @else {
+                    " Pick as many readings as you like; "
                 }
+                "a reading left at No pick scores 0."
             }
 
             // What the wallet checks the entry's terms against: what this form shows.
@@ -438,6 +442,9 @@ fn pick_row(station_id: &str, metric: Metric, forecast: Option<f64>, rule: Optio
                 }
                 @if let (Some(value), Some(Rule::Line { lower, upper })) = (forecast, rule) {
                     " " span class="pick-par" { "Par " (metric.range(value + lower, value + upper)) }
+                    @if let Some(lean) = metric.lean(lower, upper) {
+                        " " span class="pick-lean" { (lean) }
+                    }
                 }
             }
             div class="pick-options" role="radiogroup" aria-label=(format!("{} at {station_id}", metric.label())) {
@@ -705,6 +712,11 @@ mod tests {
         .into_string();
         assert!(html.contains("Par 67.4–70.2°F"), "{html}");
         assert_eq!(html.matches("pick-par").count(), 1);
+        // A band centred on the forecast has no lean to report.
+        assert!(!html.contains("pick-lean"));
+        assert!(
+            html.contains("Pick as many readings as you like; a reading left at No pick scores 0.")
+        );
         assert!(html.contains("A right pick scores 10 points."));
         assert!(!html.contains("20 points"));
         assert!(form(PayoutDestination::LoggedOut).contains("scores 20 points"));
