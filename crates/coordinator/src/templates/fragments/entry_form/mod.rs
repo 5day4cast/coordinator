@@ -512,7 +512,11 @@ mod tests {
             r#"entry 5,000 sats · service 5% 250 sats · network <span id="networkFee">50 sats</span>"#
         ));
         assert!(html.contains(NETWORK_FEE_NOTE));
-        assert_eq!(html.matches("network fee").count(), 1, "one line about the network fee");
+        assert_eq!(
+            html.matches("network fee").count(),
+            1,
+            "one line about the network fee"
+        );
 
         // Without an estimate no price is claimed for it, and no ticket can be issued either.
         let unavailable = entry_form(

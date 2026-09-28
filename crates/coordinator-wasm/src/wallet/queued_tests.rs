@@ -580,10 +580,30 @@ fn a_network_fee_is_part_of_the_ticket_price() {
     // A network fee the escrow does not claim is the coordinator's loss, not the player's.
     priced(COORDINATOR_FEE, PRICED, PRICED).unwrap();
     for (label, max_fee_sats, amount_sats, invoiced_sats) in [
-        ("escrow fee beyond the ticket", COORDINATOR_FEE + NETWORK_FEE + 1, PRICED, PRICED),
-        ("the fee without the price", COORDINATOR_FEE + NETWORK_FEE, TICKET, TICKET),
-        ("an invoice without the fee", COORDINATOR_FEE + NETWORK_FEE, PRICED, TICKET),
-        ("an invoice above the price", COORDINATOR_FEE + NETWORK_FEE, PRICED, PRICED + 1),
+        (
+            "escrow fee beyond the ticket",
+            COORDINATOR_FEE + NETWORK_FEE + 1,
+            PRICED,
+            PRICED,
+        ),
+        (
+            "the fee without the price",
+            COORDINATOR_FEE + NETWORK_FEE,
+            TICKET,
+            TICKET,
+        ),
+        (
+            "an invoice without the fee",
+            COORDINATOR_FEE + NETWORK_FEE,
+            PRICED,
+            TICKET,
+        ),
+        (
+            "an invoice above the price",
+            COORDINATOR_FEE + NETWORK_FEE,
+            PRICED,
+            PRICED + 1,
+        ),
     ] {
         assert!(
             priced(max_fee_sats, amount_sats, invoiced_sats).is_err(),

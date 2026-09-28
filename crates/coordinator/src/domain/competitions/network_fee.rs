@@ -25,7 +25,10 @@ pub const ENTRIES_PAUSED: &str = "Entries are paused while Bitcoin network fees 
 ///
 /// The rate is taken to the nearest thousandth of a sat/vB (LND's estimates are whole sat/kw,
 /// multiples of 0.004 sat/vB), so the rest is exact integer arithmetic.
-pub fn network_fee_sats(settings: &NetworkFeeSettings, sat_per_vb: f64) -> Result<u64, anyhow::Error> {
+pub fn network_fee_sats(
+    settings: &NetworkFeeSettings,
+    sat_per_vb: f64,
+) -> Result<u64, anyhow::Error> {
     if !settings.enabled {
         return Ok(0);
     }
@@ -34,12 +37,14 @@ pub fn network_fee_sats(settings: &NetworkFeeSettings, sat_per_vb: f64) -> Resul
     }
     let players = u128::from(settings.pool_players);
     if players == 0 {
-        return Err(anyhow!("network_fee_settings.pool_players must be at least 1"));
+        return Err(anyhow!(
+            "network_fee_settings.pool_players must be at least 1"
+        ));
     }
     let floor = u128::from(settings.min_sat_per_vb) * 1_000;
     let rate_milli = ((sat_per_vb * 1_000.0).round() as u128).max(floor);
-    let vbytes = u128::from(settings.base_vbytes)
-        + u128::from(settings.vbytes_per_player) * players;
+    let vbytes =
+        u128::from(settings.base_vbytes) + u128::from(settings.vbytes_per_player) * players;
     let numerator = vbytes
         .checked_mul(rate_milli)
         .and_then(|v| v.checked_mul(u128::from(settings.multiplier_percent)))
@@ -185,7 +190,10 @@ impl Coordinator {
         competition: &Competition,
         ticket: &Ticket,
     ) -> Result<TicketPrice, Error> {
-        TicketPrice::new(competition, self.ticket_network_fee(competition, ticket).await?)
+        TicketPrice::new(
+            competition,
+            self.ticket_network_fee(competition, ticket).await?,
+        )
     }
 }
 

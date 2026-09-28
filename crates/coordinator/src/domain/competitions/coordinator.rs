@@ -1507,20 +1507,20 @@ impl Coordinator {
         let contract_params = match competition.contract_parameters.clone() {
             Some(params) => params,
             None => ContractParameters {
-                    market_maker: dlctix::MarketMaker {
-                        pubkey: self.public_key,
-                    },
-                    players,
-                    event: event_announcement.clone(),
-                    outcome_payouts,
-                    // An Arkade competition's is the rate its kickoff check passed at.
-                    fee_rate: self.checked_contract_fee_rate(competition).await?,
-                    funding_value: Amount::from_sat(contract_amount_sats as u64),
-                    relative_locktime_block_delta: competition
-                        .event_submission
-                        .relative_locktime_block_delta
-                        .unwrap_or(self.relative_locktime_block_delta as u16),
+                market_maker: dlctix::MarketMaker {
+                    pubkey: self.public_key,
                 },
+                players,
+                event: event_announcement.clone(),
+                outcome_payouts,
+                // An Arkade competition's is the rate its kickoff check passed at.
+                fee_rate: self.checked_contract_fee_rate(competition).await?,
+                funding_value: Amount::from_sat(contract_amount_sats as u64),
+                relative_locktime_block_delta: competition
+                    .event_submission
+                    .relative_locktime_block_delta
+                    .unwrap_or(self.relative_locktime_block_delta as u16),
+            },
         };
         competition.contract_parameters = Some(contract_params.clone());
 

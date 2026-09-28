@@ -125,7 +125,10 @@ impl Coordinator {
     /// The most a pool's kickoff may pay the coordinator: the verifier signs an escrow into a
     /// batch only if the fee output is at most that escrow's `max_fee_sats` times the escrows
     /// in it, so the lowest cap among the entries, times their number.
-    pub(super) async fn pool_fee_cap(&self, entries: &[UserEntry]) -> Result<Amount, anyhow::Error> {
+    pub(super) async fn pool_fee_cap(
+        &self,
+        entries: &[UserEntry],
+    ) -> Result<Amount, anyhow::Error> {
         let mut lowest: Option<u64> = None;
         for entry in entries {
             let json = self
@@ -143,7 +146,10 @@ impl Coordinator {
         }
         let players = entries.len() as u64;
         Ok(Amount::from_sat(
-            lowest.unwrap_or(0).checked_mul(players).ok_or_else(|| anyhow!("Fee cap overflows"))?,
+            lowest
+                .unwrap_or(0)
+                .checked_mul(players)
+                .ok_or_else(|| anyhow!("Fee cap overflows"))?,
         ))
     }
 
@@ -323,7 +329,10 @@ impl Coordinator {
         {
             Ok(fee) => fee.unwrap_or(0),
             Err(e) => {
-                self.report_swap(pending, format!("cannot read its ticket's network fee: {e}"));
+                self.report_swap(
+                    pending,
+                    format!("cannot read its ticket's network fee: {e}"),
+                );
                 return None;
             }
         };

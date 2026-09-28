@@ -93,15 +93,16 @@ impl TicketResponse {
     /// invoice charges, and its escrow may pay out no more than the ticket above the stake. The
     /// network fee is the coordinator's to set; it is fixed on the ticket when issued.
     pub fn check_price(&self) -> Result<()> {
-        let entry_fee = match (
-            self.entry_fee_sats,
-            self.coordinator_fee_sats,
-            self.network_fee_sats,
-            self.ticket_price_sats,
-        ) {
-            (None, None, None, None) => None,
-            (Some(entry), Some(coordinator), Some(network), Some(price)) => {
-                anyhow::ensure!(
+        let entry_fee =
+            match (
+                self.entry_fee_sats,
+                self.coordinator_fee_sats,
+                self.network_fee_sats,
+                self.ticket_price_sats,
+            ) {
+                (None, None, None, None) => None,
+                (Some(entry), Some(coordinator), Some(network), Some(price)) => {
+                    anyhow::ensure!(
                     entry.checked_add(coordinator).and_then(|v| v.checked_add(network))
                         == Some(price)
                         && price == self.amount_sats,
@@ -109,10 +110,10 @@ impl TicketResponse {
                      {network} for {price}, invoiced at {}",
                     self.amount_sats
                 );
-                Some(entry)
-            }
-            _ => anyhow::bail!("Ticket price has only some of its lines"),
-        };
+                    Some(entry)
+                }
+                _ => anyhow::bail!("Ticket price has only some of its lines"),
+            };
         let escrow = self
             .keymeld_registration
             .as_ref()

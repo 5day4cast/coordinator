@@ -92,8 +92,8 @@ impl KickoffCheck {
         let cost = chain_cost_sats
             .checked_add(routing_and_liquidity_sats)
             .ok_or_else(overflow)?;
-        let margin_sats = i64::try_from(i128::from(pool.paid_sats) - i128::from(cost))
-            .map_err(|_| overflow())?;
+        let margin_sats =
+            i64::try_from(i128::from(pool.paid_sats) - i128::from(cost)).map_err(|_| overflow())?;
         let sat_per_vb = rate.to_sat_per_vb_ceil();
         let min_players = settings.min_players_at(pool.template_min_players, sat_per_vb);
         let within_ceiling = rate <= ceiling;
@@ -144,7 +144,10 @@ impl KickoffCheck {
 }
 
 impl Coordinator {
-    pub fn with_kickoff_check(mut self, settings: KickoffCheckSettings) -> Result<Self, anyhow::Error> {
+    pub fn with_kickoff_check(
+        mut self,
+        settings: KickoffCheckSettings,
+    ) -> Result<Self, anyhow::Error> {
         settings.validate()?;
         self.kickoff_check = settings;
         Ok(self)
@@ -249,9 +252,15 @@ impl Coordinator {
             check.margin_sats
         );
         if check.passed {
-            info!("Competition {} passes its kickoff check: {summary}", competition.id);
+            info!(
+                "Competition {} passes its kickoff check: {summary}",
+                competition.id
+            );
         } else {
-            warn!("Competition {} fails its kickoff check: {summary}", competition.id);
+            warn!(
+                "Competition {} fails its kickoff check: {summary}",
+                competition.id
+            );
         }
         self.competition_store
             .store_kickoff_check(competition.id, &check)
@@ -262,7 +271,10 @@ impl Coordinator {
     /// The fee ceiling the competition's players consented to, and the fewest players its
     /// terms allow: a pool's terms, or for a single competition the coordinator's ceiling and
     /// two players.
-    async fn kickoff_terms(&self, competition: &Competition) -> Result<(FeeRate, u64), anyhow::Error> {
+    async fn kickoff_terms(
+        &self,
+        competition: &Competition,
+    ) -> Result<(FeeRate, u64), anyhow::Error> {
         match self.pool_of(competition).await? {
             Some((settings, _)) => Ok((
                 settings.terms.max_fee_rate,
@@ -304,7 +316,10 @@ impl Coordinator {
         let due = match self.needs_kickoff_check(competition).await {
             Ok(due) => due,
             Err(e) => {
-                warn!("Competition {}: cannot tell if a kickoff check is due: {e:#}", competition.id);
+                warn!(
+                    "Competition {}: cannot tell if a kickoff check is due: {e:#}",
+                    competition.id
+                );
                 return KickoffGate::Wait;
             }
         };
@@ -315,7 +330,10 @@ impl Coordinator {
             Ok(check) if check.passed => KickoffGate::Proceed,
             Ok(check) => KickoffGate::Fail(CompetitionError::KickoffCheckFailed(check.reason())),
             Err(e) => {
-                warn!("Competition {}: kickoff check could not run: {e:#}", competition.id);
+                warn!(
+                    "Competition {}: kickoff check could not run: {e:#}",
+                    competition.id
+                );
                 KickoffGate::Wait
             }
         }
@@ -352,7 +370,8 @@ impl Coordinator {
         competitions: &mut [Competition],
     ) -> Result<(), Error> {
         for competition in competitions.iter_mut() {
-            competition.kickoff_check = self.competition_store.kickoff_check(competition.id).await?;
+            competition.kickoff_check =
+                self.competition_store.kickoff_check(competition.id).await?;
         }
         Ok(())
     }
