@@ -504,7 +504,7 @@ fn featured_card(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
     html! {
         div class="featured-card" {
             div class="featured-status" {
-                (phase_badge(competition))
+                (list_badge(competition))
                 span class="countdown" {
                     @if competition.phase == Phase::Live {
                         "Results in " (format::duration(competition.end - now))
@@ -691,6 +691,7 @@ pub(crate) mod tests {
 
     #[test]
     fn groups_come_in_order_with_the_newest_finished_first() {
+        // Upcoming first: entering is the thing to do on this page.
         let competitions = vec![
             view("finished-old", Phase::Scored, -300),
             view("open", Phase::Upcoming, 60),
@@ -704,7 +705,7 @@ pub(crate) mod tests {
         let waiting = position(&html, r#"data-competition-id="waiting""#);
         let newer = position(&html, r#"data-competition-id="finished-new""#);
         let older = position(&html, r#"data-competition-id="finished-old""#);
-        assert!(live < open && open < waiting && waiting < newer && newer < older);
+        assert!(open < live && live < waiting && waiting < newer && newer < older);
     }
 
     #[test]

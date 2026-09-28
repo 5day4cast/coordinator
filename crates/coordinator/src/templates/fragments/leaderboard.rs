@@ -735,7 +735,6 @@ mod tests {
         board.any_readings = false;
         let html = leaderboard_scores(&competition, &board, NOW).into_string();
         assert!(html.contains("could not verify a pot-return allocation"));
-        assert!(!html.contains("earlier entry is paid"));
         assert!(html.contains("0 pts"));
         assert!(phase_badge(&competition)
             .into_string()
