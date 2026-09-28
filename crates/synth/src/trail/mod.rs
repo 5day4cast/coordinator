@@ -623,8 +623,14 @@ pub struct Evidence<'a> {
     pub unverified_entries: usize,
     /// Synth has followed the run as long as it follows unsettled money.
     pub give_up: bool,
+    /// When the last of the paid entries' escrows can be refunded, if known. Before then, a
+    /// cancelled competition's money is where it should be.
+    pub refunds_open_at: Option<OffsetDateTime>,
     pub now: OffsetDateTime,
 }
+
+/// How long after its escrow opens a refund may take to settle before synth calls it stuck.
+pub const REFUND_GRACE: time::Duration = time::Duration::hours(1);
 
 /// Where the money stands, from what the competition says and what synth found.
 pub fn judge(evidence: &Evidence) -> Money {
@@ -637,6 +643,7 @@ pub fn judge(evidence: &Evidence) -> Money {
         paid_entries,
         unverified_entries,
         give_up,
+        refunds_open_at,
         now,
     } = *evidence;
     // A run still going decides nothing yet, even before anyone has paid.
@@ -769,7 +776,10 @@ pub fn judge(evidence: &Evidence) -> Money {
         if settled >= paid_entries {
             return Money::Refunded;
         }
-        return if give_up {
+        // An escrow is refunded only once its refund leaf opens, a day after the competition
+        // closed; until then (and a while after) the money is waiting, not stuck.
+        let waiting = refunds_open_at.is_some_and(|open| now < open + REFUND_GRACE);
+        return if give_up && !waiting {
             Money::Stuck {
                 reason: format!(
                     "{} before its contract, and {settled} of {paid_entries} escrows were refunded",
@@ -849,6 +859,7 @@ mod tests {
             paid_entries,
             unverified_entries: 0,
             give_up,
+            refunds_open_at: None,
             now: OffsetDateTime::now_utc(),
         })
     }
@@ -939,6 +950,42 @@ mod tests {
             judge_of(&completed, &short, &[], 2, true),
             Money::Stuck { .. }
         ));
+    }
+
+    /// A cancelled competition's escrows open for refunds a day after it closed: until then,
+    /// and for a grace period after, its money is waiting, not stuck.
+    #[test]
+    fn refunds_are_not_stuck_before_the_escrows_open() {
+        let cancelled = competition(serde_json::json!({ "cancelled_at": "2026-09-28T04:44:00Z" }));
+        let now = OffsetDateTime::now_utc();
+        let judged = |open: Option<OffsetDateTime>| {
+            judge(&Evidence {
+                running: false,
+                competition: Some(&cancelled),
+                decided: false,
+                payouts: &[],
+                refunds: &[],
+                paid_entries: 3,
+                unverified_entries: 0,
+                give_up: true,
+                refunds_open_at: open,
+                now,
+            })
+        };
+        assert_eq!(
+            judged(Some(now + time::Duration::hours(16))),
+            Money::Following
+        );
+        assert_eq!(
+            judged(Some(now - time::Duration::minutes(30))),
+            Money::Following,
+            "within the grace period"
+        );
+        assert!(matches!(
+            judged(Some(now - time::Duration::hours(2))),
+            Money::Stuck { .. }
+        ));
+        assert!(matches!(judged(None), Money::Stuck { .. }));
     }
 
     /// Another player won: every one of synth's players is owed nothing, and the winner is paid
@@ -1105,6 +1152,7 @@ mod tests {
             paid_entries: 0,
             unverified_entries: 1,
             give_up: true,
+            refunds_open_at: None,
             now: OffsetDateTime::now_utc(),
         };
         assert_eq!(judge(&evidence), Money::Following);

@@ -32,6 +32,8 @@ struct Protocol {
     durable_before_pay: Vec<bool>,
     /// Seats other people paid for and entered.
     others: usize,
+    /// Refunds settle only from then, as an escrow opens its refund leaf.
+    refunds_open: Option<OffsetDateTime>,
 }
 
 type Shared = Arc<Mutex<Protocol>>;
@@ -194,11 +196,18 @@ async fn refund(
     }
     (
         StatusCode::OK,
-        Json(if state.closed && state.paid.contains(&ticket) {
-            json!({"state":"settled","paid_sats":1000,"ark_txid":"mock-refund","updated_at":0})
-        } else {
-            Value::Null
-        }),
+        Json(
+            if state.closed
+                && state.paid.contains(&ticket)
+                && state
+                    .refunds_open
+                    .is_none_or(|open| OffsetDateTime::now_utc() >= open)
+            {
+                json!({"state":"settled","paid_sats":1000,"ark_txid":"mock-refund","updated_at":0})
+            } else {
+                Value::Null
+            },
+        ),
     )
 }
 
@@ -647,12 +656,48 @@ async fn paid_dropout_keeps_its_seat_and_is_refunded_without_submitting_an_entry
         &user,
         &comp,
         &trace.ticket_id.unwrap(),
+        None,
         &config(1),
     )
     .await
     .unwrap();
     assert_eq!(refunded["paid_sats"], 1000);
     assert!(mock.state.lock().unwrap().entries.is_empty());
+}
+
+/// An escrow is refunded only once its refund leaf opens, which can be long after the refund
+/// timeout: the wait lasts until it opens and the timeout more.
+#[tokio::test]
+async fn a_refund_is_waited_for_until_its_escrow_opens() {
+    let ticket = Uuid::now_v7();
+    let opens = OffsetDateTime::now_utc() + time::Duration::seconds(2);
+    let mock = Mock::new(Protocol {
+        closed: true,
+        paid: BTreeSet::from([ticket]),
+        refunds_open: Some(opens),
+        ..Default::default()
+    })
+    .await;
+    let user = SynthUser::new_random("alice").unwrap();
+    let mut config = config(1);
+    config.refund_timeout_secs = 1;
+    let competition = Uuid::now_v7();
+    let wait = |refund_at| {
+        super::super::escrow_refund::wait_for_refund(
+            &mock.client,
+            &user,
+            &competition,
+            &ticket,
+            refund_at,
+            &config,
+        )
+    };
+    assert!(
+        wait(None).await.is_err(),
+        "the timeout alone ends before the escrow opens"
+    );
+    let refunded = wait(Some(opens.unix_timestamp() + 1)).await.unwrap();
+    assert_eq!(refunded["paid_sats"], 1000);
 }
 
 #[tokio::test]

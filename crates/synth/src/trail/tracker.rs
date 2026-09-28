@@ -496,6 +496,12 @@ impl Tracker {
             paid_entries: trail.paid_entries(&entries).len(),
             unverified_entries,
             give_up: run.status != "running" && followed_long_enough(run, &self.inner.config),
+            refunds_open_at: trail
+                .paid_entries(&entries)
+                .iter()
+                .filter_map(|entry| entry.escrow)
+                .filter_map(|escrow| OffsetDateTime::from_unix_timestamp(escrow.refund_at).ok())
+                .max(),
             now,
         });
         trail.held = held(&trail, &entries, previous.and_then(|p| p.held.clone()), now);
