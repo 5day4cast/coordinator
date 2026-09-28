@@ -322,6 +322,7 @@ mockall::mock! {
         async fn get_current_height(&self) -> Result<u32, anyhow::Error>;
         async fn get_confirmed_blockchain_time(&self, blocks: usize) -> Result<u64, anyhow::Error>;
         async fn get_estimated_fee_rates(&self) -> Result<HashMap<u16, f64>, anyhow::Error>;
+        async fn estimate_fee(&self, conf_target: u16) -> Result<f64, anyhow::Error>;
         async fn get_tx_confirmation_height(&self, txid: &Txid) -> Result<Option<u32>, anyhow::Error>;
         async fn payout_output_status(
             &self,

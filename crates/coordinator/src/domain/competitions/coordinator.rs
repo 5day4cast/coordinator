@@ -4,11 +4,19 @@ mod ark_coordinator;
 mod automatic;
 #[path = "competition_steps.rs"]
 mod competition_steps;
+#[path = "kickoff_check.rs"]
+mod kickoff_check;
+#[path = "network_fee.rs"]
+mod network_fee;
 #[path = "queued_coordinator.rs"]
 mod queued_coordinator;
 #[path = "queued_kickoff.rs"]
 mod queued_kickoff;
 pub use automatic::{InvoiceFallbackRequest, PayoutAuthorizationInfo, PayoutTermsQuote};
+pub use kickoff_check::{KickoffCheck, KickoffPool};
+pub use network_fee::{
+    network_fee_sats, NetworkFeeQuote, TicketPrice, ENTRIES_PAUSED, FEE_ESTIMATE_UNAVAILABLE,
+};
 
 use super::{
     parse_invoice, states::CompetitionStatus, store::ReservedTicket, verify_entry_key,
@@ -171,7 +179,11 @@ pub struct TicketResponse {
     pub ticket_id: uuid::Uuid,
     pub payment_request: String, // Lightning HODL invoice to pay for entry
     pub payment_hash: String,    // Hex-encoded payment hash for verification
+    /// What the invoice charges: `ticket_price_sats`.
     pub amount_sats: u64,
+    /// The ticket's price line by line; the network fee is fixed on the ticket when it is issued.
+    #[serde(flatten)]
+    pub price: super::TicketPrice,
     /// The user's keymeld user_id (same as ticket_id) - used for keymeld registration
     pub keymeld_user_id: uuid::Uuid,
     /// Keymeld gateway URL for client registration
@@ -201,6 +213,11 @@ pub struct Coordinator {
     invoice_settlement_confirmations: u32,
     automatic_payouts: bool,
     automatic_payout_max_fee_rate: FeeRate,
+    /// How each ticket's network fee is priced; off until `with_network_fee`.
+    network_fee: crate::config::NetworkFeeSettings,
+    /// The check an Arkade pool passes before its contract is built; off until
+    /// `with_kickoff_check`.
+    kickoff_check: crate::config::KickoffCheckSettings,
     ark: Option<Arc<super::Arkade>>,
     wakes: super::CompetitionWakes,
     worker_leases: Arc<super::WorkerLeases>,
@@ -253,6 +270,14 @@ impl Coordinator {
             invoice_settlement_confirmations,
             automatic_payouts: false,
             automatic_payout_max_fee_rate: FeeRate::from_sat_per_vb_u32(100),
+            network_fee: crate::config::NetworkFeeSettings {
+                enabled: false,
+                ..Default::default()
+            },
+            kickoff_check: crate::config::KickoffCheckSettings {
+                enabled: false,
+                ..Default::default()
+            },
             ark: None,
             wakes: super::CompetitionWakes::default(),
             worker_leases,
@@ -744,6 +769,16 @@ impl Coordinator {
             }
 
             CompetitionStatus::EscrowConfirmed(mut state) => {
+                // A pool is checked before its oracle event exists.
+                match self.kickoff_gate(state.competition()).await {
+                    kickoff_check::KickoffGate::Proceed => {}
+                    kickoff_check::KickoffGate::Wait => {
+                        return CompetitionStatus::EscrowConfirmed(state)
+                    }
+                    kickoff_check::KickoffGate::Fail(failure) => {
+                        return CompetitionStatus::EscrowConfirmed(state).fail(failure)
+                    }
+                }
                 match self.submit_event_to_oracle(state.competition_mut()).await {
                     Ok(_) => {
                         if state.competition().event_created_at.is_some() {
@@ -782,6 +817,17 @@ impl Coordinator {
             }
 
             CompetitionStatus::EntriesSubmitted(mut state) => {
+                // Every Arkade competition is checked again just before its contract is built,
+                // at the rate the contract is built at.
+                match self.kickoff_gate(state.competition()).await {
+                    kickoff_check::KickoffGate::Proceed => {}
+                    kickoff_check::KickoffGate::Wait => {
+                        return CompetitionStatus::EntriesSubmitted(state)
+                    }
+                    kickoff_check::KickoffGate::Fail(failure) => {
+                        return CompetitionStatus::EntriesSubmitted(state).fail(failure)
+                    }
+                }
                 match self.create_funding_psbt(state.competition_mut()).await {
                     Ok(_) => {
                         let comp = state.competition();
@@ -1457,30 +1503,25 @@ impl Coordinator {
         }
 
         let contract_amount_sats = competition.event_submission.total_competition_pool;
-        let fee_rates = self.bitcoin.get_estimated_fee_rates().await?;
-        info!("Fee rates: {:?}", fee_rates);
 
-        // TODO (@tee8z): make this configurable from the admin screen
-        let fee_rate = fee_rate_for_target(&fee_rates, 1)?;
-
-        let contract_params =
-            competition
-                .contract_parameters
-                .clone()
-                .unwrap_or(ContractParameters {
+        let contract_params = match competition.contract_parameters.clone() {
+            Some(params) => params,
+            None => ContractParameters {
                     market_maker: dlctix::MarketMaker {
                         pubkey: self.public_key,
                     },
                     players,
                     event: event_announcement.clone(),
                     outcome_payouts,
-                    fee_rate,
+                    // An Arkade competition's is the rate its kickoff check passed at.
+                    fee_rate: self.checked_contract_fee_rate(competition).await?,
                     funding_value: Amount::from_sat(contract_amount_sats as u64),
                     relative_locktime_block_delta: competition
                         .event_submission
                         .relative_locktime_block_delta
                         .unwrap_or(self.relative_locktime_block_delta as u16),
-                });
+                },
+        };
         competition.contract_parameters = Some(contract_params.clone());
 
         let funding_output = contract_params.funding_output()?;
@@ -3185,6 +3226,8 @@ impl Coordinator {
             debug!("confidential competition capacity: {capacity:?}");
             self.require_payout_capabilities(false).await?;
         }
+        self.require_small_competitions_allowed(create_event.total_allowed_entries as u64)
+            .await?;
         let mut competition = Competition::new(&create_event);
         if self.automatic_payouts {
             // Entrants must authorize the oracle locking points before payment.
@@ -3283,6 +3326,7 @@ impl Coordinator {
             })
             .await?;
         self.attach_queue_details(&mut competitions).await?;
+        self.attach_kickoff_checks(&mut competitions).await?;
         Ok(competitions)
     }
 
@@ -3460,9 +3504,10 @@ impl Coordinator {
             }
         }
 
-        // The entry form shows this same amount, and the browser refuses an
-        // invoice for anything else before exposing it for payment.
-        let full_fee = competition.calculate_invoice_amount();
+        // The entry form shows the entry and coordinator fees, and the browser refuses an
+        // invoice for anything but those and the network fee before exposing it for payment.
+        let price = self.ticket_price(&competition, &ticket).await?;
+        let full_fee = price.ticket_price_sats;
 
         // Check if ticket already has a payment request (reuse existing invoice if not expired)
         // Invoice needs to stay active through:
@@ -3541,6 +3586,7 @@ impl Coordinator {
             payment_request,
             payment_hash: hex::encode(payment_hash),
             amount_sats: full_fee,
+            price,
             // ticket_id is used as the keymeld user_id for consistency
             keymeld_user_id: ticket.id,
             keymeld_gateway_url: self.keymeld_gateway_url.clone(),
@@ -3596,6 +3642,8 @@ impl Coordinator {
             })
             .await?;
         self.attach_queue_details(std::slice::from_mut(&mut competition))
+            .await?;
+        self.attach_kickoff_checks(std::slice::from_mut(&mut competition))
             .await?;
         Ok(competition)
     }

@@ -538,7 +538,8 @@ pub async fn build_app(
         config.keymeld_settings.automatic_payouts,
         config.keymeld_settings.automatic_payout_max_fee_rate_sat_vb,
     )?
-    .with_ark(arkade(&config.ark_settings).await?)?;
+    .with_ark(arkade(&config.ark_settings).await?)?
+    .with_network_fee(config.network_fee_settings.clone())?;
     let (wakes, wake_requests) = CompetitionWakes::new();
     let coordinator = Arc::new(
         coordinator
@@ -873,6 +874,10 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
         .route(
             "/api/v1/competitions/{competition_id}",
             get(get_competition),
+        )
+        .route(
+            "/api/v1/network-fee",
+            get(crate::api::routes::get_network_fee),
         )
         .route(
             "/api/v1/competitions/{competition_id}/payout-terms",

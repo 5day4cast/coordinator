@@ -23,6 +23,8 @@ pub struct MockBitcoinClient {
     address_counter: AtomicU32,
     /// Blocks a test set; otherwise one block every ten minutes up to now.
     blocks: std::sync::Mutex<Option<Vec<BlockSummary>>>,
+    /// What `estimate_fee` answers, in sat/vB; `None` fails it.
+    fee_estimate: std::sync::Mutex<Option<f64>>,
 }
 
 impl MockBitcoinClient {
@@ -33,7 +35,13 @@ impl MockBitcoinClient {
             block_height: AtomicU32::new(100), // Start at block 100
             address_counter: AtomicU32::new(0),
             blocks: std::sync::Mutex::new(None),
+            fee_estimate: std::sync::Mutex::new(Some(1.0)),
         }
+    }
+
+    /// Answer `estimate_fee` with `sat_per_vb`, or fail it with `None`.
+    pub fn set_fee_estimate(&self, sat_per_vb: Option<f64>) {
+        *self.fee_estimate.lock().unwrap() = sat_per_vb;
     }
 
     /// Serve these blocks, from height 0, and make the last one the tip.
@@ -117,6 +125,11 @@ impl Bitcoin for MockBitcoinClient {
         rates.insert(6, 10.0); // 6 blocks: 10 sat/vB
         rates.insert(12, 5.0); // 12 blocks: 5 sat/vB
         Ok(rates)
+    }
+
+    async fn estimate_fee(&self, _conf_target: u16) -> Result<f64, anyhow::Error> {
+        (*self.fee_estimate.lock().unwrap())
+            .ok_or_else(|| anyhow::anyhow!("mock fee estimate unavailable"))
     }
 
     async fn payout_output_status(

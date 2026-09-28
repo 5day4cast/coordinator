@@ -477,15 +477,18 @@ pub async fn entry_form_fragment(
         // Entries are closed; the leaderboard is what there is to see.
         return leaderboard_response(&state, &headers, &view);
     }
-    let (forecasts, terms, destination) = tokio::join!(
+    let (forecasts, terms, destination, network_fee) = tokio::join!(
         forecasts(&state, &competition, FIRST_READ_WAIT),
         state.coordinator.payout_terms_quote(competition_id),
         payout_destination(&state, auth.as_ref()),
+        state.coordinator.network_fee_quote(),
     );
     let terms = terms
         .inspect_err(|error| warn!("payout terms for {competition_id}: {error}"))
         .ok();
-    let content = entry_form(&view, &forecasts, terms.as_ref(), &destination);
+    // Logged where the estimate failed; the form says it is unavailable.
+    let network_fee = network_fee.ok().map(|quote| quote.network_fee_sats);
+    let content = entry_form(&view, &forecasts, terms.as_ref(), &destination, network_fee);
     page(
         &headers,
         &state,

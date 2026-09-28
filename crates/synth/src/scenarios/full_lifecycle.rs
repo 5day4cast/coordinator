@@ -119,6 +119,7 @@ pub(super) async fn request_entry(
         )
         .await
         .context("Failed to request ticket")?;
+    ticket.check_price()?;
     trace.ticket_requested_at = Some(OffsetDateTime::now_utc());
     trace.ticket_id = Some(ticket.ticket_id);
     trace.amount_sats = Some(ticket.amount_sats);

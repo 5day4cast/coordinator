@@ -437,6 +437,20 @@ pub async fn submit_invoice_fallback(
         .map_err(Into::into)
 }
 
+/// The network fee a ticket issued now would carry, for display before a ticket is requested.
+/// A ticket's own fee is fixed when it is issued and comes with it. 503 while the fee estimate
+/// is unavailable, when no ticket can be issued either.
+pub async fn get_network_fee(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<crate::domain::NetworkFeeQuote>, ApiError> {
+    state
+        .coordinator
+        .network_fee_quote()
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
 pub async fn get_payout_terms(
     State(state): State<Arc<AppState>>,
     Path(competition_id): Path<Uuid>,

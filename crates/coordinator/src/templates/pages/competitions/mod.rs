@@ -10,7 +10,7 @@ use crate::domain::{
     winner_payout_sats, Competition, RefundProgress, WindowShape,
 };
 use crate::infra::oracle::ScoringRules;
-use crate::templates::format::{self, sats, thousands};
+use crate::templates::format::{self, sats};
 
 mod queue;
 pub use queue::{PoolLink, PoolOf, Queue, QueueView};
@@ -26,8 +26,10 @@ pub struct CompetitionView {
     pub start: OffsetDateTime,
     pub end: OffsetDateTime,
     pub entry_fee: u64,
-    /// What the entrant pays: the entry fee plus the coordinator fee.
+    /// What the entrant pays before the network fee: the entry fee plus the coordinator fee.
     pub ticket_price: u64,
+    /// The coordinator fee as a percentage of the entry fee: `5%`, `2.5%`.
+    pub service_fee_percent: String,
     pub total_pool: u64,
     pub total_entries: u64,
     pub total_allowed_entries: u64,
@@ -87,6 +89,7 @@ impl CompetitionView {
             end: event.end_observation_date,
             entry_fee: event.entry_fee as u64,
             ticket_price: competition.calculate_invoice_amount(),
+            service_fee_percent: event.coordinator_fee.to_string(),
             total_pool: event.total_competition_pool as u64,
             total_entries: competition.total_entries,
             total_allowed_entries: event.total_allowed_entries as u64,
@@ -618,17 +621,6 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
     }
 }
 
-/// `5,000 entry fee + 250 coordinator fee`, or nothing without a fee.
-pub fn fee_breakdown(competition: &CompetitionView) -> Option<String> {
-    (competition.ticket_price > competition.entry_fee).then(|| {
-        format!(
-            "{} entry fee + {} coordinator fee",
-            thousands(competition.entry_fee),
-            thousands(competition.ticket_price - competition.entry_fee)
-        )
-    })
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -645,6 +637,7 @@ pub(crate) mod tests {
             end: start + time::Duration::minutes(10),
             entry_fee: 5000,
             ticket_price: 5250,
+            service_fee_percent: "5%".into(),
             total_pool: 15000,
             total_entries: 1,
             total_allowed_entries: 3,

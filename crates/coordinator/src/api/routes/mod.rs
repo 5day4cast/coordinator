@@ -47,6 +47,8 @@ impl IntoResponse for Error {
             Error::PaymentFailed(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             Error::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             Error::InvalidSignature(_) => (StatusCode::FORBIDDEN, self.to_string()),
+            Error::FeeEstimateUnavailable => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
+            Error::EntriesPaused => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             Error::DatabaseWrite(error) => {
                 log::error!("Database write failed: {error}");
                 match error {
@@ -105,6 +107,16 @@ mod tests {
                 Error::PaymentFailed("routing".into()),
                 StatusCode::BAD_REQUEST,
                 "Payout payment failed: routing",
+            ),
+            (
+                Error::EntriesPaused,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Entries are paused while Bitcoin network fees are high",
+            ),
+            (
+                Error::FeeEstimateUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The Bitcoin network fee estimate is unavailable right now, so no ticket was issued; try again in a moment",
             ),
             (
                 Error::Bitcoin(anyhow::anyhow!("private node detail")),

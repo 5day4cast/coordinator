@@ -15,7 +15,7 @@ use crate::infra::oracle::ScoringRules;
 use crate::templates::{
     format::{self, ordinal, sats, MetricText},
     fragments::loading::{placeholder, Pending},
-    pages::competitions::{fee_breakdown, CompetitionView},
+    pages::competitions::CompetitionView,
     shared_map::{station_map, StationPin},
 };
 
@@ -51,12 +51,19 @@ pub enum Forecasts {
     Pending(Pending),
 }
 
-/// Entry form for a competition
+/// The line under the network fee, saying what it is.
+pub const NETWORK_FEE_NOTE: &str =
+    "Your share of the Bitcoin network fees for a full pool, fixed when your ticket is issued.";
+
+/// Entry form for a competition. `network_fee` is the network fee a ticket issued now would
+/// carry, `None` while the fee estimate is unavailable; a ticket's own fee replaces it once the
+/// ticket is issued (`entry_form.js`).
 pub fn entry_form(
     competition: &CompetitionView,
     forecasts: &Forecasts,
     terms: Option<&PayoutTermsQuote>,
     destination: &PayoutDestination,
+    network_fee: Option<u64>,
 ) -> Markup {
     let picks_allowed = competition.number_of_values_per_entry;
     let queue = competition.queue.queued();
@@ -92,12 +99,7 @@ pub fn entry_form(
                 }
                 div {
                     dt { "Ticket" }
-                    dd {
-                        (sats(competition.ticket_price))
-                        @if let Some(breakdown) = fee_breakdown(competition) {
-                            span class="fact-note" { (breakdown) }
-                        }
-                    }
+                    dd { (price_lines(competition, network_fee)) }
                 }
                 div {
                     dt { "Pot" }
@@ -149,6 +151,7 @@ pub fn entry_form(
             form id="entryForm" data-competition-id=(competition.id)
                  data-entry-fee=(competition.entry_fee)
                  data-ticket-price=(competition.ticket_price)
+                 data-network-fee=[network_fee]
                  data-total-pool=(competition.total_pool)
                  data-winner-count=(competition.paid_places)
                  data-max-values=(picks_allowed)
@@ -199,7 +202,10 @@ pub fn entry_form(
 
             div class="entry-submit" {
                 button type="button" id="submitEntry" class="button is-primary is-medium" {
-                    "Pay " (sats(competition.ticket_price)) " and enter"
+                    @match network_fee {
+                        Some(fee) => { "Pay " (sats(competition.ticket_price + fee)) " and enter" }
+                        None => { "Pay and enter" }
+                    }
                 }
                 div id="successMessage" class="notification is-success hidden" {
                     "You're in. "
@@ -207,6 +213,41 @@ pub fn entry_form(
                 }
                 div id="errorMessage" class="notification is-danger hidden" {}
             }
+        }
+    }
+}
+
+/// The ticket's price and its lines: the entry fee, the service fee, and the network fee with
+/// what it is. The total and the network fee carry ids, so the ticket's own fee can replace the
+/// estimate once the ticket is issued.
+fn price_lines(competition: &CompetitionView, network_fee: Option<u64>) -> Markup {
+    let service = competition
+        .ticket_price
+        .saturating_sub(competition.entry_fee);
+    html! {
+        span id="ticketTotal" {
+            @match network_fee {
+                Some(fee) => (sats(competition.ticket_price + fee)),
+                None => { (sats(competition.ticket_price)) " + network fee" }
+            }
+        }
+        span class="fact-note price-lines" {
+            "entry " (sats(competition.entry_fee))
+            @if service > 0 {
+                " · service " (competition.service_fee_percent) " " (sats(service))
+            }
+            @if network_fee != Some(0) {
+                " · network "
+                span id="networkFee" {
+                    @match network_fee {
+                        Some(fee) => (sats(fee)),
+                        None => "unavailable right now",
+                    }
+                }
+            }
+        }
+        @if network_fee != Some(0) {
+            span class="fact-note" { (NETWORK_FEE_NOTE) }
         }
     }
 }
@@ -448,6 +489,7 @@ mod tests {
             },
             Some(&terms(true)),
             &destination,
+            Some(50),
         )
         .into_string()
     }
@@ -456,9 +498,48 @@ mod tests {
     fn entry_form_shows_the_ticket_price_the_browser_approves() {
         let html = form(PayoutDestination::LoggedOut);
         assert!(html.contains(r#"data-ticket-price="5250""#));
-        assert!(html.contains("5,250 sats"));
-        assert!(html.contains("5,000 entry fee + 250 coordinator fee"));
-        assert!(html.contains("Pay 5,250 sats and enter"));
+        assert!(html.contains(r#"data-network-fee="50""#));
+        assert!(html.contains(r#"<span id="ticketTotal">5,300 sats</span>"#));
+        assert!(html.contains("Pay 5,300 sats and enter"));
+    }
+
+    /// Entry, service and network fees are three separate amounts, and the network fee says
+    /// what it is in one line. The estimate carries an id for the ticket's own fee to replace.
+    #[test]
+    fn entry_form_shows_the_three_price_lines() {
+        let html = form(PayoutDestination::LoggedOut);
+        assert!(html.contains(
+            r#"entry 5,000 sats · service 5% 250 sats · network <span id="networkFee">50 sats</span>"#
+        ));
+        assert!(html.contains(NETWORK_FEE_NOTE));
+        assert_eq!(html.matches("network fee").count(), 1, "one line about the network fee");
+
+        // Without an estimate no price is claimed for it, and no ticket can be issued either.
+        let unavailable = entry_form(
+            &view("c1", Phase::Upcoming, 60),
+            &Forecasts::Pending(Pending::Loading),
+            Some(&terms(true)),
+            &PayoutDestination::LoggedOut,
+            None,
+        )
+        .into_string();
+        assert!(unavailable.contains("5,250 sats + network fee"));
+        assert!(unavailable.contains(r#"<span id="networkFee">unavailable right now</span>"#));
+        assert!(!unavailable.contains("data-network-fee"));
+        assert!(unavailable.contains("Pay and enter"));
+
+        // With network fees off there is no line for one.
+        let off = entry_form(
+            &view("c1", Phase::Upcoming, 60),
+            &Forecasts::Pending(Pending::Loading),
+            Some(&terms(true)),
+            &PayoutDestination::LoggedOut,
+            Some(0),
+        )
+        .into_string();
+        assert!(off.contains("entry 5,000 sats · service 5% 250 sats</span>"));
+        assert!(!off.contains("networkFee") && !off.contains(NETWORK_FEE_NOTE));
+        assert!(off.contains("Pay 5,250 sats and enter"));
     }
 
     #[test]
@@ -498,6 +579,7 @@ mod tests {
             },
             Some(&terms(true)),
             &PayoutDestination::Address("freya@lnurl.example".into()),
+            Some(50),
         )
         .into_string();
         assert!(html.contains("40 entered"));
@@ -568,6 +650,7 @@ mod tests {
             },
             None,
             &PayoutDestination::LoggedOut,
+            Some(50),
         )
         .into_string();
         assert!(html.contains("Par 67.4–70.2°F"), "{html}");
@@ -594,6 +677,7 @@ mod tests {
             },
             None,
             &PayoutDestination::LoggedOut,
+            Some(50),
         )
         .into_string();
         assert!(
@@ -621,6 +705,7 @@ mod tests {
             &forecasts,
             None,
             &PayoutDestination::LoggedOut,
+            Some(50),
         )
         .into_string();
         assert!(html.contains("no forecast yet"));

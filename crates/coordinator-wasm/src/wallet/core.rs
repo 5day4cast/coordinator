@@ -1356,6 +1356,74 @@ mod tests {
         }
     }
 
+    /// A ticket's network fee is part of its price: the invoice charges the form's price plus the
+    /// fee, and the escrow may pay out the coordinator's and network fees, but no more.
+    #[test]
+    fn payout_registration_takes_the_network_fee_as_part_of_the_price() {
+        use coordinator_ark_escrow::{EntryEscrow, EscrowTerms, RelativeTimelock};
+        use coordinator_core::keymeld::ArkEscrowPolicy;
+        use dlctix::bitcoin::absolute::LockTime;
+
+        let f = fixture();
+        let (assignment, base) = payout_assignment(&f);
+        let expiry = 1_900_000_000;
+        let xonly =
+            |point: Point| ark::XOnlyPublicKey::from_slice(&point.serialize_xonly()).unwrap();
+        let player = xonly(f.wallet.entry_key(f.entry_id).unwrap().point());
+        let market_maker = xonly(f.params.market_maker.pubkey);
+        let server = xonly(Scalar::from_slice(&[5; 32]).unwrap().base_point_mul());
+        // Each of the two players' 50,000 sat share of the pool, a 100 sat coordinator fee and a
+        // 50 sat network fee.
+        let check = |amount_sats: u64, invoiced_sats: u64, max_fee_sats: u64| {
+            let mut consent = base.clone();
+            consent.oracle_announcement.expiry = Some(expiry);
+            consent.ticket_amount_sats = amount_sats;
+            consent.ticket_invoice = test_invoice(invoiced_sats * 1_000).to_string();
+            let refund_locktime = LockTime::from_time(expiry).unwrap();
+            let exit_delay = RelativeTimelock::Seconds(2048);
+            let escrow = EntryEscrow::new(EscrowTerms {
+                player,
+                coordinator: market_maker,
+                server,
+                refund_locktime,
+                exit_delay,
+                unilateral_refund_delay: EscrowTerms::unilateral_refund_delay_for(
+                    refund_locktime,
+                    exit_delay,
+                    expiry - 86_400,
+                )
+                .unwrap(),
+            })
+            .unwrap();
+            let mut assignment = assignment.clone();
+            let mut policy: PayoutPolicy =
+                serde_json::from_str(assignment.payout_policy.as_deref().unwrap()).unwrap();
+            let mut terms: serde_json::Value =
+                serde_json::from_str(&policy.contract_terms).unwrap();
+            terms["event"] = serde_json::to_value(&consent.oracle_announcement).unwrap();
+            policy.contract_terms = terms.to_string();
+            policy.ark_escrow = Some(ArkEscrowPolicy {
+                escrow_tap_tree: hex::encode(escrow.vtxo_script().encode_tap_tree()),
+                max_fee_sats,
+                max_refund_fee_sats: 100,
+                checkpoint_exit_script: hex::encode([0x51]),
+            });
+            assignment.payout_policy = Some(serde_json::to_string(&policy).unwrap());
+            f.wallet
+                .validate_payout_registration(f.entry_id, &assignment, &consent)
+        };
+
+        check(50_150, 50_150, 150).unwrap();
+        for (label, result) in [
+            ("escrow fee beyond the ticket", check(50_150, 50_150, 151)),
+            ("the fee without the price", check(50_100, 50_100, 150)),
+            ("an invoice without the fee", check(50_150, 50_100, 150)),
+            ("an invoice above the price", check(50_150, 50_151, 150)),
+        ] {
+            assert!(result.is_err(), "{label}");
+        }
+    }
+
     fn invoice_consent(f: &mut Fixture) -> PayoutInvoiceConsent {
         let attestation = Scalar::from_slice(&[8; 32]).unwrap();
         f.params.event.locking_points[0] = MaybePoint::Valid(attestation.base_point_mul());

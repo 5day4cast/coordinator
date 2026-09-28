@@ -72,11 +72,64 @@ pub struct TicketResponse {
     pub payment_request: String,
     pub payment_hash: String,
     pub amount_sats: u64,
+    /// The price line by line. Coordinators from before the network fee leave these out.
+    #[serde(default)]
+    pub entry_fee_sats: Option<u64>,
+    #[serde(default)]
+    pub coordinator_fee_sats: Option<u64>,
+    #[serde(default)]
+    pub network_fee_sats: Option<u64>,
+    #[serde(default)]
+    pub ticket_price_sats: Option<u64>,
     pub keymeld_user_id: Uuid,
     pub keymeld_gateway_url: Option<String>,
     pub keymeld_session_id: Option<String>,
     pub keymeld_enclave_public_key: Option<String>,
     pub keymeld_registration: Option<RegistrationAssignment>,
+}
+
+impl TicketResponse {
+    /// Check the ticket's price as a wallet does before paying: its lines add up to what the
+    /// invoice charges, and its escrow may pay out no more than the ticket above the stake. The
+    /// network fee is the coordinator's to set; it is fixed on the ticket when issued.
+    pub fn check_price(&self) -> Result<()> {
+        let entry_fee = match (
+            self.entry_fee_sats,
+            self.coordinator_fee_sats,
+            self.network_fee_sats,
+            self.ticket_price_sats,
+        ) {
+            (None, None, None, None) => None,
+            (Some(entry), Some(coordinator), Some(network), Some(price)) => {
+                anyhow::ensure!(
+                    entry.checked_add(coordinator).and_then(|v| v.checked_add(network))
+                        == Some(price)
+                        && price == self.amount_sats,
+                    "Ticket price lines do not add up to its invoice: {entry} + {coordinator} + \
+                     {network} for {price}, invoiced at {}",
+                    self.amount_sats
+                );
+                Some(entry)
+            }
+            _ => anyhow::bail!("Ticket price has only some of its lines"),
+        };
+        let escrow = self
+            .keymeld_registration
+            .as_ref()
+            .and_then(|assignment| assignment.payout_policy.as_deref())
+            .map(serde_json::from_str::<coordinator_core::keymeld::PayoutPolicy>)
+            .transpose()?
+            .and_then(|policy| policy.ark_escrow);
+        if let (Some(escrow), Some(entry_fee)) = (escrow, entry_fee) {
+            anyhow::ensure!(
+                escrow.max_fee_sats.checked_add(entry_fee) <= Some(self.amount_sats),
+                "The escrow may pay out {} sats beyond the {entry_fee} sat stake of a {} sat ticket",
+                escrow.max_fee_sats,
+                self.amount_sats
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Weather prediction choices for an entry
@@ -378,5 +431,55 @@ impl CoordinatorClient {
         resp.json()
             .await
             .context("Failed to parse entries response")
+    }
+}
+
+#[cfg(test)]
+mod ticket_price_tests {
+    use super::*;
+
+    fn ticket(value: serde_json::Value) -> TicketResponse {
+        let mut base = serde_json::json!({
+            "ticket_id": Uuid::nil(),
+            "payment_request": "lnbc1",
+            "payment_hash": "00",
+            "amount_sats": 5_300,
+            "keymeld_user_id": Uuid::nil(),
+            "keymeld_gateway_url": null,
+            "keymeld_session_id": null,
+            "keymeld_enclave_public_key": null,
+            "keymeld_registration": null,
+        });
+        base.as_object_mut()
+            .unwrap()
+            .extend(value.as_object().unwrap().clone());
+        serde_json::from_value(base).unwrap()
+    }
+
+    fn priced(network: u64, amount: u64) -> TicketResponse {
+        ticket(serde_json::json!({
+            "amount_sats": amount,
+            "entry_fee_sats": 5_000,
+            "coordinator_fee_sats": 250,
+            "network_fee_sats": network,
+            "ticket_price_sats": 5_250 + network,
+        }))
+    }
+
+    #[test]
+    fn a_ticket_with_a_network_fee_is_paid_at_its_full_price() {
+        priced(50, 5_300).check_price().unwrap();
+        priced(0, 5_250).check_price().unwrap();
+        // An older coordinator sends no lines.
+        ticket(serde_json::json!({})).check_price().unwrap();
+    }
+
+    #[test]
+    fn price_lines_that_do_not_add_up_are_refused() {
+        assert!(priced(50, 5_250).check_price().is_err());
+        assert!(priced(50, 5_301).check_price().is_err());
+        assert!(ticket(serde_json::json!({ "network_fee_sats": 50 }))
+            .check_price()
+            .is_err());
     }
 }

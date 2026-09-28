@@ -2237,6 +2237,65 @@ impl CompetitionStore {
             .await
     }
 
+    /// The network fee fixed for the ticket's `hash`, if one is.
+    pub async fn fixed_ticket_network_fee(
+        &self,
+        ticket_id: Uuid,
+        hash: &str,
+    ) -> Result<Option<u64>, sqlx::Error> {
+        let fee: Option<i64> = sqlx::query_scalar(
+            "SELECT network_fee_sats FROM tickets
+             WHERE id = ? AND hash = ? AND network_fee_hash = hash",
+        )
+        .bind(ticket_id.to_string())
+        .bind(hash)
+        .fetch_optional(self.db_connection.read())
+        .await?;
+        fee.map(|fee| u64::try_from(fee).map_err(|e| sqlx::Error::Decode(Box::new(e))))
+            .transpose()
+    }
+
+    /// Fix `network_fee_sats` for the ticket's current hash, unless a fee is already fixed for
+    /// it, and return the fee that is. `None` if the ticket's hash or invoice changed.
+    pub async fn fix_ticket_network_fee(
+        &self,
+        ticket: &Ticket,
+        network_fee_sats: u64,
+    ) -> Result<Option<u64>, DatabaseWriteError> {
+        let ticket_id = ticket.id.to_string();
+        let hash = ticket.hash.clone();
+        let fee = i64::try_from(network_fee_sats)
+            .map_err(|e| DatabaseWriteError::Sqlx(sqlx::Error::Encode(Box::new(e))))?;
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let mut tx = pool.begin().await?;
+                sqlx::query(
+                    "UPDATE tickets SET network_fee_sats = ?, network_fee_hash = hash
+                     WHERE id = ? AND hash = ? AND network_fee_hash IS NOT hash
+                       AND payment_request IS NULL AND paid_at IS NULL
+                       AND reserved_by IS NOT NULL",
+                )
+                .bind(fee)
+                .bind(&ticket_id)
+                .bind(&hash)
+                .execute(&mut *tx)
+                .await?;
+                let fixed: Option<i64> = sqlx::query_scalar(
+                    "SELECT network_fee_sats FROM tickets
+                     WHERE id = ? AND hash = ? AND network_fee_hash = hash",
+                )
+                .bind(&ticket_id)
+                .bind(&hash)
+                .fetch_optional(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                fixed
+                    .map(|fee| u64::try_from(fee).map_err(|e| sqlx::Error::Decode(Box::new(e))))
+                    .transpose()
+            })
+            .await
+    }
+
     pub async fn clear_ticket_reservation(
         &self,
         ticket: &Ticket,

@@ -1990,6 +1990,11 @@ pub enum CompetitionError {
     Expired(String),
     #[error("Invalid state transition: {0}")]
     InvalidStateTransition(String),
+    /// What its entries paid beyond the pot does not cover the game's costs at the kickoff fee
+    /// rate, the rate is above the players' fee ceiling, or it has too few players for that
+    /// rate. Every entry is refunded.
+    #[error("Kickoff check failed: {0}")]
+    KickoffCheckFailed(String),
 }
 
 /// A NOT NULL integer or COUNT column as `u64`, failing closed on NULL or a
