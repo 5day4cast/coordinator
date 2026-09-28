@@ -213,7 +213,8 @@ impl NetworkFeeSettings {
 /// (the weights in `network_fee_settings`) plus `routing_and_liquidity_bps` of the pot, and the
 /// rate must be within the fee ceiling the players consented to. A pool also needs
 /// `min_players` unless the kickoff rate is at most `small_pools_max_sat_per_vb`, when its
-/// terms' own minimum holds. A pool that fails is cancelled and every entry refunded.
+/// terms' own minimum holds. A pool that fails checks again until `fee_wait_secs` after
+/// registration closes, and is then cancelled and every entry refunded.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KickoffCheckSettings {
@@ -221,6 +222,10 @@ pub struct KickoffCheckSettings {
     pub routing_and_liquidity_bps: u64,
     pub min_players: u64,
     pub small_pools_max_sat_per_vb: u64,
+    /// How long after registration closes a failing pool waits for fees to fall before it is
+    /// cancelled. Every way the check fails depends on the fee rate, so a pool checks again until
+    /// then.
+    pub fee_wait_secs: u64,
 }
 
 impl Default for KickoffCheckSettings {
@@ -230,6 +235,7 @@ impl Default for KickoffCheckSettings {
             routing_and_liquidity_bps: 50,
             min_players: 5,
             small_pools_max_sat_per_vb: 2,
+            fee_wait_secs: 3600,
         }
     }
 }

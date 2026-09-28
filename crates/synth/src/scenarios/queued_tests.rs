@@ -202,6 +202,8 @@ mod mock {
         pub kickoff_failed: BTreeSet<usize>,
         /// Pools that failed for another reason, by index.
         pub failed: BTreeSet<usize>,
+        /// Pools whose kickoff check waits for fees to fall until then, and passes after, by index.
+        pub fee_wait: std::collections::BTreeMap<usize, time::OffsetDateTime>,
     }
 
     type Shared = Arc<Mutex<Queue>>;
@@ -279,6 +281,26 @@ mod mock {
                         "passed": false},
                 })),
             ),
+            Some(index)
+                if state
+                    .fee_wait
+                    .get(&index)
+                    .is_some_and(|until| time::OffsetDateTime::now_utc() < *until) =>
+            {
+                let until = state.fee_wait[&index]
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap();
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "id": id, "created_at": AT, "event_submission": {}, "kind": "pool",
+                        "parent_id": state.id, "pool_index": index,
+                        "escrow_funds_confirmed_at": AT,
+                        "kickoff_check": {"players": 3, "min_players": 5, "sat_per_vb": 4,
+                            "passed": false, "retry_until": until},
+                    })),
+                )
+            }
             Some(index) if state.failed.contains(&index) => (
                 StatusCode::OK,
                 Json(json!({
@@ -545,4 +567,21 @@ async fn a_pool_that_fails_otherwise_fails_the_run() {
     run.mock.state.lock().unwrap().failed.insert(0);
     let (_, result) = run.after_entries().await;
     assert_eq!(result.unwrap_err().name, "wait_pools_event_created");
+}
+
+/// A pool's kickoff check waits for fees to fall, longer than synth waits for a state, and then
+/// passes: synth waits with it and follows the pool on, with nothing refunded.
+#[tokio::test]
+async fn a_pool_waiting_for_fees_to_fall_is_waited_for() {
+    let run = Run::new(QUEUED_SPLIT, &[14, 13]).await;
+    let until = time::OffsetDateTime::now_utc() + time::Duration::seconds(3);
+    run.mock.state.lock().unwrap().fee_wait.insert(1, until);
+    let (steps, result) = run.after_entries().await;
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert!(time::OffsetDateTime::now_utc() >= until);
+    assert!(!steps
+        .names()
+        .iter()
+        .any(|name| name.contains("kickoff_failed")));
+    assert!(run.mock.state.lock().unwrap().refund_lookups.is_empty());
 }

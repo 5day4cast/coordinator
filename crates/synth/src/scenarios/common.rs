@@ -41,14 +41,19 @@ pub(super) async fn wait_for_state(
     target_state: &str,
     config: &ScenarioConfig,
 ) -> Result<()> {
-    let deadline = Instant::now() + std::time::Duration::from_secs(config.state_timeout_secs);
+    let timeout = std::time::Duration::from_secs(config.state_timeout_secs);
+    let mut deadline = Instant::now() + timeout;
 
     loop {
+        let comp = client.get_competition(competition_id).await?;
+        // A kickoff check waiting for fees to fall holds the competition where it is; wait with it.
+        if let Some(until) = comp.kickoff_retry_until() {
+            let waiting = (until - OffsetDateTime::now_utc()).max(time::Duration::ZERO);
+            deadline = deadline.max(Instant::now() + waiting.unsigned_abs() + timeout);
+        }
         if Instant::now() > deadline {
             anyhow::bail!("Timeout waiting for state: {}", target_state);
         }
-
-        let comp = client.get_competition(competition_id).await?;
         let current = comp.inferred_status();
 
         if current == target_state || is_past_state(current, target_state) {

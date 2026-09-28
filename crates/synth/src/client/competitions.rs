@@ -180,6 +180,9 @@ pub struct KickoffCheck {
     pub min_players: u64,
     pub sat_per_vb: u64,
     pub passed: bool,
+    /// A failed check waits for fees to fall until then before the competition is cancelled.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub retry_until: Option<OffsetDateTime>,
 }
 
 impl CompetitionResponse {
@@ -196,11 +199,22 @@ impl CompetitionResponse {
             .is_some_and(|seats| self.total_paid_entries >= seats)
     }
 
-    /// Its kickoff check failed, which cancels it and refunds every entry.
+    /// Its kickoff check failed and it was cancelled for it, refunding every entry. Not while the
+    /// check is still waiting for fees to fall.
     pub fn failed_kickoff(&self) -> bool {
+        (self.failed_at.is_some() || self.cancelled_at.is_some())
+            && self
+                .kickoff_check
+                .as_ref()
+                .is_some_and(|check| !check.passed)
+    }
+
+    /// When its kickoff check stops waiting for fees to fall, if it is waiting.
+    pub fn kickoff_retry_until(&self) -> Option<OffsetDateTime> {
         self.kickoff_check
             .as_ref()
-            .is_some_and(|check| !check.passed)
+            .filter(|check| !check.passed)
+            .and_then(|check| check.retry_until)
     }
 }
 
