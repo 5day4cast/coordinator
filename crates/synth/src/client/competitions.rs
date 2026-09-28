@@ -204,7 +204,6 @@ impl CompetitionResponse {
     }
 }
 
-
 impl CompetitionResponse {
     /// The outcome transaction's id, once it is broadcast.
     pub fn outcome_txid(&self) -> Option<String> {

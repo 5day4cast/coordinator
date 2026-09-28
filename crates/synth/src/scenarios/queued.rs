@@ -290,18 +290,12 @@ pub(super) async fn after_entries(
         "placed": placed.len(),
     }));
     steps.push(step);
-    for state in POOL_STATES {
-        let (step, ()) = run_step(&format!("wait_pools_{state}"), || {
-            wait_for_pools_state(client, &pools, state, config)
-        })
-        .await?;
-        steps.push(step);
-    }
+    follow_pools(client, users, config, traces, &pools, &placed, steps).await?;
 
     // A paid ticket without an entry stays on the queue, which refunds it.
     let leftover: Vec<EntryTrace> = traces
         .iter()
-        .filter(|trace| trace.paid && trace.ticket_id.is_some_and(|id| !placed.contains(&id)))
+        .filter(|trace| trace.paid && trace.ticket_id.is_some_and(|id| !placed.contains_key(&id)))
         .cloned()
         .collect();
     ensure_step("verify_leftover", leftover.len() == shape.abandoned, || {
@@ -315,6 +309,82 @@ pub(super) async fn after_entries(
         return Ok(());
     }
     super::user_behavior::collect_refunds(client, users, queue_id, config, &leftover, steps).await
+}
+
+/// Follow every pool to its attestation. A pool whose kickoff check fails, as it can when network
+/// fees rise after the run drew its players, is cancelled and refunds its entries: synth's players'
+/// refunds are collected at the pool, and the other pools are followed on. Any other failure fails
+/// the run.
+async fn follow_pools(
+    client: &CoordinatorClient,
+    users: &[SynthUser],
+    config: &ScenarioConfig,
+    traces: &[EntryTrace],
+    pools: &[PoolSummary],
+    placed: &BTreeMap<Uuid, Uuid>,
+    steps: &mut Steps,
+) -> std::result::Result<(), Box<StepResult>> {
+    let mut active = pools.to_vec();
+    for state in POOL_STATES {
+        while !active.is_empty() {
+            let failed = match run_step(&format!("wait_pools_{state}"), || {
+                wait_for_pools_state(client, &active, state, config)
+            })
+            .await
+            {
+                Ok((step, ())) => {
+                    steps.push(step);
+                    break;
+                }
+                Err(failed) => failed,
+            };
+            let mut dropped = Vec::new();
+            for pool in &active {
+                let Ok(competition) = client.get_competition(&pool.competition_id).await else {
+                    continue;
+                };
+                if competition.failed_kickoff() {
+                    dropped.push((pool.clone(), competition.kickoff_check));
+                }
+            }
+            if dropped.is_empty() {
+                return Err(failed);
+            }
+            for (pool, check) in dropped {
+                active.retain(|other| other.competition_id != pool.competition_id);
+                steps.push(StepResult {
+                    name: format!("pool_{}_kickoff_failed", pool.pool_index),
+                    status: StepStatus::Passed,
+                    duration_ms: failed.duration_ms,
+                    details: Some(serde_json::json!({
+                        "pool": pool.competition_id,
+                        "kickoff_check": check,
+                    })),
+                    error: None,
+                });
+                let refunded: Vec<EntryTrace> = traces
+                    .iter()
+                    .filter(|trace| {
+                        trace.paid
+                            && trace
+                                .ticket_id
+                                .is_some_and(|id| placed.get(&id) == Some(&pool.competition_id))
+                    })
+                    .cloned()
+                    .collect();
+                super::user_behavior::collect_refunds(
+                    client,
+                    users,
+                    &pool.competition_id,
+                    config,
+                    &refunded,
+                    steps,
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn ensure_step(
@@ -334,7 +404,8 @@ fn ensure_step(
     }))
 }
 
-/// Check the queue's pools against the players' own entries, and return the tickets placed.
+/// Check the queue's pools against the players' own entries, and return each placed ticket's
+/// pool.
 async fn verify_pools(
     client: &CoordinatorClient,
     users: &[SynthUser],
@@ -342,7 +413,7 @@ async fn verify_pools(
     shape: &QueueShape,
     pools: &[PoolSummary],
     traces: &[EntryTrace],
-) -> Result<BTreeSet<Uuid>> {
+) -> Result<BTreeMap<Uuid, Uuid>> {
     for pool in pools {
         let child = client.get_competition(&pool.competition_id).await?;
         ensure!(
@@ -367,7 +438,7 @@ async fn verify_pools(
     );
     let placements = placements(client, users, traces).await?;
     check_split(&shape.rules, pools, &complete, &placements)?;
-    Ok(placements.into_keys().collect())
+    Ok(placements)
 }
 
 /// Each submitted entry's competition, by ticket: its pool once pools form. Each player lists

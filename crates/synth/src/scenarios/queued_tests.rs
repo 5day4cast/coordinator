@@ -198,6 +198,10 @@ mod mock {
         pub refunded: BTreeSet<Uuid>,
         /// Refunds asked about, by competition and ticket.
         pub refund_lookups: Vec<(Uuid, Uuid)>,
+        /// Pools cancelled by their kickoff check, by index.
+        pub kickoff_failed: BTreeSet<usize>,
+        /// Pools that failed for another reason, by index.
+        pub failed: BTreeSet<usize>,
     }
 
     type Shared = Arc<Mutex<Queue>>;
@@ -265,6 +269,24 @@ mod mock {
             );
         }
         match state.pools.iter().position(|(pool, _)| *pool == id) {
+            Some(index) if state.kickoff_failed.contains(&index) => (
+                StatusCode::OK,
+                Json(json!({
+                    "id": id, "created_at": AT, "event_submission": {}, "kind": "pool",
+                    "parent_id": state.id, "pool_index": index,
+                    "escrow_funds_confirmed_at": AT, "failed_at": AT,
+                    "kickoff_check": {"players": 3, "min_players": 5, "sat_per_vb": 4,
+                        "passed": false},
+                })),
+            ),
+            Some(index) if state.failed.contains(&index) => (
+                StatusCode::OK,
+                Json(json!({
+                    "id": id, "created_at": AT, "event_submission": {}, "kind": "pool",
+                    "parent_id": state.id, "pool_index": index,
+                    "escrow_funds_confirmed_at": AT, "failed_at": AT,
+                })),
+            ),
             Some(index) => (
                 StatusCode::OK,
                 Json(json!({
@@ -480,4 +502,47 @@ async fn other_players_can_make_a_too_small_queue_form_pools() {
         );
         assert_eq!(names.last(), Some(&"wait_pools_awaiting_attestation"));
     }
+}
+
+/// Fees rose after the run drew its players, and one pool's kickoff check cancelled it: its
+/// players' refunds are collected at the pool, and the other pool still runs.
+#[tokio::test]
+async fn a_pool_cancelled_by_its_kickoff_check_is_refunded_while_the_others_run() {
+    let run = Run::new(QUEUED_SPLIT, &[14, 13]).await;
+    run.refund_everyone();
+    let pool = run.mock.state.lock().unwrap().pools[1].clone();
+    run.mock.state.lock().unwrap().kickoff_failed.insert(1);
+    let (steps, result) = run.after_entries().await;
+    assert!(result.is_ok(), "{:?}", result.err());
+    let names = steps.names();
+    assert!(names.contains(&"pool_1_kickoff_failed"), "{names:?}");
+    assert_eq!(names.last(), Some(&"wait_pools_awaiting_attestation"));
+    let lookups = run.mock.state.lock().unwrap().refund_lookups.clone();
+    let refunded: BTreeSet<Uuid> = lookups.iter().map(|(_, ticket)| *ticket).collect();
+    assert_eq!(
+        refunded,
+        pool.1.iter().copied().collect(),
+        "the cancelled pool's tickets"
+    );
+    assert!(lookups
+        .iter()
+        .all(|(competition, _)| *competition == pool.0));
+
+    // Every pool cancelled: all are refunded, and the run still passes.
+    let run = Run::new(QUEUED_SPLIT, &[14, 13]).await;
+    run.refund_everyone();
+    run.mock.state.lock().unwrap().kickoff_failed.extend([0, 1]);
+    let (steps, result) = run.after_entries().await;
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(run.mock.state.lock().unwrap().refund_lookups.len(), 27);
+    assert!(steps.names().contains(&"pool_0_kickoff_failed"));
+}
+
+/// A pool that failed for any other reason still fails the run.
+#[tokio::test]
+async fn a_pool_that_fails_otherwise_fails_the_run() {
+    let run = Run::new(QUEUED_SPLIT, &[14, 13]).await;
+    run.mock.state.lock().unwrap().failed.insert(0);
+    let (_, result) = run.after_entries().await;
+    assert_eq!(result.unwrap_err().name, "wait_pools_event_created");
 }
