@@ -1,8 +1,8 @@
 //! Each ticket's share of the Bitcoin network fees: its own line on the ticket's price.
 //!
 //! A game costs `base_vbytes + vbytes_per_player × players` vbytes on chain. Each entry pays its
-//! share of that for a pool of `pool_players` (5: pools start small), at the current fee estimate
-//! rounded up to whole sat/vB as contracts are built (floored at `min_sat_per_vb`), times
+//! share of that for a pool of `pool_players` (5: pools start small), at the rate contracts are
+//! built at: the current estimate plus a margin (floored at `min_sat_per_vb`), times
 //! `multiplier_percent`. The fee is fixed on a ticket's
 //! payment hash the first time that hash is priced, before its escrow consent and invoice exist,
 //! and never changes after; a ticket whose hash rotates is priced again. The coordinator keeps
@@ -117,13 +117,13 @@ impl Coordinator {
     }
 }
 
-/// The rate a ticket's network fee is priced at: LND's `estimate` rounded up to whole sat/vB, as
-/// contracts are built (`fee_rate_from_estimate`), and at least `min_sat_per_vb`. The kickoff
-/// check costs a pool at the contract rate, so pricing at any lower rate would cancel pools
-/// whose fees were never short.
+/// The rate a ticket's network fee is priced at: the rate contracts are built at from LND's
+/// `estimate` (`fee_rate_from_estimate`: the estimate plus its margin), and at least
+/// `min_sat_per_vb`. The kickoff check costs a pool at the contract rate, so pricing at any lower
+/// rate would cancel pools whose fees were never short.
 fn priced_sat_per_vb(estimate: f64, min_sat_per_vb: u64) -> Result<f64, anyhow::Error> {
     let rate = crate::infra::bitcoin::fee_rate_from_estimate(estimate)?;
-    Ok(rate.to_sat_per_vb_ceil().max(min_sat_per_vb) as f64)
+    Ok((rate.to_sat_per_kwu() as f64 / 250.0).max(min_sat_per_vb as f64))
 }
 
 impl Coordinator {
@@ -245,13 +245,13 @@ mod tests {
     /// Tickets are priced at the rate contracts are built at, so a kickoff at the same estimate
     /// costs exactly what was priced.
     #[test]
-    fn priced_at_the_rounded_up_contract_rate() {
-        // LND's floor, 253 sat/kWU, is 1.012 sat/vB; contracts are built at 2.
-        assert_eq!(priced_sat_per_vb(1.012, 1).unwrap(), 2.0);
-        assert_eq!(fee(&NetworkFeeSettings::default(), 2.0), 284);
-        assert_eq!(priced_sat_per_vb(2.2, 1).unwrap(), 3.0);
-        assert_eq!(priced_sat_per_vb(3.0, 1).unwrap(), 3.0);
-        assert_eq!(priced_sat_per_vb(0.25, 1).unwrap(), 1.0);
+    fn priced_at_the_contract_rate() {
+        // LND's floor, 253 sat/kWU, is 1.012 sat/vB; contracts are built at it plus 0.25.
+        assert_eq!(priced_sat_per_vb(1.012, 1).unwrap(), 1.264);
+        assert_eq!(fee(&NetworkFeeSettings::default(), 1.264), 179);
+        assert_eq!(priced_sat_per_vb(2.2, 1).unwrap(), 2.452);
+        assert_eq!(priced_sat_per_vb(3.0, 1).unwrap(), 3.3);
+        assert_eq!(priced_sat_per_vb(0.25, 1).unwrap(), 1.012);
         assert_eq!(priced_sat_per_vb(1.0, 4).unwrap(), 4.0);
         assert!(priced_sat_per_vb(f64::NAN, 1).is_err());
     }

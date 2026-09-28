@@ -580,8 +580,8 @@ Pending: whether the closing sweep can board back into Arkade.
 
 Each ticket carries its share of the pool's chain cost, as its own line next to the entry and service fees.
 It is priced for the smallest pool the game runs, five players, with a 50% margin: `ceil((342 + 26 × 5) / 5 × rate × 1.5)` sats.
-The rate is the current two-block estimate rounded up to a whole sat/vB, as contracts are built, so the kickoff check costs a pool at the rate its fees were priced at.
-That is 284 sats at LND's floor of 1.012 sat/vB, which contracts round up to 2.
+The rate is the one contracts are built at: the current two-block estimate plus the larger of 10% and 0.25 sat/vB, so the kickoff check costs a pool at the rate its fees were priced at.
+That is 179 sats at LND's floor of 1.012 sat/vB, which contracts build at 1.264.
 The fee is fixed on the ticket's invoice when the ticket is issued and does not change for that payment hash.
 It is refunded with the escrow.
 No ticket is issued without a fee estimate, and no ticket is issued while the fee would be more than 10% of the entry fee; the entry form says entries are paused.
@@ -597,7 +597,7 @@ It passes only if all of these hold:
 - the kickoff rate is within the fee ceiling in the terms;
 - the pool has enough players for the rate: its terms' minimum while the rate is at most 2 sat/vB, and at least five above that.
 
-A pool that fails is cancelled and every entry refunded through its escrow, network fee included.
+Every way the check fails depends on the fee rate, so a pool that fails checks again until `kickoff_check_settings.fee_wait_secs` (an hour) after registration closed. If it still fails then, it is cancelled and every entry refunded through its escrow, network fee included.
 A check that cannot run yet, for example without a fee estimate, waits and runs again; nothing is built without a passed check.
 The contract is built at the rate the check passed at.
 The coordinator refuses to create a competition of fewer than five seats while the rate is above 2 sat/vB.
@@ -614,7 +614,7 @@ So the kickoff collects at most the lowest cap times the number of players, the 
 | The swap fails before the escrow exists | The Lightning payment fails back. |
 | Fewer players than the minimum pool | Every escrow is refunded after `T`. |
 | Kickoff cannot complete before `T` | Every escrow is refunded after `T`. |
-| A pool fails its kickoff check | The pool is cancelled and every escrow refunded. |
+| A pool fails its kickoff check | The pool waits up to an hour for fees to fall, then is cancelled and every escrow refunded. |
 | A pool cannot be signed within a batch | Kickoff retries in the next batch. Repeated failures refund that pool. |
 | Ark operator unavailable before kickoff | Kickoff waits. Players can unroll and exit alone, no earlier than `T` plus the exit delay. |
 | After funding | Today's pool lifecycle applies. |
