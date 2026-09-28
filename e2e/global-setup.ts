@@ -46,9 +46,11 @@ export default async function globalSetup() {
 
   // Create a test competition via the operator API
   const now = new Date();
-  const startDate = new Date(now.getTime() + 60 * 60 * 1000); // 1 hour from now
-  const endDate = new Date(now.getTime() + 2 * 60 * 60 * 1000); // 2 hours from now
-  const signingDate = new Date(now.getTime() + 3 * 60 * 60 * 1000); // 3 hours from now
+  // A full-day window: the coordinator takes full days, or a day or night half.
+  const hour = 60 * 60 * 1000;
+  const startDate = new Date(now.getTime() + hour);
+  const endDate = new Date(startDate.getTime() + 24 * hour);
+  const signingDate = new Date(endDate.getTime() + hour);
 
   const formData = new URLSearchParams();
   // NOAA requires UUIDv7: preserve random/variant bits and use the current 48-bit timestamp.
@@ -63,7 +65,8 @@ export default async function globalSetup() {
   formData.append("end_observation_date", endDate.toISOString());
   formData.append("number_of_values_per_entry", "9");
   formData.append("total_allowed_entries", "10");
-  formData.append("entry_fee", "1000");
+  // About $5: large enough that the network fee is under the 10% share that pauses entries.
+  formData.append("entry_fee", "5000");
   formData.append("coordinator_fee_percentage", "10");
   formData.append("number_of_places_win", "3");
   formData.append("locations", "KORD");
