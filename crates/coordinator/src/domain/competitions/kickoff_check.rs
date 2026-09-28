@@ -500,6 +500,26 @@ mod tests {
         assert_eq!(check.margin_sats, -(944 + 251));
     }
 
+    /// Priced and checked at the same rounded-up rate, a small pool passes at LND's floor, and a
+    /// full five still passes when the estimate more than doubles before kickoff.
+    #[test]
+    fn pools_priced_at_the_contract_rate_pass_their_check() {
+        let settings = NetworkFeeSettings::default();
+        let fee_at = |sat_per_vb: f64| network_fee_sats(&settings, sat_per_vb).unwrap();
+        let pool = |players: u64, network: u64| KickoffPool {
+            players,
+            paid_places: 1,
+            pot_sats: players * 5_000,
+            paid_sats: players * (150 + network),
+            template_min_players: 2,
+        };
+        // LND's floor, 1.012 sat/vB: priced and built at 2.
+        assert!(check_at(pool(2, fee_at(2.0)), 2).passed);
+        assert!(check_at(pool(3, fee_at(2.0)), 2).passed);
+        // Priced at 2; by kickoff the estimate is 2.2, so the contract is built at 3.
+        assert!(check_at(pool(5, fee_at(2.0)), 3).passed);
+    }
+
     /// Two or three players start a pool only while fees are extremely low; above
     /// `small_pools_max_sat_per_vb` a pool needs five, however much its entries paid.
     #[test]
