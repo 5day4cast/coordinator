@@ -1476,7 +1476,7 @@ mod tests {
         };
         let html = ledger_table(&ledger, Some(&trail)).into_string();
         assert!(html.contains("Ticket charges outside the pot are not included in the return"));
-        assert!(html.contains("including entry swap fees"));
+        assert!(html.contains("including network and entry swap fees"));
         assert!(html.contains("→ allocated for pot return</td><td class=\"num\">3,000"));
         assert!(html.contains("→ ticket charges outside the pot</td><td class=\"num\">300"));
         assert!(html.contains("entry routing, paid by the payer"));
