@@ -579,9 +579,17 @@ pub(super) async fn collect_refunds(
             .find(|user| user.name == trace.user)
             .expect("scenario user");
         let ticket = trace.ticket_id.expect("paid ticket");
+        let refund_at = trace.escrow.map(|escrow| escrow.refund_at);
         refunds.push(async move {
             let (mut step, refund) = run_step(&format!("refund_{}", user.name), || {
-                super::escrow_refund::wait_for_refund(client, user, competition_id, &ticket, config)
+                super::escrow_refund::wait_for_refund(
+                    client,
+                    user,
+                    competition_id,
+                    &ticket,
+                    refund_at,
+                    config,
+                )
             })
             .await?;
             step.details = Some(refund);

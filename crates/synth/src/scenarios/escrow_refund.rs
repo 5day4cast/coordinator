@@ -84,14 +84,29 @@ pub(super) async fn create_competition(
 }
 
 /// Wait for a ticket's refund to settle, which is the swap service claiming what it paid for.
+///
+/// An escrow can be refunded only once its refund leaf opens at `refund_at` (UNIX seconds), a day
+/// after the competition closed, so the wait lasts until then and `refund_timeout_secs` more,
+/// looking once a minute until it opens.
 pub(super) async fn wait_for_refund(
     client: &CoordinatorClient,
     user: &SynthUser,
     competition_id: &Uuid,
     ticket_id: &Uuid,
+    refund_at: Option<i64>,
     config: &ScenarioConfig,
 ) -> Result<serde_json::Value> {
-    let deadline = Instant::now() + std::time::Duration::from_secs(config.refund_timeout_secs);
+    let timeout = std::time::Duration::from_secs(config.refund_timeout_secs);
+    let until_open = refund_at
+        .and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok())
+        .map(|at| {
+            (at - OffsetDateTime::now_utc())
+                .max(time::Duration::ZERO)
+                .unsigned_abs()
+        })
+        .unwrap_or_default();
+    let opens = Instant::now() + until_open;
+    let deadline = opens + timeout;
     let mut last = None;
     while Instant::now() < deadline {
         let refund = client
@@ -115,7 +130,14 @@ pub(super) async fn wait_for_refund(
             }
             last = Some(refund.state);
         }
-        tokio::time::sleep(std::time::Duration::from_secs(config.poll_interval_secs)).await;
+        let poll = std::time::Duration::from_secs(config.poll_interval_secs);
+        let wait = if Instant::now() < opens {
+            poll.max(std::time::Duration::from_secs(60))
+                .min(opens.saturating_duration_since(Instant::now()))
+        } else {
+            poll
+        };
+        tokio::time::sleep(wait).await;
     }
     anyhow::bail!(
         "the refund of {}'s ticket stopped at {}",
