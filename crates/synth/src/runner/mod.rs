@@ -1,3 +1,5 @@
+pub mod lanes;
+
 use crate::client::CoordinatorClient;
 use crate::config::SchedulerConfig;
 use crate::db::SynthDb;
@@ -6,11 +8,13 @@ use crate::scenarios::{
     self, ScenarioConfig, ScenarioResult, ScenarioStatus, StepResult, StepStatus,
 };
 use anyhow::Result;
-use log::{error, info};
+use dashmap::DashMap;
+use log::{error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot, Mutex};
+use uuid::Uuid;
 
 /// The scenarios synth runs, by the names runs are started with.
 pub const SCENARIOS: &[&str] = &[
@@ -34,10 +38,12 @@ fn scheduled_selection<'a>(scenarios: &[&'a str], windows: &[u64], cycle: usize)
     )
 }
 
-/// The run in progress, and the step it is on.
+/// A run in progress, and the step it is on.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LiveRun {
     pub run_id: String,
+    /// The competition the run plays, by the id synth chose for it when the run was planned.
+    pub competition_id: Uuid,
     pub scenario: String,
     #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
@@ -51,8 +57,13 @@ pub struct Runner {
     db: SynthDb,
     events: Events,
     last_result: Arc<Mutex<Option<ScenarioResult>>>,
-    live: Arc<std::sync::Mutex<Option<LiveRun>>>,
+    /// Every run in progress, by its competition: runs overlap, each moving its own competition
+    /// through its states.
+    live: Live,
 }
+
+/// Runs in progress, by competition id.
+type Live = Arc<DashMap<Uuid, LiveRun>>;
 
 tokio::task_local! {
     /// The run a scenario is recording into, for the steps it records.
@@ -63,8 +74,9 @@ tokio::task_local! {
 #[derive(Clone)]
 struct Recorder {
     run_id: String,
+    competition_id: Uuid,
     events: Events,
-    live: Arc<std::sync::Mutex<Option<LiveRun>>>,
+    live: Live,
     steps: mpsc::UnboundedSender<Record>,
 }
 
@@ -82,7 +94,7 @@ enum Record {
 /// Announce that the running scenario has begun `step`. Does nothing outside a run.
 pub(crate) fn step_started(step: &str) {
     let _ = RECORDER.try_with(|recorder| {
-        if let Some(live) = recorder.live.lock().expect("live run lock").as_mut() {
+        if let Some(mut live) = recorder.live.get_mut(&recorder.competition_id) {
             live.current_step = Some(step.to_string());
         }
         recorder.events.send(Event::StepStarted {
@@ -198,7 +210,7 @@ impl Runner {
             db,
             events,
             last_result: Arc::new(Mutex::new(None)),
-            live: Arc::new(std::sync::Mutex::new(None)),
+            live: Arc::new(DashMap::new()),
         }
     }
 
@@ -222,8 +234,23 @@ impl Runner {
                 SCENARIOS.join(", ")
             ));
         }
+        let mut config = config.clone();
+        if let (Some(mix), None) = (&config.player_mix, config.min_players) {
+            config.min_players = mix.floor_at(self.network_fee_rate().await);
+        }
         let config_json = serde_json::to_string(&config.resolve_plan(scenario)?)?;
         self.db.create_run(scenario, Some(&config_json)).await
+    }
+
+    /// The coordinator's network fee rate, or None if it cannot be read, which is taken as high.
+    async fn network_fee_rate(&self) -> Option<f64> {
+        self.client
+            .network_fee_rate()
+            .await
+            .inspect_err(|e| {
+                warn!("Cannot read the network fee; drawing no small competitions: {e:#}")
+            })
+            .ok()
     }
 
     /// Run the scenario of a run [`Runner::record_run`] recorded.
@@ -251,13 +278,20 @@ impl Runner {
             config.planned_scenario.as_deref() == Some(scenario),
             "Recorded plan belongs to another scenario"
         );
-        info!("Starting scenario '{}' (run: {})", scenario, run_id);
-        *self.live.lock().expect("live run lock") = Some(LiveRun {
-            run_id: run_id.clone(),
-            scenario: scenario.to_string(),
-            started_at: OffsetDateTime::now_utc(),
-            current_step: None,
-        });
+        let competition_id = config
+            .competition_id
+            .ok_or_else(|| anyhow::anyhow!("Recorded plan has no competition id"))?;
+        info!("Starting scenario '{scenario}' (run: {run_id}, competition: {competition_id})");
+        self.live.insert(
+            competition_id,
+            LiveRun {
+                run_id: run_id.clone(),
+                competition_id,
+                scenario: scenario.to_string(),
+                started_at: OffsetDateTime::now_utc(),
+                current_step: None,
+            },
+        );
         self.events.send(Event::RunStarted {
             run_id: run_id.clone(),
             scenario: scenario.to_string(),
@@ -272,6 +306,7 @@ impl Runner {
         ));
         let recorder = Recorder {
             run_id: run_id.clone(),
+            competition_id,
             events: self.events.clone(),
             live: self.live.clone(),
             steps,
@@ -321,7 +356,7 @@ impl Runner {
         self.db
             .complete_run(&run_id, result.error.as_deref())
             .await?;
-        *self.live.lock().expect("live run lock") = None;
+        self.live.remove(&competition_id);
         *self.last_result.lock().await = Some(result.clone());
         self.events.send(Event::RunFinished {
             run_id: run_id.clone(),
@@ -349,9 +384,19 @@ impl Runner {
         self.last_result.lock().await.clone()
     }
 
-    /// The run in progress, if any.
-    pub fn live(&self) -> Option<LiveRun> {
-        self.live.lock().expect("live run lock").clone()
+    /// Every run in progress, oldest first.
+    pub fn live_runs(&self) -> Vec<LiveRun> {
+        let mut runs: Vec<LiveRun> = self.live.iter().map(|run| run.value().clone()).collect();
+        runs.sort_by_key(|run| run.started_at);
+        runs
+    }
+
+    /// The run `run_id`, if it is in progress.
+    pub fn live_run(&self, run_id: &str) -> Option<LiveRun> {
+        self.live
+            .iter()
+            .find(|run| run.run_id == run_id)
+            .map(|run| run.value().clone())
     }
 
     pub fn events(&self) -> &Events {
@@ -365,6 +410,72 @@ impl Runner {
     /// Get database reference
     pub fn db(&self) -> &SynthDb {
         &self.db
+    }
+
+    /// Run `scenario`, logging a failure. If the coordinator refused its competition as too small
+    /// for the fees, which rose since the count was drawn, draw again, large enough.
+    async fn run_or_redraw(&self, scenario: &str, mut config: ScenarioConfig) {
+        match self.run_scenario(scenario, config.clone()).await {
+            Ok(result) if result.refused_as_small() => {
+                config.min_players = config
+                    .player_mix
+                    .as_ref()
+                    .map(|mix| mix.min_players_high_fees);
+                config.seed = config.seed.map(|seed| seed.wrapping_add(0x5245_4452_4157));
+                config.competition_id = None;
+                if let Err(e) = self.run_scenario(scenario, config).await {
+                    error!("Scheduled run failed: {:?}", e);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => error!("Scheduled run failed: {:?}", e),
+        }
+    }
+
+    /// Run every lane side by side, each starting its runs on its own cadence without waiting
+    /// for its earlier ones. Returns only if a lane is invalid.
+    pub async fn run_lanes(&self, lanes: &[lanes::LaneConfig], base: ScenarioConfig) -> Result<()> {
+        for lane in lanes {
+            lane.validate(&base)?;
+        }
+        info!(
+            "Starting {} lanes: {}",
+            lanes.len(),
+            lanes
+                .iter()
+                .map(|lane| format!("{} ({:?})", lane.name, lane.scenarios))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let lanes: Vec<_> = lanes
+            .iter()
+            .cloned()
+            .map(|lane| {
+                let (runner, base) = (self.clone(), base.clone());
+                tokio::spawn(async move { runner.run_lane(lane, base).await })
+            })
+            .collect();
+        futures::future::join_all(lanes).await;
+        Ok(())
+    }
+
+    async fn run_lane(&self, lane: lanes::LaneConfig, base: ScenarioConfig) {
+        let mut after = OffsetDateTime::now_utc();
+        let mut cycle = 0usize;
+        loop {
+            let (start, close) = lane.next_start(&base, after);
+            sleep_until(start).await;
+            let (scenario, config) = lane.run_config(&base, cycle, close);
+            info!("Lane {} starts {scenario} (cycle {cycle})", lane.name);
+            let runner = self.clone();
+            tokio::spawn(async move { runner.run_or_redraw(&scenario, config).await });
+            after = match close {
+                // The next half after this one.
+                Some(close) => close + time::Duration::seconds(1) - (close - start),
+                None => start + time::Duration::seconds(lane.interval_secs as i64),
+            };
+            cycle = cycle.wrapping_add(1);
+        }
     }
 
     /// Start the scheduled runner loop
@@ -385,18 +496,27 @@ impl Runner {
         let mut cycle = 0usize;
 
         loop {
+            // Runs start every interval, however long each one's entry window keeps it going.
+            let started = tokio::time::Instant::now();
             let mut next = config.clone();
             next.observation_window_choices.clear();
             let (scenario, window) = scheduled_selection(&scenarios, &windows, cycle);
             next.observation_window_secs = window;
             next.seed = config.seed.map(|seed| seed.wrapping_add(cycle as u64));
-            if let Err(e) = self.run_scenario(scenario, next).await {
-                error!("Scheduled run failed: {:?}", e);
-            }
+            self.run_or_redraw(scenario, next).await;
             cycle = cycle.wrapping_add(1);
-            tokio::time::sleep(std::time::Duration::from_secs(scheduler.interval_secs)).await;
+            tokio::time::sleep_until(
+                started + std::time::Duration::from_secs(scheduler.interval_secs),
+            )
+            .await;
         }
     }
+}
+
+/// Sleep until `at`, at once if it has passed.
+async fn sleep_until(at: OffsetDateTime) {
+    let wait = (at - OffsetDateTime::now_utc()).max(time::Duration::ZERO);
+    tokio::time::sleep(wait.unsigned_abs()).await;
 }
 
 #[cfg(test)]
@@ -422,8 +542,9 @@ mod tests {
         let saving = tokio::spawn(save_steps(db, events.clone(), run_id.clone(), records));
         let recorder = Recorder {
             run_id,
+            competition_id: Uuid::now_v7(),
             events,
-            live: Arc::new(std::sync::Mutex::new(None)),
+            live: Arc::new(DashMap::new()),
             steps,
         };
         let mut paid = false;
@@ -531,6 +652,7 @@ mod tests {
             interval_secs: 1,
             scenario: "full_lifecycle".into(),
             scenarios: None,
+            lanes: Vec::new(),
         };
         assert!(runner
             .run_scheduled(&scheduler, ScenarioConfig::default(), vec![7200, 0])
@@ -580,12 +702,18 @@ mod tests {
         let events = Events::new();
         let mut watching = events.subscribe();
         let run_id = db.create_run("full_lifecycle", None).await.unwrap();
-        let live = Arc::new(std::sync::Mutex::new(Some(LiveRun {
-            run_id: run_id.clone(),
-            scenario: "full_lifecycle".into(),
-            started_at: OffsetDateTime::now_utc(),
-            current_step: None,
-        })));
+        let competition_id = Uuid::now_v7();
+        let live: Live = Arc::new(DashMap::new());
+        live.insert(
+            competition_id,
+            LiveRun {
+                run_id: run_id.clone(),
+                competition_id,
+                scenario: "full_lifecycle".into(),
+                started_at: OffsetDateTime::now_utc(),
+                current_step: None,
+            },
+        );
         let (steps, to_save) = mpsc::unbounded_channel();
         let saving = tokio::spawn(save_steps(
             db.clone(),
@@ -595,6 +723,7 @@ mod tests {
         ));
         let recorder = Recorder {
             run_id: run_id.clone(),
+            competition_id,
             events: events.clone(),
             live: live.clone(),
             steps,
@@ -604,12 +733,7 @@ mod tests {
             .scope(recorder, async {
                 step_started("create_competition");
                 assert_eq!(
-                    live.lock()
-                        .unwrap()
-                        .as_ref()
-                        .unwrap()
-                        .current_step
-                        .as_deref(),
+                    live.get(&competition_id).unwrap().current_step.as_deref(),
                     Some("create_competition")
                 );
                 step_finished(&StepResult {

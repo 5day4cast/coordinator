@@ -109,10 +109,16 @@ async fn main() -> anyhow::Result<()> {
         let scenario_config = config.scenario_config();
         let windows = config.defaults.observation_windows_secs.values().to_vec();
         tokio::spawn(async move {
-            if let Err(error) = scheduler_runner
-                .run_scheduled(&scheduler, scenario_config, windows)
-                .await
-            {
+            let stopped = if scheduler.lanes.is_empty() {
+                scheduler_runner
+                    .run_scheduled(&scheduler, scenario_config, windows)
+                    .await
+            } else {
+                scheduler_runner
+                    .run_lanes(&scheduler.lanes, scenario_config)
+                    .await
+            };
+            if let Err(error) = stopped {
                 error!("Scheduled runner stopped: {error:#}");
             }
         });

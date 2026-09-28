@@ -1865,6 +1865,7 @@ dependencies = [
  "config",
  "coordinator-ark-escrow",
  "coordinator-core",
+ "dashmap",
  "dlctix",
  "fern",
  "futures",

@@ -30,6 +30,8 @@ struct Protocol {
     payment_gate: Option<Arc<Barrier>>,
     db: Option<SynthDb>,
     durable_before_pay: Vec<bool>,
+    /// Seats other people paid for and entered.
+    others: usize,
 }
 
 type Shared = Arc<Mutex<Protocol>>;
@@ -72,7 +74,7 @@ impl Mock {
 async fn competition(State(state): State<Shared>, Path(id): Path<Uuid>) -> Json<Value> {
     let state = state.lock().unwrap();
     Json(
-        json!({"id":id,"created_at":"2026-01-01T00:00:00Z", "event_submission":{"start_observation_date":(OffsetDateTime::now_utc()+time::Duration::hours(1)).format(&Rfc3339).unwrap()}, "total_entries":state.entries.len(), "awaiting_attestation_at":if state.entries.len()==state.capacity { Some("2026-01-01T00:01:00Z") }else{None} }),
+        json!({"id":id,"created_at":"2026-01-01T00:00:00Z", "event_submission":{"start_observation_date":(OffsetDateTime::now_utc()+time::Duration::hours(1)).format(&Rfc3339).unwrap(), "total_allowed_entries":state.capacity}, "total_entries":state.entries.len() + state.others, "total_paid_entries":state.paid.len() + state.others, "awaiting_attestation_at":if state.entries.len() + state.others==state.capacity { Some("2026-01-01T00:01:00Z") }else{None} }),
     )
 }
 
@@ -82,7 +84,7 @@ async fn ticket(
 ) -> (StatusCode, Json<Value>) {
     let mut state = state.lock().unwrap();
     state.attempts += 1;
-    let id = if state.tickets.len() < state.capacity {
+    let id = if state.tickets.len() + state.others < state.capacity {
         Uuid::now_v7()
     } else {
         if !state.first_replacement_blocked {
@@ -294,6 +296,199 @@ async fn concurrent_actors_preserve_durable_recorder_before_either_payment() {
     assert!(traces.iter().all(|trace| trace.paid
         && trace.entry_submitted
         && trace.waits.iter().all(|wait| wait.elapsed_ms.is_some())));
+}
+
+/// Real people can take any number of a competition's seats alongside synth's players: none,
+/// one, several, or all but one. Each player left without a seat stands down, and the run still
+/// follows the competition through.
+#[tokio::test]
+async fn seats_taken_by_other_players_do_not_fail_the_run() {
+    for (seats, others) in [(5, 0), (5, 1), (5, 3), (5, 4), (8, 5)] {
+        let (_directory, db) = db().await;
+        let mock = Mock::new(Protocol {
+            capacity: seats,
+            others,
+            ..Default::default()
+        })
+        .await;
+        let runner = crate::runner::Runner::new(
+            mock.client.clone(),
+            db.clone(),
+            crate::events::Events::new(),
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            runner.run_scenario("full_lifecycle", config(seats)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let case = format!("{others} of {seats} seats taken by others");
+        assert_eq!(
+            result.status,
+            ScenarioStatus::Passed,
+            "{case}: {:?}",
+            result.error
+        );
+        let entering: Vec<&StepResult> = result
+            .steps
+            .iter()
+            .filter(|step| step.name.ends_with("_enter"))
+            .collect();
+        assert_eq!(entering.len(), seats, "{case}");
+        assert_eq!(
+            entering
+                .iter()
+                .filter(|step| step.status == StepStatus::Skipped)
+                .count(),
+            others,
+            "{case}"
+        );
+        let traces: Vec<EntryTrace> = entering
+            .iter()
+            .map(|step| serde_json::from_value(step.details.clone().unwrap()).unwrap())
+            .collect();
+        for stood_down in traces.iter().filter(|trace| trace.seat_taken) {
+            assert!(
+                !stood_down.paid && stood_down.ticket_id.is_none() && !stood_down.may_have_paid(),
+                "{case}"
+            );
+        }
+        assert_eq!(
+            traces.iter().filter(|trace| trace.entry_submitted).count(),
+            seats - others,
+            "{case}"
+        );
+        assert!(
+            result
+                .steps
+                .iter()
+                .any(|step| step.name == "wait_awaiting_attestation"),
+            "{case}"
+        );
+    }
+}
+
+/// Two runs at once, each tracked by its own competition. The mock's competition awaits its
+/// attestation only once four players have entered, two from each run, so runs made one after the
+/// other would never finish.
+#[tokio::test]
+async fn overlapping_runs_are_each_tracked_by_their_competition() {
+    let (_directory, db) = db().await;
+    let mock = Mock::new(Protocol {
+        capacity: 4,
+        ..Default::default()
+    })
+    .await;
+    let runner = crate::runner::Runner::new(
+        mock.client.clone(),
+        db.clone(),
+        crate::events::Events::new(),
+    );
+    let plan = |seed| {
+        let mut config = config(2);
+        config.seed = Some(seed);
+        config.competition_id = None;
+        config.resolve_plan("full_lifecycle").unwrap()
+    };
+    let (first, second) = (plan(1), plan(2));
+    let competitions = [
+        first.competition_id.unwrap(),
+        second.competition_id.unwrap(),
+    ];
+    assert_ne!(competitions[0], competitions[1]);
+    let watching = runner.clone();
+    let seen = tokio::spawn(async move {
+        loop {
+            let live = watching.live_runs();
+            if live.len() == 2 {
+                return live
+                    .into_iter()
+                    .map(|run| run.competition_id)
+                    .collect::<Vec<_>>();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    let (a, b) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            runner.run_scenario("full_lifecycle", first),
+            runner.run_scenario("full_lifecycle", second)
+        )
+    })
+    .await
+    .expect("overlapping runs finish together");
+    assert_eq!(a.unwrap().status, ScenarioStatus::Passed);
+    assert_eq!(b.unwrap().status, ScenarioStatus::Passed);
+    let mut seen = seen.await.unwrap();
+    seen.sort();
+    let mut expected = competitions.to_vec();
+    expected.sort();
+    assert_eq!(seen, expected);
+    assert!(
+        runner.live_runs().is_empty(),
+        "each leaves the map when it ends"
+    );
+}
+
+#[test]
+fn only_cancellations_synth_did_not_cause_are_expected() {
+    let competition = |json: Value| -> CompetitionResponse {
+        let mut base = json!({"id": Uuid::now_v7(), "created_at": "2026-01-01T00:00:00Z",
+            "event_submission": {"total_allowed_entries": 3}});
+        base.as_object_mut()
+            .unwrap()
+            .extend(json.as_object().unwrap().clone());
+        serde_json::from_value(base).unwrap()
+    };
+    let paid = |count: usize| -> Vec<EntryTrace> {
+        (0..count)
+            .map(|_| EntryTrace {
+                paid: true,
+                ..Default::default()
+            })
+            .collect()
+    };
+    let cancelled = "2026-01-01T01:00:00Z";
+    // Synth's own three players, cancelled for no reason of theirs: a coordinator failure.
+    assert_eq!(
+        expected_cancellation(
+            &competition(json!({"cancelled_at": cancelled, "total_paid_entries": 3})),
+            &paid(3)
+        ),
+        None
+    );
+    // Someone else paid and never entered.
+    assert!(expected_cancellation(
+        &competition(json!({"cancelled_at": cancelled, "total_paid_entries": 3})),
+        &paid(2)
+    )
+    .is_some());
+    // Someone else held a seat until the deadline.
+    let mut traces = paid(2);
+    traces.push(EntryTrace {
+        seat_taken: true,
+        ..Default::default()
+    });
+    assert!(expected_cancellation(
+        &competition(json!({"cancelled_at": cancelled, "total_paid_entries": 2})),
+        &traces
+    )
+    .is_some());
+    // The kickoff check failed on fees, cancelled or failed.
+    let kickoff = json!({"players": 3, "min_players": 5, "sat_per_vb": 4, "passed": false});
+    for stopped in ["cancelled_at", "failed_at"] {
+        assert!(expected_cancellation(
+            &competition(json!({stopped: cancelled, "kickoff_check": kickoff})),
+            &paid(3)
+        )
+        .is_some());
+    }
+    // Still running: nothing to excuse.
+    assert_eq!(
+        expected_cancellation(&competition(json!({})), &traces),
+        None
+    );
 }
 
 #[tokio::test]
@@ -602,17 +797,37 @@ fn restart_markers_keep_legacy_uncertainty_but_distinguish_deliberate_nonpayment
 #[test]
 fn weather_picks_replay_per_seed_and_user() {
     let stations = vec!["KDEN".into(), "KORD".into(), "KJFK".into()];
-    let picks = |seed, index| {
+    let picks_in = |seed, index, shape| {
         serde_json::to_value(full_lifecycle::generate_predictions(
             &stations,
             Some(seed),
             index,
+            shape,
         ))
         .unwrap()
     };
+    let picks = |seed, index| picks_in(seed, index, WindowShape::FullDay);
     assert_eq!(picks(19, 0), picks(19, 0));
     assert_ne!(picks(19, 0), picks(19, 1));
     assert_ne!(picks(19, 0), picks(20, 0));
+    // A half picks only what it scores, and the same as a full day for those.
+    let full = picks(19, 0);
+    for (shape, kept, dropped) in [
+        (WindowShape::Day, "temp_high", "temp_low"),
+        (WindowShape::Night, "temp_low", "temp_high"),
+    ] {
+        let half = picks_in(19, 0, shape);
+        for (half, full) in half
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(full.as_array().unwrap())
+        {
+            assert!(half[dropped].is_null(), "{shape:?}");
+            assert_eq!(half[kept], full[kept]);
+            assert_eq!(half["wind_speed"], full["wind_speed"]);
+        }
+    }
 }
 
 #[test]

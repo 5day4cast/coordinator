@@ -98,6 +98,28 @@ fn every_entry_must_be_in_exactly_one_listed_pool() {
 }
 
 #[test]
+fn other_players_can_share_the_pools() {
+    // Synth's 20 tickets, and 7 other people's, split into pools of 14 and 13.
+    let everyone = fresh(27);
+    let pools = listed(&[14, 13]);
+    let placed = place(&pools, &everyone);
+    let ours = everyone[..20].to_vec();
+    let ours_placed = placed
+        .iter()
+        .filter(|(ticket, _)| ours.contains(ticket))
+        .map(|(ticket, pool)| (*ticket, *pool))
+        .collect();
+    check_split(&rules(), &pools, &ours, &ours_placed).unwrap();
+    // Two synth players with three others: a queue too small by synth's count forms a pool.
+    let pools = listed(&[5]);
+    let ours = fresh(2);
+    check_split(&rules(), &pools, &ours, &place(&pools, &ours)).unwrap();
+    // The split is still checked against everyone the pools list.
+    let pools = listed(&[20, 7]);
+    assert!(check_split(&rules(), &pools, &ours, &place(&pools, &ours)).is_err());
+}
+
+#[test]
 fn pool_indexes_must_count_from_zero() {
     let tickets = fresh(27);
     let mut pools = listed(&[14, 13]);
@@ -176,6 +198,12 @@ mod mock {
         pub refunded: BTreeSet<Uuid>,
         /// Refunds asked about, by competition and ticket.
         pub refund_lookups: Vec<(Uuid, Uuid)>,
+        /// Pools cancelled by their kickoff check, by index.
+        pub kickoff_failed: BTreeSet<usize>,
+        /// Pools that failed for another reason, by index.
+        pub failed: BTreeSet<usize>,
+        /// Pools whose kickoff check waits for fees to fall until then, and passes after, by index.
+        pub fee_wait: std::collections::BTreeMap<usize, time::OffsetDateTime>,
     }
 
     type Shared = Arc<Mutex<Queue>>;
@@ -243,6 +271,44 @@ mod mock {
             );
         }
         match state.pools.iter().position(|(pool, _)| *pool == id) {
+            Some(index) if state.kickoff_failed.contains(&index) => (
+                StatusCode::OK,
+                Json(json!({
+                    "id": id, "created_at": AT, "event_submission": {}, "kind": "pool",
+                    "parent_id": state.id, "pool_index": index,
+                    "escrow_funds_confirmed_at": AT, "failed_at": AT,
+                    "kickoff_check": {"players": 3, "min_players": 5, "sat_per_vb": 4,
+                        "passed": false},
+                })),
+            ),
+            Some(index)
+                if state
+                    .fee_wait
+                    .get(&index)
+                    .is_some_and(|until| time::OffsetDateTime::now_utc() < *until) =>
+            {
+                let until = state.fee_wait[&index]
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap();
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "id": id, "created_at": AT, "event_submission": {}, "kind": "pool",
+                        "parent_id": state.id, "pool_index": index,
+                        "escrow_funds_confirmed_at": AT,
+                        "kickoff_check": {"players": 3, "min_players": 5, "sat_per_vb": 4,
+                            "passed": false, "retry_until": until},
+                    })),
+                )
+            }
+            Some(index) if state.failed.contains(&index) => (
+                StatusCode::OK,
+                Json(json!({
+                    "id": id, "created_at": AT, "event_submission": {}, "kind": "pool",
+                    "parent_id": state.id, "pool_index": index,
+                    "escrow_funds_confirmed_at": AT, "failed_at": AT,
+                })),
+            ),
             Some(index) => (
                 StatusCode::OK,
                 Json(json!({
@@ -431,9 +497,91 @@ async fn a_queue_too_small_for_a_pool_is_cancelled_and_refunds_everyone() {
         .all(|(competition, _)| *competition == run.queue()));
 }
 
+/// Synth's own two players formed a pool below the minimum of three: the split is wrong.
 #[tokio::test]
-async fn a_queue_that_forms_pools_when_it_should_be_cancelled_fails() {
+async fn a_queue_that_forms_a_pool_too_small_for_its_rules_fails() {
     let run = Run::new(QUEUED_TOO_FEW, &[2]).await;
+    let (steps, result) = run.after_entries().await;
+    assert_eq!(steps.names(), ["wait_cancelled", "wait_pools_formed"]);
+    assert_eq!(result.unwrap_err().name, "verify_pools");
+}
+
+/// Synth's two players are too few for a pool, but other people entered too, from one to many:
+/// the queue forms pools and they run.
+#[tokio::test]
+async fn other_players_can_make_a_too_small_queue_form_pools() {
+    for others in [1, 3, 10] {
+        let run = Run::new(QUEUED_TOO_FEW, &[2]).await;
+        run.mock.state.lock().unwrap().pools[0]
+            .1
+            .extend((0..others).map(|_| Uuid::now_v7()));
+        let (steps, result) = run.after_entries().await;
+        assert!(result.is_ok(), "{others} others: {:?}", result.err());
+        let names = steps.names();
+        assert_eq!(
+            &names[..3],
+            ["wait_cancelled", "wait_pools_formed", "verify_pools"]
+        );
+        assert_eq!(names.last(), Some(&"wait_pools_awaiting_attestation"));
+    }
+}
+
+/// Fees rose after the run drew its players, and one pool's kickoff check cancelled it: its
+/// players' refunds are collected at the pool, and the other pool still runs.
+#[tokio::test]
+async fn a_pool_cancelled_by_its_kickoff_check_is_refunded_while_the_others_run() {
+    let run = Run::new(QUEUED_SPLIT, &[14, 13]).await;
+    run.refund_everyone();
+    let pool = run.mock.state.lock().unwrap().pools[1].clone();
+    run.mock.state.lock().unwrap().kickoff_failed.insert(1);
+    let (steps, result) = run.after_entries().await;
+    assert!(result.is_ok(), "{:?}", result.err());
+    let names = steps.names();
+    assert!(names.contains(&"pool_1_kickoff_failed"), "{names:?}");
+    assert_eq!(names.last(), Some(&"wait_pools_awaiting_attestation"));
+    let lookups = run.mock.state.lock().unwrap().refund_lookups.clone();
+    let refunded: BTreeSet<Uuid> = lookups.iter().map(|(_, ticket)| *ticket).collect();
+    assert_eq!(
+        refunded,
+        pool.1.iter().copied().collect(),
+        "the cancelled pool's tickets"
+    );
+    assert!(lookups
+        .iter()
+        .all(|(competition, _)| *competition == pool.0));
+
+    // Every pool cancelled: all are refunded, and the run still passes.
+    let run = Run::new(QUEUED_SPLIT, &[14, 13]).await;
+    run.refund_everyone();
+    run.mock.state.lock().unwrap().kickoff_failed.extend([0, 1]);
+    let (steps, result) = run.after_entries().await;
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(run.mock.state.lock().unwrap().refund_lookups.len(), 27);
+    assert!(steps.names().contains(&"pool_0_kickoff_failed"));
+}
+
+/// A pool that failed for any other reason still fails the run.
+#[tokio::test]
+async fn a_pool_that_fails_otherwise_fails_the_run() {
+    let run = Run::new(QUEUED_SPLIT, &[14, 13]).await;
+    run.mock.state.lock().unwrap().failed.insert(0);
     let (_, result) = run.after_entries().await;
-    assert_eq!(result.unwrap_err().name, "wait_cancelled");
+    assert_eq!(result.unwrap_err().name, "wait_pools_event_created");
+}
+
+/// A pool's kickoff check waits for fees to fall, longer than synth waits for a state, and then
+/// passes: synth waits with it and follows the pool on, with nothing refunded.
+#[tokio::test]
+async fn a_pool_waiting_for_fees_to_fall_is_waited_for() {
+    let run = Run::new(QUEUED_SPLIT, &[14, 13]).await;
+    let until = time::OffsetDateTime::now_utc() + time::Duration::seconds(3);
+    run.mock.state.lock().unwrap().fee_wait.insert(1, until);
+    let (steps, result) = run.after_entries().await;
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert!(time::OffsetDateTime::now_utc() >= until);
+    assert!(!steps
+        .names()
+        .iter()
+        .any(|name| name.contains("kickoff_failed")));
+    assert!(run.mock.state.lock().unwrap().refund_lookups.is_empty());
 }

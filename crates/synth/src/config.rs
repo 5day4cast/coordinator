@@ -71,6 +71,10 @@ pub struct SchedulerConfig {
     /// Rotate these cases when configured; otherwise keep the legacy single scenario.
     #[serde(default)]
     pub scenarios: Option<Vec<String>>,
+    /// Streams of competitions run side by side, each on its own cadence, their runs
+    /// overlapping. When set, `interval_secs` and the scenarios above are not used.
+    #[serde(default)]
+    pub lanes: Vec<crate::runner::lanes::LaneConfig>,
 }
 
 fn default_scenario() -> String {
@@ -156,8 +160,12 @@ pub struct DefaultsConfig {
     pub seed: Option<u64>,
     #[serde(default)]
     pub entry_timing: crate::scenarios::EntryTiming,
-    /// Number of synthetic users per test
-    pub users: usize,
+    /// A fixed number of players for every run. Unset, each run draws its count from `players`.
+    #[serde(default)]
+    pub users: Option<usize>,
+    /// How many players a run draws when `users` is unset.
+    #[serde(default)]
+    pub players: crate::scenarios::PlayerMix,
     /// NOAA stations to use for competitions
     pub stations: Vec<String>,
     /// Entry fee in sats
@@ -209,12 +217,14 @@ impl Default for SynthConfig {
                 interval_secs: 3600,
                 scenario: "full_lifecycle".to_string(),
                 scenarios: None,
+                lanes: Vec::new(),
             },
             trail: Default::default(),
             defaults: DefaultsConfig {
                 seed: None,
                 entry_timing: Default::default(),
-                users: 3,
+                users: None,
+                players: Default::default(),
                 stations: vec!["KDEN".to_string(), "KJFK".to_string(), "KORD".to_string()],
                 entry_fee: 1000,
                 entry_window_secs: 120,
@@ -234,7 +244,11 @@ impl SynthConfig {
             seed: self.defaults.seed,
             entry_timing: self.defaults.entry_timing.clone(),
             observation_window_choices: self.defaults.observation_windows_secs.values().to_vec(),
-            users: self.defaults.users,
+            users: self.defaults.users.unwrap_or(3),
+            player_mix: match self.defaults.users {
+                Some(_) => None,
+                None => Some(self.defaults.players.clone()),
+            },
             stations: self.defaults.stations.clone(),
             entry_fee: self.defaults.entry_fee,
             entry_window_secs: self.defaults.entry_window_secs,
@@ -277,7 +291,6 @@ pub fn load_config(path: Option<&str>) -> anyhow::Result<SynthConfig> {
         .set_default("scheduler.enabled", false)?
         .set_default("scheduler.interval_secs", 3600)?
         .set_default("scheduler.scenario", "full_lifecycle")?
-        .set_default("defaults.users", 3)?
         .set_default("defaults.entry_fee", 1000)?
         .set_default("defaults.entry_window_secs", 120)?
         .set_default("defaults.signing_delay_secs", 60)?
@@ -285,6 +298,7 @@ pub fn load_config(path: Option<&str>) -> anyhow::Result<SynthConfig> {
 
     let config: SynthConfig = builder.build()?.try_deserialize()?;
     validate_windows(config.defaults.observation_windows_secs.values())?;
+    config.defaults.players.validate()?;
     config
         .defaults
         .entry_timing
@@ -293,6 +307,10 @@ pub fn load_config(path: Option<&str>) -> anyhow::Result<SynthConfig> {
         config
             .scheduler
             .validate(config.defaults.observation_windows_secs.values())?;
+        let base = config.scenario_config();
+        for lane in &config.scheduler.lanes {
+            lane.validate(&base)?;
+        }
     }
     Ok(config)
 }
@@ -338,6 +356,57 @@ before_submit = { min_secs = 10, max_secs = 120 }
             std::fs::write(&path, format!("[scheduler]\nenabled = true\nscenarios = {cases}\n[defaults]\nstations = [\"KDEN\"]\n")).unwrap();
             assert!(load_config(Some(path.to_str().unwrap())).is_err());
         }
+    }
+
+    #[test]
+    fn lanes_load_and_are_checked_against_the_oracles_windows() {
+        let _environment = CONFIG_ENV.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synth.toml");
+        let lanes = |half_window: &str| {
+            format!(
+                r#"
+[scheduler]
+enabled = true
+
+[[scheduler.lanes]]
+name = "open"
+interval_secs = 3600
+entry_window_secs = 3600
+scenarios = ["full_lifecycle", "duplicate_submission"]
+observation_windows_secs = [86400, 172800]
+stations_per_run = 2
+
+[[scheduler.lanes]]
+name = "halves"
+align = "utc_half"
+entry_window_secs = 3600
+scenarios = ["full_lifecycle"]
+observation_windows_secs = [{half_window}]
+
+[defaults]
+stations = ["KDEN", "KJFK", "KORD"]
+observation_windows_secs = [86400]
+entry_window_secs = 3600
+[defaults.entry_timing]
+arrival_pattern = "spread"
+before_payment = {{ min_secs = 5, max_secs = 60 }}
+before_submit = {{ min_secs = 10, max_secs = 120 }}
+deadline_margin_secs = 60
+"#
+            )
+        };
+        std::fs::write(&path, lanes("43200")).unwrap();
+        let config = load_config(Some(path.to_str().unwrap())).unwrap();
+        assert_eq!(config.scheduler.lanes.len(), 2);
+        assert_eq!(
+            config.scheduler.lanes[1].align,
+            crate::runner::lanes::Align::UtcHalf
+        );
+        assert_eq!(config.defaults.users, None, "counts are drawn");
+        // A 12-hour window starting whenever a run happens to is refused.
+        std::fs::write(&path, lanes("43200").replace("align = \"utc_half\"\n", "")).unwrap();
+        assert!(load_config(Some(path.to_str().unwrap())).is_err());
     }
 
     #[test]

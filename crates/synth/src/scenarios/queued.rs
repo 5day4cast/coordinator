@@ -159,19 +159,14 @@ pub(super) async fn create_queue(
     config: &ScenarioConfig,
     shape: &QueueShape,
 ) -> Result<Uuid> {
-    let now = OffsetDateTime::now_utc();
-    let entry_window = time::Duration::seconds(config.entry_window_secs as i64);
-    let observation_window = time::Duration::seconds(config.observation_window_secs as i64);
+    let times = config.competition_times(OffsetDateTime::now_utc());
     let queue = CreateQueuedCompetition {
-        id: Uuid::now_v7(),
-        signing_date: now
-            + entry_window
-            + observation_window
-            + time::Duration::seconds(config.signing_delay_secs as i64),
-        start_observation_date: now + entry_window,
-        end_observation_date: now + entry_window + observation_window,
+        id: times.id,
+        signing_date: times.signing,
+        start_observation_date: times.start,
+        end_observation_date: times.end,
         locations: config.stations.clone(),
-        number_of_values_per_entry: config.stations.len() * 3,
+        number_of_values_per_entry: config.values_per_entry(),
         entry_fee: config.entry_fee,
         coordinator_fee_basis_points: 1000,
         coordinator_fee_percentage: 10,
@@ -228,12 +223,36 @@ pub(super) async fn after_entries(
         deadline,
         OffsetDateTime::now_utc(),
     );
-    if shape.sizes().is_none() {
-        let (step, ()) = run_step("wait_cancelled", || {
+    // Other people's entries can make a queue too small for a pool by synth's count big enough.
+    let cancelled = if shape.sizes().is_none() {
+        match run_step("wait_cancelled", || {
             wait_for_state(client, queue_id, "cancelled", &kickoff)
         })
-        .await?;
-        steps.push(step);
+        .await
+        {
+            Ok((step, ())) => {
+                steps.push(step);
+                true
+            }
+            Err(mut step) => {
+                let formed = client
+                    .get_competition(queue_id)
+                    .await
+                    .is_ok_and(|queue| queue.pools_formed_at.is_some());
+                if !formed {
+                    return Err(step);
+                }
+                step.status = StepStatus::Skipped;
+                step.error = None;
+                step.details = Some(serde_json::json!({ "pools_formed_with_other_players": true }));
+                steps.push(*step);
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if cancelled {
         let (step, ()) = run_step("verify_no_pools", || async {
             let queue = client.get_competition(queue_id).await?;
             ensure!(
@@ -266,18 +285,12 @@ pub(super) async fn after_entries(
         "placed": placed.len(),
     }));
     steps.push(step);
-    for state in POOL_STATES {
-        let (step, ()) = run_step(&format!("wait_pools_{state}"), || {
-            wait_for_pools_state(client, &pools, state, config)
-        })
-        .await?;
-        steps.push(step);
-    }
+    follow_pools(client, users, config, traces, &pools, &placed, steps).await?;
 
     // A paid ticket without an entry stays on the queue, which refunds it.
     let leftover: Vec<EntryTrace> = traces
         .iter()
-        .filter(|trace| trace.paid && trace.ticket_id.is_some_and(|id| !placed.contains(&id)))
+        .filter(|trace| trace.paid && trace.ticket_id.is_some_and(|id| !placed.contains_key(&id)))
         .cloned()
         .collect();
     ensure_step("verify_leftover", leftover.len() == shape.abandoned, || {
@@ -291,6 +304,82 @@ pub(super) async fn after_entries(
         return Ok(());
     }
     super::user_behavior::collect_refunds(client, users, queue_id, config, &leftover, steps).await
+}
+
+/// Follow every pool to its attestation. A pool whose kickoff check fails, as it can when network
+/// fees rise after the run drew its players, is cancelled and refunds its entries: synth's players'
+/// refunds are collected at the pool, and the other pools are followed on. Any other failure fails
+/// the run.
+async fn follow_pools(
+    client: &CoordinatorClient,
+    users: &[SynthUser],
+    config: &ScenarioConfig,
+    traces: &[EntryTrace],
+    pools: &[PoolSummary],
+    placed: &BTreeMap<Uuid, Uuid>,
+    steps: &mut Steps,
+) -> std::result::Result<(), Box<StepResult>> {
+    let mut active = pools.to_vec();
+    for state in POOL_STATES {
+        while !active.is_empty() {
+            let failed = match run_step(&format!("wait_pools_{state}"), || {
+                wait_for_pools_state(client, &active, state, config)
+            })
+            .await
+            {
+                Ok((step, ())) => {
+                    steps.push(step);
+                    break;
+                }
+                Err(failed) => failed,
+            };
+            let mut dropped = Vec::new();
+            for pool in &active {
+                let Ok(competition) = client.get_competition(&pool.competition_id).await else {
+                    continue;
+                };
+                if competition.failed_kickoff() {
+                    dropped.push((pool.clone(), competition.kickoff_check));
+                }
+            }
+            if dropped.is_empty() {
+                return Err(failed);
+            }
+            for (pool, check) in dropped {
+                active.retain(|other| other.competition_id != pool.competition_id);
+                steps.push(StepResult {
+                    name: format!("pool_{}_kickoff_failed", pool.pool_index),
+                    status: StepStatus::Passed,
+                    duration_ms: failed.duration_ms,
+                    details: Some(serde_json::json!({
+                        "pool": pool.competition_id,
+                        "kickoff_check": check,
+                    })),
+                    error: None,
+                });
+                let refunded: Vec<EntryTrace> = traces
+                    .iter()
+                    .filter(|trace| {
+                        trace.paid
+                            && trace
+                                .ticket_id
+                                .is_some_and(|id| placed.get(&id) == Some(&pool.competition_id))
+                    })
+                    .cloned()
+                    .collect();
+                super::user_behavior::collect_refunds(
+                    client,
+                    users,
+                    &pool.competition_id,
+                    config,
+                    &refunded,
+                    steps,
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn ensure_step(
@@ -310,7 +399,8 @@ fn ensure_step(
     }))
 }
 
-/// Check the queue's pools against the players' own entries, and return the tickets placed.
+/// Check the queue's pools against the players' own entries, and return each placed ticket's
+/// pool.
 async fn verify_pools(
     client: &CoordinatorClient,
     users: &[SynthUser],
@@ -318,7 +408,7 @@ async fn verify_pools(
     shape: &QueueShape,
     pools: &[PoolSummary],
     traces: &[EntryTrace],
-) -> Result<BTreeSet<Uuid>> {
+) -> Result<BTreeMap<Uuid, Uuid>> {
     for pool in pools {
         let child = client.get_competition(&pool.competition_id).await?;
         ensure!(
@@ -343,7 +433,7 @@ async fn verify_pools(
     );
     let placements = placements(client, users, traces).await?;
     check_split(&shape.rules, pools, &complete, &placements)?;
-    Ok(placements.into_keys().collect())
+    Ok(placements)
 }
 
 /// Each submitted entry's competition, by ticket: its pool once pools form. Each player lists
@@ -382,21 +472,27 @@ async fn placements(
 }
 
 /// Check how a queue split its complete tickets: as many pools as the rules give for them, with
-/// the sizes the rules give (so they differ by at most one), and every complete ticket's entry in
-/// exactly one of them.
+/// the sizes the rules give (so they differ by at most one), and every one of synth's complete
+/// tickets (`complete`) in exactly one of them. Other people's entries can share the pools, so the
+/// split is of every entry the pools list, synth's and theirs.
 pub fn check_split(
     rules: &PoolRules,
     pools: &[PoolSummary],
     complete: &[Uuid],
     placements: &BTreeMap<Uuid, Uuid>,
 ) -> Result<()> {
+    let total: usize = pools.iter().map(|pool| pool.players).sum();
+    ensure!(
+        total >= complete.len(),
+        "the pools list {total} players, fewer than synth's {} complete tickets",
+        complete.len()
+    );
     let mut expected = rules
-        .sizes(complete.len())
-        .with_context(|| format!("{} tickets are too few for a pool", complete.len()))?;
+        .sizes(total)
+        .with_context(|| format!("{total} tickets are too few for a pool"))?;
     ensure!(
         pools.len() == expected.len(),
-        "{} tickets formed {} pools; expected {}",
-        complete.len(),
+        "{total} tickets formed {} pools; expected {}",
         pools.len(),
         expected.len()
     );
@@ -435,8 +531,8 @@ pub fn check_split(
     for pool in pools {
         let placed = members[&pool.competition_id];
         ensure!(
-            placed == pool.players,
-            "pool {} lists {} players but holds {placed} of the entries",
+            placed <= pool.players,
+            "pool {} lists {} players but holds {placed} of synth's entries",
             pool.pool_index,
             pool.players
         );

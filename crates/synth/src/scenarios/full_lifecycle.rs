@@ -35,22 +35,16 @@ pub(super) async fn create_competition(
     client: &CoordinatorClient,
     config: &ScenarioConfig,
 ) -> Result<Uuid> {
-    let now = OffsetDateTime::now_utc();
-    let observation_window = time::Duration::seconds(config.observation_window_secs as i64);
-
     // start_observation_date must be far enough in the future for ticket purchases
     // (coordinator requires start_observation_date - 1min > now for ticket expiry)
-    let entry_window = time::Duration::seconds(config.entry_window_secs as i64);
+    let times = config.competition_times(OffsetDateTime::now_utc());
     let competition = CreateCompetition {
-        id: Uuid::now_v7(),
-        signing_date: now
-            + entry_window
-            + observation_window
-            + time::Duration::seconds(config.signing_delay_secs as i64),
-        start_observation_date: now + entry_window,
-        end_observation_date: now + entry_window + observation_window,
+        id: times.id,
+        signing_date: times.signing,
+        start_observation_date: times.start,
+        end_observation_date: times.end,
         locations: config.stations.clone(),
-        number_of_values_per_entry: config.stations.len() * 3,
+        number_of_values_per_entry: config.values_per_entry(),
         number_of_places_win: 1.min(config.users),
         total_allowed_entries: config.users,
         entry_fee: config.entry_fee,
@@ -218,7 +212,12 @@ pub(super) async fn register_entry(
         ephemeral_pubkey: ephemeral.public_key,
         payout_hash: payout_choice.payout_hash,
         event_id: *competition_id,
-        expected_observations: generate_predictions(&config.stations, config.seed, user_index),
+        expected_observations: generate_predictions(
+            &config.stations,
+            config.seed,
+            user_index,
+            config.window_shape(),
+        ),
         encrypted_keymeld_private_key,
         keymeld_auth_pubkey,
         keymeld_registration_context,
@@ -339,11 +338,15 @@ async fn entry_payment(lnd: &Lnd, paid: crate::lnd::Paid) -> EntryPayment {
     }
 }
 
+/// A player's picks: over, par or under for each station and metric `shape` scores. Every
+/// metric is drawn whatever the window, so a seed replays the same picks.
 pub(super) fn generate_predictions(
     stations: &[String],
     seed: Option<u64>,
     user_index: usize,
+    shape: WindowShape,
 ) -> Vec<WeatherChoices> {
+    let [high, low, wind] = shape.scores();
     use rand::SeedableRng;
     // Separate each user's picks from the timing RNG and from every other user.
     let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(
@@ -357,11 +360,12 @@ pub(super) fn generate_predictions(
                 1 => Some(ValueOption::Par),
                 _ => Some(ValueOption::Under),
             };
+            let (wind_speed, temp_high, temp_low) = (pick(), pick(), pick());
             WeatherChoices {
                 stations: station.clone(),
-                wind_speed: pick(),
-                temp_high: pick(),
-                temp_low: pick(),
+                wind_speed: wind_speed.filter(|_| wind),
+                temp_high: temp_high.filter(|_| high),
+                temp_low: temp_low.filter(|_| low),
             }
         })
         .collect()

@@ -727,8 +727,7 @@ pub(super) async fn run_live(state: &Dashboard, id: &str) -> Option<Markup> {
     let now = OffsetDateTime::now_utc();
     let live_step = state
         .runner
-        .live()
-        .filter(|live| live.run_id == view.run.id)
+        .live_run(&view.run.id)
         .and_then(|live| live.current_step);
     let run = view.money();
     let rows = money::rows(&run);

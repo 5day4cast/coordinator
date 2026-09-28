@@ -47,6 +47,10 @@ pub struct KickoffCheck {
     pub passed: bool,
     #[serde(with = "time::serde::rfc3339")]
     pub checked_at: OffsetDateTime,
+    /// A failed check waits for fees to fall until then, checking again, before the pool is
+    /// cancelled. None once it passed, or when the wait is over.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub retry_until: Option<OffsetDateTime>,
 }
 
 /// What a lifecycle step does after the kickoff check.
@@ -113,6 +117,7 @@ impl KickoffCheck {
             within_ceiling,
             passed: within_ceiling && margin_sats >= 0 && pool.players >= min_players,
             checked_at,
+            retry_until: None,
         })
     }
 
@@ -136,6 +141,18 @@ impl KickoffCheck {
                 self.sat_per_vb
             )
         }
+    }
+
+    /// Until when a failed check waits for fees to fall: `fee_wait_secs` after registration
+    /// closed at `closed`, if that is still ahead. None for a check that passed.
+    pub fn fee_wait(
+        &self,
+        settings: &KickoffCheckSettings,
+        closed: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Option<OffsetDateTime> {
+        let until = closed + time::Duration::seconds(settings.fee_wait_secs as i64);
+        (!self.passed && now < until).then_some(until)
     }
 
     /// The rate the contract is built at once the check passed.
@@ -232,14 +249,20 @@ impl Coordinator {
             template_min_players,
         };
         let rate = self.contract_fee_rate().await?;
-        let check = KickoffCheck::evaluate(
+        let now = OffsetDateTime::now_utc();
+        let mut check = KickoffCheck::evaluate(
             &self.network_fee,
             &self.kickoff_check,
             pool,
             rate,
             ceiling,
-            OffsetDateTime::now_utc(),
+            now,
         )?;
+        check.retry_until = check.fee_wait(
+            &self.kickoff_check,
+            competition.event_submission.start_observation_date,
+            now,
+        );
         let summary = format!(
             "{} players (at least {} at this rate) at {} sat/vB (ceiling {}): paid {} sats \
              beyond the pot, chain {} sats for {} vB, routing and liquidity {}, margin {}",
@@ -256,6 +279,12 @@ impl Coordinator {
         if check.passed {
             info!(
                 "Competition {} passes its kickoff check: {summary}",
+                competition.id
+            );
+        } else if let Some(until) = check.retry_until {
+            info!(
+                "Competition {} fails its kickoff check for now, and waits for fees to fall until \
+                 {until}: {summary}",
                 competition.id
             );
         } else {
@@ -330,6 +359,8 @@ impl Coordinator {
         }
         match self.run_kickoff_check(competition).await {
             Ok(check) if check.passed => KickoffGate::Proceed,
+            // Fees may still fall: check again on the next pass.
+            Ok(check) if check.retry_until.is_some() => KickoffGate::Wait,
             Ok(check) => KickoffGate::Fail(CompetitionError::KickoffCheckFailed(check.reason())),
             Err(e) => {
                 warn!(
@@ -544,5 +575,41 @@ mod tests {
         let mut strict = small(5);
         strict.template_min_players = 6;
         assert!(!check_at(strict, 1).passed);
+    }
+
+    /// A failing pool waits an hour after registration closes for fees to fall, then is
+    /// cancelled; a passing one never waits.
+    #[test]
+    fn a_failed_check_waits_for_fees_to_fall_until_the_hour_is_up() {
+        let settings = KickoffCheckSettings::default();
+        let closed = NOW - time::Duration::minutes(10);
+        let failed = check_at(full_pool(50), 10);
+        assert_eq!(
+            failed.fee_wait(&settings, closed, NOW),
+            Some(closed + time::Duration::hours(1))
+        );
+        assert_eq!(
+            failed.fee_wait(&settings, closed, closed + time::Duration::hours(1)),
+            None,
+            "the wait is over"
+        );
+        assert_eq!(
+            check_at(full_pool(142), 1).fee_wait(&settings, closed, NOW),
+            None
+        );
+        let no_wait = KickoffCheckSettings {
+            fee_wait_secs: 0,
+            ..settings
+        };
+        assert_eq!(failed.fee_wait(&no_wait, closed, NOW), None);
+        // Checks stored before the wait existed still read.
+        let mut old = serde_json::to_value(&failed).unwrap();
+        old.as_object_mut().unwrap().remove("retry_until");
+        assert_eq!(
+            serde_json::from_value::<KickoffCheck>(old)
+                .unwrap()
+                .retry_until,
+            None
+        );
     }
 }

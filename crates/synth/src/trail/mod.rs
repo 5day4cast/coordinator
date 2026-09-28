@@ -75,6 +75,9 @@ pub struct EntryTrace {
     pub paid: bool,
     #[serde(default)]
     pub entry_submitted: bool,
+    /// Other players took every seat, so this one stood down without a ticket.
+    #[serde(default)]
+    pub seat_taken: bool,
 }
 
 impl EntryTrace {
@@ -689,6 +692,11 @@ pub fn judge(evidence: &Evidence) -> Money {
         if complete && paid == owed {
             return Money::PaidOut;
         }
+        // It completed owing synth's players nothing: other players won, and were paid where
+        // synth cannot see.
+        if competition.completed_at.is_some() && payouts.len() >= paid_entries && owed == 0 {
+            return Money::PaidOut;
+        }
         let stopped = competition
             .failed_at
             .or(competition.cancelled_at)
@@ -931,6 +939,27 @@ mod tests {
             judge_of(&completed, &short, &[], 2, true),
             Money::Stuck { .. }
         ));
+    }
+
+    /// Another player won: every one of synth's players is owed nothing, and the winner is paid
+    /// where synth cannot see.
+    #[test]
+    fn a_completed_competition_another_player_won_is_paid_out() {
+        let completed = competition(serde_json::json!({ "completed_at": "2026-09-24T01:02:31Z" }));
+        let losers = [payout(0, false), payout(0, false)];
+        assert_eq!(judge_of(&completed, &losers, &[], 2, false), Money::PaidOut);
+        // Not while a record is missing, or before it completes.
+        assert_eq!(
+            judge_of(&completed, &losers[..1], &[], 2, false),
+            Money::Following
+        );
+        let settling = competition(serde_json::json!({
+            "outcome_broadcasted_at": "2026-09-24T01:36:37Z",
+        }));
+        assert_eq!(
+            judge_of(&settling, &losers, &[], 2, false),
+            Money::Following
+        );
     }
 
     #[test]
