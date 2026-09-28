@@ -11,6 +11,7 @@ use uuid::Uuid;
 use super::common::{finish_result, load_users, run_step, wait_for_state, Steps};
 use super::full_lifecycle::{self, Payer, PreparedEntry};
 use super::types::*;
+use crate::client::competitions::CompetitionResponse;
 use crate::client::entries::{ApiRejection, EntrySubmission};
 use crate::client::CoordinatorClient;
 use crate::crypto::keys::SynthUser;
@@ -162,7 +163,7 @@ async fn run_steps(
             error: Some(format!("{error:#}")),
         })
     })?;
-    let (mut created, competition_id) = run_step("create_competition", || async {
+    let created = run_step(REFUSED_AS_SMALL_STEP, || async {
         if let Some(shape) = &queue {
             super::queued::create_queue(client, config, shape).await
         } else if scenario == Scenario::EscrowRefund {
@@ -171,7 +172,22 @@ async fn run_steps(
             full_lifecycle::create_competition(client, config).await
         }
     })
-    .await?;
+    .await;
+    let (mut created, competition_id) = match created {
+        // Fees rose since the run drew its players; the scheduler draws again. Not a failure.
+        Err(mut step)
+            if step
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("A competition needs at least")) =>
+        {
+            step.status = StepStatus::Skipped;
+            step.details = Some(serde_json::json!({ "players": config.users }));
+            steps.push(*step);
+            return Ok(());
+        }
+        created => created?,
+    };
     created.details = Some(serde_json::json!({ "competition_id": competition_id }));
     steps.push(created);
     let (deadline_step, deadline) = run_step("entry_deadline", || async {
@@ -229,11 +245,24 @@ async fn run_steps(
         }));
     }
 
-    if scenario == Scenario::AbandonedUnpaid {
-        let abandoned = traces
-            .iter()
-            .find(|trace| trace.behavior == Some(EntryBehavior::AbandonUnpaid))
-            .expect("resolved abandonment plan");
+    let abandoner = traces.iter().find(|trace| {
+        matches!(
+            trace.behavior,
+            Some(EntryBehavior::AbandonUnpaid | EntryBehavior::AbandonPaid)
+        )
+    });
+    if let Some(abandoner) = abandoner.filter(|trace| trace.seat_taken) {
+        // Other players filled the competition before the abandoning player got a seat, so
+        // there is no abandoned ticket to follow.
+        steps.push(abandoner.attach(StepResult {
+            name: format!("user_{}_replacement", users[config.users].name),
+            status: StepStatus::Skipped,
+            duration_ms: 0,
+            details: None,
+            error: None,
+        }));
+    } else if scenario == Scenario::AbandonedUnpaid {
+        let abandoned = abandoner.expect("resolved abandonment plan");
         let user = &users[config.users];
         let name = format!("user_{}_enter", user.name);
         let mut trace = planned_trace(
@@ -309,6 +338,17 @@ async fn run_steps(
                             .downcast_ref::<ApiRejection>()
                             .is_some_and(ApiRejection::is_no_capacity) =>
                     {
+                        // Another player reclaimed the abandoned seat and paid for it first.
+                        if client
+                            .get_competition(&competition_id)
+                            .await?
+                            .seats_all_paid()
+                        {
+                            trace.seat_taken = true;
+                            crate::runner::step_progress(&name, serde_json::to_value(&trace)?)
+                                .await?;
+                            return Ok(());
+                        }
                         crate::runner::step_progress(&name, serde_json::to_value(&trace)?).await?;
                         tokio::time::sleep(Duration::from_secs(config.poll_interval_secs.max(1)))
                             .await;
@@ -319,16 +359,19 @@ async fn run_steps(
         })
         .await;
         let step = match result {
-            Ok((step, ())) => trace.attach(step),
+            Ok((mut step, ())) => {
+                if trace.seat_taken {
+                    step.status = StepStatus::Skipped;
+                }
+                trace.attach(step)
+            }
             Err(step) => {
                 return Err(Box::new(trace.attach(*step)));
             }
         };
         steps.push(step);
         traces.push(trace);
-    }
-
-    if scenario == Scenario::PaidAbandonment {
+    } else if scenario == Scenario::PaidAbandonment {
         let user = &users[config.users];
         let name = format!("user_{}_replacement_blocked", user.name);
         let mut trace = EntryTrace::new(user);
@@ -385,32 +428,123 @@ async fn run_steps(
             deadline,
             OffsetDateTime::now_utc(),
         );
-        let (step, ()) = run_step("wait_cancelled", || {
-            wait_for_state(client, &competition_id, "cancelled", &cancellation)
+        let ours = traces.iter().filter(|trace| trace.paid).count() as u64;
+        let (mut step, filled) = run_step("wait_cancelled", || {
+            wait_cancelled_or_filled(client, &competition_id, &cancellation, ours)
         })
         .await?;
-        steps.push(step);
-        collect_refunds(client, &users, &competition_id, config, &traces, steps).await?;
-    } else {
-        for state in [
-            "collecting_entries",
-            "escrow_confirmed",
-            "event_created",
-            "entries_submitted",
-            "contract_created",
-            "signing_complete",
-            "funding_broadcasted",
-            "funding_confirmed",
-            "awaiting_attestation",
-        ] {
-            let (step, ()) = run_step(&format!("wait_{state}"), || {
-                wait_for_state(client, &competition_id, state, config)
-            })
-            .await?;
+        if !filled {
             steps.push(step);
+            return collect_refunds(client, &users, &competition_id, config, &traces, steps).await;
+        }
+        // Other players took the seats this scenario left empty, so the competition runs.
+        step.status = StepStatus::Skipped;
+        step.details = Some(serde_json::json!({ "filled_by_other_players": true }));
+        steps.push(step);
+    }
+    follow_lifecycle(client, &users, &competition_id, config, &traces, steps).await
+}
+
+/// The states a single competition passes through on its way to its attestation.
+const LIFECYCLE: [&str; 9] = [
+    "collecting_entries",
+    "escrow_confirmed",
+    "event_created",
+    "entries_submitted",
+    "contract_created",
+    "signing_complete",
+    "funding_broadcasted",
+    "funding_confirmed",
+    "awaiting_attestation",
+];
+
+/// Follow a single competition to its attestation. A competition may instead be cancelled for
+/// what synth's players did not do: a kickoff check failed on fees that rose after the run drew
+/// its players, or other players held or paid for seats and never entered. Then every paid
+/// ticket's refund is collected instead.
+async fn follow_lifecycle(
+    client: &CoordinatorClient,
+    users: &[SynthUser],
+    competition_id: &Uuid,
+    config: &ScenarioConfig,
+    traces: &[EntryTrace],
+    steps: &mut Steps,
+) -> std::result::Result<(), Box<StepResult>> {
+    for state in LIFECYCLE {
+        match run_step(&format!("wait_{state}"), || {
+            wait_for_state(client, competition_id, state, config)
+        })
+        .await
+        {
+            Ok((step, ())) => steps.push(step),
+            Err(failed) => {
+                let competition = client.get_competition(competition_id).await.ok();
+                let Some(reason) = competition
+                    .as_ref()
+                    .and_then(|competition| expected_cancellation(competition, traces))
+                else {
+                    return Err(failed);
+                };
+                steps.push(StepResult {
+                    name: "wait_cancelled".into(),
+                    status: StepStatus::Passed,
+                    duration_ms: failed.duration_ms,
+                    details: Some(serde_json::json!({ "reason": reason })),
+                    error: None,
+                });
+                return collect_refunds(client, users, competition_id, config, traces, steps).await;
+            }
         }
     }
     Ok(())
+}
+
+/// Why a competition that stopped short of its attestation did so for reasons outside synth's
+/// players, or None if synth has nothing to blame but the coordinator.
+pub(super) fn expected_cancellation(
+    competition: &CompetitionResponse,
+    traces: &[EntryTrace],
+) -> Option<&'static str> {
+    if competition.cancelled_at.is_none() && competition.failed_at.is_none() {
+        return None;
+    }
+    if competition.failed_kickoff() {
+        return Some("its kickoff check failed at the network fees then");
+    }
+    let ours = traces.iter().filter(|trace| trace.paid).count() as u64;
+    let others =
+        traces.iter().any(|trace| trace.seat_taken) || competition.total_paid_entries > ours;
+    (competition.cancelled_at.is_some() && others)
+        .then_some("other players held seats and never entered")
+}
+
+/// Wait for a competition expected to close unfilled to be cancelled: false. True if it filled
+/// instead, when other players paid for the seats synth's `ours` paid entries left empty.
+async fn wait_cancelled_or_filled(
+    client: &CoordinatorClient,
+    competition_id: &Uuid,
+    config: &ScenarioConfig,
+    ours: u64,
+) -> Result<bool> {
+    let deadline = Instant::now() + Duration::from_secs(config.state_timeout_secs);
+    loop {
+        let competition = client.get_competition(competition_id).await?;
+        if competition.cancelled_at.is_some() {
+            return Ok(false);
+        }
+        ensure!(
+            competition.failed_at.is_none(),
+            "Competition failed while waiting to be cancelled"
+        );
+        if competition.seats_all_paid() && competition.total_paid_entries > ours {
+            return Ok(true);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "Timeout waiting for state: cancelled"
+        );
+        tokio::time::sleep(Duration::from_secs(config.poll_interval_secs)).await;
+    }
 }
 
 fn reservation_hold_ms(requested_at: OffsetDateTime, now: OffsetDateTime) -> u64 {
@@ -572,15 +706,19 @@ async fn run_actor(
         )
         .await?;
         ensure_payment_time(deadline, config)?;
-        let requested = full_lifecycle::request_entry(
+        let Some(requested) = request_seat(
             client,
             user,
             competition_id,
-            config.lightning_address.as_deref(),
+            config,
+            deadline,
             &name,
             &mut trace,
         )
-        .await?;
+        .await?
+        else {
+            return Ok(());
+        };
         if plan.behavior == EntryBehavior::AbandonUnpaid {
             return Ok(());
         }
@@ -641,10 +779,59 @@ async fn run_actor(
     })
     .await;
     let step = match result {
-        Ok((step, ())) => step,
+        Ok((mut step, ())) => {
+            if trace.seat_taken {
+                step.status = StepStatus::Skipped;
+            }
+            step
+        }
         Err(step) => *step,
     };
     (trace.attach(step), trace)
+}
+
+/// Request a ticket for `user`, as a real player would: while every seat is held, keep trying
+/// until one frees up. Other people can enter synth's competitions too, so a seat may never come:
+/// None, with the trace's `seat_taken` set, once others have paid for every seat or the invoice
+/// deadline passes before one frees up.
+async fn request_seat(
+    client: &CoordinatorClient,
+    user: &SynthUser,
+    competition_id: &Uuid,
+    config: &ScenarioConfig,
+    deadline: OffsetDateTime,
+    step: &str,
+    trace: &mut EntryTrace,
+) -> Result<Option<full_lifecycle::RequestedEntry>> {
+    loop {
+        match full_lifecycle::request_entry(
+            client,
+            user,
+            competition_id,
+            config.lightning_address.as_deref(),
+            step,
+            trace,
+        )
+        .await
+        {
+            Ok(requested) => return Ok(Some(requested)),
+            Err(error)
+                if error
+                    .downcast_ref::<ApiRejection>()
+                    .is_some_and(ApiRejection::is_no_capacity) => {}
+            Err(error) => return Err(error),
+        }
+        let full = client
+            .get_competition(competition_id)
+            .await?
+            .seats_all_paid();
+        if full || ensure_payment_time(deadline, config).is_err() {
+            trace.seat_taken = true;
+            crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_secs(config.poll_interval_secs.max(1))).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -98,6 +98,28 @@ fn every_entry_must_be_in_exactly_one_listed_pool() {
 }
 
 #[test]
+fn other_players_can_share_the_pools() {
+    // Synth's 20 tickets, and 7 other people's, split into pools of 14 and 13.
+    let everyone = fresh(27);
+    let pools = listed(&[14, 13]);
+    let placed = place(&pools, &everyone);
+    let ours = everyone[..20].to_vec();
+    let ours_placed = placed
+        .iter()
+        .filter(|(ticket, _)| ours.contains(ticket))
+        .map(|(ticket, pool)| (*ticket, *pool))
+        .collect();
+    check_split(&rules(), &pools, &ours, &ours_placed).unwrap();
+    // Two synth players with three others: a queue too small by synth's count forms a pool.
+    let pools = listed(&[5]);
+    let ours = fresh(2);
+    check_split(&rules(), &pools, &ours, &place(&pools, &ours)).unwrap();
+    // The split is still checked against everyone the pools list.
+    let pools = listed(&[20, 7]);
+    assert!(check_split(&rules(), &pools, &ours, &place(&pools, &ours)).is_err());
+}
+
+#[test]
 fn pool_indexes_must_count_from_zero() {
     let tickets = fresh(27);
     let mut pools = listed(&[14, 13]);
@@ -431,9 +453,31 @@ async fn a_queue_too_small_for_a_pool_is_cancelled_and_refunds_everyone() {
         .all(|(competition, _)| *competition == run.queue()));
 }
 
+/// Synth's own two players formed a pool below the minimum of three: the split is wrong.
 #[tokio::test]
-async fn a_queue_that_forms_pools_when_it_should_be_cancelled_fails() {
+async fn a_queue_that_forms_a_pool_too_small_for_its_rules_fails() {
     let run = Run::new(QUEUED_TOO_FEW, &[2]).await;
-    let (_, result) = run.after_entries().await;
-    assert_eq!(result.unwrap_err().name, "wait_cancelled");
+    let (steps, result) = run.after_entries().await;
+    assert_eq!(steps.names(), ["wait_cancelled", "wait_pools_formed"]);
+    assert_eq!(result.unwrap_err().name, "verify_pools");
+}
+
+/// Synth's two players are too few for a pool, but other people entered too, from one to many:
+/// the queue forms pools and they run.
+#[tokio::test]
+async fn other_players_can_make_a_too_small_queue_form_pools() {
+    for others in [1, 3, 10] {
+        let run = Run::new(QUEUED_TOO_FEW, &[2]).await;
+        run.mock.state.lock().unwrap().pools[0]
+            .1
+            .extend((0..others).map(|_| Uuid::now_v7()));
+        let (steps, result) = run.after_entries().await;
+        assert!(result.is_ok(), "{others} others: {:?}", result.err());
+        let names = steps.names();
+        assert_eq!(
+            &names[..3],
+            ["wait_cancelled", "wait_pools_formed", "verify_pools"]
+        );
+        assert_eq!(names.last(), Some(&"wait_pools_awaiting_attestation"));
+    }
 }

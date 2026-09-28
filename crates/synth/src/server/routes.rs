@@ -499,6 +499,7 @@ async fn trigger_run(
     }
     if let Some(users) = params.users {
         config.users = users;
+        config.player_mix = None;
     }
     if let Some(seed) = params.seed {
         config.seed = Some(seed);

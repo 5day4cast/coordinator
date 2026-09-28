@@ -6,7 +6,7 @@ use crate::scenarios::{
     self, ScenarioConfig, ScenarioResult, ScenarioStatus, StepResult, StepStatus,
 };
 use anyhow::Result;
-use log::{error, info};
+use log::{error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -222,8 +222,23 @@ impl Runner {
                 SCENARIOS.join(", ")
             ));
         }
+        let mut config = config.clone();
+        if let (Some(mix), None) = (&config.player_mix, config.min_players) {
+            config.min_players = mix.floor_at(self.network_fee_rate().await);
+        }
         let config_json = serde_json::to_string(&config.resolve_plan(scenario)?)?;
         self.db.create_run(scenario, Some(&config_json)).await
+    }
+
+    /// The coordinator's network fee rate, or None if it cannot be read, which is taken as high.
+    async fn network_fee_rate(&self) -> Option<f64> {
+        self.client
+            .network_fee_rate()
+            .await
+            .inspect_err(|e| {
+                warn!("Cannot read the network fee; drawing no small competitions: {e:#}")
+            })
+            .ok()
     }
 
     /// Run the scenario of a run [`Runner::record_run`] recorded.
@@ -385,16 +400,34 @@ impl Runner {
         let mut cycle = 0usize;
 
         loop {
+            // Runs start every interval, however long each one's entry window keeps it going.
+            let started = tokio::time::Instant::now();
             let mut next = config.clone();
             next.observation_window_choices.clear();
             let (scenario, window) = scheduled_selection(&scenarios, &windows, cycle);
             next.observation_window_secs = window;
             next.seed = config.seed.map(|seed| seed.wrapping_add(cycle as u64));
-            if let Err(e) = self.run_scenario(scenario, next).await {
-                error!("Scheduled run failed: {:?}", e);
+            match self.run_scenario(scenario, next.clone()).await {
+                // Fees rose past what small competitions allow since the count was drawn: draw
+                // again, large enough.
+                Ok(result) if result.refused_as_small() => {
+                    next.min_players = next
+                        .player_mix
+                        .as_ref()
+                        .map(|mix| mix.min_players_high_fees);
+                    next.seed = next.seed.map(|seed| seed.wrapping_add(0x5245_4452_4157));
+                    if let Err(e) = self.run_scenario(scenario, next).await {
+                        error!("Scheduled run failed: {:?}", e);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => error!("Scheduled run failed: {:?}", e),
             }
             cycle = cycle.wrapping_add(1);
-            tokio::time::sleep(std::time::Duration::from_secs(scheduler.interval_secs)).await;
+            tokio::time::sleep_until(
+                started + std::time::Duration::from_secs(scheduler.interval_secs),
+            )
+            .await;
         }
     }
 }

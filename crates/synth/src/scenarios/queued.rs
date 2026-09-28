@@ -228,12 +228,36 @@ pub(super) async fn after_entries(
         deadline,
         OffsetDateTime::now_utc(),
     );
-    if shape.sizes().is_none() {
-        let (step, ()) = run_step("wait_cancelled", || {
+    // Other people's entries can make a queue too small for a pool by synth's count big enough.
+    let cancelled = if shape.sizes().is_none() {
+        match run_step("wait_cancelled", || {
             wait_for_state(client, queue_id, "cancelled", &kickoff)
         })
-        .await?;
-        steps.push(step);
+        .await
+        {
+            Ok((step, ())) => {
+                steps.push(step);
+                true
+            }
+            Err(mut step) => {
+                let formed = client
+                    .get_competition(queue_id)
+                    .await
+                    .is_ok_and(|queue| queue.pools_formed_at.is_some());
+                if !formed {
+                    return Err(step);
+                }
+                step.status = StepStatus::Skipped;
+                step.error = None;
+                step.details = Some(serde_json::json!({ "pools_formed_with_other_players": true }));
+                steps.push(*step);
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if cancelled {
         let (step, ()) = run_step("verify_no_pools", || async {
             let queue = client.get_competition(queue_id).await?;
             ensure!(
@@ -382,21 +406,27 @@ async fn placements(
 }
 
 /// Check how a queue split its complete tickets: as many pools as the rules give for them, with
-/// the sizes the rules give (so they differ by at most one), and every complete ticket's entry in
-/// exactly one of them.
+/// the sizes the rules give (so they differ by at most one), and every one of synth's complete
+/// tickets (`complete`) in exactly one of them. Other people's entries can share the pools, so the
+/// split is of every entry the pools list, synth's and theirs.
 pub fn check_split(
     rules: &PoolRules,
     pools: &[PoolSummary],
     complete: &[Uuid],
     placements: &BTreeMap<Uuid, Uuid>,
 ) -> Result<()> {
+    let total: usize = pools.iter().map(|pool| pool.players).sum();
+    ensure!(
+        total >= complete.len(),
+        "the pools list {total} players, fewer than synth's {} complete tickets",
+        complete.len()
+    );
     let mut expected = rules
-        .sizes(complete.len())
-        .with_context(|| format!("{} tickets are too few for a pool", complete.len()))?;
+        .sizes(total)
+        .with_context(|| format!("{total} tickets are too few for a pool"))?;
     ensure!(
         pools.len() == expected.len(),
-        "{} tickets formed {} pools; expected {}",
-        complete.len(),
+        "{total} tickets formed {} pools; expected {}",
         pools.len(),
         expected.len()
     );
@@ -435,8 +465,8 @@ pub fn check_split(
     for pool in pools {
         let placed = members[&pool.competition_id];
         ensure!(
-            placed == pool.players,
-            "pool {} lists {} players but holds {placed} of the entries",
+            placed <= pool.players,
+            "pool {} lists {} players but holds {placed} of synth's entries",
             pool.pool_index,
             pool.players
         );

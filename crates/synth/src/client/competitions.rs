@@ -168,7 +168,42 @@ pub struct CompetitionResponse {
     /// A queued competition's pools, by index; empty until they form.
     #[serde(default)]
     pub pools: Vec<PoolSummary>,
+    /// The kickoff check an Arkade competition or pool passes before its contract is built.
+    #[serde(default)]
+    pub kickoff_check: Option<KickoffCheck>,
 }
+
+/// What a competition's kickoff check found.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KickoffCheck {
+    pub players: u64,
+    pub min_players: u64,
+    pub sat_per_vb: u64,
+    pub passed: bool,
+}
+
+impl CompetitionResponse {
+    /// Seats a single competition has: its players at most.
+    pub fn seats(&self) -> Option<u64> {
+        self.event_submission
+            .get("total_allowed_entries")
+            .and_then(serde_json::Value::as_u64)
+    }
+
+    /// Other players paid for every seat of a single competition, so none is left to take.
+    pub fn seats_all_paid(&self) -> bool {
+        self.seats()
+            .is_some_and(|seats| self.total_paid_entries >= seats)
+    }
+
+    /// Its kickoff check failed, which cancels it and refunds every entry.
+    pub fn failed_kickoff(&self) -> bool {
+        self.kickoff_check
+            .as_ref()
+            .is_some_and(|check| !check.passed)
+    }
+}
+
 
 impl CompetitionResponse {
     /// The outcome transaction's id, once it is broadcast.
@@ -284,6 +319,29 @@ impl CoordinatorClient {
         resp.json()
             .await
             .context("Failed to parse competition response")
+    }
+
+    /// The network fee rate the coordinator prices entries at, in sat/vB.
+    pub async fn network_fee_rate(&self) -> Result<f64> {
+        #[derive(Deserialize)]
+        struct NetworkFee {
+            sat_per_vb: f64,
+        }
+        let url = format!("{}/api/v1/network-fee", self.base_url());
+        let resp = self
+            .http()
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to get the network fee")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Get network fee failed ({})", resp.status());
+        }
+        Ok(resp
+            .json::<NetworkFee>()
+            .await
+            .context("Failed to parse the network fee")?
+            .sat_per_vb)
     }
 
     /// List all competitions

@@ -156,8 +156,12 @@ pub struct DefaultsConfig {
     pub seed: Option<u64>,
     #[serde(default)]
     pub entry_timing: crate::scenarios::EntryTiming,
-    /// Number of synthetic users per test
-    pub users: usize,
+    /// A fixed number of players for every run. Unset, each run draws its count from `players`.
+    #[serde(default)]
+    pub users: Option<usize>,
+    /// How many players a run draws when `users` is unset.
+    #[serde(default)]
+    pub players: crate::scenarios::PlayerMix,
     /// NOAA stations to use for competitions
     pub stations: Vec<String>,
     /// Entry fee in sats
@@ -214,7 +218,8 @@ impl Default for SynthConfig {
             defaults: DefaultsConfig {
                 seed: None,
                 entry_timing: Default::default(),
-                users: 3,
+                users: None,
+                players: Default::default(),
                 stations: vec!["KDEN".to_string(), "KJFK".to_string(), "KORD".to_string()],
                 entry_fee: 1000,
                 entry_window_secs: 120,
@@ -234,7 +239,11 @@ impl SynthConfig {
             seed: self.defaults.seed,
             entry_timing: self.defaults.entry_timing.clone(),
             observation_window_choices: self.defaults.observation_windows_secs.values().to_vec(),
-            users: self.defaults.users,
+            users: self.defaults.users.unwrap_or(3),
+            player_mix: match self.defaults.users {
+                Some(_) => None,
+                None => Some(self.defaults.players.clone()),
+            },
             stations: self.defaults.stations.clone(),
             entry_fee: self.defaults.entry_fee,
             entry_window_secs: self.defaults.entry_window_secs,
@@ -277,7 +286,6 @@ pub fn load_config(path: Option<&str>) -> anyhow::Result<SynthConfig> {
         .set_default("scheduler.enabled", false)?
         .set_default("scheduler.interval_secs", 3600)?
         .set_default("scheduler.scenario", "full_lifecycle")?
-        .set_default("defaults.users", 3)?
         .set_default("defaults.entry_fee", 1000)?
         .set_default("defaults.entry_window_secs", 120)?
         .set_default("defaults.signing_delay_secs", 60)?
@@ -285,6 +293,7 @@ pub fn load_config(path: Option<&str>) -> anyhow::Result<SynthConfig> {
 
     let config: SynthConfig = builder.build()?.try_deserialize()?;
     validate_windows(config.defaults.observation_windows_secs.values())?;
+    config.defaults.players.validate()?;
     config
         .defaults
         .entry_timing
