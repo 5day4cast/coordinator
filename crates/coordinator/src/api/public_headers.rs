@@ -49,6 +49,7 @@ fn origin(url: &str) -> Option<String> {
 ///   `htmx`, so HTML and script reach the DOM only through htmx's swaps, and
 ///   `login-worker`, which admits only the log-in worker's URL (shared/wasm.js);
 /// - styles: this site's only (Bulma is vendored); no inline styles;
+/// - video: this site's only (the help page's walkthrough);
 /// - connections: this site, the API, oracle and configured Keymeld gateway.
 pub fn content_security_policy(connect: &[&str]) -> String {
     let mut connect_src = vec!["'self'".to_owned()];
@@ -62,6 +63,7 @@ pub fn content_security_policy(connect: &[&str]) -> String {
         "script-src 'self' 'wasm-unsafe-eval'".to_owned(),
         "style-src 'self'".to_owned(),
         "img-src 'self' data:".to_owned(),
+        "media-src 'self'".to_owned(),
         format!("connect-src {}", connect_src.join(" ")),
         "object-src 'none'".to_owned(),
         "base-uri 'none'".to_owned(),

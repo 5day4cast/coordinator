@@ -95,30 +95,24 @@ pub fn entry_form(
 
             dl class="entry-facts" {
                 div {
-                    dt { "Entries close" (tip("Picks lock when the window starts.")) }
+                    dt { "Entries close" (tip("Picks lock then, and the readings count from that moment on.")) }
                     dd { (format::time(competition.start, TimeStyle::DateTime)) }
                 }
                 div {
-                    dt { "Window" }
-                    dd { (format::window(competition.start, competition.end)) }
-                }
-                div {
-                    dt { "Ticket" (tip("Entry fee, service fee and your share of the Bitcoin network fee.")) }
+                    dt { "Price" }
                     dd { (price(competition, network_fee)) }
                 }
                 div {
                     dt {
-                        "Pot"
+                        "Win"
                         @if queue.is_some() {
-                            (tip("Each pool's winner takes that pool's pot."))
-                        } @else {
-                            (tip("Paid to the top scores once the result is final."))
+                            (tip("What a pool's winner takes; it grows as more players enter."))
                         }
                     }
                     dd {
-                        (competition.pot())
+                        (competition.win())
                         @if queue.is_none() && competition.paid_places > 1 {
-                            span class="fact-note" { "top " (competition.paid_places) " paid" }
+                            span class="fact-note" { "for 1st; top " (competition.paid_places) " paid" }
                         }
                     }
                 }
@@ -227,14 +221,40 @@ pub fn entry_form(
     }
 }
 
-/// The ticket's total. It carries an id, so the ticket's own network fee can replace the
-/// estimate once the ticket is issued.
+/// The ticket's price: its total, which opens to the entry, service and network fees. The
+/// total and the network fee carry ids, so the ticket's own fee can replace the estimate once
+/// the ticket is issued (`entry_form.js`).
 fn price(competition: &CompetitionView, network_fee: NetworkFee) -> Markup {
+    let network_fee = network_fee.sats();
+    let service = competition
+        .ticket_price
+        .saturating_sub(competition.entry_fee);
     html! {
-        span id="ticketTotal" {
-            @match network_fee.sats() {
-                Some(fee) => (sats(competition.ticket_price + fee)),
-                None => { (sats(competition.ticket_price)) " + network fee" }
+        details class="price-details" {
+            summary {
+                span id="ticketTotal" {
+                    @match network_fee {
+                        Some(fee) => (sats(competition.ticket_price + fee)),
+                        None => { (sats(competition.ticket_price)) " + network fee" }
+                    }
+                }
+            }
+            ul class="price-lines" {
+                li { "Entry fee " span { (sats(competition.entry_fee)) } }
+                @if service > 0 {
+                    li { "Service fee (" (competition.service_fee_percent) ") " span { (sats(service)) } }
+                }
+                @if network_fee != Some(0) {
+                    li {
+                        "Network fee "
+                        span id="networkFee" {
+                            @match network_fee {
+                                Some(fee) => (sats(fee)),
+                                None => "unavailable right now",
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -496,14 +516,21 @@ mod tests {
         assert!(html.contains("Pay 5,300 sats and enter"));
     }
 
-    /// The ticket shows its total only; what it is made of is a tooltip. The total carries an
-    /// id for the ticket's own network fee to replace.
+    /// The price is one total, "what it costs me"; tapping it opens the entry, service and
+    /// network fees. The total and the network fee carry ids for the ticket's own fee.
     #[test]
-    fn entry_form_shows_the_ticket_total_only() {
+    fn entry_form_shows_one_price_that_opens_to_its_fees() {
         let html = form(PayoutDestination::LoggedOut);
-        assert!(!html.contains("entry 5,000 sats"));
-        assert!(!html.contains("service 5%"));
-        assert!(html.contains("your share of the Bitcoin network fee"));
+        let details = html.find(r#"<details class="price-details">"#).unwrap();
+        let total = html
+            .find(r#"<span id="ticketTotal">5,300 sats</span>"#)
+            .unwrap();
+        let lines = html.find(r#"<ul class="price-lines">"#).unwrap();
+        assert!(details < total && total < lines, "the total is the summary");
+        assert!(html.contains("Entry fee <span>5,000 sats</span>"));
+        assert!(html.contains("Service fee (5%) <span>250 sats</span>"));
+        assert!(html.contains(r#"Network fee <span id="networkFee">50 sats</span>"#));
+        assert!(!html.contains(">Ticket<") && !html.contains(">Pot<"));
 
         // Without an estimate no price is claimed for it, and no ticket can be issued either.
         let unavailable = entry_form(
@@ -515,9 +542,11 @@ mod tests {
         )
         .into_string();
         assert!(unavailable.contains("5,250 sats + network fee"));
+        assert!(unavailable.contains(r#"<span id="networkFee">unavailable right now</span>"#));
         assert!(!unavailable.contains("data-network-fee"));
         assert!(unavailable.contains("Pay and enter"));
 
+        // With network fees off there is no line for one.
         let off = entry_form(
             &view("c1", Phase::Upcoming, 60),
             &Forecasts::Pending(Pending::Loading),
@@ -527,11 +556,28 @@ mod tests {
         )
         .into_string();
         assert!(off.contains(r#"<span id="ticketTotal">5,250 sats</span>"#));
+        assert!(!off.contains("networkFee"));
         assert!(off.contains("Pay 5,250 sats and enter"));
     }
 
-    /// The deadline is a fact of its own, and how scoring works is a link to the help page
-    /// rather than a paragraph on the form.
+    /// What winning pays sits beside the price: first place's prize.
+    #[test]
+    fn entry_form_shows_what_first_place_wins() {
+        let html = form(PayoutDestination::LoggedOut);
+        assert!(html.contains("<dt>Win</dt><dd>15,000 sats</dd>"), "{html}");
+        let mut two = view("c1", Phase::Upcoming, 60);
+        two.paid_places = 2;
+        let html = entry_form(
+            &two,
+            &Forecasts::Pending(Pending::Loading),
+            None,
+            &PayoutDestination::LoggedOut,
+            NetworkFee::Estimate(50),
+        )
+        .into_string();
+        assert!(html.contains("10,500 sats") && html.contains("for 1st; top 2 paid"));
+    }
+
     #[test]
     fn only_a_competition_allowing_several_entries_per_player_says_so() {
         assert!(!form(PayoutDestination::LoggedOut).contains("Per player"));
@@ -548,10 +594,16 @@ mod tests {
         assert!(html.contains("up to 3 entries"));
     }
 
+    /// The deadline is a fact of its own, and how scoring works is a link to the help page
+    /// rather than a paragraph on the form.
     #[test]
     fn entry_form_shows_the_deadline_and_links_the_rules() {
         let html = form(PayoutDestination::LoggedOut);
         assert!(html.contains("Entries close"));
+        assert!(
+            !html.contains("Window"),
+            "the deadline is the one time the form needs"
+        );
         assert!(html.contains(r#"href="/help#scoring""#));
         assert!(!html.contains("scores 20 points"));
         assert!(!html.contains("Pick as many readings"));
@@ -615,7 +667,8 @@ mod tests {
         assert!(
             html.contains(r#"data-tip="Players are split into pools of up to 25 at the start.""#)
         );
-        assert!(html.contains("100,000 sats per pool"));
+        // Forty entries make two pools of twenty: each winner takes 100,000 sats.
+        assert!(html.contains("<dd>100,000 sats</dd>"), "{html}");
         assert!(html.contains("pool&#39;s winner") || html.contains("pool's winner"));
         assert!(!html.contains(" of 3"));
         assert!(html.contains(r#"data-kind="queued""#));

@@ -8,7 +8,10 @@ use crate::domain::leaderboard::{
     progress::{LINE_POINTS, OVER_OR_UNDER_POINTS, PAR_POINTS},
     Metric, PickState, Rule,
 };
-use crate::templates::fragments::{entry_form::pick_row, picks::state_badge};
+use crate::templates::{
+    assets::{HOW_IT_WORKS_JPG, HOW_IT_WORKS_MP4},
+    fragments::{entry_form::pick_row, picks::state_badge},
+};
 
 /// A numbered marker tying a spot in the walkthrough to its note.
 fn callout(number: u8) -> Markup {
@@ -21,12 +24,14 @@ pub fn help_page() -> Markup {
             a class="back-link" href="/competitions" hx-get="/competitions"
               hx-target="#main-content" hx-push-url="true" { "← All competitions" }
             h1 class="title is-4" { "How it works" }
+            (video())
+
             nav class="help-contents" aria-label="On this page" {
                 a href="#walkthrough" { "Entering" }
                 a href="#scoring" { "Scoring" }
                 a href="#readings" { "Readings" }
                 a href="#timing" { "Deadlines and results" }
-                a href="#statuses" { "Statuses" }
+                a href="#statuses" { "Following your picks" }
                 a href="#pools" { "Entries and pools" }
                 a href="#payouts" { "Paying and payouts" }
                 a href="#advanced" { "How the tech works" }
@@ -105,12 +110,14 @@ pub fn help_page() -> Markup {
             }
 
             section id="statuses" class="content" {
-                h2 { "What each pick's status means" }
-                p { "During the window, highs and winds can only rise and lows can only fall, so a pick can settle early." }
+                h2 { "Following your picks" }
+                p {
+                    "While the window is live, each pick shows the reading so far and the points it would "
+                    "score if the window ended now. Highs and winds can only rise and lows can only fall, "
+                    "so some picks settle before the window ends:"
+                }
                 dl class="help-statuses" {
                     @for (state, meaning) in [
-                        (PickState::OnTrack, "Right if the window ended now, but it can still flip."),
-                        (PickState::OffTrack, "Wrong right now, but it can still come right."),
                         (PickState::LockedIn, "Right, and nothing left in the window can change it."),
                         (PickState::Out, "Wrong, and nothing left in the window can change it."),
                         (PickState::AwaitingResult, "The window has closed; the oracle's own reading decides."),
@@ -218,6 +225,22 @@ pub fn help_page() -> Markup {
     }
 }
 
+/// A minute's walk through entering, the leaderboard and a player's picks, recorded from these
+/// pages (`just help-video`). It loads only when played; the sections below say it all in words.
+fn video() -> Markup {
+    html! {
+        figure class="help-video" {
+            video controls playsinline preload="none" width="540" height="1168"
+                  poster=(HOW_IT_WORKS_JPG.url)
+                  aria-label="How it works: entering a competition, then following the leaderboard and your picks" {
+                source src=(HOW_IT_WORKS_MP4.url) type="video/mp4";
+                a href=(HOW_IT_WORKS_MP4.url) { "Watch how it works" }
+            }
+            figcaption { "How it works, in under a minute." }
+        }
+    }
+}
+
 /// An entry form as it looks, inert, with numbered notes.
 fn walkthrough() -> Markup {
     let band = Rule::Line {
@@ -231,8 +254,8 @@ fn walkthrough() -> Markup {
                 figure class="help-shot entry-form" inert aria-label="An example entry form" {
                     dl class="entry-facts" {
                         div { dt { "Entries close" (callout(1)) } dd { "Sep 30, 6:56 PM" } }
-                        div { dt { "Ticket" (callout(2)) } dd { "5,687 sats" } }
-                        div { dt { "Pot" (callout(3)) } dd { "30,000 sats" } }
+                        div { dt { "Price" (callout(2)) } dd { "5,687 sats" } }
+                        div { dt { "Win" (callout(3)) } dd { "30,000 sats" } }
                     }
                     fieldset class="station-picks" {
                         legend { "Chicago/O'Hare International, IL " span class="station-code" { "KORD" } (callout(4)) }
@@ -243,8 +266,8 @@ fn walkthrough() -> Markup {
                 }
                 ol class="help-callouts content" {
                     li { "The deadline. Picks lock when the observation window starts." }
-                    li { "Everything you pay: entry fee, service fee and network fee." }
-                    li { "What the winners share once the result is final." }
+                    li { "What entering costs, all in. Tap it to see the fees it's made of." }
+                    li { "What first place wins once the result is final." }
                     li { "Each airport and its forecast: here, a 77°F high at Chicago O'Hare." }
                     li {
                         "Your pick, left to right: Under, Par (73.4–76.0°F, both ends included) or Over. "
@@ -272,6 +295,19 @@ mod tests {
         );
         // Nothing the live form's script looks for.
         assert!(!html.contains("entryForm") && !html.contains("submitEntry"));
+    }
+
+    /// The video loads only when played, from this site's own hashed assets.
+    #[test]
+    fn the_video_waits_to_be_played() {
+        let html = help_page().into_string();
+        assert!(html.contains(r#"<video controls playsinline preload="none""#));
+        assert!(html.contains(&format!(r#"poster="{}""#, HOW_IT_WORKS_JPG.url)));
+        assert!(html.contains(&format!(
+            r#"<source src="{}" type="video/mp4">"#,
+            HOW_IT_WORKS_MP4.url
+        )));
+        assert!(!html.contains("autoplay"));
     }
 
     #[test]

@@ -28,6 +28,9 @@ pub struct CompetitionView {
     pub entry_fee: u64,
     /// What the entrant pays before the network fee: the entry fee plus the coordinator fee.
     pub ticket_price: u64,
+    /// The network fee a ticket issued now would add, for a competition taking entries; `None`
+    /// until the page adds it, or while there is no estimate.
+    pub network_fee: Option<u64>,
     /// The coordinator fee as a percentage of the entry fee: `5%`, `2.5%`.
     pub service_fee_percent: String,
     pub total_pool: u64,
@@ -91,6 +94,7 @@ impl CompetitionView {
             end: event.end_observation_date,
             entry_fee: event.entry_fee as u64,
             ticket_price: competition.calculate_invoice_amount(),
+            network_fee: None,
             service_fee_percent: event.coordinator_fee.to_string(),
             total_pool: event.total_competition_pool as u64,
             total_entries: competition.total_entries,
@@ -144,6 +148,34 @@ impl CompetitionView {
             }
             _ => sats(self.total_pool),
         }
+    }
+
+    /// What entering costs now: the ticket price and, when known, the network fee.
+    pub fn price(&self) -> u64 {
+        self.ticket_price + self.network_fee.unwrap_or(0)
+    }
+
+    /// What first place wins: the top prize, or for a queue the pot a pool pays its winner with
+    /// the entries so far, and never less than a smallest pool's. `None` when nothing is won
+    /// by rank (the competition didn't run, or returned its pot).
+    pub fn top_prize(&self) -> Option<u64> {
+        if !self.has_ranked_prizes() {
+            return None;
+        }
+        match &self.queue {
+            Queue::Queued(queue) => {
+                let entries = self.entry_count(queue);
+                let pools = entries.div_ceil(queue.max_players.max(1)).max(1);
+                let players = (entries / pools).max(queue.min_players.unwrap_or(2));
+                Some(self.entry_fee.saturating_mul(players))
+            }
+            _ => self.prizes().first().map(|(_, amount)| *amount),
+        }
+    }
+
+    /// [`Self::top_prize`] as the pages show it.
+    pub fn win(&self) -> String {
+        self.top_prize().map_or_else(|| "—".to_owned(), sats)
     }
 
     /// Each paid place's share in percent and in sats, first place first.
@@ -506,13 +538,6 @@ fn intro(featured: Option<&CompetitionView>, now: OffsetDateTime) -> Markup {
 }
 
 fn featured_card(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
-    // A queue's prize is its pools' pots, which depend on how many enter.
-    let prize = competition
-        .queue
-        .queued()
-        .is_none()
-        .then(|| competition.prizes().first().map(|(_, amount)| *amount))
-        .flatten();
     html! {
         div class="featured-card" {
             div class="featured-status" {
@@ -527,11 +552,10 @@ fn featured_card(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
             }
             p class="featured-window" { (format::window(competition.start, competition.end)) }
             dl class="featured-facts" {
-                div { dt { "Entry" } dd { (sats(competition.ticket_price)) } }
-                div { dt { "Pot" } dd { (competition.pot()) } }
-                @if let Some(prize) = prize {
-                    div { dt { "1st place" } dd { (sats(prize)) } }
+                @if competition.can_enter {
+                    div { dt { "Price" } dd { (sats(competition.price())) } }
                 }
+                div { dt { "Win" } dd { (competition.win()) } }
                 div { dt { "Entries" } dd { (competition.entries()) } }
             }
             a class=(if competition.can_enter { "button is-primary is-fullwidth" } else { "button is-fullwidth" })
@@ -560,10 +584,9 @@ fn list(competitions: &[&CompetitionView], now: OffsetDateTime) -> Markup {
             div class="competition-header" aria-hidden="true" {
                 span { "Status" }
                 span { "Window" }
-                span { "Entry" }
-                span { "Pot" }
+                span { "Price" }
+                span { "Win" }
                 span { "Entries" }
-                span { "Paid places" }
                 span {}
             }
             @for competition in competitions {
@@ -582,28 +605,20 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
     } else {
         "Leaderboard"
     };
-    // Phones show these facts below the window. Cancelled and refunded competitions
-    // never advertise paid places: those were only their planned winner prizes.
-    let mut facts = format!(
-        "Entry {} · Pot {} · {}",
-        sats(competition.ticket_price),
-        competition.pot(),
-        match competition.queue {
-            Queue::Queued(_) => competition.entries(),
-            _ => format!("{} entries", competition.entries()),
-        },
-    );
-    if competition.has_ranked_prizes() {
-        facts.push_str(&format!(
-            " · {} paid {}",
-            competition.paid_places,
-            if competition.paid_places == 1 {
-                "place"
-            } else {
-                "places"
-            },
-        ));
+    // Phones show these facts below the window. Only a competition taking entries has a
+    // price; one that didn't run wins nothing.
+    let mut facts = Vec::new();
+    if competition.can_enter {
+        facts.push(format!("Price {}", sats(competition.price())));
     }
+    if competition.top_prize().is_some() {
+        facts.push(format!("Win {}", competition.win()));
+    }
+    facts.push(match competition.queue {
+        Queue::Queued(_) => competition.entries(),
+        _ => format!("{} entries", competition.entries()),
+    });
+    let facts = facts.join(" · ");
     html! {
         a class="competition-row" data-competition-id=(competition.id) data-facts=(facts)
           href=(competition.url()) hx-get=(competition.url())
@@ -626,12 +641,11 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
                     Queue::Single => {}
                 }
             }
-            span class="cell-fee" data-label="Entry" { (sats(competition.ticket_price)) }
-            span class="cell-pot" data-label="Pot" { (competition.pot()) }
-            span class="cell-entries" data-label="Entries" { (competition.entries()) }
-            span class="cell-places" data-label="Paid places" {
-                @if competition.has_ranked_prizes() { (competition.paid_places) } @else { "—" }
+            span class="cell-fee" data-label="Price" {
+                @if competition.can_enter { (sats(competition.price())) } @else { "—" }
             }
+            span class="cell-win" data-label="Win" { (competition.win()) }
+            span class="cell-entries" data-label="Entries" { (competition.entries()) }
             span class="cell-action" { (action) " →" }
         }
     }
@@ -653,6 +667,7 @@ pub(crate) mod tests {
             end: start + time::Duration::minutes(10),
             entry_fee: 5000,
             ticket_price: 5250,
+            network_fee: None,
             service_fee_percent: "5%".into(),
             total_pool: 15000,
             total_entries: 1,
@@ -724,10 +739,15 @@ pub(crate) mod tests {
         assert!(html.contains(r#"href="/competitions/open/entry-form""#));
         assert!(html.contains("Daily Fantasy Weather"));
         assert!(html.contains(r#"href="/help""#));
-        assert!(html.contains("5,250 sats"));
-        assert!(html.contains("15,000 sats"));
-        assert!(html.contains("Paid places"));
-        assert!(!html.contains("Winners"));
+        // What it costs and what first place wins; the network fee is in the price once known.
+        assert!(html.contains("<dt>Price</dt><dd>5,250 sats</dd>"));
+        assert!(html.contains("<dt>Win</dt><dd>15,000 sats</dd>"));
+        assert!(!html.contains("Paid places") && !html.contains(">Pot<"));
+        let mut priced = view("open", Phase::Upcoming, 133);
+        priced.network_fee = Some(437);
+        let row = competition_row(&priced, NOW).into_string();
+        assert!(row.contains(r#"data-label="Price">5,687 sats</span>"#));
+        assert!(row.contains("Price 5,687 sats · Win 15,000 sats · 1 of 3 entries"));
     }
 
     #[test]
@@ -853,8 +873,10 @@ pub(crate) mod tests {
         refunded.pot_refunded = true;
         for competition in [refunded, view("cancelled", Phase::Cancelled, -60)] {
             let html = competition_row(&competition, NOW).into_string();
-            assert!(!html.contains("1 paid place"));
-            assert!(html.contains(r#"data-label="Paid places">—</span>"#));
+            assert!(html.contains(r#"data-label="Win">—</span>"#));
+            assert!(!html.contains("Win 15,000"));
+            // Nothing to buy either.
+            assert!(html.contains(r#"data-label="Price">—</span>"#));
         }
     }
 
@@ -870,10 +892,12 @@ pub(crate) mod tests {
         );
         assert!(row.contains("pools of up to 25"));
         // Forty entries make two pools of twenty.
-        assert!(row.contains("Pot 100,000 sats per pool · 40 entered"));
-        let mut six = queued("q", 6);
-        six.total_entries = 6;
-        assert_eq!(six.pot(), "30,000 sats");
+        assert!(row.contains("Price 5,250 sats · Win 100,000 sats · 40 entered"));
+        assert_eq!(queue.pot(), "100,000 sats per pool");
+        let six = queued("q", 6);
+        assert_eq!(six.win(), "30,000 sats");
+        // Before anyone enters, a pool's winner takes at least a smallest pool's pot.
+        assert_eq!(queued("q", 0).win(), "10,000 sats");
         assert!(row.contains(r#"href="/competitions/q/entry-form""#));
         assert!(!row.contains(" of 3"));
         assert!(phase_badge(&queue).into_string().contains(">Open</span>"));

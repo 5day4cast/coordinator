@@ -225,6 +225,8 @@ fn competition(id: &str, phase: Phase, start: OffsetDateTime, entries: u64) -> C
         end: start + Duration::DAY,
         entry_fee: 5_000,
         ticket_price: 5_250,
+        // What a ticket issued now adds, as the pages get it from the fee estimate.
+        network_fee: Some(437),
         service_fee_percent: "5%".into(),
         total_pool: 30_000,
         total_entries: entries,
