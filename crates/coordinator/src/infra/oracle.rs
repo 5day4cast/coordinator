@@ -1042,7 +1042,20 @@ mod tests {
             .iter()
             .map(|entry| serde_json::json!({
                 "id": entry.id, "event_id": body.event_id,
-                "picks": [{"target": "KORD", "metric": "temp_high", "prediction": "Over"}]
+                // Stored as NOAA v2 picks, one per predicted metric.
+                "picks": entry.expected_observations.iter().flat_map(|choices| {
+                    [
+                        ("temp_high", &choices.temp_high),
+                        ("temp_low", &choices.temp_low),
+                        ("wind_speed", &choices.wind_speed),
+                    ]
+                    .into_iter()
+                    .filter_map(|(metric, prediction)| prediction.as_ref().map(|prediction| {
+                        serde_json::json!({
+                            "target": choices.stations, "metric": metric, "prediction": prediction
+                        })
+                    }))
+                }).collect::<Vec<_>>()
             }))
             .collect::<Vec<_>>());
         lost_response()
