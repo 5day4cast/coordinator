@@ -1681,4 +1681,156 @@ mod ark_escrow {
             .await
             .is_err());
     }
+
+    fn delete_message(expire_at: u64) -> String {
+        format!(r#"{{"type":"delete","expire_at":{expire_at}}}"#)
+    }
+    fn fresh_delete_message() -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        delete_message(now + 120)
+    }
+    fn pays_nothing() -> Vec<TxOut> {
+        vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new_op_return([]),
+        }]
+    }
+    /// A proof like [`intent_proof`] whose message input commits to `message`.
+    fn delete_proof(escrow: &EntryEscrow, message: &str, outputs: Vec<TxOut>) -> ArkEscrowSpend {
+        let mut proof = intent_proof(escrow, outputs);
+        proof.unsigned_tx.input[0].previous_output =
+            coordinator_escrow::ark::intent_message_outpoint(message, escrow.script_pubkey());
+        ArkEscrowSpend::DeleteIntent {
+            proof_psbt: psbt_hex(&proof),
+            message: message.into(),
+        }
+    }
+    fn delete_parameters(spend: ArkEscrowSpend) -> Payload {
+        Payload::encode(&ActionParameters::DeleteArkIntent { spend }).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_intent_delete_signs_this_escrow_under_the_refund_permission_unbound() {
+        let (f, escrow) = ark_fixture();
+        let verifier = CoordinatorVerifier::default();
+        let attempt = attempt();
+        let unbound = Payload::default();
+        let spend = delete_proof(&escrow, &fresh_delete_message(), pays_nothing());
+        let prepared = verifier
+            .prepare(
+                f.prepare_view(&unbound, &attempt, SIGN_ARK_REFUND, &BTreeMap::new()),
+                &delete_parameters(spend.clone()),
+            )
+            .await
+            .unwrap();
+        // The message input and this escrow's input; never the other player's.
+        let inputs: Vec<usize> = prepared.output.decode().unwrap();
+        assert_eq!(inputs, vec![0, 1]);
+        assert_eq!(digests(&prepared.action).len(), 2);
+        verifier
+            .verify_execution(
+                f.execute_view(&unbound, &attempt, SIGN_ARK_REFUND),
+                &prepared,
+                &Payload::default(),
+            )
+            .await
+            .unwrap();
+        verifier
+            .restore_execution(
+                f.execute_view(&unbound, &attempt, SIGN_ARK_REFUND),
+                &prepared,
+            )
+            .await
+            .unwrap();
+
+        // A kickoff deletes its own intent under the escrow permission, with its binding.
+        let bound = f.bind(&verifier);
+        let (in_pool, _) = prepare(&verifier, &f, &bound, spend).await.unwrap();
+        assert_eq!(digests(&in_pool.action), digests(&prepared.action));
+    }
+
+    #[tokio::test]
+    async fn an_intent_delete_is_refused_if_it_pays_anything_or_proves_another_message() {
+        let (f, escrow) = ark_fixture();
+        let verifier = CoordinatorVerifier::default();
+        let attempt = attempt();
+        let unbound = Payload::default();
+        let bound = f.bind(&verifier);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let register = format!(
+            r#"{{"type":"register","onchain_output_indexes":[0],"valid_at":{now},"expire_at":{},"cosigners_public_keys":[]}}"#,
+            now + 120
+        );
+        let refused = [
+            // Outputs that move the escrow, whether to the pool or with value in an OP_RETURN.
+            delete_proof(&escrow, &fresh_delete_message(), vec![funding_output(&f)]),
+            delete_proof(
+                &escrow,
+                &fresh_delete_message(),
+                vec![TxOut {
+                    value: Amount::from_sat(1),
+                    ..pays_nothing()[0].clone()
+                }],
+            ),
+            // A registration, even one paying nothing, would put the escrow in a batch.
+            delete_proof(&escrow, &register, pays_nothing()),
+            // A delete that expired, or that stays valid for too long.
+            delete_proof(&escrow, &delete_message(now - 1), pays_nothing()),
+            delete_proof(&escrow, &delete_message(now + 24 * 60 * 60), pays_nothing()),
+        ];
+        for spend in refused {
+            assert!(verifier
+                .prepare(
+                    f.prepare_view(&unbound, &attempt, SIGN_ARK_REFUND, &BTreeMap::new()),
+                    &delete_parameters(spend.clone()),
+                )
+                .await
+                .is_err());
+            assert!(prepare(&verifier, &f, &bound, spend).await.is_err());
+        }
+
+        // The message the proof commits to, not another the request names.
+        let ArkEscrowSpend::DeleteIntent { proof_psbt, .. } =
+            delete_proof(&escrow, &fresh_delete_message(), pays_nothing())
+        else {
+            unreachable!()
+        };
+        let swapped = ArkEscrowSpend::DeleteIntent {
+            proof_psbt,
+            message: delete_message(now + 60),
+        };
+        assert!(verifier
+            .prepare(
+                f.prepare_view(&unbound, &attempt, SIGN_ARK_REFUND, &BTreeMap::new()),
+                &delete_parameters(swapped),
+            )
+            .await
+            .is_err());
+
+        // Only the refund permission deletes without a binding, and only a delete proof.
+        let spend = delete_proof(&escrow, &fresh_delete_message(), pays_nothing());
+        assert!(verifier
+            .prepare(
+                f.prepare_view(&unbound, &attempt, SIGN_ARK_ESCROW, &BTreeMap::new()),
+                &delete_parameters(spend),
+            )
+            .await
+            .is_err());
+        let intent = ArkEscrowSpend::IntentProof {
+            proof_psbt: psbt_hex(&intent_proof(&escrow, vec![funding_output(&f)])),
+        };
+        assert!(verifier
+            .prepare(
+                f.prepare_view(&unbound, &attempt, SIGN_ARK_REFUND, &BTreeMap::new()),
+                &delete_parameters(intent),
+            )
+            .await
+            .is_err());
+    }
 }

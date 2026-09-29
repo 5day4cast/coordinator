@@ -318,6 +318,13 @@ The outcome and split signatures do not need to be ready before the commitment t
 If a check or the hook fails, nothing is forfeited, and every escrow stays spendable.
 The ban on the unsigned escrows still applies, so the hook must be reliable.
 
+arkd keeps an intent queued until a batch confirms it or its owner deletes it; it re-queues one a batch selected but never confirmed.
+While queued, it holds its escrows: arkd refuses any other spend of them with `VTXO_ALREADY_REGISTERED`, refunds included.
+So a kickoff that fails before its forfeits deletes its intent, and every kickoff first deletes one an earlier attempt left, as after a restart.
+A delete proof is shaped like the intent proof and signed the same way, over each escrow's funding leaf, but pays nothing and proves a `delete` message.
+Keymeld's verifier signs it for no other shape.
+A refund that still finds its escrow held deletes the intent with a proof over that escrow alone, which frees the whole intent, and submits again.
+
 `fund_pool` is tested against a scripted arkd that checks every intent proof and forfeit signature from the PSBTs alone.
 `DlcKickoff` supplies the hook for a dlctix pool.
 The intent pays `ContractParameters::funding_output()`, which needs no outpoint.

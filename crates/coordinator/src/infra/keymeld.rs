@@ -298,6 +298,24 @@ pub trait Keymeld: Send + Sync {
         ))
     }
 
+    /// Sign a player's proof deleting a queued Arkade batch intent that holds their escrow.
+    ///
+    /// Unbound like a refund, and granted by the refund's permission: a kickoff that never
+    /// finished can leave its intent queued, and the Arkade server then refuses the refund. The
+    /// Coordinator verifier signs only a proof that pays nothing and proves a `delete` message.
+    /// Returns each signed input's index with its BIP340 signature.
+    async fn sign_ark_intent_delete(
+        &self,
+        session: &DlcKeygenSession,
+        user: UserId,
+        spend: coordinator_escrow::ark::ArkEscrowSpend,
+    ) -> Result<Vec<(usize, [u8; 64])>, KeymeldError> {
+        let _ = (session, user, spend);
+        Err(KeymeldError::Signing(
+            "Arkade intent deletes are not supported".into(),
+        ))
+    }
+
     /// Check if Keymeld is enabled
     fn is_enabled(&self) -> bool;
 

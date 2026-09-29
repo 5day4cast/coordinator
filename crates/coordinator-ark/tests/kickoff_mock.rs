@@ -3,14 +3,15 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bitcoin::key::{Keypair, Secp256k1};
 use bitcoin::secp256k1::{schnorr, Message};
 use bitcoin::{Amount, OutPoint, ScriptBuf, TxOut};
 use coordinator_ark::{
-    escrow_terms, fund_pool, BoxError, Error, EscrowInput, EscrowSigner, PoolFunding,
-    SigningRequest,
+    escrow_terms, fund_pool, BoxError, Error, EscrowInput, EscrowSigner, KickoffConfig,
+    PoolFunding, SigningRequest,
 };
 use coordinator_ark_escrow::EntryEscrow;
 
@@ -149,6 +150,105 @@ async fn a_failed_hook_forfeits_nothing() {
     assert!(matches!(result, Err(Error::Hook(_))), "{result:?}");
     assert_eq!(hooks.calls.lock().unwrap().len(), 1);
     assert!(arkd.forfeits().is_empty());
+}
+
+#[tokio::test]
+async fn a_kickoff_no_batch_selects_deletes_its_intent() {
+    let fixture = Fixture::new();
+    let arkd = Arc::new(
+        MockArkd::new(&fixture.pool, &fixture.info, Commitment::PaysThePool).never_selecting(),
+    );
+    let hooks = Hooks::new(&arkd, false);
+
+    let result = fund_pool(
+        arkd.as_ref(),
+        &fixture.info,
+        &fixture.pool,
+        &fixture.player_signer(),
+        &fixture.coordinator_signer(),
+        &hooks,
+        &KickoffConfig {
+            intent_lifetime: Duration::from_secs(120),
+            timeout: Duration::from_millis(200),
+        },
+    )
+    .await;
+
+    assert!(matches!(result, Err(Error::Timeout(_))), "{result:?}");
+    // Left queued, the intent would hold every escrow of the pool, refunds included.
+    assert!(arkd.queued().is_empty());
+    assert_eq!(arkd.state.lock().unwrap().deleted, vec![INTENT_ID]);
+    assert!(arkd.forfeits().is_empty());
+}
+
+#[tokio::test]
+async fn a_kickoff_that_fails_after_its_batch_took_the_intent_deletes_nothing() {
+    let fixture = Fixture::new();
+    let arkd = Arc::new(MockArkd::new(
+        &fixture.pool,
+        &fixture.info,
+        Commitment::PaysSomeoneElse,
+    ));
+    let hooks = Hooks::new(&arkd, false);
+
+    let result = fund_pool(
+        arkd.as_ref(),
+        &fixture.info,
+        &fixture.pool,
+        &fixture.player_signer(),
+        &fixture.coordinator_signer(),
+        &hooks,
+        &Fixture::config(),
+    )
+    .await;
+
+    // The kickoff's own error, not the delete's: the batch already took the intent.
+    assert!(matches!(result, Err(Error::Unfunded(_))), "{result:?}");
+    let state = arkd.state.lock().unwrap();
+    assert!(state.queued.is_empty() && state.deleted.is_empty());
+    assert_eq!(
+        state.delete_proofs, 2,
+        "one before registering, one after failing"
+    );
+}
+
+#[tokio::test]
+async fn a_kickoff_deletes_an_intent_an_earlier_attempt_left_queued() {
+    let fixture = Fixture::new();
+    let arkd = Arc::new(MockArkd::new(
+        &fixture.pool,
+        &fixture.info,
+        Commitment::PaysThePool,
+    ));
+    // An earlier attempt registered, then the coordinator restarted before its batch.
+    let signers = fixture
+        .pool
+        .inputs()
+        .iter()
+        .map(|input| {
+            let terms = input.escrow.terms();
+            (input.outpoint, [terms.player, terms.coordinator])
+        })
+        .collect();
+    arkd.queue_intent("intent-41", signers);
+    let hooks = Hooks::new(&arkd, false);
+
+    let kickoff = fund_pool(
+        arkd.as_ref(),
+        &fixture.info,
+        &fixture.pool,
+        &fixture.player_signer(),
+        &fixture.coordinator_signer(),
+        &hooks,
+        &Fixture::config(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(kickoff.intent_id, INTENT_ID);
+    assert_eq!(arkd.state.lock().unwrap().deleted, vec!["intent-41"]);
+    assert!(arkd.queued().is_empty(), "the batch took the new intent");
+    assert_eq!(arkd.forfeits().len(), 3);
 }
 
 /// Signs with the right key over the wrong message.

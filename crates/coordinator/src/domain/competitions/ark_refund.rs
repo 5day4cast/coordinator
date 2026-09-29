@@ -13,6 +13,12 @@
 //! player is paid once, and a refunded escrow is never spent twice. Until the escrow's refund
 //! locktime passes there is nothing to do: the refund leaf is not open yet.
 //!
+//! A kickoff that never finished can leave its batch intent queued at the Arkade server, which
+//! then refuses any other spend of the escrows it names (`VTXO_ALREADY_REGISTERED`). The refund
+//! deletes that intent, with a proof over this escrow that Keymeld and the coordinator sign and
+//! that moves nothing, and submits again. If the intent cannot be deleted, the refund keeps its
+//! swap and waits, rather than asking the player's provider for a new invoice every hour.
+//!
 //! Keymeld signs with the entry key the player's browser sealed to its enclave. The browser sends
 //! that registration before it shows the ticket's invoice, and again with the entry. Entries are
 //! registered with Keymeld when a competition fills, so a refund registers every paid ticket first
@@ -25,7 +31,7 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use coordinator_ark::{build_refund, RefundTransactions};
+use coordinator_ark::{build_refund, EscrowInput, KeypairSigner, RefundTransactions};
 use coordinator_ark_escrow::{EntryEscrow, RefundSwap, VtxoScript};
 use coordinator_escrow::ark::{psbt_hex, ArkEscrowSpend, RefundPurpose, MIN_REFUND_DEADLINE_SECS};
 use dlctix::bitcoin::absolute::LockTime;
@@ -34,7 +40,7 @@ use log::{debug, info, warn};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::{ArkRefundState, Coordinator, TicketArkEscrow, TicketArkRefund};
+use super::{ArkRefundState, Coordinator, KeymeldIntentDelete, TicketArkEscrow, TicketArkRefund};
 use super::{PaidTicketRegistration, TicketRegistration};
 use crate::domain::competitions::EntryStatus;
 use crate::domain::Error;
@@ -61,6 +67,10 @@ const REFUND_PAYMENT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Reports about a ticket's refund, by ticket.
 const REFUND_REPORTS: &str = "escrow refund";
+
+/// What a minted refund notes while a queued batch intent holds its escrow and cannot be deleted.
+/// Until it is, the refund keeps its swap: a new one would be refused too.
+pub(super) const HELD_BY_INTENT: &str = "the escrow is held by a queued Arkade batch intent";
 
 /// What a player is told about their refund.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -470,6 +480,18 @@ impl Coordinator {
                 let listed = self.listed_escrow(ark, &escrow, outpoint).await?;
                 match escrow_spend(&listed, &built) {
                     EscrowSpend::Unspent => {
+                        let session = session.context("the refund needs Keymeld, see above")?;
+                        let input = EscrowInput {
+                            escrow: script.clone(),
+                            outpoint,
+                            amount: Amount::from_sat(sats),
+                        };
+                        // Arkade refuses the refund while the intent holds the escrow, so it
+                        // is freed before a stale refund is minted again.
+                        if refund.error.as_deref() == Some(HELD_BY_INTENT) {
+                            self.delete_held_intent(ark, session, &escrow, &input)
+                                .await?;
+                        }
                         if self.is_stale(&refund, &swap)? {
                             refund = self
                                 .remint_refund(ark, &escrow, player, &script, sats, &refund)
@@ -477,8 +499,7 @@ impl Coordinator {
                             swap = self.refund_swap(ark, &refund).await?;
                             built = build(ark, &script, outpoint, sats, &swap)?;
                         }
-                        let session = session.context("the refund needs Keymeld, see above")?;
-                        self.submit_refund(ark, session, &escrow, &script, &swap, &built, &refund)
+                        self.submit_refund(ark, session, &escrow, &input, &swap, &built, &refund)
                             .await?;
                     }
                     // Either way the player is not paid: paying for a swap the service may
@@ -703,11 +724,12 @@ impl Coordinator {
         ark: &super::Arkade,
         session: &DlcKeygenSession,
         escrow: &TicketArkEscrow,
-        escrow_script: &EntryEscrow,
+        input: &EscrowInput,
         swap: &RefundSwap,
         built: &RefundTransactions,
         refund: &TicketArkRefund,
     ) -> Result<(), Error> {
+        let escrow_script = &input.escrow;
         let user = keymeld_sdk::UserId::from(escrow.ticket_id);
         let spend = |purpose| ArkEscrowSpend::Refund {
             purpose,
@@ -731,11 +753,28 @@ impl Coordinator {
             .map_err(|e| anyhow!("Keymeld will not sign the refund: {e}"))?;
         coordinator_ark::sign_refund_ark_tx(&mut ark_tx, escrow_script.terms().player, signature)
             .map_err(|e| anyhow!("Cannot place the refund's signature: {e}"))?;
-        let submitted = ark
+        let checkpoints = vec![built.checkpoint.clone()];
+        let submitted = match ark
             .transport
-            .submit_offchain(ark_tx, vec![built.checkpoint.clone()])
+            .submit_offchain(ark_tx.clone(), checkpoints.clone())
             .await
-            .map_err(|e| anyhow!("Arkade will not take the refund: {e}"))?;
+        {
+            // A kickoff's batch intent holds the escrow. Deleting it moves nothing, and Arkade
+            // still lets the escrow be spent once, so the refund signed above goes in again.
+            Err(e) if e.is_vtxo_already_registered() => {
+                self.delete_held_intent(ark, session, escrow, input).await?;
+                let resubmitted = ark.transport.submit_offchain(ark_tx, checkpoints).await;
+                if resubmitted
+                    .as_ref()
+                    .is_err_and(coordinator_ark::Error::is_vtxo_already_registered)
+                {
+                    self.note_held(escrow.ticket_id).await?;
+                }
+                resubmitted
+            }
+            submitted => submitted,
+        }
+        .map_err(|e| anyhow!("Arkade will not take the refund: {e}"))?;
 
         let mut checkpoint = submitted
             .checkpoints
@@ -778,6 +817,64 @@ impl Coordinator {
             escrow.ticket_id
         );
         Ok(())
+    }
+
+    /// Delete the queued batch intent that holds the escrow, with a proof over this escrow alone.
+    ///
+    /// Keymeld signs as the player and the coordinator with its own key, each over the escrow's
+    /// funding leaf; the proof pays nothing. Arkade deletes the whole intent, freeing the other
+    /// escrows it held too. If it cannot be deleted, the refund notes that its escrow is held.
+    async fn delete_held_intent(
+        &self,
+        ark: &super::Arkade,
+        session: &DlcKeygenSession,
+        escrow: &TicketArkEscrow,
+        input: &EscrowInput,
+    ) -> Result<(), Error> {
+        let player = KeymeldIntentDelete {
+            keymeld: self.keymeld.as_ref(),
+            session,
+            user: keymeld_sdk::UserId::from(escrow.ticket_id),
+        };
+        let coordinator = KeypairSigner::new([self.escrow_keypair()?]);
+        match coordinator_ark::delete_escrow_intent(
+            ark.transport.as_ref(),
+            input,
+            &player,
+            &coordinator,
+        )
+        .await
+        {
+            Ok(deleted) => {
+                if deleted {
+                    info!(
+                        "Deleted the Arkade batch intent that held the escrow of ticket {}",
+                        escrow.ticket_id
+                    );
+                }
+                self.competition_store
+                    .note_minted_ticket_ark_refund(escrow.ticket_id, None)
+                    .await?;
+                Ok(())
+            }
+            Err(e) => {
+                self.note_held(escrow.ticket_id).await?;
+                Err(anyhow!(
+                    "its escrow {} is held by an Arkade batch intent that cannot be deleted \
+                     yet, so its refund waits with the swap it has: {e}",
+                    input.outpoint
+                )
+                .into())
+            }
+        }
+    }
+
+    /// Note that a queued batch intent holds the minted refund's escrow.
+    async fn note_held(&self, ticket_id: Uuid) -> Result<(), Error> {
+        Ok(self
+            .competition_store
+            .note_minted_ticket_ark_refund(ticket_id, Some(HELD_BY_INTENT.into()))
+            .await?)
     }
 
     /// Finish a submitted refund, and record that its escrow is spent.

@@ -13,6 +13,12 @@
 //! If a check or the hook fails, every escrow stays spendable.
 //! But arkd bans the scripts of VTXOs whose forfeits never arrive, for its configured ban duration.
 //!
+//! arkd keeps an intent queued until a batch confirms it or its owner deletes it, and refuses
+//! every other spend of its escrows meanwhile, refunds included. So a kickoff that fails before
+//! step 5 deletes its intent, and each kickoff first deletes any intent an earlier attempt left,
+//! as one interrupted by a restart would. A delete proof signs the escrows' funding leaves like
+//! the intent, but pays nothing.
+//!
 //! The batch creates no VTXOs for this intent, so there is no VTXO tree to cosign.
 //! Steps 3 to 5 are the only work inside the server's session window.
 
@@ -37,7 +43,7 @@ use tokio::time::{timeout_at, Instant};
 
 use crate::signer::{collect_signatures, insert_signature};
 use crate::{
-    script_spend_sighash, ArkTransport, BoxError, Error, EscrowSigner, SigningPurpose,
+    script_spend_sighash, ArkTransport, BoxError, Error, EscrowSigner, EventStream, SigningPurpose,
     SigningRequest,
 };
 
@@ -204,6 +210,9 @@ impl KickoffConfig {
     }
 }
 
+/// How long a delete proof stays valid. It is used at once.
+const DELETE_PROOF_LIFETIME: Duration = Duration::from_secs(120);
+
 /// A funded pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Kickoff {
@@ -257,10 +266,18 @@ pub async fn fund_pool<T: ArkTransport + ?Sized>(
     hooks: &dyn KickoffHooks,
     config: &KickoffConfig,
 ) -> Result<Kickoff, Error> {
+    // An earlier attempt, interrupted before its batch, may have left its intent queued. arkd
+    // would refuse this one for spending the same escrows. If it cannot be deleted, registering
+    // says why.
+    match delete_pool_intent(transport, pool, players, coordinator).await {
+        Ok(true) => log::warn!("deleted a kickoff intent an earlier attempt left queued"),
+        Ok(false) => {}
+        Err(error) => log::warn!("cannot delete any kickoff intent left queued: {error}"),
+    }
     let deadline = Instant::now() + config.timeout;
     // No VTXO tree is built for this intent, so the cosigner key never signs. arkd still wants one.
     let cosigner = Keypair::new(&Secp256k1::new(), &mut thread_rng()).public_key();
-    let vtxo_inputs = intent_inputs(pool)?;
+    let vtxo_inputs = intent_inputs(&pool.inputs)?;
 
     let outputs = pool.outputs();
     let now = unix_now()?;
@@ -277,7 +294,15 @@ pub async fn fund_pool<T: ArkTransport + ?Sized>(
         outputs.into_iter().map(intent::Output::Onchain).collect(),
         message,
     )?;
-    sign_intent_proof(&mut intent, pool, players, coordinator).await?;
+    sign_intent_proof(
+        &mut intent,
+        &pool.inputs,
+        pool.coordinator,
+        SigningPurpose::IntentProof,
+        players,
+        coordinator,
+    )
+    .await?;
 
     let topics = pool
         .inputs
@@ -288,15 +313,61 @@ pub async fn fund_pool<T: ArkTransport + ?Sized>(
     // Subscribe before registering, so the batch that selects the intent cannot be missed.
     let mut events = transport.event_stream(topics).await?;
     let intent_id = transport.register_intent(intent).await?;
-    let intent_hash = sha256::Hash::hash(intent_id.as_bytes())
-        .to_byte_array()
-        .to_lower_hex_string();
     log::info!(
         "registered kickoff intent {intent_id} for {} escrows",
         pool.inputs.len()
     );
 
     let mut state = State::Registered;
+    let result = run_batch(
+        transport,
+        info,
+        pool,
+        players,
+        coordinator,
+        hooks,
+        &mut events,
+        deadline,
+        intent_id.clone(),
+        cosigner,
+        &vtxo_inputs,
+        &mut state,
+    )
+    .await;
+    // Until the forfeits are in, the escrows are the players' own, and the intent would hold
+    // them in arkd's queue. Once a batch selected it, it is gone and this deletes nothing.
+    if let Err(error) = &result {
+        if !matches!(state, State::Forfeited { .. }) {
+            if let Err(delete) = delete_pool_intent(transport, pool, players, coordinator).await {
+                log::warn!(
+                    "kickoff intent {intent_id} may still hold the escrows, since deleting it \
+                     failed ({delete}) after the kickoff failed: {error}"
+                );
+            }
+        }
+    }
+    result
+}
+
+/// Follow the batch from the intent's registration to its finalization, tracking `state`.
+#[allow(clippy::too_many_arguments)]
+async fn run_batch<T: ArkTransport + ?Sized>(
+    transport: &T,
+    info: &Info,
+    pool: &PoolFunding,
+    players: &dyn EscrowSigner,
+    coordinator: &dyn EscrowSigner,
+    hooks: &dyn KickoffHooks,
+    events: &mut EventStream<'_>,
+    deadline: Instant,
+    intent_id: String,
+    cosigner: bitcoin::secp256k1::PublicKey,
+    vtxo_inputs: &[intent::Input],
+    state: &mut State,
+) -> Result<Kickoff, Error> {
+    let intent_hash = sha256::Hash::hash(intent_id.as_bytes())
+        .to_byte_array()
+        .to_lower_hex_string();
     loop {
         let event = match timeout_at(deadline, events.next()).await {
             Err(_) => return Err(Error::Timeout(state.waiting_for())),
@@ -310,7 +381,7 @@ pub async fn fund_pool<T: ArkTransport + ?Sized>(
             {
                 transport.confirm_registration(intent_id.clone()).await?;
                 log::info!("batch {} selected kickoff intent {intent_id}", event.id);
-                state = State::Joined {
+                *state = State::Joined {
                     batch_id: event.id,
                     connectors: Vec::new(),
                 };
@@ -319,7 +390,7 @@ pub async fn fund_pool<T: ArkTransport + ?Sized>(
                 if let State::Joined {
                     batch_id,
                     connectors,
-                } = &mut state
+                } = state
                 {
                     if event.id == *batch_id
                         && matches!(event.batch_tree_event_type, BatchTreeEventType::Connector)
@@ -340,7 +411,7 @@ pub async fn fund_pool<T: ArkTransport + ?Sized>(
                 let State::Joined {
                     batch_id,
                     connectors,
-                } = &mut state
+                } = state
                 else {
                     continue;
                 };
@@ -370,7 +441,7 @@ pub async fn fund_pool<T: ArkTransport + ?Sized>(
                     .await
                     .map_err(Error::Hook)?;
                 let forfeits = sign_forfeits(
-                    &vtxo_inputs,
+                    vtxo_inputs,
                     &connectors,
                     &connector_txs,
                     info,
@@ -385,7 +456,7 @@ pub async fn fund_pool<T: ArkTransport + ?Sized>(
                     "forfeited {} escrows into commitment {commitment_txid}",
                     pool.inputs.len()
                 );
-                state = State::Forfeited {
+                *state = State::Forfeited {
                     batch_id: event.id,
                     commitment_txid,
                     funding,
@@ -398,7 +469,7 @@ pub async fn fund_pool<T: ArkTransport + ?Sized>(
                     commitment_txid,
                     funding,
                     coordinator_fee,
-                } = &state
+                } = &*state
                 {
                     if event.id != *batch_id {
                         continue;
@@ -429,9 +500,79 @@ pub async fn fund_pool<T: ArkTransport + ?Sized>(
     }
 }
 
+/// Delete any queued intent that spends one of the pool's escrows.
+///
+/// Returns whether arkd deleted one: `false` means none was queued.
+pub async fn delete_pool_intent<T: ArkTransport + ?Sized>(
+    transport: &T,
+    pool: &PoolFunding,
+    players: &dyn EscrowSigner,
+    coordinator: &dyn EscrowSigner,
+) -> Result<bool, Error> {
+    delete_intent(
+        transport,
+        &pool.inputs,
+        pool.coordinator,
+        players,
+        coordinator,
+    )
+    .await
+}
+
+/// Delete any queued intent that spends `input`'s escrow, with a proof over that escrow alone.
+///
+/// arkd deletes a whole intent for a proof over any one of its inputs, so this frees every other
+/// escrow the intent held as well. Returns whether arkd deleted one.
+pub async fn delete_escrow_intent<T: ArkTransport + ?Sized>(
+    transport: &T,
+    input: &EscrowInput,
+    players: &dyn EscrowSigner,
+    coordinator: &dyn EscrowSigner,
+) -> Result<bool, Error> {
+    let coordinator_key = input.escrow.terms().coordinator;
+    let inputs = std::slice::from_ref(input);
+    delete_intent(transport, inputs, coordinator_key, players, coordinator).await
+}
+
+/// Sign a delete proof over `inputs`, and hand it to arkd.
+async fn delete_intent<T: ArkTransport + ?Sized>(
+    transport: &T,
+    inputs: &[EscrowInput],
+    coordinator_key: XOnlyPublicKey,
+    players: &dyn EscrowSigner,
+    coordinator: &dyn EscrowSigner,
+) -> Result<bool, Error> {
+    let message = IntentMessage::Delete {
+        expire_at: unix_now()? + DELETE_PROOF_LIFETIME.as_secs(),
+    };
+    let encoded = message.encode()?;
+    // No outputs: ark-core gives the proof a single empty OP_RETURN, so it pays nothing.
+    let mut proof = make_intent(
+        |_, _| Ok(Vec::new()),
+        |_, _| Err(ark_core::Error::ad_hoc("an escrow has no on-chain inputs")),
+        intent_inputs(inputs)?,
+        Vec::new(),
+        message,
+    )?;
+    sign_intent_proof(
+        &mut proof,
+        inputs,
+        coordinator_key,
+        SigningPurpose::DeleteIntent { message: encoded },
+        players,
+        coordinator,
+    )
+    .await?;
+    match transport.delete_intent(proof).await {
+        Ok(()) => Ok(true),
+        Err(Error::NoMatchingIntent(_)) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Each escrow as an intent input, spent through its funding leaf.
-fn intent_inputs(pool: &PoolFunding) -> Result<Vec<intent::Input>, Error> {
-    pool.inputs
+fn intent_inputs(inputs: &[EscrowInput]) -> Result<Vec<intent::Input>, Error> {
+    inputs
         .iter()
         .map(|input| {
             let escrow = &input.escrow;
@@ -485,34 +626,36 @@ fn funding_leaf_requests(
     )
 }
 
-/// Sign every input of the intent proof.
+/// Sign every input of an intent proof over `inputs`, for `purpose`.
 ///
 /// As in BIP322, input 0 spends a message-only output locked like the first escrow, and inputs 1 to n spend the escrows.
 async fn sign_intent_proof(
     intent: &mut Intent,
-    pool: &PoolFunding,
+    inputs: &[EscrowInput],
+    coordinator_key: XOnlyPublicKey,
+    purpose: SigningPurpose,
     players: &dyn EscrowSigner,
     coordinator: &dyn EscrowSigner,
 ) -> Result<(), Error> {
     let psbt = Arc::new(intent.proof.clone());
-    if psbt.inputs.len() != pool.inputs.len() + 1 {
+    if psbt.inputs.len() != inputs.len() + 1 {
         return Err(Error::Protocol(
             "the intent proof has the wrong inputs".into(),
         ));
     }
     let mut requests = Vec::with_capacity(2 * psbt.inputs.len());
     for input_index in 0..psbt.inputs.len() {
-        let escrow = &pool.inputs[input_index.saturating_sub(1)];
+        let escrow = &inputs[input_index.saturating_sub(1)];
         requests.extend(funding_leaf_requests(
-            SigningPurpose::IntentProof,
+            purpose.clone(),
             &psbt,
             input_index,
             escrow,
-            pool.coordinator,
+            coordinator_key,
         )?);
     }
     for (request, signature) in
-        collect_signatures(requests, pool.coordinator, players, coordinator).await?
+        collect_signatures(requests, coordinator_key, players, coordinator).await?
     {
         insert_signature(&mut intent.proof, &request, signature);
     }

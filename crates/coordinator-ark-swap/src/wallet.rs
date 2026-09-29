@@ -185,6 +185,7 @@ impl ArkWallet {
         let response = self
             .server
             .client()
+            .grpc()
             .list_vtxos(GetVtxosRequest::new_for_addresses(std::iter::once(address)))
             .await?;
         Ok(payment_among(&response.vtxos, amount, since, paid_in))

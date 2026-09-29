@@ -15,10 +15,13 @@ coordinator-ark-escrow = { workspace = true }
 dlctix = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
+prost = { workspace = true }
 rand = { workspace = true }
 rustls = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
 
 [features]
 # A scripted arkd for tests in this and other crates.
