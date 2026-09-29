@@ -27,16 +27,24 @@ class Payouts {
     return payableEntries.filter(Boolean);
   }
 
+  // A contract whose expiry transaction settled it, with no attestation: every player
+  // is owed their share of the expiry outcome, the refund.
+  isExpiryRefund(competition) {
+    return !competition?.attestation && !!competition?.expiry_broadcasted_at;
+  }
+
   async checkEntryPayout(entry, competitions) {
     const competition = competitions.find((c) => c.id === entry.event_id);
-    if (!competition?.attestation) return null;
-
-    const oracleEvent = await this.getOracleEvent(entry.event_id);
-    if (
-      !oracleEvent?.attestation ||
-      oracleEvent.attestation !== competition.attestation
-    )
-      return null;
+    if (!competition) return null;
+    if (!this.isExpiryRefund(competition)) {
+      if (!competition.attestation) return null;
+      const oracleEvent = await this.getOracleEvent(entry.event_id);
+      if (
+        !oracleEvent?.attestation ||
+        oracleEvent.attestation !== competition.attestation
+      )
+        return null;
+    }
 
     const playerIndex = competition.contract_parameters.players.findIndex(
       (player) => player.pubkey === entry.ephemeral_pubkey,
@@ -101,6 +109,7 @@ class Payouts {
   }
 
   getCurrentOutcome(competition) {
+    if (this.isExpiryRefund(competition)) return "exp";
     if (!competition.attestation || !competition.event_announcement)
       return null;
 
@@ -140,7 +149,7 @@ class Payouts {
     }
     if (context.amount_msat / 1000 !== payoutAmount) throw new Error("The payout amount changed; refresh this page before authorizing it");
     this.validateInvoice(invoice, payoutAmount);
-    if (!competition?.contract_parameters || !competition.funding_outpoint || !competition.signed_contract?.signatures || !competition.attestation) {
+    if (!competition?.contract_parameters || !competition.funding_outpoint || !competition.signed_contract?.signatures || (!competition.attestation && !this.isExpiryRefund(competition))) {
       throw new Error("The completed payout contract is unavailable");
     }
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(invoice));
@@ -167,7 +176,7 @@ class Payouts {
         funding_outpoint: competition.funding_outpoint,
       },
       signatures: competition.signed_contract.signatures,
-      attestation: competition.attestation,
+      attestation: competition.attestation || null,
     }));
     // The exact invoice and entry-key signature are sufficient. The wallet
     // never exports its key or DLC preimage to this browser payout path.

@@ -19,6 +19,14 @@ fn signed_contract() -> (SignedContract, Scalar, [Scalar; 3]) {
 
 /// A contract between the market maker and three players who share the one outcome's payout.
 fn signed_contract_funded(funding_value: Amount) -> (SignedContract, Scalar, [Scalar; 3]) {
+    signed_contract_expiring(funding_value, None)
+}
+
+/// As [`signed_contract_funded`], with an expiry whose outcome refunds the players equally.
+fn signed_contract_expiring(
+    funding_value: Amount,
+    expiry: Option<u32>,
+) -> (SignedContract, Scalar, [Scalar; 3]) {
     let market_maker = Scalar::from_slice(&[7; 32]).unwrap();
     let players = [1, 3, 5].map(|key| Scalar::from_slice(&[key; 32]).unwrap());
     let params = ContractParameters {
@@ -39,12 +47,12 @@ fn signed_contract_funded(funding_value: Amount) -> (SignedContract, Scalar, [Sc
                 .unwrap()
                 .base_point_mul()
                 .into()],
-            expiry: None,
+            expiry,
         },
-        outcome_payouts: BTreeMap::from([(
-            Outcome::Attestation(0),
-            PayoutWeights::from([(0, 1), (1, 1), (2, 1)]),
-        )]),
+        outcome_payouts: std::iter::once(Outcome::Attestation(0))
+            .chain(expiry.map(|_| Outcome::Expiry))
+            .map(|outcome| (outcome, PayoutWeights::from([(0, 1), (1, 1), (2, 1)])))
+            .collect(),
         fee_rate: FeeRate::from_sat_per_vb_u32(1),
         funding_value,
         relative_locktime_block_delta: 72,
@@ -362,7 +370,19 @@ struct UnpaidWinners {
 
 impl UnpaidWinners {
     async fn new(funding_value: Amount, fee_rates: HashMap<u16, f64>) -> Self {
-        let (contract, market_maker, players) = signed_contract_funded(funding_value);
+        Self::with_contract(
+            signed_contract_funded(funding_value),
+            funding_value,
+            fee_rates,
+        )
+        .await
+    }
+
+    async fn with_contract(
+        (contract, market_maker, players): (SignedContract, Scalar, [Scalar; 3]),
+        funding_value: Amount,
+        fee_rates: HashMap<u16, f64>,
+    ) -> Self {
         let broadcasts = Arc::new(Mutex::new(Vec::new()));
         let mut chain = MockChain::new();
         chain
@@ -659,4 +679,82 @@ async fn split_reclaims_pay_the_economy_fee_rate() {
         assert!(entry.sweep_uneconomic_at.is_none());
     }
     settlement.database.close().await.unwrap();
+}
+
+/// A contract the oracle never attested expires: the coordinator broadcast its expiry
+/// transaction. Such a competition used to drop out of the runners with the pot on-chain and
+/// no player refunded. It is stepped again, settles on the expiry outcome with the expiry
+/// transaction as its outcome transaction, and its players are owed their refund shares.
+#[tokio::test]
+async fn an_expired_contract_settles_on_its_expiry_outcome() {
+    let expiry = 1_790_000_000;
+    let mut settlement = UnpaidWinners::with_contract(
+        signed_contract_expiring(Amount::from_sat(30_000), Some(expiry)),
+        Amount::from_sat(30_000),
+        HashMap::from([(1, 2.0), (ECONOMY_FEE_TARGET, 1.0)]),
+    )
+    .await;
+    // A row from before the expiry transaction was recorded as the outcome transaction.
+    let competition = &mut settlement.competition;
+    competition.attestation = None;
+    competition.outcome_transaction = None;
+    competition.outcome_broadcasted_at = None;
+    competition.delta_broadcasted_at = None;
+    competition.expiry_broadcasted_at = Some(OffsetDateTime::now_utc() - time::Duration::hours(2));
+    let store = &settlement.coordinator.competition_store;
+    store
+        .update_competitions(vec![competition.clone()])
+        .await
+        .unwrap();
+
+    assert!(store
+        .active_competition_ids()
+        .await
+        .unwrap()
+        .contains(&competition.id));
+    assert!(competition.settled_by_expiry());
+    assert_eq!(competition.get_current_outcome().unwrap(), Outcome::Expiry);
+    let status = CompetitionStatus::from(competition.clone());
+    assert_eq!(status.state_name(), "expiry_broadcasted");
+
+    let next = settlement.coordinator.process_status(status).await;
+    assert_eq!(next.state_name(), "outcome_broadcasted");
+    let settled = next.into_competition();
+    let expiry_txid = settlement.contract.expiry_tx().unwrap().compute_txid();
+    assert_eq!(
+        settled
+            .outcome_transaction
+            .as_ref()
+            .map(Transaction::compute_txid),
+        Some(expiry_txid)
+    );
+    assert_eq!(
+        CompetitionStatus::from(settled.clone()).state_name(),
+        "outcome_broadcasted",
+        "the stored fields reload in the state the step moved to"
+    );
+    assert_eq!(settled.get_current_outcome().unwrap(), Outcome::Expiry);
+    let params = settlement.contract.params();
+    for player in &params.players {
+        assert_eq!(
+            winner_payout_sats(params, &Outcome::Expiry, &player.pubkey).unwrap(),
+            10_000
+        );
+    }
+
+    // An attested contract whose outcome transaction is not the expiry transaction settles on
+    // its attestation, even if an expiry broadcast was also recorded.
+    let mut attested = settled.clone();
+    attested.attestation = Some(Scalar::from_slice(&[10; 32]).unwrap().into());
+    attested.outcome_transaction = Some(Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![],
+    });
+    assert!(!attested.settled_by_expiry());
+    assert_eq!(
+        attested.get_current_outcome().unwrap(),
+        Outcome::Attestation(0)
+    );
 }

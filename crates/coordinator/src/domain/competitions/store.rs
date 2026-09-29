@@ -1339,7 +1339,7 @@ impl CompetitionStore {
     pub async fn active_competition_ids(&self) -> Result<Vec<Uuid>, sqlx::Error> {
         let ids = sqlx::query_scalar::<_, String>(
             "SELECT id FROM competitions
-             WHERE expiry_broadcasted_at IS NULL AND completed_at IS NULL
+             WHERE completed_at IS NULL
                AND (cancelled_at IS NULL OR funding_confirmed_at IS NOT NULL)
                AND NOT (kind = 'queued' AND pools_formed_at IS NOT NULL)",
         )

@@ -63,6 +63,8 @@ pub enum PayoutError {
     InvalidInvoice(String),
     InvalidPolicy(String),
     PreimageMismatch,
+    /// No attestation was given and the contract has not reached its expiry.
+    NotExpired,
 }
 impl fmt::Display for PayoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -373,6 +375,25 @@ pub fn attested_outcome(
         .position(|point| *point == locking_point)
         .map(Outcome::Attestation)
         .ok_or(PayoutError::UnknownOutcome)
+}
+
+/// The outcome a contract settles on: the attested one, or, with no attestation, the
+/// expiry outcome once `now` (UNIX seconds) has reached the contract's expiry. Anyone can
+/// broadcast the expiry transaction from then on, so its refund shares are what the
+/// contract pays unless an attestation arrives first.
+pub fn settled_outcome(
+    params: &ContractParameters,
+    attestation: Option<&[u8; 32]>,
+    now: u64,
+) -> Result<Outcome, PayoutError> {
+    if let Some(attestation) = attestation {
+        return attested_outcome(params, attestation);
+    }
+    match params.event.expiry {
+        // Below this a locktime is a block height, which a clock cannot check.
+        Some(expiry) if expiry >= 500_000_000 && now >= u64::from(expiry) => Ok(Outcome::Expiry),
+        _ => Err(PayoutError::NotExpired),
+    }
 }
 
 /// What the market maker owes the player with `player_pubkey` (compressed

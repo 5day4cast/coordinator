@@ -169,7 +169,7 @@ fn settlement_request(
         claim_id,
         binding_receipt: binding.binding_receipt.clone(),
         contract_signatures: serde_json::to_string(signatures).unwrap(),
-        attestation: hex::encode([4; 32]),
+        attestation: Some(hex::encode([4; 32])),
         method: PayoutMethod::Invoice {
             invoice,
             authorization,

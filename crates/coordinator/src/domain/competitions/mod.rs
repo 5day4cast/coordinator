@@ -1378,6 +1378,9 @@ impl Competition {
     }
 
     pub(crate) fn get_current_outcome(&self) -> Result<Outcome, anyhow::Error> {
+        if self.settled_by_expiry() {
+            return Ok(Outcome::Expiry);
+        }
         let Some(attestation) = self.attestation else {
             return Err(anyhow!("No attestation found for competition {}", self.id));
         };
@@ -1592,7 +1595,9 @@ pub enum CompetitionState {
     AwaitingAttestation,
     /// Oracle has attested to the results
     Attested,
-    /// Oracle event has expired & players refunded before an attestation was provided
+    /// The contract expired before an attestation; the expiry transaction was broadcast.
+    /// Rows recorded before the expiry transaction became the outcome transaction load here
+    /// and move on to OutcomeBroadcasted; newer ones load as OutcomeBroadcasted directly.
     ExpiryBroadcasted,
     /// Outcome transaction has been broadcasted
     OutcomeBroadcasted,
@@ -1775,9 +1780,25 @@ impl Competition {
     /// expiry transaction) moves it. Such a competition must never be abandoned as failed or
     /// cancelled.
     pub fn is_settling_on_chain(&self) -> bool {
-        self.funding_confirmed_at.is_some()
-            && self.completed_at.is_none()
-            && self.expiry_broadcasted_at.is_none()
+        self.funding_confirmed_at.is_some() && self.completed_at.is_none()
+    }
+
+    /// Whether the contract settles on its expiry outcome: the coordinator broadcast the
+    /// expiry transaction and it is the transaction the settlement follows. Rows from before
+    /// the expiry transaction was recorded as the outcome transaction have none recorded.
+    pub fn settled_by_expiry(&self) -> bool {
+        if self.expiry_broadcasted_at.is_none() {
+            return false;
+        }
+        let expiry_txid = self
+            .signed_contract
+            .as_ref()
+            .and_then(|contract| contract.expiry_tx())
+            .map(|tx| tx.compute_txid());
+        match &self.outcome_transaction {
+            Some(outcome) => Some(outcome.compute_txid()) == expiry_txid,
+            None => self.attestation.is_none(),
+        }
     }
 
     /// Undo a failure or cancellation that stopped a competition while its contract held the

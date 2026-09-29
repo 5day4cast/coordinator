@@ -114,7 +114,6 @@ impl Coordinator {
             .payout_window_is_closed(competition_id)
             .await?
             || competition.delta_broadcasted_at.is_some()
-            || competition.expiry_broadcasted_at.is_some()
             || competition.completed_at.is_some()
             || competition.cancelled_at.is_some();
         let status = self
@@ -166,7 +165,6 @@ impl Coordinator {
             .get_competition(competition_id)
             .await?;
         if competition.delta_broadcasted_at.is_some()
-            || competition.expiry_broadcasted_at.is_some()
             || competition.completed_at.is_some()
             || competition.cancelled_at.is_some()
         {
@@ -593,11 +591,10 @@ impl Coordinator {
         competition: &Competition,
     ) -> Result<(), anyhow::Error> {
         if competition.kind == crate::domain::competitions::CompetitionKind::Queued
-            || competition.attestation.is_none()
+            || (competition.attestation.is_none() && !competition.settled_by_expiry())
             || competition.signed_contract.is_none()
             || competition.funding_confirmed_at.is_none()
             || competition.delta_broadcasted_at.is_some()
-            || competition.expiry_broadcasted_at.is_some()
             || competition.cancelled_at.is_some()
             || competition.completed_at.is_some()
             || competition.failed_at.is_some()
@@ -739,7 +736,6 @@ impl Coordinator {
             return Ok(());
         }
         if competition.delta_broadcasted_at.is_some()
-            || competition.expiry_broadcasted_at.is_some()
             || competition.completed_at.is_some()
             || competition.cancelled_at.is_some()
         {
@@ -767,10 +763,17 @@ impl Coordinator {
             .signed_contract
             .as_ref()
             .ok_or_else(|| anyhow!("Competition not signed"))?;
-        let attestation = competition
-            .attestation
-            .ok_or_else(|| anyhow!("Oracle has not attested"))?;
         let outcome = competition.get_current_outcome()?;
+        // The verifier settles an expiry refund on the expiry outcome when no attestation is
+        // sent, and only once the contract has expired.
+        let attestation = match outcome {
+            Outcome::Expiry => None,
+            Outcome::Attestation(_) => Some(
+                competition
+                    .attestation
+                    .ok_or_else(|| anyhow!("Oracle has not attested"))?,
+            ),
+        };
         let params = competition
             .contract_parameters
             .as_ref()
@@ -793,7 +796,7 @@ impl Coordinator {
                     claim_id: job.id,
                     binding_receipt: binding.binding_receipt,
                     contract_signatures: serde_json::to_string(contract.all_signatures())?,
-                    attestation: hex::encode(attestation.serialize()),
+                    attestation: attestation.map(|scalar| hex::encode(scalar.serialize())),
                     method: serde_json::from_str(&job.request_json)?,
                     ark_funding,
                 },

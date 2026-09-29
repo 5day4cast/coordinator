@@ -35,7 +35,8 @@ A runner repeats one step at a time:
    - **Until a time:** the state's `next_check`, or the next retry after a failure.
      A wake ends the wait early.
      Failed steps back off from 5 seconds, doubling, up to 5 minutes.
-4. On `Finished`, meaning cancelled, completed, or its expiry broadcast, release the lease and stop.
+4. On `Finished`, meaning cancelled or completed, release the lease and stop.
+   A competition whose contract expired unattested keeps running: the expiry transaction is its outcome transaction, its players are paid their `Outcome::Expiry` refund shares, and its output is split and reclaimed like any outcome's.
 
 A step always completes, even at shutdown, since an Arkade batch or a broadcast in flight must record its result.
 Cancellation is checked between steps.

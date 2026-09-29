@@ -31,11 +31,11 @@
 //!     ↓
 //! FundingSettled
 //!     ↓
-//! AwaitingAttestation
-//!     ↓
-//! Attested ──────────────→ ExpiryBroadcasted (if expired)
-//!     ↓
-//! OutcomeBroadcasted
+//! AwaitingAttestation ───→ expiry transaction broadcast (if expired unattested),
+//!     ↓                    recorded as the outcome transaction for Outcome::Expiry
+//! Attested                     │
+//!     ↓                        │
+//! OutcomeBroadcasted ←─────────┘
 //!     ↓
 //! DeltaBroadcasted
 //!     ↓
