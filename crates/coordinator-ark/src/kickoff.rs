@@ -456,7 +456,7 @@ async fn run_batch<T: ArkTransport + ?Sized>(
                     "forfeited {} escrows into commitment {commitment_txid}",
                     pool.inputs.len()
                 );
-                state = State::Forfeited {
+                *state = State::Forfeited {
                     batch_id: event.id,
                     commitment_txid,
                     funding,
