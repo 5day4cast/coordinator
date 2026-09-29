@@ -9,6 +9,27 @@
   margin-bottom: 2rem;
 }
 
+/* The walkthrough video, phone-shaped; it never grows past a phone's width. */
+.help-video {
+  max-width: 20rem;
+  margin: 0 0 1.5rem;
+}
+
+.help-video video {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--bulma-border);
+  border-radius: 0.75rem;
+  background: var(--bulma-scheme-main-bis);
+}
+
+.help-video figcaption {
+  margin-top: 0.4rem;
+  font-size: 0.85rem;
+  color: var(--bulma-text-weak);
+}
+
 .help-contents {
   display: flex;
   flex-wrap: wrap;

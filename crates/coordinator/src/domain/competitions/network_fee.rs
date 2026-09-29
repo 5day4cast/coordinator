@@ -129,6 +129,27 @@ fn priced_sat_per_vb(estimate: f64, min_sat_per_vb: u64) -> Result<f64, anyhow::
 impl Coordinator {
     /// The network fee a ticket issued now would carry. Fails if the fee estimate does: a ticket
     /// is never priced without one.
+    /// The quote pages show beside a price: at most a minute old, so pages that refresh
+    /// themselves don't ask LND for an estimate each time. A ticket's own fee is fixed from a
+    /// fresh quote when it is issued (`ticket_network_fee`), and replaces this one on the form.
+    pub async fn shown_network_fee_quote(&self) -> Result<NetworkFeeQuote, Error> {
+        const FRESH: std::time::Duration = std::time::Duration::from_secs(60);
+        let cached = *self
+            .shown_network_fee
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((_, quote)) = cached.filter(|(at, _)| at.elapsed() < FRESH) {
+            return Ok(quote);
+        }
+        let quote = self.network_fee_quote().await?;
+        *self
+            .shown_network_fee
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((std::time::Instant::now(), quote));
+        Ok(quote)
+    }
+
     pub async fn network_fee_quote(&self) -> Result<NetworkFeeQuote, Error> {
         let settings = &self.network_fee;
         let sat_per_vb = if settings.enabled {

@@ -39,30 +39,17 @@ enum Viewer {
     Other,
 }
 
-/// The badge for how a pick stands, and what that means on hover. "Final"
-/// is the oracle's attested result only; a closed window without it is
+/// The badge for how a pick stands, and what that means on hover. Only settled picks get one:
+/// while the window is open and a pick can still flip, the reading so far and its points say
+/// how it stands. "Final" is the oracle's attested result only; a closed window without it is
 /// still awaiting that result.
-fn badge(state: PickState) -> (&'static str, &'static str, &'static str) {
-    match state {
-        PickState::Pending => (
-            "pick-state",
-            "Waiting for readings",
-            "No reading from the window yet",
-        ),
+fn badge(state: PickState) -> Option<(&'static str, &'static str, &'static str)> {
+    Some(match state {
+        PickState::Pending | PickState::OnTrack | PickState::OffTrack => return None,
         PickState::LockedIn => (
             "pick-state is-locked-in",
             "Locked in",
             "Right, and the rest of the window can't change that",
-        ),
-        PickState::OnTrack => (
-            "pick-state is-on-track",
-            "On track",
-            "Right if the window ended now, but the reading can still move against it",
-        ),
-        PickState::OffTrack => (
-            "pick-state is-off-track",
-            "Off track",
-            "Wrong if the window ended now, but the reading can still come its way",
         ),
         PickState::Out => (
             "pick-state is-out",
@@ -79,12 +66,15 @@ fn badge(state: PickState) -> (&'static str, &'static str, &'static str) {
             "Final",
             "The oracle's attested result",
         ),
-    }
+    })
 }
 
 pub(crate) fn state_badge(state: PickState) -> Markup {
-    let (class, text, title) = badge(state);
-    html! { span class=(class) tabindex="0" data-tip=(title) { (text) } }
+    html! {
+        @if let Some((class, text, title)) = badge(state) {
+            span class=(class) tabindex="0" data-tip=(title) { (text) }
+        }
+    }
 }
 
 fn pick_label(pick: &ValueOptions) -> &'static str {
@@ -518,17 +508,23 @@ mod tests {
         assert!(!html.contains("Forecast") && !html.contains("lately"));
         // Coverage is said once for the dialog, not per pick.
         assert_eq!(html.matches("reports in for 9 of 24 h").count(), 1);
-        for badge in ["Locked in", "On track", "Out", "Off track"] {
+        // Settled picks say so; a pick that can still flip shows only its reading and points.
+        for badge in [">Locked in<", ">Out<"] {
             assert!(html.contains(badge), "{badge}");
         }
-        assert!(html.contains(
-            r#"data-tip="Wrong if the window ended now, but the reading can still come its way""#
-        ));
+        for gone in ["On track", "Off track", "is-on-track", "is-off-track"] {
+            assert!(!html.contains(gone), "{gone}");
+        }
+        assert!(
+            html.contains(r#"data-tip="Wrong, and the rest of the window can&#39;t change that""#)
+                || html
+                    .contains(r#"data-tip="Wrong, and the rest of the window can't change that""#)
+        );
         assert!(
             !html.contains("say how a pick stands"),
             "the legend is on the help page"
         );
-        // Locked in (10) and on track (par, 20), as if the window ended now, pick by pick.
+        // Locked in (10) and a right Par so far (20), as if the window ended now, pick by pick.
         assert!(html.contains("30 pts"));
         assert!(html.contains(r#"<span class="pick-points">+10</span>"#));
         assert!(html.contains(r#"<span class="pick-points">+20</span>"#));

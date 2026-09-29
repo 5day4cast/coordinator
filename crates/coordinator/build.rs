@@ -111,6 +111,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             content_type: "text/javascript; charset=utf-8",
             bytes: fs::read(&htmx)?,
         },
+        // The help page's how-it-works walkthrough and its first frame (`just help-video`).
+        Asset {
+            constant: "HOW_IT_WORKS_MP4",
+            stem: "how-it-works",
+            extension: "mp4",
+            content_type: "video/mp4",
+            bytes: fs::read(static_dir.join("how-it-works.mp4"))?,
+        },
+        Asset {
+            constant: "HOW_IT_WORKS_JPG",
+            stem: "how-it-works",
+            extension: "jpg",
+            content_type: "image/jpeg",
+            bytes: fs::read(static_dir.join("how-it-works.jpg"))?,
+        },
         Asset {
             constant: "USA_MAP_SVG",
             stem: "usa-map",

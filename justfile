@@ -201,6 +201,13 @@ playwright-install:
 playwright:
     cd e2e && npm test
 
+# Record the help page's how-it-works video from the player page fixtures (no services needed);
+# rebuild the coordinator afterwards to embed it
+help-video:
+    cargo run -p coordinator --example player_ui_fixtures -- target/player-ui
+    cd e2e && npm ci && node video/how-it-works.cjs ../target/player-ui ../crates/coordinator/src/templates/static/how-it-works.mp4
+    ffmpeg -y -v error -ss 1.2 -i crates/coordinator/src/templates/static/how-it-works.mp4 -frames:v 1 -q:v 6 crates/coordinator/src/templates/static/how-it-works.jpg
+
 # Run Playwright tests with visible browser
 playwright-headed:
     cd e2e && npm run test:headed

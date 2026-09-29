@@ -217,6 +217,8 @@ pub struct Coordinator {
     automatic_payout_max_fee_rate: FeeRate,
     /// How each ticket's network fee is priced; off until `with_network_fee`.
     network_fee: crate::config::NetworkFeeSettings,
+    /// The last quote pages showed, and when it was made (`shown_network_fee_quote`).
+    shown_network_fee: std::sync::Mutex<Option<(std::time::Instant, NetworkFeeQuote)>>,
     /// The check an Arkade pool passes before its contract is built; off until
     /// `with_kickoff_check`.
     kickoff_check: crate::config::KickoffCheckSettings,
@@ -276,6 +278,7 @@ impl Coordinator {
                 enabled: false,
                 ..Default::default()
             },
+            shown_network_fee: std::sync::Mutex::new(None),
             kickoff_check: crate::config::KickoffCheckSettings {
                 enabled: false,
                 ..Default::default()
