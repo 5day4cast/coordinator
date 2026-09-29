@@ -230,6 +230,8 @@ enum State {
     Joined {
         batch_id: String,
         connectors: Vec<TxGraphChunk>,
+        /// When the batch started, to log how much of its session is left at finalization.
+        started: Instant,
     },
     Forfeited {
         batch_id: String,
@@ -253,6 +255,62 @@ impl State {
             State::Joined { .. } => "waiting for the batch's commitment transaction",
             State::Forfeited { .. } => "waiting for the batch to finalize after the forfeits",
         }
+    }
+}
+
+/// A step of the kickoff inside the server's session window.
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    Contract,
+    Forfeits,
+    Submit,
+}
+
+/// How long the batch took to reach finalization, and each step after it, for the log.
+struct Steps {
+    finalization: Duration,
+    taken: Vec<(Step, Duration, bool)>,
+}
+
+impl Steps {
+    fn new(finalization: Duration) -> Self {
+        Self {
+            finalization,
+            taken: Vec::new(),
+        }
+    }
+
+    async fn time<T>(
+        &mut self,
+        step: Step,
+        run: impl std::future::Future<Output = Result<T, Error>>,
+    ) -> Result<T, Error> {
+        let started = Instant::now();
+        let result = run.await;
+        self.taken.push((step, started.elapsed(), result.is_ok()));
+        result
+    }
+}
+
+impl std::fmt::Display for Steps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "batch finalization after {:.1} s",
+            self.finalization.as_secs_f64()
+        )?;
+        for (step, taken, done) in &self.taken {
+            let what = match (step, done) {
+                (Step::Contract, true) => "contract signed in",
+                (Step::Contract, false) => "contract signing failed after",
+                (Step::Forfeits, true) => "forfeits signed in",
+                (Step::Forfeits, false) => "forfeit signing failed after",
+                (Step::Submit, true) => "submitted in",
+                (Step::Submit, false) => "submit failed after",
+            };
+            write!(f, ", {what} {:.1} s", taken.as_secs_f64())?;
+        }
+        Ok(())
     }
 }
 
@@ -379,17 +437,20 @@ async fn run_batch<T: ArkTransport + ?Sized>(
                 if matches!(state, State::Registered)
                     && event.intent_id_hashes.contains(&intent_hash) =>
             {
+                let started = Instant::now();
                 transport.confirm_registration(intent_id.clone()).await?;
                 log::info!("batch {} selected kickoff intent {intent_id}", event.id);
                 *state = State::Joined {
                     batch_id: event.id,
                     connectors: Vec::new(),
+                    started,
                 };
             }
             StreamEvent::TreeTx(event) => {
                 if let State::Joined {
                     batch_id,
                     connectors,
+                    ..
                 } = state
                 {
                     if event.id == *batch_id
@@ -411,6 +472,7 @@ async fn run_batch<T: ArkTransport + ?Sized>(
                 let State::Joined {
                     batch_id,
                     connectors,
+                    started,
                 } = state
                 else {
                     continue;
@@ -418,44 +480,72 @@ async fn run_batch<T: ArkTransport + ?Sized>(
                 if event.id != *batch_id {
                     continue;
                 }
+                let mut steps = Steps::new(started.elapsed());
                 let commitment_txid = event.commitment_tx.unsigned_tx.compute_txid();
-                let funding = paid_output(&event.commitment_tx, &pool.funding_output, "funding")?;
-                let coordinator_fee = pool
-                    .coordinator_fee
-                    .as_ref()
-                    .map(|fee| paid_output(&event.commitment_tx, fee, "coordinator fee"))
-                    .transpose()?;
                 let chunks = std::mem::take(connectors);
-                let connector_txs: HashMap<Txid, Transaction> = chunks
-                    .iter()
-                    .map(|chunk| {
-                        (
-                            chunk.tx.unsigned_tx.compute_txid(),
-                            chunk.tx.unsigned_tx.clone(),
+                let forfeited = async {
+                    let funding =
+                        paid_output(&event.commitment_tx, &pool.funding_output, "funding")?;
+                    let coordinator_fee = pool
+                        .coordinator_fee
+                        .as_ref()
+                        .map(|fee| paid_output(&event.commitment_tx, fee, "coordinator fee"))
+                        .transpose()?;
+                    let connector_txs: HashMap<Txid, Transaction> = chunks
+                        .iter()
+                        .map(|chunk| {
+                            (
+                                chunk.tx.unsigned_tx.compute_txid(),
+                                chunk.tx.unsigned_tx.clone(),
+                            )
+                        })
+                        .collect();
+                    let connectors = connector_graph(chunks, commitment_txid)?;
+                    steps
+                        .time(Step::Contract, async {
+                            hooks
+                                .before_forfeits(funding, &event.commitment_tx)
+                                .await
+                                .map_err(Error::Hook)
+                        })
+                        .await?;
+                    let forfeits = steps
+                        .time(
+                            Step::Forfeits,
+                            sign_forfeits(
+                                vtxo_inputs,
+                                &connectors,
+                                &connector_txs,
+                                info,
+                                pool,
+                                Arc::new(event.commitment_tx.unsigned_tx.clone()),
+                                players,
+                                coordinator,
+                            ),
                         )
-                    })
-                    .collect();
-                let connectors = connector_graph(chunks, commitment_txid)?;
-                hooks
-                    .before_forfeits(funding, &event.commitment_tx)
-                    .await
-                    .map_err(Error::Hook)?;
-                let forfeits = sign_forfeits(
-                    vtxo_inputs,
-                    &connectors,
-                    &connector_txs,
-                    info,
-                    pool,
-                    Arc::new(event.commitment_tx.unsigned_tx.clone()),
-                    players,
-                    coordinator,
-                )
-                .await?;
-                transport.submit_forfeits(forfeits).await?;
-                log::info!(
-                    "forfeited {} escrows into commitment {commitment_txid}",
-                    pool.inputs.len()
-                );
+                        .await?;
+                    steps
+                        .time(Step::Submit, transport.submit_forfeits(forfeits))
+                        .await?;
+                    Ok::<_, Error>((funding, coordinator_fee))
+                }
+                .await;
+                let (funding, coordinator_fee) = match forfeited {
+                    Ok(paid) => {
+                        log::info!(
+                            "forfeited {} escrows into commitment {commitment_txid}: {steps}",
+                            pool.inputs.len()
+                        );
+                        paid
+                    }
+                    Err(error) => {
+                        log::info!(
+                            "did not forfeit {} escrows into commitment {commitment_txid}: {steps}",
+                            pool.inputs.len()
+                        );
+                        return Err(error);
+                    }
+                };
                 *state = State::Forfeited {
                     batch_id: event.id,
                     commitment_txid,

@@ -138,6 +138,53 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, KeymeldError> {
     hex::decode(value).map_err(|_| invalid("Invalid protocol hex encoding"))
 }
 
+/// Run `work` on each enclave's share of `items`, the shares side by side, and return the
+/// results in the order of `items`.
+///
+/// Each enclave serializes one session's commands, but the enclaves are independent and the
+/// gateway only relays. Each share keeps its order and gets its own copy of `lane`, for a journal
+/// only work inside an Arkade batch may split: see [`EphemeralCheckpoint`]. Every share runs to
+/// its end, so no request is abandoned in flight; if any fails, so does the whole call, with the
+/// first failure in enclave order, and no result is returned.
+async fn per_enclave<S, T, R, F, Fut>(
+    items: Vec<(EnclaveId, T)>,
+    lane: &S,
+    work: F,
+) -> Result<Vec<R>, KeymeldError>
+where
+    S: Clone,
+    F: Fn(S, Vec<T>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<R>, KeymeldError>>,
+{
+    let count = items.len();
+    let mut shares: BTreeMap<EnclaveId, (Vec<usize>, Vec<T>)> = BTreeMap::new();
+    for (index, (enclave, item)) in items.into_iter().enumerate() {
+        let (indexes, items) = shares.entry(enclave).or_default();
+        indexes.push(index);
+        items.push(item);
+    }
+    let runs = shares.into_values().map(|(indexes, items)| {
+        let run = work(lane.clone(), items);
+        async move { (indexes, run.await) }
+    });
+    let mut ordered: Vec<Option<R>> = std::iter::repeat_with(|| None).take(count).collect();
+    for (indexes, results) in futures::future::join_all(runs).await {
+        let results = results?;
+        if results.len() != indexes.len() {
+            return Err(invalid(
+                "An enclave's share returned the wrong number of results",
+            ));
+        }
+        for (index, result) in indexes.into_iter().zip(results) {
+            ordered[index] = Some(result);
+        }
+    }
+    Ok(ordered
+        .into_iter()
+        .map(|result| result.expect("every item belongs to one share"))
+        .collect())
+}
+
 impl KeymeldService {
     /// Prepare and execute one unbound escrow action under the refund's permission, signing as
     /// `user`: a refund's transaction, or a proof deleting a queued intent. `stage` names it in
@@ -444,6 +491,190 @@ async fn escrow_request<T: Serialize>(
         &session.recipient_authorization.recipient_public_keys[&enclave],
     )?;
     Ok(*response)
+}
+
+/// Prepare and execute `user`'s escrow spend in the pool's session. Returns each signed input's
+/// index with its BIP340 signature.
+async fn sign_ark_spend(
+    driver: &mut ConfidentialSession<'_>,
+    session: &DlcKeygenSession,
+    state: &ProtocolState,
+    credentials: &SessionCredentials,
+    user: UserId,
+    spend: coordinator_escrow::ark::ArkEscrowSpend,
+) -> Result<Vec<(usize, [u8; 64])>, KeymeldError> {
+    let binding = state
+        .bindings
+        .get(&user)
+        .ok_or_else(|| invalid("The pool must be bound before its escrows are spent"))?;
+    let participant_key = &state
+        .policies
+        .get(&user)
+        .ok_or_else(|| invalid("Escrow participant has no accepted policy"))?
+        .policy
+        .participant_public_key;
+    // Every batch attempt signs new transactions, so each spend is a fresh attempt.
+    let attempt = ActionAttempt {
+        attempt_id: Uuid::now_v7(),
+        signing_session_id: None,
+    };
+    let prepare = PrepareEscrowRequest {
+        schema_version: escrow::SCHEMA_VERSION,
+        binding_receipt: binding.sealed_state.clone(),
+        action_id: generic::SIGN_ARK_ESCROW.into(),
+        attempt: attempt.clone(),
+        action: None,
+        action_parameters: Payload::encode(&generic::ActionParameters::SignArkEscrow { spend })?,
+        prior_preparation_receipts: vec![],
+    };
+    let prepared = escrow_request(
+        driver,
+        session,
+        state,
+        credentials,
+        &user,
+        &format!("escrow/ark/prepare/{user}/{}", attempt.attempt_id),
+        Operation::Prepare,
+        Some(generic::SIGN_ARK_ESCROW),
+        Some(attempt.clone()),
+        &prepare,
+    )
+    .await?;
+    let inputs: Vec<usize> = prepared.output.decode()?;
+    let execute = ExecuteEscrowRequest {
+        schema_version: escrow::SCHEMA_VERSION,
+        prepared_receipt: prepared.sealed_state,
+        proof: ConditionProof::VerifierEvidence {
+            evidence: Payload::default(),
+        },
+    };
+    let response = escrow_request(
+        driver,
+        session,
+        state,
+        credentials,
+        &user,
+        &format!("escrow/ark/execute/{user}/{}", attempt.attempt_id),
+        Operation::Execute,
+        Some(generic::SIGN_ARK_ESCROW),
+        Some(attempt),
+        &execute,
+    )
+    .await?;
+    let ExecutionOutput::Bip340Signatures {
+        public_key,
+        signatures,
+    } = response.output.decode()?
+    else {
+        return Err(invalid("Enclave did not sign the escrow spend"));
+    };
+    if &public_key != participant_key || signatures.len() != inputs.len() {
+        return Err(invalid(
+            "Escrow signatures differ from the authorized spend",
+        ));
+    }
+    inputs
+        .into_iter()
+        .zip(signatures)
+        .map(|(input, signature)| {
+            let bytes: [u8; 64] = signature
+                .signature
+                .try_into()
+                .map_err(|_| invalid("Invalid BIP340 signature length"))?;
+            Ok((input, bytes))
+        })
+        .collect()
+}
+
+/// Have `user`'s enclave permit signing their share of the plan's batch: prepare and execute
+/// SIGN_CONTRACT, and check the permit it returns.
+#[allow(clippy::too_many_arguments)]
+async fn permit_contract(
+    driver: &mut ConfidentialSession<'_>,
+    session: &DlcKeygenSession,
+    state: &ProtocolState,
+    credentials: &SessionCredentials,
+    roster: &SignedRoster,
+    plan: &SigningPlan,
+    ark_funding: &Option<coordinator_escrow::ark::ArkFunding>,
+    user: &UserId,
+    policy: &SignedEscrowPolicy,
+) -> Result<(), KeymeldError> {
+    let scope = scope_for_participant(roster, &plan.batch.items, user)?;
+    let expected_scope_digest = authorization_digest("escrow-signing-scope-v1", &scope)?;
+    let binding = state
+        .bindings
+        .get(user)
+        .ok_or_else(|| invalid("DLC consent must be bound before signing"))?;
+    let attempt = ActionAttempt {
+        attempt_id: plan.session_id.uuid(),
+        signing_session_id: Some(plan.session_id.clone()),
+    };
+    let request = PrepareEscrowRequest {
+        schema_version: escrow::SCHEMA_VERSION,
+        binding_receipt: binding.sealed_state.clone(),
+        action_id: generic::SIGN_CONTRACT.into(),
+        attempt: attempt.clone(),
+        action: None,
+        action_parameters: Payload::encode(&generic::ActionParameters::SignContract {
+            scope,
+            ark_funding: ark_funding.clone(),
+        })?,
+        prior_preparation_receipts: plan
+            .prior_preparations
+            .get(user)
+            .map(|prepared| vec![prepared.sealed_state.clone()])
+            .unwrap_or_default(),
+    };
+    let prepared = escrow_request(
+        driver,
+        session,
+        state,
+        credentials,
+        user,
+        &format!("escrow/sign/prepare/{user}/{}", plan.session_id),
+        Operation::Prepare,
+        Some(generic::SIGN_CONTRACT),
+        Some(attempt.clone()),
+        &request,
+    )
+    .await?;
+    let execute = ExecuteEscrowRequest {
+        schema_version: escrow::SCHEMA_VERSION,
+        prepared_receipt: prepared.sealed_state,
+        proof: ConditionProof::VerifierEvidence {
+            evidence: Payload::default(),
+        },
+    };
+    let response = escrow_request(
+        driver,
+        session,
+        state,
+        credentials,
+        user,
+        &format!("escrow/sign/execute/{user}/{}", plan.session_id),
+        Operation::Execute,
+        Some(generic::SIGN_CONTRACT),
+        Some(attempt),
+        &execute,
+    )
+    .await?;
+    let ExecutionOutput::SigningPermit {
+        signing_session_id,
+        scope_digest,
+    } = response.output.decode()?
+    else {
+        return Err(invalid("Enclave did not authorize contract signing"));
+    };
+    if signing_session_id != plan.session_id
+        || scope_digest != expected_scope_digest
+        || response.context.request.policy_digest != policy.policy.digest()?
+    {
+        return Err(invalid(
+            "Signing permit differs from the accepted policy and session",
+        ));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -1147,95 +1378,39 @@ impl Keymeld for KeymeldService {
             )
             .await?;
         driver.restore_keygen(&state.registrations).await?;
-        let mut signed = Vec::with_capacity(spends.len());
-        for (user, spend) in spends {
-            let binding = state
-                .bindings
-                .get(&user)
-                .ok_or_else(|| invalid("The pool must be bound before its escrows are spent"))?;
-            let participant_key = &state
-                .policies
-                .get(&user)
-                .ok_or_else(|| invalid("Escrow participant has no accepted policy"))?
-                .policy
-                .participant_public_key;
-            // Every batch attempt signs new transactions, so each spend is a fresh attempt.
-            let attempt = ActionAttempt {
-                attempt_id: Uuid::now_v7(),
-                signing_session_id: None,
-            };
-            let prepare = PrepareEscrowRequest {
-                schema_version: escrow::SCHEMA_VERSION,
-                binding_receipt: binding.sealed_state.clone(),
-                action_id: generic::SIGN_ARK_ESCROW.into(),
-                attempt: attempt.clone(),
-                action: None,
-                action_parameters: Payload::encode(&generic::ActionParameters::SignArkEscrow {
-                    spend,
-                })?,
-                prior_preparation_receipts: vec![],
-            };
-            let prepared = escrow_request(
-                &mut driver,
-                session,
-                &state,
-                &credentials,
-                &user,
-                &format!("escrow/ark/prepare/{user}/{}", attempt.attempt_id),
-                Operation::Prepare,
-                Some(generic::SIGN_ARK_ESCROW),
-                Some(attempt.clone()),
-                &prepare,
-            )
-            .await?;
-            let inputs: Vec<usize> = prepared.output.decode()?;
-            let execute = ExecuteEscrowRequest {
-                schema_version: escrow::SCHEMA_VERSION,
-                prepared_receipt: prepared.sealed_state,
-                proof: ConditionProof::VerifierEvidence {
-                    evidence: Payload::default(),
-                },
-            };
-            let response = escrow_request(
-                &mut driver,
-                session,
-                &state,
-                &credentials,
-                &user,
-                &format!("escrow/ark/execute/{user}/{}", attempt.attempt_id),
-                Operation::Execute,
-                Some(generic::SIGN_ARK_ESCROW),
-                Some(attempt),
-                &execute,
-            )
-            .await?;
-            let ExecutionOutput::Bip340Signatures {
-                public_key,
-                signatures,
-            } = response.output.decode()?
-            else {
-                return Err(invalid("Enclave did not sign the escrow spend"));
-            };
-            if &public_key != participant_key || signatures.len() != inputs.len() {
-                return Err(invalid(
-                    "Escrow signatures differ from the authorized spend",
-                ));
+        drop(driver);
+        let spends = spends
+            .into_iter()
+            .map(|(user, spend)| {
+                let enclave = *session
+                    .recipient_authorization
+                    .user_enclave_assignments
+                    .get(&user)
+                    .ok_or_else(|| invalid("Participant enclave is missing"))?;
+                Ok((enclave, (user, spend)))
+            })
+            .collect::<Result<Vec<_>, KeymeldError>>()?;
+        // The journal is in memory only, so each enclave's spends can run on their own copy.
+        let (state, credentials) = (&state, &credentials);
+        per_enclave(spends, &journal, move |mut journal, spends| async move {
+            let mut driver = self
+                .connect(
+                    session,
+                    state,
+                    credentials,
+                    &mut journal,
+                    &EphemeralCheckpoint,
+                )
+                .await?;
+            let mut signed = Vec::with_capacity(spends.len());
+            for (user, spend) in spends {
+                signed.push(
+                    sign_ark_spend(&mut driver, session, state, credentials, user, spend).await?,
+                );
             }
-            signed.push(
-                inputs
-                    .into_iter()
-                    .zip(signatures)
-                    .map(|(input, signature)| {
-                        let bytes: [u8; 64] = signature
-                            .signature
-                            .try_into()
-                            .map_err(|_| invalid("Invalid BIP340 signature length"))?;
-                        Ok((input, bytes))
-                    })
-                    .collect::<Result<Vec<_>, KeymeldError>>()?,
-            );
-        }
-        Ok(signed)
+            Ok(signed)
+        })
+        .await
     }
 
     async fn sign_ark_refund(
@@ -1458,81 +1633,65 @@ impl KeymeldService {
         driver
             .prepare_signing_batch(&plan.session_id, &plan.batch.items)
             .await?;
-        for (user, policy) in &state.policies {
-            let scope = scope_for_participant(&roster, &plan.batch.items, user)?;
-            let expected_scope_digest = authorization_digest("escrow-signing-scope-v1", &scope)?;
-            let binding = state
-                .bindings
-                .get(user)
-                .ok_or_else(|| invalid("DLC consent must be bound before signing"))?;
-            let attempt = ActionAttempt {
-                attempt_id: plan.session_id.uuid(),
-                signing_session_id: Some(plan.session_id.clone()),
-            };
-            let request = PrepareEscrowRequest {
-                schema_version: escrow::SCHEMA_VERSION,
-                binding_receipt: binding.sealed_state.clone(),
-                action_id: generic::SIGN_CONTRACT.into(),
-                attempt: attempt.clone(),
-                action: None,
-                action_parameters: Payload::encode(&generic::ActionParameters::SignContract {
-                    scope,
-                    ark_funding: ark_funding.clone(),
-                })?,
-                prior_preparation_receipts: plan
-                    .prior_preparations
-                    .get(user)
-                    .map(|prepared| vec![prepared.sealed_state.clone()])
-                    .unwrap_or_default(),
-            };
-            let prepared = escrow_request(
-                &mut driver,
-                session,
-                &state,
-                &credentials,
-                user,
-                &format!("escrow/sign/prepare/{user}/{}", plan.session_id),
-                Operation::Prepare,
-                Some(generic::SIGN_CONTRACT),
-                Some(attempt.clone()),
-                &request,
-            )
-            .await?;
-            let execute = ExecuteEscrowRequest {
-                schema_version: escrow::SCHEMA_VERSION,
-                prepared_receipt: prepared.sealed_state,
-                proof: ConditionProof::VerifierEvidence {
-                    evidence: Payload::default(),
-                },
-            };
-            let response = escrow_request(
-                &mut driver,
-                session,
-                &state,
-                &credentials,
-                user,
-                &format!("escrow/sign/execute/{user}/{}", plan.session_id),
-                Operation::Execute,
-                Some(generic::SIGN_CONTRACT),
-                Some(attempt),
-                &execute,
-            )
-            .await?;
-            let ExecutionOutput::SigningPermit {
-                signing_session_id,
-                scope_digest,
-            } = response.output.decode()?
-            else {
-                return Err(invalid("Enclave did not authorize contract signing"));
-            };
-            if signing_session_id != plan.session_id
-                || scope_digest != expected_scope_digest
-                || response.context.request.policy_digest != policy.policy.digest()?
-            {
-                return Err(invalid(
-                    "Signing permit differs from the accepted policy and session",
-                ));
+        if durable {
+            for (user, policy) in &state.policies {
+                permit_contract(
+                    &mut driver,
+                    session,
+                    &state,
+                    &credentials,
+                    &roster,
+                    &plan,
+                    &ark_funding,
+                    user,
+                    policy,
+                )
+                .await?;
             }
+        } else {
+            // Inside a batch the journal is in memory only, so each enclave's permits can run on
+            // their own copy of it, side by side. Signing needs only what was journaled before
+            // them, the route and the batch prepared above, so the copies are not merged back:
+            // their permit commands are dropped with the journal when the batch ends.
+            drop(driver);
+            let permits = state
+                .policies
+                .iter()
+                .map(|(user, policy)| {
+                    let enclave = *session
+                        .recipient_authorization
+                        .user_enclave_assignments
+                        .get(user)
+                        .ok_or_else(|| invalid("Participant enclave is missing"))?;
+                    Ok((enclave, (user, policy)))
+                })
+                .collect::<Result<Vec<_>, KeymeldError>>()?;
+            let (state, credentials, roster, plan, ark_funding) =
+                (&state, &credentials, &roster, &plan, &ark_funding);
+            per_enclave(permits, &journal, move |mut journal, permits| async move {
+                let mut driver = self
+                    .connect(session, state, credentials, &mut journal, saver)
+                    .await?;
+                for (user, policy) in &permits {
+                    permit_contract(
+                        &mut driver,
+                        session,
+                        state,
+                        credentials,
+                        roster,
+                        plan,
+                        ark_funding,
+                        user,
+                        policy,
+                    )
+                    .await?;
+                }
+                Ok(vec![(); permits.len()])
+            })
+            .await?;
+            driver = self
+                .connect(session, &state, &credentials, &mut journal, saver)
+                .await?;
         }
         let encrypted = driver
             .sign_prepared_batch(
@@ -1552,3 +1711,7 @@ impl KeymeldService {
         Ok(signatures)
     }
 }
+
+#[cfg(test)]
+#[path = "confidential_service_tests.rs"]
+mod tests;
