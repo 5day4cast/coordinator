@@ -115,7 +115,6 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
                     }
                 }
                 div { dt { "Entries" } dd { (competition.entries()) } }
-                div { dt { "Entry" } dd { (sats(competition.ticket_price)) } }
             }
             @if let Some(queue) = queue.filter(|_| split) {
                 (queue_pools(&competition.id, queue, None))

@@ -86,7 +86,10 @@ use tower_governor::{
     governor::GovernorConfigBuilder, key_extractor::PeerIpKeyExtractor, GovernorLayer,
 };
 use tower_http::{
-    compression::CompressionLayer,
+    compression::{
+        predicate::{DefaultPredicate, NotForContentType, Predicate},
+        CompressionLayer,
+    },
     cors::{AllowOrigin, CorsLayer},
 };
 type HttpServer = Serve<
@@ -1107,7 +1110,11 @@ async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {
 fn static_files(state: &AppState) -> Router<Arc<AppState>> {
     crate::api::ui_files::router(&state.ui_dir, state.wasm_version.clone())
         .route("/assets/{file}", get(crate::templates::assets::serve_asset))
-        .layer(CompressionLayer::new())
+        // Video is compressed already, and a byte range must be of the bytes as stored.
+        .layer(
+            CompressionLayer::new()
+                .compress_when(DefaultPredicate::new().and(NotForContentType::const_new("video/"))),
+        )
 }
 
 #[cfg(any(feature = "e2e-testing", debug_assertions))]
