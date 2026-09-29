@@ -275,11 +275,11 @@ impl OracleAuth {
                 "oracle event belongs to a different coordinator or event"
             )));
         }
-        if stored.source != "noaa_weather"
-            || stored.scoring_fields != ["temp_high", "temp_low", "wind_speed"]
-        {
+        // A competition may score any subset of the NOAA metrics; a create compares the
+        // stored metrics with its own below, and entries follow their event's.
+        if stored.source != "noaa_weather" {
             return Err(reqwest_middleware::Error::Middleware(anyhow!(
-                "oracle source or scoring fields do not match NOAA defaults"
+                "oracle event source is not NOAA"
             )));
         }
         if matches!(write, OracleWrite::Entries(_)) && stored.entries.is_empty() {
@@ -1071,7 +1071,11 @@ mod tests {
             .public_key()
             .to_bech32()
             .unwrap());
-        created["scoring_fields"] = serde_json::json!(["temp_high", "temp_low", "wind_speed"]);
+        created["scoring_fields"] = serde_json::json!(config
+            .metrics()
+            .iter()
+            .map(|metric| metric.id())
+            .collect::<Vec<_>>());
         created["entries"] = serde_json::json!([]);
         let state = RecoveryServer {
             saved: Arc::default(),
@@ -1162,6 +1166,46 @@ mod tests {
             .unwrap()
             .push(serde_json::json!({"target": "KORD", "metric": "humidity", "prediction": "Par"}));
         assert!(client.submit_entries(submission).await.is_err());
+        assert_eq!(state.entry_posts.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    /// Recovery once rejected every event not scored on temp_high, temp_low and wind_speed,
+    /// so a competition on other metrics that lost a response could not submit its entries.
+    #[tokio::test]
+    async fn recovery_accepts_events_scored_on_other_metrics() {
+        let config = CreateEvent {
+            scoring_fields: Some(vec!["temp_low".into(), "wind_speed".into()]),
+            ..event_config()
+        };
+        let (client, state, server, directory) = recovery_fixture(&config).await;
+        client.create_event(config.clone()).await.unwrap();
+        let restarted = OracleClient::new(
+            ClientBuilder::new(reqwest::Client::new()).build(),
+            &client.base_url,
+            directory.path().join("coordinator.pem").to_str().unwrap(),
+        )
+        .unwrap();
+        restarted.create_event(config.clone()).await.unwrap();
+        assert_eq!(state.create_posts.load(Ordering::SeqCst), 1);
+
+        let submission = AddEventEntries {
+            event_id: config.id,
+            entries: (0..2)
+                .map(|_| AddEventEntry {
+                    id: Uuid::now_v7(),
+                    event_id: config.id,
+                    expected_observations: vec![WeatherChoices {
+                        stations: "KORD".into(),
+                        temp_high: None,
+                        temp_low: Some(ValueOptions::Under),
+                        wind_speed: None,
+                    }],
+                })
+                .collect(),
+        };
+        client.submit_entries(submission.clone()).await.unwrap();
+        restarted.submit_entries(submission).await.unwrap();
         assert_eq!(state.entry_posts.load(Ordering::SeqCst), 1);
         server.abort();
     }
