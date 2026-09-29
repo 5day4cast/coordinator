@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
@@ -145,6 +146,50 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Renew the worker lease every `every` until `stop` changes, then release it.
+    ///
+    /// This runs apart from the work the lease guards, so a tick longer than `ttl` does not let the
+    /// lease lapse mid-tick: the API would refuse claims, and another instance could take over
+    /// while this one still works. `holding` says whether the lease was held at the last renewal;
+    /// a renewal that fails clears it, so the work pauses before the lease can expire.
+    pub async fn keep_lease(
+        &self,
+        holder: &str,
+        ttl: std::time::Duration,
+        every: std::time::Duration,
+        holding: &AtomicBool,
+        mut stop: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let mut interval = tokio::time::interval(every);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = stop.changed() => break,
+            }
+            match self.take_lease(holder, ttl).await {
+                Ok(true) => {
+                    if !holding.swap(true, Ordering::SeqCst) {
+                        log::info!("{holder} runs the swaps");
+                    }
+                }
+                Ok(false) => {
+                    if holding.swap(false, Ordering::SeqCst) {
+                        log::warn!("another ark-swapd instance took over the swaps");
+                    }
+                }
+                Err(error) => {
+                    holding.store(false, Ordering::SeqCst);
+                    log::warn!("cannot take the worker lease: {error:#}");
+                }
+            }
+        }
+        holding.store(false, Ordering::SeqCst);
+        if let Err(error) = self.release_lease(holder).await {
+            log::warn!("cannot release the worker lease: {error:#}");
+        }
     }
 
     pub async fn insert(&self, swap: &Swap) -> anyhow::Result<()> {
@@ -771,6 +816,37 @@ mod tests {
             .await
             .unwrap());
         tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(green.take_lease("green", ttl).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_lease_is_kept_through_work_that_outlasts_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("swaps.sqlite");
+        let blue = Store::open(&path).await.unwrap();
+        let green = Store::open(&path).await.unwrap();
+        let ttl = Duration::from_secs(1);
+        let holding = std::sync::Arc::new(AtomicBool::new(false));
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let keeper = {
+            let blue = blue.clone();
+            let holding = holding.clone();
+            tokio::spawn(async move {
+                blue.keep_lease("blue", ttl, Duration::from_millis(50), &holding, stopped)
+                    .await
+            })
+        };
+
+        // Work three times as long as the lease lives, as a slow tick is.
+        tokio::time::sleep(ttl * 3).await;
+        assert!(holding.load(Ordering::SeqCst));
+        assert!(blue.holds_lease("blue").await.unwrap());
+        assert!(!green.take_lease("green", ttl).await.unwrap());
+
+        // Stopping hands the lease over at once.
+        stop.send(true).unwrap();
+        keeper.await.unwrap();
+        assert!(!holding.load(Ordering::SeqCst));
         assert!(green.take_lease("green", ttl).await.unwrap());
     }
 }

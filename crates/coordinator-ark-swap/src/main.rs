@@ -13,6 +13,7 @@ mod swap;
 mod wallet;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -77,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
         invoice_expiry_secs: config.invoice_expiry_secs,
         invoice_cltv_expiry: config.invoice_cltv_expiry,
         errors: Default::default(),
+        claims: Default::default(),
     });
     let view = swapper.wallet.view().await?;
     log::info!(
@@ -91,13 +93,28 @@ async fn main() -> anyhow::Result<()> {
     // advances swaps and moves the wallet's coins; both serve the API.
     let holder = format!("ark-swapd-{}", uuid::Uuid::now_v7());
     let (stop, stopped) = tokio::sync::watch::channel(false);
+
+    // The lease is renewed apart from the work, so a slow tick cannot let it lapse. It is released
+    // only once the worker has finished its last tick.
+    let holding = Arc::new(AtomicBool::new(false));
+    let (worker_done, worker_finished) = tokio::sync::watch::channel(false);
+    let lease_task = {
+        let swapper = swapper.clone();
+        let holder = holder.clone();
+        let holding = holding.clone();
+        tokio::spawn(async move {
+            swapper
+                .store
+                .keep_lease(&holder, LEASE_TTL, TICK, &holding, worker_finished)
+                .await
+        })
+    };
+
     let worker = swapper.clone();
-    let worker_holder = holder.clone();
     let mut worker_stopped = stopped.clone();
     let worker_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(TICK);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut holding = false;
         let mut boarded_at = tokio::time::Instant::now();
         let mut looked_up_at = tokio::time::Instant::now();
         loop {
@@ -105,36 +122,22 @@ async fn main() -> anyhow::Result<()> {
                 _ = interval.tick() => {}
                 _ = worker_stopped.changed() => break,
             }
-            match worker.store.take_lease(&worker_holder, LEASE_TTL).await {
-                Ok(true) => {
-                    if !holding {
-                        log::info!("{worker_holder} runs the swaps");
-                        holding = true;
-                    }
-                    // A tick always finishes, so a payment in flight records its result.
-                    worker.tick().await;
-                    worker.refund_tick().await;
-                    if looked_up_at.elapsed() >= LOOKUP_EVERY {
-                        worker.lookup_tick().await;
-                        looked_up_at = tokio::time::Instant::now();
-                    }
-                    if boarded_at.elapsed() >= BOARD_EVERY {
-                        worker.board_tick().await;
-                        boarded_at = tokio::time::Instant::now();
-                    }
-                }
-                Ok(false) => {
-                    if holding {
-                        log::warn!("another ark-swapd instance took over the swaps");
-                        holding = false;
-                    }
-                }
-                Err(error) => log::warn!("cannot take the worker lease: {error:#}"),
+            if !holding.load(Ordering::SeqCst) {
+                continue;
+            }
+            // A tick always finishes, so a payment in flight records its result.
+            worker.tick().await;
+            worker.refund_tick().await;
+            if looked_up_at.elapsed() >= LOOKUP_EVERY {
+                worker.lookup_tick().await;
+                looked_up_at = tokio::time::Instant::now();
+            }
+            if boarded_at.elapsed() >= BOARD_EVERY {
+                worker.board_tick().await;
+                boarded_at = tokio::time::Instant::now();
             }
         }
-        if let Err(error) = worker.store.release_lease(&worker_holder).await {
-            log::warn!("cannot release the worker lease: {error:#}");
-        }
+        let _ = worker_done.send(true);
     });
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -153,5 +156,6 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
     worker_task.await?;
+    lease_task.await?;
     Ok(())
 }
