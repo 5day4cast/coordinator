@@ -83,6 +83,15 @@ pub struct ArkClient {
     digest: Arc<RwLock<String>>,
 }
 
+/// Install ring as rustls's process-wide crypto provider, unless the process has already chosen.
+///
+/// tonic's TLS uses that provider, even to build a config, and panics without one. This
+/// workspace compiles in both ring and aws-lc-rs, so rustls cannot pick one itself. Call this
+/// before anything opens a TLS channel, ark-grpc's included.
+pub(crate) fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 impl ArkClient {
     /// Wrap `grpc`, connected to `url`, whose `/v1/info` has `digest`.
     ///
@@ -91,10 +100,7 @@ impl ArkClient {
         let invalid = |error: tonic::transport::Error| {
             Error::ServerInfo(format!("cannot reach {url}: {error}"))
         };
-        // tonic's TLS uses rustls's process-wide crypto provider, even to build this config.
-        // This workspace compiles in both ring and aws-lc-rs, so rustls cannot pick one itself.
-        // Install ring, unless the process has already chosen.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        install_crypto_provider();
         let tls = ClientTlsConfig::new().with_webpki_roots();
         let channel = Endpoint::from_shared(url.to_string())
             .map_err(invalid)?
