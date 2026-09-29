@@ -91,6 +91,10 @@ impl ArkClient {
         let invalid = |error: tonic::transport::Error| {
             Error::ServerInfo(format!("cannot reach {url}: {error}"))
         };
+        // tonic's TLS uses rustls's process-wide crypto provider, even to build this config.
+        // This workspace compiles in both ring and aws-lc-rs, so rustls cannot pick one itself.
+        // Install ring, unless the process has already chosen.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let tls = ClientTlsConfig::new().with_webpki_roots();
         let channel = Endpoint::from_shared(url.to_string())
             .map_err(invalid)?

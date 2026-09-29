@@ -20,10 +20,6 @@ pub struct ArkServer {
 impl ArkServer {
     /// Connect to `url`, such as `https://mutinynet.arkade.sh`, and read the server's parameters.
     pub async fn connect(url: impl Into<String>) -> Result<Self, Error> {
-        // tonic's TLS uses rustls's process-wide crypto provider.
-        // This workspace compiles in both ring and aws-lc-rs, so rustls cannot pick one itself.
-        // Install ring, unless the process has already chosen.
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let url = url.into();
         let mut grpc = ark_grpc::Client::new(url.clone());
         grpc.connect().await?;
