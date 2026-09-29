@@ -265,3 +265,34 @@
     font-size: 0.9rem;
   }
 }
+
+/* The price is one total; tapping it opens what it is made of. */
+.price-details summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.price-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.price-details summary::after {
+  content: " ▾";
+  font-size: 0.75em;
+  color: var(--entry-muted);
+}
+
+.price-details[open] summary::after {
+  content: " ▴";
+}
+
+.price-lines {
+  margin-top: 0.25rem;
+  font-size: 0.8rem;
+  font-weight: 400;
+  color: var(--entry-muted);
+}
+
+.price-lines span {
+  white-space: nowrap;
+}

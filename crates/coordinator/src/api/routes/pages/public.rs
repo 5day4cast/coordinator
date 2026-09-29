@@ -185,16 +185,20 @@ fn now() -> OffsetDateTime {
 }
 
 async fn competition_views(state: &AppState, now: OffsetDateTime) -> Vec<CompetitionView> {
-    let (competitions, refunds) = tokio::join!(
+    let (competitions, refunds, network_fee) = tokio::join!(
         state.coordinator.get_competitions(),
         refund_progress(state, None),
+        state.coordinator.shown_network_fee_quote(),
     );
+    // What a ticket issued now adds, so the price shown is what entering costs.
+    let network_fee = network_fee.ok().map(|quote| quote.network_fee_sats);
     match competitions {
         Ok(competitions) => competitions
             .iter()
             .map(|competition| {
                 let mut view = CompetitionView::new(competition, now);
                 view.refunds = refunds.get(&competition.id).copied().unwrap_or_default();
+                view.network_fee = network_fee.filter(|_| view.can_enter);
                 view
             })
             .collect(),
@@ -493,7 +497,7 @@ pub async fn entry_form_fragment(
         forecasts(&state, &competition, FIRST_READ_WAIT),
         state.coordinator.payout_terms_quote(competition_id),
         payout_destination(&state, auth.as_ref()),
-        state.coordinator.network_fee_quote(),
+        state.coordinator.shown_network_fee_quote(),
     );
     let terms = terms
         .inspect_err(|error| warn!("payout terms for {competition_id}: {error}"))

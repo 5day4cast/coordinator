@@ -142,9 +142,10 @@ test.describe("Competitions", () => {
     const headers = page.locator("#competitions-page .competition-header").first().locator("span");
     await expect(headers.nth(0)).toContainText("Status");
     await expect(headers.nth(1)).toContainText("Window");
-    await expect(headers.nth(2)).toContainText("Entry");
-    await expect(headers.nth(3)).toContainText("Pot");
-    await expect(headers.nth(5)).toContainText("Paid places");
+    // What it costs and what first place wins; nothing else about fees or places.
+    await expect(headers.nth(2)).toContainText("Price");
+    await expect(headers.nth(3)).toContainText("Win");
+    await expect(headers.nth(4)).toContainText("Entries");
   });
 
   test("can navigate to entries page", async ({ page }) => {

@@ -121,15 +121,7 @@
   color: hsl(141, 53%, 30%);
 }
 
-.pick-state.is-on-track {
-  border-color: hsla(141, 53%, 42%, 0.55);
-  color: hsl(141, 53%, 32%);
-}
 
-.pick-state.is-off-track {
-  border-color: hsla(36, 80%, 45%, 0.55);
-  color: hsl(33, 70%, 36%);
-}
 
 .pick-state.is-out,
 .pick-state.is-final {
@@ -143,14 +135,10 @@
   color: var(--bulma-text-weak);
 }
 
-[data-theme="dark"] .pick-state.is-locked-in,
-[data-theme="dark"] .pick-state.is-on-track {
+[data-theme="dark"] .pick-state.is-locked-in {
   color: hsl(141, 50%, 62%);
 }
 
-[data-theme="dark"] .pick-state.is-off-track {
-  color: hsl(38, 80%, 62%);
-}
 
 @media screen and (max-width: 600px) {
   .picks-detail .scored-pick {
