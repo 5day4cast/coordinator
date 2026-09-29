@@ -596,7 +596,9 @@ impl Fixture {
     /// A ticket as [`Fixture::funded`] makes it, whose player sent Keymeld `sent`.
     async fn funded_after(&self, session: &DlcKeygenSession, player: u8, sent: Sent) -> ArkTicket {
         let now = OffsetDateTime::now_utc().unix_timestamp() as u32;
-        let (ticket, escrow) = self.ticket_refundable_from(player, PRICE, now - 60).await;
+        let (ticket, escrow) = self
+            .ticket_refundable_from(player, PRICE, now - 60 * 60)
+            .await;
         let (registration, policy) = self.registration(session, &ticket, &escrow, player);
         if sent == Sent::Registration {
             // Sent before paying, with the payout policy accepted for the ticket.
@@ -728,7 +730,9 @@ impl Fixture {
     /// An unpaid ticket of test key `player`, whose player sent their registration.
     async fn registered_unpaid(&self, session: &DlcKeygenSession, player: u8) -> ArkTicket {
         let now = OffsetDateTime::now_utc().unix_timestamp() as u32;
-        let (ticket, escrow) = self.ticket_refundable_from(player, PRICE, now - 60).await;
+        let (ticket, escrow) = self
+            .ticket_refundable_from(player, PRICE, now - 60 * 60)
+            .await;
         let (registration, _) = self.registration(session, &ticket, &escrow, player);
         self.register(&ticket, &registration).await;
         ticket
