@@ -345,6 +345,7 @@ impl Fixture {
             unlisted: false,
             scoring_rules: None,
             scoring_fields: None,
+            max_entries_per_player: 1,
         });
         coordinator
             .competition_store
@@ -954,6 +955,7 @@ fn event(places: usize, players: usize) -> CreateEvent {
         unlisted: false,
         scoring_rules: None,
         scoring_fields: None,
+        max_entries_per_player: 1,
     }
 }
 

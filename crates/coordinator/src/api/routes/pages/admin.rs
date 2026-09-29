@@ -233,6 +233,9 @@ pub struct CreateCompetitionForm {
     /// A queued competition's entry cap.
     #[serde(default)]
     pub max_entries: Option<u32>,
+    /// How many entries one player may make; one if unset.
+    #[serde(default)]
+    pub max_entries_per_player: Option<u32>,
 }
 
 /// Handle competition creation from HTMX form
@@ -283,6 +286,10 @@ pub async fn admin_create_competition_handler(
         );
     }
 
+    let max_entries_per_player = form
+        .max_entries_per_player
+        .unwrap_or(crate::domain::ONE_ENTRY_PER_PLAYER);
+
     let coordinator_fee =
         match crate::domain::CoordinatorFee::parse_percent(&form.coordinator_fee_percentage) {
             Ok(fee) => fee,
@@ -312,6 +319,7 @@ pub async fn admin_create_competition_handler(
                 .max_pool_size
                 .unwrap_or(coordinator_escrow::pools::MAX_POOL_PLAYERS),
             max_entries: form.max_entries,
+            max_entries_per_player,
         };
         return match state.coordinator.create_queued_competition(request).await {
             Ok(competition) => {
@@ -359,6 +367,7 @@ pub async fn admin_create_competition_handler(
         unlisted: false,
         scoring_rules: Some(scoring_rules),
         scoring_fields: None,
+        max_entries_per_player,
     };
 
     match state.coordinator.create_competition(create_event).await {

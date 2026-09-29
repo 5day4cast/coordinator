@@ -108,6 +108,9 @@ pub struct CreateArgs {
     /// How many places win.
     #[arg(long, default_value_t = 1)]
     pub places_win: usize,
+    /// How many entries one player may make.
+    #[arg(long, default_value_t = crate::domain::ONE_ENTRY_PER_PLAYER)]
+    pub max_entries_per_player: u32,
     /// Blocks between the outcome and delta transactions; the coordinator's default if unset.
     #[arg(long)]
     pub locktime_delta: Option<u16>,
@@ -118,11 +121,12 @@ pub struct CreateArgs {
     /// 10 points a right pick) or `fixed` (exact Par 20, Over or Under 10).
     #[arg(long, default_value = "lines", value_parser = parse_scoring_rules)]
     pub scoring_rules: ScoringRules,
-    /// Queue entries without a seat count, and split them into pools when observation starts.
-    /// Each pool pays one winner and scores lines, so --max-entries, --places-win and
-    /// --scoring-rules do not apply.
+    /// Make a single competition with a fixed seat count (--max-entries) instead. By default
+    /// a competition queues entries without a seat count and splits them into pools when
+    /// observation starts; each pool pays one winner and scores lines, so --max-entries,
+    /// --places-win and --scoring-rules apply to single competitions only.
     #[arg(long)]
-    pub queued: bool,
+    pub single: bool,
     /// A queued competition's smallest pool.
     #[arg(long, default_value_t = crate::domain::DEFAULT_MIN_PLAYERS)]
     pub min_players: usize,
@@ -243,6 +247,7 @@ impl CreateArgs {
             unlisted: self.unlisted,
             scoring_rules: Some(self.scoring_rules),
             scoring_fields: None,
+            max_entries_per_player: self.max_entries_per_player,
         })
     }
 }
@@ -264,6 +269,7 @@ impl CreateArgs {
             min_players: self.min_players,
             max_pool_size: self.max_pool_size,
             max_entries: self.entry_cap,
+            max_entries_per_player: self.max_entries_per_player,
         })
     }
 }
@@ -448,7 +454,7 @@ pub async fn run(args: AdminArgs) -> Result<()> {
                 }
             }
             CompetitionCommand::Create(create) => {
-                let id = if create.queued {
+                let id = if !create.single {
                     let request = create.to_queued()?;
                     if create.dry_run {
                         println!("{}", serde_json::to_string_pretty(&request)?);
@@ -747,6 +753,30 @@ mod tests {
         assert!(event.start_observation_date < event.end_observation_date);
         assert!(event.end_observation_date < event.signing_date);
         assert!(Cli::try_parse_from(["coordinator", "admin", "competitions", "create"]).is_err());
+    }
+
+    /// Competitions run with however many players enter: queued unless asked for seats.
+    #[test]
+    fn create_makes_a_queued_competition_unless_asked_for_a_single_one() {
+        let create = |extra: &[&str]| {
+            let mut argv = vec!["competitions", "create", "--stations", "KDEN"];
+            argv.extend_from_slice(extra);
+            let AdminCommand::Competitions {
+                action: CompetitionCommand::Create(create),
+            } = parse(&argv).command
+            else {
+                panic!("expected create");
+            };
+            create
+        };
+        let queued = create(&[]);
+        assert!(!queued.single);
+        let request = queued.to_queued().unwrap();
+        assert_eq!(request.max_entries_per_player, 1);
+        assert!(create(&["--single"]).single);
+        let two = create(&["--max-entries-per-player", "2"]);
+        assert_eq!(two.to_queued().unwrap().max_entries_per_player, 2);
+        assert_eq!(two.to_event().unwrap().max_entries_per_player, 2);
     }
 
     #[test]

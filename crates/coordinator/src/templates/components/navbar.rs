@@ -73,6 +73,15 @@ pub fn navbar() -> Markup {
                           hx-push-url="true" {
                             "Payouts"
                         }
+
+                        a href="/help"
+                          class="navbar-item"
+                          id="helpNavClick"
+                          hx-get="/help"
+                          hx-target="#main-content"
+                          hx-push-url="true" {
+                            "How it works"
+                        }
                     }
 
                     // Right side - auth buttons and theme toggle

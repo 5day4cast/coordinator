@@ -408,6 +408,7 @@ impl Fixture {
             unlisted: false,
             scoring_rules: None,
             scoring_fields: None,
+            max_entries_per_player: 1,
         });
         assert_eq!(competition.calculate_invoice_amount(), PRICE);
         let competition_id = competition.id;

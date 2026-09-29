@@ -71,17 +71,15 @@ pub fn time(at: OffsetDateTime, style: TimeStyle) -> Markup {
 /// domain's (`domain::leaderboard::Metric`), as the oracle scores it.
 pub trait MetricText {
     fn label(self) -> &'static str;
-    /// The reading so far, part-way through the window: the highest high and
-    /// wind, the lowest low.
-    fn so_far(self) -> &'static str;
+    /// The label in one word, for compact rows: `High`, `Low`, `Wind`.
+    fn short(self) -> &'static str;
     /// A value in the metric's unit, as the oracle reads it.
     fn value(self, value: f64) -> String;
-    /// A Par range in the metric's unit: `67.4–70.2°F`.
+    /// A Par range in the metric's unit, short enough for a pick button: `67.4–70.2°F`,
+    /// `7.5–9.5 kt`.
     fn range(self, low: f64, high: f64) -> String;
-    /// Which way a station's forecasts have leaned, from its Par band on the
-    /// miss: `forecasts here have run ~2°F hot lately`. `None` when the band
-    /// sits within half a unit of the forecast.
-    fn lean(self, lower: f64, upper: f64) -> Option<String>;
+    /// One end of a Par range, to the tenth: `67.4°F`.
+    fn bound(self, value: f64) -> String;
 }
 
 impl MetricText for Metric {
@@ -93,11 +91,11 @@ impl MetricText for Metric {
         }
     }
 
-    fn so_far(self) -> &'static str {
+    fn short(self) -> &'static str {
         match self {
-            Metric::TempHigh => "High so far",
-            Metric::TempLow => "Low so far",
-            Metric::WindSpeed => "Top wind so far",
+            Metric::TempHigh => "High",
+            Metric::TempLow => "Low",
+            Metric::WindSpeed => "Wind",
         }
     }
 
@@ -112,26 +110,15 @@ impl MetricText for Metric {
     fn range(self, low: f64, high: f64) -> String {
         match self {
             Metric::TempHigh | Metric::TempLow => format!("{low:.1}–{high:.1}°F"),
-            Metric::WindSpeed => format!("{low:.1}–{high:.1} knots"),
+            Metric::WindSpeed => format!("{low:.1}–{high:.1} kt"),
         }
     }
 
-    fn lean(self, lower: f64, upper: f64) -> Option<String> {
-        // The band's middle is the forecast's usual miss; readings below a forecast mean it ran hot.
-        let miss = (lower + upper) / 2.0;
-        let size = miss.abs().round();
-        if size < 1.0 {
-            return None;
+    fn bound(self, value: f64) -> String {
+        match self {
+            Metric::TempHigh | Metric::TempLow => format!("{value:.1}°F"),
+            Metric::WindSpeed => format!("{value:.1} kt"),
         }
-        let (amount, way) = match (self, miss < 0.0) {
-            (Metric::TempHigh | Metric::TempLow, true) => (format!("{size}°F"), "hot"),
-            (Metric::TempHigh | Metric::TempLow, false) => (format!("{size}°F"), "cold"),
-            (Metric::WindSpeed, true) if size == 1.0 => ("1 knot".to_owned(), "high"),
-            (Metric::WindSpeed, false) if size == 1.0 => ("1 knot".to_owned(), "low"),
-            (Metric::WindSpeed, true) => (format!("{size} knots"), "high"),
-            (Metric::WindSpeed, false) => (format!("{size} knots"), "low"),
-        };
-        Some(format!("forecasts here have run ~{amount} {way} lately"))
     }
 }
 
@@ -267,26 +254,5 @@ mod tests {
         assert_eq!(ordinal(3), "3rd");
         assert_eq!(ordinal(11), "11th");
         assert_eq!(ordinal(22), "22nd");
-    }
-
-    #[test]
-    fn a_par_band_off_the_forecast_says_which_way_forecasts_have_leaned() {
-        assert_eq!(
-            Metric::TempHigh.lean(-3.6, -1.0).as_deref(),
-            Some("forecasts here have run ~2°F hot lately")
-        );
-        assert_eq!(
-            Metric::TempLow.lean(0.4, 4.0).as_deref(),
-            Some("forecasts here have run ~2°F cold lately")
-        );
-        assert_eq!(
-            Metric::WindSpeed.lean(0.5, 1.5).as_deref(),
-            Some("forecasts here have run ~1 knot low lately")
-        );
-        assert_eq!(
-            Metric::WindSpeed.lean(-4.0, -2.0).as_deref(),
-            Some("forecasts here have run ~3 knots high lately")
-        );
-        assert_eq!(Metric::TempHigh.lean(-1.6, 1.2), None);
     }
 }

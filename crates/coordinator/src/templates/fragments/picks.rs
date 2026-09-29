@@ -10,7 +10,10 @@ use time::OffsetDateTime;
 
 use crate::domain::leaderboard::{Phase, PickProgress, PickState, Rule};
 use crate::infra::oracle::ValueOptions;
-use crate::templates::format::{self, MetricText};
+use crate::templates::{
+    components::tip,
+    format::{self, MetricText},
+};
 
 /// How often an open window's picks and leaderboard refresh.
 pub const LIVE_REFRESH: &str = "every 60s";
@@ -79,9 +82,9 @@ fn badge(state: PickState) -> (&'static str, &'static str, &'static str) {
     }
 }
 
-fn state_badge(state: PickState) -> Markup {
+pub(crate) fn state_badge(state: PickState) -> Markup {
     let (class, text, title) = badge(state);
-    html! { span class=(class) title=(title) { (text) } }
+    html! { span class=(class) tabindex="0" data-tip=(title) { (text) } }
 }
 
 fn pick_label(pick: &ValueOptions) -> &'static str {
@@ -162,8 +165,8 @@ fn detail(
                         (total) " pts"
                         @match phase {
                             Phase::Live => { span class="fact-note" { "so far" } }
-                            Phase::AwaitingResult => { span class="fact-note" { "awaiting the oracle's result" } }
-                            Phase::Scored => { span class="fact-note" { "Final" } }
+                            Phase::AwaitingResult => { span class="fact-note" { "pending" } }
+                            Phase::Scored => { span class="fact-note" { "final" } }
                             _ => {}
                         }
                     }
@@ -172,22 +175,18 @@ fn detail(
             @match phase {
                 Phase::Live => {
                     p class="provisional-note" {
-                        "Provisional: scored as if the window ended now"
-                        @if let Some(at) = updated_at {
-                            " · updated " (format::ago(at, now))
+                        @if let Some(at) = updated_at { "Updated " (format::ago(at, now)) }
+                        @if let Some((covered, total)) = coverage(picks) {
+                            @if updated_at.is_some() { " · " }
+                            "reports in for " (covered) " of " (total) " h"
                         }
-                        "."
-                    }
-                    p class="picks-legend" {
-                        strong { "On track" } " and " strong { "off track" } " say how a pick stands if the "
-                        "window ended now. Highs and winds only rise through the window and lows only fall, "
-                        "so once the reading has settled a pick it is " strong { "locked in" } " or " strong { "out" } "."
+                        (tip("Scored as if the window ended now; picks can still change until it closes."))
                     }
                 }
                 Phase::AwaitingResult => {
                     p class="provisional-note" {
-                        "Window closed: awaiting the oracle's result. The points are what the "
-                        "readings so far score; the oracle's own reading decides."
+                        "Window closed"
+                        (tip("The oracle's own reading decides the final scores."))
                     }
                 }
                 Phase::Unfilled => {
@@ -211,12 +210,12 @@ fn detail(
                     (Phase::Upcoming, Viewer::Other) => { p class="empty-state" { (WITHHELD) } }
                     _ => { p class="empty-state" { "No picks recorded." } }
                 }
-            } @else if !any_observed {
+            } @else if !any_observed && matches!(phase, Phase::Live | Phase::AwaitingResult | Phase::Scored) {
                 p class="entry-pending-msg mb-3" {
-                    @match phase {
-                        Phase::Live | Phase::AwaitingResult => { "Readings appear here as the oracle records them." }
-                        Phase::Scored => { "No readings were recorded for these stations in the window, so no pick scored." }
-                        _ => { "Readings appear here once the window opens." }
+                    @if phase == Phase::Scored {
+                        "No readings were recorded for these stations in the window, so no pick scored."
+                    } @else {
+                        "No readings yet."
                     }
                 }
             }
@@ -238,21 +237,56 @@ fn detail(
     }
 }
 
-fn forecast_value(pick: &PickProgress) -> Markup {
+/// How much of the window the stations have reported, the least-covered pick's: `(9, 24)`.
+fn coverage(picks: &[PickView]) -> Option<(u32, u32)> {
+    picks
+        .iter()
+        .map(|view| view.pick)
+        .filter(|pick| pick.hours_total > 0.0)
+        .map(|pick| {
+            let total = pick.hours_total.ceil() as u32;
+            ((pick.hours_covered.floor() as u32).min(total), total)
+        })
+        .min()
+}
+
+/// What the pick needs the reading to be: `< 69.4°F`, `69.4–72.0°F`, `> 72.0°F`; with a fixed
+/// Par, the forecast itself: `< 69°F`, `69°F`, `> 69°F`.
+fn pick_target(pick: &PickProgress) -> Option<String> {
+    let forecast = pick.forecast?;
+    let metric = pick.metric;
+    Some(match (pick.rule, &pick.pick) {
+        (Some(Rule::Line { lower, .. }), ValueOptions::Under) => {
+            format!("< {}", metric.bound(forecast + lower))
+        }
+        (Some(Rule::Line { lower, upper }), ValueOptions::Par) => {
+            metric.range(forecast + lower, forecast + upper)
+        }
+        (Some(Rule::Line { upper, .. }), ValueOptions::Over) => {
+            format!("> {}", metric.bound(forecast + upper))
+        }
+        (_, ValueOptions::Under) => format!("< {}", metric.value(forecast)),
+        (_, ValueOptions::Par) => metric.value(forecast),
+        (_, ValueOptions::Over) => format!("> {}", metric.value(forecast)),
+    })
+}
+
+/// `High · Under < 69.4°F`: the reading, the pick and what it needs.
+fn pick_cells(pick: &PickProgress) -> Markup {
     html! {
-        "Forecast "
-        strong { (pick.forecast.map(|value| pick.metric.value(value)).unwrap_or_else(|| "—".into())) }
-        @if let (Some(value), Some(Rule::Line { lower, upper })) = (pick.forecast, pick.rule) {
-            " (Par " (pick.metric.range(value + lower, value + upper)) ")"
-            @if let Some(lean) = pick.metric.lean(lower, upper) {
-                " · " (lean)
-            }
+        span class="pick-metric" { (pick.metric.short()) }
+        span class="pick-choice" {
+            (pick_label(&pick.pick))
+            @if let Some(target) = pick_target(pick) { " " span class="pick-target" { (target) } }
+        }
+        span class="pick-reading" {
+            @if let Some(observed) = pick.observed { (pick.metric.value(observed)) }
         }
     }
 }
 
-/// A pick once the window has closed: the reading, whether it scored, and
-/// whether that is the oracle's final result yet.
+/// A pick outside the open window: before it, just the pick; after it, the reading and
+/// whether it scored.
 fn pick_row(pick: &PickProgress) -> Markup {
     let scored = pick.forecast.is_some() && pick.observed.is_some();
     let class = match (scored, pick.hit) {
@@ -262,14 +296,7 @@ fn pick_row(pick: &PickProgress) -> Markup {
     };
     html! {
         div class=(class) {
-            span class="pick-metric" { (pick.metric.label()) }
-            span class="pick-values" {
-                (forecast_value(pick))
-                @if let Some(observed) = pick.observed {
-                    " · Observed " strong { (pick.metric.value(observed)) }
-                }
-            }
-            span class="pick-choice" { (pick_label(&pick.pick)) }
+            (pick_cells(pick))
             span class="pick-result" {
                 @if scored {
                     @if pick.hit { "✓ +" (pick.points) } @else { "✗ 0" }
@@ -280,30 +307,17 @@ fn pick_row(pick: &PickProgress) -> Markup {
     }
 }
 
-/// `Forecast 69°F · High so far 71°F · 9 of 24 h`, the points the pick
-/// earns if the window ended now, and how it stands.
+/// A pick while the window is open: the reading so far, the points it earns if the window
+/// ended now, and how it stands.
 fn live_pick_row(pick: &PickProgress) -> Markup {
     let row_class = match pick.state {
         PickState::LockedIn => "scored-pick is-live is-locked-in",
         PickState::Out => "scored-pick is-live is-out",
         _ => "scored-pick is-live",
     };
-    let hours_total = pick.hours_total.ceil() as u32;
-    let hours_covered = (pick.hours_covered.floor() as u32).min(hours_total);
     html! {
         div class=(row_class) {
-            span class="pick-metric" { (pick.metric.label()) }
-            span class="pick-values" {
-                (forecast_value(pick))
-                @match pick.observed {
-                    Some(value) => { " · " (pick.metric.so_far()) " " strong { (pick.metric.value(value)) } }
-                    None => { " · no reading yet" }
-                }
-                @if hours_total > 0 {
-                    " · reports through " (hours_covered) " of " (hours_total) " h"
-                }
-            }
-            span class="pick-choice" { (pick_label(&pick.pick)) }
+            (pick_cells(pick))
             span class="pick-result" {
                 @if pick.observed.is_some() {
                     span class="pick-points" { @if pick.hit { "+" (pick.points) } @else { "0" } }
@@ -382,8 +396,9 @@ mod tests {
         )
         .into_string();
         assert!(html.contains("John F Kennedy International Airport"));
-        assert!(html.contains("Forecast <strong>69°F</strong> · Observed <strong>55°F</strong>"));
-        assert!(html.contains("18 knots"));
+        assert!(html.contains(r#"Under <span class="pick-target">&lt; 69°F</span>"#));
+        assert!(html.contains(r#"<span class="pick-reading">55°F</span>"#));
+        assert!(html.contains("&gt; 18 knots"));
         assert!(html.contains("✓ +10"));
         assert!(html.contains("✗ 0"));
         assert!(html.contains("10 pts"));
@@ -407,9 +422,13 @@ mod tests {
         )];
         let html =
             picks_detail("e1", &views(&picks), Phase::AwaitingResult, None, NOW).into_string();
-        assert!(html.contains("Observed <strong>71°F</strong>"));
+        assert!(html.contains(r#"<span class="pick-reading">71°F</span>"#));
         assert!(html.contains("✓ +10"));
-        assert!(html.contains("Window closed: awaiting the oracle"));
+        assert!(html.contains("Window closed"));
+        assert!(
+            html.contains("oracle&#39;s own reading decides")
+                || html.contains("oracle's own reading decides")
+        );
         assert!(!html.contains(">Final<"));
         assert!(!html.contains("hx-trigger"));
     }
@@ -425,7 +444,7 @@ mod tests {
         )];
         let waiting =
             picks_detail("e", &views(&picks), Phase::AwaitingResult, None, NOW).into_string();
-        assert!(waiting.contains("as the oracle records them"));
+        assert!(waiting.contains("No readings yet."));
         let over = picks_detail("e", &views(&picks), Phase::Scored, None, NOW).into_string();
         assert!(over.contains("No readings were recorded"));
         let before = picks_detail("e", &[], Phase::Upcoming, None, NOW).into_string();
@@ -446,8 +465,11 @@ mod tests {
         )];
         let own = own_picks_detail("e", &views(&picks), NOW).into_string();
         assert!(own.contains("Your picks"));
-        assert!(own.contains("Forecast <strong>69°F</strong>"));
-        assert!(own.contains("Readings appear here once the window opens."));
+        assert!(own.contains(r#"Over <span class="pick-target">&gt; 69°F</span>"#));
+        assert!(
+            !own.contains("No readings"),
+            "nothing is due before the window"
+        );
         assert!(!own.contains("hx-"));
         let withheld = withheld_picks_detail("e", NOW).into_string();
         assert!(withheld.contains("Picks become public when entries close."));
@@ -488,18 +510,24 @@ mod tests {
         ];
         let updated = Some(NOW - time::Duration::minutes(12));
         let html = picks_detail("e1", &views(&picks), Phase::Live, updated, NOW).into_string();
+        // One line per pick: the metric, the pick and what it needs, the reading so far.
         assert!(html.contains(
-            "Forecast <strong>69°F</strong> · High so far <strong>71°F</strong> · reports through 9 of 24 h"
-        ));
-        assert!(html.contains("Low so far <strong>55°F</strong>"));
-        assert!(html.contains("Top wind so far <strong>14 knots</strong>"));
+            r#"<span class="pick-metric">High</span><span class="pick-choice">Over <span class="pick-target">&gt; 69°F</span></span><span class="pick-reading">71°F</span>"#
+        ), "{html}");
+        assert!(html.contains(r#"<span class="pick-reading">14 knots</span>"#));
+        assert!(!html.contains("Forecast") && !html.contains("lately"));
+        // Coverage is said once for the dialog, not per pick.
+        assert_eq!(html.matches("reports in for 9 of 24 h").count(), 1);
         for badge in ["Locked in", "On track", "Out", "Off track"] {
             assert!(html.contains(badge), "{badge}");
         }
         assert!(html.contains(
-            r#"title="Wrong if the window ended now, but the reading can still come its way""#
+            r#"data-tip="Wrong if the window ended now, but the reading can still come its way""#
         ));
-        assert!(html.contains("say how a pick stands if the window ended now"));
+        assert!(
+            !html.contains("say how a pick stands"),
+            "the legend is on the help page"
+        );
         // Locked in (10) and on track (par, 20), as if the window ended now, pick by pick.
         assert!(html.contains("30 pts"));
         assert!(html.contains(r#"<span class="pick-points">+10</span>"#));
@@ -509,8 +537,9 @@ mod tests {
                 .count(),
             2
         );
-        assert!(html.contains("Provisional: scored as if the window ended now · updated"));
+        assert!(html.contains("Updated <time"));
         assert!(html.contains("12 min ago"));
+        assert!(!html.contains("Provisional"));
         assert!(html.contains(r#"hx-get="/entries/e1/detail""#));
         assert!(html.contains(r#"hx-trigger="every 60s""#));
         assert!(html.contains(r#"hx-swap="outerHTML""#));
@@ -526,9 +555,8 @@ mod tests {
             PickState::Pending,
         )];
         let html = picks_detail("e1", &views(&picks), Phase::Live, None, NOW).into_string();
-        assert!(html.contains("no reading yet"));
+        assert_eq!(html.matches("No readings yet.").count(), 1);
         assert!(!html.contains("Waiting for readings"));
-        assert!(html.contains("as the oracle records them"));
     }
 
     /// A competition cancelled mid-window stops refreshing.

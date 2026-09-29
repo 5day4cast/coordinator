@@ -33,6 +33,7 @@ fn competition() -> Competition {
         unlisted: false,
         scoring_rules: None,
         scoring_fields: None,
+        max_entries_per_player: 1,
     });
     competition.total_entries = 3;
     competition.total_paid_entries = 3;

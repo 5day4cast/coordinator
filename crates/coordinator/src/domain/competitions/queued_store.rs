@@ -74,6 +74,8 @@ pub enum QueuedReservation {
     Full,
     /// The player already holds as many unpaid tickets as one may.
     TooManyUnpaid,
+    /// The player already paid for as many entries as the competition allows one player.
+    EntryLimit,
     /// The id names a ticket of another competition or player, or one already used.
     Taken,
 }
@@ -259,6 +261,7 @@ impl CompetitionStore {
         ticket_id: Uuid,
         player: &str,
         max_entries: u32,
+        max_per_player: u32,
         deadline: OffsetDateTime,
     ) -> Result<QueuedReservation, DatabaseWriteError> {
         let competition = competition_id.to_string();
@@ -287,6 +290,13 @@ impl CompetitionStore {
                 .fetch_optional(&mut *tx)
                 .await?;
                 let mut superseded_payment_hash = None;
+                // A ticket it already holds is its own to pay; a new or released one counts
+                // against the entries it may make.
+                let paid_by_player = || {
+                    sqlx::query_scalar::<_, i64>(super::store::PAID_TICKETS_OF_PLAYER)
+                        .bind(&competition)
+                        .bind(&player)
+                };
                 let count_live = |extra: &'static str| {
                     format!("SELECT COUNT(*) FROM tickets WHERE event_id = ? {extra} AND {LIVE_TICKET}")
                 };
@@ -305,6 +315,10 @@ impl CompetitionStore {
                         let paid: bool = row.try_get("paid")?;
                         let expired: bool = row.try_get("expired")?;
                         if holder.is_none() {
+                            if paid_by_player().fetch_one(&mut *tx).await? >= i64::from(max_per_player) {
+                                tx.rollback().await?;
+                                return Ok(QueuedReservation::EntryLimit);
+                            }
                             // Released unpaid; it counts toward the cap again once reserved.
                             let live: i64 = sqlx::query_scalar(&count_live(""))
                                 .bind(&competition)
@@ -342,6 +356,10 @@ impl CompetitionStore {
                         }
                     }
                     None => {
+                        if paid_by_player().fetch_one(&mut *tx).await? >= i64::from(max_per_player) {
+                            tx.rollback().await?;
+                            return Ok(QueuedReservation::EntryLimit);
+                        }
                         let live: i64 = sqlx::query_scalar(&count_live(""))
                             .bind(&competition)
                             .fetch_one(&mut *tx)

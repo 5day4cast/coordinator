@@ -19,11 +19,13 @@ pub use network_fee::{
 };
 
 use super::{
-    parse_invoice, states::CompetitionStatus, store::ReservedTicket, verify_entry_key,
-    verify_payout_preimage, winner_payout_sats, AddEntry, CompetitionError, CompetitionStore,
-    FundedContract, KeymeldSigningInfo, PayoutClaimInfo, PayoutClaimReceipt, PayoutInfo,
-    PayoutRejection, RegistrationStored, SearchBy, Ticket, TicketRegistration, TicketStatus,
-    UserEntry, UserEntryView,
+    parse_invoice,
+    states::CompetitionStatus,
+    store::{EntryAdmission, ReservedTicket, TicketReservation},
+    verify_entry_key, verify_payout_preimage, winner_payout_sats, AddEntry, CompetitionError,
+    CompetitionStore, FundedContract, KeymeldSigningInfo, PayoutClaimInfo, PayoutClaimReceipt,
+    PayoutInfo, PayoutRejection, RegistrationStored, SearchBy, Ticket, TicketRegistration,
+    TicketStatus, UserEntry, UserEntryView,
 };
 use crate::{
     api::routes::FinalSignatures,
@@ -3375,18 +3377,33 @@ impl Coordinator {
         debug!("got competition: {:?}", competition);
 
         // Get ticket
-        let ReservedTicket {
-            ticket,
-            superseded_payment_hash,
-        } = self
+        let reservation = self
             .competition_store
-            .get_and_reserve_ticket_before(competition_id, &pubkey, competition.ticket_deadline())
+            .get_and_reserve_ticket_before(
+                competition_id,
+                &pubkey,
+                competition.ticket_deadline(),
+                competition.event_submission.max_entries_per_player,
+            )
             .await
             .map_err(|e| match e {
                 DatabaseWriteError::Sqlx(sqlx::Error::RowNotFound) => Error::NoAvailableTickets,
                 e => Error::from(e),
-            })?
-            .ok_or_else(|| Error::BadRequest(super::admission::TICKETS_CLOSED.into()))?;
+            })?;
+        let ReservedTicket {
+            ticket,
+            superseded_payment_hash,
+        } = match reservation {
+            TicketReservation::Reserved(reserved) => *reserved,
+            TicketReservation::Closed => {
+                return Err(Error::BadRequest(super::admission::TICKETS_CLOSED.into()))
+            }
+            TicketReservation::EntryLimit => {
+                return Err(entry_limit_error(
+                    competition.event_submission.max_entries_per_player,
+                ))
+            }
+        };
         if let Some(old_hash) = superseded_payment_hash {
             self.cancel_superseded_invoice(ticket.id, old_hash).await;
         }
@@ -3727,6 +3744,7 @@ impl Coordinator {
 
         competition.require_entry_admission(OffsetDateTime::now_utc())?;
         let entry_deadline = competition.event_submission.start_observation_date;
+        let max_per_player = competition.event_submission.max_entries_per_player;
         let kind = competition.kind;
         validate_entry_keys(&mut entry)?;
         validate_entry(entry.clone().into(), competition).await?;
@@ -3848,12 +3866,20 @@ impl Coordinator {
         }
         let user_entry = match self
             .competition_store
-            .add_entry_with_policy_before(user_entry, ticket.id, policy, entry_deadline)
+            .add_entry_with_policy_before(
+                user_entry,
+                ticket.id,
+                policy,
+                entry_deadline,
+                max_per_player,
+            )
             .await
         {
-            Ok(entry) => {
-                entry.ok_or_else(|| Error::BadRequest(super::admission::ENTRIES_CLOSED.into()))?
+            Ok(EntryAdmission::Added(entry)) => *entry,
+            Ok(EntryAdmission::Closed) => {
+                return Err(Error::BadRequest(super::admission::ENTRIES_CLOSED.into()))
             }
+            Ok(EntryAdmission::EntryLimit) => return Err(entry_limit_error(max_per_player)),
             Err(error) => {
                 let unique_conflict = matches!(&error,
                     DatabaseWriteError::Sqlx(sqlx::Error::Database(error)) if error.is_unique_violation());
@@ -4629,6 +4655,14 @@ fn parse_hash32(hex_str: &str) -> Result<[u8; 32], anyhow::Error> {
 /// Entry keys are used verbatim when the contract is built; reject anything
 /// the contract builder could not parse so one entry cannot poison a
 /// competition.
+/// Refusal for a player who already has as many entries as a competition allows one player.
+pub(super) fn entry_limit_error(max_per_player: u32) -> Error {
+    Error::BadRequest(match max_per_player {
+        1 => "You've already entered this competition".into(),
+        max => format!("You've already made the {max} entries this competition allows one player"),
+    })
+}
+
 fn validate_entry_keys(entry: &mut AddEntry) -> Result<(), Error> {
     let pubkey = Point::from_hex(&entry.ephemeral_pubkey).map_err(|_| {
         Error::BadRequest("ephemeral_pubkey must be a compressed secp256k1 point in hex".into())
@@ -5244,6 +5278,7 @@ mod oracle_payout_order_tests {
             unlisted: false,
             scoring_rules: None,
             scoring_fields: None,
+            max_entries_per_player: 1,
         });
         let entry_ids = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
         let tickets = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
@@ -5325,6 +5360,7 @@ mod funding_lifecycle_tests {
             unlisted: false,
             scoring_rules: None,
             scoring_fields: None,
+            max_entries_per_player: 1,
         });
         assert_eq!(
             competition.funding_reservation_deadline(now).unwrap(),

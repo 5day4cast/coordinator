@@ -36,6 +36,8 @@ pub struct CompetitionView {
     pub paid_places: u64,
     pub can_enter: bool,
     pub number_of_values_per_entry: usize,
+    /// How many entries one player may make.
+    pub max_entries_per_player: u32,
     pub locations: Vec<String>,
     /// How the oracle scores the picks.
     pub scoring_rules: ScoringRules,
@@ -96,6 +98,7 @@ impl CompetitionView {
             paid_places: event.number_of_places_win as u64,
             can_enter,
             number_of_values_per_entry: event.number_of_values_per_entry,
+            max_entries_per_player: event.max_entries_per_player,
             locations: event.locations.clone(),
             scoring_rules: event.scoring_rules(),
             metrics: event.metrics(),
@@ -125,13 +128,20 @@ impl CompetitionView {
         queue.entries.unwrap_or(self.total_entries)
     }
 
-    /// The pot, or for a queue the pot of a full pool, which each pool's winner takes.
+    /// The pot. A queue's is what its entries so far put in each pool, which its winner takes:
+    /// its pools split them evenly, so the smaller pools' pot when they don't split exactly.
     pub fn pot(&self) -> String {
         match &self.queue {
-            Queue::Queued(queue) => format!(
-                "up to {}",
-                sats(self.entry_fee.saturating_mul(queue.max_players))
-            ),
+            Queue::Queued(queue) => {
+                let entries = self.entry_count(queue);
+                let pools = entries.div_ceil(queue.max_players.max(1)).max(1);
+                let pot = sats(self.entry_fee.saturating_mul(entries / pools));
+                if pools > 1 {
+                    format!("{pot} per pool")
+                } else {
+                    pot
+                }
+            }
             _ => sats(self.total_pool),
         }
     }
@@ -372,13 +382,13 @@ pub fn competitions_page(
             (intro(featured, now))
 
             @if !open.is_empty() {
-                (group("Upcoming", "Taking entries until the window starts.", &open, now))
+                (group("Upcoming", &open, now))
             }
             @if !live.is_empty() {
-                (group("Live", "Readings are being recorded now.", &live, now))
+                (group("Live", &live, now))
             }
             @if !waiting.is_empty() {
-                (group("Awaiting results", "The window is over; the result and payouts follow.", &waiting, now))
+                (group("Awaiting results", &waiting, now))
             }
             section class="competition-group" {
                 div class="group-heading" {
@@ -479,11 +489,13 @@ fn intro(featured: Option<&CompetitionView>, now: OffsetDateTime) -> Markup {
     html! {
         section class="intro" {
             div class="intro-text" {
-                h1 class="title is-4" { "Call the weather, win the pot" }
+                h1 class="title is-4" { "Daily Fantasy Weather" }
                 p {
-                    "Each competition covers a few airport weather stations. For each reading — high, low, "
-                    "wind — call it " strong { "Over" } ", " strong { "Par" } " or " strong { "Under" }
-                    " the forecast. Entry is paid in sats; when the window closes, the top scores take the pot."
+                    "Choose a city, score points on correctly forecasted weather readings. "
+                    "Pay and win with sats, all via the Lightning Network."
+                }
+                p class="intro-link" {
+                    a href="/help" hx-get="/help" hx-target="#main-content" hx-push-url="true" { "How it works →" }
                 }
             }
             @if let Some(competition) = featured {
@@ -522,9 +534,6 @@ fn featured_card(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
                 }
                 div { dt { "Entries" } dd { (competition.entries()) } }
             }
-            @if let Some(queue) = competition.queue.queued() {
-                p class="featured-note" { (queue.pool_note()) "." }
-            }
             a class=(if competition.can_enter { "button is-primary is-fullwidth" } else { "button is-fullwidth" })
               href=(competition.url()) hx-get=(competition.url())
               hx-target="#main-content" hx-push-url="true" {
@@ -534,17 +543,11 @@ fn featured_card(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
     }
 }
 
-fn group(
-    title: &str,
-    help: &str,
-    competitions: &[&CompetitionView],
-    now: OffsetDateTime,
-) -> Markup {
+fn group(title: &str, competitions: &[&CompetitionView], now: OffsetDateTime) -> Markup {
     html! {
         section class="competition-group" {
             div class="group-heading" {
                 h2 class="title is-5" { (title) }
-                span class="group-help" { (help) }
             }
             (list(competitions, now))
         }
@@ -657,6 +660,7 @@ pub(crate) mod tests {
             paid_places: 1,
             can_enter: phase == Phase::Upcoming,
             number_of_values_per_entry: 9,
+            max_entries_per_player: 1,
             locations: vec!["KPWM".into()],
             scoring_rules: ScoringRules::Fixed,
             metrics: Metric::ALL.to_vec(),
@@ -718,7 +722,8 @@ pub(crate) mod tests {
         .into_string();
         assert!(html.contains("Entries close in 2 h 13 min"));
         assert!(html.contains(r#"href="/competitions/open/entry-form""#));
-        assert!(html.contains("Call the weather"));
+        assert!(html.contains("Daily Fantasy Weather"));
+        assert!(html.contains(r#"href="/help""#));
         assert!(html.contains("5,250 sats"));
         assert!(html.contains("15,000 sats"));
         assert!(html.contains("Paid places"));
@@ -864,14 +869,17 @@ pub(crate) mod tests {
             "{row}"
         );
         assert!(row.contains("pools of up to 25"));
-        assert!(row.contains("Pot up to 125,000 sats · 40 entered"));
+        // Forty entries make two pools of twenty.
+        assert!(row.contains("Pot 100,000 sats per pool · 40 entered"));
+        let mut six = queued("q", 6);
+        six.total_entries = 6;
+        assert_eq!(six.pot(), "30,000 sats");
         assert!(row.contains(r#"href="/competitions/q/entry-form""#));
         assert!(!row.contains(" of 3"));
         assert!(phase_badge(&queue).into_string().contains(">Open</span>"));
 
         let page = competitions_page(std::slice::from_ref(&queue), ListOptions::default(), NOW)
             .into_string();
-        assert!(page.contains("Players are split into pools of up to 25 at the start."));
         assert!(!page.contains("1st place"));
         assert!(!page.contains("Full"));
 
@@ -1009,6 +1017,7 @@ pub(crate) mod tests {
             unlisted: false,
             scoring_rules: None,
             scoring_fields: None,
+            max_entries_per_player: 1,
         });
         competition.total_entries = 3;
         competition.event_announcement = Some(event.clone());

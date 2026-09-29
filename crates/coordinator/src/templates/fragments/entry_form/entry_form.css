@@ -13,15 +13,13 @@
 .entry-form .fact-note,
 .entry-form .station-code,
 .entry-form .pick-forecast.is-missing,
-.entry-form .pick-option.is-none span,
-.entry-form .pick-option.is-none input:checked + span,
 .entry-form .entry-advanced summary {
   color: var(--entry-muted);
 }
 
 .how-to-pick {
-  max-width: 42rem;
   margin-bottom: 1rem;
+  font-size: 0.9rem;
 }
 
 /* The map only shows where the stations are; keep it small. */
@@ -128,12 +126,6 @@
   font-style: italic;
 }
 
-/* Which way the station's forecasts have leaned lately, beside the Par range. */
-.pick-lean {
-  color: var(--bulma-text-weak);
-  font-size: 0.85em;
-}
-
 .pick-options {
   display: inline-flex;
   border: 1px solid var(--bulma-border);
@@ -152,6 +144,7 @@
   min-width: 4.5rem;
   padding: 0.35rem 0.75rem;
   text-align: center;
+  white-space: nowrap;
   cursor: pointer;
   user-select: none;
 }
@@ -180,17 +173,6 @@
 
 .pick-option input[value="under"]:checked + span {
   background: hsl(217, 71%, 50%);
-}
-
-.pick-option.is-none span {
-  min-width: 0;
-  color: var(--bulma-text-weak);
-}
-
-.pick-option.is-none input:checked + span {
-  color: var(--bulma-text-weak);
-  font-weight: 400;
-  background: var(--bulma-scheme-main-ter);
 }
 
 .pick-option input:disabled + span {
@@ -273,4 +255,13 @@
   top: 0;
   left: -9999px;
   opacity: 0;
+}
+
+/* Phones: three ranges side by side. */
+@media screen and (max-width: 480px) {
+  .pick-option span {
+    min-width: 0;
+    padding: 0.35rem 0.55rem;
+    font-size: 0.9rem;
+  }
 }
