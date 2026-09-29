@@ -21,6 +21,7 @@ impl ArkServer {
     /// Connect to `url`, such as `https://mutinynet.arkade.sh`, and read the server's parameters.
     pub async fn connect(url: impl Into<String>) -> Result<Self, Error> {
         let url = url.into();
+        crate::transport::install_crypto_provider();
         let mut grpc = ark_grpc::Client::new(url.clone());
         grpc.connect().await?;
         let info = grpc.get_info().await?;
