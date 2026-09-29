@@ -603,9 +603,11 @@ function showNetworkFee(fee, total) {
   if ($total) $total.textContent = formatSats(total);
 }
 
-// A pick's radio button takes the pick back when chosen again, by tap, click or Space: the
-// input chosen last in its row carries `data-picked`, which the browser's own checking
-// doesn't touch. Arrow keys move the pick within the row as usual.
+const PICK = ".pick-option input[type=radio]";
+
+// A pick's radio button takes the pick back when chosen again, by tap or click: the input
+// chosen last in its row carries `data-picked`, which the browser's own checking doesn't
+// touch. Arrow keys move the pick within the row as usual.
 function togglePick(input) {
   if (input.dataset.picked) {
     input.checked = false;
@@ -618,12 +620,23 @@ function togglePick(input) {
   input.dataset.picked = "1";
 }
 
+// Space on a chosen pick takes it back too. Browsers send no click for Space on a radio that
+// is already checked, so the key does it here; its default is stopped, or the key's release
+// would check the radio again.
+function unpickWithSpace(event) {
+  const input = event.target;
+  if (event.key !== " " || !input?.matches?.(PICK) || !input.dataset.picked) return;
+  event.preventDefault();
+  togglePick(input);
+}
+
 function setupEntryForm() {
   document.addEventListener("click", (event) => {
     if (event.target.closest?.("#submitEntry")) submitEntry();
-    if (event.target instanceof HTMLInputElement && event.target.matches(".pick-option input[type=radio]")) {
+    if (event.target instanceof HTMLInputElement && event.target.matches(PICK)) {
       togglePick(event.target);
     }
   });
+  document.addEventListener("keydown", unpickWithSpace);
 }
 

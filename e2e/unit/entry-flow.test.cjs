@@ -70,7 +70,7 @@ function load(page, document, fetch) {
   const window = {};
   const entryForm = loadBundle(["fragments/entry_form/entry_form.js"],
     { ...page, window, document, fetch, crypto: webcrypto, TextEncoder, console, session, isLoggedIn },
-    ["submitEntry", "collectPicks", "togglePick", "ticketPriceSats", "loadEntryTerms", "Entry"]);
+    ["submitEntry", "collectPicks", "togglePick", "unpickWithSpace", "ticketPriceSats", "loadEntryTerms", "Entry"]);
   assert.deepEqual(Object.keys(window), [], "nothing is put on window");
   return entryForm;
 }
@@ -153,6 +153,28 @@ test("choosing a pick again takes it back; choosing another moves it", () => {
   assert.deepEqual(row.map((input) => input.checked), [false, false, false], "chosen again: no pick");
   choose(under);
   assert.equal(under.checked, true, "and it can be picked once more");
+});
+
+test("Space takes back a chosen pick, which browsers don't click, and leaves others to the browser", () => {
+  const { document } = entryPage();
+  const entryForm = load({ CSS: { escape: (name) => name } }, document, termsFetch());
+  const form = { querySelectorAll: () => [pick] };
+  const pick = element({ name: "KPWM_temp_high", value: "par", form, matches: (selector) => selector === ".pick-option input[type=radio]" });
+  const press = (key) => {
+    let prevented = false;
+    entryForm.unpickWithSpace({ key, target: pick, preventDefault: () => { prevented = true; } });
+    return prevented;
+  };
+
+  // Not chosen yet: the browser checks it and clicks, as for any radio.
+  assert.equal(press(" "), false);
+  pick.checked = true;
+  entryForm.togglePick(pick);
+  assert.equal(press("Enter"), false, "only Space");
+  // Chosen: Space clears it, and stops the key so its release can't check it again.
+  assert.equal(press(" "), true);
+  assert.equal(pick.checked, false);
+  assert.equal(pick.dataset.picked, undefined);
 });
 
 test("entering is the consent: the ticket carries the full price and the account's address", async () => {
