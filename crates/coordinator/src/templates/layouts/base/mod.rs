@@ -20,6 +20,9 @@ use crate::templates::{
 ///   and the Trusted Types policy (shared/htmx_auth.js, htmx_security.js).
 pub const HTMX_CONFIG: &str = r#"{"mode":"same-origin","defaultTimeout":10000,"implicitInheritance":false,"noSwap":[204,304,"4xx","5xx"],"history":true,"includeIndicatorCSS":false,"extensions":"fw-auth, fw-security"}"#;
 
+/// Where players reach the people running the site.
+pub const CONTACT_EMAIL: &str = "5day4cast@protonmail.com";
+
 pub struct PageConfig<'a> {
     pub title: &'a str,
     pub api_base: &'a str,
@@ -63,6 +66,12 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                     }
                 }
 
+                footer class="site-footer" {
+                    a href="/help" hx-get="/help" hx-target="#main-content" hx-push-url="true" { "How it works" }
+                    " · Contact "
+                    a href=(format!("mailto:{CONTACT_EMAIL}")) { (CONTACT_EMAIL) }
+                }
+
                 (auth_modals())
             }
         }
@@ -82,6 +91,13 @@ mod tests {
             wasm_version: "abc123",
         };
         base(&config, html! { p { "content" } }).into_string()
+    }
+
+    #[test]
+    fn every_page_has_the_contact_email_in_its_footer() {
+        let html = page();
+        let footer = html.find(r#"<footer class="site-footer">"#).unwrap();
+        assert!(html[footer..].contains(r#"href="mailto:5day4cast@protonmail.com""#));
     }
 
     #[test]

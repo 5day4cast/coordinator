@@ -256,12 +256,11 @@ test.describe("Entry Form", () => {
       const buttonCount = await buttons.count();
 
       if (buttonCount > 0) {
-        const buttonTexts = await buttons.allTextContents();
-        const hasOver = buttonTexts.some((t) => t.includes("Over"));
-        const hasPar = buttonTexts.some((t) => t.includes("Par"));
-        const hasUnder = buttonTexts.some((t) => t.includes("Under"));
-
-        expect(hasOver || hasPar || hasUnder).toBe(true);
+        // Lines competitions label the buttons with their ranges, so check the picks themselves.
+        const values = await buttons.locator("input").evaluateAll((inputs) =>
+          inputs.map((input) => (input as HTMLInputElement).value),
+        );
+        expect(values).toEqual(expect.arrayContaining(["under", "par", "over"]));
       }
     } else {
       console.log("No competitions in Registration status available for entry");
@@ -293,19 +292,14 @@ test.describe("Entry Form", () => {
       const row = page.locator("#entryForm .pick-options").first();
       const firstPickButton = row.locator(".pick-option").first();
       const input = firstPickButton.locator("input");
-      const noPickButton = row.locator(".pick-option.is-none");
-      const noPick = noPickButton.locator("input");
-      await expect(noPick).toBeChecked();
       await expect(input).not.toBeChecked();
 
       await firstPickButton.click();
       await expect(input).toBeChecked();
-      await expect(noPick).not.toBeChecked();
 
-      // "No pick" takes the pick back.
-      await noPickButton.click();
+      // Choosing it again takes the pick back.
+      await firstPickButton.click();
       await expect(input).not.toBeChecked();
-      await expect(noPick).toBeChecked();
     } else {
       console.log("No competitions in Registration status available for entry");
       test.skip();

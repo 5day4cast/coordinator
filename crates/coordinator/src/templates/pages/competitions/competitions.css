@@ -60,12 +60,6 @@
   font-weight: 600;
 }
 
-.featured-note {
-  font-size: 0.85rem;
-  color: var(--competition-muted);
-  margin: -0.5rem 0 1rem;
-}
-
 .competition-group {
   margin-bottom: 2rem;
 }
@@ -82,7 +76,6 @@
   margin-bottom: 0;
 }
 
-.group-help,
 .cancelled-toggle {
   font-size: 0.875rem;
   color: var(--competition-muted);

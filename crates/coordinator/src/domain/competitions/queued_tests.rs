@@ -41,6 +41,7 @@ pub(super) fn request(start: OffsetDateTime) -> CreateQueuedCompetition {
         min_players: 2,
         max_pool_size: 25,
         max_entries: None,
+        max_entries_per_player: 1,
     }
 }
 
@@ -568,7 +569,7 @@ async fn queued_tickets_are_made_on_demand_up_to_the_cap() {
     let deadline = queue.competition.ticket_deadline();
     let reserve = |ticket: Uuid, player: &'static str| async move {
         store
-            .reserve_queued_ticket(id, ticket, player, 4, deadline)
+            .reserve_queued_ticket(id, ticket, player, 4, 1, deadline)
             .await
             .unwrap()
     };
@@ -630,6 +631,7 @@ async fn queued_tickets_are_made_on_demand_up_to_the_cap() {
                 Uuid::now_v7(),
                 "dave",
                 100,
+                1,
                 OffsetDateTime::now_utc() - Duration::seconds(1)
             )
             .await
@@ -660,6 +662,54 @@ async fn queued_tickets_are_made_on_demand_up_to_the_cap() {
     assert_ne!(rotated.ticket.hash, original);
     assert!(rotated.ticket.payment_request.is_none());
     assert!(rotated.superseded_payment_hash.is_some());
+}
+
+/// A player who paid for as many entries as the queue allows one player gets no new ticket.
+/// Unpaid tickets don't count, so abandoning a payment never locks a player out.
+#[tokio::test]
+async fn a_player_who_paid_for_their_entries_gets_no_more_tickets() {
+    let start = OffsetDateTime::now_utc() + Duration::hours(3);
+    let queue = Queue::new(start, PoolRules::new(2, 3).unwrap(), 100).await;
+    let store = queue.store();
+    let id = queue.competition.id;
+    let deadline = queue.competition.ticket_deadline();
+    let reserve = |player: &'static str, max_per_player| {
+        let store = store.clone();
+        async move {
+            store
+                .reserve_queued_ticket(id, Uuid::now_v7(), player, 100, max_per_player, deadline)
+                .await
+                .unwrap()
+        }
+    };
+
+    assert!(matches!(
+        reserve("alice", 1).await,
+        QueuedReservation::Reserved(_)
+    ));
+    assert!(matches!(
+        reserve("alice", 1).await,
+        QueuedReservation::Reserved(_)
+    ));
+    queue.ticket("alice", true).await;
+    assert!(matches!(
+        reserve("alice", 1).await,
+        QueuedReservation::EntryLimit
+    ));
+    assert!(matches!(
+        reserve("alice", 2).await,
+        QueuedReservation::Reserved(_)
+    ));
+    // Paid without an entry yet still counts: that ticket is the entry on its way.
+    queue.ticket("bob", false).await;
+    assert!(matches!(
+        reserve("bob", 1).await,
+        QueuedReservation::EntryLimit
+    ));
+    assert!(matches!(
+        reserve("carol", 1).await,
+        QueuedReservation::Reserved(_)
+    ));
 }
 
 #[tokio::test]

@@ -70,7 +70,7 @@ function load(page, document, fetch) {
   const window = {};
   const entryForm = loadBundle(["fragments/entry_form/entry_form.js"],
     { ...page, window, document, fetch, crypto: webcrypto, TextEncoder, console, session, isLoggedIn },
-    ["submitEntry", "collectPicks", "ticketPriceSats", "loadEntryTerms", "Entry"]);
+    ["submitEntry", "collectPicks", "togglePick", "ticketPriceSats", "loadEntryTerms", "Entry"]);
   assert.deepEqual(Object.keys(window), [], "nothing is put on window");
   return entryForm;
 }
@@ -129,6 +129,32 @@ test("picks come from the checked radios, grouped by station", () => {
   });
 });
 
+test("choosing a pick again takes it back; choosing another moves it", () => {
+  const { document } = entryPage();
+  const entryForm = load({ CSS: { escape: (name) => name } }, document, termsFetch());
+  const form = {};
+  // The browser checks a radio before its click handler runs.
+  const row = ["under", "par", "over"].map((value) => element({ name: "KPWM_temp_high", value, form }));
+  form.querySelectorAll = (selector) => {
+    assert.equal(selector, 'input[name="KPWM_temp_high"]');
+    return row;
+  };
+  const choose = (input) => {
+    for (const other of row) other.checked = other === input;
+    entryForm.togglePick(input);
+  };
+  const [under, par] = row;
+
+  choose(par);
+  assert.deepEqual(row.map((input) => input.checked), [false, true, false]);
+  choose(under);
+  assert.deepEqual(row.map((input) => input.checked), [true, false, false]);
+  choose(under);
+  assert.deepEqual(row.map((input) => input.checked), [false, false, false], "chosen again: no pick");
+  choose(under);
+  assert.equal(under.checked, true, "and it can be picked once more");
+});
+
 test("entering is the consent: the ticket carries the full price and the account's address", async () => {
   const { elements, document } = entryPage();
   let consent;
@@ -162,6 +188,28 @@ test("entering is the consent: the ticket carries the full price and the account
   assert.equal(elements.errorMessage.textContent, refusal);
   assert.ok(!elements.errorMessage.classList.contains("hidden"));
   assert.equal(elements.submitEntry.disabled, false);
+});
+
+test("a refused ticket shows the coordinator's reason, such as having entered already", async () => {
+  const { elements, document } = entryPage();
+  const reason = "You've already entered this competition";
+  const window = loggedIn({
+    AuthorizedClient: class {
+      async post(url) {
+        if (url.endsWith("/api/v1/users/login")) {
+          return { ok: true, json: async () => ({ lightning_address: "thor@lnurl.5day4cast.com" }) };
+        }
+        const error = new Error("HTTP error! status: 400");
+        error.response = { ok: false, status: 400, json: async () => ({ error: reason }) };
+        throw error;
+      }
+    },
+    dlcWallet: { entryRegistration: () => ({ ephemeral_pubkey: "pubkey", payout_hash: "hash" }) },
+  });
+  const sandbox = load(window, document, termsFetch());
+  await sandbox.submitEntry();
+  assert.equal(elements.errorMessage.textContent, reason);
+  assert.ok(!elements.errorMessage.classList.contains("hidden"));
 });
 
 test("a signed-out visitor is asked to log in before anything is requested", async () => {

@@ -5,15 +5,12 @@
 use maud::{html, Markup};
 
 use crate::domain::{
-    leaderboard::{
-        progress::{LINE_POINTS, OVER_OR_UNDER_POINTS, PAR_POINTS},
-        Metric, Rule,
-    },
-    PayoutTermsQuote, TicketStatus, WindowShape, ENTRIES_PAUSED,
+    leaderboard::{Metric, Rule},
+    PayoutTermsQuote, TicketStatus, ENTRIES_PAUSED,
 };
-use crate::infra::oracle::ScoringRules;
 use crate::templates::{
-    format::{self, ordinal, sats, MetricText},
+    components::tip,
+    format::{self, sats, MetricText, TimeStyle},
     fragments::loading::{placeholder, Pending},
     pages::competitions::CompetitionView,
     shared_map::{station_map, StationPin},
@@ -50,10 +47,6 @@ pub enum Forecasts {
     },
     Pending(Pending),
 }
-
-/// The line under the network fee, saying what it is.
-pub const NETWORK_FEE_NOTE: &str =
-    "Your share of the Bitcoin network fees for a full pool, fixed when your ticket is issued.";
 
 /// The network fee the form shows: what a ticket issued now would carry. A ticket's own fee
 /// replaces it once the ticket is issued (`entry_form.js`).
@@ -102,72 +95,59 @@ pub fn entry_form(
 
             dl class="entry-facts" {
                 div {
+                    dt { "Entries close" (tip("Picks lock when the window starts.")) }
+                    dd { (format::time(competition.start, TimeStyle::DateTime)) }
+                }
+                div {
                     dt { "Window" }
-                    dd {
-                        (format::window(competition.start, competition.end))
-                        @match competition.window_shape {
-                            Some(WindowShape::Day) => {
-                                span class="fact-note" { "Day: each airport's high and wind, no lows" }
-                            }
-                            Some(WindowShape::Night) => {
-                                span class="fact-note" { "Night: each airport's low and wind, no highs" }
-                            }
-                            Some(WindowShape::FullDay) | None => {}
+                    dd { (format::window(competition.start, competition.end)) }
+                }
+                div {
+                    dt { "Ticket" (tip("Entry fee, service fee and your share of the Bitcoin network fee.")) }
+                    dd { (price(competition, network_fee)) }
+                }
+                div {
+                    dt {
+                        "Pot"
+                        @if queue.is_some() {
+                            (tip("Each pool's winner takes that pool's pot."))
+                        } @else {
+                            (tip("Paid to the top scores once the result is final."))
                         }
                     }
-                }
-                div {
-                    dt { "Ticket" }
-                    dd { (price_lines(competition, network_fee)) }
-                }
-                div {
-                    dt { "Pot" }
                     dd {
                         (competition.pot())
-                        span class="fact-note" {
-                            @if queue.is_some() {
-                                "per pool, to its winner"
-                            } @else {
-                                @for (place, (percent, _)) in competition.prizes().iter().enumerate() {
-                                    @if place > 0 { ", " }
-                                    (ordinal(place + 1)) " " (percent) "%"
-                                }
-                            }
+                        @if queue.is_none() && competition.paid_places > 1 {
+                            span class="fact-note" { "top " (competition.paid_places) " paid" }
                         }
                     }
                 }
                 div {
-                    dt { "Entries" }
-                    dd {
-                        (competition.entries())
+                    dt {
+                        "Entries"
                         @if let Some(queue) = queue {
-                            span class="fact-note" { (queue.pool_note()) }
+                            (tip(&format!("{}.", queue.pool_note())))
                         }
+                    }
+                    dd { (competition.entries()) }
+                }
+                @if picks_allowed < pickable {
+                    div {
+                        dt { "Picks" }
+                        dd { "up to " (picks_allowed) }
+                    }
+                }
+                // One entry per player needs no line; only a competition allowing more says so.
+                @if competition.max_entries_per_player > 1 {
+                    div {
+                        dt { "Per player" }
+                        dd { "up to " (competition.max_entries_per_player) " entries" }
                     }
                 }
             }
 
             p class="how-to-pick" {
-                @match competition.scoring_rules {
-                    ScoringRules::Lines => {
-                        "For each reading, call it " strong { "Over" } ", " strong { "Par" } " or " strong { "Under" } ". "
-                        "Par is the range beside each forecast, set from how that airport's forecasts have "
-                        "missed over the last 60 days so the three are about equally likely; when its forecasts "
-                        "have been running hot or cold, the range says so. "
-                        "A right pick scores " (LINE_POINTS) " points."
-                    }
-                    ScoringRules::Fixed => {
-                        "For each reading, call it " strong { "Over" } ", " strong { "Par" } " or " strong { "Under" } " the forecast. "
-                        "Par means the reading matches the forecast exactly (to the whole degree for temperatures) and scores "
-                        (PAR_POINTS) " points; a right Over or Under scores " (OVER_OR_UNDER_POINTS) "."
-                    }
-                }
-                @if picks_allowed < pickable {
-                    " Make up to " (picks_allowed) " picks; "
-                } @else {
-                    " Pick as many readings as you like; "
-                }
-                "a reading left at No pick scores 0."
+                a href="/help#scoring" target="_blank" rel="noopener" { "How scoring works" }
             }
 
             // What the wallet checks the entry's terms against: what this form shows.
@@ -247,38 +227,15 @@ pub fn entry_form(
     }
 }
 
-/// The ticket's price and its lines: the entry fee, the service fee, and the network fee with
-/// what it is. The total and the network fee carry ids, so the ticket's own fee can replace the
+/// The ticket's total. It carries an id, so the ticket's own network fee can replace the
 /// estimate once the ticket is issued.
-fn price_lines(competition: &CompetitionView, network_fee: NetworkFee) -> Markup {
-    let network_fee = network_fee.sats();
-    let service = competition
-        .ticket_price
-        .saturating_sub(competition.entry_fee);
+fn price(competition: &CompetitionView, network_fee: NetworkFee) -> Markup {
     html! {
         span id="ticketTotal" {
-            @match network_fee {
+            @match network_fee.sats() {
                 Some(fee) => (sats(competition.ticket_price + fee)),
                 None => { (sats(competition.ticket_price)) " + network fee" }
             }
-        }
-        span class="fact-note price-lines" {
-            "entry " (sats(competition.entry_fee))
-            @if service > 0 {
-                " · service " (competition.service_fee_percent) " " (sats(service))
-            }
-            @if network_fee != Some(0) {
-                " · network "
-                span id="networkFee" {
-                    @match network_fee {
-                        Some(fee) => (sats(fee)),
-                        None => "unavailable right now",
-                    }
-                }
-            }
-        }
-        @if network_fee != Some(0) {
-            span class="fact-note" { (NETWORK_FEE_NOTE) }
         }
     }
 }
@@ -327,26 +284,17 @@ pub fn payout_line(
                 (Some(false), _) => {
                     "Winners of this competition submit a Lightning invoice after the result."
                 }
-                (_, PayoutDestination::LoggedOut) => {
-                    "Log in to enter. Winnings"
-                    @if refunds { " and refunds" }
-                    " go to the Lightning Address on your account."
-                }
+                (_, PayoutDestination::LoggedOut) => { "Log in to enter." }
                 (_, PayoutDestination::Address(address)) => {
                     "Winnings"
-                    @if refunds { ", and your refund if this competition doesn't start," }
+                    @if refunds { " and refunds" }
                     " go to " strong { (address) } "."
                 }
                 (_, PayoutDestination::NoAddress) => {
-                    "Your account has no Lightning Address, so you would submit an invoice to collect winnings. "
-                    a href="/payouts" hx-get="/payouts" hx-target="#main-content" hx-push-url="true" { "Add one" }
-                    " to be paid automatically."
+                    "No Lightning Address on your account: "
+                    a href="/payouts" hx-get="/payouts" hx-target="#main-content" hx-push-url="true" { "add one" }
+                    " to be paid automatically, or submit an invoice to collect winnings."
                 }
-            }
-            // Without an Arkade escrow the ticket is a held invoice, which is
-            // cancelled rather than collected if the competition doesn't fill.
-            @if !refunds {
-                " If this competition doesn't fill, your payment is never collected and returns to your wallet."
             }
         }
     }
@@ -428,10 +376,29 @@ pub fn ticket_status(url: &str, progress: TicketProgress) -> Markup {
     }
 }
 
-/// Over / Par / Under for one forecast, as radio buttons named `KPWM_temp_high`,
-/// with "No pick" (checked at first) to leave or take back a pick.
-fn pick_row(station_id: &str, metric: Metric, forecast: Option<f64>, rule: Option<Rule>) -> Markup {
+/// Under / Par / Over for one forecast, as radio buttons named `KPWM_temp_high`, none
+/// checked at first; choosing the checked one again takes the pick back (`entry_form.js`). With a Par
+/// band the buttons show the ranges themselves: `< 67.4°F`, `67.4–70.2°F`, `> 70.2°F`.
+pub(crate) fn pick_row(
+    station_id: &str,
+    metric: Metric,
+    forecast: Option<f64>,
+    rule: Option<Rule>,
+) -> Markup {
     let name = format!("{station_id}_{}", metric.id());
+    let band = match (forecast, rule) {
+        (Some(value), Some(Rule::Line { lower, upper })) => Some((value + lower, value + upper)),
+        _ => None,
+    };
+    let options = [("under", "Under"), ("par", "Par"), ("over", "Over")].map(|(value, word)| {
+        let text = match band {
+            Some((low, _)) if value == "under" => format!("< {}", metric.bound(low)),
+            Some((low, high)) if value == "par" => metric.range(low, high),
+            Some((_, high)) => format!("> {}", metric.bound(high)),
+            None => word.to_owned(),
+        };
+        (value, word, text)
+    });
     html! {
         div class="pick-row" {
             span class="pick-metric" {
@@ -440,23 +407,14 @@ fn pick_row(station_id: &str, metric: Metric, forecast: Option<f64>, rule: Optio
                     Some(value) => { " " strong class="pick-forecast" { (metric.value(value)) } }
                     None => { " " span class="pick-forecast is-missing" { "no forecast yet" } }
                 }
-                @if let (Some(value), Some(Rule::Line { lower, upper })) = (forecast, rule) {
-                    " " span class="pick-par" { "Par " (metric.range(value + lower, value + upper)) }
-                    @if let Some(lean) = metric.lean(lower, upper) {
-                        " " span class="pick-lean" { (lean) }
-                    }
-                }
             }
             div class="pick-options" role="radiogroup" aria-label=(format!("{} at {station_id}", metric.label())) {
-                @for (value, label) in [("over", "Over"), ("par", "Par"), ("under", "Under")] {
-                    label class="pick-option" {
-                        input type="radio" name=(name) value=(value) disabled[forecast.is_none()];
-                        span { (label) }
+                @for (value, word, text) in &options {
+                    label class="pick-option" title=[band.map(|_| word)] {
+                        input type="radio" name=(name) value=(value) disabled[forecast.is_none()]
+                              aria-label=[band.map(|_| format!("{word} ({text})"))];
+                        span { (text) }
                     }
-                }
-                label class="pick-option is-none" {
-                    input type="radio" name=(name) value="" checked;
-                    span { "No pick" }
                 }
             }
         }
@@ -490,7 +448,8 @@ mod tests {
             .unwrap()
             .contains("expired"));
     }
-    use crate::domain::leaderboard::Phase;
+    use crate::domain::{leaderboard::Phase, WindowShape};
+    use crate::infra::oracle::ScoringRules;
     use crate::templates::pages::competitions::tests::view;
 
     fn terms(arkade: bool) -> PayoutTermsQuote {
@@ -537,20 +496,14 @@ mod tests {
         assert!(html.contains("Pay 5,300 sats and enter"));
     }
 
-    /// Entry, service and network fees are three separate amounts, and the network fee says
-    /// what it is in one line. The estimate carries an id for the ticket's own fee to replace.
+    /// The ticket shows its total only; what it is made of is a tooltip. The total carries an
+    /// id for the ticket's own network fee to replace.
     #[test]
-    fn entry_form_shows_the_three_price_lines() {
+    fn entry_form_shows_the_ticket_total_only() {
         let html = form(PayoutDestination::LoggedOut);
-        assert!(html.contains(
-            r#"entry 5,000 sats · service 5% 250 sats · network <span id="networkFee">50 sats</span>"#
-        ));
-        assert!(html.contains(NETWORK_FEE_NOTE));
-        assert_eq!(
-            html.matches("network fee").count(),
-            1,
-            "one line about the network fee"
-        );
+        assert!(!html.contains("entry 5,000 sats"));
+        assert!(!html.contains("service 5%"));
+        assert!(html.contains("your share of the Bitcoin network fee"));
 
         // Without an estimate no price is claimed for it, and no ticket can be issued either.
         let unavailable = entry_form(
@@ -562,11 +515,9 @@ mod tests {
         )
         .into_string();
         assert!(unavailable.contains("5,250 sats + network fee"));
-        assert!(unavailable.contains(r#"<span id="networkFee">unavailable right now</span>"#));
         assert!(!unavailable.contains("data-network-fee"));
         assert!(unavailable.contains("Pay and enter"));
 
-        // With network fees off there is no line for one.
         let off = entry_form(
             &view("c1", Phase::Upcoming, 60),
             &Forecasts::Pending(Pending::Loading),
@@ -575,9 +526,35 @@ mod tests {
             NetworkFee::Estimate(0),
         )
         .into_string();
-        assert!(off.contains("entry 5,000 sats · service 5% 250 sats</span>"));
-        assert!(!off.contains("networkFee") && !off.contains(NETWORK_FEE_NOTE));
+        assert!(off.contains(r#"<span id="ticketTotal">5,250 sats</span>"#));
         assert!(off.contains("Pay 5,250 sats and enter"));
+    }
+
+    /// The deadline is a fact of its own, and how scoring works is a link to the help page
+    /// rather than a paragraph on the form.
+    #[test]
+    fn only_a_competition_allowing_several_entries_per_player_says_so() {
+        assert!(!form(PayoutDestination::LoggedOut).contains("Per player"));
+        let mut competition = view("c1", Phase::Upcoming, 60);
+        competition.max_entries_per_player = 3;
+        let html = entry_form(
+            &competition,
+            &Forecasts::Pending(Pending::Loading),
+            None,
+            &PayoutDestination::LoggedOut,
+            NetworkFee::Estimate(50),
+        )
+        .into_string();
+        assert!(html.contains("up to 3 entries"));
+    }
+
+    #[test]
+    fn entry_form_shows_the_deadline_and_links_the_rules() {
+        let html = form(PayoutDestination::LoggedOut);
+        assert!(html.contains("Entries close"));
+        assert!(html.contains(r#"href="/help#scoring""#));
+        assert!(!html.contains("scores 20 points"));
+        assert!(!html.contains("Pick as many readings"));
     }
 
     /// While entries are paused the form says so before any picks are made, and cannot be
@@ -593,7 +570,6 @@ mod tests {
         )
         .into_string();
         assert!(html.contains(ENTRIES_PAUSED));
-        assert!(html.contains(r#"<span id="networkFee">600 sats</span>"#));
         assert!(html.contains(r#"id="submitEntry" class="button is-primary is-medium" disabled"#));
         assert!(html.contains("Entries paused"));
         assert!(!html.contains("and enter"));
@@ -607,7 +583,6 @@ mod tests {
         assert!(html.contains("69°F") && html.contains("41°F") && html.contains("7 knots"));
         assert!(!html.contains("12.5") && !html.contains("75°F") && !html.contains("58°F"));
         assert!(html.contains(r#"name="KPWM_temp_high" value="over""#));
-        assert!(html.contains("matches the forecast exactly"));
     }
 
     #[test]
@@ -615,12 +590,8 @@ mod tests {
         let html = form(PayoutDestination::Address("freya@lnurl.example".into()));
         assert!(!html.contains(r#"type="checkbox""#));
         assert!(!html.contains("I authorize"));
-        assert!(
-            html.contains("and your refund if this competition doesn&#39;t start")
-                || html.contains("and your refund if this competition doesn't start")
-        );
+        assert!(html.contains("Winnings and refunds go to <strong>freya@lnurl.example</strong>."));
         assert_eq!(html.matches("refund").count(), 1, "one line about refunds");
-        assert!(html.contains("<strong>freya@lnurl.example</strong>"));
     }
 
     /// A queue's form shows how many entered and the pool size, and carries what the wallet
@@ -640,9 +611,12 @@ mod tests {
         )
         .into_string();
         assert!(html.contains("40 entered"));
-        assert!(html.contains("Players are split into pools of up to 25 at the start"));
-        assert!(html.contains("up to 125,000 sats"));
-        assert!(html.contains("per pool, to its winner"));
+        // How pools work is a tooltip, not a line on the form.
+        assert!(
+            html.contains(r#"data-tip="Players are split into pools of up to 25 at the start.""#)
+        );
+        assert!(html.contains("100,000 sats per pool"));
+        assert!(html.contains("pool&#39;s winner") || html.contains("pool's winner"));
         assert!(!html.contains(" of 3"));
         assert!(html.contains(r#"data-kind="queued""#));
         assert!(html.contains(r#"data-pool-min-players="2""#));
@@ -657,17 +631,11 @@ mod tests {
     }
 
     #[test]
-    fn a_held_invoice_says_the_payment_returns_if_the_competition_does_not_fill() {
-        let line = |arkade| {
-            payout_line(
-                "c1",
-                Some(&terms(arkade)),
-                &PayoutDestination::Address("freya@lnurl.example".into()),
-            )
-            .into_string()
-        };
-        assert!(line(false).contains("returns to your wallet"));
-        assert!(!line(true).contains("returns to your wallet"));
+    fn a_logged_out_visitor_is_asked_to_log_in_and_nothing_more() {
+        let line =
+            payout_line("c1", Some(&terms(false)), &PayoutDestination::LoggedOut).into_string();
+        assert!(line.contains("Log in to enter."));
+        assert!(!line.contains("returns to your wallet"));
     }
 
     #[test]
@@ -680,11 +648,12 @@ mod tests {
         assert!(html.contains("capped at 100 sat/vB"));
         // One paid place: the winner takes it all.
         assert!(html.contains("Winner shares by rank: 100%"));
-        assert!(html.contains("Add one"));
+        assert!(html.contains(">add one</a>"));
     }
 
+    /// With a Par band the buttons are the ranges, low to high, and still say which pick each is.
     #[test]
-    fn lines_competitions_show_each_picks_par_range() {
+    fn lines_competitions_put_the_ranges_in_the_pick_buttons() {
         let mut competition = view("c1", Phase::Upcoming, 60);
         competition.scoring_rules = ScoringRules::Lines;
         let mut station = station();
@@ -710,16 +679,14 @@ mod tests {
             NetworkFee::Estimate(50),
         )
         .into_string();
-        assert!(html.contains("Par 67.4–70.2°F"), "{html}");
-        assert_eq!(html.matches("pick-par").count(), 1);
-        // A band centred on the forecast has no lean to report.
-        assert!(!html.contains("pick-lean"));
-        assert!(
-            html.contains("Pick as many readings as you like; a reading left at No pick scores 0.")
-        );
-        assert!(html.contains("A right pick scores 10 points."));
-        assert!(!html.contains("20 points"));
-        assert!(form(PayoutDestination::LoggedOut).contains("scores 20 points"));
+        let under = html.find("&lt; 67.4°F").expect("under button");
+        let par = html.find("67.4–70.2°F").expect("par button");
+        let over = html.find("&gt; 70.2°F").expect("over button");
+        assert!(under < par && par < over);
+        assert!(html.contains(r#"aria-label="Par (67.4–70.2°F)""#));
+        assert!(!html.contains("pick-par") && !html.contains("lately"));
+        // Without a band yet the buttons say Over, Par, Under.
+        assert!(html.contains("<span>Over</span>"));
     }
 
     #[test]
@@ -742,11 +709,6 @@ mod tests {
             NetworkFee::Estimate(50),
         )
         .into_string();
-        assert!(
-            html.contains("Day: each airport&#39;s high and wind")
-                || html.contains("Day: each airport's high and wind"),
-            "{html}"
-        );
         assert!(html.contains("KPWM_temp_high") && html.contains("KPWM_wind_speed"));
         assert!(!html.contains("KPWM_temp_low"));
     }

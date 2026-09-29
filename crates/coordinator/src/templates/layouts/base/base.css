@@ -82,8 +82,10 @@ a.competition-row.htmx-request {
   display: inline-block;
 }
 
+/* A tint of the link colour that keeps the theme's own text readable, light or dark. */
 tr.is-own td {
-  background: var(--bulma-link-light);
+  background: color-mix(in srgb, var(--bulma-link) 16%, transparent);
+  color: var(--bulma-text-strong);
 }
 
 .account-page {
@@ -153,4 +155,12 @@ tr.is-own td {
 .github-icon {
   fill: currentColor;
   vertical-align: middle;
+}
+
+.site-footer {
+  padding: 1.5rem 1rem 2rem;
+  border-top: 1px solid var(--bulma-border-weak);
+  font-size: 0.85rem;
+  text-align: center;
+  color: var(--bulma-text-weak);
 }

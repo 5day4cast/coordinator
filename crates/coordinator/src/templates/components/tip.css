@@ -1,0 +1,64 @@
+/* Anything with data-tip shows it on hover and on focus (a tap on phones); a "?" (.tip)
+   beside a term is the usual holder. */
+[data-tip] {
+  position: relative;
+  cursor: help;
+}
+
+.tip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.05rem;
+  height: 1.05rem;
+  margin-left: 0.3rem;
+  border: 1px solid var(--bulma-border);
+  border-radius: 50%;
+  color: var(--bulma-text-weak);
+  font-size: 0.7rem;
+  font-weight: 600;
+  line-height: 1;
+  vertical-align: 0.1em;
+}
+
+[data-tip]:focus-visible {
+  outline: 2px solid var(--bulma-link);
+  outline-offset: 1px;
+}
+
+[data-tip]::after {
+  content: attr(data-tip);
+  position: absolute;
+  z-index: 20;
+  left: 50%;
+  bottom: calc(100% + 0.4rem);
+  width: max-content;
+  max-width: min(16rem, 80vw);
+  padding: 0.4rem 0.6rem;
+  border-radius: 6px;
+  background: var(--bulma-scheme-invert);
+  color: var(--bulma-scheme-main);
+  font-size: 0.8rem;
+  font-weight: 400;
+  line-height: 1.35;
+  text-align: left;
+  white-space: normal;
+  transform: translateX(-50%);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+[data-tip]:hover::after,
+[data-tip]:focus::after {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* Near a right edge (a pick's status), the bubble grows leftwards. */
+.tip-end::after,
+.pick-state[data-tip]::after {
+  left: auto;
+  right: 0;
+  transform: none;
+}

@@ -654,6 +654,17 @@ pub struct CreateEvent {
     /// (see [`WindowShape`]). Competitions stored before have none and score all three.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scoring_fields: Option<Vec<String>>,
+    /// How many entries one player (one Nostr key) may make. Competitions stored before this
+    /// rule, and any that don't set it, allow one.
+    #[serde(default = "one_entry_per_player")]
+    pub max_entries_per_player: u32,
+}
+
+/// Unless a competition says otherwise, each player enters it once.
+pub const ONE_ENTRY_PER_PLAYER: u32 = 1;
+
+fn one_entry_per_player() -> u32 {
+    ONE_ENTRY_PER_PLAYER
 }
 
 impl CreateEvent {
@@ -787,6 +798,9 @@ impl CreateEvent {
         if !(1..=50).contains(&self.locations.len()) {
             return Err("an event must contain between 1 and 50 locations");
         }
+        if self.max_entries_per_player == 0 {
+            return Err("max_entries_per_player must be at least 1");
+        }
         let mut distinct = std::collections::HashSet::new();
         for location in &self.locations {
             if location.is_empty()
@@ -836,6 +850,7 @@ mod oracle_event_validation_tests {
             unlisted: false,
             scoring_rules: None,
             scoring_fields: None,
+            max_entries_per_player: 1,
         }
     }
 

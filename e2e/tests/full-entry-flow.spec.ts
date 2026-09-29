@@ -238,7 +238,7 @@ test.describe("Full Entry Submission Flow", () => {
     await expect(page.locator("#entryContainer")).not.toBeVisible();
   });
 
-  test("a pick can be made and taken back with No pick", async ({ page }) => {
+  test("a pick is taken back by choosing it again", async ({ page }) => {
     await registerAndLogin(page);
 
     await page.waitForSelector("#competitions-page a.competition-row", {
@@ -259,19 +259,24 @@ test.describe("Full Entry Submission Flow", () => {
     });
 
     const row = page.locator("#entryForm .pick-row").first();
-    const firstButton = row.locator(".pick-option").first();
-    const noPick = row.locator(".pick-option.is-none");
+    const [first, second] = [row.locator(".pick-option").nth(0), row.locator(".pick-option").nth(1)];
+    const checked = row.locator("input:checked");
+    await expect(checked).toHaveCount(0);
 
-    const input = firstButton.locator("input");
-    await expect(input).not.toBeChecked();
-    await expect(noPick.locator("input")).toBeChecked();
+    await first.click();
+    await expect(first.locator("input")).toBeChecked();
 
-    await firstButton.click();
-    await expect(input).toBeChecked();
+    await second.click();
+    await expect(second.locator("input")).toBeChecked();
+    await expect(first.locator("input")).not.toBeChecked();
 
-    await noPick.click();
-    await expect(input).not.toBeChecked();
-    await expect(noPick.locator("input")).toBeChecked();
+    await second.click();
+    await expect(checked).toHaveCount(0);
+
+    // Space on the focused pick takes it back too.
+    await first.click();
+    await first.locator("input").press("Space");
+    await expect(checked).toHaveCount(0);
   });
 });
 
@@ -280,7 +285,7 @@ test.describe("Competition Status Display", () => {
     await page.goto("/");
 
     await page.waitForSelector("#competitions-page", { timeout: 10000 });
-    await expect(page.locator("#competitions-page .intro")).toContainText("win the pot");
+    await expect(page.locator("#competitions-page .intro")).toContainText("Daily Fantasy Weather");
 
     const rows = page.locator("#competitions-page a.competition-row");
     const count = await rows.count();

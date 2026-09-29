@@ -212,6 +212,7 @@ impl Coordinator {
                     choice.entry_id,
                     &pubkey,
                     settings.max_entries,
+                    competition.event_submission.max_entries_per_player,
                     competition.ticket_deadline(),
                 )
                 .await?
@@ -226,6 +227,11 @@ impl Coordinator {
                      its invoice to expire"
                         .into(),
                 )),
+                QueuedReservation::EntryLimit => {
+                    return Err(super::entry_limit_error(
+                        competition.event_submission.max_entries_per_player,
+                    ))
+                }
                 QueuedReservation::Taken => {
                     return Err(Error::BadRequest(
                         "This entry id is taken; start the entry again".into(),

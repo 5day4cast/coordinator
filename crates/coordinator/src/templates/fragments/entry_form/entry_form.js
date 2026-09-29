@@ -31,10 +31,17 @@ class Entry {
   }
 
   async handleTicketPayment(btc_pubkey) {
-    const response = await this.client.post(
-      `${this.coordinator_url}/api/v1/competitions/${this.competition.id}/ticket`,
-      { btc_pubkey, payout: this.payoutChoice },
-    );
+    let response;
+    try {
+      response = await this.client.post(
+        `${this.coordinator_url}/api/v1/competitions/${this.competition.id}/ticket`,
+        { btc_pubkey, payout: this.payoutChoice },
+      );
+    } catch (error) {
+      // The coordinator says why it refused: already entered, entries closed, full.
+      const data = await error.response?.json().catch(() => null);
+      throw data?.error ? new Error(data.error) : error;
+    }
 
     if (!response.ok)
       throw new Error(`Failed to get ticket: ${response.status}`);
@@ -310,11 +317,10 @@ class Entry {
 
 
 // Picks by station from the form's checked radios, named `KPWM_temp_high`.
-// "No pick" has an empty value.
+// A reading with no radio checked is skipped.
 function collectPicks(form) {
   const picks = {};
   for (const input of form.querySelectorAll('input[type="radio"]:checked')) {
-    if (!input.value) continue;
     const separator = input.name.indexOf("_");
     const stationId = input.name.slice(0, separator);
     const metric = input.name.slice(separator + 1);
@@ -597,9 +603,27 @@ function showNetworkFee(fee, total) {
   if ($total) $total.textContent = formatSats(total);
 }
 
+// A pick's radio button takes the pick back when chosen again, by tap, click or Space: the
+// input chosen last in its row carries `data-picked`, which the browser's own checking
+// doesn't touch. Arrow keys move the pick within the row as usual.
+function togglePick(input) {
+  if (input.dataset.picked) {
+    input.checked = false;
+    delete input.dataset.picked;
+    return;
+  }
+  for (const other of input.form?.querySelectorAll(`input[name="${CSS.escape(input.name)}"]`) ?? []) {
+    delete other.dataset.picked;
+  }
+  input.dataset.picked = "1";
+}
+
 function setupEntryForm() {
   document.addEventListener("click", (event) => {
     if (event.target.closest?.("#submitEntry")) submitEntry();
+    if (event.target instanceof HTMLInputElement && event.target.matches(".pick-option input[type=radio]")) {
+      togglePick(event.target);
+    }
   });
 }
 

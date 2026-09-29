@@ -31,6 +31,7 @@ fn competition(start: OffsetDateTime, capacity: usize) -> Competition {
         unlisted: true,
         scoring_rules: None,
         scoring_fields: None,
+        max_entries_per_player: 1,
     })
 }
 
@@ -137,10 +138,11 @@ async fn closed_ticket_request_does_not_reserve_or_rotate_a_ticket() {
         competition.id,
         "alice",
         competition.ticket_deadline(),
+        1,
     ))
     .await
     .unwrap();
-    assert!(denied.is_none());
+    assert!(matches!(denied, super::store::TicketReservation::Closed));
     let ticket = bounded(store.get_ticket(ticket_id)).await.unwrap();
     assert!(ticket.reserved_at.is_none());
     assert!(ticket.reserved_by.is_none());
@@ -167,7 +169,7 @@ async fn queued_reservation_registration_and_entry_cannot_cross_the_deadline() {
     bounded(start).await.unwrap();
     let deadline = OffsetDateTime::now_utc() + Duration::milliseconds(100);
     let mut reserve =
-        Box::pin(store.get_and_reserve_ticket_before(competition.id, "alice", deadline));
+        Box::pin(store.get_and_reserve_ticket_before(competition.id, "alice", deadline, 1));
     let mut register = Box::pin(store.store_ticket_registration_before(
         ticket_id,
         reserved.hash,
@@ -180,6 +182,7 @@ async fn queued_reservation_registration_and_entry_cannot_cross_the_deadline() {
         ticket_id,
         Some("policy".into()),
         deadline,
+        1,
     ));
     assert!(poll!(reserve.as_mut()).is_pending());
     assert!(poll!(register.as_mut()).is_pending());
@@ -188,9 +191,9 @@ async fn queued_reservation_registration_and_entry_cannot_cross_the_deadline() {
     assert!(OffsetDateTime::now_utc() >= deadline);
     release.send(()).unwrap();
     bounded(blocker).await.unwrap();
-    assert!(bounded(reserve).await.unwrap().is_none());
+    assert!(bounded(reserve).await.unwrap().reserved().is_none());
     assert!(bounded(register).await.unwrap().is_none());
-    assert!(bounded(enter).await.unwrap().is_none());
+    assert!(bounded(enter).await.unwrap().added().is_none());
     for table in [
         "entries",
         "entry_payout_policies",
@@ -218,9 +221,11 @@ async fn admission_before_close_preserves_registration_policy_and_one_entry_per_
         competition.id,
         "alice",
         competition.ticket_deadline(),
+        1,
     ))
     .await
     .unwrap()
+    .reserved()
     .unwrap()
     .ticket;
     assert_eq!(
@@ -240,13 +245,25 @@ async fn admission_before_close_preserves_registration_policy_and_one_entry_per_
     let second = entry(competition.id, ticket_id);
     let (first, second) = bounded(async {
         tokio::join!(
-            store.add_entry_with_policy_before(first, ticket_id, Some("policy".into()), deadline),
-            store.add_entry_with_policy_before(second, ticket_id, Some("policy".into()), deadline),
+            store.add_entry_with_policy_before(
+                first,
+                ticket_id,
+                Some("policy".into()),
+                deadline,
+                1
+            ),
+            store.add_entry_with_policy_before(
+                second,
+                ticket_id,
+                Some("policy".into()),
+                deadline,
+                1
+            ),
         )
     })
     .await;
     assert!(first.is_ok());
-    assert!(first.unwrap().is_some());
+    assert!(first.unwrap().added().is_some());
     let duplicate_error = second.unwrap_err();
     assert!(matches!(&duplicate_error,
         crate::infra::db::DatabaseWriteError::Sqlx(sqlx::Error::Database(error)) if error.is_unique_violation()));
@@ -325,10 +342,12 @@ async fn stale_unfilled_snapshot_cannot_cancel_the_last_entry_committed_before_c
         entry(snapshot.id, ticket_id),
         ticket_id,
         None,
-        snapshot.event_submission.start_observation_date
+        snapshot.event_submission.start_observation_date,
+        1
     ))
     .await
     .unwrap()
+    .added()
     .is_some());
     let (started, start) = oneshot::channel();
     let (release, released) = oneshot::channel();
@@ -436,4 +455,93 @@ fn unrelated_entry_write_failures_remain_server_errors() {
         error.into_response().status(),
         StatusCode::INTERNAL_SERVER_ERROR
     );
+}
+
+/// One entry per player unless the competition says otherwise: a player whose paid tickets all
+/// have entries gets no new ticket, and a second paid ticket makes no second entry either.
+#[tokio::test]
+async fn a_player_enters_only_as_often_as_the_competition_allows() {
+    use super::store::{EntryAdmission, TicketReservation};
+    let (_dir, db, store, competition, _) =
+        fixture(OffsetDateTime::now_utc() + Duration::hours(1), 3).await;
+    let id = competition.id;
+    let second_ticket = Uuid::now_v7();
+    bounded(db.execute_write(move |pool| async move {
+        sqlx::query("INSERT INTO tickets(id, event_id, encrypted_preimage, hash) VALUES (?, ?, 'preimage', 'hash2')")
+            .bind(second_ticket.to_string()).bind(id.to_string()).execute(&pool).await?;
+        Ok(())
+    }))
+    .await
+    .unwrap();
+    let tickets = competition.ticket_deadline();
+    let entries = competition.event_submission.start_observation_date;
+    let reserve = |max| {
+        let store = store.clone();
+        async move {
+            bounded(store.get_and_reserve_ticket_before(id, "alice", tickets, max))
+                .await
+                .unwrap()
+        }
+    };
+    let enter = |ticket: Uuid, max| {
+        let store = store.clone();
+        async move {
+            bounded(store.add_entry_with_policy_before(
+                entry(id, ticket),
+                ticket,
+                None,
+                entries,
+                max,
+            ))
+            .await
+        }
+    };
+
+    let first = reserve(1).await.reserved().unwrap().ticket;
+    // Unpaid, or paid without an entry yet, the ticket is still the player's to use.
+    assert_eq!(reserve(1).await.reserved().unwrap().ticket.id, first.id);
+    assert!(bounded(store.mark_ticket_paid(&first.hash, id))
+        .await
+        .unwrap());
+    assert_eq!(reserve(1).await.reserved().unwrap().ticket.id, first.id);
+    assert!(matches!(
+        enter(first.id, 1).await.unwrap(),
+        EntryAdmission::Added(_)
+    ));
+
+    // Sending the first entry again still reads as a retry of that ticket, not as the limit.
+    let retry = enter(first.id, 1).await.unwrap_err();
+    assert!(matches!(&retry,
+        crate::infra::db::DatabaseWriteError::Sqlx(sqlx::Error::Database(error)) if error.is_unique_violation()));
+
+    // Entered once: no second ticket, unless the competition allows two.
+    assert!(matches!(reserve(1).await, TicketReservation::EntryLimit));
+    let second = reserve(2).await.reserved().unwrap().ticket;
+    assert_eq!(second.id, second_ticket);
+
+    // A second ticket paid anyway (two paid at once, say) makes no second entry under a limit
+    // of one; cleanup refunds a paid ticket without an entry.
+    assert!(bounded(store.mark_ticket_paid(&second.hash, id))
+        .await
+        .unwrap());
+    assert!(matches!(
+        enter(second.id, 1).await.unwrap(),
+        EntryAdmission::EntryLimit
+    ));
+    assert!(matches!(
+        enter(second.id, 2).await.unwrap(),
+        EntryAdmission::Added(_)
+    ));
+
+    bounded(db.close()).await.unwrap();
+}
+
+#[test]
+fn the_entry_limit_says_so_in_plain_words() {
+    let one = super::coordinator::entry_limit_error(1);
+    assert!(
+        matches!(one, Error::BadRequest(message) if message == "You've already entered this competition")
+    );
+    let two = super::coordinator::entry_limit_error(2);
+    assert!(matches!(two, Error::BadRequest(message) if message.contains("the 2 entries")));
 }

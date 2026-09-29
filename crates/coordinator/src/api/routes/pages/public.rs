@@ -50,6 +50,7 @@ use crate::{
         pages::{
             competitions::{competitions_page, CompetitionView, ListOptions},
             entries::{entries_page, sign_in_required, EntryRow},
+            help::help_page,
             payouts::payouts_page,
         },
     },
@@ -350,6 +351,17 @@ pub async fn payouts_fragment(
     let lightning_address = user.ok().and_then(|user| user.lightning_address);
     let content = payouts_page(&payouts, lightning_address.as_deref());
     page(&headers, &state, title, content, Caching::Private)
+}
+
+/// How it works: the rules and scoring the competition pages leave out.
+pub async fn help_fragment(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    page(
+        &headers,
+        &state,
+        "How it works - Fantasy Weather",
+        help_page(),
+        Caching::Public,
+    )
 }
 
 /// An account page opened without a signature: a prompt that loads the page

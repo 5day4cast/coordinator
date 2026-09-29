@@ -880,6 +880,7 @@ mod tests {
             unlisted: false,
             scoring_rules: None,
             scoring_fields: None,
+            max_entries_per_player: 1,
         }
     }
 

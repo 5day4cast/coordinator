@@ -868,7 +868,8 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
             "/entries/{entry_id}/detail/mine",
             get(crate::api::routes::own_entry_detail_fragment),
         )
-        .route("/payouts", get(payouts_fragment));
+        .route("/payouts", get(payouts_fragment))
+        .route("/help", get(crate::api::routes::help_fragment));
 
     let api_routes = Router::new()
         .route("/", get(public_page_handler))
@@ -1348,7 +1349,7 @@ mod startup_tests {
         Arc::get_mut(&mut test.state).unwrap().keymeld_public_url =
             Some("https://keymeld.example.net/enclaves".into());
         let public = test.public();
-        for path in ["/", "/competitions", "/entries", "/payouts"] {
+        for path in ["/", "/competitions", "/entries", "/payouts", "/help"] {
             for (kind, headers) in [
                 ("page", &[][..]),
                 ("fragment", &[("hx-request", "true")][..]),
@@ -1620,6 +1621,7 @@ mod startup_tests {
             unlisted: true,
             scoring_rules: None,
             scoring_fields: None,
+            max_entries_per_player: 1,
         };
         let id = client.create(&event).await.unwrap();
         assert_eq!(id, event.id);

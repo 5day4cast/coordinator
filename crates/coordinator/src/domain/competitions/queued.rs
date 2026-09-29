@@ -137,6 +137,13 @@ pub struct CreateQueuedCompetition {
     /// The most entries the queue takes; `DEFAULT_MAX_ENTRIES` if unset.
     #[serde(default)]
     pub max_entries: Option<u32>,
+    /// How many entries one player may make; one if unset.
+    #[serde(default = "one_entry_per_player")]
+    pub max_entries_per_player: u32,
+}
+
+fn one_entry_per_player() -> u32 {
+    super::ONE_ENTRY_PER_PLAYER
 }
 
 fn default_min_players() -> usize {
@@ -189,6 +196,8 @@ impl CreateQueuedCompetition {
             unlisted: true,
             scoring_rules: Some(ScoringRules::Lines),
             scoring_fields: None,
+            // Pools copy it, so the limit holds in every pool as it did in the queue.
+            max_entries_per_player: self.max_entries_per_player,
         };
         // Pools copy the reference event, so every pool scores the metrics its window holds.
         event.fix_window_metrics()?;

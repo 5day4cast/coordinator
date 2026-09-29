@@ -1,0 +1,91 @@
+/* How it works: the rules, and an example entry form with numbered notes. */
+
+.help-page {
+  max-width: 48rem;
+}
+
+.help-page section {
+  scroll-margin-top: 4rem;
+  margin-bottom: 2rem;
+}
+
+.help-contents {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1rem;
+  margin-bottom: 1.5rem;
+  font-size: 0.9rem;
+}
+
+.help-walkthrough {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1.5rem;
+  align-items: start;
+}
+
+@media screen and (max-width: 768px) {
+  .help-walkthrough {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.help-shot {
+  margin: 0;
+  padding: 1rem;
+  border: 1px dashed var(--bulma-border);
+  border-radius: 0.75rem;
+  background: var(--bulma-scheme-main-bis);
+}
+
+.help-shot .station-picks {
+  margin-bottom: 0.75rem;
+}
+
+.help-pointer {
+  margin: 0;
+  font-size: 0.9rem;
+  text-align: right;
+}
+
+.callout {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.4rem;
+  height: 1.4rem;
+  margin-left: 0.35rem;
+  border-radius: 50%;
+  background: hsl(348, 70%, 50%);
+  color: #fff;
+  font-size: 0.8rem;
+  font-weight: 700;
+  line-height: 1;
+  vertical-align: middle;
+}
+
+.help-callouts {
+  margin: 0 0 0 1.5rem;
+  padding-left: 0.25rem;
+}
+
+.help-callouts li::marker {
+  color: hsl(348, 70%, 50%);
+  font-weight: 700;
+}
+
+.help-statuses div {
+  display: grid;
+  grid-template-columns: 11rem minmax(0, 1fr);
+  gap: 0.75rem;
+  align-items: baseline;
+  margin-bottom: 0.5rem;
+}
+
+.help-statuses dd {
+  margin: 0;
+}
+
+.help-page details summary {
+  cursor: pointer;
+}

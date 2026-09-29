@@ -180,6 +180,16 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
 
                             div class="column" {
                                 div class="field" {
+                                    label class="label" { "Entries Per Player" }
+                                    div class="control" {
+                                        input class="input" type="number" name="max_entries_per_player"
+                                              value="1" min="1";
+                                    }
+                                }
+                            }
+
+                            div class="column" {
+                                div class="field" {
                                     label class="label" { "Entry Fee (sats)" }
                                     div class="control" {
                                         input class="input" type="number" name="entry_fee"
@@ -249,7 +259,7 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
                         h3 class="subtitle is-5" { "Queued Competition" }
                         div class="field" {
                             label class="checkbox" {
-                                input type="checkbox" name="queued" value="true";
+                                input type="checkbox" name="queued" value="true" checked;
                                 " Queue entries and form pools when observation starts"
                             }
                             p class="help" {

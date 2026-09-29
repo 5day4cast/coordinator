@@ -12,6 +12,7 @@ use time::OffsetDateTime;
 
 use crate::domain::leaderboard::Phase;
 use crate::templates::{
+    components::tip,
     format::{self, ordinal, sats},
     fragments::picks::{detail_url, LIVE_REFRESH},
     pages::competitions::{phase_badge, CompetitionView, PoolLink, Queue, QueueView, Refunds},
@@ -72,9 +73,9 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
             }
             @if let Queue::Pool(pool) = &competition.queue {
                 p class="pool-of" {
-                    (pool.label()) " of a queued competition. "
+                    (pool.label()) " · "
                     a href=(pool.url()) hx-get=(pool.url()) hx-target="#main-content" hx-push-url="true" {
-                        "See all its pools"
+                        "All pools"
                     }
                 }
             }
@@ -89,8 +90,11 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
 
             dl class="leaderboard-facts" {
                 div { dt { "Pot" } dd { (competition.pot()) } }
-                @if queue.is_some() {
-                    div { dt { "Paid places" } dd { "The winner of each pool takes its pot" } }
+                @if let Some(queue) = queue {
+                    div {
+                        dt { "Paid places" (tip(&format!("{}.", queue.pool_note()))) }
+                        dd { "Each pool's winner" }
+                    }
                 } @else if competition.pot_refunded || competition.phase == Phase::Expired {
                     div class="refund-fact" {
                         dt { "Pot return allocation" }
@@ -100,8 +104,12 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
                     div {
                         dt { "Paid places" }
                         dd {
-                            @for (place, (percent, amount)) in prizes.iter().enumerate() {
-                                span class="prize" { (ordinal(place + 1)) " " (sats(*amount)) " (" (percent) "%)" }
+                            @if prizes.len() == 1 {
+                                "Winner takes all"
+                            } @else {
+                                @for (place, (_, amount)) in prizes.iter().enumerate() {
+                                    span class="prize" { (ordinal(place + 1)) " " (sats(*amount)) }
+                                }
                             }
                         }
                     }
@@ -109,12 +117,8 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
                 div { dt { "Entries" } dd { (competition.entries()) } }
                 div { dt { "Entry" } dd { (sats(competition.ticket_price)) } }
             }
-            @if let Some(queue) = queue {
-                @if split {
-                    (queue_pools(&competition.id, queue, None))
-                } @else {
-                    p class="notice" { (queue.pool_note()) "." }
-                }
+            @if let Some(queue) = queue.filter(|_| split) {
+                (queue_pools(&competition.id, queue, None))
             }
 
             @if competition.pot_refunded || competition.phase == Phase::Expired {
@@ -156,8 +160,6 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
                     hx-get=(rows_url(&competition.id)) hx-trigger="load" hx-swap="outerHTML"
                     "hx-status:500"="swap:outerHTML" {
                     (scores_table(
-                        competition,
-                        false,
                         html! {
                             tr class="rows-loading" {
                                 td colspan="5" {
@@ -193,7 +195,6 @@ pub fn queue_pools(competition_id: &str, queue: &QueueView, mine: Option<&[Uuid]
         section id="queuePools" class="queue-pools"
             hx-get=(pools_url(competition_id)) hx-trigger=(trigger) hx-swap="outerHTML" {
             h2 class="title is-6" { "Pools" }
-            p class="help" { "Entries were split into these pools at the start. Each pool's winner takes its pot." }
             ul {
                 @for (position, pool) in queue.pools.iter().enumerate() {
                     li class=[own(pool).then_some("is-own")] {
@@ -222,7 +223,6 @@ pub fn leaderboard_scores(
     now: OffsetDateTime,
 ) -> Markup {
     let live = board.phase == Phase::Live;
-    let provisional = matches!(board.phase, Phase::Live | Phase::AwaitingResult);
     // The rows are in payout order, so the oracle's result pays the first ones.
     let paid = match board.phase {
         Phase::Scored if competition.has_ranked_prizes() && !competition.pot_refunded => {
@@ -238,16 +238,17 @@ pub fn leaderboard_scores(
             @match board.phase {
                 Phase::Live => {
                     p class="provisional-note" {
-                        strong { "Provisional:" } " if the window ended now"
-                        @if let Some(at) = board.updated_at {
-                            " · updated " (format::ago(at, now))
+                        @match board.updated_at {
+                            Some(at) => { "Updated " (format::ago(at, now)) }
+                            None => { "Scores so far" }
                         }
+                        (tip("Scored as if the window ended now; scores can change until the result is final."))
                     }
                 }
                 Phase::AwaitingResult => {
                     p class="provisional-note" {
-                        strong { "Window closed:" } " awaiting the oracle's result. "
-                        "Scores are what the readings so far give."
+                        "Window closed"
+                        (tip("Scores so far; the oracle's own reading decides the final result."))
                     }
                 }
                 Phase::Expired => {
@@ -280,16 +281,16 @@ pub fn leaderboard_scores(
                 }
                 _ => {}
             }
-            (scores_table(
-                competition,
-                provisional,
-                leaderboard_rows(&board.rows, ran(board.phase) && competition.has_ranked_prizes(), paid),
-            ))
+            (scores_table(leaderboard_rows(
+                &board.rows,
+                ran(board.phase) && competition.has_ranked_prizes(),
+                paid,
+            )))
         }
     }
 }
 
-fn scores_table(competition: &CompetitionView, provisional: bool, rows: Markup) -> Markup {
+fn scores_table(rows: Markup) -> Markup {
     html! {
         div class="table-container" {
             table id="competitionLeaderboardData" class="table is-fullwidth is-hoverable leaderboard-table" {
@@ -298,21 +299,11 @@ fn scores_table(competition: &CompetitionView, provisional: bool, rows: Markup) 
                         th { "Rank" }
                         th { "Player" }
                         th { "Entry" }
-                        th class="has-text-right" { @if provisional { "Score so far" } @else { "Score" } }
+                        th class="has-text-right" { "Score" }
                         th {}
                     }
                 }
                 tbody id="leaderboardRows" { (rows) }
-            }
-        }
-        p class="help" {
-            "Select an entry to see its picks."
-            @if competition.has_ranked_prizes() {
-                " Tied scores share a rank"
-                @if !competition.prizes().is_empty() {
-                    "; if a tie spans the last paid place, the earlier entry is paid"
-                }
-                "."
             }
         }
     }
@@ -366,9 +357,11 @@ fn refund_note(competition: &CompetitionView) -> Markup {
 /// without a rank or score. `paid` is how many of the first rows, in payout order, the final
 /// result pays: none until it is in.
 pub fn leaderboard_rows(rows: &[LeaderboardRow], scored: bool, paid: usize) -> Markup {
+    // Until someone scores, everyone would share first place: no ranks yet.
+    let ranked = scored && rows.iter().any(|row| row.score != 0);
     html! {
         @for (position, row) in rows.iter().enumerate() {
-            (leaderboard_row(row, scored, position < paid))
+            (leaderboard_row(row, scored, ranked, position < paid))
         }
         @if rows.is_empty() {
             tr {
@@ -382,13 +375,13 @@ pub fn leaderboard_rows(rows: &[LeaderboardRow], scored: bool, paid: usize) -> M
 
 /// A click anywhere on the row opens the entry's picks. The copy button
 /// stops its own click (see page.js); the Picks button's click reaches the row.
-fn leaderboard_row(row: &LeaderboardRow, scored: bool, paid: bool) -> Markup {
+fn leaderboard_row(row: &LeaderboardRow, scored: bool, ranked: bool, paid: bool) -> Markup {
     html! {
         tr class="is-clickable" data-owner=(row.owner)
            hx-get=(detail_url(&row.entry_id)) hx-target="#entryValues" hx-swap="innerHTML"
            "hx-status:500"="swap:innerHTML" {
             td data-label="Rank" {
-                @if scored { (row.rank) } @else { "—" }
+                @if ranked { (row.rank) } @else { "—" }
                 @if paid { " " span class="paid-badge" { "Paid" } }
             }
             td data-label="Player" {
@@ -427,15 +420,19 @@ mod tests {
         competition.paid_places = 2;
         let html = leaderboard(&competition, NOW).into_string();
         assert!(html.contains("15,000 sats"));
-        assert!(html.contains("1st 10,500 sats (70%)"));
-        assert!(html.contains("2nd 4,500 sats (30%)"));
+        assert!(html.contains("1st 10,500 sats"));
+        assert!(html.contains("2nd 4,500 sats"));
+        assert!(!html.contains("(70%)"));
         assert!(html.contains(r#"hx-get="/competitions/c1/leaderboard/rows""#));
         assert!(
             html.contains(r#"hx-trigger="load""#),
             "a finished board loads once"
         );
         assert!(html.contains("Loading scores"));
-        assert!(html.contains("earlier entry is paid"));
+        // The tie rule and what a row does are on the help page, not under the table.
+        assert!(!html.contains("earlier entry is paid") && !html.contains("Select an entry"));
+        let one = leaderboard(&view("c1", Phase::Scored, -60), NOW).into_string();
+        assert!(one.contains("Winner takes all") && !one.contains("1st"));
     }
 
     #[test]
@@ -447,9 +444,12 @@ mod tests {
         let queue = queued("q", 40);
         let waiting = leaderboard(&queue, NOW).into_string();
         assert!(waiting.contains("40 entered"));
-        assert!(waiting.contains("up to 125,000 sats"));
-        assert!(waiting.contains("Players are split into pools of up to 25 at the start."));
-        assert!(waiting.contains("The winner of each pool takes its pot"));
+        assert!(waiting.contains("100,000 sats per pool"));
+        assert!(waiting
+            .contains(r#"data-tip="Players are split into pools of up to 25 at the start.""#));
+        assert!(
+            waiting.contains("Each pool&#39;s winner") || waiting.contains("Each pool's winner")
+        );
         assert!(!waiting.contains(" of 3"));
         assert!(waiting.contains("/competitions/q/leaderboard/rows"));
 
@@ -518,7 +518,8 @@ mod tests {
             index: Some(0),
         });
         let html = leaderboard(&pool, NOW).into_string();
-        assert!(html.contains("Pool 1 of a queued competition."));
+        assert!(html.contains("Pool 1 · <a"));
+        assert!(html.contains(">All pools</a>"));
         assert!(html.contains(r#"href="/competitions/q/leaderboard""#));
         assert!(html.contains("1 of 3"));
         assert!(html.contains("/competitions/p/leaderboard/rows"));
@@ -574,9 +575,9 @@ mod tests {
             any_readings: true,
         };
         let live = leaderboard_scores(&competition, &board, NOW).into_string();
-        assert!(live.contains("<strong>Provisional:</strong> if the window ended now · updated"));
+        assert!(live.contains("Updated <time"));
         assert!(live.contains("12 min ago"));
-        assert!(live.contains("Score so far"));
+        assert!(!live.contains("Provisional") && !live.contains("Score so far"));
         assert!(live.contains(r#"hx-trigger="every 60s""#));
         assert!(live.contains(r#"hx-swap="outerHTML""#));
 
@@ -591,15 +592,14 @@ mod tests {
             !awaiting.contains("hx-trigger"),
             "polling stops once the window closes"
         );
-        assert!(awaiting.contains("<strong>Window closed:</strong> awaiting the oracle"));
-        assert!(awaiting.contains("Score so far"));
+        assert!(awaiting.contains("Window closed"));
         let scored = LeaderboardView {
             phase: Phase::Scored,
             ..board
         };
         let done = leaderboard_scores(&closed, &scored, NOW).into_string();
         assert!(!done.contains("hx-trigger"));
-        assert!(!done.contains("Provisional") && !done.contains("Window closed"));
+        assert!(!done.contains("Updated") && !done.contains("Window closed"));
         assert!(done.contains("30 pts"));
     }
 
@@ -623,13 +623,32 @@ mod tests {
         assert!(
             html.contains(r#"<td data-label="Rank">1 <span class="paid-badge">Paid</span></td>"#)
         );
-        assert!(html.contains("the earlier entry is paid"));
         let live = LeaderboardView {
             phase: Phase::Live,
             ..tied
         };
         let provisional = leaderboard_scores(&competition, &live, NOW).into_string();
         assert!(!provisional.contains("paid-badge"));
+    }
+
+    /// With every score at 0 everyone would share first place, so no rank shows until
+    /// someone scores.
+    #[test]
+    fn no_ranks_show_until_someone_scores() {
+        let competition = view("c1", Phase::Live, -5);
+        let mut board = LeaderboardView {
+            rows: vec![row("e1", "amy", 0, 1), row("e2", "bob", 0, 1)],
+            phase: Phase::Live,
+            updated_at: None,
+            any_readings: false,
+        };
+        let html = leaderboard_scores(&competition, &board, NOW).into_string();
+        assert_eq!(html.matches(r#"<td data-label="Rank">—</td>"#).count(), 2);
+        assert_eq!(html.matches("0 pts").count(), 2);
+        board.rows = vec![row("e2", "bob", 10, 1), row("e1", "amy", 0, 2)];
+        let html = leaderboard_scores(&competition, &board, NOW).into_string();
+        assert!(html.contains(r#"<td data-label="Rank">1</td>"#));
+        assert!(html.contains(r#"<td data-label="Rank">2</td>"#));
     }
 
     /// A competition cancelled mid-window stops polling.
