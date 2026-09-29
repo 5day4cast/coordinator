@@ -123,7 +123,10 @@ pub async fn request_competition_ticket(
             if e.is_refusal() {
                 warn!("ticket request for {competition_id} refused: {e}");
             } else {
-                error!("error requesting ticket for {competition_id}: {}", e.detail());
+                error!(
+                    "error requesting ticket for {competition_id}: {}",
+                    e.detail()
+                );
             }
             e.into()
         })
