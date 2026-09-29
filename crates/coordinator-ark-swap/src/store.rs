@@ -348,10 +348,14 @@ impl Store {
         row.as_ref().map(refund).transpose()
     }
 
-    /// Refunds still to claim, oldest first.
+    /// Refunds still to claim, oldest first: with those past their deadline that paid the
+    /// player, whose swap the claim leaf can still take until the player takes it back.
     pub async fn unclaimed_refunds(&self) -> anyhow::Result<Vec<Refund>> {
         let rows = sqlx::query(
-            "SELECT * FROM refunds WHERE state IN ('minted', 'paid') ORDER BY created_at",
+            "SELECT * FROM refunds
+             WHERE state IN ('minted', 'paid')
+                OR (state = 'reclaimable' AND preimage IS NOT NULL AND claim_txid IS NULL)
+             ORDER BY created_at",
         )
         .fetch_all(&self.pool)
         .await?;

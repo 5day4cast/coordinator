@@ -123,8 +123,20 @@ impl Swapper {
     }
 
     async fn advance_refund(&self, refund: &mut Refund) -> anyhow::Result<()> {
-        // Past the deadline the player can take the swap back, so this service stops trying.
         if unix_now() >= refund.deadline {
+            // The claim leaf has no timelock: a swap this service paid for can still be claimed
+            // after the deadline, until the player takes it back.
+            if refund.preimage.is_some() {
+                if let Err(error) = self.claim_refund(refund).await {
+                    log::debug!("refund {}: late claim failed: {error:#}", refund.id);
+                }
+                if refund.state == RefundState::Claimed {
+                    return Ok(());
+                }
+            }
+            if refund.state == RefundState::Reclaimable {
+                return Ok(());
+            }
             let unclaimed = refund.preimage.is_some();
             self.transition_refund(
                 refund,
