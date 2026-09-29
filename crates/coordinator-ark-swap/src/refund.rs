@@ -160,6 +160,14 @@ impl Swapper {
 
     /// Claim the swap, once the refund has paid it.
     async fn claim_refund(&self, refund: &mut Refund) -> anyhow::Result<()> {
+        let _claiming = self.claims.lock().await;
+        // The other path may have claimed it while this one waited.
+        if let Some(current) = self.store.refund(refund.id).await? {
+            *refund = current;
+        }
+        if refund.claim_txid.is_some() {
+            return Ok(());
+        }
         let Some(preimage) = refund.preimage.as_deref() else {
             return Ok(());
         };
