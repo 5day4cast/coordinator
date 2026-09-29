@@ -59,6 +59,17 @@ pub struct Lnd {
     payment_timeout_secs: u64,
 }
 
+/// Whether a payment's error only means its progress stream was cut off: the client timed out
+/// or the body ended early. The payment itself may still be in flight or have succeeded. A hold
+/// invoice stays in flight until its receiver settles it, which can outlast the stream.
+pub fn stream_cut_short(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|e| e.is_timeout() || e.is_body() || e.is_decode())
+    })
+}
+
 impl Lnd {
     pub fn new(config: &LndConfig) -> Result<Self> {
         let mut builder = reqwest::Client::builder()
@@ -536,6 +547,42 @@ mod sats {
 
 #[cfg(test)]
 mod tests {
+    /// A payment stream the client stops reading, as when a hold invoice outlasts the client
+    /// timeout, is not a failed payment; anything else still is.
+    #[tokio::test]
+    async fn a_stream_cut_off_by_the_client_timeout_is_not_a_failure() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // Headers and the in-flight update, then nothing, like LND before settlement.
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n\
+                      11\r\n{\"status\":\"IN\"}\n\r\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(300))
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        let cut = anyhow::Error::from(response.text().await.unwrap_err())
+            .context("read the payment stream");
+        assert!(super::stream_cut_short(&cut));
+        assert!(!super::stream_cut_short(&anyhow::anyhow!(
+            "the payment ended Failed: FAILURE_REASON_NO_ROUTE"
+        )));
+    }
+
     use super::*;
 
     /// The router streams each attempt; the last line says how the payment ended, with the

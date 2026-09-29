@@ -252,13 +252,18 @@ pub(super) async fn pay_entry(
                 .context("Failed to settle invoice")?;
             trace.settled_by_test_endpoint = true;
         }
-        Payer::Lnd(lnd) => {
-            let paid = lnd
-                .pay(&prepared.ticket.payment_request)
-                .await
-                .context("Failed to pay the entry invoice")?;
-            trace.payment = Some(entry_payment(lnd, paid).await);
-        }
+        Payer::Lnd(lnd) => match lnd.pay(&prepared.ticket.payment_request).await {
+            Ok(paid) => trace.payment = Some(entry_payment(lnd, paid).await),
+            // The entry invoice is a hold invoice, in flight until the coordinator settles it.
+            // The ticket status below decides whether the coordinator holds the payment.
+            Err(e) if crate::lnd::stream_cut_short(&e) => {
+                warn!(
+                    "entry payment for ticket {} still in flight when its stream ended: {e:#}",
+                    prepared.ticket.ticket_id
+                );
+            }
+            Err(e) => return Err(e.context("Failed to pay the entry invoice")),
+        },
     }
     trace.paid = true;
     crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
