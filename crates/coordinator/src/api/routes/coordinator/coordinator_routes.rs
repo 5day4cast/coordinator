@@ -215,12 +215,23 @@ pub async fn add_event_entry(
         })
 }
 
+/// `GET /api/v1/entries?event_id=<id>` narrows the list to one competition. The query
+/// cannot carry `SearchBy::event_ids`, a list, so clients asked with `event_id` and were
+/// sent every entry the player has ever made.
+#[derive(Debug, Default, Deserialize)]
+pub struct EntriesQuery {
+    event_id: Option<Uuid>,
+}
+
 pub async fn get_entries(
     NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
-    Query(filter): Query<SearchBy>,
+    Query(query): Query<EntriesQuery>,
 ) -> Result<Json<Vec<UserEntry>>, ApiError> {
     let pubkey = pubkey.to_hex();
+    let filter = SearchBy {
+        event_ids: query.event_id.map(|id| vec![id]),
+    };
 
     state
         .coordinator
@@ -472,4 +483,22 @@ pub async fn get_payout_terms(
         .await
         .map(Json)
         .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod entries_query_tests {
+    use super::EntriesQuery;
+    use axum::{extract::Query, http::Uri};
+    use uuid::Uuid;
+
+    #[test]
+    fn entries_can_be_narrowed_to_one_competition() {
+        let id = Uuid::now_v7();
+        let uri: Uri = format!("/api/v1/entries?event_id={id}").parse().unwrap();
+        let Query(query) = Query::<EntriesQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(query.event_id, Some(id));
+        let Query(all) =
+            Query::<EntriesQuery>::try_from_uri(&"/api/v1/entries".parse().unwrap()).unwrap();
+        assert_eq!(all.event_id, None);
+    }
 }
