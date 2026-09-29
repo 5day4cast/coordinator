@@ -143,6 +143,11 @@ enum PreparedState {
         /// cap, so a changed value cannot widen what the swap keeps.
         owed_sats: u64,
     },
+    /// A proof deleting a queued batch intent that holds the escrow, under the refund's
+    /// permission. It pays nothing, so there is nothing else to recheck.
+    ArkIntentDelete {
+        spend: ArkEscrowSpend,
+    },
     Settlement {
         request_digest: [u8; 32],
         settlement: PreparedSettlement,
@@ -533,6 +538,14 @@ fn ark_escrow_action(
     let escrow = ark_escrow(signed, &terms.market_maker, ark_policy)?;
     let digests =
         ark::spend_digests(&escrow, ark_policy, &bound.contract, spend).map_err(invalid)?;
+    Ok(bip340_action(signed, digests))
+}
+
+/// The BIP340 action signing `digests` with the participant's key, and the inputs they sign.
+fn bip340_action(
+    signed: &SignedEscrowPolicy,
+    digests: Vec<(usize, [u8; 32])>,
+) -> (Action, Vec<usize>) {
     let inputs = digests.iter().map(|(input, _)| *input).collect();
     let items = digests
         .into_iter()
@@ -542,7 +555,7 @@ fn ark_escrow_action(
             digest,
         })
         .collect();
-    Ok((
+    (
         Action::SignBip340 {
             scope: Bip340Scope {
                 public_key: signed.policy.participant_public_key.clone(),
@@ -550,7 +563,45 @@ fn ark_escrow_action(
             },
         },
         inputs,
-    ))
+    )
+}
+
+/// Recompute this participant's signatures for a proof deleting a queued batch intent.
+///
+/// Like a refund it acts without a binding, from the participant's own signed policy: the
+/// escrow's terms. It is accepted only for a proof that pays nothing and proves a `delete`
+/// message, so it can free the escrow but never spend it.
+fn ark_intent_delete_action(
+    signed: &SignedEscrowPolicy,
+    policy: &PayoutPolicy,
+    consent: &EntryConsent,
+    spend: &ArkEscrowSpend,
+) -> Result<(Action, Vec<usize>), VerificationError> {
+    let ark_policy = policy
+        .ark_escrow
+        .as_ref()
+        .ok_or_else(|| invalid("This ticket has no Arkade escrow"))?;
+    let escrow = ark_escrow(signed, consent.market_maker(), ark_policy)?;
+    let digests = ark::intent_delete_digests(&escrow, spend).map_err(invalid)?;
+    Ok(bip340_action(signed, digests))
+}
+
+/// Recheck a prepared intent delete against its proof.
+fn check_intent_delete(
+    context: &ExecutionView<'_>,
+    prepared: &PreparedAction,
+    spend: &ArkEscrowSpend,
+) -> Result<(), VerificationError> {
+    if context.rule != generic::ARK_REFUND_RULE || context.permission_id != generic::SIGN_ARK_REFUND
+    {
+        return Err(invalid("Escrow intent delete permission differs"));
+    }
+    let (policy, consent) = validate_static(context.manifest, context.policy)?;
+    let (action, _) = ark_intent_delete_action(context.policy, &policy, &consent, spend)?;
+    if prepared.action != action {
+        return Err(invalid("Prepared intent delete differs from its proof"));
+    }
+    Ok(())
 }
 
 /// Recheck a prepared refund, against the invoice the verifier resolved when preparing it.
@@ -873,6 +924,37 @@ impl CoordinatorVerifier {
             output: Payload::encode(&vec![0usize]).map_err(invalid)?,
         })
     }
+
+    /// Authorize a proof deleting a queued batch intent that holds the escrow.
+    ///
+    /// A kickoff that never finished can leave its intent queued, and the Arkade server then
+    /// refuses the escrow's refund. The refund's permission covers this, and only for a fresh
+    /// proof that pays nothing and proves a `delete` message.
+    fn prepare_intent_delete(
+        &self,
+        context: PreparationView<'_>,
+        spend: ArkEscrowSpend,
+    ) -> Result<PreparedAction, VerificationError> {
+        if context.rule != generic::ARK_REFUND_RULE
+            || context.permission_id != generic::SIGN_ARK_REFUND
+        {
+            return Err(invalid("Escrow intent delete permission differs"));
+        }
+        let (policy, consent) = validate_static(context.manifest, context.policy)?;
+        let (action, inputs) = ark_intent_delete_action(context.policy, &policy, &consent, &spend)?;
+        ark::check_intent_delete_fresh(&spend, now()?).map_err(invalid)?;
+        context
+            .attempt
+            .validate(&action, &context.policy.policy.context)
+            .map_err(invalid)?;
+        Ok(PreparedAction {
+            action,
+            application_state: Payload::encode(&PreparedState::ArkIntentDelete { spend })
+                .map_err(invalid)?,
+            // The signed inputs, in the order of the signatures.
+            output: Payload::encode(&inputs).map_err(invalid)?,
+        })
+    }
 }
 
 impl EscrowVerifier for CoordinatorVerifier {
@@ -1037,6 +1119,9 @@ impl EscrowVerifier for CoordinatorVerifier {
             {
                 return self.prepare_refund(context, spend, invoice, fee_sats).await;
             }
+            if let ActionParameters::DeleteArkIntent { spend } = parameters {
+                return self.prepare_intent_delete(context, spend);
+            }
             let (bound, policy, terms) =
                 restore_binding(context.manifest, context.policy, context.bound_state)?;
             if bound.participant_public_keys != *context.participant_public_keys {
@@ -1045,6 +1130,9 @@ impl EscrowVerifier for CoordinatorVerifier {
             match parameters {
                 ActionParameters::RefundArkEscrow { .. } => {
                     Err(invalid("A refund is prepared without a binding"))
+                }
+                ActionParameters::DeleteArkIntent { .. } => {
+                    Err(invalid("An intent delete is prepared without a binding"))
                 }
                 ActionParameters::SignContract { scope, ark_funding } => {
                     if context.rule != generic::CONTRACT_RULE
@@ -1082,6 +1170,7 @@ impl EscrowVerifier for CoordinatorVerifier {
                     }
                     let (action, inputs) =
                         ark_escrow_action(context.policy, &policy, &terms, &bound, &spend)?;
+                    ark::check_intent_delete_fresh(&spend, now()?).map_err(invalid)?;
                     context
                         .attempt
                         .validate(&action, &context.policy.policy.context)
@@ -1260,11 +1349,20 @@ impl EscrowVerifier for CoordinatorVerifier {
                 }
                 return check_refund(&context, prepared, spend, invoice, *owed_sats);
             }
+            if let PreparedState::ArkIntentDelete { spend } = &state {
+                if !evidence.as_bytes().is_empty() {
+                    return Err(invalid("Invalid escrow intent delete execution"));
+                }
+                return check_intent_delete(&context, prepared, spend);
+            }
             let (bound, policy, terms) =
                 restore_binding(context.manifest, context.policy, context.bound_state)?;
             match state {
                 PreparedState::ArkRefund { .. } => {
                     Err(invalid("A refund is executed without a binding"))?
+                }
+                PreparedState::ArkIntentDelete { .. } => {
+                    Err(invalid("An intent delete is executed without a binding"))?
                 }
                 PreparedState::ContractSigning { ark_funding } => {
                     if context.rule != generic::CONTRACT_RULE
@@ -1357,11 +1455,17 @@ impl EscrowVerifier for CoordinatorVerifier {
             {
                 return check_refund(&context, prepared, spend, invoice, *owed_sats);
             }
+            if let PreparedState::ArkIntentDelete { spend } = &state {
+                return check_intent_delete(&context, prepared, spend);
+            }
             let (bound, policy, terms) =
                 restore_binding(context.manifest, context.policy, context.bound_state)?;
             match state {
                 PreparedState::ArkRefund { .. } => {
                     Err(invalid("A refund is restored without a binding"))?
+                }
+                PreparedState::ArkIntentDelete { .. } => {
+                    Err(invalid("An intent delete is restored without a binding"))?
                 }
                 PreparedState::ContractSigning { ark_funding } => {
                     if context.rule != generic::CONTRACT_RULE

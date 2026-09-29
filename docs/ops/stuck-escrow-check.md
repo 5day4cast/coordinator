@@ -110,6 +110,15 @@ Read each row as one of these cases:
 
 Before this branch, cleanup never picked any of these rows up.
 
+`refund_error` = `the escrow is held by a queued Arkade batch intent` means Arkade refused the
+refund with `VTXO_ALREADY_REGISTERED`: a kickoff that never finished left its batch intent
+queued, and arkd keeps it until a batch confirms it or its owner deletes it. Cleanup deletes the
+intent with a proof over the escrow that pays nothing, then submits the refund again. The note
+stays while the delete fails, for instance because Keymeld's verifier predates delete proofs;
+the refund then keeps its swap instead of minting a new one each hour, and the log says why. An
+arkd operator can also remove the intent: `GET /v1/admin/intents` lists it, and
+`POST /v1/admin/intents/delete` deletes it. The next cleanup pass then refunds the escrow.
+
 ## 4. Coordinator: Arkade tickets whose swap it has not counted
 
 ```sql
@@ -166,6 +175,9 @@ The coordinator and ark-swapd log each of these once per ticket, swap, or compet
 debug while the condition lasts:
 
 - `Cannot refund the escrow of ticket … yet: …`: a refund is blocked, with the reason.
+- `Cannot refund … yet: its escrow … is held by an Arkade batch intent that cannot be deleted yet…`: section 3, `refund_error`.
+- `Deleted the Arkade batch intent that held the escrow of ticket …`: a refund freed its escrow, and every other escrow of that intent.
+- `kickoff intent … may still hold the escrows, since deleting it failed…`: a kickoff failed and left its intent queued; the pool's refunds, or its next kickoff, delete it.
 - `Cannot sign the refunds of competition …: N of its tickets can still be paid…`: refunds wait for those invoices to expire.
 - `… its ticket was counted after Keymeld was given the competition's roster…`: a ticket paid too late to join the roster; needs an operator.
 - `Escrow swap … for ticket … reports its player paid; waiting for Arkade to list the escrow VTXO…`: section 4.

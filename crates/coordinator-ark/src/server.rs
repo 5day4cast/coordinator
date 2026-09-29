@@ -7,12 +7,12 @@ use coordinator_ark_escrow::{
     EntryEscrow, EscrowTerms, RelativeTimelock, ServerRules, MAINNET_HRP, TESTNET_HRP,
 };
 
-use crate::Error;
+use crate::{ArkClient, Error};
 
 /// A connected Arkade server and its `/v1/info`.
 #[derive(Clone)]
 pub struct ArkServer {
-    client: ark_grpc::Client,
+    client: ArkClient,
     info: Info,
     rules: ServerRules,
 }
@@ -24,12 +24,13 @@ impl ArkServer {
         // This workspace compiles in both ring and aws-lc-rs, so rustls cannot pick one itself.
         // Install ring, unless the process has already chosen.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let mut client = ark_grpc::Client::new(url.into());
-        client.connect().await?;
-        let info = client.get_info().await?;
+        let url = url.into();
+        let mut grpc = ark_grpc::Client::new(url.clone());
+        grpc.connect().await?;
+        let info = grpc.get_info().await?;
         let rules = server_rules(&info)?;
         Ok(Self {
-            client,
+            client: ArkClient::new(grpc, &url, info.digest.clone())?,
             info,
             rules,
         })
@@ -42,14 +43,15 @@ impl ArkServer {
     #[cfg(feature = "test-utils")]
     pub fn offline(info: Info) -> Result<Self, Error> {
         let rules = server_rules(&info)?;
+        let url = "http://offline.invalid";
         Ok(Self {
-            client: ark_grpc::Client::new("http://offline.invalid".into()),
+            client: ArkClient::new(ark_grpc::Client::new(url.into()), url, String::new())?,
             info,
             rules,
         })
     }
 
-    pub fn client(&self) -> &ark_grpc::Client {
+    pub fn client(&self) -> &ArkClient {
         &self.client
     }
 
@@ -101,6 +103,7 @@ impl ArkServer {
         });
         let response = self
             .client
+            .grpc()
             .list_vtxos(GetVtxosRequest::new_for_addresses(addresses))
             .await?;
         Ok(response.vtxos)

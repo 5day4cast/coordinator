@@ -8,6 +8,9 @@
 //!   It moves nothing itself, since the batch still needs every forfeit.
 //! - A refund may spend only this escrow, through its refund leaf, once its locktime has passed.
 //!   It may pay only the swap that sends the player's own money to their Lightning Address.
+//! - A delete proof takes a batch intent that spends this escrow out of the server's queue.
+//!   It is an intent proof that pays nothing and proves a `delete` message, so it moves nothing.
+//!   The server holds a queued intent's escrows until a batch confirms it, refunds included.
 //! - A forfeit gives the escrow to the Arkade server once the batch's commitment transaction confirms.
 //!   It must spend a connector that descends from that commitment transaction.
 //!   The commitment transaction must pay the funding output.
@@ -19,11 +22,15 @@
 use coordinator_ark_escrow::{EntryEscrow, EscrowPath, RefundSwap, VtxoScript};
 use dlctix::bitcoin::absolute::LockTime;
 use dlctix::bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
-use dlctix::bitcoin::hashes::Hash;
+use dlctix::bitcoin::hashes::{sha256, Hash};
 use dlctix::bitcoin::sighash::{Prevouts, SighashCache};
 use dlctix::bitcoin::taproot::LeafVersion;
+use dlctix::bitcoin::transaction::Version;
 pub use dlctix::bitcoin::XOnlyPublicKey;
-use dlctix::bitcoin::{OutPoint, Psbt, ScriptBuf, TapLeafHash, TapSighashType, Transaction, TxOut};
+use dlctix::bitcoin::{
+    Amount, OutPoint, Psbt, ScriptBuf, Sequence, TapLeafHash, TapSighashType, Transaction, TxIn,
+    TxOut, Txid, Witness,
+};
 use dlctix::{ContractSignatures, Outcome};
 use serde::{Deserialize, Serialize};
 
@@ -91,6 +98,9 @@ pub enum ArkEscrowSpend {
         /// The pool contract's complete signature set, as JSON.
         contract_signatures: String,
     },
+    /// A proof deleting a queued batch intent that spends this escrow. Hex-encoded PSBT, and the
+    /// intent message it proves, as JSON.
+    DeleteIntent { proof_psbt: String, message: String },
 }
 
 /// The entry's escrow, from its consented tap tree.
@@ -211,6 +221,7 @@ pub fn spend_digests(
                 )?,
             )])
         }
+        ArkEscrowSpend::DeleteIntent { .. } => intent_delete_digests(escrow, spend),
     }
 }
 
@@ -241,6 +252,127 @@ pub fn intent_proof_digests(
         return reject("the intent proof does not spend this escrow");
     }
     Ok(digests)
+}
+
+/// The longest a delete proof may stay valid, from when it is signed. It is used at once.
+pub const MAX_DELETE_INTENT_LIFETIME_SECS: u64 = 10 * 60;
+
+/// This escrow's inputs in a delete proof, each with its sighash.
+///
+/// A delete proof is shaped like an intent proof, and the server checks it the same way, but it
+/// pays nothing: its only output is an empty `OP_RETURN`. Its message must be a `delete`, which
+/// the proof's message input commits to, so the signatures cannot register an intent instead.
+/// Other escrows of the pool may be among its inputs, as in the intent it deletes.
+pub fn intent_delete_digests(
+    escrow: &EntryEscrow,
+    spend: &ArkEscrowSpend,
+) -> Result<Vec<(usize, [u8; 32])>, ArkError> {
+    let ArkEscrowSpend::DeleteIntent {
+        proof_psbt,
+        message,
+    } = spend
+    else {
+        return reject("this spend is not a delete proof");
+    };
+    let proof = psbt(proof_psbt)?;
+    delete_message_expiry(message)?;
+    let pays_nothing = TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::new_op_return([]),
+    };
+    if proof.unsigned_tx.output != [pays_nothing] {
+        return reject("a delete proof pays nothing");
+    }
+    if proof.inputs.len() < 2 || proof.inputs.len() != proof.unsigned_tx.input.len() {
+        return reject("a delete proof spends a message input and at least one escrow");
+    }
+    let message_input = proof.inputs[0]
+        .witness_utxo
+        .as_ref()
+        .ok_or_else(|| ArkError("every input needs its witness UTXO".into()))?;
+    if message_input.value != Amount::ZERO {
+        return reject("a delete proof's message input holds nothing");
+    }
+    let proven = intent_message_outpoint(message, message_input.script_pubkey.clone());
+    if proof.unsigned_tx.input[0].previous_output != proven {
+        return reject("the delete proof does not prove its message");
+    }
+    let digests = own_inputs(escrow, &proof)?
+        .into_iter()
+        .map(|index| Ok((index, sighash(escrow, &proof, index)?)))
+        .collect::<Result<Vec<_>, _>>()?;
+    if digests.is_empty() {
+        return reject("the delete proof does not spend this escrow");
+    }
+    Ok(digests)
+}
+
+/// Check a delete proof's message is valid now, and not for longer than it needs.
+///
+/// Other spends are not checked. This belongs where a signature is authorized, not where one is
+/// later restored, since by then the proof may have expired.
+pub fn check_intent_delete_fresh(spend: &ArkEscrowSpend, now: u64) -> Result<(), ArkError> {
+    let ArkEscrowSpend::DeleteIntent { message, .. } = spend else {
+        return Ok(());
+    };
+    let expire_at = delete_message_expiry(message)?;
+    if expire_at <= now || expire_at > now.saturating_add(MAX_DELETE_INTENT_LIFETIME_SECS) {
+        return reject("the delete proof expires outside the window it may be used in");
+    }
+    Ok(())
+}
+
+/// The expiry of a `delete` intent message, which must be exactly as the server encodes it.
+fn delete_message_expiry(message: &str) -> Result<u64, ArkError> {
+    #[derive(Deserialize)]
+    struct Delete {
+        #[serde(rename = "type")]
+        kind: String,
+        expire_at: u64,
+    }
+    let parsed: Delete = serde_json::from_str(message)
+        .map_err(|_| ArkError("the delete proof's message is not a delete".into()))?;
+    // Re-encoded, so no other field, spacing or order hides in what the proof commits to.
+    let canonical = format!(r#"{{"type":"delete","expire_at":{}}}"#, parsed.expire_at);
+    if parsed.kind != "delete" || message != canonical {
+        return reject("the delete proof's message is not a delete");
+    }
+    Ok(parsed.expire_at)
+}
+
+/// The output an intent proof's first input spends: that of the BIP322 "to spend" transaction for
+/// the intent `message`, locked by `script_pubkey`.
+///
+/// Every signature over the proof commits to it, and so to the message. The message hash is
+/// tagged `ark-intent-proof-message`, as the server computes it.
+pub fn intent_message_outpoint(message: &str, script_pubkey: ScriptBuf) -> OutPoint {
+    let tag = sha256::Hash::hash(b"ark-intent-proof-message");
+    let mut tagged = Vec::with_capacity(64 + message.len());
+    tagged.extend_from_slice(tag.as_byte_array());
+    tagged.extend_from_slice(tag.as_byte_array());
+    tagged.extend_from_slice(message.as_bytes());
+    let hash = sha256::Hash::hash(&tagged);
+    let to_spend = Transaction {
+        version: Version::non_standard(0),
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Txid::all_zeros(),
+                vout: u32::MAX,
+            },
+            script_sig: dlctix::bitcoin::script::Builder::new()
+                .push_opcode(dlctix::bitcoin::opcodes::OP_0)
+                .push_slice(hash.as_byte_array())
+                .into_script(),
+            sequence: Sequence::ZERO,
+            witness: Witness::default(),
+        }],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey,
+        }],
+    };
+    OutPoint::new(to_spend.compute_txid(), 0)
 }
 
 /// An Arkade offchain spend takes two transactions, and the owner signs both.
@@ -902,5 +1034,195 @@ mod refund_tests {
         let deadline_too_far_out = REFUND_AT + 3_600 - MAX_REFUND_DEADLINE_SECS - 1;
         assert!(check_refund_deadline(&swap, deadline_too_far_out).is_err());
         assert!(check_refund_deadline(&swap, REFUND_AT).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod intent_delete_tests {
+    use super::*;
+    use coordinator_ark_escrow::{EscrowTerms, RelativeTimelock};
+
+    const EXPIRE_AT: u64 = 1_790_000_600;
+
+    fn xonly(byte: u8) -> XOnlyPublicKey {
+        let secp = dlctix::bitcoin::key::Secp256k1::new();
+        dlctix::bitcoin::secp256k1::SecretKey::from_slice(&[byte; 32])
+            .unwrap()
+            .x_only_public_key(&secp)
+            .0
+    }
+
+    fn escrow(player: u8) -> EntryEscrow {
+        EntryEscrow::new(EscrowTerms {
+            player: xonly(player),
+            coordinator: xonly(18),
+            server: xonly(21),
+            refund_locktime: LockTime::from_consensus(1_790_000_000),
+            exit_delay: RelativeTimelock::Seconds(2048),
+            unilateral_refund_delay: RelativeTimelock::Seconds(2048 + 512 * 100),
+        })
+        .unwrap()
+    }
+
+    fn message(expire_at: u64) -> String {
+        format!(r#"{{"type":"delete","expire_at":{expire_at}}}"#)
+    }
+
+    fn pays_nothing() -> Vec<TxOut> {
+        vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new_op_return([]),
+        }]
+    }
+
+    fn funding_leaf(psbt: &mut Psbt, index: usize, escrow: &EntryEscrow) {
+        psbt.inputs[index].tap_scripts.insert(
+            escrow.control_block(EscrowPath::Funding),
+            (
+                escrow.script(EscrowPath::Funding).clone(),
+                LeafVersion::TapScript,
+            ),
+        );
+    }
+
+    /// A proof over `escrows` proving `message` and paying `outputs`, shaped as ark-core builds
+    /// one: input 0 spends the message's output, locked like the first escrow.
+    fn proof(escrows: &[&EntryEscrow], message: &str, outputs: Vec<TxOut>) -> Psbt {
+        let first = escrows[0];
+        let input = |previous_output| TxIn {
+            previous_output,
+            sequence: Sequence::from_512_second_intervals(4),
+            ..Default::default()
+        };
+        let message_outpoint = intent_message_outpoint(message, first.script_pubkey());
+        let mut psbt =
+            Psbt::from_unsigned_tx(Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: std::iter::once(input(message_outpoint))
+                    .chain((1..=escrows.len()).map(|index| {
+                        input(OutPoint::new(Txid::from_byte_array([index as u8; 32]), 0))
+                    }))
+                    .collect(),
+                output: outputs,
+            })
+            .unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: first.script_pubkey(),
+        });
+        funding_leaf(&mut psbt, 0, first);
+        for (index, escrow) in escrows.iter().enumerate() {
+            psbt.inputs[index + 1].witness_utxo = Some(TxOut {
+                value: Amount::from_sat(5_500),
+                script_pubkey: escrow.script_pubkey(),
+            });
+            funding_leaf(&mut psbt, index + 1, escrow);
+        }
+        psbt
+    }
+
+    fn spend(proof: &Psbt, message: &str) -> ArkEscrowSpend {
+        ArkEscrowSpend::DeleteIntent {
+            proof_psbt: psbt_hex(proof),
+            message: message.into(),
+        }
+    }
+
+    fn indexes(escrow: &EntryEscrow, spend: &ArkEscrowSpend) -> Result<Vec<usize>, ArkError> {
+        intent_delete_digests(escrow, spend)
+            .map(|digests| digests.into_iter().map(|(index, _)| index).collect())
+    }
+
+    #[test]
+    fn each_escrow_signs_its_own_inputs_of_a_delete_proof() {
+        let (first, second) = (escrow(14), escrow(15));
+        let message = message(EXPIRE_AT);
+        let delete = spend(
+            &proof(&[&first, &second], &message, pays_nothing()),
+            &message,
+        );
+        assert_eq!(indexes(&first, &delete).unwrap(), vec![0, 1]);
+        assert_eq!(indexes(&second, &delete).unwrap(), vec![2]);
+        assert!(indexes(&escrow(16), &delete).is_err(), "not this escrow's");
+    }
+
+    #[test]
+    fn a_delete_proof_pays_nothing() {
+        let escrow = escrow(14);
+        let message = message(EXPIRE_AT);
+        let paying = |outputs: Vec<TxOut>| spend(&proof(&[&escrow], &message, outputs), &message);
+        let to_pool = TxOut {
+            value: Amount::from_sat(5_000),
+            script_pubkey: escrow.script_pubkey(),
+        };
+        assert!(indexes(&escrow, &paying(vec![to_pool.clone()])).is_err());
+        let valued_op_return = TxOut {
+            value: Amount::from_sat(1),
+            ..pays_nothing()[0].clone()
+        };
+        assert!(indexes(&escrow, &paying(vec![valued_op_return])).is_err());
+        let mut and_more = pays_nothing();
+        and_more.push(to_pool);
+        assert!(indexes(&escrow, &paying(and_more)).is_err());
+        assert!(indexes(&escrow, &paying(Vec::new())).is_err());
+        assert!(indexes(&escrow, &paying(pays_nothing())).is_ok());
+    }
+
+    #[test]
+    fn a_delete_proof_proves_a_delete_message_and_nothing_else() {
+        let escrow = escrow(14);
+        // A proof committed to a registration, even one that pays nothing, is not a delete.
+        let register = r#"{"type":"register","onchain_output_indexes":[],"valid_at":1790000000,"expire_at":1790000600,"cosigners_public_keys":[]}"#;
+        let registering = proof(&[&escrow], register, pays_nothing());
+        assert!(indexes(&escrow, &spend(&registering, register)).is_err());
+        assert!(indexes(&escrow, &spend(&registering, &message(EXPIRE_AT))).is_err());
+
+        // The message must be the one the proof commits to.
+        let delete = proof(&[&escrow], &message(EXPIRE_AT), pays_nothing());
+        assert!(indexes(&escrow, &spend(&delete, &message(EXPIRE_AT + 1))).is_err());
+
+        // And encoded exactly as the server encodes it.
+        let spaced = r#"{"type": "delete", "expire_at": 1790000600}"#;
+        let spaced_proof = proof(&[&escrow], spaced, pays_nothing());
+        assert!(indexes(&escrow, &spend(&spaced_proof, spaced)).is_err());
+        let extra = r#"{"type":"delete","expire_at":1790000600,"valid_at":0}"#;
+        let extra_proof = proof(&[&escrow], extra, pays_nothing());
+        assert!(indexes(&escrow, &spend(&extra_proof, extra)).is_err());
+    }
+
+    #[test]
+    fn a_delete_proof_is_signed_only_while_it_is_fresh() {
+        let escrow = escrow(14);
+        let message = message(EXPIRE_AT);
+        let delete = spend(&proof(&[&escrow], &message, pays_nothing()), &message);
+        assert!(check_intent_delete_fresh(&delete, EXPIRE_AT - 120).is_ok());
+        assert!(check_intent_delete_fresh(&delete, EXPIRE_AT).is_err());
+        let too_long = EXPIRE_AT - MAX_DELETE_INTENT_LIFETIME_SECS - 1;
+        assert!(check_intent_delete_fresh(&delete, too_long).is_err());
+        // Other spends carry no such message.
+        let intent = ArkEscrowSpend::IntentProof {
+            proof_psbt: psbt_hex(&proof(&[&escrow], &message, pays_nothing())),
+        };
+        assert!(check_intent_delete_fresh(&intent, EXPIRE_AT).is_ok());
+    }
+
+    #[test]
+    fn existing_spends_keep_their_encoding() {
+        let intent = ArkEscrowSpend::IntentProof {
+            proof_psbt: "00".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&intent).unwrap(),
+            r#"{"kind":"intent_proof","proof_psbt":"00"}"#
+        );
+        let delete = ArkEscrowSpend::DeleteIntent {
+            proof_psbt: "00".into(),
+            message: "{}".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&delete).unwrap(),
+            r#"{"kind":"delete_intent","proof_psbt":"00","message":"{}"}"#
+        );
     }
 }

@@ -8,6 +8,8 @@
 //! - [`EscrowSigner`]: Keymeld signs as each player, and the coordinator signs with its own key.
 //! - [`KickoffHooks::before_forfeits`]: runs once the commitment transaction is known, before anything is forfeited.
 //! - [`DlcKickoff`]: signs the pool's ticketed DLC in that hook, against the batch's funding output.
+//! - [`delete_pool_intent`], [`delete_escrow_intent`]: take escrows out of arkd's batch queue, where
+//!   an intent that was never confirmed would otherwise hold them.
 //!
 //! See `docs/QUEUED_COMPETITIONS.md`.
 
@@ -23,13 +25,16 @@ mod transport;
 
 pub use dlc::{ContractSigner, DlcKickoff, LocalContractSigner};
 pub use error::{BoxError, Error};
-pub use kickoff::{fund_pool, EscrowInput, Kickoff, KickoffConfig, KickoffHooks, PoolFunding};
+pub use kickoff::{
+    delete_escrow_intent, delete_pool_intent, fund_pool, EscrowInput, Kickoff, KickoffConfig,
+    KickoffHooks, PoolFunding,
+};
 pub use refund::{build_refund, sign_refund_ark_tx, sign_refund_checkpoint, RefundTransactions};
 pub use server::{address_hrp, escrow_terms, server_rules, ArkServer};
 pub use signer::{
     script_spend_sighash, EscrowSigner, KeypairSigner, SigningPurpose, SigningRequest,
 };
-pub use transport::{ArkTransport, EventStream, OffchainSubmission};
+pub use transport::{ArkClient, ArkTransport, EventStream, OffchainSubmission};
 
 /// What [`ArkTransport::vtxos`] lists, and the addresses it lists them for.
 pub use ark_core::server::VirtualTxOutPoint;

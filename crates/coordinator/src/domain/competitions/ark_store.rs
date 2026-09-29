@@ -493,6 +493,31 @@ impl CompetitionStore {
             .await
     }
 
+    /// Note why a minted refund is held back, or clear the note with `None`.
+    ///
+    /// Only a refund still `minted` is touched, and nothing else about it changes.
+    pub async fn note_minted_ticket_ark_refund(
+        &self,
+        ticket_id: Uuid,
+        error: Option<String>,
+    ) -> Result<(), DatabaseWriteError> {
+        let updated_at = OffsetDateTime::now_utc().unix_timestamp();
+        self.db_connection
+            .execute_write(move |pool| async move {
+                sqlx::query(
+                    "UPDATE ticket_ark_refunds SET error = ?, updated_at = ?
+                     WHERE ticket_id = ? AND state = 'minted'",
+                )
+                .bind(error)
+                .bind(updated_at)
+                .bind(ticket_id.to_string())
+                .execute(&pool)
+                .await?;
+                Ok(())
+            })
+            .await
+    }
+
     /// Move a refund on, once the step before it is done.
     ///
     /// What is already recorded is kept: a step that learns nothing new passes `None`.

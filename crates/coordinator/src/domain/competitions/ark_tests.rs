@@ -189,6 +189,10 @@ struct Enclaves {
     signatures: AtomicUsize,
     /// Why Keymeld refuses to sign refunds, if it does.
     refusal: Mutex<Option<String>>,
+    /// Refuse proofs deleting an intent, as a verifier from before they were allowed does.
+    refuse_deletes: AtomicBool,
+    /// How many delete proofs Keymeld signed.
+    deletes: AtomicUsize,
 }
 
 #[async_trait]
@@ -298,6 +302,38 @@ impl Keymeld for Enclaves {
                 key,
             )
             .serialize())
+    }
+    /// Sign as the player each input the verifier derives for a delete proof.
+    async fn sign_ark_intent_delete(
+        &self,
+        _: &DlcKeygenSession,
+        user: UserId,
+        spend: ArkEscrowSpend,
+    ) -> Result<Vec<(usize, [u8; 64])>, KeymeldError> {
+        if self.refuse_deletes.load(Ordering::SeqCst) {
+            return Err(KeymeldError::Signing(
+                "Unsupported Coordinator verifier action".into(),
+            ));
+        }
+        assert!(
+            self.registered.lock().unwrap().contains(&user),
+            "Keymeld signs only for a registered entry"
+        );
+        let players = self.players.lock().unwrap();
+        let (key, escrow, _) = players.get(&user).expect("a known player");
+        let digests = coordinator_escrow::ark::intent_delete_digests(escrow, &spend).unwrap();
+        self.deletes.fetch_add(1, Ordering::SeqCst);
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        Ok(digests
+            .into_iter()
+            .map(|(input, digest)| {
+                let message = bitcoin::secp256k1::Message::from_digest(digest);
+                (
+                    input,
+                    secp.sign_schnorr_no_aux_rand(&message, key).serialize(),
+                )
+            })
+            .collect())
     }
     fn is_enabled(&self) -> bool {
         true
@@ -481,7 +517,7 @@ impl Fixture {
             .server
             .escrow_terms(
                 xonly(&keypair(player)),
-                xonly(&keypair(22)),
+                coordinator_key(),
                 refund_at,
                 refund_at.min(now) - 60 * 60,
             )
@@ -794,6 +830,18 @@ impl Fixture {
         self.store().ticket_ark_refund(ticket.id).await.unwrap()
     }
 
+    /// A kickoff's batch intent, never confirmed, holds the escrows of `players`' tickets.
+    fn intent_holds(&self, players: &[u8]) {
+        let signers = players
+            .iter()
+            .map(|player| {
+                let keys = [xonly(&keypair(*player)), coordinator_key()];
+                (outpoint(*player, 0), keys)
+            })
+            .collect();
+        self.arkd.queue_intent("kickoff-intent", signers);
+    }
+
     /// The offchain spends Arkade took, and how many of them were finalized.
     fn spends(&self) -> (usize, usize) {
         let state = self.arkd.state.lock().unwrap();
@@ -872,6 +920,17 @@ fn session_for(players: &[UserId]) -> DlcKeygenSession {
         aggregate_key: vec![],
         outcome_subset_ids: BTreeMap::new(),
     }
+}
+
+/// The coordinator's key, which the mock Bitcoin client derives as 1.
+fn coordinator_key() -> bitcoin::XOnlyPublicKey {
+    let mut secret = [0; 32];
+    secret[31] = 1;
+    let secret = bitcoin::secp256k1::SecretKey::from_slice(&secret).unwrap();
+    xonly(&Keypair::from_secret_key(
+        &bitcoin::secp256k1::Secp256k1::new(),
+        &secret,
+    ))
 }
 
 fn outpoint(byte: u8, vout: u32) -> OutPoint {
@@ -1632,5 +1691,103 @@ async fn the_registration_sent_before_paying_is_the_one_the_entry_registers() {
         )
         .await
         .unwrap();
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_kickoff_intent_left_queued_is_deleted_so_the_refunds_complete() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let first = f.funded(&session, 21, true).await;
+    let second = f.funded(&session, 23, true).await;
+    f.intent_holds(&[21, 23]);
+    f.cancel().await;
+
+    f.clean_up().await;
+    for ticket in [&first, &second] {
+        assert_eq!(
+            f.refund(ticket).await.unwrap().state,
+            ArkRefundState::Settled
+        );
+    }
+    assert!(f.arkd.queued().is_empty());
+    assert_eq!(
+        f.arkd.state.lock().unwrap().deleted,
+        vec!["kickoff-intent"],
+        "the first refund's proof deleted the whole intent, freeing both escrows"
+    );
+    assert_eq!(f.enclaves.deletes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.spends(),
+        (2, 2),
+        "each escrow was spent into its swap once"
+    );
+    // The held refund was not signed again to be resubmitted.
+    assert_eq!(f.enclaves.signatures.load(Ordering::SeqCst), 4);
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 2);
+    assert_eq!(f.ln.payments_sent(), 2);
+    assert!(!f.awaiting_cleanup().await);
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_refund_held_by_an_intent_that_cannot_be_deleted_waits_without_minting_again() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let ticket = f.funded(&session, 21, true).await;
+    f.intent_holds(&[21]);
+    f.enclaves.refuse_deletes.store(true, Ordering::SeqCst);
+    f.cancel().await;
+
+    f.clean_up().await;
+    let held = f.refund(&ticket).await.unwrap();
+    assert_eq!(held.state, ArkRefundState::Minted);
+    assert_eq!(
+        held.error.as_deref(),
+        Some(super::ark_refund::HELD_BY_INTENT)
+    );
+    assert_eq!(f.spends(), (0, 0), "Arkade refused it");
+    assert_eq!(f.enclaves.signatures.load(Ordering::SeqCst), 1);
+
+    // Hours on, its swap is stale, but a fresh one would be refused as well.
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    f.swaps.age(held.refund_id, now as u32 + 60);
+    let ticket_id = ticket.id.to_string();
+    f.database
+        .execute_write(move |pool| async move {
+            sqlx::query(
+                "UPDATE ticket_ark_refunds SET created_at = created_at - 7200 WHERE ticket_id = ?",
+            )
+            .bind(ticket_id)
+            .execute(&pool)
+            .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        f.clean_up().await;
+    }
+    let still = f.refund(&ticket).await.unwrap();
+    assert_eq!(still.refund_id, held.refund_id, "not minted again");
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.enclaves.signatures.load(Ordering::SeqCst),
+        1,
+        "nothing is signed while the escrow is held"
+    );
+    assert_eq!(f.ln.payments_sent(), 0);
+
+    // Once Keymeld signs the delete, the escrow is freed, the stale refund minted again, and paid.
+    f.enclaves.refuse_deletes.store(false, Ordering::SeqCst);
+    f.clean_up().await;
+    let refund = f.refund(&ticket).await.unwrap();
+    assert_eq!(refund.state, ArkRefundState::Settled);
+    assert_ne!(refund.refund_id, held.refund_id);
+    assert_eq!(refund.error, None);
+    assert!(f.arkd.queued().is_empty());
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 2);
+    assert_eq!(f.spends(), (1, 1));
+    assert_eq!(f.ln.payments_sent(), 1);
     f.database.close().await.unwrap();
 }

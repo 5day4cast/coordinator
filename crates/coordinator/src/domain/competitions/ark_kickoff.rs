@@ -3,7 +3,8 @@
 //! The batch spends the pool's escrow VTXOs into its dlctix funding output.
 //! Keymeld holds each player's entry key and signs as them:
 //!
-//! 1. The intent proof, for each player's escrow.
+//! 1. The intent proof, for each player's escrow. If the kickoff fails before any forfeit, a
+//!    proof deleting that intent, so the escrows are not left in the Arkade server's queue.
 //! 2. The whole contract, once the batch's commitment transaction fixes the funding outpoint.
 //! 3. Each player's forfeit, only after the contract is signed.
 //!
@@ -89,6 +90,10 @@ impl KeymeldArkPool {
         Ok(match &request.purpose {
             SigningPurpose::IntentProof => ArkEscrowSpend::IntentProof {
                 proof_psbt: psbt_hex(&request.psbt),
+            },
+            SigningPurpose::DeleteIntent { message } => ArkEscrowSpend::DeleteIntent {
+                proof_psbt: psbt_hex(&request.psbt),
+                message: message.clone(),
             },
             SigningPurpose::Forfeit {
                 commitment_tx,
@@ -189,5 +194,48 @@ impl EscrowSigner for KeymeldArkPool {
             .into_iter()
             .map(|signature| signature.expect("every request is in a group"))
             .collect())
+    }
+}
+
+/// Keymeld as one player's signer for a proof deleting a queued batch intent that holds their
+/// escrow, outside any pool: unbound, under the refund's permission.
+pub struct KeymeldIntentDelete<'a> {
+    pub keymeld: &'a dyn Keymeld,
+    pub session: &'a DlcKeygenSession,
+    pub user: UserId,
+}
+
+#[async_trait]
+impl EscrowSigner for KeymeldIntentDelete<'_> {
+    /// One Keymeld round trip, signing every input of the player's escrow in the proof.
+    async fn sign(&self, requests: &[SigningRequest]) -> Result<Vec<schnorr::Signature>, BoxError> {
+        let Some(first) = requests.first() else {
+            return Ok(Vec::new());
+        };
+        let SigningPurpose::DeleteIntent { message } = &first.purpose else {
+            return Err("outside a pool, Keymeld signs only a proof deleting an intent".into());
+        };
+        if requests.iter().any(|request| request.psbt != first.psbt) {
+            return Err("a delete proof is signed one proof at a time".into());
+        }
+        let spend = ArkEscrowSpend::DeleteIntent {
+            proof_psbt: psbt_hex(&first.psbt),
+            message: message.clone(),
+        };
+        let signed = self
+            .keymeld
+            .sign_ark_intent_delete(self.session, self.user.clone(), spend)
+            .await?;
+        requests
+            .iter()
+            .map(|request| {
+                let input = request.input_index;
+                let (_, signature) = signed
+                    .iter()
+                    .find(|(signed_input, _)| *signed_input == input)
+                    .ok_or_else(|| format!("Keymeld did not sign input {input}"))?;
+                Ok(schnorr::Signature::from_slice(signature)?)
+            })
+            .collect()
     }
 }

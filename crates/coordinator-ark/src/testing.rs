@@ -3,6 +3,10 @@
 //! The mock checks every signature the way arkd would, from the PSBTs alone.
 //! It plays one batch: selection, a connector tree, the commitment transaction, and finalization.
 //! Events from an unrelated batch are mixed in, and the kickoff must ignore them.
+//!
+//! Like arkd, it keeps a registered intent queued until a batch confirms it or a delete proof
+//! removes it, and meanwhile refuses offchain spends of its VTXOs with
+//! [`Error::VtxoAlreadyRegistered`].
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -108,6 +112,8 @@ pub struct MockArkd {
     pub batch_nonce: u8,
     pub forfeit_script: ScriptBuf,
     pub dust: Amount,
+    /// Whether a batch selects the registered intent. Without, it stays queued.
+    pub selects: bool,
     pub sender: mpsc::UnboundedSender<Result<StreamEvent, Error>>,
     pub receiver: Mutex<Option<mpsc::UnboundedReceiver<Result<StreamEvent, Error>>>>,
     pub state: Mutex<MockState>,
@@ -121,8 +127,21 @@ pub struct OffchainSpend {
     pub finalized: Vec<Psbt>,
 }
 
+/// An intent waiting in the batch queue, with the funding leaf keys of the VTXOs it spends.
+#[derive(Clone)]
+pub struct QueuedIntent {
+    pub id: String,
+    pub signers: HashMap<OutPoint, [XOnlyPublicKey; 2]>,
+}
+
 #[derive(Default)]
 pub struct MockState {
+    /// Intents registered but neither confirmed by a batch nor deleted.
+    pub queued: Vec<QueuedIntent>,
+    /// The IDs of the intents delete proofs removed, in order.
+    pub deleted: Vec<String>,
+    /// How many delete proofs were presented, whether or not they matched an intent.
+    pub delete_proofs: usize,
     /// The offchain spends submitted, in order, and what was finalized for each.
     pub offchain: Vec<OffchainSpend>,
     /// VTXOs this server lists, by the address whose script they pay. A finalized offchain
@@ -159,6 +178,7 @@ impl MockArkd {
             batch_nonce: 0,
             forfeit_script: info.forfeit_address.script_pubkey(),
             dust: info.dust,
+            selects: true,
             sender,
             receiver: Mutex::new(Some(receiver)),
             state: Mutex::default(),
@@ -176,6 +196,7 @@ impl MockArkd {
             batch_nonce: 0,
             forfeit_script: info.forfeit_address.script_pubkey(),
             dust: info.dust,
+            selects: true,
             sender,
             receiver: Mutex::new(Some(receiver)),
             state: Mutex::default(),
@@ -212,6 +233,30 @@ impl MockArkd {
             assets: Vec::new(),
             depth: 0,
         });
+    }
+
+    /// Queue an intent spending `signers`' VTXOs, as a kickoff that never finished leaves one.
+    pub fn queue_intent(&self, id: &str, signers: HashMap<OutPoint, [XOnlyPublicKey; 2]>) {
+        self.state.lock().unwrap().queued.push(QueuedIntent {
+            id: id.into(),
+            signers,
+        });
+    }
+
+    /// A server whose batches never select the intent, so it stays queued.
+    pub fn never_selecting(mut self) -> Self {
+        self.selects = false;
+        self
+    }
+
+    /// The IDs of the intents still queued.
+    pub fn queued(&self) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        state
+            .queued
+            .iter()
+            .map(|intent| intent.id.clone())
+            .collect()
     }
 
     /// A later batch, whose commitment transaction differs from the first mock's.
@@ -276,7 +321,34 @@ impl ArkTransport for MockArkd {
             let outpoint = proof.unsigned_tx.input[index].previous_output;
             MockArkd::check_leaf_signatures(proof, index, self.signers[&outpoint]);
         }
-        self.state.lock().unwrap().outputs = Some(outputs);
+        {
+            let mut state = self.state.lock().unwrap();
+            let spent = proof.unsigned_tx.input[1..]
+                .iter()
+                .map(|input| input.previous_output)
+                .collect::<Vec<_>>();
+            // arkd pushes an intent only if no queued intent spends the same VTXOs.
+            if state.queued.iter().any(|queued| {
+                spent
+                    .iter()
+                    .any(|outpoint| queued.signers.contains_key(outpoint))
+            }) {
+                return Err(Error::Protocol(
+                    "duplicated input, already registered by another intent".into(),
+                ));
+            }
+            state.outputs = Some(outputs);
+            state.queued.push(QueuedIntent {
+                id: INTENT_ID.into(),
+                signers: spent
+                    .iter()
+                    .map(|outpoint| (*outpoint, self.signers[outpoint]))
+                    .collect(),
+            });
+        }
+        if !self.selects {
+            return Ok(INTENT_ID.into());
+        }
 
         // Another batch's traffic, which the kickoff must ignore.
         self.send(StreamEvent::BatchStarted(BatchStartedEvent {
@@ -297,9 +369,71 @@ impl ArkTransport for MockArkd {
         Ok(INTENT_ID.into())
     }
 
+    /// Deletes every queued intent spending an input of the proof, as arkd does.
+    ///
+    /// The proof must pay nothing and prove a `delete` message, and each input the mock knows
+    /// the keys of must carry both funding leaf signatures.
+    async fn delete_intent(&self, proof: Intent) -> Result<(), Error> {
+        let message = proof.serialize_message()?;
+        assert!(
+            message.starts_with(r#"{"type":"delete","#),
+            "a delete proof proves a delete message, not {message}"
+        );
+        let psbt = &proof.proof;
+        assert_eq!(
+            psbt.unsigned_tx.output,
+            vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::new_op_return([]),
+            }],
+            "a delete proof pays nothing"
+        );
+        let mut state = self.state.lock().unwrap();
+        state.delete_proofs += 1;
+        let keys = |outpoint: &OutPoint| {
+            state
+                .queued
+                .iter()
+                .find_map(|queued| queued.signers.get(outpoint))
+                .or_else(|| self.signers.get(outpoint))
+                .copied()
+        };
+        // Input 0 is the BIP322 message input, locked like the first escrow.
+        let first = psbt.unsigned_tx.input[1].previous_output;
+        if let Some(keys) = keys(&first) {
+            MockArkd::check_leaf_signatures(psbt, 0, keys);
+        }
+        let mut spent = Vec::new();
+        for index in 1..psbt.inputs.len() {
+            let outpoint = psbt.unsigned_tx.input[index].previous_output;
+            if let Some(keys) = keys(&outpoint) {
+                MockArkd::check_leaf_signatures(psbt, index, keys);
+            }
+            spent.push(outpoint);
+        }
+        let (matching, kept) = std::mem::take(&mut state.queued)
+            .into_iter()
+            .partition::<Vec<_>, _>(|queued| {
+                spent
+                    .iter()
+                    .any(|outpoint| queued.signers.contains_key(outpoint))
+            });
+        state.queued = kept;
+        if matching.is_empty() {
+            return Err(Error::NoMatchingIntent(
+                "INVALID_INTENT_PROOF (23): no matching intents found for intent proof".into(),
+            ));
+        }
+        state
+            .deleted
+            .extend(matching.into_iter().map(|queued| queued.id));
+        Ok(())
+    }
+
     /// Co-signs an offchain spend, as the server does between the owner's two signatures.
     ///
     /// The owner must have signed the Ark transaction already, since the server is second on it.
+    /// A VTXO a queued intent spends is refused, as arkd refuses it.
     async fn submit_offchain(
         &self,
         ark_tx: Psbt,
@@ -309,7 +443,22 @@ impl ArkTransport for MockArkd {
             !ark_tx.inputs[0].tap_script_sigs.is_empty(),
             "the owner signs the Ark transaction before submitting it"
         );
-        self.state.lock().unwrap().offchain.push(OffchainSpend {
+        let mut state = self.state.lock().unwrap();
+        let held = checkpoints
+            .iter()
+            .flat_map(|checkpoint| &checkpoint.unsigned_tx.input)
+            .any(|input| {
+                state
+                    .queued
+                    .iter()
+                    .any(|queued| queued.signers.contains_key(&input.previous_output))
+            });
+        if held {
+            return Err(Error::VtxoAlreadyRegistered(
+                "VTXO_ALREADY_REGISTERED (4): vtxo(s) already registered".into(),
+            ));
+        }
+        state.offchain.push(OffchainSpend {
             ark_tx: ark_tx.clone(),
             checkpoints: checkpoints.clone(),
             finalized: Vec::new(),
@@ -375,6 +524,8 @@ impl ArkTransport for MockArkd {
     async fn confirm_registration(&self, intent_id: String) -> Result<(), Error> {
         assert_eq!(intent_id, INTENT_ID);
         let mut state = self.state.lock().unwrap();
+        // The batch took the intent out of the queue when it selected it.
+        state.queued.retain(|queued| queued.id != intent_id);
         let mut outputs = state.outputs.clone().unwrap();
         if self.commitment == Commitment::PaysSomeoneElse {
             outputs[0].script_pubkey = p2tr(66);

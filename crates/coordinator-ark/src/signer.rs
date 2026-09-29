@@ -26,6 +26,14 @@ pub enum SigningPurpose {
     ///
     /// It proves ownership and names the pool's funding output. It moves nothing by itself.
     IntentProof,
+    /// A proof deleting a queued intent that spends the escrow.
+    ///
+    /// It pays nothing: its only output is an empty `OP_RETURN`, and `message` is the `delete`
+    /// intent message it proves. It moves nothing, and only takes the escrow out of the batch queue.
+    DeleteIntent {
+        /// The intent message, as JSON. The proof's first input commits to it.
+        message: String,
+    },
     /// A forfeit, giving the escrow to the server once `commitment_txid` confirms.
     ///
     /// The forfeit also spends a connector from that commitment transaction, so it is void without it.
@@ -43,7 +51,7 @@ impl SigningPurpose {
     /// The commitment transaction a forfeit depends on.
     pub fn commitment_txid(&self) -> Option<Txid> {
         match self {
-            SigningPurpose::IntentProof => None,
+            SigningPurpose::IntentProof | SigningPurpose::DeleteIntent { .. } => None,
             SigningPurpose::Forfeit { commitment_tx, .. } => Some(commitment_tx.compute_txid()),
         }
     }

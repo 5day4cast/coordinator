@@ -29,8 +29,9 @@ pub const SETTLEMENT_RULE: &str = "settlement_completed";
 /// Signs spends of the entry's Arkade escrow VTXO, when the ticket has one.
 pub const SIGN_ARK_ESCROW: &str = "sign_ark_escrow";
 pub const ARK_ESCROW_RULE: &str = "ark_escrow_spend_allowed";
-/// Signs the refund of an escrow whose competition never kicked off. Unbound, because a pool
-/// that never filled has no contract and may have no completed keygen session.
+/// Signs the refund of an escrow whose competition never kicked off, and the delete proof that
+/// frees the escrow from a batch intent left queued. Unbound, because a pool that never filled
+/// has no contract and may have no completed keygen session.
 pub const SIGN_ARK_REFUND: &str = "sign_ark_refund";
 pub const ARK_REFUND_RULE: &str = "ark_refund_allowed";
 
@@ -80,6 +81,12 @@ pub enum ActionParameters {
         /// What the swap service keeps, capped by the player's consented policy.
         fee_sats: u64,
     },
+    /// Sign a proof deleting a queued batch intent that holds the entry's escrow; `spend` is an
+    /// [`ArkEscrowSpend::DeleteIntent`]. See [`crate::ark`].
+    ///
+    /// Granted by the refund permission and unbound like a refund, since it is what lets a refund
+    /// through when a kickoff that never finished left its intent queued. It moves nothing.
+    DeleteArkIntent { spend: ArkEscrowSpend },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
