@@ -56,6 +56,12 @@ fn encode_witness(elements: &[Vec<u8>]) -> Vec<u8> {
     bytes
 }
 
+/// The condition witness that satisfies a refund swap's claim condition: see
+/// [`ArkWallet::claim_refund_swap`].
+fn claim_condition_witness(preimage: &[u8; 32]) -> Vec<u8> {
+    encode_witness(&[vec![0x01], preimage.to_vec()])
+}
+
 pub struct ArkWallet {
     client: ArkClient,
     server: ArkServer,
@@ -231,6 +237,12 @@ impl ArkWallet {
         )
         .map_err(|error| anyhow::anyhow!("build the claim: {error}"))?;
 
+        // The claim leaf is `SHA256 <hash> EQUALVERIFY VERIFY <swapper> CHECKSIGVERIFY <server>
+        // CHECKSIG`. EQUALVERIFY leaves nothing for the leaf's VERIFY, so a true element sits
+        // under the preimage. arkd evaluates the condition on its own and needs exactly one true
+        // element left; with the preimage alone the stack ends empty, which arkd reports as
+        // INVALID_SIGNATURE.
+        let condition_witness = claim_condition_witness(&preimage);
         let sign = |input: &mut psbt::Input,
                     message: secp256k1::Message|
          -> Result<
@@ -239,7 +251,7 @@ impl ArkWallet {
         > {
             input
                 .unknown
-                .insert(condition_key(), encode_witness(&[preimage.to_vec()]));
+                .insert(condition_key(), condition_witness.clone());
             let signature = Secp256k1::new().sign_schnorr_no_aux_rand(&message, &self.keypair);
             Ok(vec![(signature, self.keypair.x_only_public_key().0)])
         };
@@ -469,6 +481,50 @@ fn payment_among(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The claim leaf ends its condition in EQUALVERIFY and then runs VERIFY, so the witness
+    /// must put a true element under the preimage: `[0x01, preimage]`, encoded as a count, then
+    /// each length and value. With the preimage alone, arkd's condition check (and Script)
+    /// finds an empty stack, which arkd reports as INVALID_SIGNATURE.
+    #[test]
+    fn the_claim_witness_leaves_one_true_element_for_the_claim_leaf() {
+        use bitcoin::opcodes::all::{OP_EQUALVERIFY, OP_SHA256, OP_VERIFY};
+        use coordinator_ark_escrow::{RelativeTimelock, SwapTerms};
+        let key = |byte: u8| {
+            bitcoin::secp256k1::SecretKey::from_slice(&[byte; 32])
+                .unwrap()
+                .x_only_public_key(&Secp256k1::new())
+                .0
+        };
+        let deadline = bitcoin::absolute::LockTime::from_time(1_800_000_000).unwrap();
+        let exit_delay = RelativeTimelock::Seconds(512 * 10);
+        let payment_hash = [7u8; 32];
+        let swap = RefundSwap::new(SwapTerms {
+            player: key(1),
+            swapper: key(2),
+            server: key(3),
+            payment_hash,
+            deadline,
+            exit_delay,
+            unilateral_reclaim_delay: SwapTerms::unilateral_reclaim_delay_for(
+                deadline,
+                exit_delay,
+                1_799_000_000,
+            )
+            .unwrap(),
+        })
+        .unwrap();
+        let leaf = swap.script(SwapPath::Claim).as_bytes();
+        let mut condition = vec![OP_SHA256.to_u8(), 32];
+        condition.extend_from_slice(&payment_hash);
+        condition.extend([OP_EQUALVERIFY.to_u8(), OP_VERIFY.to_u8()]);
+        assert_eq!(&leaf[..condition.len()], condition.as_slice());
+
+        let preimage = [9u8; 32];
+        let mut expected = vec![2, 1, 1, 32];
+        expected.extend_from_slice(&preimage);
+        assert_eq!(claim_condition_witness(&preimage), expected);
+    }
 
     fn vtxo(
         txid: u8,
