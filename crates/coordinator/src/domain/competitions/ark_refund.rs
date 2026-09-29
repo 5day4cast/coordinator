@@ -177,7 +177,22 @@ impl Coordinator {
                 return;
             }
         };
-        let now = OffsetDateTime::now_utc().unix_timestamp();
+        // arkd opens a refund leaf's locktime by the chain's time, which lags the clock. Checked
+        // by the clock alone, a refund went out a little early and was refused
+        // (FORFEIT_CLOSURE_LOCKED) until the blocks caught up.
+        let now = match self
+            .bitcoin
+            .get_confirmed_blockchain_time(crate::infra::bitcoin::REQUIRED_CONFIRMATIONS_FOR_TIME)
+            .await
+        {
+            Ok(chain_time) => i64::try_from(chain_time)
+                .unwrap_or(i64::MAX)
+                .min(OffsetDateTime::now_utc().unix_timestamp()),
+            Err(e) => {
+                debug!("Cannot read the chain's time to refund competition {competition_id}: {e}");
+                return;
+            }
+        };
         let mut open = Vec::new();
         for escrow in escrows {
             let ticket_id = escrow.ticket_id;
