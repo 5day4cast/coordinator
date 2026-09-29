@@ -49,6 +49,21 @@ pub enum Error {
 }
 
 impl Error {
+    /// A refusal the player can act on, such as a full competition or a used ticket, rather
+    /// than a fault. Routes log these as warnings, so errors mean something is broken.
+    pub fn is_refusal(&self) -> bool {
+        matches!(
+            self,
+            Error::NoAvailableTickets
+                | Error::CompetitionFull
+                | Error::BadRequest(_)
+                | Error::NotFound(_)
+                | Error::InvalidSignature(_)
+                | Error::FeeEstimateUnavailable
+                | Error::EntriesPaused
+        )
+    }
+
     /// The error with its causes, for logs. Players see `Bitcoin` errors only as "internal
     /// error", which says nothing to an operator.
     pub fn detail(&self) -> String {

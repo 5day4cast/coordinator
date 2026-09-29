@@ -8,7 +8,7 @@ use dlctix::{
     musig2::{AggNonce, PartialSignature, PubNonce},
     SigMap,
 };
-use log::{debug, error};
+use log::{debug, error, warn};
 use nostr::ToBech32;
 use serde::Deserialize;
 use std::str::FromStr;
@@ -120,7 +120,11 @@ pub async fn request_competition_ticket(
         .await
         .map(Json)
         .map_err(|e| {
-            error!("error requesting ticket: {:?}", e);
+            if e.is_refusal() {
+                warn!("ticket request for {competition_id} refused: {e}");
+            } else {
+                error!("error requesting ticket for {competition_id}: {}", e.detail());
+            }
             e.into()
         })
 }
@@ -199,7 +203,11 @@ pub async fn add_event_entry(
         .await
         .map(Json)
         .map_err(|e| {
-            error!("error adding entry: {:?}", e);
+            if e.is_refusal() {
+                warn!("entry refused: {e}");
+            } else {
+                error!("error adding entry: {}", e.detail());
+            }
             e.into()
         })
 }
