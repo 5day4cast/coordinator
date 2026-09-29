@@ -136,7 +136,10 @@ impl Keymeld for Escrow {
         assert!(matches!(request.method, PayoutMethod::Automatic));
         assert_eq!(request.binding_receipt, hex::encode("bound-contract"));
         assert!(!request.contract_signatures.is_empty());
-        assert!(!request.attestation.is_empty());
+        assert!(request
+            .attestation
+            .as_deref()
+            .is_some_and(|attestation| !attestation.is_empty()));
         if let Some(response) = self
             .prepared
             .lock()

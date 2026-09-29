@@ -58,7 +58,9 @@ pub enum ActionParameters {
     PrepareSettlement {
         claim_id: Uuid,
         contract_signatures: String,
-        attestation: String,
+        /// `None` settles on the expiry outcome; see [`crate::payout::settled_outcome`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<String>,
         method: PayoutMethod,
         /// For an Arkade-funded pool: the commitment transaction that fixes the funding outpoint.
         #[serde(default, skip_serializing_if = "Option::is_none")]

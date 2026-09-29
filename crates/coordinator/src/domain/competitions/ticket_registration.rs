@@ -226,7 +226,6 @@ impl CompetitionStore {
                         WHERE (t.paid_at IS NULL
                                AND (t.hash != r.ticket_hash OR t.reserved_by IS NULL))
                            OR c.completed_at IS NOT NULL
-                           OR c.expiry_broadcasted_at IS NOT NULL
                            OR ((c.cancelled_at IS NOT NULL OR c.failed_at IS NOT NULL
                                 OR (c.kind = 'queued' AND c.pools_formed_at IS NOT NULL))
                                AND NOT EXISTS (

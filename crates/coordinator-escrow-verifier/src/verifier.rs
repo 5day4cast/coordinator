@@ -1145,9 +1145,11 @@ impl EscrowVerifier for CoordinatorVerifier {
                             serde_json::from_str(&contract_signatures).map_err(invalid)?;
                         payout::verify_completed_contract(&contract, &signatures)
                             .map_err(invalid)?;
-                        let outcome = payout::attested_outcome(
+                        let attestation = attestation.as_deref().map(hex32).transpose()?;
+                        let outcome = payout::settled_outcome(
                             &contract.contract_parameters,
-                            &hex32(&attestation)?,
+                            attestation.as_ref(),
+                            now()?,
                         )
                         .map_err(invalid)?;
                         let owed_sats = payout::owed_sats(

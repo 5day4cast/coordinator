@@ -58,7 +58,9 @@ impl HasCompetitionData for Attested {
 
 /// State where the event expired and the expiry transaction was broadcast.
 ///
-/// This is the refund path - all participants get their funds back.
+/// Only rows from before the expiry transaction was recorded as the outcome transaction load
+/// here; the coordinator records it and settles them as `OutcomeBroadcasted` on
+/// `Outcome::Expiry`, the refund.
 #[derive(Debug, Clone)]
 pub struct ExpiryBroadcasted {
     pub competition_id: Uuid,

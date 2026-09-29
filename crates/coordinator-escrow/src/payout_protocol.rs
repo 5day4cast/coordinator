@@ -68,7 +68,10 @@ pub struct PreparePayoutRequest {
     pub binding_receipt: String,
     /// Serialized dlctix::ContractSignatures, never a caller's signing receipt.
     pub contract_signatures: String,
-    pub attestation: String,
+    /// Hex of the oracle's attestation scalar; `None` settles on the expiry outcome, which
+    /// the verifier accepts only once the contract has expired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<String>,
     pub method: PayoutMethod,
     /// The batch that funded an Arkade pool, whose contract is bound without a funding outpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]

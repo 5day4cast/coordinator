@@ -75,10 +75,7 @@ impl Coordinator {
                  on-chain, but it was stopped as failed or cancelled"
             );
         }
-        if competition.is_cancelled()
-            || competition.is_completed()
-            || competition.is_expiry_broadcasted()
-        {
+        if competition.is_cancelled() || competition.is_completed() {
             return Ok(Step::Finished);
         }
         if let Some(failed_at) = competition.failed_at {

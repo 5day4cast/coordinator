@@ -187,7 +187,7 @@ impl Fixture {
             ark_funding: None,
             claim_id: attempt.attempt_id,
             contract_signatures: serde_json::to_string(&sign_contract(&self.contract)).unwrap(),
-            attestation: hex::encode([4; 32]),
+            attestation: Some(hex::encode([4; 32])),
             method: PayoutMethod::Invoice {
                 invoice,
                 authorization,
@@ -748,7 +748,7 @@ async fn preparation_rejects_forged_invoice_authorization_incomplete_signatures_
         };
         match field {
             0 => *contract_signatures = "{}".into(),
-            1 => *attestation = hex::encode([7; 32]),
+            1 => *attestation = Some(hex::encode([7; 32])),
             2 => {
                 let PayoutMethod::Invoice { authorization, .. } = method else {
                     unreachable!()

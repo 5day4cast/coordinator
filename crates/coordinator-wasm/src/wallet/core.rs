@@ -81,7 +81,9 @@ pub struct PayoutInvoiceConsent {
     pub context: payout_protocol::InvoiceAuthorizationContext,
     pub contract: payout::ContractCommitment,
     pub signatures: dlctix::ContractSignatures,
-    pub attestation: String,
+    /// `None` when the payout is the contract's expiry refund.
+    #[serde(default)]
+    pub attestation: Option<String>,
 }
 
 impl DlcWalletCore {
@@ -338,11 +340,22 @@ impl DlcWalletCore {
         }
         payout::verify_completed_contract(&consent.contract, &consent.signatures)
             .map_err(|e| reject(e.to_string()))?;
-        let mut attestation = [0u8; 32];
-        hex::decode_to_slice(&consent.attestation, &mut attestation)
-            .map_err(|_| reject("Invalid payout attestation".into()))?;
-        let outcome = payout::attested_outcome(&consent.contract.contract_parameters, &attestation)
-            .map_err(|e| reject(e.to_string()))?;
+        let attestation = consent
+            .attestation
+            .as_deref()
+            .map(|attestation| {
+                let mut bytes = [0u8; 32];
+                hex::decode_to_slice(attestation, &mut bytes)
+                    .map_err(|_| reject("Invalid payout attestation".into()))
+                    .map(|()| bytes)
+            })
+            .transpose()?;
+        let outcome = payout::settled_outcome(
+            &consent.contract.contract_parameters,
+            attestation.as_ref(),
+            ::nostr::Timestamp::now().as_secs(),
+        )
+        .map_err(|e| reject(e.to_string()))?;
         let owed = payout::owed_sats(
             &consent.contract.contract_parameters,
             &outcome,
@@ -1493,7 +1506,7 @@ mod tests {
             invoice,
             contract,
             signatures: signed.all_signatures().clone(),
-            attestation: hex::encode(attestation.serialize()),
+            attestation: Some(hex::encode(attestation.serialize())),
         }
     }
 

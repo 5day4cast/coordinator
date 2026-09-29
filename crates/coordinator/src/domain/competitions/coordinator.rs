@@ -1196,7 +1196,27 @@ impl Coordinator {
                 }
             }
 
-            CompetitionStatus::ExpiryBroadcasted(state) => state.completed(),
+            // Only rows from before the expiry transaction was recorded as the outcome
+            // transaction load in this state; settle them the same way.
+            CompetitionStatus::ExpiryBroadcasted(state) => {
+                let mut competition = state.into_competition();
+                match competition
+                    .signed_contract
+                    .as_ref()
+                    .and_then(|contract| contract.expiry_tx())
+                {
+                    Some(expiry_tx) if competition.settled_by_expiry() => {
+                        competition.outcome_transaction = Some(expiry_tx);
+                        competition.outcome_broadcasted_at = competition.expiry_broadcasted_at;
+                        CompetitionStatus::OutcomeBroadcasted(OutcomeBroadcasted::from_competition(
+                            competition,
+                        ))
+                    }
+                    _ => CompetitionStatus::ExpiryBroadcasted(ExpiryBroadcasted::from_competition(
+                        competition,
+                    )),
+                }
+            }
 
             CompetitionStatus::OutcomeBroadcasted(mut state) => {
                 match self
@@ -2249,7 +2269,18 @@ impl Coordinator {
                     if competition.expiry_broadcasted_at.is_none() {
                         debug!("expiry_tx: {:?}", expiry_tx);
                         self.bitcoin.broadcast(&expiry_tx).await?;
-                        competition.expiry_broadcasted_at = Some(OffsetDateTime::now_utc())
+                        let now = OffsetDateTime::now_utc();
+                        info!(
+                            "Competition {} expired unattested; expiry tx broadcast: txid={}",
+                            competition.id,
+                            expiry_tx.compute_txid()
+                        );
+                        competition.expiry_broadcasted_at = Some(now);
+                        // The expiry transaction is the contract's outcome transaction for
+                        // Outcome::Expiry: the players are paid their refund shares, and the
+                        // output is split and reclaimed like any outcome's.
+                        competition.outcome_transaction = Some(expiry_tx);
+                        competition.outcome_broadcasted_at = Some(now);
                     };
 
                     return Ok(competition);
@@ -4418,15 +4449,12 @@ impl Coordinator {
             .competition_store
             .get_competition(competition_id)
             .await?;
-        if !competition.is_attested() {
+        if !competition.is_attested() && !competition.settled_by_expiry() {
             return Err(Error::BadRequest(
                 "Competition results not yet attested".into(),
             ));
         }
-        if competition.is_delta_broadcasted()
-            || competition.is_expiry_broadcasted()
-            || competition.is_completed()
-        {
+        if competition.is_delta_broadcasted() || competition.is_completed() {
             return Err(Error::BadRequest(
                 "Funds already received to user's on-chain key".into(),
             ));

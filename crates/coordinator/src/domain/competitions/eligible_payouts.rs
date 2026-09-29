@@ -52,7 +52,10 @@ impl Coordinator {
                 debug!("no competition {} for entry {}", entry.event_id, entry.id);
                 continue;
             };
-            if competition.attestation.is_none() || competition.outcome_broadcasted_at.is_none() {
+            // An attested result, or the expiry refund once the expiry transaction settled it.
+            if (competition.attestation.is_none() && !competition.settled_by_expiry())
+                || competition.outcome_broadcasted_at.is_none()
+            {
                 continue;
             }
             let (Some(params), Ok(outcome), Ok(entry_pubkey)) = (
@@ -71,7 +74,6 @@ impl Coordinator {
                 .await
                 .unwrap_or(true)
                 || competition.delta_broadcasted_at.is_some()
-                || competition.expiry_broadcasted_at.is_some()
                 || competition.completed_at.is_some()
                 || competition.cancelled_at.is_some();
             let automatic_lightning_address = policy

@@ -350,3 +350,30 @@ fn signing_context_covers_expiry_and_all_adaptor_and_subset_requirements() {
     )
     .is_err());
 }
+
+/// With no attestation a payout settles on the expiry outcome, but only once the contract
+/// has expired, and never for a block-height expiry a clock cannot check.
+#[test]
+fn settled_outcome_is_expiry_only_after_the_contract_expires() {
+    let (mut contract, _) = ratio_fixture(&[1, 1, 1], 3_000);
+    let params = &mut contract.contract_parameters;
+    let expiry = 1_900_000_000u32;
+    params.event.expiry = Some(expiry);
+    assert!(matches!(
+        settled_outcome(params, None, u64::from(expiry) - 1),
+        Err(PayoutError::NotExpired)
+    ));
+    assert_eq!(
+        settled_outcome(params, None, u64::from(expiry)).unwrap(),
+        Outcome::Expiry
+    );
+    params.event.expiry = Some(800_000);
+    assert!(settled_outcome(params, None, u64::MAX).is_err());
+    params.event.expiry = None;
+    assert!(settled_outcome(params, None, u64::MAX).is_err());
+    // An attestation still decides the outcome after the expiry.
+    assert!(matches!(
+        settled_outcome(params, Some(&[9; 32]), u64::MAX),
+        Err(PayoutError::UnknownOutcome)
+    ));
+}
