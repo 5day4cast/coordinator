@@ -428,6 +428,16 @@ impl Coordinator {
         Ok(())
     }
 
+    /// The coordinator's key, for the Arkade escrow proofs it co-signs outside this module.
+    pub(super) fn escrow_keypair(&self) -> Result<bitcoin::key::Keypair, Error> {
+        let secret = bitcoin::secp256k1::SecretKey::from_slice(&self.private_key.serialize())
+            .map_err(|e| Error::Bitcoin(anyhow!("The coordinator key is invalid: {e}")))?;
+        Ok(bitcoin::key::Keypair::from_secret_key(
+            &bitcoin::secp256k1::Secp256k1::new(),
+            &secret,
+        ))
+    }
+
     fn keymeld_storage_keys(&self) -> Result<Keys, Error> {
         SecretKey::from_slice(&self.private_key.serialize())
             .map(Keys::new)

@@ -123,17 +123,19 @@ async fn one_escrow_deletes_the_whole_intent_holding_it() {
     assert!(arkd.queued().is_empty());
     assert_eq!(arkd.state.lock().unwrap().deleted, vec!["intent-41"]);
     // Only this player signed: the message input and their own escrow.
-    let requests = player.requests.lock().unwrap();
-    assert_eq!(
-        requests
+    {
+        let requests = player.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.input_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(requests
             .iter()
-            .map(|request| request.input_index)
-            .collect::<Vec<_>>(),
-        vec![0, 1]
-    );
-    assert!(requests
-        .iter()
-        .all(|request| request.escrow == escrow.outpoint));
+            .all(|request| request.escrow == escrow.outpoint));
+    }
 
     // Nothing is left to delete.
     let again = delete_escrow_intent(

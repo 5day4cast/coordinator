@@ -836,13 +836,7 @@ impl Coordinator {
             session,
             user: keymeld_sdk::UserId::from(escrow.ticket_id),
         };
-        let secret =
-            dlctix::bitcoin::secp256k1::SecretKey::from_slice(&self.private_key.serialize())
-                .map_err(|e| anyhow!("The coordinator key is invalid: {e}"))?;
-        let coordinator = KeypairSigner::new([dlctix::bitcoin::key::Keypair::from_secret_key(
-            &dlctix::bitcoin::secp256k1::Secp256k1::new(),
-            &secret,
-        )]);
+        let coordinator = KeypairSigner::new([self.escrow_keypair()?]);
         match coordinator_ark::delete_escrow_intent(
             ark.transport.as_ref(),
             input,
