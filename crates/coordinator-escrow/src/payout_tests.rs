@@ -377,3 +377,31 @@ fn settled_outcome_is_expiry_only_after_the_contract_expires() {
         Err(PayoutError::UnknownOutcome)
     ));
 }
+
+/// Only successes are remembered, and the least recently used is dropped past the bound.
+#[test]
+fn verified_contracts_remember_only_successes_within_their_bound() {
+    let (contract, _) = fixture();
+    let empty = ContractSignatures {
+        expiry_tx_signature: None,
+        outcome_tx_signatures: BTreeMap::new(),
+        split_tx_signatures: BTreeMap::new(),
+    };
+    let verified = VerifiedContracts::default();
+    for _ in 0..2 {
+        assert!(verified.verify(&contract, &empty).is_err());
+    }
+    assert!(verified.0.lock().unwrap().is_empty());
+
+    let key = |n: usize| ([n as u8; 32], [(n >> 8) as u8; 32]);
+    for n in 0..MAX_VERIFIED_CONTRACTS {
+        verified.remember(key(n));
+    }
+    verified.remember(key(0));
+    assert!(verified.recall(&key(0)));
+    verified.remember(key(MAX_VERIFIED_CONTRACTS));
+    assert_eq!(verified.0.lock().unwrap().len(), MAX_VERIFIED_CONTRACTS);
+    assert!(verified.recall(&key(0)));
+    assert!(!verified.recall(&key(1)));
+    assert!(verified.recall(&key(MAX_VERIFIED_CONTRACTS)));
+}

@@ -170,11 +170,14 @@ pub fn funded_contract(
 }
 
 /// The inputs this escrow's player must sign for `spend`, each with its sighash.
+///
+/// A forfeit's contract is verified through `verified`, which a verifier keeps for the process.
 pub fn spend_digests(
     escrow: &EntryEscrow,
     policy: &ArkEscrowPolicy,
     bound: &ContractCommitment,
     spend: &ArkEscrowSpend,
+    verified: &payout::VerifiedContracts,
 ) -> Result<Vec<(usize, [u8; 32])>, ArkError> {
     match spend {
         ArkEscrowSpend::IntentProof { proof_psbt } => {
@@ -204,7 +207,8 @@ pub fn spend_digests(
             if expires && signatures.expiry_tx_signature.is_none() {
                 return reject("the contract's expiry transaction is not signed");
             }
-            payout::verify_completed_contract(&contract, &signatures)
+            verified
+                .verify(&contract, &signatures)
                 .map_err(|e| ArkError(e.to_string()))?;
             let connectors = connector_txs
                 .iter()

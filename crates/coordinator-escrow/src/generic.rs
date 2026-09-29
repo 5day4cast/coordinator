@@ -56,6 +56,16 @@ pub enum ActionParameters {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ark_funding: Option<ArkFunding>,
     },
+    /// [`ActionParameters::SignContract`] naming each message by its digest alone. The verifier
+    /// expands it to the full scope, deriving what it would otherwise check: the signers from
+    /// the bound roster and the manifest's subsets, and the adaptor points from the contract.
+    /// A verifier older than this variant refuses it; see [`refuses_compact_scope`].
+    SignContractCompact {
+        items: Vec<ContractItem>,
+        /// For an Arkade-funded pool: the commitment transaction that fixes the funding outpoint.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ark_funding: Option<ArkFunding>,
+    },
     PrepareSettlement {
         claim_id: Uuid,
         contract_signatures: String,
@@ -87,6 +97,57 @@ pub enum ActionParameters {
     /// Granted by the refund permission and unbound like a refund, since it is what lets a refund
     /// through when a kickoff that never finished left its intent queued. It moves nothing.
     DeleteArkIntent { spend: ArkEscrowSpend },
+}
+
+/// One message of a [`ActionParameters::SignContractCompact`] scope: the client-selected
+/// routing ids of a [`SigningItem`](escrow::SigningItem), and the digest naming its message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContractItem {
+    pub item_id: Uuid,
+    #[serde(with = "hex_digest")]
+    pub message_digest: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subset_id: Option<Uuid>,
+    /// Set exactly when the message is signed with an adaptor point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptor_id: Option<Uuid>,
+}
+impl ContractItem {
+    /// The compact form of a contract signing scope. It keeps everything the verifier cannot
+    /// derive, so the verifier expands it back to exactly `scope`.
+    pub fn compact(scope: &SigningScope) -> Vec<Self> {
+        scope
+            .batch
+            .iter()
+            .map(|item| Self {
+                item_id: item.item_id,
+                message_digest: item.message_digest,
+                subset_id: item.subset_id,
+                adaptor_id: match &item.adaptor {
+                    escrow::AdaptorContext::None => None,
+                    escrow::AdaptorContext::Single { adaptor_id, .. } => Some(*adaptor_id),
+                },
+            })
+            .collect()
+    }
+}
+/// Whether a refused contract signing preparation came from a verifier that predates
+/// [`ActionParameters::SignContractCompact`]. Such a verifier accepts the full form instead.
+pub fn refuses_compact_scope(error: &str) -> bool {
+    error.contains("unknown variant `sign_contract_compact`")
+}
+mod hex_digest {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(value: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(value))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 32], D::Error> {
+        let value = String::deserialize(deserializer)?;
+        let mut digest = [0; 32];
+        hex::decode_to_slice(value, &mut digest).map_err(serde::de::Error::custom)?;
+        Ok(digest)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,4 +318,154 @@ pub fn participant_policy(
     };
     policy.validate()?;
     Ok(policy)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keymeld_core::{
+        escrow::{
+            protocol::PrepareEscrowRequest, ActionAttempt, AdaptorContext, KeyTweak, ScopeSigner,
+            SigningItem, SCHEMA_VERSION,
+        },
+        SessionId, UserId,
+    };
+
+    /// One player's contract signing scope in a pool of `players`, shaped like a queued pool's:
+    /// the outcome transactions, the player's own win split, and a refund and an expiry split
+    /// for every player, each signed by every player and the market maker.
+    fn pool_scope(players: usize) -> SigningScope {
+        let signers = {
+            let mut signers = (0..=players)
+                .map(|index| ScopeSigner {
+                    user_id: UserId::from(Uuid::from_u128(index as u128 + 1)),
+                    public_key: key(index as u8 + 1),
+                })
+                .collect::<Vec<_>>();
+            signers.sort_by(|a, b| a.public_key.cmp(&b.public_key));
+            signers
+        };
+        let outcomes = players + 2;
+        SigningScope {
+            session_tweak: KeyTweak::None,
+            batch: (0..outcomes + 1 + 2 * players)
+                .map(|index| SigningItem {
+                    item_id: Uuid::now_v7(),
+                    message_digest: [index as u8; 32],
+                    subset_id: (index >= outcomes).then(Uuid::now_v7),
+                    signers: signers.clone(),
+                    tweak: KeyTweak::None,
+                    adaptor: if index + 1 < outcomes {
+                        AdaptorContext::Single {
+                            adaptor_id: Uuid::now_v7(),
+                            point: key(200),
+                        }
+                    } else {
+                        AdaptorContext::None
+                    },
+                })
+                .collect(),
+        }
+    }
+    fn key(secret: u8) -> PublicKeyBytes {
+        let secret = secp256k1::SecretKey::from_byte_array([secret; 32]).unwrap();
+        PublicKeyBytes::new(&secret.public_key(&secp256k1::Secp256k1::new()).serialize()).unwrap()
+    }
+    fn prepare_request(parameters: &ActionParameters) -> Vec<u8> {
+        serde_json::to_vec(&PrepareEscrowRequest {
+            schema_version: SCHEMA_VERSION,
+            binding_receipt: Payload::default(),
+            action_id: SIGN_CONTRACT.into(),
+            attempt: ActionAttempt {
+                attempt_id: Uuid::now_v7(),
+                signing_session_id: Some(SessionId::new_v7()),
+            },
+            action: None,
+            action_parameters: Payload::encode(parameters).unwrap(),
+            prior_preparation_receipts: vec![],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_compact_scope_keeps_what_the_verifier_cannot_derive_in_a_fraction_of_the_bytes() {
+        for players in [22, 25] {
+            let scope = pool_scope(players);
+            assert_eq!(scope.batch.len(), 3 * players + 3);
+            let items = ContractItem::compact(&scope);
+            for (item, compact) in scope.batch.iter().zip(&items) {
+                assert_eq!(compact.item_id, item.item_id);
+                assert_eq!(compact.message_digest, item.message_digest);
+                assert_eq!(compact.subset_id, item.subset_id);
+                assert_eq!(
+                    compact.adaptor_id.is_some(),
+                    matches!(item.adaptor, AdaptorContext::Single { .. })
+                );
+            }
+            let compact = ActionParameters::SignContractCompact {
+                items,
+                ark_funding: None,
+            };
+            let decoded: ActionParameters = Payload::encode(&compact).unwrap().decode().unwrap();
+            assert!(
+                matches!(decoded, ActionParameters::SignContractCompact { items, .. } if items == ContractItem::compact(&scope))
+            );
+            let full = ActionParameters::SignContract {
+                scope,
+                ark_funding: None,
+            };
+            let (full_parameters, compact_parameters) = (
+                Payload::encode(&full).unwrap().as_bytes().len(),
+                Payload::encode(&compact).unwrap().as_bytes().len(),
+            );
+            let (full_request, compact_request) = (
+                prepare_request(&full).len(),
+                prepare_request(&compact).len(),
+            );
+            println!(
+                "{players} players: parameters {full_parameters} -> {compact_parameters} bytes, \
+                 prepare request {full_request} -> {compact_request} bytes"
+            );
+            assert!(compact_request * 10 < full_request);
+        }
+    }
+
+    /// A verifier that predates the compact scope, as it decodes the parameters.
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+    #[allow(dead_code)]
+    enum OlderParameters {
+        SignContract {
+            scope: SigningScope,
+            #[serde(default)]
+            ark_funding: Option<ArkFunding>,
+        },
+        SignArkEscrow {
+            spend: ArkEscrowSpend,
+        },
+    }
+
+    #[test]
+    fn only_an_older_verifiers_refusal_of_the_compact_scope_is_recognised() {
+        let scope = pool_scope(3);
+        let compact = Payload::encode(&ActionParameters::SignContractCompact {
+            items: ContractItem::compact(&scope),
+            ark_funding: None,
+        })
+        .unwrap();
+        let refusal = compact.decode::<OlderParameters>().unwrap_err();
+        // How the refusal reaches the coordinator, through the enclave's error.
+        let relayed = format!("Enclave rejected the confidential operation: {refusal}");
+        assert!(refuses_compact_scope(&relayed), "{relayed}");
+
+        let full = Payload::encode(&ActionParameters::SignContract {
+            scope,
+            ark_funding: None,
+        })
+        .unwrap();
+        assert!(full.decode::<OlderParameters>().is_ok());
+        assert!(!refuses_compact_scope(
+            "Signing keys or tweak differ from the authorized DLC"
+        ));
+    }
 }
