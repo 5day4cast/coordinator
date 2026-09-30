@@ -49,6 +49,15 @@ impl IntoResponse for Error {
             Error::InvalidSignature(_) => (StatusCode::FORBIDDEN, self.to_string()),
             Error::FeeEstimateUnavailable => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             Error::EntriesPaused => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
+            // Retryable: the oracle is restarting or has not fitted its lines yet. Its message
+            // may name internal addresses, so it is logged rather than returned.
+            Error::OracleFailed(error) => {
+                log::warn!("Oracle request failed: {error}");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    String::from("the oracle is unavailable right now; try again in a moment"),
+                )
+            }
             Error::DatabaseWrite(error) => {
                 log::error!("Database write failed: {error}");
                 match error {
@@ -117,6 +126,13 @@ mod tests {
                 Error::FeeEstimateUnavailable,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "The Bitcoin network fee estimate is unavailable right now, so no ticket was issued; try again in a moment",
+            ),
+            (
+                Error::OracleFailed(crate::infra::oracle::Error::BadRequest(
+                    "no line has been fitted yet".into(),
+                )),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the oracle is unavailable right now; try again in a moment",
             ),
             (
                 Error::Bitcoin(anyhow::anyhow!("private node detail")),

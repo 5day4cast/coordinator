@@ -79,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
         invoice_cltv_expiry: config.invoice_cltv_expiry,
         errors: Default::default(),
         claims: Default::default(),
+        refund_turn: Default::default(),
     });
     let view = swapper.wallet.view().await?;
     log::info!(

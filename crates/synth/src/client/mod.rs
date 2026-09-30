@@ -83,10 +83,78 @@ impl CoordinatorClient {
     }
 }
 
+/// How long to wait before sending a request again after it failed to reach the coordinator,
+/// times the attempts so far.
+const TRANSPORT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Send an idempotent request up to `attempts` times while it fails to reach the coordinator, as
+/// right after either restarts. `send` builds the request afresh each time, so a signed auth
+/// header is never replayed. A response, whatever its status, is returned as it is.
+pub(crate) async fn retry_transport<F, Fut>(attempts: u32, mut send: F) -> Result<reqwest::Response>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<reqwest::Response>>,
+{
+    let mut attempt = 1;
+    loop {
+        match send().await {
+            Err(error) if attempt < attempts && transport_error(&error) => {
+                log::warn!("request did not reach the coordinator, trying again: {error:#}");
+                tokio::time::sleep(TRANSPORT_BACKOFF * attempt).await;
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// The request never got a response: the connection was refused or dropped.
+fn transport_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(|e| e.is_connect() || e.is_request())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{http::HeaderMap, routing::get, Json, Router};
+
+    #[tokio::test]
+    async fn a_request_that_never_reached_the_coordinator_is_sent_again() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = format!("http://{}", listener.local_addr().unwrap());
+        let router = Router::new().route("/", get(|| async { "up" }));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let http = Client::new();
+        let sent = std::sync::atomic::AtomicU32::new(0);
+        // Refused twice, as by a restarting coordinator, then answered.
+        let send = || async {
+            let url = match sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 | 1 => "http://127.0.0.1:1/".to_owned(),
+                _ => format!("{live}/"),
+            };
+            anyhow::Ok(http.get(url).send().await?)
+        };
+        let response = retry_transport(3, send).await.unwrap();
+        assert_eq!(response.text().await.unwrap(), "up");
+        assert_eq!(sent.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        // Three refusals are the limit, and an error that is not the transport's is final.
+        sent.store(0, std::sync::atomic::Ordering::SeqCst);
+        let refused = || async { anyhow::Ok(http.get("http://127.0.0.1:1/").send().await?) };
+        assert!(retry_transport(3, refused).await.is_err());
+        let failed = std::sync::atomic::AtomicU32::new(0);
+        let not_transport = || async {
+            failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err::<reqwest::Response, _>(anyhow::anyhow!("refused to sign"))
+        };
+        assert!(retry_transport(3, not_transport).await.is_err());
+        assert_eq!(failed.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        server.abort();
+        let _ = server.await;
+    }
 
     #[tokio::test]
     async fn wallet_requests_use_the_authenticated_operator_listener() {

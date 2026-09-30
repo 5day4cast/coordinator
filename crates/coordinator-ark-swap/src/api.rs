@@ -2,7 +2,7 @@
 //!
 //! | Route | Use |
 //! | --- | --- |
-//! | `POST /v1/swaps` | `{ "escrow_address", "amount_sat", "preimage"? }` → the swap and its invoice. Returns the open swap if the escrow already has one. |
+//! | `POST /v1/swaps` | `{ "escrow_address", "amount_sat", "preimage"? }` → the swap and its invoice. Returns the open swap if the escrow already has one, and 503 if the wallet cannot fund a new one. |
 //! | `GET /v1/swaps/{id}` | A swap's state. |
 //! | `GET /v1/swaps?payment_hash=<hex>` | The swap whose invoice pays to that hash, for tracing a payment to its escrow. |
 //! | `GET /v1/swaps?without_escrow_vtxo=true` | Swaps in `escrow_paid`, `settled` or `unsettled` that record no escrow VTXO, oldest first. Read-only, for finding money by hand. |
@@ -24,7 +24,7 @@ use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::swap::Swapper;
+use crate::swap::{Swapper, Unfunded};
 
 #[derive(Clone)]
 struct AppState {
@@ -108,7 +108,17 @@ async fn create_swap(State(state): State<AppState>, Json(request): Json<CreateSw
         .await
     {
         Ok(swap) => (StatusCode::CREATED, Json(swap)).into_response(),
-        Err(error) => failure(StatusCode::BAD_REQUEST, error),
+        Err(error) => failure(create_failure_status(&error), error),
+    }
+}
+
+/// A swap the wallet cannot fund may be asked for again once it is topped up; anything else
+/// wrong with the request is the caller's.
+fn create_failure_status(error: &anyhow::Error) -> StatusCode {
+    if error.is::<Unfunded>() {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_REQUEST
     }
 }
 
@@ -270,4 +280,25 @@ async fn board(State(state): State<AppState>) -> Response {
 fn failure(status: StatusCode, error: anyhow::Error) -> Response {
     log::warn!("{status}: {error:#}");
     (status, Json(json!({ "error": format!("{error:#}") }))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unfunded_swap_is_unavailable_not_a_bad_request() {
+        let unfunded = anyhow::Error::new(Unfunded {
+            spendable_sat: 712,
+            needed_sat: 6_848,
+        });
+        assert_eq!(
+            create_failure_status(&unfunded),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            create_failure_status(&anyhow::anyhow!("the amount is below dust")),
+            StatusCode::BAD_REQUEST
+        );
+    }
 }

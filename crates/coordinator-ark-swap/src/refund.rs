@@ -19,6 +19,11 @@ use uuid::Uuid;
 use crate::store::{Refund, RefundState};
 use crate::swap::{unix_now, Swapper};
 
+/// How long one pass of `refund_tick` claims for. A claim takes seconds, and escrow payments
+/// wait for the pass to end, so a backlog of claims is worked through a few at a time. The
+/// refunds a pass does not reach go first in the next.
+const REFUND_TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl Swapper {
     /// Mint the swap an escrow's refund pays, or return the one already minted for this invoice.
     pub async fn mint_refund(
@@ -105,20 +110,40 @@ impl Swapper {
         Ok(refund)
     }
 
-    /// Claim every refund whose swap has been paid, and retire those the player may take back.
+    /// Claim the refunds whose swaps have been paid, and retire those the player may take back,
+    /// for up to `REFUND_TICK_BUDGET`, starting after the last refund the previous pass reached.
     pub async fn refund_tick(&self) {
-        let refunds = match self.store.unclaimed_refunds().await {
+        let mut refunds = match self.store.unclaimed_refunds().await {
             Ok(refunds) => refunds,
             Err(error) => {
                 log::error!("list unclaimed refunds: {error:#}");
                 return;
             }
         };
-        for mut refund in refunds {
+        let last = *self
+            .refund_turn
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let start = turn_start(refunds.iter().map(|refund| refund.id), last);
+        refunds.rotate_left(start);
+        let started = std::time::Instant::now();
+        let total = refunds.len();
+        for (reached, mut refund) in refunds.into_iter().enumerate() {
+            if started.elapsed() >= REFUND_TICK_BUDGET {
+                log::debug!(
+                    "{} of {total} refunds wait for the next pass",
+                    total - reached
+                );
+                break;
+            }
             let id = refund.id;
             if let Err(error) = self.advance_refund(&mut refund).await {
                 log::warn!("refund {id}: {error:#}");
             }
+            *self
+                .refund_turn
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(id);
         }
     }
 
@@ -218,9 +243,37 @@ impl Swapper {
     }
 }
 
+/// Where a pass over refunds listed as `ids`, oldest first, starts: after `last`, the last one
+/// the previous pass reached, and from the oldest once it has gone round. Refund ids are UUIDv7,
+/// so they order as the refunds were minted, and `last` need not be listed any more.
+fn turn_start(mut ids: impl Iterator<Item = Uuid>, last: Option<Uuid>) -> usize {
+    last.and_then(|last| ids.position(|id| id > last))
+        .unwrap_or(0)
+}
+
 fn bytes32(hex_value: &str) -> anyhow::Result<[u8; 32]> {
     hex::decode(hex_value)?
         .try_into()
         .ok()
         .context("expected 32 bytes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pass_over_refunds_starts_where_the_last_one_stopped() {
+        let ids: Vec<Uuid> = (1..=4).map(Uuid::from_u128).collect();
+        let start = |last| turn_start(ids.iter().copied(), last);
+        assert_eq!(start(None), 0);
+        assert_eq!(start(Some(ids[0])), 1);
+        assert_eq!(start(Some(ids[2])), 3);
+        // Round again from the oldest once the newest was reached.
+        assert_eq!(start(Some(ids[3])), 0);
+        // The last one reached was claimed since, and is no longer listed.
+        let listed = [ids[0], ids[2], ids[3]];
+        assert_eq!(turn_start(listed.iter().copied(), Some(ids[1])), 1);
+        assert_eq!(turn_start(std::iter::empty(), Some(ids[1])), 0);
+    }
 }

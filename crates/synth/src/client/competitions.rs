@@ -341,12 +341,11 @@ impl CoordinatorClient {
             sat_per_vb: f64,
         }
         let url = format!("{}/api/v1/network-fee", self.base_url());
-        let resp = self
-            .http()
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to get the network fee")?;
+        let resp = super::retry_transport(3, || async {
+            anyhow::Ok(self.http().get(&url).send().await?)
+        })
+        .await
+        .context("Failed to get the network fee")?;
         if !resp.status().is_success() {
             anyhow::bail!("Get network fee failed ({})", resp.status());
         }
@@ -360,12 +359,11 @@ impl CoordinatorClient {
     /// List all competitions
     pub async fn list_competitions(&self) -> Result<Vec<CompetitionResponse>> {
         let url = format!("{}/api/v1/competitions", self.base_url());
-        let resp = self
-            .http()
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to list competitions")?;
+        let resp = super::retry_transport(3, || async {
+            anyhow::Ok(self.http().get(&url).send().await?)
+        })
+        .await
+        .context("Failed to list competitions")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -381,12 +379,11 @@ impl CoordinatorClient {
     /// Get a specific competition by ID
     pub async fn get_competition(&self, id: &Uuid) -> Result<CompetitionResponse> {
         let url = format!("{}/api/v1/competitions/{}", self.base_url(), id);
-        let resp = self
-            .http()
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to get competition")?;
+        let resp = super::retry_transport(3, || async {
+            anyhow::Ok(self.http().get(&url).send().await?)
+        })
+        .await
+        .context("Failed to get competition")?;
 
         if !resp.status().is_success() {
             let status = resp.status();

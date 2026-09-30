@@ -6,7 +6,7 @@ use crate::client::CoordinatorClient;
 use crate::crypto;
 use crate::crypto::keys::SynthUser;
 use crate::db::SynthDb;
-use crate::lnd::Lnd;
+use crate::lnd::{Lnd, Tracked};
 use crate::trail::{EntryPayment, EntryTrace, EscrowTerms, RouteHop};
 use anyhow::{Context, Result};
 use log::warn;
@@ -254,20 +254,23 @@ pub(super) async fn pay_entry(
         }
         Payer::Lnd(lnd) => match lnd.pay(&prepared.ticket.payment_request).await {
             Ok(paid) => trace.payment = Some(entry_payment(lnd, paid).await),
-            // The entry invoice is a hold invoice, in flight until the coordinator settles it.
-            // The ticket status below decides whether the coordinator holds the payment.
+            // The entry invoice is a hold invoice: ark-swapd holds the HTLC until it has paid the
+            // escrow, which can outlast the stream. Follow the payment on the node until it ends.
             Err(e) if crate::lnd::stream_cut_short(&e) => {
                 warn!(
                     "entry payment for ticket {} still in flight when its stream ended: {e:#}",
                     prepared.ticket.ticket_id
                 );
+                let paid = follow_held_payment(lnd, &prepared.ticket).await?;
+                trace.payment = Some(entry_payment(lnd, paid).await);
             }
             Err(e) => return Err(e.context("Failed to pay the entry invoice")),
         },
     }
     trace.paid = true;
     crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
-    for attempt in 0..=30 {
+    // The coordinator sees the ticket paid once it finds the escrow VTXO, seconds after settling.
+    for attempt in 0..=PAID_CHECKS {
         let status = client
             .check_ticket_status(&user.nostr_keys, competition_id, &prepared.ticket.ticket_id)
             .await
@@ -275,16 +278,85 @@ pub(super) async fn pay_entry(
         if status == TicketStatus::Paid || status == TicketStatus::Settled {
             return Ok(());
         }
-        if attempt == 30 {
+        if attempt == PAID_CHECKS {
             anyhow::bail!(
                 "Ticket {} still not paid after settle (status: {:?})",
                 prepared.ticket.ticket_id,
                 status
             );
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
     unreachable!()
+}
+
+/// Ticket status checks, a second apart, before a settled entry that is still not paid fails.
+const PAID_CHECKS: u32 = 60;
+
+/// How often a held entry payment is looked up once its stream has ended.
+const HELD_PAYMENT_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long past its invoice's expiry a held entry payment is followed. ark-swapd cancels an
+/// open invoice a minute after it expires.
+const HELD_PAYMENT_GRACE_SECS: u64 = 90;
+
+/// How long a held entry payment is followed when its invoice gives no expiry, and at most.
+const HELD_PAYMENT_DEFAULT_SECS: u64 = 600;
+const HELD_PAYMENT_MAX_SECS: u64 = 30 * 60;
+
+/// Follow an entry payment on the paying node, after its stream ended, until it succeeds or
+/// fails, and at the latest until its invoice has expired.
+async fn follow_held_payment(
+    lnd: &Lnd,
+    ticket: &crate::client::entries::TicketResponse,
+) -> Result<crate::lnd::Paid> {
+    let until = std::time::Instant::now()
+        + held_payment_budget(&ticket.payment_request, std::time::SystemTime::now());
+    loop {
+        // A lookup cut off by a restart of the node or a dropped connection is tried again.
+        let tracked = match lnd.track(&ticket.payment_hash).await {
+            Ok(tracked) => tracked,
+            Err(e) if std::time::Instant::now() < until => {
+                warn!(
+                    "look up the entry payment for ticket {}: {e:#}",
+                    ticket.ticket_id
+                );
+                tokio::time::sleep(HELD_PAYMENT_POLL).await;
+                continue;
+            }
+            Err(e) => return Err(e.context("Failed to follow the entry payment")),
+        };
+        match tracked {
+            Tracked::Succeeded(paid) => return Ok(paid),
+            Tracked::Failed => anyhow::bail!(
+                "entry payment for ticket {} failed after its stream ended",
+                ticket.ticket_id
+            ),
+            _ if std::time::Instant::now() < until => tokio::time::sleep(HELD_PAYMENT_POLL).await,
+            other => anyhow::bail!(
+                "entry payment for ticket {} still {other:?} after its invoice expired",
+                ticket.ticket_id
+            ),
+        }
+    }
+}
+
+/// How long to follow a held payment of `payment_request` from `now`: until the invoice has
+/// expired, with a grace for the service to cancel it.
+fn held_payment_budget(payment_request: &str, now: std::time::SystemTime) -> std::time::Duration {
+    let expires_at = payment_request
+        .parse::<lightning_invoice::Bolt11Invoice>()
+        .ok()
+        .and_then(|invoice| invoice.expires_at());
+    let left = match expires_at {
+        Some(at) => at.saturating_sub(
+            now.duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default(),
+        ),
+        None => std::time::Duration::from_secs(HELD_PAYMENT_DEFAULT_SECS),
+    };
+    left.min(std::time::Duration::from_secs(HELD_PAYMENT_MAX_SECS))
+        + std::time::Duration::from_secs(HELD_PAYMENT_GRACE_SECS)
 }
 
 pub(super) async fn submit_entry(
@@ -374,4 +446,51 @@ pub(super) fn generate_predictions(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dlctix::bitcoin::hashes::{sha256, Hash};
+    use dlctix::bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    /// A signed regtest invoice made at `created` (unix seconds) that expires `expiry` later.
+    fn invoice(created: u64, expiry: u64) -> String {
+        let secp = Secp256k1::new();
+        let node_key = SecretKey::from_slice(&[0x11; 32]).unwrap();
+        InvoiceBuilder::new(Currency::Regtest)
+            .description("entry".into())
+            .payment_hash(sha256::Hash::from_byte_array([3; 32]))
+            .payment_secret(PaymentSecret([7; 32]))
+            .duration_since_epoch(Duration::from_secs(created))
+            .min_final_cltv_expiry_delta(144)
+            .expiry_time(Duration::from_secs(expiry))
+            .amount_milli_satoshis(5_000_000)
+            .build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &node_key))
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn a_held_payment_is_followed_until_its_invoice_has_expired() {
+        let created = 1_790_000_000;
+        let at = |secs| UNIX_EPOCH + Duration::from_secs(created + secs);
+        let grace = Duration::from_secs(HELD_PAYMENT_GRACE_SECS);
+        assert_eq!(
+            held_payment_budget(&invoice(created, 600), at(100)),
+            Duration::from_secs(500) + grace
+        );
+        // Past its expiry, only the grace for the service to cancel it is left.
+        assert_eq!(held_payment_budget(&invoice(created, 600), at(700)), grace);
+        assert_eq!(
+            held_payment_budget(&invoice(created, 86_400), at(0)),
+            Duration::from_secs(HELD_PAYMENT_MAX_SECS) + grace
+        );
+        assert_eq!(
+            held_payment_budget("not an invoice", at(0)),
+            Duration::from_secs(HELD_PAYMENT_DEFAULT_SECS) + grace
+        );
+    }
 }

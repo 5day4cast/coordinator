@@ -36,6 +36,11 @@ impl ApiRejection {
     pub fn is_no_capacity(&self) -> bool {
         self.status == 400 && self.message == "No ticket available for competition"
     }
+
+    /// The competition closed to new entries, as it does once every seat is filled.
+    pub fn is_entries_closed(&self) -> bool {
+        self.status == 400 && self.message == "Competition is no longer accepting entries"
+    }
 }
 
 pub enum EntrySubmission {
@@ -303,15 +308,18 @@ impl CoordinatorClient {
             ticket_id
         );
 
-        let auth = create_auth_header(keys, "GET", &url, None).await?;
-
-        let resp = self
-            .http()
-            .get(&url)
-            .header("Authorization", auth)
-            .send()
-            .await
-            .context("Failed to check ticket status")?;
+        let resp = super::retry_transport(3, || async {
+            let auth = create_auth_header(keys, "GET", &url, None).await?;
+            anyhow::Ok(
+                self.http()
+                    .get(&url)
+                    .header("Authorization", auth)
+                    .send()
+                    .await?,
+            )
+        })
+        .await
+        .context("Failed to check ticket status")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -338,15 +346,18 @@ impl CoordinatorClient {
             ticket_id
         );
 
-        let auth = create_auth_header(keys, "GET", &url, None).await?;
-
-        let resp = self
-            .http()
-            .get(&url)
-            .header("Authorization", auth)
-            .send()
-            .await
-            .context("Failed to check ticket refund")?;
+        let resp = super::retry_transport(3, || async {
+            let auth = create_auth_header(keys, "GET", &url, None).await?;
+            anyhow::Ok(
+                self.http()
+                    .get(&url)
+                    .header("Authorization", auth)
+                    .send()
+                    .await?,
+            )
+        })
+        .await
+        .context("Failed to check ticket refund")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -413,15 +424,18 @@ impl CoordinatorClient {
             url = format!("{}?event_id={}", url, id);
         }
 
-        let auth = create_auth_header(keys, "GET", &url, None).await?;
-
-        let resp = self
-            .http()
-            .get(&url)
-            .header("Authorization", auth)
-            .send()
-            .await
-            .context("Failed to list entries")?;
+        let resp = super::retry_transport(3, || async {
+            let auth = create_auth_header(keys, "GET", &url, None).await?;
+            anyhow::Ok(
+                self.http()
+                    .get(&url)
+                    .header("Authorization", auth)
+                    .send()
+                    .await?,
+            )
+        })
+        .await
+        .context("Failed to list entries")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
