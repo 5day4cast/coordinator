@@ -444,7 +444,7 @@ pub async fn payouts_fragment(
 }
 
 /// How it works: the rules and scoring the competition pages leave out.
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct HelpQuery {
     /// `advanced` unfolds "How the tech works", for links into it.
     #[serde(default)]
@@ -454,11 +454,9 @@ pub struct HelpQuery {
 pub async fn help_fragment(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    query: Option<Query<HelpQuery>>,
+    Query(query): Query<HelpQuery>,
 ) -> Response {
-    let open_advanced = query
-        .map(|Query(query)| query.open.as_deref() == Some("advanced"))
-        .unwrap_or(false);
+    let open_advanced = query.open.as_deref() == Some("advanced");
     page(
         &headers,
         &state,
