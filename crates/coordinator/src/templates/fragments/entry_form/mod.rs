@@ -811,4 +811,50 @@ mod tests {
         assert!(failed.contains(">Retry</button>"));
         assert!(!failed.contains("hx-trigger"));
     }
+
+    const CSS: &str = include_str!("entry_form.css");
+
+    /// Map pins are neither blue nor grey, stand apart from the hover colour, and show on the
+    /// map's land (3:1, WCAG's bar for graphics) in both themes.
+    #[test]
+    fn the_map_pins_are_not_blue_or_grey() {
+        use crate::templates::css_check::{contrast, hsl, rgba, rule, value};
+        let hover = value(rule(CSS, ".station-pins a:focus .station-pin"), "fill");
+        for (theme, pin, map) in [
+            ("light", ".station-pin", ".station-map"),
+            (
+                "dark",
+                r#"[data-theme="dark"] .station-pin"#,
+                r#"[data-theme="dark"] .station-map"#,
+            ),
+        ] {
+            let fill = value(rule(CSS, pin), "fill");
+            let (hue, saturation, _, _) = hsl(fill);
+            assert!(!(170.0..=260.0).contains(&hue), "{theme}: {fill} is blue");
+            assert!(saturation >= 0.5, "{theme}: {fill} is grey");
+            let apart = (hue - hsl(hover).0).abs();
+            assert!(
+                apart.min(360.0 - apart) >= 30.0,
+                "{theme}: {fill} is like {hover}"
+            );
+            let land = value(rule(CSS, map), "--station-map-land");
+            let ratio = contrast(rgba(fill).0, rgba(land).0);
+            assert!(ratio >= 3.0, "{theme}: {fill} on {land} is {ratio:.2}:1");
+        }
+    }
+
+    /// On a phone the facts wrap, so a "?" can sit anywhere on the line; its bubble hangs from
+    /// the list's left edge and is no wider than the list, so it stays on the screen.
+    #[test]
+    fn a_fact_s_bubble_hangs_from_the_list_on_a_phone() {
+        use crate::templates::css_check::{rule, value};
+        assert_eq!(value(rule(CSS, ".entry-facts"), "position"), "relative");
+        assert_eq!(value(rule(CSS, ".entry-facts .tip"), "position"), "static");
+        let bubble = rule(CSS, ".entry-facts .tip::after");
+        assert_eq!(value(bubble, "left"), "0");
+        assert_eq!(value(bubble, "max-width"), "100%");
+        assert_eq!(value(bubble, "transform"), "none");
+        // The "?" is no longer what the tap area hangs from, so it is 44 px itself.
+        assert!(CSS.contains("  .entry-facts .tip {\n    width: 44px;\n    height: 44px;"));
+    }
 }

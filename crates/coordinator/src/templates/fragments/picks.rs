@@ -660,4 +660,26 @@ mod tests {
             assert!(!html.contains("hx-trigger"), "{phase:?}");
         }
     }
+
+    /// "✓ +10" sits on a green-tinted row in the dialog; it reads at WCAG AA in both themes.
+    #[test]
+    fn a_hit_s_points_read_at_4_5_to_1_in_both_themes() {
+        use crate::templates::css_check::{contrast, over, rgba, rule, value};
+        const PICKS: &str = include_str!("picks.css");
+        const SITE: &str = include_str!("../static/styles.css");
+        let tint = value(rule(PICKS, ".scored-pick.is-hit"), "background");
+        for (theme, text) in [
+            ("light", ".is-hit .pick-result"),
+            ("dark", r#"[data-theme="dark"] .is-hit .pick-result"#),
+        ] {
+            let dialog = value(
+                rule(SITE, &format!(r#"[data-theme="{theme}"]"#)),
+                "--app-modal-bg",
+            );
+            let row = over(tint, rgba(dialog).0);
+            let colour = value(rule(PICKS, text), "color");
+            let ratio = contrast(rgba(colour).0, row);
+            assert!(ratio >= 4.5, "{theme}: {colour} is {ratio:.2}:1");
+        }
+    }
 }

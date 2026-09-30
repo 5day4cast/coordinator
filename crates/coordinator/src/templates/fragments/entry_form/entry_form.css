@@ -17,6 +17,45 @@
   color: var(--entry-muted);
 }
 
+/* Phones and tablets wrap the facts, so a "?" can sit anywhere across the line and a bubble
+   centred on it runs off the screen. There the bubbles hang from the list's left edge instead,
+   above it and no wider than it. */
+@media screen and (max-width: 768px) {
+  .entry-facts {
+    position: relative;
+  }
+
+  .entry-facts .tip {
+    position: static;
+  }
+
+  .entry-facts .tip::after {
+    left: 0;
+    right: auto;
+    max-width: 100%;
+    transform: none;
+  }
+}
+
+/* The usual 44 px tap around a "?" hangs from the "?" itself (tip.css); here the "?" is not
+   positioned, so the tap is its own transparent border and the ring is drawn inside it. */
+@media screen and (max-width: 768px) and (pointer: coarse) {
+  .entry-facts .tip {
+    width: 44px;
+    height: 44px;
+    margin: calc((1.05rem - 44px) / 2);
+    margin-left: calc(0.3rem + (1.05rem - 44px) / 2);
+    border: calc((44px - 1.05rem) / 2) solid transparent;
+    box-shadow: inset 0 0 0 1px var(--bulma-border);
+    background-clip: padding-box;
+    outline-offset: calc((1.05rem - 44px) / 2 + 1px);
+  }
+
+  .entry-facts .tip::before {
+    content: none;
+  }
+}
+
 .how-to-pick {
   margin-bottom: 1rem;
   font-size: 0.9rem;
@@ -64,11 +103,17 @@
   overflow: visible;
 }
 
+/* Amber pins: not blue or grey, and apart from the crimson hover. On the map's land they are
+   4.6:1 in the light theme and 4.4:1 in the dark. */
 .station-pin {
-  fill: hsl(204, 71%, 45%);
+  fill: hsl(32, 100%, 30%);
   stroke: #fff;
   stroke-width: 2;
   vector-effect: non-scaling-stroke;
+}
+
+[data-theme="dark"] .station-pin {
+  fill: hsl(38, 95%, 58%);
 }
 
 .station-pins a:hover .station-pin,
