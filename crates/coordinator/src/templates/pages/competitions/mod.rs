@@ -232,9 +232,10 @@ impl CompetitionView {
     }
 
     /// Whether entry fees are owed back: it didn't fill, or it was cancelled for any reason,
-    /// such as a failed kickoff check, with fees in escrow.
+    /// such as a failed kickoff check, or it failed, with fees in escrow.
     pub fn owes_refunds(&self) -> bool {
-        self.did_not_fill() || (self.phase == Phase::Cancelled && self.refunds.escrowed > 0)
+        self.did_not_fill()
+            || (matches!(self.phase, Phase::Cancelled | Phase::Failed) && self.refunds.escrowed > 0)
     }
 
     /// Where the entry fees of a competition that didn't fill stand at `now`. Escrowed fees
@@ -1020,6 +1021,18 @@ pub(crate) mod tests {
         assert_eq!(
             refund_line(&full, NOW).map(text).as_deref(),
             Some("Refunded")
+        );
+        // A failed competition with escrowed fees says the same.
+        let mut failed = view("failed", Phase::Failed, -60);
+        failed.refunds = RefundProgress {
+            escrowed: 3,
+            refunded: 0,
+            opens_at: None,
+        };
+        assert!(failed.owes_refunds());
+        assert!(
+            refund_line(&failed, NOW).is_some(),
+            "a failed competition with escrows shows its refunds"
         );
         for old in [
             "Pot return<",
