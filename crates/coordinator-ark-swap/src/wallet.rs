@@ -2,8 +2,13 @@
 //!
 //! Top it up by sending VTXOs to its Ark address, for example from `mutinynet.arkade.money`.
 //! Or send on-chain coins to its boarding address and call `POST /v1/wallet/board`.
+//!
+//! Its coins are read from the indexer's listings of unspent VTXOs only. The address collects a
+//! spent VTXO for every swap and refund, and ark-client's own balance and coin selection page
+//! through all of them, a hundred at a time.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -20,7 +25,7 @@ use ark_core::send::{
     build_offchain_transactions, sign_ark_transaction, sign_checkpoint_transaction,
     OffchainTransactions, SendReceiver, VtxoInput,
 };
-use ark_core::server::GetVtxosRequest;
+use ark_core::server::{GetVtxosRequest, VirtualTxOutPoint};
 use ark_core::{ArkAddress, ExplorerUtxo};
 use bitcoin::key::{Keypair, Secp256k1};
 use bitcoin::psbt;
@@ -31,7 +36,18 @@ use coordinator_ark::{ArkServer, ArkTransport};
 use coordinator_ark_escrow::{RefundSwap, SwapPath};
 use serde::Serialize;
 
+use crate::coins::{self, Coins, Margins};
 use crate::config::Config;
+use crate::swap::unix_now;
+
+/// How many VTXOs the indexer is asked for at a time.
+const VTXO_PAGE_SIZE: i32 = 100;
+/// How long the indexer has to answer with one page.
+const VTXO_PAGE_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long `GET /v1/wallet` answers from the last reading of the wallet.
+const VIEW_TTL: Duration = Duration::from_secs(10);
+/// A reading of the wallet slower than this is logged.
+const SLOW_VIEW: Duration = Duration::from_secs(5);
 
 type ArkClient = Client<Esplora, Wallet, InMemorySwapStorage>;
 
@@ -71,15 +87,61 @@ pub struct ArkWallet {
     sending: tokio::sync::Mutex<()>,
     /// Where the boarding address's on-chain coins are read from.
     chain: Arc<Esplora>,
+    margins: Margins,
+    /// The last reading of the wallet, for `view`.
+    view: Cached<WalletView>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WalletView {
     pub ark_address: String,
     pub boarding_address: String,
+    /// Spendable VTXOs that came straight from a batch.
     pub confirmed_sat: u64,
+    /// Spendable VTXOs that came from an Arkade transaction.
     pub pre_confirmed_sat: u64,
+    /// The part of the two above that may pay an escrow: it has the pay margin of life or more.
+    pub payable_sat: u64,
+    /// The rest of them: too close to expiry to pay an escrow, until a batch renews it.
+    pub expiring_sat: u64,
+    /// Swept, expired or below dust: not spendable until a batch recovers it.
     pub recoverable_sat: u64,
+    /// UNIX seconds. When the first spendable VTXO expires.
+    pub earliest_expiry: Option<i64>,
+}
+
+/// A value kept for `ttl`, so callers in quick succession share one reading of it.
+pub struct Cached<T> {
+    ttl: Duration,
+    held: tokio::sync::Mutex<Option<(std::time::Instant, T)>>,
+}
+
+impl<T: Clone> Cached<T> {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            held: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// The value held, if it was read within `ttl`; otherwise what `read` returns, which is
+    /// then held. Callers that arrive during a reading wait for it rather than start another,
+    /// and a failed reading is not held.
+    pub async fn get<F, Fut>(&self, read: F) -> anyhow::Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<T>>,
+    {
+        let mut held = self.held.lock().await;
+        if let Some((read_at, value)) = held.as_ref() {
+            if read_at.elapsed() < self.ttl {
+                return Ok(value.clone());
+            }
+        }
+        let value = read().await?;
+        *held = Some((std::time::Instant::now(), value.clone()));
+        Ok(value)
+    }
 }
 
 impl ArkWallet {
@@ -116,6 +178,8 @@ impl ArkWallet {
             keypair,
             sending: tokio::sync::Mutex::new(()),
             chain: blockchain,
+            margins: Margins::from_days(config.renew_margin_days, config.pay_margin_days),
+            view: Cached::new(VIEW_TTL),
         })
     }
 
@@ -166,11 +230,35 @@ impl ArkWallet {
         self.server.info().dust
     }
 
+    /// How much life a coin needs to be left alone, and to pay an escrow.
+    pub fn margins(&self) -> Margins {
+        self.margins
+    }
+
     /// Pay `amount` to `address` in an Arkade transaction, returning its txid.
+    ///
+    /// The escrow inherits the expiry of the coins that pay it, so only coins with the pay
+    /// margin of life or more are spent, the longest-lived first. Without enough of them
+    /// nothing is sent.
     pub async fn pay(&self, address: ArkAddress, amount: Amount) -> anyhow::Result<Txid> {
         let _one_at_a_time = self.sending.lock().await;
+        let held = self.coins().await?;
+        let now = unix_now();
+        let pay_secs = self.margins.pay_secs;
+        let inputs = held
+            .select(amount.to_sat(), self.dust().to_sat(), now, pay_secs)
+            .with_context(|| {
+                format!(
+                    "no coins with {} days of life left cover {} sat: {} sat spendable; \
+                     {} sat awaiting renewal",
+                    pay_secs / coins::DAY_SECS,
+                    coins::grouped(amount.to_sat()),
+                    coins::grouped(held.payable_sat(now, pay_secs)),
+                    coins::grouped(held.awaiting_renewal_sat(now, pay_secs)),
+                )
+            })?;
         self.client
-            .send(vec![SendReceiver::bitcoin(address, amount)])
+            .send_selection(&inputs, vec![SendReceiver::bitcoin(address, amount)])
             .await
             .map_err(|error| anyhow::anyhow!("pay the escrow: {error}"))
     }
@@ -285,22 +373,78 @@ impl ArkWallet {
         Ok(ark_txid)
     }
 
-    /// What the wallet can spend now, in sats: its confirmed and preconfirmed VTXOs.
-    pub async fn spendable_sat(&self) -> anyhow::Result<u64> {
-        let balance = self
+    /// The wallet's unspent VTXOs, from the indexer's listings of spendable and of recoverable
+    /// ones. Neither lists the spent VTXOs, which are most of what the address has held.
+    pub async fn coins(&self) -> anyhow::Result<Coins> {
+        let info = self
             .client
-            .offchain_balance()
+            .server_info()
             .await
-            .map_err(|error| anyhow::anyhow!("read the balance: {error}"))?;
-        Ok(balance.confirmed().to_sat() + balance.pre_confirmed().to_sat())
+            .map_err(|error| anyhow::anyhow!("read the server's info: {error}"))?;
+        let addresses = self
+            .client
+            .get_offchain_addresses()
+            .await
+            .map_err(|error| anyhow::anyhow!("read the Ark addresses: {error}"))?;
+        let now = unix_now();
+        // The server no longer co-signs for a signer key past its cutoff: what sits under one
+        // cannot be sent or renewed, only recovered once it expires.
+        let unsigned: HashSet<bitcoin::ScriptBuf> = addresses
+            .iter()
+            .filter(|(_, vtxo)| info.signer_requires_recovery_at(vtxo.server_pk(), now))
+            .map(|(address, _)| address.to_p2tr_script_pubkey())
+            .collect();
+        let request =
+            || GetVtxosRequest::new_for_addresses(addresses.iter().map(|(address, _)| *address));
+        let filter = |error| anyhow::anyhow!("filter the VTXO listing: {error}");
+        let (mut vtxos, recoverable) = tokio::try_join!(
+            self.list_vtxos(request().spendable_only().map_err(filter)?),
+            self.list_vtxos(request().recoverable_only().map_err(filter)?),
+        )?;
+        vtxos.extend(recoverable);
+        vtxos.retain(|vtxo| {
+            !unsigned.contains(&vtxo.script) || coins::recoverable_at(vtxo, info.dust, now)
+        });
+        Ok(Coins::classify(&vtxos, info.dust, now))
     }
 
-    pub async fn view(&self) -> anyhow::Result<WalletView> {
-        let balance = self
-            .client
-            .offchain_balance()
+    /// Every VTXO `request` matches, a page at a time.
+    async fn list_vtxos(&self, request: GetVtxosRequest) -> anyhow::Result<Vec<VirtualTxOutPoint>> {
+        let mut vtxos = Vec::new();
+        let mut index = 0;
+        loop {
+            let page = request.clone().with_page(VTXO_PAGE_SIZE, index);
+            let response = tokio::time::timeout(
+                VTXO_PAGE_TIMEOUT,
+                self.server.client().grpc().list_vtxos(page),
+            )
             .await
-            .map_err(|error| anyhow::anyhow!("read the balance: {error}"))?;
+            .context("the indexer took too long to list the wallet's VTXOs")??;
+            vtxos.extend(response.vtxos);
+            match response.page {
+                Some(page) if page.next < page.total && page.next > index => index = page.next,
+                _ => return Ok(vtxos),
+            }
+        }
+    }
+
+    /// The wallet's addresses and balance, read at most once every `VIEW_TTL`.
+    pub async fn view(&self) -> anyhow::Result<WalletView> {
+        self.view
+            .get(|| async {
+                let started = std::time::Instant::now();
+                let view = self.read_view().await;
+                let took = started.elapsed();
+                if took > SLOW_VIEW {
+                    log::warn!("reading the Ark wallet took {:.1}s", took.as_secs_f64());
+                }
+                view
+            })
+            .await
+    }
+
+    async fn read_view(&self) -> anyhow::Result<WalletView> {
+        let coins = self.coins().await?;
         let (ark_address, _) = self
             .client
             .get_offchain_address()
@@ -311,12 +455,22 @@ impl ArkWallet {
             .get_boarding_address()
             .await
             .map_err(|error| anyhow::anyhow!("read the boarding address: {error}"))?;
+        let pre_confirmed_sat: u64 = coins
+            .spendable
+            .iter()
+            .filter(|coin| coin.preconfirmed)
+            .map(|coin| coin.sat)
+            .sum();
+        let payable_sat = coins.payable_sat(unix_now(), self.margins.pay_secs);
         Ok(WalletView {
             ark_address: ark_address.encode(),
             boarding_address: boarding_address.to_string(),
-            confirmed_sat: balance.confirmed().to_sat(),
-            pre_confirmed_sat: balance.pre_confirmed().to_sat(),
-            recoverable_sat: balance.recoverable().to_sat(),
+            confirmed_sat: coins.spendable_sat() - pre_confirmed_sat,
+            pre_confirmed_sat,
+            payable_sat,
+            expiring_sat: coins.spendable_sat() - payable_sat,
+            recoverable_sat: coins.recoverable_sat(),
+            earliest_expiry: coins.earliest_expiry(),
         })
     }
 
@@ -339,7 +493,8 @@ impl ArkWallet {
             .sum())
     }
 
-    /// Move confirmed boarding outputs, and VTXOs near expiry, into fresh VTXOs in the next batch.
+    /// Move confirmed boarding outputs, and recoverable VTXOs, into fresh VTXOs in the next batch.
+    /// VTXOs near expiry are left alone: `renew` settles those.
     pub async fn board(&self) -> anyhow::Result<Option<Txid>> {
         let _one_at_a_time = self.sending.lock().await;
         let mut rng = <rand08::rngs::StdRng as rand08::SeedableRng>::from_entropy();
@@ -347,6 +502,20 @@ impl ArkWallet {
             .settle(&mut rng)
             .await
             .map_err(|error| anyhow::anyhow!("board: {error}"))
+    }
+
+    /// Settle `coins` into one fresh VTXO in the next batch, which gives it a new batch's
+    /// whole life. Recoverable coins come back this way, and only this way.
+    ///
+    /// Like a boarding, it holds the wallet's sends for the batch, so no swap spends a coin
+    /// the batch is taking.
+    pub async fn renew(&self, coins: &[OutPoint]) -> anyhow::Result<Option<Txid>> {
+        let _one_at_a_time = self.sending.lock().await;
+        let mut rng = <rand08::rngs::StdRng as rand08::SeedableRng>::from_entropy();
+        self.client
+            .settle_vtxos(&mut rng, coins, &[])
+            .await
+            .map_err(|error| anyhow::anyhow!("renew: {error}"))
     }
 }
 
@@ -566,6 +735,37 @@ mod tests {
             assets: Vec::new(),
             depth: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn the_wallet_is_read_once_for_callers_within_the_cache_time() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let readings = AtomicU64::new(0);
+        let read = || async {
+            // A reading takes a while, as one through arkd does.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok::<u64, anyhow::Error>(readings.fetch_add(1, Ordering::SeqCst) + 1)
+        };
+        let cached = Cached::new(Duration::from_millis(200));
+
+        // Callers at once, and those soon after, share one reading.
+        let (first, second) = tokio::join!(cached.get(read), cached.get(read));
+        assert_eq!((first.unwrap(), second.unwrap()), (1, 1));
+        assert_eq!(cached.get(read).await.unwrap(), 1);
+        assert_eq!(readings.load(Ordering::SeqCst), 1);
+
+        // Once it is stale the wallet is read again.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(cached.get(read).await.unwrap(), 2);
+        assert_eq!(cached.get(read).await.unwrap(), 2);
+
+        // A failed reading is not kept: the next caller reads again.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let failed = cached
+            .get(|| async { Err::<u64, _>(anyhow::anyhow!("arkd is away")) })
+            .await;
+        assert!(failed.is_err());
+        assert_eq!(cached.get(read).await.unwrap(), 3);
     }
 
     #[test]

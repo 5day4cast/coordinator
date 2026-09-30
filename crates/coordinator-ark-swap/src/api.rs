@@ -2,15 +2,15 @@
 //!
 //! | Route | Use |
 //! | --- | --- |
-//! | `POST /v1/swaps` | `{ "escrow_address", "amount_sat", "preimage"? }` → the swap and its invoice. Returns the open swap if the escrow already has one, and 503 if the wallet cannot fund a new one. |
+//! | `POST /v1/swaps` | `{ "escrow_address", "amount_sat", "preimage"? }` → the swap and its invoice. Returns the open swap if the escrow already has one, and 503 if the wallet cannot fund a new one; the error says what it can spend and what awaits renewal. |
 //! | `GET /v1/swaps/{id}` | A swap's state. |
 //! | `GET /v1/swaps?payment_hash=<hex>` | The swap whose invoice pays to that hash, for tracing a payment to its escrow. |
 //! | `GET /v1/swaps?without_escrow_vtxo=true` | Swaps in `escrow_paid`, `settled` or `unsettled` that record no escrow VTXO, oldest first. Read-only, for finding money by hand. |
 //! | `POST /v1/refunds` | `{ "payment_hash", "amount_sat", "player_key", "deadline" }` → the swap an unused escrow's refund pays. Returns the swap already minted for that invoice. |
 //! | `POST /v1/refunds/{id}/paid` | `{ "preimage" }` → records the payment, answering 202 with the refund. The worker claims the swap. |
 //! | `GET /v1/refunds/{id}` | A refund's state. |
-//! | `GET /v1/wallet` | The Ark wallet's addresses and balance. |
-//! | `POST /v1/wallet/board` | Move confirmed boarding coins into VTXOs in the next batch. |
+//! | `GET /v1/wallet` | The Ark wallet's addresses and balance: what is spendable, what of it may pay an escrow (`payable_sat`) or is too close to expiry (`expiring_sat`), what must be recovered in a batch (`recoverable_sat`), and when the first spendable VTXO expires (`earliest_expiry`, UNIX seconds). Read at most once every 10 seconds. |
+//! | `POST /v1/wallet/board` | Move confirmed boarding coins, and recoverable VTXOs, into VTXOs in the next batch. |
 
 use std::sync::Arc;
 
@@ -280,6 +280,7 @@ mod tests {
     fn an_unfunded_swap_is_unavailable_not_a_bad_request() {
         let unfunded = anyhow::Error::new(Unfunded {
             spendable_sat: 712,
+            awaiting_renewal_sat: 0,
             needed_sat: 6_848,
         });
         assert_eq!(
