@@ -124,7 +124,8 @@ impl Swapper {
             .refund_turn
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        refunds.rotate_left(turn_start(refunds.iter().map(|refund| refund.id), last));
+        let start = turn_start(refunds.iter().map(|refund| refund.id), last);
+        refunds.rotate_left(start);
         let started = std::time::Instant::now();
         let total = refunds.len();
         for (reached, mut refund) in refunds.into_iter().enumerate() {
