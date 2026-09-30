@@ -189,8 +189,7 @@ dependencies = [
 [[package]]
 name = "ark-bdk-wallet"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74476be16d9b4f61b2a312f86d1a0ccee1ac99192805a44a264003272f06b942"
+source = "git+https://github.com/tee8z/rust-sdk?branch=fix%2Fbatch-events-by-id#36f4f9b9462bd54acba8891cdd864bd1d74d533c"
 dependencies = [
  "anyhow",
  "ark-client",
@@ -209,8 +208,7 @@ dependencies = [
 [[package]]
 name = "ark-client"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63e40663f37064d48930a85bd2c94fe49af4fc9240816b28751c6f2a908c2f98"
+source = "git+https://github.com/tee8z/rust-sdk?branch=fix%2Fbatch-events-by-id#36f4f9b9462bd54acba8891cdd864bd1d74d533c"
 dependencies = [
  "ark-core",
  "ark-delegator",
@@ -248,8 +246,7 @@ dependencies = [
 [[package]]
 name = "ark-core"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05b0ee250e82f655ae23052fbc1adee75403a0f5f95ff677dec21b527ae2d5f5"
+source = "git+https://github.com/tee8z/rust-sdk?branch=fix%2Fbatch-events-by-id#36f4f9b9462bd54acba8891cdd864bd1d74d533c"
 dependencies = [
  "bech32",
  "bitcoin",
@@ -270,8 +267,7 @@ dependencies = [
 [[package]]
 name = "ark-delegator"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74cafb8b4bfb1866f82b017c0640caf7b1b34c245d78b4424571bf82f31ccf0b"
+source = "git+https://github.com/tee8z/rust-sdk?branch=fix%2Fbatch-events-by-id#36f4f9b9462bd54acba8891cdd864bd1d74d533c"
 dependencies = [
  "ark-core",
  "bitcoin",
@@ -284,8 +280,7 @@ dependencies = [
 [[package]]
 name = "ark-fees"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce19028a562932cf67431af42f44d9f34924444bf83258f5381eeeb0ff2a7904"
+source = "git+https://github.com/tee8z/rust-sdk?branch=fix%2Fbatch-events-by-id#36f4f9b9462bd54acba8891cdd864bd1d74d533c"
 dependencies = [
  "cel",
 ]
@@ -293,8 +288,7 @@ dependencies = [
 [[package]]
 name = "ark-grpc"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42d2c5fb67829e0f2b876224ae767c0a241cbcd44e4711233c9f789ba8630cca"
+source = "git+https://github.com/tee8z/rust-sdk?branch=fix%2Fbatch-events-by-id#36f4f9b9462bd54acba8891cdd864bd1d74d533c"
 dependencies = [
  "ark-core",
  "async-stream",

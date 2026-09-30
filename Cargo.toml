@@ -172,3 +172,16 @@ opt-level = 3
 
 [profile.wasm-release.package.sha2]
 opt-level = 3
+
+# ark-client 0.11.0 misses its own batch failing when it only spends boarding UTXOs, then signs
+# the next batch's commitment TX, signs nothing and gets INVALID_BOARDING_INPUT_SIG ("no signed
+# inputs found"). The fork branch listens on the boarding outpoints, ignores other batches' events
+# and refuses to submit an unsigned commitment TX. Remove this once upstream releases the fix.
+# Every ark crate comes from the fork, so ark-client and our own ark-core/ark-grpc share one ark-core.
+[patch.crates-io]
+ark-bdk-wallet = { git = "https://github.com/tee8z/rust-sdk", branch = "fix/batch-events-by-id" }
+ark-client = { git = "https://github.com/tee8z/rust-sdk", branch = "fix/batch-events-by-id" }
+ark-core = { git = "https://github.com/tee8z/rust-sdk", branch = "fix/batch-events-by-id" }
+ark-delegator = { git = "https://github.com/tee8z/rust-sdk", branch = "fix/batch-events-by-id" }
+ark-fees = { git = "https://github.com/tee8z/rust-sdk", branch = "fix/batch-events-by-id" }
+ark-grpc = { git = "https://github.com/tee8z/rust-sdk", branch = "fix/batch-events-by-id" }
