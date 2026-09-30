@@ -19,8 +19,9 @@
 //! as one interrupted by a restart would. A delete proof signs the escrows' funding leaves like
 //! the intent, but pays nothing.
 //!
-//! The batch creates no VTXOs for this intent, so there is no VTXO tree to cosign.
-//! Steps 3 to 5 are the only work inside the server's session window.
+//! The intent lists no cosigner key. A batch that also creates other users' VTXOs builds a VTXO
+//! tree, with an empty leaf for this intent that the server cosigns alone, so the pool is never
+//! asked to cosign. Steps 3 to 5 are the only work inside the server's session window.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -33,8 +34,6 @@ use ark_core::{TxGraph, TxGraphChunk};
 use async_trait::async_trait;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::hex::DisplayHex;
-use bitcoin::key::{Keypair, Secp256k1};
-use bitcoin::secp256k1::rand::thread_rng;
 use bitcoin::taproot::LeafVersion;
 use bitcoin::{Amount, OutPoint, Psbt, TapLeafHash, Transaction, TxOut, Txid, XOnlyPublicKey};
 use coordinator_ark_escrow::{EntryEscrow, EscrowPath, ServerRules};
@@ -333,8 +332,8 @@ pub async fn fund_pool<T: ArkTransport + ?Sized>(
         Err(error) => log::warn!("cannot delete any kickoff intent left queued: {error}"),
     }
     let deadline = Instant::now() + config.timeout;
-    // No VTXO tree is built for this intent, so the cosigner key never signs. arkd still wants one.
-    let cosigner = Keypair::new(&Secp256k1::new(), &mut thread_rng()).public_key();
+    // arkd asks every listed cosigner to sign a batch's VTXO tree, even for an intent with no
+    // VTXO outputs, and needs cosigners only for off-chain receivers. So list none.
     let vtxo_inputs = intent_inputs(&pool.inputs)?;
 
     let outputs = pool.outputs();
@@ -343,7 +342,7 @@ pub async fn fund_pool<T: ArkTransport + ?Sized>(
         onchain_output_indexes: (0..outputs.len()).collect(),
         valid_at: now,
         expire_at: now + config.intent_lifetime.as_secs(),
-        own_cosigner_pks: vec![cosigner],
+        own_cosigner_pks: Vec::new(),
     };
     let mut intent = make_intent(
         |_, _| Ok(Vec::new()),
@@ -366,7 +365,6 @@ pub async fn fund_pool<T: ArkTransport + ?Sized>(
         .inputs
         .iter()
         .map(|input| input.outpoint.to_string())
-        .chain([cosigner.serialize().to_lower_hex_string()])
         .collect();
     // Subscribe before registering, so the batch that selects the intent cannot be missed.
     let mut events = transport.event_stream(topics).await?;
@@ -387,7 +385,6 @@ pub async fn fund_pool<T: ArkTransport + ?Sized>(
         &mut events,
         deadline,
         intent_id.clone(),
-        cosigner,
         &vtxo_inputs,
         &mut state,
     )
@@ -419,7 +416,6 @@ async fn run_batch<T: ArkTransport + ?Sized>(
     events: &mut EventStream<'_>,
     deadline: Instant,
     intent_id: String,
-    cosigner: bitcoin::secp256k1::PublicKey,
     vtxo_inputs: &[intent::Input],
     state: &mut State,
 ) -> Result<Kickoff, Error> {
@@ -459,14 +455,6 @@ async fn run_batch<T: ArkTransport + ?Sized>(
                         connectors.push(event.tx_graph_chunk);
                     }
                 }
-            }
-            StreamEvent::TreeSigningStarted(event)
-                if state.batch_id() == Some(event.id.as_str())
-                    && event.cosigners_pubkeys.contains(&cosigner) =>
-            {
-                return Err(Error::Protocol(
-                    "the server asked the pool to cosign a VTXO tree".into(),
-                ));
             }
             StreamEvent::BatchFinalization(event) => {
                 let State::Joined {
