@@ -1677,6 +1677,59 @@ mod ark_escrow {
         }
     }
 
+    fn register_message(expire_at: u64) -> String {
+        format!(
+            r#"{{"type":"register","onchain_output_indexes":[],"valid_at":{},"expire_at":{expire_at},"cosigners_public_keys":["02{}"]}}"#,
+            expire_at.saturating_sub(120),
+            "7b".repeat(32),
+        )
+    }
+
+    /// The same refund made in a batch, as for an escrow whose VTXO expired: an intent proof
+    /// spending the message input and the escrow through the refund leaf, paying the swap.
+    fn refund_intent_of(escrow: &EntryEscrow, swap: &RefundSwap, message: &str) -> ArkEscrowSpend {
+        let value = Amount::from_sat(REFUNDED_SATS);
+        let spent = [
+            coordinator_escrow::ark::intent_message_outpoint(message, escrow.script_pubkey()),
+            outpoint(11),
+        ];
+        let mut proof = Psbt::from_unsigned_tx(Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::from_consensus(REFUND_AT),
+            input: spent
+                .into_iter()
+                .map(|previous_output| TxIn {
+                    previous_output,
+                    sequence: dlctix::bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF,
+                    ..Default::default()
+                })
+                .collect(),
+            output: vec![TxOut {
+                value,
+                script_pubkey: swap.script_pubkey(),
+            }],
+        })
+        .unwrap();
+        for (input, value) in proof.inputs.iter_mut().zip([Amount::ZERO, value]) {
+            input.witness_utxo = Some(TxOut {
+                value,
+                script_pubkey: escrow.script_pubkey(),
+            });
+            input.tap_scripts.insert(
+                escrow.control_block(EscrowPath::Refund),
+                (
+                    escrow.script(EscrowPath::Refund).clone(),
+                    LeafVersion::TapScript,
+                ),
+            );
+        }
+        ArkEscrowSpend::RefundIntent {
+            proof_psbt: psbt_hex(&proof),
+            message: message.into(),
+            swap_tap_tree: hex::encode(swap.vtxo_script().encode_tap_tree()),
+        }
+    }
+
     pub(super) fn refund_parameters(
         spend: ArkEscrowSpend,
         invoice: String,
@@ -1751,6 +1804,151 @@ mod ark_escrow {
             .restore_execution(f.execute_view(&unbound, &first, SIGN_ARK_REFUND), &prepared)
             .await
             .unwrap();
+    }
+
+    /// Once an escrow's VTXO has expired, the server spends it only in a batch. The refund
+    /// permission signs the intent that pays the same swap there, under the same checks.
+    #[cfg(feature = "lnurl")]
+    #[tokio::test]
+    async fn a_refund_of_an_expired_escrow_is_signed_as_a_batch_intent_paying_its_swap() {
+        use crate::lnurl_transport::fixtures::{discovery_tls_fixture, FIXTURE_METADATA};
+
+        let escrow = escrow_with(14, 18);
+        let f = fixture_with(true, Some(policy_for(&escrow)));
+        let preimage = [9u8; 32];
+        let paid_sats = REFUNDED_SATS - MAX_REFUND_FEE_SATS;
+        let invoice = address_invoice_for(paid_sats, preimage, FIXTURE_METADATA);
+        let swap = refund_swap(preimage);
+        let message = register_message(now().unwrap() + 120);
+        let unbound = Payload::default();
+
+        let (client, server) = discovery_tls_fixture().await;
+        let verifier = CoordinatorVerifier::with_lnurl(client);
+        let first = attempt();
+        let prepared = verifier
+            .prepare(
+                f.prepare_view(&unbound, &first, SIGN_ARK_REFUND, &BTreeMap::new()),
+                &refund_parameters(
+                    refund_intent_of(&escrow, &swap, &message),
+                    invoice.clone(),
+                    MAX_REFUND_FEE_SATS,
+                ),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        // The message input and the escrow, both signed by the entry key.
+        let inputs: Vec<usize> = prepared.output.decode().unwrap();
+        assert_eq!(inputs, vec![0, 1]);
+        assert_eq!(digests(&prepared.action).len(), 2);
+        verifier
+            .verify_execution(
+                f.execute_view(&unbound, &first, SIGN_ARK_REFUND),
+                &prepared,
+                &Payload::default(),
+            )
+            .await
+            .unwrap();
+        verifier
+            .restore_execution(f.execute_view(&unbound, &first, SIGN_ARK_REFUND), &prepared)
+            .await
+            .unwrap();
+
+        // A swap that commits to a different invoice cannot be claimed by paying this one.
+        let (client, server) = discovery_tls_fixture().await;
+        let other = refund_swap([1u8; 32]);
+        assert!(CoordinatorVerifier::with_lnurl(client)
+            .prepare(
+                f.prepare_view(&unbound, &attempt(), SIGN_ARK_REFUND, &BTreeMap::new()),
+                &refund_parameters(
+                    refund_intent_of(&escrow, &other, &message),
+                    invoice.clone(),
+                    MAX_REFUND_FEE_SATS,
+                ),
+            )
+            .await
+            .is_err());
+        server.await.unwrap();
+
+        // An intent that expired, or one valid for longer than a batch needs, is refused
+        // before the address is resolved at all.
+        for expire_at in [now().unwrap() - 1, now().unwrap() + 24 * 60 * 60] {
+            let (client, server) = discovery_tls_fixture().await;
+            let stale = register_message(expire_at);
+            assert!(CoordinatorVerifier::with_lnurl(client)
+                .prepare(
+                    f.prepare_view(&unbound, &attempt(), SIGN_ARK_REFUND, &BTreeMap::new()),
+                    &refund_parameters(
+                        refund_intent_of(&escrow, &swap, &stale),
+                        invoice.clone(),
+                        MAX_REFUND_FEE_SATS,
+                    ),
+                )
+                .await
+                .is_err());
+            server.abort();
+        }
+    }
+
+    /// The server does not hold an intent that spends a swept VTXO to the escrow's refund
+    /// locktime, so the verifier does, by its own clock.
+    #[tokio::test]
+    async fn a_refund_intent_is_refused_before_the_escrows_refund_locktime() {
+        let later = now().unwrap() as u32 + 3_600;
+        let escrow = EntryEscrow::new(EscrowTerms {
+            refund_locktime: LockTime::from_consensus(later),
+            ..*escrow_with(14, 18).terms()
+        })
+        .unwrap();
+        let f = fixture_with(true, Some(policy_for(&escrow)));
+        let message = register_message(now().unwrap() + 120);
+        let swap = refund_swap([9u8; 32]);
+        // Even a proof that claims the locktime has passed.
+        let ArkEscrowSpend::RefundIntent {
+            proof_psbt,
+            message,
+            swap_tap_tree,
+        } = refund_intent_of(&escrow, &swap, &message)
+        else {
+            unreachable!()
+        };
+        let mut proof = Psbt::deserialize(&hex::decode(proof_psbt).unwrap()).unwrap();
+        proof.unsigned_tx.lock_time = LockTime::from_consensus(later);
+        let spend = ArkEscrowSpend::RefundIntent {
+            proof_psbt: psbt_hex(&proof),
+            message,
+            swap_tap_tree,
+        };
+        let refused = CoordinatorVerifier::default()
+            .prepare(
+                f.prepare_view(
+                    &Payload::default(),
+                    &attempt(),
+                    SIGN_ARK_REFUND,
+                    &BTreeMap::new(),
+                ),
+                &refund_parameters(spend, invoice_for(1_000, [9u8; 32]), 0),
+            )
+            .await;
+        let Err(error) = refused else {
+            panic!("a refund intent was authorized before its escrow's locktime");
+        };
+        assert!(
+            format!("{error:?}").contains("locktime has not passed"),
+            "{error:?}"
+        );
+    }
+
+    /// The pool's escrow permission signs batch intents for the pool, but never a refund's:
+    /// only the refund permission checks the swap against the player's own invoice.
+    #[tokio::test]
+    async fn the_escrow_permission_does_not_sign_a_refund_intent() {
+        let (f, escrow) = ark_fixture();
+        let verifier = CoordinatorVerifier::default();
+        let bound = f.bind(&verifier);
+        let message = register_message(now().unwrap() + 120);
+        let spend = refund_intent_of(&escrow, &refund_swap([9u8; 32]), &message);
+        assert!(prepare(&verifier, &f, &bound, spend).await.is_err());
     }
 
     #[cfg(feature = "lnurl")]

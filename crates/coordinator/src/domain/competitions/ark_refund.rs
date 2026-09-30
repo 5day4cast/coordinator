@@ -20,8 +20,13 @@
 //! swap and waits, rather than asking the player's provider for a new invoice every hour.
 //!
 //! An escrow's VTXO expires with the coin that paid it, and the Arkade server then refuses to
-//! spend it offchain (`VTXO_RECOVERABLE`). A refund that finds its escrow expired is held: it
-//! keeps the swap it has, and nothing is minted or signed for it again.
+//! spend it offchain (`VTXO_RECOVERABLE`). The server sweeps the expired coins and gives their
+//! value back only in a batch, so the refund then goes through one: an intent spends the escrow's
+//! refund leaf, with Keymeld signing as the player, and receives the same swap as a new VTXO
+//! (`coordinator_ark::recover_escrow`). From there the refund is paid and claimed as usual. Until
+//! Arkade has swept the escrow the refund is held: it keeps the swap it has, and nothing is
+//! minted or signed for it. A recovery that fails is tried again after a pause, and asks the
+//! player's provider for a new invoice at most every six hours.
 //!
 //! Keymeld signs with the entry key the player's browser sealed to its enclave. The browser sends
 //! that registration before it shows the ticket's invoice, and again with the entry. Entries are
@@ -38,7 +43,9 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use coordinator_ark::{build_refund, EscrowInput, KeypairSigner, RefundTransactions};
+use coordinator_ark::{
+    build_refund, EscrowInput, KeypairSigner, KickoffConfig, RefundTransactions,
+};
 use coordinator_ark_escrow::{EntryEscrow, RefundSwap, VtxoScript};
 use coordinator_escrow::ark::{psbt_hex, ArkEscrowSpend, RefundPurpose, MIN_REFUND_DEADLINE_SECS};
 use dlctix::bitcoin::absolute::LockTime;
@@ -47,6 +54,7 @@ use log::{debug, info, warn};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use super::KeymeldRecovery;
 use super::{ArkRefundState, Coordinator, KeymeldIntentDelete, TicketArkEscrow, TicketArkRefund};
 use super::{PaidTicketRegistration, TicketRegistration};
 use super::{RefundWriteOff, UnrefundedArkEscrow};
@@ -81,8 +89,17 @@ pub(super) const REFUND_REPORTS: &str = "escrow refund";
 pub(super) const HELD_BY_INTENT: &str = "the escrow is held by a queued Arkade batch intent";
 
 /// What a minted refund notes once its escrow's VTXO has expired on Arkade, which then refuses
-/// to spend it offchain. A new swap would be refused too, so the refund keeps the one it has.
+/// to spend it offchain. The refund goes through a batch instead, once Arkade has swept the
+/// escrow. After a recovery that failed, the note goes on with `: ` and why.
 pub(super) const HELD_EXPIRED: &str = "the escrow's VTXO expired on Arkade";
+
+/// How long a recovery that failed waits before it is tried again. Longer than a batch takes,
+/// so that one whose outcome was lost has finished, or failed, by then.
+const RECOVERY_RETRY: Duration = Duration::from_secs(10 * 60);
+
+/// While its recoveries keep failing, a stale refund is minted again at most this often, so the
+/// player's Lightning Address provider is not asked for an invoice every hour.
+const RECOVERY_REMINT_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// What a refund that cannot finish without an operator says, when it is logged. Such a refund
 /// may be written off without `force`.
@@ -673,10 +690,11 @@ impl Coordinator {
                     )
                     .into());
                 }
-                // Nor is anything minted for an escrow Arkade will not spend offchain: that
-                // would ask the player's provider for an invoice nothing can pay.
-                if expired_on_arkade(&listed) {
-                    return Err(expired(outpoint, sats, &listed));
+                // Nor is anything minted for an expired escrow until Arkade has swept it:
+                // until then nothing could pay the invoice the player's provider would be
+                // asked for.
+                if expired_on_arkade(&listed) && !listed.is_swept {
+                    return Err(awaiting_sweep(outpoint, sats, &listed));
                 }
                 let refund = self
                     .mint_refund(ark, &escrow, player, &script, sats)
@@ -695,35 +713,47 @@ impl Coordinator {
                 let listed = self.listed_escrow(ark, &escrow, outpoint).await?;
                 match escrow_spend(&listed, &built) {
                     EscrowSpend::Unspent => {
-                        // Expiry does not pass, so once Arkade has refused the escrow for it,
-                        // the refund stays held whatever the listing says.
-                        if expired_on_arkade(&listed)
-                            || refund.error.as_deref() == Some(HELD_EXPIRED)
-                        {
-                            self.note_expired(escrow.ticket_id).await?;
-                            return Err(expired(outpoint, sats, &listed));
-                        }
                         let session = session.context("the refund needs Keymeld, see above")?;
                         let input = EscrowInput {
                             escrow: script.clone(),
                             outpoint,
                             amount: Amount::from_sat(sats),
                         };
-                        // Arkade refuses the refund while the intent holds the escrow, so it
-                        // is freed before a stale refund is minted again.
-                        if refund.error.as_deref() == Some(HELD_BY_INTENT) {
-                            self.delete_held_intent(ark, session, &escrow, &input)
-                                .await?;
-                        }
-                        if self.is_stale(&refund, &swap)? {
+                        // Expiry does not pass, so once Arkade has refused the escrow for it,
+                        // the refund goes through a batch whatever the listing says.
+                        if expired_on_arkade(&listed) || held_expired(&refund) {
                             refund = self
-                                .remint_refund(ark, &escrow, player, &script, sats, &refund)
+                                .recover_refund(
+                                    ark, session, &escrow, &input, player, &listed, refund, swap,
+                                )
                                 .await?;
-                            swap = self.refund_swap(ark, &refund).await?;
-                            built = build(ark, &script, outpoint, sats, &swap)?;
-                        }
-                        self.submit_refund(ark, session, &escrow, &input, &swap, &built, &refund)
+                        } else {
+                            // Arkade refuses the refund while the intent holds the escrow, so
+                            // it is freed before a stale refund is minted again.
+                            if refund.error.as_deref() == Some(HELD_BY_INTENT) {
+                                self.delete_held_intent(ark, session, &escrow, &input)
+                                    .await?;
+                            }
+                            if self.is_stale(&refund, &swap)? {
+                                refund = self
+                                    .remint_refund(
+                                        ark,
+                                        &escrow,
+                                        player,
+                                        &script,
+                                        sats,
+                                        &refund,
+                                        REMINT_INTERVAL,
+                                    )
+                                    .await?;
+                                swap = self.refund_swap(ark, &refund).await?;
+                                built = build(ark, &script, outpoint, sats, &swap)?;
+                            }
+                            self.submit_refund(
+                                ark, session, &escrow, &input, &swap, &built, &refund,
+                            )
                             .await?;
+                        }
                     }
                     // Either way the player is not paid: paying for a swap the service may
                     // never be able to claim could pay them twice.
@@ -736,11 +766,32 @@ impl Coordinator {
                         .into());
                     }
                     EscrowSpend::Elsewhere => {
-                        return Err(anyhow!(
-                            "its escrow {outpoint} was spent by something other than its \
-                             refund; it needs an operator"
-                        )
-                        .into());
+                        // A batch that recovered the escrow may have finished after this
+                        // process stopped following it. It paid this refund's swap, or the
+                        // escrow went somewhere else.
+                        let Some(commitment) =
+                            self.recovered_into(ark, &listed, &swap, sats).await?
+                        else {
+                            return Err(anyhow!(
+                                "its escrow {outpoint} was spent by something other than its \
+                                 refund; it needs an operator"
+                            )
+                            .into());
+                        };
+                        info!(
+                            "The expired escrow of ticket {} was recovered into its swap by \
+                             the batch of commitment {commitment}",
+                            escrow.ticket_id
+                        );
+                        self.competition_store
+                            .advance_ticket_ark_refund(
+                                escrow.ticket_id,
+                                ArkRefundState::Submitted,
+                                Some(commitment.to_string()),
+                                None,
+                                None,
+                            )
+                            .await?;
                     }
                 }
             }
@@ -881,10 +932,12 @@ impl Coordinator {
             || invoice.would_expire(Duration::from_secs(now + INVOICE_MARGIN.as_secs())))
     }
 
-    /// Replace a stale minted refund with a new swap and invoice.
+    /// Replace a stale minted refund with a new swap and invoice, once `interval` has passed
+    /// since it was minted.
     ///
     /// Nothing was signed or paid for the stale one: a minted refund's escrow is unspent. Its
     /// swap at `ark-swapd` retires by itself at its deadline.
+    #[allow(clippy::too_many_arguments)]
     async fn remint_refund(
         &self,
         ark: &super::Arkade,
@@ -893,13 +946,14 @@ impl Coordinator {
         escrow_script: &EntryEscrow,
         sats: u64,
         stale: &TicketArkRefund,
+        interval: Duration,
     ) -> Result<TicketArkRefund, Error> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        if now < stale.created_at + REMINT_INTERVAL.as_secs() as i64 {
+        if now < stale.created_at + interval.as_secs() as i64 {
             return Err(anyhow!(
                 "its minted refund expired before it could be signed; it is minted again \
                  from {}",
-                stale.created_at + REMINT_INTERVAL.as_secs() as i64
+                stale.created_at + interval.as_secs() as i64
             )
             .into());
         }
@@ -999,14 +1053,13 @@ impl Coordinator {
         };
         let submitted = match submitted {
             // The escrow's VTXO expired, perhaps since it was listed. No swap or signature
-            // changes that, so the refund is held rather than minted again when this one
-            // goes stale.
+            // changes that, so the refund is noted as held, and goes through a batch from
+            // the next pass on.
             Err(e) if e.is_vtxo_recoverable() => {
-                self.note_expired(escrow.ticket_id).await?;
+                self.note_expired(escrow.ticket_id, None).await?;
                 return Err(anyhow!(
                     "its escrow {} holds {} sats, but its VTXO expired on Arkade, which will \
-                     not spend it offchain ({e}); its refund is held, and it needs an operator \
-                     (docs/ops/stuck-escrow-check.md)",
+                     not spend it offchain ({e}); it is recovered in a batch instead",
                     input.outpoint,
                     input.amount.to_sat(),
                 )
@@ -1116,12 +1169,143 @@ impl Coordinator {
             .await?)
     }
 
-    /// Note that the minted refund's escrow expired on Arkade.
-    async fn note_expired(&self, ticket_id: Uuid) -> Result<(), Error> {
+    /// Note that the minted refund's escrow expired on Arkade, and why its recovery failed if
+    /// one did.
+    async fn note_expired(&self, ticket_id: Uuid, failure: Option<&str>) -> Result<(), Error> {
+        let note = match failure {
+            Some(failure) => format!("{HELD_EXPIRED}: {failure}"),
+            None => HELD_EXPIRED.into(),
+        };
         Ok(self
             .competition_store
-            .note_minted_ticket_ark_refund(ticket_id, Some(HELD_EXPIRED.into()))
+            .note_minted_ticket_ark_refund(ticket_id, Some(note))
             .await?)
+    }
+
+    /// Refund an escrow whose VTXO expired, in a batch: the offchain refund's swap receives the
+    /// escrow's value as a new VTXO, and the refund is then paid and claimed like any other.
+    ///
+    /// Returns the refund that was recovered, which is a fresh one if the one given was stale.
+    #[allow(clippy::too_many_arguments)]
+    async fn recover_refund(
+        &self,
+        ark: &super::Arkade,
+        session: &DlcKeygenSession,
+        escrow: &TicketArkEscrow,
+        input: &EscrowInput,
+        player: &RefundPlayer,
+        listed: &coordinator_ark::VirtualTxOutPoint,
+        mut refund: TicketArkRefund,
+        mut swap: RefundSwap,
+    ) -> Result<TicketArkRefund, Error> {
+        let ticket_id = escrow.ticket_id;
+        let (outpoint, sats) = (input.outpoint, input.amount.to_sat());
+        // Arkade gives an expired VTXO's value back without more ado only once it has swept
+        // its coins. Until then a batch would want a forfeit, which only a kickoff signs.
+        if !listed.is_swept {
+            if !held_expired(&refund) {
+                self.note_expired(ticket_id, None).await?;
+            }
+            return Err(awaiting_sweep(outpoint, sats, listed));
+        }
+        // A recovery that failed waits before the next one, and says the same meanwhile.
+        let failed = failed_recovery(&refund).map(str::to_owned);
+        if let Some(failure) = &failed {
+            let retry_at = refund.updated_at + RECOVERY_RETRY.as_secs() as i64;
+            if OffsetDateTime::now_utc().unix_timestamp() < retry_at {
+                return Err(anyhow!("{failure}").into());
+            }
+        }
+        if self.is_stale(&refund, &swap)? {
+            let interval = match failed {
+                Some(_) => RECOVERY_REMINT_INTERVAL,
+                None => REMINT_INTERVAL,
+            };
+            refund = self
+                .remint_refund(ark, escrow, player, &input.escrow, sats, &refund, interval)
+                .await?;
+            swap = self.refund_swap(ark, &refund).await?;
+        }
+
+        let signer = KeymeldRecovery {
+            keymeld: self.keymeld.as_ref(),
+            session,
+            user: keymeld_sdk::UserId::from(ticket_id),
+            swap_tap_tree: hex::encode(swap.vtxo_script().encode_tap_tree()),
+            invoice: refund.invoice.clone(),
+            fee_sats: refund.fee_sats,
+        };
+        let coordinator = KeypairSigner::new([self.escrow_keypair()?]);
+        let info = ark.server.info();
+        let recovered = coordinator_ark::recover_escrow(
+            ark.transport.as_ref(),
+            info,
+            input,
+            &swap,
+            &signer,
+            &coordinator,
+            &KickoffConfig::for_server(info),
+        )
+        .await;
+        match recovered {
+            Ok(recovery) => {
+                info!(
+                    "Recovered the expired escrow of ticket {ticket_id} into its swap, as {} \
+                     in batch {} (commitment {})",
+                    recovery.swap_vtxo, recovery.batch_id, recovery.commitment_txid
+                );
+                self.competition_store
+                    .advance_ticket_ark_refund(
+                        ticket_id,
+                        ArkRefundState::Submitted,
+                        Some(recovery.commitment_txid.to_string()),
+                        None,
+                        None,
+                    )
+                    .await?;
+                Ok(refund)
+            }
+            Err(e) => {
+                let failure = format!(
+                    "its escrow {outpoint} holds {sats} sats and its VTXO expired on Arkade; \
+                     recovering it in a batch failed, and is tried again: {e}"
+                );
+                self.note_expired(ticket_id, Some(&failure)).await?;
+                Err(anyhow!(failure).into())
+            }
+        }
+    }
+
+    /// The commitment transaction of the batch that recovered the escrow into `swap`, if one
+    /// did: Arkade lists the escrow as settled by it, and a VTXO of that batch worth the
+    /// escrow at the swap's address.
+    ///
+    /// That VTXO is all the swap service needs to claim once the player is paid, so the refund
+    /// can go on from there.
+    async fn recovered_into(
+        &self,
+        ark: &super::Arkade,
+        listed: &coordinator_ark::VirtualTxOutPoint,
+        swap: &RefundSwap,
+        sats: u64,
+    ) -> Result<Option<dlctix::bitcoin::Txid>, Error> {
+        let Some(commitment) = listed.settled_by else {
+            return Ok(None);
+        };
+        let address = swap
+            .address(ark.server.hrp())
+            .map_err(|e| anyhow!("The swap has no Ark address: {e}"))?
+            .encode();
+        let paid = ark
+            .transport
+            .vtxos(vec![address])
+            .await
+            .map_err(|e| anyhow!("Arkade will not list the swap's VTXOs: {e}"))?
+            .into_iter()
+            .any(|vtxo| {
+                vtxo.amount.to_sat() == sats && vtxo.commitment_txids.contains(&commitment)
+            });
+        Ok(paid.then_some(commitment))
     }
 
     /// Finish a submitted refund, and record that its escrow is spent.
@@ -1303,15 +1487,36 @@ fn expired_on_arkade(vtxo: &coordinator_ark::VirtualTxOutPoint) -> bool {
     vtxo.is_swept || (vtxo.expires_at > 0 && vtxo.expires_at <= now)
 }
 
-/// Why the refund of an escrow whose VTXO expired is held.
-fn expired(outpoint: OutPoint, sats: u64, vtxo: &coordinator_ark::VirtualTxOutPoint) -> Error {
+/// Whether the refund noted that its escrow expired on Arkade.
+fn held_expired(refund: &TicketArkRefund) -> bool {
+    refund
+        .error
+        .as_deref()
+        .is_some_and(|note| note.starts_with(HELD_EXPIRED))
+}
+
+/// Why the refund's last recovery failed, if it noted one.
+fn failed_recovery(refund: &TicketArkRefund) -> Option<&str> {
+    refund
+        .error
+        .as_deref()?
+        .strip_prefix(HELD_EXPIRED)?
+        .strip_prefix(": ")
+}
+
+/// Why the refund of an escrow that expired, and that Arkade has not swept yet, is held.
+fn awaiting_sweep(
+    outpoint: OutPoint,
+    sats: u64,
+    vtxo: &coordinator_ark::VirtualTxOutPoint,
+) -> Error {
     let at = OffsetDateTime::from_unix_timestamp(vtxo.expires_at)
         .map(|at| at.to_string())
         .unwrap_or_else(|_| vtxo.expires_at.to_string());
     anyhow!(
         "its escrow {outpoint} holds {sats} sats, but its VTXO expired on Arkade (it lists its \
          expiry as {at}), which will not spend it offchain (VTXO_RECOVERABLE); its refund is \
-         held, and it needs an operator (docs/ops/stuck-escrow-check.md)"
+         held until Arkade has swept the escrow, and then goes through a batch"
     )
     .into()
 }

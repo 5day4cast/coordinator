@@ -119,12 +119,32 @@ the refund then keeps its swap instead of minting a new one each hour, and the l
 arkd operator can also remove the intent: `GET /v1/admin/intents` lists it, and
 `POST /v1/admin/intents/delete` deletes it. The next cleanup pass then refunds the escrow.
 
-`refund_error` = `the escrow's VTXO expired on Arkade` means Arkade refused the refund with
-`VTXO_RECOVERABLE`, or lists the escrow as expired or swept (section 5: `expiresAt`, `isSwept`).
-A VTXO expires with the coin that paid it, and arkd then spends it only in a batch. The refund is
-held: it keeps its swap, and nothing is minted or signed for it again, so the player's Lightning
-Address provider is not asked for a new invoice every hour. An escrow found expired before any
-refund was minted has no refund row at all; the log says why.
+`refund_error` starting `the escrow's VTXO expired on Arkade` means Arkade refused the refund
+with `VTXO_RECOVERABLE`, or lists the escrow as expired or swept (section 5: `expiresAt`,
+`isSwept`). A VTXO expires with the coin that paid it, and arkd then spends it only in a batch.
+
+- While Arkade lists the escrow as expired and not swept, the refund is held: it keeps its swap,
+  and nothing is minted or signed for it. An escrow found expired before any refund was minted
+  has no refund row yet; the log says why.
+- Once Arkade lists it as swept (`isSwept: true`), cleanup recovers it in a batch: an intent
+  spends the escrow's refund leaf, signed by Keymeld as the player, and the batch pays the
+  refund's swap as a new VTXO. The refund then reads `submitted`, with the batch's commitment
+  transaction as its `ark_txid`, and is paid and settled like any other. A stale swap is
+  replaced first, so the refund may get a new `refund_id`.
+- If the note goes on with `: … recovering it in a batch failed, and is tried again: …`, the
+  last attempt failed for the reason given. It is tried again after ten minutes, and while it
+  keeps failing a stale swap is replaced at most every six hours. Common reasons:
+  - Keymeld's verifier predates refunds in a batch (`Unsupported Coordinator verifier action`,
+    or a refusal to decode the spend): deploy the verifier enclave built from this version.
+  - `INTENT_INSUFFICIENT_FEE`: the Arkade server charges for the recovery, and the swap must
+    receive the escrow's whole value. Needs an operator.
+  - `timed out waiting for a batch to select the recovery intent`: the server ran no batch in
+    time. The attempt deleted its intent, and the next one registers again.
+
+A refund left `minted` whose escrow Arkade lists as settled (`settledBy`) was recovered by a
+batch this coordinator stopped following, for example across a restart. Cleanup finds the
+swap's VTXO from that batch and goes on; if the swap holds none, the log says the escrow was
+spent by something other than its refund.
 
 ### Writing off a refund that can never finish
 
@@ -228,7 +248,10 @@ debug while the condition lasts:
 - `Wrote off the refund of ticket … in competition …`: an operator wrote off its refund (see above).
 - `Cannot refund … yet: its escrow … is held by an Arkade batch intent that cannot be deleted yet…`: section 3, `refund_error`.
 - `Deleted the Arkade batch intent that held the escrow of ticket …`: a refund freed its escrow, and every other escrow of that intent.
-- `Cannot refund … yet: its escrow … holds … sats, but its VTXO expired on Arkade…`: section 3, `refund_error`.
+- `Cannot refund … yet: its escrow … holds … sats, but its VTXO expired on Arkade…`: section 3, `refund_error`; held until Arkade has swept it.
+- `Cannot refund … yet: its escrow … holds … sats and its VTXO expired on Arkade; recovering it in a batch failed, and is tried again: …`: section 3, `refund_error`.
+- `Recovered the expired escrow of ticket … into its swap, as … in batch … (commitment …)`: a batch gave an expired escrow's value back; its refund is paid next.
+- `The expired escrow of ticket … was recovered into its swap by the batch of commitment …`: the same, found after the batch finished unseen.
 - `kickoff intent … may still hold the escrows, since deleting it failed…`: a kickoff failed and left its intent queued; the pool's refunds, or its next kickoff, delete it.
 - `Cannot sign the refunds of competition …: N of its tickets can still be paid…`: refunds wait for those invoices to expire.
 - `… its ticket was counted after Keymeld was given the competition's roster…`: a ticket paid too late to join the roster; needs an operator.

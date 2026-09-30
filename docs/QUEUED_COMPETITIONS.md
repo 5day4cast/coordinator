@@ -498,6 +498,30 @@ So `T` is early, and the coin is checked:
 
 `T` is in the escrow's tap tree, so escrows issued before this change keep a `T` a day after their start.
 
+### Recovering an expired escrow
+
+An escrow can still expire before its refund: one issued with the old `T`, one paid before the expiry check existed, or one whose competition took longer to die than its coin lived.
+arkd refuses the offchain refund (`VTXO_RECOVERABLE`), and the refund is held: it keeps its swap, and nothing is minted or signed for it while it waits.
+
+The server still owes the value. Once it has swept the expired coins, it pays a swept VTXO out in a batch, to an intent that proves ownership, without a forfeit.
+So the refund goes through a batch (`coordinator_ark::recover_escrow`):
+
+1. The coordinator registers an intent.
+   Its proof spends the escrow through its refund leaf, with the refund's locktime, and Keymeld signs it as the player.
+   Its only output is the refund's swap, off chain, for the escrow's whole value.
+2. A batch selects the intent. The coordinator checks that the batch's VTXO tree pays the swap and spends from its commitment transaction, then cosigns the tree with a key made for that batch.
+3. When the batch finalizes, the swap holds a new VTXO, and the refund goes on as after an offchain spend: the coordinator pays the player's invoice, and `ark-swapd` claims the swap with the preimage.
+
+The verifier signs the intent under the refund's permission, held to the same invoice, fee cap and swap deadline as the offchain refund (`ArkEscrowSpend::RefundIntent`).
+It requires a `register` message that names no on-chain output and expires within ten minutes.
+arkd does not hold an intent that spends a swept VTXO to the leaf's locktime, so the verifier also refuses one before `T` by its own clock.
+The pool's escrow permission never signs one.
+
+An escrow that expired but is not swept yet would still need a forfeit, which only a kickoff signs, so its refund waits for the sweep.
+A recovery that fails is tried again after ten minutes, by which time a batch whose outcome was lost has finished; if it did pay the swap, the refund finds the swap funded and goes on.
+While recoveries keep failing, a stale swap is replaced at most every six hours.
+The server must take no fee for the recovery: the swap is claimed only for the escrow's exact value.
+
 ### A refund cannot race a kickoff
 
 `T` no longer outlasts the kickoff, so the refund leaf of a live pool's escrows can be open while its batch runs.
@@ -543,6 +567,7 @@ A Coordinator Ark verifier in the measured enclave authorizes each one:
 - A forfeit must spend the escrow and a connector from a commitment transaction that pays the pool's funding output.
   Keymeld must already have bound and signed that pool's contract, including the expiry transaction.
 - A refund, after `T`, must pay only into the swap toward the template's refund destination.
+  It is an offchain spend, or for an escrow whose VTXO expired, the intent of a batch that pays the same swap; see [Recovering an expired escrow](#recovering-an-expired-escrow).
 
 The coordinator side is also built.
 A ticket with an Arkade escrow carries an `ark_escrow` consent: the escrow's tap tree, and a cap on the coordinator's fee per escrow.
@@ -656,6 +681,7 @@ So the kickoff collects at most the lowest cap times the number of players, the 
 | --- | --- |
 | The swap fails before the escrow exists | The Lightning payment fails back. |
 | Fewer players than the minimum pool | Every escrow is refunded after `T`. |
+| An escrow's VTXO expires before its refund | The refund waits for the server to sweep it, then recovers it in a batch into the same swap. |
 | Kickoff keeps failing | The pool fails, and every escrow is refunded after `T`. |
 | A ticket is paid with a coin that expires before `T` plus the margin | The ticket is not counted, and never reaches a pool. Its escrow needs an operator. |
 | A pool fails its kickoff check | The pool waits up to an hour for fees to fall, then is cancelled and every escrow refunded. |

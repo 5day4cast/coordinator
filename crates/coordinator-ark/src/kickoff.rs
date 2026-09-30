@@ -874,7 +874,7 @@ fn connector_chain(
     ))
 }
 
-fn unix_now() -> Result<u64, Error> {
+pub(crate) fn unix_now() -> Result<u64, Error> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|now| now.as_secs())

@@ -187,7 +187,7 @@ where
 
 impl KeymeldService {
     /// Prepare and execute one unbound escrow action under the refund's permission, signing as
-    /// `user`: a refund's transaction, or a proof deleting a queued intent. `stage` names it in
+    /// `user`: a refund's transaction or batch intent, or a proof deleting a queued intent. `stage` names it in
     /// the journal. Returns each signed input's index with its BIP340 signature.
     async fn sign_unbound_escrow(
         &self,
@@ -1468,6 +1468,23 @@ impl Keymeld for KeymeldService {
             return Err(invalid("A refund signs one transaction at a time"));
         };
         Ok(*signature)
+    }
+
+    async fn sign_ark_refund_intent(
+        &self,
+        session: &DlcKeygenSession,
+        user: UserId,
+        spend: coordinator_escrow::ark::ArkEscrowSpend,
+        invoice: String,
+        fee_sats: u64,
+    ) -> Result<Vec<(usize, [u8; 64])>, KeymeldError> {
+        let parameters = generic::ActionParameters::RefundArkEscrow {
+            spend,
+            invoice,
+            fee_sats,
+        };
+        self.sign_unbound_escrow(session, user, "refund-intent", parameters)
+            .await
     }
 
     async fn sign_ark_intent_delete(

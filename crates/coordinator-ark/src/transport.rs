@@ -1,12 +1,14 @@
-//! The calls this crate makes to an Arkade server: a kickoff's batch, and an offchain spend.
+//! The calls this crate makes to an Arkade server: a kickoff's or a recovery's batch, and an
+//! offchain spend.
 //!
 //! [`ArkClient`] implements this over [`ark_grpc::Client`]. Tests replace it with a scripted
 //! server.
 
 use ark_core::intent::Intent;
-use ark_core::server::{GetVtxosRequest, StreamEvent, VirtualTxOutPoint};
+use ark_core::server::{GetVtxosRequest, NoncePks, PartialSigTree, StreamEvent, VirtualTxOutPoint};
 use ark_core::ArkAddress;
 use async_trait::async_trait;
+use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Psbt, Txid};
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -43,6 +45,26 @@ pub trait ArkTransport: Send + Sync {
 
     /// Hand the server the signed forfeit transactions.
     async fn submit_forfeits(&self, forfeits: Vec<Psbt>) -> Result<(), Error>;
+
+    /// Hand the server `cosigner`'s nonces for the transactions of a batch's VTXO tree.
+    ///
+    /// An intent that receives a VTXO lists a cosigner key, which signs every tree transaction
+    /// on the way to that VTXO with the server: nonces first, then
+    /// [`ArkTransport::submit_tree_signatures`].
+    async fn submit_tree_nonces(
+        &self,
+        batch_id: &str,
+        cosigner: PublicKey,
+        nonces: NoncePks,
+    ) -> Result<(), Error>;
+
+    /// Hand the server `cosigner`'s partial signatures for those transactions.
+    async fn submit_tree_signatures(
+        &self,
+        batch_id: &str,
+        cosigner: PublicKey,
+        signatures: PartialSigTree,
+    ) -> Result<(), Error>;
 
     /// Submit an offchain spend for the server to co-sign, leaving it pending.
     ///
@@ -225,6 +247,30 @@ impl ArkTransport for ArkClient {
 
     async fn submit_forfeits(&self, forfeits: Vec<Psbt>) -> Result<(), Error> {
         Ok(self.grpc.submit_signed_forfeit_txs(forfeits, None).await?)
+    }
+
+    async fn submit_tree_nonces(
+        &self,
+        batch_id: &str,
+        cosigner: PublicKey,
+        nonces: NoncePks,
+    ) -> Result<(), Error> {
+        Ok(self
+            .grpc
+            .submit_tree_nonces(batch_id, cosigner, nonces)
+            .await?)
+    }
+
+    async fn submit_tree_signatures(
+        &self,
+        batch_id: &str,
+        cosigner: PublicKey,
+        signatures: PartialSigTree,
+    ) -> Result<(), Error> {
+        Ok(self
+            .grpc
+            .submit_tree_signatures(batch_id, cosigner, signatures)
+            .await?)
     }
 
     async fn submit_offchain(

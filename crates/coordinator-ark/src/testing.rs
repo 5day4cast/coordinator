@@ -5,6 +5,11 @@
 //! Events from an unrelated batch are mixed in, and the kickoff must ignore them.
 //! The batch can also create other users' VTXOs, and start signing their VTXO tree.
 //!
+//! An intent that names no on-chain output is a recovery: it spends one swept VTXO into one new
+//! VTXO. Its batch has no connectors and takes no forfeit. It builds a VTXO tree of one leaf, asks
+//! the intent's cosigner for its nonces and signatures, and finalizes once it has them. The
+//! partial signatures are taken, not verified: ark-core does not expose what that needs.
+//!
 //! Like arkd, it keeps a registered intent queued until a batch confirms it or a delete proof
 //! removes it, and meanwhile refuses offchain spends of its VTXOs with
 //! [`Error::VtxoAlreadyRegistered`]. It refuses an offchain spend of a VTXO that expired or was
@@ -14,17 +19,21 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Mutex;
 
+use ark_core::batch::generate_nonce_tree;
 use ark_core::intent::Intent;
 use ark_core::server::{
     BatchFailed, BatchFinalizationEvent, BatchFinalizedEvent, BatchStartedEvent,
-    BatchTreeEventType, Info, StreamEvent, TreeSigningStartedEvent, TreeTxEvent, VirtualTxOutPoint,
+    BatchTreeEventType, Info, NoncePks, PartialSigTree, StreamEvent, TreeNoncesEvent,
+    TreeSigningStartedEvent, TreeTxEvent, TreeTxNoncePks, VirtualTxOutPoint,
 };
-use ark_core::TxGraphChunk;
+use ark_core::{TxGraph, TxGraphChunk};
 use async_trait::async_trait;
 use bitcoin::absolute::LockTime;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::hex::DisplayHex;
 use bitcoin::key::{Keypair, Secp256k1, TweakedPublicKey};
+use bitcoin::script::Instruction;
+use bitcoin::secp256k1::rand::rngs::OsRng;
 use bitcoin::secp256k1::{Message, PublicKey, SecretKey};
 use bitcoin::sighash::{Prevouts, SighashCache};
 use bitcoin::transaction::Version;
@@ -119,9 +128,17 @@ pub struct MockArkd {
     /// The cosigners of a VTXO tree the batch builds for other users' outputs. Without, the batch
     /// has no VTXO tree.
     pub vtxo_tree: Option<Vec<PublicKey>>,
-    pub sender: mpsc::UnboundedSender<Result<StreamEvent, Error>>,
+    /// The server's signer key, which signs no proof.
+    pub server: XOnlyPublicKey,
+    /// Where events go: the latest subscription. Each recovery subscribes anew.
+    pub sender: Mutex<mpsc::UnboundedSender<Result<StreamEvent, Error>>>,
     pub receiver: Mutex<Option<mpsc::UnboundedReceiver<Result<StreamEvent, Error>>>>,
     pub state: Mutex<MockState>,
+}
+
+/// The server's own cosigner of a recovery's VTXO tree.
+fn tree_cosigner() -> Keypair {
+    keypair(74)
 }
 
 /// An offchain spend the mock took, so a test can see what it was given.
@@ -132,11 +149,25 @@ pub struct OffchainSpend {
     pub finalized: Vec<Psbt>,
 }
 
-/// An intent waiting in the batch queue, with the funding leaf keys of the VTXOs it spends.
+/// An intent waiting in the batch queue, with the VTXOs it spends, and for each the keys that
+/// sign a proof over it through the leaf its own proof used.
 #[derive(Clone)]
 pub struct QueuedIntent {
     pub id: String,
-    pub signers: HashMap<OutPoint, [XOnlyPublicKey; 2]>,
+    pub signers: HashMap<OutPoint, Vec<XOnlyPublicKey>>,
+}
+
+/// A recovery the server was asked for: a swept VTXO, given back as a new one.
+#[derive(Clone)]
+pub struct MockRecovery {
+    /// The swept VTXO the intent spends.
+    pub outpoint: OutPoint,
+    /// The intent's only output.
+    pub paid: TxOut,
+    pub cosigner: PublicKey,
+    /// The batch's VTXO tree, a single leaf, and its commitment transaction, once a batch
+    /// selected the intent.
+    pub tree: Option<(Psbt, Psbt)>,
 }
 
 #[derive(Default)]
@@ -154,6 +185,12 @@ pub struct MockState {
     pub vtxos: Vec<VirtualTxOutPoint>,
     /// VTXOs the server treats as expired whatever it lists, as when its indexer lags.
     pub expired: HashSet<OutPoint>,
+    /// The recovery the registered intent asks for, until its batch finalizes.
+    pub recovery: Option<MockRecovery>,
+    /// The recoveries whose batch finalized: the swept VTXO, and the new one that replaced it.
+    pub recovered: Vec<(OutPoint, OutPoint)>,
+    /// How many batches selected an intent, to tell their commitment transactions apart.
+    pub batches: u32,
     /// The cosigner keys the registered intent listed.
     pub cosigners: Vec<PublicKey>,
     /// The intent's on-chain outputs.
@@ -189,14 +226,15 @@ impl MockArkd {
             dust: info.dust,
             selects: true,
             vtxo_tree: None,
-            sender,
+            server: info.signer_pk.x_only_public_key().0,
+            sender: Mutex::new(sender),
             receiver: Mutex::new(Some(receiver)),
             state: Mutex::default(),
         }
     }
 
-    /// A server that runs no batch: it takes offchain spends and lists VTXOs, as an escrow's
-    /// funding check and refund need.
+    /// A server that runs no kickoff: it takes offchain spends and lists VTXOs, as an escrow's
+    /// funding check and refund need, and recovers a swept VTXO in a batch.
     pub fn offchain(info: &Info) -> Self {
         let (sender, receiver) = mpsc::unbounded();
         Self {
@@ -208,7 +246,8 @@ impl MockArkd {
             dust: info.dust,
             selects: true,
             vtxo_tree: None,
-            sender,
+            server: info.signer_pk.x_only_public_key().0,
+            sender: Mutex::new(sender),
             receiver: Mutex::new(Some(receiver)),
             state: Mutex::default(),
         }
@@ -250,8 +289,24 @@ impl MockArkd {
     pub fn queue_intent(&self, id: &str, signers: HashMap<OutPoint, [XOnlyPublicKey; 2]>) {
         self.state.lock().unwrap().queued.push(QueuedIntent {
             id: id.into(),
-            signers,
+            signers: signers
+                .into_iter()
+                .map(|(outpoint, keys)| (outpoint, keys.to_vec()))
+                .collect(),
         });
+    }
+
+    /// Mark the listed VTXO at `outpoint` as expired at `expires_at` (UNIX seconds), and swept
+    /// or not.
+    pub fn expire_vtxo(&self, outpoint: OutPoint, expires_at: i64, swept: bool) {
+        let mut state = self.state.lock().unwrap();
+        let vtxo = state
+            .vtxos
+            .iter_mut()
+            .find(|vtxo| vtxo.outpoint == outpoint)
+            .expect("a listed VTXO");
+        vtxo.expires_at = expires_at;
+        vtxo.is_swept = swept;
     }
 
     /// A server whose batches never select the intent, so it stays queued.
@@ -284,15 +339,55 @@ impl MockArkd {
     }
 
     pub fn send(&self, event: StreamEvent) {
-        self.sender.unbounded_send(Ok(event)).unwrap();
+        // A subscriber that has gone, as after a recovery returned, misses nothing it needs.
+        let _ = self.sender.lock().unwrap().unbounded_send(Ok(event));
     }
 
     pub fn forfeits(&self) -> Vec<Psbt> {
         self.state.lock().unwrap().forfeits.clone()
     }
 
+    /// Check input `index` of a proof as arkd does, knowing only the PSBT: its one leaf must be
+    /// in the tree of the output it spends, and every key in that leaf but the server's must
+    /// have signed. Returns those keys.
+    pub fn check_tapscript_signatures(&self, psbt: &Psbt, index: usize) -> Vec<XOnlyPublicKey> {
+        let input = &psbt.inputs[index];
+        let mut leaves = input.tap_scripts.iter();
+        let (Some((control_block, (script, _))), None) = (leaves.next(), leaves.next()) else {
+            panic!("input {index} needs exactly one leaf script");
+        };
+        let prevout = input.witness_utxo.as_ref().expect("a witness UTXO");
+        assert!(
+            prevout.script_pubkey.is_p2tr(),
+            "input {index} is not taproot"
+        );
+        let output_key = XOnlyPublicKey::from_slice(&prevout.script_pubkey.as_bytes()[2..])
+            .expect("a taproot output key");
+        assert!(
+            control_block.verify_taproot_commitment(
+                &Secp256k1::verification_only(),
+                output_key,
+                script
+            ),
+            "input {index}'s leaf is not in the tree of the output it spends"
+        );
+        let keys: Vec<XOnlyPublicKey> = script
+            .instructions()
+            .filter_map(|instruction| match instruction {
+                Ok(Instruction::PushBytes(bytes)) if bytes.len() == 32 => {
+                    XOnlyPublicKey::from_slice(bytes.as_bytes()).ok()
+                }
+                _ => None,
+            })
+            .filter(|key| *key != self.server)
+            .collect();
+        assert!(!keys.is_empty(), "input {index}'s leaf names no signer");
+        MockArkd::check_leaf_signatures(psbt, index, &keys);
+        keys
+    }
+
     /// Check that `keys` signed input `index` of `psbt` through its only leaf, as arkd does.
-    pub fn check_leaf_signatures(psbt: &Psbt, index: usize, keys: [XOnlyPublicKey; 2]) {
+    pub fn check_leaf_signatures(psbt: &Psbt, index: usize, keys: &[XOnlyPublicKey]) {
         let input = &psbt.inputs[index];
         let (_, (script, version)) = input.tap_scripts.iter().next().expect("a leaf script");
         let leaf_hash = bitcoin::TapLeafHash::from_script(script, *version);
@@ -314,17 +409,181 @@ impl MockArkd {
         for key in keys {
             let signature = input
                 .tap_script_sigs
-                .get(&(key, leaf_hash))
+                .get(&(*key, leaf_hash))
                 .unwrap_or_else(|| panic!("input {index} lacks a signature from {key}"));
-            secp.verify_schnorr(&signature.signature, &message, &key)
+            secp.verify_schnorr(&signature.signature, &message, key)
                 .unwrap_or_else(|_| panic!("input {index} has a bad signature from {key}"));
         }
+    }
+
+    /// Tell the intent's owner that a batch selected it, amid another batch's traffic.
+    fn announce_batch(&self) {
+        // Another batch's traffic, which the intent's owner must ignore.
+        self.send(StreamEvent::BatchStarted(BatchStartedEvent {
+            id: "batch-6".into(),
+            intent_id_hashes: vec!["00".repeat(32)],
+            batch_expiry: Sequence::from_512_second_intervals(100),
+        }));
+        self.send(StreamEvent::BatchFailed(BatchFailed {
+            id: "batch-6".into(),
+            reason: "not ours".into(),
+        }));
+        let hash = sha256::Hash::hash(INTENT_ID.as_bytes()).to_byte_array();
+        self.send(StreamEvent::BatchStarted(BatchStartedEvent {
+            id: BATCH.into(),
+            intent_id_hashes: vec!["11".repeat(32), hash.to_lower_hex_string()],
+            batch_expiry: Sequence::from_512_second_intervals(100),
+        }));
+    }
+
+    /// Queue a recovery: an intent spending one swept VTXO into one new VTXO.
+    ///
+    /// arkd takes such an intent without a forfeit, since it already holds a swept VTXO's
+    /// coins. It checks the proof's signatures from the PSBT alone, whatever leaf it spends.
+    fn register_recovery(&self, intent: &Intent, message: &str) -> Result<String, Error> {
+        let proof = &intent.proof;
+        assert_eq!(
+            proof.inputs.len(),
+            2,
+            "a recovery spends the message input and one VTXO"
+        );
+        let outpoint = proof.unsigned_tx.input[1].previous_output;
+        let [paid] = proof.unsigned_tx.output.as_slice() else {
+            panic!("a recovery pays one output");
+        };
+        assert!(paid.script_pubkey.is_p2tr(), "a VTXO's script is taproot");
+        let signers = self.check_tapscript_signatures(proof, 1);
+        assert_eq!(self.check_tapscript_signatures(proof, 0), signers);
+        let cosigners = listed_cosigners(message);
+        let [cosigner] = cosigners.as_slice() else {
+            panic!("an intent that receives a VTXO lists its cosigner");
+        };
+        {
+            let mut state = self.state.lock().unwrap();
+            let vtxo = state
+                .vtxos
+                .iter()
+                .find(|vtxo| vtxo.outpoint == outpoint)
+                .expect("a recovery spends a VTXO this server lists");
+            if vtxo.is_spent {
+                return Err(Error::Protocol(format!(
+                    "VTXO_ALREADY_SPENT (6): input {outpoint} already spent"
+                )));
+            }
+            // An unswept VTXO would need a forfeit, which a recovery does not sign.
+            assert!(vtxo.is_swept, "only a swept VTXO is recovered");
+            let spent = proof.inputs[1].witness_utxo.as_ref().unwrap();
+            assert_eq!(
+                (spent.value, &spent.script_pubkey),
+                (vtxo.amount, &vtxo.script)
+            );
+            // This server takes no fee, and cannot pay out more than the VTXO held.
+            assert!(paid.value <= vtxo.amount);
+            if state
+                .queued
+                .iter()
+                .any(|queued| queued.signers.contains_key(&outpoint))
+            {
+                return Err(Error::Protocol(
+                    "duplicated input, already registered by another intent".into(),
+                ));
+            }
+            state.cosigners = cosigners.clone();
+            state.recovery = Some(MockRecovery {
+                outpoint,
+                paid: paid.clone(),
+                cosigner: *cosigner,
+                tree: None,
+            });
+            state.queued.push(QueuedIntent {
+                id: INTENT_ID.into(),
+                signers: HashMap::from([(outpoint, signers)]),
+            });
+        }
+        if self.selects {
+            self.announce_batch();
+        }
+        Ok(INTENT_ID.into())
+    }
+
+    /// Start the batch of a recovery: a commitment transaction, and a VTXO tree of one leaf
+    /// that pays the intent's output, for the intent's cosigner and the server's to sign.
+    fn start_recovery(&self, state: &mut MockState) {
+        state.batches += 1;
+        let recovery = state.recovery.as_mut().expect("a recovery");
+        let mut paid = recovery.paid.clone();
+        if self.commitment == Commitment::PaysSomeoneElse {
+            paid.script_pubkey = p2tr(66);
+        }
+        let commitment = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(
+                    Txid::from_byte_array([0xcc; 32]),
+                    100 + state.batches,
+                ),
+                ..Default::default()
+            }],
+            output: vec![
+                // The batch output, which the tree spends.
+                TxOut {
+                    value: paid.value,
+                    script_pubkey: p2tr(72),
+                },
+                ark_core::anchor_output(),
+            ],
+        };
+        let mut leaf = Psbt::from_unsigned_tx(Transaction {
+            version: Version::non_standard(3),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(commitment.compute_txid(), 0),
+                ..Default::default()
+            }],
+            output: vec![paid, ark_core::anchor_output()],
+        })
+        .unwrap();
+        // arkd names a tree transaction's cosigners in its input's PSBT fields.
+        let cosigners = [recovery.cosigner, tree_cosigner().public_key()];
+        for (index, cosigner) in cosigners.iter().enumerate() {
+            let mut key = ark_core::VTXO_COSIGNER_PSBT_KEY.to_vec();
+            key.push(index as u8);
+            leaf.inputs[0].unknown.insert(
+                bitcoin::psbt::raw::Key {
+                    type_value: 222,
+                    key,
+                },
+                cosigner.serialize().to_vec(),
+            );
+        }
+        let commitment = Psbt::from_unsigned_tx(commitment).unwrap();
+        self.send(StreamEvent::TreeTx(TreeTxEvent {
+            id: BATCH.into(),
+            topic: Vec::new(),
+            batch_tree_event_type: BatchTreeEventType::Vtxo,
+            tx_graph_chunk: TxGraphChunk {
+                txid: Some(leaf.unsigned_tx.compute_txid()),
+                tx: leaf.clone(),
+                children: HashMap::new(),
+            },
+        }));
+        self.send(StreamEvent::TreeSigningStarted(TreeSigningStartedEvent {
+            id: BATCH.into(),
+            cosigners_pubkeys: vec![recovery.cosigner],
+            unsigned_commitment_tx: commitment.clone(),
+        }));
+        recovery.tree = Some((leaf, commitment));
     }
 }
 
 #[async_trait]
 impl ArkTransport for MockArkd {
     async fn register_intent(&self, intent: Intent) -> Result<String, Error> {
+        let message = intent.serialize_message()?;
+        if message.contains(r#""onchain_output_indexes":[]"#) {
+            return self.register_recovery(&intent, &message);
+        }
         let proof = &intent.proof;
         let outputs = proof.unsigned_tx.output.clone();
         let indexes: Vec<String> = (0..outputs.len()).map(|index| index.to_string()).collect();
@@ -334,10 +593,10 @@ impl ArkTransport for MockArkd {
         )));
         // Input 0 is the BIP322 message input, locked like the first escrow.
         let first = proof.unsigned_tx.input[1].previous_output;
-        MockArkd::check_leaf_signatures(proof, 0, self.signers[&first]);
+        MockArkd::check_leaf_signatures(proof, 0, &self.signers[&first]);
         for index in 1..proof.inputs.len() {
             let outpoint = proof.unsigned_tx.input[index].previous_output;
-            MockArkd::check_leaf_signatures(proof, index, self.signers[&outpoint]);
+            MockArkd::check_leaf_signatures(proof, index, &self.signers[&outpoint]);
         }
         {
             let mut state = self.state.lock().unwrap();
@@ -361,30 +620,13 @@ impl ArkTransport for MockArkd {
                 id: INTENT_ID.into(),
                 signers: spent
                     .iter()
-                    .map(|outpoint| (*outpoint, self.signers[outpoint]))
+                    .map(|outpoint| (*outpoint, self.signers[outpoint].to_vec()))
                     .collect(),
             });
         }
-        if !self.selects {
-            return Ok(INTENT_ID.into());
+        if self.selects {
+            self.announce_batch();
         }
-
-        // Another batch's traffic, which the kickoff must ignore.
-        self.send(StreamEvent::BatchStarted(BatchStartedEvent {
-            id: "batch-6".into(),
-            intent_id_hashes: vec!["00".repeat(32)],
-            batch_expiry: Sequence::from_512_second_intervals(100),
-        }));
-        self.send(StreamEvent::BatchFailed(BatchFailed {
-            id: "batch-6".into(),
-            reason: "not ours".into(),
-        }));
-        let hash = sha256::Hash::hash(INTENT_ID.as_bytes()).to_byte_array();
-        self.send(StreamEvent::BatchStarted(BatchStartedEvent {
-            id: BATCH.into(),
-            intent_id_hashes: vec!["11".repeat(32), hash.to_lower_hex_string()],
-            batch_expiry: Sequence::from_512_second_intervals(100),
-        }));
         Ok(INTENT_ID.into())
     }
 
@@ -409,24 +651,30 @@ impl ArkTransport for MockArkd {
         );
         let mut state = self.state.lock().unwrap();
         state.delete_proofs += 1;
+        // A delete proof spends an escrow through its funding leaf, whatever leaf the intent
+        // it deletes used, so both funding keys sign it when this server knows them.
         let keys = |outpoint: &OutPoint| {
-            state
-                .queued
-                .iter()
-                .find_map(|queued| queued.signers.get(outpoint))
-                .or_else(|| self.signers.get(outpoint))
-                .copied()
+            self.signers
+                .get(outpoint)
+                .map(|keys| keys.to_vec())
+                .or_else(|| {
+                    state
+                        .queued
+                        .iter()
+                        .find_map(|queued| queued.signers.get(outpoint))
+                        .cloned()
+                })
         };
         // Input 0 is the BIP322 message input, locked like the first escrow.
         let first = psbt.unsigned_tx.input[1].previous_output;
         if let Some(keys) = keys(&first) {
-            MockArkd::check_leaf_signatures(psbt, 0, keys);
+            MockArkd::check_leaf_signatures(psbt, 0, &keys);
         }
         let mut spent = Vec::new();
         for index in 1..psbt.inputs.len() {
             let outpoint = psbt.unsigned_tx.input[index].previous_output;
             if let Some(keys) = keys(&outpoint) {
-                MockArkd::check_leaf_signatures(psbt, index, keys);
+                MockArkd::check_leaf_signatures(psbt, index, &keys);
             }
             spent.push(outpoint);
         }
@@ -442,6 +690,14 @@ impl ArkTransport for MockArkd {
             return Err(Error::NoMatchingIntent(
                 "INVALID_INTENT_PROOF (23): no matching intents found for intent proof".into(),
             ));
+        }
+        // A recovery that was queued goes with its intent.
+        if state
+            .recovery
+            .as_ref()
+            .is_some_and(|recovery| spent.contains(&recovery.outpoint))
+        {
+            state.recovery = None;
         }
         state
             .deleted
@@ -565,6 +821,10 @@ impl ArkTransport for MockArkd {
         let mut state = self.state.lock().unwrap();
         // The batch took the intent out of the queue when it selected it.
         state.queued.retain(|queued| queued.id != intent_id);
+        if state.recovery.is_some() {
+            self.start_recovery(&mut state);
+            return Ok(());
+        }
         let mut outputs = state.outputs.clone().unwrap();
         if self.commitment == Commitment::PaysSomeoneElse {
             outputs[0].script_pubkey = p2tr(66);
@@ -679,13 +939,116 @@ impl ArkTransport for MockArkd {
         for outpoint in self.signers.keys() {
             assert!(topics.contains(&outpoint.to_string()));
         }
-        let receiver = self
-            .receiver
-            .lock()
-            .unwrap()
-            .take()
-            .expect("one subscription");
+        // The first subscription takes the events sent so far. A later one, as each recovery
+        // makes, starts a stream of its own.
+        let receiver = self.receiver.lock().unwrap().take().unwrap_or_else(|| {
+            let (sender, receiver) = mpsc::unbounded();
+            *self.sender.lock().unwrap() = sender;
+            receiver
+        });
         Ok(receiver.boxed())
+    }
+
+    /// Answers a recovery's cosigner with every cosigner's nonce for the tree's one transaction:
+    /// its own, and the server's.
+    async fn submit_tree_nonces(
+        &self,
+        batch_id: &str,
+        cosigner: PublicKey,
+        nonces: NoncePks,
+    ) -> Result<(), Error> {
+        assert_eq!(batch_id, BATCH);
+        let state = self.state.lock().unwrap();
+        let recovery = state.recovery.as_ref().expect("a recovery's batch");
+        assert_eq!(cosigner, recovery.cosigner);
+        let (leaf, commitment) = recovery.tree.clone().expect("a tree being signed");
+        let txid = leaf.unsigned_tx.compute_txid();
+        let own = nonces
+            .get(&txid)
+            .expect("a nonce for the tree's transaction");
+        let graph = TxGraph::new(vec![TxGraphChunk {
+            txid: Some(txid),
+            tx: leaf,
+            children: HashMap::new(),
+        }])?;
+        let server = tree_cosigner().public_key();
+        let servers = generate_nonce_tree(&mut OsRng, &graph, server, &commitment)?
+            .to_nonce_pks()
+            .get(&txid)
+            .expect("the server's nonce");
+        self.send(StreamEvent::TreeNonces(TreeNoncesEvent {
+            id: BATCH.into(),
+            topic: Vec::new(),
+            txid,
+            nonces: TreeTxNoncePks::new(HashMap::from([
+                (cosigner.x_only_public_key().0, own),
+                (server.x_only_public_key().0, servers),
+            ])),
+        }));
+        Ok(())
+    }
+
+    /// Takes the cosigner's partial signature, and finalizes the recovery's batch: the swept
+    /// VTXO is settled, and the new one listed.
+    async fn submit_tree_signatures(
+        &self,
+        batch_id: &str,
+        cosigner: PublicKey,
+        signatures: PartialSigTree,
+    ) -> Result<(), Error> {
+        assert_eq!(batch_id, BATCH);
+        let mut state = self.state.lock().unwrap();
+        let recovery = state.recovery.take().expect("a recovery's batch");
+        assert_eq!(cosigner, recovery.cosigner);
+        let (leaf, commitment) = recovery.tree.expect("a tree being signed");
+        let txid = leaf.unsigned_tx.compute_txid();
+        assert_eq!(
+            signatures.0.keys().collect::<Vec<_>>(),
+            vec![&txid],
+            "one partial signature, for the tree's transaction"
+        );
+        let commitment_txid = commitment.unsigned_tx.compute_txid();
+        let swept = state
+            .vtxos
+            .iter_mut()
+            .find(|vtxo| vtxo.outpoint == recovery.outpoint)
+            .expect("the swept VTXO");
+        swept.is_spent = true;
+        swept.settled_by = Some(commitment_txid);
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_secs() as i64;
+        let paid = &leaf.unsigned_tx.output[0];
+        let vtxo = OutPoint::new(txid, 0);
+        state.vtxos.push(VirtualTxOutPoint {
+            outpoint: vtxo,
+            created_at,
+            expires_at: created_at + 7 * 24 * 60 * 60,
+            amount: paid.value,
+            script: paid.script_pubkey.clone(),
+            is_preconfirmed: false,
+            is_swept: false,
+            is_unrolled: false,
+            is_spent: false,
+            spent_by: None,
+            commitment_txids: vec![commitment_txid],
+            settled_by: None,
+            ark_txid: None,
+            assets: Vec::new(),
+            depth: 0,
+        });
+        state.recovered.push((recovery.outpoint, vtxo));
+        state.commitment_txid = Some(commitment_txid);
+        self.send(StreamEvent::BatchFinalization(BatchFinalizationEvent {
+            id: BATCH.into(),
+            commitment_tx: commitment,
+        }));
+        self.send(StreamEvent::BatchFinalized(BatchFinalizedEvent {
+            id: BATCH.into(),
+            commitment_txid,
+        }));
+        Ok(())
     }
 
     async fn submit_forfeits(&self, forfeits: Vec<Psbt>) -> Result<(), Error> {
@@ -699,7 +1062,7 @@ impl ArkTransport for MockArkd {
             assert!(spent.insert(escrow), "two forfeits for {escrow}");
             assert_eq!(tx.output[0].script_pubkey, self.forfeit_script);
             assert_eq!(tx.output[0].value, self.amounts[&escrow] + self.dust);
-            MockArkd::check_leaf_signatures(forfeit, 1, self.signers[&escrow]);
+            MockArkd::check_leaf_signatures(forfeit, 1, &self.signers[&escrow]);
         }
         assert_eq!(spent.len(), self.signers.len());
         state.forfeits = forfeits;

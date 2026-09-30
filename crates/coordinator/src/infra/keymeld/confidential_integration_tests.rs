@@ -1677,8 +1677,9 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_funded() {
     })
     .unwrap();
 
-    // Each signature resolves the player's address again, so a provider answers once per one.
-    let (client, provider) = discovery_tls_fixture_times(2).await;
+    // Each signature resolves the player's address again, so a provider answers once per one:
+    // the refund's two transactions, and later the intent of its batch.
+    let (client, provider) = discovery_tls_fixture_times(3).await;
     let consent = |lnurl, unfinished_keygen| Consent {
         escrows: Some(std::slice::from_ref(&escrow)),
         lightning_address: Some("alice+prize@wallet.example".into()),
@@ -1725,7 +1726,6 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_funded() {
     // The Ark transaction is signed first, before the server co-signs it; the checkpoint after.
     let ark = sign(RefundPurpose::ArkTransaction).await.unwrap();
     let checkpoint = sign(RefundPurpose::Checkpoint).await.unwrap();
-    provider.await.unwrap();
     assert_ne!(ark, checkpoint, "each transaction signs its own digest");
 
     // Each signature is the player's entry key over the digest the verifier derived.
@@ -1744,10 +1744,71 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_funded() {
             coordinator_escrow::ark::refund_from(&escrow, &policy, &spend(purpose)).unwrap();
         secp.verify_schnorr(
             &dlctix::bitcoin::secp256k1::schnorr::Signature::from_slice(&signature).unwrap(),
-            &dlctix::bitcoin::secp256k1::Message::from_digest(spent.digest),
+            &dlctix::bitcoin::secp256k1::Message::from_digest(spent.digests[0].1),
             &xonly(&entry_key),
         )
         .expect("the player's entry key signed the refund");
+    }
+
+    // The same escrow, once its VTXO has expired: Arkade spends it only in a batch, so the
+    // refund is an intent that receives the same swap there. Keymeld signs its proof under the
+    // same permission, held to the same invoice, and the scripted arkd checks the signatures
+    // from the proof alone before its batch pays the swap.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let arkd = coordinator_ark::testing::MockArkd::offchain(&info);
+    let expired = coordinator_ark::EscrowInput {
+        escrow: escrow.clone(),
+        outpoint: OutPoint::new(dlctix::bitcoin::Txid::from_byte_array([3u8; 32]), 0),
+        amount: Amount::from_sat(ESCROW_SATS),
+    };
+    let address = escrow
+        .address(coordinator_ark::address_hrp(info.network))
+        .unwrap()
+        .encode();
+    arkd.add_vtxo(
+        &address,
+        expired.outpoint,
+        expired.amount,
+        now - 7 * 86_400,
+        false,
+    );
+    arkd.expire_vtxo(expired.outpoint, now - 60, true);
+    let signer = crate::domain::KeymeldRecovery {
+        keymeld: harness.service.as_ref(),
+        session: &harness.session,
+        user: harness.players[0].clone(),
+        swap_tap_tree: hex::encode(swap.vtxo_script().encode_tap_tree()),
+        invoice: invoice.clone(),
+        fee_sats: REFUND_FEE_SATS,
+    };
+    let recovery = coordinator_ark::recover_escrow(
+        &arkd,
+        &info,
+        &expired,
+        &swap,
+        &signer,
+        &coordinator_ark::KeypairSigner::new([market_maker]),
+        &coordinator_ark::KickoffConfig::for_server(&info),
+    )
+    .await
+    .expect("Keymeld signs the intent that recovers an expired escrow into its swap");
+    provider.await.unwrap();
+    {
+        let state = arkd.state.lock().unwrap();
+        assert_eq!(
+            state.recovered,
+            vec![(expired.outpoint, recovery.swap_vtxo)]
+        );
+        let paid = state
+            .vtxos
+            .iter()
+            .find(|vtxo| vtxo.outpoint == recovery.swap_vtxo)
+            .unwrap();
+        assert_eq!(paid.script, swap.script_pubkey());
+        assert_eq!(paid.amount, Amount::from_sat(ESCROW_SATS));
     }
 
     // A competition cancelled before its pool filled never completed keygen, and its escrows
@@ -1915,7 +1976,7 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_filled() {
             coordinator_escrow::ark::refund_from(&escrows[0], &policy, &spend(purpose)).unwrap();
         secp.verify_schnorr(
             &dlctix::bitcoin::secp256k1::schnorr::Signature::from_slice(&signature).unwrap(),
-            &dlctix::bitcoin::secp256k1::Message::from_digest(spent.digest),
+            &dlctix::bitcoin::secp256k1::Message::from_digest(spent.digests[0].1),
             &xonly(&keypair(entry_secret(0)[0])),
         )
         .expect("the player's own entry key signed the refund");

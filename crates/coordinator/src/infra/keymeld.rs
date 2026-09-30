@@ -298,6 +298,27 @@ pub trait Keymeld: Send + Sync {
         ))
     }
 
+    /// Sign a player's refund of an escrow whose VTXO expired, as the intent of a batch.
+    ///
+    /// The Arkade server spends an expired VTXO only in a batch, so `spend` is an
+    /// `ArkEscrowSpend::RefundIntent`: a proof spending the escrow's refund leaf, whose only
+    /// output is the refund's swap. The Coordinator verifier holds it to everything
+    /// [`Keymeld::sign_ark_refund`] is held to. Returns each signed input's index with its
+    /// BIP340 signature.
+    async fn sign_ark_refund_intent(
+        &self,
+        session: &DlcKeygenSession,
+        user: UserId,
+        spend: coordinator_escrow::ark::ArkEscrowSpend,
+        invoice: String,
+        fee_sats: u64,
+    ) -> Result<Vec<(usize, [u8; 64])>, KeymeldError> {
+        let _ = (session, user, spend, invoice, fee_sats);
+        Err(KeymeldError::Signing(
+            "Arkade refunds in a batch are not supported".into(),
+        ))
+    }
+
     /// Sign a player's proof deleting a queued Arkade batch intent that holds their escrow.
     ///
     /// Unbound like a refund, and granted by the refund's permission: a kickoff that never

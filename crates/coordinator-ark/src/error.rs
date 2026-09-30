@@ -20,7 +20,7 @@ pub enum Error {
     ///
     /// A VTXO lives until the batch it descends from expires, and a preconfirmed one inherits
     /// the expiry of the coin that paid it. After that the server spends it only in a batch,
-    /// as a recovery.
+    /// as a recovery; see [`crate::recover_escrow`].
     #[error("a VTXO it spends has expired, and can only be recovered in a batch: {0}")]
     VtxoRecoverable(String),
     /// No registered intent spends an input of a delete proof, so there was nothing to delete.
