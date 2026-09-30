@@ -40,12 +40,15 @@ fn operator() -> Arc<EnclaveOperator> {
     operator_verifying(CoordinatorVerifier::default())
 }
 fn operator_verifying(verifier: CoordinatorVerifier) -> Arc<EnclaveOperator> {
+    enclave_verifying(1, verifier)
+}
+fn enclave_verifying(id: u32, verifier: CoordinatorVerifier) -> Arc<EnclaveOperator> {
     let operator = EnclaveOperator::with_verifiers(
-        EnclaveId::new(1),
+        EnclaveId::new(id),
         VerifierRegistry::new(vec![Arc::new(verifier)]).unwrap(),
     )
     .unwrap();
-    operator.set_test_keys([15; 32]);
+    operator.set_test_keys([14 + id as u8; 32]);
     Arc::new(operator)
 }
 async fn relay(
@@ -86,6 +89,93 @@ async fn enclaves(State(state): State<Relay>) -> Json<serde_json::Value> {
         "attestation_document":"","active_sessions":0,"uptime_seconds":0,
         "healthy":true,"key_epoch":1,"key_generation_time":0,"last_health_check":0
     }],"total_enclaves":1,"healthy_enclaves":1}))
+}
+/// A pool's enclaves behind one relay, as a gateway fronts them. It counts the requests each
+/// enclave has in flight, and can hold every request for `delay`. It refuses the requests of the
+/// enclave `down` names while another request is in flight, as if that enclave failed while the
+/// enclaves' shares of a step ran side by side.
+#[derive(Clone)]
+struct PoolRelay {
+    operators: Arc<BTreeMap<EnclaveId, Arc<EnclaveOperator>>>,
+    delay: Arc<Mutex<Duration>>,
+    down: Arc<Mutex<Option<EnclaveId>>>,
+    load: Arc<Mutex<Load>>,
+}
+
+/// The requests in flight through a [`PoolRelay`].
+#[derive(Default)]
+struct Load {
+    in_flight: BTreeMap<EnclaveId, usize>,
+    /// The most requests in flight at once, over all enclaves.
+    most: usize,
+    /// The most requests in flight at once to any one enclave.
+    most_on_one: usize,
+}
+
+async fn pool_relay(
+    State(relay): State<PoolRelay>,
+    Json(envelope): Json<EnclaveEnvelope>,
+) -> Result<Json<EnclaveEnvelope>, axum::http::StatusCode> {
+    let enclave = envelope.destination_enclave;
+    let down = *relay.down.lock().unwrap() == Some(enclave);
+    {
+        let mut load = relay.load.lock().unwrap();
+        // A step's work before it splits by enclave goes one request at a time, so this fails
+        // only the enclave's share.
+        if down && load.in_flight.values().any(|count| *count > 0) {
+            return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        }
+        let on_one = load.in_flight.entry(enclave).or_default();
+        *on_one += 1;
+        let on_one = *on_one;
+        let total: usize = load.in_flight.values().sum();
+        load.most = load.most.max(total);
+        load.most_on_one = load.most_on_one.max(on_one);
+    }
+    let delay = *relay.delay.lock().unwrap();
+    tokio::time::sleep(delay).await;
+    let outcome = relay.operators[&enclave]
+        .handle_command(Command::new(EnclaveCommand::Confidential(Box::new(
+            envelope,
+        ))))
+        .await
+        .unwrap();
+    *relay
+        .load
+        .lock()
+        .unwrap()
+        .in_flight
+        .get_mut(&enclave)
+        .unwrap() -= 1;
+    let EnclaveOutcome::Confidential(response) = outcome.response else {
+        panic!("application response escaped encryption")
+    };
+    Ok(Json(*response))
+}
+async fn pool_public_key(
+    State(relay): State<PoolRelay>,
+    axum::extract::Path(id): axum::extract::Path<u32>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "enclave_id":id,"public_key":hex::encode(relay.operators[&EnclaveId::new(id)].get_public_key()),
+        "attestation_document":"","pcr_measurements":{},"timestamp":0,"healthy":true,"key_epoch":1
+    }))
+}
+async fn pool_enclaves(State(relay): State<PoolRelay>) -> Json<serde_json::Value> {
+    let listed: Vec<_> = relay
+        .operators
+        .iter()
+        .map(|(id, operator)| {
+            serde_json::json!({
+                "enclave_id":id.as_u32(),"public_key":hex::encode(operator.get_public_key()),
+                "attestation_document":"","active_sessions":0,"uptime_seconds":0,
+                "healthy":true,"key_epoch":1,"key_generation_time":0,"last_health_check":0
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "total_enclaves":listed.len(),"healthy_enclaves":listed.len(),"enclaves":listed
+    }))
 }
 fn parameters() -> ContractParameters {
     ContractParameters {
@@ -501,6 +591,7 @@ struct PoolHarness {
     params: ContractParameters,
     players: Vec<UserId>,
     policies: BTreeMap<UserId, PayoutPolicy>,
+    relay: PoolRelay,
     /// The registrations of the players left unregistered, as their browsers prepared them.
     unregistered: Vec<(UserId, ParticipantRegistrationData)>,
     db: DBConnection,
@@ -530,6 +621,8 @@ struct Consent<'a> {
     /// Register only the first this many players, as a pool that never filled did. All when
     /// unset.
     registered: Option<usize>,
+    /// How many enclaves the players spread over: one when unset.
+    enclaves: usize,
 }
 
 impl<'a> Consent<'a> {
@@ -557,23 +650,34 @@ impl PoolHarness {
             lnurl,
             unfinished_keygen,
             registered,
+            enclaves,
         } = consent;
         let count = params.players.len();
-        let relay_state = Relay {
-            operator: Arc::new(Mutex::new(match lnurl {
-                Some(client) => operator_verifying(CoordinatorVerifier::with_lnurl(client)),
-                None => operator(),
-            })),
-            requests: Default::default(),
-            responses: Default::default(),
+        // Only the first enclave checks refunds against an LNURL provider: those tests use one.
+        let mut lnurl = lnurl;
+        let relay = PoolRelay {
+            operators: Arc::new(
+                (1..=enclaves.max(1) as u32)
+                    .map(|id| {
+                        let verifier = match lnurl.take() {
+                            Some(client) => CoordinatorVerifier::with_lnurl(client),
+                            None => CoordinatorVerifier::default(),
+                        };
+                        (EnclaveId::new(id), enclave_verifying(id, verifier))
+                    })
+                    .collect(),
+            ),
+            delay: Default::default(),
+            down: Default::default(),
+            load: Default::default(),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let app = Router::new()
-            .route("/api/v1/confidential", post(relay))
-            .route("/api/v1/enclaves/1/public-key", get(public_key))
-            .route("/api/v1/enclaves", get(enclaves))
-            .with_state(relay_state)
+            .route("/api/v1/confidential", post(pool_relay))
+            .route("/api/v1/enclaves/{id}/public-key", get(pool_public_key))
+            .route("/api/v1/enclaves", get(pool_enclaves))
+            .with_state(relay.clone())
             .layer(tower_http::decompression::RequestDecompressionLayer::new());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let directory = tempfile::tempdir().unwrap();
@@ -685,6 +789,7 @@ impl PoolHarness {
             params,
             players,
             policies,
+            relay,
             unregistered,
             db,
             server,
@@ -957,6 +1062,327 @@ async fn keymeld_signs_an_arkade_pool_kickoff() {
         Some(second.funding)
     );
     harness.stop().await;
+}
+
+/// Signs through [`crate::domain::KeymeldArkPool`], noting the most requests the relay had in
+/// flight during each step, overall and to any one enclave. With `down`, the relay refuses one
+/// enclave's requests during the step it names.
+struct Watched {
+    pool: Arc<crate::domain::KeymeldArkPool>,
+    relay: PoolRelay,
+    down: Option<(&'static str, EnclaveId)>,
+    seen: Mutex<BTreeMap<&'static str, (usize, usize)>>,
+}
+
+impl Watched {
+    fn new(
+        pool: Arc<crate::domain::KeymeldArkPool>,
+        relay: PoolRelay,
+        down: Option<(&'static str, EnclaveId)>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            pool,
+            relay,
+            down,
+            seen: Default::default(),
+        })
+    }
+
+    async fn watch<T>(&self, step: &'static str, run: impl std::future::Future<Output = T>) -> T {
+        {
+            let mut load = self.relay.load.lock().unwrap();
+            load.most = 0;
+            load.most_on_one = 0;
+        }
+        *self.relay.down.lock().unwrap() = self
+            .down
+            .filter(|(during, _)| *during == step)
+            .map(|(_, enclave)| enclave);
+        let result = run.await;
+        *self.relay.down.lock().unwrap() = None;
+        let load = self.relay.load.lock().unwrap();
+        self.seen
+            .lock()
+            .unwrap()
+            .insert(step, (load.most, load.most_on_one));
+        result
+    }
+
+    fn seen(&self, step: &str) -> (usize, usize) {
+        self.seen.lock().unwrap()[step]
+    }
+}
+
+#[async_trait]
+impl coordinator_ark::ContractSigner for Watched {
+    async fn sign_contract(
+        &self,
+        dlc: &TicketedDLC,
+        commitment_tx: &dlctix::bitcoin::Psbt,
+    ) -> Result<ContractSignatures, coordinator_ark::BoxError> {
+        self.watch("contract", self.pool.sign_contract(dlc, commitment_tx))
+            .await
+    }
+
+    async fn keep(
+        &self,
+        contract: &dlctix::SignedContract,
+        commitment_tx: &dlctix::bitcoin::Psbt,
+    ) -> Result<(), coordinator_ark::BoxError> {
+        self.pool.keep(contract, commitment_tx).await
+    }
+}
+
+#[async_trait]
+impl coordinator_ark::EscrowSigner for Watched {
+    async fn sign(
+        &self,
+        requests: &[coordinator_ark::SigningRequest],
+    ) -> Result<Vec<dlctix::bitcoin::secp256k1::schnorr::Signature>, coordinator_ark::BoxError>
+    {
+        let step = match requests.first().map(|request| &request.purpose) {
+            Some(coordinator_ark::SigningPurpose::IntentProof) => "intent proof",
+            Some(coordinator_ark::SigningPurpose::DeleteIntent { .. }) => "intent delete",
+            _ => "forfeits",
+        };
+        self.watch(step, self.pool.sign(requests)).await
+    }
+}
+
+/// A pool of `count` players funded from Arkade escrows, spread over `enclaves` enclaves, and
+/// bound before its batch without a funding outpoint.
+struct ArkadePool {
+    harness: PoolHarness,
+    funding: coordinator_ark::PoolFunding,
+    keymeld: Arc<crate::domain::KeymeldArkPool>,
+}
+
+impl ArkadePool {
+    async fn start(count: usize, enclaves: usize) -> Self {
+        use coordinator_ark::testing::{keypair, mock_info, xonly};
+        use coordinator_ark::{escrow_terms, server_rules, EscrowInput, PoolFunding};
+
+        let info = mock_info(&keypair(7));
+        let rules = server_rules(&info).unwrap();
+        let escrows: Vec<_> = (0..count)
+            .map(|index| {
+                let terms = escrow_terms(
+                    &rules,
+                    xonly(&keypair(entry_secret(index)[0])),
+                    xonly(&keypair(18)),
+                    1_790_000_000,
+                    1_789_900_000,
+                )
+                .unwrap();
+                coordinator_ark_escrow::EntryEscrow::new(terms).unwrap()
+            })
+            .collect();
+        let harness = PoolHarness::start_with(
+            pool_parameters(count),
+            Consent {
+                escrows: Some(&escrows),
+                enclaves,
+                ..Default::default()
+            },
+        )
+        .await;
+        harness
+            .service
+            .bind_payout_contract(
+                &harness.session,
+                &ContractCommitment {
+                    contract_parameters: harness.params.clone(),
+                    funding_outpoint: OutPoint::null(),
+                },
+                &harness.policies,
+            )
+            .await
+            .unwrap();
+        let inputs = escrows
+            .into_iter()
+            .enumerate()
+            .map(|(index, escrow)| EscrowInput {
+                escrow,
+                outpoint: OutPoint::new(
+                    dlctix::bitcoin::Txid::from_byte_array([index as u8 + 1; 32]),
+                    0,
+                ),
+                amount: Amount::from_sat(20_000),
+            })
+            .collect();
+        let keymeld = Arc::new(crate::domain::KeymeldArkPool::new(
+            harness.service.clone(),
+            harness.session.clone(),
+            (0..count)
+                .map(|index| {
+                    (
+                        xonly(&keypair(entry_secret(index)[0])),
+                        harness.players[index].clone(),
+                    )
+                })
+                .collect(),
+        ));
+        let output = coordinator_ark::DlcKickoff::new(harness.params.clone(), keymeld.clone())
+            .unwrap()
+            .funding_output()
+            .clone();
+        let funding = PoolFunding::new(inputs, output, &rules, info.dust).unwrap();
+        Self {
+            harness,
+            funding,
+            keymeld,
+        }
+    }
+
+    /// Kick the pool off in a batch of a scripted arkd, which checks every intent proof and
+    /// forfeit signature itself. Returns the kickoff and the forfeits arkd received.
+    async fn kick_off(
+        &self,
+        signer: &Arc<Watched>,
+        batch_nonce: u8,
+    ) -> (
+        Result<coordinator_ark::Kickoff, coordinator_ark::Error>,
+        Vec<dlctix::bitcoin::Psbt>,
+    ) {
+        use coordinator_ark::testing::{keypair, mock_info, Commitment, MockArkd};
+        let info = mock_info(&keypair(7));
+        let arkd = MockArkd::new(&self.funding, &info, Commitment::PaysThePool)
+            .with_batch_nonce(batch_nonce);
+        let hooks =
+            coordinator_ark::DlcKickoff::new(self.harness.params.clone(), signer.clone()).unwrap();
+        let kickoff = coordinator_ark::fund_pool(
+            &arkd,
+            &info,
+            &self.funding,
+            &**signer,
+            &coordinator_ark::KeypairSigner::new([keypair(18)]),
+            &hooks,
+            &coordinator_ark::KickoffConfig {
+                intent_lifetime: Duration::from_secs(120),
+                timeout: Duration::from_secs(120),
+            },
+        )
+        .await;
+        (kickoff, arkd.forfeits())
+    }
+
+    /// The enclave of the pool's second player.
+    fn an_enclave(&self) -> EnclaveId {
+        self.harness
+            .session
+            .recipient_authorization
+            .user_enclave_assignments[&self.harness.players[1]]
+    }
+}
+
+/// Inside a batch, each enclave's share of the contract permits and escrow spends runs beside the
+/// others, one request at a time per enclave, and the forfeits arkd checks come back in order.
+#[tokio::test]
+async fn keymeld_signs_each_enclaves_share_of_an_arkade_kickoff_side_by_side() {
+    let pool = ArkadePool::start(6, 3).await;
+    assert_eq!(pool.harness.relay.operators.len(), 3);
+    // Hold each request, so shares that run side by side overlap at the relay.
+    *pool.harness.relay.delay.lock().unwrap() = Duration::from_millis(20);
+    let signer = Watched::new(pool.keymeld.clone(), pool.harness.relay.clone(), None);
+
+    let (kickoff, forfeits) = pool.kick_off(&signer, 0).await;
+    let kickoff = kickoff.unwrap();
+    assert_eq!(forfeits.len(), 6);
+    assert_eq!(
+        pool.keymeld
+            .signed_contract()
+            .map(|kept| kept.dlc().funding_outpoint()),
+        Some(kickoff.funding)
+    );
+    for step in ["intent proof", "contract", "forfeits"] {
+        let (most, most_on_one) = signer.seen(step);
+        assert_eq!(most_on_one, 1, "{step}: one request at a time per enclave");
+        assert!(most > 1, "{step}: the enclaves' shares ran side by side");
+    }
+    pool.harness.stop().await;
+}
+
+/// An enclave that fails its share fails the whole step, and nothing its peers signed is used:
+/// no forfeit reaches arkd. The next batch signs afresh.
+#[tokio::test]
+async fn an_enclave_failing_its_share_fails_the_kickoff_step() {
+    let pool = ArkadePool::start(6, 3).await;
+    let enclave = pool.an_enclave();
+    *pool.harness.relay.delay.lock().unwrap() = Duration::from_millis(20);
+
+    let signer = Watched::new(
+        pool.keymeld.clone(),
+        pool.harness.relay.clone(),
+        Some(("contract", enclave)),
+    );
+    let (kickoff, forfeits) = pool.kick_off(&signer, 0).await;
+    assert!(matches!(kickoff, Err(coordinator_ark::Error::Hook(_))));
+    assert!(forfeits.is_empty());
+    assert!(pool.keymeld.signed_contract().is_none());
+
+    let signer = Watched::new(
+        pool.keymeld.clone(),
+        pool.harness.relay.clone(),
+        Some(("forfeits", enclave)),
+    );
+    let (kickoff, forfeits) = pool.kick_off(&signer, 1).await;
+    assert!(kickoff.is_err());
+    assert!(forfeits.is_empty());
+
+    let signer = Watched::new(pool.keymeld.clone(), pool.harness.relay.clone(), None);
+    let (kickoff, forfeits) = pool.kick_off(&signer, 2).await;
+    kickoff.unwrap();
+    assert_eq!(forfeits.len(), 6);
+    pool.harness.stop().await;
+}
+
+/// Outside a batch the journal is durable, and the contract's permits still go one at a time.
+#[tokio::test]
+async fn durable_contract_signing_sends_one_request_at_a_time() {
+    let pool = PoolHarness::start_with(
+        pool_parameters(6),
+        Consent {
+            enclaves: 3,
+            ..Default::default()
+        },
+    )
+    .await;
+    *pool.relay.delay.lock().unwrap() = Duration::from_millis(5);
+    pool.relay.load.lock().unwrap().most = 0;
+    let hooks = coordinator_ark::DlcKickoff::new(
+        pool.params.clone(),
+        ServiceContractSigner {
+            service: pool.service.clone(),
+            session: pool.session.clone(),
+            players: pool.players.clone(),
+            policies: pool.policies.clone(),
+        },
+    )
+    .unwrap();
+    let commitment = dlctix::bitcoin::Transaction {
+        version: dlctix::bitcoin::transaction::Version::TWO,
+        lock_time: dlctix::bitcoin::absolute::LockTime::ZERO,
+        input: vec![dlctix::bitcoin::TxIn {
+            previous_output: OutPoint::new(dlctix::bitcoin::Txid::from_byte_array([7; 32]), 0),
+            ..Default::default()
+        }],
+        output: vec![hooks.funding_output().clone()],
+    };
+    let funding = OutPoint::new(commitment.compute_txid(), 0);
+    let commitment = dlctix::bitcoin::Psbt::from_unsigned_tx(commitment).unwrap();
+    coordinator_ark::KickoffHooks::before_forfeits(&hooks, funding, &commitment)
+        .await
+        .unwrap();
+    payout::verify_completed_contract(
+        &ContractCommitment {
+            contract_parameters: pool.params.clone(),
+            funding_outpoint: funding,
+        },
+        hooks.signed_contract().unwrap().all_signatures(),
+    )
+    .unwrap();
+    assert_eq!(pool.relay.load.lock().unwrap().most, 1);
+    pool.stop().await;
 }
 
 /// A run of [`keymeld_kicks_off_a_pool_on_mutinynet`], kept between its steps.
@@ -1261,6 +1687,7 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_funded() {
         lnurl,
         unfinished_keygen,
         registered: None,
+        enclaves: 1,
     };
     let harness = PoolHarness::start_with(pool_parameters(1), consent(Some(client), false)).await;
 
@@ -1432,6 +1859,7 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_filled() {
             lnurl: Some(client),
             unfinished_keygen: true,
             registered: Some(1),
+            enclaves: 1,
         },
     )
     .await;
