@@ -82,7 +82,7 @@ Before each new payment, the coordinator checks that the outcome output remains 
 It checks both the Electrum tip and a fresh, synchronized LND tip.
 The payment route's total CLTV limit must end before the player's earliest on-chain claim.
 The limit reserves twelve settlement blocks and one mempool block.
-The limit shrinks as the chain advances and cannot exceed 144 blocks.
+The limit shrinks as the chain advances and cannot exceed 432 blocks.
 An invoice whose final CLTV requirement does not fit is not sent.
 
 At the cutoff, the coordinator closes the Lightning payout window.
