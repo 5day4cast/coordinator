@@ -174,6 +174,8 @@ pub struct Leaderboard {
     pub refreshing: bool,
     /// The latest observation report at any of the competition's stations.
     pub observed_until: Option<OffsetDateTime>,
+    /// The oracle could not verify the window's data, so it could not settle the event.
+    pub settlement_blocked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -624,6 +626,7 @@ pub fn build(
         weather_fetched_at: weather.latest.as_ref().map(|weather| weather.fetched_at),
         refreshing: weather.refreshing,
         observed_until,
+        settlement_blocked: weather_value.is_some_and(|weather| weather.event.settlement_blocked),
     }
 }
 

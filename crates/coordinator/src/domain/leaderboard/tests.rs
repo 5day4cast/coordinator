@@ -116,6 +116,7 @@ fn weather(scores: HashMap<Uuid, u64>, entries: usize, attested: bool) -> Compet
             scores,
             attested,
             lines: vec![],
+            settlement_blocked: false,
         },
         observations: Some(vec![StationObservations {
             station_id: "KPWM".into(),

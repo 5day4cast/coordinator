@@ -60,6 +60,9 @@ pub struct EventReadings {
     pub scores: HashMap<Uuid, u64>,
     pub entry_count: usize,
     pub attested: bool,
+    /// The oracle could not settle the event unsigned: its last check of the data failed.
+    /// Why is the oracle operator's business, so only that it happened is kept.
+    pub settlement_blocked: bool,
 }
 
 impl EventReadings {
@@ -160,6 +163,8 @@ impl OracleWeather {
             attestation: Option<serde_json::Value>,
             #[serde(default)]
             lines: Vec<EventLine>,
+            #[serde(default)]
+            settlement_block: Option<serde_json::Value>,
         }
         let url = format!("{}/oracle/events/{event_id}", self.base_url);
         let response = self.http.get(&url).send().await?;
@@ -181,6 +186,7 @@ impl OracleWeather {
             readings: event.readings,
             lines: event.lines,
             attested: event.attestation.is_some_and(|value| !value.is_null()),
+            settlement_blocked: event.settlement_block.is_some_and(|value| !value.is_null()),
         })
     }
 
@@ -417,10 +423,24 @@ mod tests {
             "entries": [{ "id": entry_id, "base_score": 10 }],
             "attestation": "signed-result"
         });
+        let blocked_id = Uuid::now_v7();
+        let blocked = json!({
+            "entries": [{ "id": entry_id, "base_score": null }],
+            "attestation": null,
+            "settlement_block": {
+                "code": "source_check_failed",
+                "message": "KPWM: observations disagree",
+                "checked_at": "2026-09-24T13:00:00Z"
+            }
+        });
         let app = Router::new()
             .route(
                 &format!("/oracle/events/{id}"),
                 get(move || async move { Json(event) }),
+            )
+            .route(
+                &format!("/oracle/events/{blocked_id}"),
+                get(move || async move { Json(blocked) }),
             )
             .route(
                 "/stations/observations",
@@ -446,6 +466,9 @@ mod tests {
 
         let readings = oracle.event_readings(id).await.unwrap();
         assert!(readings.is_final());
+        assert!(!readings.settlement_blocked);
+        let blocked = oracle.event_readings(blocked_id).await.unwrap();
+        assert!(blocked.settlement_blocked && !blocked.is_final());
         assert_eq!(readings.scores.get(&entry_id), Some(&10));
         assert_eq!(
             readings.reading("KPWM", "wind_speed").unwrap().observed,
