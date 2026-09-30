@@ -1939,16 +1939,26 @@ mod ark_escrow {
         );
     }
 
-    /// The pool's escrow permission signs batch intents for the pool, but never a refund's:
-    /// only the refund permission checks the swap against the player's own invoice.
+    /// The pool's escrow permission signs the pool's batch, and never a refund, offchain or in
+    /// a batch: only the refund permission checks the swap against an invoice from the
+    /// player's own Lightning Address. Signed here, a refund could pay a swap the caller made
+    /// for itself, once the escrow's locktime had passed.
     #[tokio::test]
-    async fn the_escrow_permission_does_not_sign_a_refund_intent() {
+    async fn the_escrow_permission_does_not_sign_a_refund_even_for_a_bound_pool() {
         let (f, escrow) = ark_fixture();
         let verifier = CoordinatorVerifier::default();
         let bound = f.bind(&verifier);
+        let swap = refund_swap([9u8; 32]);
         let message = register_message(now().unwrap() + 120);
-        let spend = refund_intent_of(&escrow, &refund_swap([9u8; 32]), &message);
-        assert!(prepare(&verifier, &f, &bound, spend).await.is_err());
+        for spend in [
+            refund_signing(&escrow, &swap, RefundPurpose::ArkTransaction),
+            refund_signing(&escrow, &swap, RefundPurpose::Checkpoint),
+            refund_intent_of(&escrow, &swap, &message),
+        ] {
+            // Each is a refund the refund's own rules accept.
+            coordinator_escrow::ark::refund_from(&escrow, &policy_for(&escrow), &spend).unwrap();
+            assert!(prepare(&verifier, &f, &bound, spend).await.is_err());
+        }
     }
 
     #[cfg(feature = "lnurl")]

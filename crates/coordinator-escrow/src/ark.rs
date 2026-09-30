@@ -202,11 +202,11 @@ pub fn spend_digests(
                 .map_err(|e| ArkError(e.to_string()))?;
             intent_proof_digests(escrow, policy.max_fee_sats, &funding_output, &proof)
         }
-        ArkEscrowSpend::Refund { .. } => Ok(refund_from(escrow, policy, spend)?.1.digests),
-        // Its swap must commit to an invoice from the player's own address, which only the
-        // refund permission checks.
-        ArkEscrowSpend::RefundIntent { .. } => {
-            reject("a refund in a batch is signed under the refund permission")
+        // A refund's swap must commit to an invoice from the player's own Lightning Address,
+        // which only the refund permission checks. Signed here, a refund could pay a swap the
+        // caller made for itself.
+        ArkEscrowSpend::Refund { .. } | ArkEscrowSpend::RefundIntent { .. } => {
+            reject("a refund is signed under the refund permission")
         }
         ArkEscrowSpend::Forfeit {
             forfeit_psbt,
