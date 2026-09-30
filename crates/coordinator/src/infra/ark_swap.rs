@@ -114,6 +114,18 @@ pub trait EscrowSwaps: Send + Sync {
     async fn refund(&self, id: Uuid) -> anyhow::Result<RefundSwap>;
 }
 
+/// ark-swapd answered 503: its wallet cannot fund a swap right now. Asking again later may work.
+#[derive(Debug)]
+pub struct SwapsUnavailable(pub String);
+
+impl std::fmt::Display for SwapsUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SwapsUnavailable {}
+
 pub struct SwapClient {
     http: reqwest::Client,
     base_url: String,
@@ -138,7 +150,11 @@ impl SwapClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("ark-swapd answered {status}: {body}");
+            let error = format!("ark-swapd answered {status}: {body}");
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                return Err(SwapsUnavailable(error).into());
+            }
+            anyhow::bail!(error);
         }
         Ok(response.json().await?)
     }

@@ -46,6 +46,9 @@ pub enum Error {
     /// the entry.
     #[error("{}", competitions::ENTRIES_PAUSED)]
     EntriesPaused,
+    /// Retryable: the swap service cannot fund an entry's swap right now.
+    #[error("{}", competitions::SWAPS_UNAVAILABLE)]
+    SwapsUnavailable,
 }
 
 impl Error {
@@ -61,6 +64,7 @@ impl Error {
                 | Error::InvalidSignature(_)
                 | Error::FeeEstimateUnavailable
                 | Error::EntriesPaused
+                | Error::SwapsUnavailable
         )
     }
 

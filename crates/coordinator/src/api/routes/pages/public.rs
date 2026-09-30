@@ -808,6 +808,7 @@ fn leaderboard_view(board: &Leaderboard) -> LeaderboardView {
             .rows
             .iter()
             .any(|row| row.picks.iter().any(|pick| pick.observed.is_some())),
+        unverified: board.settlement_blocked,
     }
 }
 

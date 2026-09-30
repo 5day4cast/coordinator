@@ -89,6 +89,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         phase: Phase::Live,
         updated_at: Some(now - Duration::minutes(2)),
         any_readings: false,
+        unverified: false,
     };
     // Rows arrive after the page loads; here they are put where they land, the last one
     // marked as the viewer's own as page.js would.

@@ -231,6 +231,12 @@ impl CompetitionView {
         }
     }
 
+    /// Whether entry fees are owed back: it didn't fill, or it was cancelled for any reason,
+    /// such as a failed kickoff check, with fees in escrow.
+    pub fn owes_refunds(&self) -> bool {
+        self.did_not_fill() || (self.phase == Phase::Cancelled && self.refunds.escrowed > 0)
+    }
+
     /// Where the entry fees of a competition that didn't fill stand at `now`. Escrowed fees
     /// are returned once their escrows' refund locktime passes, up to a day after the start;
     /// held Lightning payments are released when the competition is cancelled.
@@ -347,7 +353,7 @@ fn badge(competition: &CompetitionView, split: bool) -> Markup {
 /// Under a competition that didn't run: where its entry fees stand. Escrow refunds open at
 /// their locktime, so until then it says when; nothing when no fee was paid.
 pub fn refund_line(competition: &CompetitionView, now: OffsetDateTime) -> Option<Markup> {
-    if !competition.did_not_fill() {
+    if !competition.owes_refunds() {
         return None;
     }
     Some(match competition.refunds(now) {
@@ -991,6 +997,29 @@ pub(crate) mod tests {
         operator.total_entries = 3;
         assert!(badge(&operator).contains(">Cancelled</span>"));
         assert_eq!(refund_line(&operator, NOW).map(text), None);
+
+        // Cancelled with every seat taken, as a failed kickoff check does: the escrowed fees
+        // are owed back all the same.
+        let mut full = view("full", Phase::Cancelled, -60);
+        full.total_entries = full.total_allowed_entries;
+        full.refunds = RefundProgress {
+            escrowed: 5,
+            refunded: 0,
+            opens_at: Some(NOW - time::Duration::minutes(1)),
+        };
+        assert!(!full.did_not_fill());
+        assert!(badge(&full).contains(">Cancelled</span>"));
+        assert_eq!(
+            refund_line(&full, NOW).map(text).as_deref(),
+            Some("Refunding…")
+        );
+        assert!(text(competition_row(&full, NOW))
+            .contains(r#"<span class="cell-note refund-line">Refunding…</span>"#));
+        full.refunds.refunded = 5;
+        assert_eq!(
+            refund_line(&full, NOW).map(text).as_deref(),
+            Some("Refunded")
+        );
         for old in [
             "Pot return<",
             "Contract expired",

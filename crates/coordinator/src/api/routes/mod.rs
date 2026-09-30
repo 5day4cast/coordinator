@@ -49,6 +49,7 @@ impl IntoResponse for Error {
             Error::InvalidSignature(_) => (StatusCode::FORBIDDEN, self.to_string()),
             Error::FeeEstimateUnavailable => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             Error::EntriesPaused => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
+            Error::SwapsUnavailable => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             // Retryable: the oracle is restarting or has not fitted its lines yet. Its message
             // may name internal addresses, so it is logged rather than returned.
             Error::OracleFailed(error) => {
@@ -126,6 +127,11 @@ mod tests {
                 Error::FeeEstimateUnavailable,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "The Bitcoin network fee estimate is unavailable right now, so no ticket was issued; try again in a moment",
+            ),
+            (
+                Error::SwapsUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Lightning payments are unavailable for a moment, so no invoice was made; try again in a moment",
             ),
             (
                 Error::OracleFailed(crate::infra::oracle::Error::BadRequest(

@@ -47,6 +47,8 @@ pub struct LeaderboardView {
     pub updated_at: Option<OffsetDateTime>,
     /// Any pick has a reading from the window.
     pub any_readings: bool,
+    /// The oracle could not verify the window's weather data.
+    pub unverified: bool,
 }
 
 /// Whether a competition in `phase` ran, so its entries have scores. One that didn't fill, or
@@ -147,7 +149,12 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
                     (refund_note(competition, now))
                 }
             } @else if !split && !ran(competition.phase) {
-                p class="notice" { "This competition did not run, so nothing is scored." }
+                p class="notice" {
+                    "This competition did not run, so nothing is scored."
+                    @if competition.owes_refunds() {
+                        " " (refund_note(competition, now))
+                    }
+                }
             }
 
             @if split {
@@ -248,6 +255,12 @@ pub fn leaderboard_scores(
                     p class="provisional-note" {
                         "Window closed"
                         (tip_start("Scores so far; the oracle's own reading decides the final result."))
+                    }
+                }
+                Phase::Expired if board.unverified => {
+                    p class="notice" {
+                        "The oracle couldn't verify the weather data for this window, so the pot is "
+                        "shared back among the entries."
                     }
                 }
                 Phase::Expired => {
@@ -577,6 +590,7 @@ mod tests {
             phase: Phase::Live,
             updated_at: Some(NOW - time::Duration::minutes(12)),
             any_readings: true,
+            unverified: false,
         };
         let live = leaderboard_scores(&competition, &board, NOW).into_string();
         assert!(live.contains("Updated <time"));
@@ -621,6 +635,7 @@ mod tests {
             phase: Phase::Scored,
             updated_at: None,
             any_readings: true,
+            unverified: false,
         };
         let html = leaderboard_scores(&competition, &tied, NOW).into_string();
         assert_eq!(html.matches("paid-badge").count(), 1);
@@ -645,6 +660,7 @@ mod tests {
             phase: Phase::Live,
             updated_at: None,
             any_readings: false,
+            unverified: false,
         };
         let html = leaderboard_scores(&competition, &board, NOW).into_string();
         assert_eq!(html.matches(r#"<td data-label="Rank">—</td>"#).count(), 2);
@@ -664,6 +680,7 @@ mod tests {
             phase: Phase::Cancelled,
             updated_at: None,
             any_readings: false,
+            unverified: false,
         };
         assert!(!leaderboard_scores(&competition, &board, NOW)
             .into_string()
@@ -715,6 +732,7 @@ mod tests {
             phase: Phase::Unfilled,
             updated_at: None,
             any_readings: true,
+            unverified: false,
         };
         let scores = leaderboard_scores(&competition, &board, NOW).into_string();
         assert!(!scores.contains("30 pts"), "{scores}");
@@ -729,6 +747,30 @@ mod tests {
         assert!(leaderboard(&competition, NOW)
             .into_string()
             .contains("No entry fees were paid."));
+    }
+
+    /// A full competition cancelled before it ran, as by a failed kickoff check, still says
+    /// where its escrowed entry fees stand; an operator's cancellation with nothing escrowed
+    /// does not.
+    #[test]
+    fn a_cancelled_competition_with_escrows_explains_its_refunds() {
+        let mut competition = view("c1", Phase::Cancelled, -60);
+        competition.total_entries = competition.total_allowed_entries;
+        let page = leaderboard(&competition, NOW).into_string();
+        assert!(page.contains("did not run, so nothing is scored."));
+        assert!(!page.contains("Refund") && !page.contains("returned"));
+
+        competition.refunds = crate::domain::RefundProgress {
+            escrowed: 3,
+            refunded: 1,
+            opens_at: Some(NOW - time::Duration::minutes(5)),
+        };
+        let page = leaderboard(&competition, NOW).into_string();
+        assert!(page.contains("did not run, so nothing is scored. Refunding… "));
+        assert!(page.contains("1 of 3 paid entry fees returned so far"));
+        assert!(phase_badge(&competition)
+            .into_string()
+            .contains(">Cancelled</span>"));
     }
 
     /// A no-score outcome explains why each entry has an allocation without
@@ -747,6 +789,7 @@ mod tests {
             phase: Phase::Scored,
             updated_at: None,
             any_readings: false,
+            unverified: false,
         };
         let html = leaderboard_scores(&competition, &board, NOW).into_string();
         assert!(html.contains("No-score outcome."));
@@ -812,6 +855,7 @@ mod tests {
             phase: Phase::Scored,
             updated_at: None,
             any_readings: false,
+            unverified: false,
         };
         assert!(leaderboard_scores(&competition, &board, NOW)
             .into_string()
@@ -850,11 +894,33 @@ mod tests {
             phase: Phase::Expired,
             updated_at: None,
             any_readings: false,
+            unverified: false,
         };
         let scores = leaderboard_scores(&competition, &board, NOW).into_string();
         assert!(scores.contains("never signed a result in time"));
         assert!(!scores.contains("attestation") && !scores.contains("signed expiry terms"));
         assert!(!scores.contains("No-score outcome"));
         assert!(!scores.contains("0 pts"));
+        // The oracle couldn't verify the window's data: said plainly, with no detail.
+        let unverified = LeaderboardView {
+            unverified: true,
+            ..board
+        };
+        let scores = leaderboard_scores(&competition, &unverified, NOW).into_string();
+        assert!(
+            scores.contains("The oracle couldn&#39;t verify the weather data for this window")
+                || scores.contains("The oracle couldn't verify the weather data for this window")
+        );
+        assert!(scores.contains("so the pot is shared back among the entries."));
+        assert!(!scores.contains("never signed a result in time"));
+        assert_eq!(scores.matches(r#"class="notice""#).count(), 1);
+
+        // Only an expired competition says so.
+        let awaiting = LeaderboardView {
+            phase: Phase::AwaitingResult,
+            ..unverified
+        };
+        let scores = leaderboard_scores(&competition, &awaiting, NOW).into_string();
+        assert!(!scores.contains("couldn"));
     }
 }

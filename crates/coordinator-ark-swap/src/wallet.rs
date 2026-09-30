@@ -157,6 +157,11 @@ impl ArkWallet {
         Ok(self.server.rules().check(vtxo)?)
     }
 
+    /// How long the Arkade server's batch sessions last.
+    pub fn session_duration(&self) -> Duration {
+        Duration::from_secs(self.server.info().session_duration)
+    }
+
     pub fn dust(&self) -> Amount {
         self.server.info().dust
     }
