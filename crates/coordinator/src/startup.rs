@@ -26,7 +26,7 @@ use crate::{
     domain::{
         leaderboard::Leaderboards, CompetitionRunners, CompetitionStore, CompetitionWakes,
         Coordinator, InvoiceSubscriber, InvoiceWatcher, PaymentSubscriber, PayoutWatcher, UserInfo,
-        UserStore,
+        UserStore, ARK_SWAP_BOARDS_EVERY,
     },
     infra::{
         bitcoin::{Bitcoin, BitcoinClient, BitcoinSyncWatcher},
@@ -670,6 +670,7 @@ pub async fn build_app(
             "escrow swaps",
             cancel_token.clone(),
             async move {
+                let mut boards_read_at: Option<std::time::Instant> = None;
                 loop {
                     tokio::select! {
                         _ = ark_cancel.cancelled() => break,
@@ -677,6 +678,15 @@ pub async fn build_app(
                             .worker_leases()
                             .tick("escrow-swaps", ark_coordinator.check_ark_swaps()) => {
                             if let Some(Err(error)) = result { error!("Escrow swap worker: {}", error); }
+                        }
+                    }
+                    // Every instance reads ark-swapd's boards, lease or not: each one decides
+                    // for itself whether its ticket route pauses Arkade entries.
+                    if boards_read_at.is_none_or(|read| read.elapsed() >= ARK_SWAP_BOARDS_EVERY) {
+                        boards_read_at = Some(std::time::Instant::now());
+                        tokio::select! {
+                            _ = ark_cancel.cancelled() => break,
+                            _ = ark_coordinator.read_ark_swap_boards() => {}
                         }
                     }
                     tokio::select! {

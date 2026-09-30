@@ -91,6 +91,8 @@ pub struct ArkWallet {
     margins: Margins,
     /// The last reading of the wallet, for `view`.
     view: Cached<WalletView>,
+    /// How the last boards and renewals went, for `view`.
+    boards: BoardOutcomes,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -112,6 +114,69 @@ pub struct WalletView {
     /// Confirmed, unspent coins at the boarding address: what the next board would move in.
     /// They stay here until a batch takes them, so a top-up the server cannot board shows here.
     pub boarding_sat: u64,
+    /// The last board or renewal the Arkade server failed, since this instance started.
+    pub last_board_failure: Option<BoardFailure>,
+    /// UNIX seconds. When a batch last took a board or a renewal, since this instance started.
+    pub last_board_success_at: Option<i64>,
+}
+
+/// A board or renewal the Arkade server failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BoardFailure {
+    /// UNIX seconds.
+    pub at: i64,
+    pub message: String,
+}
+
+/// How the wallet's boards and renewals last went, kept in memory. The coordinator reads it to
+/// learn whether the Arkade server takes batches while it runs none of its own.
+#[derive(Debug, Default)]
+pub struct BoardOutcomes(std::sync::Mutex<Outcomes>);
+
+#[derive(Debug, Default)]
+struct Outcomes {
+    failure: Option<BoardFailure>,
+    success_at: Option<i64>,
+}
+
+impl BoardOutcomes {
+    /// Count a board or renewal at `now`. A batch that took the coins is a success and a failure
+    /// of the server's is a failure; nothing to board, or a failure on this side, is neither.
+    pub fn record(&self, outcome: &anyhow::Result<Option<Txid>>, now: i64) {
+        let mut outcomes = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        match outcome {
+            Ok(Some(_)) => outcomes.success_at = Some(now),
+            Ok(None) => {}
+            Err(error) => {
+                let message = format!("{error:#}");
+                if server_fault(&message) {
+                    outcomes.failure = Some(BoardFailure { at: now, message });
+                }
+            }
+        }
+    }
+
+    /// Put the last outcomes in `view`, which may be a cached reading of the wallet.
+    pub fn stamp(&self, view: &mut WalletView) {
+        let outcomes = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        view.last_board_failure = outcomes.failure.clone();
+        view.last_board_success_at = outcomes.success_at;
+    }
+}
+
+/// Whether a board or renewal failed on the Arkade server's side: a batch the server gave up on,
+/// or a request it answered with an internal error or could not be reached for. The same
+/// classification as `coordinator_ark::Error::is_server_fault`, read from the message, because
+/// ark-client keeps the server's gRPC status inside an opaque error.
+fn server_fault(message: &str) -> bool {
+    const FAULTS: [&str; 3] = [
+        // ark-client's error for the server's `BatchFailed` event.
+        "batch failed ",
+        // How a gRPC `Internal` or `Unavailable` status prints.
+        "code: 'Internal error'",
+        "code: 'The service is currently unavailable'",
+    ];
+    FAULTS.iter().any(|fault| message.contains(fault))
 }
 
 /// A value kept for `ttl`, so callers in quick succession share one reading of it.
@@ -184,6 +249,7 @@ impl ArkWallet {
             chain: blockchain,
             margins: Margins::from_days(config.renew_margin_days, config.pay_margin_days),
             view: Cached::new(VIEW_TTL),
+            boards: BoardOutcomes::default(),
         })
     }
 
@@ -432,9 +498,11 @@ impl ArkWallet {
         }
     }
 
-    /// The wallet's addresses and balance, read at most once every `VIEW_TTL`.
+    /// The wallet's addresses and balance, read at most once every `VIEW_TTL`, and how its
+    /// boards last went.
     pub async fn view(&self) -> anyhow::Result<WalletView> {
-        self.view
+        let mut view = self
+            .view
             .get(|| async {
                 let started = std::time::Instant::now();
                 let view = self.read_view().await;
@@ -444,7 +512,9 @@ impl ArkWallet {
                 }
                 view
             })
-            .await
+            .await?;
+        self.boards.stamp(&mut view);
+        Ok(view)
     }
 
     async fn read_view(&self) -> anyhow::Result<WalletView> {
@@ -477,6 +547,8 @@ impl ArkWallet {
             recoverable_sat: coins.recoverable_sat(),
             earliest_expiry: coins.earliest_expiry(),
             boarding_sat,
+            last_board_failure: None,
+            last_board_success_at: None,
         })
     }
 
@@ -504,10 +576,13 @@ impl ArkWallet {
     pub async fn board(&self) -> anyhow::Result<Option<Txid>> {
         let _one_at_a_time = self.sending.lock().await;
         let mut rng = <rand08::rngs::StdRng as rand08::SeedableRng>::from_entropy();
-        self.client
+        let boarded = self
+            .client
             .settle(&mut rng)
             .await
-            .map_err(|error| anyhow::anyhow!("board: {error}"))
+            .map_err(|error| anyhow::anyhow!("board: {error}"));
+        self.boards.record(&boarded, unix_now());
+        boarded
     }
 
     /// Settle `coins` into one fresh VTXO in the next batch, which gives it a new batch's
@@ -518,10 +593,13 @@ impl ArkWallet {
     pub async fn renew(&self, coins: &[OutPoint]) -> anyhow::Result<Option<Txid>> {
         let _one_at_a_time = self.sending.lock().await;
         let mut rng = <rand08::rngs::StdRng as rand08::SeedableRng>::from_entropy();
-        self.client
+        let renewed = self
+            .client
             .settle_vtxos(&mut rng, coins, &[])
             .await
-            .map_err(|error| anyhow::anyhow!("renew: {error}"))
+            .map_err(|error| anyhow::anyhow!("renew: {error}"));
+        self.boards.record(&renewed, unix_now());
+        renewed
     }
 }
 
@@ -789,9 +867,91 @@ mod tests {
             recoverable_sat: 0,
             earliest_expiry: None,
             boarding_sat: 400_000,
+            last_board_failure: None,
+            last_board_success_at: None,
         };
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(json["boarding_sat"], 400_000);
+    }
+
+    /// A board as ark-client fails it when the server answers with `status`.
+    fn refused_board(status: tonic::Status) -> anyhow::Result<Option<Txid>> {
+        Err(anyhow::anyhow!(
+            "board: Failed to join batch: request failed{status}"
+        ))
+    }
+
+    #[test]
+    fn the_wallet_view_reports_the_last_failed_and_the_last_successful_board() {
+        use bitcoin::hashes::Hash;
+        let boards = BoardOutcomes::default();
+        let mut view = WalletView {
+            ark_address: "tark1".to_string(),
+            boarding_address: "tb1q".to_string(),
+            confirmed_sat: 0,
+            pre_confirmed_sat: 0,
+            payable_sat: 0,
+            expiring_sat: 0,
+            recoverable_sat: 0,
+            earliest_expiry: None,
+            boarding_sat: 400_000,
+            last_board_failure: None,
+            last_board_success_at: None,
+        };
+        boards.stamp(&mut view);
+        let json = serde_json::to_value(&view).unwrap();
+        assert!(json["last_board_failure"].is_null());
+        assert!(json["last_board_success_at"].is_null());
+
+        let rescan = tonic::Status::internal(
+            "INTERNAL_ERROR (0): failed to rescan boarding utxos: HTTP 500",
+        );
+        boards.record(&refused_board(rescan), 1_000);
+        boards.stamp(&mut view);
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["last_board_failure"]["at"], 1_000);
+        assert!(json["last_board_failure"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("failed to rescan boarding utxos"));
+        assert!(json["last_board_success_at"].is_null());
+
+        // Nothing to board, and a failure on this side, change nothing.
+        boards.record(&Ok(None), 1_060);
+        boards.record(&Err(anyhow::anyhow!("board: not enough funds")), 1_060);
+        boards.stamp(&mut view);
+        assert_eq!(view.last_board_failure.as_ref().unwrap().at, 1_000);
+
+        boards.record(&Ok(Some(Txid::from_byte_array([1; 32]))), 1_120);
+        boards.stamp(&mut view);
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["last_board_success_at"], 1_120);
+        assert_eq!(
+            json["last_board_failure"]["at"], 1_000,
+            "the failure is kept"
+        );
+    }
+
+    #[test]
+    fn only_the_servers_own_failures_count_against_a_board() {
+        let fault = |outcome: anyhow::Result<Option<Txid>>| {
+            server_fault(&format!("{:#}", outcome.unwrap_err()))
+        };
+        assert!(fault(refused_board(tonic::Status::internal(
+            "INTERNAL_ERROR (0): failed to rescan boarding utxos: HTTP 500"
+        ))));
+        assert!(fault(refused_board(tonic::Status::unavailable(
+            "connection refused"
+        ))));
+        assert!(fault(Err(anyhow::anyhow!(
+            "renew: Failed to join batch: batch failed 7f3a: failed to create commitment tx"
+        ))));
+        assert!(!fault(refused_board(tonic::Status::invalid_argument(
+            "VTXO_ALREADY_SPENT (6): already spent"
+        ))));
+        assert!(!fault(Err(anyhow::anyhow!(
+            "board: Failed to join batch: not enough funds to cover fees"
+        ))));
     }
 
     #[tokio::test]
