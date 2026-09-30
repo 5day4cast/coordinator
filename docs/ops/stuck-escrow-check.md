@@ -119,6 +119,41 @@ the refund then keeps its swap instead of minting a new one each hour, and the l
 arkd operator can also remove the intent: `GET /v1/admin/intents` lists it, and
 `POST /v1/admin/intents/delete` deletes it. The next cleanup pass then refunds the escrow.
 
+### Writing off a refund that can never finish
+
+Some rows above never finish on their own: `entry` empty with `registered = 0` (nothing can sign
+the refund leaf), a ticket counted after Keymeld had the roster, a player who gave no Lightning
+Address, or an escrow spent by something other than its refund. Cleanup retries them on every
+pass, the log says `… it needs an operator` for each, and the competition's pages keep saying
+`Refunding… 0 of N paid entry fees returned so far`.
+
+Once the operator has decided not to refund such an escrow (or has settled with the player some
+other way), write it off:
+
+```sh
+coordinator admin write-off-refund --ticket <ticket-id> --reason "<why>" --yes
+# every stuck refund of one competition; the others are listed and left alone
+coordinator admin write-off-refund --competition <competition-id> --reason "<why>" --yes
+```
+
+This writes to the coordinator's database and nothing else: the escrow stays where it is on
+Arkade. From then on cleanup skips the escrow without logging it, the competition leaves the
+cleanup queue once nothing else is owed, and the pages count the escrow as no longer owed: it
+drops out of the `N of M` count and of `Refunds open …`, and a competition whose other escrows are
+refunded reads `Refunded`, with a note of how many fees were not returned.
+`coordinator admin competitions show <id>` lists each write-off with its reason, and the JSON
+(`GET /api/v1/admin/competitions/{id}`) carries them in `refund_write_offs`. The reason and time
+are kept in `ticket_ark_refund_write_offs`.
+
+A ticket's refund is written off without `--force` only when it is stuck: no refund was ever
+minted and its player never sent a registration, or this coordinator process last logged it as
+needing an operator (a restart forgets that until the next cleanup pass logs it again). Any other
+refund still in progress is refused unless `--force`; a forced write-off stops cleanup where the
+refund stopped, so check sections 2 and 5 first. A settled refund, one already written off, an
+escrow a batch spent into its pool, and one whose competition has not been cancelled or failed
+are always refused. The endpoint is `POST /api/v1/admin/refunds/write-off` with
+`{"ticket_id" | "competition_id", "reason", "force"}`.
+
 ## 4. Coordinator: Arkade tickets whose swap it has not counted
 
 ```sql
@@ -175,6 +210,7 @@ The coordinator and ark-swapd log each of these once per ticket, swap, or compet
 debug while the condition lasts:
 
 - `Cannot refund the escrow of ticket … yet: …`: a refund is blocked, with the reason.
+- `Wrote off the refund of ticket … in competition …`: an operator wrote off its refund (see above).
 - `Cannot refund … yet: its escrow … is held by an Arkade batch intent that cannot be deleted yet…`: section 3, `refund_error`.
 - `Deleted the Arkade batch intent that held the escrow of ticket …`: a refund freed its escrow, and every other escrow of that intent.
 - `kickoff intent … may still hold the escrows, since deleting it failed…`: a kickoff failed and left its intent queued; the pool's refunds, or its next kickoff, delete it.
