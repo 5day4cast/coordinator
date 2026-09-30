@@ -429,7 +429,8 @@ impl SynthDb {
         .context("list runs whose money is still being followed")
     }
 
-    /// Runs whose money is stuck now, with their trails, oldest first.
+    /// Runs whose money is stuck now, and runs synth stopped following while their money was
+    /// held, never seeing it move; with their trails, oldest first.
     pub async fn held_runs(&self) -> Result<Vec<HeldRun>> {
         #[derive(sqlx::FromRow)]
         struct Row {
@@ -440,7 +441,9 @@ impl SynthDb {
         let rows = sqlx::query_as::<_, Row>(
             "SELECT test_runs.*, money_trails.money AS money, money_trails.trail_json \
              FROM money_trails JOIN test_runs ON test_runs.id = money_trails.run_id \
-             WHERE money_trails.money = 'stuck' ORDER BY test_runs.started_at",
+             WHERE money_trails.money = 'stuck' OR (money_trails.money = 'unverified' \
+               AND json_extract(money_trails.trail_json, '$.held') IS NOT NULL) \
+             ORDER BY test_runs.started_at",
         )
         .fetch_all(&self.pool)
         .await
@@ -1047,6 +1050,28 @@ mod tests {
         .unwrap();
         assert!(db.runs_to_follow().await.unwrap().is_empty());
         assert!(db.held_runs().await.unwrap().is_empty());
+
+        // Money synth stopped following while it was held is still listed; money it merely
+        // could not verify, never held, is not.
+        let unverified = trail(Money::Unverified {
+            reason: "0 of 3 payouts confirmed".into(),
+        });
+        db.record_money(&run, &verdict(&unverified)).await.unwrap();
+        assert!(db.held_runs().await.unwrap().is_empty());
+        let mut was_held = unverified.clone();
+        was_held.held = Some(crate::trail::Held {
+            since: OffsetDateTime::now_utc(),
+            found: OffsetDateTime::now_utc(),
+            reason: "no payout was sent".into(),
+            sats: 3000,
+            nearest_expiry: None,
+            until: Some(OffsetDateTime::now_utc()),
+            then: Some("synth stopped following it".into()),
+        });
+        db.record_money(&run, &verdict(&was_held)).await.unwrap();
+        let held = db.held_runs().await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].run.money.as_deref(), Some("unverified"));
     }
 
     /// Databases made before runs kept their competition find it in the steps, once.

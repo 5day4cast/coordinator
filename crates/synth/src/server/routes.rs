@@ -4,7 +4,7 @@ use crate::db::HeldRun;
 use crate::rebalance::Rebalancer;
 use crate::runner::Runner;
 use crate::scenarios::{ScenarioConfig, ScenarioStatus};
-use crate::trail::tracker::{Tracker, UnrecordedSwaps};
+use crate::trail::tracker::{Tracker, UnrecordedSwaps, UnrefundedCompetitions};
 use crate::trail::{label_words, Held};
 use axum::{
     extract::{Path, Query, State},
@@ -160,6 +160,8 @@ pub(super) async fn dashboard_live(
         .unwrap_or_default();
     let held = runner.db().held_runs().await.unwrap_or_default();
     let unrecorded = tracker.unrecorded_swaps();
+    let unrefunded = tracker.unrefunded_competitions();
+    let coordinator = runner.client().base_url();
 
     html! {
         @if !live.is_empty() {
@@ -204,7 +206,7 @@ pub(super) async fn dashboard_live(
             }
         }
 
-        (stuck_money(&held, unrecorded.as_ref(), now))
+        (stuck_money(&held, unrecorded.as_ref(), unrefunded.as_ref(), coordinator, now))
 
         section.status {
             h2 { "Last Run" }
@@ -234,8 +236,18 @@ pub(super) async fn dashboard_live(
                 @if let Some(run) = runs.first() {
                     p { a href=(format!("/runs/{}", run.id)) { "See where the money went →" } }
                 }
+            } @else if let Some(run) = runs.first() {
+                // Nothing has run since synth started; the newest run it has recorded stands in.
+                div.result {
+                    p { "Scenario: " strong { (run.scenario) } " " (run_status(&run.status, run.money.as_deref())) }
+                    p { "Started " (format::time_text(&run.started_at, now)) }
+                    @if let Some(error) = &run.error_message {
+                        p.error { "Error: " (error) }
+                    }
+                }
+                p { a href=(format!("/runs/{}", run.id)) { "See its steps and where the money went →" } }
             } @else {
-                p { "No runs since synth started." }
+                p { "No runs yet." }
             }
         }
 
@@ -356,11 +368,14 @@ pub(super) async fn dashboard_live(
     }
 }
 
-/// Every run whose money is stuck now, oldest first, and the swaps ark-swapd says funded an escrow
-/// without recording its output, whoever made them.
+/// Every run whose money is stuck now, oldest first; the runs synth stopped following while
+/// their money was held; the competitions that never ran and still hold escrows; and the swaps
+/// ark-swapd says funded an escrow without recording its output. The last two whoever made them.
 fn stuck_money(
     held: &[HeldRun],
     unrecorded: Option<&UnrecordedSwaps>,
+    unrefunded: Option<&UnrefundedCompetitions>,
+    coordinator: &str,
     now: OffsetDateTime,
 ) -> Markup {
     let mut held: Vec<(&HeldRun, &Held)> = held
@@ -368,12 +383,17 @@ fn stuck_money(
         .filter_map(|run| Some((run, run.trail.held.as_ref()?)))
         .collect();
     held.sort_by_key(|(_, held)| held.since);
-    let total: u64 = held.iter().map(|(_, held)| held.sats).sum();
-    let nearest = held
+    let (stuck, stopped): (Vec<_>, Vec<_>) = held
+        .iter()
+        .copied()
+        .partition(|(run, _)| run.run.money.as_deref() == Some("stuck"));
+    let total: u64 = stuck.iter().map(|(_, held)| held.sats).sum();
+    let nearest = stuck
         .iter()
         .filter_map(|(_, held)| held.nearest_expiry)
         .min();
     let swaps = unrecorded.map_or(&[][..], |unrecorded| &unrecorded.swaps[..]);
+    let competitions = unrefunded.map_or(&[][..], |unrefunded| &unrefunded.competitions[..]);
     let run_of = |payment_hash: &str| {
         held.iter()
             .find(|(run, _)| {
@@ -384,39 +404,84 @@ fn stuck_money(
             })
             .map(|(run, _)| run.run.id.clone())
     };
+    let run_for = |competition: uuid::Uuid| {
+        held.iter()
+            .find(|(run, _)| run.trail.competition_id == competition)
+            .map(|(run, _)| run.run.id.clone())
+    };
+    let holding = !held.is_empty() || !competitions.is_empty();
     html! {
-        section class=(if held.is_empty() { "stuck-money" } else { "stuck-money held" }) {
+        section class=(if holding { "stuck-money held" } else { "stuck-money" }) {
             h2 { "Stuck money" }
-            @if held.is_empty() {
+            @if stuck.is_empty() {
                 p.note { "No run's money is stuck." }
             } @else {
                 p {
-                    strong { (format::sats(total)) " sats" } " held by " (held.len()) " run(s)"
+                    strong { (format::sats(total)) " sats" } " held by " (stuck.len()) " run(s)"
                     @if let Some(at) = nearest.and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok()) {
                         "; the nearest escrow expiry or refund opening is " (format::time(at, now))
                     }
                     ". Each run's page lays out what holds it and what should move it."
                 }
-                // On a phone each run stacks into a card, so the reason is never cut off.
-                div.scroll { table.stack {
-                    thead { tr { th { "Run" } th { "Held since" } th.num { "Sats" } th { "Nearest expiry" } th { "Why" } } }
-                    tbody {
-                        @for (run, held) in &held {
-                            tr {
-                                td data-label="Run" { a href=(format!("/runs/{}", run.run.id)) title=(run.run.id) { (short_id(&run.run.id)) } br; span.note { (run.run.scenario) } }
-                                td data-label="Held since" { (format::time(held.since, now)) }
-                                td.num data-label="Sats" { (format::sats(held.sats)) }
-                                td data-label="Nearest expiry" {
-                                    @match held.nearest_expiry.and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok()) {
-                                        Some(at) => (format::time(at, now)),
-                                        None => span.note { "not known" },
+                (held_runs(&stuck, false, now))
+            }
+            @if !stopped.is_empty() {
+                h3 { "Held when synth stopped following" }
+                p {
+                    strong { (format::sats(stopped.iter().map(|(_, held)| held.sats).sum::<u64>())) " sats" }
+                    " held by " (stopped.len()) " run(s) synth stopped following without seeing the money move. "
+                    "They read unverified, not passed; each run's page says where it was held."
+                }
+                (held_runs(&stopped, true, now))
+            }
+            @if let Some(unrefunded) = unrefunded {
+                h3 { "Competitions that didn't run" }
+                @if let Some(error) = &unrefunded.error {
+                    p.error { "The coordinator did not list them: " (error) }
+                } @else if competitions.is_empty() {
+                    p.note { "None holds an escrow that is not refunded yet." }
+                } @else {
+                    p {
+                        strong { (format::sats(competitions.iter().filter_map(|competition| competition.sats).sum::<u64>())) " sats" }
+                        " of entry fees not yet returned by " (competitions.len()) " competition(s) that were cancelled, "
+                        "failed or never filled, before their contract. Not all are synth's."
+                    }
+                    div.scroll { table.stack {
+                        thead { tr { th { "Competition" } th { "Stopped" } th.num { "Not returned" } th { "Refunds open" } th { "Run" } } }
+                        tbody {
+                            @for competition in competitions {
+                                tr {
+                                    td data-label="Competition" {
+                                        a href=(format!("{}/competitions/{}/leaderboard", coordinator.trim_end_matches('/'), competition.competition_id))
+                                            rel="noreferrer" title=(competition.competition_id) { (short_id(&competition.competition_id.to_string())) }
+                                        br; span.note { (competition.state) }
+                                    }
+                                    td data-label="Stopped" { (format::time(competition.stopped, now)) }
+                                    td.num data-label="Not returned" {
+                                        @match competition.sats {
+                                            Some(sats) => { (format::sats(sats)) " sats" },
+                                            None => span.note { "entry fee not known" },
+                                        }
+                                        br; span.note { (competition.unrefunded) " of " (competition.escrowed) " escrows" }
+                                    }
+                                    td data-label="Refunds open" {
+                                        @match competition.opens_at {
+                                            Some(at) => (format::time(at, now)),
+                                            None => span.note { "not said" },
+                                        }
+                                    }
+                                    td data-label="Run" {
+                                        @match run_for(competition.competition_id) {
+                                            Some(run) => a href=(format!("/runs/{run}")) { (short_id(&run)) },
+                                            None => span.note { "not a stuck synth run" },
+                                        }
                                     }
                                 }
-                                td data-label="Why" { (held.reason) }
                             }
                         }
-                    }
-                } }
+                    } }
+                }
+                p.note { "Asked the coordinator " (format::time(unrefunded.checked_at, now)) "." }
             }
             @if let Some(unrecorded) = unrecorded {
                 h3 { "Swaps without an escrow output" }
@@ -452,6 +517,37 @@ fn stuck_money(
                 p.note { "Asked ark-swapd " (format::time(unrecorded.checked_at, now)) "." }
             }
         }
+    }
+}
+
+/// Held runs, one per row: while stuck, the nearest expiry; once synth stopped following, when.
+fn held_runs(runs: &[(&HeldRun, &Held)], stopped: bool, now: OffsetDateTime) -> Markup {
+    let last = if stopped {
+        "Stopped following"
+    } else {
+        "Nearest expiry"
+    };
+    html! {
+        // On a phone each run stacks into a card, so the reason is never cut off.
+        div.scroll { table.stack {
+            thead { tr { th { "Run" } th { "Held since" } th.num { "Sats" } th { (last) } th { "Why" } } }
+            tbody {
+                @for (run, held) in runs {
+                    tr {
+                        td data-label="Run" { a href=(format!("/runs/{}", run.run.id)) title=(run.run.id) { (short_id(&run.run.id)) } br; span.note { (run.run.scenario) } }
+                        td data-label="Held since" { (format::time(held.since, now)) }
+                        td.num data-label="Sats" { (format::sats(held.sats)) }
+                        td data-label=(last) {
+                            @match (stopped, held.until, held.nearest_expiry.and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok())) {
+                                (true, Some(at), _) | (false, _, Some(at)) => (format::time(at, now)),
+                                _ => span.note { "not known" },
+                            }
+                        }
+                        td data-label="Why" { (held.reason) }
+                    }
+                }
+            }
+        } }
     }
 }
 
@@ -686,16 +782,23 @@ async fn history(
     Json(serde_json::json!({ "runs": runs }))
 }
 
-/// A run's status badge. A run whose steps passed but whose money is stuck now reads as stuck, so
-/// it never shows green over money nobody can move. Runs that finished before synth failed them
-/// for it keep "passed" in the database, so this is decided when the page is drawn.
+/// A run's status badge. A run whose steps passed reads "passed" only once its money has settled:
+/// while synth still follows it (its competition running or paying out) it reads "passed · still
+/// live", and it never shows green over money nobody can move or synth could not verify. Runs
+/// that finished before synth failed them for it keep "passed" in the database, so this is
+/// decided when the page is drawn.
 pub(super) fn run_status(status: &str, money: Option<&str>) -> Markup {
-    if status == "passed" && money == Some("stuck") {
-        html! {
+    match (status, money) {
+        ("passed", Some("stuck")) => html! {
             span class="badge stuck" title="Its steps passed, but its money is stuck" { "money stuck" }
-        }
-    } else {
-        html! { span class=(format!("badge {status}")) { (status) } }
+        },
+        ("passed", Some("unverified" | "timed_out")) => html! {
+            span class="badge unverified" title="Its steps passed, but synth could not confirm where its money went" { "money unverified" }
+        },
+        ("passed", Some("following")) => html! {
+            span class="badge following" title="Its steps passed; synth follows its money until the payouts or refunds are confirmed" { "passed · still live" }
+        },
+        _ => html! { span class=(format!("badge {status}")) { (status) } },
     }
 }
 
@@ -718,7 +821,7 @@ fn step_class(status: &crate::scenarios::StepStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::SynthDb;
+    use crate::db::{SynthDb, TestRun};
     use std::time::{Duration, Instant};
 
     /// The load-time budget: anything slower to load is a bug.
@@ -868,6 +971,29 @@ mod tests {
         assert!(badge("passed", None).contains(r#"class="badge passed""#));
         assert!(badge("failed", Some("stuck")).contains(r#"class="badge failed""#));
         assert!(badge("passed", Some("stuck")).contains("money stuck"));
+    }
+
+    /// "passed" is kept for runs whose money settled; a run still followed reads as still live,
+    /// and one whose payouts synth could not confirm never reads as passed.
+    #[test]
+    fn passed_waits_for_the_money_to_settle() {
+        let badge = |status, money| run_status(status, money).into_string();
+        let live = badge("passed", Some("following"));
+        assert!(live.contains(r#"class="badge following""#), "{live}");
+        assert!(live.contains("passed · still live"), "{live}");
+        for label in ["paid_out", "refunded", "nothing_paid"] {
+            let settled = badge("passed", Some(label));
+            assert!(settled.contains(">passed<"), "{settled}");
+        }
+        for label in ["unverified", "timed_out"] {
+            let unverified = badge("passed", Some(label));
+            assert!(
+                unverified.contains(r#"class="badge unverified""#),
+                "{unverified}"
+            );
+            assert!(!unverified.contains("passed<"), "{unverified}");
+        }
+        assert!(badge("running", Some("following")).contains(">running<"));
     }
 
     /// A manual trigger resolves its duration from the current choices, not the duration
@@ -1031,6 +1157,170 @@ mod tests {
         let table = between(stuck, r#"<table class="stack">"#, "</table>");
         assert!(table.contains(r#"data-label="Why""#), "{table}");
         assert!(table.contains(">3,000<"), "{table}");
+    }
+
+    /// Every table scrolls inside its own box, so none widens a phone's page; the run page's
+    /// Competition table, with its errors, did.
+    #[tokio::test]
+    async fn every_table_scrolls_inside_its_box() {
+        let directory = tempfile::tempdir().unwrap();
+        let (dashboard, run) = stuck_dashboard(&directory).await;
+        let run_page = super::super::run_detail::run_live(&dashboard, &run)
+            .await
+            .unwrap()
+            .into_string();
+        let home = dashboard_live(&dashboard).await.into_string();
+        for page in [run_page.as_str(), home.as_str()] {
+            let tables: Vec<&str> = page.split("<table").skip(1).collect();
+            assert!(!tables.is_empty());
+            for (index, before) in page.split("<table").enumerate().take(tables.len()) {
+                assert!(
+                    before.ends_with(r#"<div class="scroll">"#),
+                    "table {index} is not in a scroll box: …{}",
+                    &before[before.len().saturating_sub(200)..]
+                );
+            }
+        }
+        let css = include_str!("assets/synth.css");
+        assert!(css.contains(".error { color: var(--failed); overflow-wrap: anywhere; }"));
+        let phone = between(css, "@media (max-width: 640px)", "\n}\n");
+        assert!(phone.contains("table.facts th { width: auto;"), "{phone}");
+    }
+
+    /// With nothing run since synth started, the Last Run panel shows the newest recorded run
+    /// rather than saying there are none above a list of them.
+    #[tokio::test]
+    async fn last_run_falls_back_to_the_newest_recorded_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let (dashboard, run) = stuck_dashboard(&directory).await;
+        let home = dashboard_live(&dashboard).await.into_string();
+        let last = between(&home, "<h2>Last Run</h2>", "</section>");
+        assert!(!last.contains("No runs"), "{last}");
+        assert!(last.contains("full_lifecycle"), "{last}");
+        assert!(last.contains(&format!("/runs/{run}")), "{last}");
+        assert!(last.contains("money stuck"), "{last}");
+
+        let empty = tempfile::tempdir().unwrap();
+        let db = SynthDb::new(&empty.path().join("synth.sqlite").display().to_string())
+            .await
+            .unwrap();
+        let home = dashboard_live(&Dashboard::for_tests(db))
+            .await
+            .into_string();
+        assert!(home.contains("No runs yet."), "{home}");
+    }
+
+    /// Runs synth stopped following while their money was held stay on the panel, as
+    /// unverified; competitions that never ran and hold escrows are listed with what they owe.
+    #[test]
+    fn the_stuck_money_panel_lists_unverified_holds_and_unrefunded_competitions() {
+        use crate::trail::tracker::Unrefunded;
+        let now = time::macros::datetime!(2026-09-29 21:00:00 UTC);
+        let held = |money: &str, sats: u64| {
+            let run = TestRun {
+                id: uuid::Uuid::now_v7().to_string(),
+                scenario: "full_lifecycle".into(),
+                status: "passed".into(),
+                started_at: "2026-09-24T00:04:00Z".into(),
+                completed_at: Some("2026-09-24T00:08:00Z".into()),
+                error_message: None,
+                config_json: None,
+                competition_id: None,
+                money: Some(money.into()),
+            };
+            let trail: crate::trail::Trail = serde_json::from_value(serde_json::json!({
+                "refreshed_at": "2026-09-26T21:54:00Z",
+                "competition_id": uuid::Uuid::now_v7(),
+                "money": { "status": money, "reason": "no payout was sent", "since": "2026-09-24T03:12:00Z" },
+                "held": {
+                    "since": "2026-09-24T03:12:00Z", "found": "2026-09-24T05:00:00Z",
+                    "reason": "no payout was sent", "sats": sats,
+                    "until": (money == "unverified").then_some("2026-09-26T21:54:00Z"),
+                },
+            }))
+            .unwrap();
+            HeldRun { run, trail }
+        };
+        let runs = [held("stuck", 1100), held("unverified", 3000)];
+        let ours = runs[0].trail.competition_id;
+        let unrefunded = UnrefundedCompetitions {
+            checked_at: now,
+            competitions: vec![
+                Unrefunded {
+                    competition_id: ours,
+                    state: "cancelled".into(),
+                    stopped: time::macros::datetime!(2026-09-28 21:26:00 UTC),
+                    escrowed: 6,
+                    unrefunded: 5,
+                    sats: Some(5000),
+                    opens_at: Some(time::macros::datetime!(2026-09-29 21:26:00 UTC)),
+                },
+                Unrefunded {
+                    competition_id: uuid::Uuid::now_v7(),
+                    state: "created".into(),
+                    stopped: time::macros::datetime!(2026-09-28 22:00:00 UTC),
+                    escrowed: 2,
+                    unrefunded: 2,
+                    sats: Some(2000),
+                    opens_at: None,
+                },
+            ],
+            error: None,
+        };
+        let panel =
+            stuck_money(&runs, None, Some(&unrefunded), "https://5day4cast.com", now).into_string();
+        let stuck = between(&panel, "<h2>Stuck money</h2>", "<h3>");
+        assert!(
+            stuck.contains("<strong>1,100 sats</strong> held by 1 run(s)"),
+            "{stuck}"
+        );
+        let stopped = between(&panel, "Held when synth stopped following", "</table>");
+        assert!(stopped.contains("<strong>3,000 sats</strong>"), "{stopped}");
+        assert!(
+            stopped.contains(r#"data-label="Stopped following""#),
+            "{stopped}"
+        );
+        assert!(stopped.contains(&runs[1].run.id), "{stopped}");
+
+        let competitions = between(&panel, "Competitions that didn't run", "</section>");
+        assert!(
+            competitions.contains("<strong>7,000 sats</strong>"),
+            "{competitions}"
+        );
+        assert!(competitions.contains("5 of 6 escrows"), "{competitions}");
+        assert!(competitions.contains(">5,000 sats"), "{competitions}");
+        assert!(
+            competitions.contains("datetime=\"2026-09-29T21:26:00Z\""),
+            "{competitions}"
+        );
+        assert!(competitions.contains("not said"), "{competitions}");
+        assert!(
+            competitions.contains(&format!(
+                "https://5day4cast.com/competitions/{ours}/leaderboard"
+            )),
+            "{competitions}"
+        );
+        // The competition of a stuck synth run links to the run.
+        assert!(
+            competitions.contains(&format!("/runs/{}", runs[0].run.id)),
+            "{competitions}"
+        );
+        assert!(
+            competitions.contains("not a stuck synth run"),
+            "{competitions}"
+        );
+
+        let failed = UnrefundedCompetitions {
+            checked_at: now,
+            competitions: Vec::new(),
+            error: Some("401 Unauthorized".into()),
+        };
+        let panel =
+            stuck_money(&[], None, Some(&failed), "https://5day4cast.com", now).into_string();
+        assert!(
+            panel.contains("The coordinator did not list them: 401 Unauthorized"),
+            "{panel}"
+        );
     }
 
     #[test]

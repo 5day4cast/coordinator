@@ -764,8 +764,13 @@ fn run_section(
     };
     html! {
         h1 { (run.scenario) " " (routes::run_status(&run.status, money)) }
-        @if run.status == "passed" && money == Some("stuck") {
-            p.note { "Its steps passed, but its money is stuck: see where it is held below." }
+        @if run.status == "passed" {
+            @match money {
+                Some("stuck") => p.note { "Its steps passed, but its money is stuck: see where it is held below." },
+                Some("unverified" | "timed_out") => p.note { "Its steps passed, but synth stopped following its money before it could confirm where it went: see below." },
+                Some("following") => p.note { "Its steps passed. Its competition is still running or paying out; synth follows the money until the payouts or refunds are confirmed." },
+                _ => {},
+            }
         }
         @if let Some(step) = live_step {
             p.running { "Now: " strong { (step) } }
@@ -895,7 +900,7 @@ fn competition_section(view: &RunView, now: OffsetDateTime) -> Markup {
             h2 { "Competition" }
             @match view.competition_id {
                 None => p { "The run made no competition." },
-                Some(id) => {
+                Some(id) => div.scroll {
                     table {
                         tr { th { "Competition" } td { (copyable(&id.to_string())) } }
                         tr { th { "Pages" } td {
@@ -920,7 +925,7 @@ fn competition_section(view: &RunView, now: OffsetDateTime) -> Markup {
                             }
                         }
                     }
-                }
+                },
             }
         }
     }
