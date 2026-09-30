@@ -35,6 +35,9 @@ function closeModal($modal) {
     document.documentElement.classList.toggle('is-clipped', !!document.querySelector('.modal.is-active'));
     // Loaded content goes with the dialog, and with it any refresh it runs.
     $modal.querySelector('[data-clear-on-close]')?.replaceChildren();
+    // Whoever opened it hears it close, however it closed (the payment dialog's Pay button
+    // comes back); before focus returns, so a button re-enabled here gets it.
+    $modal.dispatchEvent(new CustomEvent('fw:modal-closed'));
     const opener = modalOpeners.get($modal);
     modalOpeners.delete($modal);
     const target = [opener, document.getElementById('navToggle'), document.querySelector('.navbar-brand a[href]')]

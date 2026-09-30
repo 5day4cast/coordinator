@@ -1,6 +1,8 @@
 // Small behaviours for server-rendered pages. They run on every htmx swap too.
 
-// <time data-local> elements carry UTC; show them in the reader's time zone.
+// <time data-local> elements carry UTC; show them in the reader's time zone. One marked
+// data-zone (a window's end) also names the zone, "Sep 30, 10:02 PM EDT", so the reader
+// knows the times are their own.
 function localizeTimes(root) {
   for (const element of root.querySelectorAll("time[data-local]")) {
     const date = new Date(element.getAttribute("datetime"));
@@ -9,6 +11,7 @@ function localizeTimes(root) {
       element.dataset.local === "time"
         ? { hour: "numeric", minute: "2-digit" }
         : { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" };
+    if ("zone" in element.dataset) options.timeZoneName = "short";
     element.textContent = date.toLocaleString(undefined, options);
     element.title = date.toLocaleString();
   }

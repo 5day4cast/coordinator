@@ -166,7 +166,8 @@ impl CompetitionView {
         }
     }
 
-    /// What entering costs now: the ticket price and, when known, the network fee.
+    /// What entering costs now, all in: the ticket price and, when known, the network fee. Players
+    /// see it as the "Entry fee"; `entry_fee` itself is only the pot's share of it.
     pub fn price(&self) -> u64 {
         self.ticket_price + self.network_fee.unwrap_or(0)
     }
@@ -652,7 +653,7 @@ fn featured_card(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
             p class="featured-window" { (format::window(competition.start, competition.end)) }
             dl class="featured-facts" {
                 @if competition.can_enter {
-                    div { dt { "Price" } dd { (sats(competition.price())) } }
+                    div { dt { "Entry fee" } dd { (sats(competition.price())) } }
                 }
                 div { dt { "Win" } dd { (competition.win()) } }
                 div { dt { "Entries" } dd { (competition.entries()) } }
@@ -683,7 +684,7 @@ fn list(competitions: &[&CompetitionView], now: OffsetDateTime) -> Markup {
             div class="competition-header" aria-hidden="true" {
                 span { "Status" }
                 span { "Window" }
-                span { "Price" }
+                span { "Entry fee" }
                 span { "Win" }
                 span { "Entries" }
                 span {}
@@ -704,11 +705,11 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
     } else {
         "Leaderboard"
     };
-    // Phones show these facts below the window. Only a competition taking entries has a
-    // price; one that didn't run wins nothing.
+    // Phones show these facts below the window. Only a competition taking entries has an
+    // entry fee, the all-in price; one that didn't run wins nothing.
     let mut facts = Vec::new();
     if competition.can_enter {
-        facts.push(format!("Price {}", sats(competition.price())));
+        facts.push(format!("Entry fee {}", sats(competition.price())));
     }
     if competition.top_prize().is_some() {
         facts.push(format!("Win {}", competition.win()));
@@ -745,7 +746,7 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
                     Queue::Single => {}
                 }
             }
-            span class="cell-fee" data-label="Price" {
+            span class="cell-fee" data-label="Entry fee" {
                 @if competition.can_enter { (sats(competition.price())) } @else { "—" }
             }
             span class="cell-win" data-label="Win" { (competition.win()) }
@@ -844,15 +845,17 @@ pub(crate) mod tests {
         assert!(html.contains(r#"href="/competitions/open/entry-form""#));
         assert!(html.contains("Daily Fantasy Weather"));
         assert!(html.contains(r#"href="/help""#));
-        // What it costs and what first place wins; the network fee is in the price once known.
-        assert!(html.contains("<dt>Price</dt><dd>5,250 sats</dd>"));
+        // What it costs, all in, and what first place wins; the network fee is in the entry fee
+        // once known.
+        assert!(html.contains("<dt>Entry fee</dt><dd>5,250 sats</dd>"));
+        assert!(!html.contains(">Price<"));
         assert!(html.contains("<dt>Win</dt><dd>15,000 sats</dd>"));
         assert!(!html.contains("Paid places") && !html.contains(">Pot<"));
         let mut priced = view("open", Phase::Upcoming, 133);
         priced.network_fee = Some(437);
         let row = competition_row(&priced, NOW).into_string();
-        assert!(row.contains(r#"data-label="Price">5,687 sats</span>"#));
-        assert!(row.contains("Price 5,687 sats · Win 15,000 sats · 1 of 3 entries"));
+        assert!(row.contains(r#"data-label="Entry fee">5,687 sats</span>"#));
+        assert!(row.contains("Entry fee 5,687 sats · Win 15,000 sats · 1 of 3 entries"));
     }
 
     #[test]
@@ -1112,7 +1115,7 @@ pub(crate) mod tests {
             assert!(html.contains(r#"data-label="Win">—</span>"#));
             assert!(!html.contains("Win 15,000"));
             // Nothing to buy either.
-            assert!(html.contains(r#"data-label="Price">—</span>"#));
+            assert!(html.contains(r#"data-label="Entry fee">—</span>"#));
         }
     }
 
@@ -1128,7 +1131,7 @@ pub(crate) mod tests {
         );
         assert!(row.contains("pools of up to 25"));
         // Forty entries make two pools of twenty.
-        assert!(row.contains("Price 5,250 sats · Win 100,000 sats · 40 entered"));
+        assert!(row.contains("Entry fee 5,250 sats · Win 100,000 sats · 40 entered"));
         assert_eq!(queue.pot(), "100,000 sats per pool");
         let six = queued("q", 6);
         assert_eq!(six.win(), "30,000 sats");

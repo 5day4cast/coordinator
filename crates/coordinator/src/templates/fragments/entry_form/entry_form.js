@@ -12,6 +12,9 @@ class Entry {
     );
     this.competition = competition;
     this.ticket = null;
+    // Set while its invoice waits to be paid, and once it is.
+    this.awaitingPayment = false;
+    this.paid = false;
   }
 
   async init() {
@@ -39,12 +42,8 @@ class Entry {
       );
     } catch (error) {
       // The coordinator says why it refused: already entered, entries closed, full.
-      const data = await error.response?.json().catch(() => null);
-      throw data?.error ? new Error(data.error) : error;
+      throw await requestFailure(error);
     }
-
-    if (!response.ok)
-      throw new Error(`Failed to get ticket: ${response.status}`);
 
     const ticketData = await response.json();
     this.ticket = {
@@ -146,7 +145,10 @@ class Entry {
   // htmx fragment, signed like the account pages, that polls every 2 s until
   // it is paid or fails (see ticket_status in mod.rs) and then says so with an
   // fw:ticket-paid or fw:ticket-failed event. Closing the dialog keeps it
-  // polling, hidden, for up to 5 minutes, since a payment may be in flight.
+  // polling, hidden, since a payment from a wallet may still arrive; the
+  // coordinator fails an unpaid ticket after 10 minutes. `onDialogClosed`
+  // hears the dialog close while the ticket is unpaid; `reopenPayment` shows
+  // the same invoice again.
   async showPaymentModal() {
     const $modal = document.getElementById("ticketPaymentModal");
     const $copyFeedback = document.getElementById("copyFeedback");
@@ -212,10 +214,9 @@ class Entry {
       setTimeout(() => ($copyFeedback.textContent = hint), 2000);
     };
     $qrButton.onclick = copyInvoice;
-    const networkFee = this.ticketAmountSats - this.shownPrice.ticketPrice;
+    // One all-in number; what it is made of is on the form only.
     document.getElementById("ticketPaymentAmount").textContent =
-      `Pay ${formatSats(this.ticketAmountSats)} by Lightning to enter this competition` +
-      (networkFee > 0 ? `, including its ${formatSats(networkFee)} network fee:` : ":");
+      `Pay ${formatSats(this.ticketAmountSats)} by Lightning to enter this competition.`;
 
     const status = document.createElement("div");
     status.id = "paymentStatus";
@@ -227,41 +228,59 @@ class Entry {
     document.getElementById("paymentStatus").replaceWith(status);
     window.htmx.process(status);
     $error.classList.add("is-hidden");
-    $modal.classList.add("is-active");
+    this.awaitingPayment = true;
+    openModal($modal);
 
     return new Promise((resolve, reject) => {
+      // Closing (the backdrop, Esc, the close button) only hides the invoice.
+      const closed = () => this.onDialogClosed?.();
       const finish = (error) => {
         document.removeEventListener("fw:ticket-paid", paid);
         document.removeEventListener("fw:ticket-failed", failed);
+        $modal.removeEventListener("fw:modal-closed", closed);
         clearTimeout(giveUp);
+        this.awaitingPayment = false;
         // A poller that leaves the page stops; close the dialog.
         const idle = document.createElement("div");
         idle.id = "paymentStatus";
         document.getElementById("paymentStatus")?.replaceWith(idle);
         $qrContainer.replaceChildren();
         document.querySelectorAll("#walletLinks a").forEach((a) => a.removeAttribute("href"));
-        $modal.classList.remove("is-active");
+        closeModal($modal);
         if (error) {
           $error.textContent = error.message;
           $error.classList.remove("is-hidden");
           reject(error);
         } else {
+          this.paid = true;
+          this.onPaid?.();
           resolve(true);
         }
       };
       const paid = () => finish();
       const failed = (event) => finish(new Error(event.detail?.message || "The ticket payment failed"));
-      const giveUp = setTimeout(() => finish(new Error("Payment cancelled by user")), 5 * 60 * 1000);
+      // Only if the coordinator never answers: it fails an unpaid ticket after 10 minutes.
+      const giveUp = setTimeout(
+        () => finish(new Error("The payment wasn't confirmed; check your wallet, then try again")),
+        15 * 60 * 1000,
+      );
       document.addEventListener("fw:ticket-paid", paid);
       document.addEventListener("fw:ticket-failed", failed);
-      // Closing hides the dialog; polling goes on until paid or given up.
-      $modal.querySelector(".modal-close").onclick = () => $modal.classList.remove("is-active");
+      $modal.addEventListener("fw:modal-closed", closed);
     });
   }
 
-  async submit(expectedObservations) {
+  // The invoice of the ticket already issued, shown again after its dialog was closed.
+  reopenPayment() {
+    openModal(document.getElementById("ticketPaymentModal"));
+  }
+
+  // Pays for the ticket, unless it is paid already, then enters the picks as they are now
+  // (`this.entry.submit`, updated when Pay reopens the invoice).
+  async submit() {
     try {
-      await this.handleTicketPayment(this.entry.ephemeral_pubkey);
+      if (!this.paid) await this.handleTicketPayment(this.entry.ephemeral_pubkey);
+      const expectedObservations = this.buildExpectedObservations(this.entry.submit);
 
       const keymeldData = this.preparedRegistration;
       const encrypted_keymeld_private_key = keymeldData?.encrypted_private_key ?? null;
@@ -282,14 +301,12 @@ class Entry {
         keymeld_escrow_policy,
       };
 
-      const response = await this.client.post(
-        `${this.coordinator_url}/api/v1/entries`,
-        entry_body,
-      );
-
-      if (!response.ok)
-        throw new Error(`Failed to create entry, status: ${response.status}`);
-
+      let response;
+      try {
+        response = await this.client.post(`${this.coordinator_url}/api/v1/entries`, entry_body);
+      } catch (error) {
+        throw await requestFailure(error);
+      }
       return await response.json();
     } catch (e) {
       console.error("Error submitting entry:", e);
@@ -431,6 +448,68 @@ async function loadPayoutAddress() {
   return user.lightning_address || null;
 }
 
+// Messages for requests that never got an answer, or got a server error: things the
+// player can act on, never a bare status.
+const UNREACHABLE = "Couldn't reach the server, try again";
+const SERVER_ERROR = "Something went wrong on the server; try again in a moment";
+
+// A fetch that never reached the server: offline, or the server restarting. Browsers word
+// it differently (Chrome and Brave, Firefox, Safari, Node).
+function unreachable(detail) {
+  return /Failed to fetch|NetworkError|Load failed|fetch failed/i.test(detail);
+}
+
+// What a failed coordinator request (AuthorizedClient's error, with its response) tells the
+// player: the coordinator's own reason for a refusal; for a 503 (the oracle, the network fee
+// estimate or a busy database), to try again in a moment.
+async function requestFailure(error) {
+  const response = error?.response;
+  if (!response) return error;
+  let data = null;
+  try {
+    data = await response.json();
+  } catch {
+    // No JSON body: a proxy's page, say.
+  }
+  const reason = typeof data?.error === "string" ? data.error : "";
+  const sentence = reason && reason[0].toUpperCase() + reason.slice(1);
+  if (response.status === 503) {
+    if (!sentence) return new Error("The server is busy; try again in a moment");
+    return new Error(/try again/i.test(sentence) ? sentence : `${sentence}; try again in a moment`);
+  }
+  // A proxy with nothing behind it, during a restart.
+  if (response.status === 502 || response.status === 504) return new Error(UNREACHABLE);
+  if (response.status >= 500) return new Error(SERVER_ERROR);
+  return sentence ? new Error(sentence) : error;
+}
+
+// The Pay button while a request or the invoice is out. The form may have been loaded again
+// since, so callers that run later look the button up then.
+function setBusy(button, busy) {
+  if (!button) return;
+  button.disabled = busy;
+  if (busy) button.classList.add("is-loading");
+  else button.classList.remove("is-loading");
+}
+
+// Pay with nothing picked: say so above the picks, and take the player to the first one.
+// Without the picks on the page (forecasts still loading), the message goes under Pay.
+function askForPicks(form, errorMsg) {
+  const message = document.getElementById("picksMessage") ?? errorMsg;
+  message.textContent = "Make at least one pick";
+  message.classList.remove("hidden");
+  const first = form.querySelector?.(`${PICK}:not(:disabled)`);
+  first?.focus();
+}
+
+function hidePicksMessage() {
+  document.getElementById("picksMessage")?.classList.add("hidden");
+}
+
+// The entry whose ticket was issued and which isn't entered yet. Pay picks it up again rather
+// than asking for another ticket: its invoice while that is unpaid, the entry itself once paid.
+let pendingEntry = null;
+
 /**
  * Submit entry - handles the full flow:
  * 1. Collect picks from form
@@ -447,6 +526,24 @@ async function submitEntry() {
   errorMsg.classList.add("hidden");
   errorMsg.textContent = "";
   successMsg.classList.add("hidden");
+  hidePicksMessage();
+
+  // The picks first: nothing to log in or pay for without them.
+  const picks = collectPicks(form);
+  let choiceCount = 0;
+  for (const stationPicks of Object.values(picks)) {
+    choiceCount += Object.keys(stationPicks).length;
+  }
+  if (choiceCount === 0) {
+    askForPicks(form, errorMsg);
+    return;
+  }
+  const maxValues = parseInt(form.dataset.maxValues, 10) || 1;
+  if (choiceCount > maxValues) {
+    errorMsg.textContent = `You can make up to ${maxValues} picks; you made ${choiceCount}`;
+    errorMsg.classList.remove("hidden");
+    return;
+  }
 
   if (!isLoggedIn() || !session.nostrClient || !session.dlcWallet) {
     showLogin();
@@ -459,86 +556,101 @@ async function submitEntry() {
     return;
   }
 
-  submitBtn.disabled = true;
-  submitBtn.classList.add("is-loading");
+  // A ticket already issued for this competition: show its invoice again, with the picks as
+  // they are now. The call that issued it still waits for the payment and enters the picks
+  // once it arrives.
+  const pending = pendingEntry?.competition.id === form.dataset.competitionId ? pendingEntry : null;
+  if (pending?.awaitingPayment) {
+    pending.entry.submit = picks;
+    setBusy(submitBtn, true);
+    pending.reopenPayment();
+    return;
+  }
+
+  setBusy(submitBtn, true);
+  const payButton = () => document.getElementById("submitEntry");
 
   try {
-    const competitionId = form.dataset.competitionId;
-    const picks = collectPicks(form);
-    let choiceCount = 0;
-    for (const stationPicks of Object.values(picks)) {
-      choiceCount += Object.keys(stationPicks).length;
+    let currentEntry = pending;
+    if (currentEntry) {
+      // Paid, but the entry didn't go through: enter it again, never pay again.
+      currentEntry.entry.submit = picks;
+    } else {
+      currentEntry = await newEntry(form, picks);
+      pendingEntry = currentEntry;
     }
-    if (choiceCount === 0) {
-      throw new Error("Make at least one pick");
-    }
-    const maxValues = parseInt(form.dataset.maxValues, 10) || 1;
-    if (choiceCount > maxValues) {
-      throw new Error(`You can make up to ${maxValues} picks; you made ${choiceCount}`);
-    }
+    // The dialog closed with the ticket unpaid: Pay works again, and reopens it.
+    currentEntry.onDialogClosed = () => setBusy(payButton(), false);
+    currentEntry.onPaid = () => setBusy(payButton(), true);
 
-    const payoutTerms = await loadEntryTerms(form);
-    // Automatic payouts go to the account's address; without one, or for a
-    // legacy competition, the winner submits an invoice instead.
-    const address = payoutTerms.quote.enabled ? await loadPayoutAddress() : null;
-    if (address && (address.length > 320 || !/^[a-z0-9_+.-]+@[a-z0-9.-]+$/.test(address))) {
-      throw new Error("The Lightning Address on your account is not valid; update it on the Payouts page");
-    }
-    // The price shown on the form; the wallet refuses an invoice for anything but it and the
-    // ticket's network fee.
-    const shownPrice = {
-      entryFee: Number(form.dataset.entryFee),
-      ticketPrice: Number(form.dataset.ticketPrice),
-      networkFee: Number(form.dataset.networkFee),
-    };
-    if (!Number.isSafeInteger(shownPrice.ticketPrice) || shownPrice.ticketPrice <= 0) {
-      throw new Error("The competition is missing its ticket price");
-    }
-    if (!("networkFee" in form.dataset) || !Number.isSafeInteger(shownPrice.networkFee)) {
-      throw new Error("The network fee estimate is unavailable right now; go back to the competitions list and open this competition again in a moment");
-    }
-
-    const body = document.body;
-    const currentEntry = new Entry(body.dataset.apiBase || "", body.dataset.oracleBase || "", {
-      id: competitionId,
-    });
-    await currentEntry.init();
-    currentEntry.payoutTerms = payoutTerms;
-    currentEntry.shownPrice = shownPrice;
-    currentEntry.payoutChoice = {
-      entry_id: currentEntry.entry.id,
-      payout_hash: currentEntry.entry.payout_hash,
-      lightning_address: address,
-      allow_invoice_fallback: true,
-      release_entry_key_after_payment: true,
-    };
-    currentEntry.entry.submit = picks;
-
-    await currentEntry.submit(currentEntry.buildExpectedObservations(picks));
+    await currentEntry.submit();
+    pendingEntry = null;
 
     successMsg.classList.remove("hidden");
     submitBtn.textContent = "Entered";
     submitBtn.classList.remove("is-loading");
     submitBtn.classList.add("is-success");
-  } catch (error) {
-    console.error("Entry submission failed:", error);
+  } catch (caught) {
+    console.error("Entry submission failed:", caught);
+    // A ticket that failed or was never paid is done with; a paid one is entered on the next Pay.
+    if (pendingEntry && !pendingEntry.paid && !pendingEntry.awaitingPayment) pendingEntry = null;
 
+    const error = caught?.response ? await requestFailure(caught) : caught;
     // WASM rejects with plain strings, which have no message property.
-    const detail = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+    const detail = typeof error === "string" ? error : typeof error?.message === "string" ? error.message : "";
     let userMessage = detail || "Failed to submit entry";
     if (detail.includes("No signer initialized")) {
       userMessage = "Session expired. Please log in again.";
       showLogin();
-    } else if (detail.includes("NetworkError")) {
-      userMessage =
-        "Network error. Please check your connection and try again.";
+    } else if (unreachable(detail)) {
+      userMessage = UNREACHABLE;
     }
 
     errorMsg.textContent = userMessage;
     errorMsg.classList.remove("hidden");
-    submitBtn.disabled = false;
-    submitBtn.classList.remove("is-loading");
+    setBusy(submitBtn, false);
   }
+}
+
+// A new entry for `picks`, checked against the terms the form showed, with its payout address.
+async function newEntry(form, picks) {
+  const payoutTerms = await loadEntryTerms(form);
+  // Automatic payouts go to the account's address; without one, or for a
+  // legacy competition, the winner submits an invoice instead.
+  const address = payoutTerms.quote.enabled ? await loadPayoutAddress() : null;
+  if (address && (address.length > 320 || !/^[a-z0-9_+.-]+@[a-z0-9.-]+$/.test(address))) {
+    throw new Error("The Lightning Address on your account is not valid; update it on the Payouts page");
+  }
+  // The price shown on the form; the wallet refuses an invoice for anything but it and the
+  // ticket's network fee.
+  const shownPrice = {
+    entryFee: Number(form.dataset.entryFee),
+    ticketPrice: Number(form.dataset.ticketPrice),
+    networkFee: Number(form.dataset.networkFee),
+  };
+  if (!Number.isSafeInteger(shownPrice.ticketPrice) || shownPrice.ticketPrice <= 0) {
+    throw new Error("The competition is missing its ticket price");
+  }
+  if (!("networkFee" in form.dataset) || !Number.isSafeInteger(shownPrice.networkFee)) {
+    throw new Error("The network fee estimate is unavailable right now; go back to the competitions list and open this competition again in a moment");
+  }
+
+  const body = document.body;
+  const currentEntry = new Entry(body.dataset.apiBase || "", body.dataset.oracleBase || "", {
+    id: form.dataset.competitionId,
+  });
+  await currentEntry.init();
+  currentEntry.payoutTerms = payoutTerms;
+  currentEntry.shownPrice = shownPrice;
+  currentEntry.payoutChoice = {
+    entry_id: currentEntry.entry.id,
+    payout_hash: currentEntry.entry.payout_hash,
+    lightning_address: address,
+    allow_invoice_fallback: true,
+    release_entry_key_after_payment: true,
+  };
+  currentEntry.entry.submit = picks;
+  return currentEntry;
 }
 
 /**
@@ -598,12 +710,14 @@ function ticketTotalSats(ticket, shown) {
   return total;
 }
 
-// Replace the form's estimate with the ticket's own network fee.
+// Replace the form's estimate with the ticket's own network fee, in the total and on Pay.
 function showNetworkFee(fee, total) {
   const $fee = document.getElementById("networkFee");
   if ($fee) $fee.textContent = formatSats(fee);
   const $total = document.getElementById("ticketTotal");
   if ($total) $total.textContent = formatSats(total);
+  const $pay = document.getElementById("submitEntry");
+  if ($pay) $pay.textContent = `Pay ${formatSats(total)} and enter`;
 }
 
 const PICK = ".pick-option input[type=radio]";
@@ -638,6 +752,7 @@ function setupEntryForm() {
     if (event.target.closest?.("#submitEntry")) submitEntry();
     if (event.target instanceof HTMLInputElement && event.target.matches(PICK)) {
       togglePick(event.target);
+      hidePicksMessage();
     }
   });
   document.addEventListener("keydown", unpickWithSpace);

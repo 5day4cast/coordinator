@@ -14,16 +14,26 @@ const EVENT = {
 
 function element(extra = {}) {
   const classes = new Set(extra.classes || []);
+  const listeners = {};
   return {
     textContent: "",
     checked: false,
     disabled: false,
     dataset: {},
+    attributes: {},
     classList: {
       add: (name) => classes.add(name),
       remove: (name) => classes.delete(name),
       contains: (name) => classes.has(name),
+      toggle: (name, on) => (on ? classes.add(name) : classes.delete(name)),
     },
+    setAttribute(name, value) { this.attributes[name] = value; },
+    removeAttribute(name) { delete this.attributes[name]; },
+    append() {},
+    replaceChildren(...children) { this.children = children; },
+    addEventListener: (type, listener) => (listeners[type] ??= new Set()).add(listener),
+    removeEventListener: (type, listener) => listeners[type]?.delete(listener),
+    dispatch: (type, event = {}) => [...(listeners[type] ?? [])].forEach((listener) => listener(event)),
     ...extra,
   };
 }
@@ -67,11 +77,12 @@ function load(page, document, fetch) {
   const wasm = { DlcWallet: { newEntryId: () => "0190b6a0-0000-7000-8000-000000000001" } };
   const session = { wasm, nostrClient: page.nostrClient ?? null, dlcWallet: page.dlcWallet ?? null };
   const isLoggedIn = () => Boolean(page.isLoggedIn?.());
-  const window = {};
+  // htmx is the page's own, on window; nothing else is.
+  const window = page.htmx ? { htmx: page.htmx } : {};
   const entryForm = loadBundle(["fragments/entry_form/entry_form.js"],
     { ...page, window, document, fetch, crypto: webcrypto, TextEncoder, console, session, isLoggedIn },
     ["submitEntry", "collectPicks", "togglePick", "unpickWithSpace", "ticketPriceSats", "loadEntryTerms", "Entry"]);
-  assert.deepEqual(Object.keys(window), [], "nothing is put on window");
+  assert.deepEqual(Object.keys(window), page.htmx ? ["htmx"] : [], "nothing is put on window");
   return entryForm;
 }
 
@@ -549,4 +560,250 @@ test("without a network fee estimate no ticket is requested", async () => {
   const sandbox = load(window, document, termsFetch());
   await sandbox.submitEntry();
   assert.match(elements.errorMessage.textContent, /network fee estimate is unavailable/);
+});
+
+// Pay with nothing picked says so above the picks and takes the player to the first one,
+// before anything is asked of the wallet or the server.
+test("paying with no picks says to make one and focuses the first pick", async () => {
+  const { elements, document } = entryPage([]);
+  let focused = null;
+  const first = element({ focus() { focused = this; } });
+  elements.entryForm.querySelector = (selector) => {
+    assert.equal(selector, ".pick-option input[type=radio]:not(:disabled)");
+    return first;
+  };
+  elements.picksMessage = element({ classes: ["hidden"] });
+  const sandbox = load({ isLoggedIn: () => false, openModal: () => assert.fail("no log-in for no picks") },
+    document, async () => assert.fail("nothing fetched"));
+  await sandbox.submitEntry();
+  assert.equal(elements.picksMessage.textContent, "Make at least one pick");
+  assert.ok(!elements.picksMessage.classList.contains("hidden"));
+  assert.equal(focused, first);
+  assert.equal(elements.submitEntry.disabled, false);
+  assert.ok(!elements.submitEntry.classList.contains("is-loading"));
+});
+
+test("with the picks still loading, the message shows under Pay", async () => {
+  const { elements, document } = entryPage([]);
+  elements.entryForm.querySelector = () => null;
+  const sandbox = load({}, document, async () => assert.fail("nothing fetched"));
+  await sandbox.submitEntry();
+  assert.equal(elements.errorMessage.textContent, "Make at least one pick");
+  assert.ok(!elements.errorMessage.classList.contains("hidden"));
+});
+
+// A player who gets as far as the invoice: the payment dialog and its status poller, with
+// the dialog helpers (modal_utils.js) reduced to what they do to the dialog.
+function payingPlayer({ ticket = () => ({ ok: true, json: async () => ({ ticket_id: "ticket",
+  payment_request: "lnbc53000n1ticket", ...price(), keymeld_session_id: "session",
+  keymeld_registration: { user_id: "ticket", session_id: "session", payout_policy: "policy" } }) }),
+  entry = () => ({ ok: true, json: async () => ({ id: "entry" }) }) } = {}) {
+  const { elements, document } = entryPage();
+  Object.assign(elements, {
+    ticketPaymentModal: element({ querySelector: () => null }),
+    copyFeedback: element(),
+    ticketPaymentError: element({ classes: ["is-hidden"] }),
+    qrContainer: element(),
+    walletLinkLightning: element(),
+    walletLinkZeus: element(),
+    walletLinkCashApp: element(),
+    paymentStatus: element(),
+    ticketPaymentAmount: element(),
+  });
+  const modal = elements.ticketPaymentModal;
+  const documentListeners = {};
+  const polled = [];
+  Object.assign(document, {
+    createElement: () => element({
+      replaceWith() {},
+    }),
+    querySelectorAll: () => [],
+    addEventListener: (type, listener) => (documentListeners[type] ??= new Set()).add(listener),
+    removeEventListener: (type, listener) => documentListeners[type]?.delete(listener),
+  });
+  elements.paymentStatus.replaceWith = (status) => {
+    polled.push(status.attributes["hx-get"]);
+    elements.paymentStatus = Object.assign(status, { replaceWith: elements.paymentStatus.replaceWith });
+  };
+  const requests = [];
+  const page = loggedIn({
+    htmx: { process: () => {} },
+    openModal: (dialog) => dialog.classList.add("is-active"),
+    // As closeModal does: hide it, then tell whoever opened it.
+    closeModal: (dialog) => {
+      if (!dialog.classList.contains("is-active")) return;
+      dialog.classList.remove("is-active");
+      dialog.dispatch("fw:modal-closed");
+    },
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+    AuthorizedClient: class {
+      async post(url, body) {
+        requests.push({ url, body });
+        if (url.endsWith("/api/v1/users/login")) {
+          return { ok: true, json: async () => ({ lightning_address: "thor@lnurl.5day4cast.com" }) };
+        }
+        if (url.endsWith("/registration")) return { ok: true, status: 204 };
+        const response = url.endsWith("/api/v1/entries") ? await entry(body) : await ticket();
+        if (!response.ok) {
+          const error = new Error(`HTTP error! status: ${response.status}`);
+          error.response = response;
+          throw error;
+        }
+        return response;
+      }
+    },
+    dlcWallet: {
+      entryRegistration: () => ({ ephemeral_pubkey: "pubkey", payout_hash: "hash" }),
+      keymeldPayoutRegistration: async () => ({
+        encrypted_private_key: "sealed", auth_pubkey: "auth", context: { user_id: "ticket" },
+      }),
+      invoiceQr: (invoice) => `data:image/svg+xml,${invoice}`,
+    },
+  });
+  const sandbox = load(page, document, termsFetch());
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  // Clicks Pay and returns once the invoice is shown or the flow has ended; `done` is the
+  // click's flow, which waits for the payment.
+  const pay = async () => {
+    let ended = false;
+    const done = sandbox.submitEntry().finally(() => { ended = true; });
+    for (let i = 0; i < 50 && !ended && !modal.classList.contains("is-active"); i++) await settle();
+    return { done };
+  };
+  const tickets = () => requests.filter(({ url }) => url.endsWith("/ticket"));
+  const entries = () => requests.filter(({ url }) => url.endsWith("/api/v1/entries"));
+  const announce = (type, detail) => [...(documentListeners[type] ?? [])].forEach((listener) => listener({ detail }));
+  return { sandbox, elements, modal, pay, settle, tickets, entries, polled, announce };
+}
+
+test("the payment dialog shows one all-in amount and no fee wording", async () => {
+  const { elements, modal, pay } = payingPlayer();
+  await pay();
+  assert.ok(modal.classList.contains("is-active"));
+  assert.equal(elements.ticketPaymentAmount.textContent,
+    "Pay 5,300 sats by Lightning to enter this competition.");
+  assert.doesNotMatch(elements.ticketPaymentAmount.textContent, /fee/);
+});
+
+test("closing the payment dialog gives Pay back; Pay reopens the same invoice, and a payment made meanwhile enters", async () => {
+  const { sandbox, elements, modal, pay, settle, tickets, entries, polled, announce } = payingPlayer();
+  const { done: first } = await pay();
+  assert.ok(modal.classList.contains("is-active"), "the invoice is shown");
+  assert.ok(elements.submitEntry.classList.contains("is-loading"));
+  const invoice = elements.walletLinkLightning.href;
+  assert.equal(invoice, "lightning:lnbc53000n1ticket");
+
+  // The backdrop, Esc or the close button: all closeModal.
+  closeDialog(modal);
+  assert.ok(!modal.classList.contains("is-active"));
+  assert.equal(elements.submitEntry.disabled, false, "Pay works again");
+  assert.ok(!elements.submitEntry.classList.contains("is-loading"), "no spinner");
+  assert.equal(polled.length, 1, "the payment is still watched");
+
+  // Pay again: the same ticket and invoice, no second ticket.
+  await sandbox.submitEntry();
+  assert.ok(modal.classList.contains("is-active"), "the dialog opens again");
+  assert.equal(elements.walletLinkLightning.href, invoice);
+  assert.equal(tickets().length, 1);
+  assert.equal(polled.length, 1, "the same poller");
+
+  // Closed again, then paid from the wallet: the entry goes through all the same.
+  closeDialog(modal);
+  assert.equal(elements.submitEntry.disabled, false);
+  announce("fw:ticket-paid");
+  await first;
+  assert.equal(entries().length, 1);
+  assert.equal(entries()[0].body.ticket_id, "ticket");
+  assert.equal(elements.submitEntry.textContent, "Entered");
+  assert.ok(!elements.successMessage.classList.contains("hidden"));
+  assert.equal(tickets().length, 1);
+});
+
+function closeDialog(modal) {
+  modal.classList.remove("is-active");
+  modal.dispatch("fw:modal-closed");
+}
+
+test("reopening enters the picks as they are when Pay is clicked again", async () => {
+  const { sandbox, elements, modal, pay, settle, entries, announce } = payingPlayer();
+  const { done: first } = await pay();
+  closeDialog(modal);
+  const picks = [{ name: "KPWM_temp_low", value: "under" }];
+  elements.entryForm.querySelectorAll = () => picks;
+  await sandbox.submitEntry();
+  announce("fw:ticket-paid");
+  await first;
+  assert.deepEqual(JSON.parse(JSON.stringify(entries()[0].body.expected_observations)),
+    [{ stations: "KPWM", temp_low: "Under" }]);
+});
+
+test("a ticket that expires unpaid gives Pay back for a new one", async () => {
+  const { sandbox, elements, modal, pay, settle, tickets, announce } = payingPlayer();
+  const { done: first } = await pay();
+  closeDialog(modal);
+  announce("fw:ticket-failed", { message: "Ticket payment expired. Please request a new ticket." });
+  await first;
+  assert.match(elements.errorMessage.textContent, /expired/);
+  assert.equal(elements.submitEntry.disabled, false);
+  assert.ok(!elements.submitEntry.classList.contains("is-loading"));
+  await pay();
+  assert.equal(tickets().length, 2, "a new ticket once the old one failed");
+});
+
+test("a paid ticket whose entry failed is entered on the next Pay, without paying again", async () => {
+  let refuse = true;
+  const { sandbox, elements, pay, settle, tickets, entries, announce } = payingPlayer({
+    entry: () => (refuse
+      ? { ok: false, status: 503, json: async () => ({ error: "database write was not accepted" }) }
+      : { ok: true, json: async () => ({ id: "entry" }) }),
+  });
+  const { done: first } = await pay();
+  announce("fw:ticket-paid");
+  await first;
+  assert.equal(elements.errorMessage.textContent, "Database write was not accepted; try again in a moment");
+  assert.equal(elements.submitEntry.disabled, false);
+  refuse = false;
+  await sandbox.submitEntry();
+  assert.equal(entries().length, 2);
+  assert.equal(tickets().length, 1, "never a second ticket");
+  assert.equal(elements.submitEntry.textContent, "Entered");
+});
+
+// Seen during a restart: the request never answered, then a 500, then a 503. Each says what
+// to do, and none leaves the spinner on.
+test("failed requests say to try again and give Pay back", async () => {
+  for (const [label, ticket, message] of [
+    ["unreachable", () => { throw new TypeError("Failed to fetch"); }, "Couldn't reach the server, try again"],
+    ["a proxy with nothing behind it", () => ({ ok: false, status: 502, json: async () => { throw new SyntaxError("html"); } }),
+      "Couldn't reach the server, try again"],
+    ["a server error", () => ({ ok: false, status: 500, json: async () => ({ error: "internal server error" }) }),
+      "Something went wrong on the server; try again in a moment"],
+    ["the oracle unavailable", () => ({ ok: false, status: 503,
+      json: async () => ({ error: "the oracle is unavailable right now; try again in a moment" }) }),
+      "The oracle is unavailable right now; try again in a moment"],
+    ["busy, with no reason", () => ({ ok: false, status: 503, json: async () => ({}) }),
+      "The server is busy; try again in a moment"],
+    ["an auth error's object", () => ({ ok: false, status: 503,
+      json: async () => ({ error: { type: "replay_guard_full", detail: "full" } }) }),
+      "The server is busy; try again in a moment"],
+  ]) {
+    const { elements, modal, pay, tickets } = payingPlayer({ ticket });
+    await (await pay()).done;
+    assert.equal(elements.errorMessage.textContent, message, label);
+    assert.ok(!elements.errorMessage.classList.contains("hidden"), label);
+    assert.equal(elements.submitEntry.disabled, false, label);
+    assert.ok(!elements.submitEntry.classList.contains("is-loading"), label);
+    assert.ok(!modal.classList.contains("is-active"), label);
+    assert.equal(tickets().length, 1, label);
+  }
+});
+
+test("terms that can't be fetched say to try again and give Pay back", async () => {
+  const { elements, document } = entryPage();
+  const sandbox = load(loggedIn({ dlcWallet: {} }), document, async () => { throw new TypeError("Failed to fetch"); });
+  await sandbox.submitEntry();
+  assert.equal(elements.errorMessage.textContent, "Couldn't reach the server, try again");
+  assert.equal(elements.submitEntry.disabled, false);
+  assert.ok(!elements.submitEntry.classList.contains("is-loading"));
 });

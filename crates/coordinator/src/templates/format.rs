@@ -50,6 +50,16 @@ pub enum TimeStyle {
 /// A UTC time the browser rewrites in the reader's time zone (`localizeTimes`
 /// in shared/page.js).
 pub fn time(at: OffsetDateTime, style: TimeStyle) -> Markup {
+    local_time(at, style, false)
+}
+
+/// A [`time`] that also names the reader's time zone once localized: `Sep 30, 10:02 PM EDT`.
+/// Said once per time or window, so a reader knows the times are their own.
+pub fn zoned_time(at: OffsetDateTime, style: TimeStyle) -> Markup {
+    local_time(at, style, true)
+}
+
+fn local_time(at: OffsetDateTime, style: TimeStyle, zoned: bool) -> Markup {
     let utc = at.to_offset(time::UtcOffset::UTC);
     let fallback = match style {
         TimeStyle::DateTime => utc.format(format_description!(
@@ -63,7 +73,8 @@ pub fn time(at: OffsetDateTime, style: TimeStyle) -> Markup {
         TimeStyle::Time => "time",
     };
     html! {
-        time datetime=(utc.format(&Rfc3339).unwrap_or_default()) data-local=(style) { (fallback) }
+        time datetime=(utc.format(&Rfc3339).unwrap_or_default()) data-local=(style)
+            data-zone[zoned] { (fallback) }
     }
 }
 
@@ -141,7 +152,8 @@ pub fn ago(at: OffsetDateTime, now: OffsetDateTime) -> Markup {
     }
 }
 
-/// A competition's observation window: `Sep 24, 11:44 – 11:54`.
+/// A competition's observation window: `Sep 24, 11:44 – 11:54`, and once localized the reader's
+/// zone after its end: `Sep 24, 7:44 – 7:54 AM EDT`.
 pub fn window(start: OffsetDateTime, end: OffsetDateTime) -> Markup {
     let same_day =
         start.to_offset(time::UtcOffset::UTC).date() == end.to_offset(time::UtcOffset::UTC).date();
@@ -149,7 +161,7 @@ pub fn window(start: OffsetDateTime, end: OffsetDateTime) -> Markup {
         span class="window" {
             (time(start, TimeStyle::DateTime))
             " – "
-            (time(end, if same_day { TimeStyle::Time } else { TimeStyle::DateTime }))
+            (zoned_time(end, if same_day { TimeStyle::Time } else { TimeStyle::DateTime }))
         }
     }
 }
@@ -226,7 +238,9 @@ mod tests {
         assert!(html.contains(
             r#"datetime="2026-09-24T11:44:00Z" data-local="datetime">Sep 24, 11:44 UTC"#
         ));
-        assert!(html.contains(r#"data-local="time">11:54 UTC"#));
+        assert!(html.contains(r#"data-local="time" data-zone>11:54 UTC"#));
+        // The zone is named once, after the window's end.
+        assert_eq!(html.matches("data-zone").count(), 1);
     }
 
     #[test]
