@@ -16,9 +16,10 @@ use crate::{
         get_estimated_fee_rates, get_next_address, get_outputs, get_ticket_refund,
         get_ticket_status, health, leaderboard_fragment, leaderboard_rows_fragment, login,
         login_username, not_found, operator_competition, operator_competitions,
-        operator_delete_competition, payouts_fragment, public_page_handler, register,
-        register_ticket, register_username, request_competition_ticket, send_to_address,
-        set_lightning_address, submit_final_signatures, submit_public_nonces, submit_ticket_payout,
+        operator_delete_competition, operator_write_off_refunds, payouts_fragment,
+        public_page_handler, register, register_ticket, register_username,
+        request_competition_ticket, send_to_address, set_lightning_address,
+        submit_final_signatures, submit_public_nonces, submit_ticket_payout,
         ticket_status_fragment,
     },
     config::Settings,
@@ -1004,8 +1005,8 @@ fn limited<S: Clone + Send + Sync + 'static>(
     router.route_layer(GovernorLayer::new(config))
 }
 
-/// Admin listener: operator pages, the LND wallet API, and competition creation, viewing and
-/// deletion for scripts and `coordinator admin`.
+/// Admin listener: operator pages, the LND wallet API, competition creation, viewing and
+/// deletion, and escrow refund write-offs, for scripts and `coordinator admin`.
 ///
 /// Everything except the sign-in form and static assets sits behind `require_operator`.
 /// No CORS layer: operator pages call only their own origin. The test-settle route,
@@ -1051,6 +1052,10 @@ pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Ne
         .route(
             "/api/v1/admin/competitions/{competition_id}",
             get(operator_competition).delete(operator_delete_competition),
+        )
+        .route(
+            "/api/v1/admin/refunds/write-off",
+            post(operator_write_off_refunds),
         )
         .route_layer(middleware::from_fn_with_state(
             access.clone(),
@@ -1263,6 +1268,7 @@ mod startup_tests {
         ("GET", "/api/v1/admin/competitions"),
         ("GET", COMPETITION_PATH),
         ("DELETE", COMPETITION_PATH),
+        ("POST", "/api/v1/admin/refunds/write-off"),
     ];
 
     fn protected_routes() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
