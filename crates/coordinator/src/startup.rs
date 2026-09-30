@@ -1706,6 +1706,7 @@ async fn arkade(
         server,
         swaps: Arc::new(swaps),
         refund_after_start_secs: settings.refund_after_start_secs,
+        escrow_expiry_margin_secs: settings.escrow_expiry_margin_secs,
         max_refund_fee_sats: settings.max_refund_fee_sats,
     }))
 }

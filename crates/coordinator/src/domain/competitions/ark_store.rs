@@ -55,7 +55,8 @@ pub enum ArkRefundState {
     /// The refund's transactions are built and its Ark transaction is going to Arkade. The
     /// escrow may or may not be spent yet, so a resume asks the server before rebuilding.
     Submitting,
-    /// The escrow was spent into that swap on Arkade.
+    /// The escrow was spent into that swap on Arkade: offchain, or in a batch if its VTXO had
+    /// expired.
     Submitted,
     /// The player's invoice was paid, and its preimage given to ark-swapd.
     Paid,
@@ -387,6 +388,19 @@ impl CompetitionStore {
         .iter()
         .map(escrow_row)
         .collect()
+    }
+
+    /// How many of a competition's escrows have a refund under way or done. A pool with one
+    /// cannot be funded: that escrow is going back to its player.
+    pub async fn ark_refunds_started(&self, event_id: Uuid) -> Result<u64, sqlx::Error> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ticket_ark_refunds r JOIN tickets t ON t.id = r.ticket_id
+             WHERE t.event_id = ?",
+        )
+        .bind(event_id.to_string())
+        .fetch_one(self.db_connection.read())
+        .await?;
+        Ok(count as u64)
     }
 
     /// How many of a competition's tickets are reserved with an invoice that can still be paid.

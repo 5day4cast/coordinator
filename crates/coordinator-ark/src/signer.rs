@@ -2,6 +2,7 @@
 //!
 //! Every spend of an escrow's funding leaf needs the player's key and the coordinator's key.
 //! (The server adds its own signature.)
+//! A refund spends the refund leaf, which needs the player's key alone.
 //! Keymeld holds each entry's player key and signs only what its policy allows.
 //! So each request carries the whole transaction, and the purpose it serves, for the signer to check.
 
@@ -34,6 +35,14 @@ pub enum SigningPurpose {
         /// The intent message, as JSON. The proof's first input commits to it.
         message: String,
     },
+    /// The intent proof of an escrow's refund in a batch, for an escrow whose VTXO expired.
+    ///
+    /// It spends the escrow through its refund leaf, and its only output is the refund's swap,
+    /// as a new VTXO. `message` is the `register` intent message it proves.
+    RefundIntent {
+        /// The intent message, as JSON. The proof's first input commits to it.
+        message: String,
+    },
     /// A forfeit, giving the escrow to the server once `commitment_txid` confirms.
     ///
     /// The forfeit also spends a connector from that commitment transaction, so it is void without it.
@@ -51,13 +60,16 @@ impl SigningPurpose {
     /// The commitment transaction a forfeit depends on.
     pub fn commitment_txid(&self) -> Option<Txid> {
         match self {
-            SigningPurpose::IntentProof | SigningPurpose::DeleteIntent { .. } => None,
+            SigningPurpose::IntentProof
+            | SigningPurpose::DeleteIntent { .. }
+            | SigningPurpose::RefundIntent { .. } => None,
             SigningPurpose::Forfeit { commitment_tx, .. } => Some(commitment_tx.compute_txid()),
         }
     }
 }
 
-/// One signature to make: a script-path spend of an escrow's funding leaf.
+/// One signature to make: a script-path spend of an escrow's leaf, the funding leaf unless the
+/// purpose is a refund.
 #[derive(Debug, Clone)]
 pub struct SigningRequest {
     pub purpose: SigningPurpose,

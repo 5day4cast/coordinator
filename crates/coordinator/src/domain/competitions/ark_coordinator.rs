@@ -58,20 +58,14 @@ impl Coordinator {
             Some(existing) => existing.escrow_tap_tree,
             None => {
                 let now = OffsetDateTime::now_utc().unix_timestamp();
-                let refund_at = competition
-                    .event_submission
-                    .start_observation_date
-                    .unix_timestamp()
-                    + ark.refund_after_start_secs as i64;
-                // Players' wallets refuse an escrow that outlasts the contract's expiry.
-                let refund_at = match competition
-                    .event_announcement
-                    .as_ref()
-                    .and_then(|event| event.expiry)
-                {
-                    Some(expiry) => refund_at.min(i64::from(expiry)),
-                    None => refund_at,
-                };
+                let refund_at = escrow_refund_at(
+                    competition.event_submission.start_observation_date,
+                    ark.refund_after_start_secs,
+                    competition
+                        .event_announcement
+                        .as_ref()
+                        .and_then(|event| event.expiry),
+                );
                 let seconds = |value: i64| {
                     u32::try_from(value)
                         .map_err(|_| Error::BadRequest("Timestamp out of range".into()))
@@ -374,7 +368,12 @@ impl Coordinator {
                 return None;
             }
         };
-        match paid_escrow_vtxo(&vtxos, &escrow.escrow_address, swap, price) {
+        // The refund leaf opens at the escrow's locktime, and an expired VTXO cannot be spent
+        // offchain. So the coin ark-swapd paid with must outlive the locktime by a margin.
+        let live_until =
+            crate::domain::competitions::ark_refund::refund_opens_at(&escrow.escrow_tap_tree)
+                .map(|opens| opens.unix_timestamp() + ark.escrow_expiry_margin_secs as i64);
+        match paid_escrow_vtxo(&vtxos, &escrow.escrow_address, swap, price, live_until) {
             Ok(outpoint) => Some((outpoint.to_string(), price)),
             Err(problem) => {
                 self.report_swap(pending, problem);
@@ -442,6 +441,18 @@ impl Coordinator {
                 .await;
         }
 
+        // Refunds run only for a competition that will never kick off, so none should be under
+        // way here. If one is, its escrow is on its way back to its player, and the pool must
+        // not be funded without it.
+        let refunding = self
+            .competition_store
+            .ark_refunds_started(competition.id)
+            .await?;
+        if refunding > 0 {
+            return Err(anyhow!(
+                "{refunding} of its escrows are being refunded, so its pool cannot be funded"
+            ));
+        }
         let escrows = self
             .competition_store
             .funded_ark_escrows(competition.id)
@@ -603,6 +614,22 @@ impl Coordinator {
     }
 }
 
+/// When an escrow's refund leaf opens, in UNIX seconds: `after_start_secs` after the observation
+/// window starts, and no later than the contract's `expiry`, since players' wallets refuse an
+/// escrow that outlasts it.
+///
+/// The locktime is part of the escrow's script, so an escrow already issued keeps the one it
+/// was issued with.
+fn escrow_refund_at(start: OffsetDateTime, after_start_secs: u64, expiry: Option<u32>) -> i64 {
+    let refund_at = start
+        .unix_timestamp()
+        .saturating_add(i64::try_from(after_start_secs).unwrap_or(i64::MAX));
+    match expiry {
+        Some(expiry) => refund_at.min(i64::from(expiry)),
+        None => refund_at,
+    }
+}
+
 /// What a player is told when ark-swapd would not make a ticket's swap. A wallet that cannot fund
 /// it now may later, so that is retryable; anything else is a refusal.
 fn swap_failure(error: &anyhow::Error) -> Error {
@@ -623,12 +650,15 @@ const SWAP_REPORTS: &str = "escrow swap";
 /// The VTXO among `vtxos` that a paid swap put in the escrow at `address`.
 ///
 /// It is the one the swap names, or else the output of the swap's Ark transaction. It must be
-/// at `address`, unspent, and worth `price`. The error says what is missing or wrong.
+/// at `address`, unspent, and worth `price`. With `live_until` (UNIX seconds), it must not
+/// expire on Arkade before then: a VTXO inherits the expiry of the coins that paid it, and an
+/// expired one cannot be refunded offchain. The error says what is missing or wrong.
 fn paid_escrow_vtxo(
     vtxos: &[coordinator_ark::VirtualTxOutPoint],
     address: &str,
     swap: &crate::infra::ark_swap::Swap,
     price: u64,
+    live_until: Option<i64>,
 ) -> Result<OutPoint, String> {
     let script = coordinator_ark::ArkAddress::decode(address)
         .map_err(|e| format!("pays an escrow whose address is invalid: {e}"))?
@@ -688,6 +718,24 @@ fn paid_escrow_vtxo(
             vtxo.outpoint
         ));
     }
+    // A server that lists no expiry gives nothing to judge by.
+    if let Some(live_until) = live_until.filter(|_| vtxo.expires_at > 0) {
+        if vtxo.is_swept || vtxo.expires_at < live_until {
+            let at = |seconds: i64| {
+                OffsetDateTime::from_unix_timestamp(seconds)
+                    .map(|time| time.to_string())
+                    .unwrap_or_else(|_| seconds.to_string())
+            };
+            return Err(format!(
+                "paid {} with a coin that expires on Arkade at {}, but its escrow must live \
+                 until {} for a refund to finish; the ticket is not counted, and its escrow \
+                 needs an operator (docs/ops/stuck-escrow-check.md)",
+                vtxo.outpoint,
+                at(vtxo.expires_at),
+                at(live_until),
+            ));
+        }
+    }
     Ok(vtxo.outpoint)
 }
 
@@ -695,6 +743,50 @@ fn paid_escrow_vtxo(
 mod tests {
     use super::*;
     use crate::infra::ark_swap::SwapsUnavailable;
+
+    /// A refund must open while the escrow's VTXO is alive. A VTXO lives seven days from the
+    /// batch its coins descend from, and ark-swapd's coins may be days old, so a day after the
+    /// start was too late: escrows paid from a coin with a day left had expired by then.
+    #[test]
+    fn an_escrows_refund_opens_soon_after_the_start_and_by_the_contracts_expiry() {
+        use crate::config::DEFAULT_REFUND_AFTER_START_SECS;
+        use coordinator_ark::testing::{keypair, mock_info, xonly};
+
+        let start = OffsetDateTime::from_unix_timestamp(1_790_650_000).unwrap();
+        let opens = escrow_refund_at(start, DEFAULT_REFUND_AFTER_START_SECS, None);
+        assert_eq!(opens, start.unix_timestamp() + 45 * 60);
+        assert!(
+            opens - start.unix_timestamp() < 60 * 60,
+            "well inside the life of any coin worth paying an escrow from"
+        );
+
+        // Players' wallets refuse an escrow that outlasts the contract's expiry.
+        let expiry = start.unix_timestamp() as u32 + 600;
+        assert_eq!(
+            escrow_refund_at(start, DEFAULT_REFUND_AFTER_START_SECS, Some(expiry)),
+            i64::from(expiry)
+        );
+        let later = start.unix_timestamp() as u32 + 7 * 86_400;
+        assert_eq!(
+            escrow_refund_at(start, DEFAULT_REFUND_AFTER_START_SECS, Some(later)),
+            opens
+        );
+
+        // The escrow's script carries that time as its refund leaf's locktime.
+        let rules = coordinator_ark::server_rules(&mock_info(&keypair(7))).unwrap();
+        let terms = coordinator_ark::escrow_terms(
+            &rules,
+            xonly(&keypair(21)),
+            xonly(&keypair(18)),
+            opens as u32,
+            start.unix_timestamp() as u32 - 3_600,
+        )
+        .unwrap();
+        assert_eq!(
+            terms.refund_locktime,
+            bitcoin::absolute::LockTime::from_consensus(opens as u32)
+        );
+    }
 
     #[test]
     fn an_unfunded_swap_service_is_retryable_and_other_failures_are_not() {

@@ -111,7 +111,9 @@ A unilateral leaf is usable only after the escrow is unrolled on chain, and wait
 - The player key is the deposited entry key.
   Keymeld signs for the player.
   Each ticket has its own entry key, so every escrow address is unique without a nonce leaf.
-- `T` is a timestamp after registration closes, with enough margin to finish kickoff and the batch.
+- `T` is a timestamp shortly after registration closes: 45 minutes by default (`refund_after_start_secs`).
+  It is part of the script, so an escrow keeps the `T` it was issued with.
+  See [When a refund opens](#when-a-refund-opens).
 - The exit delay is the server's `unilateralExitDelay`.
 - The escrow amount is the ticket price: the entry fee, the coordinator fee and the ticket's network fee.
   Its `max_fee_sats` is the coordinator and network fees, so the kickoff can pay the coordinator no more.
@@ -154,7 +156,7 @@ A combined CSV and CLTV leaf is one example.
    7. The Ark operator broadcasts the commitment transaction.
       Keymeld finishes the pools' remaining DLC signatures.
 4. Each pool then follows today's lifecycle: attestation, automatic Lightning payouts, and on-chain resolution.
-5. If kickoff does not complete by `T`, each escrow is refunded; see "Refunds".
+5. If the competition is cancelled or fails instead, each escrow is refunded once `T` has passed; see "Refunds".
 
 Kickoff runs after the observation window opens.
 The oracle accepts a new event and its entries until the window ends, and every pick is fixed when registration closes, so a late start gives no one an advantage.
@@ -340,9 +342,10 @@ An Arkade competition moves through the existing lifecycle with these difference
 
 1. **Ticket.**
    The ticket request fixes the ticket's escrow for its entry key and returns it in the payout policy as `ark_escrow`.
-   Its refund time `T` is the observation start plus `refund_after_start_secs`, capped at the contract's expiry.
+   Its refund time `T` is the observation start plus `refund_after_start_secs` (45 minutes by default), capped at the contract's expiry.
    The invoice comes from `ark-swapd`, for the ticket's hash.
    A worker polls the swaps; a ticket is paid once its escrow VTXO exists, and `ark-swapd` has settled the invoice by then.
+   The VTXO must also outlive `T` by `escrow_expiry_margin_secs` (six hours by default), as Arkade lists its expiry; see [When a refund opens](#when-a-refund-opens).
 2. **Contract.**
    The contract is built without a wallet PSBT and no funding outpoint.
    Keymeld keygen runs as it does today.
@@ -364,8 +367,8 @@ It must refund no later than the contract's expiry, and its fee may not exceed t
 Gaps:
 
 - A cancelled Arkade competition does not refund its escrows yet; see [Refunds](#refunds).
-- Escrow VTXOs expire 7 days after they are created, and nothing renews them yet.
-  A competition must kick off within 7 days of its first paid ticket.
+- An escrow VTXO expires with the batch its coins descend from: at most 7 days after it is paid, and sooner when `ark-swapd` pays it from older coins. Nothing renews it.
+  A competition must kick off before its escrows expire.
 - If the process stops inside a batch that then completes, the next attempt fails on spent escrows until an operator records the commitment.
 
 ### Queued competitions in the coordinator
@@ -476,6 +479,63 @@ The player's template authorizes Keymeld to spend that leaf into an Arkade-to-Li
 A refund therefore needs no action from the player and no Ark wallet.
 If the Lightning Address fails, the refund is retried, and the player can claim through the invoice fallback.
 
+### When a refund opens
+
+A VTXO lives 7 days from the batch it descends from, and a preconfirmed VTXO, which is what an offchain payment creates, inherits the expiry of the coin that paid it.
+`ark-swapd` pays each escrow offchain from its own wallet, so an escrow lives only as long as that coin has left.
+Once a VTXO has expired, arkd refuses to spend it offchain (`VTXO_RECOVERABLE`): the server sweeps its coins, and gives them back only in a batch.
+
+On 2026-09-30 this stranded refunds.
+`T` was a day after the start, and the escrows had been paid from coins with about a day left, so each refund opened minutes after its escrow expired.
+
+So `T` is early, and the coin is checked:
+
+- `T` is the observation start plus `refund_after_start_secs`, 45 minutes by default.
+  A kickoff runs within minutes of the start, and a pool that waits for fees is cancelled an hour after it.
+- When a ticket's payment is confirmed, the coordinator reads the escrow VTXO's expiry from arkd.
+  If it is before `T` plus `escrow_expiry_margin_secs` (six hours by default), the ticket is not counted, like one paid with the wrong amount, and the log names the ticket and the expiry.
+  A short-lived coin therefore never reaches a pool. Its player has paid, so it needs an operator (`docs/ops/stuck-escrow-check.md`).
+
+`T` is in the escrow's tap tree, so escrows issued before this change keep a `T` a day after their start.
+
+### Recovering an expired escrow
+
+An escrow can still expire before its refund: one issued with the old `T`, one paid before the expiry check existed, or one whose competition took longer to die than its coin lived.
+arkd refuses the offchain refund (`VTXO_RECOVERABLE`), and the refund is held: it keeps its swap, and nothing is minted or signed for it while it waits.
+
+The server still owes the value. Once it has swept the expired coins, it pays a swept VTXO out in a batch, to an intent that proves ownership, without a forfeit.
+So the refund goes through a batch (`coordinator_ark::recover_escrow`):
+
+1. The coordinator registers an intent.
+   Its proof spends the escrow through its refund leaf, with the refund's locktime, and Keymeld signs it as the player.
+   Its only output is the refund's swap, off chain, for the escrow's whole value.
+2. A batch selects the intent. The coordinator checks that the batch's VTXO tree pays the swap and spends from its commitment transaction, then cosigns the tree with a key made for that batch.
+3. When the batch finalizes, the swap holds a new VTXO, and the refund goes on as after an offchain spend: the coordinator pays the player's invoice, and `ark-swapd` claims the swap with the preimage.
+
+The verifier signs the intent under the refund's permission, held to the same invoice, fee cap and swap deadline as the offchain refund (`ArkEscrowSpend::RefundIntent`).
+It requires a `register` message that names no on-chain output and expires within ten minutes.
+arkd does not hold an intent that spends a swept VTXO to the leaf's locktime, so the verifier also refuses one before `T` by its own clock.
+The pool's escrow permission never signs one.
+
+An escrow that expired but is not swept yet would still need a forfeit, which only a kickoff signs, so its refund waits for the sweep.
+A recovery that fails is tried again after ten minutes, by which time a batch whose outcome was lost has finished; if it did pay the swap, the refund finds the swap funded and goes on.
+While recoveries keep failing, a stale swap is replaced at most every six hours.
+The server must take no fee for the recovery: the swap is claimed only for the escrow's exact value.
+
+### A refund cannot race a kickoff
+
+`T` no longer outlasts the kickoff, so the refund leaf of a live pool's escrows can be open while its batch runs.
+That is safe, because a refund and a kickoff of the same escrow are never both under way:
+
+- Only the coordinator, through Keymeld, can sign a refund, and it refunds only the escrows of a competition that was cancelled or failed, and the tickets of a queued competition that no pool took.
+  A live competition's escrows are never refunded, however long ago `T` passed.
+- A competition is cancelled or failed by its own runner, in the step that would otherwise run the kickoff, under the competition's lease.
+  So by the time refunds start, no kickoff of that competition is running, and none starts again.
+- A kickoff that fails before its forfeits deletes its batch intent, and forfeits nothing. One that was interrupted leaves its intent queued, and the refund deletes it (see [Funding in an Arkade batch](#funding-in-an-arkade-batch)).
+- As a last check, a kickoff refuses to fund a pool while any of its escrows has a refund recorded.
+- arkd spends an escrow once. A batch needs every escrow's forfeit, so a pool is funded with all of its escrows or none: a refund cannot take one player out of a funded pool.
+  Once a batch has forfeited the escrows, their refund leaves are moot.
+
 If the operator stops cooperating, the player can unroll the escrow and spend the unilateral refund leaf.
 That leaf opens no earlier than `T` plus the exit delay.
 
@@ -507,6 +567,7 @@ A Coordinator Ark verifier in the measured enclave authorizes each one:
 - A forfeit must spend the escrow and a connector from a commitment transaction that pays the pool's funding output.
   Keymeld must already have bound and signed that pool's contract, including the expiry transaction.
 - A refund, after `T`, must pay only into the swap toward the template's refund destination.
+  It is an offchain spend, or for an escrow whose VTXO expired, the intent of a batch that pays the same swap; see [Recovering an expired escrow](#recovering-an-expired-escrow).
 
 The coordinator side is also built.
 A ticket with an Arkade escrow carries an `ark_escrow` consent: the escrow's tap tree, and a cap on the coordinator's fee per escrow.
@@ -620,7 +681,9 @@ So the kickoff collects at most the lowest cap times the number of players, the 
 | --- | --- |
 | The swap fails before the escrow exists | The Lightning payment fails back. |
 | Fewer players than the minimum pool | Every escrow is refunded after `T`. |
-| Kickoff cannot complete before `T` | Every escrow is refunded after `T`. |
+| An escrow's VTXO expires before its refund | The refund waits for the server to sweep it, then recovers it in a batch into the same swap. |
+| Kickoff keeps failing | The pool fails, and every escrow is refunded after `T`. |
+| A ticket is paid with a coin that expires before `T` plus the margin | The ticket is not counted, and never reaches a pool. Its escrow needs an operator. |
 | A pool fails its kickoff check | The pool waits up to an hour for fees to fall, then is cancelled and every escrow refunded. |
 | A pool cannot be signed within a batch | Kickoff retries in the next batch. Repeated failures refund that pool. |
 | Ark operator unavailable before kickoff | Kickoff waits. Players can unroll and exit alone, no earlier than `T` plus the exit delay. |
@@ -672,8 +735,8 @@ So the kickoff collects at most the lowest cap times the number of players, the 
 
 ## Open questions
 
-- Registration length and `T`.
-  Escrow VTXOs expire after 7 days on the test server, and nothing renews them, so registration must stay shorter than that.
+- Registration length.
+  Escrow VTXOs expire at most 7 days after they are paid, and nothing renews them, so registration must stay shorter than the life `ark-swapd`'s coins have left.
 - The default minimum pool size, and whether to cap a competition's total entries.
 - The mainnet operator fees and the VTXO expiry, and who pays for renewal if kickoff is delayed.
 - Whether one winner per pool is enough, or whether raising the confidential signing limit is in scope.

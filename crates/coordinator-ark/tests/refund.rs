@@ -104,7 +104,7 @@ fn the_verifier_authorizes_the_refund_this_crate_builds() {
     let checkpoint = signed(RefundPurpose::Checkpoint).expect("the checkpoint is authorized");
     assert_eq!(ark.value_sats, VALUE.to_sat());
     assert_eq!(checkpoint.value_sats, VALUE.to_sat());
-    assert_ne!(ark.digest, checkpoint.digest);
+    assert_ne!(ark.digests, checkpoint.digests);
 }
 
 #[test]

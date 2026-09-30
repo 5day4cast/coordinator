@@ -193,6 +193,11 @@ struct Enclaves {
     refuse_deletes: AtomicBool,
     /// How many delete proofs Keymeld signed.
     deletes: AtomicUsize,
+    /// Refuse a refund's batch intent, as a verifier from before they were allowed does.
+    refuse_recoveries: AtomicBool,
+    /// How many refund intents Keymeld was asked to sign, and how many it signed.
+    recovery_requests: AtomicUsize,
+    recoveries: AtomicUsize,
 }
 
 #[async_trait]
@@ -298,10 +303,50 @@ impl Keymeld for Enclaves {
         self.signatures.fetch_add(1, Ordering::SeqCst);
         Ok(bitcoin::secp256k1::Secp256k1::new()
             .sign_schnorr_no_aux_rand(
-                &bitcoin::secp256k1::Message::from_digest(refund.digest),
+                &bitcoin::secp256k1::Message::from_digest(refund.digests[0].1),
                 key,
             )
             .serialize())
+    }
+    /// Sign as the player both inputs of the intent the verifier derives for a refund in a
+    /// batch.
+    async fn sign_ark_refund_intent(
+        &self,
+        _: &DlcKeygenSession,
+        user: UserId,
+        spend: ArkEscrowSpend,
+        _: String,
+        _: u64,
+    ) -> Result<Vec<(usize, [u8; 64])>, KeymeldError> {
+        self.recovery_requests.fetch_add(1, Ordering::SeqCst);
+        if self.refuse_recoveries.load(Ordering::SeqCst) {
+            return Err(KeymeldError::Signing(
+                "Unsupported Coordinator verifier action".into(),
+            ));
+        }
+        assert!(
+            self.registered.lock().unwrap().contains(&user),
+            "Keymeld signs only for a registered entry"
+        );
+        self.roster_sent.store(true, Ordering::SeqCst);
+        let players = self.players.lock().unwrap();
+        let (key, escrow, policy) = players.get(&user).expect("a known player");
+        let (_, refund) = coordinator_escrow::ark::refund_from(escrow, policy, &spend).unwrap();
+        let now = OffsetDateTime::now_utc().unix_timestamp() as u64;
+        coordinator_escrow::ark::check_refund_intent_fresh(escrow, &spend, now).unwrap();
+        self.recoveries.fetch_add(1, Ordering::SeqCst);
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        Ok(refund
+            .digests
+            .into_iter()
+            .map(|(input, digest)| {
+                let message = bitcoin::secp256k1::Message::from_digest(digest);
+                (
+                    input,
+                    secp.sign_schnorr_no_aux_rand(&message, key).serialize(),
+                )
+            })
+            .collect())
     }
     /// Sign as the player each input the verifier derives for a delete proof.
     async fn sign_ark_intent_delete(
@@ -422,7 +467,8 @@ impl Fixture {
             server: server.clone(),
             transport: arkd.clone(),
             swaps: swaps.clone(),
-            refund_after_start_secs: 60 * 60,
+            refund_after_start_secs: crate::config::DEFAULT_REFUND_AFTER_START_SECS,
+            escrow_expiry_margin_secs: crate::config::DEFAULT_ESCROW_EXPIRY_MARGIN_SECS,
             max_refund_fee_sats: 100,
         }))
         .unwrap();
@@ -584,6 +630,18 @@ impl Fixture {
         let created_at = OffsetDateTime::now_utc().unix_timestamp();
         self.arkd
             .add_vtxo(address, outpoint, Amount::from_sat(sats), created_at, spent);
+    }
+
+    /// Arkade says the VTXO at `outpoint` expires at `expires_at` (UNIX seconds), swept or not.
+    fn arkade_expires(&self, outpoint: OutPoint, expires_at: i64, swept: bool) {
+        let mut state = self.arkd.state.lock().unwrap();
+        let vtxo = state
+            .vtxos
+            .iter_mut()
+            .find(|vtxo| vtxo.outpoint == outpoint)
+            .expect("a listed VTXO");
+        vtxo.expires_at = expires_at;
+        vtxo.is_swept = swept;
     }
 
     /// Whether the ticket is paid, settled, and its escrow recorded as funded by `vtxo`.
@@ -1038,6 +1096,43 @@ async fn a_spent_vtxo_does_not_pay_the_ticket() {
 }
 
 #[tokio::test]
+async fn a_coin_that_expires_before_the_refund_could_finish_does_not_pay_the_ticket() {
+    let f = Fixture::new().await;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let margin = crate::config::DEFAULT_ESCROW_EXPIRY_MARGIN_SECS as i64;
+    // Its escrow's refund leaf opens in an hour.
+    let (ticket, _) = f
+        .ticket_refundable_from(21, PRICE, now as u32 + 3_600)
+        .await;
+    let paid = outpoint(0xaa, 0);
+    f.swap_reports(&ticket, SwapState::Settled, Some(paid), Some(paid.txid));
+    f.arkade_lists(&ticket.escrow_address, paid, PRICE, false);
+
+    // ark-swapd paid it from a coin with two hours of life left: a preconfirmed VTXO expires
+    // with the coin it was paid from. A refund opening in an hour would find it expired or
+    // nearly so.
+    f.arkade_expires(paid, now + 7_200, false);
+    f.coordinator.check_ark_swaps().await.unwrap();
+    assert_eq!(
+        f.paid_by(&ticket).await,
+        None,
+        "a short-lived escrow never reaches a pool"
+    );
+    assert_eq!(f.pending().await, 1);
+
+    // One Arkade already swept is refused whatever expiry it lists.
+    f.arkade_expires(paid, now + 30 * 86_400, true);
+    f.coordinator.check_ark_swaps().await.unwrap();
+    assert_eq!(f.paid_by(&ticket).await, None);
+
+    // A coin that outlives the refund locktime by the margin pays the ticket.
+    f.arkade_expires(paid, now + 3_600 + margin, false);
+    f.coordinator.check_ark_swaps().await.unwrap();
+    assert_eq!(f.paid_by(&ticket).await, Some((paid.to_string(), PRICE)));
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_swap_for_another_amount_than_the_ticket_price_does_not_pay_it() {
     let f = Fixture::new().await;
     // ark-swapd's own amount agrees with the VTXO, but not with what the ticket costs.
@@ -1080,6 +1175,17 @@ async fn a_cancelled_arkade_competition_refunds_each_funded_escrow_once() {
         !f.awaiting_cleanup().await,
         "a live competition is not cleaned up"
     );
+    // The refund leaves opened an hour ago, and nothing is refunded: only a competition that
+    // will never kick off refunds its escrows, however early their locktime.
+    f.clean_up().await;
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        f.store()
+            .ark_refunds_started(f.competition_id)
+            .await
+            .unwrap(),
+        0
+    );
     f.cancel().await;
     assert!(
         f.awaiting_cleanup().await,
@@ -1107,6 +1213,14 @@ async fn a_cancelled_arkade_competition_refunds_each_funded_escrow_once() {
     assert_eq!(f.ln.payments_sent(), 2);
     assert_eq!(f.swaps.claimed.lock().unwrap().len(), 2);
     assert!(!f.awaiting_cleanup().await, "nothing is left to refund");
+    assert_eq!(
+        f.store()
+            .ark_refunds_started(f.competition_id)
+            .await
+            .unwrap(),
+        2,
+        "a kickoff would refuse to fund a pool whose escrows went back"
+    );
 
     // Later passes find nothing to do.
     f.coordinator.refund_ark_escrows(f.competition_id).await;
@@ -1790,6 +1904,349 @@ async fn a_refund_held_by_an_intent_that_cannot_be_deleted_waits_without_minting
     assert_eq!(f.spends(), (1, 1));
     assert_eq!(f.ln.payments_sent(), 1);
     f.database.close().await.unwrap();
+}
+
+impl Fixture {
+    /// An hour passes for the ticket's minted refund: its swap's deadline is too close to sign
+    /// for, and it was minted long enough ago to be minted again.
+    async fn refund_goes_stale(&self, ticket: &ArkTicket) {
+        let refund = self.refund(ticket).await.unwrap();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        self.swaps.age(refund.refund_id, now as u32 + 60);
+        let ticket_id = ticket.id.to_string();
+        self.database
+            .execute_write(move |pool| async move {
+                sqlx::query(
+                    "UPDATE ticket_ark_refunds SET created_at = created_at - 7200 WHERE ticket_id = ?",
+                )
+                .bind(ticket_id)
+                .execute(&pool)
+                .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+}
+
+/// Production, 2026-09-30: ark-swapd paid escrows from coins with a day left, and their refund
+/// leaves opened after they expired. Arkade refused every refund with VTXO_RECOVERABLE, the
+/// swap went stale unsigned, and the refund was minted again every hour.
+#[tokio::test]
+async fn a_refund_arkade_refuses_as_expired_is_held_once_and_not_minted_again() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let ticket = f.funded(&session, 21, true).await;
+    f.cancel().await;
+    // Arkade's list still shows the escrow alive, but the server refuses to spend it.
+    f.arkd.state.lock().unwrap().expired.insert(outpoint(21, 0));
+
+    f.clean_up().await;
+    let held = f.refund(&ticket).await.unwrap();
+    assert_eq!(held.state, ArkRefundState::Minted);
+    assert_eq!(held.error.as_deref(), Some(super::ark_refund::HELD_EXPIRED));
+    assert_eq!(f.spends(), (0, 0), "Arkade refused it");
+    assert_eq!(f.enclaves.signatures.load(Ordering::SeqCst), 1);
+    let logged = f.reported(&ticket).expect("the held refund is logged");
+    assert!(logged.contains("VTXO_RECOVERABLE"), "{logged}");
+
+    // Hours on, its swap is stale. A fresh one would be refused as well, so none is minted.
+    f.refund_goes_stale(&ticket).await;
+    for _ in 0..3 {
+        f.clean_up().await;
+    }
+    let still = f.refund(&ticket).await.unwrap();
+    assert_eq!(still.refund_id, held.refund_id, "not minted again");
+    assert_eq!(
+        still.error.as_deref(),
+        Some(super::ark_refund::HELD_EXPIRED)
+    );
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.enclaves.signatures.load(Ordering::SeqCst),
+        1,
+        "nothing is signed for an escrow Arkade will not spend"
+    );
+    assert_eq!(f.ln.payments_sent(), 0);
+    assert!(
+        f.awaiting_cleanup().await,
+        "its escrow stays listed as holding a buy-in"
+    );
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_expired_escrow_waits_unminted_until_arkade_sweeps_it_and_is_then_recovered() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let ticket = f.funded(&session, 21, true).await;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    // Expired, but Arkade has not swept it yet: a batch would still want a forfeit for it.
+    f.arkade_expires(outpoint(21, 0), now - 60, false);
+    f.cancel().await;
+
+    for _ in 0..2 {
+        f.clean_up().await;
+    }
+    assert!(f.refund(&ticket).await.is_none());
+    let logged = f.reported(&ticket).expect("the held refund is logged");
+    assert!(logged.contains("expired on Arkade"), "{logged}");
+    assert_eq!(
+        f.swaps.minted.load(Ordering::SeqCst),
+        0,
+        "the player's provider is not asked for an invoice nothing can pay yet"
+    );
+    assert_eq!(f.enclaves.recovery_requests.load(Ordering::SeqCst), 0);
+
+    // Arkade sweeps the expired coins, and a batch gives the escrow's value back.
+    f.arkade_expires(outpoint(21, 0), now - 60, true);
+    f.clean_up().await;
+    let refund = f.refund(&ticket).await.unwrap();
+    assert_eq!(refund.state, ArkRefundState::Settled);
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 1);
+    assert_eq!(f.recovered(), vec![outpoint(21, 0)]);
+    assert_eq!(f.spends(), (0, 0), "nothing went offchain");
+    assert_eq!(f.ln.payments_sent(), 1);
+    assert!(!f.awaiting_cleanup().await);
+    f.database.close().await.unwrap();
+}
+
+/// The escrows of 2026-09-30: refused all morning as expired, their refunds minted and stale,
+/// and since swept by Arkade. A batch recovers each into a fresh swap, and the refund goes on
+/// as if the offchain spend had gone through.
+#[tokio::test]
+async fn a_held_refund_of_a_swept_escrow_is_recovered_in_a_batch_and_its_player_paid() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let ticket = f.funded(&session, 21, true).await;
+    f.cancel().await;
+    f.arkd.state.lock().unwrap().expired.insert(outpoint(21, 0));
+    f.clean_up().await;
+    let held = f.refund(&ticket).await.unwrap();
+    assert_eq!(held.error.as_deref(), Some(super::ark_refund::HELD_EXPIRED));
+    assert_eq!(f.enclaves.signatures.load(Ordering::SeqCst), 1);
+
+    // Hours on, its swap is stale, and Arkade lists the escrow as swept.
+    f.refund_goes_stale(&ticket).await;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    f.arkade_expires(outpoint(21, 0), now - 3_600, true);
+    f.clean_up().await;
+
+    let refund = f.refund(&ticket).await.unwrap();
+    assert_eq!(refund.state, ArkRefundState::Settled);
+    assert_ne!(
+        refund.refund_id, held.refund_id,
+        "a fresh swap and invoice for the batch to pay"
+    );
+    assert_eq!(refund.error, None);
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 2);
+    {
+        // The batch settled the escrow, and its only new VTXO is the fresh swap's, holding
+        // the whole ticket price.
+        let state = f.arkd.state.lock().unwrap();
+        let [(escrow, swap_vtxo)] = state.recovered.as_slice() else {
+            panic!("one recovery: {:?}", state.recovered);
+        };
+        assert_eq!(*escrow, outpoint(21, 0));
+        assert_eq!(
+            refund.ark_txid,
+            state.commitment_txid.map(|txid| txid.to_string()),
+            "the refund names the batch's commitment transaction"
+        );
+        let swap_address = f.swaps.refunds.lock().unwrap()[&refund.refund_id]
+            .swap_address
+            .clone();
+        let paid = state
+            .vtxos
+            .iter()
+            .find(|vtxo| vtxo.outpoint == *swap_vtxo)
+            .unwrap();
+        assert_eq!(
+            paid.script,
+            coordinator_ark::ArkAddress::decode(&swap_address)
+                .unwrap()
+                .to_p2tr_script_pubkey()
+        );
+        assert_eq!(paid.amount, Amount::from_sat(PRICE));
+        assert!(state.queued.is_empty(), "no intent is left on the escrow");
+    }
+    assert_eq!(f.spends(), (0, 0), "nothing went offchain");
+    assert_eq!(f.enclaves.recoveries.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.enclaves.signatures.load(Ordering::SeqCst),
+        1,
+        "no offchain refund was signed again"
+    );
+    assert_eq!(f.ln.payments_sent(), 1);
+    assert_eq!(f.swaps.claimed.lock().unwrap().len(), 1);
+    assert!(!f.awaiting_cleanup().await, "nothing is left to refund");
+
+    // Later passes find nothing to do.
+    f.clean_up().await;
+    assert_eq!(f.enclaves.recoveries.load(Ordering::SeqCst), 1);
+    assert_eq!(f.ln.payments_sent(), 1, "no player is paid twice");
+    f.database.close().await.unwrap();
+}
+
+/// A recovery that cannot be signed, as while Keymeld's verifier predates refunds in a batch,
+/// is tried again after a pause, and asks for a new invoice at most every six hours.
+#[tokio::test]
+async fn a_recovery_that_fails_waits_before_it_is_tried_or_minted_again() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let ticket = f.funded(&session, 21, true).await;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    f.arkade_expires(outpoint(21, 0), now - 3_600, true);
+    f.enclaves.refuse_recoveries.store(true, Ordering::SeqCst);
+    f.cancel().await;
+
+    f.clean_up().await;
+    let held = f.refund(&ticket).await.unwrap();
+    assert_eq!(held.state, ArkRefundState::Minted);
+    let note = held.error.clone().expect("the failed recovery is noted");
+    assert!(
+        note.starts_with(super::ark_refund::HELD_EXPIRED) && note.contains("tried again"),
+        "{note}"
+    );
+    assert_eq!(f.enclaves.recovery_requests.load(Ordering::SeqCst), 1);
+    assert!(f.recovered().is_empty());
+    assert!(
+        f.arkd.queued().is_empty(),
+        "no intent is left on the escrow"
+    );
+
+    // The next passes wait out the pause, and say the same.
+    let logged = f.reported(&ticket);
+    for _ in 0..3 {
+        f.clean_up().await;
+    }
+    assert_eq!(f.enclaves.recovery_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(f.reported(&ticket), logged, "logged once");
+
+    // After the pause it is tried again, with the swap it has, which is still fresh.
+    f.refund_clock(&ticket, "updated_at", 3_600).await;
+    for _ in 0..2 {
+        f.clean_up().await;
+    }
+    assert_eq!(f.enclaves.recovery_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 1);
+
+    // By the pause after that its swap is stale. While recoveries fail, a new one is minted
+    // only every six hours, so the player's provider is not asked every hour.
+    f.refund_clock(&ticket, "updated_at", 3_600).await;
+    f.refund_goes_stale(&ticket).await;
+    for _ in 0..2 {
+        f.clean_up().await;
+    }
+    assert_eq!(f.refund(&ticket).await.unwrap().refund_id, held.refund_id);
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 1);
+    assert_eq!(f.enclaves.recovery_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(f.ln.payments_sent(), 0);
+
+    // Six hours on Keymeld signs, and the escrow is recovered into a fresh swap.
+    f.refund_clock(&ticket, "created_at", 6 * 3_600).await;
+    f.enclaves.refuse_recoveries.store(false, Ordering::SeqCst);
+    f.clean_up().await;
+    let refund = f.refund(&ticket).await.unwrap();
+    assert_eq!(refund.state, ArkRefundState::Settled);
+    assert_ne!(refund.refund_id, held.refund_id);
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 2);
+    assert_eq!(f.recovered(), vec![outpoint(21, 0)]);
+    assert_eq!(f.ln.payments_sent(), 1);
+    f.database.close().await.unwrap();
+}
+
+/// A batch that recovered the escrow can finish after the coordinator stopped following it, as
+/// across a restart. The refund then finds its swap funded, and goes on from there.
+#[tokio::test]
+async fn a_recovery_whose_batch_finished_unseen_is_picked_up_from_its_swap() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let ticket = f.funded(&session, 21, true).await;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    f.arkade_expires(outpoint(21, 0), now - 3_600, true);
+    // The refund is minted, and its first recovery is lost.
+    f.enclaves.refuse_recoveries.store(true, Ordering::SeqCst);
+    f.cancel().await;
+    f.clean_up().await;
+    let minted = f.refund(&ticket).await.unwrap();
+    assert_eq!(minted.state, ArkRefundState::Minted);
+
+    // Arkade lists the escrow as settled by a batch, which paid nothing to this refund's swap.
+    let commitment = Txid::from_byte_array([0xc7; 32]);
+    {
+        let mut state = f.arkd.state.lock().unwrap();
+        let escrow = state
+            .vtxos
+            .iter_mut()
+            .find(|vtxo| vtxo.outpoint == outpoint(21, 0))
+            .unwrap();
+        escrow.is_spent = true;
+        escrow.settled_by = Some(commitment);
+    }
+    f.clean_up().await;
+    assert_eq!(
+        f.refund(&ticket).await.unwrap().state,
+        ArkRefundState::Minted
+    );
+    let logged = f.reported(&ticket).unwrap();
+    assert!(logged.contains("it needs an operator"), "{logged}");
+    assert_eq!(
+        f.ln.payments_sent(),
+        0,
+        "no player is paid for a swap nothing funded"
+    );
+
+    // The batch did pay the swap: Arkade lists its VTXO, from the same commitment.
+    let swap_address = f.swaps.refunds.lock().unwrap()[&minted.refund_id]
+        .swap_address
+        .clone();
+    let swap_vtxo = outpoint(0xc8, 0);
+    f.arkade_lists(&swap_address, swap_vtxo, PRICE, false);
+    f.arkd
+        .state
+        .lock()
+        .unwrap()
+        .vtxos
+        .iter_mut()
+        .find(|vtxo| vtxo.outpoint == swap_vtxo)
+        .unwrap()
+        .commitment_txids = vec![commitment];
+    f.clean_up().await;
+    let refund = f.refund(&ticket).await.unwrap();
+    assert_eq!(refund.state, ArkRefundState::Settled);
+    assert_eq!(refund.refund_id, minted.refund_id);
+    assert_eq!(refund.ark_txid, Some(commitment.to_string()));
+    assert_eq!(f.ln.payments_sent(), 1);
+    assert_eq!(
+        f.enclaves.recoveries.load(Ordering::SeqCst),
+        0,
+        "nothing more was signed"
+    );
+    f.database.close().await.unwrap();
+}
+
+impl Fixture {
+    /// The escrows Arkade recovered in a batch, in order.
+    fn recovered(&self) -> Vec<OutPoint> {
+        let state = self.arkd.state.lock().unwrap();
+        state.recovered.iter().map(|(escrow, _)| *escrow).collect()
+    }
+
+    /// Move the ticket's refund `seconds` back in time, by its `created_at` or `updated_at`.
+    async fn refund_clock(&self, ticket: &ArkTicket, column: &str, seconds: i64) {
+        let ticket_id = ticket.id.to_string();
+        let query = format!(
+            "UPDATE ticket_ark_refunds SET {column} = {column} - {seconds} WHERE ticket_id = ?"
+        );
+        self.database
+            .execute_write(move |pool| async move {
+                sqlx::query(&query).bind(ticket_id).execute(&pool).await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
 }
 
 impl Fixture {

@@ -29,9 +29,10 @@ pub const SETTLEMENT_RULE: &str = "settlement_completed";
 /// Signs spends of the entry's Arkade escrow VTXO, when the ticket has one.
 pub const SIGN_ARK_ESCROW: &str = "sign_ark_escrow";
 pub const ARK_ESCROW_RULE: &str = "ark_escrow_spend_allowed";
-/// Signs the refund of an escrow whose competition never kicked off, and the delete proof that
-/// frees the escrow from a batch intent left queued. Unbound, because a pool that never filled
-/// has no contract and may have no completed keygen session.
+/// Signs the refund of an escrow whose competition never kicked off, offchain or, once the
+/// escrow's VTXO has expired, as the intent of a batch; and the delete proof that frees the
+/// escrow from a batch intent left queued. Unbound, because a pool that never filled has no
+/// contract and may have no completed keygen session.
 pub const SIGN_ARK_REFUND: &str = "sign_ark_refund";
 pub const ARK_REFUND_RULE: &str = "ark_refund_allowed";
 
@@ -79,7 +80,8 @@ pub enum ActionParameters {
     },
     /// Sign the entry's Arkade escrow spend. See [`crate::ark`].
     SignArkEscrow { spend: ArkEscrowSpend },
-    /// Sign the refund of an escrow whose competition never kicked off. See [`crate::ark`].
+    /// Sign the refund of an escrow whose competition never kicked off; `spend` is an
+    /// [`ArkEscrowSpend::Refund`] or an [`ArkEscrowSpend::RefundIntent`]. See [`crate::ark`].
     ///
     /// The invoice is supplied rather than requested by the verifier, because the swap the
     /// refund pays must already commit to its payment hash. The verifier checks it was issued

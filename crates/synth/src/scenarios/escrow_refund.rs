@@ -85,9 +85,9 @@ pub(super) async fn create_competition(
 
 /// Wait for a ticket's refund to settle, which is the swap service claiming what it paid for.
 ///
-/// An escrow can be refunded only once its refund leaf opens at `refund_at` (UNIX seconds), a day
-/// after the competition closed, so the wait lasts until then and `refund_timeout_secs` more,
-/// looking once a minute until it opens.
+/// An escrow can be refunded only once its refund leaf opens at `refund_at` (UNIX seconds),
+/// shortly after the competition closed, so the wait lasts until then and `refund_timeout_secs`
+/// more, looking once a minute until it opens.
 pub(super) async fn wait_for_refund(
     client: &CoordinatorClient,
     user: &SynthUser,

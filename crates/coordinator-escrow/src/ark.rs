@@ -8,6 +8,8 @@
 //!   It moves nothing itself, since the batch still needs every forfeit.
 //! - A refund may spend only this escrow, through its refund leaf, once its locktime has passed.
 //!   It may pay only the swap that sends the player's own money to their Lightning Address.
+//!   Once the escrow's VTXO has expired, the server spends it only in a batch, so the refund is
+//!   then an intent: a proof spending this escrow alone, whose only output is that swap.
 //! - A delete proof takes a batch intent that spends this escrow out of the server's queue.
 //!   It is an intent proof that pays nothing and proves a `delete` message, so it moves nothing.
 //!   The server holds a queued intent's escrows until a batch confirms it, refunds included.
@@ -66,8 +68,10 @@ impl ArkFunding {
 /// A refund's spend of the escrow, once its transaction is known to be well formed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefundSpend {
-    /// The BIP340 digest the player's entry key signs.
-    pub digest: [u8; 32],
+    /// Each input the player's entry key signs, with its BIP340 digest. An offchain refund
+    /// signs one input of one transaction at a time; a refund in a batch signs both inputs of
+    /// its intent proof.
+    pub digests: Vec<(usize, [u8; 32])>,
     /// The escrow's value, all of which the swap receives.
     pub value_sats: u64,
 }
@@ -86,6 +90,16 @@ pub enum ArkEscrowSpend {
         purpose: RefundPurpose,
         ark_psbt: String,
         checkpoint_psbt: String,
+        swap_tap_tree: String,
+    },
+    /// A refund of this escrow made in a batch, after its locktime, into the swap that pays
+    /// the player's Lightning Address. The server spends a VTXO that expired only in a batch,
+    /// so this is what refunds one. `proof_psbt` is the intent proof, a hex-encoded PSBT;
+    /// `message` the `register` intent message it proves, as JSON; the swap's `TapTree` field
+    /// is hex.
+    RefundIntent {
+        proof_psbt: String,
+        message: String,
         swap_tap_tree: String,
     },
     /// A forfeit of this escrow into the batch that funds the pool.
@@ -188,8 +202,11 @@ pub fn spend_digests(
                 .map_err(|e| ArkError(e.to_string()))?;
             intent_proof_digests(escrow, policy.max_fee_sats, &funding_output, &proof)
         }
-        ArkEscrowSpend::Refund { .. } => {
-            Ok(vec![(0, refund_from(escrow, policy, spend)?.1.digest)])
+        // A refund's swap must commit to an invoice from the player's own Lightning Address,
+        // which only the refund permission checks. Signed here, a refund could pay a swap the
+        // caller made for itself.
+        ArkEscrowSpend::Refund { .. } | ArkEscrowSpend::RefundIntent { .. } => {
+            reject("a refund is signed under the refund permission")
         }
         ArkEscrowSpend::Forfeit {
             forfeit_psbt,
@@ -478,13 +495,143 @@ pub fn refund_spend(
         RefundPurpose::Checkpoint => checkpoint,
     };
     Ok(RefundSpend {
-        digest: sighash_through(escrow, signed, 0, EscrowPath::Refund)?,
+        digests: vec![(0, sighash_through(escrow, signed, 0, EscrowPath::Refund)?)],
         value_sats: value.to_sat(),
     })
 }
 
+/// The longest a refund's batch intent may stay valid, from when it is signed. A batch takes
+/// it within minutes, or it is deleted and signed again.
+pub const MAX_REFUND_INTENT_LIFETIME_SECS: u64 = 10 * 60;
+
+/// Check a refund made in a batch, and give the digests the player signs.
+///
+/// Once an escrow's VTXO has expired, the server spends it only in a batch, where it gives the
+/// owner a new VTXO for it. The refund is then an intent rather than an offchain spend: a
+/// proof whose only output is the swap, worth the whole escrow, exactly as [`refund_spend`]
+/// pays it.
+///
+/// - The proof spends this escrow alone, through its refund leaf, with the refund's locktime.
+///   As in BIP322, input 0 is the message input, locked like the escrow, and input 1 the escrow.
+/// - Its message must be a `register` that names no on-chain output, so the swap is paid as a
+///   VTXO and not as an on-chain output nothing could spend collaboratively. The message input
+///   commits to it, so the signatures serve no other message.
+///
+/// The proof moves nothing itself: the server puts the output in a batch, or not at all.
+pub fn refund_intent_spend(
+    escrow: &EntryEscrow,
+    swap: &RefundSwap,
+    proof: &Psbt,
+    message: &str,
+) -> Result<RefundSpend, ArkError> {
+    if swap.terms().player != escrow.terms().player {
+        return reject("the swap belongs to another player");
+    }
+    if swap.terms().server != escrow.terms().server {
+        return reject("the swap names another Arkade server");
+    }
+    if !register_message(message)?.onchain_output_indexes.is_empty() {
+        return reject("a refund's intent pays the swap as a VTXO, not on chain");
+    }
+    if proof.inputs.len() != 2 || proof.unsigned_tx.input.len() != 2 {
+        return reject("a refund's intent proof spends a message input and this escrow alone");
+    }
+    if own_inputs_through(escrow, proof, EscrowPath::Refund)? != [0, 1] {
+        return reject("both inputs of the proof must be this escrow's, through its refund leaf");
+    }
+    let witness_utxo = |index: usize| {
+        proof.inputs[index]
+            .witness_utxo
+            .as_ref()
+            .ok_or_else(|| ArkError("every input needs its witness UTXO".into()))
+    };
+    if witness_utxo(0)?.value != Amount::ZERO {
+        return reject("an intent proof's message input holds nothing");
+    }
+    let proven = intent_message_outpoint(message, escrow.script_pubkey());
+    if proof.unsigned_tx.input[0].previous_output != proven {
+        return reject("the intent proof does not prove its message");
+    }
+    let value = witness_utxo(1)?.value;
+    open_at_refund_time(escrow, proof)?;
+    let pays_the_swap = TxOut {
+        value,
+        script_pubkey: swap.script_pubkey(),
+    };
+    if proof.unsigned_tx.output != [pays_the_swap] {
+        return reject("the intent pays something other than the whole escrow to the swap");
+    }
+    Ok(RefundSpend {
+        digests: [0, 1]
+            .into_iter()
+            .map(|index| {
+                Ok((
+                    index,
+                    sighash_through(escrow, proof, index, EscrowPath::Refund)?,
+                ))
+            })
+            .collect::<Result<_, ArkError>>()?,
+        value_sats: value.to_sat(),
+    })
+}
+
+/// Check a refund made in a batch may be signed now: the escrow's refund locktime has passed,
+/// and the intent's message is valid now, and not for longer than a batch needs.
+///
+/// The server holds an offchain refund to its locktime against the chain. It checks nothing of
+/// the kind for an intent that spends a swept VTXO, so the locktime is held to this clock.
+///
+/// Other spends are not checked. Like [`check_intent_delete_fresh`], this belongs where a
+/// signature is authorized, not where one is later restored.
+pub fn check_refund_intent_fresh(
+    escrow: &EntryEscrow,
+    spend: &ArkEscrowSpend,
+    now: u64,
+) -> Result<(), ArkError> {
+    let ArkEscrowSpend::RefundIntent { message, .. } = spend else {
+        return Ok(());
+    };
+    let LockTime::Seconds(open_at) = escrow.terms().refund_locktime else {
+        return reject("the escrow's refund time is not a timestamp");
+    };
+    if now < u64::from(open_at.to_consensus_u32()) {
+        return reject("the escrow's refund locktime has not passed");
+    }
+    let message = register_message(message)?;
+    if message.expire_at <= now
+        || message.expire_at > now.saturating_add(MAX_REFUND_INTENT_LIFETIME_SECS)
+    {
+        return reject("the refund's intent expires outside the window it may be used in");
+    }
+    Ok(())
+}
+
+/// A `register` intent message, with exactly the fields the server encodes.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterMessage {
+    #[serde(rename = "type")]
+    kind: String,
+    onchain_output_indexes: Vec<u64>,
+    #[allow(dead_code)]
+    valid_at: u64,
+    expire_at: u64,
+    /// The keys that cosign the batch's VTXO tree for the intent's outputs.
+    #[allow(dead_code)]
+    cosigners_public_keys: Vec<String>,
+}
+
+fn register_message(message: &str) -> Result<RegisterMessage, ArkError> {
+    let parsed: RegisterMessage = serde_json::from_str(message)
+        .map_err(|_| ArkError("the refund's intent message is not a register".into()))?;
+    if parsed.kind != "register" {
+        return reject("the refund's intent message is not a register");
+    }
+    Ok(parsed)
+}
+
 /// A refund's transaction may only spend once the escrow's refund locktime has passed, and its
-/// input must leave `CHECKLOCKTIMEVERIFY` enabled.
+/// inputs must leave `CHECKLOCKTIMEVERIFY` enabled.
 fn open_at_refund_time(escrow: &EntryEscrow, psbt: &Psbt) -> Result<(), ArkError> {
     let open = match (escrow.terms().refund_locktime, psbt.unsigned_tx.lock_time) {
         (LockTime::Seconds(until), LockTime::Seconds(at)) => {
@@ -499,7 +646,12 @@ fn open_at_refund_time(escrow: &EntryEscrow, psbt: &Psbt) -> Result<(), ArkError
         return reject("the refund's locktime is before the escrow's");
     }
     // A final sequence disables CHECKLOCKTIMEVERIFY, which would spend the escrow at any time.
-    if psbt.unsigned_tx.input[0].sequence.is_final() {
+    if psbt
+        .unsigned_tx
+        .input
+        .iter()
+        .any(|input| input.sequence.is_final())
+    {
         return reject("the refund's input must not be final");
     }
     Ok(())
@@ -534,30 +686,44 @@ pub struct RefundTransactions {
     pub checkpoint: Psbt,
 }
 
-/// The refund an [`ArkEscrowSpend::Refund`] carries: the swap it pays and its spend of the escrow.
+/// The refund an [`ArkEscrowSpend::Refund`] or [`ArkEscrowSpend::RefundIntent`] carries: the swap
+/// it pays and its spend of the escrow.
 pub fn refund_from(
     escrow: &EntryEscrow,
     policy: &ArkEscrowPolicy,
     spend: &ArkEscrowSpend,
 ) -> Result<(RefundSwap, RefundSpend), ArkError> {
-    let ArkEscrowSpend::Refund {
-        purpose,
-        ark_psbt,
-        checkpoint_psbt,
-        swap_tap_tree,
-    } = spend
-    else {
-        return reject("this spend is not a refund");
+    let refund_swap = |swap_tap_tree: &str| {
+        let tap_tree = hex::decode(swap_tap_tree).map_err(|e| ArkError(e.to_string()))?;
+        let vtxo = VtxoScript::decode_tap_tree(&tap_tree).map_err(|e| ArkError(e.to_string()))?;
+        RefundSwap::from_vtxo_script(&vtxo).map_err(|e| ArkError(e.to_string()))
     };
-    let tap_tree = hex::decode(swap_tap_tree).map_err(|e| ArkError(e.to_string()))?;
-    let vtxo = VtxoScript::decode_tap_tree(&tap_tree).map_err(|e| ArkError(e.to_string()))?;
-    let swap = RefundSwap::from_vtxo_script(&vtxo).map_err(|e| ArkError(e.to_string()))?;
-    let transactions = RefundTransactions {
-        ark: psbt(ark_psbt)?,
-        checkpoint: psbt(checkpoint_psbt)?,
-    };
-    let spend = refund_spend(escrow, &swap, policy, &transactions, *purpose)?;
-    Ok((swap, spend))
+    match spend {
+        ArkEscrowSpend::Refund {
+            purpose,
+            ark_psbt,
+            checkpoint_psbt,
+            swap_tap_tree,
+        } => {
+            let swap = refund_swap(swap_tap_tree)?;
+            let transactions = RefundTransactions {
+                ark: psbt(ark_psbt)?,
+                checkpoint: psbt(checkpoint_psbt)?,
+            };
+            let spend = refund_spend(escrow, &swap, policy, &transactions, *purpose)?;
+            Ok((swap, spend))
+        }
+        ArkEscrowSpend::RefundIntent {
+            proof_psbt,
+            message,
+            swap_tap_tree,
+        } => {
+            let swap = refund_swap(swap_tap_tree)?;
+            let spend = refund_intent_spend(escrow, &swap, &psbt(proof_psbt)?, message)?;
+            Ok((swap, spend))
+        }
+        _ => reject("this spend is not a refund"),
+    }
 }
 
 /// The soonest a refund swap's deadline may fall: the service needs time to pay the invoice.
@@ -869,7 +1035,201 @@ mod refund_tests {
         let ark = spend(&escrow, &swap, &refund, RefundPurpose::ArkTransaction).unwrap();
         assert_eq!(checkpoint.value_sats, VALUE.to_sat());
         assert_eq!(ark.value_sats, VALUE.to_sat());
-        assert_ne!(checkpoint.digest, ark.digest);
+        assert_ne!(checkpoint.digests, ark.digests);
+        assert_eq!(
+            ark.digests.len(),
+            1,
+            "one input of one transaction at a time"
+        );
+    }
+
+    fn register(onchain: &str, expire_at: u64) -> String {
+        format!(
+            r#"{{"type":"register","onchain_output_indexes":[{onchain}],"valid_at":{},"expire_at":{expire_at},"cosigners_public_keys":["02{}"]}}"#,
+            expire_at - 120,
+            "7b".repeat(32),
+        )
+    }
+
+    /// A refund's intent proof: the message input and the escrow, both through `leaf`, paying
+    /// `outputs`.
+    fn intent(
+        escrow: &EntryEscrow,
+        message: &str,
+        leaf: EscrowPath,
+        outputs: Vec<TxOut>,
+        lock_time: LockTime,
+    ) -> Psbt {
+        let spent = [
+            intent_message_outpoint(message, escrow.script_pubkey()),
+            OutPoint::new(Txid::from_byte_array([7u8; 32]), 0),
+        ];
+        let mut psbt = Psbt::from_unsigned_tx(Transaction {
+            version: Version::TWO,
+            lock_time,
+            input: spent
+                .into_iter()
+                .map(|previous_output| TxIn {
+                    previous_output,
+                    sequence: Sequence::ENABLE_LOCKTIME_NO_RBF,
+                    ..Default::default()
+                })
+                .collect(),
+            output: outputs,
+        })
+        .unwrap();
+        for (input, value) in psbt.inputs.iter_mut().zip([Amount::ZERO, VALUE]) {
+            input.witness_utxo = Some(TxOut {
+                value,
+                script_pubkey: escrow.script_pubkey(),
+            });
+            input.tap_scripts.insert(
+                escrow.control_block(leaf),
+                (escrow.script(leaf).clone(), LeafVersion::TapScript),
+            );
+        }
+        psbt
+    }
+
+    fn pays(script_pubkey: ScriptBuf, value: Amount) -> Vec<TxOut> {
+        vec![TxOut {
+            value,
+            script_pubkey,
+        }]
+    }
+
+    /// A refund intent paying the whole escrow to `swap`, after the refund locktime.
+    fn refund_intent(escrow: &EntryEscrow, swap: &RefundSwap, message: &str) -> Psbt {
+        intent(
+            escrow,
+            message,
+            EscrowPath::Refund,
+            pays(swap.script_pubkey(), VALUE),
+            LockTime::from_consensus(REFUND_AT),
+        )
+    }
+
+    #[test]
+    fn a_refund_in_a_batch_signs_both_inputs_of_a_proof_that_pays_the_swap_alone() {
+        let (escrow, swap) = (escrow(), swap_for(14));
+        let message = register("", 1_790_000_600);
+        let proof = refund_intent(&escrow, &swap, &message);
+        let spend = refund_intent_spend(&escrow, &swap, &proof, &message).unwrap();
+        assert_eq!(spend.value_sats, VALUE.to_sat());
+        let [(0, message_input), (1, escrow_input)] = spend.digests.as_slice() else {
+            panic!("the message input and the escrow are signed: {spend:?}");
+        };
+        assert_ne!(message_input, escrow_input);
+
+        // The same refund, carried as a spend with the swap's tap tree.
+        let carried = ArkEscrowSpend::RefundIntent {
+            proof_psbt: psbt_hex(&proof),
+            message: message.clone(),
+            swap_tap_tree: hex::encode(swap.vtxo_script().encode_tap_tree()),
+        };
+        let (_, from) = refund_from(&escrow, &policy(100), &carried).unwrap();
+        assert_eq!(from, spend);
+        check_refund_intent_fresh(&escrow, &carried, 1_790_000_500).unwrap();
+        // Expired, or valid for longer than a batch needs.
+        assert!(check_refund_intent_fresh(&escrow, &carried, 1_790_000_600).is_err());
+        // Before the escrow's refund locktime, which the server does not check for a swept
+        // VTXO, whatever the proof's own locktime says.
+        let early = register("", u64::from(REFUND_AT) + 10);
+        let early = ArkEscrowSpend::RefundIntent {
+            proof_psbt: psbt_hex(&refund_intent(&escrow, &swap, &early)),
+            message: early,
+            swap_tap_tree: hex::encode(swap.vtxo_script().encode_tap_tree()),
+        };
+        assert!(refund_from(&escrow, &policy(100), &early).is_ok());
+        assert!(check_refund_intent_fresh(&escrow, &early, u64::from(REFUND_AT) - 60).is_err());
+        check_refund_intent_fresh(&escrow, &early, u64::from(REFUND_AT)).unwrap();
+        let too_long = register("", 1_790_000_600 + 3_600);
+        let too_long = ArkEscrowSpend::RefundIntent {
+            proof_psbt: psbt_hex(&refund_intent(&escrow, &swap, &too_long)),
+            message: too_long,
+            swap_tap_tree: hex::encode(swap.vtxo_script().encode_tap_tree()),
+        };
+        assert!(check_refund_intent_fresh(&escrow, &too_long, 1_790_000_500).is_err());
+    }
+
+    #[test]
+    fn a_refund_in_a_batch_is_refused_unless_it_pays_the_whole_escrow_to_the_swap_as_a_vtxo() {
+        let (escrow, swap) = (escrow(), swap_for(14));
+        let message = register("", 1_790_000_600);
+        let at = LockTime::from_consensus(REFUND_AT);
+        let refused = |proof: &Psbt, message: &str| {
+            refund_intent_spend(&escrow, &swap, proof, message).is_err()
+        };
+        let paying = |outputs| intent(&escrow, &message, EscrowPath::Refund, outputs, at);
+
+        // Less than the escrow, another script, or a second output beside the swap.
+        assert!(refused(
+            &paying(pays(swap.script_pubkey(), VALUE - Amount::from_sat(1))),
+            &message
+        ));
+        assert!(refused(
+            &paying(pays(escrow.script_pubkey(), VALUE)),
+            &message
+        ));
+        let mut split = pays(swap.script_pubkey(), VALUE - Amount::from_sat(1_000));
+        split.extend(pays(exit_script(), Amount::from_sat(1_000)));
+        assert!(refused(&paying(split), &message));
+
+        // An on-chain output to the swap's script: nothing could spend it collaboratively.
+        let onchain = register("0", 1_790_000_600);
+        assert!(refused(&refund_intent(&escrow, &swap, &onchain), &onchain));
+
+        // Another message than the proof commits to, and one that is not a register.
+        let proof = refund_intent(&escrow, &swap, &message);
+        assert!(refused(&proof, &register("", 1_790_000_601)));
+        let delete = r#"{"type":"delete","expire_at":1790000600}"#;
+        assert!(refused(&refund_intent(&escrow, &swap, delete), delete));
+        let extra = message.replace("}", r#","note":1}"#);
+        assert!(refused(&refund_intent(&escrow, &swap, &extra), &extra));
+
+        // Before the refund locktime, through the funding leaf, or with a final input.
+        let early = LockTime::from_consensus(REFUND_AT - 1);
+        assert!(refused(
+            &intent(
+                &escrow,
+                &message,
+                EscrowPath::Refund,
+                pays(swap.script_pubkey(), VALUE),
+                early
+            ),
+            &message
+        ));
+        assert!(refused(
+            &intent(
+                &escrow,
+                &message,
+                EscrowPath::Funding,
+                pays(swap.script_pubkey(), VALUE),
+                at
+            ),
+            &message
+        ));
+        let mut final_input = refund_intent(&escrow, &swap, &message);
+        final_input.unsigned_tx.input[1].sequence = Sequence::MAX;
+        assert!(refused(&final_input, &message));
+
+        // Another escrow beside this one, or another player's swap.
+        let mut crowded = refund_intent(&escrow, &swap, &message);
+        crowded.unsigned_tx.input.push(TxIn {
+            previous_output: OutPoint::new(Txid::from_byte_array([8u8; 32]), 0),
+            sequence: Sequence::ENABLE_LOCKTIME_NO_RBF,
+            ..Default::default()
+        });
+        crowded.inputs.push(crowded.inputs[1].clone());
+        assert!(refused(&crowded, &message));
+        let other = swap_for(15);
+        assert!(refund_intent_spend(
+            &escrow,
+            &other,
+            &refund_intent(&escrow, &other, &message),
+            &message
+        )
+        .is_err());
     }
 
     #[test]

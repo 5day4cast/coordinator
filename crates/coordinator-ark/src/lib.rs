@@ -10,12 +10,15 @@
 //! - [`DlcKickoff`]: signs the pool's ticketed DLC in that hook, against the batch's funding output.
 //! - [`delete_pool_intent`], [`delete_escrow_intent`]: take escrows out of arkd's batch queue, where
 //!   an intent that was never confirmed would otherwise hold them.
+//! - [`build_refund`]: an escrow's refund, offchain, into the swap that pays its player.
+//! - [`recover_escrow`]: the same refund in a batch, for an escrow whose VTXO expired.
 //!
 //! See `docs/QUEUED_COMPETITIONS.md`.
 
 mod dlc;
 mod error;
 mod kickoff;
+mod recover;
 mod refund;
 mod server;
 mod signer;
@@ -29,6 +32,7 @@ pub use kickoff::{
     delete_escrow_intent, delete_pool_intent, fund_pool, EscrowInput, Kickoff, KickoffConfig,
     KickoffHooks, PoolFunding,
 };
+pub use recover::{recover_escrow, Recovery};
 pub use refund::{build_refund, sign_refund_ark_tx, sign_refund_checkpoint, RefundTransactions};
 pub use server::{address_hrp, escrow_terms, server_rules, ArkServer};
 pub use signer::{

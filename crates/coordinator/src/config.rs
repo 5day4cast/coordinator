@@ -277,17 +277,40 @@ pub struct ArkSettings {
     /// A file holding `ark-swapd`'s bearer token.
     #[serde(default)]
     pub swap_token_file: String,
-    /// How long after the observation window starts an unfunded entry can be refunded.
+    /// How long after the observation window starts an escrow's refund leaf opens.
+    ///
+    /// Short on purpose. An escrow VTXO inherits the expiry of the coins that paid it, and an
+    /// expired VTXO cannot be refunded offchain, so the refund must open well inside the coin's
+    /// life. It does not need to outlast the kickoff: refunds run only for a competition that
+    /// will never kick off (`docs/QUEUED_COMPETITIONS.md`, "Refunds"). It is part of the escrow's
+    /// script, so it applies to escrows issued from then on.
     #[serde(default = "default_refund_after_start_secs")]
     pub refund_after_start_secs: u64,
+    /// How much longer than its refund locktime an escrow's VTXO must live, as Arkade lists it
+    /// when the ticket's payment is confirmed. A ticket paid with a shorter-lived coin is not
+    /// counted: its escrow could expire before a refund finishes.
+    #[serde(default = "default_escrow_expiry_margin_secs")]
+    pub escrow_expiry_margin_secs: u64,
     /// The most the swap service may keep from a refunded escrow for paying the player's
     /// Lightning Address. The player consents to this cap when entering.
     #[serde(default = "default_max_refund_fee_sats")]
     pub max_refund_fee_sats: u64,
 }
 
+/// 45 minutes: a kickoff runs within minutes of the start, and a pool waits at most an hour for
+/// fees to fall before it is cancelled.
+pub const DEFAULT_REFUND_AFTER_START_SECS: u64 = 45 * 60;
+
+/// Six hours: time for the competition to fail, the chain's time to pass the locktime, and the
+/// refund to be signed and paid.
+pub const DEFAULT_ESCROW_EXPIRY_MARGIN_SECS: u64 = 6 * 60 * 60;
+
 fn default_refund_after_start_secs() -> u64 {
-    24 * 60 * 60
+    DEFAULT_REFUND_AFTER_START_SECS
+}
+
+fn default_escrow_expiry_margin_secs() -> u64 {
+    DEFAULT_ESCROW_EXPIRY_MARGIN_SECS
 }
 
 fn default_max_refund_fee_sats() -> u64 {

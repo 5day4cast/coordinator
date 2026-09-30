@@ -669,15 +669,7 @@ fn ark_refund_action(
         .ok_or_else(|| invalid("This ticket has no Arkade escrow"))?;
     let escrow = ark_escrow(signed, consent.market_maker(), ark_policy)?;
     let (swap, refund) = ark::refund_from(&escrow, ark_policy, spend).map_err(invalid)?;
-    let action = Action::SignBip340 {
-        scope: Bip340Scope {
-            public_key: signed.policy.participant_public_key.clone(),
-            items: vec![Bip340Item {
-                item_id: Uuid::from_u128(1),
-                digest: refund.digest,
-            }],
-        },
-    };
+    let (action, _) = bip340_action(signed, refund.digests.clone());
     Ok((action, swap, refund))
 }
 
@@ -978,6 +970,9 @@ impl CoordinatorVerifier {
     /// The player consented to the escrow's terms and to a cap on what a swap may keep. This
     /// resolves their own Lightning Address for the remainder, and signs only a refund paying a
     /// swap that commits to that invoice, so the service is paid by revealing its preimage.
+    ///
+    /// The refund is an offchain spend, or, once the escrow's VTXO has expired, an intent that
+    /// pays the same swap in a batch. Both are held to the same invoice, fee and deadline.
     async fn prepare_refund(
         &self,
         context: PreparationView<'_>,
@@ -992,10 +987,15 @@ impl CoordinatorVerifier {
         }
         let (policy, consent) = validate_static(context.manifest, context.policy)?;
         let (action, swap, refund) = ark_refund_action(context.policy, &policy, &consent, &spend)?;
+        let now = now()?;
         let ark_policy = policy
             .ark_escrow
             .as_ref()
             .ok_or_else(|| invalid("This ticket has no Arkade escrow"))?;
+        // A refund in a batch is an intent, which must be fresh like any proof of one, and
+        // whose locktime only this clock holds it to.
+        let escrow = ark_escrow(context.policy, consent.market_maker(), ark_policy)?;
+        ark::check_refund_intent_fresh(&escrow, &spend, now).map_err(invalid)?;
         let owed_sats = ark::refund_invoice_sats(&refund, fee_sats, ark_policy).map_err(invalid)?;
         let amount_msat = owed_sats
             .checked_mul(1000)
@@ -1004,7 +1004,6 @@ impl CoordinatorVerifier {
             .automatic_lightning_address
             .as_ref()
             .ok_or_else(|| invalid("This entry has no Lightning Address to refund"))?;
-        let now = now()?;
         let parsed = payout::validate_invoice(&invoice, owed_sats, consent.network(), now)
             .map_err(invalid)?;
         // The invoice is the caller's, so it is checked against the address the player signed.
@@ -1018,6 +1017,8 @@ impl CoordinatorVerifier {
             .attempt
             .validate(&action, &context.policy.policy.context)
             .map_err(invalid)?;
+        // The signed inputs, in the order of the signatures, as for any other escrow spend.
+        let inputs: Vec<usize> = refund.digests.iter().map(|(input, _)| *input).collect();
         Ok(PreparedAction {
             action,
             application_state: Payload::encode(&PreparedState::ArkRefund {
@@ -1026,8 +1027,7 @@ impl CoordinatorVerifier {
                 owed_sats,
             })
             .map_err(invalid)?,
-            // The signed input, as for any other escrow spend.
-            output: Payload::encode(&vec![0usize]).map_err(invalid)?,
+            output: Payload::encode(&inputs).map_err(invalid)?,
         })
     }
 

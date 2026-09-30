@@ -33,8 +33,11 @@ pub struct Arkade {
     /// answer them without one running.
     pub transport: Arc<dyn coordinator_ark::ArkTransport>,
     pub swaps: Arc<dyn crate::infra::ark_swap::EscrowSwaps>,
-    /// How long after the observation window starts an unfunded entry can be refunded.
+    /// How long after the observation window starts an escrow's refund leaf opens.
     pub refund_after_start_secs: u64,
+    /// How much longer than its refund locktime an escrow's VTXO must live for its ticket to
+    /// be counted as paid.
+    pub escrow_expiry_margin_secs: u64,
     /// The most a refund's swap may keep for paying the player's Lightning Address.
     pub max_refund_fee_sats: u64,
 }
@@ -95,6 +98,9 @@ impl KeymeldArkPool {
                 proof_psbt: psbt_hex(&request.psbt),
                 message: message.clone(),
             },
+            SigningPurpose::RefundIntent { .. } => {
+                return Err("a pool being funded does not refund its escrows".into())
+            }
             SigningPurpose::Forfeit {
                 commitment_tx,
                 connectors,
@@ -226,16 +232,82 @@ impl EscrowSigner for KeymeldIntentDelete<'_> {
             .keymeld
             .sign_ark_intent_delete(self.session, self.user.clone(), spend)
             .await?;
-        requests
-            .iter()
-            .map(|request| {
-                let input = request.input_index;
-                let (_, signature) = signed
-                    .iter()
-                    .find(|(signed_input, _)| *signed_input == input)
-                    .ok_or_else(|| format!("Keymeld did not sign input {input}"))?;
-                Ok(schnorr::Signature::from_slice(signature)?)
-            })
-            .collect()
+        signatures_for(requests, &signed)
     }
+}
+
+/// Keymeld as one player's signer for the batch that recovers their expired escrow into their
+/// refund's swap, outside any pool: unbound, under the refund's permission.
+///
+/// It signs the batch's intent proof, which the verifier holds to the refund's invoice and
+/// fee, and the proofs that delete an intent an earlier attempt left queued.
+pub struct KeymeldRecovery<'a> {
+    pub keymeld: &'a dyn Keymeld,
+    pub session: &'a DlcKeygenSession,
+    pub user: UserId,
+    /// The refund's swap: its PSBT `TapTree` field, hex.
+    pub swap_tap_tree: String,
+    /// The invoice the swap commits to, from the player's Lightning Address, and what the swap
+    /// service keeps.
+    pub invoice: String,
+    pub fee_sats: u64,
+}
+
+#[async_trait]
+impl EscrowSigner for KeymeldRecovery<'_> {
+    /// One Keymeld round trip, signing every input of the player's escrow in the proof.
+    async fn sign(&self, requests: &[SigningRequest]) -> Result<Vec<schnorr::Signature>, BoxError> {
+        let Some(first) = requests.first() else {
+            return Ok(Vec::new());
+        };
+        let message = match &first.purpose {
+            SigningPurpose::RefundIntent { message } => message,
+            SigningPurpose::DeleteIntent { .. } => {
+                let delete = KeymeldIntentDelete {
+                    keymeld: self.keymeld,
+                    session: self.session,
+                    user: self.user.clone(),
+                };
+                return delete.sign(requests).await;
+            }
+            _ => return Err("outside a pool, Keymeld signs only a refund or a delete".into()),
+        };
+        if requests.iter().any(|request| request.psbt != first.psbt) {
+            return Err("a refund's intent is signed one proof at a time".into());
+        }
+        let spend = ArkEscrowSpend::RefundIntent {
+            proof_psbt: psbt_hex(&first.psbt),
+            message: message.clone(),
+            swap_tap_tree: self.swap_tap_tree.clone(),
+        };
+        let signed = self
+            .keymeld
+            .sign_ark_refund_intent(
+                self.session,
+                self.user.clone(),
+                spend,
+                self.invoice.clone(),
+                self.fee_sats,
+            )
+            .await?;
+        signatures_for(requests, &signed)
+    }
+}
+
+/// The signature Keymeld made for each request's input, in the requests' order.
+fn signatures_for(
+    requests: &[SigningRequest],
+    signed: &[(usize, [u8; 64])],
+) -> Result<Vec<schnorr::Signature>, BoxError> {
+    requests
+        .iter()
+        .map(|request| {
+            let input = request.input_index;
+            let (_, signature) = signed
+                .iter()
+                .find(|(signed_input, _)| *signed_input == input)
+                .ok_or_else(|| format!("Keymeld did not sign input {input}"))?;
+            Ok(schnorr::Signature::from_slice(signature)?)
+        })
+        .collect()
 }
