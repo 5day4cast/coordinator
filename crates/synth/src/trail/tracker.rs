@@ -25,7 +25,7 @@ use super::{
     PayeeCheck, PayoutSeen, PayoutState, RefundSeen, RouteHop, SwapSeen, Trail, VtxoSeen,
 };
 use crate::ark_swap::{ArkSwap, Swap};
-use crate::client::competitions::CompetitionResponse;
+use crate::client::competitions::{CompetitionResponse, OperatorCompetition};
 use crate::client::CoordinatorClient;
 use crate::crypto::keys::SynthUser;
 use crate::db::{SynthDb, TestRun, TestStep, Verdict};
@@ -93,6 +93,9 @@ const STUCK_RECHECK: Duration = Duration::from_secs(15 * 60);
 /// How often ark-swapd is asked for swaps that record no escrow output.
 const UNRECORDED_SWAPS_EVERY: Duration = Duration::from_secs(5 * 60);
 
+/// How often the coordinator is asked which competitions that never ran hold escrows.
+const UNREFUNDED_EVERY: Duration = Duration::from_secs(5 * 60);
+
 /// A Lightning node synth can reach, by the name it gives itself.
 struct Node {
     lnd: Lnd,
@@ -155,6 +158,53 @@ pub struct UnrecordedSwaps {
     pub error: Option<String>,
 }
 
+/// A competition that never ran whose funded escrows are not all refunded, whoever paid them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unrefunded {
+    pub competition_id: Uuid,
+    pub state: String,
+    /// When it was cancelled or failed, or when its window opened without it filling.
+    pub stopped: OffsetDateTime,
+    pub escrowed: u64,
+    pub unrefunded: u64,
+    /// The entry fees not returned yet, if the coordinator gave the entry fee.
+    pub sats: Option<u64>,
+    /// When the first escrow not refunded yet can be, if the coordinator says.
+    pub opens_at: Option<OffsetDateTime>,
+}
+
+/// What the coordinator last said about competitions that never ran and still hold escrows.
+#[derive(Debug, Clone)]
+pub struct UnrefundedCompetitions {
+    pub checked_at: OffsetDateTime,
+    pub competitions: Vec<Unrefunded>,
+    pub error: Option<String>,
+}
+
+/// The competitions that never ran and hold escrows not refunded yet, the oldest stop first.
+pub fn unrefunded(competitions: &[OperatorCompetition], now: OffsetDateTime) -> Vec<Unrefunded> {
+    let mut found: Vec<Unrefunded> = competitions
+        .iter()
+        .filter(|competition| competition.unrefunded() > 0)
+        .filter_map(|competition| {
+            let refunds = competition.refunds?;
+            Some(Unrefunded {
+                competition_id: competition.id,
+                state: competition.state.clone(),
+                stopped: competition.did_not_run(now)?,
+                escrowed: refunds.escrowed,
+                unrefunded: competition.unrefunded(),
+                sats: competition
+                    .entry_fee()
+                    .map(|fee| fee * competition.unrefunded()),
+                opens_at: refunds.opens_at,
+            })
+        })
+        .collect();
+    found.sort_by_key(|competition| competition.stopped);
+    found
+}
+
 #[derive(Clone)]
 pub struct Tracker {
     inner: Arc<Inner>,
@@ -178,6 +228,7 @@ struct Inner {
     /// Each followed run's competition as last looked at, and when its trail was last refreshed.
     seen: Mutex<HashMap<String, (String, Instant)>>,
     unrecorded: Mutex<Option<(Instant, UnrecordedSwaps)>>,
+    unrefunded: Mutex<Option<(Instant, UnrefundedCompetitions)>>,
 }
 
 impl Tracker {
@@ -220,6 +271,7 @@ impl Tracker {
                 busy: Mutex::default(),
                 seen: Mutex::default(),
                 unrecorded: Mutex::default(),
+                unrefunded: Mutex::default(),
             }),
         })
     }
@@ -241,6 +293,16 @@ impl Tracker {
             .expect("unrecorded swaps lock")
             .as_ref()
             .map(|(_, swaps)| swaps.clone())
+    }
+
+    /// What the coordinator last said about competitions that never ran and still hold escrows.
+    pub fn unrefunded_competitions(&self) -> Option<UnrefundedCompetitions> {
+        self.inner
+            .unrefunded
+            .lock()
+            .expect("unrefunded competitions lock")
+            .as_ref()
+            .map(|(_, found)| found.clone())
     }
 
     /// Follow the runs' money for as long as synth runs.
@@ -277,6 +339,7 @@ impl Tracker {
             }
         }
         self.check_unrecorded_swaps().await;
+        self.check_unrefunded_competitions().await;
         Ok(())
     }
 
@@ -1154,6 +1217,39 @@ impl Tracker {
         refunds
     }
 
+    /// Ask the coordinator, every few minutes, which competitions that never ran still hold
+    /// escrows. Its competition list is large, so pages never wait on it.
+    async fn check_unrefunded_competitions(&self) {
+        let due = self
+            .inner
+            .unrefunded
+            .lock()
+            .expect("unrefunded competitions lock")
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= UNREFUNDED_EVERY);
+        if !due {
+            return;
+        }
+        let now = OffsetDateTime::now_utc();
+        let checked = match self.inner.client.list_operator_competitions().await {
+            Ok(competitions) => UnrefundedCompetitions {
+                checked_at: now,
+                competitions: unrefunded(&competitions, now),
+                error: None,
+            },
+            Err(e) => UnrefundedCompetitions {
+                checked_at: now,
+                competitions: Vec::new(),
+                error: Some(format!("{e:#}")),
+            },
+        };
+        *self
+            .inner
+            .unrefunded
+            .lock()
+            .expect("unrefunded competitions lock") = Some((Instant::now(), checked));
+    }
+
     /// Ask ark-swapd, every few minutes, for swaps that record no escrow output.
     async fn check_unrecorded_swaps(&self) {
         let Some(ark_swap) = &self.inner.ark_swap else {
@@ -1632,10 +1728,13 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let counted = calls.clone();
         let fixture = fixture(
-            Router::new().fallback(move || {
+            Router::new().fallback(move |uri: axum::http::Uri| {
                 let calls = counted.clone();
                 async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
+                    // The operator's competition list is asked for separately, once a tick.
+                    if uri.path() != "/api/v1/admin/competitions" {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                    }
                     StatusCode::SERVICE_UNAVAILABLE
                 }
             }),
@@ -2232,5 +2331,78 @@ mod tests {
             &run(now - time::Duration::hours(9)),
             &config
         ));
+    }
+
+    /// Competitions that never ran and hold escrows are found, with the entry fees not
+    /// returned; ones that ran, were refunded, or may still run are not.
+    #[test]
+    fn competitions_that_never_ran_with_unrefunded_escrows_are_found() {
+        use time::macros::datetime;
+        let now = datetime!(2026-09-29 21:00:00 UTC);
+        let competition = |state: &str, milestones: serde_json::Value, refunds| {
+            serde_json::from_value::<OperatorCompetition>(serde_json::json!({
+                "id": Uuid::now_v7(),
+                "state": state,
+                "event_submission": {
+                    "entry_fee": 1000,
+                    "start_observation_date": "2026-09-28T21:00:00Z",
+                },
+                "total_paid_entries": 5,
+                "milestones": milestones,
+                "refunds": refunds,
+            }))
+            .unwrap()
+        };
+        let cancelled = competition(
+            "cancelled",
+            serde_json::json!([{ "name": "cancelled", "at": "2026-09-28T21:26:00Z" }]),
+            serde_json::json!({ "escrowed": 5, "refunded": 1, "opens_at": "2026-09-29T21:26:00Z" }),
+        );
+        let unfilled = competition(
+            "created",
+            serde_json::json!([]),
+            serde_json::json!({ "escrowed": 2, "refunded": 0 }),
+        );
+        let refunded = competition(
+            "cancelled",
+            serde_json::json!([{ "name": "cancelled", "at": "2026-09-28T20:00:00Z" }]),
+            serde_json::json!({ "escrowed": 3, "refunded": 3 }),
+        );
+        let ran = competition(
+            "failed",
+            serde_json::json!([
+                { "name": "funding_confirmed", "at": "2026-09-28T20:00:00Z" },
+                { "name": "failed", "at": "2026-09-28T22:00:00Z" },
+            ]),
+            serde_json::json!({ "escrowed": 3, "refunded": 0 }),
+        );
+        let live = competition(
+            "escrow_funds_confirmed",
+            serde_json::json!([]),
+            serde_json::json!({ "escrowed": 3, "refunded": 0 }),
+        );
+        let nothing_paid = competition("cancelled", serde_json::json!([]), serde_json::Value::Null);
+
+        let found = unrefunded(
+            &[
+                refunded,
+                cancelled.clone(),
+                ran,
+                live,
+                nothing_paid,
+                unfilled.clone(),
+            ],
+            now,
+        );
+        let ids: Vec<Uuid> = found.iter().map(|found| found.competition_id).collect();
+        assert_eq!(ids, [unfilled.id, cancelled.id], "oldest stop first");
+        assert_eq!(found[0].stopped, datetime!(2026-09-28 21:00:00 UTC));
+        assert_eq!(found[0].opens_at, None);
+        assert_eq!(found[1].unrefunded, 4);
+        assert_eq!(found[1].sats, Some(4000));
+        assert_eq!(found[1].opens_at, Some(datetime!(2026-09-29 21:26:00 UTC)));
+
+        // Before its window opens, a competition waiting for entries may still run.
+        assert!(unrefunded(&[unfilled], datetime!(2026-09-28 20:00:00 UTC)).is_empty());
     }
 }

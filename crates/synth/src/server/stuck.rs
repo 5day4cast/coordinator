@@ -18,11 +18,15 @@ pub fn block(run: &Run, now: OffsetDateTime) -> Option<Markup> {
     let trail = run.trail?;
     let held = trail.held.as_ref()?;
     let still = matches!(trail.money, Money::Stuck { .. }) && held.until.is_none();
+    // Synth stopped following it while it was held, so it never saw the money move.
+    let unverified = matches!(trail.money, Money::Unverified { .. });
     let competition = trail.competition.as_ref();
     Some(html! {
         section.stuck {
             h2 {
-                @if still { span class="badge stuck" { "Stuck" } " " } @else { span class="badge was_stuck" { "Was stuck" } " " }
+                @if still { span class="badge stuck" { "Stuck" } " " }
+                @else if unverified { span class="badge unverified" title="Synth stopped following it while it was held" { "Unverified" } " " }
+                @else { span class="badge was_stuck" { "Was stuck" } " " }
                 (format::sats(held.sats)) " sats held"
             }
             p {
@@ -544,6 +548,24 @@ mod tests {
             OffsetDateTime::now_utc(),
         );
         assert_eq!(component, "the Arkade server");
+    }
+
+    /// Money synth stopped following while it was held is unverified, not "was stuck": nobody
+    /// saw it move.
+    #[test]
+    fn money_synth_stopped_following_while_held_reads_unverified() {
+        let entry = entry();
+        let mut trail = cancelled_trail(swap("settled", Some("ee:0")), &entry);
+        trail.money = Money::Unverified {
+            reason: "0 of 3 payouts confirmed".into(),
+        };
+        let held = trail.held.as_mut().unwrap();
+        held.until = Some(time::macros::datetime!(2026-09-24 09:00:00 UTC));
+        held.then = Some("synth stopped following it: 0 of 3 payouts confirmed".into());
+        let page = render(&trail, std::slice::from_ref(&entry));
+        let heading = &page[page.find("<h2>").unwrap()..page.find("</h2>").unwrap()];
+        assert!(heading.contains(r#"class="badge unverified""#), "{heading}");
+        assert!(!heading.contains("Was stuck"), "{heading}");
     }
 
     /// Once the money moves, the block stays as the record of where it was held.

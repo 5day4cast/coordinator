@@ -75,6 +75,90 @@ pub struct PoolSummary {
     pub players: usize,
 }
 
+/// A competition's funded Arkade escrows, and how many of their players were refunded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefundProgress {
+    pub escrowed: u64,
+    pub refunded: u64,
+    /// When the first escrow not refunded yet can be; not every coordinator says.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub opens_at: Option<OffsetDateTime>,
+}
+
+/// A step a competition reached, as the operator listener names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Milestone {
+    pub name: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+}
+
+/// A competition as the operator listener reports it: what synth needs to find escrows a
+/// competition that never ran still holds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorCompetition {
+    pub id: Uuid,
+    pub state: String,
+    pub event_submission: serde_json::Value,
+    #[serde(default)]
+    pub total_paid_entries: u64,
+    #[serde(default)]
+    pub milestones: Vec<Milestone>,
+    /// None when it has no funded escrows.
+    #[serde(default)]
+    pub refunds: Option<RefundProgress>,
+    #[serde(default)]
+    pub kind: CompetitionKind,
+}
+
+impl OperatorCompetition {
+    fn reached(&self, name: &str) -> Option<OffsetDateTime> {
+        self.milestones
+            .iter()
+            .find(|milestone| milestone.name == name)
+            .map(|milestone| milestone.at)
+    }
+
+    /// When it stopped without running: cancelled or failed before its funding confirmed, or
+    /// still waiting for entries after its observation window opened. None if it ran or may.
+    pub fn did_not_run(&self, now: OffsetDateTime) -> Option<OffsetDateTime> {
+        if self.reached("funding_confirmed").is_some() {
+            return None;
+        }
+        match self.state.as_str() {
+            "cancelled" => self.reached("cancelled"),
+            "failed" => self.reached("failed"),
+            // A queued competition forms its pools at the start; it is not left unfilled.
+            "created" if self.kind != CompetitionKind::Queued => {
+                let start = self
+                    .event_submission
+                    .get("start_observation_date")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|at| {
+                        OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
+                            .ok()
+                    })?;
+                (start <= now).then_some(start)
+            }
+            _ => None,
+        }
+    }
+
+    /// Paid escrows not refunded yet.
+    pub fn unrefunded(&self) -> u64 {
+        self.refunds.map_or(0, |refunds| {
+            refunds.escrowed.saturating_sub(refunds.refunded)
+        })
+    }
+
+    /// The entry fee, in sats, each escrow returns.
+    pub fn entry_fee(&self) -> Option<u64> {
+        self.event_submission
+            .get("entry_fee")
+            .and_then(serde_json::Value::as_u64)
+    }
+}
+
 /// Competition response from the API
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompetitionResponse {
@@ -374,6 +458,26 @@ impl CoordinatorClient {
         resp.json()
             .await
             .context("Failed to parse competitions response")
+    }
+
+    /// Every competition as the operator listener reports it, with its escrow refunds.
+    pub async fn list_operator_competitions(&self) -> Result<Vec<OperatorCompetition>> {
+        let url = format!("{}/api/v1/admin/competitions", self.admin_url());
+        let resp = super::retry_transport(3, || async {
+            anyhow::Ok(self.admin_get(&url).send().await?)
+        })
+        .await
+        .context("Failed to list the operator's competitions")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("List the operator's competitions failed ({status}): {body}");
+        }
+
+        resp.json()
+            .await
+            .context("Failed to parse the operator's competitions")
     }
 
     /// Get a specific competition by ID
