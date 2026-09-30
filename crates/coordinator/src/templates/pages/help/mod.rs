@@ -18,7 +18,9 @@ fn callout(number: u8) -> Markup {
     html! { span class="callout" aria-hidden="true" { (number) } }
 }
 
-pub fn help_page() -> Markup {
+/// `open_advanced` renders "How the tech works" unfolded: links into it say so in
+/// their address, since a fragment alone cannot open a `details`.
+pub fn help_page(open_advanced: bool) -> Markup {
     html! {
         div class="help-page" {
             a class="back-link" href="/competitions" hx-get="/competitions"
@@ -34,7 +36,7 @@ pub fn help_page() -> Markup {
                 a href="#statuses" { "Following your picks" }
                 a href="#pools" { "Entries and pools" }
                 a href="#payouts" { "Paying and payouts" }
-                a href="#advanced" { "How the tech works" }
+                a href="/help?open=advanced#advanced" { "How the tech works" }
             }
 
             (walkthrough())
@@ -147,7 +149,8 @@ pub fn help_page() -> Markup {
                 ul {
                     li {
                         "You pay one entry fee over Lightning, all in. "
-                        a href="#advanced" { "What's in it" } " is under How the tech works."
+                        a href="/help?open=advanced#where-your-sats-go" { "What's in it" }
+                        " is under How the tech works."
                     }
                     li {
                         "Winnings go to the Lightning Address on your account. Without one, you submit an "
@@ -161,9 +164,9 @@ pub fn help_page() -> Markup {
             }
 
             section id="advanced" class="content" {
-                details {
+                details open[open_advanced] {
                     summary { h2 class="is-inline" { "How the tech works" } }
-                    h3 { "Where your sats go" }
+                    h3 id="where-your-sats-go" { "Where your sats go" }
                     ul {
                         li {
                             strong { "Pot contribution" } ": goes into the pot. Every entrant's contribution "
@@ -301,8 +304,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn links_into_the_folded_section_open_it() {
+        let folded = help_page(false).into_string();
+        assert!(folded.contains("<details>"), "{folded}");
+        assert!(folded.contains(r##"href="/help?open=advanced#where-your-sats-go""##));
+        assert!(folded.contains(r##"href="/help?open=advanced#advanced""##));
+        assert!(folded.contains(r#"<h3 id="where-your-sats-go">"#));
+
+        let unfolded = help_page(true).into_string();
+        assert!(unfolded.contains("<details open>"), "{unfolded}");
+    }
+
+    #[test]
     fn the_walkthrough_uses_the_real_pick_buttons_and_does_nothing() {
-        let html = help_page().into_string();
+        let html = help_page(false).into_string();
         assert!(html.contains(r#"class="help-shot entry-form" inert"#));
         assert!(
             html.contains("&lt; 73.4°F")
@@ -316,7 +331,7 @@ mod tests {
     /// Both recordings load only when played, from this site's own hashed assets.
     #[test]
     fn the_video_waits_to_be_played() {
-        let html = help_page().into_string();
+        let html = help_page(false).into_string();
         for (class, mp4, poster) in [
             ("is-phone", &HOW_IT_WORKS_MP4, &HOW_IT_WORKS_JPG),
             (
@@ -339,7 +354,7 @@ mod tests {
     /// The video's music is credited as its CC BY 4.0 licence asks.
     #[test]
     fn the_video_credits_its_music() {
-        let html = help_page().into_string();
+        let html = help_page(false).into_string();
         let credit = r#"Music: <a href="https://incompetech.com/music/royalty-free/index.html?isrc=USUAN1300010">Local Forecast</a> by Kevin MacLeod (incompetech.com), <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>"#;
         // Once, under both recordings.
         assert_eq!(html.matches(credit).count(), 1);
@@ -347,7 +362,7 @@ mod tests {
 
     #[test]
     fn every_section_the_forms_link_to_is_here() {
-        let html = help_page().into_string();
+        let html = help_page(false).into_string();
         for id in [
             "walkthrough",
             "scoring",

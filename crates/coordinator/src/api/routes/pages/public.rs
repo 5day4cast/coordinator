@@ -444,12 +444,24 @@ pub async fn payouts_fragment(
 }
 
 /// How it works: the rules and scoring the competition pages leave out.
-pub async fn help_fragment(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+#[derive(Debug, Default, Deserialize)]
+pub struct HelpQuery {
+    /// `advanced` unfolds "How the tech works", for links into it.
+    #[serde(default)]
+    open: Option<String>,
+}
+
+pub async fn help_fragment(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<HelpQuery>,
+) -> Response {
+    let open_advanced = query.open.as_deref() == Some("advanced");
     page(
         &headers,
         &state,
         "How it works - Fantasy Weather",
-        help_page(),
+        help_page(open_advanced),
         Caching::Public,
     )
 }

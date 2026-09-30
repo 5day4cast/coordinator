@@ -179,7 +179,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             ),
         ),
         ("entry", entry),
-        ("help", help_page()),
+        ("help", help_page(false)),
         ("leaderboard", PreEscaped(board_page)),
         ("picks", html! { (PreEscaped(scores)) (dialog) }),
     ];
