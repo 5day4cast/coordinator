@@ -77,17 +77,17 @@ async fn gated_oracle(
 
 /// The coordinator's app, with mock Bitcoin, Lightning and oracle contract calls, reading
 /// weather from `oracle_url`.
-struct Coordinator {
-    state: Arc<AppState>,
-    router: Router,
+pub(super) struct Coordinator {
+    pub(super) state: Arc<AppState>,
+    pub(super) router: Router,
     tasks: TaskTracker,
     cancel: CancellationToken,
-    databases: Vec<DBConnection>,
+    pub(super) databases: Vec<DBConnection>,
     _data: tempfile::TempDir,
 }
 
 impl Coordinator {
-    async fn start(oracle_url: String) -> Self {
+    pub(super) async fn start(oracle_url: String) -> Self {
         let data = tempfile::tempdir().unwrap();
         let mut settings = Settings::default();
         settings.db_settings.data_folder = data.path().display().to_string();
@@ -115,7 +115,7 @@ impl Coordinator {
     }
 
     /// A competition over `stations` whose window opens at `start`.
-    async fn competition(
+    pub(super) async fn competition(
         &self,
         start: OffsetDateTime,
         stations: &[&str],
@@ -235,7 +235,7 @@ impl Coordinator {
         String::from_utf8(body.to_vec()).unwrap()
     }
 
-    async fn stop(self) {
+    pub(super) async fn stop(self) {
         self.cancel.cancel();
         for handle in self.state.background_threads.values() {
             handle.abort();

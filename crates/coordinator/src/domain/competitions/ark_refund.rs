@@ -221,15 +221,7 @@ impl Coordinator {
             let Some(status) = progress.get_mut(&competition_id) else {
                 continue;
             };
-            let opens_at = escrow_script(&tap_tree).ok().and_then(|script| {
-                match script.terms().refund_locktime {
-                    LockTime::Seconds(at) => {
-                        OffsetDateTime::from_unix_timestamp(i64::from(at.to_consensus_u32())).ok()
-                    }
-                    LockTime::Blocks(_) => None,
-                }
-            });
-            if let Some(opens_at) = opens_at {
+            if let Some(opens_at) = refund_opens_at(&tap_tree) {
                 status.opens_at = Some(status.opens_at.map_or(opens_at, |at| at.min(opens_at)));
             }
         }
@@ -1232,6 +1224,17 @@ fn needs_signing(refundable: &Refundable) -> bool {
 /// An escrow's script, from the tap tree recorded with it.
 fn entry_escrow(escrow: &TicketArkEscrow) -> Result<EntryEscrow, Error> {
     escrow_script(&escrow.escrow_tap_tree)
+}
+
+/// When the escrow a stored tap tree (hex) describes opens for its refund: its refund locktime,
+/// when that is a time.
+pub(super) fn refund_opens_at(tap_tree: &str) -> Option<OffsetDateTime> {
+    match escrow_script(tap_tree).ok()?.terms().refund_locktime {
+        LockTime::Seconds(at) => {
+            OffsetDateTime::from_unix_timestamp(i64::from(at.to_consensus_u32())).ok()
+        }
+        LockTime::Blocks(_) => None,
+    }
 }
 
 /// The entry escrow a stored tap tree (hex) describes.
