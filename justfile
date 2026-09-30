@@ -201,11 +201,29 @@ playwright-install:
 playwright:
     cd e2e && npm test
 
-# Record the help page's how-it-works video from the player page fixtures (no services needed);
-# rebuild the coordinator afterwards to embed it
+# Record the help page's how-it-works video from the player page fixtures (no services needed),
+# with "Local Forecast" by Kevin MacLeod (incompetech.com, CC BY 4.0; see e2e/video/MUSIC.md) under
+# it; rebuild the coordinator afterwards to embed it
 help-video:
+    #!/usr/bin/env bash
+    set -euo pipefail
     cargo run -p coordinator --example player_ui_fixtures -- target/player-ui
-    cd e2e && npm ci && node video/how-it-works.cjs ../target/player-ui ../crates/coordinator/src/templates/static/how-it-works.mp4
+    (cd e2e && npm ci && node video/how-it-works.cjs ../target/player-ui ../target/how-it-works-clip.mp4)
+    music=target/local-forecast.mp3
+    if ! echo "c0b120cb91a62468f5024162c8942dd2310696c076b6a1df2b88892350575b87  $music" | sha256sum -c --status 2>/dev/null; then
+        curl -fsSL -o "$music" "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Local%20Forecast.mp3"
+        echo "c0b120cb91a62468f5024162c8942dd2310696c076b6a1df2b88892350575b87  $music" | sha256sum -c --quiet
+    fi
+    # The music sits well under the picture (80 kb/s keeps a minute under 1 MB) and fades out
+    # over the last 3 s. The video is re-encoded to limited-range yuv420p (Chrome's frames are
+    # full-range JPEGs, and Safari can refuse full-range yuvj420p) with the index up front, so
+    # it starts playing before it has all loaded.
+    length=$(ffprobe -v error -show_entries format=duration -of csv=p=0 target/how-it-works-clip.mp4)
+    ffmpeg -y -v error -i target/how-it-works-clip.mp4 -i "$music" -map 0:v:0 -map 1:a:0 \
+        -vf "scale=in_range=pc:out_range=tv,format=yuv420p" -color_range tv \
+        -c:v libx264 -preset slow -crf 31 -pix_fmt yuv420p \
+        -af "volume=0.35,afade=t=out:st=$(awk -v l="$length" 'BEGIN { print l - 3 }'):d=3" -c:a aac -b:a 80k \
+        -shortest -movflags +faststart crates/coordinator/src/templates/static/how-it-works.mp4
     ffmpeg -y -v error -ss 1.2 -i crates/coordinator/src/templates/static/how-it-works.mp4 -frames:v 1 -q:v 6 crates/coordinator/src/templates/static/how-it-works.jpg
 
 # Run Playwright tests with visible browser

@@ -42,10 +42,11 @@ function serve(root) {
 }
 
 // The overlay: a ring around what is being shown, a caption bubble pointing at it, and a dot
-// where a tap lands. Drawn into the page, so it is in the recording.
+// where a tap lands, in the help page's callout teal (the Pay button's, a step darker). Drawn
+// into the page, so it is in the recording.
 const OVERLAY_CSS = `
-  .hiw-ring { position: fixed; z-index: 2147483000; pointer-events: none; border: 3px solid #e11d48;
-    border-radius: 10px; box-shadow: 0 0 0 5px rgba(225, 29, 72, .22); transition: all .35s ease; }
+  .hiw-ring { position: fixed; z-index: 2147483000; pointer-events: none; border: 3px solid #00806c;
+    border-radius: 10px; box-shadow: 0 0 0 5px rgba(0, 128, 108, .22); transition: all .35s ease; }
   .hiw-bubble { position: fixed; z-index: 2147483001; pointer-events: none; max-width: 330px;
     padding: 10px 14px; border-radius: 12px; background: #111827; color: #fff;
     font: 600 16px/1.35 system-ui, sans-serif; box-shadow: 0 6px 20px rgba(0,0,0,.3); }
@@ -55,7 +56,7 @@ const OVERLAY_CSS = `
   .hiw-bubble.is-above::before { bottom: -6px; }
   .hiw-bubble.is-centered::before { display: none; }
   .hiw-tap { position: fixed; z-index: 2147483002; pointer-events: none; width: 34px; height: 34px;
-    margin: -17px 0 0 -17px; border-radius: 50%; background: rgba(225, 29, 72, .45);
+    margin: -17px 0 0 -17px; border-radius: 50%; background: rgba(0, 128, 108, .45);
     border: 2px solid #fff; }
 `;
 
