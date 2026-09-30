@@ -1327,6 +1327,10 @@ impl Serialize for Competition {
 
 const TICKET_EXPIRY_BUFFER: Duration = Duration::minutes(1);
 
+/// How long keygen and signing may take after the contract is built before the competition
+/// expires.
+const SIGNING_TIMEOUT: Duration = Duration::hours(2);
+
 impl Competition {
     async fn generate_competition_tickets(
         &self,
@@ -1829,6 +1833,17 @@ impl Competition {
         self.errors.len() > 5
     }
 
+    /// Until when a failed Arkade kickoff is tried again: while a pool whose kickoff check failed
+    /// would still wait `fee_wait` after registration closes for fees to fall, and never past the
+    /// point the competition expires waiting for signatures.
+    pub fn kickoff_deadline(&self, fee_wait: Duration) -> OffsetDateTime {
+        let fee_wait_over = self.event_submission.start_observation_date + fee_wait;
+        match self.contracted_at {
+            Some(contracted_at) => fee_wait_over.min(contracted_at + SIGNING_TIMEOUT),
+            None => fee_wait_over,
+        }
+    }
+
     pub fn is_expired(&self) -> bool {
         self.is_expired_at(OffsetDateTime::now_utc())
     }
@@ -1853,12 +1868,10 @@ impl Competition {
 
         // Add timeouts for different stages
         match self.get_state() {
-            CompetitionState::ContractCreated | CompetitionState::AwaitingSignatures => {
-                // Give 2 hours for keymeld keygen and signing after contract creation
-                self.contracted_at
-                    .map(|t| now - t > Duration::hours(2))
-                    .unwrap_or(false)
-            }
+            CompetitionState::ContractCreated | CompetitionState::AwaitingSignatures => self
+                .contracted_at
+                .map(|t| now - t > SIGNING_TIMEOUT)
+                .unwrap_or(false),
             _ => false,
         }
     }

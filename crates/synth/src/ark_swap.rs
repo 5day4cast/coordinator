@@ -21,6 +21,10 @@ pub struct ArkWallet {
     pub boarding_address: String,
     pub confirmed_sat: u64,
     pub pre_confirmed_sat: u64,
+    /// Confirmed coins at the boarding address that no batch has taken yet. An ark-swapd older
+    /// than this field reports none.
+    #[serde(default)]
+    pub boarding_sat: u64,
 }
 
 impl ArkWallet {

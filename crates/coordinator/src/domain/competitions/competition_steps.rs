@@ -464,6 +464,167 @@ mod tests {
         database.close().await.unwrap();
     }
 
+    /// An Arkade competition whose contract is built and whose keygen is done, so its next step
+    /// runs the kickoff batch. Registration closed `closed_ago` before now.
+    fn awaiting_kickoff(closed_ago: time::Duration) -> Competition {
+        let now = OffsetDateTime::now_utc();
+        let start = now - closed_ago;
+        let mut competition = Competition::new(&CreateEvent {
+            id: Uuid::now_v7(),
+            signing_date: start + time::Duration::hours(3),
+            start_observation_date: start,
+            end_observation_date: start + time::Duration::hours(2),
+            locations: vec!["KDEN".into()],
+            number_of_values_per_entry: 3,
+            number_of_places_win: 1,
+            total_allowed_entries: 2,
+            entry_fee: 50_000,
+            coordinator_fee: crate::domain::CoordinatorFee::whole_percent(0),
+            total_competition_pool: 100_000,
+            relative_locktime_block_delta: Some(72),
+            unlisted: false,
+            scoring_rules: None,
+            scoring_fields: None,
+            max_entries_per_player: 1,
+        });
+        competition.total_entries = 2;
+        competition.total_paid_entries = 2;
+        competition.contract_parameters = Some(parameters());
+        competition.contracted_at = Some(start);
+        competition.keymeld_keygen_completed_at = Some(start);
+        competition
+    }
+
+    /// The Arkade server failing every batch, as it did for thirteen minutes on 2026-09-30.
+    fn server_failure() -> anyhow::Error {
+        anyhow!("INTERNAL_ERROR (0): failed to create commitment tx: failed to estimate fee")
+            .context("fund the pool in a batch")
+    }
+
+    #[test]
+    fn a_kickoff_waits_as_long_as_a_failed_kickoff_check_would() {
+        let hour = time::Duration::hours(1);
+        let competition = awaiting_kickoff(time::Duration::minutes(10));
+        let start = competition.event_submission.start_observation_date;
+        assert_eq!(competition.kickoff_deadline(hour), start + hour);
+
+        // Never past the point it expires waiting for signatures.
+        assert_eq!(
+            competition.kickoff_deadline(time::Duration::hours(5)),
+            competition.contracted_at.unwrap() + time::Duration::hours(2)
+        );
+        let mut never_contracted = competition.clone();
+        never_contracted.contracted_at = None;
+        assert_eq!(never_contracted.kickoff_deadline(hour), start + hour);
+    }
+
+    /// Kickoff attempts run about a minute apart, so a competition used to fail after a few
+    /// failed batches, minutes into an outage of the Arkade server, and refund every entry.
+    #[test]
+    fn failed_batches_before_the_deadline_leave_the_kickoff_retrying() {
+        let now = OffsetDateTime::now_utc();
+        let mut competition = awaiting_kickoff(time::Duration::minutes(10));
+        // Earlier errors of other kinds still count toward aborting.
+        competition.errors =
+            vec![CompetitionError::FailedEscrowConfirmation("timed out".into()); 2];
+        let deadline = now + time::Duration::minutes(50);
+        let counted = crate::metrics::COMPETITION_STEP_FAILURES.get();
+
+        let mut status = CompetitionStatus::from(competition);
+        for minute in 0..12 {
+            status = kickoff_failed(
+                status,
+                &server_failure(),
+                deadline,
+                now + time::Duration::minutes(minute),
+            );
+            assert_eq!(status.state_name(), "awaiting_signatures");
+        }
+        assert!(
+            crate::metrics::COMPETITION_STEP_FAILURES.get() >= counted + 12,
+            "each failed attempt is counted"
+        );
+        let competition = status.into_competition();
+        assert!(competition.failed_at.is_none());
+        assert_eq!(
+            competition.errors.len(),
+            2,
+            "failed batches are not counted"
+        );
+        assert!(!competition.should_abort());
+        assert_eq!(
+            CompetitionStatus::from(competition).state_name(),
+            "awaiting_signatures",
+            "it reloads in the state it retries from"
+        );
+    }
+
+    #[test]
+    fn a_failed_batch_at_the_deadline_fails_the_competition_with_the_server_error() {
+        let now = OffsetDateTime::now_utc();
+        let status = CompetitionStatus::from(awaiting_kickoff(time::Duration::minutes(60)));
+        let counted = crate::metrics::COMPETITION_STEP_FAILURES.get();
+
+        let failed = kickoff_failed(status, &server_failure(), now, now);
+        assert_eq!(failed.state_name(), "failed");
+        assert!(crate::metrics::COMPETITION_STEP_FAILURES.get() > counted);
+        let competition = failed.into_competition();
+        assert!(competition.failed_at.is_some());
+        let reason = competition.errors.last().unwrap().to_string();
+        assert!(
+            reason.contains("failed to estimate fee") && reason.contains("deadline"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn other_errors_still_abort_after_six() {
+        let mut competition = awaiting_kickoff(time::Duration::minutes(10));
+        competition.errors = vec![CompetitionError::FailedFundingConfirmation("no tip".into()); 5];
+        assert!(!competition.should_abort());
+        competition
+            .errors
+            .push(CompetitionError::FailedFundingConfirmation("no tip".into()));
+        assert!(competition.should_abort());
+    }
+
+    /// Through the step itself: a kickoff that cannot run (here Arkade is not configured) is
+    /// retried until the deadline, and fails the competition after it.
+    #[tokio::test]
+    async fn the_kickoff_step_retries_until_its_deadline_and_then_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let (coordinator, database) = test_coordinator(directory.path()).await;
+        let store = &coordinator.competition_store;
+
+        let retrying = awaiting_kickoff(time::Duration::minutes(10));
+        let late = awaiting_kickoff(time::Duration::minutes(90));
+        let fee_wait = time::Duration::seconds(coordinator.kickoff_check.fee_wait_secs as i64);
+        assert!(retrying.kickoff_deadline(fee_wait) > OffsetDateTime::now_utc());
+        assert!(late.kickoff_deadline(fee_wait) <= OffsetDateTime::now_utc());
+        for competition in [&retrying, &late] {
+            store
+                .add_competition_with_tickets(competition.clone(), vec![])
+                .await
+                .unwrap();
+            store.mark_ark_funded(competition.id).await.unwrap();
+        }
+
+        let mut status = CompetitionStatus::from(retrying);
+        for _ in 0..(6 + 2) {
+            status = coordinator.process_status(status).await;
+            assert_eq!(status.state_name(), "awaiting_signatures");
+        }
+        assert!(status.into_competition().errors.is_empty());
+
+        let failed = coordinator
+            .process_status(CompetitionStatus::from(late))
+            .await;
+        assert_eq!(failed.state_name(), "failed");
+        let reason = failed.into_competition().errors.last().unwrap().to_string();
+        assert!(reason.contains("Arkade is not configured"), "{reason}");
+        database.close().await.unwrap();
+    }
+
     /// Competitions an earlier version failed, then cancelled, while their contract held the pot
     /// on-chain are picked up again and settle; ones that never had a funded contract stay
     /// cancelled.

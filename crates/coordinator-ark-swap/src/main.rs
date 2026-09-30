@@ -87,12 +87,13 @@ async fn main() -> anyhow::Result<()> {
     let view = swapper.wallet.view().await?;
     log::info!(
         "Ark wallet {} holds {} sat confirmed and {} sat preconfirmed, {} sat of it too close to \
-         expiry to pay an escrow, and {} sat recoverable; boarding address {}",
+         expiry to pay an escrow, and {} sat recoverable; {} sat await boarding at {}",
         view.ark_address,
         view.confirmed_sat,
         view.pre_confirmed_sat,
         view.expiring_sat,
         view.recoverable_sat,
+        view.boarding_sat,
         view.boarding_address
     );
 

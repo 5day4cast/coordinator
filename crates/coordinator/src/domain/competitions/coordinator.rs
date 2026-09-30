@@ -121,6 +121,37 @@ fn retry_settlement(status: CompetitionStatus, error: CompetitionError) -> Compe
     CompetitionStatus::from(competition)
 }
 
+/// What a failed Arkade kickoff leaves its competition in.
+///
+/// A failed batch spends nothing, and the Arkade server's outages pass. So while `deadline` is
+/// ahead the competition stays where it is and its next step tries again, and the failure does
+/// not count toward `should_abort`: a short outage used to fail a competition after a handful of
+/// attempts a minute apart. Once `deadline` has passed the competition fails with the last
+/// error, and every entry is refunded.
+fn kickoff_failed(
+    status: CompetitionStatus,
+    error: &anyhow::Error,
+    deadline: OffsetDateTime,
+    now: OffsetDateTime,
+) -> CompetitionStatus {
+    let competition_id = status.competition_id();
+    crate::metrics::COMPETITION_STEP_FAILURES.inc();
+    if now < deadline {
+        warn!(
+            "Competition {competition_id} Arkade kickoff failed, and is tried again until \
+             {deadline}: {error:#}"
+        );
+        return status;
+    }
+    error!(
+        "Competition {competition_id} Arkade kickoff failed, and it fails: its deadline to kick \
+         off, {deadline}, has passed: {error:#}"
+    );
+    status.fail(CompetitionError::FailedBroadcast(format!(
+        "the Arkade kickoff was still failing at its deadline, {deadline}: {error:#}"
+    )))
+}
+
 /// Whether the split-reclaim transactions can be broadcast yet.
 ///
 /// The market maker's reclaim path on a split output is locked for the contract's reclaim delay
@@ -982,14 +1013,18 @@ impl Coordinator {
                             }
                         }
                         Err(e) => {
-                            error!("Competition {competition_id} Arkade kickoff failed: {e:#}");
-                            let error = CompetitionError::FailedBroadcast(e.to_string());
-                            state.competition_mut().errors.push(error.clone());
-                            if state.competition().should_abort() {
-                                CompetitionStatus::AwaitingSignatures(state).fail(error)
-                            } else {
-                                CompetitionStatus::AwaitingSignatures(state)
-                            }
+                            let deadline =
+                                state
+                                    .competition()
+                                    .kickoff_deadline(time::Duration::seconds(
+                                        self.kickoff_check.fee_wait_secs as i64,
+                                    ));
+                            kickoff_failed(
+                                CompetitionStatus::AwaitingSignatures(state),
+                                &e,
+                                deadline,
+                                OffsetDateTime::now_utc(),
+                            )
                         }
                     };
                 }
