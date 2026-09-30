@@ -9,7 +9,7 @@ use crate::domain::{
     PayoutTermsQuote, TicketStatus, ENTRIES_PAUSED,
 };
 use crate::templates::{
-    components::tip,
+    components::{tip, tip_start},
     format::{self, sats, MetricText, TimeStyle},
     fragments::loading::{placeholder, Pending},
     pages::competitions::CompetitionView,
@@ -95,7 +95,7 @@ pub fn entry_form(
 
             dl class="entry-facts" {
                 div {
-                    dt { "Entries close" (tip("Picks lock then, and the readings count from that moment on.")) }
+                    dt { "Entries close" (tip_start("Picks lock then, and the readings count from that moment on.")) }
                     dd { (format::time(competition.start, TimeStyle::DateTime)) }
                 }
                 div {
@@ -514,6 +514,8 @@ mod tests {
         assert!(html.contains(r#"data-network-fee="50""#));
         assert!(html.contains(r#"<span id="ticketTotal">5,300 sats</span>"#));
         assert!(html.contains("Pay 5,300 sats and enter"));
+        // At the start of its line, so its bubble grows rightwards and stays on a phone.
+        assert!(html.contains(r#"<dt>Entries close<span class="tip tip-start""#));
     }
 
     /// The price is one total, "what it costs me"; tapping it opens the entry, service and

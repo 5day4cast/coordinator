@@ -27,8 +27,17 @@ pub struct TicketArkEscrow {
 /// A competition's funded escrows, and how many of their players have been refunded.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RefundProgress {
+    /// Paid tickets whose escrow is funded: the entry fees to return.
     pub escrowed: u64,
     pub refunded: u64,
+    /// When the first escrow not refunded yet can be: its refund locktime. Nothing can be
+    /// refunded before. Only the pages ask for it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub opens_at: Option<OffsetDateTime>,
 }
 
 /// Where a funded escrow's refund has got to.
@@ -153,6 +162,11 @@ fn escrow_row(row: &sqlx::sqlite::SqliteRow) -> Result<TicketArkEscrow, sqlx::Er
             .try_get::<Option<i64>, _>("vtxo_sats")?
             .map(|sats| sats as u64),
     })
+}
+
+/// Competition ids as a JSON array, for `json_each` in a query.
+fn id_list(ids: &[Uuid]) -> String {
+    serde_json::Value::from(ids.iter().map(Uuid::to_string).collect::<Vec<_>>()).to_string()
 }
 
 impl CompetitionStore {
@@ -350,14 +364,14 @@ impl CompetitionStore {
         Ok(count as u64)
     }
 
-    /// How far the refunds of each competition's funded escrows have got, for `event_id` or for
+    /// How far the refunds of each competition's funded escrows have got, for `event_ids` or for
     /// every competition. Competitions without funded escrows are left out.
     ///
     /// An escrow counts once its player has been paid; the escrows of a pool that a batch
     /// funded were spent into it, so they are not counted at all.
     pub async fn ark_refund_progress(
         &self,
-        event_id: Option<Uuid>,
+        event_ids: Option<&[Uuid]>,
     ) -> Result<std::collections::HashMap<Uuid, RefundProgress>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT t.event_id AS event_id, COUNT(*) AS escrowed,
@@ -365,13 +379,13 @@ impl CompetitionStore {
              FROM ticket_ark_escrows e
              JOIN tickets t ON t.id = e.ticket_id AND t.hash = e.ticket_hash
              LEFT JOIN ticket_ark_refunds r ON r.ticket_id = e.ticket_id
-             WHERE e.funded_at IS NOT NULL
-               AND (?1 IS NULL OR t.event_id = ?1)
+             WHERE e.funded_at IS NOT NULL AND t.paid_at IS NOT NULL
+               AND (?1 IS NULL OR t.event_id IN (SELECT value FROM json_each(?1)))
                AND NOT EXISTS (SELECT 1 FROM ark_funded_competitions a
                                WHERE a.event_id = t.event_id AND a.commitment_tx IS NOT NULL)
              GROUP BY t.event_id",
         )
-        .bind(event_id.map(|id| id.to_string()))
+        .bind(event_ids.map(id_list))
         .fetch_all(self.db_connection.read())
         .await?;
         rows.iter()
@@ -383,8 +397,38 @@ impl CompetitionStore {
                     RefundProgress {
                         escrowed: row.try_get::<i64, _>("escrowed")? as u64,
                         refunded: row.try_get::<i64, _>("refunded")? as u64,
+                        opens_at: None,
                     },
                 ))
+            })
+            .collect()
+    }
+
+    /// The tap trees of the funded escrows of `event_ids` whose players are not refunded yet,
+    /// with their competitions. Each holds when its refund opens.
+    pub async fn unrefunded_ark_escrow_trees(
+        &self,
+        event_ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT t.event_id AS event_id, e.escrow_tap_tree AS escrow_tap_tree
+             FROM ticket_ark_escrows e
+             JOIN tickets t ON t.id = e.ticket_id AND t.hash = e.ticket_hash
+             LEFT JOIN ticket_ark_refunds r ON r.ticket_id = e.ticket_id
+             WHERE e.funded_at IS NOT NULL AND t.paid_at IS NOT NULL
+               AND (r.state IS NULL OR r.state NOT IN ('paid', 'settled'))
+               AND t.event_id IN (SELECT value FROM json_each(?1))
+               AND NOT EXISTS (SELECT 1 FROM ark_funded_competitions a
+                               WHERE a.event_id = t.event_id AND a.commitment_tx IS NOT NULL)",
+        )
+        .bind(id_list(event_ids))
+        .fetch_all(self.db_connection.read())
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let id: String = row.try_get("event_id")?;
+                let id = Uuid::parse_str(&id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+                Ok((id, row.try_get("escrow_tap_tree")?))
             })
             .collect()
     }

@@ -48,7 +48,7 @@ use crate::{
         },
         layouts::base::{base, PageConfig},
         pages::{
-            competitions::{competitions_page, CompetitionView, ListOptions},
+            competitions::{competitions_page, shown_ids, CompetitionView, ListOptions},
             entries::{entries_page, sign_in_required, EntryRow},
             help::help_page,
             payouts::payouts_page,
@@ -184,10 +184,11 @@ fn now() -> OffsetDateTime {
     OffsetDateTime::now_utc()
 }
 
+/// Every competition as the lists show it, read without contracts: until [`complete`] is given
+/// a view, it has no refunds and doesn't say whether its pot went back to the players.
 async fn competition_views(state: &AppState, now: OffsetDateTime) -> Vec<CompetitionView> {
-    let (competitions, refunds, network_fee) = tokio::join!(
-        state.coordinator.get_competitions(),
-        refund_progress(state, None),
+    let (competitions, network_fee) = tokio::join!(
+        state.coordinator.list_competitions(),
         state.coordinator.shown_network_fee_quote(),
     );
     // What a ticket issued now adds, so the price shown is what entering costs.
@@ -197,7 +198,6 @@ async fn competition_views(state: &AppState, now: OffsetDateTime) -> Vec<Competi
             .iter()
             .map(|competition| {
                 let mut view = CompetitionView::new(competition, now);
-                view.refunds = refunds.get(&competition.id).copied().unwrap_or_default();
                 view.network_fee = network_fee.filter(|_| view.can_enter);
                 view
             })
@@ -209,15 +209,56 @@ async fn competition_views(state: &AppState, now: OffsetDateTime) -> Vec<Competi
     }
 }
 
-/// How far competitions' escrow refunds have got; none if that can't be read, so a page still
-/// renders.
-async fn refund_progress(
+/// Adds what the page shows of the competitions `shown` and the list leaves out: their refunds,
+/// and for a scored one whether its pot went back to the players, which takes its contract.
+async fn complete(state: &AppState, views: &mut [CompetitionView], shown: &[String]) {
+    let ids: Vec<Uuid> = shown
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect();
+    let scored: Vec<Uuid> = views
+        .iter()
+        .filter(|view| view.phase == Phase::Scored && shown.contains(&view.id))
+        .filter_map(|view| Uuid::parse_str(&view.id).ok())
+        .collect();
+    let (refunds, scored) = tokio::join!(
+        refund_status(state, &ids),
+        futures::future::join_all(
+            scored
+                .into_iter()
+                .map(|id| state.coordinator.get_competition(id))
+        )
+    );
+    for view in views.iter_mut() {
+        if let Some(progress) = Uuid::parse_str(&view.id)
+            .ok()
+            .and_then(|id| refunds.get(&id))
+        {
+            view.refunds = *progress;
+        }
+    }
+    for competition in scored {
+        match competition {
+            Ok(competition) => {
+                let id = competition.id.to_string();
+                if let Some(view) = views.iter_mut().find(|view| view.id == id) {
+                    view.add_contract(&competition);
+                }
+            }
+            Err(error) => error!("failed to load a shown competition: {error}"),
+        }
+    }
+}
+
+/// How far the escrow refunds of `competition_ids` have got; none if that can't be read, so a
+/// page still renders.
+async fn refund_status(
     state: &AppState,
-    competition_id: Option<Uuid>,
+    competition_ids: &[Uuid],
 ) -> std::collections::HashMap<Uuid, RefundProgress> {
     state
         .coordinator
-        .refund_progress(competition_id)
+        .refund_status(competition_ids)
         .await
         .unwrap_or_else(|error| {
             error!("failed to read refund progress: {error}");
@@ -232,7 +273,7 @@ async fn competition_view(
     now: OffsetDateTime,
 ) -> CompetitionView {
     let mut view = CompetitionView::new(competition, now);
-    view.refunds = refund_progress(state, Some(competition.id))
+    view.refunds = refund_status(state, &[competition.id])
         .await
         .remove(&competition.id)
         .unwrap_or_default();
@@ -285,8 +326,11 @@ pub async fn competitions_fragment(
     headers: HeaderMap,
 ) -> Response {
     let now = now();
-    let competitions = competition_views(&state, now).await;
-    let content = competitions_page(&competitions, query.into(), now);
+    let options = ListOptions::from(query);
+    let mut competitions = competition_views(&state, now).await;
+    let shown = shown_ids(&competitions, options);
+    complete(&state, &mut competitions, &shown).await;
+    let content = competitions_page(&competitions, options, now);
     page(
         &headers,
         &state,
@@ -307,11 +351,16 @@ pub async fn entries_fragment(
         return signed_out(&headers, &state, title, "/entries", "your entries");
     };
     let now = now();
-    let (entries, competitions) = tokio::join!(
+    let (entries, mut competitions) = tokio::join!(
         state.coordinator.get_user_entry_views(pubkey.to_hex()),
         competition_views(&state, now)
     );
     let entries = entries.unwrap_or_default();
+    let shown: Vec<String> = entries
+        .iter()
+        .map(|entry| entry.competition_id.clone())
+        .collect();
+    complete(&state, &mut competitions, &shown).await;
     let rows: Vec<EntryRow> = entries
         .iter()
         .map(|entry| EntryRow {
@@ -323,7 +372,7 @@ pub async fn entries_fragment(
         .collect();
     let open = competitions
         .iter()
-        .filter(|competition| competition.can_enter)
+        .filter(|competition| competition.can_enter && !competition.unlisted)
         .min_by_key(|competition| competition.start);
     page(
         &headers,

@@ -33,7 +33,8 @@
   left: 50%;
   bottom: calc(100% + 0.4rem);
   width: max-content;
-  max-width: min(16rem, 80vw);
+  /* Never wider than the screen, less its margins. */
+  max-width: min(16rem, calc(100vw - 2rem));
   padding: 0.4rem 0.6rem;
   border-radius: 6px;
   background: var(--bulma-scheme-invert);
@@ -61,4 +62,21 @@
   left: auto;
   right: 0;
   transform: none;
+}
+
+/* Near a left edge (a term that starts a line, the help page's legend), it grows rightwards. */
+.tip-start::after,
+.help-statuses .pick-state[data-tip]::after {
+  left: 0;
+  right: auto;
+  transform: none;
+}
+
+/* On touch screens a "?" takes a 44 px tap around it. */
+@media (pointer: coarse) {
+  .tip::before {
+    content: "";
+    position: absolute;
+    inset: calc((1.05rem - 44px) / 2);
+  }
 }

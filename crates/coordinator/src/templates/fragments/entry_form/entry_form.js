@@ -330,8 +330,11 @@ function collectPicks(form) {
   return picks;
 }
 
+// Pay while signed out: log in first. The wallet starts loading now, not
+// when the form is shown.
 function showLogin() {
   openModal(document.getElementById("loginModal"));
+  loadWallet();
 }
 
 const TERMS_CHANGED = "This competition's terms changed since the form opened; go back to the competitions list and open it again";

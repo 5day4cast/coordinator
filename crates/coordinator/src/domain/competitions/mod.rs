@@ -12,6 +12,8 @@ mod coordinator;
 mod coordinator_fee;
 mod eligible_payouts;
 mod lease_store;
+#[cfg(test)]
+mod list_store_tests;
 mod metrics_store;
 mod payout;
 mod queued;
@@ -1375,6 +1377,13 @@ impl Competition {
                         .zip(weights.values().min())
                         .is_some_and(|(max, min)| max - min <= 1)
             })
+    }
+
+    /// Whether the public lists show it. An unlisted competition is reached by its link, and
+    /// is in the API. A queued competition's reference event is always off the oracle's list,
+    /// and its pools copy it, so for them the flag says nothing: they are listed.
+    pub fn is_listed(&self) -> bool {
+        self.kind != CompetitionKind::Single || !self.event_submission.unlisted
     }
 
     pub(crate) fn get_current_outcome(&self) -> Result<Outcome, anyhow::Error> {

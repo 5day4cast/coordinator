@@ -78,14 +78,23 @@ function resetForgotPasswordModal() {
   document.getElementById("forgotStep3")?.classList.add("is-hidden");
 }
 
-// Log-in and sign-up buttons anywhere on the page, including ones htmx
-// swaps in later, carry data-open-modal. Opening either starts loading the
-// wallet, so it is ready by the time the form is filled in.
+// Starts loading the wallet, which takes most of a second, so it is ready by
+// the time the form is sent.
+function loadWallet() {
+  initWasm().catch(() => {});
+}
+
+// Log-in and sign-up buttons anywhere on the page, including ones htmx swaps
+// in later, carry data-open-modal; clicking one loads the wallet. A dialog the
+// page opens itself (an account page opened while signed out) loads it only
+// once the visitor types in it, so a visitor who doesn't log in never
+// downloads it; sending the form loads it in any case.
 function openAuthModal(id, opener = document.activeElement) {
   if (id === "loginModal") resetLoginModal();
   if (id === "registerModal") resetRegisterModal();
-  openModal(document.getElementById(id), opener);
-  initWasm().catch(() => {});
+  const modal = document.getElementById(id);
+  openModal(modal, opener);
+  modal?.addEventListener("input", loadWallet, { once: true });
 }
 
 function setupAuthModals(authManager) {
@@ -94,6 +103,7 @@ function setupAuthModals(authManager) {
     if (!opener) return;
     event.preventDefault();
     openAuthModal(opener.dataset.openModal, opener);
+    loadWallet();
   });
 
   document.getElementById("closeLoginModal")?.addEventListener("click", () => {

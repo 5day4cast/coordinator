@@ -7,7 +7,7 @@ use crate::domain::UserEntryView;
 use crate::templates::{
     format,
     fragments::picks::detail_url,
-    pages::competitions::{phase_badge, CompetitionView, Queue},
+    pages::competitions::{phase_badge, refund_line, CompetitionView, Queue},
 };
 
 /// An entry with its competition, when the competition could be loaded.
@@ -74,7 +74,12 @@ fn entry_row(row: &EntryRow) -> Markup {
                 }
             }
             td data-label="Status" {
-                @if let Some(competition) = row.competition { (phase_badge(competition)) }
+                @if let Some(competition) = row.competition {
+                    (phase_badge(competition))
+                    @if let Some(refunds) = refund_line(competition, OffsetDateTime::now_utc()) {
+                        span class="cell-note refund-line" { (refunds) }
+                    }
+                }
             }
             td data-label="Entry" { (format::copyable_id(&row.entry.entry_id)) }
             td data-label="Payment" { (row.entry.status) }

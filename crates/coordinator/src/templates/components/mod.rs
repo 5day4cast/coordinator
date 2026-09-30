@@ -4,4 +4,4 @@ mod tip;
 
 pub use modals::auth_modals;
 pub use navbar::{menu_toggle, navbar};
-pub use tip::tip;
+pub use tip::{tip, tip_start};

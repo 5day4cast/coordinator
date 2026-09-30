@@ -167,6 +167,40 @@ impl Coordinator {
         }))
     }
 
+    /// How far the escrow refunds of `competition_ids` have got, and when the first escrow
+    /// not refunded yet opens for its refund. The pages ask for the competitions they show.
+    pub async fn refund_status(
+        &self,
+        competition_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, super::RefundProgress>, Error> {
+        if competition_ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let (mut progress, trees) = tokio::try_join!(
+            self.competition_store
+                .ark_refund_progress(Some(competition_ids)),
+            self.competition_store
+                .unrefunded_ark_escrow_trees(competition_ids),
+        )?;
+        for (competition_id, tap_tree) in trees {
+            let Some(status) = progress.get_mut(&competition_id) else {
+                continue;
+            };
+            let opens_at = escrow_script(&tap_tree).ok().and_then(|script| {
+                match script.terms().refund_locktime {
+                    LockTime::Seconds(at) => {
+                        OffsetDateTime::from_unix_timestamp(i64::from(at.to_consensus_u32())).ok()
+                    }
+                    LockTime::Blocks(_) => None,
+                }
+            });
+            if let Some(opens_at) = opens_at {
+                status.opens_at = Some(status.opens_at.map_or(opens_at, |at| at.min(opens_at)));
+            }
+        }
+        Ok(progress)
+    }
+
     /// Refund every funded escrow of a competition that will never kick off.
     ///
     /// Runs from the cleanup queue, so a refund that cannot finish now is retried later: a
@@ -1022,8 +1056,13 @@ fn needs_signing(refundable: &Refundable) -> bool {
 
 /// An escrow's script, from the tap tree recorded with it.
 fn entry_escrow(escrow: &TicketArkEscrow) -> Result<EntryEscrow, Error> {
-    let tap_tree = hex::decode(&escrow.escrow_tap_tree)
-        .map_err(|e| anyhow!("The escrow's tap tree is not hex: {e}"))?;
+    escrow_script(&escrow.escrow_tap_tree)
+}
+
+/// The entry escrow a stored tap tree (hex) describes.
+fn escrow_script(tap_tree: &str) -> Result<EntryEscrow, Error> {
+    let tap_tree =
+        hex::decode(tap_tree).map_err(|e| anyhow!("The escrow's tap tree is not hex: {e}"))?;
     Ok(EntryEscrow::from_vtxo_script(
         &VtxoScript::decode_tap_tree(&tap_tree)
             .map_err(|e| anyhow!("The escrow's tap tree is invalid: {e}"))?,

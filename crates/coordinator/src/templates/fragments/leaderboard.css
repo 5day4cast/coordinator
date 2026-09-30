@@ -115,3 +115,7 @@
   background: hsla(141, 53%, 42%, 0.18);
   color: hsl(141, 53%, 30%);
 }
+
+[data-theme="dark"] .paid-badge {
+  color: hsl(141, 53%, 65%);
+}

@@ -12,8 +12,8 @@ use time::OffsetDateTime;
 
 use crate::domain::leaderboard::Phase;
 use crate::templates::{
-    components::tip,
-    format::{self, ordinal, sats},
+    components::{tip, tip_start},
+    format::{self, ordinal, sats, TimeStyle},
     fragments::picks::{detail_url, LIVE_REFRESH},
     pages::competitions::{phase_badge, CompetitionView, PoolLink, Queue, QueueView, Refunds},
 };
@@ -97,7 +97,7 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
                     }
                 } @else if competition.pot_refunded || competition.phase == Phase::Expired {
                     div class="refund-fact" {
-                        dt { "Pot return allocation" }
+                        dt { "Each entry's share" }
                         dd { (refund_allocation(competition)) }
                     }
                 } @else if competition.has_ranked_prizes() {
@@ -122,11 +122,11 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
 
             @if competition.pot_refunded || competition.phase == Phase::Expired {
                 p class="notice" {
-                    "The allocation follows the signed contract; payment may still be pending."
+                    "The competition's terms set these shares; payment may still be pending."
                     @let fee = competition.ticket_price.saturating_sub(competition.entry_fee);
                     @if fee > 0 {
-                        " The " (sats(fee)) " coordinator fee in each " (sats(competition.ticket_price))
-                        " ticket is outside the pot and is not part of this return."
+                        " The " (sats(fee)) " service fee in each " (sats(competition.ticket_price))
+                        " ticket isn't part of the pot, so it isn't shared back."
                     }
                 }
             }
@@ -144,7 +144,7 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
                         "Not enough entries arrived before the window started, so this competition "
                     }
                     "doesn't run and nothing is scored. "
-                    (refund_note(competition))
+                    (refund_note(competition, now))
                 }
             } @else if !split && !ran(competition.phase) {
                 p class="notice" { "This competition did not run, so nothing is scored." }
@@ -247,13 +247,13 @@ pub fn leaderboard_scores(
                 Phase::AwaitingResult => {
                     p class="provisional-note" {
                         "Window closed"
-                        (tip("Scores so far; the oracle's own reading decides the final result."))
+                        (tip_start("Scores so far; the oracle's own reading decides the final result."))
                     }
                 }
                 Phase::Expired => {
                     p class="notice" {
-                        "The contract expired without an oracle attestation. Its signed expiry terms "
-                        "determine each entry's pot return."
+                        "The oracle never signed a result in time, so under the competition's terms "
+                        "the pot is shared back among the entries."
                     }
                 }
                 Phase::Scored if competition.pot_refunded => {
@@ -264,7 +264,7 @@ pub fn leaderboard_scores(
                         } @else {
                             "No entry scored any points. "
                         }
-                        "Each entry receives a share of the pot under this competition's signed terms."
+                        "Each entry receives a share of the pot under this competition's terms."
                         @if competition.refund_shares.as_ref().is_some_and(|shares| {
                             shares.first().is_some_and(|first| shares.iter().any(|amount| amount != first))
                         }) {
@@ -274,8 +274,8 @@ pub fn leaderboard_scores(
                 }
                 Phase::Scored if !board.any_readings && !board.rows.is_empty() => {
                     p class="notice" {
-                        "No readings are available for this window. The signed outcome determines "
-                        "payouts; this page could not verify a pot-return allocation."
+                        "No readings are available for this window. The oracle's result decides the "
+                        "payouts; this page couldn't work out each entry's share."
                     }
                 }
                 _ => {}
@@ -334,16 +334,21 @@ fn refund_allocation(competition: &CompetitionView) -> Markup {
     }
 }
 
-/// What happened to the entry fees of a competition that didn't fill.
-fn refund_note(competition: &CompetitionView) -> Markup {
+/// What happened to the entry fees of a competition that didn't fill. Escrowed fees can't
+/// move until their escrows' refund locktime, so until then it says when they will.
+fn refund_note(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
     let progress = competition.refunds;
     html! {
-        @match competition.refunds() {
+        @match competition.refunds(now) {
             Refunds::Nothing => { "No entry fees were paid." }
             Refunds::Done => { "Every entry fee has been returned." }
+            Refunds::Locked(at) => {
+                "Entry fees go back to the refund destination shown when entering. Refunds open "
+                (format::time(at, TimeStyle::DateTime)) ", when the escrows holding them unlock."
+            }
             Refunds::Pending if progress.escrowed > 0 => {
-                "Entry fees go back to the refund destination shown when entering: "
-                (progress.refunded) " of " (progress.escrowed) " returned so far."
+                "Refunding… Entry fees go back to the refund destination shown when entering: "
+                (progress.refunded) " of " (progress.escrowed) " paid entry fees returned so far."
             }
             Refunds::Pending => {
                 "Entry fees go back to the refund destination shown when entering once it is cancelled."
@@ -687,10 +692,23 @@ mod tests {
         competition.refunds = crate::domain::RefundProgress {
             escrowed: 2,
             refunded: 1,
+            opens_at: Some(NOW - time::Duration::minutes(5)),
         };
         let page = leaderboard(&competition, NOW).into_string();
         assert!(page.contains("nothing is scored"));
-        assert!(page.contains("1 of 2 returned so far"));
+        assert!(page.contains("Refunding… "));
+        assert!(page.contains("1 of 2 paid entry fees returned so far"));
+
+        // Until the escrows unlock, it says when refunds open rather than "0 of 2".
+        let mut locked = competition.clone();
+        locked.refunds.refunded = 0;
+        locked.refunds.opens_at = Some(NOW + time::Duration::hours(15));
+        let page = leaderboard(&locked, NOW).into_string();
+        assert!(
+            page.contains(r#"Refunds open <time datetime="2026-09-25T03:00:00Z""#),
+            "{page}"
+        );
+        assert!(!page.contains("returned so far") && !page.contains("Refunding"));
 
         let board = LeaderboardView {
             rows: vec![row("e1", "bob", 30, 1), row("e2", "amy", 30, 1)],
@@ -739,9 +757,9 @@ mod tests {
         assert!(!html.contains("earlier entry is paid"));
         assert!(!html.contains("0 pts"), "{html}");
         assert_eq!(html.matches("not scored").count(), 3);
-        assert!(phase_badge(&competition)
-            .into_string()
-            .contains(">Pot return</span>"));
+        let badge = phase_badge(&competition).into_string();
+        assert!(badge.contains(">Finished</span>"));
+        assert!(badge.contains("the pot is shared back"));
 
         board.any_readings = true;
         let with_readings = leaderboard_scores(&competition, &board, NOW).into_string();
@@ -752,7 +770,10 @@ mod tests {
         competition.pot_refunded = false;
         board.any_readings = false;
         let html = leaderboard_scores(&competition, &board, NOW).into_string();
-        assert!(html.contains("could not verify a pot-return allocation"));
+        assert!(
+            html.contains("couldn&#39;t work out each entry&#39;s share")
+                || html.contains("couldn't work out each entry's share")
+        );
         assert!(html.contains("0 pts"));
         assert!(phase_badge(&competition)
             .into_string()
@@ -772,12 +793,15 @@ mod tests {
         competition.pot_refunded = true;
         competition.refund_shares = Some(vec![1_020, 990, 990]);
         let historical = leaderboard(&competition, NOW).into_string();
-        assert!(historical.contains("Pot return allocation"));
+        assert!(
+            historical.contains("Each entry&#39;s share")
+                || historical.contains("Each entry's share")
+        );
         assert!(historical.contains("1 entry × 1,020 sats"));
         assert!(historical.contains("2 entries × 990 sats"));
         assert!(historical.contains("payment may still be pending"));
-        assert!(historical.contains("100 sats coordinator fee in each 1,100 sats ticket"));
-        assert!(historical.contains("outside the pot and is not part of this return"));
+        assert!(historical.contains("100 sats service fee in each 1,100 sats ticket"));
+        assert!(!historical.contains("coordinator fee") && !historical.contains("signed contract"));
         assert!(!historical.contains("Pot returned"));
         assert!(!historical.contains("Paid places"));
         assert!(!historical.contains("1st"));
@@ -813,11 +837,11 @@ mod tests {
         competition.ticket_price = 1_000;
         competition.refund_shares = Some(vec![1_000; 3]);
         let html = leaderboard(&competition, NOW).into_string();
-        assert!(html.contains("Contract expired"));
-        assert!(html.contains("Pot return allocation"));
+        assert!(html.contains(">Finished</span>"));
+        assert!(html.contains("Each entry&#39;s share") || html.contains("Each entry's share"));
         assert!(html.contains("1,000 sats per entry"));
         assert!(html.contains("payment may still be pending"));
-        assert!(!html.contains("coordinator fee"));
+        assert!(!html.contains("service fee"));
         assert!(!html.contains("Paid places"));
         assert!(!html.contains("Pot returned"));
 
@@ -828,8 +852,8 @@ mod tests {
             any_readings: false,
         };
         let scores = leaderboard_scores(&competition, &board, NOW).into_string();
-        assert!(scores.contains("expired without an oracle attestation"));
-        assert!(scores.contains("signed expiry terms"));
+        assert!(scores.contains("never signed a result in time"));
+        assert!(!scores.contains("attestation") && !scores.contains("signed expiry terms"));
         assert!(!scores.contains("No-score outcome"));
         assert!(!scores.contains("0 pts"));
     }

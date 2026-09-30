@@ -66,6 +66,35 @@ a.competition-row.htmx-request {
   color: var(--bulma-text-strong);
 }
 
+/* Touch screens: every small control takes a tap of at least 44 px. The copy button keeps its
+   size in the row and takes the tap around it. */
+@media (pointer: coarse) {
+  .copy-button {
+    position: relative;
+  }
+
+  .copy-button::before {
+    content: "";
+    position: absolute;
+    inset: -15px -4px;
+  }
+
+  .picks-button,
+  .navbar-burger {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .modal-close.is-large {
+    width: 44px;
+    height: 44px;
+    min-width: 44px;
+    min-height: 44px;
+    max-width: 44px;
+    max-height: 44px;
+  }
+}
+
 /* "You" on the viewer's own rows, marked in the browser. */
 .you-badge {
   display: none;
@@ -150,6 +179,10 @@ tr.is-own td {
 .navbar-brand-text {
   flex-direction: column;
   align-items: flex-start;
+}
+
+.brand-note {
+  color: var(--bulma-text-weak);
 }
 
 .github-icon {
