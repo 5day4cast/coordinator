@@ -69,6 +69,18 @@
   text-align: right;
 }
 
+/* The numbered notes wear the Pay button's teal, a step darker: white on it is 4.9:1, and the
+   list numbers are 4.9:1 on the light page. Numbers in the list lighten to the full teal on the
+   dark page (8.7:1). The video's rings use the same colour. */
+.help-page {
+  --help-callout: hsl(var(--bulma-primary-h), var(--bulma-primary-s), 25%);
+  --help-callout-marker: var(--help-callout);
+}
+
+[data-theme="dark"] .help-page {
+  --help-callout-marker: hsl(var(--bulma-primary-h), var(--bulma-primary-s), 41%);
+}
+
 .callout {
   display: inline-flex;
   align-items: center;
@@ -77,7 +89,7 @@
   height: 1.4rem;
   margin-left: 0.35rem;
   border-radius: 50%;
-  background: hsl(348, 70%, 50%);
+  background: var(--help-callout);
   color: #fff;
   font-size: 0.8rem;
   font-weight: 700;
@@ -91,7 +103,7 @@
 }
 
 .help-callouts li::marker {
-  color: hsl(348, 70%, 50%);
+  color: var(--help-callout-marker);
   font-weight: 700;
 }
 

@@ -232,7 +232,16 @@ fn video() -> Markup {
                 source src=(HOW_IT_WORKS_MP4.url) type="video/mp4";
                 a href=(HOW_IT_WORKS_MP4.url) { "Watch how it works" }
             }
-            figcaption { "How it works, in under a minute." }
+            figcaption {
+                "How it works, in under a minute."
+                br;
+                "Music: "
+                a href="https://incompetech.com/music/royalty-free/index.html?isrc=USUAN1300010" {
+                    "Local Forecast"
+                }
+                " by Kevin MacLeod (incompetech.com), "
+                a href="https://creativecommons.org/licenses/by/4.0/" { "CC BY 4.0" }
+            }
         }
     }
 }
@@ -304,6 +313,16 @@ mod tests {
             HOW_IT_WORKS_MP4.url
         )));
         assert!(!html.contains("autoplay"));
+        assert!(!video().into_string().contains("muted"));
+    }
+
+    /// The video's music is credited as its CC BY 4.0 licence asks.
+    #[test]
+    fn the_video_credits_its_music() {
+        let html = help_page().into_string();
+        assert!(html.contains(
+            r#"Music: <a href="https://incompetech.com/music/royalty-free/index.html?isrc=USUAN1300010">Local Forecast</a> by Kevin MacLeod (incompetech.com), <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>"#
+        ));
     }
 
     #[test]
