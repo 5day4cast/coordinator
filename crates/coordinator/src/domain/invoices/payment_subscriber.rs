@@ -3,8 +3,9 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
+use super::payout_watcher::record_payment_failure;
 use crate::{
-    domain::{competitions::PayoutError, Coordinator, PaymentStatus},
+    domain::{Coordinator, PaymentStatus},
     infra::lightning::{Ln, PaymentUpdate},
 };
 
@@ -110,22 +111,23 @@ impl PaymentSubscriber {
                 }
             }
             PaymentStatus::Failed => {
-                let error_msg = update
+                let reason = update
                     .failure_reason
                     .unwrap_or_else(|| "Unknown".to_string());
-                warn!("Payment failed for payout {}: {}", payout.id, error_msg);
-
-                if let Err(e) = self
-                    .coordinator
-                    .competition_store
-                    .mark_payout_failed(
-                        payout.id,
-                        OffsetDateTime::now_utc(),
-                        PayoutError::FailedToPayOut(error_msg),
-                    )
-                    .await
+                // The payout watcher sends the invoice again when the failure can pass, and
+                // records the same failure here at most once between the two.
+                if let Err(e) = record_payment_failure(
+                    &self.coordinator.competition_store,
+                    self.coordinator.bitcoin.as_ref(),
+                    &payout,
+                    &reason,
+                )
+                .await
                 {
-                    error!("Failed to mark payout {} as failed: {}", payout.id, e);
+                    error!(
+                        "Failed to record the failed payment of payout {}: {}",
+                        payout.id, e
+                    );
                 }
             }
             _ => {}

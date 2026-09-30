@@ -5,15 +5,21 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    domain::{competitions::PayoutError, CompetitionStore, Coordinator, PaymentStatus},
+    domain::{
+        competitions::{payout_resend_delay_secs, EntryPayout, PayoutError},
+        CompetitionStore, Coordinator, PaymentStatus,
+    },
     infra::{
         bitcoin::{Bitcoin, PayoutOutputStatus},
         lightning::{
-            extract_payment_hash_from_invoice, invoice_is_expired, payout_cltv_limit,
-            payout_htlc_expiry_height, Ln, PaymentDeadline, PaymentNotFound,
+            classify_payment_failure, extract_payment_hash_from_invoice, invoice_is_expired,
+            invoice_payee_node_id, payout_cltv_limit, payout_htlc_expiry_height, Ln,
+            PaymentDeadline, PaymentNotFound,
         },
     },
+    metrics::record_payout_send_failure,
 };
+use lightning_invoice::Bolt11Invoice;
 
 pub struct PayoutWatcher {
     competition_store: Arc<CompetitionStore>,
@@ -78,60 +84,133 @@ impl PayoutWatcher {
     async fn send_eligibility(
         &self,
         entry_id: uuid::Uuid,
-        invoice: &lightning_invoice::Bolt11Invoice,
+        invoice: &Bolt11Invoice,
     ) -> Result<SendEligibility, anyhow::Error> {
-        let entry = self
-            .competition_store
-            .get_entry_by_id(entry_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Payout entry no longer exists"))?;
-        let competition = self
-            .competition_store
-            .get_competition(entry.event_id)
-            .await?;
-        if competition.delta_broadcasted_at.is_some()
-            || competition.completed_at.is_some()
-            || competition.failed_at.is_some()
-            || competition.cancelled_at.is_some()
-            || entry.sellback_broadcasted_at.is_some()
-            || entry.reclaimed_broadcasted_at.is_some()
-        {
-            return Ok(SendEligibility::Closed(
-                "Competition has entered on-chain resolution".into(),
-            ));
-        }
-        let Some(outcome) = competition.outcome_transaction.as_ref() else {
-            return Ok(SendEligibility::Deferred("Outcome is not available".into()));
-        };
-        let params = competition
-            .contract_parameters
-            .as_ref()
-            .or_else(|| {
-                competition
-                    .signed_contract
-                    .as_ref()
-                    .map(|signed| signed.params())
-            })
-            .ok_or_else(|| anyhow::anyhow!("Payout has no persisted contract parameters"))?;
-        let [output] = outcome.output.as_slice() else {
-            return Err(anyhow::anyhow!("DLC outcome must have exactly one output"));
-        };
-        let status = tokio::time::timeout(
-            Duration::from_secs(20),
-            self.bitcoin.payout_output_status(
-                bitcoin::OutPoint {
-                    txid: outcome.compute_txid(),
-                    vout: 0,
-                },
-                output.clone(),
-            ),
+        send_eligibility(
+            &self.competition_store,
+            self.bitcoin.as_ref(),
+            entry_id,
+            invoice,
         )
-        .await??;
-        Ok(classify_output(
-            status,
-            params.relative_locktime_block_delta,
-            invoice.min_final_cltv_expiry_delta(),
-        ))
+        .await
+    }
+
+    /// Ask LND to pay the payout's invoice before `deadline`. Every send of a payout uses the
+    /// invoice it was stored with, so LND sees one payment hash however often it is sent.
+    async fn send(
+        &self,
+        payout: &EntryPayout,
+        invoice: &Bolt11Invoice,
+        deadline: PaymentDeadline,
+        attempt: u32,
+    ) -> Result<(), anyhow::Error> {
+        info!(
+            "Sending payout {} ({}), attempt {}",
+            payout.id,
+            send_fields(payout, Some(invoice), Some(deadline)),
+            attempt
+        );
+        self.ln
+            .send_payment_before_height(
+                payout.payout_payment_request.clone(),
+                payout.payout_amount_sats,
+                60,
+                1000,
+                deadline,
+            )
+            .await
+    }
+
+    /// LND reports the payment failed, so no attempt for its hash is live. A failure that can
+    /// pass keeps the payout pending, and its invoice is sent again when its retry time
+    /// comes. The payout fails only on a conclusive reason, or once the invoice has expired
+    /// or the Lightning window has closed.
+    async fn handle_failed_payment(
+        &self,
+        payout: &EntryPayout,
+        reason: &str,
+    ) -> Result<(), anyhow::Error> {
+        let store = &self.competition_store;
+        if record_payment_failure(store, self.bitcoin.as_ref(), payout, reason).await?
+            == FailedPayment::Failed
+        {
+            return Ok(());
+        }
+        let invoice = payout
+            .payout_payment_request
+            .parse::<Bolt11Invoice>()
+            .map_err(|error| anyhow::anyhow!("Invalid stored payout invoice: {error}"))?;
+        if invoice_is_expired(&invoice) || !store.payout_send_allowed(payout.id).await? {
+            if store
+                .mark_payout_failed(
+                    payout.id,
+                    OffsetDateTime::now_utc(),
+                    PayoutError::FailedToPayOut(format!(
+                        "Invoice expired or on-chain settlement began before a payment succeeded; last failure: {reason}"
+                    )),
+                )
+                .await?
+            {
+                info!(
+                    "Payout {} will be resolved via onchain sellback or reclaim transaction for entry {}",
+                    payout.id, payout.entry_id
+                );
+            }
+            return Ok(());
+        }
+        let Some(state) = store.payout_send_state(payout.id).await? else {
+            return Ok(());
+        };
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        if state.next_send_at.is_none_or(|at| at > now) {
+            return Ok(());
+        }
+        let deadline = match self.send_eligibility(payout.entry_id, &invoice).await {
+            Ok(SendEligibility::Ready(deadline)) => deadline,
+            Ok(SendEligibility::Closed(closed)) => {
+                store
+                    .mark_payout_failed(
+                        payout.id,
+                        OffsetDateTime::now_utc(),
+                        PayoutError::FailedToPayOut(closed),
+                    )
+                    .await?;
+                return Ok(());
+            }
+            Ok(SendEligibility::Deferred(deferred)) => {
+                debug!(
+                    "Payout {} waits for safe chain state: {}",
+                    payout.id, deferred
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                warn!("Payout {} chain state unavailable: {}", payout.id, error);
+                return Ok(());
+            }
+        };
+        if !store.begin_payout_resend(payout.id).await? {
+            return Ok(());
+        }
+        // LND drops the failed attempt when the same hash is paid again, and refuses the
+        // request while an attempt is in flight or has succeeded.
+        if let Err(error) = self
+            .send(payout, &invoice, deadline, state.send_attempts + 1)
+            .await
+        {
+            warn!(
+                "Payout {} remains pending after send error: {}",
+                payout.id, error
+            );
+            store
+                .defer_payout_resend(
+                    payout.id,
+                    OffsetDateTime::now_utc().unix_timestamp()
+                        + payout_resend_delay_secs(state.send_attempts),
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     async fn handle_pending_payouts(&self) -> Result<(), anyhow::Error> {
@@ -197,28 +276,13 @@ impl PayoutWatcher {
                             }
                         }
                         PaymentStatus::Failed => {
-                            let error_msg = payment.failure_reason;
-
-                            warn!(
-                                "Payment failed for payout {} (entry {}): {}. Will resolve via onchain transaction.",
-                                payout.id, payout.entry_id, error_msg
-                            );
-
-                            // Mark the payout as failed
                             if let Err(e) = self
-                                .competition_store
-                                .mark_payout_failed(
-                                    payout.id,
-                                    OffsetDateTime::now_utc(),
-                                    PayoutError::FailedToPayOut(error_msg),
-                                )
+                                .handle_failed_payment(&payout, &payment.failure_reason)
                                 .await
                             {
-                                error!("Failed to mark payout {} as failed: {}", payout.id, e);
-                            } else {
-                                info!(
-                                    "Payout {} will be resolved via onchain sellback or reclaim transaction for entry {}",
-                                    payout.id, payout.entry_id
+                                error!(
+                                    "Failed to handle the failed payment of payout {}: {}",
+                                    payout.id, e
                                 );
                             }
                         }
@@ -238,7 +302,7 @@ impl PayoutWatcher {
                     // LND confirms that no payment exists before we release it.
                     let invoice = payout
                         .payout_payment_request
-                        .parse::<lightning_invoice::Bolt11Invoice>()
+                        .parse::<Bolt11Invoice>()
                         .map_err(|error| {
                             anyhow::anyhow!("Invalid stored payout invoice: {error}")
                         })?;
@@ -287,17 +351,7 @@ impl PayoutWatcher {
                     // Recover a crash between persisting the payout and sending it.
                     // Keep using the same invoice/hash: LND deduplicates attempts
                     // if the original request is accepted concurrently.
-                    if let Err(error) = self
-                        .ln
-                        .send_payment_before_height(
-                            payout.payout_payment_request,
-                            payout.payout_amount_sats,
-                            60,
-                            1000,
-                            deadline,
-                        )
-                        .await
-                    {
+                    if let Err(error) = self.send(&payout, &invoice, deadline, 1).await {
                         warn!(
                             "Payout {} remains pending after send error: {}",
                             payout.id, error
@@ -312,6 +366,155 @@ impl PayoutWatcher {
 
         Ok(())
     }
+}
+
+/// What a failed payment left of its payout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailedPayment {
+    /// The payout stays pending, and the payout watcher sends its invoice again.
+    Retrying,
+    /// The payout failed and its claim is retired.
+    Failed,
+}
+
+/// Record a payment LND reports as failed. The payout watcher and the payment subscriber
+/// both see each failure; the first to record it counts and logs it. Only a conclusive
+/// reason fails the payout here.
+pub(crate) async fn record_payment_failure(
+    store: &CompetitionStore,
+    bitcoin: &dyn Bitcoin,
+    payout: &EntryPayout,
+    reason: &str,
+) -> Result<FailedPayment, anyhow::Error> {
+    let failure = classify_payment_failure(reason);
+    if !failure.transient {
+        if store
+            .mark_payout_failed(
+                payout.id,
+                OffsetDateTime::now_utc(),
+                PayoutError::FailedToPayOut(reason.to_owned()),
+            )
+            .await?
+        {
+            record_payout_send_failure(failure.reason);
+            warn!(
+                "Payment failed for payout {} ({}): {}. Will resolve via onchain transaction.",
+                payout.id,
+                failed_send_fields(store, bitcoin, payout).await,
+                reason
+            );
+        }
+        return Ok(FailedPayment::Failed);
+    }
+    if let Some(state) = store.schedule_payout_resend(payout.id).await? {
+        record_payout_send_failure(failure.reason);
+        warn!(
+            "Payment failed for payout {} ({}): {}. {} sends failed; the same invoice is sent again in {} seconds.",
+            payout.id,
+            failed_send_fields(store, bitcoin, payout).await,
+            reason,
+            state.send_attempts,
+            payout_resend_delay_secs(state.send_attempts)
+        );
+    }
+    Ok(FailedPayment::Retrying)
+}
+
+/// What a send of a payout is logged with: its entry, amount, payee node and the CLTV limit
+/// its deadline allows. LND is given that limit unless its tip is past the height checked,
+/// which leaves fewer blocks.
+fn send_fields(
+    payout: &EntryPayout,
+    invoice: Option<&Bolt11Invoice>,
+    deadline: Option<PaymentDeadline>,
+) -> String {
+    let payee = invoice.map_or_else(|| "unknown".to_owned(), invoice_payee_node_id);
+    let cltv_limit = invoice
+        .zip(deadline)
+        .and_then(|(invoice, deadline)| {
+            let height = deadline.minimum_chain_height;
+            payout_cltv_limit(deadline, height, invoice.min_final_cltv_expiry_delta())
+                .ok()
+                .map(|limit| format!("{limit} at height {height}"))
+        })
+        .unwrap_or_else(|| "unknown".to_owned());
+    format!(
+        "entry {}, {} sats, payee {}, CLTV limit {}",
+        payout.entry_id, payout.payout_amount_sats, payee, cltv_limit
+    )
+}
+
+/// The same fields for a send that failed, with the CLTV limit of a send made now.
+async fn failed_send_fields(
+    store: &CompetitionStore,
+    bitcoin: &dyn Bitcoin,
+    payout: &EntryPayout,
+) -> String {
+    let invoice = payout.payout_payment_request.parse::<Bolt11Invoice>().ok();
+    let deadline = match &invoice {
+        Some(invoice) => match send_eligibility(store, bitcoin, payout.entry_id, invoice).await {
+            Ok(SendEligibility::Ready(deadline)) => Some(deadline),
+            _ => None,
+        },
+        None => None,
+    };
+    send_fields(payout, invoice.as_ref(), deadline)
+}
+
+async fn send_eligibility(
+    store: &CompetitionStore,
+    chain: &dyn Bitcoin,
+    entry_id: uuid::Uuid,
+    invoice: &Bolt11Invoice,
+) -> Result<SendEligibility, anyhow::Error> {
+    let entry = store
+        .get_entry_by_id(entry_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Payout entry no longer exists"))?;
+    let competition = store.get_competition(entry.event_id).await?;
+    if competition.delta_broadcasted_at.is_some()
+        || competition.completed_at.is_some()
+        || competition.failed_at.is_some()
+        || competition.cancelled_at.is_some()
+        || entry.sellback_broadcasted_at.is_some()
+        || entry.reclaimed_broadcasted_at.is_some()
+    {
+        return Ok(SendEligibility::Closed(
+            "Competition has entered on-chain resolution".into(),
+        ));
+    }
+    let Some(outcome) = competition.outcome_transaction.as_ref() else {
+        return Ok(SendEligibility::Deferred("Outcome is not available".into()));
+    };
+    let params = competition
+        .contract_parameters
+        .as_ref()
+        .or_else(|| {
+            competition
+                .signed_contract
+                .as_ref()
+                .map(|signed| signed.params())
+        })
+        .ok_or_else(|| anyhow::anyhow!("Payout has no persisted contract parameters"))?;
+    let [output] = outcome.output.as_slice() else {
+        return Err(anyhow::anyhow!("DLC outcome must have exactly one output"));
+    };
+    let status = tokio::time::timeout(
+        Duration::from_secs(20),
+        chain.payout_output_status(
+            bitcoin::OutPoint {
+                txid: outcome.compute_txid(),
+                vout: 0,
+            },
+            output.clone(),
+        ),
+    )
+    .await??;
+    Ok(classify_output(
+        status,
+        params.relative_locktime_block_delta,
+        invoice.min_final_cltv_expiry_delta(),
+    ))
 }
 
 #[derive(Debug)]
@@ -352,17 +555,21 @@ mod tests {
         lightning::LnClient,
     };
     use axum::{
-        extract::State,
+        extract::{Path, State},
         response::IntoResponse,
         routing::{get, post},
         Json, Router,
     };
+    use base64::Engine;
     use bitcoin::{
         hashes::{sha256, Hash},
         secp256k1::{Secp256k1, SecretKey},
     };
     use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
     use uuid::Uuid;
 
     #[test]
@@ -426,8 +633,14 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn payout_outbox_recovers_an_unsent_payment_and_keeps_ambiguous_errors_locked() {
+    /// A competition with a confirmed outcome and one entry owed a payout.
+    async fn fixture() -> (
+        tempfile::TempDir,
+        DBConnection,
+        CompetitionStore,
+        Uuid,
+        Uuid,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let database = DBConnection::new(
             directory.path().to_str().unwrap(),
@@ -487,21 +700,66 @@ mod tests {
                 .bind(entry_id.to_string()).bind(event_id.to_string()).bind(ticket_id.to_string()).bind(entry_submission).execute(&pool).await?;
             Ok(())
         }).await.unwrap();
-        let invoice = |timestamp, hash| {
-            InvoiceBuilder::new(Currency::Regtest)
-                .description("payout".into())
-                .payment_hash(sha256::Hash::from_byte_array([hash; 32]))
-                .payment_secret(PaymentSecret([8; 32]))
-                .amount_milli_satoshis(10_000)
-                .duration_since_epoch(timestamp)
-                .min_final_cltv_expiry_delta(18)
-                .build_signed(|hash| {
-                    Secp256k1::new()
-                        .sign_ecdsa_recoverable(hash, &SecretKey::from_slice(&[9; 32]).unwrap())
-                })
-                .unwrap()
-                .to_string()
-        };
+        (directory, database, store, event_id, entry_id)
+    }
+
+    fn invoice(timestamp: Duration, hash: u8) -> String {
+        InvoiceBuilder::new(Currency::Regtest)
+            .description("payout".into())
+            .payment_hash(sha256::Hash::from_byte_array([hash; 32]))
+            .payment_secret(PaymentSecret([8; 32]))
+            .amount_milli_satoshis(10_000)
+            .duration_since_epoch(timestamp)
+            .min_final_cltv_expiry_delta(18)
+            .build_signed(|hash| {
+                Secp256k1::new()
+                    .sign_ecdsa_recoverable(hash, &SecretKey::from_slice(&[9; 32]).unwrap())
+            })
+            .unwrap()
+            .to_string()
+    }
+
+    fn fresh_invoice(hash: u8) -> String {
+        invoice(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap(),
+            hash,
+        )
+    }
+
+    fn watcher(store: &CompetitionStore, address: std::net::SocketAddr) -> PayoutWatcher {
+        PayoutWatcher {
+            leases: Arc::new(crate::domain::WorkerLeases::new(
+                Arc::new(store.clone()),
+                "test".into(),
+                Duration::from_secs(30),
+            )),
+            competition_store: Arc::new(store.clone()),
+            bitcoin: Arc::new(crate::infra::bitcoin_mock::MockBitcoinClient::new(
+                bitcoin::Network::Regtest,
+            )),
+            ln: Arc::new(LnClient {
+                base_url: reqwest::Url::parse(&format!("http://{address}/")).unwrap(),
+                client: reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build(),
+                payment_client: reqwest::Client::new(),
+                macaroon: secrecy::SecretString::from("test-macaroon"),
+            }),
+            sync_interval: Duration::from_secs(1),
+            cancel_token: CancellationToken::new(),
+        }
+    }
+
+    async fn tick(watcher: &PayoutWatcher) {
+        tokio::time::timeout(Duration::from_secs(5), watcher.handle_pending_payouts())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn payout_outbox_recovers_an_unsent_payment_and_keeps_ambiguous_errors_locked() {
+        let (_directory, database, store, event_id, entry_id) = fixture().await;
         // This queued invoice expired while the process was stopped.
         let expired_id = store
             .store_payout_info_pending(
@@ -513,12 +771,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let invoice = invoice(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap(),
-            7,
-        );
+        let invoice = fresh_invoice(7);
         let sends = Arc::new(AtomicUsize::new(0));
         let router = Router::new()
             .route("/v1/getinfo", get(||async{Json(serde_json::json!({"synced_to_chain":true,"block_height":100}))}))
@@ -544,25 +797,7 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
-        let watcher = PayoutWatcher {
-            leases: Arc::new(crate::domain::WorkerLeases::new(
-                Arc::new(store.clone()),
-                "test".into(),
-                Duration::from_secs(30),
-            )),
-            competition_store: Arc::new(store.clone()),
-            bitcoin: Arc::new(crate::infra::bitcoin_mock::MockBitcoinClient::new(
-                bitcoin::Network::Regtest,
-            )),
-            ln: Arc::new(LnClient {
-                base_url: reqwest::Url::parse(&format!("http://{address}/")).unwrap(),
-                client: reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build(),
-                payment_client: reqwest::Client::new(),
-                macaroon: secrecy::SecretString::from("test-macaroon"),
-            }),
-            sync_interval: Duration::from_secs(1),
-            cancel_token: CancellationToken::new(),
-        };
+        let watcher = watcher(&store, address);
         tokio::time::timeout(Duration::from_secs(5), watcher.handle_pending_payouts())
             .await
             .unwrap()
@@ -622,6 +857,182 @@ mod tests {
             .succeed_at
             .is_some());
         assert_eq!(sends.load(Ordering::SeqCst), 1);
+        server.abort();
+        database.close().await.unwrap();
+    }
+
+    /// An LND that accepts every payment and then fails it for `reason`.
+    #[derive(Clone)]
+    struct FailingLnd {
+        /// The payment hash of each send, in order.
+        sent: Arc<Mutex<Vec<String>>>,
+        reason: Arc<Mutex<&'static str>>,
+    }
+
+    async fn retry_time_passes(database: &DBConnection, payout_id: Uuid) {
+        database
+            .execute_write(move |pool| async move {
+                sqlx::query("UPDATE payouts SET next_send_at = 0 WHERE id = ?")
+                    .bind(payout_id.to_string())
+                    .execute(&pool)
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_sends_the_same_invoice_again_and_a_conclusive_one_fails_the_payout(
+    ) {
+        let (_directory, database, store, event_id, entry_id) = fixture().await;
+        let lnd = FailingLnd {
+            sent: Arc::default(),
+            reason: Arc::new(Mutex::new("FAILURE_REASON_NO_ROUTE")),
+        };
+        let router = Router::new()
+            .route("/v1/getinfo", get(||async{Json(serde_json::json!({"synced_to_chain":true,"block_height":100}))}))
+            .route("/v2/router/track/{hash}", get(|State(lnd): State<FailingLnd>, Path(hash): Path<String>| async move {
+                let hash = hex::encode(base64::engine::general_purpose::URL_SAFE.decode(hash).unwrap());
+                if !lnd.sent.lock().unwrap().contains(&hash) {
+                    return reqwest::StatusCode::NOT_FOUND.into_response();
+                }
+                Json(serde_json::json!({"result": {
+                    "payment_hash": hash, "status": "FAILED",
+                    "value": "10", "creation_date": "0", "fee": "0",
+                    "value_sat": "10", "value_msat": "10000", "payment_request": "invoice",
+                    "fee_sat": "0", "fee_msat": "0", "creation_time_ns": "0", "failure_reason": *lnd.reason.lock().unwrap()
+                }})).into_response()
+            }))
+            .route("/v2/router/send", post(|State(lnd): State<FailingLnd>, Json(body): Json<serde_json::Value>| async move {
+                let hash = extract_payment_hash_from_invoice(body["payment_request"].as_str().unwrap()).unwrap();
+                lnd.sent.lock().unwrap().push(hash);
+                // The stream ends once LND has given up on the payment.
+                reqwest::StatusCode::OK
+            }))
+            .with_state(lnd.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let watcher = watcher(&store, address);
+        let sent = || lnd.sent.lock().unwrap().clone();
+        let no_route_failures = || {
+            crate::metrics::PAYOUT_SEND_FAILURES
+                .with_label_values(&["FAILURE_REASON_NO_ROUTE"])
+                .get()
+        };
+        let hash = hex::encode([7; 32]);
+        let payout_id = store
+            .store_payout_info_pending(
+                entry_id,
+                "preimage".into(),
+                "private".into(),
+                fresh_invoice(7),
+                10,
+            )
+            .await
+            .unwrap();
+        tick(&watcher).await;
+        assert_eq!(sent(), vec![hash.clone()]);
+        let counted = no_route_failures();
+
+        // LND found no route. The payout keeps its invoice and waits to send it again.
+        tick(&watcher).await;
+        let payout = store.get_payout(payout_id).await.unwrap().unwrap();
+        assert!(payout.failed_at.is_none() && payout.succeed_at.is_none());
+        let waiting = store.payout_send_state(payout_id).await.unwrap().unwrap();
+        assert_eq!(waiting.send_attempts, 1);
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        assert!(waiting.next_send_at.unwrap() > now);
+        assert!(waiting.next_send_at.unwrap() <= now + 30);
+        assert!(no_route_failures() > counted);
+
+        // The payment subscriber reports the same failure, and later ticks see it again.
+        // It is one failed send, and nothing is sent before the retry time.
+        assert_eq!(
+            record_payment_failure(
+                &store,
+                watcher.bitcoin.as_ref(),
+                &payout,
+                "FAILURE_REASON_NO_ROUTE"
+            )
+            .await
+            .unwrap(),
+            FailedPayment::Retrying
+        );
+        tick(&watcher).await;
+        assert_eq!(
+            store.payout_send_state(payout_id).await.unwrap().unwrap(),
+            waiting
+        );
+        assert_eq!(sent().len(), 1);
+
+        // At the retry time LND is asked to pay the same payment hash again.
+        retry_time_passes(&database, payout_id).await;
+        tick(&watcher).await;
+        assert_eq!(sent(), vec![hash.clone(), hash.clone()]);
+        let resent = store.payout_send_state(payout_id).await.unwrap().unwrap();
+        assert_eq!((resent.send_attempts, resent.next_send_at), (1, None));
+        assert_eq!(store.get_all_pending_payouts().await.unwrap().len(), 1);
+
+        // The second failure waits twice as long.
+        tick(&watcher).await;
+        let waiting = store.payout_send_state(payout_id).await.unwrap().unwrap();
+        assert_eq!(waiting.send_attempts, 2);
+        assert!(waiting.next_send_at.unwrap() > OffsetDateTime::now_utc().unix_timestamp() + 30);
+        assert_eq!(sent().len(), 2);
+
+        // The payee rejecting the invoice is conclusive.
+        retry_time_passes(&database, payout_id).await;
+        tick(&watcher).await;
+        assert_eq!(sent().len(), 3);
+        *lnd.reason.lock().unwrap() = "FAILURE_REASON_INCORRECT_PAYMENT_DETAILS";
+        tick(&watcher).await;
+        let payout = store.get_payout(payout_id).await.unwrap().unwrap();
+        assert!(payout.failed_at.is_some());
+        assert!(payout
+            .error
+            .unwrap()
+            .to_string()
+            .contains("FAILURE_REASON_INCORRECT_PAYMENT_DETAILS"));
+        tick(&watcher).await;
+        assert_eq!(sent().len(), 3);
+
+        // A payout waiting to be sent again fails once the Lightning window closes.
+        *lnd.reason.lock().unwrap() = "FAILURE_REASON_NO_ROUTE";
+        let waiting_id = store
+            .store_payout_info_pending(
+                entry_id,
+                "preimage".into(),
+                "private".into(),
+                fresh_invoice(5),
+                10,
+            )
+            .await
+            .unwrap();
+        tick(&watcher).await;
+        tick(&watcher).await;
+        assert_eq!(sent().len(), 4);
+        assert!(store
+            .get_payout(waiting_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .failed_at
+            .is_none());
+        store.enable_automatic_payouts(event_id).await.unwrap();
+        store.close_payout_window(event_id).await.unwrap();
+        tick(&watcher).await;
+        assert!(store
+            .get_payout(waiting_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .failed_at
+            .is_some());
+        assert_eq!(sent().len(), 4);
         server.abort();
         database.close().await.unwrap();
     }

@@ -1,5 +1,8 @@
 //! Persistence boundaries for automatic payout recovery, using the real migrations.
-use super::{CompetitionStore, FixedTicketPayoutPolicy, PayoutError};
+use super::{
+    payout_resend_delay_secs, CompetitionStore, FixedTicketPayoutPolicy, PayoutError,
+    MAX_AUTOMATIC_CLAIMS_PER_ENTRY,
+};
 use crate::infra::db::{DBConnection, DatabasePoolConfig, DatabaseType};
 use bitcoin::{
     hashes::{sha256, Hash},
@@ -155,6 +158,166 @@ async fn concurrent_workers_persist_one_intent_before_preparing_an_invoice() {
     assert_eq!(jobs.len(), 1);
     assert!(jobs[0].prepared_json.is_none());
     assert!(jobs[0].payout_id.is_none());
+    bounded(f.database.close()).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_entry_gets_no_automatic_claim_beyond_the_cap() {
+    let f = Fixture::new().await;
+    let (other_entry, _) = f.add_entry(3).await;
+    let create = |entry| f.store.create_payout_job(entry, "\"Automatic\"".into());
+    for used in 0..MAX_AUTOMATIC_CLAIMS_PER_ENTRY {
+        assert_eq!(
+            bounded(f.store.payout_claims_used(f.entry_id))
+                .await
+                .unwrap(),
+            used
+        );
+        let job = bounded(create(f.entry_id)).await.unwrap();
+        bounded(
+            f.store
+                .fail_payout_job_with_reason(job, "Escrow preparation capacity exhausted".into()),
+        )
+        .await
+        .unwrap();
+        assert!(!bounded(f.store.has_live_payout_job(f.entry_id))
+            .await
+            .unwrap());
+    }
+    // Failed claims count too: each one had the enclave prepare the release.
+    assert!(bounded(create(f.entry_id)).await.is_err());
+    assert_eq!(
+        bounded(f.store.payout_claims_used(f.entry_id))
+            .await
+            .unwrap(),
+        MAX_AUTOMATIC_CLAIMS_PER_ENTRY
+    );
+    assert_eq!(f.count("payout_jobs").await, MAX_AUTOMATIC_CLAIMS_PER_ENTRY);
+    let reasons: i64 = bounded(
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM payout_jobs WHERE failed_at IS NOT NULL AND last_error = 'Escrow preparation capacity exhausted'",
+        )
+        .fetch_one(f.database.read()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reasons, MAX_AUTOMATIC_CLAIMS_PER_ENTRY);
+    // The cap is per entry.
+    let other = bounded(create(other_entry)).await.unwrap();
+    // A claim whose invoice may still be paid is never retired by a reason alone.
+    f.store
+        .store_prepared_payout(other, invoice([7; 32]), 10, prepared([7; 32]))
+        .await
+        .unwrap();
+    bounded(
+        f.store
+            .fail_payout_job_with_reason(other, "unrelated".into()),
+    )
+    .await
+    .unwrap();
+    assert!(bounded(f.store.has_live_payout_job(other_entry))
+        .await
+        .unwrap());
+    bounded(f.database.close()).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_send_keeps_the_payout_pending_with_a_growing_retry_delay() {
+    assert_eq!(
+        [0, 1, 2, 3, 4, 5, 6, 7, u32::MAX].map(payout_resend_delay_secs),
+        [30, 30, 60, 120, 240, 480, 600, 600, 600]
+    );
+    let f = Fixture::new().await;
+    let job = bounded(
+        f.store
+            .create_payout_job(f.entry_id, "\"Automatic\"".into()),
+    )
+    .await
+    .unwrap();
+    let payout = f.prepare(job, [7; 32]).await;
+    let state = || async {
+        bounded(f.store.payout_send_state(payout))
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(
+        (state().await.send_attempts, state().await.next_send_at),
+        (0, None)
+    );
+    // No retry is due before a send has failed.
+    assert!(!bounded(f.store.begin_payout_resend(payout)).await.unwrap());
+
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let first = bounded(f.store.schedule_payout_resend(payout))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.send_attempts, 1);
+    assert!((now + 30..=now + 35).contains(&first.next_send_at.unwrap()));
+    // The same failure reported twice is one failed send.
+    assert!(bounded(f.store.schedule_payout_resend(payout))
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(state().await, first);
+    // The payout stays pending, so its claim stays live and is not retired.
+    assert_eq!(
+        bounded(f.store.get_all_pending_payouts())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    bounded(f.store.fail_payout_job(job)).await.unwrap();
+    assert!(bounded(f.store.has_live_payout_job(f.entry_id))
+        .await
+        .unwrap());
+
+    // The invoice is not sent again before its retry time.
+    assert!(!bounded(f.store.begin_payout_resend(payout)).await.unwrap());
+    bounded(f.database.execute_write(move |pool| async move {
+        sqlx::query("UPDATE payouts SET next_send_at = 0 WHERE id = ?")
+            .bind(payout.to_string())
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }))
+    .await
+    .unwrap();
+    assert!(bounded(f.store.begin_payout_resend(payout)).await.unwrap());
+    assert!(!bounded(f.store.begin_payout_resend(payout)).await.unwrap());
+    assert_eq!(
+        (state().await.send_attempts, state().await.next_send_at),
+        (1, None)
+    );
+
+    // A send that may not have reached LND gets its retry time back without a count.
+    bounded(f.store.defer_payout_resend(payout, now + 30))
+        .await
+        .unwrap();
+    assert_eq!(
+        (state().await.send_attempts, state().await.next_send_at),
+        (1, Some(now + 30))
+    );
+    assert!(bounded(f.store.schedule_payout_resend(payout))
+        .await
+        .unwrap()
+        .is_none());
+
+    // A failed or paid payout is never scheduled again.
+    assert!(bounded(f.store.mark_payout_failed(
+        payout,
+        OffsetDateTime::now_utc(),
+        PayoutError::FailedToPayOut("FAILURE_REASON_INCORRECT_PAYMENT_DETAILS".into()),
+    ))
+    .await
+    .unwrap());
+    assert!(!bounded(f.store.begin_payout_resend(payout)).await.unwrap());
+    assert!(bounded(f.store.schedule_payout_resend(payout))
+        .await
+        .unwrap()
+        .is_none());
     bounded(f.database.close()).await.unwrap();
 }
 
