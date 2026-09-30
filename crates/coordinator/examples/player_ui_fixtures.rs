@@ -243,6 +243,7 @@ fn competition(id: &str, phase: Phase, start: OffsetDateTime, entries: u64) -> C
         pot_refunded: false,
         refund_shares: None,
         queue: Queue::Single,
+        unlisted: false,
     }
 }
 
