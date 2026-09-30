@@ -38,12 +38,14 @@
 }
 
 /* The usual 44 px tap around a "?" hangs from the "?" itself (tip.css); here the "?" is not
-   positioned, so the tap is its own transparent border and the ring is drawn inside it. */
+   positioned, so the tap is its own transparent border and the ring is drawn inside it. It
+   takes its own room above, below and after it, so the next fact never covers part of it; it
+   reaches back only over its own term. */
 @media screen and (max-width: 768px) and (pointer: coarse) {
   .entry-facts .tip {
     width: 44px;
     height: 44px;
-    margin: calc((1.05rem - 44px) / 2);
+    margin: 0;
     margin-left: calc(0.3rem + (1.05rem - 44px) / 2);
     border: calc((44px - 1.05rem) / 2) solid transparent;
     box-shadow: inset 0 0 0 1px var(--bulma-border);
@@ -333,6 +335,15 @@
 
 .price-details[open] summary::after {
   content: " ▴";
+}
+
+/* On touch screens the total is a 44 px tall tap. */
+@media (pointer: coarse) {
+  .price-details summary {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+  }
 }
 
 .price-lines {

@@ -76,7 +76,11 @@ a.competition-row.htmx-request {
   .copy-button::before {
     content: "";
     position: absolute;
-    inset: -15px -4px;
+    top: 50%;
+    left: 50%;
+    width: max(calc(100% + 8px), 44px);
+    height: 44px;
+    transform: translate(-50%, -50%);
   }
 
   .picks-button,
