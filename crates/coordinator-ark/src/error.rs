@@ -16,6 +16,13 @@ pub enum Error {
     /// the intent's owner deletes it; see [`crate::delete_escrow_intent`].
     #[error("a VTXO it spends is held by a registered batch intent: {0}")]
     VtxoAlreadyRegistered(String),
+    /// arkd's `VTXO_RECOVERABLE`: a VTXO being spent offchain has expired, or was swept.
+    ///
+    /// A VTXO lives until the batch it descends from expires, and a preconfirmed one inherits
+    /// the expiry of the coin that paid it. After that the server spends it only in a batch,
+    /// as a recovery.
+    #[error("a VTXO it spends has expired, and can only be recovered in a batch: {0}")]
+    VtxoRecoverable(String),
     /// No registered intent spends an input of a delete proof, so there was nothing to delete.
     #[error("no registered intent spends the proof's inputs: {0}")]
     NoMatchingIntent(String),
@@ -48,6 +55,8 @@ pub enum Error {
 
 /// arkd's code for `VTXO_ALREADY_REGISTERED`, the only error it maps to gRPC `AlreadyExists`.
 const VTXO_ALREADY_REGISTERED: i32 = 4;
+/// arkd's code for `VTXO_RECOVERABLE`, under gRPC `InvalidArgument` like many others.
+const VTXO_RECOVERABLE: i32 = 8;
 /// arkd's code for `INVALID_INTENT_PROOF`, which a delete proof matching no intent also gets.
 const INVALID_INTENT_PROOF: i32 = 23;
 
@@ -55,6 +64,11 @@ impl Error {
     /// Whether arkd refused because a VTXO being spent is held by a registered batch intent.
     pub fn is_vtxo_already_registered(&self) -> bool {
         matches!(self, Error::VtxoAlreadyRegistered(_))
+    }
+
+    /// Whether arkd refused an offchain spend because a VTXO it spends has expired.
+    pub fn is_vtxo_recoverable(&self) -> bool {
+        matches!(self, Error::VtxoRecoverable(_))
     }
 
     /// Recognise arkd's own errors in a gRPC status; anything else is `other`.
@@ -65,6 +79,15 @@ impl Error {
             && code.is_none_or(|code| code == VTXO_ALREADY_REGISTERED)
         {
             return Error::VtxoAlreadyRegistered(message.into());
+        }
+        // Without the code, only the name arkd starts its message with tells it apart.
+        if status.code() == tonic::Code::InvalidArgument
+            && match code {
+                Some(code) => code == VTXO_RECOVERABLE,
+                None => message.contains("VTXO_RECOVERABLE"),
+            }
+        {
+            return Error::VtxoRecoverable(message.into());
         }
         if status.code() == tonic::Code::InvalidArgument
             && code.is_none_or(|code| code == INVALID_INTENT_PROOF)
@@ -177,6 +200,25 @@ mod tests {
         assert!(matches!(error, Error::Status(_)));
         let error = Error::from(status(tonic::Code::InvalidArgument, message, None));
         assert!(!error.is_vtxo_already_registered());
+    }
+
+    #[test]
+    fn arkd_vtxo_recoverable_is_recognised() {
+        let message = "VTXO_RECOVERABLE (8): \
+                       7386ff34fd5918688e97c484fb04832a9ed2631afc1262ca94c82e29b0c74477:0 \
+                       is recoverable";
+        for arkd in [Some(8), None] {
+            let error = Error::from(status(tonic::Code::InvalidArgument, message, arkd));
+            assert!(error.is_vtxo_recoverable(), "{error}");
+        }
+        // Another arkd error under the same gRPC code is not, whatever its message says.
+        let spent = "VTXO_ALREADY_SPENT (6): already spent";
+        for arkd in [Some(6), None] {
+            let error = Error::from(status(tonic::Code::InvalidArgument, spent, arkd));
+            assert!(!error.is_vtxo_recoverable(), "{error}");
+        }
+        let error = Error::from(status(tonic::Code::InvalidArgument, message, Some(6)));
+        assert!(!error.is_vtxo_recoverable());
     }
 
     #[test]

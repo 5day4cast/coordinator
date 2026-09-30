@@ -1862,6 +1862,104 @@ async fn a_refund_held_by_an_intent_that_cannot_be_deleted_waits_without_minting
 }
 
 impl Fixture {
+    /// An hour passes for the ticket's minted refund: its swap's deadline is too close to sign
+    /// for, and it was minted long enough ago to be minted again.
+    async fn refund_goes_stale(&self, ticket: &ArkTicket) {
+        let refund = self.refund(ticket).await.unwrap();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        self.swaps.age(refund.refund_id, now as u32 + 60);
+        let ticket_id = ticket.id.to_string();
+        self.database
+            .execute_write(move |pool| async move {
+                sqlx::query(
+                    "UPDATE ticket_ark_refunds SET created_at = created_at - 7200 WHERE ticket_id = ?",
+                )
+                .bind(ticket_id)
+                .execute(&pool)
+                .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+}
+
+/// Production, 2026-09-30: ark-swapd paid escrows from coins with a day left, and their refund
+/// leaves opened after they expired. Arkade refused every refund with VTXO_RECOVERABLE, the
+/// swap went stale unsigned, and the refund was minted again every hour.
+#[tokio::test]
+async fn a_refund_arkade_refuses_as_expired_is_held_once_and_not_minted_again() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let ticket = f.funded(&session, 21, true).await;
+    f.cancel().await;
+    // Arkade's list still shows the escrow alive, but the server refuses to spend it.
+    f.arkd.state.lock().unwrap().expired.insert(outpoint(21, 0));
+
+    f.clean_up().await;
+    let held = f.refund(&ticket).await.unwrap();
+    assert_eq!(held.state, ArkRefundState::Minted);
+    assert_eq!(held.error.as_deref(), Some(super::ark_refund::HELD_EXPIRED));
+    assert_eq!(f.spends(), (0, 0), "Arkade refused it");
+    assert_eq!(f.enclaves.signatures.load(Ordering::SeqCst), 1);
+    let logged = f.reported(&ticket).expect("the held refund is logged");
+    assert!(logged.contains("VTXO_RECOVERABLE"), "{logged}");
+
+    // Hours on, its swap is stale. A fresh one would be refused as well, so none is minted.
+    f.refund_goes_stale(&ticket).await;
+    for _ in 0..3 {
+        f.clean_up().await;
+    }
+    let still = f.refund(&ticket).await.unwrap();
+    assert_eq!(still.refund_id, held.refund_id, "not minted again");
+    assert_eq!(
+        still.error.as_deref(),
+        Some(super::ark_refund::HELD_EXPIRED)
+    );
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.enclaves.signatures.load(Ordering::SeqCst),
+        1,
+        "nothing is signed for an escrow Arkade will not spend"
+    );
+    assert_eq!(f.ln.payments_sent(), 0);
+    assert!(
+        f.awaiting_cleanup().await,
+        "its escrow stays listed as holding a buy-in"
+    );
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn nothing_is_minted_for_an_escrow_arkade_lists_as_expired() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let expired = f.funded(&session, 21, true).await;
+    let swept = f.funded(&session, 23, true).await;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    f.arkade_expires(outpoint(21, 0), now - 60, false);
+    f.arkade_expires(outpoint(23, 0), now - 60, true);
+    f.cancel().await;
+
+    for _ in 0..2 {
+        f.clean_up().await;
+    }
+    for ticket in [&expired, &swept] {
+        assert!(f.refund(ticket).await.is_none());
+        let logged = f.reported(ticket).expect("the held refund is logged");
+        assert!(logged.contains("expired on Arkade"), "{logged}");
+    }
+    assert_eq!(
+        f.swaps.minted.load(Ordering::SeqCst),
+        0,
+        "the player's provider is not asked for an invoice nothing can pay"
+    );
+    assert_eq!(f.enclaves.signatures.load(Ordering::SeqCst), 0);
+    assert_eq!(f.spends(), (0, 0));
+    f.database.close().await.unwrap();
+}
+
+impl Fixture {
     /// What the refund pass last logged about the ticket, while it lasts.
     fn reported(&self, ticket: &ArkTicket) -> Option<String> {
         self.coordinator

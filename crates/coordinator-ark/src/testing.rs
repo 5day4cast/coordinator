@@ -7,7 +7,8 @@
 //!
 //! Like arkd, it keeps a registered intent queued until a batch confirms it or a delete proof
 //! removes it, and meanwhile refuses offchain spends of its VTXOs with
-//! [`Error::VtxoAlreadyRegistered`].
+//! [`Error::VtxoAlreadyRegistered`]. It refuses an offchain spend of a VTXO that expired or was
+//! swept with [`Error::VtxoRecoverable`].
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -151,6 +152,8 @@ pub struct MockState {
     /// VTXOs this server lists, by the address whose script they pay. A finalized offchain
     /// spend marks its inputs spent here.
     pub vtxos: Vec<VirtualTxOutPoint>,
+    /// VTXOs the server treats as expired whatever it lists, as when its indexer lags.
+    pub expired: HashSet<OutPoint>,
     /// The cosigner keys the registered intent listed.
     pub cosigners: Vec<PublicKey>,
     /// The intent's on-chain outputs.
@@ -473,6 +476,26 @@ impl ArkTransport for MockArkd {
             return Err(Error::VtxoAlreadyRegistered(
                 "VTXO_ALREADY_REGISTERED (4): vtxo(s) already registered".into(),
             ));
+        }
+        // arkd spends a VTXO offchain only until it expires: `vtxo.Swept || vtxo.IsExpired()`.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_secs() as i64;
+        let recoverable = checkpoints
+            .iter()
+            .flat_map(|checkpoint| &checkpoint.unsigned_tx.input)
+            .map(|input| input.previous_output)
+            .find(|outpoint| {
+                state.expired.contains(outpoint)
+                    || state.vtxos.iter().any(|vtxo| {
+                        vtxo.outpoint == *outpoint && (vtxo.is_swept || vtxo.expires_at <= now)
+                    })
+            });
+        if let Some(outpoint) = recoverable {
+            return Err(Error::VtxoRecoverable(format!(
+                "VTXO_RECOVERABLE (8): {outpoint} is recoverable"
+            )));
         }
         state.offchain.push(OffchainSpend {
             ark_tx: ark_tx.clone(),

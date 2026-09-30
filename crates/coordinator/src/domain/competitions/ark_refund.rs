@@ -19,6 +19,10 @@
 //! that moves nothing, and submits again. If the intent cannot be deleted, the refund keeps its
 //! swap and waits, rather than asking the player's provider for a new invoice every hour.
 //!
+//! An escrow's VTXO expires with the coin that paid it, and the Arkade server then refuses to
+//! spend it offchain (`VTXO_RECOVERABLE`). A refund that finds its escrow expired is held: it
+//! keeps the swap it has, and nothing is minted or signed for it again.
+//!
 //! Keymeld signs with the entry key the player's browser sealed to its enclave. The browser sends
 //! that registration before it shows the ticket's invoice, and again with the entry. Entries are
 //! registered with Keymeld when a competition fills, so a refund registers every paid ticket first
@@ -75,6 +79,10 @@ pub(super) const REFUND_REPORTS: &str = "escrow refund";
 /// What a minted refund notes while a queued batch intent holds its escrow and cannot be deleted.
 /// Until it is, the refund keeps its swap: a new one would be refused too.
 pub(super) const HELD_BY_INTENT: &str = "the escrow is held by a queued Arkade batch intent";
+
+/// What a minted refund notes once its escrow's VTXO has expired on Arkade, which then refuses
+/// to spend it offchain. A new swap would be refused too, so the refund keeps the one it has.
+pub(super) const HELD_EXPIRED: &str = "the escrow's VTXO expired on Arkade";
 
 /// What a refund that cannot finish without an operator says, when it is logged. Such a refund
 /// may be written off without `force`.
@@ -657,12 +665,18 @@ impl Coordinator {
             Some(refund) => refund,
             None => {
                 // Nothing was ever submitted for this escrow, so it must still be unspent.
-                if self.listed_escrow(ark, &escrow, outpoint).await?.is_spent {
+                let listed = self.listed_escrow(ark, &escrow, outpoint).await?;
+                if listed.is_spent {
                     return Err(anyhow!(
                         "its escrow {outpoint} was spent by something other than a refund; \
                          it needs an operator"
                     )
                     .into());
+                }
+                // Nor is anything minted for an escrow Arkade will not spend offchain: that
+                // would ask the player's provider for an invoice nothing can pay.
+                if expired_on_arkade(&listed) {
+                    return Err(expired(outpoint, sats, &listed));
                 }
                 let refund = self
                     .mint_refund(ark, &escrow, player, &script, sats)
@@ -681,6 +695,14 @@ impl Coordinator {
                 let listed = self.listed_escrow(ark, &escrow, outpoint).await?;
                 match escrow_spend(&listed, &built) {
                     EscrowSpend::Unspent => {
+                        // Expiry does not pass, so once Arkade has refused the escrow for it,
+                        // the refund stays held whatever the listing says.
+                        if expired_on_arkade(&listed)
+                            || refund.error.as_deref() == Some(HELD_EXPIRED)
+                        {
+                            self.note_expired(escrow.ticket_id).await?;
+                            return Err(expired(outpoint, sats, &listed));
+                        }
                         let session = session.context("the refund needs Keymeld, see above")?;
                         let input = EscrowInput {
                             escrow: script.clone(),
@@ -974,8 +996,24 @@ impl Coordinator {
                 resubmitted
             }
             submitted => submitted,
-        }
-        .map_err(|e| anyhow!("Arkade will not take the refund: {e}"))?;
+        };
+        let submitted = match submitted {
+            // The escrow's VTXO expired, perhaps since it was listed. No swap or signature
+            // changes that, so the refund is held rather than minted again when this one
+            // goes stale.
+            Err(e) if e.is_vtxo_recoverable() => {
+                self.note_expired(escrow.ticket_id).await?;
+                return Err(anyhow!(
+                    "its escrow {} holds {} sats, but its VTXO expired on Arkade, which will \
+                     not spend it offchain ({e}); its refund is held, and it needs an operator \
+                     (docs/ops/stuck-escrow-check.md)",
+                    input.outpoint,
+                    input.amount.to_sat(),
+                )
+                .into());
+            }
+            submitted => submitted.map_err(|e| anyhow!("Arkade will not take the refund: {e}"))?,
+        };
 
         let mut checkpoint = submitted
             .checkpoints
@@ -1075,6 +1113,14 @@ impl Coordinator {
         Ok(self
             .competition_store
             .note_minted_ticket_ark_refund(ticket_id, Some(HELD_BY_INTENT.into()))
+            .await?)
+    }
+
+    /// Note that the minted refund's escrow expired on Arkade.
+    async fn note_expired(&self, ticket_id: Uuid) -> Result<(), Error> {
+        Ok(self
+            .competition_store
+            .note_minted_ticket_ark_refund(ticket_id, Some(HELD_EXPIRED.into()))
             .await?)
     }
 
@@ -1246,6 +1292,28 @@ fn escrow_script(tap_tree: &str) -> Result<EntryEscrow, Error> {
             .map_err(|e| anyhow!("The escrow's tap tree is invalid: {e}"))?,
     )
     .map_err(|e| anyhow!("The escrow's leaves are not an entry escrow: {e}"))?)
+}
+
+/// Whether Arkade will no longer spend the VTXO offchain: it expired, or the server swept it.
+///
+/// arkd decides by its own clock. A server that lists no expiry gives nothing to judge by, and
+/// says so itself when the refund is submitted.
+fn expired_on_arkade(vtxo: &coordinator_ark::VirtualTxOutPoint) -> bool {
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    vtxo.is_swept || (vtxo.expires_at > 0 && vtxo.expires_at <= now)
+}
+
+/// Why the refund of an escrow whose VTXO expired is held.
+fn expired(outpoint: OutPoint, sats: u64, vtxo: &coordinator_ark::VirtualTxOutPoint) -> Error {
+    let at = OffsetDateTime::from_unix_timestamp(vtxo.expires_at)
+        .map(|at| at.to_string())
+        .unwrap_or_else(|_| vtxo.expires_at.to_string());
+    anyhow!(
+        "its escrow {outpoint} holds {sats} sats, but its VTXO expired on Arkade (it lists its \
+         expiry as {at}), which will not spend it offchain (VTXO_RECOVERABLE); its refund is \
+         held, and it needs an operator (docs/ops/stuck-escrow-check.md)"
+    )
+    .into()
 }
 
 /// Where the escrow's VTXO went: nowhere yet, into `refund` (by its checkpoint or Ark

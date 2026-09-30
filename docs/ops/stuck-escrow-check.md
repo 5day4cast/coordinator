@@ -119,6 +119,13 @@ the refund then keeps its swap instead of minting a new one each hour, and the l
 arkd operator can also remove the intent: `GET /v1/admin/intents` lists it, and
 `POST /v1/admin/intents/delete` deletes it. The next cleanup pass then refunds the escrow.
 
+`refund_error` = `the escrow's VTXO expired on Arkade` means Arkade refused the refund with
+`VTXO_RECOVERABLE`, or lists the escrow as expired or swept (section 5: `expiresAt`, `isSwept`).
+A VTXO expires with the coin that paid it, and arkd then spends it only in a batch. The refund is
+held: it keeps its swap, and nothing is minted or signed for it again, so the player's Lightning
+Address provider is not asked for a new invoice every hour. An escrow found expired before any
+refund was minted has no refund row at all; the log says why.
+
 ### Writing off a refund that can never finish
 
 Some rows above never finish on their own: `entry` empty with `registered = 0` (nothing can sign
@@ -221,6 +228,7 @@ debug while the condition lasts:
 - `Wrote off the refund of ticket … in competition …`: an operator wrote off its refund (see above).
 - `Cannot refund … yet: its escrow … is held by an Arkade batch intent that cannot be deleted yet…`: section 3, `refund_error`.
 - `Deleted the Arkade batch intent that held the escrow of ticket …`: a refund freed its escrow, and every other escrow of that intent.
+- `Cannot refund … yet: its escrow … holds … sats, but its VTXO expired on Arkade…`: section 3, `refund_error`.
 - `kickoff intent … may still hold the escrows, since deleting it failed…`: a kickoff failed and left its intent queued; the pool's refunds, or its next kickoff, delete it.
 - `Cannot sign the refunds of competition …: N of its tickets can still be paid…`: refunds wait for those invoices to expire.
 - `… its ticket was counted after Keymeld was given the competition's roster…`: a ticket paid too late to join the roster; needs an operator.
