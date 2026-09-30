@@ -237,10 +237,17 @@ test("a refused ticket shows the coordinator's reason, such as having entered al
 test("a signed-out visitor is asked to log in before anything is requested", async () => {
   const { elements, document } = entryPage();
   let opened = null;
-  const sandbox = load({ isLoggedIn: () => false, openModal: (modal) => { opened = modal; } }, document,
-    async () => assert.fail("nothing may be fetched while signed out"));
+  let walletLoads = 0;
+  const sandbox = load({
+    isLoggedIn: () => false,
+    openModal: (modal) => { opened = modal; },
+    // Pay is what loads the wallet for a signed-out visitor, not showing the form.
+    loadWallet: () => { walletLoads += 1; },
+  }, document, async () => assert.fail("nothing may be fetched while signed out"));
+  assert.equal(walletLoads, 0);
   await sandbox.submitEntry();
   assert.equal(opened, elements.loginModal);
+  assert.equal(walletLoads, 1);
 });
 
 test("changed terms never tell the user to reload, which would log them out", async () => {

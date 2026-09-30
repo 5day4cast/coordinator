@@ -10,7 +10,7 @@ use crate::domain::{
     winner_payout_sats, Competition, RefundProgress, WindowShape,
 };
 use crate::infra::oracle::ScoringRules;
-use crate::templates::format::{self, sats};
+use crate::templates::format::{self, sats, TimeStyle};
 
 mod queue;
 pub use queue::{PoolLink, PoolOf, Queue, QueueView};
@@ -58,6 +58,8 @@ pub struct CompetitionView {
     pub refund_shares: Option<Vec<u64>>,
     /// A queue split into pools at the start, one of its pools, or a single competition.
     pub queue: Queue,
+    /// Reached by its link only: the public lists leave it out.
+    pub unlisted: bool,
 }
 
 /// Where the entry fees of a competition that didn't run stand.
@@ -65,15 +67,19 @@ pub struct CompetitionView {
 pub enum Refunds {
     /// No entry fee was paid, so nothing is owed.
     Nothing,
+    /// Escrowed fees can't be returned before their escrows' refund locktime.
+    Locked(OffsetDateTime),
     Pending,
     Done,
 }
 
 impl CompetitionView {
+    /// The view of `competition`. One read without its contract, as the lists read them,
+    /// says nothing about a returned pot until [`Self::add_contract`] is given the whole
+    /// competition.
     pub fn new(competition: &Competition, now: OffsetDateTime) -> Self {
         let event = &competition.event_submission;
         let phase = Phase::of(competition, now);
-        let pot_refunded = phase == Phase::Scored && competition.refunds_every_entry();
         let queue = Queue::of(competition);
         let can_enter = phase == Phase::Upcoming
             && match &queue {
@@ -87,7 +93,7 @@ impl CompetitionView {
                 // A pool's players come from its competition's queue.
                 Queue::Pool(_) => false,
             };
-        Self {
+        let mut view = Self {
             id: competition.id.to_string(),
             phase,
             start: event.start_observation_date,
@@ -111,12 +117,22 @@ impl CompetitionView {
                 .as_ref()
                 .and_then(|_| event.window_shape()),
             refunds: RefundProgress::default(),
-            pot_refunded,
-            refund_shares: (pot_refunded || phase == Phase::Expired)
-                .then(|| refund_shares(competition, phase))
-                .flatten(),
+            pot_refunded: false,
+            refund_shares: None,
             queue,
-        }
+            unlisted: !competition.is_listed(),
+        };
+        view.add_contract(competition);
+        view
+    }
+
+    /// Whether the pot went back to every entry, and in what shares, from the competition's
+    /// contract and outcome.
+    pub fn add_contract(&mut self, competition: &Competition) {
+        self.pot_refunded = self.phase == Phase::Scored && competition.refunds_every_entry();
+        self.refund_shares = (self.pot_refunded || self.phase == Phase::Expired)
+            .then(|| refund_shares(competition, self.phase))
+            .flatten();
     }
 
     /// `3 of 25`, or `40 entered` for a queue, which has no seat count.
@@ -215,24 +231,33 @@ impl CompetitionView {
         }
     }
 
-    /// Where the entry fees of a competition that didn't fill stand. Escrowed fees are returned
-    /// once their players are paid; held Lightning payments are released when the competition
-    /// is cancelled.
-    pub fn refunds(&self) -> Refunds {
-        let RefundProgress { escrowed, refunded } = self.refunds;
+    /// Where the entry fees of a competition that didn't fill stand at `now`. Escrowed fees
+    /// are returned once their escrows' refund locktime passes, up to a day after the start;
+    /// held Lightning payments are released when the competition is cancelled.
+    pub fn refunds(&self, now: OffsetDateTime) -> Refunds {
+        let RefundProgress {
+            escrowed,
+            refunded,
+            opens_at,
+        } = self.refunds;
         if escrowed > 0 {
-            if refunded >= escrowed {
-                Refunds::Done
-            } else {
-                Refunds::Pending
+            match opens_at {
+                _ if refunded >= escrowed => Refunds::Done,
+                Some(at) if at > now && refunded == 0 => Refunds::Locked(at),
+                _ => Refunds::Pending,
             }
-        } else if self.total_entries == 0 {
+        } else if self.paid_nothing() {
             Refunds::Nothing
         } else if self.phase == Phase::Unfilled {
             Refunds::Pending
         } else {
             Refunds::Done
         }
+    }
+
+    /// Nobody paid an entry fee: no escrow was funded and there are no entries.
+    fn paid_nothing(&self) -> bool {
+        self.refunds.escrowed == 0 && self.total_entries == 0
     }
 
     pub fn url(&self) -> String {
@@ -262,8 +287,9 @@ fn refund_shares(competition: &Competition, phase: Phase) -> Option<Vec<u64>> {
 }
 
 /// The badge for a competition's phase. Live is the loudest thing on the page;
-/// finished and cancelled competitions stay quiet. A queue split into pools
-/// says so: its pools carry on as competitions of their own.
+/// finished competitions stay quiet, and say only whether they ran: how the pot or the
+/// entry fees went back is in the title, the refund line and the leaderboard. A queue
+/// split into pools says so: its pools carry on as competitions of their own.
 pub fn phase_badge(competition: &CompetitionView) -> Markup {
     let split = competition
         .queue
@@ -287,36 +313,49 @@ fn badge(competition: &CompetitionView, split: bool) -> Markup {
         }
         Phase::Upcoming if !competition.can_enter => ("badge badge-open", "Full"),
         Phase::Upcoming => ("badge badge-open", "Open"),
-        Phase::Unfilled => ("badge badge-quiet", unfilled_label(competition)),
         Phase::Live => ("badge badge-live", "Live"),
         Phase::AwaitingResult => ("badge badge-waiting", "Awaiting results"),
-        Phase::Scored if competition.pot_refunded => ("badge badge-quiet", "Pot return"),
-        Phase::Scored => ("badge badge-quiet", "Finished"),
-        Phase::Expired => ("badge badge-quiet", "Contract expired"),
-        Phase::Cancelled if competition.did_not_fill() => {
-            ("badge badge-quiet", unfilled_label(competition))
-        }
-        Phase::Cancelled => ("badge badge-quiet", "Cancelled"),
-        Phase::Failed => ("badge badge-failed", "Failed"),
+        Phase::Scored | Phase::Expired => ("badge badge-quiet", "Finished"),
+        // Cancelled by the operator, not for want of entries.
+        Phase::Cancelled if !competition.did_not_fill() => ("badge badge-quiet", "Cancelled"),
+        Phase::Unfilled | Phase::Cancelled | Phase::Failed => ("badge badge-quiet", "Didn't run"),
     };
-    let title = competition
-        .did_not_fill()
-        .then(|| match competition.refunds() {
-            Refunds::Nothing => "Not enough entries by the start; no entry fees were paid",
-            _ => "Not enough entries by the start; every entry fee is returned",
-        });
+    let title = match competition.phase {
+        _ if split => None,
+        _ if competition.did_not_fill() => {
+            Some(match (queue.is_some(), competition.paid_nothing()) {
+                (true, true) => "Too few players entered to make a pool; no entry fees were paid",
+                (true, false) => {
+                    "Too few players entered to make a pool; every entry fee is returned"
+                }
+                (false, true) => "Not enough entries by the start; no entry fees were paid",
+                (false, false) => "Not enough entries by the start; every entry fee is returned",
+            })
+        }
+        Phase::Failed => Some("It stopped before it ran, so nothing is scored"),
+        Phase::Scored if competition.pot_refunded => {
+            Some("No entry scored, so the pot is shared back among the entries")
+        }
+        Phase::Expired => Some(
+            "The oracle never signed a result in time, so the pot is shared back among the entries",
+        ),
+        _ => None,
+    };
     html! { span class=(class) title=[title] { (label) } }
 }
 
-fn unfilled_label(competition: &CompetitionView) -> &'static str {
-    match (competition.refunds(), competition.queue.queued().is_some()) {
-        (Refunds::Nothing, false) => "Didn't fill",
-        (Refunds::Pending, false) => "Didn't fill: refund pending",
-        (Refunds::Done, false) => "Didn't fill: refunded",
-        (Refunds::Nothing, true) => "Too few entries",
-        (Refunds::Pending, true) => "Too few entries: refund pending",
-        (Refunds::Done, true) => "Too few entries: refunded",
+/// Under a competition that didn't run: where its entry fees stand. Escrow refunds open at
+/// their locktime, so until then it says when; nothing when no fee was paid.
+pub fn refund_line(competition: &CompetitionView, now: OffsetDateTime) -> Option<Markup> {
+    if !competition.did_not_fill() {
+        return None;
     }
+    Some(match competition.refunds(now) {
+        Refunds::Nothing => return None,
+        Refunds::Locked(at) => html! { "Refunds open " (format::time(at, TimeStyle::DateTime)) },
+        Refunds::Pending => html! { "Refunding…" },
+        Refunds::Done => html! { "Refunded" },
+    })
 }
 
 /// What the list shows: which page of finished competitions, and whether
@@ -356,6 +395,95 @@ fn list_link(url: String, label: Markup) -> Markup {
     }
 }
 
+/// What the list shows for `options`: every competition taking entries, live or awaiting
+/// results, one page of finished ones, and the one to feature.
+struct Sections<'a> {
+    open: Vec<&'a CompetitionView>,
+    live: Vec<&'a CompetitionView>,
+    waiting: Vec<&'a CompetitionView>,
+    /// This page of the finished ones, newest first.
+    finished: Vec<&'a CompetitionView>,
+    page: usize,
+    pages: usize,
+    /// How many cancelled competitions there are, shown or not.
+    cancelled: usize,
+    featured: Option<&'a CompetitionView>,
+}
+
+impl<'a> Sections<'a> {
+    /// `competitions` as [`listed`] gives them.
+    fn of(competitions: &'a [CompetitionView], options: ListOptions) -> Self {
+        let mut live = by_phase(competitions, &[Phase::Live]);
+        let mut open = by_phase(competitions, &[Phase::Upcoming]);
+        let mut waiting = by_phase(competitions, &[Phase::AwaitingResult]);
+        let finished_phases: &[Phase] = if options.show_cancelled {
+            &[
+                Phase::Unfilled,
+                Phase::Scored,
+                Phase::Expired,
+                Phase::Failed,
+                Phase::Cancelled,
+            ]
+        } else {
+            &[
+                Phase::Unfilled,
+                Phase::Scored,
+                Phase::Expired,
+                Phase::Failed,
+            ]
+        };
+        let mut finished = by_phase(competitions, finished_phases);
+        let cancelled = by_phase(competitions, &[Phase::Cancelled]).len();
+        live.sort_by_key(|competition| std::cmp::Reverse(competition.start));
+        open.sort_by_key(|competition| std::cmp::Reverse(competition.start));
+        waiting.sort_by_key(|competition| std::cmp::Reverse(competition.end));
+        finished.sort_by_key(|competition| std::cmp::Reverse(competition.end));
+
+        let pages = finished.len().div_ceil(PAGE_SIZE).max(1);
+        let page = options.page.min(pages - 1);
+        let finished = finished
+            .into_iter()
+            .skip(page * PAGE_SIZE)
+            .take(PAGE_SIZE)
+            .collect();
+        let featured = open
+            .iter()
+            .filter(|competition| competition.can_enter)
+            .min_by_key(|competition| competition.start)
+            .or_else(|| live.first())
+            .copied();
+        Self {
+            open,
+            live,
+            waiting,
+            finished,
+            page,
+            pages,
+            cancelled,
+            featured,
+        }
+    }
+
+    fn shown(&self) -> impl Iterator<Item = &'a CompetitionView> + '_ {
+        self.open
+            .iter()
+            .chain(&self.live)
+            .chain(&self.waiting)
+            .chain(&self.finished)
+            .copied()
+    }
+}
+
+/// The ids of the competitions the list shows for `options`: the ones a page needs refunds and
+/// contracts for. A queue split into pools is shown by its own id.
+pub fn shown_ids(competitions: &[CompetitionView], options: ListOptions) -> Vec<String> {
+    let competitions = listed(competitions);
+    Sections::of(&competitions, options)
+        .shown()
+        .map(|competition| competition.id.clone())
+        .collect()
+}
+
 /// Competitions page content: intro, the one to enter now, then every group.
 pub fn competitions_page(
     competitions: &[CompetitionView],
@@ -363,46 +491,16 @@ pub fn competitions_page(
     now: OffsetDateTime,
 ) -> Markup {
     let competitions = &listed(competitions);
-    let mut live = by_phase(competitions, &[Phase::Live]);
-    let mut open = by_phase(competitions, &[Phase::Upcoming]);
-    let mut waiting = by_phase(competitions, &[Phase::AwaitingResult]);
-    let finished_phases: &[Phase] = if options.show_cancelled {
-        &[
-            Phase::Unfilled,
-            Phase::Scored,
-            Phase::Expired,
-            Phase::Failed,
-            Phase::Cancelled,
-        ]
-    } else {
-        &[
-            Phase::Unfilled,
-            Phase::Scored,
-            Phase::Expired,
-            Phase::Failed,
-        ]
-    };
-    let mut finished = by_phase(competitions, finished_phases);
-    let cancelled = by_phase(competitions, &[Phase::Cancelled]).len();
-    live.sort_by_key(|competition| std::cmp::Reverse(competition.start));
-    open.sort_by_key(|competition| std::cmp::Reverse(competition.start));
-    waiting.sort_by_key(|competition| std::cmp::Reverse(competition.end));
-    finished.sort_by_key(|competition| std::cmp::Reverse(competition.end));
-
-    let pages = finished.len().div_ceil(PAGE_SIZE).max(1);
-    let page = options.page.min(pages - 1);
-    let shown: Vec<_> = finished
-        .iter()
-        .skip(page * PAGE_SIZE)
-        .take(PAGE_SIZE)
-        .copied()
-        .collect();
-    let featured = open
-        .iter()
-        .filter(|competition| competition.can_enter)
-        .min_by_key(|competition| competition.start)
-        .or_else(|| live.first())
-        .copied();
+    let Sections {
+        open,
+        live,
+        waiting,
+        finished,
+        page,
+        pages,
+        cancelled,
+        featured,
+    } = Sections::of(competitions, options);
     let show_cancelled = options.show_cancelled;
 
     html! {
@@ -434,10 +532,10 @@ pub fn competitions_page(
                         }
                     }
                 }
-                @if shown.is_empty() {
+                @if finished.is_empty() {
                     p class="empty-state" { "No finished competitions yet." }
                 } @else {
-                    (list(&shown, now))
+                    (list(&finished, now))
                 }
                 @if pages > 1 {
                     nav class="pager" aria-label="Finished competitions pages" {
@@ -455,9 +553,10 @@ pub fn competitions_page(
     }
 }
 
-/// The competitions the list shows. A queued competition stands for its pools, which its page
-/// links: a pool whose competition is listed isn't, and a queue split into pools is listed where
-/// its least advanced pool is, since it has no lifecycle of its own after the split.
+/// The competitions the list shows. An unlisted competition is left out: it is reached by its
+/// link. A queued competition stands for its pools, which its page links: a pool whose
+/// competition is listed isn't, and a queue split into pools is listed where its least advanced
+/// pool is, since it has no lifecycle of its own after the split.
 fn listed(competitions: &[CompetitionView]) -> Vec<CompetitionView> {
     fn pools_of<'a>(
         competitions: &'a [CompetitionView],
@@ -475,7 +574,7 @@ fn listed(competitions: &[CompetitionView]) -> Vec<CompetitionView> {
     };
     competitions
         .iter()
-        .filter(|competition| !listed_parent(competition))
+        .filter(|competition| !competition.unlisted && !listed_parent(competition))
         .map(|competition| {
             let mut shown = competition.clone();
             if competition
@@ -629,7 +728,12 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
                 @match competition.phase {
                     Phase::Upcoming => { span class="cell-note" { "starts in " (format::duration(competition.start - now)) } }
                     Phase::Live => { span class="cell-note" { "ends in " (format::duration(competition.end - now)) } }
+                    Phase::Expired => { span class="cell-note" { "no result · pot shared back" } }
+                    Phase::Scored if competition.pot_refunded => { span class="cell-note" { "no winner · pot shared back" } }
                     _ => {}
+                }
+                @if let Some(refunds) = refund_line(competition, now) {
+                    span class="cell-note refund-line" { (refunds) }
                 }
                 @match &competition.queue {
                     Queue::Queued(queue) if queue.pools.is_empty() => {
@@ -684,6 +788,7 @@ pub(crate) mod tests {
             pot_refunded: false,
             refund_shares: None,
             queue: Queue::Single,
+            unlisted: false,
         }
     }
 
@@ -772,11 +877,15 @@ pub(crate) mod tests {
         .into_string();
         assert!(shown.contains("unfilled"));
         assert!(
-            shown.contains("Didn't fill"),
+            shown.contains("Didn&#39;t run") || shown.contains("Didn't run"),
             "an unfilled competition says so"
         );
         assert!(!shown.contains("badge-failed"));
         assert!(shown.contains("Hide cancelled (1)"));
+    }
+
+    fn text(markup: Markup) -> String {
+        markup.into_string().replace("&#39;", "'")
     }
 
     /// The window started before it filled: not live, and not hidden with
@@ -784,48 +893,175 @@ pub(crate) mod tests {
     #[test]
     fn an_unfilled_competition_says_its_refund_is_pending() {
         let unfilled = view("unfilled", Phase::Unfilled, -5);
-        let html = competitions_page(std::slice::from_ref(&unfilled), ListOptions::default(), NOW)
-            .into_string();
-        assert!(html.contains("Didn't fill: refund pending"));
+        let html = text(competitions_page(
+            std::slice::from_ref(&unfilled),
+            ListOptions::default(),
+            NOW,
+        ));
+        assert!(html.contains(">Didn't run</span>"));
+        assert!(html.contains("Refunding…"));
         assert!(!html.contains("badge-live"));
         assert!(!html.contains("ends in"));
         assert!(unfilled.did_not_fill());
         assert!(!unfilled.can_enter);
     }
 
-    /// "Refund pending" only while something is owed: never with nothing paid in, and it
-    /// moves to "refunded" once every escrowed fee is back.
+    /// Nothing about refunds with nothing paid in. Escrowed fees say when their refunds open
+    /// while the escrows are locked, "Refunding…" once they are open, and "Refunded" once every
+    /// escrowed fee is back.
     #[test]
     fn an_unfilled_competition_says_where_its_refunds_stand() {
-        let badge = |view: &CompetitionView| phase_badge(view).into_string();
+        let badge = |view: &CompetitionView| text(phase_badge(view));
+        let line = |view: &CompetitionView| refund_line(view, NOW).map(text);
 
         let mut empty = view("empty", Phase::Unfilled, -5);
         empty.total_entries = 0;
-        assert!(badge(&empty).contains(">Didn't fill</span>"));
+        assert!(badge(&empty).contains(">Didn't run</span>"));
         assert!(badge(&empty).contains("no entry fees were paid"));
+        assert_eq!(line(&empty), None);
 
-        // A fee paid into escrow without an entry is still owed back.
+        // A fee paid into escrow without an entry is still owed back. Its escrow opens a day
+        // after the start.
+        let opens_at = NOW + time::Duration::hours(20);
         let mut escrowed = empty.clone();
         escrowed.refunds = RefundProgress {
             escrowed: 1,
             refunded: 0,
+            opens_at: Some(opens_at),
         };
-        assert!(badge(&escrowed).contains("Didn't fill: refund pending"));
+        assert!(badge(&escrowed).contains("every entry fee is returned"));
+        assert_eq!(escrowed.refunds(NOW), Refunds::Locked(opens_at));
+        let locked = line(&escrowed).unwrap();
+        assert!(locked.starts_with("Refunds open <time"), "{locked}");
+        assert!(locked.contains(">Sep 25, 08:00 UTC</time>"), "{locked}");
+        assert!(!locked.contains("pending"));
+
+        // Open: under way, whatever the count.
+        assert_eq!(
+            escrowed.refunds(opens_at + time::Duration::minutes(1)),
+            Refunds::Pending
+        );
+        escrowed.refunds.opens_at = Some(NOW - time::Duration::minutes(1));
+        assert_eq!(line(&escrowed).as_deref(), Some("Refunding…"));
 
         let mut cancelled = view("cancelled", Phase::Cancelled, -600);
         cancelled.total_entries = 2;
         cancelled.refunds = RefundProgress {
             escrowed: 3,
             refunded: 2,
+            opens_at: Some(NOW + time::Duration::hours(1)),
         };
-        assert!(badge(&cancelled).contains("Didn't fill: refund pending"));
+        // Some are back already, so the rest are being refunded, not locked.
+        assert_eq!(line(&cancelled).as_deref(), Some("Refunding…"));
         cancelled.refunds.refunded = 3;
-        assert!(badge(&cancelled).contains("Didn't fill: refunded"));
+        assert_eq!(line(&cancelled).as_deref(), Some("Refunded"));
+        assert!(badge(&cancelled).contains(">Didn't run</span>"));
 
         // Held Lightning payments are released when it is cancelled.
         let mut held = view("held", Phase::Cancelled, -600);
         held.total_entries = 2;
-        assert!(badge(&held).contains("Didn't fill: refunded"));
+        assert_eq!(line(&held).as_deref(), Some("Refunded"));
+
+        // The list shows the line under the window.
+        let row = text(competition_row(&escrowed, NOW));
+        assert!(row.contains(r#"<span class="cell-note refund-line">Refunding…</span>"#));
+    }
+
+    /// Finished competitions say only whether they ran; an operator's cancellation stays
+    /// "Cancelled".
+    #[test]
+    fn finished_competitions_say_finished_or_did_not_run() {
+        let badge = |view: &CompetitionView| text(phase_badge(view));
+        let mut returned = view("returned", Phase::Scored, -60);
+        returned.pot_refunded = true;
+        for finished in [
+            view("scored", Phase::Scored, -60),
+            returned.clone(),
+            view("expired", Phase::Expired, -60),
+        ] {
+            assert!(
+                badge(&finished).contains(">Finished</span>"),
+                "{}",
+                finished.id
+            );
+        }
+        assert!(text(competition_row(&returned, NOW)).contains("no winner · pot shared back"));
+        assert!(badge(&view("failed", Phase::Failed, -60)).contains(">Didn't run</span>"));
+        let mut operator = view("operator", Phase::Cancelled, -60);
+        operator.total_entries = 3;
+        assert!(badge(&operator).contains(">Cancelled</span>"));
+        assert_eq!(refund_line(&operator, NOW).map(text), None);
+        for old in [
+            "Pot return<",
+            "Contract expired",
+            "Didn't fill",
+            "Too few entries",
+            ">Failed<",
+        ] {
+            for competition in [&returned, &operator] {
+                assert!(!badge(competition).contains(old));
+            }
+        }
+    }
+
+    /// An unlisted competition is reached by its link only: the list leaves it out, and it is
+    /// never featured.
+    #[test]
+    fn unlisted_competitions_are_not_listed() {
+        let mut hidden = view("hidden-open", Phase::Upcoming, 30);
+        hidden.unlisted = true;
+        let mut hidden_done = view("hidden-done", Phase::Scored, -100);
+        hidden_done.unlisted = true;
+        let competitions = [
+            hidden,
+            hidden_done,
+            view("listed-open", Phase::Upcoming, 60),
+        ];
+        let html = competitions_page(&competitions, ListOptions::default(), NOW).into_string();
+        assert!(!html.contains("hidden-open") && !html.contains("hidden-done"));
+        assert!(html.contains(r#"href="/competitions/listed-open/entry-form""#));
+        assert!(html.contains("No finished competitions yet."));
+        assert_eq!(
+            shown_ids(&competitions, ListOptions::default()),
+            vec!["listed-open".to_owned()]
+        );
+    }
+
+    /// The rows the handler completes are exactly the rows the page shows.
+    #[test]
+    fn shown_ids_are_the_rows_the_page_shows() {
+        let mut competitions: Vec<_> = (0..25)
+            .map(|index| {
+                view(
+                    &format!("done-{index:02}"),
+                    Phase::Scored,
+                    -1000 + index * 20,
+                )
+            })
+            .collect();
+        competitions.push(view("open", Phase::Upcoming, 60));
+        competitions.push(view("live", Phase::Live, -5));
+        competitions.push(view("cancelled", Phase::Cancelled, -30));
+        for page in 0..4 {
+            for show_cancelled in [false, true] {
+                let options = ListOptions {
+                    page,
+                    show_cancelled,
+                };
+                let html = competitions_page(&competitions, options, NOW).into_string();
+                let mut rendered: Vec<_> = html
+                    .match_indices(r#"class="competition-row" data-competition-id=""#)
+                    .map(|(at, found)| {
+                        let rest = &html[at + found.len()..];
+                        rest[..rest.find('"').unwrap()].to_owned()
+                    })
+                    .collect();
+                let mut shown = shown_ids(&competitions, options);
+                rendered.sort();
+                shown.sort();
+                assert_eq!(rendered, shown, "page {page}, cancelled {show_cancelled}");
+            }
+        }
     }
 
     #[test]
@@ -996,11 +1232,16 @@ pub(crate) mod tests {
         small.refunds = RefundProgress {
             escrowed: 1,
             refunded: 0,
+            opens_at: None,
         };
         assert!(small.did_not_fill());
-        assert!(phase_badge(&small)
-            .into_string()
-            .contains("Too few entries: refund pending"));
+        let badge = text(phase_badge(&small));
+        assert!(badge.contains(">Didn't run</span>"));
+        assert!(badge.contains("Too few players entered to make a pool"));
+        assert_eq!(
+            refund_line(&small, NOW).map(text).as_deref(),
+            Some("Refunding…")
+        );
         small.phase = Phase::Cancelled;
         if let Queue::Queued(queue) = &mut small.queue {
             queue.entries = Some(5);
@@ -1122,6 +1363,6 @@ pub(crate) mod tests {
         assert_eq!(expired.refund_shares, Some(vec![1_000; 3]));
         assert!(phase_badge(&expired)
             .into_string()
-            .contains("Contract expired"));
+            .contains(">Finished</span>"));
     }
 }

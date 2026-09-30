@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 use crate::domain::leaderboard::{Phase, PickProgress, PickState, Rule};
 use crate::infra::oracle::ValueOptions;
 use crate::templates::{
-    components::tip,
+    components::{tip, tip_start},
     format::{self, MetricText},
 };
 
@@ -176,7 +176,7 @@ fn detail(
                 Phase::AwaitingResult => {
                     p class="provisional-note" {
                         "Window closed"
-                        (tip("The oracle's own reading decides the final scores."))
+                        (tip_start("The oracle's own reading decides the final scores."))
                     }
                 }
                 Phase::Unfilled => {

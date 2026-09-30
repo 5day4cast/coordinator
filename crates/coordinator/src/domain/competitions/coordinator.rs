@@ -3358,7 +3358,7 @@ impl Coordinator {
     ) -> Result<std::collections::HashMap<Uuid, super::RefundProgress>, Error> {
         Ok(self
             .competition_store
-            .ark_refund_progress(competition_id)
+            .ark_refund_progress(competition_id.as_ref().map(std::slice::from_ref))
             .await?)
     }
 
@@ -3373,6 +3373,21 @@ impl Coordinator {
             .await?;
         self.attach_queue_details(&mut competitions).await?;
         self.attach_kickoff_checks(&mut competitions).await?;
+        Ok(competitions)
+    }
+
+    /// Every competition as the public lists show it, with its queue: without its contract,
+    /// signatures or transactions (see [`CompetitionStore::list_competitions`]).
+    pub async fn list_competitions(&self) -> Result<Vec<Competition>, Error> {
+        let mut competitions = self
+            .competition_store
+            .list_competitions()
+            .map_err(|e| {
+                error!("failed to list competitions: {:?}", e);
+                Error::from(e)
+            })
+            .await?;
+        self.attach_queue_details(&mut competitions).await?;
         Ok(competitions)
     }
 

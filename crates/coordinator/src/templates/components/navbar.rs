@@ -28,7 +28,7 @@ pub fn navbar() -> Markup {
                         a href="/" {
                             strong class="is-size-5" { "Fantasy Weather" }
                         }
-                        span class="is-size-7 has-text-grey" {
+                        span class="is-size-7 brand-note" {
                             "Powered by "
                             a href="https://www.4casttruth.win/" target="_blank" rel="noopener" class="is-underlined" { "4cast Truth Oracle" }
                         }

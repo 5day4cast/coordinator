@@ -146,6 +146,28 @@ fn a_queued_entry_id_must_be_a_recent_uuidv7() {
     assert!(queued::check_entry_id(at(now + Duration::minutes(10)), now).is_err());
 }
 
+/// A queued competition's reference event is off the oracle's list, and its pools copy it, but
+/// the public lists show them. A single competition's flag keeps it off the lists.
+#[test]
+fn queues_and_pools_are_listed_though_their_events_are_unlisted() {
+    let event = request(OffsetDateTime::now_utc() + Duration::hours(6))
+        .reference_event()
+        .unwrap();
+    let mut queue = Competition::new(&event);
+    queue.kind = CompetitionKind::Queued;
+    assert!(queue.is_listed());
+    let mut pool = Competition::new(&queued::pool_event(&event, Uuid::now_v7(), 7, 5_000).unwrap());
+    pool.kind = CompetitionKind::Pool;
+    assert!(pool.event_submission.unlisted && pool.is_listed());
+
+    assert!(!Competition::new(&event).is_listed());
+    let listed = CreateEvent {
+        unlisted: false,
+        ..event
+    };
+    assert!(Competition::new(&listed).is_listed());
+}
+
 #[test]
 fn a_queued_competition_takes_entries_until_its_pools_form() {
     let start = OffsetDateTime::now_utc() + Duration::hours(1);

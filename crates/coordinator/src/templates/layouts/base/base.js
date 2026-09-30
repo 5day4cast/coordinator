@@ -1,5 +1,5 @@
 // Runs last in the bundle, once the page has parsed. The WASM wallet is not
-// loaded here: it loads when someone opens the log-in or sign-up dialog.
+// loaded here: it loads when someone clicks Log in, Sign up or Pay.
 function initApp() {
   setupModalCloseHandlers();
   setupThemeToggle();

@@ -292,7 +292,7 @@ test.describe("Competition Status Display", () => {
     for (let i = 0; i < count; i++) {
       const status = await rows.nth(i).locator(".cell-status").textContent();
       expect(
-        ["Open", "Full", "Live", "Awaiting results", "Finished", "Didn't fill", "Cancelled", "Failed"].some((s) =>
+        ["Open", "Full", "Entries closed", "Live", "Awaiting results", "Finished", "Didn't run", "Cancelled"].some((s) =>
           status?.includes(s),
         ),
       ).toBe(true);

@@ -139,9 +139,13 @@
   pointer-events: none;
 }
 
+/* 44 px tall: a pick is tapped more than anything else on the page. */
 .pick-option span {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   min-width: 4.5rem;
+  min-height: 44px;
   padding: 0.35rem 0.75rem;
   text-align: center;
   white-space: nowrap;

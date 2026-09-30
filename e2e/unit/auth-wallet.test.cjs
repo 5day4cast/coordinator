@@ -139,3 +139,35 @@ test("password reset signs the replacement credentials with the recovered key", 
   assert.equal(credentialsFreed, true);
   assert.equal(manager.forgotChallenge, null);
 });
+
+// The wallet is most of a second to download: a Log in or Sign up click loads
+// it, but a dialog the page opens by itself (an account page opened signed
+// out) loads it only once the visitor types in it.
+test("the wallet loads when someone asks to log in, not when the page opens the dialog", () => {
+  let loads = 0;
+  const listeners = {};
+  const modal = { addEventListener: (type, listener, options) => { listeners[type] = { listener, options }; } };
+  let onClick;
+  const document = {
+    activeElement: null,
+    querySelector: () => null,
+    getElementById: (id) => (id === "loginModal" ? modal : null),
+    addEventListener: (type, listener) => { if (type === "click") onClick = listener; },
+  };
+  const { openAuthModal, setupAuthModals } = loadBundle(["components/modals/modals.js"], {
+    window: {}, session: {}, console, document, setTimeout: () => {},
+    openModal: () => {},
+    initWasm: async () => { loads += 1; },
+  }, ["openAuthModal", "setupAuthModals"]);
+
+  openAuthModal("loginModal");
+  assert.equal(loads, 0, "opening the dialog alone loads nothing");
+  assert.equal(listeners.input.options.once, true);
+  listeners.input.listener();
+  assert.equal(loads, 1, "typing in it does");
+
+  setupAuthModals({});
+  const opener = { dataset: { openModal: "loginModal" } };
+  onClick({ target: { closest: () => opener }, preventDefault() {} });
+  assert.equal(loads, 2, "a Log in click does");
+});

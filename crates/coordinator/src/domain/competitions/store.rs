@@ -1545,6 +1545,100 @@ impl CompetitionStore {
         Ok(competitions)
     }
 
+    /// Every competition as the public lists show it, oldest first: its terms, entry counts and
+    /// lifecycle times, but not its contract, nonces, signatures or transactions, which are most
+    /// of a row and which a list never shows. Those fields are `None`, so read anything derived
+    /// from them (a pot return, an outcome) from [`Self::get_competition`].
+    ///
+    /// Without its contract, a competition whose contract exists but that recorded nothing
+    /// else would read as just created; those few are read in full, so
+    /// [`Competition::get_state`] reads as it does for [`Self::get_competitions`].
+    pub async fn list_competitions(&self) -> Result<Vec<Competition>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            WITH entry_counts AS (
+                SELECT
+                    entries.event_id,
+                    COUNT(entries.id) AS total_entries,
+                    COUNT(entries.public_nonces) AS total_entry_nonces,
+                    COUNT(entries.signed_at) AS total_signed_entries,
+                    COUNT(tickets.paid_at) AS total_paid_entries
+                FROM entries
+                LEFT JOIN tickets ON entries.ticket_id = tickets.id
+                GROUP BY entries.event_id
+            ),
+            payout_stats AS (
+                SELECT
+                    entries.event_id,
+                    COUNT(DISTINCT CASE WHEN payouts.succeed_at IS NOT NULL THEN payouts.entry_id END) AS total_paid_out_entries
+                FROM entries
+                JOIN payouts ON entries.id = payouts.entry_id
+                GROUP BY entries.event_id
+            )
+            SELECT
+                competitions.id AS id,
+                created_at,
+                event_submission,
+                NULL AS event_announcement,
+                COALESCE(entry_counts.total_entries, 0) AS total_entries,
+                COALESCE(entry_counts.total_entry_nonces, 0) AS total_entry_nonces,
+                COALESCE(entry_counts.total_signed_entries, 0) AS total_signed_entries,
+                COALESCE(entry_counts.total_paid_entries, 0) AS total_paid_entries,
+                COALESCE(payout_stats.total_paid_out_entries, 0) AS total_paid_out_entries,
+                NULL AS outcome_transaction,
+                NULL AS funding_psbt_base64,
+                NULL AS funding_outpoint,
+                NULL AS funding_transaction,
+                NULL AS contract_parameters,
+                NULL AS public_nonces,
+                NULL AS aggregated_nonces,
+                NULL AS partial_signatures,
+                NULL AS signed_contract,
+                attestation,
+                cancelled_at,
+                contracted_at,
+                competitions.signed_at AS signed_at,
+                escrow_funds_confirmed_at,
+                event_created_at,
+                entries_submitted_at,
+                funding_broadcasted_at,
+                funding_confirmed_at,
+                funding_settled_at,
+                awaiting_attestation_at,
+                invoices_settled_at,
+                expiry_broadcasted_at,
+                outcome_broadcasted_at,
+                delta_broadcasted_at,
+                completed_at,
+                failed_at,
+                keymeld_keygen_completed_at,
+                NULL AS errors,
+                competitions.kind AS kind,
+                competitions.parent_id AS parent_id,
+                competitions.pool_index AS pool_index,
+                competitions.pools_formed_at AS pools_formed_at,
+                competitions.contract_parameters IS NOT NULL AS has_contract
+            FROM competitions
+            LEFT JOIN entry_counts ON entry_counts.event_id = competitions.id
+            LEFT JOIN payout_stats ON payout_stats.event_id = competitions.id
+            ORDER BY competitions.id"#,
+        )
+        .fetch_all(self.db_connection.read())
+        .await?;
+
+        let mut competitions = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let competition = <Competition as sqlx::FromRow<_>>::from_row(row)?;
+            let has_contract = sqlx::Row::try_get::<i64, _>(row, "has_contract")? != 0;
+            if has_contract && competition.get_state() == super::CompetitionState::Created {
+                competitions.push(self.get_competition(competition.id).await?);
+            } else {
+                competitions.push(competition);
+            }
+        }
+        Ok(competitions)
+    }
+
     pub async fn get_competition(&self, competition_id: Uuid) -> Result<Competition, sqlx::Error> {
         let query_str = r#"
             WITH payout_stats AS (

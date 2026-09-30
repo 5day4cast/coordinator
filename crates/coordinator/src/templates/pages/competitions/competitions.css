@@ -136,7 +136,7 @@
   white-space: nowrap;
 }
 
-/* A long status ("Didn't fill: refund pending") wraps inside its column rather than running
+/* A long status ("Awaiting results") wraps inside its column rather than running
    into the window beside it. */
 .cell-status {
   min-width: 0;
@@ -151,6 +151,11 @@
 .cell-note {
   font-size: 0.8rem;
   color: var(--competition-muted);
+}
+
+/* Under a competition that didn't run: where its entry fees stand. */
+.refund-line {
+  display: block;
 }
 
 .cell-action {
@@ -185,8 +190,9 @@
   border: 1px solid transparent;
 }
 
+/* White on it: 5.7:1. */
 .badge-live {
-  background: hsl(141, 53%, 42%);
+  background: hsl(141, 53%, 30%);
   color: #fff;
 }
 
