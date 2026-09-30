@@ -49,6 +49,10 @@ pub enum Error {
     /// the entry.
     #[error("{}", competitions::ENTRIES_PAUSED)]
     EntriesPaused,
+    /// Retryable later: no ticket for an Arkade competition is issued while the Arkade server is
+    /// failing batch steps.
+    #[error("{}", competitions::ARKADE_UNAVAILABLE)]
+    ArkadeUnavailable,
     /// Retryable: the swap service cannot fund an entry's swap right now.
     #[error("{}", competitions::SWAPS_UNAVAILABLE)]
     SwapsUnavailable,
@@ -68,6 +72,7 @@ impl Error {
                 | Error::InvalidSignature(_)
                 | Error::FeeEstimateUnavailable
                 | Error::EntriesPaused
+                | Error::ArkadeUnavailable
                 | Error::SwapsUnavailable
         )
     }

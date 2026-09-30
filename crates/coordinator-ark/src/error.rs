@@ -71,6 +71,21 @@ impl Error {
         matches!(self, Error::VtxoRecoverable(_))
     }
 
+    /// Whether the Arkade server itself failed, rather than refusing what it was sent or this
+    /// side failing: a batch the server gave up on, such as one whose commitment transaction it
+    /// could not build, or a request it answered with an internal error or could not be reached
+    /// for.
+    pub fn is_server_fault(&self) -> bool {
+        match self {
+            Error::BatchFailed { .. } => true,
+            Error::Status(status) => server_fault(status),
+            Error::Server(error) => std::error::Error::source(error)
+                .and_then(|source| source.downcast_ref::<tonic::Status>())
+                .is_some_and(server_fault),
+            _ => false,
+        }
+    }
+
     /// Recognise arkd's own errors in a gRPC status; anything else is `other`.
     fn classify(status: &tonic::Status, other: impl FnOnce() -> Error) -> Error {
         let code = arkd_code(status);
@@ -115,6 +130,15 @@ impl From<tonic::Status> for Error {
     fn from(status: tonic::Status) -> Self {
         Error::classify(&status.clone(), || Error::Status(status))
     }
+}
+
+/// arkd answers its `INTERNAL_ERROR`, such as a failed rescan of boarding outputs, with gRPC
+/// `Internal`; a server that is down or restarting is `Unavailable`.
+fn server_fault(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Internal | tonic::Code::Unavailable
+    )
 }
 
 /// The code arkd puts in its `ark.v1.ErrorDetails`, carried in the status's details.
@@ -229,5 +253,32 @@ mod tests {
         let invalid = "INVALID_INTENT_PROOF (23): invalid signature";
         let error = Error::from(status(tonic::Code::InvalidArgument, invalid, Some(23)));
         assert!(matches!(error, Error::Status(_)));
+    }
+
+    #[test]
+    fn server_faults_are_told_apart_from_refusals() {
+        let rescan = "INTERNAL_ERROR (0): failed to rescan boarding utxos: HTTP 500";
+        assert!(Error::from(status(tonic::Code::Internal, rescan, Some(0))).is_server_fault());
+        assert!(
+            Error::from(status(tonic::Code::Unavailable, "connection refused", None))
+                .is_server_fault()
+        );
+        let failed = Error::BatchFailed {
+            id: "batch".into(),
+            reason: "failed to create commitment tx: failed to estimate fee".into(),
+        };
+        assert!(failed.is_server_fault());
+        // A refusal of what was sent, or a failure on this side, is not the server's.
+        let spent = "VTXO_ALREADY_SPENT (6): already spent";
+        assert!(
+            !Error::from(status(tonic::Code::InvalidArgument, spent, Some(6))).is_server_fault()
+        );
+        let recoverable = "VTXO_RECOVERABLE (8): is recoverable";
+        assert!(
+            !Error::from(status(tonic::Code::InvalidArgument, recoverable, Some(8)))
+                .is_server_fault()
+        );
+        assert!(!Error::Timeout("waiting for the batch").is_server_fault());
+        assert!(!Error::Signer("keymeld refused".into()).is_server_fault());
     }
 }

@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::domain::competitions::{
-    admission, ArkCommitment, Arkade, KeymeldArkPool, TicketArkEscrow, TicketPrice,
+    admission, ArkCommitment, Arkade, ArkadeHealth, KeymeldArkPool, TicketArkEscrow, TicketPrice,
 };
 use coordinator_escrow::authorization::ArkEscrowPolicy;
 
@@ -21,6 +21,16 @@ impl Coordinator {
         }
         self.ark = ark.map(Arc::new);
         Ok(self)
+    }
+
+    /// How long a failure of the Arkade server pauses entries when nothing succeeds after it.
+    pub fn with_arkade_outage_secs(mut self, outage_secs: u64) -> Self {
+        self.arkade_health = Arc::new(ArkadeHealth::new(outage_secs));
+        self
+    }
+
+    pub fn arkade_health(&self) -> Arc<ArkadeHealth> {
+        self.arkade_health.clone()
     }
 
     pub fn ark(&self) -> Option<&Arkade> {
@@ -541,7 +551,9 @@ impl Coordinator {
             &hooks,
             &KickoffConfig::for_server(info),
         )
-        .await?;
+        .await;
+        self.arkade_health.record(&kickoff);
+        let kickoff = kickoff?;
         let signed = hooks
             .signed_contract()
             .ok_or_else(|| anyhow!("The batch finished without a signed contract"))?;

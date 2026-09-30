@@ -1109,6 +1109,12 @@ impl Coordinator {
             }
             submitted => submitted,
         };
+        if let Err(e) = &submitted {
+            if e.is_server_fault() {
+                self.arkade_health
+                    .failed(&e.to_string(), OffsetDateTime::now_utc());
+            }
+        }
         let submitted = match submitted {
             // The escrow's VTXO expired, perhaps since it was listed. No swap or signature
             // changes that, so the refund is noted as held, and goes through a batch from
@@ -1320,6 +1326,7 @@ impl Coordinator {
             &config,
         )
         .await;
+        self.arkade_health.record(&recovered);
         match recovered {
             Ok(recovery) => {
                 info!(
@@ -1389,10 +1396,12 @@ impl Coordinator {
         ark_txid: dlctix::bitcoin::Txid,
         checkpoint: dlctix::bitcoin::Psbt,
     ) -> Result<(), Error> {
-        ark.transport
+        let finalized = ark
+            .transport
             .finalize_offchain(ark_txid, vec![checkpoint])
-            .await
-            .map_err(|e| anyhow!("Arkade will not finalize the refund: {e}"))?;
+            .await;
+        self.arkade_health.record(&finalized);
+        finalized.map_err(|e| anyhow!("Arkade will not finalize the refund: {e}"))?;
         self.competition_store
             .advance_ticket_ark_refund(ticket_id, ArkRefundState::Submitted, None, None, None)
             .await?;

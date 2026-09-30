@@ -50,6 +50,7 @@ impl IntoResponse for Error {
             Error::InvalidSignature(_) => (StatusCode::FORBIDDEN, self.to_string()),
             Error::FeeEstimateUnavailable => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             Error::EntriesPaused => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
+            Error::ArkadeUnavailable => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             Error::SwapsUnavailable => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             // Retryable: the oracle is restarting or has not fitted its lines yet. Its message
             // may name internal addresses, so it is logged rather than returned.
@@ -128,6 +129,11 @@ mod tests {
                 Error::EntriesPaused,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Entries are paused while Bitcoin network fees are high",
+            ),
+            (
+                Error::ArkadeUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Entries are paused while the Arkade network recovers; try again in a little while",
             ),
             (
                 Error::FeeEstimateUnavailable,

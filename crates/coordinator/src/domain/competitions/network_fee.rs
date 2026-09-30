@@ -21,6 +21,10 @@ pub const FEE_ESTIMATE_UNAVAILABLE: &str =
 /// The message a player sees while entries are paused.
 pub const ENTRIES_PAUSED: &str = "Entries are paused while Bitcoin network fees are high";
 
+/// The message a player sees while the Arkade server is failing batch steps (`arkade_health.rs`).
+pub const ARKADE_UNAVAILABLE: &str =
+    "Entries are paused while the Arkade network recovers; try again in a little while";
+
 /// `ceil((base + per_player × n) / n × rate × multiplier / 100)` sats, `n` the priced pool size,
 /// the rate floored at `min_sat_per_vb`. Zero when the fee is off.
 ///
@@ -67,6 +71,9 @@ pub struct NetworkFeeQuote {
     /// No ticket is issued while the fee is more than this share of the entry fee, in basis
     /// points; 0 never pauses.
     pub pause_above_entry_bps: u64,
+    /// No ticket for an Arkade competition is issued while the Arkade server is failing batch
+    /// steps, whatever the fee.
+    pub arkade_unavailable: bool,
 }
 
 impl NetworkFeeQuote {
@@ -139,7 +146,11 @@ impl Coordinator {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some((_, quote)) = cached.filter(|(at, _)| at.elapsed() < FRESH) {
-            return Ok(quote);
+            // The Arkade server's health is decided afresh: it costs no request.
+            return Ok(NetworkFeeQuote {
+                arkade_unavailable: self.arkade_unavailable(),
+                ..quote
+            });
         }
         let quote = self.network_fee_quote().await?;
         *self
@@ -183,17 +194,36 @@ impl Coordinator {
             pool_players: settings.pool_players,
             multiplier_percent: settings.multiplier_percent,
             pause_above_entry_bps: settings.pause_above_entry_bps,
+            arkade_unavailable: self.arkade_unavailable(),
         })
+    }
+
+    /// Whether entries to Arkade competitions are paused because the Arkade server is failing
+    /// batch steps.
+    pub fn arkade_unavailable(&self) -> bool {
+        self.arkade_health
+            .unavailable(time::OffsetDateTime::now_utc())
     }
 
     /// The ticket's network fee for its current hash: fixed now at the current estimate unless it
     /// already is, and refused while entries are paused. A ticket invoiced before network fees
-    /// existed has none.
-    pub(super) async fn ticket_network_fee(
+    /// existed has none. No ticket for an Arkade competition gets an invoice while the Arkade
+    /// server is failing batch steps: its escrow could neither kick off nor be refunded.
+    pub(in crate::domain::competitions) async fn ticket_network_fee(
         &self,
         competition: &Competition,
         ticket: &Ticket,
     ) -> Result<u64, Error> {
+        if ticket.payment_request.is_none()
+            && self.arkade_unavailable()
+            && self.competition_store.is_ark_funded(competition.id).await?
+        {
+            info!(
+                "Ticket {} refused: the Arkade server is failing batch steps",
+                ticket.id
+            );
+            return Err(Error::ArkadeUnavailable);
+        }
         if let Some(fee) = self
             .competition_store
             .fixed_ticket_network_fee(ticket.id, &ticket.hash)
@@ -356,6 +386,7 @@ mod tests {
             pool_players: 5,
             multiplier_percent: 150,
             pause_above_entry_bps: 1_000,
+            arkade_unavailable: false,
         };
         assert!(quote.pauses(ENTRY));
         assert!(!quote.pauses(5_920));

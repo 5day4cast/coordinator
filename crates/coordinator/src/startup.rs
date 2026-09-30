@@ -148,7 +148,8 @@ impl Application {
                     let metrics = Metrics::new(
                         app_state.coordinator.competition_store.clone(),
                         app_state.background_threads.clone(),
-                    )?;
+                    )?
+                    .with_arkade_health(app_state.coordinator.arkade_health());
                     Some(build_server(address, metrics_app(Arc::new(metrics))).await?)
                 }
                 None => None,
@@ -543,6 +544,7 @@ pub async fn build_app(
         config.keymeld_settings.automatic_payout_max_fee_rate_sat_vb,
     )?
     .with_ark(arkade(&config.ark_settings).await?)?
+    .with_arkade_outage_secs(config.ark_settings.arkade_outage_secs)
     .with_network_fee(config.network_fee_settings.clone())?
     .with_kickoff_check(config.kickoff_check_settings.clone())?;
     let (wakes, wake_requests) = CompetitionWakes::new();

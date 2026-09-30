@@ -7,6 +7,8 @@ pub use ark_refund::{RefusedWriteOff, TicketRefund, WriteOffReport, WriteOffTarg
 mod ark_store;
 #[cfg(test)]
 mod ark_tests;
+mod arkade_health;
+pub use arkade_health::{arkade_unavailable, ArkadeHealth, DEFAULT_ARKADE_OUTAGE_SECS};
 mod automatic_store;
 mod coordinator;
 mod coordinator_fee;
