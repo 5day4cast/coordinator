@@ -67,6 +67,10 @@ pub async fn serve_asset(Path(file): Path<String>, request: HeaderMap) -> Respon
         HeaderValue::from_static("nosniff"),
     );
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    // Stated outright: a cache in front of the site serves byte ranges of a
+    // stored copy only when it knows the whole length, and without it the
+    // help video cannot be scrubbed.
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(body.len()));
     if let Some(range) = range.and_then(|range| HeaderValue::from_str(&range).ok()) {
         headers.insert(header::CONTENT_RANGE, range);
     }
