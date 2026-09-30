@@ -73,8 +73,9 @@ function entryPage(checked = [{ name: "KPWM_temp_high", value: "over" }]) {
 // The bundle shares the wallet session, isLoggedIn and its other scripts'
 // names (AuthorizedClient, openModal) inside one scope; a test hands them in.
 function load(page, document, fetch) {
-  // The wallet makes entry ids (DlcWallet.newEntryId).
-  const wasm = { DlcWallet: { newEntryId: () => "0190b6a0-0000-7000-8000-000000000001" } };
+  // The wallet makes entry ids (DlcWallet.newEntryId), a new one each time.
+  let made = 0;
+  const wasm = { DlcWallet: { newEntryId: () => `0190b6a0-0000-7000-8000-${String(++made).padStart(12, "0")}` } };
   const session = { wasm, nostrClient: page.nostrClient ?? null, dlcWallet: page.dlcWallet ?? null };
   const isLoggedIn = () => Boolean(page.isLoggedIn?.());
   // htmx is the page's own, on window; nothing else is.
@@ -597,7 +598,7 @@ test("with the picks still loading, the message shows under Pay", async () => {
 function payingPlayer({ ticket = () => ({ ok: true, json: async () => ({ ticket_id: "ticket",
   payment_request: "lnbc53000n1ticket", ...price(), keymeld_session_id: "session",
   keymeld_registration: { user_id: "ticket", session_id: "session", payout_policy: "policy" } }) }),
-  entry = () => ({ ok: true, json: async () => ({ id: "entry" }) }) } = {}) {
+  entry = () => ({ ok: true, json: async () => ({ id: "entry" }) }), sessionStorage } = {}) {
   const { elements, document } = entryPage();
   Object.assign(elements, {
     ticketPaymentModal: element({ querySelector: () => null }),
@@ -627,6 +628,7 @@ function payingPlayer({ ticket = () => ({ ok: true, json: async () => ({ ticket_
   };
   const requests = [];
   const page = loggedIn({
+    sessionStorage,
     htmx: { process: () => {} },
     openModal: (dialog) => dialog.classList.add("is-active"),
     // As closeModal does: hide it, then tell whoever opened it.
@@ -644,7 +646,7 @@ function payingPlayer({ ticket = () => ({ ok: true, json: async () => ({ ticket_
           return { ok: true, json: async () => ({ lightning_address: "thor@lnurl.5day4cast.com" }) };
         }
         if (url.endsWith("/registration")) return { ok: true, status: 204 };
-        const response = url.endsWith("/api/v1/entries") ? await entry(body) : await ticket();
+        const response = url.endsWith("/api/v1/entries") ? await entry(body) : await ticket(body);
         if (!response.ok) {
           const error = new Error(`HTTP error! status: ${response.status}`);
           error.response = response;
@@ -806,4 +808,113 @@ test("terms that can't be fetched say to try again and give Pay back", async () 
   assert.equal(elements.errorMessage.textContent, "Couldn't reach the server, try again");
   assert.equal(elements.submitEntry.disabled, false);
   assert.ok(!elements.submitEntry.classList.contains("is-loading"));
+});
+
+// The coordinator's rules for one player's ticket requests: a request for the entry the ticket
+// is reserved for gets that ticket and invoice back; one for another entry is refused with a
+// 409 and releases the reservation. `lose` answers requests whose answer never arrives.
+function reservingCoordinator() {
+  const server = { reserved: null, issued: 0, lose: 0 };
+  server.ticket = (body) => {
+    const entryId = body.payout.entry_id;
+    if (server.reserved && server.reserved !== entryId) {
+      server.reserved = null;
+      return { ok: false, status: 409, json: async () => ({ error: "your ticket was already requested with a different entry key or payout choice; that request has been cancelled, so request the ticket again" }) };
+    }
+    if (!server.reserved) {
+      server.reserved = entryId;
+      server.issued += 1;
+    }
+    const id = `ticket-${server.issued}`;
+    if (server.lose > 0) {
+      server.lose -= 1;
+      throw new TypeError("Failed to fetch");
+    }
+    return { ok: true, json: async () => ({ ticket_id: id, payment_request: `lnbc53000n1${id}`, ...price(),
+      keymeld_session_id: "session", keymeld_registration: { user_id: id, session_id: "session", payout_policy: "policy" } }) };
+  };
+  // The ticket is entered, or its reservation lapsed unpaid.
+  server.entry = () => {
+    server.reserved = null;
+    return { ok: true, json: async () => ({ id: "entry" }) };
+  };
+  server.expire = () => { server.reserved = null; };
+  return server;
+}
+
+function tabStorage() {
+  const items = new Map();
+  return {
+    getItem: (key) => items.get(key) ?? null,
+    setItem: (key, value) => items.set(key, String(value)),
+    removeItem: (key) => items.delete(key),
+  };
+}
+
+const entryIds = (tickets) => tickets().map(({ body }) => body.payout.entry_id);
+
+test("a retry after an answer that never came sends the same entry and gets the same ticket", async () => {
+  const server = reservingCoordinator();
+  const sessionStorage = tabStorage();
+  const { elements, modal, pay, tickets } = payingPlayer({ ticket: server.ticket, sessionStorage });
+  server.lose = 1;
+  await (await pay()).done;
+  assert.equal(elements.errorMessage.textContent, "Couldn't reach the server, try again");
+  assert.equal(elements.submitEntry.disabled, false);
+
+  await pay();
+  assert.ok(modal.classList.contains("is-active"), "the invoice is shown");
+  assert.ok(elements.errorMessage.classList.contains("hidden"), "no 409");
+  assert.equal(elements.walletLinkLightning.href, "lightning:lnbc53000n1ticket-1");
+  assert.equal(server.issued, 1);
+  const [first, retry] = entryIds(tickets);
+  assert.equal(retry, first, "the same entry id");
+  assert.deepEqual(tickets()[1].body, tickets()[0].body, "the same entry key and payout choice");
+
+  // A reload within the reservation asks for the same ticket too.
+  const reloaded = payingPlayer({ ticket: server.ticket, sessionStorage });
+  await reloaded.pay();
+  assert.ok(reloaded.modal.classList.contains("is-active"));
+  assert.deepEqual(entryIds(reloaded.tickets), [first]);
+  assert.equal(reloaded.elements.walletLinkLightning.href, "lightning:lnbc53000n1ticket-1");
+});
+
+test("after an entry is made, Pay starts a new entry", async () => {
+  const server = reservingCoordinator();
+  const sessionStorage = tabStorage();
+  const { elements, pay, tickets, entries, announce } = payingPlayer({ ticket: server.ticket, entry: server.entry, sessionStorage });
+  const { done } = await pay();
+  announce("fw:ticket-paid");
+  await done;
+  assert.equal(entries().length, 1);
+  assert.equal(elements.submitEntry.textContent, "Entered");
+
+  await pay();
+  const [first, second] = entryIds(tickets);
+  assert.notEqual(second, first, "a new entry id");
+  assert.notEqual(tickets()[1].body.payout.payout_hash, undefined);
+  assert.equal(server.issued, 2);
+  assert.ok(elements.errorMessage.classList.contains("hidden"));
+  // A reload after entering starts a new entry as well.
+  const reloaded = payingPlayer({ ticket: server.ticket, entry: server.entry, sessionStorage });
+  await reloaded.pay();
+  assert.equal(entryIds(reloaded.tickets)[0], second, "the second entry, not the one entered");
+});
+
+test("an expired ticket renews the entry, and the next request gets a ticket", async () => {
+  const server = reservingCoordinator();
+  const { elements, modal, pay, tickets, announce } = payingPlayer({ ticket: server.ticket, sessionStorage: tabStorage() });
+  const { done } = await pay();
+  closeDialog(modal);
+  server.expire();
+  announce("fw:ticket-failed", { message: "Ticket payment expired. Please request a new ticket." });
+  await done;
+  assert.match(elements.errorMessage.textContent, /expired/);
+
+  await pay();
+  const [first, second] = entryIds(tickets);
+  assert.notEqual(second, first, "a new entry for the new ticket");
+  assert.ok(modal.classList.contains("is-active"));
+  assert.ok(elements.errorMessage.classList.contains("hidden"), "no 409");
+  assert.equal(elements.walletLinkLightning.href, "lightning:lnbc53000n1ticket-2");
 });
