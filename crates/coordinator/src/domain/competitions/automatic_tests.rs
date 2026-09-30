@@ -1367,6 +1367,36 @@ async fn a_retried_ticket_request_gets_the_same_ticket_and_invoice() {
     assert!(policy(&first).is_some());
     assert_eq!(policy(&retry), policy(&first));
     assert!(!f.invoice_cancelled(&first));
+    assert_eq!(
+        f.ln.invoices_added(),
+        1,
+        "the retry issued no second invoice"
+    );
+}
+
+#[tokio::test]
+async fn a_retry_sent_while_the_first_request_is_answered_gets_the_same_ticket() {
+    let f = TicketFixture::new().await;
+    let entry = TicketFixture::entry(1);
+    // The browser gave up waiting and asked again; the first request is still being answered.
+    let (first, retry) = tokio::join!(f.request("alice", &entry), f.request("alice", &entry));
+    let (first, retry) = (first.unwrap(), retry.unwrap());
+    assert_eq!(retry.ticket_id, first.ticket_id);
+    assert_eq!(retry.payment_request, first.payment_request);
+    assert_eq!(retry.payment_hash, first.payment_hash);
+    assert_eq!(f.ln.invoices_added(), 1, "one invoice for the one ticket");
+    assert!(!f.invoice_cancelled(&first));
+    let ticket = f
+        .coordinator
+        .competition_store
+        .get_ticket(first.ticket_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        ticket.payment_request.as_ref(),
+        Some(&first.payment_request)
+    );
+    assert_eq!(ticket.reserved_by.as_deref(), Some("alice"));
 }
 
 #[tokio::test]

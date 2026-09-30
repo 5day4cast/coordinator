@@ -132,6 +132,49 @@ fn observation_start_expires_only_unfilled_created_competitions() {
 }
 
 #[tokio::test]
+async fn a_players_side_by_side_reservations_share_one_ticket() {
+    let (_dir, db, store, competition, ticket_id) =
+        fixture(OffsetDateTime::now_utc() + Duration::hours(1), 3).await;
+    let other = Uuid::now_v7();
+    let event_id = competition.id;
+    bounded(db.execute_write(move |pool| async move {
+        sqlx::query("INSERT INTO tickets(id, event_id, encrypted_preimage, hash) VALUES (?, ?, 'other', 'other')")
+            .bind(other.to_string()).bind(event_id.to_string()).execute(&pool).await?;
+        Ok(())
+    }))
+    .await
+    .unwrap();
+    // A retry sent while the first request is still reserving: one ticket, with nothing rotated.
+    let deadline = competition.ticket_deadline();
+    let (first, retry) = bounded(async {
+        tokio::join!(
+            store.get_and_reserve_ticket_before(competition.id, "alice", deadline, 1),
+            store.get_and_reserve_ticket_before(competition.id, "alice", deadline, 1),
+        )
+    })
+    .await;
+    let reserved = |reservation| match reservation {
+        Ok(super::store::TicketReservation::Reserved(reserved)) => *reserved,
+        _ => panic!("no ticket reserved"),
+    };
+    let (first, retry) = (reserved(first), reserved(retry));
+    assert_eq!(retry.ticket.id, first.ticket.id);
+    assert_eq!(retry.ticket.hash, first.ticket.hash);
+    assert!(first.superseded_payment_hash.is_none() && retry.superseded_payment_hash.is_none());
+    let untouched = if first.ticket.id == ticket_id {
+        other
+    } else {
+        ticket_id
+    };
+    assert!(bounded(store.get_ticket(untouched))
+        .await
+        .unwrap()
+        .reserved_by
+        .is_none());
+    bounded(db.close()).await.unwrap();
+}
+
+#[tokio::test]
 async fn closed_ticket_request_does_not_reserve_or_rotate_a_ticket() {
     let (_dir, db, store, competition, ticket_id) = fixture(OffsetDateTime::now_utc(), 3).await;
     let denied = bounded(store.get_and_reserve_ticket_before(

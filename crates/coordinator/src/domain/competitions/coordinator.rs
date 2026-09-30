@@ -228,7 +228,12 @@ pub struct Coordinator {
     worker_leases: Arc<super::WorkerLeases>,
     /// Lasting conditions already logged, so each is warned about once rather than every step.
     pub(super) reported: super::Reported,
+    /// One ticket request at a time per competition and player (`lock_ticket_request`).
+    ticket_requests: TicketRequestLocks,
 }
+
+type TicketRequestLocks =
+    std::sync::Mutex<HashMap<(Uuid, String), std::sync::Weak<tokio::sync::Mutex<()>>>>;
 
 impl Coordinator {
     #[expect(
@@ -288,6 +293,7 @@ impl Coordinator {
             wakes: super::CompetitionWakes::default(),
             worker_leases,
             reported: super::Reported::default(),
+            ticket_requests: TicketRequestLocks::default(),
         };
         coordinator.validate_coordinator_metadata().await?;
         Ok(coordinator)
@@ -3402,6 +3408,16 @@ impl Coordinator {
             .await
     }
 
+    /// A ticket for `pubkey`'s entry on the competition, and the invoice that pays for it.
+    ///
+    /// The payout choice's entry id is the request's idempotency key for a player on a
+    /// competition: a request for the entry its unpaid ticket is reserved for, with the same entry
+    /// key and payout choices, gets that ticket, invoice and payout policy back, however often it
+    /// is sent, and a retry sent while the first request is still being answered waits for it
+    /// rather than issuing a second invoice. A request for another entry while one is reserved is
+    /// refused with [`Error::Conflict`] and releases the reservation, so the next request gets a
+    /// ticket. Once the ticket is entered, or its reservation lapses unpaid, a request is answered
+    /// as a new one.
     pub async fn request_ticket_with_payout(
         &self,
         pubkey: String,
@@ -3409,6 +3425,7 @@ impl Coordinator {
         btc_pubkey: BitcoinPublicKey,
         payout: Option<coordinator_core::PayoutRegistrationRequest>,
     ) -> Result<TicketResponse, Error> {
+        let _one_at_a_time = self.lock_ticket_request(competition_id, &pubkey).await;
         let competition = self
             .competition_store
             .get_competition(competition_id)
@@ -3486,6 +3503,33 @@ impl Coordinator {
             self.release_failed_reservation(&ticket).await;
         }
         result
+    }
+
+    /// Serializes a player's ticket requests for a competition. The reservation is atomic, but
+    /// the invoice is added to it later: two requests answered side by side would both find the
+    /// ticket without one and each add their own. The second one waits, then finds the first's.
+    async fn lock_ticket_request(
+        &self,
+        competition_id: Uuid,
+        pubkey: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self
+                .ticket_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            let key = (competition_id, pubkey.to_owned());
+            match locks.get(&key).and_then(std::sync::Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(key, Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
     }
 
     /// Release the reservation a failed ticket request was handed, so the player's next

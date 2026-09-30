@@ -17,12 +17,16 @@ class Entry {
     this.paid = false;
   }
 
-  async init() {
+  // `kept` is the entry an earlier ticket request carried (see keptEntry). It is used again
+  // unless another account's wallet made it.
+  async init(kept = null) {
     // The entry key is derived from the entry id, so every entry gets its own
     // key and no counter or entry ordering is involved.
-    const id = session.wasm.DlcWallet.newEntryId();
+    const reuse = kept && session.dlcWallet.entryRegistration(kept.id).ephemeral_pubkey === kept.ephemeral_pubkey;
+    const id = reuse ? kept.id : session.wasm.DlcWallet.newEntryId();
     const { ephemeral_pubkey, payout_hash } =
       session.dlcWallet.entryRegistration(id);
+    keepEntry(this.competition.id, { id, ephemeral_pubkey });
 
     this.entry = {
       id,
@@ -46,6 +50,9 @@ class Entry {
     }
 
     const ticketData = await response.json();
+    // Until the wallet accepts this ticket: one it refuses (other terms, a higher network fee)
+    // would come back the same for this entry, so the next Pay starts a new entry.
+    this.renew = true;
     this.ticket = {
       id: ticketData.ticket_id,
       payment_request: ticketData.payment_request,
@@ -117,6 +124,7 @@ class Entry {
         ? await session.dlcWallet.keymeldRegistration(this.entry.id, JSON.stringify(assignment))
         : null;
     }
+    this.renew = false;
     // Ticket hash, wallet key and enclave trust are all checked before
     // exposing the invoice for payment. A failed check cannot leave a paid ticket.
     // The registration is sent before the invoice is shown, so a ticket paid
@@ -248,6 +256,8 @@ class Entry {
         document.querySelectorAll("#walletLinks a").forEach((a) => a.removeAttribute("href"));
         closeModal($modal);
         if (error) {
+          // The ticket expired or failed: the next Pay starts a new entry.
+          this.renew = true;
           $error.textContent = error.message;
           $error.classList.remove("is-hidden");
           reject(error);
@@ -506,6 +516,40 @@ function hidePicksMessage() {
   document.getElementById("picksMessage")?.classList.add("hidden");
 }
 
+// The entry every ticket request for a competition carries, by competition id, until it is
+// entered or its ticket expires, fails or is refused. The coordinator takes the entry id as the
+// request's idempotency key: a request for the same entry gets the same ticket and invoice, so
+// a retry after an answer that never came goes through. The tab keeps it as well, so a reload
+// within the ticket's reservation asks for the same ticket.
+const keptEntries = new Map();
+const keptEntryKey = (competitionId) => `fw:entry:${competitionId}`;
+
+function keptEntry(competitionId) {
+  if (!keptEntries.has(competitionId)) {
+    try {
+      const kept = JSON.parse(sessionStorage.getItem(keptEntryKey(competitionId)));
+      if (kept) keptEntries.set(competitionId, kept);
+    } catch {
+      // No session storage (a private window, say): kept for this page only.
+    }
+  }
+  return keptEntries.get(competitionId) ?? null;
+}
+
+function keepEntry(competitionId, entry) {
+  keptEntries.set(competitionId, entry);
+  try {
+    sessionStorage.setItem(keptEntryKey(competitionId), JSON.stringify(entry));
+  } catch {}
+}
+
+function forgetEntry(competitionId) {
+  keptEntries.delete(competitionId);
+  try {
+    sessionStorage.removeItem(keptEntryKey(competitionId));
+  } catch {}
+}
+
 // The entry whose ticket was issued and which isn't entered yet. Pay picks it up again rather
 // than asking for another ticket: its invoice while that is unpaid, the entry itself once paid.
 let pendingEntry = null;
@@ -585,6 +629,7 @@ async function submitEntry() {
 
     await currentEntry.submit();
     pendingEntry = null;
+    forgetEntry(currentEntry.competition.id);
 
     successMsg.classList.remove("hidden");
     submitBtn.textContent = "Entered";
@@ -593,7 +638,12 @@ async function submitEntry() {
   } catch (caught) {
     console.error("Entry submission failed:", caught);
     // A ticket that failed or was never paid is done with; a paid one is entered on the next Pay.
-    if (pendingEntry && !pendingEntry.paid && !pendingEntry.awaitingPayment) pendingEntry = null;
+    // The entry itself is kept for the next request unless its ticket expired, failed or was
+    // refused: a request whose answer never came gets the same ticket back.
+    if (pendingEntry && !pendingEntry.paid && !pendingEntry.awaitingPayment) {
+      if (pendingEntry.renew) forgetEntry(pendingEntry.competition.id);
+      pendingEntry = null;
+    }
 
     const error = caught?.response ? await requestFailure(caught) : caught;
     // WASM rejects with plain strings, which have no message property.
@@ -639,7 +689,7 @@ async function newEntry(form, picks) {
   const currentEntry = new Entry(body.dataset.apiBase || "", body.dataset.oracleBase || "", {
     id: form.dataset.competitionId,
   });
-  await currentEntry.init();
+  await currentEntry.init(keptEntry(form.dataset.competitionId));
   currentEntry.payoutTerms = payoutTerms;
   currentEntry.shownPrice = shownPrice;
   currentEntry.payoutChoice = {
