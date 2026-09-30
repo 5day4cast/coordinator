@@ -12,7 +12,7 @@ mod network_fee;
 mod queued_coordinator;
 #[path = "queued_kickoff.rs"]
 mod queued_kickoff;
-pub use ark_coordinator::SWAPS_UNAVAILABLE;
+pub use ark_coordinator::{ARK_SWAP_BOARDS_EVERY, SWAPS_UNAVAILABLE};
 pub use automatic::{InvoiceFallbackRequest, PayoutAuthorizationInfo, PayoutTermsQuote};
 pub use kickoff_check::{KickoffCheck, KickoffPool};
 pub use network_fee::{

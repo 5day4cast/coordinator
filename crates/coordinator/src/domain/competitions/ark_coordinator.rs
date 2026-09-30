@@ -33,6 +33,40 @@ impl Coordinator {
         self.arkade_health.clone()
     }
 
+    /// Learn from ark-swapd how its boards last went, since the Arkade server failing those is
+    /// an outage too while the coordinator runs no batch step of its own. A failed or slow read
+    /// is ignored.
+    pub async fn read_ark_swap_boards(&self) {
+        let Some(ark) = self.ark() else {
+            return;
+        };
+        let wallet = match tokio::time::timeout(ARK_SWAP_WALLET_TIMEOUT, ark.swaps.wallet()).await {
+            Ok(Ok(wallet)) => wallet,
+            Ok(Err(error)) => {
+                debug!("Could not read ark-swapd's boards: {error:#}");
+                return;
+            }
+            Err(_) => {
+                debug!(
+                    "Could not read ark-swapd's boards: no answer within {}s",
+                    ARK_SWAP_WALLET_TIMEOUT.as_secs()
+                );
+                return;
+            }
+        };
+        let at = |seconds: i64| OffsetDateTime::from_unix_timestamp(seconds).ok();
+        let failure = wallet
+            .last_board_failure
+            .and_then(|failure| Some((at(failure.at)?, format!("ark-swapd {}", failure.message))));
+        self.arkade_health.observed(
+            failure
+                .as_ref()
+                .map(|(at, message)| (*at, message.as_str())),
+            wallet.last_board_success_at.and_then(at),
+            OffsetDateTime::now_utc(),
+        );
+    }
+
     pub fn ark(&self) -> Option<&Arkade> {
         self.ark.as_deref()
     }
@@ -658,6 +692,10 @@ pub const SWAPS_UNAVAILABLE: &str =
 
 /// Reports about pending escrow swaps, by swap.
 const SWAP_REPORTS: &str = "escrow swap";
+
+/// How often ark-swapd's boards are read, and how long it has to answer.
+pub const ARK_SWAP_BOARDS_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+const ARK_SWAP_WALLET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The VTXO among `vtxos` that a paid swap put in the escrow at `address`.
 ///

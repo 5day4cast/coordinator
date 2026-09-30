@@ -9,7 +9,7 @@
 //! | `POST /v1/refunds` | `{ "payment_hash", "amount_sat", "player_key", "deadline" }` → the swap an unused escrow's refund pays. Returns the swap already minted for that invoice. |
 //! | `POST /v1/refunds/{id}/paid` | `{ "preimage" }` → records the payment, answering 202 with the refund. The worker claims the swap. |
 //! | `GET /v1/refunds/{id}` | A refund's state. |
-//! | `GET /v1/wallet` | The Ark wallet's addresses and balance: what is spendable, what of it may pay an escrow (`payable_sat`) or is too close to expiry (`expiring_sat`), what must be recovered in a batch (`recoverable_sat`), when the first spendable VTXO expires (`earliest_expiry`, UNIX seconds), and what has confirmed at the boarding address but no batch has taken yet (`boarding_sat`). Read at most once every 10 seconds. |
+//! | `GET /v1/wallet` | The Ark wallet's addresses and balance: what is spendable, what of it may pay an escrow (`payable_sat`) or is too close to expiry (`expiring_sat`), what must be recovered in a batch (`recoverable_sat`), when the first spendable VTXO expires (`earliest_expiry`, UNIX seconds), and what has confirmed at the boarding address but no batch has taken yet (`boarding_sat`). Read at most once every 10 seconds. Also how boards and renewals went since the service started: the last one the Arkade server failed (`last_board_failure`, `{ "at", "message" }` with `at` in UNIX seconds), and when a batch last took one (`last_board_success_at`, UNIX seconds). The coordinator pauses Arkade entries on a failure newer than the last success. |
 //! | `POST /v1/wallet/board` | Move confirmed boarding coins, and recoverable VTXOs, into VTXOs in the next batch. |
 
 use std::sync::Arc;

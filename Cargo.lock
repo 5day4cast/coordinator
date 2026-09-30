@@ -1769,6 +1769,7 @@ dependencies = [
  "time",
  "tokio",
  "toml",
+ "tonic 0.14.6",
  "uuid",
 ]
 

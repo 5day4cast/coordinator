@@ -3,7 +3,9 @@
 
 use super::*;
 use crate::infra::{
-    ark_swap::{EscrowSwaps, RefundSwap as MintedRefund, Swap, SwapState},
+    ark_swap::{
+        BoardFailure, EscrowSwaps, RefundSwap as MintedRefund, Swap, SwapState, SwapWallet,
+    },
     bitcoin_mock::MockBitcoinClient,
     db::{DBConnection, DatabasePoolConfig, DatabaseType},
     keymeld::{
@@ -48,6 +50,8 @@ struct Swaps {
     claimed: Mutex<Vec<Uuid>>,
     /// Lose the answer to the next report of a refund's preimage.
     lose_next_claim: AtomicBool,
+    /// How its boards last went, or `None` for a wallet it cannot read.
+    wallet: Mutex<Option<SwapWallet>>,
 }
 
 impl Swaps {
@@ -59,6 +63,7 @@ impl Swaps {
             minted: AtomicUsize::new(0),
             claimed: Mutex::default(),
             lose_next_claim: AtomicBool::new(false),
+            wallet: Mutex::new(Some(SwapWallet::default())),
         }
     }
 
@@ -175,6 +180,14 @@ impl EscrowSwaps for Swaps {
             .get(&id)
             .cloned()
             .ok_or_else(|| anyhow!("no refund {id}"))
+    }
+
+    async fn wallet(&self) -> anyhow::Result<SwapWallet> {
+        self.wallet
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow!("ark-swapd answered 502 Bad Gateway: arkd is away"))
     }
 }
 
@@ -1317,6 +1330,41 @@ async fn no_ticket_is_issued_while_the_arkade_server_is_failing() {
             .unwrap()
             .arkade_unavailable
     );
+    f.database.close().await.unwrap();
+}
+
+/// While no batch step of the coordinator's own runs, ark-swapd's failed boards show the Arkade
+/// server is failing; its next board lifts the pause. An unreadable wallet changes nothing.
+#[tokio::test]
+async fn ark_swapds_failed_boards_pause_entries() {
+    let f = Fixture::new().await;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let rescan = BoardFailure {
+        at: now - 60,
+        message: "board: Failed to join batch: request failed code: 'Internal error', message: \
+                  \"INTERNAL_ERROR (0): failed to rescan boarding utxos: HTTP 500\""
+            .into(),
+    };
+    *f.swaps.wallet.lock().unwrap() = Some(SwapWallet {
+        last_board_failure: Some(rescan.clone()),
+        last_board_success_at: Some(now - 600),
+    });
+    f.coordinator.read_ark_swap_boards().await;
+    assert!(f.coordinator.arkade_unavailable());
+
+    *f.swaps.wallet.lock().unwrap() = None;
+    f.coordinator.read_ark_swap_boards().await;
+    assert!(
+        f.coordinator.arkade_unavailable(),
+        "an unreadable wallet changes nothing"
+    );
+
+    *f.swaps.wallet.lock().unwrap() = Some(SwapWallet {
+        last_board_failure: Some(rescan),
+        last_board_success_at: Some(now),
+    });
+    f.coordinator.read_ark_swap_boards().await;
+    assert!(!f.coordinator.arkade_unavailable());
     f.database.close().await.unwrap();
 }
 

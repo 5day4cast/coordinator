@@ -1,7 +1,11 @@
-//! Whether the Arkade server is working, judged from the coordinator's own batch steps.
+//! Whether the Arkade server is working, judged from the coordinator's own batch steps and from
+//! ark-swapd's boards.
 //!
 //! A kickoff that forfeits its escrows, a recovery the server takes in a batch, and a refund it
-//! takes offchain are successes. A batch the server gave up on, or a request it answered with an
+//! takes offchain are successes, and so is a batch that took one of ark-swapd's boards or
+//! renewals. ark-swapd reports those it saw on `GET /v1/wallet`, and the coordinator reads them
+//! once a minute: while no ticket gets as far as a kickoff, they are what shows the server's
+//! state. A batch the server gave up on, or a request it answered with an
 //! internal error, is a failure (`coordinator_ark::Error::is_server_fault`); a refusal of what was
 //! sent, or a failure on this side, is neither. While the last failure is newer than the last
 //! success and less than `arkade_outage_secs` old, the server is unavailable and no ticket for an
@@ -75,6 +79,35 @@ impl ArkadeHealth {
     pub fn failed(&self, message: &str, now: OffsetDateTime) {
         let mut seen = self.lock();
         seen.last_failure = Some((now, message.to_owned()));
+        self.decide(&mut seen, now);
+    }
+
+    /// What ark-swapd reports of its boards: when the server last failed one, and when a batch
+    /// last took one. Each counts only if newer than what was seen, so reading the same ones
+    /// again changes nothing, and an old failure does not pause entries again.
+    pub fn observed(
+        &self,
+        failure: Option<(OffsetDateTime, &str)>,
+        success: Option<OffsetDateTime>,
+        now: OffsetDateTime,
+    ) {
+        let mut seen = self.lock();
+        // A clock ahead of this one must not stretch a failure past its window.
+        if let Some(success) = success.map(|at| at.min(now)) {
+            if seen.last_success.is_none_or(|last| success > last) {
+                seen.last_success = Some(success);
+            }
+        }
+        if let Some((at, message)) = failure {
+            let at = at.min(now);
+            if seen
+                .last_failure
+                .as_ref()
+                .is_none_or(|(last, _)| at > *last)
+            {
+                seen.last_failure = Some((at, message.to_owned()));
+            }
+        }
         self.decide(&mut seen, now);
     }
 
@@ -192,6 +225,54 @@ mod tests {
         health.failed("failed to rescan boarding utxos", at(3));
         assert!(health.unavailable(at(10)));
         assert!(!health.unavailable(at(18)), "a quiet window lifts it");
+    }
+
+    #[test]
+    fn a_board_failure_newer_than_the_last_success_pauses_entries() {
+        let health = ArkadeHealth::new(900);
+        health.succeeded(at(0));
+        health.observed(
+            Some((at(5), "board: failed to rescan boarding utxos")),
+            None,
+            at(6),
+        );
+        assert!(health.unavailable(at(6)));
+        // ark-swapd reporting an older success, or the same failure again, keeps the pause.
+        health.observed(
+            Some((at(5), "board: failed to rescan boarding utxos")),
+            Some(at(3)),
+            at(7),
+        );
+        assert!(health.unavailable(at(7)));
+    }
+
+    #[test]
+    fn a_board_success_newer_than_the_failure_lifts_the_pause() {
+        let health = ArkadeHealth::new(900);
+        health.failed("batch failed: failed to create commitment tx", at(0));
+        assert!(health.unavailable(at(1)));
+        health.observed(Some((at(0), "board: batch failed")), Some(at(2)), at(3));
+        assert!(!health.unavailable(at(3)));
+    }
+
+    #[test]
+    fn an_old_board_failure_does_nothing() {
+        let health = ArkadeHealth::new(900);
+        // Older than the last success.
+        health.succeeded(at(10));
+        health.observed(Some((at(5), "board: batch failed")), None, at(11));
+        assert!(!health.unavailable(at(11)));
+        // Older than the window, with nothing after it.
+        let health = ArkadeHealth::new(900);
+        health.observed(Some((at(0), "board: batch failed")), None, at(20));
+        assert!(!health.unavailable(at(20)));
+        // A failure that lifted by a quiet window, read again, does not pause again.
+        let health = ArkadeHealth::new(900);
+        health.observed(Some((at(0), "board: batch failed")), None, at(1));
+        assert!(health.unavailable(at(1)));
+        assert!(!health.unavailable(at(16)));
+        health.observed(Some((at(0), "board: batch failed")), None, at(17));
+        assert!(!health.unavailable(at(17)));
     }
 
     #[test]
