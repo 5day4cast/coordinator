@@ -3,6 +3,7 @@
 //! The mock checks every signature the way arkd would, from the PSBTs alone.
 //! It plays one batch: selection, a connector tree, the commitment transaction, and finalization.
 //! Events from an unrelated batch are mixed in, and the kickoff must ignore them.
+//! The batch can also create other users' VTXOs, and start signing their VTXO tree.
 //!
 //! Like arkd, it keeps a registered intent queued until a batch confirms it or a delete proof
 //! removes it, and meanwhile refuses offchain spends of its VTXOs with
@@ -15,7 +16,7 @@ use std::sync::Mutex;
 use ark_core::intent::Intent;
 use ark_core::server::{
     BatchFailed, BatchFinalizationEvent, BatchFinalizedEvent, BatchStartedEvent,
-    BatchTreeEventType, Info, StreamEvent, TreeTxEvent, VirtualTxOutPoint,
+    BatchTreeEventType, Info, StreamEvent, TreeSigningStartedEvent, TreeTxEvent, VirtualTxOutPoint,
 };
 use ark_core::TxGraphChunk;
 use async_trait::async_trait;
@@ -23,7 +24,7 @@ use bitcoin::absolute::LockTime;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::hex::DisplayHex;
 use bitcoin::key::{Keypair, Secp256k1, TweakedPublicKey};
-use bitcoin::secp256k1::{Message, SecretKey};
+use bitcoin::secp256k1::{Message, PublicKey, SecretKey};
 use bitcoin::sighash::{Prevouts, SighashCache};
 use bitcoin::transaction::Version;
 use bitcoin::{
@@ -114,6 +115,9 @@ pub struct MockArkd {
     pub dust: Amount,
     /// Whether a batch selects the registered intent. Without, it stays queued.
     pub selects: bool,
+    /// The cosigners of a VTXO tree the batch builds for other users' outputs. Without, the batch
+    /// has no VTXO tree.
+    pub vtxo_tree: Option<Vec<PublicKey>>,
     pub sender: mpsc::UnboundedSender<Result<StreamEvent, Error>>,
     pub receiver: Mutex<Option<mpsc::UnboundedReceiver<Result<StreamEvent, Error>>>>,
     pub state: Mutex<MockState>,
@@ -147,6 +151,8 @@ pub struct MockState {
     /// VTXOs this server lists, by the address whose script they pay. A finalized offchain
     /// spend marks its inputs spent here.
     pub vtxos: Vec<VirtualTxOutPoint>,
+    /// The cosigner keys the registered intent listed.
+    pub cosigners: Vec<PublicKey>,
     /// The intent's on-chain outputs.
     pub outputs: Option<Vec<TxOut>>,
     pub commitment_txid: Option<Txid>,
@@ -179,6 +185,7 @@ impl MockArkd {
             forfeit_script: info.forfeit_address.script_pubkey(),
             dust: info.dust,
             selects: true,
+            vtxo_tree: None,
             sender,
             receiver: Mutex::new(Some(receiver)),
             state: Mutex::default(),
@@ -197,6 +204,7 @@ impl MockArkd {
             forfeit_script: info.forfeit_address.script_pubkey(),
             dust: info.dust,
             selects: true,
+            vtxo_tree: None,
             sender,
             receiver: Mutex::new(Some(receiver)),
             state: Mutex::default(),
@@ -246,6 +254,13 @@ impl MockArkd {
     /// A server whose batches never select the intent, so it stays queued.
     pub fn never_selecting(mut self) -> Self {
         self.selects = false;
+        self
+    }
+
+    /// A server whose batch also creates other users' VTXOs, and asks `cosigners` to sign
+    /// their VTXO tree.
+    pub fn sharing_a_vtxo_tree(mut self, cosigners: Vec<PublicKey>) -> Self {
+        self.vtxo_tree = Some(cosigners);
         self
     }
 
@@ -337,6 +352,7 @@ impl ArkTransport for MockArkd {
                     "duplicated input, already registered by another intent".into(),
                 ));
             }
+            state.cosigners = listed_cosigners(&intent.serialize_message()?);
             state.outputs = Some(outputs);
             state.queued.push(QueuedIntent {
                 id: INTENT_ID.into(),
@@ -530,6 +546,16 @@ impl ArkTransport for MockArkd {
         if self.commitment == Commitment::PaysSomeoneElse {
             outputs[0].script_pubkey = p2tr(66);
         }
+        // arkd puts the VTXO tree's batch output first.
+        if self.vtxo_tree.is_some() {
+            outputs.insert(
+                0,
+                TxOut {
+                    value: Amount::from_sat(5_000),
+                    script_pubkey: p2tr(72),
+                },
+            );
+        }
         let connector_vout = outputs.len() as u32;
         let escrows = self.signers.len() as u64;
         outputs.extend([
@@ -568,6 +594,40 @@ impl ArkTransport for MockArkd {
         };
         state.commitment_txid = Some(commitment.compute_txid());
         state.connector_txid = Some(connectors.compute_txid());
+
+        if let Some(cosigners) = &self.vtxo_tree {
+            let leaf = Transaction {
+                version: Version::non_standard(3),
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::new(commitment.compute_txid(), 0),
+                    ..Default::default()
+                }],
+                output: vec![
+                    TxOut {
+                        value: Amount::from_sat(5_000),
+                        script_pubkey: p2tr(73),
+                    },
+                    ark_core::anchor_output(),
+                ],
+            };
+            self.send(StreamEvent::TreeTx(TreeTxEvent {
+                id: BATCH.into(),
+                topic: Vec::new(),
+                batch_tree_event_type: BatchTreeEventType::Vtxo,
+                tx_graph_chunk: TxGraphChunk {
+                    txid: Some(leaf.compute_txid()),
+                    tx: Psbt::from_unsigned_tx(leaf).unwrap(),
+                    children: HashMap::new(),
+                },
+            }));
+            self.send(StreamEvent::TreeSigningStarted(TreeSigningStartedEvent {
+                id: BATCH.into(),
+                // Like arkd, it asks every selected intent's cosigners.
+                cosigners_pubkeys: cosigners.iter().chain(&state.cosigners).copied().collect(),
+                unsigned_commitment_tx: Psbt::from_unsigned_tx(commitment.clone()).unwrap(),
+            }));
+        }
 
         // A connector tree from the unrelated batch comes first.
         let mut stray = connectors.clone();
@@ -627,4 +687,17 @@ impl ArkTransport for MockArkd {
         }));
         Ok(())
     }
+}
+
+/// The keys in a register message's `cosigners_public_keys`.
+fn listed_cosigners(message: &str) -> Vec<PublicKey> {
+    let (_, listed) = message
+        .split_once(r#""cosigners_public_keys":["#)
+        .expect("a register message lists its cosigners");
+    let (listed, _) = listed.split_once(']').unwrap();
+    listed
+        .split(',')
+        .filter(|key| !key.is_empty())
+        .map(|key| PublicKey::from_str(key.trim_matches('"')).unwrap())
+        .collect()
 }

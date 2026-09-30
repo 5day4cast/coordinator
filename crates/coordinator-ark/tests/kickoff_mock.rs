@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bitcoin::key::{Keypair, Secp256k1};
-use bitcoin::secp256k1::{schnorr, Message};
+use bitcoin::secp256k1::{schnorr, Message, PublicKey};
 use bitcoin::{Amount, OutPoint, ScriptBuf, TxOut};
 use coordinator_ark::{
     escrow_terms, fund_pool, BoxError, Error, EscrowInput, EscrowSigner, KickoffConfig,
@@ -98,6 +98,74 @@ async fn pays_the_coordinator_fee_in_the_same_batch() {
         Some(OutPoint::new(kickoff.commitment_txid, 1))
     );
     assert_eq!(arkd.forfeits().len(), 3);
+}
+
+#[tokio::test]
+async fn the_kickoff_intent_lists_no_cosigner() {
+    let fixture = Fixture::new();
+    let arkd = Arc::new(MockArkd::new(
+        &fixture.pool,
+        &fixture.info,
+        Commitment::PaysThePool,
+    ));
+    let hooks = Hooks::new(&arkd, false);
+
+    fund_pool(
+        arkd.as_ref(),
+        &fixture.info,
+        &fixture.pool,
+        &fixture.player_signer(),
+        &fixture.coordinator_signer(),
+        &hooks,
+        &Fixture::config(),
+    )
+    .await
+    .unwrap();
+
+    assert!(arkd.state.lock().unwrap().cosigners.is_empty());
+}
+
+/// Fund the pool in a batch that also creates other users' VTXOs, whose tree `cosigners` sign.
+async fn fund_in_a_batch_with_a_vtxo_tree(cosigners: Vec<PublicKey>) {
+    let fixture = Fixture::new();
+    let arkd = Arc::new(
+        MockArkd::new(&fixture.pool, &fixture.info, Commitment::PaysThePool)
+            .sharing_a_vtxo_tree(cosigners),
+    );
+    let hooks = Hooks::new(&arkd, false);
+
+    let kickoff = fund_pool(
+        arkd.as_ref(),
+        &fixture.info,
+        &fixture.pool,
+        &fixture.player_signer(),
+        &fixture.coordinator_signer(),
+        &hooks,
+        &Fixture::config(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(kickoff.batch_id, BATCH);
+    // The VTXO tree's batch output comes first.
+    assert_eq!(kickoff.funding, OutPoint::new(kickoff.commitment_txid, 1));
+    assert_eq!(*hooks.calls.lock().unwrap(), vec![(kickoff.funding, 0)]);
+    assert_eq!(arkd.forfeits().len(), 3);
+    assert!(arkd.state.lock().unwrap().cosigners.is_empty());
+}
+
+#[tokio::test]
+async fn a_kickoff_sharing_a_batch_with_other_users_vtxos_is_not_asked_to_cosign() {
+    let others = [keypair(20), keypair(21)]
+        .iter()
+        .map(|keypair| keypair.public_key())
+        .collect();
+    fund_in_a_batch_with_a_vtxo_tree(others).await;
+}
+
+#[tokio::test]
+async fn a_kickoff_ignores_a_tree_signing_that_lists_no_cosigner() {
+    fund_in_a_batch_with_a_vtxo_tree(Vec::new()).await;
 }
 
 #[tokio::test]
