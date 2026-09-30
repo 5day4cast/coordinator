@@ -628,8 +628,9 @@ fn intro(featured: Option<&CompetitionView>, now: OffsetDateTime) -> Markup {
             div class="intro-text" {
                 h1 class="title is-4" { "Daily Fantasy Weather" }
                 p {
-                    "Choose a city, score points on correctly forecasted weather readings. "
-                    "Pay and win with sats, all via the Lightning Network."
+                    span class="intro-line" { "Choose a city, score points on correctly forecasted weather readings." }
+                    " "
+                    span class="intro-line" { "Pay and win with sats, all via the Lightning Network." }
                 }
                 p class="intro-link" {
                     a href="/help" hx-get="/help" hx-target="#main-content" hx-push-url="true" { "How it works →" }

@@ -21,6 +21,14 @@
   color: var(--competition-muted);
 }
 
+/* Beside the featured card there is room for a sentence per line; on narrower
+   screens the sentences flow as one paragraph. */
+@media screen and (min-width: 1024px) {
+  .intro-line {
+    display: block;
+  }
+}
+
 .featured-card {
   border: 1px solid var(--bulma-border);
   border-radius: 0.75rem;
