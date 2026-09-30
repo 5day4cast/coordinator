@@ -4,10 +4,7 @@
 
 use maud::{html, Markup};
 
-use crate::domain::leaderboard::{
-    progress::{LINE_POINTS, OVER_OR_UNDER_POINTS, PAR_POINTS},
-    Metric, PickState, Rule,
-};
+use crate::domain::leaderboard::{progress::LINE_POINTS, Metric, PickState, Rule};
 use crate::templates::{
     assets::{HOW_IT_WORKS_JPG, HOW_IT_WORKS_MP4},
     fragments::{entry_form::pick_row, picks::state_badge},
@@ -59,11 +56,6 @@ pub fn help_page() -> Markup {
                     li {
                         "Par includes both ends of the range, and the reading is compared before rounding: "
                         "with Par 80.4–83.0°F, 83.0°F is Par and 83.1°F is Over."
-                    }
-                    li {
-                        "Some older competitions score a fixed Par instead: the reading must match the "
-                        "forecast exactly (to the whole degree for temperatures) for " (PAR_POINTS)
-                        " points, and a right Over or Under scores " (OVER_OR_UNDER_POINTS) "."
                     }
                     li { "When a competition caps how many picks you make, its page says so beside the entry fee." }
                 }
@@ -136,8 +128,8 @@ pub fn help_page() -> Markup {
                         "unless its page says it allows more."
                     }
                     li {
-                        "Some competitions take any number of entries and split them into pools when "
-                        "entries close. Each pool runs as its own competition, with its own pot and leaderboard."
+                        "A competition takes any number of entries and splits them into pools of up to 25 "
+                        "when entries close. Each pool runs as its own competition, with its own pot and leaderboard."
                     }
                     li {
                         "A pool needs a minimum number of players. When Bitcoin network fees spike, that "
@@ -198,8 +190,7 @@ pub fn help_page() -> Markup {
                         li {
                             "Behind it, entry fees are held in escrow on Arkade, a Bitcoin layer that batches "
                             "many payments into one on-chain transaction, and each competition's pot is funded "
-                            "in one batch. Some older competitions hold your Lightning payment instead, and "
-                            "only collect it once the competition runs."
+                            "in one batch."
                         }
                     }
                     h3 { "The contract" }
