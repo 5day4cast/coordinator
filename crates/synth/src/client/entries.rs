@@ -303,15 +303,18 @@ impl CoordinatorClient {
             ticket_id
         );
 
-        let auth = create_auth_header(keys, "GET", &url, None).await?;
-
-        let resp = self
-            .http()
-            .get(&url)
-            .header("Authorization", auth)
-            .send()
-            .await
-            .context("Failed to check ticket status")?;
+        let resp = super::retry_transport(3, || async {
+            let auth = create_auth_header(keys, "GET", &url, None).await?;
+            anyhow::Ok(
+                self.http()
+                    .get(&url)
+                    .header("Authorization", auth)
+                    .send()
+                    .await?,
+            )
+        })
+        .await
+        .context("Failed to check ticket status")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -338,15 +341,18 @@ impl CoordinatorClient {
             ticket_id
         );
 
-        let auth = create_auth_header(keys, "GET", &url, None).await?;
-
-        let resp = self
-            .http()
-            .get(&url)
-            .header("Authorization", auth)
-            .send()
-            .await
-            .context("Failed to check ticket refund")?;
+        let resp = super::retry_transport(3, || async {
+            let auth = create_auth_header(keys, "GET", &url, None).await?;
+            anyhow::Ok(
+                self.http()
+                    .get(&url)
+                    .header("Authorization", auth)
+                    .send()
+                    .await?,
+            )
+        })
+        .await
+        .context("Failed to check ticket refund")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -413,15 +419,18 @@ impl CoordinatorClient {
             url = format!("{}?event_id={}", url, id);
         }
 
-        let auth = create_auth_header(keys, "GET", &url, None).await?;
-
-        let resp = self
-            .http()
-            .get(&url)
-            .header("Authorization", auth)
-            .send()
-            .await
-            .context("Failed to list entries")?;
+        let resp = super::retry_transport(3, || async {
+            let auth = create_auth_header(keys, "GET", &url, None).await?;
+            anyhow::Ok(
+                self.http()
+                    .get(&url)
+                    .header("Authorization", auth)
+                    .send()
+                    .await?,
+            )
+        })
+        .await
+        .context("Failed to list entries")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
