@@ -21,6 +21,9 @@ struct Protocol {
     events: Vec<String>,
     attempts: usize,
     recycle: bool,
+    /// Recycling hands out a fresh seat instead of the unpaid one: Some(true) once another
+    /// player has paid for the unpaid seat, Some(false) while it stays reserved.
+    other_seat: Option<bool>,
     first_replacement_blocked: bool,
     duplicate_status: u16,
     closed: bool,
@@ -108,7 +111,15 @@ async fn ticket(
             .find(|id| !state.paid.contains(id))
             .copied()
         {
-            Some(id) => id,
+            Some(unpaid) => match state.other_seat {
+                None => unpaid,
+                Some(taken) => {
+                    if taken {
+                        state.paid.insert(unpaid);
+                    }
+                    Uuid::now_v7()
+                }
+            },
             None => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -608,6 +619,67 @@ async fn unpaid_dropout_never_pays_and_replacement_retries_then_rotates_its_tick
         2
     );
     assert_eq!(state.entries.len(), 2);
+}
+
+/// Another player may take the abandoned seat before the replacement asks; the replacement then
+/// gets another, and passes as long as the abandoned ticket is no longer reserved.
+#[tokio::test]
+async fn replacement_may_get_another_seat_once_the_abandoned_one_is_released() {
+    for taken in [true, false] {
+        let (_directory, db) = db().await;
+        let mock = Mock::new(Protocol {
+            capacity: 2,
+            recycle: true,
+            other_seat: Some(taken),
+            ..Default::default()
+        })
+        .await;
+        let config = config(2).resolve_plan("abandoned_unpaid").unwrap();
+        let mut steps = Steps::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_steps(
+                &mock.client,
+                &db,
+                &config,
+                Scenario::AbandonedUnpaid,
+                &Payer::TestEndpoint,
+                &mut steps,
+            ),
+        )
+        .await
+        .unwrap();
+        if !taken {
+            let step = result.unwrap_err();
+            assert!(
+                step.error.unwrap().contains("still reserved"),
+                "an abandoned ticket still reserved fails the replacement"
+            );
+            continue;
+        }
+        result.unwrap();
+        let result = finish_result(
+            "test",
+            OffsetDateTime::now_utc(),
+            Instant::now(),
+            steps,
+            false,
+        );
+        let traces: Vec<EntryTrace> = result
+            .steps
+            .iter()
+            .filter(|step| step.name.ends_with("_enter"))
+            .map(|step| serde_json::from_value(step.details.clone().unwrap()).unwrap())
+            .collect();
+        let abandoned = traces
+            .iter()
+            .find(|trace| trace.behavior == Some(EntryBehavior::AbandonUnpaid))
+            .unwrap();
+        let replacement = traces.iter().find(|trace| trace.user == "charlie").unwrap();
+        assert_ne!(abandoned.ticket_id, replacement.ticket_id);
+        assert_ne!(abandoned.payment_hash, replacement.payment_hash);
+        assert!(replacement.paid && replacement.entry_submitted);
+    }
 }
 
 #[tokio::test]

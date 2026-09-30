@@ -12,7 +12,7 @@ use super::common::{finish_result, load_users, run_step, wait_for_state, Steps};
 use super::full_lifecycle::{self, Payer, PreparedEntry};
 use super::types::*;
 use crate::client::competitions::CompetitionResponse;
-use crate::client::entries::{ApiRejection, EntrySubmission};
+use crate::client::entries::{ApiRejection, EntrySubmission, TicketStatus};
 use crate::client::CoordinatorClient;
 use crate::crypto::keys::SynthUser;
 use crate::db::SynthDb;
@@ -263,6 +263,10 @@ async fn run_steps(
         }));
     } else if scenario == Scenario::AbandonedUnpaid {
         let abandoned = abandoner.expect("resolved abandonment plan");
+        let abandoner_user = users
+            .iter()
+            .find(|user| user.name == abandoned.user)
+            .expect("abandoning player is a loaded user");
         let user = &users[config.users];
         let name = format!("user_{}_enter", user.name);
         let mut trace = planned_trace(
@@ -296,10 +300,18 @@ async fn run_steps(
                 .await
                 {
                     Ok(requested) => {
-                        ensure!(
-                            Some(requested.ticket.ticket_id) == abandoned.ticket_id,
-                            "replacement did not reclaim the abandoned seat"
-                        );
+                        // The coordinator frees an abandoned seat when its swap expires, and a
+                        // late player may take it first. What must hold is that the abandoned
+                        // invoice pays for nothing.
+                        if Some(requested.ticket.ticket_id) != abandoned.ticket_id {
+                            log::info!(
+                                "abandoned seat {:?} was reclaimed by another player before \
+                                 replacement {} got ticket {}",
+                                abandoned.ticket_id,
+                                user.name,
+                                requested.ticket.ticket_id
+                            );
+                        }
                         ensure!(
                             Some(&requested.ticket.payment_hash) != abandoned.payment_hash.as_ref(),
                             "recycled unpaid ticket retained its old invoice hash"
@@ -325,6 +337,13 @@ async fn run_steps(
                             payer,
                             &name,
                             &mut trace,
+                        )
+                        .await?;
+                        ensure_abandoned_released(
+                            client,
+                            abandoner_user,
+                            &competition_id,
+                            abandoned,
                         )
                         .await?;
                         ensure_submission_time(deadline, config)?;
@@ -544,6 +563,31 @@ async fn wait_cancelled_or_filled(
             "Timeout waiting for state: cancelled"
         );
         tokio::time::sleep(Duration::from_secs(config.poll_interval_secs)).await;
+    }
+}
+
+/// As the player who abandoned it, check the abandoned ticket is no longer reserved: the
+/// coordinator released it, whoever holds the seat now.
+async fn ensure_abandoned_released(
+    client: &CoordinatorClient,
+    abandoner: &SynthUser,
+    competition_id: &Uuid,
+    abandoned: &EntryTrace,
+) -> Result<()> {
+    let Some(ticket_id) = abandoned.ticket_id else {
+        return Ok(());
+    };
+    match client
+        .check_ticket_status(&abandoner.nostr_keys, competition_id, &ticket_id)
+        .await
+    {
+        Ok(TicketStatus::Reserved) => {
+            anyhow::bail!("abandoned ticket {ticket_id} is still reserved by its abandoner")
+        }
+        Ok(_) => Ok(()),
+        // A released ticket is no longer the abandoner's to look up.
+        Err(error) if format!("{error:#}").contains("not reserved by this user") => Ok(()),
+        Err(error) => Err(error.context("Failed to check the abandoned ticket")),
     }
 }
 
