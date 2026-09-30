@@ -181,6 +181,11 @@ pub fn help_page() -> Markup {
                             "until fees come down. Entries already taken are unaffected."
                         }
                     }
+                    p {
+                        "For example, an entry fee of 5,330 sats is 5,000 sats pot contribution + 150 sats "
+                        "service fee (3%) + 180 sats network fee. Every entrant pays the same entry fee, so "
+                        "five entrants make a 25,000-sat pot."
+                    }
                     h3 { "The network underneath" }
                     ul {
                         li {
