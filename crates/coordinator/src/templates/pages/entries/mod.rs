@@ -218,6 +218,7 @@ fn returned(row: &EntryRow) -> Markup {
         Returned::AwaitingResult => nothing("awaiting results"),
         Returned::NoPayout => nothing("no payout"),
         Returned::NoRefund => nothing("no refund recorded"),
+        Returned::RefundWrittenOff => nothing("refund stopped; contact support"),
         Returned::Payout(payout) => {
             // Everyone's share of a pot that went back, rather than a win.
             let shared = row.competition.is_some_and(|competition| {
@@ -516,6 +517,7 @@ mod tests {
                 sats: 5_300,
                 opens_at: Some(opens),
                 spent_into_pool: false,
+                written_off: false,
                 refund: None,
             }),
             ..entry()
@@ -541,6 +543,11 @@ mod tests {
             .state = ArkRefundState::Settled;
         let cell = returned_cell(&escrowed, Phase::Cancelled);
         assert!(cell.contains("Refunded 5,280 sats"));
+        let mut written_off = escrowed.clone();
+        written_off.escrow.as_mut().unwrap().refund = None;
+        written_off.escrow.as_mut().unwrap().written_off = true;
+        assert!(returned_cell(&written_off, Phase::Cancelled)
+            .contains("refund stopped; contact support"));
 
         // Its references are behind the row's "?".
         let html = one_row(&escrowed, &view("c1", Phase::Cancelled, -5));

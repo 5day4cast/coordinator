@@ -51,6 +51,8 @@ pub struct LedgerEscrow {
     pub opens_at: Option<OffsetDateTime>,
     /// A batch spent it into its competition's funding, so there is nothing left to refund.
     pub spent_into_pool: bool,
+    /// An operator wrote its refund off: it can never finish, and support settles it instead.
+    pub written_off: bool,
     pub refund: Option<EscrowRefund>,
 }
 
@@ -93,6 +95,8 @@ pub enum Returned {
     NoPayout,
     Payout(LedgerPayout),
     Refund(Refund),
+    /// Its escrow's refund was written off: it can never finish on its own.
+    RefundWrittenOff,
     /// It didn't run, and no refund is recorded or on its way.
     NoRefund,
 }
@@ -142,6 +146,12 @@ impl LedgerEntry {
             .as_ref()
             .filter(|escrow| !escrow.spent_into_pool)
         {
+            let refunded = escrow.refund.as_ref().is_some_and(|refund| {
+                matches!(refund.state, ArkRefundState::Paid | ArkRefundState::Settled)
+            });
+            if escrow.written_off && !refunded {
+                return Returned::RefundWrittenOff;
+            }
             if let Some(refund) = &escrow.refund {
                 let state = match refund.state {
                     ArkRefundState::Paid | ArkRefundState::Settled => {
@@ -294,6 +304,7 @@ impl CompetitionStore {
                    unixepoch(t.invoice_cancelled_at) AS released_at,
                    a.vtxo_sats AS escrow_sats, a.escrow_tap_tree AS escrow_tap_tree,
                    f.commitment_tx IS NOT NULL AS spent_into_pool,
+                   w.ticket_id IS NOT NULL AS written_off,
                    r.refund_id AS refund_id, r.payment_hash AS refund_payment_hash,
                    r.fee_sats AS refund_fee_sats, r.state AS refund_state,
                    r.updated_at AS refund_updated_at,
@@ -309,6 +320,8 @@ impl CompetitionStore {
                 ON a.ticket_id = t.id AND a.ticket_hash = t.hash AND a.funded_at IS NOT NULL
             LEFT JOIN ticket_ark_refunds r ON r.ticket_id = t.id
             LEFT JOIN ark_funded_competitions f ON f.event_id = t.event_id
+            LEFT JOIN ticket_ark_refund_write_offs w
+                ON w.ticket_id = t.id AND w.ticket_hash = t.hash
             LEFT JOIN latest_payouts p ON p.entry_id = e.id AND p.rn = 1
             WHERE e.pubkey = ?1
             ORDER BY json_extract(c.event_submission, '$.start_observation_date') DESC, e.id DESC",
@@ -382,8 +395,9 @@ fn ledger_entry(row: &SqliteRow) -> Result<LedgerEntry, sqlx::Error> {
     let escrow = match sats(row, "escrow_sats")? {
         Some(sats) => {
             let spent_into_pool: bool = row.try_get("spent_into_pool")?;
+            let written_off: bool = row.try_get("written_off")?;
             // Only an escrow still owed back needs its locktime, which takes its script.
-            let opens_at = if spent_into_pool || refund.is_some() {
+            let opens_at = if spent_into_pool || written_off || refund.is_some() {
                 None
             } else {
                 row.try_get::<Option<String>, _>("escrow_tap_tree")?
@@ -394,6 +408,7 @@ fn ledger_entry(row: &SqliteRow) -> Result<LedgerEntry, sqlx::Error> {
                 sats,
                 opens_at,
                 spent_into_pool,
+                written_off,
                 refund,
             })
         }
@@ -654,6 +669,18 @@ mod tests {
             vec![released_ticket],
         )
         .await;
+        // Its escrow's refund written off by an operator.
+        let written_off_in = competition(&store, 6).await;
+        let (written_off, written_off_ticket) = entry(&database, written_off_in, PLAYER).await;
+        escrow(&database, &written_off_ticket, now - Duration::days(1)).await;
+        run(
+            &database,
+            "INSERT INTO ticket_ark_refund_write_offs (ticket_id, ticket_hash, reason,
+                 written_off_at)
+             VALUES (?1, 'hash-' || ?1, 'no registration', 1788436800)",
+            vec![written_off_ticket],
+        )
+        .await;
         // Another player's entry is not the player's.
         entry(&database, won_in, "someone-else").await;
 
@@ -661,7 +688,7 @@ mod tests {
         let ids: Vec<&str> = ledger.iter().map(|row| row.entry_id.as_str()).collect();
         assert_eq!(
             ids,
-            [&released, &locked, &refunded, &pending, &won].map(String::as_str),
+            [&released, &locked, &refunded, &pending, &won, &written_off].map(String::as_str),
             "newest competition first, and only the player's"
         );
         let by_id = |id: &str| ledger.iter().find(|row| row.entry_id == id).unwrap();
@@ -710,11 +737,14 @@ mod tests {
 
         let locked = by_id(&locked).escrow.as_ref().unwrap();
         assert_eq!(locked.opens_at, Some(opens));
-        assert!(!locked.spent_into_pool && locked.refund.is_none());
+        assert!(!locked.spent_into_pool && !locked.written_off && locked.refund.is_none());
 
         let released = by_id(&released);
         assert_eq!(released.lightning_released_at, Some(at(1_788_341_400)));
         assert!(!released.lightning_settled && released.escrow.is_none());
+
+        let written_off = by_id(&written_off).escrow.as_ref().unwrap();
+        assert!(written_off.written_off && written_off.opens_at.is_none());
 
         // What each shows once the competitions are read: these two won, and the others were
         // called off.
@@ -730,8 +760,8 @@ mod tests {
         assert_eq!(
             totals,
             LedgerTotals {
-                entries: 5,
-                paid_sats: 26_500,
+                entries: 6,
+                paid_sats: 31_800,
                 won_sats: 12_000,
                 refunded_sats: 5_280 + 5_300,
                 pending_payouts: 1,
@@ -741,7 +771,7 @@ mod tests {
                 locked_until: Some(opens),
             }
         );
-        assert_eq!(totals.net_sats(), 22_580 - 26_500);
+        assert_eq!(totals.net_sats(), 22_580 - 31_800);
         assert!(store.player_ledger("nobody").await.unwrap().is_empty());
     }
 
@@ -802,6 +832,7 @@ mod tests {
                 sats: 5_300,
                 opens_at: Some(now + Duration::hours(3)),
                 spent_into_pool: false,
+                written_off: false,
                 refund: None,
             }),
             ..paid()
@@ -827,6 +858,18 @@ mod tests {
             ..escrowed.clone()
         };
         assert_eq!(spent.returned(Some(Phase::Scored), now), Returned::NoPayout);
+        // A refund written off is no longer on its way; one paid before stays refunded.
+        let written_off = LedgerEntry {
+            escrow: Some(LedgerEscrow {
+                written_off: true,
+                ..escrowed.escrow.clone().unwrap()
+            }),
+            ..escrowed.clone()
+        };
+        assert_eq!(
+            written_off.returned(Some(Phase::Cancelled), now),
+            Returned::RefundWrittenOff
+        );
         // A refund under way counts once the player's invoice is paid.
         let mut refunding = escrowed.clone();
         refunding.escrow.as_mut().unwrap().refund = Some(EscrowRefund {
