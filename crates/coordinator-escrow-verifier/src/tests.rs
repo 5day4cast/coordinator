@@ -1,7 +1,7 @@
 use super::*;
 use coordinator_escrow::authorization::ArkEscrowPolicy;
 use coordinator_escrow::generic::{
-    registration, ARK_ESCROW_RULE, ARK_REFUND_RULE, CONTRACT_RULE, RELEASE_ENTRY_KEY,
+    registration, ContractItem, ARK_ESCROW_RULE, ARK_REFUND_RULE, CONTRACT_RULE, RELEASE_ENTRY_KEY,
     RELEASE_PREIMAGE, SETTLEMENT_RULE, SIGN_ARK_ESCROW, SIGN_ARK_REFUND, SIGN_CONTRACT,
 };
 use coordinator_escrow::payout::dlctix::{
@@ -977,6 +977,176 @@ async fn renewed_invoice_keeps_late_paid_candidate_and_freezes_both_releases() {
         .unwrap();
 }
 
+/// The compact scope expands to the full one, and both forms get the same decisions: the same
+/// prepared action for a good scope, and a refusal for each tampered one.
+#[tokio::test]
+async fn a_compact_scope_expands_to_the_full_scope_with_the_same_decisions() {
+    let verifier = CoordinatorVerifier::default();
+    let f = fixture(false);
+    let bound = f.bind(&verifier);
+    let attempt = ActionAttempt {
+        attempt_id: Uuid::now_v7(),
+        signing_session_id: Some(SessionId::new_v7()),
+    };
+    let prior = BTreeMap::new();
+    let scope = f.scope();
+    let full = |scope: &SigningScope| {
+        Payload::encode(&ActionParameters::SignContract {
+            scope: scope.clone(),
+            ark_funding: None,
+        })
+        .unwrap()
+    };
+    let compact = |scope: &SigningScope| {
+        Payload::encode(&ActionParameters::SignContractCompact {
+            items: ContractItem::compact(scope),
+            ark_funding: None,
+        })
+        .unwrap()
+    };
+    let (restored, _, _) = restore_binding(&f.manifest, &f.policy, &bound).unwrap();
+    assert_eq!(
+        expand_signing_scope(
+            &f.manifest,
+            &restored,
+            &f.contract,
+            &ContractItem::compact(&scope)
+        )
+        .unwrap(),
+        scope
+    );
+
+    // An older coordinator's full form is still accepted, and prepares the same action.
+    let from_full = verifier
+        .prepare(
+            f.prepare_view(&bound, &attempt, SIGN_CONTRACT, &prior),
+            &full(&scope),
+        )
+        .await
+        .unwrap();
+    let from_compact = verifier
+        .prepare(
+            f.prepare_view(&bound, &attempt, SIGN_CONTRACT, &prior),
+            &compact(&scope),
+        )
+        .await
+        .unwrap();
+    assert_eq!(from_compact, from_full);
+    verifier
+        .verify_execution(
+            f.execute_view(&bound, &attempt, SIGN_CONTRACT),
+            &from_compact,
+            &Payload::default(),
+        )
+        .await
+        .unwrap();
+    verifier
+        .restore_execution(
+            f.execute_view(&bound, &attempt, SIGN_CONTRACT),
+            &from_compact,
+        )
+        .await
+        .unwrap();
+
+    for mutation in 0..6 {
+        let mut bad = scope.clone();
+        match mutation {
+            // A tampered digest.
+            0 => bad.batch[0].message_digest[0] ^= 1,
+            // An item for a message outside the contract.
+            1 => {
+                let mut unknown = bad.batch[0].clone();
+                unknown.item_id = Uuid::now_v7();
+                unknown.message_digest = [7; 32];
+                bad.batch.push(unknown);
+            }
+            // A subset the manifest does not define.
+            2 => bad.batch[0].subset_id = Some(Uuid::now_v7()),
+            // A defined subset that is not the message's signers.
+            3 => {
+                let item = bad
+                    .batch
+                    .iter_mut()
+                    .find(|item| item.subset_id.is_none())
+                    .unwrap();
+                item.subset_id = Some(Uuid::from_u128(1));
+            }
+            // An adaptor message without its adaptor.
+            4 => {
+                let item = bad
+                    .batch
+                    .iter_mut()
+                    .find(|item| matches!(item.adaptor, AdaptorContext::Single { .. }))
+                    .unwrap();
+                item.adaptor = AdaptorContext::None;
+            }
+            // A required message left out.
+            _ => {
+                bad.batch.pop();
+            }
+        }
+        for (form, params) in [("full", full(&bad)), ("compact", compact(&bad))] {
+            assert!(
+                verifier
+                    .prepare(
+                        f.prepare_view(&bound, &attempt, SIGN_CONTRACT, &prior),
+                        &params
+                    )
+                    .await
+                    .is_err(),
+                "{form} form, mutation {mutation}"
+            );
+        }
+    }
+    // The compact form cannot name an adaptor where the contract has none.
+    let mut items = ContractItem::compact(&scope);
+    let item = items
+        .iter_mut()
+        .find(|item| item.adaptor_id.is_none())
+        .unwrap();
+    item.adaptor_id = Some(Uuid::now_v7());
+    let params = Payload::encode(&ActionParameters::SignContractCompact {
+        items,
+        ark_funding: None,
+    })
+    .unwrap();
+    assert!(verifier
+        .prepare(
+            f.prepare_view(&bound, &attempt, SIGN_CONTRACT, &prior),
+            &params
+        )
+        .await
+        .is_err());
+}
+
+/// Verifying a completed contract through the cache answers as verifying it directly does,
+/// and a changed signature is verified again rather than found.
+#[test]
+fn a_verified_contract_is_remembered_only_for_its_exact_signatures() {
+    let f = fixture(false);
+    let signed = sign_contract(&f.contract);
+    let mut changed = signed.clone();
+    changed.expiry_tx_signature = changed.split_tx_signatures.values().next().cloned();
+    let mut elsewhere = f.contract.clone();
+    elsewhere.funding_outpoint.vout = 1;
+    let contracts = payout::VerifiedContracts::default();
+    for _ in 0..2 {
+        for (contract, signatures) in [
+            (&f.contract, &signed),
+            (&f.contract, &changed),
+            (&elsewhere, &signed),
+        ] {
+            assert_eq!(
+                contracts.verify(contract, signatures).is_ok(),
+                payout::verify_completed_contract(contract, signatures).is_ok()
+            );
+        }
+    }
+    assert!(contracts.verify(&f.contract, &signed).is_ok());
+    assert!(contracts.verify(&f.contract, &changed).is_err());
+    assert!(contracts.verify(&elsewhere, &signed).is_err());
+}
+
 #[path = "queued_tests.rs"]
 mod queued_pools;
 
@@ -1832,5 +2002,100 @@ mod ark_escrow {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_compact_scope_signs_against_the_batch_outpoint_as_the_full_one_does() {
+        let verifier = CoordinatorVerifier::default();
+        let (f, escrow) = ark_fixture();
+        let bound = f.bind(&verifier);
+        let batch = new_batch(&f, &escrow);
+        let contract = funded(&f, &batch.commitment);
+        let attempt = ActionAttempt {
+            attempt_id: Uuid::now_v7(),
+            signing_session_id: Some(SessionId::new_v7()),
+        };
+        let prior = BTreeMap::new();
+        let scope = f.scope_for(&contract);
+        let funding = Some(ArkFunding::new(&batch.commitment, 0));
+        let full = Payload::encode(&ActionParameters::SignContract {
+            scope: scope.clone(),
+            ark_funding: funding.clone(),
+        })
+        .unwrap();
+        let compact = |ark_funding: Option<ArkFunding>, scope: &SigningScope| {
+            Payload::encode(&ActionParameters::SignContractCompact {
+                items: ContractItem::compact(scope),
+                ark_funding,
+            })
+            .unwrap()
+        };
+        let from_full = verifier
+            .prepare(
+                f.prepare_view(&bound, &attempt, SIGN_CONTRACT, &prior),
+                &full,
+            )
+            .await
+            .unwrap();
+        let from_compact = verifier
+            .prepare(
+                f.prepare_view(&bound, &attempt, SIGN_CONTRACT, &prior),
+                &compact(funding, &scope),
+            )
+            .await
+            .unwrap();
+        assert_eq!(from_compact, from_full);
+        verifier
+            .verify_execution(
+                f.execute_view(&bound, &attempt, SIGN_CONTRACT),
+                &from_compact,
+                &Payload::default(),
+            )
+            .await
+            .unwrap();
+        // Messages of the unfunded contract, or no commitment at all, are refused.
+        for (ark_funding, scope) in [
+            (Some(ArkFunding::new(&batch.commitment, 0)), f.scope()),
+            (None, scope),
+        ] {
+            assert!(verifier
+                .prepare(
+                    f.prepare_view(&bound, &attempt, SIGN_CONTRACT, &prior),
+                    &compact(ark_funding, &scope)
+                )
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_kickoffs_forfeits_verify_its_contract_once_but_never_a_changed_one() {
+        let verifier = CoordinatorVerifier::default();
+        let (f, escrow) = ark_fixture();
+        let bound = f.bind(&verifier);
+        let batch = new_batch(&f, &escrow);
+        let signed = sign_contract(&funded(&f, &batch.commitment));
+        let (first, _) = prepare(&verifier, &f, &bound, forfeit_spend(&batch, &signed))
+            .await
+            .unwrap();
+        let (again, attempt) = prepare(&verifier, &f, &bound, forfeit_spend(&batch, &signed))
+            .await
+            .unwrap();
+        assert_eq!(again.action, first.action);
+        verifier
+            .verify_execution(
+                f.execute_view(&bound, &attempt, SIGN_ARK_ESCROW),
+                &again,
+                &Payload::default(),
+            )
+            .await
+            .unwrap();
+        let mut changed = signed.clone();
+        changed.expiry_tx_signature = changed.split_tx_signatures.values().next().cloned();
+        assert!(
+            prepare(&verifier, &f, &bound, forfeit_spend(&batch, &changed))
+                .await
+                .is_err()
+        );
     }
 }

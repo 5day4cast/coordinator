@@ -203,6 +203,63 @@ pub fn verify_completed_contract(
         .map_err(|e| PayoutError::ContractMismatch(e.to_string()))
 }
 
+/// The most completed contracts [`VerifiedContracts`] remembers.
+pub const MAX_VERIFIED_CONTRACTS: usize = 64;
+
+/// Completed contracts this process has already verified, so that the forfeits of one kickoff,
+/// each carrying the same contract and signatures, verify them once.
+///
+/// Only a success is remembered, keyed by the contract's digest and the digest of the exact
+/// signatures verified, so a changed signature is verified again and a failure never becomes a
+/// success. Both are digests of public data. The oldest entry is dropped beyond
+/// [`MAX_VERIFIED_CONTRACTS`].
+#[derive(Default)]
+pub struct VerifiedContracts(std::sync::Mutex<std::collections::VecDeque<([u8; 32], [u8; 32])>>);
+impl VerifiedContracts {
+    /// [`verify_completed_contract`], once for each contract and signature set.
+    pub fn verify(
+        &self,
+        contract: &ContractCommitment,
+        signatures: &ContractSignatures,
+    ) -> Result<(), PayoutError> {
+        let key = (
+            authorization_digest("payout-contract-v1", contract)
+                .map_err(|e| PayoutError::ContractMismatch(e.to_string()))?,
+            authorization_digest("payout-contract-signatures-v1", signatures)
+                .map_err(|e| PayoutError::ContractMismatch(e.to_string()))?,
+        );
+        if self.recall(&key) {
+            return Ok(());
+        }
+        verify_completed_contract(contract, signatures)?;
+        self.remember(key);
+        Ok(())
+    }
+    /// Whether `key` was verified, making it the most recently used if so.
+    fn recall(&self, key: &([u8; 32], [u8; 32])) -> bool {
+        let Ok(mut verified) = self.0.lock() else {
+            return false;
+        };
+        let Some(index) = verified.iter().position(|entry| entry == key) else {
+            return false;
+        };
+        let entry = verified.remove(index).expect("found entry");
+        verified.push_back(entry);
+        true
+    }
+    fn remember(&self, key: ([u8; 32], [u8; 32])) {
+        let Ok(mut verified) = self.0.lock() else {
+            return;
+        };
+        if !verified.contains(&key) {
+            if verified.len() >= MAX_VERIFIED_CONTRACTS {
+                verified.pop_front();
+            }
+            verified.push_back(key);
+        }
+    }
+}
+
 fn lightning_network(
     network: Network,
 ) -> Result<crate::escrow_lightning::LightningNetwork, PayoutError> {

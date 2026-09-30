@@ -610,14 +610,15 @@ async fn permit_contract(
         attempt_id: plan.session_id.uuid(),
         signing_session_id: Some(plan.session_id.clone()),
     };
-    let request = PrepareEscrowRequest {
+    // The verifier derives the signers and adaptor points, so only the ids and digests go.
+    let mut request = PrepareEscrowRequest {
         schema_version: escrow::SCHEMA_VERSION,
         binding_receipt: binding.sealed_state.clone(),
         action_id: generic::SIGN_CONTRACT.into(),
         attempt: attempt.clone(),
         action: None,
-        action_parameters: Payload::encode(&generic::ActionParameters::SignContract {
-            scope,
+        action_parameters: Payload::encode(&generic::ActionParameters::SignContractCompact {
+            items: generic::ContractItem::compact(&scope),
             ark_funding: ark_funding.clone(),
         })?,
         prior_preparation_receipts: plan
@@ -626,19 +627,44 @@ async fn permit_contract(
             .map(|prepared| vec![prepared.sealed_state.clone()])
             .unwrap_or_default(),
     };
-    let prepared = escrow_request(
+    let stage = format!("escrow/sign/prepare/{user}/{}", plan.session_id);
+    let prepared = match escrow_request(
         driver,
         session,
         state,
         credentials,
         user,
-        &format!("escrow/sign/prepare/{user}/{}", plan.session_id),
+        &stage,
         Operation::Prepare,
         Some(generic::SIGN_CONTRACT),
         Some(attempt.clone()),
         &request,
     )
-    .await?;
+    .await
+    {
+        // Both forms authorize the same action, so the full one is sent where needed.
+        Err(error) if needs_full_scope(&error) => {
+            request.action_parameters =
+                Payload::encode(&generic::ActionParameters::SignContract {
+                    scope,
+                    ark_funding: ark_funding.clone(),
+                })?;
+            escrow_request(
+                driver,
+                session,
+                state,
+                credentials,
+                user,
+                &stage,
+                Operation::Prepare,
+                Some(generic::SIGN_CONTRACT),
+                Some(attempt.clone()),
+                &request,
+            )
+            .await?
+        }
+        result => result?,
+    };
     let execute = ExecuteEscrowRequest {
         schema_version: escrow::SCHEMA_VERSION,
         prepared_receipt: prepared.sealed_state,
@@ -675,6 +701,15 @@ async fn permit_contract(
         ));
     }
     Ok(())
+}
+
+/// Whether a contract signing preparation must be sent with its full scope: a verifier older
+/// than the compact scope refused it, or an earlier release journaled this stage with the full
+/// scope, which a retry must repeat exactly.
+fn needs_full_scope(error: &KeymeldError) -> bool {
+    let error = error.to_string();
+    generic::refuses_compact_scope(&error)
+        || error.contains("Confidential retry changed its original inputs")
 }
 
 #[async_trait]

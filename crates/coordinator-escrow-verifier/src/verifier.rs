@@ -4,7 +4,9 @@ use coordinator_escrow::payout::dlctix::{ContractSignatures, MarketMaker};
 use coordinator_escrow::{
     ark::{self, ArkEscrowSpend, ArkFunding},
     authorization::PayoutPolicy,
-    generic::{self, ActionParameters, ContractBinding, PaymentEvidence, PreparedSettlement},
+    generic::{
+        self, ActionParameters, ContractBinding, ContractItem, PaymentEvidence, PreparedSettlement,
+    },
     oracle_statement::SignedStatement,
     payout::{self, ContractAuthorization, ContractCommitment},
     payout_protocol::{InvoiceAuthorizationContext, PayoutMethod},
@@ -14,7 +16,8 @@ use keymeld_core::{
     authorization::SignedSessionManifest,
     escrow::{
         self, protocol::Payload, Action, AdaptorContext, Bip340Item, Bip340Scope, Condition,
-        KeyTweak, Permission, PublicKeyBytes, SignedEscrowPolicy, SigningScope,
+        KeyTweak, Permission, PublicKeyBytes, ScopeSigner, SignedEscrowPolicy, SigningItem,
+        SigningScope,
     },
     protocol::{EnclaveError, ValidationError},
     SessionId, UserId,
@@ -47,6 +50,8 @@ pub struct CoordinatorVerifier {
     #[cfg(feature = "lnurl")]
     lnurl: Option<crate::lnurl_transport::LnurlPayClient>,
     ledger: Mutex<SettlementLedger>,
+    /// Completed contracts already verified, so a kickoff's forfeits verify theirs once.
+    contracts: payout::VerifiedContracts,
 }
 impl CoordinatorVerifier {
     /// Enables network preparation only in this statically registered verifier.
@@ -56,6 +61,7 @@ impl CoordinatorVerifier {
         Self {
             lnurl: Some(client),
             ledger: Mutex::default(),
+            contracts: payout::VerifiedContracts::default(),
         }
     }
     pub fn lnurl_enabled(&self) -> bool {
@@ -530,14 +536,15 @@ fn ark_escrow_action(
     terms: &ContractAuthorization,
     bound: &BoundContract,
     spend: &ArkEscrowSpend,
+    verified: &payout::VerifiedContracts,
 ) -> Result<(Action, Vec<usize>), VerificationError> {
     let ark_policy = policy
         .ark_escrow
         .as_ref()
         .ok_or_else(|| invalid("This ticket has no Arkade escrow"))?;
     let escrow = ark_escrow(signed, &terms.market_maker, ark_policy)?;
-    let digests =
-        ark::spend_digests(&escrow, ark_policy, &bound.contract, spend).map_err(invalid)?;
+    let digests = ark::spend_digests(&escrow, ark_policy, &bound.contract, spend, verified)
+        .map_err(invalid)?;
     Ok(bip340_action(signed, digests))
 }
 
@@ -771,6 +778,105 @@ fn validate_signing_scope(
         ));
     }
     Ok(())
+}
+/// Expand a compact contract signing scope to the full scope it names, for
+/// [`validate_signing_scope`] to check as if the client had sent it. The signers come from the
+/// bound roster or the manifest's subset, and the adaptor points from the contract.
+fn expand_signing_scope(
+    manifest: &SignedSessionManifest,
+    bound: &BoundContract,
+    contract: &ContractCommitment,
+    items: &[ContractItem],
+) -> Result<SigningScope, VerificationError> {
+    let adaptor_points = payout::signing_requirements(contract)
+        .map_err(invalid)?
+        .into_iter()
+        .map(|(message, item)| (escrow::sha256(&message), item.adaptor_point))
+        .collect::<BTreeMap<_, _>>();
+    let batch = items
+        .iter()
+        .map(|item| {
+            let users = match item.subset_id {
+                None => bound.participant_public_keys.keys().collect::<Vec<_>>(),
+                Some(id) => manifest
+                    .manifest
+                    .subset_definitions
+                    .iter()
+                    .find(|subset| subset.subset_id == id)
+                    .ok_or_else(|| invalid("Unknown signing subset"))?
+                    .participants
+                    .iter()
+                    .collect(),
+            };
+            let mut signers = users
+                .into_iter()
+                .map(|user| {
+                    Ok(ScopeSigner {
+                        user_id: user.clone(),
+                        public_key: bound
+                            .participant_public_keys
+                            .get(user)
+                            .ok_or_else(|| invalid("Signing subset is outside the bound roster"))?
+                            .clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, VerificationError>>()?;
+            signers.sort_by(|a, b| a.public_key.cmp(&b.public_key));
+            let point = adaptor_points
+                .get(&item.message_digest)
+                .ok_or_else(|| invalid("Signing message is outside the authorized DLC"))?;
+            let adaptor = match (item.adaptor_id, point) {
+                (None, None) => AdaptorContext::None,
+                (Some(adaptor_id), Some(point)) => AdaptorContext::Single {
+                    adaptor_id,
+                    point: PublicKeyBytes::new(point).map_err(invalid)?,
+                },
+                _ => {
+                    return Err(invalid(
+                        "Adaptor differs from the authorized oracle outcome",
+                    ))
+                }
+            };
+            Ok(SigningItem {
+                item_id: item.item_id,
+                message_digest: item.message_digest,
+                subset_id: item.subset_id,
+                signers,
+                tweak: KeyTweak::None,
+                adaptor,
+            })
+        })
+        .collect::<Result<_, VerificationError>>()?;
+    Ok(SigningScope {
+        session_tweak: KeyTweak::None,
+        batch,
+    })
+}
+/// Authorize contract signing for `scope`, which may first be expanded from the funded contract.
+fn prepare_contract_signing(
+    context: &PreparationView<'_>,
+    bound: &BoundContract,
+    policy: &PayoutPolicy,
+    ark_funding: Option<ArkFunding>,
+    scope: impl FnOnce(&ContractCommitment) -> Result<SigningScope, VerificationError>,
+) -> Result<PreparedAction, VerificationError> {
+    if context.rule != generic::CONTRACT_RULE || context.permission_id != generic::SIGN_CONTRACT {
+        return Err(invalid("Contract signing permission differs"));
+    }
+    let contract = funded(bound, policy, ark_funding.as_ref())?;
+    let scope = scope(&contract)?;
+    validate_signing_scope(context.manifest, context.policy, bound, &contract, &scope)?;
+    let action = Action::Sign { scope };
+    context
+        .attempt
+        .validate(&action, &context.policy.policy.context)
+        .map_err(invalid)?;
+    Ok(PreparedAction {
+        action,
+        application_state: Payload::encode(&PreparedState::ContractSigning { ark_funding })
+            .map_err(invalid)?,
+        output: Payload::default(),
+    })
 }
 fn release_action(signed: &SignedEscrowPolicy, id: &str) -> Result<Action, VerificationError> {
     match signed.policy.grants.get(id).map(|grant| &grant.operation) {
@@ -1135,31 +1241,11 @@ impl EscrowVerifier for CoordinatorVerifier {
                     Err(invalid("An intent delete is prepared without a binding"))
                 }
                 ActionParameters::SignContract { scope, ark_funding } => {
-                    if context.rule != generic::CONTRACT_RULE
-                        || context.permission_id != generic::SIGN_CONTRACT
-                    {
-                        return Err(invalid("Contract signing permission differs"));
-                    }
-                    let contract = funded(&bound, &policy, ark_funding.as_ref())?;
-                    validate_signing_scope(
-                        context.manifest,
-                        context.policy,
-                        &bound,
-                        &contract,
-                        &scope,
-                    )?;
-                    let action = Action::Sign { scope };
-                    context
-                        .attempt
-                        .validate(&action, &context.policy.policy.context)
-                        .map_err(invalid)?;
-                    Ok(PreparedAction {
-                        action,
-                        application_state: Payload::encode(&PreparedState::ContractSigning {
-                            ark_funding,
-                        })
-                        .map_err(invalid)?,
-                        output: Payload::default(),
+                    prepare_contract_signing(&context, &bound, &policy, ark_funding, |_| Ok(scope))
+                }
+                ActionParameters::SignContractCompact { items, ark_funding } => {
+                    prepare_contract_signing(&context, &bound, &policy, ark_funding, |contract| {
+                        expand_signing_scope(context.manifest, &bound, contract, &items)
                     })
                 }
                 ActionParameters::SignArkEscrow { spend } => {
@@ -1168,8 +1254,14 @@ impl EscrowVerifier for CoordinatorVerifier {
                     {
                         return Err(invalid("Escrow spend permission differs"));
                     }
-                    let (action, inputs) =
-                        ark_escrow_action(context.policy, &policy, &terms, &bound, &spend)?;
+                    let (action, inputs) = ark_escrow_action(
+                        context.policy,
+                        &policy,
+                        &terms,
+                        &bound,
+                        &spend,
+                        &self.contracts,
+                    )?;
                     ark::check_intent_delete_fresh(&spend, now()?).map_err(invalid)?;
                     context
                         .attempt
@@ -1232,7 +1324,8 @@ impl EscrowVerifier for CoordinatorVerifier {
                         let contract = funded(&bound, &policy, ark_funding.as_ref())?;
                         let signatures: ContractSignatures =
                             serde_json::from_str(&contract_signatures).map_err(invalid)?;
-                        payout::verify_completed_contract(&contract, &signatures)
+                        self.contracts
+                            .verify(&contract, &signatures)
                             .map_err(invalid)?;
                         let attestation = attestation.as_deref().map(hex32).transpose()?;
                         let outcome = payout::settled_outcome(
@@ -1390,8 +1483,14 @@ impl EscrowVerifier for CoordinatorVerifier {
                     {
                         return Err(invalid("Invalid escrow spend execution"));
                     }
-                    let (action, _) =
-                        ark_escrow_action(context.policy, &policy, &terms, &bound, &spend)?;
+                    let (action, _) = ark_escrow_action(
+                        context.policy,
+                        &policy,
+                        &terms,
+                        &bound,
+                        &spend,
+                        &self.contracts,
+                    )?;
                     if prepared.action != action {
                         return Err(invalid(
                             "Prepared escrow spend differs from its transactions",
@@ -1491,8 +1590,14 @@ impl EscrowVerifier for CoordinatorVerifier {
                     {
                         return Err(invalid("Invalid restored escrow spend"));
                     }
-                    let (action, _) =
-                        ark_escrow_action(context.policy, &policy, &terms, &bound, &spend)?;
+                    let (action, _) = ark_escrow_action(
+                        context.policy,
+                        &policy,
+                        &terms,
+                        &bound,
+                        &spend,
+                        &self.contracts,
+                    )?;
                     if prepared.action != action {
                         return Err(invalid(
                             "Restored escrow spend differs from its transactions",
