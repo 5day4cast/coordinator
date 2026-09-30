@@ -263,6 +263,8 @@ pub struct Coordinator {
     worker_leases: Arc<super::WorkerLeases>,
     /// Lasting conditions already logged, so each is warned about once rather than every step.
     pub(super) reported: super::Reported,
+    /// When each pending escrow swap may next be looked up on Arkade.
+    pub(super) escrow_lookups: ark_coordinator::EscrowLookups,
     /// One ticket request at a time per competition and player (`lock_ticket_request`).
     ticket_requests: TicketRequestLocks,
 }
@@ -329,6 +331,7 @@ impl Coordinator {
             wakes: super::CompetitionWakes::default(),
             worker_leases,
             reported: super::Reported::default(),
+            escrow_lookups: Default::default(),
             ticket_requests: TicketRequestLocks::default(),
         };
         coordinator.validate_coordinator_metadata().await?;
