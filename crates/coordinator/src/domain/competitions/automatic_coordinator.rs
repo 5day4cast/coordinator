@@ -1,6 +1,7 @@
 //! Browser-independent payout preparation and paid-claim recovery.
 use super::*;
-use crate::domain::{PaymentStatus, PayoutJob};
+use crate::domain::{competitions::MAX_AUTOMATIC_CLAIMS_PER_ENTRY, PaymentStatus, PayoutJob};
+use crate::infra::keymeld::KeymeldError;
 use coordinator_core::PayoutRegistrationRequest;
 use coordinator_escrow::{
     authorization::PayoutPolicy,
@@ -678,6 +679,16 @@ impl Coordinator {
             {
                 continue;
             }
+            // Every claim has the enclave prepare the release again, and it does so a bounded
+            // number of times. Stop short of that bound and leave the entry to the chain.
+            let used = self.competition_store.payout_claims_used(entry.id).await?;
+            if used >= MAX_AUTOMATIC_CLAIMS_PER_ENTRY {
+                warn!(
+                    "Entry {} waits for on-chain settlement; {} Lightning claims already used",
+                    entry.id, used
+                );
+                continue;
+            }
             // Only the unique insert winner may create the durable intent.
             if let Err(e) = self
                 .competition_store
@@ -832,7 +843,7 @@ impl Coordinator {
                 commitment_tx: done.commitment_tx,
                 vout: done.funding_vout,
             });
-        let prepared = self
+        let prepared = match self
             .keymeld
             .prepare_payout(
                 &session,
@@ -846,7 +857,23 @@ impl Coordinator {
                     ark_funding,
                 },
             )
-            .await?;
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) if preparation_capacity_exhausted(&error) => {
+                // The enclave will never prepare this claim, nor another one for the entry.
+                // Retrying cannot change that; the entry is settled on-chain.
+                warn!(
+                    "Payout job {} for entry {} cannot be prepared and is retired: {}",
+                    job.id, job.entry_id, error
+                );
+                self.competition_store
+                    .fail_payout_job_with_reason(job.id, error.to_string())
+                    .await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
         if prepared.claim_id != job.id || prepared.user_id != user_id || prepared.owed_sats != owed
         {
             return Err(anyhow!("Prepared payout does not match the durable claim"));
@@ -870,6 +897,14 @@ impl Coordinator {
             .await?;
         Ok(())
     }
+}
+
+/// Whether the enclave refused a preparation because the release permission has none left.
+fn preparation_capacity_exhausted(error: &KeymeldError) -> bool {
+    matches!(
+        error,
+        KeymeldError::Sdk(keymeld_sdk::SdkError::EscrowPreparationExhausted { .. })
+    ) || error.to_string().contains("capacity exhausted")
 }
 
 /// Ticket UUID order is also NOAA's oracle entry order for new competitions.

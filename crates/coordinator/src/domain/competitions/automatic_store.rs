@@ -26,6 +26,26 @@ pub struct FixedTicketPayoutPolicy {
     pub policy_json: String,
 }
 
+/// Automatic Lightning claims one entry may use. Every claim after the first asks the
+/// enclave to renew its release preparation, and it renews one at most 16 times; the rest
+/// is left for the player's own invoice fallback.
+pub const MAX_AUTOMATIC_CLAIMS_PER_ENTRY: i64 = 12;
+
+/// Where a pending payout stands between sends of its invoice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayoutSendState {
+    /// Sends of the invoice that failed for a reason that can pass.
+    pub send_attempts: u32,
+    /// When the invoice may be sent again, in Unix seconds. `None` while a send is awaited.
+    pub next_send_at: Option<i64>,
+}
+
+/// Seconds to wait before sending an invoice again once `failed_sends` sends of it failed:
+/// 30 seconds at first, doubling up to ten minutes.
+pub fn payout_resend_delay_secs(failed_sends: u32) -> i64 {
+    (30_i64 << failed_sends.saturating_sub(1).min(5)).min(600)
+}
+
 fn invalid(message: impl Into<String>) -> DatabaseWriteError {
     sqlx::Error::Protocol(message.into()).into()
 }
@@ -54,6 +74,74 @@ impl CompetitionStore {
     pub async fn payout_send_allowed(&self, payout_id: Uuid) -> Result<bool, sqlx::Error> {
         sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM payouts p JOIN entries e ON e.id = p.entry_id JOIN automatic_payout_competitions a ON a.event_id = e.event_id WHERE p.id = ? AND a.payout_window_closed_at IS NOT NULL)")
             .bind(payout_id.to_string()).fetch_one(self.db_connection.read()).await
+    }
+
+    pub async fn payout_send_state(
+        &self,
+        payout_id: Uuid,
+    ) -> Result<Option<PayoutSendState>, sqlx::Error> {
+        let row = sqlx::query("SELECT send_attempts, next_send_at FROM payouts WHERE id = ?")
+            .bind(payout_id.to_string())
+            .fetch_optional(self.db_connection.read())
+            .await?;
+        row.map(|row| {
+            Ok(PayoutSendState {
+                send_attempts: row.try_get("send_attempts")?,
+                next_send_at: row.try_get("next_send_at")?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Record that the awaited send of a pending payout failed for a reason that can pass, and
+    /// set when its invoice may be sent again. The payout keeps its invoice and stays pending,
+    /// so its claim stays live. Returns `None` when this failure was already recorded, or the
+    /// payout is no longer pending.
+    pub async fn schedule_payout_resend(
+        &self,
+        payout_id: Uuid,
+    ) -> Result<Option<PayoutSendState>, DatabaseWriteError> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        self.db_connection.execute_write(move |pool| async move {
+            let mut tx = pool.begin().await?;
+            let failed: Option<u32> = sqlx::query_scalar("SELECT send_attempts FROM payouts WHERE id = ? AND succeed_at IS NULL AND failed_at IS NULL AND next_send_at IS NULL")
+                .bind(payout_id.to_string()).fetch_optional(&mut *tx).await?;
+            let Some(failed) = failed else { return Ok(None); };
+            let state = PayoutSendState {
+                send_attempts: failed.saturating_add(1),
+                next_send_at: Some(now + payout_resend_delay_secs(failed.saturating_add(1))),
+            };
+            sqlx::query("UPDATE payouts SET send_attempts = ?, next_send_at = ? WHERE id = ?")
+                .bind(state.send_attempts).bind(state.next_send_at).bind(payout_id.to_string())
+                .execute(&mut *tx).await?;
+            tx.commit().await?;
+            Ok(Some(state))
+        }).await
+    }
+
+    /// Take a pending payout whose retry time has passed for one more send of its invoice.
+    /// Until that send ends, the payout has no retry time, so its failure is counted once.
+    pub async fn begin_payout_resend(&self, payout_id: Uuid) -> Result<bool, DatabaseWriteError> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        self.db_connection.execute_write(move |pool| async move {
+            let result = sqlx::query("UPDATE payouts SET next_send_at = NULL WHERE id = ? AND succeed_at IS NULL AND failed_at IS NULL AND next_send_at IS NOT NULL AND next_send_at <= ?")
+                .bind(payout_id.to_string()).bind(now).execute(&pool).await?;
+            Ok(result.rows_affected() > 0)
+        }).await
+    }
+
+    /// Give a payout its retry time back after a send that may never have reached LND. No
+    /// failure is counted: LND still reports the one that was.
+    pub async fn defer_payout_resend(
+        &self,
+        payout_id: Uuid,
+        next_send_at: i64,
+    ) -> Result<(), DatabaseWriteError> {
+        self.db_connection.execute_write(move |pool| async move {
+            sqlx::query("UPDATE payouts SET next_send_at = ? WHERE id = ? AND succeed_at IS NULL AND failed_at IS NULL AND next_send_at IS NULL")
+                .bind(next_send_at).bind(payout_id.to_string()).execute(&pool).await?;
+            Ok(())
+        }).await
     }
 
     /// Backfill payment hashes from legacy rows before accepting automatic claims.
@@ -216,7 +304,16 @@ impl CompetitionStore {
             .await
     }
 
-    /// The unique index arbitrates concurrent workers and manual fallback.
+    /// Claims an entry has used, in any state. Each one had the enclave prepare its release.
+    pub async fn payout_claims_used(&self, entry_id: Uuid) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM payout_jobs WHERE entry_id = ?")
+            .bind(entry_id.to_string())
+            .fetch_one(self.db_connection.read())
+            .await
+    }
+
+    /// The unique index arbitrates concurrent workers and manual fallback. An entry that used
+    /// [`MAX_AUTOMATIC_CLAIMS_PER_ENTRY`] claims gets no further one.
     pub async fn create_payout_job(
         &self,
         entry_id: Uuid,
@@ -229,6 +326,11 @@ impl CompetitionStore {
             let closed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM entries e JOIN automatic_payout_competitions a ON a.event_id = e.event_id WHERE e.id = ? AND a.payout_window_closed_at IS NOT NULL)")
                 .bind(entry_id.to_string()).fetch_one(&mut *tx).await?;
             if closed { return Err(sqlx::Error::Protocol("Lightning payout window is closed".into())); }
+            let used: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payout_jobs WHERE entry_id = ?")
+                .bind(entry_id.to_string()).fetch_one(&mut *tx).await?;
+            if used >= MAX_AUTOMATIC_CLAIMS_PER_ENTRY {
+                return Err(sqlx::Error::Protocol("Entry has used its Lightning claims".into()));
+            }
 
             sqlx::query("INSERT INTO payout_jobs(id, entry_id, request_json, created_at, retry_at) VALUES (?, ?, ?, ?, ?)")
                 .bind(id.to_string()).bind(entry_id.to_string()).bind(request_json)
@@ -392,6 +494,20 @@ impl CompetitionStore {
         self.db_connection.execute_write(move |pool| async move {
             sqlx::query("UPDATE payout_jobs SET failed_at = ? WHERE id = ? AND completed_at IS NULL AND payout_id IN (SELECT id FROM payouts WHERE failed_at IS NOT NULL AND succeed_at IS NULL)")
                 .bind(OffsetDateTime::now_utc().unix_timestamp()).bind(id.to_string()).execute(&pool).await?;
+            Ok(())
+        }).await
+    }
+
+    /// Retire a claim that can never be prepared, such as one the enclave has no preparation
+    /// left for. A claim whose invoice may still be paid is left alone.
+    pub async fn fail_payout_job_with_reason(
+        &self,
+        id: Uuid,
+        reason: String,
+    ) -> Result<(), DatabaseWriteError> {
+        self.db_connection.execute_write(move |pool| async move {
+            sqlx::query("UPDATE payout_jobs SET failed_at = ?, last_error = ? WHERE id = ? AND completed_at IS NULL AND failed_at IS NULL AND (payout_id IS NULL OR payout_id IN (SELECT id FROM payouts WHERE failed_at IS NOT NULL AND succeed_at IS NULL))")
+                .bind(OffsetDateTime::now_utc().unix_timestamp()).bind(reason).bind(id.to_string()).execute(&pool).await?;
             Ok(())
         }).await
     }

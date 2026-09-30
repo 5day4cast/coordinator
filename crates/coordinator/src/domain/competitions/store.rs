@@ -567,12 +567,13 @@ impl CompetitionStore {
         Ok(())
     }
 
+    /// Returns whether this call failed the payout; one already failed or succeeded is kept.
     pub async fn mark_payout_failed(
         &self,
         payout_id: Uuid,
         failed_at: OffsetDateTime,
         error: PayoutError,
-    ) -> Result<(), DatabaseWriteError> {
+    ) -> Result<bool, DatabaseWriteError> {
         let error_blob =
             serde_json::to_string(&error).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
         let failed_at_str = failed_at
@@ -599,7 +600,7 @@ impl CompetitionStore {
         if newly_failed {
             crate::metrics::record_payout_result(false);
         }
-        Ok(())
+        Ok(newly_failed)
     }
 
     pub async fn get_payout(&self, payout_id: Uuid) -> Result<Option<EntryPayout>, sqlx::Error> {

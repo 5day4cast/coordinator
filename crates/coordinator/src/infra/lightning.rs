@@ -174,6 +174,46 @@ pub struct PaymentLookupResponse {
     pub failure_reason: String,
 }
 
+/// Why LND gave up on a payment, and whether sending the same invoice again can succeed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaymentFailure {
+    /// LND's failure reason, or "other" for one this coordinator does not tell apart. The
+    /// set is bounded, so it is safe as a metric label.
+    pub reason: &'static str,
+    /// The payee may still be paid with the same invoice once routing recovers.
+    pub transient: bool,
+}
+
+/// Every reason [`classify_payment_failure`] returns.
+pub const PAYMENT_FAILURE_REASONS: [&str; 6] = [
+    "FAILURE_REASON_NO_ROUTE",
+    "FAILURE_REASON_TIMEOUT",
+    "FAILURE_REASON_INSUFFICIENT_BALANCE",
+    "FAILURE_REASON_ERROR",
+    "FAILURE_REASON_INCORRECT_PAYMENT_DETAILS",
+    "other",
+];
+
+/// Classify the `failure_reason` LND reports for a failed payment. Only the payee rejecting
+/// the invoice is conclusive: the payment hash, amount or final CLTV it was offered will not
+/// be accepted later either. No route, a timeout, no outbound balance and a routing error
+/// depend on the state of the network and of the payout node's channels, which changes. A
+/// reason this coordinator does not know is sent again too; the invoice's expiry and the
+/// on-chain settlement window bound how long that lasts.
+pub fn classify_payment_failure(reason: &str) -> PaymentFailure {
+    let (reason, transient) = match reason {
+        "FAILURE_REASON_NO_ROUTE" => ("FAILURE_REASON_NO_ROUTE", true),
+        "FAILURE_REASON_TIMEOUT" => ("FAILURE_REASON_TIMEOUT", true),
+        "FAILURE_REASON_INSUFFICIENT_BALANCE" => ("FAILURE_REASON_INSUFFICIENT_BALANCE", true),
+        "FAILURE_REASON_ERROR" => ("FAILURE_REASON_ERROR", true),
+        "FAILURE_REASON_INCORRECT_PAYMENT_DETAILS" => {
+            ("FAILURE_REASON_INCORRECT_PAYMENT_DETAILS", false)
+        }
+        _ => ("other", true),
+    };
+    PaymentFailure { reason, transient }
+}
+
 /// LND has no payment attempt for this hash. This is the only lookup failure
 /// for which the payout watcher may initiate the stored invoice again.
 #[derive(Debug, thiserror::Error)]
@@ -268,6 +308,11 @@ impl LnClient {
         if let Some(limit) = cltv_limit {
             body["cltv_limit"] = json!(limit);
             body["cancelable"] = json!(true);
+            info!(
+                "Sending payment {} with CLTV limit {}",
+                hex::encode(invoice.payment_hash().as_byte_array()),
+                limit
+            );
         }
         debug!("sending payment: {:?}", body);
         let url = format!("{}v2/router/send", self.base_url);
@@ -1041,6 +1086,11 @@ pub fn extract_payment_hash_from_invoice(payment_request: &str) -> Result<String
     Ok(hex::encode(payment_hash.as_byte_array()))
 }
 
+/// The node an invoice pays: the key it names, or else the one that signed it.
+pub(crate) fn invoice_payee_node_id(invoice: &Bolt11Invoice) -> String {
+    invoice.get_payee_pub_key().to_string()
+}
+
 pub(crate) fn invoice_is_expired(invoice: &Bolt11Invoice) -> bool {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1095,6 +1145,60 @@ mod tests {
             )
             .unwrap(),
             MAX_PAYOUT_CLTV_DELTA
+        );
+    }
+
+    #[test]
+    fn only_a_payee_rejection_is_a_conclusive_payment_failure() {
+        for reason in [
+            "FAILURE_REASON_NO_ROUTE",
+            "FAILURE_REASON_TIMEOUT",
+            "FAILURE_REASON_INSUFFICIENT_BALANCE",
+            "FAILURE_REASON_ERROR",
+        ] {
+            assert_eq!(
+                classify_payment_failure(reason),
+                PaymentFailure {
+                    reason,
+                    transient: true
+                }
+            );
+        }
+        assert_eq!(
+            classify_payment_failure("FAILURE_REASON_INCORRECT_PAYMENT_DETAILS"),
+            PaymentFailure {
+                reason: "FAILURE_REASON_INCORRECT_PAYMENT_DETAILS",
+                transient: false
+            }
+        );
+        // Reasons outside the known set share one label, whatever LND sends.
+        for reason in [
+            "FAILURE_REASON_CANCELED",
+            "FAILURE_REASON_NONE",
+            "Unknown",
+            "",
+        ] {
+            assert_eq!(
+                classify_payment_failure(reason),
+                PaymentFailure {
+                    reason: "other",
+                    transient: true
+                }
+            );
+        }
+        for reason in PAYMENT_FAILURE_REASONS {
+            assert_eq!(classify_payment_failure(reason).reason, reason);
+        }
+    }
+
+    #[test]
+    fn payee_node_id_is_the_key_that_signed_the_invoice() {
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        let invoice: Bolt11Invoice = fresh_test_invoice().parse().unwrap();
+        let signer = SecretKey::from_slice(&[9; 32]).unwrap();
+        assert_eq!(
+            invoice_payee_node_id(&invoice),
+            PublicKey::from_secret_key(&Secp256k1::new(), &signer).to_string()
         );
     }
 

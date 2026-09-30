@@ -72,6 +72,8 @@ struct Escrow {
     release_calls: AtomicUsize,
     fail_prepare: AtomicBool,
     fail_release: AtomicBool,
+    /// The release permission has no preparation left, as after too many renewed claims.
+    preparations_exhausted: AtomicBool,
     claims: Mutex<Vec<Uuid>>,
     policies: Mutex<BTreeMap<UserId, coordinator_escrow::escrow::SignedEscrowPolicy>>,
     contract_digest: Mutex<String>,
@@ -92,6 +94,7 @@ impl Escrow {
             release_calls: AtomicUsize::new(0),
             fail_prepare: AtomicBool::new(false),
             fail_release: AtomicBool::new(false),
+            preparations_exhausted: AtomicBool::new(false),
             claims: Mutex::new(vec![]),
             policies: Mutex::new(BTreeMap::new()),
             contract_digest: Mutex::new(String::new()),
@@ -136,6 +139,13 @@ impl Keymeld for Escrow {
     ) -> Result<PayoutPreparedResponse, KeymeldError> {
         self.prepare_calls.fetch_add(1, Ordering::SeqCst);
         self.claims.lock().unwrap().push(request.claim_id);
+        if self.preparations_exhausted.load(Ordering::SeqCst) {
+            return Err(KeymeldError::Sdk(
+                keymeld_sdk::SdkError::EscrowPreparationExhausted {
+                    reason: "Release preparation candidate limit reached".into(),
+                },
+            ));
+        }
         assert!(matches!(request.method, PayoutMethod::Automatic));
         assert_eq!(request.binding_receipt, hex::encode("bound-contract"));
         assert!(!request.contract_signatures.is_empty());
@@ -885,6 +895,56 @@ async fn expired_lost_preparation_response_reconciles_before_obtaining_a_new_inv
     let new_payout = jobs[0].payout_id.unwrap();
     assert_ne!(new_payout, old_payout);
     assert_eq!(f.escrow.prepare_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(f.escrow.release_calls.load(Ordering::SeqCst), 0);
+    f.assert_no_secrets().await;
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn exhausted_enclave_preparations_retire_the_claim_and_the_entry_stops_claiming() {
+    let f = Fixture::new().await;
+    f.escrow
+        .preparations_exhausted
+        .store(true, Ordering::SeqCst);
+    f.tick().await;
+    // The claim is failed for good, with the enclave's answer, instead of being retried.
+    let job: (Option<i64>, i64, Option<String>) = sqlx::query_as(
+        "SELECT failed_at, attempts, last_error FROM payout_jobs WHERE entry_id = ?",
+    )
+    .bind(f.winner.to_string())
+    .fetch_one(f.database.read())
+    .await
+    .unwrap();
+    assert!(job.0.is_some());
+    assert_eq!(job.1, 0);
+    assert!(job
+        .2
+        .unwrap()
+        .contains("Escrow preparation capacity exhausted"));
+    let store = &f.coordinator.competition_store;
+    assert!(store.due_payout_jobs().await.unwrap().is_empty());
+    assert!(!store.has_live_payout_job(f.winner).await.unwrap());
+    assert!(!store.has_unsettled_payout_jobs(f.event_id).await.unwrap());
+    assert_eq!(store.store_counts().await.unwrap().payout_jobs_failed, 1);
+
+    // Later ticks claim again only up to the cap, and then leave the entry to the chain.
+    for _ in 0..MAX_AUTOMATIC_CLAIMS_PER_ENTRY + 3 {
+        f.ready_retries().await;
+        f.tick().await;
+    }
+    assert_eq!(
+        store.payout_claims_used(f.winner).await.unwrap(),
+        MAX_AUTOMATIC_CLAIMS_PER_ENTRY
+    );
+    assert_eq!(
+        f.escrow.prepare_calls.load(Ordering::SeqCst) as i64,
+        MAX_AUTOMATIC_CLAIMS_PER_ENTRY
+    );
+    assert!(store.due_payout_jobs().await.unwrap().is_empty());
+    assert_eq!(
+        store.store_counts().await.unwrap().payout_jobs_failed,
+        MAX_AUTOMATIC_CLAIMS_PER_ENTRY
+    );
     assert_eq!(f.escrow.release_calls.load(Ordering::SeqCst), 0);
     f.assert_no_secrets().await;
     f.database.close().await.unwrap();

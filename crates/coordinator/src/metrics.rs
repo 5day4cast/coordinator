@@ -23,7 +23,10 @@ use std::{
 };
 use tokio::{sync::Mutex, task::JoinHandle};
 
-use crate::domain::{CompetitionStore, TicketStatus};
+use crate::{
+    domain::{CompetitionStore, TicketStatus},
+    infra::lightning::PAYMENT_FAILURE_REASONS,
+};
 
 /// How long database-derived gauges are reused between scrapes.
 pub const DB_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
@@ -87,6 +90,19 @@ pub static PAYOUT_ATTEMPTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("valid metric")
 });
 
+/// Sends of a payout invoice that LND failed, by its failure reason. One payout counts once
+/// for every send that failed, so a payout waiting for a route counts again at each retry.
+pub static PAYOUT_SEND_FAILURES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "coordinator_payout_send_failures_total",
+            "Failed sends of a Lightning payout invoice by LND failure reason",
+        ),
+        &["reason"],
+    )
+    .expect("valid metric")
+});
+
 /// Competition steps that returned an error; the runner retries them with backoff.
 pub static COMPETITION_STEP_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
     IntCounter::new(
@@ -101,6 +117,12 @@ pub fn record_payout_result(succeeded: bool) {
     PAYOUT_ATTEMPTS
         .with_label_values(&[if succeeded { "succeeded" } else { "failed" }])
         .inc();
+}
+
+/// Record a failed send of a payout invoice. `reason` comes from
+/// [`classify_payment_failure`](crate::infra::lightning::classify_payment_failure).
+pub fn record_payout_send_failure(reason: &'static str) {
+    PAYOUT_SEND_FAILURES.with_label_values(&[reason]).inc();
 }
 
 /// The coordinator's metrics and what they are computed from.
@@ -194,10 +216,16 @@ impl Metrics {
             .register(Box::new(PAYOUT_ATTEMPTS.clone()))?;
         metrics
             .registry
+            .register(Box::new(PAYOUT_SEND_FAILURES.clone()))?;
+        metrics
+            .registry
             .register(Box::new(COMPETITION_STEP_FAILURES.clone()))?;
         // Show both results from the start, so a rate over them is defined.
         for result in ["succeeded", "failed"] {
             PAYOUT_ATTEMPTS.with_label_values(&[result]);
+        }
+        for reason in PAYMENT_FAILURE_REASONS {
+            PAYOUT_SEND_FAILURES.with_label_values(&[reason]);
         }
         Ok(metrics)
     }
@@ -361,6 +389,7 @@ mod tests {
             "coordinator_payout_job_oldest_open_age_seconds",
             "coordinator_background_thread_up",
             "coordinator_payout_attempts_total",
+            "coordinator_payout_send_failures_total",
             "coordinator_competition_step_failures_total",
             "coordinator_build_info",
         ] {
@@ -377,6 +406,8 @@ mod tests {
             "coordinator_background_thread_up{thread=\"running_worker\"} 1",
             "coordinator_background_thread_up{thread=\"stopped_worker\"} 0",
             "coordinator_payout_attempts_total{result=\"failed\"}",
+            "coordinator_payout_send_failures_total{reason=\"FAILURE_REASON_NO_ROUTE\"}",
+            "coordinator_payout_send_failures_total{reason=\"other\"}",
         ] {
             assert!(body.contains(sample), "missing {sample} in:\n{body}");
         }
