@@ -2123,8 +2123,16 @@ async fn a_recovery_that_fails_waits_before_it_is_tried_or_minted_again() {
     assert_eq!(f.enclaves.recovery_requests.load(Ordering::SeqCst), 1);
     assert_eq!(f.reported(&ticket), logged, "logged once");
 
-    // After the pause its swap is stale too. While recoveries fail, a new one is minted only
-    // every six hours, so the player's provider is not asked every hour.
+    // After the pause it is tried again, with the swap it has, which is still fresh.
+    f.refund_clock(&ticket, "updated_at", 3_600).await;
+    for _ in 0..2 {
+        f.clean_up().await;
+    }
+    assert_eq!(f.enclaves.recovery_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 1);
+
+    // By the pause after that its swap is stale. While recoveries fail, a new one is minted
+    // only every six hours, so the player's provider is not asked every hour.
     f.refund_clock(&ticket, "updated_at", 3_600).await;
     f.refund_goes_stale(&ticket).await;
     for _ in 0..2 {
@@ -2132,7 +2140,7 @@ async fn a_recovery_that_fails_waits_before_it_is_tried_or_minted_again() {
     }
     assert_eq!(f.refund(&ticket).await.unwrap().refund_id, held.refund_id);
     assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 1);
-    assert_eq!(f.enclaves.recovery_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(f.enclaves.recovery_requests.load(Ordering::SeqCst), 2);
     assert_eq!(f.ln.payments_sent(), 0);
 
     // Six hours on Keymeld signs, and the escrow is recovered into a fresh swap.

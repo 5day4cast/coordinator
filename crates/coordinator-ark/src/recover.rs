@@ -19,7 +19,12 @@
 //!
 //! Like a kickoff's, the intent holds the escrow in arkd's queue until a batch confirms it. So a
 //! recovery first deletes any intent an earlier attempt left, and deletes its own if it fails
-//! before the tree is signed.
+//! before the tree is signed. A batch that selected the intent has taken it out of the queue,
+//! and arkd puts it back only if it was never confirmed: the next attempt's first step deletes
+//! that one.
+//!
+//! Refusing to sign a tree, as one that does not pay the swap, fails the batch, and arkd then
+//! bans the escrow's script for its ban duration, as it does for a missing forfeit.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -152,7 +157,7 @@ pub async fn recover_escrow<T: ArkTransport + ?Sized>(
     )
     .await;
     // Until the tree is signed the batch cannot finish, and the intent would hold the escrow in
-    // arkd's queue. Once a batch selected it, it is gone and this deletes nothing.
+    // arkd's queue. If a batch has selected it, it is out of the queue and this deletes nothing.
     if let Err(error) = &result {
         if !signed {
             if let Err(delete) = delete_escrow_intent(transport, input, player, coordinator).await {

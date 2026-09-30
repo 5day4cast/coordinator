@@ -735,7 +735,7 @@ impl Coordinator {
                                 self.delete_held_intent(ark, session, &escrow, &input)
                                     .await?;
                             }
-                            if self.is_stale(&refund, &swap)? {
+                            if self.is_stale(&refund, &swap, Duration::ZERO)? {
                                 refund = self
                                     .remint_refund(
                                         ark,
@@ -919,8 +919,17 @@ impl Coordinator {
 
     /// Whether a minted refund can no longer be signed: the verifier signs only for a swap
     /// whose deadline is at least `MIN_REFUND_DEADLINE_SECS` away, and an unexpired invoice.
-    fn is_stale(&self, refund: &TicketArkRefund, swap: &RefundSwap) -> Result<bool, Error> {
-        let now = OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
+    ///
+    /// `within` is how long spending the escrow may take before the invoice is paid: nothing
+    /// for an offchain spend, and a batch for a recovery. An invoice that expired meanwhile
+    /// could not be paid, and a refund past `Minted` is never minted again.
+    fn is_stale(
+        &self,
+        refund: &TicketArkRefund,
+        swap: &RefundSwap,
+        within: Duration,
+    ) -> Result<bool, Error> {
+        let now = OffsetDateTime::now_utc().unix_timestamp().max(0) as u64 + within.as_secs();
         let soonest_deadline = now + u64::from(MIN_REFUND_DEADLINE_SECS) + STALE_MARGIN.as_secs();
         let LockTime::Seconds(deadline) = swap.terms().deadline else {
             return Err(anyhow!("The refund's swap deadline is not a timestamp").into());
@@ -936,7 +945,7 @@ impl Coordinator {
     /// Replace a stale minted refund with a new swap and invoice, once `interval` has passed
     /// since it was minted.
     ///
-    /// Nothing was signed or paid for the stale one: a minted refund's escrow is unspent. Its
+    /// Nothing was spent or paid for the stale one: a minted refund's escrow is unspent. Its
     /// swap at `ark-swapd` retires by itself at its deadline.
     #[allow(clippy::too_many_arguments)]
     async fn remint_refund(
@@ -952,8 +961,8 @@ impl Coordinator {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         if now < stale.created_at + interval.as_secs() as i64 {
             return Err(anyhow!(
-                "its minted refund expired before it could be signed; it is minted again \
-                 from {}",
+                "its minted refund went stale before its escrow could be spent; it is minted \
+                 again from {}",
                 stale.created_at + interval.as_secs() as i64
             )
             .into());
@@ -969,7 +978,7 @@ impl Coordinator {
             return Err(anyhow!("its refund moved on while it was minted again").into());
         }
         info!(
-            "Minted the refund of ticket {} again: swap {} replaces {}, which expired unsigned",
+            "Minted the refund of ticket {} again: swap {} replaces {}, which went stale unspent",
             escrow.ticket_id, fresh.refund_id, stale.refund_id
         );
         Ok(fresh)
@@ -1217,7 +1226,11 @@ impl Coordinator {
                 return Err(anyhow!("{failure}").into());
             }
         }
-        if self.is_stale(&refund, &swap)? {
+        // The invoice is paid only after the batch, which can take as long as this waits for
+        // one. A swap or invoice that would not last that long is replaced first.
+        let info = ark.server.info();
+        let config = KickoffConfig::for_server(info);
+        if self.is_stale(&refund, &swap, config.timeout)? {
             let interval = match failed {
                 Some(_) => RECOVERY_REMINT_INTERVAL,
                 None => REMINT_INTERVAL,
@@ -1237,7 +1250,6 @@ impl Coordinator {
             fee_sats: refund.fee_sats,
         };
         let coordinator = KeypairSigner::new([self.escrow_keypair()?]);
-        let info = ark.server.info();
         let recovered = coordinator_ark::recover_escrow(
             ark.transport.as_ref(),
             info,
@@ -1245,7 +1257,7 @@ impl Coordinator {
             &swap,
             &signer,
             &coordinator,
-            &KickoffConfig::for_server(info),
+            &config,
         )
         .await;
         match recovered {
