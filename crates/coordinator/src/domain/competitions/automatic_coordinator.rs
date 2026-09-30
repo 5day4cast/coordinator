@@ -11,6 +11,29 @@ use coordinator_escrow::{
     },
 };
 
+const TICKET_AUTHORIZATION_CONFLICT: &str =
+    "Your ticket was already requested with a different entry key or payout choice; that \
+     request has been cancelled, so request the ticket again";
+
+/// Whether two payout policies carry the same choices by the player. The rest is derived by
+/// the coordinator and may differ between requests without changing what the player chose.
+fn same_player_choice(a: &PayoutPolicy, b: &PayoutPolicy) -> Result<bool, Error> {
+    let consent = |policy| {
+        coordinator_escrow::queued::EntryConsent::from_policy(policy)
+            .map_err(|e| Error::BadRequest(e.to_string()))
+    };
+    let (a_terms, b_terms) = (consent(a)?, consent(b)?);
+    Ok(
+        a.automatic_lightning_address == b.automatic_lightning_address
+            && a.allow_invoice_fallback == b.allow_invoice_fallback
+            && a.release_entry_key_after_payment == b.release_entry_key_after_payment
+            && a_terms.entry_id() == b_terms.entry_id()
+            && a_terms.competition_id() == b_terms.competition_id()
+            && a_terms.ticket_hash() == b_terms.ticket_hash()
+            && a_terms.payout_hash() == b_terms.payout_hash(),
+    )
+}
+
 #[derive(Serialize)]
 pub struct PayoutAuthorizationInfo {
     pub keygen_session_id: String,
@@ -339,15 +362,37 @@ impl Coordinator {
         };
         ContractAuthorization::from_policy(&policy)
             .map_err(|e| Error::BadRequest(e.to_string()))?;
-        self.competition_store
+        self.fix_ticket_payout_policy(ticket, entry_pubkey, &policy)
+            .await
+    }
+
+    /// Fix `policy` as the ticket's payout authorization. A retried request whose response was
+    /// lost is handed the same reserved ticket; it keeps the authorization fixed first unless
+    /// the player chose differently, since the player's registration is sealed against it.
+    pub(super) async fn fix_ticket_payout_policy(
+        &self,
+        ticket: &Ticket,
+        entry_pubkey: &BitcoinPublicKey,
+        policy: &PayoutPolicy,
+    ) -> Result<(), Error> {
+        let Some(fixed) = self
+            .competition_store
             .store_ticket_payout_policy(
                 ticket.id,
                 ticket.hash.clone(),
                 entry_pubkey.to_string(),
-                serde_json::to_string(&policy).map_err(|e| Error::Bitcoin(e.into()))?,
+                serde_json::to_string(policy).map_err(|e| Error::Bitcoin(e.into()))?,
             )
-            .await?;
-        Ok(())
+            .await?
+        else {
+            return Ok(());
+        };
+        let stored: PayoutPolicy =
+            serde_json::from_str(&fixed.policy_json).map_err(|e| Error::Bitcoin(e.into()))?;
+        if fixed.entry_pubkey == entry_pubkey.to_string() && same_player_choice(&stored, policy)? {
+            return Ok(());
+        }
+        Err(Error::Conflict(TICKET_AUTHORIZATION_CONFLICT.into()))
     }
 
     pub(super) async fn validate_entry_payout_policy(

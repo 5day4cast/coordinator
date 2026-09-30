@@ -3481,21 +3481,30 @@ impl Coordinator {
                 .await
         }
         .await;
-        match result {
-            Ok(response) => Ok(response),
-            Err(e) => {
-                if let Err(clear_err) = self
-                    .competition_store
-                    .clear_ticket_reservation(&ticket)
+        if result.is_err() {
+            self.release_failed_reservation(&ticket).await;
+        }
+        result
+    }
+
+    /// Release the reservation a failed ticket request was handed, so the player's next
+    /// request starts afresh. An invoice an earlier request issued for it is cancelled: the
+    /// ticket's hash rotates, so a payment to it could no longer buy the ticket.
+    pub(super) async fn release_failed_reservation(&self, ticket: &Ticket) {
+        match self
+            .competition_store
+            .clear_ticket_reservation(ticket)
+            .await
+        {
+            Ok(true) if ticket.payment_request.is_some() => {
+                self.cancel_superseded_invoice(ticket.id, ticket.hash.clone())
                     .await
-                {
-                    error!(
-                        "Failed to clear ticket reservation for ticket {}: {}",
-                        ticket.id, clear_err
-                    );
-                }
-                Err(e)
             }
+            Ok(_) => {}
+            Err(e) => error!(
+                "Failed to clear ticket reservation for ticket {}: {}",
+                ticket.id, e
+            ),
         }
     }
 

@@ -506,30 +506,52 @@ async fn entry_authorization_is_immutable_but_unpaid_ticket_recycling_can_rotate
             .as_deref(),
         Some("alice@example.org")
     );
-    bounded(f.store.store_ticket_payout_policy(
-        f.ticket_id,
-        "old-hash".into(),
-        "alice-key".into(),
-        "alice-policy".into(),
-    ))
-    .await
-    .unwrap();
-    assert!(bounded(f.store.store_ticket_payout_policy(
-        f.ticket_id,
-        "old-hash".into(),
-        "mallory-key".into(),
-        "mallory-policy".into()
-    ))
-    .await
-    .is_err());
-    bounded(f.store.store_ticket_payout_policy(
-        f.ticket_id,
-        "new-hash".into(),
-        "bob-key".into(),
-        "bob-policy".into(),
-    ))
-    .await
-    .unwrap();
+    for _ in 0..2 {
+        // Storing the same authorization again, as a retried request does, changes nothing.
+        assert_eq!(
+            bounded(f.store.store_ticket_payout_policy(
+                f.ticket_id,
+                "old-hash".into(),
+                "alice-key".into(),
+                "alice-policy".into(),
+            ))
+            .await
+            .unwrap(),
+            None
+        );
+    }
+    assert_eq!(
+        bounded(f.store.store_ticket_payout_policy(
+            f.ticket_id,
+            "old-hash".into(),
+            "mallory-key".into(),
+            "mallory-policy".into()
+        ))
+        .await
+        .unwrap(),
+        Some(FixedTicketPayoutPolicy {
+            entry_pubkey: "alice-key".into(),
+            policy_json: "alice-policy".into(),
+        })
+    );
+    assert_eq!(
+        bounded(f.store.ticket_payout_policy(f.ticket_id, "old-hash"))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("alice-policy")
+    );
+    assert_eq!(
+        bounded(f.store.store_ticket_payout_policy(
+            f.ticket_id,
+            "new-hash".into(),
+            "bob-key".into(),
+            "bob-policy".into(),
+        ))
+        .await
+        .unwrap(),
+        None
+    );
     assert!(
         bounded(f.store.ticket_payout_policy(f.ticket_id, "old-hash"))
             .await
