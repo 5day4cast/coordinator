@@ -252,10 +252,21 @@ impl Coordinator {
                 }
             };
             if swap.state.player_paid() {
+                // Arkade is asked only once ark-swapd names what it paid, and a lookup that
+                // finds nothing waits longer each time, so a listing the server cannot answer
+                // is not asked every two seconds for every swap.
+                if swap.escrow_vtxo.is_none() && swap.ark_txid.is_none() {
+                    continue;
+                }
+                if !self.escrow_lookups.due(pending.swap_id) {
+                    continue;
+                }
                 let Some((vtxo, sats)) = self.verified_escrow_vtxo(ark, &pending, &swap).await
                 else {
+                    self.escrow_lookups.missed(pending.swap_id);
                     continue;
                 };
+                self.escrow_lookups.clear(pending.swap_id);
                 let paid = self
                     .competition_store
                     .mark_ticket_ark_paid(
@@ -789,9 +800,81 @@ fn paid_escrow_vtxo(
     Ok(vtxo.outpoint)
 }
 
+/// When each pending swap's escrow may next be looked up on Arkade, and how many lookups
+/// found nothing. The first miss waits two seconds, each further one twice as long, up to a
+/// minute; a swap that is verified or ends is forgotten.
+#[derive(Default)]
+pub(crate) struct EscrowLookups {
+    next: std::sync::Mutex<std::collections::HashMap<Uuid, (std::time::Instant, u32)>>,
+    /// Every lookup is due at once: for tests that check a swap twice in a row.
+    immediate: std::sync::atomic::AtomicBool,
+}
+
+impl EscrowLookups {
+    #[cfg(test)]
+    pub(crate) fn set_immediate(&self) {
+        self.immediate
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn due(&self, swap: Uuid) -> bool {
+        if self.immediate.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
+        let next = self
+            .next
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        next.get(&swap)
+            .is_none_or(|(at, _)| std::time::Instant::now() >= *at)
+    }
+
+    pub(crate) fn missed(&self, swap: Uuid) {
+        let mut next = self
+            .next
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let misses = next.get(&swap).map_or(0, |(_, misses)| *misses) + 1;
+        next.insert(
+            swap,
+            (std::time::Instant::now() + lookup_delay(misses), misses),
+        );
+    }
+
+    pub(crate) fn clear(&self, swap: Uuid) {
+        self.next
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&swap);
+    }
+}
+
+/// How long to wait after the `misses`th lookup that found no escrow VTXO.
+pub(crate) fn lookup_delay(misses: u32) -> std::time::Duration {
+    let seconds = 2u64.saturating_mul(1u64 << misses.saturating_sub(1).min(5));
+    std::time::Duration::from_secs(seconds.min(60))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escrow_lookups_back_off_and_forget_a_verified_swap() {
+        assert_eq!(lookup_delay(1).as_secs(), 2);
+        assert_eq!(lookup_delay(2).as_secs(), 4);
+        assert_eq!(lookup_delay(5).as_secs(), 32);
+        assert_eq!(lookup_delay(6).as_secs(), 60);
+        assert_eq!(lookup_delay(40).as_secs(), 60);
+
+        let lookups = EscrowLookups::default();
+        let swap = Uuid::now_v7();
+        assert!(lookups.due(swap));
+        lookups.missed(swap);
+        assert!(!lookups.due(swap));
+        lookups.clear(swap);
+        assert!(lookups.due(swap));
+    }
     use crate::infra::ark_swap::SwapsUnavailable;
 
     /// A refund must open while the escrow's VTXO is alive. A VTXO lives seven days from the

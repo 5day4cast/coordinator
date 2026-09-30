@@ -485,6 +485,8 @@ impl Fixture {
             max_refund_fee_sats: 100,
         }))
         .unwrap();
+        // The tests check a swap several times in a row, so no lookup waits.
+        coordinator.escrow_lookups.set_immediate();
 
         let now = OffsetDateTime::now_utc();
         let competition = Competition::new(&CreateEvent {
