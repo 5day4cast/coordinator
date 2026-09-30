@@ -1,7 +1,8 @@
 # Music in the how-it-works video
 
-`just help-video` puts this track under the recording of the help page's video
-(`crates/coordinator/src/templates/static/how-it-works.mp4`). The recipe downloads it into
+`just help-video` puts this track under both recordings of the help page's video, the phone
+one and the desktop one (`crates/coordinator/src/templates/static/how-it-works.mp4` and
+`how-it-works-desktop.mp4`). The recipe downloads it into
 `target/` and checks its SHA-256; it is not stored in the repository.
 
 - Title: Local Forecast

@@ -6,7 +6,10 @@ use maud::{html, Markup};
 
 use crate::domain::leaderboard::{progress::LINE_POINTS, Metric, PickState, Rule};
 use crate::templates::{
-    assets::{HOW_IT_WORKS_JPG, HOW_IT_WORKS_MP4},
+    assets::{
+        Asset, HOW_IT_WORKS_DESKTOP_JPG, HOW_IT_WORKS_DESKTOP_MP4, HOW_IT_WORKS_JPG,
+        HOW_IT_WORKS_MP4,
+    },
     fragments::{entry_form::pick_row, picks::state_badge},
 };
 
@@ -222,16 +225,13 @@ pub fn help_page() -> Markup {
 }
 
 /// A minute's walk through entering, the leaderboard and a player's picks, recorded from these
-/// pages (`just help-video`). It loads only when played; the sections below say it all in words.
+/// pages (`just help-video`), once on a phone and once on a desktop screen; help.css shows the
+/// one that fits. It loads only when played; the sections below say it all in words.
 fn video() -> Markup {
     html! {
         figure class="help-video" {
-            video controls playsinline preload="none" width="540" height="1168"
-                  poster=(HOW_IT_WORKS_JPG.url)
-                  aria-label="How it works: entering a competition, then following the leaderboard and your picks" {
-                source src=(HOW_IT_WORKS_MP4.url) type="video/mp4";
-                a href=(HOW_IT_WORKS_MP4.url) { "Watch how it works" }
-            }
+            (recording("is-phone", &HOW_IT_WORKS_MP4, &HOW_IT_WORKS_JPG, (540, 1168)))
+            (recording("is-desktop", &HOW_IT_WORKS_DESKTOP_MP4, &HOW_IT_WORKS_DESKTOP_JPG, (960, 600)))
             figcaption {
                 "How it works, in under a minute."
                 br;
@@ -242,6 +242,17 @@ fn video() -> Markup {
                 " by Kevin MacLeod (incompetech.com), "
                 a href="https://creativecommons.org/licenses/by/4.0/" { "CC BY 4.0" }
             }
+        }
+    }
+}
+
+fn recording(class: &str, mp4: &Asset, poster: &Asset, (width, height): (u32, u32)) -> Markup {
+    html! {
+        video class=(class) controls playsinline preload="none" width=(width) height=(height)
+              poster=(poster.url)
+              aria-label="How it works: entering a competition, then following the leaderboard and your picks" {
+            source src=(mp4.url) type="video/mp4";
+            a href=(mp4.url) { "Watch how it works" }
         }
     }
 }
@@ -302,16 +313,25 @@ mod tests {
         assert!(!html.contains("entryForm") && !html.contains("submitEntry"));
     }
 
-    /// The video loads only when played, from this site's own hashed assets.
+    /// Both recordings load only when played, from this site's own hashed assets.
     #[test]
     fn the_video_waits_to_be_played() {
         let html = help_page().into_string();
-        assert!(html.contains(r#"<video controls playsinline preload="none""#));
-        assert!(html.contains(&format!(r#"poster="{}""#, HOW_IT_WORKS_JPG.url)));
-        assert!(html.contains(&format!(
-            r#"<source src="{}" type="video/mp4">"#,
-            HOW_IT_WORKS_MP4.url
-        )));
+        for (class, mp4, poster) in [
+            ("is-phone", &HOW_IT_WORKS_MP4, &HOW_IT_WORKS_JPG),
+            (
+                "is-desktop",
+                &HOW_IT_WORKS_DESKTOP_MP4,
+                &HOW_IT_WORKS_DESKTOP_JPG,
+            ),
+        ] {
+            assert!(html.contains(&format!(
+                r#"<video class="{class}" controls playsinline preload="none""#
+            )));
+            assert!(html.contains(&format!(r#"poster="{}""#, poster.url)));
+            assert!(html.contains(&format!(r#"<source src="{}" type="video/mp4">"#, mp4.url)));
+        }
+        assert_eq!(html.matches("<video ").count(), 2);
         assert!(!html.contains("autoplay"));
         assert!(!video().into_string().contains("muted"));
     }
@@ -320,9 +340,9 @@ mod tests {
     #[test]
     fn the_video_credits_its_music() {
         let html = help_page().into_string();
-        assert!(html.contains(
-            r#"Music: <a href="https://incompetech.com/music/royalty-free/index.html?isrc=USUAN1300010">Local Forecast</a> by Kevin MacLeod (incompetech.com), <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>"#
-        ));
+        let credit = r#"Music: <a href="https://incompetech.com/music/royalty-free/index.html?isrc=USUAN1300010">Local Forecast</a> by Kevin MacLeod (incompetech.com), <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>"#;
+        // Once, under both recordings.
+        assert_eq!(html.matches(credit).count(), 1);
     }
 
     #[test]
