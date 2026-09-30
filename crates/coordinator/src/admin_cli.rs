@@ -1,6 +1,6 @@
-//! `coordinator admin`: drive competitions from a terminal or a script, through the operator
-//! listener and its bearer token. A client only; everything it does, the operator listener's
-//! HTTP API does.
+//! `coordinator admin`: drive competitions, and write off escrow refunds that can never finish,
+//! from a terminal or a script, through the operator listener and its bearer token. A client
+//! only; everything it does, the operator listener's HTTP API does.
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
@@ -15,8 +15,8 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    api::routes::OperatorCompetition,
-    domain::{CoordinatorFee, CreateEvent, CreateQueuedCompetition},
+    api::routes::{OperatorCompetition, WriteOffRequest},
+    domain::{CoordinatorFee, CreateEvent, CreateQueuedCompetition, WriteOffReport},
     infra::oracle::ScoringRules,
 };
 
@@ -52,6 +52,30 @@ pub enum AdminCommand {
         #[command(subcommand)]
         action: CompetitionCommand,
     },
+    /// Write off escrow refunds that can never finish, such as a paid ticket's whose player
+    /// never sent a registration. Cleanup stops trying them and the pages stop counting them as
+    /// owed; the escrow itself is not touched.
+    WriteOffRefund(WriteOffArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("target").required(true).args(["ticket", "competition"])))]
+pub struct WriteOffArgs {
+    /// The ticket whose refund to write off. Refused unless the refund is stuck, or --force.
+    #[arg(long)]
+    pub ticket: Option<Uuid>,
+    /// Write off every stuck refund of this competition; the others are listed and left.
+    #[arg(long)]
+    pub competition: Option<Uuid>,
+    /// Why; kept with each write-off and shown with it.
+    #[arg(long)]
+    pub reason: String,
+    /// Also write off refunds that are not stuck, such as one in progress.
+    #[arg(long)]
+    pub force: bool,
+    /// Do not ask for confirmation.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -375,6 +399,17 @@ impl AdminClient {
         Ok(checked(response).await?.json::<Created>().await?.id)
     }
 
+    /// Write off escrow refunds, returning what was written off and what was refused.
+    pub async fn write_off_refunds(&self, request: &WriteOffRequest) -> Result<WriteOffReport> {
+        let response = self
+            .request(reqwest::Method::POST, "/api/v1/admin/refunds/write-off")
+            .json(request)
+            .send()
+            .await
+            .context("reach the operator listener")?;
+        Ok(checked(response).await?.json().await?)
+    }
+
     pub async fn delete(&self, id: Uuid) -> Result<()> {
         let response = self
             .request(
@@ -501,8 +536,66 @@ pub async fn run(args: AdminArgs) -> Result<()> {
                 }
             }
         },
+        AdminCommand::WriteOffRefund(write_off) => {
+            let what = match (write_off.ticket, write_off.competition) {
+                (Some(ticket), _) => format!("Write off the escrow refund of ticket {ticket}"),
+                (None, Some(competition)) => {
+                    format!("Write off the stuck escrow refunds of competition {competition}")
+                }
+                (None, None) => bail!("give --ticket or --competition"),
+            };
+            let what = if write_off.force {
+                format!("{what}, even if not stuck")
+            } else {
+                what
+            };
+            confirm(&what, write_off.yes)?;
+            let report = client
+                .write_off_refunds(&WriteOffRequest {
+                    ticket_id: write_off.ticket,
+                    competition_id: write_off.competition,
+                    reason: write_off.reason,
+                    force: write_off.force,
+                })
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", write_off_text(&report));
+            }
+            if report.written_off.is_empty() && !report.refused.is_empty() {
+                bail!("no refund was written off");
+            }
+        }
     }
     Ok(())
+}
+
+/// What a write-off did, one line per ticket.
+pub fn write_off_text(report: &WriteOffReport) -> String {
+    let mut out = String::new();
+    if report.written_off.is_empty() && report.refused.is_empty() {
+        out.push_str("No escrow refunds are waiting\n");
+    }
+    for written in &report.written_off {
+        let _ = writeln!(
+            out,
+            "Wrote off the refund of ticket {} (competition {}): escrow {} holds {} sats; {}",
+            written.ticket_id,
+            written.competition_id,
+            written.vtxo_outpoint.as_deref().unwrap_or("-"),
+            written.vtxo_sats.unwrap_or_default(),
+            written.reason
+        );
+    }
+    for refused in &report.refused {
+        let _ = writeln!(
+            out,
+            "Left the refund of ticket {}: {}",
+            refused.ticket_id, refused.why
+        );
+    }
+    out
 }
 
 fn when(at: OffsetDateTime) -> String {
@@ -610,6 +703,13 @@ pub fn show_text(c: &OperatorCompetition) -> String {
     );
     let _ = writeln!(out, "Scoring       {}", terms.scoring_rules().as_str());
     let refunds = match c.refunds {
+        Some(p) if p.written_off > 0 => format!(
+            "{} of {} escrows refunded; {} outstanding; {} written off",
+            p.refunded,
+            p.escrowed,
+            p.escrowed - p.refunded,
+            p.written_off
+        ),
         Some(p) if p.refunded >= p.escrowed => format!("all {} escrows refunded", p.escrowed),
         Some(p) => format!(
             "{} of {} escrows refunded; {} outstanding",
@@ -620,6 +720,16 @@ pub fn show_text(c: &OperatorCompetition) -> String {
         None => "no funded escrows to refund".to_string(),
     };
     let _ = writeln!(out, "Refunds       {refunds}");
+    for written in &c.refund_write_offs {
+        let _ = writeln!(
+            out,
+            "  written off {}  ticket {}  {} sats  {}",
+            when(written.written_off_at),
+            written.ticket_id,
+            written.vtxo_sats.unwrap_or_default(),
+            written.reason
+        );
+    }
     let _ = writeln!(out, "\nSettlement");
     for milestone in &c.milestones {
         let _ = writeln!(out, "  {:<26}  {}", milestone.name, when(milestone.at));
@@ -724,6 +834,123 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(Cli::try_parse_from(["coordinator", "admin", "competitions", "cancel"]).is_err());
+    }
+
+    #[test]
+    fn write_off_refund_needs_a_ticket_or_a_competition_and_a_reason() {
+        let id = Uuid::nil().to_string();
+        let args = parse(&[
+            "write-off-refund",
+            "--ticket",
+            &id,
+            "--reason",
+            "never registered",
+        ]);
+        match args.command {
+            AdminCommand::WriteOffRefund(write_off) => {
+                assert_eq!(write_off.ticket, Some(Uuid::nil()));
+                assert_eq!(write_off.competition, None);
+                assert_eq!(write_off.reason, "never registered");
+                assert!(!write_off.force && !write_off.yes);
+            }
+            other => panic!("{other:?}"),
+        }
+        let args = parse(&[
+            "write-off-refund",
+            "--competition",
+            &id,
+            "--reason",
+            "r",
+            "--force",
+            "--yes",
+        ]);
+        match args.command {
+            AdminCommand::WriteOffRefund(write_off) => {
+                assert_eq!(write_off.competition, Some(Uuid::nil()));
+                assert!(write_off.force && write_off.yes);
+            }
+            other => panic!("{other:?}"),
+        }
+        for bad in [
+            vec!["write-off-refund", "--reason", "r"],
+            vec!["write-off-refund", "--ticket", &id],
+            vec![
+                "write-off-refund",
+                "--ticket",
+                &id,
+                "--competition",
+                &id,
+                "--reason",
+                "r",
+            ],
+        ] {
+            let mut argv = vec!["coordinator", "admin"];
+            argv.extend(bad.iter().copied());
+            assert!(Cli::try_parse_from(&argv).is_err(), "{bad:?}");
+        }
+    }
+
+    /// The operator sees each written-off refund with its reason, beside the refund count.
+    #[test]
+    fn show_lists_written_off_refunds_with_their_reasons() {
+        let now = OffsetDateTime::parse("2026-09-24T12:00:00Z", &Rfc3339).unwrap();
+        let args = parse(&["competitions", "create", "--stations", "KDEN", "--single"]);
+        let AdminCommand::Competitions {
+            action: CompetitionCommand::Create(create),
+        } = args.command
+        else {
+            panic!("expected create");
+        };
+        let competition = crate::domain::Competition::new(&create.to_event().unwrap());
+        let write_off = crate::domain::RefundWriteOff {
+            ticket_id: Uuid::nil(),
+            competition_id: competition.id,
+            vtxo_outpoint: Some(format!("{}:0", "ab".repeat(32))),
+            vtxo_sats: Some(5_500),
+            reason: "the player never sent a registration".into(),
+            refund_state: None,
+            written_off_at: now,
+        };
+        let progress = crate::domain::RefundProgress {
+            escrowed: 2,
+            refunded: 2,
+            written_off: 1,
+            opens_at: None,
+        };
+        let shown = OperatorCompetition::new(&competition, Some(progress), vec![write_off.clone()]);
+        let text = show_text(&shown);
+        assert!(
+            text.contains("2 of 2 escrows refunded; 0 outstanding; 1 written off"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "written off 2026-09-24 12:00Z  ticket {}  5500 sats  the player never sent a \
+                 registration",
+                Uuid::nil()
+            )),
+            "{text}"
+        );
+        let json = serde_json::to_value(&shown).unwrap();
+        assert_eq!(
+            json["refund_write_offs"][0]["reason"],
+            "the player never sent a registration"
+        );
+
+        let report = WriteOffReport {
+            written_off: vec![write_off],
+            refused: vec![crate::domain::RefusedWriteOff {
+                ticket_id: competition.id,
+                why: "its refund is in progress (paid); --force writes it off anyway".into(),
+            }],
+        };
+        let text = write_off_text(&report);
+        assert!(text.contains("Wrote off the refund of ticket"), "{text}");
+        assert!(
+            text.contains("holds 5500 sats; the player never sent"),
+            "{text}"
+        );
+        assert!(text.contains("Left the refund of ticket"), "{text}");
     }
 
     #[test]

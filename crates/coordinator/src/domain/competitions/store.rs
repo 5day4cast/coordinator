@@ -1354,9 +1354,10 @@ impl CompetitionStore {
     /// lifecycle ends. Successful cancellation/reclaim/refund markers drain this queue.
     ///
     /// The work is a held invoice to cancel, an on-chain escrow to reclaim, or a funded Arkade
-    /// escrow to refund. An Arkade ticket is paid and settled at once, since the swap service
-    /// settles its invoice, so only its escrow says it still holds the player's buy-in. The
-    /// escrows of a pool that a batch funded were spent into it, so they are not refunded.
+    /// escrow to refund that an operator has not written off. An Arkade ticket is paid and
+    /// settled at once, since the swap service settles its invoice, so only its escrow says it
+    /// still holds the player's buy-in. The escrows of a pool that a batch funded were spent into
+    /// it, so they are not refunded.
     ///
     /// A queued competition that formed its pools keeps only the tickets no pool took, so their
     /// escrows are refunded the same way.
@@ -1377,7 +1378,11 @@ impl CompetitionStore {
                                 LEFT JOIN ticket_ark_refunds r ON r.ticket_id = e.ticket_id
                                 WHERE e.ticket_id = tickets.id AND e.ticket_hash = tickets.hash
                                   AND e.funded_at IS NOT NULL
-                                  AND (r.state IS NULL OR r.state != 'settled'))
+                                  AND (r.state IS NULL OR r.state != 'settled')
+                                  AND NOT EXISTS (
+                                      SELECT 1 FROM ticket_ark_refund_write_offs w
+                                      WHERE w.ticket_id = e.ticket_id
+                                        AND w.ticket_hash = e.ticket_hash))
                         AND NOT EXISTS (SELECT 1 FROM ark_funded_competitions a
                                         WHERE a.event_id = competitions.id
                                           AND a.commitment_tx IS NOT NULL)))",

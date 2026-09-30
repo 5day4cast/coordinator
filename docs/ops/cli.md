@@ -27,8 +27,8 @@ coordinator admin competitions list
 coordinator admin competitions list --state active
 coordinator admin competitions list --state awaiting_attestation --state failed --json
 
-# One competition: terms, state, settlement milestones, the last errors kept on it, and how many
-# of its funded Arkade escrows have been refunded.
+# One competition: terms, state, settlement milestones, the last errors kept on it, how many
+# of its funded Arkade escrows have been refunded, and any written off with their reasons.
 coordinator admin competitions show <competition-id>
 
 # Create one. The fields and defaults are the admin page's: 3 entries of 5000 sats, a 5% fee,
@@ -44,6 +44,18 @@ coordinator admin competitions cancel <competition-id>
 coordinator admin competitions cancel <competition-id> --yes
 ```
 
+```sh
+# Write off an escrow refund that can never finish, such as a paid ticket whose player never sent
+# a registration: cleanup stops retrying it and the pages stop counting it as owed. Refused for a
+# refund still in progress unless --force. It asks first; --yes skips that.
+coordinator admin write-off-refund --ticket <ticket-id> --reason "never registered" --yes
+# Every stuck refund of a competition; the others are listed and left.
+coordinator admin write-off-refund --competition <competition-id> --reason "never registered" --yes
+```
+
+See [stuck escrows](stuck-escrow-check.md#writing-off-a-refund-that-can-never-finish) for when
+to write one off.
+
 `cancel` (alias `delete`) is the admin page's delete: it removes a competition with no paid
 entries. Once an entry is paid the coordinator refuses, and the competition runs its course; a
 competition that fails or never fills is cancelled and refunded by the coordinator itself.
@@ -57,6 +69,7 @@ bearer token:
 | `GET` | `/api/v1/admin/competitions/{id}` | one competition, the same shape |
 | `POST` | `/api/v1/competitions` | create (JSON `CreateEvent`) |
 | `DELETE` | `/api/v1/admin/competitions/{id}` | delete a competition with no paid entries |
+| `POST` | `/api/v1/admin/refunds/write-off` | write off escrow refunds (JSON `ticket_id` or `competition_id`, `reason`, `force`) |
 
 ## `synth`
 

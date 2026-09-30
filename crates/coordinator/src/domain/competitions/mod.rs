@@ -3,7 +3,7 @@ mod admission;
 mod admission_tests;
 mod ark_kickoff;
 mod ark_refund;
-pub use ark_refund::TicketRefund;
+pub use ark_refund::{RefusedWriteOff, TicketRefund, WriteOffReport, WriteOffTarget};
 mod ark_store;
 #[cfg(test)]
 mod ark_tests;

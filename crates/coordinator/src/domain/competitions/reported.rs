@@ -28,6 +28,15 @@ impl Reported {
         }
     }
 
+    /// What was last reported about `subject` under `topic`, while it lasts.
+    pub fn last(&self, topic: &'static str, subject: Uuid) -> Option<String> {
+        self.last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(topic, subject))
+            .cloned()
+    }
+
     /// Forget `subject` under `topic` once its condition clears, so a recurrence is reported.
     pub fn clear(&self, topic: &'static str, subject: Uuid) {
         self.last

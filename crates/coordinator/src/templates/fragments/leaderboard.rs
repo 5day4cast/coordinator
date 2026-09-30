@@ -348,12 +348,19 @@ fn refund_allocation(competition: &CompetitionView) -> Markup {
 }
 
 /// What happened to the entry fees of a competition that didn't fill. Escrowed fees can't
-/// move until their escrows' refund locktime, so until then it says when they will.
+/// move until their escrows' refund locktime, so until then it says when they will. Fees whose
+/// refund an operator wrote off are no longer counted as owed, but are said to be.
 fn refund_note(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
     let progress = competition.refunds;
     html! {
         @match competition.refunds(now) {
             Refunds::Nothing => { "No entry fees were paid." }
+            Refunds::Done if progress.written_off > 0 => {
+                "Refunds are finished: " (progress.refunded) " of "
+                (progress.escrowed + progress.written_off) " paid entry fees were returned; the \
+                 operator closed the other " (progress.written_off) ", which could not be \
+                 refunded automatically."
+            }
             Refunds::Done => { "Every entry fee has been returned." }
             Refunds::Locked(at) => {
                 "Entry fees go back to the refund destination shown when entering. Refunds open "
@@ -709,6 +716,7 @@ mod tests {
         competition.refunds = crate::domain::RefundProgress {
             escrowed: 2,
             refunded: 1,
+            written_off: 0,
             opens_at: Some(NOW - time::Duration::minutes(5)),
         };
         let page = leaderboard(&competition, NOW).into_string();
@@ -749,6 +757,47 @@ mod tests {
             .contains("No entry fees were paid."));
     }
 
+    /// An escrow whose refund an operator wrote off is no longer owed: once the rest are
+    /// returned, refunds are finished, and the page says how many were not.
+    #[test]
+    fn written_off_refunds_leave_the_rest_done() {
+        let mut competition = view("c1", Phase::Unfilled, -60);
+        competition.total_entries = 0;
+        competition.refunds = crate::domain::RefundProgress {
+            escrowed: 2,
+            refunded: 1,
+            written_off: 1,
+            opens_at: Some(NOW - time::Duration::minutes(5)),
+        };
+        let page = leaderboard(&competition, NOW).into_string();
+        assert!(
+            page.contains("1 of 2 paid entry fees returned so far"),
+            "{page}"
+        );
+
+        competition.refunds.refunded = 2;
+        let page = leaderboard(&competition, NOW).into_string();
+        assert!(!page.contains("Refunding"), "{page}");
+        assert!(
+            page.contains(
+                "Refunds are finished: 2 of 3 paid entry fees were returned; the operator \
+                 closed the other 1, which could not be refunded automatically."
+            ),
+            "{page}"
+        );
+
+        // Every paid fee written off: nothing is owed, and it was not a competition nobody paid.
+        competition.refunds = crate::domain::RefundProgress {
+            escrowed: 0,
+            refunded: 0,
+            written_off: 1,
+            opens_at: None,
+        };
+        let page = leaderboard(&competition, NOW).into_string();
+        assert!(page.contains("Refunds are finished: 0 of 1"), "{page}");
+        assert!(!page.contains("No entry fees were paid."));
+    }
+
     /// A full competition cancelled before it ran, as by a failed kickoff check, still says
     /// where its escrowed entry fees stand; an operator's cancellation with nothing escrowed
     /// does not.
@@ -763,6 +812,7 @@ mod tests {
         competition.refunds = crate::domain::RefundProgress {
             escrowed: 3,
             refunded: 1,
+            written_off: 0,
             opens_at: Some(NOW - time::Duration::minutes(5)),
         };
         let page = leaderboard(&competition, NOW).into_string();

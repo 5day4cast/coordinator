@@ -1,6 +1,7 @@
 //! Competition views for the operator listener's scripts and command line
 //! (`coordinator admin`): what state each competition is in, how far it has settled, the errors
-//! it kept, and how far its escrow refunds have got.
+//! it kept, and how far its escrow refunds have got; and writing off escrow refunds that can
+//! never finish.
 
 use axum::{
     extract::{Path, State},
@@ -16,7 +17,7 @@ use crate::{
     api::routes::ApiError,
     domain::{
         Competition, CompetitionError, CompetitionKind, CreateEvent, Error, QueueSummary,
-        RefundProgress,
+        RefundProgress, RefundWriteOff, WriteOffReport, WriteOffTarget,
     },
     startup::AppState,
 };
@@ -40,6 +41,9 @@ pub struct OperatorCompetition {
     pub errors: Vec<CompetitionError>,
     /// Its funded Arkade escrows and how many have been refunded; None when it has none.
     pub refunds: Option<RefundProgress>,
+    /// The escrow refunds an operator wrote off, with their reasons.
+    #[serde(default)]
+    pub refund_write_offs: Vec<RefundWriteOff>,
     /// `single`, `queued` or `pool`.
     #[serde(default)]
     pub kind: CompetitionKind,
@@ -60,7 +64,11 @@ pub struct Milestone {
 }
 
 impl OperatorCompetition {
-    pub fn new(competition: &Competition, refunds: Option<RefundProgress>) -> Self {
+    pub fn new(
+        competition: &Competition,
+        refunds: Option<RefundProgress>,
+        refund_write_offs: Vec<RefundWriteOff>,
+    ) -> Self {
         let c = competition;
         let mut milestones: Vec<Milestone> = [
             ("created", Some(c.created_at)),
@@ -104,6 +112,7 @@ impl OperatorCompetition {
             milestones,
             errors: c.errors.clone(),
             refunds,
+            refund_write_offs,
             kind: c.kind,
             parent_id: c.parent_id,
             queue: c.queue.clone(),
@@ -127,9 +136,17 @@ pub async fn operator_competitions(
 ) -> Result<Json<Vec<OperatorCompetition>>, ApiError> {
     let competitions = state.coordinator.get_competitions().await?;
     let refunds = state.coordinator.refund_progress(None).await?;
+    let write_offs = state.coordinator.refund_write_offs(None).await?;
     let mut competitions: Vec<_> = competitions
         .iter()
-        .map(|c| OperatorCompetition::new(c, refunds.get(&c.id).copied()))
+        .map(|c| {
+            let written_off = write_offs
+                .iter()
+                .filter(|write_off| write_off.competition_id == c.id)
+                .cloned()
+                .collect();
+            OperatorCompetition::new(c, refunds.get(&c.id).copied(), written_off)
+        })
         .collect();
     competitions.sort_by_key(|c| std::cmp::Reverse(c.created_at));
     Ok(Json(competitions))
@@ -145,10 +162,58 @@ pub async fn operator_competition(
         .await
         .map_err(|e| found(id, e))?;
     let refunds = state.coordinator.refund_progress(Some(id)).await?;
+    let write_offs = state.coordinator.refund_write_offs(Some(id)).await?;
     Ok(Json(OperatorCompetition::new(
         &competition,
         refunds.get(&id).copied(),
+        write_offs,
     )))
+}
+
+/// Write off escrow refunds that can never finish: one ticket's, or every stuck one of a
+/// competition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteOffRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub competition_id: Option<Uuid>,
+    /// Kept with each write-off, and shown with it.
+    pub reason: String,
+    /// Also write off refunds that are not stuck, such as one in progress.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Write off escrow refunds, as `coordinator admin write-off-refund` does. A ticket's refund that
+/// is not stuck is refused unless forced; a competition's are written off where they are stuck,
+/// and the rest listed as refused.
+pub async fn operator_write_off_refunds(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<WriteOffRequest>,
+) -> Result<Json<WriteOffReport>, ApiError> {
+    let target = match (request.ticket_id, request.competition_id) {
+        (Some(ticket_id), None) => WriteOffTarget::Ticket(ticket_id),
+        (None, Some(competition_id)) => {
+            state
+                .coordinator
+                .get_competition(competition_id)
+                .await
+                .map_err(|e| found(competition_id, e))?;
+            WriteOffTarget::Competition(competition_id)
+        }
+        _ => {
+            return Err(
+                Error::BadRequest("give either a ticket_id or a competition_id".into()).into(),
+            )
+        }
+    };
+    Ok(Json(
+        state
+            .coordinator
+            .write_off_refunds(target, &request.reason, request.force)
+            .await?,
+    ))
 }
 
 /// Delete a competition nobody has paid into, as the admin page's delete button does.
