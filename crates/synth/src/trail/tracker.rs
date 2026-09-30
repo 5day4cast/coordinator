@@ -1728,10 +1728,13 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let counted = calls.clone();
         let fixture = fixture(
-            Router::new().fallback(move || {
+            Router::new().fallback(move |uri: axum::http::Uri| {
                 let calls = counted.clone();
                 async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
+                    // The operator's competition list is asked for separately, once a tick.
+                    if uri.path() != "/api/v1/admin/competitions" {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                    }
                     StatusCode::SERVICE_UNAVAILABLE
                 }
             }),
