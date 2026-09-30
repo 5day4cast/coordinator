@@ -26,7 +26,8 @@
 //! (`coordinator_ark::recover_escrow`). From there the refund is paid and claimed as usual. Until
 //! Arkade has swept the escrow the refund is held: it keeps the swap it has, and nothing is
 //! minted or signed for it. A recovery that fails is tried again after a pause, and asks the
-//! player's provider for a new invoice at most every six hours.
+//! player's provider for a new invoice at most every six hours, then twelve, then once a day
+//! while it keeps failing.
 //!
 //! Keymeld signs with the entry key the player's browser sealed to its enclave. The browser sends
 //! that registration before it shows the ticket's invoice, and again with the entry. Entries are
@@ -98,8 +99,19 @@ pub(super) const HELD_EXPIRED: &str = "the escrow's VTXO expired on Arkade";
 const RECOVERY_RETRY: Duration = Duration::from_secs(10 * 60);
 
 /// While its recoveries keep failing, a stale refund is minted again at most this often, so the
-/// player's Lightning Address provider is not asked for an invoice every hour.
+/// player's Lightning Address provider is not asked for an invoice every hour. Each remint in a
+/// row doubles the wait, up to [`MAX_RECOVERY_REMINT_INTERVAL`]: a batch that fails on Arkade's
+/// side, as when it cannot estimate its fee, fails as well for a fresh swap.
 const RECOVERY_REMINT_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const MAX_RECOVERY_REMINT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How long a stale refund whose recoveries keep failing waits to be minted again, after it was
+/// minted again `remints` times in a row already.
+pub(super) fn recovery_remint_interval(remints: u32) -> Duration {
+    RECOVERY_REMINT_INTERVAL
+        .saturating_mul(1 << remints.min(2))
+        .min(MAX_RECOVERY_REMINT_INTERVAL)
+}
 
 /// What a refund that cannot finish without an operator says, when it is logged. Such a refund
 /// may be written off without `force`.
@@ -143,11 +155,18 @@ pub struct TicketRefund {
     /// expired, the commitment transaction of the batch that did.
     pub ark_txid: Option<String>,
     /// The invoice the refund pays, from the player's Lightning Address, and its payment hash:
-    /// what the player's wallet shows the refund as.
+    /// what the player's wallet shows the refund as. Empty for a refund written off before it
+    /// was minted.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub invoice: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub payment_hash: String,
     /// UNIX seconds.
     pub updated_at: i64,
+    /// An operator wrote the refund off: it will not finish on its own, and is no longer owed.
+    /// Its `state` is where it stopped, or `written_off` if it never started.
+    #[serde(default)]
+    pub written_off: bool,
 }
 
 /// The player of a paid ticket, and what Keymeld registers for them, or why it cannot.
@@ -207,8 +226,21 @@ impl Coordinator {
         if ticket.reserved_by.as_deref() != Some(&user_pubkey) {
             return Err(Error::BadRequest("Ticket not reserved by this user".into()));
         }
-        let Some(refund) = self.competition_store.ticket_ark_refund(ticket_id).await? else {
-            return Ok(None);
+        let (refund, written_off_at) = tokio::try_join!(
+            self.competition_store.ticket_ark_refund(ticket_id),
+            self.competition_store
+                .ticket_ark_refund_written_off(ticket_id, &ticket.hash),
+        )?;
+        let Some(refund) = refund else {
+            return Ok(written_off_at.map(|at| TicketRefund {
+                state: "written_off".into(),
+                paid_sats: 0,
+                ark_txid: None,
+                invoice: String::new(),
+                payment_hash: String::new(),
+                updated_at: at,
+                written_off: true,
+            }));
         };
         let escrow = self
             .competition_store
@@ -225,11 +257,13 @@ impl Coordinator {
             invoice: refund.invoice,
             payment_hash: refund.payment_hash,
             updated_at: refund.updated_at,
+            written_off: written_off_at.is_some(),
         }))
     }
 
     /// How far the escrow refunds of `competition_ids` have got, and when the first escrow
-    /// not refunded yet opens for its refund. The pages ask for the competitions they show.
+    /// not refunded yet opens for its refund, with their entry fees paid by held Lightning
+    /// payments. The pages ask for the competitions they show.
     pub async fn refund_status(
         &self,
         competition_ids: &[Uuid],
@@ -237,12 +271,20 @@ impl Coordinator {
         if competition_ids.is_empty() {
             return Ok(Default::default());
         }
-        let (mut progress, trees) = tokio::try_join!(
+        let (mut progress, trees, lightning) = tokio::try_join!(
             self.competition_store
                 .ark_refund_progress(Some(competition_ids)),
             self.competition_store
                 .unrefunded_ark_escrow_trees(competition_ids),
+            self.competition_store
+                .lightning_refund_progress(competition_ids),
         )?;
+        for (competition_id, held) in lightning {
+            let status = progress.entry(competition_id).or_default();
+            status.held = held.held;
+            status.released = held.released;
+            status.settled = held.settled;
+        }
         for (competition_id, tap_tree) in trees {
             let Some(status) = progress.get_mut(&competition_id) else {
                 continue;
@@ -745,6 +787,7 @@ impl Coordinator {
                                         sats,
                                         &refund,
                                         REMINT_INTERVAL,
+                                        0,
                                     )
                                     .await?;
                                 swap = self.refund_swap(ark, &refund).await?;
@@ -914,6 +957,7 @@ impl Coordinator {
             error: None,
             created_at: now,
             updated_at: now,
+            recovery_remints: 0,
         })
     }
 
@@ -943,7 +987,7 @@ impl Coordinator {
     }
 
     /// Replace a stale minted refund with a new swap and invoice, once `interval` has passed
-    /// since it was minted.
+    /// since it was minted. The new one records `recovery_remints`.
     ///
     /// Nothing was spent or paid for the stale one: a minted refund's escrow is unspent. Its
     /// swap at `ark-swapd` retires by itself at its deadline.
@@ -957,6 +1001,7 @@ impl Coordinator {
         sats: u64,
         stale: &TicketArkRefund,
         interval: Duration,
+        recovery_remints: u32,
     ) -> Result<TicketArkRefund, Error> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         if now < stale.created_at + interval.as_secs() as i64 {
@@ -967,9 +1012,12 @@ impl Coordinator {
             )
             .into());
         }
-        let fresh = self
-            .mint_refund(ark, escrow, player, escrow_script, sats)
-            .await?;
+        let fresh = TicketArkRefund {
+            recovery_remints,
+            ..self
+                .mint_refund(ark, escrow, player, escrow_script, sats)
+                .await?
+        };
         if !self
             .competition_store
             .replace_minted_ticket_ark_refund(stale.refund_id, fresh.clone())
@@ -1231,12 +1279,24 @@ impl Coordinator {
         let info = ark.server.info();
         let config = KickoffConfig::for_server(info);
         if self.is_stale(&refund, &swap, config.timeout)? {
-            let interval = match failed {
-                Some(_) => RECOVERY_REMINT_INTERVAL,
-                None => REMINT_INTERVAL,
+            let (interval, remints) = match failed {
+                Some(_) => (
+                    recovery_remint_interval(refund.recovery_remints),
+                    refund.recovery_remints.saturating_add(1),
+                ),
+                None => (REMINT_INTERVAL, 0),
             };
             refund = self
-                .remint_refund(ark, escrow, player, &input.escrow, sats, &refund, interval)
+                .remint_refund(
+                    ark,
+                    escrow,
+                    player,
+                    &input.escrow,
+                    sats,
+                    &refund,
+                    interval,
+                    remints,
+                )
                 .await?;
             swap = self.refund_swap(ark, &refund).await?;
         }

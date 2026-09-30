@@ -71,6 +71,9 @@ pub enum Refunds {
     Locked(OffsetDateTime),
     Pending,
     Done,
+    /// Refunds are over, but some fees weren't returned: an operator wrote off their escrows'
+    /// refunds, or their Lightning payments were settled.
+    Partly,
 }
 
 impl CompetitionView {
@@ -139,7 +142,18 @@ impl CompetitionView {
     pub fn entries(&self) -> String {
         match &self.queue {
             Queue::Queued(queue) => format!("{} entered", self.entry_count(queue)),
-            _ => format!("{} of {}", self.total_entries, self.total_allowed_entries),
+            _ => format!("{} of {}", self.entered(), self.total_allowed_entries),
+        }
+    }
+
+    /// Its entries. For one that didn't run, every paid entry fee counts, as its refunds count
+    /// them, even one whose entry never arrived.
+    pub fn entered(&self) -> u64 {
+        match self.phase {
+            Phase::Unfilled | Phase::Cancelled | Phase::Failed => {
+                self.total_entries.max(self.refunds.paid())
+            }
+            _ => self.total_entries,
         }
     }
 
@@ -233,11 +247,10 @@ impl CompetitionView {
     }
 
     /// Whether entry fees are owed back: it didn't fill, or it was cancelled for any reason,
-    /// such as a failed kickoff check, or it failed, with fees in escrow.
+    /// such as a failed kickoff check, or it failed, with fees paid.
     pub fn owes_refunds(&self) -> bool {
         self.did_not_fill()
-            || (matches!(self.phase, Phase::Cancelled | Phase::Failed)
-                && self.refunds.escrowed + self.refunds.written_off > 0)
+            || (matches!(self.phase, Phase::Cancelled | Phase::Failed) && self.refunds.paid() > 0)
     }
 
     /// Where the entry fees of a competition that didn't fill stand at `now`. Escrowed fees
@@ -248,18 +261,27 @@ impl CompetitionView {
             escrowed,
             refunded,
             written_off,
+            held,
+            released,
+            settled,
             opens_at,
         } = self.refunds;
-        // A written-off escrow is no longer owed: refunds are done once the rest are.
+        // A written-off escrow is no longer owed: refunds are over once the rest are.
         if escrowed > 0 || written_off > 0 {
             match opens_at {
+                _ if refunded >= escrowed && written_off > 0 => Refunds::Partly,
                 _ if refunded >= escrowed => Refunds::Done,
                 Some(at) if at > now && refunded == 0 => Refunds::Locked(at),
                 _ => Refunds::Pending,
             }
         } else if self.paid_nothing() {
             Refunds::Nothing
-        } else if self.phase == Phase::Unfilled {
+        } else if held > 0 && released >= held {
+            Refunds::Done
+        } else if held > 0 && released + settled >= held {
+            // A settled payment can't be released: the rest were, and that is all.
+            Refunds::Partly
+        } else if held > 0 || self.phase == Phase::Unfilled {
             Refunds::Pending
         } else {
             Refunds::Done
@@ -268,7 +290,7 @@ impl CompetitionView {
 
     /// Nobody paid an entry fee: no escrow was funded and there are no entries.
     fn paid_nothing(&self) -> bool {
-        self.refunds.escrowed == 0 && self.refunds.written_off == 0 && self.total_entries == 0
+        self.refunds.paid() == 0 && self.total_entries == 0
     }
 
     pub fn url(&self) -> String {
@@ -366,6 +388,7 @@ pub fn refund_line(competition: &CompetitionView, now: OffsetDateTime) -> Option
         Refunds::Locked(at) => html! { "Refunds open " (format::time(at, TimeStyle::DateTime)) },
         Refunds::Pending => html! { "Refunding…" },
         Refunds::Done => html! { "Refunded" },
+        Refunds::Partly => html! { "Not all refunded" },
     })
 }
 
@@ -943,6 +966,7 @@ pub(crate) mod tests {
             refunded: 0,
             written_off: 0,
             opens_at: Some(opens_at),
+            ..Default::default()
         };
         assert!(badge(&escrowed).contains("every entry fee is returned"));
         assert_eq!(escrowed.refunds(NOW), Refunds::Locked(opens_at));
@@ -966,6 +990,7 @@ pub(crate) mod tests {
             refunded: 2,
             written_off: 0,
             opens_at: Some(NOW + time::Duration::hours(1)),
+            ..Default::default()
         };
         // Some are back already, so the rest are being refunded, not locked.
         assert_eq!(line(&cancelled).as_deref(), Some("Refunding…"));
@@ -973,22 +998,28 @@ pub(crate) mod tests {
         assert_eq!(line(&cancelled).as_deref(), Some("Refunded"));
         assert!(badge(&cancelled).contains(">Didn't run</span>"));
 
-        // An escrow an operator wrote off is no longer owed: done once the rest are back.
-        cancelled.refunds.refunded = 2;
+        // An escrow an operator wrote off is no longer owed, but wasn't returned either: over
+        // once the rest are back, and not all refunded.
+        cancelled.refunds.refunded = 1;
         cancelled.refunds.escrowed = 2;
         cancelled.refunds.written_off = 1;
-        assert_eq!(cancelled.refunds(NOW), Refunds::Done);
-        assert_eq!(line(&cancelled).as_deref(), Some("Refunded"));
+        assert_eq!(line(&cancelled).as_deref(), Some("Refunding…"));
+        cancelled.refunds.refunded = 2;
+        assert_eq!(cancelled.refunds(NOW), Refunds::Partly);
+        assert_eq!(line(&cancelled).as_deref(), Some("Not all refunded"));
         let mut written_off = empty.clone();
         written_off.refunds = RefundProgress {
             escrowed: 0,
             refunded: 0,
             written_off: 1,
             opens_at: None,
+            ..Default::default()
         };
-        assert_eq!(written_off.refunds(NOW), Refunds::Done);
-        assert_eq!(line(&written_off).as_deref(), Some("Refunded"));
+        assert_eq!(written_off.refunds(NOW), Refunds::Partly);
+        assert_eq!(line(&written_off).as_deref(), Some("Not all refunded"));
         assert!(!badge(&written_off).contains("no entry fees were paid"));
+        // Its entries count the fee its refunds count, though its entry never arrived.
+        assert_eq!(written_off.entries(), "1 of 3");
 
         // Held Lightning payments are released when it is cancelled.
         let mut held = view("held", Phase::Cancelled, -600);
@@ -1024,6 +1055,30 @@ pub(crate) mod tests {
         operator.total_entries = 3;
         assert!(badge(&operator).contains(">Cancelled</span>"));
         assert_eq!(refund_line(&operator, NOW).map(text), None);
+        // Its entry fees held by Lightning: refunded once every invoice is released, not all
+        // refunded when one was settled instead.
+        operator.refunds = RefundProgress {
+            held: 2,
+            released: 1,
+            ..Default::default()
+        };
+        assert!(operator.owes_refunds());
+        assert_eq!(
+            refund_line(&operator, NOW).map(text).as_deref(),
+            Some("Refunding…")
+        );
+        operator.refunds.released = 2;
+        assert_eq!(
+            refund_line(&operator, NOW).map(text).as_deref(),
+            Some("Refunded")
+        );
+        operator.refunds.released = 1;
+        operator.refunds.settled = 1;
+        assert_eq!(
+            refund_line(&operator, NOW).map(text).as_deref(),
+            Some("Not all refunded")
+        );
+        assert!(badge(&operator).contains(">Cancelled</span>"));
 
         // Cancelled with every seat taken, as a failed kickoff check does: the escrowed fees
         // are owed back all the same.
@@ -1034,6 +1089,7 @@ pub(crate) mod tests {
             refunded: 0,
             written_off: 0,
             opens_at: Some(NOW - time::Duration::minutes(1)),
+            ..Default::default()
         };
         assert!(!full.did_not_fill());
         assert!(badge(&full).contains(">Cancelled</span>"));
@@ -1055,6 +1111,7 @@ pub(crate) mod tests {
             refunded: 0,
             written_off: 0,
             opens_at: None,
+            ..Default::default()
         };
         assert!(failed.owes_refunds());
         assert!(
@@ -1304,6 +1361,7 @@ pub(crate) mod tests {
             refunded: 0,
             written_off: 0,
             opens_at: None,
+            ..Default::default()
         };
         assert!(small.did_not_fill());
         let badge = text(phase_badge(&small));

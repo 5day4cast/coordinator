@@ -916,6 +916,7 @@ mod tests {
             refunded: 2,
             written_off: 1,
             opens_at: None,
+            ..Default::default()
         };
         let shown = OperatorCompetition::new(&competition, Some(progress), vec![write_off.clone()]);
         let text = show_text(&shown);

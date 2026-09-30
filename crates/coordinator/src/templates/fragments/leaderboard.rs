@@ -125,10 +125,9 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
             @if competition.pot_refunded || competition.phase == Phase::Expired {
                 p class="notice" {
                     "The competition's terms set these shares; payment may still be pending."
-                    @let fee = competition.ticket_price.saturating_sub(competition.entry_fee);
-                    @if fee > 0 {
-                        " The " (sats(fee)) " service fee in each " (sats(competition.ticket_price))
-                        " ticket isn't part of the pot, so it isn't shared back."
+                    @if competition.ticket_price > competition.entry_fee {
+                        " The service fee included in the entry fee isn't part of the pot, so it \
+                         isn't shared back."
                     }
                 }
             }
@@ -160,7 +159,10 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
             @if split {
                 // Each pool's page has its scores.
             } @else if competition.total_entries == 0 {
-                p class="empty-state" { "No entries yet." }
+                // Fees paid for entries that never arrived are counted in the refund note.
+                @if competition.entered() == 0 {
+                    p class="empty-state" { "No entries yet." }
+                }
             } @else {
                 div id="leaderboardScores" class="leaderboard-scores"
                     hx-get=(rows_url(&competition.id)) hx-trigger="load" hx-swap="outerHTML"
@@ -349,17 +351,24 @@ fn refund_allocation(competition: &CompetitionView) -> Markup {
 
 /// What happened to the entry fees of a competition that didn't fill. Escrowed fees can't
 /// move until their escrows' refund locktime, so until then it says when they will. Fees whose
-/// refund an operator wrote off are no longer counted as owed, but are said to be.
+/// refund an operator wrote off, or whose Lightning payment was settled, are no longer counted
+/// as owed, but are said to be, with where to ask about them.
 fn refund_note(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
     let progress = competition.refunds;
+    let returned = progress.refunded + progress.released;
+    let kept = progress.paid().saturating_sub(returned);
     html! {
         @match competition.refunds(now) {
             Refunds::Nothing => { "No entry fees were paid." }
-            Refunds::Done if progress.written_off > 0 => {
-                "Refunds are finished: " (progress.refunded) " of "
-                (progress.escrowed + progress.written_off) " paid entry fees were returned; the \
-                 operator closed the other " (progress.written_off) ", which could not be \
-                 refunded automatically."
+            Refunds::Partly if progress.written_off > 0 => {
+                "Refunds are finished: " (returned) " of " (progress.paid()) " paid entry fees \
+                 were returned; the operator closed the other " (kept) ", which could not be \
+                 refunded automatically. If one of them is yours, contact us."
+            }
+            Refunds::Partly => {
+                "Refunds are finished: " (returned) " of " (progress.paid()) " paid entry fees \
+                 were returned; the other " (kept) " could not be refunded automatically. If one \
+                 of them is yours, contact us."
             }
             Refunds::Done => { "Every entry fee has been returned." }
             Refunds::Locked(at) => {
@@ -369,6 +378,10 @@ fn refund_note(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
             Refunds::Pending if progress.escrowed > 0 => {
                 "Refunding… Entry fees go back to the refund destination shown when entering: "
                 (progress.refunded) " of " (progress.escrowed) " paid entry fees returned so far."
+            }
+            Refunds::Pending if progress.held > 0 && competition.phase != Phase::Unfilled => {
+                "Refunding… Held entry fees go back to their payers: " (progress.released) " of "
+                (progress.held) " released so far."
             }
             Refunds::Pending => {
                 "Entry fees go back to the refund destination shown when entering once it is cancelled."
@@ -718,6 +731,7 @@ mod tests {
             refunded: 1,
             written_off: 0,
             opens_at: Some(NOW - time::Duration::minutes(5)),
+            ..Default::default()
         };
         let page = leaderboard(&competition, NOW).into_string();
         assert!(page.contains("nothing is scored"));
@@ -768,6 +782,7 @@ mod tests {
             refunded: 1,
             written_off: 1,
             opens_at: Some(NOW - time::Duration::minutes(5)),
+            ..Default::default()
         };
         let page = leaderboard(&competition, NOW).into_string();
         assert!(
@@ -781,7 +796,8 @@ mod tests {
         assert!(
             page.contains(
                 "Refunds are finished: 2 of 3 paid entry fees were returned; the operator \
-                 closed the other 1, which could not be refunded automatically."
+                 closed the other 1, which could not be refunded automatically. If one of them \
+                 is yours, contact us."
             ),
             "{page}"
         );
@@ -792,10 +808,47 @@ mod tests {
             refunded: 0,
             written_off: 1,
             opens_at: None,
+            ..Default::default()
         };
         let page = leaderboard(&competition, NOW).into_string();
         assert!(page.contains("Refunds are finished: 0 of 1"), "{page}");
         assert!(!page.contains("No entry fees were paid."));
+        // Its entries count the fee it counts, with no "No entries yet" beside it.
+        assert!(page.contains("<dd>1 of 3</dd>"), "{page}");
+        assert!(!page.contains("No entries yet."), "{page}");
+    }
+
+    /// A competition cancelled with entry fees held by Lightning, not escrowed, says where they
+    /// stand: released, being released, or settled so they couldn't be.
+    #[test]
+    fn a_cancelled_competition_paid_by_lightning_explains_its_refunds() {
+        let mut competition = view("c1", Phase::Cancelled, -60);
+        competition.total_entries = competition.total_allowed_entries;
+        competition.refunds = crate::domain::RefundProgress {
+            held: 2,
+            released: 1,
+            ..Default::default()
+        };
+        let page = leaderboard(&competition, NOW).into_string();
+        assert!(page.contains("Refunding… Held entry fees go back to their payers: 1 of 2"));
+
+        competition.refunds.released = 2;
+        let page = leaderboard(&competition, NOW).into_string();
+        assert!(
+            page.contains("Every entry fee has been returned."),
+            "{page}"
+        );
+
+        competition.refunds.released = 1;
+        competition.refunds.settled = 1;
+        let page = leaderboard(&competition, NOW).into_string();
+        assert!(
+            page.contains(
+                "Refunds are finished: 1 of 2 paid entry fees were returned; the other 1 could \
+                 not be refunded automatically. If one of them is yours, contact us."
+            ),
+            "{page}"
+        );
     }
 
     /// A full competition cancelled before it ran, as by a failed kickoff check, still says
@@ -814,6 +867,7 @@ mod tests {
             refunded: 1,
             written_off: 0,
             opens_at: Some(NOW - time::Duration::minutes(5)),
+            ..Default::default()
         };
         let page = leaderboard(&competition, NOW).into_string();
         assert!(page.contains("did not run, so nothing is scored. Refunding… "));
@@ -893,7 +947,8 @@ mod tests {
         assert!(historical.contains("1 entry × 1,020 sats"));
         assert!(historical.contains("2 entries × 990 sats"));
         assert!(historical.contains("payment may still be pending"));
-        assert!(historical.contains("100 sats service fee in each 1,100 sats ticket"));
+        assert!(historical.contains("The service fee included in the entry fee isn"));
+        assert!(!historical.contains("1,100 sats"), "{historical}");
         assert!(!historical.contains("coordinator fee") && !historical.contains("signed contract"));
         assert!(!historical.contains("Pot returned"));
         assert!(!historical.contains("Paid places"));
