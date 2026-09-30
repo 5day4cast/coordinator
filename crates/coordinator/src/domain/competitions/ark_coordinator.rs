@@ -184,7 +184,7 @@ impl Coordinator {
                     "Failed to create the escrow swap for ticket {}: {e:#}",
                     ticket.id
                 );
-                Error::BadRequest("Failed to create invoice".into())
+                swap_failure(&e)
             })?;
         if swap.payment_hash != ticket.hash {
             return Err(Error::BadRequest(
@@ -603,6 +603,20 @@ impl Coordinator {
     }
 }
 
+/// What a player is told when ark-swapd would not make a ticket's swap. A wallet that cannot fund
+/// it now may later, so that is retryable; anything else is a refusal.
+fn swap_failure(error: &anyhow::Error) -> Error {
+    if error.is::<crate::infra::ark_swap::SwapsUnavailable>() {
+        Error::SwapsUnavailable
+    } else {
+        Error::BadRequest("Failed to create invoice".into())
+    }
+}
+
+/// The message a player sees when ark-swapd cannot fund a swap right now.
+pub const SWAPS_UNAVAILABLE: &str =
+    "Lightning payments are unavailable for a moment, so no invoice was made; try again in a moment";
+
 /// Reports about pending escrow swaps, by swap.
 const SWAP_REPORTS: &str = "escrow swap";
 
@@ -675,4 +689,29 @@ fn paid_escrow_vtxo(
         ));
     }
     Ok(vtxo.outpoint)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infra::ark_swap::SwapsUnavailable;
+
+    #[test]
+    fn an_unfunded_swap_service_is_retryable_and_other_failures_are_not() {
+        let unavailable = anyhow::Error::new(SwapsUnavailable(
+            "ark-swapd answered 503 Service Unavailable: {}".into(),
+        ));
+        assert!(matches!(
+            swap_failure(&unavailable),
+            Error::SwapsUnavailable
+        ));
+        assert!(matches!(
+            swap_failure(&anyhow!("ark-swapd answered 400 Bad Request: dust")),
+            Error::BadRequest(_)
+        ));
+        assert!(matches!(
+            swap_failure(&anyhow!("error sending request")),
+            Error::BadRequest(_)
+        ));
+    }
 }
