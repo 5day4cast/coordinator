@@ -47,6 +47,11 @@ function setupPage() {
     markOwnRows(event.target);
   });
 
+  // A tip or a disclosure inside a clickable row opens without opening the row.
+  document.addEventListener("click", (event) => {
+    if (event.target.closest?.("tr.is-clickable :is([data-tip], details)")) event.stopPropagation();
+  }, true);
+
   document.addEventListener("click", async (event) => {
     const button = event.target.closest?.("[data-copy]");
     if (!button) return;

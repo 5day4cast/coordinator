@@ -12,6 +12,7 @@ mod coordinator;
 mod coordinator_fee;
 mod eligible_payouts;
 mod lease_store;
+mod ledger;
 #[cfg(test)]
 mod list_store_tests;
 mod metrics_store;
@@ -48,6 +49,7 @@ use dlctix::{
 pub use eligible_payouts::*;
 use keymeld_sdk::types::{RegistrationContext, SignedSessionManifest};
 pub use lease_store::*;
+pub use ledger::*;
 use log::{debug, error};
 pub use metrics_store::*;
 pub use payout::*;

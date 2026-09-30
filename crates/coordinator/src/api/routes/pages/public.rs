@@ -7,7 +7,7 @@
 //! budget; without the weather yet, they say it is still loading and ask again
 //! (`fragments::loading`).
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::{
     extract::{FromRequestParts, Path, Query, State},
@@ -27,7 +27,7 @@ use crate::{
     api::extractors::NostrAuth,
     domain::{
         leaderboard::{Leaderboard, Phase, FIRST_READ_WAIT},
-        Competition, Error, RefundProgress,
+        Competition, Error, LedgerTotals, RefundProgress, Returned,
     },
     infra::refresh_cache::Cached,
     startup::AppState,
@@ -49,7 +49,7 @@ use crate::{
         layouts::base::{base, PageConfig},
         pages::{
             competitions::{competitions_page, shown_ids, CompetitionView, ListOptions},
-            entries::{entries_page, sign_in_required, EntryRow},
+            entries::{entries_page, older_entries, sign_in_required, EntryRow, PAGE_SIZE},
             help::help_page,
             payouts::payouts_page,
         },
@@ -340,9 +340,18 @@ pub async fn competitions_fragment(
     )
 }
 
-/// Entries page (requires auth; signed-out visitors get the log-in prompt)
+/// `?from=25` on the entries page: the rows after the first 25, for "Show older entries".
+#[derive(Debug, Default, Deserialize)]
+pub struct EntriesPage {
+    from: Option<usize>,
+}
+
+/// Entries page (requires auth; signed-out visitors get the log-in prompt): the totals of
+/// the player's money over every entry, and a page of the entries with theirs. `?from=` asks
+/// htmx for the next page's rows alone.
 pub async fn entries_fragment(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<EntriesPage>,
     headers: HeaderMap,
     MaybeAuth(auth): MaybeAuth,
 ) -> Response {
@@ -351,25 +360,53 @@ pub async fn entries_fragment(
         return signed_out(&headers, &state, title, "/entries", "your entries");
     };
     let now = now();
-    let (entries, mut competitions) = tokio::join!(
-        state.coordinator.get_user_entry_views(pubkey.to_hex()),
+    let pubkey = pubkey.to_hex();
+    let (ledger, mut competitions) = tokio::join!(
+        state.coordinator.player_ledger(&pubkey),
         competition_views(&state, now)
     );
-    let entries = entries.unwrap_or_default();
-    let shown: Vec<String> = entries
+    let ledger = ledger
+        .inspect_err(|error| error!("failed to load entries: {error}"))
+        .unwrap_or_default();
+    let phases: HashMap<&str, Phase> = competitions
+        .iter()
+        .map(|competition| (competition.id.as_str(), competition.phase))
+        .collect();
+    let returned: Vec<Returned> = ledger
+        .iter()
+        .map(|entry| entry.returned(phases.get(entry.competition_id.as_str()).copied(), now))
+        .collect();
+    let mut totals = LedgerTotals::default();
+    for (entry, returned) in ledger.iter().zip(&returned) {
+        totals.add(entry, returned);
+    }
+    let from = query
+        .from
+        .filter(|_| is_fragment(&headers))
+        .unwrap_or(0)
+        .min(ledger.len());
+    let shown = from..(from + PAGE_SIZE).min(ledger.len());
+    let shown_ids: Vec<String> = ledger[shown.clone()]
         .iter()
         .map(|entry| entry.competition_id.clone())
         .collect();
-    complete(&state, &mut competitions, &shown).await;
-    let rows: Vec<EntryRow> = entries
+    complete(&state, &mut competitions, &shown_ids).await;
+    let views: HashMap<&str, &CompetitionView> = competitions
         .iter()
-        .map(|entry| EntryRow {
+        .map(|competition| (competition.id.as_str(), competition))
+        .collect();
+    let rows: Vec<EntryRow> = ledger[shown.clone()]
+        .iter()
+        .zip(&returned[shown])
+        .map(|(entry, returned)| EntryRow {
             entry,
-            competition: competitions
-                .iter()
-                .find(|competition| competition.id == entry.competition_id),
+            competition: views.get(entry.competition_id.as_str()).copied(),
+            returned,
         })
         .collect();
+    if from > 0 {
+        return fragment(older_entries(&rows, from, ledger.len()), Caching::Private);
+    }
     let open = competitions
         .iter()
         .filter(|competition| competition.can_enter && !competition.unlisted)
@@ -378,7 +415,7 @@ pub async fn entries_fragment(
         &headers,
         &state,
         title,
-        entries_page(&rows, open),
+        entries_page(&rows, &totals, ledger.len(), open),
         Caching::Private,
     )
 }

@@ -1,0 +1,84 @@
+/* The player's money over all their entries, above the table. */
+.ledger-summary {
+  margin-bottom: 1rem;
+}
+
+.ledger-line {
+  font-size: 1.05rem;
+}
+
+.ledger-line > span {
+  display: inline-block;
+}
+
+.ledger-net.is-up {
+  color: var(--bulma-success-on-scheme);
+}
+
+.ledger-net.is-down {
+  color: var(--bulma-danger-on-scheme);
+}
+
+.ledger-pending {
+  font-size: 0.875rem;
+  color: var(--bulma-text-weak);
+}
+
+.entries-table .ledger-paid,
+.entries-table .ledger-returned {
+  white-space: nowrap;
+}
+
+/* An amount's note (when it was paid, where a refund stands) goes under it. */
+.entries-table .ledger-when {
+  display: block;
+}
+
+.ledger-settled {
+  font-weight: 600;
+}
+
+/* The table scrolls sideways, which clips anything above its first row: its tips open below. */
+.entries-table [data-tip]::after {
+  bottom: auto;
+  top: calc(100% + 0.4rem);
+}
+
+/* The references support asks for, behind a "?" beside the row's links. */
+.ledger-details {
+  display: inline-block;
+  margin-right: 0.5rem;
+  text-align: left;
+  vertical-align: middle;
+}
+
+.ledger-details summary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.3rem;
+  height: 1.3rem;
+  border: 1px solid var(--bulma-border);
+  border-radius: 50%;
+  color: var(--bulma-text-weak);
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;
+}
+
+.ledger-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.ledger-details[open] dl {
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 0.15rem 0.75rem;
+  margin-top: 0.4rem;
+  font-size: 0.8rem;
+}
+
+.ledger-details dt {
+  color: var(--bulma-text-weak);
+}
