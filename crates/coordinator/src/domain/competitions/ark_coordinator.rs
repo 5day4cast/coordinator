@@ -768,10 +768,21 @@ fn paid_escrow_vtxo(
 #[derive(Default)]
 pub(crate) struct EscrowLookups {
     next: std::sync::Mutex<std::collections::HashMap<Uuid, (std::time::Instant, u32)>>,
+    /// Every lookup is due at once: for tests that check a swap twice in a row.
+    immediate: std::sync::atomic::AtomicBool,
 }
 
 impl EscrowLookups {
+    #[cfg(test)]
+    pub(crate) fn set_immediate(&self) {
+        self.immediate
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn due(&self, swap: Uuid) -> bool {
+        if self.immediate.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
         let next = self
             .next
             .lock()
