@@ -17,6 +17,9 @@ pub enum Error {
     NotFound(String),
     #[error("{0}")]
     BadRequest(String),
+    /// The request contradicts what an earlier one already fixed.
+    #[error("{0}")]
+    Conflict(String),
     #[error("problem querying db: {0}")]
     DbError(#[from] sqlx::Error),
     #[error("database write failed: {0}")]
@@ -60,6 +63,7 @@ impl Error {
             Error::NoAvailableTickets
                 | Error::CompetitionFull
                 | Error::BadRequest(_)
+                | Error::Conflict(_)
                 | Error::NotFound(_)
                 | Error::InvalidSignature(_)
                 | Error::FeeEstimateUnavailable

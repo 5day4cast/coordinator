@@ -19,6 +19,13 @@ pub struct PayoutJob {
     pub attempts: u32,
 }
 
+/// The payout authorization a ticket's hash was first fixed with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedTicketPayoutPolicy {
+    pub entry_pubkey: String,
+    pub policy_json: String,
+}
+
 fn invalid(message: impl Into<String>) -> DatabaseWriteError {
     sqlx::Error::Protocol(message.into()).into()
 }
@@ -88,13 +95,16 @@ impl CompetitionStore {
             .collect()
     }
 
+    /// Fix the payout authorization of a ticket's current hash. Returns the authorization
+    /// already fixed for it if that differs, leaving it in place: a retried ticket request
+    /// decides whether the difference matters.
     pub async fn store_ticket_payout_policy(
         &self,
         ticket_id: Uuid,
         ticket_hash: String,
         entry_pubkey: String,
         policy_json: String,
-    ) -> Result<(), DatabaseWriteError> {
+    ) -> Result<Option<FixedTicketPayoutPolicy>, DatabaseWriteError> {
         self.db_connection.execute_write(move |pool| async move {
             let mut tx = pool.begin().await?;
             // A recycled unpaid ticket has a new hash and may accept a new policy.
@@ -104,11 +114,16 @@ impl CompetitionStore {
                 .bind(ticket_id.to_string()).bind(&ticket_hash).bind(&entry_pubkey).bind(&policy_json).execute(&mut *tx).await?;
             let row = sqlx::query("SELECT entry_pubkey, policy_json FROM ticket_payout_policies WHERE ticket_id = ? AND ticket_hash = ?")
                 .bind(ticket_id.to_string()).bind(ticket_hash).fetch_one(&mut *tx).await?;
-            if row.try_get::<String, _>("entry_pubkey")? != entry_pubkey || row.try_get::<String, _>("policy_json")? != policy_json {
-                return Err(sqlx::Error::Protocol("Ticket payout authorization has already been fixed".into()));
-            }
+            let fixed = FixedTicketPayoutPolicy {
+                entry_pubkey: row.try_get("entry_pubkey")?,
+                policy_json: row.try_get("policy_json")?,
+            };
             tx.commit().await?;
-            Ok(())
+            if fixed.entry_pubkey == entry_pubkey && fixed.policy_json == policy_json {
+                Ok(None)
+            } else {
+                Ok(Some(fixed))
+            }
         }).await
     }
 

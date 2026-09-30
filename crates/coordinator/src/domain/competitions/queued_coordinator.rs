@@ -257,16 +257,7 @@ impl Coordinator {
         }
         .await;
         if result.is_err() {
-            if let Err(clear_err) = self
-                .competition_store
-                .clear_ticket_reservation(&ticket)
-                .await
-            {
-                error!(
-                    "Failed to clear the reservation of queued ticket {}: {}",
-                    ticket.id, clear_err
-                );
-            }
+            self.release_failed_reservation(&ticket).await;
         }
         result
     }
@@ -325,15 +316,8 @@ impl Coordinator {
                 "The queued entry's policy does not round-trip".into(),
             ));
         }
-        self.competition_store
-            .store_ticket_payout_policy(
-                ticket.id,
-                ticket.hash.clone(),
-                entry_pubkey.to_string(),
-                serde_json::to_string(&policy).map_err(|e| Error::Bitcoin(e.into()))?,
-            )
-            .await?;
-        Ok(())
+        self.fix_ticket_payout_policy(ticket, entry_pubkey, &policy)
+            .await
     }
 
     /// Where the player's browser deposits the entry key for a queued ticket: the terms' deposit

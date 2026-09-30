@@ -77,6 +77,8 @@ struct Escrow {
     contract_digest: Mutex<String>,
     prepared: Mutex<BTreeMap<(UserId, Uuid), PayoutPreparedResponse>>,
     released: Mutex<BTreeMap<UserId, Uuid>>,
+    /// Whether a player's browser is requesting tickets, and so asks where to register.
+    browser_online: AtomicBool,
 }
 
 impl Escrow {
@@ -95,6 +97,7 @@ impl Escrow {
             contract_digest: Mutex::new(String::new()),
             prepared: Mutex::new(BTreeMap::new()),
             released: Mutex::new(BTreeMap::new()),
+            browser_online: AtomicBool::new(false),
         }
     }
 
@@ -307,10 +310,25 @@ impl Keymeld for Escrow {
     }
     async fn get_registration_assignment(
         &self,
-        _: &DlcKeygenSession,
-        _: UserId,
+        session: &DlcKeygenSession,
+        user: UserId,
     ) -> Result<RegistrationAssignment, KeymeldError> {
-        panic!("browser is offline")
+        assert!(
+            self.browser_online.load(Ordering::SeqCst),
+            "browser is offline"
+        );
+        Ok(RegistrationAssignment {
+            session_id: session.session_id.to_string(),
+            user_id: user.uuid(),
+            manifest_hash: vec![],
+            enclave_id: 1,
+            enclave_key_epoch: 1,
+            enclave_public_key: "enclave".into(),
+            gateway_url: "http://keymeld.invalid".into(),
+            trusted_pcrs: BTreeMap::new(),
+            dangerous_trust_unattested_enclaves: false,
+            payout_policy: None,
+        })
     }
 }
 
@@ -1197,4 +1215,224 @@ async fn supported_automatic_competition_shape_passes_admission() {
     // The gate must not reject a competition the confidential path can serve.
     let capacity = coordinator_escrow::capacity::validate_competition_capacity(2, 1).unwrap();
     assert!(capacity.signing_items <= keymeld_core::escrow::MAX_BATCH_ITEMS);
+}
+
+/// A competition taking tickets, whose players' browsers request them.
+struct TicketFixture {
+    _directory: TempDir,
+    coordinator: Coordinator,
+    ln: Arc<MockLnClient>,
+    event_id: Uuid,
+}
+
+impl TicketFixture {
+    async fn new() -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Fixture::open(&directory).await;
+        let escrow = Arc::new(Escrow::new());
+        escrow.browser_online.store(true, Ordering::SeqCst);
+        let ln = Arc::new(MockLnClient::new());
+        let coordinator = Coordinator::new(
+            Arc::new(MockOracle::new([12; 32])),
+            CompetitionStore::new(database.clone()),
+            Arc::new(MockBitcoinClient::new(Network::Regtest)),
+            ln.clone(),
+            Arc::new(MockLnurlPay::new(Network::Regtest)),
+            escrow,
+            None,
+            72,
+            1,
+            "ticket-retry-test".into(),
+            false,
+            1,
+        )
+        .await
+        .unwrap()
+        .with_automatic_payouts(true, 100)
+        .unwrap();
+        let now = OffsetDateTime::now_utc();
+        let mut competition = Competition::new(&CreateEvent {
+            id: Uuid::now_v7(),
+            signing_date: now + time::Duration::hours(3),
+            start_observation_date: now + time::Duration::hours(1),
+            end_observation_date: now + time::Duration::hours(2),
+            locations: vec!["KDEN".into()],
+            number_of_values_per_entry: 3,
+            number_of_places_win: 1,
+            total_allowed_entries: 3,
+            entry_fee: 50_000,
+            coordinator_fee: crate::domain::CoordinatorFee::whole_percent(0),
+            total_competition_pool: 150_000,
+            relative_locktime_block_delta: Some(72),
+            unlisted: false,
+            scoring_rules: None,
+            scoring_fields: None,
+            max_entries_per_player: 1,
+        });
+        let event_id = competition.id;
+        let store = &coordinator.competition_store;
+        store
+            .add_competition_with_tickets(competition.clone(), vec![])
+            .await
+            .unwrap();
+        competition.event_announcement = Some(parameters(coordinator.private_key).event);
+        store.update_competitions(vec![competition]).await.unwrap();
+        let tickets = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
+        for (index, ticket_id) in tickets.into_iter().enumerate() {
+            let preimage = [40 + index as u8; 32];
+            let hash = hex::encode(dlctix::hashlock::sha256(&preimage));
+            database.execute_write(move |pool| async move {
+                sqlx::query("INSERT INTO tickets (id, event_id, encrypted_preimage, hash) VALUES (?, ?, ?, ?)")
+                    .bind(ticket_id.to_string()).bind(event_id.to_string()).bind(hex::encode(preimage)).bind(hash)
+                    .execute(&pool).await?;
+                Ok(())
+            }).await.unwrap();
+        }
+        let session = session([UserId::from(tickets[0]), UserId::from(tickets[1])]);
+        let stored = StoredDlcKeygenSession::from_session(
+            &session,
+            &coordinator.keymeld_storage_keys().unwrap(),
+        )
+        .unwrap();
+        store
+            .store_keymeld_session(event_id, &stored)
+            .await
+            .unwrap();
+        store.enable_automatic_payouts(event_id).await.unwrap();
+        Self {
+            _directory: directory,
+            coordinator,
+            ln,
+            event_id,
+        }
+    }
+
+    /// A browser's entry: its key and its payout choice.
+    fn entry(key: u8) -> (BitcoinPublicKey, PayoutRegistrationRequest) {
+        let secret = bitcoin::secp256k1::SecretKey::from_slice(&[key; 32]).unwrap();
+        let pubkey =
+            BitcoinPublicKey::new(secret.public_key(&bitcoin::secp256k1::Secp256k1::new()));
+        let choice = PayoutRegistrationRequest {
+            entry_id: Uuid::now_v7(),
+            payout_hash: hex::encode(dlctix::hashlock::sha256(&[key + 1; 32])),
+            lightning_address: None,
+            allow_invoice_fallback: true,
+            release_entry_key_after_payment: true,
+        };
+        (pubkey, choice)
+    }
+
+    async fn request(
+        &self,
+        player: &str,
+        (pubkey, choice): &(BitcoinPublicKey, PayoutRegistrationRequest),
+    ) -> Result<TicketResponse, Error> {
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            self.coordinator.request_ticket_with_payout(
+                player.into(),
+                self.event_id,
+                *pubkey,
+                Some(choice.clone()),
+            ),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn invoice_cancelled(&self, ticket: &TicketResponse) -> bool {
+        matches!(
+            self.ln.get_invoice_state(&ticket.payment_hash),
+            Some(crate::infra::lightning::InvoiceState::Canceled)
+        )
+    }
+}
+
+#[tokio::test]
+async fn a_retried_ticket_request_gets_the_same_ticket_and_invoice() {
+    let f = TicketFixture::new().await;
+    let entry = TicketFixture::entry(1);
+    let first = f.request("alice", &entry).await.unwrap();
+    // The response was lost and the browser asks again with the same entry.
+    let retry = f.request("alice", &entry).await.unwrap();
+    assert_eq!(retry.ticket_id, first.ticket_id);
+    assert_eq!(retry.payment_request, first.payment_request);
+    assert_eq!(retry.payment_hash, first.payment_hash);
+    let policy = |ticket: &TicketResponse| {
+        ticket
+            .keymeld_registration
+            .as_ref()
+            .and_then(|registration| registration.payout_policy.clone())
+    };
+    assert!(policy(&first).is_some());
+    assert_eq!(policy(&retry), policy(&first));
+    assert!(!f.invoice_cancelled(&first));
+}
+
+#[tokio::test]
+async fn a_retry_that_keeps_the_players_choices_keeps_the_fixed_authorization() {
+    let f = TicketFixture::new().await;
+    let entry = TicketFixture::entry(1);
+    let first = f.request("alice", &entry).await.unwrap();
+    let store = &f.coordinator.competition_store;
+    let ticket = store.get_ticket(first.ticket_id).await.unwrap();
+    let fixed = store
+        .ticket_payout_policy(ticket.id, &ticket.hash)
+        .await
+        .unwrap()
+        .unwrap();
+    // The coordinator derives the contract terms; a retry deriving them differently, as after
+    // a fee cap change, keeps those the player's registration is sealed against.
+    let mut policy: PayoutPolicy = serde_json::from_str(&fixed).unwrap();
+    let mut terms: ContractAuthorization = serde_json::from_str(&policy.contract_terms).unwrap();
+    terms.max_fee_rate = FeeRate::from_sat_per_vb_u32(7);
+    policy.contract_terms = serde_json::to_string(&terms).unwrap();
+    f.coordinator
+        .fix_ticket_payout_policy(&ticket, &entry.0, &policy)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .ticket_payout_policy(ticket.id, &ticket.hash)
+            .await
+            .unwrap(),
+        Some(fixed.clone())
+    );
+    // Another payout address is the player's choice, and is refused.
+    let mut policy: PayoutPolicy = serde_json::from_str(&fixed).unwrap();
+    policy.automatic_lightning_address = Some("mallory@example.org".into());
+    assert!(matches!(
+        f.coordinator
+            .fix_ticket_payout_policy(&ticket, &entry.0, &policy)
+            .await,
+        Err(Error::Conflict(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_retry_with_another_entry_is_a_conflict_that_releases_the_ticket() {
+    let f = TicketFixture::new().await;
+    let first = f.request("alice", &TicketFixture::entry(1)).await.unwrap();
+    // A browser that started its entry over has a new entry key and payout hash.
+    let fresh = TicketFixture::entry(5);
+    let refused = f.request("alice", &fresh).await.unwrap_err();
+    assert!(matches!(refused, Error::Conflict(_)), "{refused:?}");
+    assert!(refused.is_refusal());
+    // The first invoice can no longer buy the ticket, so it is cancelled.
+    assert!(f.invoice_cancelled(&first));
+    let again = f.request("alice", &fresh).await.unwrap();
+    assert_ne!(again.payment_hash, first.payment_hash);
+    assert!(!f.invoice_cancelled(&again));
+}
+
+#[tokio::test]
+async fn another_player_is_never_handed_a_reserved_ticket() {
+    let f = TicketFixture::new().await;
+    let alice = f.request("alice", &TicketFixture::entry(1)).await.unwrap();
+    let bob = f.request("bob", &TicketFixture::entry(1)).await.unwrap();
+    assert_ne!(bob.ticket_id, alice.ticket_id);
+    assert_ne!(bob.payment_hash, alice.payment_hash);
+    assert!(!f.invoice_cancelled(&alice));
+    let retry = f.request("alice", &TicketFixture::entry(1)).await;
+    assert!(matches!(retry, Err(Error::Conflict(_))));
 }

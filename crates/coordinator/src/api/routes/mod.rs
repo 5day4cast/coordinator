@@ -44,6 +44,7 @@ impl IntoResponse for Error {
             Error::NoAvailableTickets => (StatusCode::BAD_REQUEST, self.to_string()),
             Error::CompetitionFull => (StatusCode::BAD_REQUEST, self.to_string()),
             Error::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            Error::Conflict(_) => (StatusCode::CONFLICT, self.to_string()),
             Error::PaymentFailed(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             Error::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             Error::InvalidSignature(_) => (StatusCode::FORBIDDEN, self.to_string()),
@@ -107,6 +108,11 @@ mod tests {
                 Error::BadRequest("bad".into()),
                 StatusCode::BAD_REQUEST,
                 "bad",
+            ),
+            (
+                Error::Conflict("taken".into()),
+                StatusCode::CONFLICT,
+                "taken",
             ),
             (
                 Error::InvalidSignature("nope".into()),
