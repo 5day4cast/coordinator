@@ -321,11 +321,7 @@ pub(super) async fn dashboard_live(
                     @match (&rebalancer.config().arkade, &observation.arkade) {
                         (None, _) => p.note { "Arkade: ark-swapd's wallet is not watched." },
                         (Some(_), None) => p.error { "Arkade: ark-swapd did not report its wallet." },
-                        (Some(arkade), Some(wallet)) => p {
-                            "Arkade: ark-swapd can fund " strong { (format::sats(wallet.spendable_sat())) }
-                            " sats of escrows, topped up with " (format::sats(arkade.top_up_sats))
-                            " sats on-chain below " (format::sats(arkade.low_sats)) "."
-                        },
+                        (Some(arkade), Some(wallet)) => (arkade_liquidity(arkade, wallet)),
                     }
                     @if let Some(checked_at) = observation.checked_at {
                         p.note { "Checked " (format::time(checked_at, now)) }
@@ -543,6 +539,24 @@ fn stuck_money(
 }
 
 /// Held runs, one per row: while stuck, the nearest expiry; once synth stopped following, when.
+/// The Liquidity line for ark-swapd's wallet: what it can fund, and what waits at its boarding
+/// address for the Arkade server to board.
+fn arkade_liquidity(
+    arkade: &crate::rebalance::ArkadeTopUpConfig,
+    wallet: &crate::ark_swap::ArkWallet,
+) -> Markup {
+    html! {
+        p {
+            "Arkade: ark-swapd can fund " strong { (format::sats(wallet.spendable_sat())) } " sats of escrows"
+            @if wallet.boarding_sat > 0 {
+                " and " strong { (format::sats(wallet.boarding_sat)) } " sats await boarding"
+            }
+            ", topped up with " (format::sats(arkade.top_up_sats))
+            " sats on-chain below " (format::sats(arkade.low_sats)) "."
+        }
+    }
+}
+
 fn held_runs(runs: &[(&HeldRun, &Held)], stopped: bool, now: OffsetDateTime) -> Markup {
     let last = if stopped {
         "Stopped following"
@@ -1406,6 +1420,38 @@ mod tests {
             panel.contains("The coordinator did not list them: 401 Unauthorized"),
             "{panel}"
         );
+    }
+
+    #[test]
+    fn the_liquidity_line_shows_what_awaits_boarding() {
+        use crate::ark_swap::{ArkSwapConfig, ArkWallet};
+        let arkade = crate::rebalance::ArkadeTopUpConfig {
+            ark_swap: ArkSwapConfig {
+                url: String::new(),
+                token_file: "unused".into(),
+            },
+            low_sats: 50_000,
+            top_up_sats: 200_000,
+            settle_secs: 3600,
+        };
+        let wallet = |boarding_sat| ArkWallet {
+            boarding_address: "tb1q".to_string(),
+            confirmed_sat: 700,
+            pre_confirmed_sat: 500,
+            boarding_sat,
+        };
+        let line = arkade_liquidity(&arkade, &wallet(400_000)).into_string();
+        assert!(
+            line.contains(&format!(
+                "can fund <strong>{}</strong> sats of escrows and <strong>{}</strong> sats await boarding, topped up",
+                format::sats(1_200),
+                format::sats(400_000)
+            )),
+            "{line}"
+        );
+        let line = arkade_liquidity(&arkade, &wallet(0)).into_string();
+        assert!(!line.contains("await boarding"), "{line}");
+        assert!(line.contains("sats of escrows, topped up"), "{line}");
     }
 
     #[test]

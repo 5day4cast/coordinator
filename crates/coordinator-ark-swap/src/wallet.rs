@@ -1,7 +1,8 @@
 //! The service's own Ark wallet: the liquidity that pays escrows.
 //!
 //! Top it up by sending VTXOs to its Ark address, for example from `mutinynet.arkade.money`.
-//! Or send on-chain coins to its boarding address and call `POST /v1/wallet/board`.
+//! Or send on-chain coins to its boarding address and call `POST /v1/wallet/board`. Until a batch
+//! boards them, confirmed coins there show in the view as `boarding_sat`, not as spendable.
 //!
 //! Its coins are read from the indexer's listings of unspent VTXOs only. The address collects a
 //! spent VTXO for every swap and refund, and ark-client's own balance and coin selection page
@@ -108,6 +109,9 @@ pub struct WalletView {
     pub recoverable_sat: u64,
     /// UNIX seconds. When the first spendable VTXO expires.
     pub earliest_expiry: Option<i64>,
+    /// Confirmed, unspent coins at the boarding address: what the next board would move in.
+    /// They stay here until a batch takes them, so a top-up the server cannot board shows here.
+    pub boarding_sat: u64,
 }
 
 /// A value kept for `ttl`, so callers in quick succession share one reading of it.
@@ -462,6 +466,7 @@ impl ArkWallet {
             .map(|coin| coin.sat)
             .sum();
         let payable_sat = coins.payable_sat(unix_now(), self.margins.pay_secs);
+        let boarding_sat = self.boarding_sat_at(&boarding_address).await?;
         Ok(WalletView {
             ark_address: ark_address.encode(),
             boarding_address: boarding_address.to_string(),
@@ -471,6 +476,7 @@ impl ArkWallet {
             expiring_sat: coins.spendable_sat() - payable_sat,
             recoverable_sat: coins.recoverable_sat(),
             earliest_expiry: coins.earliest_expiry(),
+            boarding_sat,
         })
     }
 
@@ -481,16 +487,16 @@ impl ArkWallet {
             .get_boarding_address()
             .await
             .map_err(|error| anyhow::anyhow!("read the boarding address: {error}"))?;
+        self.boarding_sat_at(&address).await
+    }
+
+    async fn boarding_sat_at(&self, address: &Address) -> anyhow::Result<u64> {
         let outputs = self
             .chain
-            .find_outpoints(&address)
+            .find_outpoints(address)
             .await
             .map_err(|error| anyhow::anyhow!("list the boarding outputs: {error}"))?;
-        Ok(outputs
-            .iter()
-            .filter(|output| output.confirmations > 0 && !output.is_spent)
-            .map(|output| output.amount.to_sat())
-            .sum())
+        Ok(boarding_sat(&outputs))
     }
 
     /// Move confirmed boarding outputs, and recoverable VTXOs, into fresh VTXOs in the next batch.
@@ -663,6 +669,16 @@ fn payment_among(
         .map(|vtxo| vtxo.outpoint)
 }
 
+/// What of the boarding address's outputs the next board would move in: those confirmed and
+/// not yet spent.
+fn boarding_sat(outputs: &[ExplorerUtxo]) -> u64 {
+    outputs
+        .iter()
+        .filter(|output| output.confirmations > 0 && !output.is_spent)
+        .map(|output| output.amount.to_sat())
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -735,6 +751,47 @@ mod tests {
             assets: Vec::new(),
             depth: 0,
         }
+    }
+
+    #[test]
+    fn only_confirmed_unspent_boarding_outputs_await_boarding() {
+        use bitcoin::hashes::Hash;
+        let output = |txid: u8, sat: u64, confirmations: u64, is_spent: bool| ExplorerUtxo {
+            outpoint: OutPoint::new(Txid::from_byte_array([txid; 32]), 0),
+            amount: Amount::from_sat(sat),
+            confirmation_blocktime: (confirmations > 0).then_some(1_800_000_000),
+            confirmations,
+            is_spent,
+        };
+        assert_eq!(boarding_sat(&[]), 0);
+        assert_eq!(
+            boarding_sat(&[
+                // Two top-ups the server has not boarded yet.
+                output(1, 200_000, 12, false),
+                output(2, 200_000, 3, false),
+                // One still in the mempool, and one a batch already took.
+                output(3, 50_000, 0, false),
+                output(4, 70_000, 40, true),
+            ]),
+            400_000
+        );
+    }
+
+    #[test]
+    fn the_wallet_view_reports_what_awaits_boarding() {
+        let view = WalletView {
+            ark_address: "tark1".to_string(),
+            boarding_address: "tb1q".to_string(),
+            confirmed_sat: 0,
+            pre_confirmed_sat: 1_000,
+            payable_sat: 1_000,
+            expiring_sat: 0,
+            recoverable_sat: 0,
+            earliest_expiry: None,
+            boarding_sat: 400_000,
+        };
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["boarding_sat"], 400_000);
     }
 
     #[tokio::test]

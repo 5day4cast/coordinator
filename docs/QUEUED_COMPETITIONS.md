@@ -353,7 +353,8 @@ An Arkade competition moves through the existing lifecycle with these difference
    The coordinator binds the contract with a null funding outpoint and runs `fund_pool` with Keymeld as every player's signer.
    The batch pays the funding output, plus the coordinator's fee when it is at least dust.
    The coordinator stores the batch's commitment transaction, then moves the competition straight to `FundingBroadcasted`.
-   A failed batch spends nothing and is retried; after repeated failures the competition fails.
+   A failed batch spends nothing and is retried on the next step, however often it fails, until the kickoff deadline: an hour after registration closes (`fee_wait_secs`, as a failed kickoff check waits), and never past the two hours a competition may wait for signatures.
+   A batch that still fails then fails the competition with the Arkade server's error, and every entry is refunded.
    If the process stops after the batch but before saving the competition, the next attempt finds the stored commitment and has Keymeld sign the contract again.
 4. **After funding.**
    Confirmation, attestation, and outcome transactions are unchanged; the commitment transaction is the funding transaction.
