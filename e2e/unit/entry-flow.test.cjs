@@ -542,7 +542,8 @@ test("a network fee more than twice the form's estimate is refused", async () =>
   const { sandbox, elements, consent } = pricedPlayer(price(101));
   await sandbox.submitEntry();
   assert.equal(consent(), null);
-  assert.match(elements.errorMessage.textContent, /network fee rose to 101 sats/);
+  assert.match(elements.errorMessage.textContent, /entry fee rose to 5,351 sats/);
+  assert.doesNotMatch(elements.errorMessage.textContent, /network fee/);
   assert.doesNotMatch(elements.errorMessage.textContent, /reload/i);
 });
 
@@ -560,7 +561,8 @@ test("without a network fee estimate no ticket is requested", async () => {
   });
   const sandbox = load(window, document, termsFetch());
   await sandbox.submitEntry();
-  assert.match(elements.errorMessage.textContent, /network fee estimate is unavailable/);
+  assert.match(elements.errorMessage.textContent, /entry fee is unavailable/);
+  assert.doesNotMatch(elements.errorMessage.textContent, /network fee/);
 });
 
 // Pay with nothing picked says so above the picks and takes the player to the first one,
