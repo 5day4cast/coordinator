@@ -1,6 +1,6 @@
 //! Moving the test network's money back to where the scenarios spend it from.
 //!
-//! Every entry moves money in two directions that never reverse on their own:
+//! A competition moves money in three directions that never reverse on their own:
 //!
 //! - Lightning: players pay from one node into the node holding the coordinator's invoices, so
 //!   the payer's side of their channel only shrinks. The receiving node pays the payer back over
@@ -8,6 +8,9 @@
 //! - Arkade: ark-swapd pays each escrow from its own Arkade wallet and is paid in Lightning, so
 //!   that wallet only shrinks. The payer sends it coins on-chain at its boarding address whenever
 //!   it runs low, and ark-swapd boards them once they confirm.
+//! - Payouts: winners are paid from the receiving node to the node behind their Lightning
+//!   Address, so the receiving node's side of their channel only shrinks. The payee pays it back
+//!   over their channel whenever its share falls too low.
 
 use std::sync::Arc;
 
@@ -29,7 +32,8 @@ pub struct RebalanceConfig {
     #[serde(default = "default_interval_secs")]
     pub interval_secs: u64,
     /// The node entries are paid to, which pays the balance back. It needs a macaroon that may
-    /// send payments; the payer's needs to create invoices too.
+    /// send payments; the payer's needs to create invoices too, and so does this one when the
+    /// payee pays it back.
     pub source: LndConfig,
     /// Rebalance once the payer holds less than this percentage of the channel.
     #[serde(default = "default_low_percent")]
@@ -44,6 +48,56 @@ pub struct RebalanceConfig {
     /// on-chain.
     #[serde(default)]
     pub arkade: Option<ArkadeTopUpConfig>,
+    /// Paying the source back as payouts drain its channel with the payee.
+    #[serde(default)]
+    pub payee: Option<PayeeLegConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PayeeLegConfig {
+    /// The node winners are paid at. It needs a macaroon that may send payments, which the
+    /// read-only one under `trail.payee` may not.
+    pub lnd: LndConfig,
+    /// Rebalance once the source holds less than this percentage of its channel with the payee.
+    /// The payer's share is used when this is left out, as it is for the two below.
+    #[serde(default)]
+    pub low_percent: Option<u64>,
+    /// Rebalance up to this percentage.
+    #[serde(default)]
+    pub target_percent: Option<u64>,
+    /// The most one rebalance moves.
+    #[serde(default)]
+    pub max_sats: Option<u64>,
+}
+
+/// When a channel is rebalanced, and how far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shares {
+    pub low_percent: u64,
+    pub target_percent: u64,
+    pub max_sats: u64,
+}
+
+impl RebalanceConfig {
+    /// The shares the payer's channel is kept at.
+    pub fn shares(&self) -> Shares {
+        Shares {
+            low_percent: self.low_percent,
+            target_percent: self.target_percent,
+            max_sats: self.max_sats,
+        }
+    }
+
+    /// The shares the source's channel with the payee is kept at: the payee leg's own where it
+    /// sets them, the payer's otherwise. None when no payee is configured.
+    pub fn payee_shares(&self) -> Option<Shares> {
+        let payee = self.payee.as_ref()?;
+        Some(Shares {
+            low_percent: payee.low_percent.unwrap_or(self.low_percent),
+            target_percent: payee.target_percent.unwrap_or(self.target_percent),
+            max_sats: payee.max_sats.unwrap_or(self.max_sats),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -97,6 +151,10 @@ pub struct Observation {
     /// The two ends of the channel, as they name themselves.
     pub payer: Option<NodeIdentity>,
     pub source: Option<NodeIdentity>,
+    /// The source's channel with the payee, from the payee's side: the source holds the remote
+    /// balance.
+    pub payee_channel: Option<Channel>,
+    pub payee: Option<NodeIdentity>,
 }
 
 /// What one rebalance moved, by leg.
@@ -104,12 +162,14 @@ pub struct Observation {
 pub struct Moved {
     pub channel_sats: Option<u64>,
     pub arkade_sats: Option<u64>,
+    pub payee_sats: Option<u64>,
 }
 
 #[derive(Clone)]
 pub struct Rebalancer {
     payer: Arc<Lnd>,
     source: Arc<Lnd>,
+    payee: Option<Arc<Lnd>>,
     ark_swap: Option<Arc<ArkSwap>>,
     config: RebalanceConfig,
     db: SynthDb,
@@ -120,6 +180,7 @@ pub struct Rebalancer {
 /// The kinds of rebalance the database records.
 const CHANNEL: &str = "channel";
 const ARKADE: &str = "arkade";
+const PAYEE: &str = "payee";
 
 impl Rebalancer {
     pub fn new(
@@ -134,9 +195,16 @@ impl Rebalancer {
             )),
             None => None,
         };
+        let payee = match &config.payee {
+            Some(payee) => Some(Arc::new(
+                Lnd::new(&payee.lnd).context("open the payee's node")?,
+            )),
+            None => None,
+        };
         Ok(Self {
             payer: Arc::new(Lnd::new(payer).context("open the paying node")?),
             source: Arc::new(Lnd::new(&config.source).context("open the source node")?),
+            payee,
             ark_swap,
             config,
             db,
@@ -166,23 +234,34 @@ impl Rebalancer {
         }
     }
 
-    /// Check both legs, moving money on each that has run low. One leg failing does not stop the
-    /// other.
+    /// Check every leg, moving money on each that has run low. One leg failing does not stop the
+    /// others.
     pub async fn rebalance(&self) -> Result<Moved> {
         self.last.lock().await.checked_at = Some(OffsetDateTime::now_utc());
         let channel = self.rebalance_channel().await;
+        let payee = match (&self.payee, self.config.payee_shares()) {
+            (Some(payee), Some(shares)) => self.rebalance_payee(payee, shares).await,
+            _ => Ok(None),
+        };
         let arkade = match &self.ark_swap {
             Some(ark_swap) => self.top_up_arkade(ark_swap).await,
             None => Ok(None),
         };
         self.events.send(Event::Rebalanced);
-        match (channel, arkade) {
-            (Ok(channel_sats), Ok(arkade_sats)) => Ok(Moved {
+        match (channel, payee, arkade) {
+            (Ok(channel_sats), Ok(payee_sats), Ok(arkade_sats)) => Ok(Moved {
                 channel_sats,
                 arkade_sats,
+                payee_sats,
             }),
-            (Err(e), Ok(_)) | (Ok(_), Err(e)) => Err(e),
-            (Err(channel), Err(arkade)) => Err(anyhow::anyhow!("{channel:#}; and {arkade:#}")),
+            (channel, payee, arkade) => {
+                let failed: Vec<String> = [channel.err(), payee.err(), arkade.err()]
+                    .into_iter()
+                    .flatten()
+                    .map(|e| format!("{e:#}"))
+                    .collect();
+                Err(anyhow::anyhow!("{}", failed.join("; and ")))
+            }
         }
     }
 
@@ -223,6 +302,50 @@ impl Rebalancer {
                 channel_id: channel.id.clone(),
                 amount_sats: amount,
                 local_before_sats: channel.local_sats,
+                capacity_sats: channel.local_sats + channel.remote_sats,
+                txid: None,
+                error: outcome.as_ref().err().map(|e| format!("{e:#}")),
+            })
+            .await?;
+        outcome.map(|()| Some(amount))
+    }
+
+    /// Check the source's channel with the payee, and have the payee pay the source back if the
+    /// source's share is too low.
+    async fn rebalance_payee(&self, payee: &Lnd, shares: Shares) -> Result<Option<u64>> {
+        let source = self
+            .source
+            .identity()
+            .await
+            .context("read the source node")?;
+        let identity = payee.identity().await.ok();
+        let channel = payee
+            .channel_with(&source.pubkey)
+            .await
+            .context("read the payee's channels")?;
+        {
+            let mut last = self.last.lock().await;
+            last.payee_channel = channel.clone();
+            last.payee = identity;
+        }
+        let channel =
+            channel.context("the payee has no active channel with the source node to rebalance")?;
+
+        let Some(amount) = amount_to_pay_back(&channel, shares) else {
+            return Ok(None);
+        };
+        info!(
+            "Rebalancing {amount} sats from the payee to the source, which holds {} of {} sats",
+            channel.remote_sats,
+            channel.local_sats + channel.remote_sats
+        );
+        let outcome = self.pay_source_back(payee, &channel, amount).await;
+        self.db
+            .record_rebalance(&Rebalance {
+                kind: PAYEE,
+                channel_id: channel.id.clone(),
+                amount_sats: amount,
+                local_before_sats: channel.remote_sats,
                 capacity_sats: channel.local_sats + channel.remote_sats,
                 txid: None,
                 error: outcome.as_ref().err().map(|e| format!("{e:#}")),
@@ -281,6 +404,19 @@ impl Rebalancer {
             .context("have the source pay the payer")?;
         Ok(())
     }
+
+    async fn pay_source_back(&self, payee: &Lnd, channel: &Channel, amount: u64) -> Result<()> {
+        let invoice = self
+            .source
+            .invoice(amount, "synth rebalance")
+            .await
+            .context("have the source invoice the payee")?;
+        payee
+            .pay_through(&invoice, &channel.id)
+            .await
+            .context("have the payee pay the source")?;
+        Ok(())
+    }
 }
 
 /// Whether ark-swapd needs coins: it can fund less than the low mark, and no top-up has been sent
@@ -298,15 +434,27 @@ fn needs_top_up(
 /// one. Balances exclude the channel reserve and commitment fees, so the target is of what the
 /// two sides hold, not of the channel's capacity.
 fn amount_to_move(channel: &Channel, config: &RebalanceConfig) -> Option<u64> {
-    let held = channel.local_sats + channel.remote_sats;
-    if held == 0 || channel.local_sats * 100 >= held * config.low_percent {
+    amount_to_refill(channel.local_sats, channel.remote_sats, config.shares())
+}
+
+/// How much the payee pays to bring the source back to its target share of their channel, if it
+/// has fallen below the low one. The channel is the payee's, so the source holds its remote side.
+fn amount_to_pay_back(channel: &Channel, shares: Shares) -> Option<u64> {
+    amount_to_refill(channel.remote_sats, channel.local_sats, shares)
+}
+
+/// How much one side of a channel is sent by the other to reach its target share: nothing until
+/// it falls below the low one, and never more than the other side holds.
+fn amount_to_refill(drained_sats: u64, other_sats: u64, shares: Shares) -> Option<u64> {
+    let held = drained_sats + other_sats;
+    if held == 0 || drained_sats * 100 >= held * shares.low_percent {
         return None;
     }
-    let target = held * config.target_percent / 100;
+    let target = held * shares.target_percent / 100;
     let amount = target
-        .saturating_sub(channel.local_sats)
-        .min(config.max_sats)
-        .min(channel.remote_sats);
+        .saturating_sub(drained_sats)
+        .min(shares.max_sats)
+        .min(other_sats);
     (amount > 0).then_some(amount)
 }
 
@@ -329,6 +477,7 @@ mod tests {
             target_percent: 50,
             max_sats: 200_000,
             arkade: None,
+            payee: None,
         }
     }
 
@@ -398,5 +547,198 @@ mod tests {
     #[test]
     fn an_empty_channel_has_nothing_to_move() {
         assert_eq!(amount_to_move(&channel(0, 0), &config()), None);
+    }
+
+    fn payee_leg(
+        low_percent: Option<u64>,
+        target_percent: Option<u64>,
+        max_sats: Option<u64>,
+    ) -> RebalanceConfig {
+        RebalanceConfig {
+            payee: Some(PayeeLegConfig {
+                lnd: config().source,
+                low_percent,
+                target_percent,
+                max_sats,
+            }),
+            ..config()
+        }
+    }
+
+    /// The channel is read from the payee, so the source's balance is the remote one.
+    #[test]
+    fn the_payee_pays_the_source_back_only_below_its_low_share() {
+        let shares = payee_leg(None, None, None).payee_shares().unwrap();
+        let cases = [
+            (1_978_000, 22_000, Some(200_000), "drained by payouts"),
+            (900_000, 100_000, Some(200_000), "capped by max_sats"),
+            (710_000, 290_000, Some(200_000), "just below the low share"),
+            (700_000, 300_000, None, "at the low share"),
+            (400_000, 600_000, None, "the source holds most of it"),
+            (0, 1_000_000, None, "the payee holds nothing"),
+            (0, 0, None, "an empty channel"),
+        ];
+        for (payee_sats, source_sats, expected, case) in cases {
+            assert_eq!(
+                amount_to_pay_back(&channel(payee_sats, source_sats), shares),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_payee_brings_the_source_up_to_its_target_share_within_the_cap() {
+        let cases = [
+            (200_000, 200_000, "never more than one rebalance may move"),
+            (1_000_000, 250_000, "up to the target share"),
+            (100_000, 100_000, "a smaller cap"),
+        ];
+        for (max_sats, expected, case) in cases {
+            let shares = payee_leg(None, None, Some(max_sats))
+                .payee_shares()
+                .unwrap();
+            assert_eq!(
+                amount_to_pay_back(&channel(750_000, 250_000), shares),
+                Some(expected),
+                "{case}"
+            );
+        }
+        let generous = payee_leg(None, Some(90), Some(1_000_000))
+            .payee_shares()
+            .unwrap();
+        assert_eq!(
+            amount_to_pay_back(&channel(150_000, 50_000), generous),
+            Some(130_000)
+        );
+        assert_eq!(
+            amount_to_pay_back(&channel(50_000, 0), generous),
+            Some(45_000)
+        );
+        let everything = payee_leg(None, Some(100), Some(1_000_000))
+            .payee_shares()
+            .unwrap();
+        assert_eq!(
+            amount_to_pay_back(&channel(50_000, 0), everything),
+            Some(50_000),
+            "never more than the payee holds"
+        );
+    }
+
+    #[test]
+    fn the_payee_legs_own_shares_win_over_the_payers() {
+        assert_eq!(config().payee_shares(), None, "no payee, no leg");
+        assert_eq!(
+            payee_leg(None, None, None).payee_shares(),
+            Some(config().shares()),
+            "the payer's shares where the leg sets none"
+        );
+        assert_eq!(
+            payee_leg(Some(10), Some(40), Some(500_000)).payee_shares(),
+            Some(Shares {
+                low_percent: 10,
+                target_percent: 40,
+                max_sats: 500_000,
+            })
+        );
+        assert_eq!(
+            payee_leg(None, Some(40), None).payee_shares(),
+            Some(Shares {
+                low_percent: 30,
+                target_percent: 40,
+                max_sats: 200_000,
+            }),
+            "each is overridden on its own"
+        );
+
+        // The same channel is left alone or refilled depending on whose shares apply, and the
+        // payer's leg is not changed by them.
+        let drained = channel(800_000, 200_000);
+        let overridden = payee_leg(Some(10), Some(40), Some(500_000));
+        assert_eq!(
+            amount_to_pay_back(
+                &drained,
+                payee_leg(None, None, None).payee_shares().unwrap()
+            ),
+            Some(200_000)
+        );
+        assert_eq!(
+            amount_to_pay_back(&drained, overridden.payee_shares().unwrap()),
+            None
+        );
+        assert_eq!(
+            amount_to_pay_back(
+                &channel(950_000, 50_000),
+                overridden.payee_shares().unwrap()
+            ),
+            Some(350_000)
+        );
+        assert_eq!(
+            amount_to_move(&channel(250_000, 750_000), &overridden),
+            Some(200_000)
+        );
+    }
+
+    #[test]
+    fn the_config_is_read_with_and_without_a_payee() {
+        let without = r#"
+enabled = true
+
+[source]
+rest_url = "https://source.example:8080"
+macaroon_file = "/run/secrets/source.macaroon"
+"#;
+        let config: RebalanceConfig = toml::from_str(without).unwrap();
+        assert!(config.payee.is_none());
+        assert_eq!(config.payee_shares(), None);
+
+        let bare = format!(
+            r#"{without}
+[payee.lnd]
+rest_url = "https://payee.example:8080"
+macaroon_file = "/run/secrets/payee-pay.macaroon"
+tls_cert_file = "/run/secrets/payee.tls.cert"
+"#
+        );
+        let config: RebalanceConfig = toml::from_str(&bare).unwrap();
+        let payee = config.payee.as_ref().expect("payee");
+        assert_eq!(payee.lnd.rest_url, "https://payee.example:8080");
+        assert_eq!(
+            payee.lnd.macaroon_file,
+            std::path::Path::new("/run/secrets/payee-pay.macaroon")
+        );
+        assert_eq!(
+            payee.lnd.tls_cert_file.as_deref(),
+            Some(std::path::Path::new("/run/secrets/payee.tls.cert"))
+        );
+        assert_eq!(
+            (payee.low_percent, payee.target_percent, payee.max_sats),
+            (None, None, None)
+        );
+        assert_eq!(config.payee_shares(), Some(config.shares()));
+
+        let overridden = format!(
+            r#"low_percent = 25
+{without}
+[payee]
+low_percent = 10
+target_percent = 40
+max_sats = 500000
+
+[payee.lnd]
+rest_url = "https://payee.example:8080"
+macaroon_file = "/run/secrets/payee-pay.macaroon"
+"#
+        );
+        let config: RebalanceConfig = toml::from_str(&overridden).unwrap();
+        assert_eq!(config.low_percent, 25);
+        assert_eq!(
+            config.payee_shares(),
+            Some(Shares {
+                low_percent: 10,
+                target_percent: 40,
+                max_sats: 500_000,
+            })
+        );
     }
 }

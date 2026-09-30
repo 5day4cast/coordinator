@@ -151,6 +151,14 @@ pub(super) async fn dashboard_live(
             name(observation.source.as_ref(), "the source node")
         )
     });
+    // The payee leg's channel joins the source node and the payee.
+    let payee_ends = observation.as_ref().map(|observation| {
+        format!(
+            "{} ↔ {}",
+            name(observation.source.as_ref(), "the source node"),
+            name(observation.payee.as_ref(), "the payee")
+        )
+    });
     let runs = runner.db().list_runs(10).await.unwrap_or_default();
     let live = runner.live_runs();
     let health = runner
@@ -299,6 +307,17 @@ pub(super) async fn dashboard_live(
                         },
                         None => p.error { "The payer has no active channel with the source node." },
                     }
+                    @match (rebalancer.config().payee_shares(), &observation.payee_channel) {
+                        (None, _) => {},
+                        (Some(shares), Some(channel)) => p {
+                            "Payouts: the source node, " strong { (name(observation.source.as_ref(), "the source node")) }
+                            ", holds " strong { (format::sats(channel.remote_sats)) } " of " (format::sats(channel.local_sats + channel.remote_sats))
+                            " sats in channel " code { (channel.id) } " with "
+                            strong { (name(observation.payee.as_ref(), "the payee")) }
+                            ", rebalancing below " (shares.low_percent) "%."
+                        },
+                        (Some(_), None) => p.error { "The payee has no active channel with the source node." },
+                    }
                     @match (&rebalancer.config().arkade, &observation.arkade) {
                         (None, _) => p.note { "Arkade: ark-swapd's wallet is not watched." },
                         (Some(_), None) => p.error { "Arkade: ark-swapd did not report its wallet." },
@@ -327,7 +346,8 @@ pub(super) async fn dashboard_live(
                                     (rebalance.kind.as_deref().unwrap_or("channel"))
                                     @if rebalance.kind.as_deref() != Some("arkade") {
                                         br; code { (rebalance.channel_id) }
-                                        @if let Some(ends) = &channel_ends { br; span.note { (ends) } }
+                                        @let ends = if rebalance.kind.as_deref() == Some("payee") { &payee_ends } else { &channel_ends };
+                                        @if let Some(ends) = ends { br; span.note { (ends) } }
                                     }
                                 }
                                 td.num { (format::sats_signed(rebalance.amount_sats)) " sats" }
@@ -746,6 +766,8 @@ async fn trigger_rebalance(
                 "Rebalanced: "
                 (moved.channel_sats.map_or("nothing".to_string(), |sats| format!("{} sats", format::sats(sats))))
                 " over the channel, "
+                (moved.payee_sats.map_or("nothing".to_string(), |sats| format!("{} sats", format::sats(sats))))
+                " from the payee, "
                 (moved.arkade_sats.map_or("nothing".to_string(), |sats| format!("{} sats", format::sats(sats))))
                 " on-chain to ark-swapd."
             }
