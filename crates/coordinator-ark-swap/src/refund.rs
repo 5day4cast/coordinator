@@ -4,7 +4,7 @@
 //!    that invoice's payment hash. `mint` returns the swap's script and address.
 //! 2. The coordinator refunds the escrow into that swap, with Keymeld signing as the player.
 //! 3. The coordinator pays the invoice and reports the preimage the payment revealed.
-//! 4. `tick` claims the swap into this service's wallet, once the refund has paid it.
+//! 4. `refund_tick` claims the swap into this service's wallet, once the refund has paid it.
 //!
 //! The service can only take the swap by revealing that preimage, so it is paid for the coins it
 //! claims. If it never claims, the player takes the swap back after the deadline, which costs the
@@ -16,7 +16,7 @@ use coordinator_ark_escrow::{RefundSwap, SwapTerms, VtxoScript};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::store::{Refund, RefundState};
+use crate::store::{Refund, RefundState, Store};
 use crate::swap::{unix_now, Swapper};
 
 /// How long one pass of `refund_tick` claims for. A claim takes seconds, and escrow payments
@@ -87,29 +87,13 @@ impl Swapper {
         Ok(refund)
     }
 
-    /// Record the preimage the coordinator's payment revealed, and try to claim at once.
+    /// Record the preimage the coordinator's payment revealed. `refund_tick` claims the swap.
+    ///
+    /// It does not claim here: a claim waits for the wallet's other sends, and a boarding holds
+    /// the wallet for a whole batch, far longer than the coordinator waits for an answer.
     pub async fn refund_paid(&self, id: Uuid, preimage: [u8; 32]) -> anyhow::Result<Refund> {
-        let mut refund = self
-            .store
-            .refund(id)
-            .await?
-            .with_context(|| format!("no refund {id}"))?;
-        let hash: [u8; 32] = Sha256::digest(preimage).into();
-        anyhow::ensure!(
-            hex::encode(hash) == refund.payment_hash,
-            "this preimage does not settle the refund's invoice"
-        );
-        if refund.preimage.is_none() {
-            refund.preimage = Some(hex::encode(preimage));
-            self.transition_refund(&mut refund, RefundState::Paid, None)
-                .await?;
-        }
-        if let Err(error) = self.claim_refund(&mut refund).await {
-            log::warn!("refund {id}: {error:#}");
-        }
-        Ok(refund)
+        record_preimage(&self.store, id, preimage).await
     }
-
     /// Claim the refunds whose swaps have been paid, and retire those the player may take back,
     /// for up to `REFUND_TICK_BUDGET`, starting after the last refund the previous pass reached.
     pub async fn refund_tick(&self) {
@@ -185,8 +169,7 @@ impl Swapper {
 
     /// Claim the swap, once the refund has paid it.
     async fn claim_refund(&self, refund: &mut Refund) -> anyhow::Result<()> {
-        let _claiming = self.claims.lock().await;
-        // The other path may have claimed it while this one waited.
+        // An earlier pass may have claimed it since this one listed it.
         if let Some(current) = self.store.refund(refund.id).await? {
             *refund = current;
         }
@@ -243,6 +226,27 @@ impl Swapper {
     }
 }
 
+/// Record `preimage` as settling refund `id`'s invoice, and mark the refund paid.
+async fn record_preimage(store: &Store, id: Uuid, preimage: [u8; 32]) -> anyhow::Result<Refund> {
+    let mut refund = store
+        .refund(id)
+        .await?
+        .with_context(|| format!("no refund {id}"))?;
+    let hash: [u8; 32] = Sha256::digest(preimage).into();
+    anyhow::ensure!(
+        hex::encode(hash) == refund.payment_hash,
+        "this preimage does not settle the refund's invoice"
+    );
+    if refund.preimage.is_none() {
+        refund.preimage = Some(hex::encode(preimage));
+        refund.state = RefundState::Paid;
+        refund.error = None;
+        refund.updated_at = unix_now();
+        store.update_refund(&refund).await?;
+    }
+    Ok(refund)
+}
+
 /// Where a pass over refunds listed as `ids`, oldest first, starts: after `last`, the last one
 /// the previous pass reached, and from the oldest once it has gone round. Refund ids are UUIDv7,
 /// so they order as the refunds were minted, and `last` need not be listed any more.
@@ -261,6 +265,62 @@ fn bytes32(hex_value: &str) -> anyhow::Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn minted(payment_hash: [u8; 32]) -> Refund {
+        Refund {
+            id: Uuid::now_v7(),
+            payment_hash: hex::encode(payment_hash),
+            amount_sat: 20_000,
+            player_key: "14".repeat(32),
+            deadline: 1_790_003_600,
+            swap_tap_tree: "aa".into(),
+            swap_address: "tark1refund".into(),
+            state: RefundState::Minted,
+            preimage: None,
+            swap_vtxo: None,
+            claim_txid: None,
+            error: None,
+            created_at: 1_790_000_000,
+            updated_at: 1_790_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_paid_refund_is_recorded_while_a_boarding_holds_the_wallet() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("swaps.sqlite"))
+            .await
+            .unwrap();
+        let preimage = [7u8; 32];
+        let refund = minted(Sha256::digest(preimage).into());
+        store.insert_refund(&refund).await.unwrap();
+
+        // A boarding holds the wallet's send lock for a whole batch.
+        let sending = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let _boarding = sending.clone().lock_owned().await;
+
+        let paid = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            record_preimage(&store, refund.id, preimage),
+        )
+        .await
+        .expect("recording the payment waits for no send")
+        .unwrap();
+        assert_eq!(paid.state, RefundState::Paid);
+        assert_eq!(paid.preimage, Some(hex::encode(preimage)));
+        // `refund_tick` claims it later.
+        let unclaimed = store.unclaimed_refunds().await.unwrap();
+        assert_eq!(unclaimed.len(), 1);
+        assert_eq!(unclaimed[0].preimage, paid.preimage);
+
+        // A repeated report is answered the same way, and a wrong preimage is refused.
+        let again = record_preimage(&store, refund.id, preimage).await.unwrap();
+        assert_eq!(again.state, RefundState::Paid);
+        assert!(record_preimage(&store, refund.id, [8u8; 32]).await.is_err());
+        assert!(record_preimage(&store, Uuid::now_v7(), preimage)
+            .await
+            .is_err());
+    }
 
     #[test]
     fn a_pass_over_refunds_starts_where_the_last_one_stopped() {

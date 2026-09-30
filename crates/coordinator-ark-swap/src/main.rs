@@ -11,9 +11,10 @@ mod refund;
 mod store;
 mod swap;
 mod wallet;
+mod worker;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -78,7 +79,6 @@ async fn main() -> anyhow::Result<()> {
         invoice_expiry_secs: config.invoice_expiry_secs,
         invoice_cltv_expiry: config.invoice_cltv_expiry,
         errors: Default::default(),
-        claims: Default::default(),
         refund_turn: Default::default(),
     });
     let view = swapper.wallet.view().await?;
@@ -111,35 +111,23 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
-    let worker = swapper.clone();
-    let mut worker_stopped = stopped.clone();
-    let worker_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(TICK);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut boarded_at = tokio::time::Instant::now();
-        let mut looked_up_at = tokio::time::Instant::now();
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {}
-                _ = worker_stopped.changed() => break,
-            }
-            if !holding.load(Ordering::SeqCst) {
-                continue;
-            }
-            // A tick always finishes, so a payment in flight records its result.
-            worker.tick().await;
-            worker.refund_tick().await;
-            if looked_up_at.elapsed() >= LOOKUP_EVERY {
-                worker.lookup_tick().await;
-                looked_up_at = tokio::time::Instant::now();
-            }
-            if boarded_at.elapsed() >= BOARD_EVERY {
-                worker.board_tick().await;
-                boarded_at = tokio::time::Instant::now();
-            }
-        }
-        let _ = worker_done.send(true);
-    });
+    let session = swapper.wallet.session_duration();
+    let cadence = worker::Cadence {
+        tick: TICK,
+        lookup_every: LOOKUP_EVERY,
+        board_every: BOARD_EVERY,
+        // ark-client gives a boarding two sessions, the rest of one and the batch after, and
+        // stops waiting itself. This bounds a boarding that hangs past that.
+        board_timeout: 2 * session + Duration::from_secs(60),
+    };
+    let worker_task = {
+        let stopped = stopped.clone();
+        let swapper = swapper.clone();
+        tokio::spawn(async move {
+            worker::run(swapper, cadence, holding, stopped).await;
+            let _ = worker_done.send(true);
+        })
+    };
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     log::info!("listening on {} as {holder}", config.listen);

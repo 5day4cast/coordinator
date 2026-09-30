@@ -151,7 +151,7 @@ impl Store {
     /// Renew the worker lease every `every` until `stop` changes, then release it.
     ///
     /// This runs apart from the work the lease guards, so a tick longer than `ttl` does not let the
-    /// lease lapse mid-tick: the API would refuse claims, and another instance could take over
+    /// lease lapse mid-tick: the API would refuse boards, and another instance could take over
     /// while this one still works. `holding` says whether the lease was held at the last renewal;
     /// a renewal that fails clears it, so the work pauses before the lease can expire.
     pub async fn keep_lease(

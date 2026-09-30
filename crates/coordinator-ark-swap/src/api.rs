@@ -7,7 +7,7 @@
 //! | `GET /v1/swaps?payment_hash=<hex>` | The swap whose invoice pays to that hash, for tracing a payment to its escrow. |
 //! | `GET /v1/swaps?without_escrow_vtxo=true` | Swaps in `escrow_paid`, `settled` or `unsettled` that record no escrow VTXO, oldest first. Read-only, for finding money by hand. |
 //! | `POST /v1/refunds` | `{ "payment_hash", "amount_sat", "player_key", "deadline" }` → the swap an unused escrow's refund pays. Returns the swap already minted for that invoice. |
-//! | `POST /v1/refunds/{id}/paid` | `{ "preimage" }` → records the payment and claims the swap. |
+//! | `POST /v1/refunds/{id}/paid` | `{ "preimage" }` → records the payment, answering 202 with the refund. The worker claims the swap. |
 //! | `GET /v1/refunds/{id}` | A refund's state. |
 //! | `GET /v1/wallet` | The Ark wallet's addresses and balance. |
 //! | `POST /v1/wallet/board` | Move confirmed boarding coins into VTXOs in the next batch. |
@@ -216,23 +216,13 @@ async fn refund_paid(
     Path(id): Path<Uuid>,
     Json(request): Json<RefundPaid>,
 ) -> Response {
-    // Only the lease holder claims, so two instances never spend the same swap.
-    match state.swapper.store.holds_lease(&state.holder).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return failure(
-                StatusCode::CONFLICT,
-                anyhow::anyhow!("another ark-swapd instance runs the wallet; retry there"),
-            )
-        }
-        Err(error) => return failure(StatusCode::INTERNAL_SERVER_ERROR, error),
-    }
+    // Either instance records the payment; the lease holder's worker claims the swap.
     let preimage = match bytes32(&request.preimage) {
         Ok(preimage) => preimage,
         Err(error) => return failure(StatusCode::BAD_REQUEST, error),
     };
     match state.swapper.refund_paid(id, preimage).await {
-        Ok(refund) => Json(refund).into_response(),
+        Ok(refund) => (StatusCode::ACCEPTED, Json(refund)).into_response(),
         Err(error) => failure(StatusCode::BAD_REQUEST, error),
     }
 }

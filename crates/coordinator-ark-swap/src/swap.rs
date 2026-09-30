@@ -74,9 +74,6 @@ pub struct Swapper {
     pub invoice_cltv_expiry: u32,
     /// The last error each swap logged, so a lasting one is logged once, not every tick.
     pub errors: SwapErrors,
-    /// Held while claiming a refund's swap. The API and the worker both claim, so each goes in
-    /// turn, and the second finds the refund claimed rather than sending the same claim again.
-    pub claims: tokio::sync::Mutex<()>,
     /// The last refund `refund_tick` reached, so the next pass carries on after it.
     pub refund_turn: std::sync::Mutex<Option<Uuid>>,
 }
