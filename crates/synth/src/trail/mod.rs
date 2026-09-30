@@ -418,6 +418,9 @@ pub struct RefundSeen {
     pub fee_msat: Option<u64>,
     #[serde(default)]
     pub paid_by: Option<String>,
+    /// An operator wrote the refund off, so nothing will move it and it is no longer owed.
+    #[serde(default)]
+    pub written_off: bool,
 }
 
 impl RefundSeen {
@@ -449,6 +452,9 @@ pub enum Money {
     /// the run: it says what synth could not see, not that money was lost.
     #[serde(alias = "timed_out")]
     Unverified { reason: String },
+    /// An operator wrote off the refunds that were left, after the rest settled: nothing will
+    /// move it, and it is not stuck money any more. Does not fail the run.
+    WrittenOff { reason: String },
 }
 
 impl Money {
@@ -472,6 +478,7 @@ impl Money {
             Money::NothingPaid => "nothing_paid",
             Money::Stuck { .. } => "stuck",
             Money::Unverified { .. } => "unverified",
+            Money::WrittenOff { .. } => "written_off",
         }
     }
 
@@ -482,7 +489,9 @@ impl Money {
 
     pub fn reason(&self) -> Option<&str> {
         match self {
-            Money::Stuck { reason, .. } | Money::Unverified { reason } => Some(reason),
+            Money::Stuck { reason, .. }
+            | Money::Unverified { reason }
+            | Money::WrittenOff { reason } => Some(reason),
             _ => None,
         }
     }
@@ -498,6 +507,7 @@ pub fn label_words(label: &str) -> &'static str {
         "stuck" => "stuck",
         // Labelled "timed_out" before synth told unverified money from stuck money.
         "unverified" | "timed_out" => "unverified",
+        "written_off" => "written off",
         _ => "unknown",
     }
 }
@@ -779,6 +789,19 @@ pub fn judge(evidence: &Evidence) -> Money {
         let settled = refunds.iter().filter(|refund| refund.is_settled()).count();
         if settled >= paid_entries {
             return Money::Refunded;
+        }
+        let written_off = refunds
+            .iter()
+            .filter(|refund| refund.written_off && !refund.is_settled())
+            .count();
+        if written_off > 0 && settled + written_off >= paid_entries {
+            return Money::WrittenOff {
+                reason: format!(
+                    "{} before its contract; {settled} of {paid_entries} escrows were refunded, \
+                     and the operator wrote off the other {written_off}",
+                    died(at)
+                ),
+            };
         }
         // An escrow is refunded only once its refund leaf opens, a day after the competition
         // closed; until then (and a while after) the money is waiting, not stuck.
@@ -1115,6 +1138,7 @@ mod tests {
             preimage: None,
             fee_msat: None,
             paid_by: None,
+            written_off: false,
         }
     }
 
@@ -1136,6 +1160,35 @@ mod tests {
             judge_of(&cancelled, &[], &refunds, 2, false),
             Money::Refunded
         );
+    }
+
+    /// Refunds an operator wrote off are no longer owed: once the rest settle, the money is
+    /// written off, not stuck, and synth stops watching it.
+    #[test]
+    fn written_off_refunds_are_not_stuck_money() {
+        let cancelled = competition(serde_json::json!({ "cancelled_at": "2026-09-24T03:00:00Z" }));
+        let written_off = RefundSeen {
+            written_off: true,
+            ..refund("written_off")
+        };
+        let refunds = [refund("settled"), written_off.clone()];
+        let judged = judge_of(&cancelled, &[], &refunds, 2, true);
+        assert_eq!(
+            judged,
+            Money::WrittenOff {
+                reason: "the competition was cancelled at 03:00 UTC before its contract; 1 of 2 \
+                         escrows were refunded, and the operator wrote off the other 1"
+                    .into(),
+            }
+        );
+        assert!(judged.is_final() && !judged.is_good());
+        assert_eq!(judged.words(), "written off");
+        // One still owed besides keeps it stuck.
+        let refunds = [refund("submitted"), written_off];
+        assert!(matches!(
+            judge_of(&cancelled, &[], &refunds, 2, true),
+            Money::Stuck { .. }
+        ));
     }
 
     #[test]

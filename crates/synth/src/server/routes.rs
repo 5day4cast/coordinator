@@ -408,9 +408,11 @@ fn stuck_money(
         .copied()
         .partition(|(run, _)| run.run.money.as_deref() == Some("stuck"));
     let total: u64 = stuck.iter().map(|(_, held)| held.sats).sum();
+    // One already past says nothing about when the money can move.
     let nearest = stuck
         .iter()
         .filter_map(|(_, held)| held.nearest_expiry)
+        .filter(|at| *at > now.unix_timestamp())
         .min();
     let swaps = unrecorded.map_or(&[][..], |unrecorded| &unrecorded.swaps[..]);
     let competitions = unrefunded.map_or(&[][..], |unrefunded| &unrefunded.competitions[..]);
@@ -559,7 +561,9 @@ fn held_runs(runs: &[(&HeldRun, &Held)], stopped: bool, now: OffsetDateTime) -> 
                         td.num data-label="Sats" { (format::sats(held.sats)) }
                         td data-label=(last) {
                             @match (stopped, held.until, held.nearest_expiry.and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok())) {
-                                (true, Some(at), _) | (false, _, Some(at)) => (format::time(at, now)),
+                                (true, Some(at), _) => (format::time(at, now)),
+                                (false, _, Some(at)) if at > now => (format::time(at, now)),
+                                (false, _, Some(_)) => span.note { "passed" },
                                 _ => span.note { "not known" },
                             }
                         }
@@ -817,6 +821,9 @@ pub(super) fn run_status(status: &str, money: Option<&str>) -> Markup {
         ("passed", Some("unverified" | "timed_out")) => html! {
             span class="badge unverified" title="Its steps passed, but synth could not confirm where its money went" { "money unverified" }
         },
+        ("passed", Some("written_off")) => html! {
+            span class="badge unverified" title="Its steps passed, but an operator wrote off refunds that could not finish" { "refunds written off" }
+        },
         ("passed", Some("following")) => html! {
             span class="badge following" title="Its steps passed; synth follows its money until the payouts or refunds are confirmed" { "passed · still live" }
         },
@@ -1007,6 +1014,9 @@ mod tests {
             let settled = badge("passed", Some(label));
             assert!(settled.contains(">passed<"), "{settled}");
         }
+        let written_off = badge("passed", Some("written_off"));
+        assert!(written_off.contains("refunds written off"), "{written_off}");
+        assert!(!written_off.contains("passed<"), "{written_off}");
         for label in ["unverified", "timed_out"] {
             let unverified = badge("passed", Some(label));
             assert!(
@@ -1230,6 +1240,59 @@ mod tests {
             .await
             .into_string();
         assert!(home.contains("No runs yet."), "{home}");
+    }
+
+    /// An escrow expiry already past says nothing about when stuck money can move: the panel
+    /// leaves it out of its summary and says it passed.
+    #[test]
+    fn the_stuck_money_panel_leaves_out_expiries_already_past() {
+        let now = time::macros::datetime!(2026-09-30 17:21:00 UTC);
+        let held = |nearest: i64| {
+            let run = TestRun {
+                id: uuid::Uuid::now_v7().to_string(),
+                scenario: "escrow_refund".into(),
+                status: "passed".into(),
+                started_at: "2026-09-24T00:04:00Z".into(),
+                completed_at: Some("2026-09-24T00:08:00Z".into()),
+                error_message: None,
+                config_json: None,
+                competition_id: None,
+                money: Some("stuck".into()),
+            };
+            let trail: crate::trail::Trail = serde_json::from_value(serde_json::json!({
+                "refreshed_at": "2026-09-30T17:00:00Z",
+                "competition_id": uuid::Uuid::now_v7(),
+                "money": { "status": "stuck", "reason": "not refunded", "since": "2026-09-24T03:12:00Z" },
+                "held": {
+                    "since": "2026-09-24T03:12:00Z", "found": "2026-09-24T05:00:00Z",
+                    "reason": "not refunded", "sats": 1100, "nearest_expiry": nearest,
+                },
+            }))
+            .unwrap();
+            HeldRun { run, trail }
+        };
+        let past = (now - time::Duration::hours(13)).unix_timestamp();
+        let panel =
+            stuck_money(&[held(past)], None, None, "https://5day4cast.com", now).into_string();
+        assert!(!panel.contains("nearest escrow expiry"), "{panel}");
+        assert!(
+            panel.contains(r#"<span class="note">passed</span>"#),
+            "{panel}"
+        );
+
+        let soon = (now + time::Duration::hours(2)).unix_timestamp();
+        let panel = stuck_money(
+            &[held(past), held(soon)],
+            None,
+            None,
+            "https://5day4cast.com",
+            now,
+        )
+        .into_string();
+        assert!(
+            panel.contains("the nearest escrow expiry or refund opening is"),
+            "{panel}"
+        );
     }
 
     /// Runs synth stopped following while their money was held stay on the panel, as
