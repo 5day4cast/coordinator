@@ -101,6 +101,23 @@ pub async fn public_response_headers(
     if signed {
         response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
     }
+    // A proxy in front of the site (Cloudflare) rewrites HTML it is allowed to
+    // transform: it injects its analytics beacon and obfuscates e-mail
+    // addresses, and both trip the policy above in htmx swaps. `no-transform`
+    // tells it to leave the markup alone.
+    if is_html {
+        let cache_control = match response_headers
+            .get(CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+        {
+            Some(value) if value.contains("no-transform") => None,
+            Some(value) => Some(format!("{value}, no-transform")),
+            None => Some("no-transform".to_owned()),
+        };
+        if let Some(value) = cache_control.and_then(|value| HeaderValue::from_str(&value).ok()) {
+            response_headers.insert(CACHE_CONTROL, value);
+        }
+    }
     response_headers
         .entry(X_CONTENT_TYPE_OPTIONS)
         .or_insert(HeaderValue::from_static("nosniff"));

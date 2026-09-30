@@ -139,7 +139,7 @@ async fn only_the_signed_in_owner_gets_their_ledger() {
     ] {
         let (answered, caching, body) = get(&coordinator, path, htmx, None).await;
         assert_eq!(answered, status, "{path}");
-        assert_eq!(caching, "private, no-store", "{path}");
+        assert_eq!(caching, "private, no-store, no-transform", "{path}");
         assert!(body.contains("Log in to see your entries"), "{path}");
         assert!(
             !body.contains("ledgerSummary") && !body.contains(short),
@@ -151,7 +151,7 @@ async fn only_the_signed_in_owner_gets_their_ledger() {
     // all in; the payout settled.
     let (status, caching, body) = get(&coordinator, "/entries", true, Some(&owner)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(caching, "private, no-store");
+    assert_eq!(caching, "private, no-store, no-transform");
     assert!(body.contains(r#"id="ledgerSummary""#));
     assert!(body.contains("Paid <strong>6,340 sats</strong> across 1 entry"));
     assert!(body.contains("Received <strong>9,000 sats</strong> (won 9,000 sats"));

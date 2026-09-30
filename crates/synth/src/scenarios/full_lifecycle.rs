@@ -48,8 +48,8 @@ pub(super) async fn create_competition(
         number_of_places_win: 1.min(config.users),
         total_allowed_entries: config.users,
         entry_fee: config.entry_fee,
-        coordinator_fee_basis_points: 1000,
-        coordinator_fee_percentage: 10,
+        coordinator_fee_basis_points: 300,
+        coordinator_fee_percentage: 3,
         total_competition_pool: config.entry_fee * config.users,
         // A test competition: kept off the oracle's public events list.
         unlisted: true,

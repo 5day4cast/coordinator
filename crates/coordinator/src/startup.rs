@@ -1397,6 +1397,13 @@ mod startup_tests {
                     "the wallet needs its configured attestation gateway"
                 );
                 assert_eq!(response_headers["x-content-type-options"], "nosniff");
+                assert!(
+                    response_headers["cache-control"]
+                        .to_str()
+                        .unwrap()
+                        .contains("no-transform"),
+                    "{path}"
+                );
                 assert!(!body.contains(" onclick="), "{path}");
                 assert_eq!(
                     body.contains("<!DOCTYPE html>"),
@@ -1404,7 +1411,10 @@ mod startup_tests {
                     "{kind} {path}"
                 );
                 if account {
-                    assert_eq!(response_headers["cache-control"], "private, no-store");
+                    assert_eq!(
+                        response_headers["cache-control"],
+                        "private, no-store, no-transform"
+                    );
                     assert!(body.contains("sign-in-required"));
                 }
             }
