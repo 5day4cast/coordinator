@@ -236,7 +236,8 @@ impl CompetitionView {
     /// such as a failed kickoff check, or it failed, with fees in escrow.
     pub fn owes_refunds(&self) -> bool {
         self.did_not_fill()
-            || (matches!(self.phase, Phase::Cancelled | Phase::Failed) && self.refunds.escrowed > 0)
+            || (matches!(self.phase, Phase::Cancelled | Phase::Failed)
+                && self.refunds.escrowed + self.refunds.written_off > 0)
     }
 
     /// Where the entry fees of a competition that didn't fill stand at `now`. Escrowed fees
@@ -246,9 +247,11 @@ impl CompetitionView {
         let RefundProgress {
             escrowed,
             refunded,
+            written_off,
             opens_at,
         } = self.refunds;
-        if escrowed > 0 {
+        // A written-off escrow is no longer owed: refunds are done once the rest are.
+        if escrowed > 0 || written_off > 0 {
             match opens_at {
                 _ if refunded >= escrowed => Refunds::Done,
                 Some(at) if at > now && refunded == 0 => Refunds::Locked(at),
@@ -265,7 +268,7 @@ impl CompetitionView {
 
     /// Nobody paid an entry fee: no escrow was funded and there are no entries.
     fn paid_nothing(&self) -> bool {
-        self.refunds.escrowed == 0 && self.total_entries == 0
+        self.refunds.escrowed == 0 && self.refunds.written_off == 0 && self.total_entries == 0
     }
 
     pub fn url(&self) -> String {
@@ -938,6 +941,7 @@ pub(crate) mod tests {
         escrowed.refunds = RefundProgress {
             escrowed: 1,
             refunded: 0,
+            written_off: 0,
             opens_at: Some(opens_at),
         };
         assert!(badge(&escrowed).contains("every entry fee is returned"));
@@ -960,6 +964,7 @@ pub(crate) mod tests {
         cancelled.refunds = RefundProgress {
             escrowed: 3,
             refunded: 2,
+            written_off: 0,
             opens_at: Some(NOW + time::Duration::hours(1)),
         };
         // Some are back already, so the rest are being refunded, not locked.
@@ -967,6 +972,23 @@ pub(crate) mod tests {
         cancelled.refunds.refunded = 3;
         assert_eq!(line(&cancelled).as_deref(), Some("Refunded"));
         assert!(badge(&cancelled).contains(">Didn't run</span>"));
+
+        // An escrow an operator wrote off is no longer owed: done once the rest are back.
+        cancelled.refunds.refunded = 2;
+        cancelled.refunds.escrowed = 2;
+        cancelled.refunds.written_off = 1;
+        assert_eq!(cancelled.refunds(NOW), Refunds::Done);
+        assert_eq!(line(&cancelled).as_deref(), Some("Refunded"));
+        let mut written_off = empty.clone();
+        written_off.refunds = RefundProgress {
+            escrowed: 0,
+            refunded: 0,
+            written_off: 1,
+            opens_at: None,
+        };
+        assert_eq!(written_off.refunds(NOW), Refunds::Done);
+        assert_eq!(line(&written_off).as_deref(), Some("Refunded"));
+        assert!(!badge(&written_off).contains("no entry fees were paid"));
 
         // Held Lightning payments are released when it is cancelled.
         let mut held = view("held", Phase::Cancelled, -600);
@@ -1010,6 +1032,7 @@ pub(crate) mod tests {
         full.refunds = RefundProgress {
             escrowed: 5,
             refunded: 0,
+            written_off: 0,
             opens_at: Some(NOW - time::Duration::minutes(1)),
         };
         assert!(!full.did_not_fill());
@@ -1030,6 +1053,7 @@ pub(crate) mod tests {
         failed.refunds = RefundProgress {
             escrowed: 3,
             refunded: 0,
+            written_off: 0,
             opens_at: None,
         };
         assert!(failed.owes_refunds());
@@ -1278,6 +1302,7 @@ pub(crate) mod tests {
         small.refunds = RefundProgress {
             escrowed: 1,
             refunded: 0,
+            written_off: 0,
             opens_at: None,
         };
         assert!(small.did_not_fill());

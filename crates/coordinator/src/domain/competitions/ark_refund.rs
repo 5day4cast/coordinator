@@ -27,6 +27,9 @@
 //! from the roster. Once Keymeld has a competition's roster it cannot change, so a ticket counted
 //! after that needs an operator, as does a paid ticket whose player never sent a registration
 //! (`docs/ops/stuck-escrow-check.md`).
+//!
+//! An operator can write off a refund that can never finish. Cleanup then leaves its escrow
+//! alone, and the pages no longer count it as owed.
 
 use std::time::Duration;
 
@@ -42,6 +45,7 @@ use uuid::Uuid;
 
 use super::{ArkRefundState, Coordinator, KeymeldIntentDelete, TicketArkEscrow, TicketArkRefund};
 use super::{PaidTicketRegistration, TicketRegistration};
+use super::{RefundWriteOff, UnrefundedArkEscrow};
 use crate::domain::competitions::EntryStatus;
 use crate::domain::Error;
 use crate::domain::PaymentStatus;
@@ -66,11 +70,42 @@ const REMINT_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const REFUND_PAYMENT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Reports about a ticket's refund, by ticket.
-const REFUND_REPORTS: &str = "escrow refund";
+pub(super) const REFUND_REPORTS: &str = "escrow refund";
 
 /// What a minted refund notes while a queued batch intent holds its escrow and cannot be deleted.
 /// Until it is, the refund keeps its swap: a new one would be refused too.
 pub(super) const HELD_BY_INTENT: &str = "the escrow is held by a queued Arkade batch intent";
+
+/// What a refund that cannot finish without an operator says, when it is logged. Such a refund
+/// may be written off without `force`.
+const NEEDS_OPERATOR: &str = "it needs an operator";
+
+/// Why a refund cannot be minted when its player gave no Lightning Address.
+const NO_ADDRESS: &str = "the player gave no Lightning Address to refund to";
+
+/// The longest reason a write-off keeps.
+const MAX_WRITE_OFF_REASON: usize = 500;
+
+/// Which refunds to write off: one ticket's, or every stuck one of a competition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOffTarget {
+    Ticket(Uuid),
+    Competition(Uuid),
+}
+
+/// A refund a write-off left alone, and why.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RefusedWriteOff {
+    pub ticket_id: Uuid,
+    pub why: String,
+}
+
+/// What a write-off did.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct WriteOffReport {
+    pub written_off: Vec<RefundWriteOff>,
+    pub refused: Vec<RefusedWriteOff>,
+}
 
 /// What a player is told about their refund.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -199,6 +234,146 @@ impl Coordinator {
             }
         }
         Ok(progress)
+    }
+
+    /// Write off the refunds of `target` that can never finish, so cleanup stops trying them
+    /// and the pages stop counting them as owed. Nothing moves: the escrow stays where it is.
+    ///
+    /// A refund is stuck when its player never sent a registration, so nothing can sign it, or
+    /// when cleanup last reported that it needs an operator. Any other refund still in progress
+    /// is refused unless `force`. A settled refund, one already written off, an escrow a batch
+    /// spent into its pool, and one whose competition may still run are always refused.
+    ///
+    /// For one ticket a refusal is an error; for a competition it is listed with the rest.
+    pub async fn write_off_refunds(
+        &self,
+        target: WriteOffTarget,
+        reason: &str,
+        force: bool,
+    ) -> Result<WriteOffReport, Error> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(Error::BadRequest("give a reason for the write-off".into()));
+        }
+        if reason.chars().count() > MAX_WRITE_OFF_REASON {
+            return Err(Error::BadRequest(format!(
+                "the reason is longer than {MAX_WRITE_OFF_REASON} characters"
+            )));
+        }
+        let escrows = match target {
+            WriteOffTarget::Ticket(ticket_id) => {
+                let escrows = self
+                    .competition_store
+                    .unrefunded_ark_escrows(Some(ticket_id), None)
+                    .await?;
+                if escrows.is_empty() {
+                    return Err(Error::NotFound(format!(
+                        "ticket {ticket_id} has no funded escrow waiting for a refund"
+                    )));
+                }
+                escrows
+            }
+            WriteOffTarget::Competition(competition_id) => {
+                self.competition_store
+                    .unrefunded_ark_escrows(None, Some(competition_id))
+                    .await?
+            }
+        };
+        let mut report = WriteOffReport::default();
+        let mut written = Vec::new();
+        for escrow in escrows {
+            let ticket_id = escrow.ticket_id;
+            if let Err(why) = self.may_write_off(&escrow, force) {
+                report.refused.push(RefusedWriteOff { ticket_id, why });
+                continue;
+            }
+            if !self
+                .competition_store
+                .write_off_ticket_ark_refund(
+                    ticket_id,
+                    escrow.ticket_hash.clone(),
+                    reason.to_string(),
+                    escrow.refund_state,
+                )
+                .await?
+            {
+                report.refused.push(RefusedWriteOff {
+                    ticket_id,
+                    why: "its refund is already written off".into(),
+                });
+                continue;
+            }
+            self.reported.clear(REFUND_REPORTS, ticket_id);
+            written.push(ticket_id);
+            info!(
+                "Wrote off the refund of ticket {ticket_id} in competition {}: its escrow {} \
+                 holds {} sats and will not be refunded ({reason})",
+                escrow.competition_id,
+                escrow.vtxo_outpoint.as_deref().unwrap_or("?"),
+                escrow.vtxo_sats.unwrap_or_default(),
+            );
+        }
+        report.written_off = self
+            .competition_store
+            .ark_refund_write_offs(None)
+            .await?
+            .into_iter()
+            .filter(|write_off| written.contains(&write_off.ticket_id))
+            .collect();
+        if let WriteOffTarget::Ticket(ticket_id) = target {
+            if let Some(refused) = report.refused.first() {
+                return Err(Error::BadRequest(format!(
+                    "the refund of ticket {ticket_id} was not written off: {}",
+                    refused.why
+                )));
+            }
+        }
+        Ok(report)
+    }
+
+    /// The written-off refunds of `competition_id`, or of every competition.
+    pub async fn refund_write_offs(
+        &self,
+        competition_id: Option<Uuid>,
+    ) -> Result<Vec<RefundWriteOff>, Error> {
+        Ok(self
+            .competition_store
+            .ark_refund_write_offs(competition_id.as_ref().map(std::slice::from_ref))
+            .await?)
+    }
+
+    /// Whether an unrefunded escrow's refund may be written off, or why not.
+    fn may_write_off(&self, escrow: &UnrefundedArkEscrow, force: bool) -> Result<(), String> {
+        if let Some(reason) = &escrow.written_off {
+            return Err(format!("its refund is already written off ({reason})"));
+        }
+        if escrow.pooled {
+            let why = "a batch spent its escrow into the pool, so nothing is owed back";
+            return Err(why.into());
+        }
+        if !escrow.ended {
+            let why = "its competition has not been cancelled or failed, so nothing is owed back";
+            return Err(why.into());
+        }
+        let never_registered = escrow.refund_state.is_none() && !escrow.registered;
+        let needs_operator = self
+            .reported
+            .last(REFUND_REPORTS, escrow.ticket_id)
+            .is_some_and(|problem| {
+                problem.contains(NEEDS_OPERATOR) || problem.contains(NO_ADDRESS)
+            });
+        if never_registered || needs_operator || force {
+            return Ok(());
+        }
+        Err(match escrow.refund_state {
+            Some(state) => format!(
+                "its refund is in progress ({}); --force writes it off anyway",
+                state.as_str()
+            ),
+            None => "its player sent a registration, so cleanup can still refund it; --force \
+                     writes it off anyway"
+                .into(),
+        })
     }
 
     /// Refund every funded escrow of a competition that will never kick off.
@@ -622,7 +797,7 @@ impl Coordinator {
         let address = policy
             .automatic_lightning_address
             .as_deref()
-            .context("the player gave no Lightning Address to refund to")?
+            .context(NO_ADDRESS)?
             .parse()
             .map_err(|e| anyhow!("The player's Lightning Address is invalid: {e}"))?;
         let fee_sats = ark.max_refund_fee_sats.min(sats.saturating_sub(1));

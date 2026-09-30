@@ -1791,3 +1791,187 @@ async fn a_refund_held_by_an_intent_that_cannot_be_deleted_waits_without_minting
     assert_eq!(f.ln.payments_sent(), 1);
     f.database.close().await.unwrap();
 }
+
+impl Fixture {
+    /// What the refund pass last logged about the ticket, while it lasts.
+    fn reported(&self, ticket: &ArkTicket) -> Option<String> {
+        self.coordinator
+            .reported
+            .last(super::ark_refund::REFUND_REPORTS, ticket.id)
+    }
+
+    async fn progress(&self) -> RefundProgress {
+        self.coordinator
+            .refund_status(&[self.competition_id])
+            .await
+            .unwrap()
+            .remove(&self.competition_id)
+            .unwrap_or_default()
+    }
+
+    async fn write_off(&self, ticket: &ArkTicket, force: bool) -> Result<WriteOffReport, Error> {
+        self.coordinator
+            .write_off_refunds(
+                WriteOffTarget::Ticket(ticket.id),
+                "the player never sent a registration",
+                force,
+            )
+            .await
+    }
+}
+
+#[tokio::test]
+async fn a_written_off_refund_is_skipped_by_cleanup_without_a_log_line() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let ticket = f.funded(&session, 21, false).await;
+    f.cancel().await;
+    f.clean_up().await;
+    let logged = f.reported(&ticket).expect("the stuck refund is logged");
+    assert!(logged.contains("never sent Keymeld"), "{logged}");
+    assert!(f.awaiting_cleanup().await);
+
+    let report = f.write_off(&ticket, false).await.unwrap();
+    assert!(report.refused.is_empty(), "{:?}", report.refused);
+    let [written] = report.written_off.as_slice() else {
+        panic!("one refund is written off: {report:?}");
+    };
+    assert_eq!(written.ticket_id, ticket.id);
+    assert_eq!(written.competition_id, f.competition_id);
+    assert_eq!(written.vtxo_sats, Some(PRICE));
+    assert_eq!(written.reason, "the player never sent a registration");
+    assert_eq!(written.refund_state, None, "no refund was ever minted");
+
+    f.coordinator.refund_ark_escrows(f.competition_id).await;
+    f.clean_up().await;
+    assert_eq!(f.reported(&ticket), None, "cleanup no longer looks at it");
+    assert!(f.refund(&ticket).await.is_none());
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 0);
+    assert_eq!(f.spends(), (0, 0));
+    assert!(
+        !f.awaiting_cleanup().await,
+        "nothing is left to refund, so the competition leaves the cleanup queue"
+    );
+
+    // A second write-off is refused, and keeps the first reason.
+    let again = f.write_off(&ticket, true).await.unwrap_err();
+    assert!(again.to_string().contains("already written off"), "{again}");
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn written_off_escrows_are_no_longer_owed() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let entered = f.funded(&session, 21, true).await;
+    let stuck = f.funded(&session, 23, false).await;
+    f.cancel().await;
+    f.clean_up().await;
+    assert_eq!(
+        f.refund(&entered).await.unwrap().state,
+        ArkRefundState::Settled
+    );
+    let progress = f.progress().await;
+    assert_eq!((progress.refunded, progress.escrowed), (1, 2));
+    assert!(
+        progress.opens_at.is_some(),
+        "the stuck escrow is still owed"
+    );
+
+    f.write_off(&stuck, false).await.unwrap();
+    let progress = f.progress().await;
+    assert_eq!(
+        (progress.refunded, progress.escrowed, progress.written_off),
+        (1, 1, 1),
+        "the written-off escrow leaves the denominator"
+    );
+    assert_eq!(
+        progress.opens_at, None,
+        "and no longer says when refunds open"
+    );
+    assert_eq!(
+        f.coordinator
+            .refund_progress(Some(f.competition_id))
+            .await
+            .unwrap()[&f.competition_id],
+        progress
+    );
+    let listed = f
+        .coordinator
+        .refund_write_offs(Some(f.competition_id))
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].ticket_id, stuck.id);
+    assert_eq!(listed[0].reason, "the player never sent a registration");
+    assert!(!f.awaiting_cleanup().await);
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_refund_in_progress_is_written_off_only_with_force() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let paid = f.funded(&session, 21, true).await;
+    let stuck = f.funded(&session, 23, false).await;
+
+    // Its competition may still run, so nothing is owed back yet.
+    let live = f.write_off(&stuck, true).await.unwrap_err();
+    assert!(live.to_string().contains("not been cancelled"), "{live}");
+
+    f.cancel().await;
+    f.swaps.lose_next_claim.store(true, Ordering::SeqCst);
+    f.clean_up().await;
+    assert_eq!(f.refund(&paid).await.unwrap().state, ArkRefundState::Paid);
+
+    let refused = f.write_off(&paid, false).await.unwrap_err();
+    assert!(
+        refused.to_string().contains("in progress (paid)"),
+        "{refused}"
+    );
+    assert!(f
+        .coordinator
+        .refund_write_offs(None)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // A competition's stuck refunds are written off, and the rest listed as left alone.
+    let report = f
+        .coordinator
+        .write_off_refunds(
+            WriteOffTarget::Competition(f.competition_id),
+            "the player never sent a registration",
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report
+            .written_off
+            .iter()
+            .map(|written| written.ticket_id)
+            .collect::<Vec<_>>(),
+        vec![stuck.id]
+    );
+    assert_eq!(report.refused.len(), 1);
+    assert_eq!(report.refused[0].ticket_id, paid.id);
+
+    let forced = f.write_off(&paid, true).await.unwrap();
+    assert_eq!(forced.written_off[0].refund_state.as_deref(), Some("paid"));
+    f.clean_up().await;
+    assert_eq!(
+        f.refund(&paid).await.unwrap().state,
+        ArkRefundState::Paid,
+        "cleanup leaves a written-off refund where it stopped"
+    );
+    assert_eq!(f.ln.payments_sent(), 1);
+
+    let blank = f
+        .coordinator
+        .write_off_refunds(WriteOffTarget::Ticket(paid.id), "  ", true)
+        .await
+        .unwrap_err();
+    assert!(blank.to_string().contains("reason"), "{blank}");
+    f.database.close().await.unwrap();
+}

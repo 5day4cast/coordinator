@@ -27,9 +27,12 @@ pub struct TicketArkEscrow {
 /// A competition's funded escrows, and how many of their players have been refunded.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RefundProgress {
-    /// Paid tickets whose escrow is funded: the entry fees to return.
+    /// Paid tickets whose escrow is funded and not written off: the entry fees to return.
     pub escrowed: u64,
     pub refunded: u64,
+    /// Funded escrows an operator wrote off: no longer owed, so not in `escrowed`.
+    #[serde(default)]
+    pub written_off: u64,
     /// When the first escrow not refunded yet can be: its refund locktime. Nothing can be
     /// refunded before. Only the pages ask for it.
     #[serde(
@@ -89,6 +92,42 @@ impl std::str::FromStr for ArkRefundState {
             }
         })
     }
+}
+
+/// An escrow whose refund an operator wrote off, and why. Cleanup no longer tries to refund
+/// it, and the pages no longer count it as owed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RefundWriteOff {
+    pub ticket_id: Uuid,
+    pub competition_id: Uuid,
+    /// The escrow's VTXO, `txid:vout`, and what it holds.
+    pub vtxo_outpoint: Option<String>,
+    pub vtxo_sats: Option<u64>,
+    pub reason: String,
+    /// The refund's state when it was written off; None when none was ever minted.
+    pub refund_state: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub written_off_at: OffsetDateTime,
+}
+
+/// A funded escrow of a paid ticket that has not been refunded, as a write-off sees it.
+#[derive(Debug, Clone)]
+pub struct UnrefundedArkEscrow {
+    pub ticket_id: Uuid,
+    pub ticket_hash: String,
+    pub competition_id: Uuid,
+    pub vtxo_outpoint: Option<String>,
+    pub vtxo_sats: Option<u64>,
+    /// Its competition was cancelled or failed, or is a queue that formed its pools without it:
+    /// its escrow is owed back.
+    pub ended: bool,
+    /// A batch spent the competition's escrows into its pool, so nothing is owed back.
+    pub pooled: bool,
+    /// Its player sent a registration, with an entry or before paying, that can sign the refund.
+    pub registered: bool,
+    pub refund_state: Option<ArkRefundState>,
+    /// The reason it was written off, if it was.
+    pub written_off: Option<String>,
 }
 
 /// One ticket's refund, and the swap that pays its player.
@@ -368,17 +407,23 @@ impl CompetitionStore {
     /// every competition. Competitions without funded escrows are left out.
     ///
     /// An escrow counts once its player has been paid; the escrows of a pool that a batch
-    /// funded were spent into it, so they are not counted at all.
+    /// funded were spent into it, so they are not counted at all. A written-off escrow is no
+    /// longer owed, so it is counted apart.
     pub async fn ark_refund_progress(
         &self,
         event_ids: Option<&[Uuid]>,
     ) -> Result<std::collections::HashMap<Uuid, RefundProgress>, sqlx::Error> {
         let rows = sqlx::query(
-            "SELECT t.event_id AS event_id, COUNT(*) AS escrowed,
-                    SUM(CASE WHEN r.state IN ('paid', 'settled') THEN 1 ELSE 0 END) AS refunded
+            "SELECT t.event_id AS event_id,
+                    SUM(CASE WHEN w.ticket_id IS NULL THEN 1 ELSE 0 END) AS escrowed,
+                    SUM(CASE WHEN w.ticket_id IS NULL AND r.state IN ('paid', 'settled')
+                             THEN 1 ELSE 0 END) AS refunded,
+                    SUM(CASE WHEN w.ticket_id IS NOT NULL THEN 1 ELSE 0 END) AS written_off
              FROM ticket_ark_escrows e
              JOIN tickets t ON t.id = e.ticket_id AND t.hash = e.ticket_hash
              LEFT JOIN ticket_ark_refunds r ON r.ticket_id = e.ticket_id
+             LEFT JOIN ticket_ark_refund_write_offs w
+                    ON w.ticket_id = e.ticket_id AND w.ticket_hash = e.ticket_hash
              WHERE e.funded_at IS NOT NULL AND t.paid_at IS NOT NULL
                AND (?1 IS NULL OR t.event_id IN (SELECT value FROM json_each(?1)))
                AND NOT EXISTS (SELECT 1 FROM ark_funded_competitions a
@@ -397,6 +442,7 @@ impl CompetitionStore {
                     RefundProgress {
                         escrowed: row.try_get::<i64, _>("escrowed")? as u64,
                         refunded: row.try_get::<i64, _>("refunded")? as u64,
+                        written_off: row.try_get::<i64, _>("written_off")? as u64,
                         opens_at: None,
                     },
                 ))
@@ -405,7 +451,7 @@ impl CompetitionStore {
     }
 
     /// The tap trees of the funded escrows of `event_ids` whose players are not refunded yet,
-    /// with their competitions. Each holds when its refund opens.
+    /// and were not written off, with their competitions. Each holds when its refund opens.
     pub async fn unrefunded_ark_escrow_trees(
         &self,
         event_ids: &[Uuid],
@@ -417,6 +463,8 @@ impl CompetitionStore {
              LEFT JOIN ticket_ark_refunds r ON r.ticket_id = e.ticket_id
              WHERE e.funded_at IS NOT NULL AND t.paid_at IS NOT NULL
                AND (r.state IS NULL OR r.state NOT IN ('paid', 'settled'))
+               AND NOT EXISTS (SELECT 1 FROM ticket_ark_refund_write_offs w
+                               WHERE w.ticket_id = e.ticket_id AND w.ticket_hash = e.ticket_hash)
                AND t.event_id IN (SELECT value FROM json_each(?1))
                AND NOT EXISTS (SELECT 1 FROM ark_funded_competitions a
                                WHERE a.event_id = t.event_id AND a.commitment_tx IS NOT NULL)",
@@ -436,7 +484,8 @@ impl CompetitionStore {
     /// The funded escrows of a competition that still need refunding, in ticket order.
     ///
     /// An escrow is refunded once its refund settles. The escrows of a pool that a batch funded
-    /// were spent into it, so they have nothing left to refund.
+    /// were spent into it, so they have nothing left to refund, and a written-off escrow is
+    /// left alone.
     pub async fn refundable_ark_escrows(
         &self,
         event_id: Uuid,
@@ -447,6 +496,8 @@ impl CompetitionStore {
              LEFT JOIN ticket_ark_refunds r ON r.ticket_id = e.ticket_id
              WHERE t.event_id = ? AND e.funded_at IS NOT NULL
                AND (r.state IS NULL OR r.state != 'settled')
+               AND NOT EXISTS (SELECT 1 FROM ticket_ark_refund_write_offs w
+                               WHERE w.ticket_id = e.ticket_id AND w.ticket_hash = e.ticket_hash)
                AND NOT EXISTS (SELECT 1 FROM ark_funded_competitions a
                                WHERE a.event_id = t.event_id AND a.commitment_tx IS NOT NULL)
              ORDER BY e.ticket_id",
@@ -592,6 +643,139 @@ impl CompetitionStore {
                 Ok(())
             })
             .await
+    }
+
+    /// The funded escrows of paid tickets not refunded yet, of one ticket or one competition,
+    /// in ticket order, with what a write-off needs to know about each.
+    pub async fn unrefunded_ark_escrows(
+        &self,
+        ticket_id: Option<Uuid>,
+        event_id: Option<Uuid>,
+    ) -> Result<Vec<UnrefundedArkEscrow>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT e.ticket_id, e.ticket_hash, t.event_id, e.vtxo_outpoint, e.vtxo_sats,
+                    (c.failed_at IS NOT NULL OR c.cancelled_at IS NOT NULL
+                     OR (c.kind = 'queued' AND c.pools_formed_at IS NOT NULL)) AS ended,
+                    EXISTS (SELECT 1 FROM ark_funded_competitions a
+                            WHERE a.event_id = t.event_id AND a.commitment_tx IS NOT NULL) AS pooled,
+                    (EXISTS (SELECT 1 FROM entries en WHERE en.ticket_id = t.id)
+                     OR EXISTS (SELECT 1 FROM ticket_keymeld_registrations k
+                                WHERE k.ticket_id = t.id AND k.ticket_hash = t.hash)) AS registered,
+                    r.state AS refund_state, w.reason AS written_off
+             FROM ticket_ark_escrows e
+             JOIN tickets t ON t.id = e.ticket_id AND t.hash = e.ticket_hash
+             JOIN competitions c ON c.id = t.event_id
+             LEFT JOIN ticket_ark_refunds r ON r.ticket_id = e.ticket_id
+             LEFT JOIN ticket_ark_refund_write_offs w
+                    ON w.ticket_id = e.ticket_id AND w.ticket_hash = e.ticket_hash
+             WHERE e.funded_at IS NOT NULL AND t.paid_at IS NOT NULL
+               AND (r.state IS NULL OR r.state != 'settled')
+               AND (?1 IS NULL OR e.ticket_id = ?1)
+               AND (?2 IS NULL OR t.event_id = ?2)
+             ORDER BY e.ticket_id",
+        )
+        .bind(ticket_id.map(|id| id.to_string()))
+        .bind(event_id.map(|id| id.to_string()))
+        .fetch_all(self.db_connection.read())
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let uuid = |name: &str| -> Result<Uuid, sqlx::Error> {
+                    Uuid::parse_str(&row.try_get::<String, _>(name)?)
+                        .map_err(|e| sqlx::Error::Decode(Box::new(e)))
+                };
+                Ok(UnrefundedArkEscrow {
+                    ticket_id: uuid("ticket_id")?,
+                    ticket_hash: row.try_get("ticket_hash")?,
+                    competition_id: uuid("event_id")?,
+                    vtxo_outpoint: row.try_get("vtxo_outpoint")?,
+                    vtxo_sats: row
+                        .try_get::<Option<i64>, _>("vtxo_sats")?
+                        .map(|sats| sats as u64),
+                    ended: row.try_get("ended")?,
+                    pooled: row.try_get("pooled")?,
+                    registered: row.try_get("registered")?,
+                    refund_state: row
+                        .try_get::<Option<&str>, _>("refund_state")?
+                        .map(str::parse)
+                        .transpose()?,
+                    written_off: row.try_get("written_off")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Record that an escrow's refund is written off. Returns whether it was: an escrow
+    /// already written off keeps its first reason.
+    pub async fn write_off_ticket_ark_refund(
+        &self,
+        ticket_id: Uuid,
+        ticket_hash: String,
+        reason: String,
+        refund_state: Option<ArkRefundState>,
+    ) -> Result<bool, DatabaseWriteError> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        self.db_connection
+            .execute_write(move |pool| async move {
+                let written = sqlx::query(
+                    "INSERT INTO ticket_ark_refund_write_offs
+                        (ticket_id, ticket_hash, reason, refund_state, written_off_at)
+                     VALUES (?, ?, ?, ?, ?)
+                     ON CONFLICT (ticket_id) DO NOTHING",
+                )
+                .bind(ticket_id.to_string())
+                .bind(ticket_hash)
+                .bind(reason)
+                .bind(refund_state.map(ArkRefundState::as_str))
+                .bind(now)
+                .execute(&pool)
+                .await?
+                .rows_affected();
+                Ok(written > 0)
+            })
+            .await
+    }
+
+    /// The written-off refunds of `event_ids`, or of every competition, in ticket order.
+    pub async fn ark_refund_write_offs(
+        &self,
+        event_ids: Option<&[Uuid]>,
+    ) -> Result<Vec<RefundWriteOff>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT w.ticket_id, t.event_id, e.vtxo_outpoint, e.vtxo_sats, w.reason,
+                    w.refund_state, w.written_off_at
+             FROM ticket_ark_refund_write_offs w
+             JOIN tickets t ON t.id = w.ticket_id AND t.hash = w.ticket_hash
+             LEFT JOIN ticket_ark_escrows e
+                    ON e.ticket_id = w.ticket_id AND e.ticket_hash = w.ticket_hash
+             WHERE ?1 IS NULL OR t.event_id IN (SELECT value FROM json_each(?1))
+             ORDER BY w.ticket_id",
+        )
+        .bind(event_ids.map(id_list))
+        .fetch_all(self.db_connection.read())
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let uuid = |name: &str| -> Result<Uuid, sqlx::Error> {
+                    Uuid::parse_str(&row.try_get::<String, _>(name)?)
+                        .map_err(|e| sqlx::Error::Decode(Box::new(e)))
+                };
+                Ok(RefundWriteOff {
+                    ticket_id: uuid("ticket_id")?,
+                    competition_id: uuid("event_id")?,
+                    vtxo_outpoint: row.try_get("vtxo_outpoint")?,
+                    vtxo_sats: row
+                        .try_get::<Option<i64>, _>("vtxo_sats")?
+                        .map(|sats| sats as u64),
+                    reason: row.try_get("reason")?,
+                    refund_state: row.try_get("refund_state")?,
+                    written_off_at: OffsetDateTime::from_unix_timestamp(
+                        row.try_get("written_off_at")?,
+                    )
+                    .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+                })
+            })
+            .collect()
     }
 
     pub async fn store_ark_commitment(
