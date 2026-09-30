@@ -55,7 +55,8 @@ pub enum ArkRefundState {
     /// The refund's transactions are built and its Ark transaction is going to Arkade. The
     /// escrow may or may not be spent yet, so a resume asks the server before rebuilding.
     Submitting,
-    /// The escrow was spent into that swap on Arkade.
+    /// The escrow was spent into that swap on Arkade: offchain, or in a batch if its VTXO had
+    /// expired.
     Submitted,
     /// The player's invoice was paid, and its preimage given to ark-swapd.
     Paid,

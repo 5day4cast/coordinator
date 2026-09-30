@@ -241,7 +241,7 @@ impl CompetitionView {
     }
 
     /// Where the entry fees of a competition that didn't fill stand at `now`. Escrowed fees
-    /// are returned once their escrows' refund locktime passes, up to a day after the start;
+    /// are returned once their escrows' refund locktime passes, shortly after the start;
     /// held Lightning payments are released when the competition is cancelled.
     pub fn refunds(&self, now: OffsetDateTime) -> Refunds {
         let RefundProgress {
@@ -934,8 +934,8 @@ pub(crate) mod tests {
         assert!(badge(&empty).contains("no entry fees were paid"));
         assert_eq!(line(&empty), None);
 
-        // A fee paid into escrow without an entry is still owed back. Its escrow opens a day
-        // after the start.
+        // A fee paid into escrow without an entry is still owed back, once its escrow's
+        // refund leaf opens.
         let opens_at = NOW + time::Duration::hours(20);
         let mut escrowed = empty.clone();
         escrowed.refunds = RefundProgress {

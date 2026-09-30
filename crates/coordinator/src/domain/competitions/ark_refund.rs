@@ -139,7 +139,8 @@ pub struct TicketRefund {
     pub state: String,
     /// What the player is paid, after the swap service's fee.
     pub paid_sats: u64,
-    /// The Arkade transaction that moved the escrow into the swap.
+    /// The Arkade transaction that moved the escrow into the swap, or for an escrow that had
+    /// expired, the commitment transaction of the batch that did.
     pub ark_txid: Option<String>,
     /// The invoice the refund pays, from the player's Lightning Address, and its payment hash:
     /// what the player's wallet shows the refund as.
