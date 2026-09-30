@@ -149,7 +149,12 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
                     (refund_note(competition, now))
                 }
             } @else if !split && !ran(competition.phase) {
-                p class="notice" { "This competition did not run, so nothing is scored." }
+                p class="notice" {
+                    "This competition did not run, so nothing is scored."
+                    @if competition.owes_refunds() {
+                        " " (refund_note(competition, now))
+                    }
+                }
             }
 
             @if split {
@@ -742,6 +747,30 @@ mod tests {
         assert!(leaderboard(&competition, NOW)
             .into_string()
             .contains("No entry fees were paid."));
+    }
+
+    /// A full competition cancelled before it ran, as by a failed kickoff check, still says
+    /// where its escrowed entry fees stand; an operator's cancellation with nothing escrowed
+    /// does not.
+    #[test]
+    fn a_cancelled_competition_with_escrows_explains_its_refunds() {
+        let mut competition = view("c1", Phase::Cancelled, -60);
+        competition.total_entries = competition.total_allowed_entries;
+        let page = leaderboard(&competition, NOW).into_string();
+        assert!(page.contains("did not run, so nothing is scored."));
+        assert!(!page.contains("Refund") && !page.contains("returned"));
+
+        competition.refunds = crate::domain::RefundProgress {
+            escrowed: 3,
+            refunded: 1,
+            opens_at: Some(NOW - time::Duration::minutes(5)),
+        };
+        let page = leaderboard(&competition, NOW).into_string();
+        assert!(page.contains("did not run, so nothing is scored. Refunding… "));
+        assert!(page.contains("1 of 3 paid entry fees returned so far"));
+        assert!(phase_badge(&competition)
+            .into_string()
+            .contains(">Cancelled</span>"));
     }
 
     /// A no-score outcome explains why each entry has an allocation without
