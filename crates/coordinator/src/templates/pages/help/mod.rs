@@ -248,7 +248,7 @@ fn video() -> Markup {
 
 fn recording(class: &str, mp4: &Asset, poster: &Asset, (width, height): (u32, u32)) -> Markup {
     html! {
-        video class=(class) controls playsinline preload="none" width=(width) height=(height)
+        video class=(class) controls playsinline preload="metadata" width=(width) height=(height)
               poster=(poster.url)
               aria-label="How it works: entering a competition, then following the leaderboard and your picks" {
             source src=(mp4.url) type="video/mp4";
@@ -326,7 +326,7 @@ mod tests {
             ),
         ] {
             assert!(html.contains(&format!(
-                r#"<video class="{class}" controls playsinline preload="none""#
+                r#"<video class="{class}" controls playsinline preload="metadata""#
             )));
             assert!(html.contains(&format!(r#"poster="{}""#, poster.url)));
             assert!(html.contains(&format!(r#"<source src="{}" type="video/mp4">"#, mp4.url)));
