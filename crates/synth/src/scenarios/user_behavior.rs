@@ -217,6 +217,7 @@ async fn run_steps(
         actors.push(run_actor(
             client,
             user,
+            &users,
             &competition_id,
             config,
             payer,
@@ -723,6 +724,7 @@ fn ensure_submission_time(deadline: OffsetDateTime, config: &ScenarioConfig) -> 
 async fn run_actor(
     client: &CoordinatorClient,
     user: &SynthUser,
+    players: &[SynthUser],
     competition_id: &Uuid,
     config: &ScenarioConfig,
     payer: &Payer<'_>,
@@ -761,6 +763,7 @@ async fn run_actor(
         let Some(requested) = request_seat(
             client,
             user,
+            players,
             competition_id,
             config,
             deadline,
@@ -834,6 +837,9 @@ async fn run_actor(
         Ok((mut step, ())) => {
             if trace.seat_taken {
                 step.status = StepStatus::Skipped;
+                if trace.outside_entries.is_some_and(|outside| outside > 0) {
+                    step.error = Some("seat taken by outside player".into());
+                }
             }
             step
         }
@@ -844,11 +850,14 @@ async fn run_actor(
 
 /// Request a ticket for `user`, as a real player would: while every seat is held, keep trying
 /// until one frees up. Other people can enter synth's competitions too, so a seat may never come:
-/// None, with the trace's `seat_taken` set, once others have paid for every seat or the invoice
+/// None, with the trace's `seat_taken` set, once others have paid for every seat, the
+/// competition closed to entries with some of them outside synth's `players`, or the invoice
 /// deadline passes before one frees up.
+#[allow(clippy::too_many_arguments)]
 async fn request_seat(
     client: &CoordinatorClient,
     user: &SynthUser,
+    players: &[SynthUser],
     competition_id: &Uuid,
     config: &ScenarioConfig,
     deadline: OffsetDateTime,
@@ -871,6 +880,22 @@ async fn request_seat(
                 if error
                     .downcast_ref::<ApiRejection>()
                     .is_some_and(ApiRejection::is_no_capacity) => {}
+            // Synth sizes a competition to its players, so it closes early only if someone
+            // else took a seat.
+            Err(error)
+                if error
+                    .downcast_ref::<ApiRejection>()
+                    .is_some_and(ApiRejection::is_entries_closed) =>
+            {
+                let outside = outside_entries(client, players, competition_id).await?;
+                trace.outside_entries = Some(outside);
+                if outside == 0 {
+                    return Err(error);
+                }
+                trace.seat_taken = true;
+                crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
+                return Ok(None);
+            }
             Err(error) => return Err(error),
         }
         let full = client
@@ -878,12 +903,36 @@ async fn request_seat(
             .await?
             .seats_all_paid();
         if full || ensure_payment_time(deadline, config).is_err() {
+            if full {
+                trace.outside_entries = outside_entries(client, players, competition_id).await.ok();
+            }
             trace.seat_taken = true;
             crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
             return Ok(None);
         }
         tokio::time::sleep(Duration::from_secs(config.poll_interval_secs.max(1))).await;
     }
+}
+
+/// How many of the competition's entries synth's `players` did not make.
+async fn outside_entries(
+    client: &CoordinatorClient,
+    players: &[SynthUser],
+    competition_id: &Uuid,
+) -> Result<u64> {
+    let total = client.get_competition(competition_id).await?.total_entries;
+    let mut ours = std::collections::BTreeSet::new();
+    for player in players {
+        for entry in client
+            .list_entries(&player.nostr_keys, Some(competition_id))
+            .await?
+        {
+            if entry.event_id == *competition_id {
+                ours.insert(entry.id);
+            }
+        }
+    }
+    Ok(total.saturating_sub(ours.len() as u64))
 }
 
 #[allow(clippy::too_many_arguments)]

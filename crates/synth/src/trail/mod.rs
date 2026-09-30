@@ -78,6 +78,10 @@ pub struct EntryTrace {
     /// Other players took every seat, so this one stood down without a ticket.
     #[serde(default)]
     pub seat_taken: bool,
+    /// Entries in the competition that synth's players did not make, counted when this one was
+    /// refused a seat. Some and above zero when an outside player took the seat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside_entries: Option<u64>,
 }
 
 impl EntryTrace {

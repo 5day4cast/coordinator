@@ -25,6 +25,8 @@ struct Protocol {
     /// player has paid for the unpaid seat, Some(false) while it stays reserved.
     other_seat: Option<bool>,
     first_replacement_blocked: bool,
+    /// Ticket requests are refused as the competition no longer accepts entries.
+    tickets_closed: bool,
     duplicate_status: u16,
     closed: bool,
     refund_failure: Option<Uuid>,
@@ -89,6 +91,12 @@ async fn ticket(
 ) -> (StatusCode, Json<Value>) {
     let mut state = state.lock().unwrap();
     state.attempts += 1;
+    if state.tickets_closed {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"Competition is no longer accepting entries"})),
+        );
+    }
     let id = if state.tickets.len() + state.others < state.capacity {
         Uuid::now_v7()
     } else {
@@ -696,6 +704,7 @@ async fn paid_dropout_keeps_its_seat_and_is_refunded_without_submitting_an_entry
     let (step, trace) = run_actor(
         &mock.client,
         &user,
+        std::slice::from_ref(&user),
         &comp,
         &config(1),
         &Payer::TestEndpoint,
@@ -785,6 +794,7 @@ async fn duplicate_submission_requires_the_expected_400_and_one_accepted_entry()
         let (step, trace) = run_actor(
             &mock.client,
             &user,
+            std::slice::from_ref(&user),
             &Uuid::now_v7(),
             &config(1),
             &Payer::TestEndpoint,
@@ -808,6 +818,41 @@ async fn duplicate_submission_requires_the_expected_400_and_one_accepted_entry()
             1,
             "double-click and retry never pay twice"
         );
+    }
+}
+
+/// Synth sizes a competition to its players, so one that closed before a player got a seat was
+/// filled by someone else: skipped, not failed. With no outside entry, it is a failure.
+#[tokio::test]
+async fn a_seat_taken_by_an_outside_player_skips_the_entry() {
+    for (others, expected) in [(1, StepStatus::Skipped), (0, StepStatus::Failed)] {
+        let mock = Mock::new(Protocol {
+            capacity: 1,
+            others,
+            tickets_closed: true,
+            ..Default::default()
+        })
+        .await;
+        let user = SynthUser::new_random("alice").unwrap();
+        let (step, trace) = run_actor(
+            &mock.client,
+            &user,
+            std::slice::from_ref(&user),
+            &Uuid::now_v7(),
+            &config(1),
+            &Payer::TestEndpoint,
+            &plan(EntryBehavior::Complete),
+            Instant::now(),
+            OffsetDateTime::now_utc() + time::Duration::hours(1),
+        )
+        .await;
+        assert_eq!(step.status, expected);
+        assert_eq!(trace.outside_entries, Some(others as u64));
+        assert_eq!(trace.seat_taken, others > 0);
+        if others > 0 {
+            assert_eq!(step.error.as_deref(), Some("seat taken by outside player"));
+        }
+        assert!(mock.state.lock().unwrap().events.is_empty());
     }
 }
 
@@ -879,6 +924,7 @@ async fn missed_invoice_deadline_aborts_before_requesting_or_paying() {
     let (step, trace) = run_actor(
         &mock.client,
         &user,
+        std::slice::from_ref(&user),
         &Uuid::now_v7(),
         &config(1),
         &Payer::TestEndpoint,
@@ -1127,6 +1173,7 @@ async fn missing_required_refund_registration_stops_before_payment() {
     let (step, trace) = run_actor(
         &mock.client,
         &user,
+        std::slice::from_ref(&user),
         &Uuid::now_v7(),
         &config(1),
         &Payer::TestEndpoint,

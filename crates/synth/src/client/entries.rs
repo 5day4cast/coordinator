@@ -36,6 +36,11 @@ impl ApiRejection {
     pub fn is_no_capacity(&self) -> bool {
         self.status == 400 && self.message == "No ticket available for competition"
     }
+
+    /// The competition closed to new entries, as it does once every seat is filled.
+    pub fn is_entries_closed(&self) -> bool {
+        self.status == 400 && self.message == "Competition is no longer accepting entries"
+    }
 }
 
 pub enum EntrySubmission {
