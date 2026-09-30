@@ -96,10 +96,10 @@ pub fn entry_form(
             dl class="entry-facts" {
                 div {
                     dt { "Entries close" (tip_start("Picks lock then, and the readings count from that moment on.")) }
-                    dd { (format::time(competition.start, TimeStyle::DateTime)) }
+                    dd { (format::zoned_time(competition.start, TimeStyle::DateTime)) }
                 }
                 div {
-                    dt { "Price" }
+                    dt { "Entry fee" }
                     dd { (price(competition, network_fee)) }
                 }
                 div {
@@ -221,9 +221,10 @@ pub fn entry_form(
     }
 }
 
-/// The ticket's price: its total, which opens to the entry, service and network fees. The
-/// total and the network fee carry ids, so the ticket's own fee can replace the estimate once
-/// the ticket is issued (`entry_form.js`).
+/// What entering costs, all in: one total, which opens to what it is made of (the pot
+/// contribution, the service fee and the network fee). Only this form shows the parts. The total
+/// and the network fee carry ids, so the ticket's own fee can replace the estimate once the
+/// ticket is issued (`entry_form.js`).
 fn price(competition: &CompetitionView, network_fee: NetworkFee) -> Markup {
     let network_fee = network_fee.sats();
     let service = competition
@@ -232,15 +233,10 @@ fn price(competition: &CompetitionView, network_fee: NetworkFee) -> Markup {
     html! {
         details class="price-details" {
             summary {
-                span id="ticketTotal" {
-                    @match network_fee {
-                        Some(fee) => (sats(competition.ticket_price + fee)),
-                        None => { (sats(competition.ticket_price)) " + network fee" }
-                    }
-                }
+                span id="ticketTotal" { (sats(competition.ticket_price + network_fee.unwrap_or(0))) }
             }
             ul class="price-lines" {
-                li { "Entry fee " span { (sats(competition.entry_fee)) } }
+                li { "Pot contribution " span { (sats(competition.entry_fee)) } }
                 @if service > 0 {
                     li { "Service fee (" (competition.service_fee_percent) ") " span { (sats(service)) } }
                 }
@@ -275,6 +271,9 @@ pub fn forecast_choices(competition_id: &str, forecasts: &Forecasts, asked: u8) 
         Forecasts::Ready { stations, pins } => html! {
             div id="entryForecasts" {
                 @if !pins.is_empty() { (station_map(pins)) }
+                // Says so when Pay is clicked with nothing picked (`entry_form.js`), right above
+                // the first pick, which then takes focus.
+                p id="picksMessage" class="notification is-danger hidden" role="alert" {}
                 @for station in stations { (station_picks(station)) }
             }
         },
@@ -518,8 +517,8 @@ mod tests {
         assert!(html.contains(r#"<dt>Entries close<span class="tip tip-start""#));
     }
 
-    /// The price is one total, "what it costs me"; tapping it opens the entry, service and
-    /// network fees. The total and the network fee carry ids for the ticket's own fee.
+    /// The entry fee is one total, "what it costs me"; tapping it opens the pot contribution,
+    /// service and network fees. The total and the network fee carry ids for the ticket's own fee.
     #[test]
     fn entry_form_shows_one_price_that_opens_to_its_fees() {
         let html = form(PayoutDestination::LoggedOut);
@@ -529,7 +528,10 @@ mod tests {
             .unwrap();
         let lines = html.find(r#"<ul class="price-lines">"#).unwrap();
         assert!(details < total && total < lines, "the total is the summary");
-        assert!(html.contains("Entry fee <span>5,000 sats</span>"));
+        // One all-in number, labelled as players know it; the parts only in the disclosure.
+        assert!(html.contains(r#"<dt>Entry fee</dt><dd><details class="price-details">"#));
+        assert!(!html.contains("<dt>Price</dt>"));
+        assert!(html.contains("Pot contribution <span>5,000 sats</span>"));
         assert!(html.contains("Service fee (5%) <span>250 sats</span>"));
         assert!(html.contains(r#"Network fee <span id="networkFee">50 sats</span>"#));
         assert!(!html.contains(">Ticket<") && !html.contains(">Pot<"));
@@ -543,7 +545,8 @@ mod tests {
             NetworkFee::Unavailable,
         )
         .into_string();
-        assert!(unavailable.contains("5,250 sats + network fee"));
+        assert!(unavailable.contains(r#"<span id="ticketTotal">5,250 sats</span>"#));
+        assert!(!unavailable.contains("+ network fee"));
         assert!(unavailable.contains(r#"<span id="networkFee">unavailable right now</span>"#));
         assert!(!unavailable.contains("data-network-fee"));
         assert!(unavailable.contains("Pay and enter"));
@@ -602,6 +605,8 @@ mod tests {
     fn entry_form_shows_the_deadline_and_links_the_rules() {
         let html = form(PayoutDestination::LoggedOut);
         assert!(html.contains("Entries close"));
+        // Localized, it names the reader's zone: the one time on the form.
+        assert_eq!(html.matches("data-zone").count(), 1);
         assert!(
             !html.contains("Window"),
             "the deadline is the one time the form needs"

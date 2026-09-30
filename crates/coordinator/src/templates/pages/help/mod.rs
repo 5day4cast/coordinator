@@ -151,7 +151,7 @@ pub fn help_page() -> Markup {
                 h2 { "Paying and payouts" }
                 ul {
                     li {
-                        "You pay one ticket price over Lightning. "
+                        "You pay one entry fee over Lightning, all in. "
                         a href="#advanced" { "What's in it" } " is under How the tech works."
                     }
                     li {
@@ -171,11 +171,11 @@ pub fn help_page() -> Markup {
                     h3 { "Where your sats go" }
                     ul {
                         li {
-                            strong { "Entry fee" } ": goes into the pot. Every entrant's entry fee together "
-                            "is what the winners share."
+                            strong { "Pot contribution" } ": goes into the pot. Every entrant's contribution "
+                            "together is what the winners share."
                         }
                         li {
-                            strong { "Service fee" } ": a percentage of the entry fee that runs the site. "
+                            strong { "Service fee" } ": a percentage of the pot contribution that runs the site. "
                             "It is not part of the pot."
                         }
                         li {
@@ -254,7 +254,7 @@ fn walkthrough() -> Markup {
                 figure class="help-shot entry-form" inert aria-label="An example entry form" {
                     dl class="entry-facts" {
                         div { dt { "Entries close" (callout(1)) } dd { "Sep 30, 6:56 PM" } }
-                        div { dt { "Price" (callout(2)) } dd { "5,687 sats" } }
+                        div { dt { "Entry fee" (callout(2)) } dd { "5,687 sats" } }
                         div { dt { "Win" (callout(3)) } dd { "30,000 sats" } }
                     }
                     fieldset class="station-picks" {

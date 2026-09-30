@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 use crate::domain::leaderboard::{Phase, PickProgress, PickState, Rule};
 use crate::infra::oracle::ValueOptions;
 use crate::templates::{
-    components::{tip, tip_start},
+    components::{tip_end, tip_start},
     format::{self, MetricText},
 };
 
@@ -58,7 +58,7 @@ fn badge(state: PickState) -> Option<(&'static str, &'static str, &'static str)>
         ),
         PickState::AwaitingResult => (
             "pick-state is-awaiting",
-            "Awaiting the oracle's result",
+            "Awaiting oracle",
             "The window has closed; the oracle's own reading decides",
         ),
         PickState::Final => (
@@ -170,7 +170,7 @@ fn detail(
                             @if updated_at.is_some() { " · " }
                             "reports in for " (covered) " of " (total) " h"
                         }
-                        (tip("Scored as if the window ended now; picks can still change until it closes."))
+                        (tip_end("Scored as if the window ended now; picks can still change until it closes."))
                     }
                 }
                 Phase::AwaitingResult => {
@@ -209,6 +209,7 @@ fn detail(
                     }
                 }
             }
+            @if !picks.is_empty() { (picks_header(phase)) }
             @for station in &stations {
                 @let station_picks: Vec<&PickView> = picks.iter().filter(|view| view.pick.station_id == *station).collect();
                 section class="picks-station" {
@@ -222,6 +223,26 @@ fn detail(
                         @if live { (live_pick_row(view.pick)) } @else { (pick_row(view.pick)) }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// What each column of the pick rows is, once above them: the reading picked on, the pick and
+/// what it needs, the reading and the points. Before the window there is neither of the last two.
+fn picks_header(phase: Phase) -> Markup {
+    let observed = match phase {
+        Phase::Upcoming => None,
+        Phase::Live => Some("So far"),
+        _ => Some("Observed"),
+    };
+    html! {
+        div class="scored-pick picks-header" aria-hidden="true" {
+            span { "Reading" }
+            span { "Pick" }
+            @if let Some(observed) = observed {
+                span class="pick-reading" { (observed) }
+                span class="pick-result" { "Points" }
             }
         }
     }
@@ -421,6 +442,70 @@ mod tests {
         );
         assert!(!html.contains(">Final<"));
         assert!(!html.contains("hx-trigger"));
+    }
+
+    /// The status fits its column: short, with the reason in its tip.
+    #[test]
+    fn the_awaiting_status_is_short_and_explains_itself_on_tap() {
+        let picks = [pick(
+            Metric::TempHigh,
+            ValueOptions::Over,
+            83.0,
+            Some(83.0),
+            PickState::AwaitingResult,
+        )];
+        let html =
+            picks_detail("e1", &views(&picks), Phase::AwaitingResult, None, NOW).into_string();
+        assert!(html.contains(r#"<span class="pick-state is-awaiting" tabindex="0" data-tip="The window has closed; the oracle"#));
+        assert!(html.contains(">Awaiting oracle</span>"));
+        assert!(
+            !html.contains("Awaiting the oracle&#39;s result")
+                && !html.contains("Awaiting the oracle's result")
+        );
+        // The picks dialog's "Window closed" tip still grows rightwards from the line's start.
+        assert!(html.contains(r#"Window closed<span class="tip tip-start""#));
+    }
+
+    /// Which value is the pick and which the reading: named once, above every station's rows.
+    #[test]
+    fn one_header_names_the_columns() {
+        let picks = [
+            pick(
+                Metric::TempHigh,
+                ValueOptions::Over,
+                83.0,
+                Some(83.0),
+                PickState::Final,
+            ),
+            PickProgress {
+                station_id: "KMIA".into(),
+                ..pick(
+                    Metric::TempLow,
+                    ValueOptions::Under,
+                    75.4,
+                    Some(72.0),
+                    PickState::Final,
+                )
+            },
+        ];
+        let header = r#"<div class="scored-pick picks-header" aria-hidden="true"><span>Reading</span><span>Pick</span><span class="pick-reading">Observed</span><span class="pick-result">Points</span></div>"#;
+        let html = picks_detail("e1", &views(&picks), Phase::Scored, None, NOW).into_string();
+        assert_eq!(html.matches(header).count(), 1, "{html}");
+        assert!(
+            html.find(header) < html.find("picks-station"),
+            "above the rows"
+        );
+        assert_eq!(html.matches("picks-station-name").count(), 2);
+
+        let live = picks_detail("e1", &views(&picks), Phase::Live, None, NOW).into_string();
+        assert!(live.contains(r#"<span class="pick-reading">So far</span>"#));
+        // Before the window there is only the pick to name.
+        let own = own_picks_detail("e1", &views(&picks), NOW).into_string();
+        assert!(own.contains("<span>Reading</span><span>Pick</span></div>"));
+        assert!(!own.contains(">Observed<") && !own.contains(">Points<"));
+        // No picks, no header.
+        let none = picks_detail("e1", &[], Phase::Scored, None, NOW).into_string();
+        assert!(!none.contains("picks-header"));
     }
 
     #[test]

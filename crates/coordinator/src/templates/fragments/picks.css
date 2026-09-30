@@ -34,10 +34,11 @@
   margin-bottom: 0.35rem;
 }
 
-/* One line per pick: High · Under < 69.4°F · 71°F · result. */
+/* One line per pick: High · Under < 69.4°F · 71°F · result. The result column fits its
+   status, which wraps rather than pushing the row wider than the dialog. */
 .scored-pick {
   display: grid;
-  grid-template-columns: 3.5rem minmax(0, 1fr) 4.5rem 5.5rem;
+  grid-template-columns: 3.5rem minmax(0, 1fr) 4.5rem minmax(4.5rem, max-content);
   gap: 0.5rem;
   align-items: center;
   padding: 0.35rem 0.5rem;
@@ -47,6 +48,22 @@
 
 .scored-pick + .scored-pick {
   margin-top: 0.2rem;
+}
+
+/* What each column is, once above the rows. */
+.picks-header {
+  padding-top: 0;
+  padding-bottom: 0;
+  margin-bottom: 0.5rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--bulma-text-weak);
+}
+
+.picks-header .pick-result {
+  color: inherit;
 }
 
 .scored-pick.is-hit {
@@ -113,7 +130,8 @@
   border-radius: 999px;
   font-size: 0.75rem;
   font-weight: 600;
-  white-space: nowrap;
+  line-height: 1.3;
+  text-align: center;
 }
 
 .pick-state.is-locked-in {
@@ -142,7 +160,12 @@
 
 @media screen and (max-width: 600px) {
   .picks-detail .scored-pick {
-    grid-template-columns: 2.75rem minmax(0, 1fr) auto auto;
+    grid-template-columns: 2.75rem minmax(0, 1fr) auto minmax(3.5rem, max-content);
     font-size: 0.85rem;
   }
+}
+
+/* The dialog never scrolls sideways: rows fit it, and a "?" bubble stays inside. */
+#entryScore .modal-content {
+  overflow-x: hidden;
 }

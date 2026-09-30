@@ -1,5 +1,19 @@
 /* Anything with data-tip shows it on hover and on focus (a tap on phones); a "?" (.tip)
    beside a term is the usual holder. */
+
+/* The bubble is the page's opposite. Bulma's dark theme keeps --bulma-scheme-invert dark, so
+   the bubble has its own colours: 15.0:1 in the light theme, 15.5:1 in the dark. */
+:root,
+[data-theme="light"] {
+  --tip-bg: #26262e;
+  --tip-text: #ffffff;
+}
+
+[data-theme="dark"] {
+  --tip-bg: #ececf2;
+  --tip-text: #14141f;
+}
+
 [data-tip] {
   position: relative;
   cursor: help;
@@ -37,23 +51,22 @@
   max-width: min(16rem, calc(100vw - 2rem));
   padding: 0.4rem 0.6rem;
   border-radius: 6px;
-  background: var(--bulma-scheme-invert);
-  color: var(--bulma-scheme-main);
+  background: var(--tip-bg);
+  color: var(--tip-text);
   font-size: 0.8rem;
   font-weight: 400;
   line-height: 1.35;
   text-align: left;
   white-space: normal;
   transform: translateX(-50%);
-  opacity: 0;
-  visibility: hidden;
+  /* Not laid out until shown, so a hidden bubble never widens a dialog. */
+  display: none;
   pointer-events: none;
 }
 
 [data-tip]:hover::after,
 [data-tip]:focus::after {
-  opacity: 1;
-  visibility: visible;
+  display: block;
 }
 
 /* Near a right edge (a pick's status), the bubble grows leftwards. */
