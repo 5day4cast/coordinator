@@ -151,7 +151,7 @@ async fn only_the_signed_in_owner_gets_their_ledger() {
     // all in; the payout settled.
     let (status, caching, body) = get(&coordinator, "/entries", true, Some(&owner)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(caching, "private, no-store");
+    assert_eq!(caching, "private, no-store, no-transform");
     assert!(body.contains(r#"id="ledgerSummary""#));
     assert!(body.contains("Paid <strong>6,340 sats</strong> across 1 entry"));
     assert!(body.contains("Received <strong>9,000 sats</strong> (won 9,000 sats"));
