@@ -942,13 +942,17 @@ pub struct CoordinatorSettings {
     /// A reasonable number of blocks within which a transaction can confirm.
     /// Used for enforcing relative locktime timeout spending conditions.
     /// We keep this the same for all competitions so it is a known behavior to the users/players
-    /// Default is 144 blocks or about 24 hours on mainnet
+    /// Default is 432 blocks or about 72 hours on mainnet
     /// Reasonable values are:
     ///
     /// - `72`:  ~12 hours
     /// - `144`: ~24 hours
     /// - `432`: ~72 hours
     /// - `1008`: ~1 week
+    ///
+    /// It is also the window for paying winners over Lightning: a payout HTLC must expire
+    /// inside it, and each hop of the route claims about 80 blocks of that, so 144 only
+    /// reaches winners one hop away while 432 reaches most of the network.
     pub relative_locktime_block_delta: u16,
 
     /// The number of confirmations required for a transaction to be considered confirmed
@@ -1035,7 +1039,7 @@ impl Default for CoordinatorSettings {
             name: String::from("coordinator"),
             oracle_url: String::from("http://127.0.0.1:9800"),
             private_key_file: String::from("./creds/coordinator_private_key.pem"),
-            relative_locktime_block_delta: 144,
+            relative_locktime_block_delta: 432,
             required_confirmations: 1,
             sync_interval_secs: 15,
             sweep_interval_secs: default_sweep_interval_secs(),

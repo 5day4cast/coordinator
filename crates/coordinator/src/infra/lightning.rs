@@ -27,7 +27,13 @@ use crate::{domain::PaymentStatus, LnSettings};
 /// the participant's earliest relative-locktime spend. This is a safety margin,
 /// not an atomic guarantee across chain reads and LND accepting the request.
 pub const PAYOUT_SETTLEMENT_MARGIN_BLOCKS: u32 = 12;
-pub const MAX_PAYOUT_CLTV_DELTA: u32 = 144;
+/// The most blocks a payout HTLC may lock, however long the contract's window is.
+///
+/// Every hop on a route adds its own CLTV delta, 80 blocks on a default LND node, on top of the
+/// invoice's final CLTV. So this bounds how many hops a payout can cross: 144 fits a single hop,
+/// 432 fits a few, and the contract's `relative_locktime_block_delta` must be at least as long,
+/// since the limit is also cut to what remains of that window.
+pub const MAX_PAYOUT_CLTV_DELTA: u32 = 432;
 const LND_FINAL_CLTV_PADDING: u32 = 3;
 
 #[derive(Debug, Clone, Copy)]
