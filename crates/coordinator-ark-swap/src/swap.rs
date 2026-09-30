@@ -54,6 +54,8 @@ pub struct Swapper {
     /// Held while claiming a refund's swap. The API and the worker both claim, so each goes in
     /// turn, and the second finds the refund claimed rather than sending the same claim again.
     pub claims: tokio::sync::Mutex<()>,
+    /// The last refund `refund_tick` reached, so the next pass carries on after it.
+    pub refund_turn: std::sync::Mutex<Option<Uuid>>,
 }
 
 /// The last error logged for each swap.
