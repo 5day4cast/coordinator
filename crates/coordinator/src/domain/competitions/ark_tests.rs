@@ -1231,6 +1231,95 @@ async fn a_cancelled_arkade_competition_refunds_each_funded_escrow_once() {
     f.database.close().await.unwrap();
 }
 
+/// 2026-09-30: the Arkade server failed every batch, then every boarding, for hours. A ticket
+/// sold then is paid into an escrow that can neither kick off nor be refunded, so while the
+/// server is failing no new ticket is issued; one already invoiced goes on. A refund the server
+/// takes lifts the pause.
+#[tokio::test]
+async fn no_ticket_is_issued_while_the_arkade_server_is_failing() {
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let entered = f.funded(&session, 21, true).await;
+    let id = Uuid::now_v7();
+    let competition_id = f.competition_id.to_string();
+    f.database
+        .execute_write(move |pool| async move {
+            sqlx::query(
+                "INSERT INTO tickets (id, event_id, encrypted_preimage, hash, reserved_at,
+                    reserved_by)
+                 VALUES (?, ?, ?, ?, datetime('now'), 'player')",
+            )
+            .bind(id.to_string())
+            .bind(competition_id)
+            .bind(hex::encode([40; 32]))
+            .bind(hex::encode([41; 32]))
+            .execute(&pool)
+            .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let competition = f.store().get_competition(f.competition_id).await.unwrap();
+    let fresh = f.store().get_ticket(id).await.unwrap();
+    let invoiced = f.store().get_ticket(entered.id).await.unwrap();
+    assert!(fresh.payment_request.is_none());
+
+    f.coordinator.arkade_health().failed(
+        "INTERNAL_ERROR (0): failed to rescan boarding utxos: HTTP 500",
+        OffsetDateTime::now_utc(),
+    );
+    assert!(f.coordinator.arkade_unavailable());
+    assert!(
+        f.coordinator
+            .network_fee_quote()
+            .await
+            .unwrap()
+            .arkade_unavailable
+    );
+    let refused = f
+        .coordinator
+        .ticket_network_fee(&competition, &fresh)
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, Error::ArkadeUnavailable), "{refused}");
+    assert_eq!(
+        refused.to_string(),
+        "Entries are paused while the Arkade network recovers; try again in a little while"
+    );
+    f.coordinator
+        .ticket_network_fee(&competition, &invoiced)
+        .await
+        .expect("a ticket already invoiced goes on");
+
+    // The refund of a cancelled competition's escrow goes through, so the server is working.
+    // The unpaid ticket is let go first: refunds wait while a ticket can still be paid.
+    f.database
+        .execute_write(move |pool| async move {
+            sqlx::query("DELETE FROM tickets WHERE id = ?")
+                .bind(id.to_string())
+                .execute(&pool)
+                .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    f.cancel().await;
+    f.clean_up().await;
+    assert_eq!(
+        f.refund(&entered).await.unwrap().state,
+        ArkRefundState::Settled
+    );
+    assert!(!f.coordinator.arkade_unavailable());
+    assert!(
+        !f.coordinator
+            .network_fee_quote()
+            .await
+            .unwrap()
+            .arkade_unavailable
+    );
+    f.database.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_paid_ticket_never_entered_is_refunded_with_the_registration_sent_before_paying() {
     let f = Fixture::new().await;

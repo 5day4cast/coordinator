@@ -355,6 +355,8 @@ An Arkade competition moves through the existing lifecycle with these difference
    The coordinator stores the batch's commitment transaction, then moves the competition straight to `FundingBroadcasted`.
    A failed batch spends nothing and is retried on the next step, however often it fails, until the kickoff deadline: an hour after registration closes (`fee_wait_secs`, as a failed kickoff check waits), and never past the two hours a competition may wait for signatures.
    A batch that still fails then fails the competition with the Arkade server's error, and every entry is refunded.
+   While the Arkade server is failing batch steps (a kickoff, a recovery or a refund failing on the server's side, with nothing succeeding since), entries to Arkade competitions are paused: no new ticket is issued, since its escrow could neither kick off nor be refunded.
+   The next batch step that succeeds lifts the pause, and so does `arkade_outage_secs` (15 minutes by default) without a failure; `coordinator_arkade_unavailable` reads 1 meanwhile.
    If the process stops after the batch but before saving the competition, the next attempt finds the stored commitment and has Keymeld sign the contract again.
 4. **After funding.**
    Confirmation, attestation, and outcome transactions are unchanged; the commitment transaction is the funding transaction.

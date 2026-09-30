@@ -6,7 +6,7 @@ use maud::{html, Markup};
 
 use crate::domain::{
     leaderboard::{Metric, Rule},
-    PayoutTermsQuote, TicketStatus, ENTRIES_PAUSED,
+    PayoutTermsQuote, TicketStatus, ARKADE_UNAVAILABLE, ENTRIES_PAUSED,
 };
 use crate::templates::{
     components::{tip, tip_start},
@@ -55,6 +55,9 @@ pub enum NetworkFee {
     Estimate(u64),
     /// No ticket is issued while the fee is this high a share of the entry.
     Paused(u64),
+    /// No ticket for this Arkade competition is issued while the Arkade server is failing
+    /// batch steps.
+    ArkadeUnavailable(u64),
     /// No fee estimate, so no ticket either.
     Unavailable,
 }
@@ -62,7 +65,9 @@ pub enum NetworkFee {
 impl NetworkFee {
     fn sats(self) -> Option<u64> {
         match self {
-            NetworkFee::Estimate(fee) | NetworkFee::Paused(fee) => Some(fee),
+            NetworkFee::Estimate(fee)
+            | NetworkFee::Paused(fee)
+            | NetworkFee::ArkadeUnavailable(fee) => Some(fee),
             NetworkFee::Unavailable => None,
         }
     }
@@ -76,7 +81,14 @@ pub fn entry_form(
     destination: &PayoutDestination,
     network_fee: NetworkFee,
 ) -> Markup {
-    let paused = matches!(network_fee, NetworkFee::Paused(_));
+    // Why no ticket is issued now, in the one sentence the player sees.
+    let paused = match network_fee {
+        NetworkFee::Paused(_) => Some(format!(
+            "{ENTRIES_PAUSED}. Entries already taken are unaffected; check back later."
+        )),
+        NetworkFee::ArkadeUnavailable(_) => Some(format!("{ARKADE_UNAVAILABLE}.")),
+        NetworkFee::Estimate(_) | NetworkFee::Unavailable => None,
+    };
     let picks_allowed = competition.number_of_values_per_entry;
     let queue = competition.queue.queued();
     let pickable = match forecasts {
@@ -198,17 +210,15 @@ pub fn entry_form(
             }
 
             div class="entry-submit" {
-                @if paused {
-                    div id="entriesPaused" class="notification is-warning" {
-                        (ENTRIES_PAUSED) ". Entries already taken are unaffected; check back later."
-                    }
+                @if let Some(reason) = &paused {
+                    div id="entriesPaused" class="notification is-warning" { (reason) }
                 }
                 button type="button" id="submitEntry" class="button is-primary is-medium"
-                       disabled[paused] {
+                       disabled[paused.is_some()] {
                     @match (paused, network_fee.sats()) {
-                        (true, _) => { "Entries paused" }
-                        (false, Some(fee)) => { "Pay " (sats(competition.ticket_price + fee)) " and enter" }
-                        (false, None) => { "Pay and enter" }
+                        (Some(_), _) => { "Entries paused" }
+                        (None, Some(fee)) => { "Pay " (sats(competition.ticket_price + fee)) " and enter" }
+                        (None, None) => { "Pay and enter" }
                     }
                 }
                 div id="successMessage" class="notification is-success hidden" {
@@ -629,6 +639,27 @@ mod tests {
         )
         .into_string();
         assert!(html.contains(ENTRIES_PAUSED));
+        assert!(html.contains(r#"id="submitEntry" class="button is-primary is-medium" disabled"#));
+        assert!(html.contains("Entries paused"));
+        assert!(!html.contains("and enter"));
+    }
+
+    /// While the Arkade server is failing batch steps the form says so in one sentence, in place
+    /// of the fee pause, and cannot be submitted.
+    #[test]
+    fn entry_form_says_when_entries_wait_for_arkade() {
+        let html = entry_form(
+            &view("c1", Phase::Upcoming, 60),
+            &Forecasts::Pending(Pending::Loading),
+            Some(&terms(true)),
+            &PayoutDestination::LoggedOut,
+            NetworkFee::ArkadeUnavailable(50),
+        )
+        .into_string();
+        assert!(html.contains(
+            "Entries are paused while the Arkade network recovers; try again in a little while."
+        ));
+        assert!(!html.contains(ENTRIES_PAUSED));
         assert!(html.contains(r#"id="submitEntry" class="button is-primary is-medium" disabled"#));
         assert!(html.contains("Entries paused"));
         assert!(!html.contains("and enter"));

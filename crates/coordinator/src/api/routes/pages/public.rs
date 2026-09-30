@@ -601,7 +601,11 @@ pub async fn entry_form_fragment(
         .inspect_err(|error| warn!("payout terms for {competition_id}: {error}"))
         .ok();
     // Logged where the estimate failed; the form says it is unavailable.
+    let arkade = terms.as_ref().is_some_and(|terms| terms.arkade);
     let network_fee = match network_fee {
+        Ok(quote) if arkade && quote.arkade_unavailable => {
+            NetworkFee::ArkadeUnavailable(quote.network_fee_sats)
+        }
         Ok(quote) if quote.pauses(view.entry_fee) => NetworkFee::Paused(quote.network_fee_sats),
         Ok(quote) => NetworkFee::Estimate(quote.network_fee_sats),
         Err(_) => NetworkFee::Unavailable,

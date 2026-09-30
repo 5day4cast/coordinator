@@ -16,7 +16,8 @@ pub use ark_coordinator::SWAPS_UNAVAILABLE;
 pub use automatic::{InvoiceFallbackRequest, PayoutAuthorizationInfo, PayoutTermsQuote};
 pub use kickoff_check::{KickoffCheck, KickoffPool};
 pub use network_fee::{
-    network_fee_sats, NetworkFeeQuote, TicketPrice, ENTRIES_PAUSED, FEE_ESTIMATE_UNAVAILABLE,
+    network_fee_sats, NetworkFeeQuote, TicketPrice, ARKADE_UNAVAILABLE, ENTRIES_PAUSED,
+    FEE_ESTIMATE_UNAVAILABLE,
 };
 
 use super::{
@@ -255,6 +256,9 @@ pub struct Coordinator {
     /// `with_kickoff_check`.
     kickoff_check: crate::config::KickoffCheckSettings,
     ark: Option<Arc<super::Arkade>>,
+    /// Whether the Arkade server is failing batch steps, which pauses entries to Arkade
+    /// competitions.
+    pub(super) arkade_health: Arc<super::ArkadeHealth>,
     wakes: super::CompetitionWakes,
     worker_leases: Arc<super::WorkerLeases>,
     /// Lasting conditions already logged, so each is warned about once rather than every step.
@@ -321,6 +325,7 @@ impl Coordinator {
                 ..Default::default()
             },
             ark: None,
+            arkade_health: Arc::default(),
             wakes: super::CompetitionWakes::default(),
             worker_leases,
             reported: super::Reported::default(),

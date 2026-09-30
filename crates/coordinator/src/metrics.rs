@@ -24,7 +24,7 @@ use std::{
 use tokio::{sync::Mutex, task::JoinHandle};
 
 use crate::{
-    domain::{CompetitionStore, TicketStatus},
+    domain::{ArkadeHealth, CompetitionStore, TicketStatus},
     infra::lightning::PAYMENT_FAILURE_REASONS,
 };
 
@@ -112,6 +112,16 @@ pub static COMPETITION_STEP_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("valid metric")
 });
 
+/// Whether entries to Arkade competitions are paused because the Arkade server is failing
+/// batch steps (1) or not (0). Set where the pause is decided (`ArkadeHealth`).
+pub static ARKADE_UNAVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "coordinator_arkade_unavailable",
+        "Whether entries are paused because the Arkade server is failing batch steps",
+    )
+    .expect("valid metric")
+});
+
 /// Record a payout reaching its final result for the first time.
 pub fn record_payout_result(succeeded: bool) {
     PAYOUT_ATTEMPTS
@@ -130,6 +140,8 @@ pub struct Metrics {
     registry: Registry,
     store: Arc<CompetitionStore>,
     background_threads: Arc<HashMap<String, JoinHandle<()>>>,
+    /// Decided again at each scrape, so a pause that lapsed with nothing running reads 0.
+    arkade: Option<Arc<ArkadeHealth>>,
     last_refresh: Mutex<Option<Instant>>,
     competitions: IntGaugeVec,
     entries: IntGaugeVec,
@@ -200,6 +212,7 @@ impl Metrics {
             registry,
             store,
             background_threads,
+            arkade: None,
             last_refresh: Mutex::new(None),
         };
 
@@ -220,6 +233,9 @@ impl Metrics {
         metrics
             .registry
             .register(Box::new(COMPETITION_STEP_FAILURES.clone()))?;
+        metrics
+            .registry
+            .register(Box::new(ARKADE_UNAVAILABLE.clone()))?;
         // Show both results from the start, so a rate over them is defined.
         for result in ["succeeded", "failed"] {
             PAYOUT_ATTEMPTS.with_label_values(&[result]);
@@ -230,9 +246,17 @@ impl Metrics {
         Ok(metrics)
     }
 
+    pub fn with_arkade_health(mut self, arkade: Arc<ArkadeHealth>) -> Self {
+        self.arkade = Some(arkade);
+        self
+    }
+
     /// Render every metric in the Prometheus text format.
     pub async fn render(&self) -> String {
         self.refresh_threads();
+        if let Some(arkade) = &self.arkade {
+            arkade.unavailable(time::OffsetDateTime::now_utc());
+        }
         self.refresh_database().await;
         let mut buffer = Vec::new();
         if let Err(error) = TextEncoder::new().encode(&self.registry.gather(), &mut buffer) {
@@ -391,6 +415,7 @@ mod tests {
             "coordinator_payout_attempts_total",
             "coordinator_payout_send_failures_total",
             "coordinator_competition_step_failures_total",
+            "coordinator_arkade_unavailable",
             "coordinator_build_info",
         ] {
             assert!(

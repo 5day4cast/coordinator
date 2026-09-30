@@ -295,6 +295,10 @@ pub struct ArkSettings {
     /// Lightning Address. The player consents to this cap when entering.
     #[serde(default = "default_max_refund_fee_sats")]
     pub max_refund_fee_sats: u64,
+    /// How long after the Arkade server fails a batch step entries stay paused when nothing
+    /// succeeds after it. The next success lifts the pause sooner.
+    #[serde(default = "default_arkade_outage_secs")]
+    pub arkade_outage_secs: u64,
 }
 
 /// 45 minutes: a kickoff runs within minutes of the start, and a pool waits at most an hour for
@@ -315,6 +319,10 @@ fn default_escrow_expiry_margin_secs() -> u64 {
 
 fn default_max_refund_fee_sats() -> u64 {
     100
+}
+
+fn default_arkade_outage_secs() -> u64 {
+    crate::domain::DEFAULT_ARKADE_OUTAGE_SECS
 }
 
 impl ArkSettings {
