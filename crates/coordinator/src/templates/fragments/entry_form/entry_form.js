@@ -682,7 +682,7 @@ async function newEntry(form, picks) {
     throw new Error("The competition is missing its ticket price");
   }
   if (!("networkFee" in form.dataset) || !Number.isSafeInteger(shownPrice.networkFee)) {
-    throw new Error("The network fee estimate is unavailable right now; go back to the competitions list and open this competition again in a moment");
+    throw new Error("The entry fee is unavailable right now; go back to the competitions list and open this competition again in a moment");
   }
 
   const body = document.body;
@@ -755,7 +755,7 @@ function ticketTotalSats(ticket, shown) {
     throw new Error(TERMS_CHANGED);
   }
   if (fee > 2 * shown.networkFee) {
-    throw new Error(`The network fee rose to ${formatSats(fee)} since the form opened; go back to the competitions list and open this competition again to see the new price`);
+    throw new Error(`The entry fee rose to ${formatSats(total)} since the form opened; go back to the competitions list and open this competition again to see the new price`);
   }
   return total;
 }

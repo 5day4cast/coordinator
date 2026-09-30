@@ -66,6 +66,17 @@ mod tests {
         );
     }
 
+    /// On a touch screen a "?" takes a 44 px tap, sized outright: inset from the "?", its
+    /// border took 2 px off and left 42.
+    #[test]
+    fn a_tip_takes_a_44_px_tap_on_a_touch_screen() {
+        let touch = &CSS[CSS.find("@media (pointer: coarse)").unwrap()..];
+        let tap = rule(touch, ".tip::before");
+        assert_eq!(value(tap, "width"), "44px");
+        assert_eq!(value(tap, "height"), "44px");
+        assert_eq!(value(tap, "transform"), "translate(-50%, -50%)");
+    }
+
     /// A hidden bubble is not laid out, so wherever it would sit it never widens a page or a
     /// dialog; `visibility: hidden` once made a phone page 438 px wide.
     #[test]

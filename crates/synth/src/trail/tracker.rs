@@ -1194,6 +1194,7 @@ impl Tracker {
                         preimage: None,
                         fee_msat: None,
                         paid_by: None,
+                        written_off: refund.written_off,
                     };
                     if let Some(hash) = seen.payment_hash.clone() {
                         for node in &self.inner.nodes {
@@ -1358,7 +1359,7 @@ fn held(
 ) -> Option<Held> {
     match (&trail.money, previous) {
         (Money::Stuck { reason, since }, previous) => {
-            let (sats, nearest_expiry) = holding(trail, entries);
+            let (sats, nearest_expiry) = holding(trail, entries, now);
             Some(match previous.filter(|held| held.until.is_none()) {
                 // Keep when it was first held, but say why it is held now: refunds that went
                 // through since then change the reason ("1 of 2 escrows were refunded").
@@ -1398,6 +1399,7 @@ fn held(
                 Money::Unverified { reason } => {
                     format!("synth stopped following it: {reason}")
                 }
+                Money::WrittenOff { reason } => format!("written off: {reason}"),
                 other => format!("it moved on: {}", other.words()),
             }),
             ..held
@@ -1407,8 +1409,9 @@ fn held(
 }
 
 /// What stuck money amounts to, in sats, and the soonest one of its escrows expires or opens its
-/// refund leaf. Escrows hold it until the contract is funded; the contract holds it after.
-fn holding(trail: &Trail, entries: &[EntryTrace]) -> (u64, Option<i64>) {
+/// refund leaf after `now`. Escrows hold it until the contract is funded; the contract holds it
+/// after.
+fn holding(trail: &Trail, entries: &[EntryTrace], now: OffsetDateTime) -> (u64, Option<i64>) {
     let contracted = trail.competition.as_ref().is_some_and(super::contracted);
     if contracted {
         let states = super::payout_states(&trail.payouts, trail.ended());
@@ -1425,7 +1428,11 @@ fn holding(trail: &Trail, entries: &[EntryTrace]) -> (u64, Option<i64>) {
     let mut sats = 0;
     let mut nearest: Option<i64> = None;
     for entry in trail.paid_entries(entries) {
-        if trail.refund_of(entry).is_some_and(RefundSeen::is_settled) {
+        // A written-off refund is no longer owed: nothing holds it for anyone to move.
+        if trail
+            .refund_of(entry)
+            .is_some_and(|refund| refund.is_settled() || refund.written_off)
+        {
             continue;
         }
         let swap = trail.swap_of(entry);
@@ -1437,7 +1444,11 @@ fn holding(trail: &Trail, entries: &[EntryTrace]) -> (u64, Option<i64>) {
             swap.and_then(|swap| swap.vtxo.as_ref()?.expires_at),
             entry.escrow.map(|escrow| escrow.refund_at),
         ];
-        for at in expiries.into_iter().flatten() {
+        for at in expiries
+            .into_iter()
+            .flatten()
+            .filter(|at| *at > now.unix_timestamp())
+        {
             nearest = Some(nearest.map_or(at, |nearest| nearest.min(at)));
         }
     }
@@ -1988,6 +1999,7 @@ mod tests {
                 preimage: None,
                 fee_msat: None,
                 paid_by: None,
+                written_off: false,
             }],
             funding_tx: None,
             outcome_tx: None,

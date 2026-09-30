@@ -836,9 +836,22 @@ async fn cancelled_competitions_keep_cleanup_work_until_each_invoice_and_escrow_
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, f.ticket_id);
     }
+    // The pages count the paid tickets without an escrow: one held and released, one settled.
+    let lightning = || async {
+        bounded(f.store.lightning_refund_progress(&[f.event_id]))
+            .await
+            .unwrap()
+            .remove(&f.event_id)
+            .unwrap()
+    };
+    let before = lightning().await;
+    assert_eq!((before.held, before.released, before.settled), (2, 0, 1));
     assert!(bounded(f.store.mark_ticket_invoice_cancelled(f.ticket_id))
         .await
         .unwrap());
+    let after = lightning().await;
+    assert_eq!((after.held, after.released, after.settled), (2, 1, 1));
+    assert_eq!(after.paid(), 2);
     assert!(bounded(f.store.get_competitions_pending_cleanup(false))
         .await
         .unwrap()
@@ -928,6 +941,7 @@ async fn a_refund_records_each_step_before_taking_it() {
         error: None,
         created_at: 1_790_000_000,
         updated_at: 1_790_000_000,
+        recovery_remints: 0,
     };
     bounded(fixture.store.store_ticket_ark_refund(refund.clone()))
         .await

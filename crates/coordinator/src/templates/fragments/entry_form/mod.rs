@@ -857,4 +857,26 @@ mod tests {
         // The "?" is no longer what the tap area hangs from, so it is 44 px itself.
         assert!(CSS.contains("  .entry-facts .tip {\n    width: 44px;\n    height: 44px;"));
     }
+
+    /// A fact's 44 px "?" takes its own room above, below and after it: hanging into the next
+    /// fact, that fact covered 13 px of it. The total that opens the price's parts is a 44 px
+    /// tall tap too.
+    #[test]
+    fn the_facts_taps_are_44_px_and_not_covered() {
+        use crate::templates::css_check::{rule, value};
+        let touch = &CSS[CSS
+            .find("@media screen and (max-width: 768px) and (pointer: coarse)")
+            .unwrap()..];
+        let tip = rule(touch, ".entry-facts .tip");
+        assert_eq!(value(tip, "margin"), "0");
+        assert_eq!(
+            value(tip, "margin-left"),
+            "calc(0.3rem + (1.05rem - 44px) / 2)"
+        );
+        let coarse = &CSS[CSS.find("@media (pointer: coarse)").unwrap()..];
+        assert_eq!(
+            value(rule(coarse, ".price-details summary"), "min-height"),
+            "44px"
+        );
+    }
 }

@@ -768,6 +768,7 @@ fn run_section(
             @match money {
                 Some("stuck") => p.note { "Its steps passed, but its money is stuck: see where it is held below." },
                 Some("unverified" | "timed_out") => p.note { "Its steps passed, but synth stopped following its money before it could confirm where it went: see below." },
+                Some("written_off") => p.note { "Its steps passed, but an operator wrote off refunds that could not finish: see below." },
                 Some("following") => p.note { "Its steps passed. Its competition is still running or paying out; synth follows the money until the payouts or refunds are confirmed." },
                 _ => {},
             }
@@ -1585,6 +1586,7 @@ mod tests {
             preimage: None,
             fee_msat: None,
             paid_by: None,
+            written_off: false,
         });
         let boxes = flow(
             &entries,

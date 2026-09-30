@@ -410,7 +410,8 @@ pub fn outcome(run: &TestRun) -> Option<Outcome> {
         "passed" => match (run.competition_id.as_deref(), run.money.as_deref()) {
             (None, _) => Some(Outcome::Passed),
             (_, Some("paid_out" | "refunded" | "nothing_paid")) => Some(Outcome::Passed),
-            (_, Some("unverified")) => Some(Outcome::Unverified),
+            // Written off by an operator: not stuck any more, and not where it should be either.
+            (_, Some("unverified" | "written_off")) => Some(Outcome::Unverified),
             _ => None,
         },
         _ => Some(Outcome::Failed(

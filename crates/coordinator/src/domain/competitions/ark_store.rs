@@ -33,6 +33,16 @@ pub struct RefundProgress {
     /// Funded escrows an operator wrote off: no longer owed, so not in `escrowed`.
     #[serde(default)]
     pub written_off: u64,
+    /// Paid tickets without a funded escrow, whose held Lightning payment is the entry fee to
+    /// return. Only the pages ask for these.
+    #[serde(default)]
+    pub held: u64,
+    /// Of `held`, those whose invoice was cancelled, so the payment went back to its payer.
+    #[serde(default)]
+    pub released: u64,
+    /// Of `held`, those whose invoice was settled: the fee was taken and can't be released.
+    #[serde(default)]
+    pub settled: u64,
     /// When the first escrow not refunded yet can be: its refund locktime. Nothing can be
     /// refunded before. Only the pages ask for it.
     #[serde(
@@ -41,6 +51,13 @@ pub struct RefundProgress {
         with = "time::serde::rfc3339::option"
     )]
     pub opens_at: Option<OffsetDateTime>,
+}
+
+impl RefundProgress {
+    /// Every paid entry fee counted here: escrowed, written off, or held by Lightning.
+    pub fn paid(&self) -> u64 {
+        self.escrowed + self.written_off + self.held
+    }
 }
 
 /// Where a funded escrow's refund has got to.
@@ -147,6 +164,8 @@ pub struct TicketArkRefund {
     pub error: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// How many times in a row it was minted again while its escrow's recovery kept failing.
+    pub recovery_remints: u32,
 }
 
 /// A swap still waiting to fund a reserved ticket's escrow.
@@ -182,6 +201,7 @@ fn refund_row(row: &sqlx::sqlite::SqliteRow) -> Result<TicketArkRefund, sqlx::Er
         error: row.try_get("error")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+        recovery_remints: row.try_get::<i64, _>("recovery_remints")? as u32,
     })
 }
 
@@ -457,7 +477,47 @@ impl CompetitionStore {
                         escrowed: row.try_get::<i64, _>("escrowed")? as u64,
                         refunded: row.try_get::<i64, _>("refunded")? as u64,
                         written_off: row.try_get::<i64, _>("written_off")? as u64,
-                        opens_at: None,
+                        ..Default::default()
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Each competition's paid tickets that have no funded escrow, so their entry fee is a held
+    /// Lightning payment: how many there are, how many were released by cancelling their
+    /// invoice, and how many were settled instead. Competitions without any are left out.
+    pub async fn lightning_refund_progress(
+        &self,
+        event_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, RefundProgress>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT t.event_id AS event_id,
+                    COUNT(*) AS held,
+                    SUM(CASE WHEN t.invoice_cancelled_at IS NOT NULL THEN 1 ELSE 0 END)
+                        AS released,
+                    SUM(CASE WHEN t.settled_at IS NOT NULL THEN 1 ELSE 0 END) AS settled
+             FROM tickets t
+             WHERE t.paid_at IS NOT NULL
+               AND t.event_id IN (SELECT value FROM json_each(?1))
+               AND NOT EXISTS (SELECT 1 FROM ticket_ark_escrows e
+                               WHERE e.ticket_id = t.id AND e.funded_at IS NOT NULL)
+             GROUP BY t.event_id",
+        )
+        .bind(id_list(event_ids))
+        .fetch_all(self.db_connection.read())
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let id: String = row.try_get("event_id")?;
+                let id = Uuid::parse_str(&id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+                Ok((
+                    id,
+                    RefundProgress {
+                        held: row.try_get::<i64, _>("held")? as u64,
+                        released: row.try_get::<i64, _>("released")? as u64,
+                        settled: row.try_get::<i64, _>("settled")? as u64,
+                        ..Default::default()
                     },
                 ))
             })
@@ -536,6 +596,23 @@ impl CompetitionStore {
         row.as_ref().map(refund_row).transpose()
     }
 
+    /// When the refund of the escrow of ticket `ticket_id` with `ticket_hash` was written off,
+    /// in UNIX seconds; None if it wasn't.
+    pub async fn ticket_ark_refund_written_off(
+        &self,
+        ticket_id: Uuid,
+        ticket_hash: &str,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT written_off_at FROM ticket_ark_refund_write_offs
+             WHERE ticket_id = ? AND ticket_hash = ?",
+        )
+        .bind(ticket_id.to_string())
+        .bind(ticket_hash)
+        .fetch_optional(self.db_connection.read())
+        .await
+    }
+
     /// Record a refund's swap, before anything is signed or paid.
     pub async fn store_ticket_ark_refund(
         &self,
@@ -582,7 +659,7 @@ impl CompetitionStore {
                 let replaced = sqlx::query(
                     "UPDATE ticket_ark_refunds SET refund_id = ?, invoice = ?, payment_hash = ?,
                         fee_sats = ?, state = ?, ark_txid = NULL, checkpoint_psbt = NULL,
-                        error = NULL, created_at = ?, updated_at = ?
+                        error = NULL, created_at = ?, updated_at = ?, recovery_remints = ?
                      WHERE ticket_id = ? AND refund_id = ? AND state = 'minted'",
                 )
                 .bind(refund.refund_id.to_string())
@@ -592,6 +669,7 @@ impl CompetitionStore {
                 .bind(refund.state.as_str())
                 .bind(refund.created_at)
                 .bind(refund.updated_at)
+                .bind(i64::from(refund.recovery_remints))
                 .bind(refund.ticket_id.to_string())
                 .bind(stale_refund_id.to_string())
                 .execute(&pool)

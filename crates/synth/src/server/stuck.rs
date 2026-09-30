@@ -38,7 +38,7 @@ pub fn block(run: &Run, now: OffsetDateTime) -> Option<Markup> {
                     ". Then " (then) "."
                 } @else {
                     ", " (format::span_between(held.since, now)) " so far."
-                    @if let Some(at) = held.nearest_expiry.and_then(unix) {
+                    @if let Some(at) = held.nearest_expiry.and_then(unix).filter(|at| *at > now) {
                         " Nearest expiry or refund opening: " (format::time(at, now)) "."
                     }
                     " Synth only watches it; it never moves or refunds money."
@@ -51,7 +51,7 @@ pub fn block(run: &Run, now: OffsetDateTime) -> Option<Markup> {
                 (contract_facts(trail, run.links))
             } @else {
                 @for entry in trail.paid_entries(run.entries) {
-                    @if !trail.refund_of(entry).is_some_and(|refund| refund.is_settled()) {
+                    @if !trail.refund_of(entry).is_some_and(|refund| refund.is_settled() || refund.written_off) {
                         (escrow_facts(trail, entry, run.links, now))
                     }
                 }

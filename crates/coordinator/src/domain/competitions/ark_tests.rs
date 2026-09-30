@@ -2156,6 +2156,71 @@ async fn a_recovery_that_fails_waits_before_it_is_tried_or_minted_again() {
     f.database.close().await.unwrap();
 }
 
+/// Production, 2026-09-29: Arkade failed every batch ("failed to estimate fee") for a day, and
+/// each stale refund was minted again every six hours, each time asking the player's provider
+/// for an invoice. A fresh swap does not help a batch Arkade cannot make, so while recoveries
+/// keep failing each remint waits twice as long as the last, up to a day.
+#[tokio::test]
+async fn a_recovery_that_keeps_failing_is_minted_again_less_and_less_often() {
+    let hour = 3_600;
+    assert_eq!(
+        [0, 1, 2, 3, 9].map(
+            |remints| super::ark_refund::recovery_remint_interval(remints).as_secs() / hour as u64
+        ),
+        [6, 12, 24, 24, 24]
+    );
+
+    let f = Fixture::new().await;
+    let session = f.keymeld_session().await;
+    let ticket = f.funded(&session, 21, true).await;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    f.arkade_expires(outpoint(21, 0), now - hour, true);
+    f.enclaves.refuse_recoveries.store(true, Ordering::SeqCst);
+    f.cancel().await;
+    f.clean_up().await;
+    assert_eq!(f.refund(&ticket).await.unwrap().recovery_remints, 0);
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 1);
+
+    for (remints, hours) in [(1, 6), (2, 12), (3, 24), (4, 24)] {
+        // Past the pause after the last failure, with the swap stale (two hours older).
+        f.refund_clock(&ticket, "updated_at", hour).await;
+        f.refund_goes_stale(&ticket).await;
+        f.refund_clock(&ticket, "created_at", (hours - 3) * hour)
+            .await;
+        f.clean_up().await;
+        assert_eq!(
+            f.swaps.minted.load(Ordering::SeqCst),
+            remints,
+            "not minted again within {hours} hours"
+        );
+        f.refund_clock(&ticket, "created_at", hour).await;
+        f.clean_up().await;
+        assert_eq!(f.swaps.minted.load(Ordering::SeqCst), remints + 1);
+        let refund = f.refund(&ticket).await.unwrap();
+        assert_eq!(refund.recovery_remints, remints as u32);
+        assert!(failed_again(&refund), "{:?}", refund.error);
+    }
+    assert_eq!(f.ln.payments_sent(), 0);
+
+    // Once Arkade makes the batch, the refund goes through with the swap it has.
+    f.enclaves.refuse_recoveries.store(false, Ordering::SeqCst);
+    f.refund_clock(&ticket, "updated_at", hour).await;
+    f.clean_up().await;
+    assert_eq!(
+        f.refund(&ticket).await.unwrap().state,
+        ArkRefundState::Settled
+    );
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 5);
+    f.database.close().await.unwrap();
+}
+
+/// Whether the refund notes a recovery that failed.
+fn failed_again(refund: &TicketArkRefund) -> bool {
+    refund.error.as_deref().is_some_and(|note| {
+        note.starts_with(super::ark_refund::HELD_EXPIRED) && note.contains("tried again")
+    })
+}
+
 /// A batch that recovered the escrow can finish after the coordinator stopped following it, as
 /// across a restart. The refund then finds its swap funded, and goes on from there.
 #[tokio::test]
@@ -2298,6 +2363,17 @@ async fn a_written_off_refund_is_skipped_by_cleanup_without_a_log_line() {
     assert_eq!(written.vtxo_sats, Some(PRICE));
     assert_eq!(written.reason, "the player never sent a registration");
     assert_eq!(written.refund_state, None, "no refund was ever minted");
+    // The player's refund says it was written off, though none was minted.
+    let told = f
+        .coordinator
+        .get_ticket_refund("player".into(), f.competition_id, ticket.id)
+        .await
+        .unwrap()
+        .expect("a written-off refund is reported");
+    assert!(told.written_off);
+    assert_eq!((told.state.as_str(), told.paid_sats), ("written_off", 0));
+    let json = serde_json::to_value(&told).unwrap();
+    assert!(json.get("payment_hash").is_none(), "{json}");
 
     f.coordinator.refund_ark_escrows(f.competition_id).await;
     f.clean_up().await;
@@ -2416,6 +2492,20 @@ async fn a_refund_in_progress_is_written_off_only_with_force() {
 
     let forced = f.write_off(&paid, true).await.unwrap();
     assert_eq!(forced.written_off[0].refund_state.as_deref(), Some("paid"));
+    let told = f
+        .coordinator
+        .get_ticket_refund("player".into(), f.competition_id, paid.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((told.state.as_str(), told.written_off), ("paid", true));
+    let other = f
+        .coordinator
+        .get_ticket_refund("player".into(), f.competition_id, stuck.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(other.written_off);
     f.clean_up().await;
     assert_eq!(
         f.refund(&paid).await.unwrap().state,
