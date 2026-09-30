@@ -216,8 +216,8 @@ help-video:
         curl -fsSL -o "$music" "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Local%20Forecast.mp3"
         echo "c0b120cb91a62468f5024162c8942dd2310696c076b6a1df2b88892350575b87  $music" | sha256sum -c --quiet
     fi
-    # The music sits well under the picture (80 kb/s keeps the phone's minute under 1 MB) and
-    # fades out over the last 3 s. The video is re-encoded to limited-range yuv420p (Chrome's
+    # The music sits well under the picture, in mono at 40 kb/s (the picture itself is under
+    # 60 kb/s, so the sound was most of the file), and fades out over the last 3 s. The video is re-encoded to limited-range yuv420p (Chrome's
     # frames are full-range JPEGs, and Safari can refuse full-range yuvj420p) with the index up
     # front, so it starts playing before it has all loaded. Both cuts get the same treatment.
     static=crates/coordinator/src/templates/static
@@ -227,7 +227,7 @@ help-video:
         ffmpeg -y -v error -i "$clip" -i "$music" -map 0:v:0 -map 1:a:0 \
             -vf "scale=in_range=pc:out_range=tv,format=yuv420p" -color_range tv \
             -c:v libx264 -preset slow -crf 31 -pix_fmt yuv420p \
-            -af "volume=0.35,afade=t=out:st=$(awk -v l="$length" 'BEGIN { print l - 3 }'):d=3" -c:a aac -b:a 80k \
+            -af "volume=0.35,afade=t=out:st=$(awk -v l="$length" 'BEGIN { print l - 3 }'):d=3" -ac 1 -c:a aac -b:a 40k \
             -shortest -movflags +faststart "$static/$name.mp4"
         ffmpeg -y -v error -ss 1.2 -i "$static/$name.mp4" -frames:v 1 -q:v 6 "$static/$name.jpg"
     done
