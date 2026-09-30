@@ -1690,7 +1690,7 @@ impl KeymeldService {
             })
             .await?;
             driver = self
-                .connect(session, &state, &credentials, &mut journal, saver)
+                .connect(session, state, credentials, &mut journal, saver)
                 .await?;
         }
         let encrypted = driver
