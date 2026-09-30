@@ -139,7 +139,7 @@ async fn only_the_signed_in_owner_gets_their_ledger() {
     ] {
         let (answered, caching, body) = get(&coordinator, path, htmx, None).await;
         assert_eq!(answered, status, "{path}");
-        assert_eq!(caching, "private, no-store", "{path}");
+        assert_eq!(caching, "private, no-store, no-transform", "{path}");
         assert!(body.contains("Log in to see your entries"), "{path}");
         assert!(
             !body.contains("ledgerSummary") && !body.contains(short),
