@@ -190,8 +190,8 @@ pub fn help_page() -> Markup {
                         }
                     }
                     p {
-                        "For example, an entry fee of 5,680 sats is 5,000 sats pot contribution + 500 sats "
-                        "service fee (10%) + 180 sats network fee. Every entrant pays the same entry fee, so "
+                        "For example, an entry fee of 5,330 sats is 5,000 sats pot contribution + 150 sats "
+                        "service fee (3%) + 180 sats network fee. Every entrant pays the same entry fee, so "
                         "five entrants make a 25,000-sat pot."
                     }
                     h3 { "The network underneath" }
