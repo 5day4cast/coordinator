@@ -1,11 +1,12 @@
-// Records the help page's "How it works" video: a phone-sized walk through the player pages,
+// Records the help page's "How it works" video: a walk through the player pages, filmed on a
+// phone (the default) or on a desktop screen (`--viewport desktop`),
 // with a ring and a caption on each thing as it comes up. It plays the pages
 // `player_ui_fixtures` exports (the real templates with sample data), served from a local
 // directory, so it needs no running coordinator. Frames come from Chrome's screencast at the
 // phone's pixel density (Playwright's own recorder films at CSS pixels), and ffmpeg makes the
 // MP4 the help page plays. `just help-video` runs it.
 //
-//   node video/how-it-works.cjs <fixtures-dir> <out.mp4>
+//   node video/how-it-works.cjs [--viewport phone|desktop] <fixtures-dir> <out.mp4>
 const { chromium } = require("@playwright/test");
 const { createServer } = require("node:http");
 const { readFile, writeFile, mkdtemp, rm } = require("node:fs/promises");
@@ -13,16 +14,25 @@ const { execFileSync } = require("node:child_process");
 const path = require("node:path");
 const os = require("node:os");
 
-const [fixtures, output] = process.argv.slice(2);
-if (!fixtures || !output) {
-  console.error("usage: node video/how-it-works.cjs <fixtures-dir> <out.mp4>");
+// Each screen the video is filmed on: its CSS viewport, pixel density, the width the MP4 is
+// encoded at, and what a user does to a button there.
+const PRESETS = {
+  // Sharp on a phone, a few hundred kilobytes for a minute.
+  phone: { viewport: { width: 390, height: 844 }, scale: 2, videoWidth: 540, tap: "Tap" },
+  // Landscape, shown in the help page's column on wider screens.
+  desktop: { viewport: { width: 1280, height: 800 }, scale: 1, videoWidth: 960, tap: "Click" },
+};
+
+const args = process.argv.slice(2);
+let preset = "phone";
+const flag = args.indexOf("--viewport");
+if (flag !== -1) [, preset] = args.splice(flag, 2);
+const [fixtures, output] = args;
+if (!fixtures || !output || !PRESETS[preset]) {
+  console.error("usage: node video/how-it-works.cjs [--viewport phone|desktop] <fixtures-dir> <out.mp4>");
   process.exit(2);
 }
-
-const VIEWPORT = { width: 390, height: 844 };
-const SCALE = 2;
-// The width the MP4 is encoded at: sharp on a phone, a few hundred kilobytes for a minute.
-const VIDEO_WIDTH = 540;
+const { viewport: VIEWPORT, scale: SCALE, videoWidth: VIDEO_WIDTH, tap: TAP } = PRESETS[preset];
 
 const TYPES = { ".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml" };
 
@@ -54,6 +64,10 @@ const OVERLAY_CSS = `
     width: 14px; height: 14px; background: #111827; transform: translateX(-50%) rotate(45deg); }
   .hiw-bubble.is-below::before { top: -6px; }
   .hiw-bubble.is-above::before { bottom: -6px; }
+  .hiw-bubble.is-right::before, .hiw-bubble.is-left::before { top: var(--arrow-y, 50%);
+    left: auto; transform: translateY(-50%) rotate(45deg); }
+  .hiw-bubble.is-right::before { left: -6px; }
+  .hiw-bubble.is-left::before { right: -6px; }
   .hiw-bubble.is-centered::before { display: none; }
   .hiw-tap { position: fixed; z-index: 2147483002; pointer-events: none; width: 34px; height: 34px;
     margin: -17px 0 0 -17px; border-radius: 50%; background: rgba(0, 128, 108, .45);
@@ -97,14 +111,32 @@ async function show(page, text, selector, { nth = 0, hold = 2800 } = {}) {
         width: `${box.width + 12}px`, height: `${box.height + 12}px`,
       });
       document.body.append(ring);
+      // Below the ring, else above it; a tall block (common on a wide screen) gets the caption
+      // beside it, so the caption never covers what it points at.
       const below = box.bottom + 20 + bubble.offsetHeight < innerHeight;
-      bubble.classList.add(below ? "is-below" : "is-above");
-      const left = Math.min(Math.max(12, box.left + box.width / 2 - bubble.offsetWidth / 2),
-        innerWidth - bubble.offsetWidth - 12);
-      bubble.style.left = `${left}px`;
-      bubble.style.top = below ? `${box.bottom + 16}px` : `${box.top - bubble.offsetHeight - 16}px`;
-      bubble.style.setProperty("--arrow-x",
-        `${Math.min(Math.max(16, box.left + box.width / 2 - left), bubble.offsetWidth - 16)}px`);
+      const above = box.top - 20 - bubble.offsetHeight > 0;
+      const right = box.right + 24 + bubble.offsetWidth < innerWidth;
+      const left = box.left - 24 - bubble.offsetWidth > 0;
+      if (below || above || (!right && !left)) {
+        const x = Math.min(Math.max(12, box.left + box.width / 2 - bubble.offsetWidth / 2),
+          innerWidth - bubble.offsetWidth - 12);
+        bubble.classList.add(below || !above ? "is-below" : "is-above");
+        bubble.style.left = `${x}px`;
+        bubble.style.top = below ? `${box.bottom + 16}px`
+          : above ? `${box.top - bubble.offsetHeight - 16}px`
+          : `${innerHeight - bubble.offsetHeight - 12}px`;
+        bubble.style.setProperty("--arrow-x",
+          `${Math.min(Math.max(16, box.left + box.width / 2 - x), bubble.offsetWidth - 16)}px`);
+      } else {
+        const middle = (Math.max(box.top, 0) + Math.min(box.bottom, innerHeight)) / 2;
+        const y = Math.min(Math.max(12, middle - bubble.offsetHeight / 2),
+          innerHeight - bubble.offsetHeight - 12);
+        bubble.classList.add(right ? "is-right" : "is-left");
+        bubble.style.left = right ? `${box.right + 16}px` : `${box.left - bubble.offsetWidth - 16}px`;
+        bubble.style.top = `${y}px`;
+        bubble.style.setProperty("--arrow-y",
+          `${Math.min(Math.max(16, middle - y), bubble.offsetHeight - 16)}px`);
+      }
     },
     { text, selector, nth },
   );
@@ -179,10 +211,10 @@ async function scenes(page, base) {
   await show(page, "Entries close at this time. Your picks lock then.", ".entry-facts > div", { nth: 0 });
   await show(page, "The price is everything you pay.", ".price-details summary");
   await tap(page, page.locator(".price-details summary"));
-  await show(page, "Tap it to see the fees it's made of.", ".price-lines");
+  await show(page, `${TAP} it to see the fees it's made of.`, ".price-lines");
   await tap(page, page.locator(".price-details summary"));
   await page.locator(".entry-facts .tip").first().focus();
-  await show(page, "Tap any ? for what a term means.", ".entry-facts .tip", { hold: 2600 });
+  await show(page, `${TAP} any ? for what a term means.`, ".entry-facts .tip", { hold: 2600 });
   await page.locator(".entry-facts .tip").first().blur();
 
   const high = page.locator(".pick-row").nth(0);
@@ -195,7 +227,7 @@ async function scenes(page, base) {
   // Choosing a pick again clears it (entry_form.js; these pages run no scripts).
   await tap(page, high.locator(".pick-option").nth(1));
   await high.locator("input:checked").evaluateAll((inputs) => inputs.forEach((input) => { input.checked = false; }));
-  await show(page, "Tap a pick again to clear it.", ".pick-options", { hold: 2400 });
+  await show(page, `${TAP} a pick again to clear it.`, ".pick-options", { hold: 2400 });
   await show(page, "Pay the Lightning invoice and you're in.", "#submitEntry", { hold: 3000 });
 
   await open(page, base, "leaderboard");
@@ -203,7 +235,7 @@ async function scenes(page, base) {
   await show(page, "That's you.", "tr.is-own", { hold: 2200 });
 
   await open(page, base, "picks");
-  await show(page, "Tap Picks to see each reading so far...", ".pick-reading", { nth: 3, hold: 3000 });
+  await show(page, `${TAP} Picks to see each reading so far...`, ".pick-reading", { nth: 3, hold: 3000 });
   await show(page, "...and the points it scores if the window ended now.", ".pick-points", { nth: 1, hold: 3000 });
 
   await open(page, base, "help");

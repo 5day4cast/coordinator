@@ -9,10 +9,30 @@
   margin-bottom: 2rem;
 }
 
-/* The walkthrough video, phone-shaped; it never grows past a phone's width. */
+/* The walkthrough video: the phone recording, never wider than a phone, below 768px; the
+   desktop recording across the column from 768px. The other is not displayed, and with
+   preload="none" it never loads. */
 .help-video {
   max-width: 20rem;
   margin: 0 0 1.5rem;
+}
+
+.help-video video.is-desktop {
+  display: none;
+}
+
+@media (min-width: 768px) {
+  .help-video {
+    max-width: none;
+  }
+
+  .help-video video.is-phone {
+    display: none;
+  }
+
+  .help-video video.is-desktop {
+    display: block;
+  }
 }
 
 .help-video video {

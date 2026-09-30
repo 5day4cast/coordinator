@@ -126,6 +126,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             content_type: "image/jpeg",
             bytes: fs::read(static_dir.join("how-it-works.jpg"))?,
         },
+        // The same walkthrough filmed at a desktop's width, for wider screens.
+        Asset {
+            constant: "HOW_IT_WORKS_DESKTOP_MP4",
+            stem: "how-it-works-desktop",
+            extension: "mp4",
+            content_type: "video/mp4",
+            bytes: fs::read(static_dir.join("how-it-works-desktop.mp4"))?,
+        },
+        Asset {
+            constant: "HOW_IT_WORKS_DESKTOP_JPG",
+            stem: "how-it-works-desktop",
+            extension: "jpg",
+            content_type: "image/jpeg",
+            bytes: fs::read(static_dir.join("how-it-works-desktop.jpg"))?,
+        },
         Asset {
             constant: "USA_MAP_SVG",
             stem: "usa-map",
