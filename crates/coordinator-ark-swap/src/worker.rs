@@ -1,4 +1,5 @@
-//! The worker: the lease holder advances swaps and refunds, and boards the wallet's on-chain coins.
+//! The worker: the lease holder advances swaps and refunds, boards the wallet's on-chain coins,
+//! and renews the coins that are running out.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +14,7 @@ pub trait Steps: Send + Sync + 'static {
     fn refund_tick(&self) -> impl Future<Output = ()> + Send;
     fn lookup_tick(&self) -> impl Future<Output = ()> + Send;
     fn board_tick(&self) -> impl Future<Output = ()> + Send;
+    fn renew_tick(&self) -> impl Future<Output = ()> + Send;
 }
 
 impl Steps for Swapper {
@@ -31,6 +33,10 @@ impl Steps for Swapper {
     fn board_tick(&self) -> impl Future<Output = ()> + Send {
         Swapper::board_tick(self)
     }
+
+    fn renew_tick(&self) -> impl Future<Output = ()> + Send {
+        Swapper::renew_tick(self)
+    }
 }
 
 /// How often the worker takes each step.
@@ -40,9 +46,9 @@ pub struct Cadence {
     pub tick: Duration,
     /// How often settled swaps whose escrow VTXO is unknown are checked for lookups that are due.
     pub lookup_every: Duration,
-    /// How often a boarding starts, once the last one has ended.
+    /// How often a boarding, and then a renewal, starts, once the last ones have ended.
     pub board_every: Duration,
-    /// How long a boarding may take before it is given up.
+    /// How long a boarding, or a renewal, may take before it is given up.
     pub board_timeout: Duration,
 }
 
@@ -54,8 +60,9 @@ pub async fn run<S: Steps>(
     holding: Arc<AtomicBool>,
     mut stopped: tokio::sync::watch::Receiver<bool>,
 ) {
-    // A boarding waits for a whole batch, minutes, so it runs beside the other steps, one boarding
-    // at a time. The wallet's send lock still puts its spends in turn with theirs.
+    // A boarding waits for a whole batch, minutes, and so does a renewal. They run beside the
+    // other steps, one settlement at a time: a renewal follows the boarding in the same task.
+    // The wallet's send lock still puts their spends in turn with the others'.
     let boarding = Arc::new(tokio::sync::Mutex::new(()));
     let mut interval = tokio::time::interval(cadence.tick);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -90,13 +97,22 @@ pub async fn run<S: Steps>(
                             cadence.board_timeout.as_secs()
                         );
                     }
+                    if tokio::time::timeout(cadence.board_timeout, steps.renew_tick())
+                        .await
+                        .is_err()
+                    {
+                        log::warn!(
+                            "gave up a renewal after {}s",
+                            cadence.board_timeout.as_secs()
+                        );
+                    }
                 });
                 boarded_at = tokio::time::Instant::now();
             }
         }
     }
-    // The lease is handed over only after a boarding in flight ends, so two instances never
-    // board the same coins.
+    // The lease is handed over only after a boarding or renewal in flight ends, so two instances
+    // never settle the same coins.
     drop(boarding.lock().await);
 }
 
@@ -105,12 +121,14 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    /// Counts the steps taken. A boarding lasts until it is released or given up.
+    /// Counts the steps taken. A boarding lasts until it is released or given up, and a renewal
+    /// a little while.
     struct Counted {
         ticks: AtomicUsize,
         refund_ticks: AtomicUsize,
         lookups: AtomicUsize,
         boardings: AtomicUsize,
+        renewals: AtomicUsize,
         boarding_now: AtomicUsize,
         most_boarding_at_once: AtomicUsize,
         release: tokio::sync::Semaphore,
@@ -123,6 +141,7 @@ mod tests {
                 refund_ticks: AtomicUsize::new(0),
                 lookups: AtomicUsize::new(0),
                 boardings: AtomicUsize::new(0),
+                renewals: AtomicUsize::new(0),
                 boarding_now: AtomicUsize::new(0),
                 most_boarding_at_once: AtomicUsize::new(0),
                 release: tokio::sync::Semaphore::new(0),
@@ -158,6 +177,14 @@ mod tests {
             let _ended = Boarding(&self.boarding_now);
             self.most_boarding_at_once.fetch_max(now, Ordering::SeqCst);
             self.release.acquire().await.expect("never closed").forget();
+        }
+
+        async fn renew_tick(&self) {
+            self.renewals.fetch_add(1, Ordering::SeqCst);
+            let now = self.boarding_now.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ended = Boarding(&self.boarding_now);
+            self.most_boarding_at_once.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(30)).await;
         }
     }
 
@@ -206,9 +233,17 @@ mod tests {
             "a second boarding waits for the first"
         );
 
-        // Once it ends, the next one starts.
+        assert_eq!(
+            steps.renewals.load(Ordering::SeqCst),
+            0,
+            "a renewal waits for the boarding"
+        );
+
+        // Once it ends a renewal follows, with nothing at the boarding address needed, and then
+        // the next boarding starts. They never settle at once.
         steps.release.add_permits(1);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(steps.renewals.load(Ordering::SeqCst), 1);
         assert_eq!(steps.boardings.load(Ordering::SeqCst), 2);
         assert_eq!(steps.most_boarding_at_once.load(Ordering::SeqCst), 1);
 
@@ -230,6 +265,10 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(steps.boardings.load(Ordering::SeqCst) >= 2);
+        assert!(
+            steps.renewals.load(Ordering::SeqCst) >= 1,
+            "a renewal still runs after a boarding that was given up"
+        );
         assert_eq!(steps.most_boarding_at_once.load(Ordering::SeqCst), 1);
 
         stop.send(true).unwrap();

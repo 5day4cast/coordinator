@@ -5,6 +5,7 @@
 //! It needs no third-party swap provider. See `swap.rs` for the steps and `api.rs` for the routes.
 
 mod api;
+mod coins;
 mod config;
 mod lnd;
 mod refund;
@@ -40,7 +41,8 @@ struct Cli {
 
 /// How often unfinished swaps advance. An HTLC is held for about this long before the escrow is paid.
 const TICK: Duration = Duration::from_secs(1);
-/// How often the wallet's holder boards what has confirmed at its boarding address.
+/// How often the wallet's holder boards what has confirmed at its boarding address, and renews
+/// the VTXOs that are recoverable or close to expiry.
 const BOARD_EVERY: Duration = Duration::from_secs(60);
 /// How often settled swaps whose escrow VTXO is unknown are checked for lookups that are due.
 /// Each swap waits out its own backoff; see `Swapper::lookup_tick`.
@@ -80,13 +82,17 @@ async fn main() -> anyhow::Result<()> {
         invoice_cltv_expiry: config.invoice_cltv_expiry,
         errors: Default::default(),
         refund_turn: Default::default(),
+        renewed: Default::default(),
     });
     let view = swapper.wallet.view().await?;
     log::info!(
-        "Ark wallet {} holds {} sat confirmed and {} sat preconfirmed; boarding address {}",
+        "Ark wallet {} holds {} sat confirmed and {} sat preconfirmed, {} sat of it too close to \
+         expiry to pay an escrow, and {} sat recoverable; boarding address {}",
         view.ark_address,
         view.confirmed_sat,
         view.pre_confirmed_sat,
+        view.expiring_sat,
+        view.recoverable_sat,
         view.boarding_address
     );
 
@@ -116,8 +122,8 @@ async fn main() -> anyhow::Result<()> {
         tick: TICK,
         lookup_every: LOOKUP_EVERY,
         board_every: BOARD_EVERY,
-        // ark-client gives a boarding two sessions, the rest of one and the batch after, and
-        // stops waiting itself. This bounds a boarding that hangs past that.
+        // ark-client gives a boarding or a renewal two sessions, the rest of one and the batch
+        // after, and stops waiting itself. This bounds one that hangs past that.
         board_timeout: 2 * session + Duration::from_secs(60),
     };
     let worker_task = {
