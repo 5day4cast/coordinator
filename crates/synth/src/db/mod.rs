@@ -76,11 +76,13 @@ pub struct TestStep {
 /// A rebalance about to be recorded.
 #[derive(Debug, Clone)]
 pub struct Rebalance {
-    /// `channel`, for the payer's channel, or `arkade`, for ark-swapd's wallet.
+    /// `channel`, for the payer's channel, `payee`, for the source's channel with the payee, or
+    /// `arkade`, for ark-swapd's wallet.
     pub kind: &'static str,
     /// The channel, or `ark-swapd` for its wallet.
     pub channel_id: String,
     pub amount_sats: u64,
+    /// What the side being paid back held: the payer, the source for `payee`, or ark-swapd.
     pub local_before_sats: u64,
     pub capacity_sats: u64,
     /// The on-chain transaction, for an Arkade top-up.
