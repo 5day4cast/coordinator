@@ -43,6 +43,29 @@ const VTXO_LOOKUP_MAX_WAIT_SECS: i64 = 10 * 60;
 /// The indexer lists a payment within seconds, so this is far more than it needs.
 const VTXO_LOOKUPS: u32 = 20;
 
+/// Kept spare beyond what unpaid swaps promise, for the fees of paying their escrows.
+const FEE_MARGIN_SAT: u64 = 1_000;
+
+/// The wallet cannot pay a new swap's escrow on top of those its unpaid swaps promise. The API
+/// answers 503: the swap may be asked for again once the wallet has been topped up.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Unfunded {
+    pub spendable_sat: u64,
+    pub needed_sat: u64,
+}
+
+impl std::fmt::Display for Unfunded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the Ark wallet can spend {} sat, short of the {} sat its unpaid swaps and this one need",
+            self.spendable_sat, self.needed_sat
+        )
+    }
+}
+
+impl std::error::Error for Unfunded {}
+
 pub struct Swapper {
     pub store: Store,
     pub lnd: Lnd,
@@ -107,6 +130,15 @@ impl Swapper {
                 "an open swap for this escrow has a different amount or payment hash"
             );
             return Ok(open);
+        }
+        // Refuse a swap the wallet cannot pay, rather than hold the payer's HTLC until it fails.
+        // A balance that cannot be read is left to the payment to find out.
+        match self.wallet.spendable_sat().await {
+            Ok(spendable_sat) => {
+                let promised_sat = self.store.unpaid_swap_sat().await?;
+                check_funded(spendable_sat, promised_sat, amount_sat)?;
+            }
+            Err(error) => log::warn!("check the wallet can fund a new swap: {error:#}"),
         }
 
         let preimage = preimage.unwrap_or_else(rand08::random);
@@ -464,6 +496,22 @@ fn payment_step(swap: &Swap, listed: bool, now: i64) -> PaymentStep {
     }
 }
 
+/// Whether a wallet that can spend `spendable_sat` funds a swap of `amount_sat` on top of the
+/// `promised_sat` its unpaid swaps promise.
+fn check_funded(spendable_sat: u64, promised_sat: u64, amount_sat: u64) -> Result<(), Unfunded> {
+    let needed_sat = promised_sat
+        .saturating_add(amount_sat)
+        .saturating_add(FEE_MARGIN_SAT);
+    if spendable_sat >= needed_sat {
+        Ok(())
+    } else {
+        Err(Unfunded {
+            spendable_sat,
+            needed_sat,
+        })
+    }
+}
+
 /// How long to wait after the `lookups`th missed lookup of a settled swap's escrow VTXO.
 fn vtxo_lookup_wait(lookups: u32) -> i64 {
     VTXO_LOOKUP_FIRST_WAIT_SECS
@@ -559,6 +607,27 @@ mod tests {
             payment_step(&paying(Some(sent), PAY_ATTEMPTS), true, sent + 10_000),
             PaymentStep::Record
         );
+    }
+
+    #[test]
+    fn a_swap_is_refused_when_the_wallet_cannot_fund_it_and_those_before_it() {
+        assert_eq!(check_funded(20_000, 12_000, 6_000), Ok(()));
+        assert_eq!(
+            check_funded(19_000, 12_000, 6_000),
+            Ok(()),
+            "exactly enough"
+        );
+        assert_eq!(
+            check_funded(18_999, 12_000, 6_000),
+            Err(Unfunded {
+                spendable_sat: 18_999,
+                needed_sat: 19_000
+            })
+        );
+        // The case seen: 712 sat left for a 5,848 sat escrow.
+        assert!(check_funded(712, 0, 5_848).is_err());
+        let refused: anyhow::Error = check_funded(0, 0, 6_000).unwrap_err().into();
+        assert!(refused.is::<Unfunded>());
     }
 
     #[test]

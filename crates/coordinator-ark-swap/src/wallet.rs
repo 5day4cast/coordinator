@@ -280,6 +280,16 @@ impl ArkWallet {
         Ok(ark_txid)
     }
 
+    /// What the wallet can spend now, in sats: its confirmed and preconfirmed VTXOs.
+    pub async fn spendable_sat(&self) -> anyhow::Result<u64> {
+        let balance = self
+            .client
+            .offchain_balance()
+            .await
+            .map_err(|error| anyhow::anyhow!("read the balance: {error}"))?;
+        Ok(balance.confirmed().to_sat() + balance.pre_confirmed().to_sat())
+    }
+
     pub async fn view(&self) -> anyhow::Result<WalletView> {
         let balance = self
             .client

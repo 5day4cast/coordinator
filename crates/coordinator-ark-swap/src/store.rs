@@ -299,6 +299,18 @@ impl Store {
         Ok(row.is_some())
     }
 
+    /// What the swaps not yet paid promise to pay into escrows, in sats: those awaiting a payment
+    /// and those holding one while the escrow is paid.
+    pub async fn unpaid_swap_sat(&self) -> anyhow::Result<u64> {
+        let row = sqlx::query(
+            "SELECT COALESCE(SUM(amount_sat), 0) AS promised FROM swaps
+             WHERE state IN ('awaiting_payment', 'paying_escrow')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.try_get::<i64, _>("promised")? as u64)
+    }
+
     /// Swaps that have not ended. Those holding a payer's HTLC while the escrow is paid or
     /// settled come first, then those awaiting payment, oldest first within each.
     pub async fn unfinished(&self) -> anyhow::Result<Vec<Swap>> {
@@ -652,6 +664,27 @@ mod tests {
             vec![paid.id, paying.id, awaiting.id],
             "a settled swap is not live, even without its VTXO"
         );
+    }
+
+    #[tokio::test]
+    async fn unpaid_swaps_promise_their_amounts_until_they_pay() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("swaps.sqlite"))
+            .await
+            .unwrap();
+        assert_eq!(store.unpaid_swap_sat().await.unwrap(), 0);
+        let awaiting = swap_for(&"b1".repeat(32), 1_790_000_000);
+        let mut paying = swap_for(&"b2".repeat(32), 1_790_000_100);
+        paying.state = SwapState::PayingEscrow;
+        paying.amount_sat = 7_000;
+        let mut paid = swap_for(&"b3".repeat(32), 1_790_000_200);
+        paid.state = SwapState::EscrowPaid;
+        let mut expired = swap_for(&"b4".repeat(32), 1_789_999_000);
+        expired.state = SwapState::Expired;
+        for swap in [&awaiting, &paying, &paid, &expired] {
+            store.insert(swap).await.unwrap();
+        }
+        assert_eq!(store.unpaid_swap_sat().await.unwrap(), 6_300 + 7_000);
     }
 
     #[tokio::test]
