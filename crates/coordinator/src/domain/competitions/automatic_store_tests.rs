@@ -1,5 +1,5 @@
 //! Persistence boundaries for automatic payout recovery, using the real migrations.
-use super::{CompetitionStore, PayoutError};
+use super::{CompetitionStore, FixedTicketPayoutPolicy, PayoutError};
 use crate::infra::db::{DBConnection, DatabasePoolConfig, DatabaseType};
 use bitcoin::{
     hashes::{sha256, Hash},

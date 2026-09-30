@@ -1358,10 +1358,14 @@ async fn a_retried_ticket_request_gets_the_same_ticket_and_invoice() {
     assert_eq!(retry.ticket_id, first.ticket_id);
     assert_eq!(retry.payment_request, first.payment_request);
     assert_eq!(retry.payment_hash, first.payment_hash);
-    assert_eq!(
-        retry.keymeld_registration.unwrap().payout_policy,
-        first.keymeld_registration.unwrap().payout_policy
-    );
+    let policy = |ticket: &TicketResponse| {
+        ticket
+            .keymeld_registration
+            .as_ref()
+            .and_then(|registration| registration.payout_policy.clone())
+    };
+    assert!(policy(&first).is_some());
+    assert_eq!(policy(&retry), policy(&first));
     assert!(!f.invoice_cancelled(&first));
 }
 
