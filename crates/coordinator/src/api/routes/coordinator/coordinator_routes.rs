@@ -101,6 +101,13 @@ pub struct TicketRequest {
 /// - The HODL invoice (revealed to user when coordinator settles the invoice)
 /// - The ticket secret (to claim winnings if user wins the DLC)
 /// - The escrow transaction refund path (to claim refund if needed)
+///
+/// Retries: `payout.entry_id` is the request's idempotency key for the player on this
+/// competition. Sending the same request again (same entry id, entry key and payout choices)
+/// while its ticket is unpaid answers `200` with the same ticket, invoice and payout policy,
+/// even while the first request is still being answered. A request for another entry while one
+/// is reserved answers `409 Conflict` and releases the reservation; request the ticket again.
+/// After the ticket is entered, or its reservation lapses unpaid, a request is a new one.
 pub async fn request_competition_ticket(
     State(state): State<Arc<AppState>>,
     Path(competition_id): Path<Uuid>,

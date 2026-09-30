@@ -151,6 +151,14 @@ impl MockLnClient {
         self.sent.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// How many invoices were added, so a test can tell a retried request issued no second one.
+    pub fn invoices_added(&self) -> u64 {
+        self.invoice_counter
+            .read()
+            .map(|counter| *counter)
+            .unwrap_or(0)
+    }
+
     /// Reset all mock state (invoices and payments).
     pub fn reset(&self) {
         if let Ok(mut invoices) = self.invoices.write() {
