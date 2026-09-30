@@ -130,4 +130,31 @@ mod tests {
             r#"<meta name="htmx-config" content="{&quot;mode&quot;:&quot;same-origin&quot;"#
         ));
     }
+
+    /// Phone tables shrink small buttons to 32 px (styles.css); on a touch screen Picks keeps
+    /// 44 px with a selector that outranks that one.
+    #[test]
+    fn picks_stays_44_px_tall_in_a_phone_table() {
+        use crate::templates::css_check::{rule, value};
+        let site = include_str!("../../static/styles.css");
+        let base = include_str!("base.css");
+        assert_eq!(
+            value(
+                rule(site, ".table:not(.is-card-mobile) .button.is-small"),
+                "min-height"
+            ),
+            "32px"
+        );
+        let touch = &base[base.find("@media (pointer: coarse)").unwrap()..];
+        assert_eq!(
+            value(
+                rule(
+                    touch,
+                    ".table:not(.is-card-mobile) .button.is-small.picks-button"
+                ),
+                "min-height"
+            ),
+            "44px"
+        );
+    }
 }

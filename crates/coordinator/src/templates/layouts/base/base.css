@@ -85,6 +85,11 @@ a.competition-row.htmx-request {
     min-height: 44px;
   }
 
+  /* Outranks the 32 px of small buttons in phone tables (styles.css). */
+  .table:not(.is-card-mobile) .button.is-small.picks-button {
+    min-height: 44px;
+  }
+
   .modal-close.is-large {
     width: 44px;
     height: 44px;

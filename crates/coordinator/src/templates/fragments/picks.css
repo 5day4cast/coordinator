@@ -94,8 +94,13 @@
   font-weight: 600;
 }
 
+/* "✓ +10" on its green-tinted row: 5.0:1 in the light theme, 8.6:1 in the dark. */
 .is-hit .pick-result {
-  color: hsl(141, 53%, 36%);
+  color: hsl(141, 53%, 30%);
+}
+
+[data-theme="dark"] .is-hit .pick-result {
+  color: hsl(141, 50%, 62%);
 }
 
 .is-miss .pick-result {
