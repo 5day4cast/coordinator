@@ -389,6 +389,19 @@ impl CompetitionStore {
         .collect()
     }
 
+    /// How many of a competition's escrows have a refund under way or done. A pool with one
+    /// cannot be funded: that escrow is going back to its player.
+    pub async fn ark_refunds_started(&self, event_id: Uuid) -> Result<u64, sqlx::Error> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ticket_ark_refunds r JOIN tickets t ON t.id = r.ticket_id
+             WHERE t.event_id = ?",
+        )
+        .bind(event_id.to_string())
+        .fetch_one(self.db_connection.read())
+        .await?;
+        Ok(count as u64)
+    }
+
     /// How many of a competition's tickets are reserved with an invoice that can still be paid.
     pub async fn payable_ticket_count(&self, event_id: Uuid) -> Result<u64, sqlx::Error> {
         let count: i64 = sqlx::query_scalar(

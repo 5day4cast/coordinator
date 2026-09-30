@@ -422,7 +422,8 @@ impl Fixture {
             server: server.clone(),
             transport: arkd.clone(),
             swaps: swaps.clone(),
-            refund_after_start_secs: 60 * 60,
+            refund_after_start_secs: crate::config::DEFAULT_REFUND_AFTER_START_SECS,
+            escrow_expiry_margin_secs: crate::config::DEFAULT_ESCROW_EXPIRY_MARGIN_SECS,
             max_refund_fee_sats: 100,
         }))
         .unwrap();
@@ -584,6 +585,18 @@ impl Fixture {
         let created_at = OffsetDateTime::now_utc().unix_timestamp();
         self.arkd
             .add_vtxo(address, outpoint, Amount::from_sat(sats), created_at, spent);
+    }
+
+    /// Arkade says the VTXO at `outpoint` expires at `expires_at` (UNIX seconds), swept or not.
+    fn arkade_expires(&self, outpoint: OutPoint, expires_at: i64, swept: bool) {
+        let mut state = self.arkd.state.lock().unwrap();
+        let vtxo = state
+            .vtxos
+            .iter_mut()
+            .find(|vtxo| vtxo.outpoint == outpoint)
+            .expect("a listed VTXO");
+        vtxo.expires_at = expires_at;
+        vtxo.is_swept = swept;
     }
 
     /// Whether the ticket is paid, settled, and its escrow recorded as funded by `vtxo`.
@@ -1038,6 +1051,43 @@ async fn a_spent_vtxo_does_not_pay_the_ticket() {
 }
 
 #[tokio::test]
+async fn a_coin_that_expires_before_the_refund_could_finish_does_not_pay_the_ticket() {
+    let f = Fixture::new().await;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let margin = crate::config::DEFAULT_ESCROW_EXPIRY_MARGIN_SECS as i64;
+    // Its escrow's refund leaf opens in an hour.
+    let (ticket, _) = f
+        .ticket_refundable_from(21, PRICE, now as u32 + 3_600)
+        .await;
+    let paid = outpoint(0xaa, 0);
+    f.swap_reports(&ticket, SwapState::Settled, Some(paid), Some(paid.txid));
+    f.arkade_lists(&ticket.escrow_address, paid, PRICE, false);
+
+    // ark-swapd paid it from a coin with two hours of life left: a preconfirmed VTXO expires
+    // with the coin it was paid from. A refund opening in an hour would find it expired or
+    // nearly so.
+    f.arkade_expires(paid, now + 7_200, false);
+    f.coordinator.check_ark_swaps().await.unwrap();
+    assert_eq!(
+        f.paid_by(&ticket).await,
+        None,
+        "a short-lived escrow never reaches a pool"
+    );
+    assert_eq!(f.pending().await, 1);
+
+    // One Arkade already swept is refused whatever expiry it lists.
+    f.arkade_expires(paid, now + 30 * 86_400, true);
+    f.coordinator.check_ark_swaps().await.unwrap();
+    assert_eq!(f.paid_by(&ticket).await, None);
+
+    // A coin that outlives the refund locktime by the margin pays the ticket.
+    f.arkade_expires(paid, now + 3_600 + margin, false);
+    f.coordinator.check_ark_swaps().await.unwrap();
+    assert_eq!(f.paid_by(&ticket).await, Some((paid.to_string(), PRICE)));
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_swap_for_another_amount_than_the_ticket_price_does_not_pay_it() {
     let f = Fixture::new().await;
     // ark-swapd's own amount agrees with the VTXO, but not with what the ticket costs.
@@ -1080,6 +1130,17 @@ async fn a_cancelled_arkade_competition_refunds_each_funded_escrow_once() {
         !f.awaiting_cleanup().await,
         "a live competition is not cleaned up"
     );
+    // The refund leaves opened an hour ago, and nothing is refunded: only a competition that
+    // will never kick off refunds its escrows, however early their locktime.
+    f.clean_up().await;
+    assert_eq!(f.swaps.minted.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        f.store()
+            .ark_refunds_started(f.competition_id)
+            .await
+            .unwrap(),
+        0
+    );
     f.cancel().await;
     assert!(
         f.awaiting_cleanup().await,
@@ -1107,6 +1168,14 @@ async fn a_cancelled_arkade_competition_refunds_each_funded_escrow_once() {
     assert_eq!(f.ln.payments_sent(), 2);
     assert_eq!(f.swaps.claimed.lock().unwrap().len(), 2);
     assert!(!f.awaiting_cleanup().await, "nothing is left to refund");
+    assert_eq!(
+        f.store()
+            .ark_refunds_started(f.competition_id)
+            .await
+            .unwrap(),
+        2,
+        "a kickoff would refuse to fund a pool whose escrows went back"
+    );
 
     // Later passes find nothing to do.
     f.coordinator.refund_ark_escrows(f.competition_id).await;

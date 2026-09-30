@@ -33,8 +33,11 @@ pub struct Arkade {
     /// answer them without one running.
     pub transport: Arc<dyn coordinator_ark::ArkTransport>,
     pub swaps: Arc<dyn crate::infra::ark_swap::EscrowSwaps>,
-    /// How long after the observation window starts an unfunded entry can be refunded.
+    /// How long after the observation window starts an escrow's refund leaf opens.
     pub refund_after_start_secs: u64,
+    /// How much longer than its refund locktime an escrow's VTXO must live for its ticket to
+    /// be counted as paid.
+    pub escrow_expiry_margin_secs: u64,
     /// The most a refund's swap may keep for paying the player's Lightning Address.
     pub max_refund_fee_sats: u64,
 }
