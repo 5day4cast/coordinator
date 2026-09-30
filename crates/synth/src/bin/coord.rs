@@ -195,8 +195,9 @@ async fn main() -> Result<()> {
                     number_of_places_win: 1,
                     total_allowed_entries: max_entries,
                     entry_fee,
-                    coordinator_fee_basis_points: 1000,
-                    coordinator_fee_percentage: 10,
+                    // The service fee the site charges.
+                    coordinator_fee_basis_points: 300,
+                    coordinator_fee_percentage: 3,
                     total_competition_pool: entry_fee * max_entries,
                     unlisted: !listed,
                 };
