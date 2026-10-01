@@ -246,18 +246,22 @@
 
         # The gateway is generic. Coordinator's measured image owns the verifier.
         keymeld-gateway = keymeld.packages.${system}.keymeld-gateway-escrow;
-        mkCoordinatorEnclave = lnurl: craneLib.buildPackage ({
-          pname = if lnurl then "coordinator-verifier-enclave-lnurl" else "coordinator-verifier-enclave";
+        mkCoordinatorEnclave = { lnurl, localWitness ? false }: craneLib.buildPackage ({
+          pname = if localWitness then "coordinator-verifier-enclave-simulation"
+            else if lnurl then "coordinator-verifier-enclave-lnurl" else "coordinator-verifier-enclave";
           version = workspaceVersion;
           inherit src;
           cargoArtifacts = workspaceDeps;
           buildInputs = commonBuildInputs;
           nativeBuildInputs = commonNativeBuildInputs;
           cargoExtraArgs = "-p coordinator-verifier-enclave --bin coordinator-verifier-enclave"
-            + pkgs.lib.optionalString lnurl " --features lnurl";
+            + pkgs.lib.optionalString (lnurl || localWitness)
+              (" --features " + pkgs.lib.concatStringsSep ","
+                (pkgs.lib.optional lnurl "lnurl" ++ pkgs.lib.optional localWitness "payout-witness-local"));
         } // commonEnvs);
-        coordinator-verifier-enclave = mkCoordinatorEnclave false;
-        coordinator-verifier-enclave-lnurl = mkCoordinatorEnclave true;
+        coordinator-verifier-enclave = mkCoordinatorEnclave { lnurl = false; };
+        coordinator-verifier-enclave-lnurl = mkCoordinatorEnclave { lnurl = true; };
+        coordinator-verifier-enclave-simulation = mkCoordinatorEnclave { lnurl = true; localWitness = true; };
         coordinator-lnurl-relay = craneLib.buildPackage ({
           pname = "coordinator-lnurl-relay";
           version = workspaceVersion;
@@ -266,6 +270,15 @@
           buildInputs = commonBuildInputs;
           nativeBuildInputs = commonNativeBuildInputs;
           cargoExtraArgs = "-p coordinator-lnurl-relay --bin coordinator-lnurl-relay";
+        } // commonEnvs);
+        coordinator-payout-witness = craneLib.buildPackage ({
+          pname = "coordinator-payout-witness";
+          version = workspaceVersion;
+          inherit src;
+          cargoArtifacts = workspaceDeps;
+          buildInputs = commonBuildInputs;
+          nativeBuildInputs = commonNativeBuildInputs;
+          cargoExtraArgs = "-p coordinator-payout-witness --bin coordinator-payout-witness";
         } // commonEnvs);
         coordinator-nitro-entrypoint = pkgs.writeShellApplication {
           name = "coordinator-nitro-entrypoint";
@@ -603,7 +616,7 @@
           # nix-built keymeld binaries; see run-moto.
           AWS="env -u LD_LIBRARY_PATH ${pkgs.awscli2}/bin/aws --endpoint-url $KMS_ENDPOINT"
           KEYMELD_GATEWAY="env -u LD_LIBRARY_PATH ${keymeld-gateway}/bin/keymeld-gateway"
-          KEYMELD_ENCLAVE="env -u LD_LIBRARY_PATH ${coordinator-verifier-enclave-lnurl}/bin/coordinator-verifier-enclave"
+          KEYMELD_ENCLAVE="env -u LD_LIBRARY_PATH ${coordinator-verifier-enclave-simulation}/bin/coordinator-verifier-enclave"
           COORDINATOR_LNURL_RELAY="env -u LD_LIBRARY_PATH ${coordinator-lnurl-relay}/bin/coordinator-lnurl-relay"
           CURL="env -u LD_LIBRARY_PATH ${pkgs.curl}/bin/curl -fsS --max-time 2"
 
@@ -611,6 +624,30 @@
 
           export KEYMELD_ENVIRONMENT=development
           export KEYMELD_DANGEROUS_TRUST_UNATTESTED_ENCLAVES=true
+          # A fresh ledger is an explicit administrative action, never a startup side effect.
+          export COORDINATOR_PAYOUT_WITNESS_MODE="''${COORDINATOR_PAYOUT_WITNESS_MODE:-local-simulation}"
+          : "''${COORDINATOR_PAYOUT_WITNESS_LEDGER_ID:?Set the ledger UUID printed by coordinator-payout-witness initialize-empty or from the reviewed import}"
+          export COORDINATOR_PAYOUT_WITNESS_LEDGER_ID
+          case "$COORDINATOR_PAYOUT_WITNESS_MODE" in
+            local-simulation)
+              : "''${COORDINATOR_PAYOUT_WITNESS_DATABASE:?Set the existing absolute witness database path}"
+              case "$COORDINATOR_PAYOUT_WITNESS_DATABASE" in
+                /*) ;;
+                *) echo "Witness database path must be absolute" >&2; exit 1 ;;
+              esac
+              if [ ! -s "$COORDINATOR_PAYOUT_WITNESS_DATABASE" ]; then
+                echo "Initialize the witness explicitly before starting enclaves" >&2
+                exit 1
+              fi
+              export COORDINATOR_PAYOUT_WITNESS_DATABASE
+              ;;
+            https)
+              : "''${COORDINATOR_PAYOUT_WITNESS_URL:?Set the fixed HTTPS witness URL}"
+              : "''${COORDINATOR_PAYOUT_WITNESS_KEY_FILE:?Set the protected witness authentication key file}"
+              export COORDINATOR_PAYOUT_WITNESS_URL COORDINATOR_PAYOUT_WITNESS_KEY_FILE
+              ;;
+            *) echo "Witness mode must be local-simulation or https" >&2; exit 1 ;;
+          esac
           export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test
           export AWS_DEFAULT_REGION=us-west-2 AWS_REGION=us-west-2 AWS_EC2_METADATA_DISABLED=true
 
@@ -634,7 +671,7 @@
           export ENCLAVE_KMS_KEY_ID="$KMS_ALIAS"
           export ENCLAVE_KMS_ENDPOINT="$KMS_ENDPOINT"
 
-          if [ "$COORDINATOR_ESCROW_LNURL_ENABLED" = true ]; then
+          if [ "$COORDINATOR_ESCROW_LNURL_ENABLED" = true ] || [ "$COORDINATOR_PAYOUT_WITNESS_MODE" = https ]; then
             TRANSPORT_MODE=tcp $COORDINATOR_LNURL_RELAY > "$LOGS_DIR/lnurl-relay.log" 2>&1 &
             echo $! > "$KEYMELD_DIR/lnurl-relay.pid"
           fi
@@ -987,7 +1024,8 @@
 
             # Keymeld binaries for e2e testing
             keymeld-gateway
-            coordinator-verifier-enclave-lnurl
+            coordinator-verifier-enclave-simulation
+            coordinator-payout-witness
             coordinator-lnurl-relay
             build-coordinator-eif
 
@@ -1158,7 +1196,7 @@
         packages = {
           default = coordinator;
           inherit coordinator coordinator-wasm wallet-cli synth docker-coordinator docker-synth;
-          inherit coordinator-verifier-enclave coordinator-verifier-enclave-lnurl coordinator-lnurl-relay;
+          inherit coordinator-verifier-enclave coordinator-verifier-enclave-lnurl coordinator-verifier-enclave-simulation coordinator-lnurl-relay coordinator-payout-witness;
           inherit docker-coordinator-verifier-enclave docker-coordinator-verifier-enclave-lnurl docker-coordinator-lnurl-relay;
           inherit build-coordinator-eif;
           inherit start-regtest stop-regtest mine-blocks;

@@ -4,3 +4,4 @@ pub mod lnurl_transport;
 mod verifier;
 pub use verifier::CoordinatorVerifier;
 pub mod config;
+pub mod witness;

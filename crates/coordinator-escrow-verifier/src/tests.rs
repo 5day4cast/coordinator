@@ -417,7 +417,7 @@ fn invoice_for(sats: u64, preimage: [u8; 32]) -> String {
 
 #[test]
 fn registration_rejects_disabled_automatic_policy_but_retains_recovery() {
-    let verifier = CoordinatorVerifier::default();
+    let verifier = CoordinatorVerifier::default().with_test_ledger();
     let fallback = fixture(false);
     assert!(verifier
         .validate_registration(RegistrationView {
@@ -489,7 +489,7 @@ fn registration_rejects_disabled_automatic_policy_but_retains_recovery() {
 
 #[test]
 fn binding_rejects_missing_policies_changed_economics_and_wrong_roster() {
-    let verifier = CoordinatorVerifier::default();
+    let verifier = CoordinatorVerifier::default().with_test_ledger();
     let f = fixture(false);
     let data = Payload::encode(&ContractBinding {
         statement: None,
@@ -545,7 +545,7 @@ fn binding_rejects_missing_policies_changed_economics_and_wrong_roster() {
 
 #[tokio::test]
 async fn signing_derives_messages_keys_subsets_tweaks_and_adaptors_from_bound_contract() {
-    let verifier = CoordinatorVerifier::default();
+    let verifier = CoordinatorVerifier::default().with_test_ledger();
     let f = fixture(false);
     let bound = f.bind(&verifier);
     let attempt = ActionAttempt {
@@ -624,7 +624,7 @@ async fn signing_derives_messages_keys_subsets_tweaks_and_adaptors_from_bound_co
 
 #[tokio::test]
 async fn payment_releases_only_independent_grants_and_restores_the_same_invoice() {
-    let verifier = CoordinatorVerifier::default();
+    let verifier = CoordinatorVerifier::default().with_test_ledger();
     let f = fixture(false);
     let bound = f.bind(&verifier);
     let attempt = ActionAttempt {
@@ -650,7 +650,7 @@ async fn payment_releases_only_independent_grants_and_restores_the_same_invoice(
     let prior = BTreeMap::from([(RELEASE_PREIMAGE.into(), first.clone())]);
     // A fresh verifier has no network client or preparation cache. The engine's
     // authenticated sibling state is sufficient for the distinct key permission.
-    let restored = CoordinatorVerifier::default();
+    let restored = CoordinatorVerifier::default().with_test_ledger();
     let second = restored
         .prepare(
             f.prepare_view(&bound, &attempt, RELEASE_ENTRY_KEY, &prior),
@@ -727,7 +727,7 @@ async fn payment_releases_only_independent_grants_and_restores_the_same_invoice(
 
 #[tokio::test]
 async fn preparation_rejects_forged_invoice_authorization_incomplete_signatures_and_outcome() {
-    let verifier = CoordinatorVerifier::default();
+    let verifier = CoordinatorVerifier::default().with_test_ledger();
     let f = fixture(false);
     let bound = f.bind(&verifier);
     let attempt = ActionAttempt {
@@ -778,7 +778,7 @@ async fn enclave_tls_prepares_automatic_invoice_and_disabled_instance_recovers_p
     let f = fixture(true);
     let (client, server) =
         crate::lnurl_transport::fixtures::automatic_payout_tls_fixture(invoice()).await;
-    let verifier = CoordinatorVerifier::with_lnurl(client);
+    let verifier = CoordinatorVerifier::with_lnurl(client).with_test_ledger();
     verifier
         .validate_registration(RegistrationView {
             manifest: &f.manifest,
@@ -805,7 +805,7 @@ async fn enclave_tls_prepares_automatic_invoice_and_disabled_instance_recovers_p
         .await
         .unwrap();
     server.await.unwrap();
-    let disabled = CoordinatorVerifier::default();
+    let disabled = CoordinatorVerifier::default().with_test_ledger();
     let prior = BTreeMap::from([(RELEASE_PREIMAGE.into(), first.clone())]);
     let second = disabled
         .prepare(
@@ -839,7 +839,7 @@ async fn enclave_tls_prepares_automatic_invoice_and_disabled_instance_recovers_p
 
 #[tokio::test]
 async fn renewed_invoice_keeps_late_paid_candidate_and_freezes_both_releases() {
-    let verifier = CoordinatorVerifier::default();
+    let verifier = CoordinatorVerifier::default().with_test_ledger();
     let f = fixture(false);
     let bound = f.bind(&verifier);
     let first_attempt = ActionAttempt {
@@ -943,7 +943,7 @@ async fn renewed_invoice_keeps_late_paid_candidate_and_freezes_both_releases() {
     // Authenticated Executed-receipt recovery has no original payment evidence.
     // Rehydrate the same claim fence before the engine recovers the first grant,
     // so the other grant cannot execute under a different paid candidate.
-    let restored = CoordinatorVerifier::default();
+    let restored = CoordinatorVerifier::default().with_test_ledger();
     let mut substituted = first_preimage.clone();
     substituted.output = renewed_preimage.output.clone();
     assert!(restored
@@ -981,7 +981,7 @@ async fn renewed_invoice_keeps_late_paid_candidate_and_freezes_both_releases() {
 /// prepared action for a good scope, and a refusal for each tampered one.
 #[tokio::test]
 async fn a_compact_scope_expands_to_the_full_scope_with_the_same_decisions() {
-    let verifier = CoordinatorVerifier::default();
+    let verifier = CoordinatorVerifier::default().with_test_ledger();
     let f = fixture(false);
     let bound = f.bind(&verifier);
     let attempt = ActionAttempt {
@@ -1365,7 +1365,7 @@ mod ark_escrow {
 
     #[test]
     fn the_escrow_must_belong_to_the_entry_key_and_the_market_maker() {
-        let verifier = CoordinatorVerifier::default();
+        let verifier = CoordinatorVerifier::default().with_test_ledger();
         for escrow in [escrow_with(15, 18), escrow_with(14, 19)] {
             let f = fixture_with(false, Some(policy_for(&escrow)));
             assert!(verifier
@@ -1394,7 +1394,7 @@ mod ark_escrow {
 
     #[tokio::test]
     async fn an_intent_proof_signs_only_this_escrow_into_the_pool() {
-        let verifier = CoordinatorVerifier::default();
+        let verifier = CoordinatorVerifier::default().with_test_ledger();
         let (f, escrow) = ark_fixture();
         let bound = f.bind(&verifier);
 
@@ -1457,7 +1457,7 @@ mod ark_escrow {
 
     #[tokio::test]
     async fn a_forfeit_needs_the_signed_contract_and_a_connector_from_the_commitment() {
-        let verifier = CoordinatorVerifier::default();
+        let verifier = CoordinatorVerifier::default().with_test_ledger();
         let (f, escrow) = ark_fixture();
         let bound = f.bind(&verifier);
         let batch = new_batch(&f, &escrow);
@@ -1516,7 +1516,7 @@ mod ark_escrow {
 
     #[tokio::test]
     async fn contract_signing_uses_the_batch_outpoint() {
-        let verifier = CoordinatorVerifier::default();
+        let verifier = CoordinatorVerifier::default().with_test_ledger();
         let (f, escrow) = ark_fixture();
         let bound = f.bind(&verifier);
         let batch = new_batch(&f, &escrow);
@@ -1741,7 +1741,7 @@ mod ark_escrow {
         // Providers may return uppercase BOLT11. The receipt and later database
         // lookup must use the same canonical representation.
         let (client, provider) = automatic_payout_tls_fixture(invoice.to_uppercase()).await;
-        let verifier = CoordinatorVerifier::with_lnurl(client);
+        let verifier = CoordinatorVerifier::with_lnurl(client).with_test_ledger();
         let unbound = Payload::default();
         let attempt = attempt();
         let prepared = verifier
@@ -1854,7 +1854,7 @@ mod ark_escrow {
         let legacy = Payload::encode(&legacy).unwrap();
         assert!(legacy.decode::<ActionParameters>().is_err());
 
-        let verifier = CoordinatorVerifier::default();
+        let verifier = CoordinatorVerifier::default().with_test_ledger();
         let attempt = attempt();
         let unbound = Payload::default();
         assert!(verifier
@@ -1914,7 +1914,7 @@ mod ark_escrow {
         let paid_sats = REFUNDED_SATS - MAX_REFUND_FEE_SATS;
         let invoice = address_invoice_for(paid_sats, preimage, FIXTURE_METADATA);
 
-        let verifier = CoordinatorVerifier::default();
+        let verifier = CoordinatorVerifier::default().with_test_ledger();
         let swap = refund_swap(preimage);
         let first = attempt();
         let unbound = Payload::default();
@@ -1936,7 +1936,7 @@ mod ark_escrow {
         // The server co-signs between the two, so the checkpoint is signed in its own attempt,
         // over its own digest.
 
-        let second = CoordinatorVerifier::default();
+        let second = CoordinatorVerifier::default().with_test_ledger();
         let later = attempt();
         let checkpoint = second
             .prepare(
@@ -1984,7 +1984,7 @@ mod ark_escrow {
         let message = register_message(now().unwrap() + 120);
         let unbound = Payload::default();
 
-        let verifier = CoordinatorVerifier::default();
+        let verifier = CoordinatorVerifier::default().with_test_ledger();
         let first = attempt();
         let prepared = verifier
             .prepare(
@@ -2020,6 +2020,7 @@ mod ark_escrow {
 
         let other = refund_swap([1u8; 32]);
         assert!(CoordinatorVerifier::default()
+            .with_test_ledger()
             .prepare(
                 f.prepare_view(&unbound, &attempt(), SIGN_ARK_REFUND, &BTreeMap::new()),
                 &refund_parameters(
@@ -2037,6 +2038,7 @@ mod ark_escrow {
         for expire_at in [now().unwrap() - 1, now().unwrap() + 24 * 60 * 60] {
             let stale = register_message(expire_at);
             assert!(CoordinatorVerifier::default()
+                .with_test_ledger()
                 .prepare(
                     f.prepare_view(&unbound, &attempt(), SIGN_ARK_REFUND, &BTreeMap::new()),
                     &refund_parameters(
@@ -2081,6 +2083,7 @@ mod ark_escrow {
             swap_tap_tree,
         };
         let refused = CoordinatorVerifier::default()
+            .with_test_ledger()
             .prepare(
                 f.prepare_view(
                     &Payload::default(),
@@ -2107,7 +2110,7 @@ mod ark_escrow {
     #[tokio::test]
     async fn the_escrow_permission_does_not_sign_a_refund_even_for_a_bound_pool() {
         let (f, escrow) = ark_fixture();
-        let verifier = CoordinatorVerifier::default();
+        let verifier = CoordinatorVerifier::default().with_test_ledger();
         let bound = f.bind(&verifier);
         let swap = refund_swap([9u8; 32]);
         let message = register_message(now().unwrap() + 120);
@@ -2166,7 +2169,7 @@ mod ark_escrow {
             *invoice_authorization = "00".repeat(64);
         }
         assert!(prepare(
-            CoordinatorVerifier::default(),
+            CoordinatorVerifier::default().with_test_ledger(),
             Payload::encode(&copied_metadata).unwrap()
         )
         .await
@@ -2179,9 +2182,11 @@ mod ark_escrow {
             address_invoice_for(paid_sats, preimage, FIXTURE_METADATA),
             MAX_REFUND_FEE_SATS,
         );
-        assert!(prepare(CoordinatorVerifier::default(), params)
-            .await
-            .is_err());
+        assert!(
+            prepare(CoordinatorVerifier::default().with_test_ledger(), params)
+                .await
+                .is_err()
+        );
 
         // A fee above the player's cap is refused before the address is resolved at all.
 
@@ -2190,16 +2195,18 @@ mod ark_escrow {
             address_invoice_for(paid_sats, preimage, FIXTURE_METADATA),
             MAX_REFUND_FEE_SATS + 1,
         );
-        assert!(prepare(CoordinatorVerifier::default(), params)
-            .await
-            .is_err());
+        assert!(
+            prepare(CoordinatorVerifier::default().with_test_ledger(), params)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn only_the_refund_permission_signs_a_refund() {
         let escrow = escrow_with(14, 18);
         let f = fixture_with(true, Some(policy_for(&escrow)));
-        let verifier = CoordinatorVerifier::default();
+        let verifier = CoordinatorVerifier::default().with_test_ledger();
         let attempt = attempt();
         let unbound = Payload::default();
         // The escrow spending permission may not sign a refund, and the refund permission may
@@ -2263,7 +2270,7 @@ mod ark_escrow {
     #[tokio::test]
     async fn an_intent_delete_signs_this_escrow_under_the_refund_permission_unbound() {
         let (f, escrow) = ark_fixture();
-        let verifier = CoordinatorVerifier::default();
+        let verifier = CoordinatorVerifier::default().with_test_ledger();
         let attempt = attempt();
         let unbound = Payload::default();
         let spend = delete_proof(&escrow, &fresh_delete_message(), pays_nothing());
@@ -2303,7 +2310,7 @@ mod ark_escrow {
     #[tokio::test]
     async fn an_intent_delete_is_refused_if_it_pays_anything_or_proves_another_message() {
         let (f, escrow) = ark_fixture();
-        let verifier = CoordinatorVerifier::default();
+        let verifier = CoordinatorVerifier::default().with_test_ledger();
         let attempt = attempt();
         let unbound = Payload::default();
         let bound = f.bind(&verifier);
@@ -2384,7 +2391,7 @@ mod ark_escrow {
 
     #[tokio::test]
     async fn a_compact_scope_signs_against_the_batch_outpoint_as_the_full_one_does() {
-        let verifier = CoordinatorVerifier::default();
+        let verifier = CoordinatorVerifier::default().with_test_ledger();
         let (f, escrow) = ark_fixture();
         let bound = f.bind(&verifier);
         let batch = new_batch(&f, &escrow);
@@ -2448,7 +2455,7 @@ mod ark_escrow {
 
     #[tokio::test]
     async fn a_kickoffs_forfeits_verify_its_contract_once_but_never_a_changed_one() {
-        let verifier = CoordinatorVerifier::default();
+        let verifier = CoordinatorVerifier::default().with_test_ledger();
         let (f, escrow) = ark_fixture();
         let bound = f.bind(&verifier);
         let batch = new_batch(&f, &escrow);
@@ -2476,4 +2483,51 @@ mod ark_escrow {
                 .is_err()
         );
     }
+}
+
+#[tokio::test]
+async fn missing_durable_witness_refuses_preparation_execution_and_restoration() {
+    let verifier = CoordinatorVerifier::default();
+    let f = fixture(false);
+    let prepared_by = CoordinatorVerifier::default().with_test_ledger();
+    let bound = f.bind(&prepared_by);
+    let attempt = ActionAttempt {
+        attempt_id: Uuid::now_v7(),
+        signing_session_id: None,
+    };
+    let params = f.settlement_parameters(&attempt);
+    let prior = BTreeMap::new();
+    assert!(verifier
+        .prepare(
+            f.prepare_view(&bound, &attempt, RELEASE_PREIMAGE, &prior),
+            &params
+        )
+        .await
+        .is_err());
+    let prepared = prepared_by
+        .prepare(
+            f.prepare_view(&bound, &attempt, RELEASE_PREIMAGE, &prior),
+            &params,
+        )
+        .await
+        .unwrap();
+    let proof = Payload::encode(&PaymentEvidence {
+        payment_preimage: [9; 32],
+    })
+    .unwrap();
+    assert!(verifier
+        .verify_execution(
+            f.execute_view(&bound, &attempt, RELEASE_PREIMAGE),
+            &prepared,
+            &proof
+        )
+        .await
+        .is_err());
+    assert!(verifier
+        .restore_execution(
+            f.execute_view(&bound, &attempt, RELEASE_PREIMAGE),
+            &prepared
+        )
+        .await
+        .is_err());
 }

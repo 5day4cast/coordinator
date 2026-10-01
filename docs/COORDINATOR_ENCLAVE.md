@@ -139,9 +139,11 @@ These additional interfaces are not implemented by this Coordinator extraction:
 - MuSig2 interaction with signing parties outside the managed Keymeld participant set.
 - A general plain BIP340 signing interface governed by escrow permissions.
 - Immutable application policy attached to every generic stored key outside session escrow.
-- Durable anti-equivocation state anchored independently of host-controlled sealed receipts.
 
 Sealed receipts authenticate earlier decisions. They do not prevent a host from replaying an older complete state snapshot.
 An application that requires cross-restart uniqueness needs an independent durable state anchor.
 The verifier execution hook is asynchronous and runs before custody effects, outside the session and escrow ledger locks.
-This permits a future application-owned witness or compare-and-set commit. No such witness is implemented here.
+The [payout witness](payout-witness.md) commits permanent claim ownership before preparation, execution, and receipt restoration.
+Production uses an independently administered HTTPS witness with fresh authenticated receipts.
+The explicit TCP simulation artifact can share a local SQLite ledger under the lab host's trust boundary.
+Neither mode turns sealed receipts into protection against rollback of the witness's own storage.

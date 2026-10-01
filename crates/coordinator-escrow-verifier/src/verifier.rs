@@ -29,89 +29,74 @@ use keymeld_enclave::escrow_verifier::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Mutex,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
-const MAX_LEDGER_ENTRIES: usize = 4096;
 type Claim = (SessionId, UserId, Uuid);
-
-// Process-local duplicate-payment defense. Sealed receipts and this cache do not
-// establish global antirollback or durable cross-restart uniqueness.
-#[derive(Default)]
-struct SettlementLedger {
-    payment_hashes: BTreeMap<String, Claim>,
-    released_entries: BTreeMap<(SessionId, UserId), Uuid>,
-}
 
 #[derive(Default)]
 pub struct CoordinatorVerifier {
     #[cfg(feature = "lnurl")]
     lnurl: Option<crate::lnurl_transport::LnurlPayClient>,
-    ledger: Mutex<SettlementLedger>,
+    witness: Option<Arc<dyn crate::witness::ReservationWitness>>,
     /// Completed contracts already verified, so a kickoff's forfeits verify theirs once.
     contracts: payout::VerifiedContracts,
 }
 impl CoordinatorVerifier {
     /// Enables network preparation only in this statically registered verifier.
-    /// The default constructor permits invoice fallback and paid-claim recovery.
+    /// Payout preparation and recovery also require an independent durable witness.
     #[cfg(feature = "lnurl")]
     pub fn with_lnurl(client: crate::lnurl_transport::LnurlPayClient) -> Self {
         Self {
             lnurl: Some(client),
-            ledger: Mutex::default(),
-            contracts: payout::VerifiedContracts::default(),
+            ..Self::default()
         }
     }
+    #[cfg(feature = "lnurl")]
     pub fn lnurl_enabled(&self) -> bool {
-        #[cfg(feature = "lnurl")]
-        {
-            self.lnurl.is_some()
-        }
-        #[cfg(not(feature = "lnurl"))]
-        {
-            false
-        }
+        self.lnurl.is_some()
     }
-    fn reserve_payment(
+    #[cfg(not(feature = "lnurl"))]
+    pub fn lnurl_enabled(&self) -> bool {
+        false
+    }
+    pub fn with_witness(mut self, witness: Arc<dyn crate::witness::ReservationWitness>) -> Self {
+        self.witness = Some(witness);
+        self
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_test_ledger(self) -> Self {
+        self.with_witness(Arc::new(crate::witness::MemoryWitness::default()))
+    }
+
+    async fn reserve_payment(
         &self,
         claim: Claim,
         invoice_hash: &str,
         executing: bool,
     ) -> Result<(), VerificationError> {
-        let mut ledger = self
-            .ledger
-            .lock()
-            .map_err(|_| invalid("Settlement ledger lock poisoned"))?;
-        if ledger
-            .payment_hashes
-            .get(invoice_hash)
-            .is_some_and(|owner| owner != &claim)
-        {
-            return Err(invalid("Payment hash is committed to another claim"));
-        }
-        let entry = (claim.0.clone(), claim.1.clone());
-        if ledger
-            .released_entries
-            .get(&entry)
-            .is_some_and(|attempt| *attempt != claim.2)
-        {
-            return Err(invalid(
-                "Entry has already been released under another claim",
-            ));
-        }
-        if !ledger.payment_hashes.contains_key(invoice_hash)
-            && ledger.payment_hashes.len() >= MAX_LEDGER_ENTRIES
-        {
-            return Err(invalid("Settlement ledger capacity reached"));
-        }
-        ledger
-            .payment_hashes
-            .insert(invoice_hash.into(), claim.clone());
-        if executing {
-            ledger.released_entries.insert(entry, claim.2);
-        }
+        use coordinator_escrow::payout_witness::{Claim, Reservation, WitnessError};
+        let witness = self
+            .witness
+            .as_ref()
+            .ok_or_else(|| invalid(WitnessError::NotConfigured))?;
+        // This call commits before a preparation or custody release becomes usable.
+        // Unknown outcomes retry this exact ownership; historical claims never expire.
+        witness
+            .reserve(Reservation {
+                claim: Claim {
+                    session_id: claim.0.uuid(),
+                    user_id: claim.1.uuid(),
+                    claim_id: claim.2,
+                },
+                payment_hash: hex32(invoice_hash)?,
+                executing,
+            })
+            .await
+            .map_err(invalid)?;
         Ok(())
     }
 }
@@ -1129,8 +1114,8 @@ impl EscrowVerifier for CoordinatorVerifier {
     fn capabilities(&self) -> Result<Payload, VerificationError> {
         Payload::encode(
             &coordinator_escrow::payout_capabilities::PayoutCapabilities {
-                payout: true,
-                lnurl: self.lnurl_enabled(),
+                payout: self.witness.is_some(),
+                lnurl: self.witness.is_some() && self.lnurl_enabled(),
             },
         )
         .map_err(invalid)
@@ -1468,7 +1453,8 @@ impl EscrowVerifier for CoordinatorVerifier {
                         ),
                         &settlement.payment_hash,
                         false,
-                    )?;
+                    )
+                    .await?;
                     Ok(PreparedAction {
                         action,
                         application_state: Payload::encode(&PreparedState::Settlement {
@@ -1600,7 +1586,8 @@ impl EscrowVerifier for CoordinatorVerifier {
                         ),
                         &settlement.payment_hash,
                         true,
-                    )?;
+                    )
+                    .await?;
                 }
             }
             context
@@ -1710,7 +1697,8 @@ impl EscrowVerifier for CoordinatorVerifier {
                         ),
                         &settlement.payment_hash,
                         true,
-                    )?;
+                    )
+                    .await?;
                 }
             }
             Ok(())

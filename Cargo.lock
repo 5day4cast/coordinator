@@ -1727,6 +1727,7 @@ dependencies = [
  "coordinator-ark-escrow",
  "dlctix",
  "hex",
+ "hmac 0.12.1",
  "keymeld-core",
  "lightning-invoice",
  "secp256k1 0.31.1",
@@ -1747,6 +1748,7 @@ dependencies = [
  "bytes",
  "coordinator-ark-escrow",
  "coordinator-escrow",
+ "coordinator-payout-witness",
  "hex",
  "http-body-util",
  "hyper",
@@ -1767,6 +1769,7 @@ dependencies = [
  "url",
  "uuid",
  "webpki-roots 1.0.5",
+ "zeroize",
 ]
 
 [[package]]
@@ -1822,6 +1825,22 @@ dependencies = [
  "toml",
  "tower",
  "tower-http 0.5.2",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "coordinator-payout-witness"
+version = "2.14.10"
+dependencies = [
+ "anyhow",
+ "axum",
+ "coordinator-escrow",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
  "uuid",
  "zeroize",
 ]

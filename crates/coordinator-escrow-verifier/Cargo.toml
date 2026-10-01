@@ -7,12 +7,15 @@ license.workspace = true
 [features]
 default = []
 lnurl = ["dep:url", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes"]
+# Only for explicitly trusted TCP simulations; Nitro keeps the HTTPS witness.
+payout-witness-local = ["dep:coordinator-payout-witness"]
 # Carries the LNURL provider fixtures to other crates' tests. Never enable in a release build.
 test-support = ["lnurl", "dep:rcgen"]
 
 [dependencies]
 coordinator-escrow = { path = "../coordinator-escrow", features = ["networking"] }
 coordinator-ark-escrow = { path = "../coordinator-ark-escrow" }
+coordinator-payout-witness = { path = "../coordinator-payout-witness", optional = true }
 keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "425508fd6cca2deec64543098e15e907507d514e", default-features = false, features = ["escrow", "enclave"] }
 keymeld-enclave = { git = "https://github.com/tee8z/keymeld", rev = "425508fd6cca2deec64543098e15e907507d514e", default-features = false, features = ["escrow"] }
 serde.workspace = true
@@ -20,6 +23,8 @@ serde_json.workspace = true
 sha2.workspace = true
 hex.workspace = true
 uuid.workspace = true
+rand.workspace = true
+zeroize.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tokio = { workspace = true, features = ["full"] }
@@ -37,4 +42,3 @@ bytes = { version = "1", optional = true }
 [dev-dependencies]
 rcgen = "0.13.2"
 secp256k1 = { version = "0.31", features = ["serde"] }
-rand.workspace = true

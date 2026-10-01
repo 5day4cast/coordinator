@@ -142,6 +142,57 @@ class ReleaseTests(unittest.TestCase):
         self.assertTrue(names)
         self.assertTrue(all(name.startswith("pkg") for name in names), names)
 
+    def enclave_files(self):
+        for binary in ("coordinator-verifier-enclave", "coordinator-lnurl-relay"):
+            self.put(f"target/{TARGET}/release/{binary}", "binary fixture").chmod(0o755)
+
+    def test_enclave_archive_does_not_require_or_include_a_local_witness(self):
+        self.enclave_files()
+        destination = release.package_enclave(self.root, VERSION, SOURCE, TARGET, self.root / "release")
+        self.assertEqual(destination.name, f"coordinator-verifier-enclave-{VERSION}-{TARGET}.tar.gz")
+        with tarfile.open(destination) as archive:
+            prefix = f"coordinator-verifier-enclave-{VERSION}-{TARGET}/"
+            for binary in ("coordinator-verifier-enclave", "coordinator-lnurl-relay"):
+                self.assertIn(prefix + "bin/" + binary, archive.getnames())
+                self.assertEqual(archive.getmember(prefix + "bin/" + binary).mode, 0o755)
+            self.assertNotIn(prefix + "bin/coordinator-payout-witness", archive.getnames())
+            manifest = json.load(archive.extractfile(prefix + "RELEASE.json"))
+            self.assertEqual(manifest["source_commit"], SOURCE)
+            self.assertEqual(manifest["features"], ["lnurl"])
+
+    def test_simulation_archive_is_distinct_and_includes_witness_bootstrap_binary(self):
+        self.enclave_files()
+        production = release.package_enclave(self.root, VERSION, SOURCE, TARGET, self.root / "release")
+        production_hash = release.digest(production)
+        self.put(f"target/{TARGET}/release/coordinator-payout-witness", "witness fixture").chmod(0o755)
+        # The release workflow rebuilds the same binary with simulation features
+        # after the HTTPS-only archive has already been created.
+        self.put(f"target/{TARGET}/release/coordinator-verifier-enclave", "simulation fixture").chmod(0o755)
+        destination = release.package_enclave(
+            self.root, VERSION, SOURCE, TARGET, self.root / "release", simulation=True
+        )
+        self.assertEqual(destination.name, f"coordinator-verifier-enclave-simulation-{VERSION}-{TARGET}.tar.gz")
+        self.assertNotEqual(destination, production)
+        self.assertEqual(release.digest(production), production_hash)
+        with tarfile.open(destination) as archive:
+            prefix = f"coordinator-verifier-enclave-simulation-{VERSION}-{TARGET}/"
+            for binary in ("coordinator-verifier-enclave", "coordinator-lnurl-relay", "coordinator-payout-witness"):
+                self.assertIn(prefix + "bin/" + binary, archive.getnames())
+                self.assertEqual(archive.getmember(prefix + "bin/" + binary).mode, 0o755)
+            self.assertEqual(archive.extractfile(prefix + "bin/coordinator-verifier-enclave").read(), b"simulation fixture")
+            manifest = json.load(archive.extractfile(prefix + "RELEASE.json"))
+            self.assertEqual(manifest["source_commit"], SOURCE)
+            self.assertEqual(manifest["features"], ["lnurl", "payout-witness-local"])
+            checksums = archive.extractfile(prefix + "SHA256SUMS").read().decode()
+            self.assertIn("  bin/coordinator-payout-witness\n", checksums)
+
+    def test_simulation_archive_requires_the_witness_bootstrap_binary(self):
+        self.enclave_files()
+        with self.assertRaisesRegex(ValueError, "missing or empty release asset.*coordinator-payout-witness"):
+            release.package_enclave(
+                self.root, VERSION, SOURCE, TARGET, self.root / "release", simulation=True
+            )
+
     def test_swap_archive_contains_the_service_and_provenance(self):
         self.put(f"target/{TARGET}/release/ark-swapd", "binary fixture").chmod(0o755)
         destination = release.package_swap(self.root, VERSION, SOURCE, TARGET, self.root / "release")

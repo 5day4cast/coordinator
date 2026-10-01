@@ -53,7 +53,10 @@ struct Enclaves(Arc<BTreeMap<EnclaveId, Arc<EnclaveOperator>>>);
 fn operator(id: u32) -> Arc<EnclaveOperator> {
     let operator = EnclaveOperator::with_verifiers(
         EnclaveId::new(id),
-        VerifierRegistry::new(vec![Arc::new(CoordinatorVerifier::default())]).unwrap(),
+        VerifierRegistry::new(vec![Arc::new(
+            CoordinatorVerifier::default().with_test_ledger(),
+        )])
+        .unwrap(),
     )
     .unwrap();
     operator.set_test_keys([200 + id as u8; 32]);

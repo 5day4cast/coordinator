@@ -9,12 +9,12 @@ use bytes::Bytes;
 use coordinator_escrow::lnurl_relay::{
     read_control, validate_addresses, validate_dns_host, write_control, RelayRequest, RelayResponse,
 };
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, Request, Response};
 use hyper_util::rt::TokioIo;
 use keymeld_core::managed_socket::{SocketConnector, SocketStream};
 use rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     net::{IpAddr, SocketAddr},
@@ -80,7 +80,7 @@ fn discovery_url(address: &str) -> Result<Url> {
         .map_err(|_| LnurlError::InvalidAddress.into())
 }
 
-fn validate_url(url: &Url) -> Result<()> {
+pub(crate) fn validate_url(url: &Url) -> Result<()> {
     ensure!(
         url.as_str().len() <= MAX_URL_BYTES
             && url.scheme() == "https"
@@ -145,10 +145,21 @@ impl LnurlPayClient {
     async fn get_json(&self, url: Url) -> Result<Value> {
         validate_url(&url)?;
         // Includes relay DNS, connect, TLS, HTTP headers and complete response.
-        request_with_timeout(REQUEST_TIMEOUT, self.get_json_inner(url)).await
+        request_with_timeout(REQUEST_TIMEOUT, self.get_json_inner(url, None)).await
     }
 
-    async fn get_json_inner(&self, url: Url) -> Result<Value> {
+    /// The witness URL is operator configuration. Never resolve it from payout input.
+    pub(crate) async fn post_json(&self, url: Url, payload: &impl Serialize) -> Result<Value> {
+        validate_url(&url)?;
+        let body = serde_json::to_vec(payload)?;
+        ensure!(
+            body.len() <= coordinator_escrow::payout_witness::MAX_REQUEST_BYTES,
+            "Witness request exceeds size limit"
+        );
+        request_with_timeout(REQUEST_TIMEOUT, self.get_json_inner(url, Some(body.into()))).await
+    }
+
+    async fn get_json_inner(&self, url: Url, body: Option<Bytes>) -> Result<Value> {
         let host = url.host_str().ok_or(LnurlError::UnsafeUrl)?;
         let port = url.port_or_known_default().ok_or(LnurlError::UnsafeUrl)?;
         let addresses = if let Some(ip) = literal_ip(&url) {
@@ -189,7 +200,10 @@ impl LnurlPayClient {
         .await
         .map_err(|_| anyhow!("LNURL TLS handshake timed out"))?
         .map_err(|_| anyhow!("LNURL TLS authentication failed"))?;
-        fetch_json(TokioIo::new(tls), &url).await
+        match body {
+            None => fetch_json(TokioIo::new(tls), &url).await,
+            Some(body) => fetch_json_request(TokioIo::new(tls), &url, Some(body)).await,
+        }
     }
 
     async fn connect_pinned(&self, address: SocketAddr) -> Result<SocketStream> {
@@ -240,6 +254,13 @@ async fn fetch_json<S>(socket: S, url: &Url) -> Result<Value>
 where
     S: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
+    fetch_json_request(socket, url, None).await
+}
+
+async fn fetch_json_request<S>(socket: S, url: &Url, body: Option<Bytes>) -> Result<Value>
+where
+    S: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
     let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
         .max_buf_size(32 * 1024)
         .max_headers(64)
@@ -257,12 +278,20 @@ where
     ));
     let target = &url[url::Position::BeforePath..url::Position::AfterQuery];
     let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
-    let request = Request::get(target)
+    let method = if body.is_some() {
+        hyper::Method::POST
+    } else {
+        hyper::Method::GET
+    };
+    let request = Request::builder()
+        .method(method)
+        .uri(target)
+        .header("Content-Type", "application/json")
         .header("Host", authority)
         .header("Accept", "application/json")
         .header("Accept-Encoding", "identity")
         .header("Connection", "close")
-        .body(Empty::<Bytes>::new())?;
+        .body(Full::new(body.unwrap_or_default()))?;
     let response = sender
         .send_request(request)
         .await

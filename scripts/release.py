@@ -158,18 +158,22 @@ def package_native(root, version, source, target, asset, wasm_archive, output):
         return archive(package, output)
 
 
-def package_enclave(root, version, source, target, output):
+def package_enclave(root, version, source, target, output, simulation=False):
     """Package the coordinator verifier enclave and its LNURL relay for a Keymeld host."""
     binaries = root / "target" / target / "release"
     names = ("coordinator-verifier-enclave", "coordinator-lnurl-relay")
+    if simulation:
+        names += ("coordinator-payout-witness",)
     require_files(binaries, names)
     with tempfile.TemporaryDirectory() as temporary:
-        package = Path(temporary) / f"coordinator-verifier-enclave-{version}-{target}"
+        variant = "-simulation" if simulation else ""
+        package = Path(temporary) / f"coordinator-verifier-enclave{variant}-{version}-{target}"
         (package / "bin").mkdir(parents=True)
         for binary in names:
             shutil.copy2(binaries / binary, package / "bin" / binary)
         provenance = metadata(root, version, source)
-        provenance.update(target=target, features=["lnurl"])
+        features = ["lnurl", "payout-witness-local"] if simulation else ["lnurl"]
+        provenance.update(target=target, features=features)
         (package / "RELEASE.json").write_text(json.dumps(provenance, indent=2) + "\n")
         (package / "README.txt").write_text(
             f"Coordinator verifier enclave v{version}\nSource: {source}\n\n"
@@ -180,9 +184,13 @@ def package_enclave(root, version, source, target, output):
             "environment as keymeld-enclave, plus COORDINATOR_ESCROW_LNURL_ENABLED and\n"
             "COORDINATOR_LNURL_RELAY_PORT.\n\n"
             "bin/coordinator-lnurl-relay is the host-side relay the enclave uses for LNURL\n"
-            "traffic; run it on the relay port when LNURL is enabled.\n\n"
-            "Use sha256sum -c SHA256SUMS to verify files. See docs/COORDINATOR_ENCLAVE.md:\n"
-            "https://github.com/5day4cast/coordinator/blob/v" + version + "/docs/COORDINATOR_ENCLAVE.md\n"
+            "traffic and HTTPS witness reservations; run it when either uses HTTPS.\n\n"
+            + ("This simulation artifact includes coordinator-payout-witness. Local storage requires\n"
+               "COORDINATOR_PAYOUT_WITNESS_MODE=local-simulation, an initialized database,\n"
+               "its pinned ledger UUID, TCP transport, and explicit unattested development trust.\n\n"
+               if simulation else "The HTTPS witness URL, pinned ledger UUID, and confidential key file are required.\n\n")
+            + "Use sha256sum -c SHA256SUMS to verify files. See docs/payout-witness.md:\n"
+            "https://github.com/5day4cast/coordinator/blob/v" + version + "/docs/payout-witness.md\n"
         )
         return archive(package, output)
 
@@ -232,7 +240,7 @@ def package_synth(root, version, source, target, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["validate", "wasm", "native", "enclave", "swap", "synth", "checksums"])
+    parser.add_argument("command", choices=["validate", "wasm", "native", "enclave", "enclave-simulation", "swap", "synth", "checksums"])
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--version")
     parser.add_argument("--source")
@@ -255,8 +263,9 @@ def main():
         parser.error("--source must be the complete source commit SHA")
     if args.command == "wasm":
         print(package_wasm(args.root, args.version, args.source, args.wasm, args.output))
-    elif args.command == "enclave":
-        print(package_enclave(args.root, args.version, args.source, args.target, args.output))
+    elif args.command in ("enclave", "enclave-simulation"):
+        print(package_enclave(args.root, args.version, args.source, args.target, args.output,
+                              simulation=args.command == "enclave-simulation"))
     elif args.command == "swap":
         print(package_swap(args.root, args.version, args.source, args.target, args.output))
     elif args.command == "synth":
