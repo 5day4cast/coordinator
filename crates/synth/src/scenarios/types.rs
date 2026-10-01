@@ -284,6 +284,8 @@ pub struct ScenarioConfig {
     pub stations: Vec<String>,
     /// Entry fee in sats
     pub entry_fee: usize,
+    #[serde(default = "default_max_ticket_fees_sats")]
+    pub max_ticket_fees_sats: u64,
     /// Time before observation starts (entry window) in seconds
     pub entry_window_secs: u64,
     /// Observation window duration in seconds
@@ -376,6 +378,10 @@ pub struct CompetitionTimes {
     pub signing: OffsetDateTime,
 }
 
+pub fn default_max_ticket_fees_sats() -> u64 {
+    1_000
+}
+
 fn default_refund_timeout_secs() -> u64 {
     30 * 60
 }
@@ -391,6 +397,7 @@ impl Default for ScenarioConfig {
             users: 3,
             stations: vec!["KDEN".to_string(), "KJFK".to_string(), "KORD".to_string()],
             entry_fee: 1000,
+            max_ticket_fees_sats: default_max_ticket_fees_sats(),
             entry_window_secs: 120,
             observation_window_secs: default_observation_windows()[0],
             signing_delay_secs: 60,

@@ -35,6 +35,9 @@ pub struct EntryTrace {
     /// None on historical traces; false means this run definitely has not tried paying.
     #[serde(default)]
     pub payment_started: Option<bool>,
+    /// Canonical invoice and bound amount validated and saved before a real payment.
+    #[serde(default)]
+    pub payment_intent: Option<crate::payment::ValidatedInvoice>,
     #[serde(default)]
     pub ticket_registered: bool,
     #[serde(default, with = "time::serde::rfc3339::option")]

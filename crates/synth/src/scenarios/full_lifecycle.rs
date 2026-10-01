@@ -82,6 +82,8 @@ pub(super) struct PreparedEntry {
     pub entry: AddEntry,
     /// The ticket's policy is a queued competition's template, not a concrete contract.
     pub queued: bool,
+    expected_stake: u64,
+    max_ticket_fees: u64,
 }
 
 pub(super) async fn request_entry(
@@ -228,6 +230,8 @@ pub(super) async fn register_entry(
         ticket,
         entry,
         queued: consent.is_some_and(|consent| consent.queued),
+        expected_stake: u64::try_from(config.entry_fee).context("stake exceeds u64")?,
+        max_ticket_fees: config.max_ticket_fees_sats,
     })
 }
 
@@ -240,6 +244,13 @@ pub(super) async fn pay_entry(
     step: &str,
     trace: &mut EntryTrace,
 ) -> Result<()> {
+    if let Payer::Lnd(lnd) = payer {
+        trace.payment_intent = Some(prepared.ticket.payment_intent(
+            prepared.expected_stake,
+            prepared.max_ticket_fees,
+            lnd.network().await?,
+        )?);
+    }
     trace.payment_started = Some(true);
     // Persist both the ticket and the intent before payment: a restart can distinguish
     // an unpaid dropout from an interrupted Lightning request.
@@ -252,7 +263,15 @@ pub(super) async fn pay_entry(
                 .context("Failed to settle invoice")?;
             trace.settled_by_test_endpoint = true;
         }
-        Payer::Lnd(lnd) => match lnd.pay(&prepared.ticket.payment_request).await {
+        Payer::Lnd(lnd) => match lnd
+            .pay(
+                trace
+                    .payment_intent
+                    .as_ref()
+                    .context("validated payment intent missing")?,
+            )
+            .await
+        {
             Ok(paid) => trace.payment = Some(entry_payment(lnd, paid).await),
             // The entry invoice is a hold invoice: ark-swapd holds the HTLC until it has paid the
             // escrow, which can outlast the stream. Follow the payment on the node until it ends.
@@ -262,6 +281,11 @@ pub(super) async fn pay_entry(
                     prepared.ticket.ticket_id
                 );
                 let paid = follow_held_payment(lnd, &prepared.ticket).await?;
+                trace
+                    .payment_intent
+                    .as_ref()
+                    .context("validated payment intent missing")?
+                    .verify_paid(&paid)?;
                 trace.payment = Some(entry_payment(lnd, paid).await);
             }
             Err(e) => return Err(e.context("Failed to pay the entry invoice")),

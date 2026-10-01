@@ -98,6 +98,36 @@ pub struct TicketResponse {
 }
 
 impl TicketResponse {
+    /// Bind the ticket's signed principal and hash to the locally configured stake and fee cap.
+    pub fn payment_intent(
+        &self,
+        expected_stake: u64,
+        max_fees: u64,
+        network: lightning_invoice::Currency,
+    ) -> Result<crate::payment::ValidatedInvoice> {
+        self.check_price()?;
+        if let Some(stake) = self.entry_fee_sats {
+            anyhow::ensure!(
+                stake == expected_stake,
+                "ticket stake differs from the planned competition"
+            );
+        }
+        anyhow::ensure!(
+            self.amount_sats >= expected_stake,
+            "ticket is smaller than the planned stake"
+        );
+        let budget = expected_stake
+            .checked_add(max_fees)
+            .context("ticket budget overflow")?;
+        crate::payment::ValidatedInvoice::validate(
+            &self.payment_request,
+            Some(&self.payment_hash),
+            self.amount_sats,
+            budget,
+            network,
+        )
+    }
+
     /// Check the ticket's price as a wallet does before paying: its lines add up to what the
     /// invoice charges, and its escrow may pay out no more than the ticket above the stake. The
     /// network fee is the coordinator's to set; it is fixed on the ticket when issued.
@@ -132,7 +162,7 @@ impl TicketResponse {
             .and_then(|policy| policy.ark_escrow);
         if let (Some(escrow), Some(entry_fee)) = (escrow, entry_fee) {
             anyhow::ensure!(
-                escrow.max_fee_sats.checked_add(entry_fee) <= Some(self.amount_sats),
+                escrow.max_fee_sats.checked_add(entry_fee).is_some_and(|total| total <= self.amount_sats),
                 "The escrow may pay out {} sats beyond the {entry_fee} sat stake of a {} sat ticket",
                 escrow.max_fee_sats,
                 self.amount_sats

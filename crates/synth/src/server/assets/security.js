@@ -19,3 +19,14 @@
     },
   });
 })();
+
+// htmx 4 exposes request headers on detail.ctx. Only our origin receives the nonce.
+document.addEventListener('htmx:config:request', function authorizeOperatorWrite(event) {
+  const request = event.detail.ctx.request;
+  const target = new URL(request.action, window.location.href);
+  if (target.origin !== window.location.origin || /^(GET|HEAD|OPTIONS)$/i.test(request.method)) return;
+  const cookie = document.cookie.split('; ').find(function isNonce(value) {
+    return value.startsWith('synth_csrf=');
+  });
+  if (cookie) request.headers['X-Synth-CSRF'] = cookie.slice('synth_csrf='.length);
+});

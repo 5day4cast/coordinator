@@ -6,6 +6,7 @@
 //! settle endpoint holds no invoice of ark-swapd's to settle. Scenarios that do not need an
 //! escrow keep using that endpoint, and leave this unconfigured.
 
+use crate::payment::ValidatedInvoice;
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::URL_SAFE;
 use base64::Engine;
@@ -97,25 +98,61 @@ impl Lnd {
     }
 
     /// Pay `invoice`, waiting for it to settle or fail.
-    pub async fn pay(&self, invoice: &str) -> Result<Paid> {
-        self.send(json!({
-            "payment_request": invoice,
-            "timeout_seconds": self.payment_timeout_secs,
-            "fee_limit_sat": self.fee_limit_sats.to_string(),
-        }))
-        .await
+    pub async fn pay(&self, invoice: &ValidatedInvoice) -> Result<Paid> {
+        invoice.ensure_fresh()?;
+        let paid = self
+            .send(json!({
+                "payment_request": invoice.invoice(),
+                "timeout_seconds": self.payment_timeout_secs,
+                "fee_limit_sat": self.fee_limit_sats.to_string(),
+            }))
+            .await?;
+        invoice.verify_paid(&paid)?;
+        Ok(paid)
     }
 
     /// Pay `invoice` over `channel` only, so the payment moves that channel's balance and no
     /// other's.
-    pub async fn pay_through(&self, invoice: &str, channel: &str) -> Result<Paid> {
-        self.send(json!({
-            "payment_request": invoice,
-            "timeout_seconds": self.payment_timeout_secs,
-            "fee_limit_sat": self.fee_limit_sats.to_string(),
-            "outgoing_chan_ids": [channel],
-        }))
-        .await
+    pub async fn pay_through(&self, invoice: &ValidatedInvoice, channel: &str) -> Result<Paid> {
+        invoice.ensure_fresh()?;
+        let paid = self
+            .send(json!({
+                "payment_request": invoice.invoice(),
+                "timeout_seconds": self.payment_timeout_secs,
+                "fee_limit_sat": self.fee_limit_sats.to_string(),
+                "outgoing_chan_ids": [channel],
+            }))
+            .await?;
+        invoice.verify_paid(&paid)?;
+        Ok(paid)
+    }
+
+    /// Validate invoice networks against the configured paying node, not coordinator JSON.
+    pub async fn network(&self) -> Result<lightning_invoice::Currency> {
+        #[derive(Deserialize)]
+        struct Info {
+            chains: Vec<Chain>,
+        }
+        #[derive(Deserialize)]
+        struct Chain {
+            chain: String,
+            network: String,
+        }
+        let info: Info = self.get("v1/getinfo").await?;
+        let chain = info
+            .chains
+            .iter()
+            .find(|chain| chain.chain == "bitcoin")
+            .context("paying node did not report a Bitcoin network")?;
+        use lightning_invoice::Currency;
+        match chain.network.as_str() {
+            "mainnet" => Ok(Currency::Bitcoin),
+            "testnet" | "testnet3" | "testnet4" => Ok(Currency::BitcoinTestnet),
+            "regtest" => Ok(Currency::Regtest),
+            "signet" => Ok(Currency::Signet),
+            "simnet" => Ok(Currency::Simnet),
+            other => anyhow::bail!("unsupported paying node network: {other}"),
+        }
     }
 
     /// The router streams a payment's progress, so this reads until the last status it reports.
@@ -170,12 +207,12 @@ impl Lnd {
             .send()
             .await
             .context("look the payment up")?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(Tracked::NeverMade);
-        }
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::NOT_FOUND && never_made(&body) {
+                return Ok(Tracked::NeverMade);
+            }
             anyhow::bail!("LND refused ({status}): {body}");
         }
         // A payment still in flight keeps the stream open; the timeout ends it.
@@ -185,15 +222,22 @@ impl Lnd {
             Err(e) => return Err(e).context("read the payment"),
         };
         match last_payment(&body) {
-            Ok(payment) => Ok(match payment.status {
-                PaymentStatus::Succeeded => Tracked::Succeeded(payment.paid()),
-                PaymentStatus::Failed => Tracked::Failed,
-                PaymentStatus::InFlight | PaymentStatus::Initiated | PaymentStatus::Unknown => {
-                    Tracked::InFlight
-                }
-            }),
-            // LND reports a payment it never made as an error in the stream.
-            Err(e) if never_made(&format!("{e:#}")) => Ok(Tracked::NeverMade),
+            Ok(payment) => {
+                anyhow::ensure!(
+                    payment.payment_hash.eq_ignore_ascii_case(payment_hash),
+                    "LND tracked a different payment hash"
+                );
+                Ok(match payment.status {
+                    PaymentStatus::Succeeded => Tracked::Succeeded(payment.paid()),
+                    PaymentStatus::Failed => Tracked::Failed,
+                    PaymentStatus::InFlight | PaymentStatus::Initiated | PaymentStatus::Unknown => {
+                        Tracked::InFlight
+                    }
+                })
+            }
+            // Require LND's payment-specific NOT_FOUND error. A missing proxy route or
+            // another lookup failure is not proof that a transfer never started.
+            Err(_) if never_made(&body) => Ok(Tracked::NeverMade),
             Err(e) => Err(e),
         }
     }
@@ -473,8 +517,21 @@ impl Payment {
 }
 
 /// Whether LND's error says it never made the payment, rather than that the lookup failed.
-fn never_made(error: &str) -> bool {
-    error.contains("isn't initiated") || error.contains("not found")
+fn never_made(body: &str) -> bool {
+    let Some(last) = body.lines().rfind(|line| !line.trim().is_empty()) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(last) else {
+        return false;
+    };
+    let error = value.get("error").unwrap_or(&value);
+    error.get("code").and_then(serde_json::Value::as_u64) == Some(5)
+        && error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| {
+                message.contains("payment") && message.ends_with("isn't initiated")
+            })
 }
 
 /// The last payment update in a router stream.
@@ -616,6 +673,23 @@ mod tests {
         let error = last_payment(r#"{"error":{"code":5,"message":"payment isn't initiated"}}"#)
             .unwrap_err();
         assert!(format!("{error:#}").contains("isn't initiated"));
+    }
+
+    #[test]
+    fn missing_routes_and_other_lookup_errors_do_not_release_payment_intents() {
+        assert!(never_made(
+            r#"{"error":{"code":5,"message":"payment isn't initiated"}}"#
+        ));
+        assert!(never_made(
+            r#"{"code":5,"message":"payment isn't initiated"}"#
+        ));
+        assert!(!never_made("404 not found"));
+        assert!(!never_made(
+            r#"{"error":{"code":5,"message":"route not found"}}"#
+        ));
+        assert!(!never_made(
+            r#"{"error":{"code":14,"message":"payment isn't initiated"}}"#
+        ));
     }
 
     #[test]

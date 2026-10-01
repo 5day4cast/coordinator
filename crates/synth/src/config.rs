@@ -51,6 +51,12 @@ pub struct ServerConfig {
     pub host: String,
     /// Port to bind to
     pub port: u16,
+    /// Public browser origins allowed to start runs and move funds. Empty uses the request Host.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    /// Bearer token for non-browser operator calls. Browser controls use a CSRF nonce.
+    #[serde(default)]
+    pub operator_token_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -170,6 +176,9 @@ pub struct DefaultsConfig {
     pub stations: Vec<String>,
     /// Entry fee in sats
     pub entry_fee: usize,
+    /// Most a ticket may add to the configured stake, including coordinator and network fees.
+    #[serde(default = "crate::scenarios::types::default_max_ticket_fees_sats")]
+    pub max_ticket_fees_sats: u64,
     /// Time before observation starts (entry window) in seconds
     pub entry_window_secs: u64,
     /// Observation durations in seconds. Manual runs choose one; scheduled runs rotate.
@@ -208,6 +217,8 @@ impl Default for SynthConfig {
             server: ServerConfig {
                 host: "0.0.0.0".to_string(),
                 port: 9980,
+                allowed_origins: Vec::new(),
+                operator_token_file: None,
             },
             db: DbConfig {
                 path: "./data/synth.db".to_string(),
@@ -227,6 +238,7 @@ impl Default for SynthConfig {
                 players: Default::default(),
                 stations: vec!["KDEN".to_string(), "KJFK".to_string(), "KORD".to_string()],
                 entry_fee: 1000,
+                max_ticket_fees_sats: crate::scenarios::types::default_max_ticket_fees_sats(),
                 entry_window_secs: 120,
                 observation_windows_secs: ObservationWindows::default(),
                 signing_delay_secs: 60,
@@ -251,6 +263,7 @@ impl SynthConfig {
             },
             stations: self.defaults.stations.clone(),
             entry_fee: self.defaults.entry_fee,
+            max_ticket_fees_sats: self.defaults.max_ticket_fees_sats,
             entry_window_secs: self.defaults.entry_window_secs,
             observation_window_secs: self.defaults.observation_windows_secs.values()[0],
             signing_delay_secs: self.defaults.signing_delay_secs,
