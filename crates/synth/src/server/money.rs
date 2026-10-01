@@ -763,8 +763,9 @@ pub struct Ledger {
     pub closing_fees: Option<u64>,
     /// What the coordinator's node paid to route the confirmed payouts, in millisats.
     pub payout_routing_fee_msat: Option<u64>,
-    /// Once the money stopped moving, what is not accounted for: positive when money owed or
-    /// held is missing, negative when more left than was owed. Zero while it moves.
+    /// Once settlement is assessed, what is not accounted for: positive when money owed or
+    /// held is missing, negative when more left than was owed. Unverified obligations remain
+    /// visible while the tracker continues looking. Zero during normal settlement progress.
     pub remainder: i64,
     /// Why it does not balance, in words, for each thing that is off.
     pub flags: Vec<String>,
@@ -920,10 +921,9 @@ fn scope_ledger(run: &Run) -> Ledger {
         ));
     }
 
-    // Once the money stopped, what is missing.
-    let stopped = trail.money.is_final() || matches!(trail.money, Money::Stuck { .. });
+    // Tracking an uncertain outcome must not hide its outstanding obligations.
     let funded = trail.competition.as_ref().is_some_and(contracted);
-    if stopped && trail.money != Money::NothingPaid {
+    if trail.money.is_assessed() && trail.money != Money::NothingPaid {
         if funded
             || trail
                 .competition

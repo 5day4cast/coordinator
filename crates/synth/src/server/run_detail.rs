@@ -1014,9 +1014,7 @@ fn ledger_table(ledger: &Ledger, trail: Option<&Trail>) -> Markup {
             format::group(&format::msat_as_sats(msat))
         })
     };
-    let stopped = trail.is_some_and(|trail| {
-        trail.money.is_final() || matches!(trail.money, crate::trail::Money::Stuck { .. })
-    });
+    let assessed = trail.is_some_and(|trail| trail.money.is_assessed());
     let pot_return = trail
         .and_then(|trail| trail.settlement.as_ref())
         .is_some_and(is_pot_return);
@@ -1046,9 +1044,9 @@ fn ledger_table(ledger: &Ledger, trail: Option<&Trail>) -> Markup {
                     tr.total { td { "Pot" } td.num { (sats(ledger.pot)) } td {} }
                     tr { td { @if pot_return { "→ allocated for pot return" } @else { "→ owed to winners" } } td.num { (format::sats(ledger.owed)) } td.note { "their shares under the outcome" } }
                     tr { td { "→ confirmed paid over Lightning" } td.num { (format::sats(ledger.paid_out)) } td.note { (ledger.confirmed_payouts) " payouts" } }
-                    tr class=(if stopped && ledger.unpaid > 0 { "flag" } else { "" }) {
+                    tr class=(if assessed && ledger.unpaid > 0 { "flag" } else { "" }) {
                         td { "→ owed, not confirmed paid" } td.num { (format::sats(ledger.unpaid)) }
-                        td.note { @if !stopped && ledger.unpaid > 0 { "still to come" } }
+                        td.note { @if !assessed && ledger.unpaid > 0 { "still to come" } }
                     }
                     @if ledger.rounding > 0 {
                         tr { td { "→ owed to nobody" } td.num { (format::sats(ledger.rounding)) } td.note { "rounding the shares down leaves it in the pot" } }
@@ -1071,12 +1069,12 @@ fn ledger_table(ledger: &Ledger, trail: Option<&Trail>) -> Markup {
                 tr class=(if ledger.remainder != 0 { "total flag" } else { "total" }) {
                     td { "Unaccounted for" }
                     td.num { (format::sats_signed(ledger.remainder)) }
-                    td.note { @if !stopped { "judged once the money stops moving" } }
+                    td.note { @if !assessed { "judged once settlement is assessed" } }
                 }
             }
         } }
         @if ledger.flags.is_empty() {
-            @if stopped { p.note { "Player payments balance. Fees are shown separately; unavailable fees are not treated as zero." } }
+            @if assessed { p.note { "Player payments balance. Fees are shown separately; unavailable fees are not treated as zero." } }
         } @else {
             ul { @for flag in &ledger.flags { li.flag { (flag) } } }
         }

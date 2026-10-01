@@ -1227,7 +1227,7 @@ mod tests {
         let home = dashboard_live(&Dashboard::for_tests(db))
             .await
             .into_string();
-        assert!(home.contains("No runs yet."), "{home}");
+        assert!(home.contains("No completed runs yet."), "{home}");
     }
 
     /// An escrow expiry already past says nothing about when stuck money can move: the panel

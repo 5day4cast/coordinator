@@ -458,6 +458,11 @@ pub enum Money {
 }
 
 impl Money {
+    /// Whether settlement has a verdict, even when missing evidence keeps tracking active.
+    pub fn is_assessed(&self) -> bool {
+        !matches!(self, Money::Following)
+    }
+
     /// Whether synth has stopped looking for news about it. Stuck money is watched until it
     /// moves, so it is not final.
     pub fn is_final(&self) -> bool {
