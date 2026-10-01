@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
         .map(|value| value.parse::<u32>())
         .transpose()?
         .unwrap_or(0);
-    let verifier = coordinator_escrow_verifier::config::from_env()?;
+    let verifier = coordinator_escrow_verifier::config::from_env().await?;
     let registry = VerifierRegistry::new(vec![Arc::new(verifier)])?;
     let operator = create_enclave_operator_with_verifiers(EnclaveId::new(enclave_id), registry)?;
     let config = ServerConfig {

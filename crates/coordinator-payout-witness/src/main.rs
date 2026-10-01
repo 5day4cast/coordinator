@@ -10,7 +10,7 @@ use axum::{
 use coordinator_escrow::payout_witness::{
     Authenticated, AuthenticationKey, Receipt, Request, WitnessError, MAX_REQUEST_BYTES,
 };
-use coordinator_payout_witness::{initialize, Ledger};
+use coordinator_payout_witness::{initialize, initialize_empty, Ledger};
 use std::{
     path::Path,
     sync::{
@@ -131,7 +131,16 @@ async fn main() -> Result<()> {
             println!("Imported {} payment hashes and {} released entries", occupancy.payment_hashes, occupancy.released_entries);
             Ok(())
         }
+        [operation, database, acknowledgment]
+            if operation == "initialize-empty" && acknowledgment == "--acknowledge-fresh-epoch" =>
+        {
+            let ledger_id = initialize_empty(Path::new(database), true)
+                .await
+                .context("Fresh-epoch initialization failed; no ledger identity may be reused")?;
+            println!("PAYOUT_WITNESS_LEDGER_ID={ledger_id}");
+            Ok(())
+        }
         [operation, database] if operation == "serve" => serve(Path::new(database)).await,
-        _ => bail!("Usage: coordinator-payout-witness initialize-from DATABASE COMPLETE_INVENTORY | serve DATABASE"),
+        _ => bail!("Usage: coordinator-payout-witness initialize-from DATABASE COMPLETE_INVENTORY | initialize-empty DATABASE --acknowledge-fresh-epoch | serve DATABASE"),
     }
 }

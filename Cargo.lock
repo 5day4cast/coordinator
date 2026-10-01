@@ -1748,6 +1748,7 @@ dependencies = [
  "bytes",
  "coordinator-ark-escrow",
  "coordinator-escrow",
+ "coordinator-payout-witness",
  "hex",
  "http-body-util",
  "hyper",

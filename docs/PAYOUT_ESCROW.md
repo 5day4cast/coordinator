@@ -155,7 +155,8 @@ Participants therefore trust their chosen provider not to collude with the coord
 
 Sealed receipts authenticate restart state but do not prevent a hostile host from restoring an older database and enclave state.
 The current restoration system has no external monotonic counter.
-The enclave claim ledger does not span separate enclaves or survive a hostile rollback.
+The [payout witness](payout-witness.md) shares permanent claim ownership across verifier instances and restarts.
+Production requires independently administered witness storage; local simulation trusts the lab host and does not resist its rollback.
 The coordinator must retain its durable global payment-hash index across restarts.
 Immutable recipient and economic policies remain enforced after restoration.
 Do not describe the receipts as cryptographic rollback protection.
@@ -173,4 +174,4 @@ The verifier rechecks the authorized contract, amount, network, and invoice reci
 Reconcile the previous payment before requesting another invoice. Retain earlier receipts for late paid proofs.
 The first successfully executed candidate fixes each release grant; competing candidates cannot execute it afterward.
 Retrying the successful candidate recovers its result without another LNURL lookup.
-These rules do not turn sealed state into a durable antirollback witness.
+These rules do not turn sealed state into protection against rollback of witness storage.

@@ -35,6 +35,8 @@ CREATE TABLE released_entries (
 ) WITHOUT ROWID;
 ";
 
+const FRESH_EPOCH_CHECKPOINT: &str = "fresh deployment epoch: operator acknowledged retirement of prior coordinator state, enclave signing keys, and invoices";
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BootstrapHeader {
@@ -225,9 +227,37 @@ pub async fn initialize(database: &Path, inventory: &Path) -> Result<Occupancy> 
         (8..=512).contains(&header.complete_history_checkpoint.len()),
         "A complete-history checkpoint declaration is required"
     );
+    initialize_database(database, header, &mut source).await
+}
+
+/// Start a separate deployment epoch after retiring the prior deployment and
+/// its enclave signing keys, invoices, and claim state. Never use this to recover a
+/// missing witness for an existing epoch: its history must be imported instead.
+/// The caller must explicitly acknowledge that retirement before any file is
+/// created. A generated identity prevents reuse of the previous ledger pin.
+pub async fn initialize_empty(database: &Path, acknowledge_fresh_epoch: bool) -> Result<Uuid> {
+    ensure!(
+        acknowledge_fresh_epoch,
+        "Empty initialization requires explicit acknowledgment of a fresh deployment epoch"
+    );
+    let ledger_id = Uuid::now_v7();
+    let header = BootstrapHeader {
+        ledger_id,
+        complete_history_checkpoint: FRESH_EPOCH_CHECKPOINT.to_owned(),
+    };
+    let mut source = std::io::empty();
+    initialize_database(database, header, &mut source).await?;
+    Ok(ledger_id)
+}
+
+async fn initialize_database(
+    database: &Path,
+    header: BootstrapHeader,
+    source: &mut impl BufRead,
+) -> Result<Occupancy> {
     create_database_file(database)?;
     let pool = connect_existing(database).await?;
-    let result = import_inventory(&pool, header, &mut source).await;
+    let result = import_inventory(&pool, header, source).await;
     pool.close().await;
     result
 }
