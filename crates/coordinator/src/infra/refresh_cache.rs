@@ -78,6 +78,14 @@ struct Slot<V> {
     read_at: Instant,
 }
 
+impl<V> Slot<V> {
+    fn refresh_status(&self, ttl: Duration) -> (bool, bool) {
+        let state = self.state.borrow();
+        let due = state.latest.as_ref().is_none_or(|value| value.age() >= ttl);
+        (due, state.refreshing)
+    }
+}
+
 pub struct RefreshCache<K, V> {
     slots: Mutex<HashMap<K, Slot<V>>>,
 }
@@ -160,7 +168,7 @@ where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = anyhow::Result<V>> + Send + 'static,
     {
-        drop(self.read(&key, ttl, fetch));
+        let _updates = self.read(&key, ttl, fetch);
     }
 
     fn read<F, Fut>(
@@ -194,11 +202,7 @@ where
             read_at: Instant::now(),
         });
         slot.read_at = Instant::now();
-        let (due, refreshing) = {
-            let state = slot.state.borrow();
-            let due = state.latest.as_ref().is_none_or(|value| value.age() >= ttl);
-            (due, state.refreshing)
-        };
+        let (due, refreshing) = slot.refresh_status(ttl);
         let backing_off = slot
             .failed_at
             .is_some_and(|failed| failed.elapsed() < RETRY_AFTER);
@@ -235,7 +239,7 @@ where
 {
     fn finish(mut self, result: anyhow::Result<V>) {
         self.result = Some(result);
-        drop(self);
+        // Returning ends this refresh and publishes its result through Drop.
     }
 }
 

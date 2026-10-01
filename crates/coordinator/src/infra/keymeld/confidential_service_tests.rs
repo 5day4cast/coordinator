@@ -19,6 +19,12 @@ struct Seen {
     most_running: usize,
 }
 
+fn record_running_share(seen: &StdMutex<Seen>) {
+    let mut seen = seen.lock().unwrap();
+    seen.running += 1;
+    seen.most_running = seen.most_running.max(seen.running);
+}
+
 /// Work on one enclave's share: the first enclave's items take longest, so shares finish out of
 /// order. `fails` names an item that fails, after the items before it.
 async fn work(
@@ -28,11 +34,7 @@ async fn work(
     fails: &[u32],
 ) -> Result<Vec<String>, KeymeldError> {
     assert!(lane.is_empty(), "each share starts from its own copy");
-    {
-        let mut seen = seen.lock().unwrap();
-        seen.running += 1;
-        seen.most_running = seen.most_running.max(seen.running);
-    }
+    record_running_share(seen);
     let mut lane = lane;
     let mut results = Vec::new();
     let mut failed = None;

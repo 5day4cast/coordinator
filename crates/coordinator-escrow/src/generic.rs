@@ -338,16 +338,7 @@ mod tests {
     /// the outcome transactions, the player's own win split, and a refund and an expiry split
     /// for every player, each signed by every player and the market maker.
     fn pool_scope(players: usize) -> SigningScope {
-        let signers = {
-            let mut signers = (0..=players)
-                .map(|index| ScopeSigner {
-                    user_id: UserId::from(Uuid::from_u128(index as u128 + 1)),
-                    public_key: key(index as u8 + 1),
-                })
-                .collect::<Vec<_>>();
-            signers.sort_by(|a, b| a.public_key.cmp(&b.public_key));
-            signers
-        };
+        let signers = sorted_pool_signers(players);
         let outcomes = players + 2;
         SigningScope {
             session_tweak: KeyTweak::None,
@@ -370,6 +361,18 @@ mod tests {
                 .collect(),
         }
     }
+
+    fn sorted_pool_signers(players: usize) -> Vec<ScopeSigner> {
+        let mut signers = (0..=players)
+            .map(|index| ScopeSigner {
+                user_id: UserId::from(Uuid::from_u128(index as u128 + 1)),
+                public_key: key(index as u8 + 1),
+            })
+            .collect::<Vec<_>>();
+        signers.sort_by(|a, b| a.public_key.cmp(&b.public_key));
+        signers
+    }
+
     fn key(secret: u8) -> PublicKeyBytes {
         let secret = secp256k1::SecretKey::from_byte_array([secret; 32]).unwrap();
         PublicKeyBytes::new(&secret.public_key(&secp256k1::Secp256k1::new()).serialize()).unwrap()

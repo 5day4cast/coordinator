@@ -328,6 +328,23 @@ impl Fixture {
     }
 }
 
+async fn assert_pending_escrow_is_immutable(database: &DBConnection, ticket: &Ticket) {
+    let store = CompetitionStore::new(database.clone());
+    assert_eq!(store.get_pending_tickets().await.unwrap().len(), 1);
+    assert!(!store
+        .update_ticket_escrow_transaction(ticket, "different transaction")
+        .await
+        .unwrap());
+}
+
+fn assert_identical_publications(broadcasts: &Mutex<Vec<Transaction>>, stored_bytes: &str) {
+    let publications = broadcasts.lock().unwrap();
+    assert_eq!(publications.len(), 5);
+    assert!(publications
+        .iter()
+        .all(|tx| hex::encode(bitcoin::consensus::serialize(tx)) == stored_bytes));
+}
+
 #[tokio::test]
 async fn unknown_publication_and_settlement_recover_exact_escrow_after_restart() {
     let mut f = Fixture::new(false).await;
@@ -348,13 +365,7 @@ async fn unknown_publication_and_settlement_recover_exact_escrow_after_restart()
         .expect("persist before unknown publication");
     assert_eq!(f.broadcasts.lock().unwrap().len(), 3);
     assert!(f.released.lock().unwrap().is_empty());
-    let store = CompetitionStore::new(f.database.clone());
-    assert_eq!(store.get_pending_tickets().await.unwrap().len(), 1);
-    assert!(!store
-        .update_ticket_escrow_transaction(&after_error, "different transaction")
-        .await
-        .unwrap());
-    drop(store);
+    assert_pending_escrow_is_immutable(&f.database, &after_error).await;
     f.database.close().await.unwrap();
     f.database = open(&f.directory).await;
     f.fail_broadcast.store(false, Ordering::SeqCst);
@@ -389,13 +400,7 @@ async fn unknown_publication_and_settlement_recover_exact_escrow_after_restart()
         settled.escrow_transaction.as_deref(),
         Some(stored_bytes.as_str())
     );
-    {
-        let publications = f.broadcasts.lock().unwrap();
-        assert_eq!(publications.len(), 5);
-        assert!(publications
-            .iter()
-            .all(|tx| hex::encode(bitcoin::consensus::serialize(tx)) == stored_bytes));
-    }
+    assert_identical_publications(&f.broadcasts, &stored_bytes);
     assert!(CompetitionStore::new(f.database.clone())
         .get_pending_tickets()
         .await

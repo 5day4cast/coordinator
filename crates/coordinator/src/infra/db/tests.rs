@@ -209,9 +209,7 @@ async fn full_queue_rejects_new_writes_before_admission() {
     bounded(database.close()).await.unwrap();
 }
 
-#[tokio::test]
-async fn shutdown_drains_accepted_writes_after_callers_drop() {
-    let (directory, database) = database().await;
+async fn admit_writes_without_waiting(database: &DBConnection) -> oneshot::Sender<()> {
     let (started, start) = oneshot::channel();
     let (release, released) = oneshot::channel();
     let mut first = Box::pin(database.execute_write(move |_pool| async move {
@@ -228,8 +226,14 @@ async fn shutdown_drains_accepted_writes_after_callers_drop() {
         Ok(())
     }));
     assert!(poll!(accepted.as_mut()).is_pending());
-    drop(accepted);
-    drop(first);
+
+    release
+}
+
+#[tokio::test]
+async fn shutdown_drains_accepted_writes_after_callers_drop() {
+    let (directory, database) = database().await;
+    let release = admit_writes_without_waiting(&database).await;
 
     let mut close = Box::pin(database.clone().close());
     assert!(poll!(close.as_mut()).is_pending());
@@ -394,57 +398,7 @@ async fn registration_migration_preserves_legacy_entries_and_new_context_roundtr
     new_entry.ephemeral_pubkey = "ephemeral-2".into();
     new_entry.payout_hash = "hash-2".into();
     new_entry.keymeld_registration_context = Some(context.clone());
-    let signed_policy = {
-        use coordinator_escrow::escrow::{
-            self, Action, ActionGrant, ApplicationContext, Condition, EscrowContext, EscrowPolicy,
-            Permission, PublicKeyBytes, Recipient, SecretCommitment, SignedEscrowPolicy,
-        };
-        let key = PublicKeyBytes::new(
-            &keymeld_sdk::UserCredentials::from_private_key(&[9; 32])
-                .unwrap()
-                .public_key_bytes(),
-        )
-        .unwrap();
-        SignedEscrowPolicy::sign(
-            EscrowPolicy {
-                schema_version: escrow::SCHEMA_VERSION,
-                context: EscrowContext {
-                    keygen_session_id: context.keygen_session_id.clone(),
-                    user_id: context.user_id.clone(),
-                    escrow_id: new_entry.id,
-                    manifest_digest: [1; 32],
-                    application: ApplicationContext::commit("storage.test".into(), 1, &[]).unwrap(),
-                },
-                participant_public_key: key.clone(),
-                verifier: None,
-                secrets: std::collections::BTreeMap::from([(
-                    "deposit".into(),
-                    SecretCommitment::from_secret(&[6; 32]).unwrap(),
-                )]),
-                grants: std::collections::BTreeMap::from([(
-                    "release".into(),
-                    ActionGrant {
-                        preparation: coordinator_escrow::escrow::PreparationPolicy::Single,
-                        repetition: escrow::Repetition::Once,
-                        unbound: false,
-                        condition: Condition::HashlockSha256 {
-                            commitment: escrow::sha256(&[8; 32]),
-                        },
-                        operation: Permission::Exact {
-                            action: Action::ReleaseSecret {
-                                name: "deposit".into(),
-                                recipient: Recipient {
-                                    encryption_public_key: key,
-                                },
-                            },
-                        },
-                    },
-                )]),
-            },
-            &[9; 32],
-        )
-        .unwrap()
-    };
+    let signed_policy = storage_entry_policy(&context, new_entry.id);
     new_entry.keymeld_escrow_policy = Some(signed_policy.clone());
     bounded(store.add_entry(new_entry.clone(), new_ticket))
         .await
@@ -787,4 +741,59 @@ async fn concurrent_payouts_are_exclusive_and_terminal_states_cannot_be_overwrit
     assert!(succeeded.failed_at.is_none());
     assert!(bounded(start()).await.is_err());
     bounded(database.close()).await.unwrap();
+}
+
+fn storage_entry_policy(
+    context: &RegistrationContext,
+    entry_id: Uuid,
+) -> coordinator_escrow::escrow::SignedEscrowPolicy {
+    use coordinator_escrow::escrow::{
+        self, Action, ActionGrant, ApplicationContext, Condition, EscrowContext, EscrowPolicy,
+        Permission, PublicKeyBytes, Recipient, SecretCommitment, SignedEscrowPolicy,
+    };
+    let key = PublicKeyBytes::new(
+        &keymeld_sdk::UserCredentials::from_private_key(&[9; 32])
+            .unwrap()
+            .public_key_bytes(),
+    )
+    .unwrap();
+    SignedEscrowPolicy::sign(
+        EscrowPolicy {
+            schema_version: escrow::SCHEMA_VERSION,
+            context: EscrowContext {
+                keygen_session_id: context.keygen_session_id.clone(),
+                user_id: context.user_id.clone(),
+                escrow_id: entry_id,
+                manifest_digest: [1; 32],
+                application: ApplicationContext::commit("storage.test".into(), 1, &[]).unwrap(),
+            },
+            participant_public_key: key.clone(),
+            verifier: None,
+            secrets: std::collections::BTreeMap::from([(
+                "deposit".into(),
+                SecretCommitment::from_secret(&[6; 32]).unwrap(),
+            )]),
+            grants: std::collections::BTreeMap::from([(
+                "release".into(),
+                ActionGrant {
+                    preparation: coordinator_escrow::escrow::PreparationPolicy::Single,
+                    repetition: escrow::Repetition::Once,
+                    unbound: false,
+                    condition: Condition::HashlockSha256 {
+                        commitment: escrow::sha256(&[8; 32]),
+                    },
+                    operation: Permission::Exact {
+                        action: Action::ReleaseSecret {
+                            name: "deposit".into(),
+                            recipient: Recipient {
+                                encryption_public_key: key,
+                            },
+                        },
+                    },
+                },
+            )]),
+        },
+        &[9; 32],
+    )
+    .unwrap()
 }
