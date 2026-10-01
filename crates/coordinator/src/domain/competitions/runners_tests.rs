@@ -46,6 +46,12 @@ struct FakeSteps {
 }
 
 impl FakeSteps {
+    fn record_step(&self, competition_id: Uuid, holder: &str) -> usize {
+        let mut log = self.log.lock().unwrap();
+        log.push((competition_id, holder.to_owned()));
+        log.iter().filter(|(id, _)| *id == competition_id).count()
+    }
+
     fn steps(&self, competition_id: Uuid) -> Vec<String> {
         self.log
             .lock()
@@ -69,11 +75,7 @@ impl CompetitionSteps for FakeSteps {
         let delay = self.delays.lock().unwrap().get(&id).copied();
         tokio::time::sleep(delay.unwrap_or(Duration::from_millis(5))).await;
         self.in_step.lock().unwrap().remove(&id);
-        let taken = {
-            let mut log = self.log.lock().unwrap();
-            log.push((id, lease.holder.clone()));
-            log.iter().filter(|(logged, _)| *logged == id).count()
-        };
+        let taken = self.record_step(id, &lease.holder);
         if self
             .finish_after
             .lock()
