@@ -267,6 +267,15 @@
           nativeBuildInputs = commonNativeBuildInputs;
           cargoExtraArgs = "-p coordinator-lnurl-relay --bin coordinator-lnurl-relay";
         } // commonEnvs);
+        coordinator-payout-witness = craneLib.buildPackage ({
+          pname = "coordinator-payout-witness";
+          version = workspaceVersion;
+          inherit src;
+          cargoArtifacts = workspaceDeps;
+          buildInputs = commonBuildInputs;
+          nativeBuildInputs = commonNativeBuildInputs;
+          cargoExtraArgs = "-p coordinator-payout-witness --bin coordinator-payout-witness";
+        } // commonEnvs);
         coordinator-nitro-entrypoint = pkgs.writeShellApplication {
           name = "coordinator-nitro-entrypoint";
           runtimeInputs = [ pkgs.socat pkgs.iproute2 pkgs.util-linux pkgs.coreutils ];
@@ -1158,7 +1167,7 @@
         packages = {
           default = coordinator;
           inherit coordinator coordinator-wasm wallet-cli synth docker-coordinator docker-synth;
-          inherit coordinator-verifier-enclave coordinator-verifier-enclave-lnurl coordinator-lnurl-relay;
+          inherit coordinator-verifier-enclave coordinator-verifier-enclave-lnurl coordinator-lnurl-relay coordinator-payout-witness;
           inherit docker-coordinator-verifier-enclave docker-coordinator-verifier-enclave-lnurl docker-coordinator-lnurl-relay;
           inherit build-coordinator-eif;
           inherit start-regtest stop-regtest mine-blocks;

@@ -11,6 +11,7 @@ pub mod oracle_statement;
 pub mod payout;
 pub mod payout_capabilities;
 pub mod payout_protocol;
+pub mod payout_witness;
 pub mod pools;
 pub mod queued;
 pub mod refund_invoice;

@@ -8,6 +8,7 @@ members = [
     "crates/coordinator-escrow-verifier",
     "crates/coordinator-verifier-enclave",
     "crates/coordinator-lnurl-relay",
+    "crates/coordinator-payout-witness",
     "crates/coordinator-ark-escrow",
     "crates/coordinator-ark",
     "crates/coordinator-ark-swap",

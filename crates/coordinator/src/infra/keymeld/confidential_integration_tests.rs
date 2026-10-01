@@ -37,7 +37,7 @@ struct Relay {
     responses: Arc<Mutex<Vec<String>>>,
 }
 fn operator() -> Arc<EnclaveOperator> {
-    operator_verifying(CoordinatorVerifier::default())
+    operator_verifying(CoordinatorVerifier::default().with_test_ledger())
 }
 fn operator_verifying(verifier: CoordinatorVerifier) -> Arc<EnclaveOperator> {
     enclave_verifying(1, verifier)
@@ -660,8 +660,10 @@ impl PoolHarness {
                 (1..=enclaves.max(1) as u32)
                     .map(|id| {
                         let verifier = match lnurl.take() {
-                            Some(client) => CoordinatorVerifier::with_lnurl(client),
-                            None => CoordinatorVerifier::default(),
+                            Some(client) => {
+                                CoordinatorVerifier::with_lnurl(client).with_test_ledger()
+                            }
+                            None => CoordinatorVerifier::default().with_test_ledger(),
                         };
                         (EnclaveId::new(id), enclave_verifying(id, verifier))
                     })

@@ -392,11 +392,13 @@ impl Pool {
         manifest: &SignedSessionManifest,
         policy: &SignedEscrowPolicy,
     ) -> Result<(), VerificationError> {
-        CoordinatorVerifier::default().validate_registration(RegistrationView {
-            manifest,
-            policy,
-            restoring: false,
-        })
+        CoordinatorVerifier::default()
+            .with_test_ledger()
+            .validate_registration(RegistrationView {
+                manifest,
+                policy,
+                restoring: false,
+            })
     }
     /// Bind as slot 0, after `change`.
     fn bind(
@@ -411,7 +413,7 @@ impl Pool {
             statement: Some(self.statement.clone()),
         };
         change(self, &mut inputs);
-        CoordinatorVerifier::default().bind(
+        CoordinatorVerifier::default().with_test_ledger().bind(
             BindView {
                 manifest: &inputs.manifest,
                 policy: &self.f.policy,
@@ -574,6 +576,7 @@ async fn a_pool_binds_the_contract_its_formation_and_statement_give() {
     // Every member binds the same contract.
     for slot in 1..3 {
         CoordinatorVerifier::default()
+            .with_test_ledger()
             .bind(
                 BindView {
                     manifest: &pool.f.manifest,
@@ -611,7 +614,7 @@ async fn a_pool_binds_the_contract_its_formation_and_statement_give() {
     assert!(restore_binding(&pool.f.manifest, &pool.f.policy, &changed).is_err());
 
     // A bound action acts on the derived terms: the escrow is spent only into this contract.
-    let verifier = CoordinatorVerifier::default();
+    let verifier = CoordinatorVerifier::default().with_test_ledger();
     let escrow = escrow_with(KEYS[0], MAKER);
     let fee = TxOut {
         value: Amount::from_sat(2 * MAX_FEE_SATS),
@@ -770,7 +773,7 @@ fn a_pool_roster_follows_its_entry_order() {
 
 #[test]
 fn a_single_competition_binds_no_statement() {
-    let verifier = CoordinatorVerifier::default();
+    let verifier = CoordinatorVerifier::default().with_test_ledger();
     let f = fixture(false);
     let pool = pool_fixture(false);
     let bind = |statement: Option<SignedStatement>| {
@@ -851,7 +854,7 @@ async fn a_queued_refund_pays_the_players_own_address() {
             keys: pool.f.keys.clone(),
             contract: pool.f.contract.clone(),
         };
-        let verifier = CoordinatorVerifier::default();
+        let verifier = CoordinatorVerifier::default().with_test_ledger();
         let unbound = Payload::default();
         let first = attempt();
         let prepared = verifier

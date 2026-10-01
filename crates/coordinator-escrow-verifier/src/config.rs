@@ -1,8 +1,8 @@
 //! Operator-owned configuration. Requests cannot enable network access or add TLS roots.
 use crate::CoordinatorVerifier;
-#[cfg(feature = "lnurl")]
-use anyhow::ensure;
 use anyhow::Result;
+#[cfg(feature = "lnurl")]
+use anyhow::{ensure, Context};
 
 pub fn from_env() -> Result<CoordinatorVerifier> {
     let enabled = parse_enabled(
@@ -10,22 +10,41 @@ pub fn from_env() -> Result<CoordinatorVerifier> {
             .ok()
             .as_deref(),
     )?;
-    if !enabled {
-        return Ok(CoordinatorVerifier::default());
-    }
-    #[cfg(feature = "lnurl")]
-    {
-        Ok(CoordinatorVerifier::with_lnurl(
-            crate::lnurl_transport::LnurlPayClient::new(relay_connector()?)?,
-        ))
-    }
-    #[cfg(not(feature = "lnurl"))]
-    {
-        anyhow::bail!(
-            "COORDINATOR_ESCROW_LNURL_ENABLED requires the custom enclave's lnurl feature"
-        );
-    }
+    configured_verifier(enabled)
 }
+
+#[cfg(feature = "lnurl")]
+fn configured_verifier(enabled: bool) -> Result<CoordinatorVerifier> {
+    use coordinator_escrow::payout_witness::AuthenticationKey;
+    use std::sync::Arc;
+    let url = std::env::var("COORDINATOR_PAYOUT_WITNESS_URL")
+        .context("Durable payout witness URL is required")?
+        .parse()?;
+    let ledger_id = std::env::var("COORDINATOR_PAYOUT_WITNESS_LEDGER_ID")
+        .context("Pinned payout ledger identity is required")?
+        .parse()?;
+    let key_path = std::env::var("COORDINATOR_PAYOUT_WITNESS_KEY_FILE")
+        .context("Confidentially provisioned payout witness key file is required")?;
+    let key_bytes = zeroize::Zeroizing::new(std::fs::read_to_string(key_path)?);
+    let key = AuthenticationKey::from_hex(&key_bytes)?;
+    let transport = crate::lnurl_transport::LnurlPayClient::new(relay_connector()?)?;
+    let verifier = if enabled {
+        CoordinatorVerifier::with_lnurl(transport.clone())
+    } else {
+        CoordinatorVerifier::default()
+    };
+    Ok(
+        verifier.with_witness(Arc::new(crate::witness::HttpsWitness::new(
+            transport, url, ledger_id, key,
+        )?)),
+    )
+}
+
+#[cfg(not(feature = "lnurl"))]
+fn configured_verifier(_enabled: bool) -> Result<CoordinatorVerifier> {
+    anyhow::bail!("Durable payout witness requires the custom enclave's lnurl HTTPS feature")
+}
+
 fn parse_enabled(value: Option<&str>) -> Result<bool> {
     match value {
         None | Some("false") => Ok(false),
