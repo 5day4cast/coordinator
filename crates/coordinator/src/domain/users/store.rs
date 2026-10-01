@@ -62,6 +62,10 @@ pub struct UserStore {
 }
 
 impl UserStore {
+    pub(crate) fn auth_database(&self) -> DBConnection {
+        self.db_connection.clone()
+    }
+
     pub fn new(db_connection: DBConnection) -> Self {
         Self { db_connection }
     }

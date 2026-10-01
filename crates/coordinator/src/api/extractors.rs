@@ -31,22 +31,21 @@ pub async fn create_auth_event(
     url: &str,
     payload_hash: Option<Sha256Hash>,
     keys: &Keys,
-) -> Event {
-    let http_method = HttpMethod::from_str(method).unwrap();
-    let http_url = Url::from_str(url).unwrap();
+) -> anyhow::Result<Event> {
+    let http_method = HttpMethod::from_str(method)?;
+    let http_url = Url::from_str(url)?;
     let mut http_data = HttpData::new(http_url, http_method);
 
     if let Some(hash) = payload_hash {
         http_data = http_data.payload(hash);
     }
 
-    EventBuilder::http_auth(http_data)
+    Ok(EventBuilder::http_auth(http_data)
         .tag(Tag::custom(
             TagKind::Custom("request-id".into()),
             [hex::encode(rand::random::<[u8; 16]>())],
         ))
-        .sign_with_keys(keys)
-        .expect("Failed to sign event")
+        .sign_with_keys(keys)?)
 }
 
 #[derive(Clone, Debug)]
@@ -130,10 +129,12 @@ where
             .extensions
             .get::<Arc<Nip98ReplayGuard>>()
             .ok_or(AuthError::ReplayGuardMissing)?
-            .claim(event.id, created_at, now)
+            .claim_verified(event.id, created_at, now)
+            .await
             .map_err(|rejection| match rejection {
                 ReplayRejection::Replayed => AuthError::Replayed,
-                ReplayRejection::Full => AuthError::ReplayGuardFull,
+                ReplayRejection::Expired => AuthError::ExpiredTimestamp,
+                ReplayRejection::Full | ReplayRejection::Unavailable => AuthError::ReplayGuardFull,
             })?;
 
         Ok(Self {
@@ -326,7 +327,7 @@ mod tests {
             ("https://attacker.example/test", true, false),
             ("http://localhost/test", false, true),
         ] {
-            let event = create_auth_event("GET", url, None, &keys).await;
+            let event = create_auth_event("GET", url, None, &keys).await.unwrap();
             let mut request = Request::builder()
                 .method("GET")
                 .uri("/test")
@@ -359,7 +360,9 @@ mod tests {
         let keys = Keys::generate();
         let state = AppState;
 
-        let event = create_auth_event("GET", "http://localhost/test", None, &keys).await;
+        let event = create_auth_event("GET", "http://localhost/test", None, &keys)
+            .await
+            .unwrap();
 
         let auth_header = format!(
             "Nostr {}",
@@ -390,7 +393,9 @@ mod tests {
     ) -> Result<AuthedJson<serde_json::Value>, AuthError> {
         let keys = Keys::generate();
         let payload = signed_body.map(|body| Sha256Hash::hash(body.as_bytes()));
-        let event = create_auth_event("POST", "http://localhost/test", payload, &keys).await;
+        let event = create_auth_event("POST", "http://localhost/test", payload, &keys)
+            .await
+            .unwrap();
         let request = Request::builder()
             .extension(Arc::new(Nip98ReplayGuard::new(16)))
             .method("POST")
@@ -412,7 +417,9 @@ mod tests {
     #[tokio::test]
     async fn the_same_auth_header_is_accepted_only_once() {
         let keys = Keys::generate();
-        let event = create_auth_event("GET", "http://localhost/test", None, &keys).await;
+        let event = create_auth_event("GET", "http://localhost/test", None, &keys)
+            .await
+            .unwrap();
         let header = format!(
             "Nostr {}",
             BASE64.encode(serde_json::to_string(&event).unwrap())
@@ -469,10 +476,13 @@ mod tests {
     #[tokio::test]
     async fn forged_event_does_not_claim_a_valid_auth_event_id() {
         let keys = Keys::generate();
-        let event = create_auth_event("GET", "http://localhost/test", None, &keys).await;
+        let event = create_auth_event("GET", "http://localhost/test", None, &keys)
+            .await
+            .unwrap();
         let mut forged = event.clone();
         forged.sig = create_auth_event("GET", "http://localhost/test", None, &Keys::generate())
             .await
+            .unwrap()
             .sig;
         let guard = Arc::new(Nip98ReplayGuard::new(16));
         let request = |event: &Event| {
@@ -510,7 +520,9 @@ mod tests {
         let keys = Keys::generate();
         let guard = Arc::new(Nip98ReplayGuard::new(16));
         for _ in 0..16 {
-            let event = create_auth_event("GET", "http://localhost/test", None, &keys).await;
+            let event = create_auth_event("GET", "http://localhost/test", None, &keys)
+                .await
+                .unwrap();
             let mut parts = Request::builder()
                 .method("GET")
                 .uri("/test")
@@ -537,7 +549,9 @@ mod tests {
     #[tokio::test]
     async fn missing_replay_guard_fails_closed() {
         let keys = Keys::generate();
-        let event = create_auth_event("GET", "http://localhost/test", None, &keys).await;
+        let event = create_auth_event("GET", "http://localhost/test", None, &keys)
+            .await
+            .unwrap();
         let mut parts = Request::builder()
             .method("GET")
             .uri("/test")
@@ -594,8 +608,9 @@ mod tests {
         let body = r#"{"test": "data"}"#;
         let payload_hash = Sha256Hash::hash(body.as_bytes());
 
-        let event =
-            create_auth_event("POST", "http://localhost/test", Some(payload_hash), &keys).await;
+        let event = create_auth_event("POST", "http://localhost/test", Some(payload_hash), &keys)
+            .await
+            .unwrap();
 
         let auth_header = format!(
             "Nostr {}",
@@ -783,7 +798,9 @@ mod tests {
         let keys = Keys::generate();
         let state = Arc::new(AppState);
 
-        let event = create_auth_event("GET", "http://localhost/different-path", None, &keys).await;
+        let event = create_auth_event("GET", "http://localhost/different-path", None, &keys)
+            .await
+            .unwrap();
 
         let auth_header = format!(
             "Nostr {}",
@@ -810,7 +827,9 @@ mod tests {
         let keys = Keys::generate();
         let state = Arc::new(AppState);
 
-        let event = create_auth_event("POST", "http://localhost/test", None, &keys).await;
+        let event = create_auth_event("POST", "http://localhost/test", None, &keys)
+            .await
+            .unwrap();
 
         let auth_header = format!(
             "Nostr {}",
@@ -888,7 +907,8 @@ mod tests {
             None,
             &keys,
         )
-        .await;
+        .await
+        .unwrap();
 
         let auth_header = format!(
             "Nostr {}",

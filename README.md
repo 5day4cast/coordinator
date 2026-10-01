@@ -233,7 +233,9 @@ Set `keymeld_settings.public_gateway_url` to the browser-reachable gateway addre
 Allow the coordinator's exact browser origin in Keymeld's `server.cors_allowed_origins`.
 For Helm, use `keymeld.trustedPcrs` and `keymeld.publicGatewayUrl`.
 An enabled coordinator rejects missing or invalid trust pins unless `keymeld_settings.dangerous_trust_unattested_enclaves` is set.
-That setting exists for local simulation and for staging where Keymeld runs simulated enclaves with Moto KMS instead of Nitro hardware.
+That setting supports simulated enclaves without Nitro hardware.
+Local helpers use Moto KMS; the deployed simulation service uses a persisted development KMS key.
+Neither configuration provides hardware custody or protection from a compromised application host.
 The coordinator refuses it on mainnet or together with trust pins, warns at startup, and forwards it to browsers in the ticket response so they skip attestation for that gateway only.
 For Helm, use `keymeld.dangerousTrustUnattestedEnclaves`.
 
@@ -303,6 +305,25 @@ For `wallet-cli`, use the equivalent `[bitcoin]` and `[ln]` sections in its conf
 The wallet balance API now returns `confirmed`, `unconfirmed`, and `locked` amounts in satoshis.
 Update clients that read `immature`, `trusted_pending`, or `untrusted_pending`.
 The wallet outputs API returns `outpoint`, `txout`, and `confirmations` for each unspent output.
+
+### Ark swap chain indexing
+
+`ark-swapd` reads Bitcoin chain data from a self-hosted [electrs](https://github.com/romanz/electrs) server.
+Set its required `electrum_url` to the Electrum endpoint on the same network as the Ark server and LND.
+For custom signets, electrs must use the same signet challenge as the Ark server and LND.
+The genesis check rejects other Bitcoin networks but cannot distinguish custom signet challenges.
+For a private network, an example is `electrum_url = "tcp://192.168.1.15:50001"`.
+Use `ssl://` for an endpoint with a publicly trusted TLS certificate.
+Plain TCP needs a trusted private network or an authenticated tunnel.
+There is no public indexer fallback.
+
+Replace the old `esplora_url` setting when upgrading `ark-swapd`.
+The new binary rejects the old setting; previous binaries do not accept `electrum_url`.
+Update the binary and generated configuration together, including the `arkSwap.electrumUrl` NixOS module option.
+For blue/green deployments, stop the old slot before applying the new shared configuration.
+Keep the existing `data_dir`, `wallet.key`, `swaps.sqlite`, and their backups.
+Changing the indexer does not move funds or rotate the wallet key.
+Ark VTXO operations still use the configured Ark server.
 
 ### SQLite ownership and shutdown
 

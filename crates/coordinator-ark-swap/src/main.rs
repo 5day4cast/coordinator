@@ -7,8 +7,10 @@
 mod api;
 mod coins;
 mod config;
+mod electrum;
 mod invoices;
 mod lnd;
+mod onchain_wallet;
 mod refund;
 mod store;
 mod swap;

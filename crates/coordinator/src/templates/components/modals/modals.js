@@ -594,9 +594,8 @@ class AuthManager {
         throw new Error("Failed to initiate password reset");
       }
 
-      const { challenge, nostr_pubkey } = await response.json();
+      const { challenge } = await response.json();
       this.forgotChallenge = challenge;
-      this.forgotNpub = nostr_pubkey;
       this.forgotUsername = username;
 
       document.getElementById("forgotStep1")?.classList.add("is-hidden");
@@ -631,16 +630,8 @@ class AuthManager {
     try {
       session.nostrClient.initialize(session.wasm.SignerType.PrivateKey, nsec);
       if (nsecInput) nsecInput.value = "";
-      const derivedNpub = await session.nostrClient.getPublicKey();
-
-      if (derivedNpub !== this.forgotNpub) {
-        session.nostrClient = new session.wasm.NostrClientWrapper();
-        if (errorElement)
-          errorElement.textContent =
-            "This recovery key does not match the account";
-        return;
-      }
-
+      // The anonymous challenge response reveals no account identity. The
+      // authenticated reset checks that this recovery key owns the username.
       this.forgotSignedChallenge = await session.nostrClient.signChallenge(
         this.forgotChallenge,
       );
@@ -706,7 +697,6 @@ class AuthManager {
       );
 
       this.forgotChallenge = null;
-      this.forgotNpub = null;
       this.forgotUsername = null;
       this.forgotSignedChallenge = null;
       // The recovery key only proved ownership; log in again with the new password.
