@@ -1,8 +1,12 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use blake2::{
+    digest::{consts::U32, KeyInit, Mac},
+    Blake2bMac,
+};
 use log::{debug, error};
 use nostr::{Event, ToBech32};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use crate::{
     api::{
@@ -28,23 +32,40 @@ fn credential_task_error(e: tokio::task::JoinError) -> ApiError {
     ApiError::Status(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-/// Argon2 takes tens of milliseconds; keep it off the async workers so a burst
-/// of login attempts cannot stall every other request.
+// Bound both active Argon2 work and admission. The permit lives in the blocking
+// closure, so cancelling its HTTP request cannot admit replacement work early.
+static CREDENTIAL_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+const MAX_RESET_CHALLENGES: usize = 4096;
+const RESET_CHALLENGE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Reject overload before creating or queueing an expensive blocking task.
 async fn hash_auth_key_blocking(key: AuthKey) -> Result<String, ApiError> {
-    tokio::task::spawn_blocking(move || hash_auth_key(&key))
-        .await
-        .map_err(credential_task_error)?
-        .map_err(|e| ApiError::from(credential_error(e)))
+    let permit = CREDENTIAL_WORK
+        .try_acquire()
+        .map_err(|_| ApiError::Status(StatusCode::TOO_MANY_REQUESTS))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        hash_auth_key(&key)
+    })
+    .await
+    .map_err(credential_task_error)?
+    .map_err(|e| ApiError::from(credential_error(e)))
 }
 
 async fn verify_auth_key_blocking(
     key: AuthKey,
     stored_hash: Option<String>,
 ) -> Result<bool, ApiError> {
-    tokio::task::spawn_blocking(move || verify_auth_key(&key, stored_hash.as_deref()))
-        .await
-        .map_err(credential_task_error)?
-        .map_err(|e| ApiError::from(credential_error(e)))
+    let permit = CREDENTIAL_WORK
+        .try_acquire()
+        .map_err(|_| ApiError::Status(StatusCode::TOO_MANY_REQUESTS))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        verify_auth_key(&key, stored_hash.as_deref())
+    })
+    .await
+    .map_err(credential_task_error)?
+    .map_err(|e| ApiError::from(credential_error(e)))
 }
 
 pub async fn login(
@@ -314,7 +335,10 @@ pub async fn set_lightning_address(
         body,
     }: AuthedJson<LightningAddressPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let nostr_pubkey = pubkey.to_bech32().expect("public bech32 format");
+    let nostr_pubkey = match pubkey.to_bech32() {
+        Ok(encoded) => encoded,
+        Err(never) => match never {},
+    };
     let address = checked_lightning_address(&state, &body.lightning_address).await?;
     state
         .users_info
@@ -359,7 +383,6 @@ pub async fn change_password(
     }
 
     let new_password_hash = hash_auth_key_blocking(body.new_auth_key).await?;
-
     state
         .users_info
         .update_password(&pubkey_str, new_password_hash, body.new_encrypted_nsec)
@@ -376,57 +399,78 @@ pub struct ForgotPasswordRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForgotPasswordChallenge {
     pub challenge: String,
-    pub nostr_pubkey: String,
+}
+
+// Issuance is stateless: anonymous callers cannot fill or evict recovery slots.
+// Restarting a process invalidates its outstanding five-minute challenges.
+static RESET_CHALLENGE_KEY: LazyLock<[u8; 32]> = LazyLock::new(|| {
+    use rand::Rng;
+    let mut key = [0u8; 32];
+    rand::rng().fill(&mut key);
+    key
+});
+type ResetMac = Blake2bMac<U32>;
+
+fn reset_challenge_mac(username: &str, issued: &str, nonce: &str) -> Option<ResetMac> {
+    let mut mac = <ResetMac as KeyInit>::new_from_slice(&*RESET_CHALLENGE_KEY).ok()?;
+    mac.update(b"coordinator/password-reset/v1\0");
+    mac.update(&(username.len() as u64).to_be_bytes());
+    mac.update(username.as_bytes());
+    mac.update(issued.as_bytes());
+    mac.update(b":");
+    mac.update(nonce.as_bytes());
+    Some(mac)
+}
+
+fn reset_now() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|t| t.as_secs())
+}
+
+fn issue_reset_challenge(username: &str, now: u64) -> Option<String> {
+    use rand::Rng;
+    let mut nonce = [0u8; 32];
+    rand::rng().fill(&mut nonce);
+    let nonce = hex::encode(nonce);
+    let issued = now.to_string();
+    let tag = reset_challenge_mac(username, &issued, &nonce)?
+        .finalize()
+        .into_bytes();
+    Some(format!("{issued}:{nonce}:{}", hex::encode(tag)))
+}
+
+fn valid_reset_challenge(username: &str, challenge: &str, now: u64) -> bool {
+    let mut parts = challenge.split(':');
+    let (Some(issued), Some(nonce), Some(tag), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let Ok(timestamp) = issued.parse::<u64>() else {
+        return false;
+    };
+    if now < timestamp || now - timestamp >= RESET_CHALLENGE_TTL.as_secs() || nonce.len() != 64 {
+        return false;
+    }
+    let Ok(tag) = hex::decode(tag) else {
+        return false;
+    };
+    reset_challenge_mac(username, issued, nonce).is_some_and(|mac| mac.verify_slice(&tag).is_ok())
 }
 
 pub async fn forgot_password_challenge(
-    State(state): State<Arc<AppState>>,
     Json(body): Json<ForgotPasswordRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!("forgot password request for: {}", body.username);
-
-    let challenge = {
-        use rand::Rng;
-        let mut bytes = [0u8; 32];
-        rand::rng().fill(&mut bytes);
-        hex::encode(bytes)
-    };
-
-    let nostr_pubkey = match state
-        .users_info
-        .get_pubkey_by_username(&body.username)
-        .await
-    {
-        Ok(pubkey) => {
-            let mut challenges = state.forgot_password_challenges.write().await;
-            challenges.insert(
-                body.username.clone(),
-                (challenge.clone(), std::time::Instant::now()),
-            );
-            pubkey
-        }
-        Err(domain::Error::NotFound(_)) => {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            body.username.hash(&mut hasher);
-            format!(
-                "npub1fake{:016x}0000000000000000000000000000",
-                hasher.finish()
-            )
-        }
-        Err(e) => {
-            error!("Failed to get pubkey by username: {}", e);
-            return Err(ApiError::from(e));
-        }
-    };
-
-    Ok((
-        StatusCode::OK,
-        Json(ForgotPasswordChallenge {
-            challenge,
-            nostr_pubkey,
-        }),
-    ))
+    if body.username.is_empty() || body.username.len() > 256 {
+        return Err(ApiError::Status(StatusCode::BAD_REQUEST));
+    }
+    // The response has the same shape for existing and unknown accounts.
+    let challenge = reset_now()
+        .and_then(|now| issue_reset_challenge(&body.username, now))
+        .ok_or(ApiError::Status(StatusCode::SERVICE_UNAVAILABLE))?;
+    Ok((StatusCode::OK, Json(ForgotPasswordChallenge { challenge })))
 }
 
 #[derive(Deserialize)]
@@ -448,15 +492,8 @@ pub async fn forgot_password_reset(
 ) -> Result<impl IntoResponse, ApiError> {
     debug!("forgot password reset for: {}", body.username);
 
-    let challenge_valid = {
-        let challenges = state.forgot_password_challenges.read().await;
-        if let Some((stored_challenge, created_at)) = challenges.get(&body.username) {
-            stored_challenge == &body.challenge
-                && created_at.elapsed() < std::time::Duration::from_secs(300)
-        } else {
-            false
-        }
-    };
+    let challenge_valid =
+        reset_now().is_some_and(|now| valid_reset_challenge(&body.username, &body.challenge, now));
 
     if !challenge_valid {
         return Err(ApiError::from(domain::Error::BadRequest(
@@ -506,6 +543,9 @@ pub async fn forgot_password_reset(
         )));
     }
 
+    // Admission failure must leave the valid challenge usable.
+    let new_password_hash = hash_auth_key_blocking(body.new_auth_key).await?;
+
     // Verify the account proof and body-bound authorization before consuming the
     // challenge. Claim it atomically so concurrent requests cannot reset twice.
     if !claim_reset_challenge(
@@ -519,8 +559,6 @@ pub async fn forgot_password_reset(
             "Invalid or expired challenge".to_string(),
         )));
     }
-
-    let new_password_hash = hash_auth_key_blocking(body.new_auth_key).await?;
 
     state
         .users_info
@@ -538,50 +576,54 @@ async fn claim_reset_challenge(
     challenge: &str,
 ) -> bool {
     let mut challenges = challenges.write().await;
-    let valid = challenges.get(username).is_some_and(|(stored, created)| {
-        stored == challenge && created.elapsed() < std::time::Duration::from_secs(300)
-    });
-    if valid {
-        challenges.remove(username);
+    if !reset_now().is_some_and(|now| valid_reset_challenge(username, challenge, now)) {
+        return false;
     }
-    valid
+    challenges.retain(|_, (_, consumed)| consumed.elapsed() < RESET_CHALLENGE_TTL);
+    if challenges.contains_key(challenge) || challenges.len() >= MAX_RESET_CHALLENGES {
+        return false;
+    }
+    // Only authenticated account owners can consume storage, after both proofs verify.
+    challenges.insert(
+        challenge.to_owned(),
+        (username.to_owned(), std::time::Instant::now()),
+    );
+    true
 }
 
 #[cfg(test)]
 mod reset_tests {
     use super::*;
-    use std::{
-        collections::HashMap,
-        time::{Duration, Instant},
-    };
+    use std::collections::HashMap;
     use tokio::sync::RwLock;
 
     #[tokio::test]
     async fn concurrent_password_resets_can_claim_a_challenge_only_once() {
-        let challenges = RwLock::new(HashMap::from([(
-            "alice".into(),
-            ("challenge".into(), Instant::now()),
-        )]));
+        let challenges = RwLock::new(HashMap::new());
+        let challenge = issue_reset_challenge("alice", reset_now().unwrap()).unwrap();
         let (first, second) = tokio::join!(
-            claim_reset_challenge(&challenges, "alice", "challenge"),
-            claim_reset_challenge(&challenges, "alice", "challenge"),
+            claim_reset_challenge(&challenges, "alice", &challenge),
+            claim_reset_challenge(&challenges, "alice", &challenge),
         );
         assert_ne!(first, second);
-        assert!(!claim_reset_challenge(&challenges, "alice", "challenge").await);
+        assert!(!claim_reset_challenge(&challenges, "alice", &challenge).await);
     }
 
     #[tokio::test]
-    async fn invalid_challenges_cannot_consume_a_live_challenge() {
-        let challenges = RwLock::new(HashMap::from([
-            ("alice".into(), ("challenge".into(), Instant::now())),
-            (
-                "expired".into(),
-                ("old".into(), Instant::now() - Duration::from_secs(301)),
-            ),
-        ]));
-        assert!(!claim_reset_challenge(&challenges, "alice", "wrong").await);
-        assert!(!claim_reset_challenge(&challenges, "missing", "challenge").await);
-        assert!(!claim_reset_challenge(&challenges, "expired", "old").await);
-        assert!(claim_reset_challenge(&challenges, "alice", "challenge").await);
+    async fn issuance_cannot_replace_a_live_challenge_and_proofs_bind_owner_and_expiry() {
+        let challenges = RwLock::new(HashMap::new());
+        let now = reset_now().unwrap();
+        let first = issue_reset_challenge("alice", now).unwrap();
+        let second = issue_reset_challenge("alice", now).unwrap();
+        let unknown = issue_reset_challenge("missing", now).unwrap();
+        assert_eq!(first.len(), unknown.len());
+        assert_ne!(first, second);
+        assert!(!valid_reset_challenge("bob", &first, now));
+        assert!(!valid_reset_challenge("alice", &first, now + 300));
+        assert!(!valid_reset_challenge("alice", &first, now - 1));
+        assert!(!valid_reset_challenge("alice", &format!("{first}0"), now));
+        assert!(!claim_reset_challenge(&challenges, "bob", &first).await);
+        assert!(claim_reset_challenge(&challenges, "alice", &first).await);
+        assert!(claim_reset_challenge(&challenges, "alice", &second).await);
     }
 }

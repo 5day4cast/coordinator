@@ -103,7 +103,8 @@ impl Coordinator {
                 rate_limit: RateLimitSettings::disabled(),
                 ..APISettings::default()
             },
-        );
+        )
+        .unwrap();
         Self {
             state,
             router,

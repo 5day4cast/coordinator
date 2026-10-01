@@ -227,7 +227,8 @@ impl OracleAuth {
             payload_hash,
             &self.0,
         )
-        .await;
+        .await
+        .map_err(reqwest_middleware::Error::Middleware)?;
         let encoded = serde_json::to_vec(&event)
             .map_err(|error| reqwest_middleware::Error::Middleware(error.into()))?;
         let authorization = format!("Nostr {}", BASE64.encode(encoded))

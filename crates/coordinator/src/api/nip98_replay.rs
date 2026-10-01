@@ -8,16 +8,13 @@
 //! signature verifies, and is remembered until the extractor would reject it
 //! as expired anyway.
 //!
-//! The guard is per process, which is enough while one process serves the
-//! public API at a time. Blue/green runs two coordinator slots on one
-//! database, but nix-rollout writes one upstream to `upstream.caddy` and stops
-//! the previous slot after a switch (nixos_setup `apps/forecast/default.nix`,
-//! nix-rollout `runtime::route_to`). What remains is a switch or restart: a
-//! header first used up to 2 × [`MAX_EVENT_SKEW_SECS`] before it can be
-//! replayed once afterwards. Serving from both slots at once, or closing that
-//! gap, needs the claims in the shared database.
+//! Production claims are committed to the shared users database before admitting
+//! the request. Restarts and blue/green slots share the same uniqueness fence.
+//! Database failure rejects authentication; the in-memory constructor is test-only.
 
+use crate::infra::db::DBConnection;
 use nostr::EventId;
+#[cfg(test)]
 use std::{
     collections::HashMap,
     sync::{Mutex, PoisonError},
@@ -31,7 +28,9 @@ pub const MAX_EVENT_SKEW_SECS: i64 = 60;
 pub const DEFAULT_REPLAY_CAPACITY: usize = 100_000;
 
 pub struct Nip98ReplayGuard {
+    database: Option<DBConnection>,
     /// Event id to the last unix second at which it could still be accepted.
+    #[cfg(test)]
     seen: Mutex<HashMap<EventId, i64>>,
     capacity: usize,
 }
@@ -42,18 +41,91 @@ pub enum ReplayRejection {
     Replayed,
     /// Every remembered event is still live; refuse rather than forget one.
     Full,
+    Unavailable,
+    Expired,
 }
 
 impl Nip98ReplayGuard {
+    #[cfg(test)]
     pub fn new(capacity: usize) -> Self {
         Self {
+            database: None,
+            #[cfg(test)]
             seen: Mutex::new(HashMap::new()),
             capacity,
         }
     }
 
+    pub fn with_database(capacity: usize, database: DBConnection) -> Self {
+        Self {
+            database: Some(database),
+            #[cfg(test)]
+            seen: Mutex::new(HashMap::new()),
+            capacity,
+        }
+    }
+
+    pub async fn claim_verified(
+        &self,
+        id: EventId,
+        created_at: i64,
+        now: i64,
+    ) -> Result<(), ReplayRejection> {
+        let Some(database) = &self.database else {
+            #[cfg(test)]
+            return self.claim(id, created_at, now);
+            #[cfg(not(test))]
+            return Err(ReplayRejection::Unavailable);
+        };
+        let capacity = i64::try_from(self.capacity).unwrap_or(i64::MAX);
+        let id = id.to_hex();
+        let accepted = database
+            .execute_write(move |pool| async move {
+                let mut tx = pool.begin().await?;
+                // The first write acquires SQLite's writer lock before counting/admitting.
+                sqlx::query("DELETE FROM nip98_consumed_events WHERE expires_at < ?")
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await?;
+                // Recheck after queueing and acquiring the writer lock. An old proof
+                // must not be re-admitted after another request pruned its row.
+                let admitted_at = time::OffsetDateTime::now_utc().unix_timestamp();
+                if created_at.saturating_add(MAX_EVENT_SKEW_SECS) < admitted_at {
+                    return Ok(Err(ReplayRejection::Expired));
+                }
+                let exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM nip98_consumed_events WHERE event_id = ?)",
+                )
+                .bind(&id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if exists {
+                    return Ok(Err(ReplayRejection::Replayed));
+                }
+                let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nip98_consumed_events")
+                    .fetch_one(&mut *tx)
+                    .await?;
+                if count >= capacity {
+                    return Ok(Err(ReplayRejection::Full));
+                }
+                sqlx::query(
+                    "INSERT INTO nip98_consumed_events (event_id, expires_at) VALUES (?, ?)",
+                )
+                .bind(id)
+                .bind(created_at.saturating_add(MAX_EVENT_SKEW_SECS))
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Ok(Ok(()))
+            })
+            .await
+            .map_err(|_| ReplayRejection::Unavailable)?;
+        accepted
+    }
+
     /// Claim `id` for a single use. Admission also prunes a full guard,
     /// keeping the common path to one hash lookup.
+    #[cfg(test)]
     pub fn claim(&self, id: EventId, created_at: i64, now: i64) -> Result<(), ReplayRejection> {
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         if seen.contains_key(&id) {
@@ -70,6 +142,7 @@ impl Nip98ReplayGuard {
     }
 
     /// Forget expired events during idle periods without waiting for capacity.
+    #[cfg(test)]
     pub fn prune(&self, now: i64) {
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         seen.retain(|_, last_valid| *last_valid >= now);
@@ -124,6 +197,43 @@ mod tests {
         assert_eq!(
             guard.claim(id(2), 1_050, 1_061),
             Err(ReplayRejection::Replayed)
+        );
+    }
+    #[sqlx::test(migrations = "./migrations/users")]
+    async fn database_claims_survive_guard_replacement_and_serialize_writers(
+        pool: sqlx::SqlitePool,
+    ) {
+        let database = || {
+            DBConnection::new_with_pools(
+                "auth-test".into(),
+                ":memory:".into(),
+                pool.clone(),
+                pool.clone(),
+            )
+        };
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let first = Nip98ReplayGuard::with_database(8, database());
+        first.claim_verified(id(7), now, now).await.unwrap();
+        drop(first);
+        let second = Nip98ReplayGuard::with_database(8, database());
+        let third = Nip98ReplayGuard::with_database(8, database());
+        assert_eq!(
+            second.claim_verified(id(7), now, now).await,
+            Err(ReplayRejection::Replayed)
+        );
+        let (a, b) = tokio::join!(
+            second.claim_verified(id(8), now, now),
+            third.claim_verified(id(8), now, now),
+        );
+        assert!(matches!(
+            (a, b),
+            (Ok(()), Err(ReplayRejection::Replayed)) | (Err(ReplayRejection::Replayed), Ok(()))
+        ));
+        // Timestamp admission is repeated under the database lock, not trusted
+        // from an extractor that may have been queued before expiry.
+        assert_eq!(
+            second.claim_verified(id(9), now - 61, now - 61).await,
+            Err(ReplayRejection::Expired)
         );
     }
 }

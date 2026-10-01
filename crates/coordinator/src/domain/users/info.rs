@@ -8,6 +8,10 @@ pub struct UserInfo {
 }
 
 impl UserInfo {
+    pub(crate) fn auth_database(&self) -> crate::infra::db::DBConnection {
+        self.user_store.auth_database()
+    }
+
     pub fn new(user_store: UserStore) -> Self {
         Self {
             user_store: Arc::new(user_store),

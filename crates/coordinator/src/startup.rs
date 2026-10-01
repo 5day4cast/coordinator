@@ -137,7 +137,7 @@ impl Application {
         let app_state = Arc::new(app_state);
         let servers = async {
             let server =
-                build_server(listener, app(app_state.clone(), &config.api_settings)).await?;
+                build_server(listener, app(app_state.clone(), &config.api_settings)?).await?;
             let admin_server = build_server(
                 admin_listener,
                 admin_app(app_state.clone(), admin_access, network),
@@ -230,7 +230,9 @@ impl Application {
                 metrics_http_finished = true;
                 shutdown_error = Some(anyhow!("Metrics HTTP server stopped unexpectedly: {result:?}"));
             }
-            () = shutdown_signal() => {}
+            result = shutdown_signal() => {
+                if let Err(error) = result { shutdown_error = Some(error.into()); }
+            }
             () = writer_stopped => {
                 shutdown_error = Some(anyhow!("Database writer stopped unexpectedly"));
             }
@@ -335,6 +337,7 @@ pub struct AppState {
     pub leaderboards: Arc<Leaderboards>,
     pub lnurl: Arc<dyn LnurlPay>,
     pub background_threads: Arc<HashMap<String, JoinHandle<()>>>,
+    /// Consumed reset challenges mapped to their owner and consumption time.
     pub forgot_password_challenges: Arc<RwLock<HashMap<String, (String, std::time::Instant)>>>,
 }
 
@@ -838,7 +841,7 @@ pub async fn build_server(
 
 /// Public listener: participant API, public pages, and static assets. It must never
 /// route an operator path; `startup_tests` proves this for every admin route.
-pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
+pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow::Error> {
     let origins: Vec<HeaderValue> = api
         .origins
         .iter()
@@ -851,21 +854,12 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
         app_state.remote_url.as_str(),
         app_state.private_url.as_str(),
     ]))
-    .expect("api_settings.origins and ui_settings urls are validated at startup");
+    .map_err(|error| anyhow!("Invalid authentication origins: {error}"))?;
 
-    // Release expired replay entries during idle periods as well as admission.
-    let replay = Arc::new(Nip98ReplayGuard::new(api.replay_capacity));
-    {
-        let guard = Arc::downgrade(&replay);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                let Some(guard) = guard.upgrade() else { break };
-                guard.prune(time::OffsetDateTime::now_utc().unix_timestamp());
-            }
-        });
-    }
+    let replay = Arc::new(Nip98ReplayGuard::with_database(
+        api.replay_capacity,
+        app_state.users_info.auth_database(),
+    ));
 
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
@@ -887,7 +881,7 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
         &api.rate_limit,
         api.rate_limit.auth_per_second,
         api.rate_limit.auth_burst,
-    );
+    )?;
 
     // HTMX public routes (some require JS bridge for auth)
     let htmx_routes = Router::new()
@@ -1000,7 +994,7 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
         &api.rate_limit,
         api.rate_limit.per_second,
         api.rate_limit.burst,
-    );
+    )?;
 
     // The wallet also fetches the assigned enclave's attestation from Keymeld.
     let public_headers = Arc::new(PublicHeaders::new(&[
@@ -1009,7 +1003,7 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
         app_state.keymeld_public_url.as_deref().unwrap_or_default(),
     ]));
 
-    Router::new()
+    Ok(Router::new()
         .merge(api_routes)
         .merge(static_files(&app_state))
         .layer(Extension(replay))
@@ -1020,7 +1014,7 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Router {
         ))
         .layer(middleware::from_fn(log_request))
         .with_state(app_state)
-        .layer(cors)
+        .layer(cors))
 }
 
 /// Per-client limit on every route of `router`, unless limiting is off.
@@ -1030,9 +1024,9 @@ fn limited<S: Clone + Send + Sync + 'static>(
     settings: &RateLimitSettings,
     per_second: u32,
     burst: u32,
-) -> Router<S> {
+) -> Result<Router<S>, anyhow::Error> {
     if !settings.enabled {
-        return router;
+        return Ok(router);
     }
     let config = Arc::new(
         GovernorConfigBuilder::default()
@@ -1042,7 +1036,7 @@ fn limited<S: Clone + Send + Sync + 'static>(
             .burst_size(burst.max(1))
             .key_extractor(PeerIpKeyExtractor)
             .finish()
-            .expect("rate limit settings are valid"),
+            .ok_or_else(|| anyhow!("Invalid request rate limit configuration"))?,
     );
     // The limiter only forgets idle clients when told to.
     let limiter = Arc::downgrade(config.limiter());
@@ -1056,7 +1050,7 @@ fn limited<S: Clone + Send + Sync + 'static>(
             limiter.retain_recent();
         }
     });
-    router.route_layer(GovernorLayer::new(config))
+    Ok(router.route_layer(GovernorLayer::new(config)))
 }
 
 /// Admin listener: operator pages, the LND wallet API, competition creation, viewing and
@@ -1274,14 +1268,15 @@ impl Middleware for LoggingMiddleware {
     }
 }
 
-async fn shutdown_signal() {
-    let mut sigint = signal(SignalKind::interrupt()).expect("Failed to install SIGINT handler");
-    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
+async fn shutdown_signal() -> std::io::Result<()> {
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
 
     select! {
         _ = sigint.recv() => info!("Received SIGINT signal"),
         _ = sigterm.recv() => info!("Received SIGTERM signal"),
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1371,6 +1366,7 @@ mod startup_tests {
                     ..APISettings::default()
                 },
             )
+            .unwrap()
         }
 
         async fn stop(self) {

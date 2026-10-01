@@ -196,6 +196,12 @@ struct LiveSubscription {
     events: SubscriptionStream,
     scripts: HashSet<String>,
     last_message: tokio::time::Instant,
+    opened_at: tokio::time::Instant,
+}
+
+fn subscription_recovered(live: &Option<LiveSubscription>) -> bool {
+    live.as_ref()
+        .is_some_and(|live| live.opened_at.elapsed() >= Duration::from_secs(60))
 }
 
 /// Why a subscription ended.
@@ -203,9 +209,9 @@ enum SubscriptionEnd {
     Cancelled,
     /// Another process checks the escrow swaps, so it watches them too.
     NotLeased,
-    /// The stream ended or failed, or could not be opened. `live` if it had been open.
+    /// The stream ended or failed. Recovery requires a full minute of uptime.
     Dropped {
-        live: bool,
+        recovered: bool,
         reason: String,
     },
 }
@@ -227,11 +233,11 @@ impl Coordinator {
             let wait = match end {
                 SubscriptionEnd::Cancelled => return Ok(()),
                 SubscriptionEnd::NotLeased => self.escrow_watch.check_lease_every(),
-                SubscriptionEnd::Dropped { live, reason } => {
-                    if live {
+                SubscriptionEnd::Dropped { recovered, reason } => {
+                    if recovered {
                         failures = 0;
                     }
-                    failures += 1;
+                    failures = failures.saturating_add(1);
                     let wait = self.escrow_watch.retry_after(failures);
                     if failures == 1 {
                         warn!(
@@ -282,7 +288,7 @@ impl Coordinator {
             ),
             Err(e) => {
                 return SubscriptionEnd::Dropped {
-                    live: false,
+                    recovered: false,
                     reason: format!("cannot read the pending escrow swaps: {e}"),
                 }
             }
@@ -293,7 +299,7 @@ impl Coordinator {
         let end = loop {
             if let Err(e) = self.update_escrow_subscription(ark, &mut live).await {
                 break SubscriptionEnd::Dropped {
-                    live: live.is_some(),
+                    recovered: subscription_recovered(&live),
                     reason: e.to_string(),
                 };
             }
@@ -308,10 +314,10 @@ impl Coordinator {
                 message = next_escrow_event(&mut live) => match message {
                     Ok(Some(event)) => self.escrow_event(ark, event).await,
                     Ok(None) => break SubscriptionEnd::Dropped {
-                        live: true,
+                        recovered: subscription_recovered(&live),
                         reason: "the server ended the stream".into(),
                     },
-                    Err(reason) => break SubscriptionEnd::Dropped { live: true, reason },
+                    Err(reason) => break SubscriptionEnd::Dropped { recovered: subscription_recovered(&live), reason },
                 },
             }
         };
@@ -357,6 +363,7 @@ impl Coordinator {
                     events,
                     scripts,
                     last_message: tokio::time::Instant::now(),
+                    opened_at: tokio::time::Instant::now(),
                 });
             }
             Some(live) => {
