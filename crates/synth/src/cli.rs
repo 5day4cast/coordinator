@@ -401,7 +401,7 @@ fn confirm(what: &str, yes: bool) -> Result<()> {
 pub enum Outcome {
     /// Its steps passed and its money ended where it should.
     Passed,
-    /// Its steps passed; synth stopped following the money before it could verify it.
+    /// Its steps passed; settlement remains unverified while synth continues checking.
     Unverified,
     Failed(String),
     Stuck,

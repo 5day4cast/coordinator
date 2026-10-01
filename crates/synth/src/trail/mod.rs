@@ -451,8 +451,8 @@ pub enum Money {
         #[serde(default = "OffsetDateTime::now_utc", with = "time::serde::rfc3339")]
         since: OffsetDateTime,
     },
-    /// Synth stopped following it before it could verify where the money went. Does not fail
-    /// the run: it says what synth could not see, not that money was lost.
+    /// Synth cannot yet verify where the money went and keeps checking at a slower cadence.
+    /// Does not fail the run: missing evidence does not establish lost money.
     #[serde(alias = "timed_out")]
     Unverified { reason: String },
     /// An operator wrote off the refunds that were left, after the rest settled: nothing will
@@ -461,10 +461,18 @@ pub enum Money {
 }
 
 impl Money {
+    /// Whether settlement has a verdict, even when missing evidence keeps tracking active.
+    pub fn is_assessed(&self) -> bool {
+        !matches!(self, Money::Following)
+    }
+
     /// Whether synth has stopped looking for news about it. Stuck money is watched until it
     /// moves, so it is not final.
     pub fn is_final(&self) -> bool {
-        !matches!(self, Money::Following | Money::Stuck { .. })
+        !matches!(
+            self,
+            Money::Following | Money::Stuck { .. } | Money::Unverified { .. }
+        )
     }
 
     /// Whether the money ended where it should.
@@ -538,9 +546,50 @@ pub struct Held {
     pub then: Option<String>,
 }
 
+/// A queue's durable ticket placement and independent settlement evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolTrail {
+    pub ticket_ids: Vec<Uuid>,
+    /// Accepted entry IDs recovered from authenticated ticket placement.
+    #[serde(default)]
+    pub entry_ids: std::collections::BTreeMap<Uuid, Uuid>,
+    pub trail: Trail,
+}
+
+impl PoolTrail {
+    pub fn entries(&self, entries: &[EntryTrace]) -> Vec<EntryTrace> {
+        entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .ticket_id
+                    .is_some_and(|ticket| self.ticket_ids.contains(&ticket))
+            })
+            .cloned()
+            .map(|mut entry| {
+                if let Some(id) = entry
+                    .ticket_id
+                    .and_then(|ticket| self.entry_ids.get(&ticket))
+                {
+                    entry.entry_id = Some(*id);
+                }
+                entry
+            })
+            .collect()
+    }
+}
+
 /// What the tracker last found about a run's money.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trail {
+    /// Child scopes are persisted with the parent verdict so restarts retain
+    /// assignment, payout receipts, refunds, and each pool's latest lifecycle.
+    #[serde(default)]
+    pub pools: Vec<PoolTrail>,
+    /// Earliest time unresolved evidence is labelled unverified, after the latest known
+    /// lifecycle or refund milestone and the configured settlement grace. Never ends tracking.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub follow_until: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339")]
     pub refreshed_at: OffsetDateTime,
     pub competition_id: Uuid,
@@ -577,6 +626,32 @@ pub struct Trail {
 }
 
 impl Trail {
+    /// Entries whose money remains on this competition rather than a child pool.
+    pub fn own_entries(&self, entries: &[EntryTrace]) -> Vec<EntryTrace> {
+        entries
+            .iter()
+            .filter(|entry| {
+                !self.pools.iter().any(|pool| {
+                    entry
+                        .ticket_id
+                        .is_some_and(|ticket| pool.ticket_ids.contains(&ticket))
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn scope_of(&self, entry: &EntryTrace) -> &Trail {
+        self.pools
+            .iter()
+            .find(|pool| {
+                entry
+                    .ticket_id
+                    .is_some_and(|ticket| pool.ticket_ids.contains(&ticket))
+            })
+            .map_or(self, |pool| &pool.trail)
+    }
+
     /// The entries that paid: those whose steps say so, and those found paid afterwards.
     pub fn paid_entries<'a>(&self, entries: &'a [EntryTrace]) -> Vec<&'a EntryTrace> {
         entries
@@ -588,7 +663,8 @@ impl Trail {
     /// The payment the paying node made for an entry whose step did not see it finish.
     pub fn late_payment(&self, entry: &EntryTrace) -> Option<&EntryPayment> {
         let hash = entry.payment_hash.as_ref()?;
-        self.late_payments
+        self.scope_of(entry)
+            .late_payments
             .iter()
             .find(|late| &late.payment_hash == hash)?
             .payment
@@ -597,12 +673,16 @@ impl Trail {
 
     pub fn swap_of(&self, entry: &EntryTrace) -> Option<&SwapSeen> {
         let hash = entry.payment_hash.as_ref()?;
-        self.swaps.iter().find(|swap| &swap.payment_hash == hash)
+        self.scope_of(entry)
+            .swaps
+            .iter()
+            .find(|swap| &swap.payment_hash == hash)
     }
 
     pub fn refund_of(&self, entry: &EntryTrace) -> Option<&RefundSeen> {
         let ticket = entry.ticket_id?;
-        self.refunds
+        self.scope_of(entry)
+            .refunds
             .iter()
             .find(|refund| refund.ticket_id == ticket)
     }
@@ -632,6 +712,8 @@ pub struct Evidence<'a> {
     pub competition: Option<&'a CompetitionResponse>,
     /// Whether an outcome (the oracle's, or the contract's expiry) decided the payouts.
     pub decided: bool,
+    /// Every payout row matches a player's share under verified outcome weights.
+    pub payout_terms_known: bool,
     pub payouts: &'a [PayoutSeen],
     pub refunds: &'a [RefundSeen],
     /// Entries that paid, by their steps or found paid on the paying node afterwards.
@@ -655,12 +737,13 @@ pub fn judge(evidence: &Evidence) -> Money {
         running,
         competition,
         decided,
+        payout_terms_known,
         payouts,
-        refunds,
+        refunds: _,
         paid_entries,
         unverified_entries,
         give_up,
-        refunds_open_at,
+        refunds_open_at: _,
         now,
     } = *evidence;
     // A run still going decides nothing yet, even before anyone has paid.
@@ -703,6 +786,16 @@ pub fn judge(evidence: &Evidence) -> Money {
         )
     };
 
+    if competition.kind == crate::client::competitions::CompetitionKind::Queued {
+        if let Some(at) = competition.pools_formed_at {
+            return judge_refunds(
+                evidence,
+                at,
+                "the queue closed and left these tickets unassigned",
+            );
+        }
+    }
+
     if competition.completed_at.is_some() || (is_ended && contracted(competition)) {
         let states = payout_states(payouts, is_ended);
         let count = |wanted: PayoutState| states.iter().filter(|state| **state == wanted).count();
@@ -712,13 +805,18 @@ pub fn judge(evidence: &Evidence) -> Money {
         let in_flight = count(PayoutState::SentUnconfirmed);
         let other_node = count(PayoutState::OtherNode);
         let confirmed = format!("{paid} of {owed} payouts confirmed");
-        let complete = payouts.len() >= paid_entries && owed > 0;
+        let complete = decided && payout_terms_known && payouts.len() >= paid_entries && owed > 0;
         if complete && paid == owed {
             return Money::PaidOut;
         }
         // It completed owing synth's players nothing: other players won, and were paid where
         // synth cannot see.
-        if competition.completed_at.is_some() && payouts.len() >= paid_entries && owed == 0 {
+        if competition.completed_at.is_some()
+            && decided
+            && payout_terms_known
+            && payouts.len() >= paid_entries
+            && owed == 0
+        {
             return Money::PaidOut;
         }
         let stopped = competition
@@ -789,37 +887,7 @@ pub fn judge(evidence: &Evidence) -> Money {
     }
 
     if let Some(at) = competition.cancelled_at.or(competition.failed_at) {
-        let settled = refunds.iter().filter(|refund| refund.is_settled()).count();
-        if settled >= paid_entries {
-            return Money::Refunded;
-        }
-        let written_off = refunds
-            .iter()
-            .filter(|refund| refund.written_off && !refund.is_settled())
-            .count();
-        if written_off > 0 && settled + written_off >= paid_entries {
-            return Money::WrittenOff {
-                reason: format!(
-                    "{} before its contract; {settled} of {paid_entries} escrows were refunded, \
-                     and the operator wrote off the other {written_off}",
-                    died(at)
-                ),
-            };
-        }
-        // An escrow is refunded only once its refund leaf opens, a day after the competition
-        // closed; until then (and a while after) the money is waiting, not stuck.
-        let waiting = refunds_open_at.is_some_and(|open| now < open + REFUND_GRACE);
-        return if give_up && !waiting {
-            Money::Stuck {
-                reason: format!(
-                    "{} before its contract, and {settled} of {paid_entries} escrows were refunded",
-                    died(at)
-                ),
-                since: at,
-            }
-        } else {
-            Money::Following
-        };
+        return judge_refunds(evidence, at, &format!("{} before its contract", died(at)));
     }
     if give_up {
         let states = payout_states(payouts, false);
@@ -827,7 +895,7 @@ pub fn judge(evidence: &Evidence) -> Money {
         let paid = states.iter().filter(|s| **s == PayoutState::Paid).count();
         Money::Unverified {
             reason: format!(
-                "synth stopped following it at {}, with {paid} of {owed} payouts confirmed",
+                "settlement remains unverified at {}, with {paid} of {owed} payouts confirmed",
                 competition
                     .state
                     .as_deref()
@@ -836,6 +904,96 @@ pub fn judge(evidence: &Evidence) -> Money {
         }
     } else {
         Money::Following
+    }
+}
+
+fn judge_refunds(evidence: &Evidence, at: OffsetDateTime, stopped: &str) -> Money {
+    let settled = evidence
+        .refunds
+        .iter()
+        .filter(|refund| refund.is_settled())
+        .count();
+    if settled >= evidence.paid_entries {
+        return Money::Refunded;
+    }
+    let written_off = evidence
+        .refunds
+        .iter()
+        .filter(|refund| refund.written_off && !refund.is_settled())
+        .count();
+    if written_off > 0 && settled + written_off >= evidence.paid_entries {
+        return Money::WrittenOff {
+            reason: format!(
+                "{stopped}; {settled} of {} escrows were refunded, and the operator wrote off the other {written_off}",
+                evidence.paid_entries
+            ),
+        };
+    }
+    let waiting = evidence
+        .refunds_open_at
+        .is_some_and(|open| evidence.now < open + REFUND_GRACE);
+    if evidence.give_up && !waiting {
+        Money::Stuck {
+            reason: format!(
+                "{stopped}, and {settled} of {} escrows were refunded",
+                evidence.paid_entries
+            ),
+            since: at,
+        }
+    } else {
+        Money::Following
+    }
+}
+
+/// A queue succeeds only after both its leftovers and all child liabilities settle.
+pub fn combined_money(root: &Money, pools: &[PoolTrail]) -> Money {
+    let outcomes: Vec<(Option<Uuid>, &Money)> = std::iter::once((None, root))
+        .chain(
+            pools
+                .iter()
+                .map(|pool| (Some(pool.trail.competition_id), &pool.trail.money)),
+        )
+        .collect();
+    for (id, money) in &outcomes {
+        if let Money::Stuck { reason, since } = money {
+            return Money::Stuck {
+                reason: id.map_or_else(|| reason.clone(), |id| format!("pool {id}: {reason}")),
+                since: *since,
+            };
+        }
+    }
+    for (id, money) in &outcomes {
+        if let Money::Unverified { reason } = money {
+            return Money::Unverified {
+                reason: id.map_or_else(|| reason.clone(), |id| format!("pool {id}: {reason}")),
+            };
+        }
+    }
+    if outcomes
+        .iter()
+        .any(|(_, money)| matches!(money, Money::Following))
+    {
+        return Money::Following;
+    }
+    for (id, money) in &outcomes {
+        if let Money::WrittenOff { reason } = money {
+            return Money::WrittenOff {
+                reason: id.map_or_else(|| reason.clone(), |id| format!("pool {id}: {reason}")),
+            };
+        }
+    }
+    if outcomes
+        .iter()
+        .any(|(_, money)| matches!(money, Money::PaidOut))
+    {
+        Money::PaidOut
+    } else if outcomes
+        .iter()
+        .any(|(_, money)| matches!(money, Money::Refunded))
+    {
+        Money::Refunded
+    } else {
+        Money::NothingPaid
     }
 }
 
@@ -883,7 +1041,9 @@ mod tests {
         judge(&Evidence {
             running: false,
             competition: Some(competition),
-            decided: payouts.iter().any(|payout| payout.owed_sats > 0),
+            decided: payouts.iter().any(|payout| payout.owed_sats > 0)
+                || competition.completed_at.is_some(),
+            payout_terms_known: true,
             payouts,
             refunds,
             paid_entries,
@@ -993,6 +1153,7 @@ mod tests {
                 running: false,
                 competition: Some(&cancelled),
                 decided: false,
+                payout_terms_known: false,
                 payouts: &[],
                 refunds: &[],
                 paid_entries: 3,
@@ -1037,6 +1198,34 @@ mod tests {
             judge_of(&settling, &losers, &[], 2, false),
             Money::Following
         );
+    }
+
+    #[test]
+    fn missing_outcome_or_payout_weights_cannot_prove_zero_entitlement() {
+        let completed = competition(serde_json::json!({ "completed_at": "2026-09-24T01:02:31Z" }));
+        let payouts = [payout(0, false)];
+        let mut evidence = Evidence {
+            running: false,
+            competition: Some(&completed),
+            decided: false,
+            payout_terms_known: false,
+            payouts: &payouts,
+            refunds: &[],
+            paid_entries: 1,
+            unverified_entries: 0,
+            give_up: false,
+            refunds_open_at: None,
+            now: OffsetDateTime::now_utc(),
+        };
+        assert_eq!(judge(&evidence), Money::Following);
+        evidence.give_up = true;
+        assert!(matches!(judge(&evidence), Money::Unverified { .. }));
+        evidence.decided = true;
+        assert!(matches!(judge(&evidence), Money::Unverified { .. }));
+        evidence.payout_terms_known = true;
+        assert_eq!(judge(&evidence), Money::PaidOut);
+        evidence.decided = false;
+        assert!(matches!(judge(&evidence), Money::Unverified { .. }));
     }
 
     #[test]
@@ -1109,7 +1298,7 @@ mod tests {
     }
 
     #[test]
-    fn a_competition_awaiting_its_oracle_is_followed_until_synth_gives_up() {
+    fn a_competition_awaiting_its_oracle_becomes_unverified_after_its_deadline() {
         let waiting = competition(serde_json::json!({
             "funding_broadcasted_at": "2026-09-24T01:11:26Z",
             "state": "outcome_broadcasted",
@@ -1123,7 +1312,7 @@ mod tests {
             judge_of(&waiting, &payouts, &[], 3, true),
             Money::Unverified {
                 reason:
-                    "synth stopped following it at outcome_broadcasted, with 0 of 1 payouts confirmed"
+                    "settlement remains unverified at outcome_broadcasted, with 0 of 1 payouts confirmed"
                         .into()
             }
         );
@@ -1207,6 +1396,7 @@ mod tests {
             running: true,
             competition: Some(&created),
             decided: false,
+            payout_terms_known: false,
             payouts: &[],
             refunds: &[],
             paid_entries: 0,

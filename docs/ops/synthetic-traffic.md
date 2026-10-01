@@ -127,7 +127,11 @@ Queued cases need both too, since every queued entry waits in an Arkade escrow a
 
 A pool whose kickoff batch fails is not covered yet. It needs an operator test hook on the coordinator that fails one pool's batch.
 
-The money tracker follows the competition a run created, which for a queued case is the queue. It confirms a cancelled queue's refunds, but does not follow pools yet: a run whose queue formed pools ends with its money unverified, and its pools' payouts are checked by hand.
+The money tracker follows the queue and each child pool. Authenticated entry lists assign submitted tickets to their pools. Saved assignments survive coordinator outages and synth restarts. Unassigned paid tickets remain on the queue for refund tracking. Conflicting or missing placement evidence prevents a successful money verdict.
+
+Each pool keeps its own settlement, payout receipts, refunds, and transaction evidence. The run succeeds only after every tracked payment reaches a verified final outcome. Run details and exports show pool identities and separate ledgers.
+
+Tracking deadlines use the latest observation, signing, contract-expiry, and escrow-refund terms, plus the configured grace period. The parent keeps the latest child deadline. Expected settlement can therefore continue beyond eight hours. Unverified trails remain eligible for later checks. The database migration reopens historical unverified and timed-out trails.
 
 Scheduled runs cycle through every scenario at one observation duration, then advance to the next duration. Every configured case receives every configured duration.
 
@@ -176,3 +180,13 @@ If a progress write or acknowledgement fails, that actor stops before its next p
 A failed run does not prove that no payment occurred. Inspect its entry traces and money trail before any retry.
 
 An expected rejection must have the specific entry error being tested. Authentication failures, transport failures, and server errors fail the scenario.
+
+## Read monitoring metrics
+
+`/metrics` registers collectors at server startup. Run counters and duration histograms describe scenarios completed by the current process; they reset on restart.
+
+`synth_competition_lifecycle_healthy` reads persisted settlement evidence. It is `1` for the latest assessed full lifecycle with verified payouts, `0` for a failed or stuck outcome, and `NaN` when evidence is absent or unverified. A newer run still within its settlement deadline does not erase an earlier assessed result. An overdue unresolved run does. The gauge also becomes `NaN` if no full-lifecycle money trail has refreshed for 30 minutes.
+
+`synth_last_successful_run_timestamp` is the persisted time when payouts were first verified, not the earlier time when scenario steps ended. Repeated refreshes do not advance it. Read this timestamp with the health gauge to distinguish recent success from old evidence. Existing verified rows migrate using their last stored trail refresh time because earlier verification timestamps were not retained.
+
+The dashboard's Last Run card reads the latest completed run and its money verdict from the database. Its link and steps belong to that same run, including after a restart or while a newer run is in progress.

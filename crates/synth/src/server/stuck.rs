@@ -18,14 +18,15 @@ pub fn block(run: &Run, now: OffsetDateTime) -> Option<Markup> {
     let trail = run.trail?;
     let held = trail.held.as_ref()?;
     let still = matches!(trail.money, Money::Stuck { .. }) && held.until.is_none();
-    // Synth stopped following it while it was held, so it never saw the money move.
-    let unverified = matches!(trail.money, Money::Unverified { .. });
+    // Missing settlement evidence does not establish that held money moved.
+    let unverified = matches!(trail.money, Money::Unverified { .. })
+        || (matches!(trail.money, Money::Following) && held.until.is_none());
     let competition = trail.competition.as_ref();
     Some(html! {
         section.stuck {
             h2 {
                 @if still { span class="badge stuck" { "Stuck" } " " }
-                @else if unverified { span class="badge unverified" title="Synth stopped following it while it was held" { "Unverified" } " " }
+                @else if unverified { span class="badge unverified" title="Settlement remains unverified; synth keeps checking" { "Unverified" } " " }
                 @else { span class="badge was_stuck" { "Was stuck" } " " }
                 (format::sats(held.sats)) " sats held"
             }
@@ -404,6 +405,8 @@ mod tests {
         let since = time::macros::datetime!(2026-09-24 03:00:00 UTC);
         let _ = entry;
         Trail {
+            follow_until: None,
+            pools: Vec::new(),
             refreshed_at: OffsetDateTime::now_utc(),
             competition_id: competition.id,
             competition: Some(competition),
@@ -550,18 +553,17 @@ mod tests {
         assert_eq!(component, "the Arkade server");
     }
 
-    /// Money synth stopped following while it was held is unverified, not "was stuck": nobody
-    /// saw it move.
+    /// Missing settlement evidence leaves held money unverified until synth sees it move.
     #[test]
-    fn money_synth_stopped_following_while_held_reads_unverified() {
+    fn money_with_missing_settlement_evidence_reads_unverified() {
         let entry = entry();
         let mut trail = cancelled_trail(swap("settled", Some("ee:0")), &entry);
         trail.money = Money::Unverified {
             reason: "0 of 3 payouts confirmed".into(),
         };
         let held = trail.held.as_mut().unwrap();
-        held.until = Some(time::macros::datetime!(2026-09-24 09:00:00 UTC));
-        held.then = Some("synth stopped following it: 0 of 3 payouts confirmed".into());
+        held.until = None;
+        held.then = None;
         let page = render(&trail, std::slice::from_ref(&entry));
         let heading = &page[page.find("<h2>").unwrap()..page.find("</h2>").unwrap()];
         assert!(heading.contains(r#"class="badge unverified""#), "{heading}");

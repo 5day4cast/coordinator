@@ -21,11 +21,12 @@ use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 use super::{
-    ended, judge, ChainTx, EntryPayment, EntryTrace, Evidence, Held, LatePayment, Money,
-    PayeeCheck, PayoutSeen, PayoutState, RefundSeen, RouteHop, SwapSeen, Trail, VtxoSeen,
+    combined_money, ended, judge, ChainTx, EntryPayment, EntryTrace, Evidence, Held, LatePayment,
+    Money, PayeeCheck, PayoutSeen, PayoutState, PoolTrail, RefundSeen, RouteHop, SwapSeen, Trail,
+    VtxoSeen,
 };
 use crate::ark_swap::{ArkSwap, Swap};
-use crate::client::competitions::{CompetitionResponse, OperatorCompetition};
+use crate::client::competitions::{CompetitionKind, CompetitionResponse, OperatorCompetition};
 use crate::client::CoordinatorClient;
 use crate::crypto::keys::SynthUser;
 use crate::db::{SynthDb, TestRun, TestStep, Verdict};
@@ -43,8 +44,8 @@ pub struct TrailConfig {
     /// How often a run's trail is refreshed while its competition does not move: payouts show up
     /// on the nodes and in ark-swapd without the competition's state changing.
     pub slow_interval_secs: u64,
-    /// How long after a run starts synth stops following its money. A lifecycle competition
-    /// pays out about three hours after its run ends, once its outcome has 144 blocks on it.
+    /// Settlement grace after the latest known event, contract, or refund milestone.
+    /// Missing evidence after this interval is unverified and continues to be checked.
     pub follow_timeout_secs: u64,
     /// How long synth keeps watching stuck money for it to move, from when it found it stuck.
     pub stuck_watch_secs: u64,
@@ -321,7 +322,7 @@ impl Tracker {
     pub async fn run(&self) {
         info!(
             "Following each run's money every {}s for two minutes after its competition moves \
-             and every {}s otherwise, for up to {}s after it starts",
+             and every {}s otherwise, with {}s of grace after lifecycle milestones",
             self.inner.config.interval_secs,
             self.inner.config.slow_interval_secs,
             self.inner.config.follow_timeout_secs
@@ -336,15 +337,7 @@ impl Tracker {
 
     async fn tick(&self) -> Result<()> {
         let runs = self.inner.db.runs_to_follow().await?;
-        {
-            // Forget the runs no longer followed, so the map stays as small as the queue.
-            let followed: HashSet<&str> = runs.iter().map(|run| run.id.as_str()).collect();
-            self.inner
-                .seen
-                .lock()
-                .expect("seen lock")
-                .retain(|id, _| followed.contains(id.as_str()));
-        }
+        self.prune_seen(&runs);
         // Every due run is looked up first, so the Arkade indexer is asked about all their escrow
         // outputs together.
         let mut due = Vec::new();
@@ -375,6 +368,15 @@ impl Tracker {
         Ok(())
     }
 
+    fn prune_seen(&self, runs: &[TestRun]) {
+        let followed: HashSet<&str> = runs.iter().map(|run| run.id.as_str()).collect();
+        self.inner
+            .seen
+            .lock()
+            .expect("seen lock")
+            .retain(|id, _| followed.contains(id.as_str()));
+    }
+
     /// Look at a run's competition, and look the run's money up if it moved or is due, but for
     /// its escrow outputs; with the competition's fingerprint. Stuck money is only looked at
     /// every so often.
@@ -390,10 +392,12 @@ impl Tracker {
             .expect("seen lock")
             .get(&run.id)
             .cloned();
-        if run.money.as_deref() == Some("stuck")
-            && last
-                .as_ref()
-                .is_some_and(|seen| seen.refreshed.elapsed() < STUCK_RECHECK)
+        if matches!(
+            run.money.as_deref(),
+            Some("stuck" | "unverified" | "timed_out")
+        ) && last
+            .as_ref()
+            .is_some_and(|seen| seen.refreshed.elapsed() < STUCK_RECHECK)
         {
             return Ok(None);
         }
@@ -506,10 +510,193 @@ impl Tracker {
         competition_id: Uuid,
         competition: Result<CompetitionResponse>,
     ) -> Result<Gathered> {
-        let now = OffsetDateTime::now_utc();
         let steps = self.inner.db.get_steps(&run.id).await?;
         let entries = entries_of(&steps);
-        let previous_trail = self.inner.db.get_trail(&run.id).await?;
+        let previous = self.inner.db.get_trail(&run.id).await?;
+        let queue = competition
+            .as_ref()
+            .ok()
+            .or_else(|| previous.as_ref()?.competition.as_ref());
+        if !queue.is_some_and(|queue| queue.kind == CompetitionKind::Queued) {
+            return self
+                .gather_scope(run, competition_id, competition, entries, previous, &steps)
+                .await;
+        }
+        // Retain previously declared pools through partial coordinator responses.
+        let mut pool_ids: Vec<Uuid> = queue
+            .into_iter()
+            .flat_map(|queue| &queue.pools)
+            .map(|pool| pool.competition_id)
+            .chain(
+                previous
+                    .iter()
+                    .flat_map(|trail| &trail.pools)
+                    .map(|pool| pool.trail.competition_id),
+            )
+            .collect();
+        pool_ids.sort();
+        pool_ids.dedup();
+        let invalid_pools = pool_ids.contains(&competition_id) || pool_ids.len() > 128;
+        pool_ids.retain(|id| *id != competition_id);
+        pool_ids.truncate(128);
+        let mut placement = self
+            .place_entries(competition_id, &pool_ids, entries, previous.as_ref())
+            .await;
+        if invalid_pools {
+            placement.uncertain += 1;
+            placement
+                .gaps
+                .push("the queue declared an invalid or oversized child-pool set".into());
+        }
+        let mut children = Vec::new();
+        for pool_id in pool_ids {
+            let response = self
+                .inner
+                .client
+                .get_competition(&pool_id)
+                .await
+                .and_then(|pool| {
+                    anyhow::ensure!(
+                        pool.id == pool_id
+                            && pool.kind == CompetitionKind::Pool
+                            && pool.parent_id == Some(competition_id),
+                        "pool {pool_id} does not belong to queue {competition_id}"
+                    );
+                    Ok(pool)
+                });
+            let prior = previous
+                .as_ref()
+                .and_then(|trail| {
+                    trail
+                        .pools
+                        .iter()
+                        .find(|pool| pool.trail.competition_id == pool_id)
+                })
+                .map(|pool| pool.trail.clone());
+            let entries = placement.pools.remove(&pool_id).unwrap_or_default();
+            children.push(
+                self.gather_scope(run, pool_id, response, entries, prior, &[])
+                    .await?,
+            );
+        }
+        let mut root = self
+            .gather_scope(
+                run,
+                competition_id,
+                competition,
+                placement.root,
+                previous,
+                &steps,
+            )
+            .await?;
+        root.unverified_entries += placement.uncertain;
+        root.trail.gaps.extend(placement.gaps);
+        root.trail.follow_until = root
+            .trail
+            .follow_until
+            .into_iter()
+            .chain(children.iter().filter_map(|pool| pool.trail.follow_until))
+            .max();
+        root.pools = children;
+        Ok(root)
+    }
+
+    /// Resolve each submitted ticket using the player's authenticated entry list.
+    /// Persisted assignments survive outages; conflicting evidence remains unknown.
+    async fn place_entries(
+        &self,
+        root_id: Uuid,
+        pool_ids: &[Uuid],
+        entries: Vec<EntryTrace>,
+        previous: Option<&Trail>,
+    ) -> Placement {
+        let players = self.players(&entries).await;
+        let mut listed = HashMap::new();
+        for (user, player) in &players {
+            listed.insert(
+                user.clone(),
+                self.inner
+                    .client
+                    .list_entries(&player.nostr_keys, None)
+                    .await,
+            );
+        }
+        let mut placement = Placement::default();
+        for mut entry in entries {
+            let prior_pool = previous.and_then(|trail| {
+                trail.pools.iter().find(|pool| {
+                    entry
+                        .ticket_id
+                        .is_some_and(|ticket| pool.ticket_ids.contains(&ticket))
+                })
+            });
+            if let Some(id) = prior_pool.and_then(|pool| {
+                entry
+                    .ticket_id
+                    .and_then(|ticket| pool.entry_ids.get(&ticket))
+            }) {
+                entry.entry_id = Some(*id);
+            }
+            let prior = prior_pool.map(|pool| pool.trail.competition_id);
+            let mut owner = prior.unwrap_or(root_id);
+            if entry.entry_submitted || entry.submission_attempts > 0 {
+                match (listed.get(&entry.user), players.get(&entry.user)) {
+                    (Some(Ok(rows)), Some(player)) => {
+                        let matches: Vec<_> = rows
+                            .iter()
+                            .filter(|row| entry.ticket_id == Some(row.ticket_id))
+                            .collect();
+                        match matches.as_slice() {
+                            [row]
+                                if row.pubkey == player.nostr_keys.public_key().to_hex()
+                                    && (row.event_id == root_id
+                                        || pool_ids.contains(&row.event_id))
+                                    && prior.is_none_or(|prior| prior == row.event_id) =>
+                            {
+                                owner = row.event_id;
+                                entry.entry_id = Some(row.id);
+                            }
+                            [] if prior.is_none() => {}
+                            _ => {
+                                placement.uncertain += 1;
+                                placement.gaps.push(format!("{}'s ticket placement is missing, conflicting, or outside the queue", entry.user));
+                            }
+                        }
+                    }
+                    _ if prior.is_some() => {
+                        placement.gaps.push(format!(
+                            "{}'s entry list is unavailable; retained its recorded pool",
+                            entry.user
+                        ));
+                    }
+                    _ => {
+                        placement.uncertain += 1;
+                        placement.gaps.push(format!(
+                            "{}'s ticket placement could not be verified",
+                            entry.user
+                        ));
+                    }
+                }
+            }
+            if owner == root_id {
+                placement.root.push(entry);
+            } else {
+                placement.pools.entry(owner).or_default().push(entry);
+            }
+        }
+        placement
+    }
+
+    async fn gather_scope(
+        &self,
+        run: &TestRun,
+        competition_id: Uuid,
+        competition: Result<CompetitionResponse>,
+        entries: Vec<EntryTrace>,
+        previous_trail: Option<Trail>,
+        steps: &[TestStep],
+    ) -> Result<Gathered> {
+        let now = OffsetDateTime::now_utc();
         let previous = previous_trail.as_ref();
         let mut gaps = Vec::new();
 
@@ -526,14 +713,16 @@ impl Tracker {
             .as_ref()
             .and_then(Settlement::of)
             .or_else(|| previous?.settlement.clone());
-        let is_ended = competition.as_ref().is_some_and(ended)
-            || previous.is_some_and(|previous| previous.ended());
+        let is_ended = competition.as_ref().is_some_and(refunds_due)
+            || previous
+                .and_then(|previous| previous.competition.as_ref())
+                .is_some_and(refunds_due);
         // Held money is looked at closely: the invoice's state, and the escrow output's.
         let inspect = is_ended || previous.is_some_and(|p| matches!(p.money, Money::Stuck { .. }));
         let players = self.players(&entries).await;
 
         let late_payments = self.late_payments(&entries, previous, &mut gaps).await;
-        let unverified_entries = unverified_entries(&steps, &entries, &late_payments);
+        let unverified_entries = unverified_entries(steps, &entries, &late_payments);
         if unverified_entries > 0 {
             gaps.push(format!(
                 "{unverified_entries} entry payment(s) could not be verified either way"
@@ -599,7 +788,16 @@ impl Tracker {
             Vec::new()
         };
 
+        let follow_until = settlement_deadline(
+            run,
+            competition.as_ref(),
+            &entries,
+            previous,
+            &self.inner.config,
+        );
         let trail = Trail {
+            pools: Vec::new(),
+            follow_until,
             refreshed_at: now,
             competition_id,
             competition: competition
@@ -619,6 +817,7 @@ impl Tracker {
             gaps,
         };
         Ok(Gathered {
+            pools: Vec::new(),
             run: run.clone(),
             entries,
             previous: previous_trail,
@@ -631,55 +830,46 @@ impl Tracker {
 
     /// Fill in a run's escrow outputs from what the Arkade indexer said of them, judge where its
     /// money stands, and save the trail.
-    async fn conclude(&self, gathered: Gathered, vtxos: &Vtxos) -> Result<Trail> {
-        let asked = gathered.outpoints();
-        let Gathered {
-            run,
-            entries,
-            previous,
-            mut trail,
-            unverified_entries,
-            now,
-            ..
-        } = gathered;
-        let run = &run;
-        let previous = previous.as_ref();
-        for swap in &mut trail.swaps {
-            let Some(outpoint) = swap.escrow_vtxo.as_ref().filter(|o| asked.contains(*o)) else {
-                continue;
-            };
-            match vtxos.get(outpoint) {
-                Some(Ok(found)) => swap.vtxo = Some(found.clone()),
-                Some(Err(e)) => trail.gaps.push(format!("the Arkade indexer: {e}")),
-                None => trail.gaps.push(format!(
-                    "the Arkade indexer does not know {}'s escrow output",
-                    swap.user
-                )),
-            }
+    async fn conclude(&self, mut gathered: Gathered, vtxos: &Vtxos) -> Result<Trail> {
+        let reused_hashes = reused_payout_hashes(&gathered);
+        for pool in &mut gathered.pools {
+            conclude_scope(pool, vtxos, &reused_hashes);
         }
-        trail.money = judge(&Evidence {
-            running: run.status == "running",
-            competition: trail.competition.as_ref(),
-            decided: trail
-                .settlement
-                .as_ref()
-                .is_some_and(|settlement| settlement.decided.is_some()),
-            payouts: &trail.payouts,
-            refunds: &trail.refunds,
-            paid_entries: trail.paid_entries(&entries).len(),
-            unverified_entries,
-            give_up: run.status != "running" && followed_long_enough(run, &self.inner.config),
-            refunds_open_at: trail
-                .paid_entries(&entries)
-                .iter()
-                .filter_map(|entry| entry.escrow)
-                .filter_map(|escrow| OffsetDateTime::from_unix_timestamp(escrow.refund_at).ok())
-                .max(),
-            now,
-        });
-        trail.held = held(&trail, &entries, previous.and_then(|p| p.held.clone()), now);
-        self.record(run, &trail, previous).await?;
-        Ok(trail)
+        conclude_scope(&mut gathered, vtxos, &reused_hashes);
+        gathered.trail.pools = gathered
+            .pools
+            .into_iter()
+            .map(|pool| PoolTrail {
+                ticket_ids: pool
+                    .entries
+                    .iter()
+                    .filter_map(|entry| entry.ticket_id)
+                    .collect(),
+                entry_ids: pool
+                    .entries
+                    .iter()
+                    .filter_map(|entry| Some((entry.ticket_id?, entry.entry_id?)))
+                    .collect(),
+                trail: pool.trail,
+            })
+            .collect();
+        gathered.trail.money = combined_money(&gathered.trail.money, &gathered.trail.pools);
+        gathered.trail.held = include_pool_holdings(
+            held(
+                &gathered.trail,
+                &gathered.entries,
+                gathered
+                    .previous
+                    .as_ref()
+                    .and_then(|trail| trail.held.clone()),
+                gathered.now,
+            ),
+            &gathered.trail.pools,
+            &gathered.trail.money,
+        );
+        self.record(&gathered.run, &gathered.trail, gathered.previous.as_ref())
+            .await?;
+        Ok(gathered.trail)
     }
 
     /// Save the trail, with the step its verdict adds and the run it fails, together.
@@ -694,6 +884,7 @@ impl Tracker {
         let step = match &trail.money {
             Money::Following => None,
             Money::Stuck { .. } if changed => Some("money_stuck"),
+            Money::Unverified { .. } if changed => Some("money_unverified"),
             _ if changed && trail.money.is_final() => Some("money_settled"),
             _ => None,
         };
@@ -710,14 +901,11 @@ impl Tracker {
             .and_then(parse_time)
             .map(|at| (OffsetDateTime::now_utc() - at).whole_milliseconds().max(0) as i64)
             .unwrap_or(0);
-        let watched_long_enough = trail.held.as_ref().is_some_and(|held| {
-            OffsetDateTime::now_utc() - held.found
-                > time::Duration::seconds(self.inner.config.stuck_watch_secs as i64)
-        });
-        let follow = match trail.money {
-            Money::Stuck { .. } => !watched_long_enough,
-            _ => !trail.money.is_final(),
-        };
+        let follow = keep_following(
+            trail,
+            OffsetDateTime::now_utc(),
+            self.inner.config.stuck_watch_secs,
+        );
         self.inner
             .db
             .record_money(
@@ -1539,6 +1727,7 @@ fn held(
                 },
             })
         }
+        (Money::Following | Money::Unverified { .. }, previous) => previous,
         (moved, Some(held)) if held.until.is_none() => Some(Held {
             until: Some(now),
             then: Some(match moved {
@@ -1555,9 +1744,6 @@ fn held(
                     }
                 }
                 Money::PaidOut => "paid out to the winners".to_string(),
-                Money::Unverified { reason } => {
-                    format!("synth stopped following it: {reason}")
-                }
                 Money::WrittenOff { reason } => format!("written off: {reason}"),
                 other => format!("it moved on: {}", other.words()),
             }),
@@ -1565,6 +1751,49 @@ fn held(
         }),
         (_, previous) => previous,
     }
+}
+
+/// Each newly stuck child receives its full watch interval even if another held money earlier.
+fn keep_following(trail: &Trail, now: OffsetDateTime, watch_secs: u64) -> bool {
+    let watch = time::Duration::seconds(i64::try_from(watch_secs).unwrap_or(i64::MAX));
+    let own_pending = match trail.money {
+        Money::Stuck { .. } => trail
+            .held
+            .as_ref()
+            .is_none_or(|held| now - held.found <= watch),
+        _ => !trail.money.is_final(),
+    };
+    own_pending
+        || trail
+            .pools
+            .iter()
+            .any(|pool| keep_following(&pool.trail, now, watch_secs))
+}
+
+/// Add every still-held child liability to the queue's dashboard total.
+fn include_pool_holdings(own: Option<Held>, pools: &[PoolTrail], money: &Money) -> Option<Held> {
+    if !matches!(money, Money::Stuck { .. }) {
+        return own;
+    }
+    let mut total = own?;
+    if total.until.is_some() {
+        return Some(total);
+    }
+    for child in pools
+        .iter()
+        .filter_map(|pool| pool.trail.held.as_ref())
+        .filter(|held| held.until.is_none())
+    {
+        total.sats = total.sats.saturating_add(child.sats);
+        total.since = total.since.min(child.since);
+        total.found = total.found.min(child.found);
+        total.nearest_expiry = total
+            .nearest_expiry
+            .into_iter()
+            .chain(child.nearest_expiry)
+            .min();
+    }
+    Some(total)
 }
 
 /// What stuck money amounts to, in sats, and the soonest one of its escrows expires or opens its
@@ -1693,8 +1922,126 @@ fn is_due(
 /// Arkade outputs by `txid:vout`, as the indexer answered for them, or why it did not.
 type Vtxos = HashMap<String, std::result::Result<VtxoSeen, String>>;
 
+#[derive(Default)]
+struct Placement {
+    root: Vec<EntryTrace>,
+    pools: HashMap<Uuid, Vec<EntryTrace>>,
+    uncertain: usize,
+    gaps: Vec<String>,
+}
+
+fn refunds_due(competition: &CompetitionResponse) -> bool {
+    ended(competition)
+        || (competition.kind == CompetitionKind::Queued && competition.pools_formed_at.is_some())
+}
+
+/// Zero is an entitlement only when the contract explicitly excludes this player from its outcome.
+fn payout_terms_known(settlement: Option<&Settlement>, payouts: &[PayoutSeen]) -> bool {
+    settlement.is_some_and(|settlement| {
+        settlement.decided.is_some()
+            && settlement.shares.iter().any(|share| share.weight > 0)
+            && payouts.iter().all(|payout| {
+                settlement.shares.iter().any(|share| {
+                    share.pubkey == payout.pubkey
+                        && share.weight == payout.weight
+                        && share.owed_sats == payout.owed_sats
+                })
+            })
+    })
+}
+
+/// A receipt cannot settle separate liabilities in different competitions.
+fn reused_payout_hashes(gathered: &Gathered) -> HashSet<String> {
+    let mut owners = HashMap::new();
+    let mut reused = HashSet::new();
+    for trail in
+        std::iter::once(&gathered.trail).chain(gathered.pools.iter().map(|pool| &pool.trail))
+    {
+        for payout in trail.payouts.iter().filter(|payout| payout.owed_sats > 0) {
+            let Some(hash) = payout.payment_hash.as_ref() else {
+                continue;
+            };
+            let hash = hash.to_ascii_lowercase();
+            if owners
+                .insert(hash.clone(), trail.competition_id)
+                .is_some_and(|owner| owner != trail.competition_id)
+            {
+                reused.insert(hash);
+            }
+        }
+    }
+    reused
+}
+
+/// Conclude one competition without writing a partial parent verdict.
+fn conclude_scope(gathered: &mut Gathered, vtxos: &Vtxos, reused_hashes: &HashSet<String>) {
+    let asked = gathered.own_outpoints();
+    let trail = &mut gathered.trail;
+    for swap in &mut trail.swaps {
+        let Some(outpoint) = swap.escrow_vtxo.as_ref().filter(|o| asked.contains(*o)) else {
+            continue;
+        };
+        match vtxos.get(outpoint) {
+            Some(Ok(found)) => swap.vtxo = Some(found.clone()),
+            Some(Err(error)) => trail.gaps.push(format!("the Arkade indexer: {error}")),
+            None => trail.gaps.push(format!(
+                "the Arkade indexer does not know {}'s escrow output",
+                swap.user
+            )),
+        }
+    }
+    trail.money = judge(&Evidence {
+        running: gathered.run.status == "running",
+        competition: trail.competition.as_ref(),
+        decided: trail
+            .settlement
+            .as_ref()
+            .is_some_and(|settlement| settlement.decided.is_some()),
+        payout_terms_known: payout_terms_known(trail.settlement.as_ref(), &trail.payouts),
+        payouts: &trail.payouts,
+        refunds: &trail.refunds,
+        paid_entries: trail.paid_entries(&gathered.entries).len(),
+        unverified_entries: gathered.unverified_entries,
+        give_up: gathered.run.status != "running"
+            && trail
+                .follow_until
+                .is_some_and(|until| gathered.now >= until),
+        refunds_open_at: trail
+            .paid_entries(&gathered.entries)
+            .iter()
+            .filter_map(|entry| entry.escrow)
+            .filter_map(|escrow| OffsetDateTime::from_unix_timestamp(escrow.refund_at).ok())
+            .max(),
+        now: gathered.now,
+    });
+    if trail.payouts.iter().any(|payout| {
+        payout.owed_sats > 0
+            && payout
+                .payment_hash
+                .as_ref()
+                .is_some_and(|hash| reused_hashes.contains(&hash.to_ascii_lowercase()))
+    }) {
+        let reason =
+            "a payout payment hash is reused by another competition; settlement cannot be verified";
+        trail.gaps.push(reason.into());
+        trail.money = Money::Unverified {
+            reason: reason.into(),
+        };
+    }
+    trail.held = held(
+        trail,
+        &gathered.entries,
+        gathered
+            .previous
+            .as_ref()
+            .and_then(|trail| trail.held.clone()),
+        gathered.now,
+    );
+}
+
 /// A run's money, looked up but for its escrow outputs and not judged yet.
 struct Gathered {
+    pools: Vec<Gathered>,
     run: TestRun,
     entries: Vec<EntryTrace>,
     previous: Option<Trail>,
@@ -1709,6 +2056,13 @@ impl Gathered {
     /// The escrow outputs to ask the Arkade indexer about: those that can still change. One seen
     /// spent or swept, or whose entry's refund has settled, is not asked about again.
     fn outpoints(&self) -> Vec<String> {
+        self.own_outpoints()
+            .into_iter()
+            .chain(self.pools.iter().flat_map(Gathered::own_outpoints))
+            .collect()
+    }
+
+    fn own_outpoints(&self) -> Vec<String> {
         if !self.inspect_vtxos {
             return Vec::new();
         }
@@ -1760,11 +2114,68 @@ fn parse_time(at: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok()
 }
 
-fn followed_long_enough(run: &TestRun, config: &TrailConfig) -> bool {
-    parse_time(&run.started_at).is_some_and(|started| {
-        OffsetDateTime::now_utc() - started
-            >= time::Duration::seconds(config.follow_timeout_secs as i64)
-    })
+/// Keep the grace anchored to contract terms, never to when an HTTP refresh happens.
+/// Persist the greatest deadline so a later outage or a slim response cannot shorten it.
+fn settlement_deadline(
+    run: &TestRun,
+    competition: Option<&CompetitionResponse>,
+    entries: &[EntryTrace],
+    previous: Option<&Trail>,
+    config: &TrailConfig,
+) -> Option<OffsetDateTime> {
+    let mut milestones = Vec::new();
+    milestones.extend(parse_time(&run.started_at));
+    if let Some(competition) = competition {
+        for name in ["end_observation_date", "signing_date"] {
+            milestones.extend(
+                competition
+                    .event_submission
+                    .get(name)
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(parse_time),
+            );
+        }
+        milestones.extend(
+            competition
+                .event_announcement
+                .as_ref()
+                .and_then(|announcement| announcement.get("expiry"))
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok()),
+        );
+        milestones.extend(
+            [
+                competition.completed_at,
+                competition.cancelled_at,
+                competition.failed_at,
+                competition.outcome_broadcasted_at,
+                competition.expiry_broadcasted_at,
+            ]
+            .into_iter()
+            .flatten(),
+        );
+    }
+    milestones.extend(
+        entries
+            .iter()
+            .filter_map(|entry| entry.escrow)
+            .filter_map(|escrow| {
+                escrow
+                    .refund_at
+                    .checked_add(i64::from(escrow.solo_delay_secs))
+            })
+            .filter_map(|at| OffsetDateTime::from_unix_timestamp(at).ok()),
+    );
+    let grace =
+        time::Duration::seconds(i64::try_from(config.follow_timeout_secs).unwrap_or(i64::MAX));
+    let deadline = milestones
+        .into_iter()
+        .max()
+        .and_then(|at| at.checked_add(grace));
+    deadline
+        .into_iter()
+        .chain(previous.and_then(|trail| trail.follow_until))
+        .max()
 }
 
 /// Open the nodes a tracker can look payments up on: the payer, and the node entries are paid to.
@@ -1901,6 +2312,217 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queue_tracking_waits_for_child_payouts_and_retains_placements_across_outages() {
+        use std::sync::atomic::AtomicBool;
+        let queue_id = Uuid::now_v7();
+        let paid_pool = Uuid::now_v7();
+        let cancelled_pool = Uuid::now_v7();
+        let tickets = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()];
+        let accepted = [Uuid::now_v7(), Uuid::now_v7()];
+        let listed = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let completed = Arc::new(AtomicBool::new(false));
+        let terms_known = Arc::new(AtomicBool::new(false));
+        let unavailable = Arc::new(AtomicBool::new(false));
+        let refunds = Arc::new(Mutex::new(Vec::new()));
+        let entries_state = listed.clone();
+        let entries_down = unavailable.clone();
+        let pool_done = completed.clone();
+        let pool_terms = terms_known.clone();
+        let requested_refunds = refunds.clone();
+        let router = Router::new()
+            .route("/api/v1/entries", get(move || {
+                let listed = entries_state.clone();
+                let unavailable = entries_down.clone();
+                async move {
+                    if unavailable.load(Ordering::SeqCst) {
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                    Json(listed.lock().unwrap().clone()).into_response()
+                }
+            }))
+            .route("/api/v1/competitions/{id}", get(move |axum::extract::Path(id): axum::extract::Path<Uuid>| {
+                let completed = pool_done.clone();
+                let terms_known = pool_terms.clone();
+                async move {
+                    let mut value = serde_json::json!({
+                        "id":id, "created_at":"2026-09-24T01:00:00Z", "event_submission":{},
+                        "kind":"pool", "parent_id":queue_id,
+                    });
+                    if id == cancelled_pool {
+                        value["cancelled_at"] = "2026-09-24T03:00:00Z".into();
+                    } else if completed.load(Ordering::SeqCst) {
+                        value["completed_at"] = "2026-09-24T03:00:00Z".into();
+                    }
+                    if id == paid_pool && terms_known.load(Ordering::SeqCst) {
+                        let known: serde_json::Value = serde_json::from_str(include_str!("../fixtures/lab-competition.json")).unwrap();
+                        for field in ["contract_parameters", "event_announcement", "attestation"] {
+                            value[field] = known[field].clone();
+                        }
+                        value["contract_parameters"]["outcome_payouts"]["att3"] = serde_json::json!({"1":100});
+                    }
+                    Json(value)
+                }
+            }))
+            .route("/api/v1/competitions/{id}/tickets/{ticket}/refund", get(move |axum::extract::Path((id,ticket)): axum::extract::Path<(Uuid,Uuid)>| {
+                let refunds = requested_refunds.clone();
+                async move {
+                    refunds.lock().unwrap().push((id,ticket));
+                    Json(serde_json::json!({"state":"settled","paid_sats":1000,"ark_txid":null,"updated_at":1}))
+                }
+            }));
+        let fixture = fixture(router, false, false).await;
+        let mut traces = Vec::new();
+        for (index, name) in ["alice", "bob", "carol"].into_iter().enumerate() {
+            let user = fixture.db().get_or_create_user(name).await.unwrap();
+            traces.push(serde_json::json!({
+                "user":name, "nostr_pubkey":user.nostr_pubkey, "paid":true,
+                "amount_sats":1000, "ticket_id":tickets[index], "entry_id":tickets[index],
+                "entry_submitted":index < 2,
+            }));
+            if index < 2 {
+                listed.lock().unwrap().push(serde_json::json!({
+                    "id":accepted[index], "ticket_id":tickets[index],
+                    "event_id":if index == 0 { paid_pool } else { cancelled_pool },
+                    "pubkey":user.nostr_pubkey, "ephemeral_pubkey":if index == 0 { "020033e61d10ed276d0e2799f036f6367e7ba25182f82231acb52ffc5572f9b7f5" } else { name },
+                    "signed_at":null,"paid_at":null,"paid_out_at":null,
+                }));
+            }
+        }
+        let run = fixture.run(queue_id, &traces).await;
+        let queue = competition(
+            queue_id,
+            serde_json::json!({
+                "kind":"queued", "pools_formed_at":"2026-09-24T03:00:00Z",
+                "pools":[{"competition_id":paid_pool,"pool_index":0,"players":2},
+                         {"competition_id":cancelled_pool,"pool_index":1,"players":2}],
+            }),
+        );
+        let pending = fixture
+            .tracker
+            .refresh_run(&run, queue_id, Ok(queue.clone()))
+            .await
+            .unwrap();
+        assert!(
+            !pending.money.is_good(),
+            "a completed queue cannot hide an unfinished pool"
+        );
+        assert_eq!(pending.pools.len(), 2);
+        assert!(pending
+            .pools
+            .iter()
+            .any(|pool| pool.trail.competition_id == paid_pool && pool.ticket_ids == [tickets[0]]));
+        assert!(refunds.lock().unwrap().contains(&(queue_id, tickets[2])));
+        assert!(refunds
+            .lock()
+            .unwrap()
+            .contains(&(cancelled_pool, tickets[1])));
+        completed.store(true, Ordering::SeqCst);
+        let missing_terms = fixture
+            .tracker
+            .refresh_run(&run, queue_id, Ok(queue.clone()))
+            .await
+            .unwrap();
+        assert!(
+            !missing_terms.money.is_good(),
+            "completed without settlement terms cannot prove zero entitlement"
+        );
+        terms_known.store(true, Ordering::SeqCst);
+        let settled = fixture
+            .tracker
+            .refresh_run(&run, queue_id, Ok(queue.clone()))
+            .await
+            .unwrap();
+        assert_eq!(settled.money, Money::PaidOut);
+        assert_eq!(
+            settled
+                .pools
+                .iter()
+                .find(|pool| pool.trail.competition_id == paid_pool)
+                .unwrap()
+                .trail
+                .payouts
+                .len(),
+            1
+        );
+        unavailable.store(true, Ordering::SeqCst);
+        let mut retained = fixture
+            .tracker
+            .gather(&run, queue_id, Ok(queue))
+            .await
+            .unwrap();
+        assert!(retained.entries.iter().all(|entry| entry.user == "carol"));
+        assert_eq!(
+            retained
+                .pools
+                .iter()
+                .map(|pool| pool.entries.len())
+                .sum::<usize>(),
+            2
+        );
+        assert!(
+            retained
+                .pools
+                .iter()
+                .flat_map(|pool| &pool.entries)
+                .all(|entry| entry.entry_id.is_some_and(|id| accepted.contains(&id))),
+            "accepted entry IDs survive entry-list outages"
+        );
+        let saved = fixture.db().get_trail(&run.id).await.unwrap().unwrap();
+        assert_eq!(
+            saved.pools.len(),
+            2,
+            "ticket placement survives a database round trip"
+        );
+        let since = time::macros::datetime!(2026-09-24 03:00:00 UTC);
+        let mut root_held = Held {
+            since: since + time::Duration::HOUR,
+            found: since + time::Duration::HOUR,
+            reason: "pool liabilities remain held".into(),
+            sats: 0,
+            nearest_expiry: None,
+            until: None,
+            then: None,
+        };
+        let mut children = saved.pools.clone();
+        for child in &mut children {
+            child.trail.held = Some(Held {
+                since,
+                found: since,
+                sats: 1000,
+                nearest_expiry: Some(99),
+                ..root_held.clone()
+            });
+        }
+        root_held = include_pool_holdings(
+            Some(root_held),
+            &children,
+            &Money::Stuck {
+                reason: "pool liabilities remain held".into(),
+                since,
+            },
+        )
+        .unwrap();
+        assert_eq!(root_held.sats, 2000);
+        assert_eq!(root_held.nearest_expiry, Some(99));
+        assert_eq!(root_held.since, since);
+        assert_eq!(root_held.found, since);
+        for pool in &mut retained.pools {
+            pool.trail.payouts = vec![PayoutSeen {
+                owed_sats: 1000,
+                payment_hash: Some("ab".repeat(32)),
+                ..PayoutSeen::default()
+            }];
+        }
+        let conflicting = fixture
+            .tracker
+            .conclude(retained, &HashMap::new())
+            .await
+            .unwrap();
+        assert!(matches!(conflicting.money, Money::Unverified { .. }));
+        assert!(conflicting.pools.iter().all(|pool| matches!(&pool.trail.money, Money::Unverified { reason } if reason.contains("reused"))));
+    }
+
+    #[tokio::test]
     async fn a_lost_submission_response_is_recovered_by_ticket_without_assuming_acceptance() {
         let competition_id = Uuid::now_v7();
         let ticket_id = Uuid::now_v7();
@@ -2008,21 +2630,21 @@ mod tests {
             "passed",
             "money synth could not verify does not fail the run"
         );
-        assert!(fixture.db().runs_to_follow().await.unwrap().is_empty());
+        assert_eq!(fixture.db().runs_to_follow().await.unwrap().len(), 1);
         fixture.tracker.tick().await.unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
-            "the unverified run left the queue"
+            "unverified evidence is retried at the slower cadence"
         );
         assert!(
-            fixture.tracker.inner.seen.lock().unwrap().is_empty(),
-            "runs no longer followed are forgotten"
+            !fixture.tracker.inner.seen.lock().unwrap().is_empty(),
+            "unverified runs retain their refresh cadence"
         );
     }
 
     #[tokio::test]
-    async fn incomplete_entry_evidence_is_followed_until_synth_gives_up() {
+    async fn incomplete_entry_evidence_remains_followed_after_its_deadline() {
         let payment = serde_json::json!({
             "user": "alice", "nostr_pubkey": "00", "paid": false,
             "ticket_id": Uuid::now_v7(), "payment_hash": "00".repeat(32)
@@ -2058,15 +2680,29 @@ mod tests {
                 .any(|gap| gap.contains("could not be verified")));
 
             fixture.follow_for(0);
+            let mut gathered = fixture
+                .tracker
+                .gather(&run, competition_id, Ok(competition))
+                .await
+                .unwrap();
+            assert!(
+                gathered
+                    .trail
+                    .follow_until
+                    .is_some_and(|until| until > gathered.now),
+                "a shorter configured grace cannot shorten the persisted deadline"
+            );
+            gathered.now = gathered.trail.follow_until.unwrap() + time::Duration::SECOND;
             let trail = fixture
                 .tracker
-                .refresh_run(&run, competition_id, Ok(competition))
+                .conclude(gathered, &HashMap::new())
                 .await
                 .unwrap();
             assert!(
                 matches!(trail.money, Money::Unverified { .. }),
                 "{details:?}"
             );
+            assert_eq!(db.runs_to_follow().await.unwrap().len(), 1);
         }
     }
 
@@ -2221,6 +2857,8 @@ mod tests {
         let since = time::macros::datetime!(2026-09-24 03:00:00 UTC);
         let later = time::macros::datetime!(2026-09-24 09:00:00 UTC);
         let mut trail = Trail {
+            follow_until: None,
+            pools: Vec::new(),
             refreshed_at: later,
             competition_id: Uuid::now_v7(),
             competition: None,
@@ -2257,6 +2895,20 @@ mod tests {
             until: None,
             then: None,
         };
+        trail.money = Money::Unverified {
+            reason: "payee is unavailable".into(),
+        };
+        assert_eq!(
+            held(&trail, &[], Some(earlier.clone()), later),
+            Some(earlier.clone()),
+            "missing evidence does not prove held money moved"
+        );
+        trail.money = Money::Following;
+        assert_eq!(
+            held(&trail, &[], Some(earlier.clone()), later),
+            Some(earlier.clone())
+        );
+        trail.money = Money::Refunded;
         let moved = held(&trail, &[], Some(earlier.clone()), later).unwrap();
         assert_eq!(moved.since, since);
         assert_eq!(moved.until, Some(later));
@@ -2282,6 +2934,8 @@ mod tests {
         let now_reason = "the competition was cancelled at 07:57 UTC before its contract, and 1 \
                           of 2 escrows were refunded";
         let trail = Trail {
+            follow_until: None,
+            pools: Vec::new(),
             refreshed_at: later,
             competition_id: Uuid::now_v7(),
             competition: None,
@@ -2559,30 +3213,34 @@ mod tests {
     }
 
     #[test]
-    fn a_run_is_followed_until_its_timeout_after_it_started() {
-        let config = TrailConfig::default();
-        let run = |started: OffsetDateTime| TestRun {
+    fn a_long_competition_gets_grace_after_its_terms_and_unverified_is_followed() {
+        let now = time::macros::datetime!(2026-10-01 00:00:00 UTC);
+        let competition: CompetitionResponse = serde_json::from_value(serde_json::json!({
+            "id": Uuid::now_v7(), "created_at": "2026-10-01T00:00:00Z",
+            "event_submission": {"end_observation_date": "2026-10-03T00:00:00Z",
+                                 "signing_date": "2026-10-03T01:00:00Z"},
+            "event_announcement": {"expiry": (now + time::Duration::hours(52)).unix_timestamp()}
+        }))
+        .unwrap();
+        let run = TestRun {
             id: "r".into(),
             scenario: "full_lifecycle".into(),
             status: "passed".into(),
-            started_at: started
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap(),
+            started_at: "2026-10-01T00:00:00Z".into(),
             completed_at: None,
             error_message: None,
             config_json: None,
             competition_id: None,
             money: None,
         };
-        let now = OffsetDateTime::now_utc();
-        assert!(!followed_long_enough(
-            &run(now - time::Duration::hours(3)),
-            &config
-        ));
-        assert!(followed_long_enough(
-            &run(now - time::Duration::hours(9)),
-            &config
-        ));
+        assert_eq!(
+            settlement_deadline(&run, Some(&competition), &[], None, &TrailConfig::default()),
+            Some(now + time::Duration::hours(60))
+        );
+        assert!(!Money::Unverified {
+            reason: "node unavailable".into()
+        }
+        .is_final());
     }
 
     /// Competitions that never ran and hold escrows are found, with the entry fees not

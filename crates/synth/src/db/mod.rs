@@ -123,7 +123,7 @@ const RUN_COLUMNS: &str = "SELECT test_runs.*, money_trails.money AS money FROM 
      LEFT JOIN money_trails ON money_trails.run_id = test_runs.id";
 
 /// Bumped with each migration that rewrites existing rows, so each runs once.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 fn now_rfc3339() -> Result<String> {
     Ok(OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?)
@@ -268,6 +268,8 @@ impl SynthDb {
         .execute(&self.pool)
         .await?;
 
+        self.add_column_if_missing("money_trails", "verified_at", "TEXT")
+            .await?;
         let version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(&self.pool)
             .await?;
@@ -287,6 +289,16 @@ impl SynthDb {
             sqlx::query("UPDATE money_trails SET follow = money IN ('following', 'stuck')")
                 .execute(&self.pool)
                 .await?;
+        }
+        if version < 2 {
+            sqlx::query("UPDATE money_trails SET verified_at = updated_at WHERE money = 'paid_out' AND verified_at IS NULL")
+                .execute(&self.pool).await?;
+            // Older trackers stopped observing unresolved money after eight hours from start.
+            sqlx::query(
+                "UPDATE money_trails SET follow = 1 WHERE money IN ('unverified', 'timed_out')",
+            )
+            .execute(&self.pool)
+            .await?;
         }
         if version < SCHEMA_VERSION {
             sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
@@ -424,6 +436,47 @@ impl SynthDb {
         Ok(runs)
     }
 
+    /// The most recently completed run, independent of newer runs still in progress.
+    pub async fn last_completed_run(&self) -> Result<Option<TestRun>> {
+        sqlx::query_as::<_, TestRun>(&format!(
+            "{RUN_COLUMNS} WHERE completed_at IS NOT NULL \
+             ORDER BY completed_at DESC, started_at DESC, test_runs.id DESC LIMIT 1"
+        ))
+        .fetch_optional(&self.pool)
+        .await
+        .context("read the last completed run")
+    }
+
+    /// Durable lifecycle evidence for metrics; scenario completion alone is not settlement.
+    pub async fn lifecycle_metrics(&self) -> Result<(Option<TestRun>, Option<i64>, Option<i64>)> {
+        let latest = sqlx::query_as::<_, TestRun>(&format!(
+            "{RUN_COLUMNS} WHERE scenario = 'full_lifecycle' \
+             AND test_runs.status != 'running' \
+             AND (money_trails.money IS NULL OR money_trails.money != 'following' \
+                  OR test_runs.status IN ('failed', 'interrupted') \
+                  OR CAST(strftime('%s', json_extract(money_trails.trail_json, '$.follow_until')) AS INTEGER) <= unixepoch()) \
+             ORDER BY started_at DESC, test_runs.id DESC LIMIT 1"
+        ))
+        .fetch_optional(&self.pool)
+        .await?;
+        let success: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(CAST(strftime('%s', money_trails.verified_at) AS INTEGER)) \
+             FROM test_runs JOIN money_trails ON money_trails.run_id = test_runs.id \
+             WHERE test_runs.scenario = 'full_lifecycle' AND test_runs.status = 'passed' \
+             AND money_trails.money = 'paid_out'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let observed: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(CAST(strftime('%s', money_trails.updated_at) AS INTEGER)) \
+             FROM money_trails JOIN test_runs ON test_runs.id = money_trails.run_id \
+             WHERE test_runs.scenario = 'full_lifecycle'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((latest, success, observed))
+    }
+
     /// Pending money must stay visible even after newer runs fill the dashboard's page.
     pub async fn runs_to_follow(&self) -> Result<Vec<TestRun>> {
         sqlx::query_as::<_, TestRun>(&format!(
@@ -435,8 +488,7 @@ impl SynthDb {
         .context("list runs whose money is still being followed")
     }
 
-    /// Runs whose money is stuck now, and runs synth stopped following while their money was
-    /// held, never seeing it move; with their trails, oldest first.
+    /// Runs with stuck or unresolved held money, with their trails, oldest first.
     pub async fn held_runs(&self) -> Result<Vec<HeldRun>> {
         #[derive(sqlx::FromRow)]
         struct Row {
@@ -447,7 +499,7 @@ impl SynthDb {
         let rows = sqlx::query_as::<_, Row>(
             "SELECT test_runs.*, money_trails.money AS money, money_trails.trail_json \
              FROM money_trails JOIN test_runs ON test_runs.id = money_trails.run_id \
-             WHERE money_trails.money = 'stuck' OR (money_trails.money = 'unverified' \
+             WHERE money_trails.money = 'stuck' OR (money_trails.money IN ('following', 'unverified') \
                AND json_extract(money_trails.trail_json, '$.held') IS NOT NULL) \
              ORDER BY test_runs.started_at",
         )
@@ -533,17 +585,20 @@ impl SynthDb {
         let now = now_rfc3339()?;
         let mut transaction = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO money_trails (run_id, money, trail_json, updated_at, follow) \
-             VALUES (?, ?, ?, ?, ?) \
+            "INSERT INTO money_trails (run_id, money, trail_json, updated_at, follow, verified_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
              ON CONFLICT(run_id) DO UPDATE SET money = excluded.money, \
              trail_json = excluded.trail_json, updated_at = excluded.updated_at, \
-             follow = excluded.follow",
+             follow = excluded.follow, \
+             verified_at = CASE WHEN excluded.money = 'paid_out' \
+                 THEN COALESCE(money_trails.verified_at, excluded.verified_at) ELSE NULL END",
         )
         .bind(run_id)
         .bind(verdict.trail.money.label())
         .bind(serde_json::to_string(verdict.trail)?)
         .bind(&now)
         .bind(verdict.follow)
+        .bind(matches!(verdict.trail.money, crate::trail::Money::PaidOut).then_some(&now))
         .execute(&mut *transaction)
         .await?;
         if let Some((name, duration_ms, error, details)) = verdict.step {
@@ -942,8 +997,99 @@ mod tests {
         assert_eq!(db.get_steps(&finished).await.unwrap()[0].status, "passed");
     }
 
+    #[tokio::test]
+    async fn last_completed_card_keeps_its_identity_when_a_new_run_starts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synth.sqlite");
+        let db = SynthDb::new(path.to_str().unwrap()).await.unwrap();
+        let finished = db.create_run("full_lifecycle", None).await.unwrap();
+        db.complete_run(&finished, None).await.unwrap();
+        let running = db.create_run("full_lifecycle", None).await.unwrap();
+        assert_ne!(finished, running);
+        assert_eq!(db.last_completed_run().await.unwrap().unwrap().id, finished);
+        assert!(
+            db.lifecycle_metrics()
+                .await
+                .unwrap()
+                .0
+                .unwrap()
+                .money
+                .is_none(),
+            "steps alone cannot report healthy"
+        );
+        db.record_money(
+            &finished,
+            &Verdict {
+                trail: &trail(crate::trail::Money::PaidOut),
+                follow: false,
+                step: None,
+                fail_passed_run: None,
+            },
+        )
+        .await
+        .unwrap();
+        let reopened = SynthDb::new(path.to_str().unwrap()).await.unwrap();
+        let (latest, success, observed) = reopened.lifecycle_metrics().await.unwrap();
+        assert!(observed.is_some());
+        assert_eq!(latest.unwrap().id, finished);
+        assert!(
+            success.is_some(),
+            "verified success survives process state loss"
+        );
+        assert_eq!(
+            reopened
+                .last_completed_run()
+                .await
+                .unwrap()
+                .unwrap()
+                .money
+                .as_deref(),
+            Some("paid_out")
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_reopens_prematurely_unverified_trails() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synth.sqlite");
+        let db = SynthDb::new(path.to_str().unwrap()).await.unwrap();
+        let id = db.create_run("full_lifecycle", None).await.unwrap();
+        sqlx::query("UPDATE test_runs SET competition_id = ? WHERE id = ?")
+            .bind(Uuid::now_v7().to_string())
+            .bind(&id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db.record_money(
+            &id,
+            &Verdict {
+                trail: &trail(crate::trail::Money::Unverified {
+                    reason: "old timeout".into(),
+                }),
+                follow: false,
+                step: None,
+                fail_passed_run: None,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("PRAGMA user_version = 1")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let reopened = SynthDb::new(path.to_str().unwrap()).await.unwrap();
+        assert!(reopened
+            .runs_to_follow()
+            .await
+            .unwrap()
+            .iter()
+            .any(|run| run.id == id));
+    }
+
     fn trail(money: crate::trail::Money) -> crate::trail::Trail {
         crate::trail::Trail {
+            follow_until: None,
+            pools: Vec::new(),
             refreshed_at: OffsetDateTime::now_utc(),
             competition_id: Uuid::now_v7(),
             competition: None,

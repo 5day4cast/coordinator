@@ -3,7 +3,7 @@ use super::live::{self, Live};
 use crate::db::HeldRun;
 use crate::rebalance::Rebalancer;
 use crate::runner::Runner;
-use crate::scenarios::{ScenarioConfig, ScenarioStatus};
+use crate::scenarios::ScenarioConfig;
 use crate::trail::tracker::{Tracker, UnrecordedSwaps, UnrefundedCompetitions};
 use crate::trail::{label_words, Held};
 use axum::{
@@ -137,7 +137,11 @@ pub(super) async fn dashboard_live(
     }: &Dashboard,
 ) -> Markup {
     let now = OffsetDateTime::now_utc();
-    let last = runner.last_result().await;
+    let last = runner.db().last_completed_run().await.unwrap_or_default();
+    let last_steps = match &last {
+        Some(run) => runner.db().get_steps(&run.id).await.unwrap_or_default(),
+        None => Vec::new(),
+    };
     let observation = match &rebalancer {
         Some(rebalancer) => Some(rebalancer.last().await).filter(|o| o.checked_at.is_some()),
         None => None,
@@ -218,34 +222,7 @@ pub(super) async fn dashboard_live(
 
         section.status {
             h2 { "Last Run" }
-            @if let Some(ref result) = last {
-                div.result {
-                    p { "Scenario: " strong { (result.scenario) } " "
-                        span class=(format!("badge {}", status_class(&result.status))) { (status_class(&result.status)) } }
-                    p { "Took " (format::duration_ms(result.total_duration_ms)) }
-                    @if let Some(ref err) = result.error {
-                        p.error { "Error: " (err) }
-                    }
-                }
-                h3 { "Steps" }
-                div.scroll { table {
-                    thead { tr { th { "Step" } th { "Status" } th.num { "Took" } th { "Error" } } }
-                    tbody {
-                        @for step in &result.steps {
-                            tr {
-                                td { (step.name) }
-                                td { span class=(format!("badge {}", step_class(&step.status))) { (step_class(&step.status)) } }
-                                td.num { (format::duration_ms(step.duration_ms)) }
-                                td { @if let Some(error) = &step.error { span.error { (error) } } @else { "-" } }
-                            }
-                        }
-                    }
-                } }
-                @if let Some(run) = runs.first() {
-                    p { a href=(format!("/runs/{}", run.id)) { "See where the money went →" } }
-                }
-            } @else if let Some(run) = runs.first() {
-                // Nothing has run since synth started; the newest run it has recorded stands in.
+            @if let Some(run) = &last {
                 div.result {
                     p { "Scenario: " strong { (run.scenario) } " " (run_status(&run.status, run.money.as_deref())) }
                     p { "Started " (format::time_text(&run.started_at, now)) }
@@ -253,9 +230,23 @@ pub(super) async fn dashboard_live(
                         p.error { "Error: " (error) }
                     }
                 }
+                h3 { "Steps" }
+                div.scroll { table {
+                    thead { tr { th { "Step" } th { "Status" } th.num { "Took" } th { "Error" } } }
+                    tbody {
+                        @for step in &last_steps {
+                            tr {
+                                td { (step.step_name) }
+                                td { span class=(format!("badge {}", step.status)) { (step.status) } }
+                                td.num { @if let Some(duration) = step.duration_ms { (format::duration_ms(duration)) } @else { "-" } }
+                                td { @if let Some(error) = &step.error_message { span.error { (error) } } @else { "-" } }
+                            }
+                        }
+                    }
+                } }
                 p { a href=(format!("/runs/{}", run.id)) { "See its steps and where the money went →" } }
             } @else {
-                p { "No runs yet." }
+                p { "No completed runs yet." }
             }
         }
 
@@ -331,7 +322,7 @@ pub(super) async fn dashboard_live(
             @if !rebalances.is_empty() {
                 div.scroll { table {
                     thead { tr {
-                        th { "When" } th { "Leg" } th.num { "Moved" } th.num { "Held before" }
+                        th { "When" } th { "Leg" } th.num { "Amount" } th.num { "Held before" }
                         th { "Status" } th { "Error / transaction" }
                     } }
                     tbody {
@@ -384,8 +375,7 @@ pub(super) async fn dashboard_live(
     }
 }
 
-/// Every run whose money is stuck now, oldest first; the runs synth stopped following while
-/// their money was held; the competitions that never ran and still hold escrows; and the swaps
+/// Every run whose money is stuck now, oldest first; runs with unresolved held money; the competitions that never ran and still hold escrows; and the swaps
 /// ark-swapd says funded an escrow without recording its output. The last two whoever made them.
 fn stuck_money(
     held: &[HeldRun],
@@ -444,11 +434,11 @@ fn stuck_money(
                 (held_runs(&stuck, false, now))
             }
             @if !stopped.is_empty() {
-                h3 { "Held when synth stopped following" }
+                h3 { "Held money still unverified" }
                 p {
                     strong { (format::sats(stopped.iter().map(|(_, held)| held.sats).sum::<u64>())) " sats" }
-                    " held by " (stopped.len()) " run(s) synth stopped following without seeing the money move. "
-                    "They read unverified, not passed; each run's page says where it was held."
+                    " last seen held by " (stopped.len()) " run(s). Synth continues checking for settlement; "
+                    "each run's page records the latest evidence."
                 }
                 (held_runs(&stopped, true, now))
             }
@@ -538,7 +528,7 @@ fn stuck_money(
     }
 }
 
-/// Held runs, one per row: while stuck, the nearest expiry; once synth stopped following, when.
+/// Held runs, one per row: known stuck money shows expiry; uncertain money shows the last check.
 /// The Liquidity line for ark-swapd's wallet: what it can fund, and what waits at its boarding
 /// address for the Arkade server to board.
 fn arkade_liquidity(
@@ -559,7 +549,7 @@ fn arkade_liquidity(
 
 fn held_runs(runs: &[(&HeldRun, &Held)], stopped: bool, now: OffsetDateTime) -> Markup {
     let last = if stopped {
-        "Stopped following"
+        "Last checked"
     } else {
         "Nearest expiry"
     };
@@ -575,7 +565,7 @@ fn held_runs(runs: &[(&HeldRun, &Held)], stopped: bool, now: OffsetDateTime) -> 
                         td.num data-label="Sats" { (format::sats(held.sats)) }
                         td data-label=(last) {
                             @match (stopped, held.until, held.nearest_expiry.and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok())) {
-                                (true, Some(at), _) => (format::time(at, now)),
+                                (true, _, _) => (format::time(run.trail.refreshed_at, now)),
                                 (false, _, Some(at)) if at > now => (format::time(at, now)),
                                 (false, _, Some(_)) => span.note { "passed" },
                                 _ => span.note { "not known" },
@@ -842,22 +832,6 @@ pub(super) fn run_status(status: &str, money: Option<&str>) -> Markup {
             span class="badge following" title="Its steps passed; synth follows its money until the payouts or refunds are confirmed" { "passed · still live" }
         },
         _ => html! { span class=(format!("badge {status}")) { (status) } },
-    }
-}
-
-fn status_class(status: &ScenarioStatus) -> &'static str {
-    match status {
-        ScenarioStatus::Passed => "passed",
-        ScenarioStatus::Failed => "failed",
-        ScenarioStatus::Running => "running",
-    }
-}
-
-fn step_class(status: &crate::scenarios::StepStatus) -> &'static str {
-    match status {
-        crate::scenarios::StepStatus::Passed => "passed",
-        crate::scenarios::StepStatus::Failed => "failed",
-        crate::scenarios::StepStatus::Skipped => "skipped",
     }
 }
 
@@ -1253,7 +1227,7 @@ mod tests {
         let home = dashboard_live(&Dashboard::for_tests(db))
             .await
             .into_string();
-        assert!(home.contains("No runs yet."), "{home}");
+        assert!(home.contains("No completed runs yet."), "{home}");
     }
 
     /// An escrow expiry already past says nothing about when stuck money can move: the panel
@@ -1309,7 +1283,7 @@ mod tests {
         );
     }
 
-    /// Runs synth stopped following while their money was held stay on the panel, as
+    /// Runs with unresolved held money stay on the panel, as
     /// unverified; competitions that never ran and hold escrows are listed with what they owe.
     #[test]
     fn the_stuck_money_panel_lists_unverified_holds_and_unrefunded_competitions() {
@@ -1373,10 +1347,10 @@ mod tests {
             stuck.contains("<strong>1,100 sats</strong> held by 1 run(s)"),
             "{stuck}"
         );
-        let stopped = between(&panel, "Held when synth stopped following", "</table>");
+        let stopped = between(&panel, "Held money still unverified", "</table>");
         assert!(stopped.contains("<strong>3,000 sats</strong>"), "{stopped}");
         assert!(
-            stopped.contains(r#"data-label="Stopped following""#),
+            stopped.contains(r#"data-label="Last checked""#),
             "{stopped}"
         );
         assert!(stopped.contains(&runs[1].run.id), "{stopped}");

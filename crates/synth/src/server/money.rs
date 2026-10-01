@@ -230,8 +230,96 @@ impl Run<'_> {
     }
 }
 
+/// One independently accounted competition, including the queue's leftovers.
+pub struct Scope<'a> {
+    pub competition_id: Option<Uuid>,
+    pub entries: Vec<EntryTrace>,
+    pub scenario_refunds: Vec<(String, ScenarioRefund)>,
+    pub trail: Option<&'a Trail>,
+}
+
+impl Scope<'_> {
+    pub fn run<'a>(&'a self, parent: &'a Run<'_>) -> Run<'a> {
+        Run {
+            competition_id: self.competition_id,
+            entries: &self.entries,
+            scenario_refunds: &self.scenario_refunds,
+            trail: self.trail,
+            links: parent.links,
+            paid_by_node: parent.paid_by_node,
+        }
+    }
+}
+
+pub fn scopes<'a>(run: &Run<'a>) -> Vec<Scope<'a>> {
+    let own = run.trail.map_or_else(
+        || run.entries.to_vec(),
+        |trail| trail.own_entries(run.entries),
+    );
+    let mut scopes = vec![money_scope(
+        run.competition_id,
+        own,
+        run.trail,
+        run.scenario_refunds,
+    )];
+    if let Some(trail) = run.trail {
+        for pool in &trail.pools {
+            scopes.push(money_scope(
+                Some(pool.trail.competition_id),
+                pool.entries(run.entries),
+                Some(&pool.trail),
+                run.scenario_refunds,
+            ));
+        }
+    }
+    scopes
+}
+
+fn money_scope<'a>(
+    competition_id: Option<Uuid>,
+    entries: Vec<EntryTrace>,
+    trail: Option<&'a Trail>,
+    refunds: &[(String, ScenarioRefund)],
+) -> Scope<'a> {
+    let scenario_refunds = refunds
+        .iter()
+        .filter(|(user, _)| entries.iter().any(|entry| &entry.user == user))
+        .cloned()
+        .collect();
+    Scope {
+        competition_id,
+        entries,
+        scenario_refunds,
+        trail,
+    }
+}
+
 /// Every hop of a run's money, in the order it moved.
 pub fn rows(run: &Run) -> Vec<Row> {
+    let scopes = scopes(run);
+    let several = scopes.len() > 1;
+    scopes
+        .iter()
+        .flat_map(|scope| {
+            let mut rows = scope_rows(&scope.run(run));
+            if several {
+                for row in &mut rows {
+                    row.step = format!(
+                        "{} · {}",
+                        scope
+                            .competition_id
+                            .map(|id| id.to_string())
+                            .unwrap_or_default(),
+                        row.step
+                    );
+                }
+            }
+            rows
+        })
+        .collect()
+}
+
+fn scope_rows(run: &Run) -> Vec<Row> {
     let links = run.links;
     let mut rows = Vec::new();
     if let Some(id) = run.competition_id {
@@ -675,14 +763,23 @@ pub struct Ledger {
     pub closing_fees: Option<u64>,
     /// What the coordinator's node paid to route the confirmed payouts, in millisats.
     pub payout_routing_fee_msat: Option<u64>,
-    /// Once the money stopped moving, what is not accounted for: positive when money owed or
-    /// held is missing, negative when more left than was owed. Zero while it moves.
+    /// Once settlement is assessed, what is not accounted for: positive when money owed or
+    /// held is missing, negative when more left than was owed. Unverified obligations remain
+    /// visible while the tracker continues looking. Zero during normal settlement progress.
     pub remainder: i64,
     /// Why it does not balance, in words, for each thing that is off.
     pub flags: Vec<String>,
 }
 
 pub fn ledger(run: &Run) -> Ledger {
+    if run.trail.is_some_and(|trail| !trail.pools.is_empty()) {
+        let scopes = scopes(run);
+        return scope_ledger(&scopes[0].run(run));
+    }
+    scope_ledger(run)
+}
+
+fn scope_ledger(run: &Run) -> Ledger {
     let paid = run.paid_entries();
     let paid_in: u64 = paid.iter().filter_map(|entry| entry.amount_sats).sum();
     let mut ledger = Ledger {
@@ -773,23 +870,7 @@ pub fn ledger(run: &Run) -> Ledger {
     {
         ledger.rounding = pot.unwrap_or(0).saturating_sub(ledger.owed);
     }
-    ledger.refund_fees = {
-        let kept: Option<Vec<u64>> = trail
-            .refunds
-            .iter()
-            .filter(|refund| refund.is_settled())
-            .map(|refund| {
-                let entry = run
-                    .entries
-                    .iter()
-                    .find(|entry| entry.ticket_id == Some(refund.ticket_id))?;
-                let escrowed = trail.swap_of(entry)?.amount_sat;
-                Some(escrowed.saturating_sub(refund.paid_sats))
-            })
-            .collect();
-        kept.filter(|kept| !kept.is_empty())
-            .map(|kept| kept.iter().sum())
-    };
+    ledger.refund_fees = refund_fees(run, trail);
     ledger.funding_batch_fee = trail.funding_tx.as_ref().and_then(|tx| tx.fee_sat);
     ledger.outcome_fee = trail.outcome_tx.as_ref().and_then(|tx| tx.fee_sat);
     ledger.closing_fees = (!trail.closing_txs.is_empty())
@@ -840,10 +921,9 @@ pub fn ledger(run: &Run) -> Ledger {
         ));
     }
 
-    // Once the money stopped, what is missing.
-    let stopped = trail.money.is_final() || matches!(trail.money, Money::Stuck { .. });
+    // Tracking an uncertain outcome must not hide its outstanding obligations.
     let funded = trail.competition.as_ref().is_some_and(contracted);
-    if stopped && trail.money != Money::NothingPaid {
+    if trail.money.is_assessed() && trail.money != Money::NothingPaid {
         if funded
             || trail
                 .competition
@@ -927,6 +1007,24 @@ pub fn tsv(rows: &[Row]) -> String {
     out
 }
 
+fn refund_fees(run: &Run, trail: &Trail) -> Option<u64> {
+    let kept: Option<Vec<u64>> = trail
+        .refunds
+        .iter()
+        .filter(|refund| refund.is_settled())
+        .map(|refund| {
+            let entry = run
+                .entries
+                .iter()
+                .find(|entry| entry.ticket_id == Some(refund.ticket_id))?;
+            let escrowed = trail.swap_of(entry)?.amount_sat;
+            Some(escrowed.saturating_sub(refund.paid_sats))
+        })
+        .collect();
+    kept.filter(|kept| !kept.is_empty())
+        .map(|kept| kept.iter().sum())
+}
+
 /// The whole trail as JSON: where the money stands, where it was held, the ledger, and every hop.
 pub fn json(run_id: &str, run: &Run, ledger: &Ledger, rows: &[Row]) -> String {
     serde_json::to_string_pretty(&serde_json::json!({
@@ -935,6 +1033,11 @@ pub fn json(run_id: &str, run: &Run, ledger: &Ledger, rows: &[Row]) -> String {
         "money": run.trail.map(|trail| &trail.money),
         "held": run.trail.and_then(|trail| trail.held.as_ref()),
         "ledger": ledger,
+        "pools": run.trail.map(|trail| &trail.pools),
+        "pool_ledgers": scopes(run).iter().skip(1).map(|scope| serde_json::json!({
+            "competition_id": scope.competition_id,
+            "ledger": scope_ledger(&scope.run(run)),
+        })).collect::<Vec<_>>(),
         "hops": rows,
     }))
     .unwrap_or_default()
@@ -996,6 +1099,8 @@ mod tests {
             .unwrap();
         let owed = [1020, 990, 990];
         Trail {
+            follow_until: None,
+            pools: Vec::new(),
             refreshed_at: OffsetDateTime::now_utc(),
             competition_id: competition.id,
             competition: Some(competition),
