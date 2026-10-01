@@ -472,10 +472,18 @@ pub struct LnSettings {
     /// admin macaroon travels on this connection.
     #[serde(default)]
     pub dangerous_accept_invalid_tls: bool,
-    /// Interval in seconds to check for new invoices
+    /// Interval in seconds to check for new invoices while the invoice subscription is down
     pub invoice_watch_interval: u64,
-    /// Interval in seconds to check for new payouts
+    /// Interval in seconds to check for new invoices while the invoice subscription is up;
+    /// the check only reconciles events the subscription missed
+    #[serde(default = "default_watch_interval_subscribed")]
+    pub invoice_watch_interval_subscribed: u64,
+    /// Interval in seconds to check for new payouts while the payment subscription is down
     pub payout_watch_interval: u64,
+    /// Interval in seconds to check for new payouts while the payment subscription is up;
+    /// the check only reconciles events the subscription missed
+    #[serde(default = "default_watch_interval_subscribed")]
+    pub payout_watch_interval_subscribed: u64,
     /// Enable mock LN client for E2E testing (no real LND required)
     #[serde(default)]
     pub mock_enabled: bool,
@@ -493,11 +501,17 @@ impl Default for LnSettings {
             tls_cert_path: Some(String::from("./creds/tls.cert")),
             dangerous_accept_invalid_tls: false,
             invoice_watch_interval: 5,
+            invoice_watch_interval_subscribed: default_watch_interval_subscribed(),
             payout_watch_interval: 5,
+            payout_watch_interval_subscribed: default_watch_interval_subscribed(),
             mock_enabled: false,
             mock_auto_accept_secs: None,
         }
     }
+}
+
+fn default_watch_interval_subscribed() -> u64 {
+    60
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -921,9 +935,17 @@ pub struct BitcoinSettings {
     /// Frequency in seconds for how often to refresh block data with on-chain
     /// (usually want to set to half as often as a block on average will come in, 10min block time -> refresh every 5min)
     pub refresh_blocks_secs: u64,
+    /// Frequency in seconds of the same refresh while the Electrum block header
+    /// subscription is up; a new block also triggers a refresh at once
+    #[serde(default = "default_refresh_blocks_secs_subscribed")]
+    pub refresh_blocks_secs_subscribed: u64,
     /// Enable mock Bitcoin client for E2E testing (no real Bitcoin infrastructure required)
     #[serde(default)]
     pub mock_enabled: bool,
+}
+
+fn default_refresh_blocks_secs_subscribed() -> u64 {
+    120
 }
 
 impl Default for BitcoinSettings {
@@ -934,6 +956,7 @@ impl Default for BitcoinSettings {
             explorer_url: None,
             seed_path: String::from("./creds/coordinator_private_key.pem"),
             refresh_blocks_secs: 15,
+            refresh_blocks_secs_subscribed: default_refresh_blocks_secs_subscribed(),
             mock_enabled: false,
         }
     }

@@ -10,6 +10,7 @@ use time::OffsetDateTime;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
+use super::SubscriptionHealth;
 use crate::{
     domain::{competitions::Ticket, Coordinator},
     infra::{
@@ -25,7 +26,11 @@ const RETRY_DELAY_MS: u64 = 1000;
 pub struct InvoiceWatcher {
     coordinator: Arc<Coordinator>,
     ln: Arc<dyn Ln>,
+    /// Between sweeps while the invoice subscription is down.
     sync_interval: Duration,
+    /// Between sweeps while the invoice subscription is up.
+    subscribed_interval: Duration,
+    subscription: Arc<SubscriptionHealth>,
     cancel_token: CancellationToken,
 }
 
@@ -40,8 +45,21 @@ impl InvoiceWatcher {
             coordinator,
             ln,
             sync_interval,
+            subscribed_interval: sync_interval,
+            subscription: Arc::new(SubscriptionHealth::new("Invoice")),
             cancel_token,
         }
+    }
+
+    /// Sweep only every `subscribed_interval` while `subscription` is up.
+    pub fn with_subscription(
+        mut self,
+        subscription: Arc<SubscriptionHealth>,
+        subscribed_interval: Duration,
+    ) -> Self {
+        self.subscription = subscription;
+        self.subscribed_interval = subscribed_interval;
+        self
     }
 
     pub async fn watch(&self) -> Result<(), anyhow::Error> {
@@ -69,8 +87,9 @@ impl InvoiceWatcher {
                 None => debug!("Another coordinator watches invoices"),
             }
 
+            // The sweep also reconciles events the subscription missed.
             tokio::select! {
-                _ = sleep(self.sync_interval) => continue,
+                _ = self.subscription.wait(self.sync_interval, self.subscribed_interval) => continue,
                 _ = self.cancel_token.cancelled() => {
                     info!("Invoice watcher cancelled during sleep");
                     break;

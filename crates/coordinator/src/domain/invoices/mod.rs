@@ -2,12 +2,14 @@ mod invoice_subscriber;
 mod invoice_watcher;
 mod payment_subscriber;
 mod payout_watcher;
+mod subscription_health;
 
 pub use invoice_subscriber::InvoiceSubscriber;
 pub use invoice_watcher::InvoiceWatcher;
 pub use payment_subscriber::PaymentSubscriber;
 pub use payout_watcher::PayoutWatcher;
 use serde::{Deserialize, Serialize};
+pub use subscription_health::SubscriptionHealth;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PaymentLookupResponse {

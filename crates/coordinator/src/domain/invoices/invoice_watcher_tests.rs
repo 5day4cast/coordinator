@@ -462,3 +462,24 @@ async fn a_cancelled_invoice_of_a_paid_ticket_is_recorded_once_and_no_longer_pol
     );
     f.database.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn the_watcher_sweeps_slowly_only_while_its_subscription_is_up() {
+    let f = Fixture::new(false).await;
+    let subscription = Arc::new(SubscriptionHealth::new("Invoice"));
+    let watcher = f
+        .watcher()
+        .await
+        .with_subscription(subscription.clone(), Duration::from_secs(60));
+    let interval = || subscription.interval(watcher.sync_interval, watcher.subscribed_interval);
+    // The sweep is the same whichever interval separates it from the next.
+    watcher.handle_pending_invoices().await.unwrap();
+
+    assert_eq!(interval(), Duration::from_millis(5));
+    subscription.set_up();
+    assert_eq!(interval(), Duration::from_secs(60));
+    // A dropped subscription may have missed events: back to the fast interval.
+    subscription.set_down();
+    assert_eq!(interval(), Duration::from_millis(5));
+    f.database.close().await.unwrap();
+}

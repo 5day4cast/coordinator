@@ -1,9 +1,9 @@
 use log::{debug, error, info, warn};
 use std::{sync::Arc, time::Duration};
 use time::OffsetDateTime;
-use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
+use super::SubscriptionHealth;
 use crate::{
     domain::{
         competitions::{payout_resend_delay_secs, EntryPayout, PayoutError},
@@ -26,7 +26,11 @@ pub struct PayoutWatcher {
     ln: Arc<dyn Ln>,
     bitcoin: Arc<dyn Bitcoin>,
     leases: Arc<crate::domain::WorkerLeases>,
+    /// Between sweeps while the payment subscription is down.
     sync_interval: Duration,
+    /// Between sweeps while the payment subscription is up.
+    subscribed_interval: Duration,
+    subscription: Arc<SubscriptionHealth>,
     cancel_token: CancellationToken,
 }
 
@@ -43,8 +47,21 @@ impl PayoutWatcher {
             leases: coordinator.worker_leases().clone(),
             ln,
             sync_interval,
+            subscribed_interval: sync_interval,
+            subscription: Arc::new(SubscriptionHealth::new("Payment")),
             cancel_token,
         }
+    }
+
+    /// Sweep only every `subscribed_interval` while `subscription` is up.
+    pub fn with_subscription(
+        mut self,
+        subscription: Arc<SubscriptionHealth>,
+        subscribed_interval: Duration,
+    ) -> Self {
+        self.subscription = subscription;
+        self.subscribed_interval = subscribed_interval;
+        self
     }
 
     pub async fn watch(&self) -> Result<(), anyhow::Error> {
@@ -68,8 +85,9 @@ impl PayoutWatcher {
                 _ = self.cancel_token.cancelled() => break,
             }
 
+            // The sweep also reconciles events the subscription missed.
             tokio::select! {
-                _ = sleep(self.sync_interval) => continue,
+                _ = self.subscription.wait(self.sync_interval, self.subscribed_interval) => continue,
                 _ = self.cancel_token.cancelled() => {
                     info!("Payout watcher cancelled during sleep");
                     break;
@@ -746,6 +764,8 @@ mod tests {
                 macaroon: secrecy::SecretString::from("test-macaroon"),
             }),
             sync_interval: Duration::from_secs(1),
+            subscribed_interval: Duration::from_secs(1),
+            subscription: Arc::new(SubscriptionHealth::new("Payment")),
             cancel_token: CancellationToken::new(),
         }
     }

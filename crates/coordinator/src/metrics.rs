@@ -122,6 +122,26 @@ pub static ARKADE_UNAVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("valid metric")
 });
 
+/// Whether the LND invoice subscription is connected (1) or not (0). While it is not, the
+/// invoice watcher polls at its fallback interval. Set by `SubscriptionHealth`.
+pub static LN_INVOICE_SUBSCRIPTION_UP: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "coordinator_ln_invoice_subscription_up",
+        "Whether the LND invoice subscription is connected",
+    )
+    .expect("valid metric")
+});
+
+/// Whether the LND payment subscription is connected (1) or not (0). While it is not, the
+/// payout watcher polls at its fallback interval. Set by `SubscriptionHealth`.
+pub static LN_PAYMENT_SUBSCRIPTION_UP: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "coordinator_ln_payment_subscription_up",
+        "Whether the LND payment subscription is connected",
+    )
+    .expect("valid metric")
+});
+
 /// Record a payout reaching its final result for the first time.
 pub fn record_payout_result(succeeded: bool) {
     PAYOUT_ATTEMPTS
@@ -236,6 +256,12 @@ impl Metrics {
         metrics
             .registry
             .register(Box::new(ARKADE_UNAVAILABLE.clone()))?;
+        metrics
+            .registry
+            .register(Box::new(LN_INVOICE_SUBSCRIPTION_UP.clone()))?;
+        metrics
+            .registry
+            .register(Box::new(LN_PAYMENT_SUBSCRIPTION_UP.clone()))?;
         // Show both results from the start, so a rate over them is defined.
         for result in ["succeeded", "failed"] {
             PAYOUT_ATTEMPTS.with_label_values(&[result]);
