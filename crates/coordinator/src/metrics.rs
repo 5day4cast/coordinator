@@ -122,6 +122,24 @@ pub static ARKADE_UNAVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("valid metric")
 });
 
+/// Whether the Arkade subscription watching pending escrows is open (1) or not (0).
+pub static ESCROW_SUBSCRIPTION_UP: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "coordinator_escrow_subscription_up",
+        "Whether the Arkade subscription watching pending escrows is open",
+    )
+    .expect("valid metric")
+});
+
+/// Transactions the Arkade escrow subscription reported.
+pub static ESCROW_EVENTS: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "coordinator_escrow_events_total",
+        "Transactions the Arkade escrow subscription reported",
+    )
+    .expect("valid metric")
+});
+
 /// Record a payout reaching its final result for the first time.
 pub fn record_payout_result(succeeded: bool) {
     PAYOUT_ATTEMPTS
@@ -236,6 +254,10 @@ impl Metrics {
         metrics
             .registry
             .register(Box::new(ARKADE_UNAVAILABLE.clone()))?;
+        metrics
+            .registry
+            .register(Box::new(ESCROW_SUBSCRIPTION_UP.clone()))?;
+        metrics.registry.register(Box::new(ESCROW_EVENTS.clone()))?;
         // Show both results from the start, so a rate over them is defined.
         for result in ["succeeded", "failed"] {
             PAYOUT_ATTEMPTS.with_label_values(&[result]);

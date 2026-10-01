@@ -232,6 +232,9 @@ impl Coordinator {
         self.competition_store
             .set_ticket_ark_swap(ticket.id, ticket.hash.clone(), swap.id)
             .await?;
+        // The escrow subscription watches it from now, rather than from the next check of the
+        // pending swaps.
+        self.escrow_watch.watch(&escrow.escrow_address);
         let expires_at = OffsetDateTime::from_unix_timestamp(swap.expires_at)
             .map_err(|e| Error::BadRequest(e.to_string()))?;
         Ok((swap.invoice, expires_at))
@@ -239,11 +242,23 @@ impl Coordinator {
 
     /// Advance every pending escrow swap. A ticket is paid once its player's payment settled
     /// and Arkade lists the escrow VTXO holding the ticket's price.
+    ///
+    /// ark-swapd is asked about every swap on each check. Arkade is not asked per swap: what the
+    /// escrow subscription reported is checked first, and the swaps it has not settled are
+    /// looked up together in one listing, at most every thirty seconds.
     pub async fn check_ark_swaps(&self) -> Result<(), Error> {
         let Some(ark) = self.ark() else {
             return Ok(());
         };
-        for pending in self.competition_store.pending_ark_swaps().await? {
+        let pending_swaps = self.competition_store.pending_ark_swaps().await?;
+        // Swaps made by another coordinator process are watched from here.
+        self.escrow_watch.replace(
+            pending_swaps
+                .iter()
+                .map(|pending| pending.escrow_address.as_str()),
+        );
+        let mut unverified = Vec::new();
+        for pending in pending_swaps {
             let swap = match ark.swaps.swap(pending.swap_id).await {
                 Ok(swap) => swap,
                 Err(e) => {
@@ -252,43 +267,19 @@ impl Coordinator {
                 }
             };
             if swap.state.player_paid() {
-                // Arkade is asked only once ark-swapd names what it paid, and a lookup that
-                // finds nothing waits longer each time, so a listing the server cannot answer
-                // is not asked every two seconds for every swap.
+                // Arkade is asked only once ark-swapd names what it paid.
                 if swap.escrow_vtxo.is_none() && swap.ark_txid.is_none() {
                     continue;
                 }
-                if !self.escrow_lookups.due(pending.swap_id) {
-                    continue;
+                let seen = self.escrow_watch.seen(&pending.escrow_address);
+                if !seen.is_empty() {
+                    if self.settle_paid_swap(ark, &pending, &swap, &seen).await? {
+                        continue;
+                    }
+                    // What the subscription reported is not enough, so the listing decides.
+                    self.escrow_watch.clear_seen(&pending.escrow_address);
                 }
-                let Some((vtxo, sats)) = self.verified_escrow_vtxo(ark, &pending, &swap).await
-                else {
-                    self.escrow_lookups.missed(pending.swap_id);
-                    continue;
-                };
-                self.escrow_lookups.clear(pending.swap_id);
-                let paid = self
-                    .competition_store
-                    .mark_ticket_ark_paid(
-                        pending.ticket_id,
-                        pending.ticket_hash.clone(),
-                        pending.competition_id,
-                        vtxo.clone(),
-                        sats,
-                    )
-                    .await?;
-                self.reported.clear(SWAP_REPORTS, pending.swap_id);
-                if paid {
-                    info!("Ticket {} paid into its escrow {vtxo}", pending.ticket_id);
-                } else {
-                    // Its escrow is recorded as funded, so cleanup can still refund it.
-                    warn!(
-                        "Escrow {vtxo} of ticket {} is funded, but the ticket is no longer \
-                         reserved, so it was not marked paid",
-                        pending.ticket_id
-                    );
-                }
-                self.wake_competition(pending.competition_id);
+                unverified.push((pending, swap));
             } else if swap.state.ended_unpaid() {
                 if swap.state == crate::infra::ark_swap::SwapState::Unsettled
                     && self
@@ -306,18 +297,93 @@ impl Coordinator {
                 self.competition_store
                     .clear_ticket_reservation(&ticket)
                     .await?;
+                self.escrow_watch.forget(&pending.escrow_address);
                 info!(
                     "Escrow swap for ticket {} ended unpaid; the reservation is released",
                     pending.ticket_id
                 );
             }
         }
+        if unverified.is_empty() || !self.escrow_watch.sweep_due() {
+            return Ok(());
+        }
+        let addresses = unverified
+            .iter()
+            .map(|(pending, _)| pending.escrow_address.clone())
+            .collect();
+        let listed = match ark.transport.vtxos(addresses).await {
+            Ok(listed) => listed,
+            Err(e) => {
+                for (pending, _) in &unverified {
+                    self.report_swap(pending, format!("cannot list its escrow on Arkade: {e}"));
+                }
+                return Ok(());
+            }
+        };
+        for (pending, swap) in &unverified {
+            self.settle_paid_swap(ark, pending, swap, &listed).await?;
+        }
         Ok(())
+    }
+
+    /// Mark a paid swap's ticket paid, if `vtxos` hold its escrow VTXO as
+    /// [`Coordinator::verified_escrow_vtxo`] requires. Whether it did.
+    ///
+    /// The periodic check and the escrow subscription both settle swaps through this.
+    pub(super) async fn settle_paid_swap(
+        &self,
+        ark: &Arkade,
+        pending: &crate::domain::competitions::PendingArkSwap,
+        swap: &crate::infra::ark_swap::Swap,
+        vtxos: &[coordinator_ark::VirtualTxOutPoint],
+    ) -> Result<bool, Error> {
+        // The subscription and the periodic check may come to the same swap at once.
+        let _settling = self.escrow_watch.settling.lock().await;
+        let funded = self
+            .competition_store
+            .ticket_ark_escrow(pending.ticket_id, &pending.ticket_hash)
+            .await?
+            .is_some_and(|escrow| escrow.vtxo_outpoint.is_some());
+        if funded {
+            self.escrow_watch.forget(&pending.escrow_address);
+            return Ok(true);
+        }
+        let Some((vtxo, sats)) = self.verified_escrow_vtxo(ark, pending, swap, vtxos).await else {
+            return Ok(false);
+        };
+        let paid = self
+            .competition_store
+            .mark_ticket_ark_paid(
+                pending.ticket_id,
+                pending.ticket_hash.clone(),
+                pending.competition_id,
+                vtxo.clone(),
+                sats,
+            )
+            .await?;
+        self.reported.clear(SWAP_REPORTS, pending.swap_id);
+        self.escrow_watch.forget(&pending.escrow_address);
+        if paid {
+            info!("Ticket {} paid into its escrow {vtxo}", pending.ticket_id);
+        } else {
+            // Its escrow is recorded as funded, so cleanup can still refund it.
+            warn!(
+                "Escrow {vtxo} of ticket {} is funded, but the ticket is no longer \
+                 reserved, so it was not marked paid",
+                pending.ticket_id
+            );
+        }
+        self.wake_competition(pending.competition_id);
+        Ok(true)
     }
 
     /// Log a problem with a pending swap once, then at debug while it lasts: swaps are checked
     /// every few seconds.
-    fn report_swap(&self, pending: &crate::domain::competitions::PendingArkSwap, problem: String) {
+    pub(super) fn report_swap(
+        &self,
+        pending: &crate::domain::competitions::PendingArkSwap,
+        problem: String,
+    ) {
         if self
             .reported
             .is_new(SWAP_REPORTS, pending.swap_id, &problem)
@@ -335,13 +401,14 @@ impl Coordinator {
     ///
     /// ark-swapd reports the VTXO it paid, or at least the Ark transaction that paid it, and
     /// neither is taken on trust: the swap must pay the ticket's own escrow address its price,
-    /// and Arkade must list an unspent VTXO there with that value. Until it does the ticket
-    /// stays unpaid.
+    /// and Arkade must list an unspent VTXO there with that value, in `vtxos`, a listing or what
+    /// the escrow subscription reported. Until it does the ticket stays unpaid.
     async fn verified_escrow_vtxo(
         &self,
         ark: &Arkade,
         pending: &crate::domain::competitions::PendingArkSwap,
         swap: &crate::infra::ark_swap::Swap,
+        vtxos: &[coordinator_ark::VirtualTxOutPoint],
     ) -> Option<(String, u64)> {
         let escrow = match self
             .competition_store
@@ -412,23 +479,12 @@ impl Coordinator {
             );
             return None;
         }
-        let vtxos = match ark
-            .transport
-            .vtxos(vec![escrow.escrow_address.clone()])
-            .await
-        {
-            Ok(vtxos) => vtxos,
-            Err(e) => {
-                self.report_swap(pending, format!("cannot list its escrow on Arkade: {e}"));
-                return None;
-            }
-        };
         // The refund leaf opens at the escrow's locktime, and an expired VTXO cannot be spent
         // offchain. So the coin ark-swapd paid with must outlive the locktime by a margin.
         let live_until =
             crate::domain::competitions::ark_refund::refund_opens_at(&escrow.escrow_tap_tree)
                 .map(|opens| opens.unix_timestamp() + ark.escrow_expiry_margin_secs as i64);
-        match paid_escrow_vtxo(&vtxos, &escrow.escrow_address, swap, price, live_until) {
+        match paid_escrow_vtxo(vtxos, &escrow.escrow_address, swap, price, live_until) {
             Ok(outpoint) => Some((outpoint.to_string(), price)),
             Err(problem) => {
                 self.report_swap(pending, problem);
@@ -710,7 +766,8 @@ const ARK_SWAP_WALLET_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 /// The VTXO among `vtxos` that a paid swap put in the escrow at `address`.
 ///
-/// It is the one the swap names, or else the output of the swap's Ark transaction. It must be
+/// It is the one the swap names, or else the output of the swap's Ark transaction at
+/// `address`, since `vtxos` may list other escrows the same transaction paid. It must be
 /// at `address`, unspent, and worth `price`. With `live_until` (UNIX seconds), it must not
 /// expire on Arkade before then: a VTXO inherits the expiry of the coins that paid it, and an
 /// expired one cannot be refunded offchain. The error says what is missing or wrong.
@@ -749,7 +806,10 @@ fn paid_escrow_vtxo(
     }
     let vtxo = match (named, paid_in) {
         (Some(named), _) => vtxos.iter().find(|vtxo| vtxo.outpoint == named),
-        (None, Some(paid_in)) => vtxos.iter().find(|vtxo| vtxo.outpoint.txid == paid_in),
+        (None, Some(paid_in)) => vtxos
+            .iter()
+            .filter(|vtxo| vtxo.outpoint.txid == paid_in)
+            .min_by_key(|vtxo| vtxo.script != script),
         (None, None) => {
             return Err(
                 "reports its player paid, but neither its escrow VTXO nor the Ark \
@@ -800,81 +860,24 @@ fn paid_escrow_vtxo(
     Ok(vtxo.outpoint)
 }
 
-/// When each pending swap's escrow may next be looked up on Arkade, and how many lookups
-/// found nothing. The first miss waits two seconds, each further one twice as long, up to a
-/// minute; a swap that is verified or ends is forgotten.
-#[derive(Default)]
-pub(crate) struct EscrowLookups {
-    next: std::sync::Mutex<std::collections::HashMap<Uuid, (std::time::Instant, u32)>>,
-    /// Every lookup is due at once: for tests that check a swap twice in a row.
-    immediate: std::sync::atomic::AtomicBool,
-}
-
-impl EscrowLookups {
-    #[cfg(test)]
-    pub(crate) fn set_immediate(&self) {
-        self.immediate
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub(crate) fn due(&self, swap: Uuid) -> bool {
-        if self.immediate.load(std::sync::atomic::Ordering::Relaxed) {
-            return true;
-        }
-        let next = self
-            .next
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        next.get(&swap)
-            .is_none_or(|(at, _)| std::time::Instant::now() >= *at)
-    }
-
-    pub(crate) fn missed(&self, swap: Uuid) {
-        let mut next = self
-            .next
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let misses = next.get(&swap).map_or(0, |(_, misses)| *misses) + 1;
-        next.insert(
-            swap,
-            (std::time::Instant::now() + lookup_delay(misses), misses),
-        );
-    }
-
-    pub(crate) fn clear(&self, swap: Uuid) {
-        self.next
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&swap);
-    }
-}
-
-/// How long to wait after the `misses`th lookup that found no escrow VTXO.
-pub(crate) fn lookup_delay(misses: u32) -> std::time::Duration {
-    let seconds = 2u64.saturating_mul(1u64 << misses.saturating_sub(1).min(5));
-    std::time::Duration::from_secs(seconds.min(60))
+/// The output script, hex, of the escrow at the encoded Ark `address`: what the escrow
+/// subscription watches, and what Arkade lists the escrow's VTXOs under.
+pub(super) fn escrow_script(address: &str) -> Option<String> {
+    use bitcoin::hex::DisplayHex;
+    coordinator_ark::ArkAddress::decode(address)
+        .ok()
+        .map(|address| {
+            address
+                .to_p2tr_script_pubkey()
+                .as_bytes()
+                .to_lower_hex_string()
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn escrow_lookups_back_off_and_forget_a_verified_swap() {
-        assert_eq!(lookup_delay(1).as_secs(), 2);
-        assert_eq!(lookup_delay(2).as_secs(), 4);
-        assert_eq!(lookup_delay(5).as_secs(), 32);
-        assert_eq!(lookup_delay(6).as_secs(), 60);
-        assert_eq!(lookup_delay(40).as_secs(), 60);
-
-        let lookups = EscrowLookups::default();
-        let swap = Uuid::now_v7();
-        assert!(lookups.due(swap));
-        lookups.missed(swap);
-        assert!(!lookups.due(swap));
-        lookups.clear(swap);
-        assert!(lookups.due(swap));
-    }
     use crate::infra::ark_swap::SwapsUnavailable;
 
     /// A refund must open while the escrow's VTXO is alive. A VTXO lives seven days from the
