@@ -14,6 +14,10 @@
 //! removes it, and meanwhile refuses offchain spends of its VTXOs with
 //! [`Error::VtxoAlreadyRegistered`]. It refuses an offchain spend of a VTXO that expired or was
 //! swept with [`Error::VtxoRecoverable`].
+//!
+//! It keeps one script subscription at a time, as its indexer would: a test announces a listed
+//! VTXO to it, or ends its stream, and sees which scripts it watches and what it was asked to
+//! list.
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -44,7 +48,10 @@ use bitcoin::{
 use futures::channel::mpsc;
 use futures::StreamExt;
 
-use crate::{ArkTransport, Error, EventStream, PoolFunding};
+use crate::{
+    ArkTransport, Error, EventStream, PoolFunding, ScriptTransaction, SubscriptionEvent,
+    SubscriptionStream,
+};
 
 pub const BATCH: &str = "batch-7";
 pub const INTENT_ID: &str = "intent-42";
@@ -198,6 +205,14 @@ pub struct MockState {
     pub commitment_txid: Option<Txid>,
     pub connector_txid: Option<Txid>,
     pub forfeits: Vec<Psbt>,
+    /// The addresses of each VTXO listing asked for, in order.
+    pub listings: Vec<Vec<String>>,
+    /// The script subscription: its ID, and the scripts it watches.
+    pub subscription: Option<(String, HashSet<String>)>,
+    /// How many subscriptions were started.
+    pub subscriptions: usize,
+    /// Where the open subscription stream's events go.
+    pub subscriber: Option<mpsc::UnboundedSender<Result<SubscriptionEvent, Error>>>,
 }
 
 impl MockArkd {
@@ -283,6 +298,66 @@ impl MockArkd {
             assets: Vec::new(),
             depth: 0,
         });
+    }
+
+    /// Tell the open subscription stream about the listed VTXO at `outpoint`, as the indexer
+    /// does once a transaction creates it, if its script is watched. Whether it was sent.
+    pub fn announce_vtxo(&self, outpoint: OutPoint) -> bool {
+        let state = self.state.lock().unwrap();
+        let vtxo = state
+            .vtxos
+            .iter()
+            .find(|vtxo| vtxo.outpoint == outpoint)
+            .expect("a listed VTXO")
+            .clone();
+        let script = vtxo.script.to_hex_string();
+        let watched = state
+            .subscription
+            .as_ref()
+            .is_some_and(|(_, scripts)| scripts.contains(&script));
+        let Some(subscriber) = state.subscriber.as_ref().filter(|_| watched) else {
+            return false;
+        };
+        subscriber
+            .unbounded_send(Ok(SubscriptionEvent::Transaction(ScriptTransaction {
+                txid: outpoint.txid.to_string(),
+                scripts: vec![script],
+                new_vtxos: vec![vtxo],
+                spent_vtxos: Vec::new(),
+            })))
+            .is_ok()
+    }
+
+    /// Send the open subscription stream a heartbeat.
+    pub fn heartbeat(&self) {
+        if let Some(subscriber) = self.state.lock().unwrap().subscriber.as_ref() {
+            let _ = subscriber.unbounded_send(Ok(SubscriptionEvent::Heartbeat));
+        }
+    }
+
+    /// End the open subscription stream, and forget the subscription, as a restarted server
+    /// would.
+    pub fn drop_subscription(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.subscriber = None;
+        state.subscription = None;
+    }
+
+    /// The scripts the subscription watches, sorted.
+    pub fn subscribed_scripts(&self) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        let mut scripts: Vec<String> = state
+            .subscription
+            .iter()
+            .flat_map(|(_, scripts)| scripts.iter().cloned())
+            .collect();
+        scripts.sort();
+        scripts
+    }
+
+    /// The addresses of each VTXO listing asked for, in order.
+    pub fn listings(&self) -> Vec<Vec<String>> {
+        self.state.lock().unwrap().listings.clone()
     }
 
     /// Queue an intent spending `signers`' VTXOs, as a kickoff that never finished leaves one.
@@ -797,6 +872,7 @@ impl ArkTransport for MockArkd {
 
     /// The VTXOs at `addresses`, spent or not, as arkd's indexer lists them.
     async fn vtxos(&self, addresses: Vec<String>) -> Result<Vec<VirtualTxOutPoint>, Error> {
+        self.state.lock().unwrap().listings.push(addresses.clone());
         let scripts = addresses
             .iter()
             .map(|address| {
@@ -814,6 +890,65 @@ impl ArkTransport for MockArkd {
             .filter(|vtxo| scripts.contains(&vtxo.script))
             .cloned()
             .collect())
+    }
+
+    async fn subscribe_scripts(
+        &self,
+        scripts: Vec<String>,
+        subscription: Option<String>,
+    ) -> Result<String, Error> {
+        let mut state = self.state.lock().unwrap();
+        match (subscription, state.subscription.as_mut()) {
+            (Some(id), Some((current, watched))) if id == *current => {
+                watched.extend(scripts);
+                Ok(id)
+            }
+            (Some(id), _) => Err(Error::Status(tonic::Status::not_found(format!(
+                "subscription {id} not found"
+            )))),
+            (None, _) => {
+                state.subscriptions += 1;
+                let id = format!("subscription-{}", state.subscriptions);
+                state.subscription = Some((id.clone(), scripts.into_iter().collect()));
+                Ok(id)
+            }
+        }
+    }
+
+    async fn unsubscribe_scripts(
+        &self,
+        subscription: &str,
+        scripts: Vec<String>,
+    ) -> Result<(), Error> {
+        let mut state = self.state.lock().unwrap();
+        match state.subscription.as_mut() {
+            Some((current, watched)) if current == subscription => {
+                for script in &scripts {
+                    watched.remove(script);
+                }
+                Ok(())
+            }
+            _ => Err(Error::Status(tonic::Status::not_found(format!(
+                "subscription {subscription} not found"
+            )))),
+        }
+    }
+
+    async fn subscription_events(&self, subscription: &str) -> Result<SubscriptionStream, Error> {
+        let mut state = self.state.lock().unwrap();
+        if state
+            .subscription
+            .as_ref()
+            .is_none_or(|(current, _)| current != subscription)
+        {
+            return Err(Error::Status(tonic::Status::not_found(format!(
+                "subscription {subscription} not found"
+            ))));
+        }
+        let (sender, receiver) = mpsc::unbounded();
+        let _ = sender.unbounded_send(Ok(SubscriptionEvent::Started(subscription.to_string())));
+        state.subscriber = Some(sender);
+        Ok(receiver.boxed())
     }
 
     async fn confirm_registration(&self, intent_id: String) -> Result<(), Error> {

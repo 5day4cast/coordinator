@@ -61,7 +61,7 @@ Callers wake a competition after committing the change it should see:
 - A competition is created.
 - An entry is added.
 - A ticket is paid: the invoice watcher, the invoice subscriber, and `handle_invoice_accepted`.
-- An Arkade escrow is funded: `check_ark_swaps`.
+- An Arkade escrow is funded: `check_ark_swaps`, or the escrow subscription (`watch_ark_escrows`).
 
 Each wake is also recorded in `competition_wakes`.
 Every coordinator polls that table each second, `wake_poll`, and wakes its own runners for other coordinators' wakes.
@@ -108,6 +108,9 @@ Each tick runs under a `worker:<name>` lease (`WorkerLeases::tick`), which the w
 | `automatic-payouts` | Prepares winners' claims with Keymeld |
 | `invoice-watcher` | Settles hold invoices and broadcasts escrow transactions |
 | `escrow-swaps` | Records funded Arkade escrows |
+
+The process holding `escrow-swaps` also keeps the one Arkade subscription to the pending escrows' scripts, so an escrow payment the server reports settles its ticket at once.
+`check_ark_swaps` still asks ark-swapd about every swap each tick, and lists the escrows the subscription has not settled in one `GetVtxos` call, at most every thirty seconds.
 
 The LND invoice and payment subscriptions, and the block watcher, only record idempotent state, so both coordinators run them.
 

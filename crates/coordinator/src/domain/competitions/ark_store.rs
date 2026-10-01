@@ -175,6 +175,8 @@ pub struct PendingArkSwap {
     pub ticket_hash: String,
     pub competition_id: Uuid,
     pub swap_id: Uuid,
+    /// The ticket's escrow address, encoded.
+    pub escrow_address: String,
 }
 
 /// The Arkade batch that funded a competition's pool.
@@ -370,7 +372,7 @@ impl CompetitionStore {
     /// Swaps for reserved tickets whose escrow is not funded yet.
     pub async fn pending_ark_swaps(&self) -> Result<Vec<PendingArkSwap>, sqlx::Error> {
         let rows = sqlx::query(
-            "SELECT e.ticket_id, e.ticket_hash, e.swap_id, t.event_id
+            "SELECT e.ticket_id, e.ticket_hash, e.swap_id, e.escrow_address, t.event_id
              FROM ticket_ark_escrows e JOIN tickets t ON t.id = e.ticket_id AND t.hash = e.ticket_hash
              WHERE e.swap_id IS NOT NULL AND e.funded_at IS NULL AND t.reserved_at IS NOT NULL",
         )
@@ -387,6 +389,7 @@ impl CompetitionStore {
                     ticket_hash: row.try_get("ticket_hash")?,
                     competition_id: uuid("event_id")?,
                     swap_id: uuid("swap_id")?,
+                    escrow_address: row.try_get("escrow_address")?,
                 })
             })
             .collect()

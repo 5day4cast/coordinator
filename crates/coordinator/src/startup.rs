@@ -724,6 +724,18 @@ pub async fn build_app(
             },
         );
         threads.insert("escrow_swaps".to_string(), ark_handle);
+
+        // The same process watches the escrows on Arkade, so a payment settles its ticket as
+        // soon as the server reports it; the swaps' check lists what this misses.
+        let watch_coordinator = coordinator.clone();
+        let watch_cancel = cancel_token.clone();
+        let watch_handle = spawn_supervised(
+            &tracker,
+            "escrow subscription",
+            cancel_token.clone(),
+            async move { watch_coordinator.watch_ark_escrows(watch_cancel).await },
+        );
+        threads.insert("escrow_subscription".to_string(), watch_handle);
     }
 
     // Subscription-based watchers for faster payment detection
