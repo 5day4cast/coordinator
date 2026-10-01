@@ -112,14 +112,9 @@ struct Load {
     most_on_one: usize,
 }
 
-async fn pool_relay(
-    State(relay): State<PoolRelay>,
-    Json(envelope): Json<EnclaveEnvelope>,
-) -> Result<Json<EnclaveEnvelope>, axum::http::StatusCode> {
-    let enclave = envelope.destination_enclave;
-    let down = *relay.down.lock().unwrap() == Some(enclave);
-    {
-        let mut load = relay.load.lock().unwrap();
+impl PoolRelay {
+    fn admit_request(&self, enclave: EnclaveId, down: bool) -> Result<(), axum::http::StatusCode> {
+        let mut load = self.load.lock().unwrap();
         // A step's work before it splits by enclave goes one request at a time, so this fails
         // only the enclave's share.
         if down && load.in_flight.values().any(|count| *count > 0) {
@@ -131,7 +126,23 @@ async fn pool_relay(
         let total: usize = load.in_flight.values().sum();
         load.most = load.most.max(total);
         load.most_on_one = load.most_on_one.max(on_one);
+        Ok(())
     }
+
+    fn reset_load_peaks(&self) {
+        let mut load = self.load.lock().unwrap();
+        load.most = 0;
+        load.most_on_one = 0;
+    }
+}
+
+async fn pool_relay(
+    State(relay): State<PoolRelay>,
+    Json(envelope): Json<EnclaveEnvelope>,
+) -> Result<Json<EnclaveEnvelope>, axum::http::StatusCode> {
+    let enclave = envelope.destination_enclave;
+    let down = *relay.down.lock().unwrap() == Some(enclave);
+    relay.admit_request(enclave, down)?;
     let delay = *relay.delay.lock().unwrap();
     tokio::time::sleep(delay).await;
     let outcome = relay.operators[&enclave]
@@ -266,6 +277,26 @@ fn settlement_request(
         },
         ark_funding: None,
     }
+}
+
+async fn prepare_candidates_before_restart(
+    service: Arc<dyn Keymeld>,
+    session: &DlcKeygenSession,
+    player: UserId,
+    first_request: PreparePayoutRequest,
+    renewed_request: PreparePayoutRequest,
+) -> (PayoutPreparedResponse, PayoutPreparedResponse) {
+    let first = service
+        .prepare_payout(session, player.clone(), first_request)
+        .await
+        .unwrap();
+    let renewed = service
+        .prepare_payout(session, player, renewed_request)
+        .await
+        .unwrap();
+    assert_ne!(first.invoice, renewed.invoice);
+    assert_ne!(first.claim_id, renewed.claim_id);
+    (first, renewed)
 }
 
 #[tokio::test]
@@ -419,21 +450,18 @@ async fn coordinator_service_executes_confidential_dlc_and_recovers_late_paid_ca
     payout::verify_completed_contract(&contract, &signatures).unwrap();
     let first_request =
         settlement_request(&session, &player, &terms, binding, &signatures, [9; 32]);
-    let first = service
-        .prepare_payout(&session, player.clone(), first_request.clone())
-        .await
-        .unwrap();
     let renewed_request =
         settlement_request(&session, &player, &terms, binding, &signatures, [22; 32]);
-    let renewed = service
-        .prepare_payout(&session, player.clone(), renewed_request)
-        .await
-        .unwrap();
-    assert_ne!(first.invoice, renewed.invoice);
-    assert_ne!(first.claim_id, renewed.claim_id);
+    let (first, renewed) = prepare_candidates_before_restart(
+        service,
+        &session,
+        player.clone(),
+        first_request,
+        renewed_request,
+    )
+    .await;
     // Replace both enclave state and the service. The database and authenticated
     // generic receipts are the only continuity for policy, candidate and custody.
-    drop(service);
     *relay_state.operator.lock().unwrap() = operator();
     let restored = create_keymeld_service(settings, maker, &[18; 32], db.clone()).unwrap();
     let wrong = ReleasePayoutRequest {
@@ -1089,11 +1117,7 @@ impl Watched {
     }
 
     async fn watch<T>(&self, step: &'static str, run: impl std::future::Future<Output = T>) -> T {
-        {
-            let mut load = self.relay.load.lock().unwrap();
-            load.most = 0;
-            load.most_on_one = 0;
-        }
+        self.relay.reset_load_peaks();
         *self.relay.down.lock().unwrap() = self
             .down
             .filter(|(during, _)| *during == step)
@@ -1803,20 +1827,13 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_funded() {
     .await
     .expect("Keymeld signs the intent that recovers an expired escrow into its swap");
     provider.await.unwrap();
-    {
-        let state = arkd.state.lock().unwrap();
-        assert_eq!(
-            state.recovered,
-            vec![(expired.outpoint, recovery.swap_vtxo)]
-        );
-        let paid = state
-            .vtxos
-            .iter()
-            .find(|vtxo| vtxo.outpoint == recovery.swap_vtxo)
-            .unwrap();
-        assert_eq!(paid.script, swap.script_pubkey());
-        assert_eq!(paid.amount, Amount::from_sat(ESCROW_SATS));
-    }
+    assert_recovered_swap(
+        &arkd,
+        expired.outpoint,
+        recovery.swap_vtxo,
+        &swap.script_pubkey(),
+        Amount::from_sat(ESCROW_SATS),
+    );
 
     // A competition cancelled before its pool filled never completed keygen, and its escrows
     // must still be refundable.
@@ -2189,4 +2206,22 @@ async fn key_deposits_are_checked_alone_and_registered_into_a_pool_session() {
         .unwrap();
     assert_eq!(roster.roster.participants.len(), 3);
     server.abort();
+}
+
+fn assert_recovered_swap(
+    arkd: &coordinator_ark::testing::MockArkd,
+    expired: OutPoint,
+    swap: OutPoint,
+    expected_script: &dlctix::bitcoin::ScriptBuf,
+    expected_amount: Amount,
+) {
+    let state = arkd.state.lock().unwrap();
+    assert_eq!(state.recovered, vec![(expired, swap)]);
+    let paid = state
+        .vtxos
+        .iter()
+        .find(|vtxo| vtxo.outpoint == swap)
+        .unwrap();
+    assert_eq!(&paid.script, expected_script);
+    assert_eq!(paid.amount, expected_amount);
 }

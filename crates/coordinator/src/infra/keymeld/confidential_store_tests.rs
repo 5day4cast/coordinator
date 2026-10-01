@@ -128,39 +128,7 @@ async fn replace(db: &DBConnection, session: &SessionId, version: i64, ciphertex
 #[tokio::test]
 async fn checkpoint_aead_roundtrips_large_private_state_without_plaintext_in_database() {
     let (_directory, db) = database().await;
-    let session = SessionId::new_v7();
-    let key = SessionSecret::from_bytes([23; 32]);
-    let mut state = state(&session);
-    state.session.encrypted_session_secret = "private journal marker ".repeat(8192);
-    assert!(serde_json::to_vec(&state).unwrap().len() > 64 * 1024);
-    assert!(create(&db, &key, &session, &state).await.unwrap());
-    assert!(!create(&db, &key, &session, &state).await.unwrap());
-    let (version, ciphertext) = row(&db, &session).await;
-    assert_eq!(version, 0);
-    assert!(!ciphertext.contains("private journal marker"));
-    let (_, loaded) = load(&db, &key, &session).await.unwrap().unwrap();
-    assert_eq!(
-        serde_json::to_value(&loaded).unwrap(),
-        serde_json::to_value(&state).unwrap()
-    );
-    let checkpoint =
-        DurableCheckpoint::new(db.clone(), key.clone(), session.clone(), version, loaded);
-    checkpoint
-        .save(&ConfidentialJournal::default())
-        .await
-        .unwrap();
-    assert_eq!(row(&db, &session).await.0, 1);
-    assert_eq!(
-        load(&db, &key, &session)
-            .await
-            .unwrap()
-            .unwrap()
-            .1
-            .session
-            .encrypted_session_secret,
-        state.session.encrypted_session_secret
-    );
-    drop(checkpoint);
+    assert_checkpoint_roundtrip(&db).await;
     db.close().await.unwrap();
 }
 
@@ -209,10 +177,68 @@ async fn checkpoint_rejects_wrong_key_session_version_schema_and_ciphertext() {
 #[tokio::test]
 async fn independently_loaded_checkpoints_use_compare_and_swap_without_lost_updates() {
     let (_directory, db) = database().await;
+    assert_checkpoint_compare_and_swap(&db).await;
+    db.close().await.unwrap();
+}
+
+async fn enclave_key() -> Json<serde_json::Value> {
+    Json(
+        serde_json::json!({"enclave_id":1,"public_key":hex::encode(AuthorizationCredentials::from_secret(&[15;32]).unwrap().public_key_bytes()),"attestation_document":"","pcr_measurements":{},"timestamp":0,"healthy":true,"key_epoch":1}),
+    )
+}
+async fn should_not_send(State(count): State<Arc<AtomicUsize>>) -> StatusCode {
+    count.fetch_add(1, Ordering::SeqCst);
+    StatusCode::INTERNAL_SERVER_ERROR
+}
+
+#[tokio::test]
+async fn sdk_sends_no_enclave_command_after_durable_checkpoint_cas_failure() {
+    let (_directory, db) = database().await;
+    let server = assert_stale_checkpoint_stops_command(&db).await;
+    server.abort();
+    db.close().await.unwrap();
+}
+
+async fn assert_checkpoint_roundtrip(db: &DBConnection) {
+    let session = SessionId::new_v7();
+    let key = SessionSecret::from_bytes([23; 32]);
+    let mut state = state(&session);
+    state.session.encrypted_session_secret = "private journal marker ".repeat(8192);
+    assert!(serde_json::to_vec(&state).unwrap().len() > 64 * 1024);
+    assert!(create(db, &key, &session, &state).await.unwrap());
+    assert!(!create(db, &key, &session, &state).await.unwrap());
+    let (version, ciphertext) = row(db, &session).await;
+    assert_eq!(version, 0);
+    assert!(!ciphertext.contains("private journal marker"));
+    let (_, loaded) = load(db, &key, &session).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(&loaded).unwrap(),
+        serde_json::to_value(&state).unwrap()
+    );
+    let checkpoint =
+        DurableCheckpoint::new(db.clone(), key.clone(), session.clone(), version, loaded);
+    checkpoint
+        .save(&ConfidentialJournal::default())
+        .await
+        .unwrap();
+    assert_eq!(row(db, &session).await.0, 1);
+    assert_eq!(
+        load(db, &key, &session)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .session
+            .encrypted_session_secret,
+        state.session.encrypted_session_secret
+    );
+}
+
+async fn assert_checkpoint_compare_and_swap(db: &DBConnection) {
     let session = SessionId::new_v7();
     let key = SessionSecret::from_bytes([26; 32]);
     let original = state(&session);
-    create(&db, &key, &session, &original).await.unwrap();
+    create(db, &key, &session, &original).await.unwrap();
     let first = DurableCheckpoint::new(
         db.clone(),
         key.clone(),
@@ -233,7 +259,7 @@ async fn independently_loaded_checkpoints_use_compare_and_swap_without_lost_upda
     right.session.encrypted_session_secret = "second committed state".into();
     let (a, b) = tokio::join!(first.finish(left), second.finish(right));
     assert_ne!(a.is_ok(), b.is_ok());
-    let (version, loaded) = load(&db, &key, &session).await.unwrap().unwrap();
+    let (version, loaded) = load(db, &key, &session).await.unwrap().unwrap();
     assert_eq!(version, 1);
     assert_eq!(
         loaded.session.encrypted_session_secret,
@@ -250,29 +276,14 @@ async fn independently_loaded_checkpoints_use_compare_and_swap_without_lost_upda
         "failed CAS must leave in-memory checkpoint uncommitted"
     );
     assert!(loser.save(&ConfidentialJournal::default()).await.is_err());
-    assert_eq!(row(&db, &session).await.0, 1);
-    drop(first);
-    drop(second);
-    db.close().await.unwrap();
+    assert_eq!(row(db, &session).await.0, 1);
 }
 
-async fn enclave_key() -> Json<serde_json::Value> {
-    Json(
-        serde_json::json!({"enclave_id":1,"public_key":hex::encode(AuthorizationCredentials::from_secret(&[15;32]).unwrap().public_key_bytes()),"attestation_document":"","pcr_measurements":{},"timestamp":0,"healthy":true,"key_epoch":1}),
-    )
-}
-async fn should_not_send(State(count): State<Arc<AtomicUsize>>) -> StatusCode {
-    count.fetch_add(1, Ordering::SeqCst);
-    StatusCode::INTERNAL_SERVER_ERROR
-}
-
-#[tokio::test]
-async fn sdk_sends_no_enclave_command_after_durable_checkpoint_cas_failure() {
-    let (_directory, db) = database().await;
+async fn assert_stale_checkpoint_stops_command(db: &DBConnection) -> tokio::task::JoinHandle<()> {
     let session_id = SessionId::new_v7();
     let key = SessionSecret::from_bytes([27; 32]);
     let state = state(&session_id);
-    create(&db, &key, &session_id, &state).await.unwrap();
+    create(db, &key, &session_id, &state).await.unwrap();
     let stale = DurableCheckpoint::new(
         db.clone(),
         key.clone(),
@@ -341,10 +352,6 @@ async fn sdk_sends_no_enclave_command_after_durable_checkpoint_cas_failure() {
         .await;
     assert!(result.is_err());
     assert_eq!(count.load(Ordering::SeqCst), 0);
-    assert_eq!(row(&db, &session_id).await.0, 1);
-    drop(session);
-    drop(stale);
-    drop(winner);
-    server.abort();
-    db.close().await.unwrap();
+    assert_eq!(row(db, &session_id).await.0, 1);
+    server
 }

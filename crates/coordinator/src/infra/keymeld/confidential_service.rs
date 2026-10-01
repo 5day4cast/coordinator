@@ -307,6 +307,10 @@ impl KeymeldService {
             .ok_or_else(|| invalid("Confidential signing requires durable application storage"))
     }
     async fn lock_session(&self, id: &SessionId) -> OwnedMutexGuard<()> {
+        self.session_lock(id).await.lock_owned().await
+    }
+
+    async fn session_lock(&self, id: &SessionId) -> Arc<Mutex<()>> {
         let mut locks = self.session_locks.lock().await;
         locks.retain(|_, lock| lock.strong_count() > 0);
         let lock = locks
@@ -317,8 +321,7 @@ impl KeymeldService {
                 locks.insert(id.clone(), Arc::downgrade(&lock));
                 lock
             });
-        drop(locks);
-        lock.lock_owned().await
+        lock
     }
     fn storage_keys(&self) -> Result<Keys, KeymeldError> {
         let secret = Zeroizing::new(self.user_credentials.private_key_bytes());
@@ -949,20 +952,10 @@ impl Keymeld for KeymeldService {
         }
         let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
         let mut journal = std::mem::take(&mut state.journal);
-        let mut driver = self
+        let driver = self
             .connect(session, &state, &credentials, &mut journal, &checkpoint)
             .await?;
-        // The admission is journaled before it is sent. Only an authenticated enclave rejection
-        // lets the slot try again, with a corrected registration; otherwise one refused
-        // registration would lock the slot for good.
-        let admission = format!("admit/{user}");
-        if driver.command_was_rejected(&admission, data.context.enclave_id) {
-            driver
-                .clear_rejected_command(&admission, data.context.enclave_id)
-                .await?;
-        }
-        driver.validate_registration(&native).await?;
-        drop(driver);
+        admit_native_registration(driver, &user, data.context.enclave_id, &native).await?;
         state.registrations.insert(user.clone(), native);
         if let Some(policy) = &data.escrow_policy {
             state.policies.insert(user, policy.clone());
@@ -980,11 +973,10 @@ impl Keymeld for KeymeldService {
         let (mut state, checkpoint) = self.checkpoint(session).await?;
         let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
         let mut journal = std::mem::take(&mut state.journal);
-        let mut driver = self
+        let driver = self
             .connect(session, &state, &credentials, &mut journal, &checkpoint)
             .await?;
-        let roster = driver.restore_keygen(&state.registrations).await?;
-        drop(driver);
+        let roster = restore_roster(driver, &state.registrations).await?;
         state.roster = Some(roster.clone());
         state.journal = journal;
         checkpoint.finish(state).await?;
@@ -1176,83 +1168,17 @@ impl Keymeld for KeymeldService {
         let settlement_plan = state.settlements[&user].clone();
         let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
         let mut journal = std::mem::take(&mut state.journal);
-        let mut driver = self
+        let driver = self
             .connect(session, &state, &credentials, &mut journal, &checkpoint)
             .await?;
-        driver.restore_keygen(&state.registrations).await?;
-        let attempt = ActionAttempt {
-            attempt_id: request.claim_id,
-            signing_session_id: None,
-        };
-        let parameters = Payload::encode(&generic::ActionParameters::PrepareSettlement {
-            claim_id: request.claim_id,
-            contract_signatures: request.contract_signatures,
-            attestation: request.attestation,
-            method: request.method,
-            ark_funding: request.ark_funding,
-        })?;
-        let first_request = PrepareEscrowRequest {
-            schema_version: escrow::SCHEMA_VERSION,
-            binding_receipt: binding.sealed_state.clone(),
-            action_id: generic::RELEASE_PREIMAGE.into(),
-            attempt: attempt.clone(),
-            action: None,
-            action_parameters: parameters.clone(),
-            prior_preparation_receipts: settlement_plan
-                .prior_preparations
-                .get(generic::RELEASE_PREIMAGE)
-                .map(|previous| vec![previous.sealed_state.clone()])
-                .unwrap_or_default(),
-        };
-        let first = escrow_request(
-            &mut driver,
+        let response = EscrowPhase {
+            driver,
             session,
-            &state,
-            &credentials,
-            &user,
-            &format!(
-                "escrow/prepare/{user}/{}/{}/",
-                request.claim_id,
-                generic::RELEASE_PREIMAGE
-            ),
-            Operation::Prepare,
-            Some(generic::RELEASE_PREIMAGE),
-            Some(attempt.clone()),
-            &first_request,
-        )
-        .await?;
-        let mut key_predecessors = vec![first.sealed_state.clone()];
-        if let Some(previous) = settlement_plan
-            .prior_preparations
-            .get(generic::RELEASE_ENTRY_KEY)
-        {
-            key_predecessors.push(previous.sealed_state.clone());
+            state: &state,
+            credentials: &credentials,
         }
-        let second_request = PrepareEscrowRequest {
-            action_id: generic::RELEASE_ENTRY_KEY.into(),
-            prior_preparation_receipts: key_predecessors,
-            ..first_request
-        };
-        let second = escrow_request(
-            &mut driver,
-            session,
-            &state,
-            &credentials,
-            &user,
-            &format!(
-                "escrow/prepare/{user}/{}/{}/",
-                request.claim_id,
-                generic::RELEASE_ENTRY_KEY
-            ),
-            Operation::Prepare,
-            Some(generic::RELEASE_ENTRY_KEY),
-            Some(attempt),
-            &second_request,
-        )
+        .prepare_payout(&user, request, &binding, &settlement_plan)
         .await?;
-        let response = PayoutPreparedResponse::from_responses(first, second)?;
-        verify_prepared_payout_origin(session, &user, &response)?;
-        drop(driver);
         state.journal = journal;
         checkpoint.finish(state).await?;
         Ok(response)
@@ -1292,73 +1218,17 @@ impl Keymeld for KeymeldService {
         };
         let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
         let mut journal = std::mem::take(&mut state.journal);
-        let mut driver = self
+        let driver = self
             .connect(session, &state, &credentials, &mut journal, &checkpoint)
             .await?;
-        driver.restore_keygen(&state.registrations).await?;
-        let mut released = BTreeMap::new();
-        for (permission, prepared) in [
-            (generic::RELEASE_PREIMAGE, &receipts.preimage_preparation),
-            (generic::RELEASE_ENTRY_KEY, &receipts.key_preparation),
-        ] {
-            let execute = ExecuteEscrowRequest {
-                schema_version: escrow::SCHEMA_VERSION,
-                prepared_receipt: prepared.sealed_state.clone(),
-                proof: ConditionProof::VerifierEvidence {
-                    evidence: Payload::encode(&evidence)?,
-                },
-            };
-            let response = escrow_request(
-                &mut driver,
-                session,
-                &state,
-                &credentials,
-                &user,
-                &format!("escrow/execute/{user}/{}/{permission}", request.claim_id),
-                Operation::Execute,
-                Some(permission),
-                prepared.context.request.attempt.clone(),
-                &execute,
-            )
-            .await?;
-            let output: ExecutionOutput = response.output.decode()?;
-            let (recipient, ciphertext) = match output {
-                ExecutionOutput::ReleasedSecret {
-                    ref name,
-                    ref recipient,
-                    ref encrypted_secret,
-                } if permission == generic::RELEASE_PREIMAGE
-                    && name == generic::PREIMAGE_SECRET =>
-                {
-                    (recipient, encrypted_secret)
-                }
-                ExecutionOutput::ReleasedSigningKey {
-                    ref public_key,
-                    ref recipient,
-                    ref encrypted_key,
-                } if permission == generic::RELEASE_ENTRY_KEY
-                    && public_key == &state.policies[&user].policy.participant_public_key =>
-                {
-                    (recipient, encrypted_key)
-                }
-                _ => {
-                    return Err(invalid(
-                        "Enclave release has an unexpected permission or key",
-                    ))
-                }
-            };
-            if recipient.encryption_public_key.as_bytes()
-                != self.user_credentials.public_key_bytes()
-            {
-                return Err(invalid("Released escrow belongs to a different recipient"));
-            }
-            let value = self.user_credentials.decrypt_ecies(ciphertext.as_bytes())?;
-            if value.len() != 32 {
-                return Err(invalid("Invalid released secret length"));
-            }
-            released.insert(permission, Zeroizing::new(hex::encode(&*value)));
+        let released = EscrowPhase {
+            driver,
+            session,
+            state: &state,
+            credentials: &credentials,
         }
-        drop(driver);
+        .release_payout(self, &user, request.claim_id, &receipts, &evidence)
+        .await?;
         state.journal = journal;
         checkpoint.finish(state).await?;
         Ok(PayoutSecrets {
@@ -1409,7 +1279,7 @@ impl Keymeld for KeymeldService {
         let (mut state, _) = self.checkpoint(session).await?;
         let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
         let mut journal = std::mem::take(&mut state.journal);
-        let mut driver = self
+        let driver = self
             .connect(
                 session,
                 &state,
@@ -1418,8 +1288,7 @@ impl Keymeld for KeymeldService {
                 &EphemeralCheckpoint,
             )
             .await?;
-        driver.restore_keygen(&state.registrations).await?;
-        drop(driver);
+        restore_roster(driver, &state.registrations).await?;
         let spends = spends
             .into_iter()
             .map(|(user, spend)| {
@@ -1583,48 +1452,21 @@ impl KeymeldService {
         }
         let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
         let mut journal = std::mem::take(&mut state.journal);
-        let mut driver = self
+        let driver = self
             .connect(session, &state, &credentials, &mut journal, &checkpoint)
             .await?;
-        let roster = driver.restore_keygen(&state.registrations).await?;
         let binding = generic::ContractBinding {
             statement,
             contract: contract.clone(),
         };
-        let mut responses = Vec::new();
-        for (user, policy) in &state.policies {
-            let request = BindEscrowRequest {
-                schema_version: escrow::SCHEMA_VERSION,
-                policy: policy.clone(),
-                application_context: policy
-                    .policy
-                    .verifier
-                    .as_ref()
-                    .ok_or_else(|| invalid("Missing trusted verifier"))?
-                    .policy_data
-                    .clone(),
-                participant_policies: state.policies.clone(),
-                binding_data: Payload::encode(&binding)?,
-            };
-            let response = escrow_request(
-                &mut driver,
-                session,
-                &state,
-                &credentials,
-                user,
-                &format!("escrow/bind/{user}"),
-                Operation::Bind,
-                None,
-                None,
-                &request,
-            )
-            .await?;
-            responses.push(PayoutContractBoundResponse::from_response(
-                binding.clone(),
-                response,
-            )?);
+        let (roster, responses) = EscrowPhase {
+            driver,
+            session,
+            state: &state,
+            credentials: &credentials,
         }
-        drop(driver);
+        .bind_contract(binding)
+        .await?;
         state.bindings = responses
             .iter()
             .map(|bound| (bound.user_id.clone(), bound.response.clone()))
@@ -1711,24 +1553,7 @@ impl KeymeldService {
             .await?;
         let roster = driver.restore_keygen(&state.registrations).await?;
         if driver.is_signing_aborted(&plan.session_id) {
-            // A lost nonce round cannot be resumed. Preserve the exact approved
-            // messages and use the latest sealed preparation for each signer to
-            // authorize a new session under explicit repetition consent.
-            for user in state.policies.keys() {
-                let enclave = session.recipient_authorization.user_enclave_assignments[user];
-                let stage = format!("escrow/sign/prepare/{user}/{}", plan.session_id);
-                if let Some(outcome) = driver.command_outcome(&stage, enclave) {
-                    if let EnclaveOutcome::Musig(MusigOutcome::Keygen(KeygenOutcome::Escrow(
-                        prepared,
-                    ))) = &outcome.response
-                    {
-                        plan.prior_preparations
-                            .insert(user.clone(), *prepared.clone());
-                    }
-                }
-            }
-            plan.session_id = SessionId::new_v7();
-            drop(driver);
+            renew_aborted_signing(driver, session, &state, &mut plan);
             state.signing = Some(plan.clone());
             state.journal = journal.clone();
             if durable {
@@ -1738,30 +1563,26 @@ impl KeymeldService {
                 .connect(session, &state, &credentials, &mut journal, saver)
                 .await?;
         }
-        driver
-            .prepare_signing_batch(&plan.session_id, &plan.batch.items)
-            .await?;
-        if durable {
-            for (user, policy) in &state.policies {
-                permit_contract(
-                    &mut driver,
-                    session,
-                    &state,
-                    &credentials,
-                    &roster,
-                    &plan,
-                    &ark_funding,
-                    user,
-                    policy,
-                )
-                .await?;
+        let signatures = if durable {
+            EscrowPhase {
+                driver,
+                session,
+                state: &state,
+                credentials: &credentials,
             }
+            .sign_durable_batch(
+                &roster,
+                &plan,
+                &ark_funding,
+                self.settings.signing_session_expiry_secs,
+            )
+            .await?
         } else {
             // Inside a batch the journal is in memory only, so each enclave's permits can run on
             // their own copy of it, side by side. Signing needs only what was journaled before
             // them, the route and the batch prepared above, so the copies are not merged back:
             // their permit commands are dropped with the journal when the batch ends.
-            drop(driver);
+            prepare_signing_round(driver, &plan).await?;
             let permits = state
                 .policies
                 .iter()
@@ -1797,26 +1618,327 @@ impl KeymeldService {
                 Ok(vec![(); permits.len()])
             })
             .await?;
-            driver = self
+            let driver = self
                 .connect(session, state, credentials, &mut journal, saver)
                 .await?;
-        }
-        let encrypted = driver
-            .sign_prepared_batch(
-                &plan.session_id,
-                self.settings.signing_session_expiry_secs,
-                &[],
-            )
-            .await?;
-        let results = driver.decrypt_batch_results(&encrypted)?;
-        let signatures = plan.batch.parse_results(&results)?;
-        drop(driver);
+            finish_signing_batch(driver, plan, self.settings.signing_session_expiry_secs).await?
+        };
         if durable {
             state.roster = Some(roster);
             state.journal = journal;
             checkpoint.finish(state).await?;
         }
         Ok(signatures)
+    }
+}
+
+fn renew_aborted_signing(
+    driver: ConfidentialSession<'_>,
+    session: &DlcKeygenSession,
+    state: &ProtocolState,
+    plan: &mut SigningPlan,
+) {
+    // A lost nonce round cannot be resumed. Preserve the exact approved
+    // messages and use the latest sealed preparation for each signer to
+    // authorize a new session under explicit repetition consent.
+    for user in state.policies.keys() {
+        let enclave = session.recipient_authorization.user_enclave_assignments[user];
+        let stage = format!("escrow/sign/prepare/{user}/{}", plan.session_id);
+        if let Some(outcome) = driver.command_outcome(&stage, enclave) {
+            if let EnclaveOutcome::Musig(MusigOutcome::Keygen(KeygenOutcome::Escrow(prepared))) =
+                &outcome.response
+            {
+                plan.prior_preparations
+                    .insert(user.clone(), *prepared.clone());
+            }
+        }
+    }
+    plan.session_id = SessionId::new_v7();
+}
+
+async fn prepare_signing_round(
+    mut driver: ConfidentialSession<'_>,
+    plan: &SigningPlan,
+) -> Result<(), KeymeldError> {
+    driver
+        .prepare_signing_batch(&plan.session_id, &plan.batch.items)
+        .await?;
+    Ok(())
+}
+
+async fn finish_signing_batch(
+    mut driver: ConfidentialSession<'_>,
+    plan: &SigningPlan,
+    expiry_secs: u64,
+) -> Result<DlcSignatureResults, KeymeldError> {
+    let encrypted = driver
+        .sign_prepared_batch(&plan.session_id, expiry_secs, &[])
+        .await?;
+    let results = driver.decrypt_batch_results(&encrypted)?;
+    Ok(plan.batch.parse_results(&results)?)
+}
+
+/// Admit the exact registration, releasing the driver before persisting its journal.
+async fn admit_native_registration(
+    mut driver: ConfidentialSession<'_>,
+    user: &UserId,
+    enclave: EnclaveId,
+    native: &NativeRegistration,
+) -> Result<(), KeymeldError> {
+    // The admission is journaled before it is sent. Only an authenticated enclave rejection
+    // lets the slot try again, with a corrected registration; otherwise one refused
+    // registration would lock the slot for good.
+    let admission = format!("admit/{user}");
+    if driver.command_was_rejected(&admission, enclave) {
+        driver.clear_rejected_command(&admission, enclave).await?;
+    }
+    driver.validate_registration(native).await?;
+    Ok(())
+}
+
+async fn restore_roster(
+    mut driver: ConfidentialSession<'_>,
+    registrations: &BTreeMap<UserId, NativeRegistration>,
+) -> Result<SignedRoster, KeymeldError> {
+    Ok(driver.restore_keygen(registrations).await?)
+}
+
+/// One connected operation phase. Returning consumes its driver and ends the
+/// journal borrow before the caller updates or commits protocol state.
+struct EscrowPhase<'driver, 'state> {
+    driver: ConfidentialSession<'driver>,
+    session: &'state DlcKeygenSession,
+    state: &'state ProtocolState,
+    credentials: &'state SessionCredentials,
+}
+
+impl EscrowPhase<'_, '_> {
+    async fn sign_durable_batch(
+        mut self,
+        roster: &SignedRoster,
+        plan: &SigningPlan,
+        ark_funding: &Option<coordinator_escrow::ark::ArkFunding>,
+        expiry_secs: u64,
+    ) -> Result<DlcSignatureResults, KeymeldError> {
+        let (session, state, credentials) = (self.session, self.state, self.credentials);
+        self.driver
+            .prepare_signing_batch(&plan.session_id, &plan.batch.items)
+            .await?;
+        for (user, policy) in &state.policies {
+            permit_contract(
+                &mut self.driver,
+                session,
+                state,
+                credentials,
+                roster,
+                plan,
+                ark_funding,
+                user,
+                policy,
+            )
+            .await?;
+        }
+        finish_signing_batch(self.driver, plan, expiry_secs).await
+    }
+    async fn prepare_payout(
+        mut self,
+        user: &UserId,
+        request: PreparePayoutRequest,
+        binding: &EscrowResponse,
+        settlement_plan: &SettlementPlan,
+    ) -> Result<PayoutPreparedResponse, KeymeldError> {
+        let (session, state, credentials) = (self.session, self.state, self.credentials);
+        self.driver.restore_keygen(&state.registrations).await?;
+        let attempt = ActionAttempt {
+            attempt_id: request.claim_id,
+            signing_session_id: None,
+        };
+        let parameters = Payload::encode(&generic::ActionParameters::PrepareSettlement {
+            claim_id: request.claim_id,
+            contract_signatures: request.contract_signatures,
+            attestation: request.attestation,
+            method: request.method,
+            ark_funding: request.ark_funding,
+        })?;
+        let first_request = PrepareEscrowRequest {
+            schema_version: escrow::SCHEMA_VERSION,
+            binding_receipt: binding.sealed_state.clone(),
+            action_id: generic::RELEASE_PREIMAGE.into(),
+            attempt: attempt.clone(),
+            action: None,
+            action_parameters: parameters.clone(),
+            prior_preparation_receipts: settlement_plan
+                .prior_preparations
+                .get(generic::RELEASE_PREIMAGE)
+                .map(|previous| vec![previous.sealed_state.clone()])
+                .unwrap_or_default(),
+        };
+        let first = escrow_request(
+            &mut self.driver,
+            session,
+            state,
+            credentials,
+            user,
+            &format!(
+                "escrow/prepare/{user}/{}/{}/",
+                request.claim_id,
+                generic::RELEASE_PREIMAGE
+            ),
+            Operation::Prepare,
+            Some(generic::RELEASE_PREIMAGE),
+            Some(attempt.clone()),
+            &first_request,
+        )
+        .await?;
+        let mut key_predecessors = vec![first.sealed_state.clone()];
+        if let Some(previous) = settlement_plan
+            .prior_preparations
+            .get(generic::RELEASE_ENTRY_KEY)
+        {
+            key_predecessors.push(previous.sealed_state.clone());
+        }
+        let second_request = PrepareEscrowRequest {
+            action_id: generic::RELEASE_ENTRY_KEY.into(),
+            prior_preparation_receipts: key_predecessors,
+            ..first_request
+        };
+        let second = escrow_request(
+            &mut self.driver,
+            session,
+            state,
+            credentials,
+            user,
+            &format!(
+                "escrow/prepare/{user}/{}/{}/",
+                request.claim_id,
+                generic::RELEASE_ENTRY_KEY
+            ),
+            Operation::Prepare,
+            Some(generic::RELEASE_ENTRY_KEY),
+            Some(attempt),
+            &second_request,
+        )
+        .await?;
+        let response = PayoutPreparedResponse::from_responses(first, second)?;
+        verify_prepared_payout_origin(session, user, &response)?;
+        Ok(response)
+    }
+    async fn release_payout(
+        mut self,
+        service: &KeymeldService,
+        user: &UserId,
+        claim_id: Uuid,
+        receipts: &PreparedPayoutReceipts,
+        evidence: &generic::PaymentEvidence,
+    ) -> Result<BTreeMap<&'static str, Zeroizing<String>>, KeymeldError> {
+        let (session, state, credentials) = (self.session, self.state, self.credentials);
+        self.driver.restore_keygen(&state.registrations).await?;
+        let mut released = BTreeMap::new();
+        for (permission, prepared) in [
+            (generic::RELEASE_PREIMAGE, &receipts.preimage_preparation),
+            (generic::RELEASE_ENTRY_KEY, &receipts.key_preparation),
+        ] {
+            let execute = ExecuteEscrowRequest {
+                schema_version: escrow::SCHEMA_VERSION,
+                prepared_receipt: prepared.sealed_state.clone(),
+                proof: ConditionProof::VerifierEvidence {
+                    evidence: Payload::encode(evidence)?,
+                },
+            };
+            let response = escrow_request(
+                &mut self.driver,
+                session,
+                state,
+                credentials,
+                user,
+                &format!("escrow/execute/{user}/{}/{permission}", claim_id),
+                Operation::Execute,
+                Some(permission),
+                prepared.context.request.attempt.clone(),
+                &execute,
+            )
+            .await?;
+            let output: ExecutionOutput = response.output.decode()?;
+            let (recipient, ciphertext) = match output {
+                ExecutionOutput::ReleasedSecret {
+                    ref name,
+                    ref recipient,
+                    ref encrypted_secret,
+                } if permission == generic::RELEASE_PREIMAGE
+                    && name == generic::PREIMAGE_SECRET =>
+                {
+                    (recipient, encrypted_secret)
+                }
+                ExecutionOutput::ReleasedSigningKey {
+                    ref public_key,
+                    ref recipient,
+                    ref encrypted_key,
+                } if permission == generic::RELEASE_ENTRY_KEY
+                    && public_key == &state.policies[user].policy.participant_public_key =>
+                {
+                    (recipient, encrypted_key)
+                }
+                _ => {
+                    return Err(invalid(
+                        "Enclave release has an unexpected permission or key",
+                    ))
+                }
+            };
+            if recipient.encryption_public_key.as_bytes()
+                != service.user_credentials.public_key_bytes()
+            {
+                return Err(invalid("Released escrow belongs to a different recipient"));
+            }
+            let value = service
+                .user_credentials
+                .decrypt_ecies(ciphertext.as_bytes())?;
+            if value.len() != 32 {
+                return Err(invalid("Invalid released secret length"));
+            }
+            released.insert(permission, Zeroizing::new(hex::encode(&*value)));
+        }
+        Ok(released)
+    }
+    async fn bind_contract(
+        mut self,
+        binding: generic::ContractBinding,
+    ) -> Result<(SignedRoster, Vec<PayoutContractBoundResponse>), KeymeldError> {
+        let (session, state, credentials) = (self.session, self.state, self.credentials);
+        let roster = self.driver.restore_keygen(&state.registrations).await?;
+        let mut responses = Vec::new();
+        for (user, policy) in &state.policies {
+            let request = BindEscrowRequest {
+                schema_version: escrow::SCHEMA_VERSION,
+                policy: policy.clone(),
+                application_context: policy
+                    .policy
+                    .verifier
+                    .as_ref()
+                    .ok_or_else(|| invalid("Missing trusted verifier"))?
+                    .policy_data
+                    .clone(),
+                participant_policies: state.policies.clone(),
+                binding_data: Payload::encode(&binding)?,
+            };
+            let response = escrow_request(
+                &mut self.driver,
+                session,
+                state,
+                credentials,
+                user,
+                &format!("escrow/bind/{user}"),
+                Operation::Bind,
+                None,
+                None,
+                &request,
+            )
+            .await?;
+            responses.push(PayoutContractBoundResponse::from_response(
+                binding.clone(),
+                response,
+            )?);
+        }
+        Ok((roster, responses))
     }
 }
 

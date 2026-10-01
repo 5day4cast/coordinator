@@ -84,6 +84,20 @@ struct Escrow {
 }
 
 impl Escrow {
+    fn record_release(&self, user_id: UserId, claim_id: Uuid) -> Result<(), KeymeldError> {
+        let mut released = self.released.lock().unwrap();
+        if released
+            .get(&user_id)
+            .is_some_and(|claim| *claim != claim_id)
+        {
+            return Err(KeymeldError::Session(
+                "release permission already executed".into(),
+            ));
+        }
+        released.insert(user_id, claim_id);
+        Ok(())
+    }
+
     fn new() -> Self {
         Self {
             invoice: Mutex::new(Self::invoice(
@@ -247,17 +261,7 @@ impl Keymeld for Escrow {
                 .unwrap(),
         )
         .unwrap();
-        let mut released = self.released.lock().unwrap();
-        if released
-            .get(&user_id)
-            .is_some_and(|claim| *claim != request.claim_id)
-        {
-            return Err(KeymeldError::Session(
-                "release permission already executed".into(),
-            ));
-        }
-        released.insert(user_id, request.claim_id);
-        drop(released);
+        self.record_release(user_id, request.claim_id)?;
         assert!(self.claims.lock().unwrap().contains(&request.claim_id));
         if self.fail_release.swap(false, Ordering::SeqCst) {
             return Err(KeymeldError::Session("simulated enclave restart".into()));

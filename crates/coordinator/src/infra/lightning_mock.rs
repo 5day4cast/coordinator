@@ -88,62 +88,56 @@ impl MockLnClient {
     /// Manually accept an invoice by its payment hash (hex-encoded).
     /// This simulates a user paying the invoice.
     pub fn accept_invoice(&self, payment_hash_hex: &str) -> Result<(), String> {
-        let (update, value_sats) = {
-            let mut invoices = self.invoices.write().map_err(|e| e.to_string())?;
-            if let Some(invoice) = invoices.get_mut(payment_hash_hex) {
-                if invoice.state == InvoiceState::Open {
-                    invoice.state = InvoiceState::Accepted;
-                    info!("Mock: Invoice {} accepted", payment_hash_hex);
-                    (true, invoice.value_sats)
-                } else {
-                    return Err(format!(
-                        "Invoice {} is not in Open state (current: {:?})",
-                        payment_hash_hex, invoice.state
-                    ));
-                }
-            } else {
-                return Err(format!("Invoice {} not found", payment_hash_hex));
-            }
-        };
-
-        if update {
-            self.broadcast_invoice_update(InvoiceUpdate {
-                payment_hash: payment_hash_hex.to_string(),
-                state: InvoiceState::Accepted,
-                amt_paid_sat: Some(value_sats),
-            });
-        }
+        let update = self.mark_invoice_accepted(payment_hash_hex)?;
+        self.broadcast_invoice_update(update);
         Ok(())
+    }
+
+    fn mark_invoice_accepted(&self, payment_hash_hex: &str) -> Result<InvoiceUpdate, String> {
+        let mut invoices = self.invoices.write().map_err(|e| e.to_string())?;
+        let invoice = invoices
+            .get_mut(payment_hash_hex)
+            .ok_or_else(|| format!("Invoice {} not found", payment_hash_hex))?;
+        if invoice.state != InvoiceState::Open {
+            return Err(format!(
+                "Invoice {} is not in Open state (current: {:?})",
+                payment_hash_hex, invoice.state
+            ));
+        }
+        invoice.state = InvoiceState::Accepted;
+        info!("Mock: Invoice {} accepted", payment_hash_hex);
+        Ok(InvoiceUpdate {
+            payment_hash: payment_hash_hex.to_string(),
+            state: InvoiceState::Accepted,
+            amt_paid_sat: Some(invoice.value_sats),
+        })
     }
 
     /// Manually settle an invoice by its payment hash (hex-encoded).
     pub fn settle_invoice_by_hash(&self, payment_hash_hex: &str) -> Result<(), String> {
-        let (update, value_sats) = {
-            let mut invoices = self.invoices.write().map_err(|e| e.to_string())?;
-            if let Some(invoice) = invoices.get_mut(payment_hash_hex) {
-                if invoice.state == InvoiceState::Accepted || invoice.state == InvoiceState::Open {
-                    invoice.state = InvoiceState::Settled;
-                    info!("Mock: Invoice {} settled", payment_hash_hex);
-                    (true, invoice.value_sats)
-                } else {
-                    return Err(format!(
-                        "Invoice {} cannot be settled (current: {:?})",
-                        payment_hash_hex, invoice.state
-                    ));
-                }
-            } else {
-                return Err(format!("Invoice {} not found", payment_hash_hex));
-            }
-        };
-
-        if update {
-            self.broadcast_invoice_update(InvoiceUpdate {
-                payment_hash: payment_hash_hex.to_string(),
-                state: InvoiceState::Settled,
-                amt_paid_sat: Some(value_sats),
-            });
-        }
+        let update = self.mark_invoice_settled(payment_hash_hex)?;
+        self.broadcast_invoice_update(update);
         Ok(())
+    }
+
+    fn mark_invoice_settled(&self, payment_hash_hex: &str) -> Result<InvoiceUpdate, String> {
+        let mut invoices = self.invoices.write().map_err(|e| e.to_string())?;
+        let invoice = invoices
+            .get_mut(payment_hash_hex)
+            .ok_or_else(|| format!("Invoice {} not found", payment_hash_hex))?;
+        if invoice.state != InvoiceState::Accepted && invoice.state != InvoiceState::Open {
+            return Err(format!(
+                "Invoice {} cannot be settled (current: {:?})",
+                payment_hash_hex, invoice.state
+            ));
+        }
+        invoice.state = InvoiceState::Settled;
+        info!("Mock: Invoice {} settled", payment_hash_hex);
+        Ok(InvoiceUpdate {
+            payment_hash: payment_hash_hex.to_string(),
+            state: InvoiceState::Settled,
+            amt_paid_sat: Some(invoice.value_sats),
+        })
     }
 
     /// How many payments were sent.
@@ -221,30 +215,7 @@ impl MockLnClient {
         let invoice_subscribers = self.invoice_subscribers.clone();
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            let update = {
-                if let Ok(mut invoices) = invoices.write() {
-                    if let Some(invoice) = invoices.get_mut(&payment_hash_hex) {
-                        if invoice.state == InvoiceState::Open {
-                            invoice.state = InvoiceState::Accepted;
-                            info!(
-                                "Mock: Auto-accepted invoice {} after {:?}",
-                                payment_hash_hex, delay
-                            );
-                            Some(InvoiceUpdate {
-                                payment_hash: payment_hash_hex.clone(),
-                                state: InvoiceState::Accepted,
-                                amt_paid_sat: Some(invoice.value_sats),
-                            })
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            };
+            let update = Self::auto_accept_update(&invoices, &payment_hash_hex, delay);
 
             // Broadcast update outside the lock
             if let Some(update) = update {
@@ -255,6 +226,68 @@ impl MockLnClient {
                 }
             }
         });
+    }
+
+    fn auto_accept_update(
+        invoices: &RwLock<HashMap<String, MockInvoice>>,
+        payment_hash_hex: &str,
+        delay: Duration,
+    ) -> Option<InvoiceUpdate> {
+        let mut invoices = invoices.write().ok()?;
+        let invoice = invoices.get_mut(payment_hash_hex)?;
+        if invoice.state != InvoiceState::Open {
+            return None;
+        }
+        invoice.state = InvoiceState::Accepted;
+        info!(
+            "Mock: Auto-accepted invoice {} after {:?}",
+            payment_hash_hex, delay
+        );
+        Some(InvoiceUpdate {
+            payment_hash: payment_hash_hex.to_string(),
+            state: InvoiceState::Accepted,
+            amt_paid_sat: Some(invoice.value_sats),
+        })
+    }
+
+    fn store_invoice(&self, invoice: MockInvoice) -> anyhow::Result<()> {
+        let mut invoices = self
+            .invoices
+            .write()
+            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+        invoices.insert(invoice.payment_hash.clone(), invoice);
+        Ok(())
+    }
+
+    fn record_payment_status(
+        &self,
+        payment_hash: String,
+        status: PaymentStatus,
+    ) -> anyhow::Result<()> {
+        let mut payments = self
+            .payments
+            .write()
+            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+        payments.insert(payment_hash, status);
+        Ok(())
+    }
+
+    fn register_invoice_subscriber(&self, tx: mpsc::Sender<InvoiceUpdate>) -> anyhow::Result<()> {
+        let mut subs = self
+            .invoice_subscribers
+            .write()
+            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+        subs.push(tx);
+        Ok(())
+    }
+
+    fn register_payment_subscriber(&self, tx: mpsc::Sender<PaymentUpdate>) -> anyhow::Result<()> {
+        let mut subs = self
+            .payment_subscribers
+            .write()
+            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+        subs.push(tx);
+        Ok(())
     }
 
     /// Broadcast an invoice update to all subscribers
@@ -313,13 +346,7 @@ impl Ln for MockLnClient {
             preimage: None,
         };
 
-        {
-            let mut invoices = self
-                .invoices
-                .write()
-                .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
-            invoices.insert(ticket_hash_hex.clone(), invoice);
-        }
+        self.store_invoice(invoice)?;
 
         // If auto-accept is enabled, schedule acceptance
         if let Some(delay) = self.auto_accept_delay {
@@ -369,13 +396,7 @@ impl Ln for MockLnClient {
             preimage: None,
         };
 
-        {
-            let mut invoices = self
-                .invoices
-                .write()
-                .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
-            invoices.insert(payment_hash_hex, invoice);
-        }
+        self.store_invoice(invoice)?;
 
         let mut counter = self
             .invoice_counter
@@ -416,13 +437,7 @@ impl Ln for MockLnClient {
             preimage: None,
         };
 
-        {
-            let mut invoices = self
-                .invoices
-                .write()
-                .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
-            invoices.insert(payment_hash_hex, invoice);
-        }
+        self.store_invoice(invoice)?;
 
         Ok(payment_request)
     }
@@ -544,13 +559,7 @@ impl Ln for MockLnClient {
         let payment_hash_hex = extract_payment_hash_from_invoice(&payout_payment_request)?;
         self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        {
-            let mut payments = self
-                .payments
-                .write()
-                .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
-            payments.insert(payment_hash_hex.clone(), PaymentStatus::Succeeded);
-        }
+        self.record_payment_status(payment_hash_hex.clone(), PaymentStatus::Succeeded)?;
         if let Ok(invoice) = payout_payment_request.parse::<lightning_invoice::Bolt11Invoice>() {
             let secret = invoice.payment_secret().0;
             if hex::encode(sha256::Hash::hash(&secret).to_byte_array()) == payment_hash_hex {
@@ -588,13 +597,7 @@ impl Ln for MockLnClient {
     async fn subscribe_invoices(&self) -> Result<mpsc::Receiver<InvoiceUpdate>, anyhow::Error> {
         let (tx, rx) = mpsc::channel(100);
 
-        {
-            let mut subs = self
-                .invoice_subscribers
-                .write()
-                .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
-            subs.push(tx);
-        }
+        self.register_invoice_subscriber(tx)?;
 
         info!("Mock LN: New invoice subscription registered");
         Ok(rx)
@@ -603,13 +606,7 @@ impl Ln for MockLnClient {
     async fn subscribe_payments(&self) -> Result<mpsc::Receiver<PaymentUpdate>, anyhow::Error> {
         let (tx, rx) = mpsc::channel(100);
 
-        {
-            let mut subs = self
-                .payment_subscribers
-                .write()
-                .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
-            subs.push(tx);
-        }
+        self.register_payment_subscriber(tx)?;
 
         info!("Mock LN: New payment subscription registered");
         Ok(rx)

@@ -198,6 +198,11 @@ mod tests {
             Err(ReplayRejection::Replayed)
         );
     }
+    async fn claim_before_guard_replacement(database: DBConnection, now: i64) {
+        let first = Nip98ReplayGuard::with_database(8, database);
+        first.claim_verified(id(7), now, now).await.unwrap();
+    }
+
     #[sqlx::test(migrations = "./migrations/users")]
     async fn database_claims_survive_guard_replacement_and_serialize_writers(
         pool: sqlx::SqlitePool,
@@ -211,9 +216,7 @@ mod tests {
             )
         };
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let first = Nip98ReplayGuard::with_database(8, database());
-        first.claim_verified(id(7), now, now).await.unwrap();
-        drop(first);
+        claim_before_guard_replacement(database(), now).await;
         let second = Nip98ReplayGuard::with_database(8, database());
         let third = Nip98ReplayGuard::with_database(8, database());
         assert_eq!(
