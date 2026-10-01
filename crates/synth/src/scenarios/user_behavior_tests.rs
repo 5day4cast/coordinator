@@ -147,17 +147,22 @@ async fn ticket(
     )
 }
 
+fn begin_payment_attempt(
+    state: &Shared,
+    ticket: Uuid,
+) -> (Option<Arc<Barrier>>, bool, Option<SynthDb>) {
+    let mut state = state.lock().unwrap();
+    let first = state.events.iter().all(|event| !event.starts_with("pay:"));
+    state.events.push(format!("pay:{ticket}"));
+    (
+        state.payment_gate.clone(),
+        state.fail_first_payment && first,
+        state.db.clone(),
+    )
+}
+
 async fn pay(State(state): State<Shared>, Path(ticket): Path<Uuid>) -> (StatusCode, Json<Value>) {
-    let (gate, fail, db) = {
-        let mut state = state.lock().unwrap();
-        let first = state.events.iter().all(|event| !event.starts_with("pay:"));
-        state.events.push(format!("pay:{ticket}"));
-        (
-            state.payment_gate.clone(),
-            state.fail_first_payment && first,
-            state.db.clone(),
-        )
-    };
+    let (gate, fail, db) = begin_payment_attempt(&state, ticket);
     if let Some(gate) = gate {
         gate.wait().await;
     }

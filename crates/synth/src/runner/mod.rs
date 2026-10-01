@@ -356,6 +356,16 @@ impl Runner {
         self.db
             .complete_run(&run_id, result.error.as_deref())
             .await?;
+        crate::server::metrics::record_scenario(
+            scenario,
+            result.status == ScenarioStatus::Passed,
+            result.total_duration_ms,
+            &result
+                .steps
+                .iter()
+                .map(|step| (step.name.clone(), step.duration_ms))
+                .collect::<Vec<_>>(),
+        );
         self.live.remove(&competition_id);
         *self.last_result.lock().await = Some(result.clone());
         self.events.send(Event::RunFinished {

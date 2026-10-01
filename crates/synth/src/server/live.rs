@@ -266,13 +266,20 @@ mod tests {
     fn a_topic_is_watched_only_while_a_page_is_open() {
         let live = Live::new();
         assert!(!live.is_watched("run:r1"));
-        let first = Watching::new(live.clone(), "run:r1".into());
-        let second = Watching::new(live.clone(), "run:r1".into());
-        drop(first);
-        assert!(live.is_watched("run:r1"), "one page still has it open");
-        drop(second);
+        watch_one_page(&live);
         assert!(!live.is_watched("run:r1"));
         assert!(live.watched().is_empty());
+    }
+
+    fn watch_one_page(live: &Live) {
+        let first = Watching::new(live.clone(), "run:r1".into());
+        watch_another_page(live, &first);
+        assert!(live.is_watched("run:r1"), "one page still has it open");
+    }
+
+    fn watch_another_page(live: &Live, _first: &Watching) {
+        let _second = Watching::new(live.clone(), "run:r1".into());
+        assert_eq!(live.watchers.lock().unwrap().get("run:r1"), Some(&2));
     }
 
     /// What a stream opens with, until it goes quiet.

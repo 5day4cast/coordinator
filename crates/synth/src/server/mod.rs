@@ -32,10 +32,11 @@ pub async fn start_server(
     };
     // Pages are pushed their live part as things change, rendered once however many watch.
     tokio::spawn(live::render_changes(dashboard.clone()));
+    let metrics = metrics::router(dashboard.runner.db().clone());
     let app = Router::new()
         .merge(routes::router(dashboard))
         .merge(assets::router())
-        .merge(metrics::router())
+        .merge(metrics)
         .layer(axum::middleware::map_response(secure));
 
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;

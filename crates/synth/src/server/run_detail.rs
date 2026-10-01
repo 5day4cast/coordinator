@@ -70,10 +70,7 @@ fn outcome_words(settlement: &Settlement, payouts: &[PayoutSeen]) -> String {
         (Some(Decided::Attested(index)), [winner]) => format!("{winner} won (outcome {index})"),
         (Some(Decided::Attested(index)), []) => format!("outcome {index} allocates no payouts"),
         (Some(Decided::Attested(index)), winners) => {
-            format!(
-                "Ranked payouts to {} (outcome {index})",
-                winners.join(", ")
-            )
+            format!("Ranked payouts to {} (outcome {index})", winners.join(", "))
         }
     }
 }
@@ -734,16 +731,27 @@ pub(super) async fn run_live(state: &Dashboard, id: &str) -> Option<Markup> {
     Some(html! {
         (run_section(&view.run, view.trail.as_ref(), live_step.as_deref(), now))
         (money_section(&view, now))
-        @if let Some(stuck) = stuck::block(&run, now) { (stuck) }
-        (hops_section(&view, &rows))
-        section {
-            h2 { "Ledger" }
-            (ledger_table(&money::ledger(&run), view.trail.as_ref()))
+        @for scope in money::scopes(&run) {
+            @if let Some(stuck) = stuck::block(&scope.run(&run), now) { (stuck) }
         }
+        (hops_section(&view, &rows))
+        (ledger_sections(&run))
         (competition_section(&view, now))
         (steps_section(&view.steps))
         p.note { "Updated " (format::time(now, now)) }
     })
+}
+
+fn ledger_sections(run: &Run) -> Markup {
+    let scopes = money::scopes(run);
+    html! {
+        @for scope in &scopes {
+            section {
+                h2 { "Ledger" @if scopes.len() > 1 { " · " (scope.competition_id.map(|id| id.to_string()).unwrap_or_default()) } }
+                (ledger_table(&money::ledger(&scope.run(run)), scope.trail))
+            }
+        }
+    }
 }
 
 fn run_section(
@@ -767,7 +775,7 @@ fn run_section(
         @if run.status == "passed" {
             @match money {
                 Some("stuck") => p.note { "Its steps passed, but its money is stuck: see where it is held below." },
-                Some("unverified" | "timed_out") => p.note { "Its steps passed, but synth stopped following its money before it could confirm where it went: see below." },
+                Some("unverified" | "timed_out") => p.note { "Its steps passed, but settlement is still unverified. Synth keeps checking the money: see below." },
                 Some("written_off") => p.note { "Its steps passed, but an operator wrote off refunds that could not finish: see below." },
                 Some("following") => p.note { "Its steps passed. Its competition is still running or paying out; synth follows the money until the payouts or refunds are confirmed." },
                 _ => {},
@@ -812,7 +820,21 @@ fn money_section(view: &RunView, now: OffsetDateTime) -> Markup {
                 None if view.competition_id.is_some() => p.note { "Looking the money up; this page updates when it has." },
                 None => p.note { "The run made no competition, so no money moved past the payments." },
             }
-            (flow_diagram(&flow(&view.entries, &view.scenario_refunds, trail, view.run.status == "failed", &view.run.scenario, &failed_entries)))
+            @for scope in money::scopes(&view.money()) {
+                @if trail.is_some_and(|trail| !trail.pools.is_empty()) {
+                    h3 {
+                        (scope.competition_id.map(|id| id.to_string()).unwrap_or_default())
+                        @if let Some(evidence) = scope.trail {
+                            " · " span class=(format!("badge {}", evidence.money.label())) { (evidence.money.words()) }
+                        }
+                    }
+                }
+                (flow_diagram(&flow(&scope.entries, &scope.scenario_refunds, scope.trail, view.run.status == "failed", &view.run.scenario, &failed_entries)))
+                @if let Some(evidence) = scope.trail.filter(|trail| !trail.pools.is_empty() || trail.competition.as_ref().is_some_and(|competition| competition.parent_id.is_some())) {
+                    @if let Some(reason) = evidence.money.reason() { p.note { (reason) } }
+                    @for gap in &evidence.gaps { p.note { (gap) } }
+                }
+            }
         }
     }
 }
@@ -1105,6 +1127,8 @@ mod tests {
 
     fn trail_of(competition: CompetitionResponse, settlement: Option<Settlement>) -> Trail {
         Trail {
+            follow_until: None,
+            pools: Vec::new(),
             refreshed_at: OffsetDateTime::now_utc(),
             competition_id: competition.id,
             competition: Some(competition),

@@ -76,6 +76,14 @@ impl Settlement {
             };
             params.outcome_payouts.get(&outcome)
         });
+        if decided.is_some()
+            && weights.is_none_or(|weights| {
+                !weights.values().any(|weight| *weight > 0)
+                    || weights.keys().any(|index| *index >= players.len())
+            })
+        {
+            return None;
+        }
         Some(Settlement {
             pot_sats,
             decided,
@@ -199,6 +207,23 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1020, 990, 990]
         );
+    }
+
+    #[test]
+    fn a_decided_outcome_requires_usable_weights() {
+        let original: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/lab-competition.json")).unwrap();
+        for weights in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"0":0}),
+            serde_json::json!({"99":1}),
+        ] {
+            let mut malformed = original.clone();
+            malformed["contract_parameters"]["outcome_payouts"]["att3"] = weights;
+            let competition: CompetitionResponse = serde_json::from_value(malformed).unwrap();
+            assert!(Settlement::of(&competition).is_none());
+        }
     }
 
     #[test]
