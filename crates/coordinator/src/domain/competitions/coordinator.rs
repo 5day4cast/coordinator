@@ -4,6 +4,8 @@ mod ark_coordinator;
 mod automatic;
 #[path = "competition_steps.rs"]
 mod competition_steps;
+#[path = "escrow_watch.rs"]
+mod escrow_watch;
 #[path = "kickoff_check.rs"]
 mod kickoff_check;
 #[path = "network_fee.rs"]
@@ -263,8 +265,9 @@ pub struct Coordinator {
     worker_leases: Arc<super::WorkerLeases>,
     /// Lasting conditions already logged, so each is warned about once rather than every step.
     pub(super) reported: super::Reported,
-    /// When each pending escrow swap may next be looked up on Arkade.
-    pub(super) escrow_lookups: ark_coordinator::EscrowLookups,
+    /// The pending swaps' escrows the Arkade subscription watches, and when they were last
+    /// listed.
+    pub(super) escrow_watch: escrow_watch::EscrowWatch,
     /// One ticket request at a time per competition and player (`lock_ticket_request`).
     ticket_requests: TicketRequestLocks,
 }
@@ -331,7 +334,7 @@ impl Coordinator {
             wakes: super::CompetitionWakes::default(),
             worker_leases,
             reported: super::Reported::default(),
-            escrow_lookups: Default::default(),
+            escrow_watch: Default::default(),
             ticket_requests: TicketRequestLocks::default(),
         };
         coordinator.validate_coordinator_metadata().await?;

@@ -38,7 +38,10 @@ pub use server::{address_hrp, escrow_terms, server_rules, ArkServer};
 pub use signer::{
     script_spend_sighash, EscrowSigner, KeypairSigner, SigningPurpose, SigningRequest,
 };
-pub use transport::{ArkClient, ArkTransport, EventStream, OffchainSubmission};
+pub use transport::{
+    ArkClient, ArkTransport, EventStream, OffchainSubmission, ScriptTransaction, SubscriptionEvent,
+    SubscriptionStream,
+};
 
 /// What [`ArkTransport::vtxos`] lists, and the addresses it lists them for.
 pub use ark_core::server::VirtualTxOutPoint;

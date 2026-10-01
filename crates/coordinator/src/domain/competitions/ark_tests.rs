@@ -485,8 +485,9 @@ impl Fixture {
             max_refund_fee_sats: 100,
         }))
         .unwrap();
-        // The tests check a swap several times in a row, so no lookup waits.
-        coordinator.escrow_lookups.set_immediate();
+        // The tests check a swap several times in a row, so every check lists the escrows, and
+        // a dropped subscription is opened again at once.
+        coordinator.escrow_watch.set_immediate();
 
         let now = OffsetDateTime::now_utc();
         let competition = Competition::new(&CreateEvent {
@@ -1030,6 +1031,223 @@ async fn a_settled_swap_pays_the_ticket_once_arkade_lists_its_escrow_vtxo() {
     f.coordinator.check_ark_swaps().await.unwrap();
     assert_eq!(f.paid_by(&ticket).await, Some((paid.to_string(), PRICE)));
     assert_eq!(f.pending().await, 0, "a paid ticket's swap is done");
+    f.database.close().await.unwrap();
+}
+
+/// The output script, hex, of the escrow at `address`, as the subscription watches it.
+fn escrow_script(address: &str) -> String {
+    coordinator_ark::ArkAddress::decode(address)
+        .unwrap()
+        .to_p2tr_script_pubkey()
+        .to_hex_string()
+}
+
+/// Wait until `check` holds, for up to five seconds.
+async fn until<F, Fut>(what: &str, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..500 {
+        if check().await {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("waited in vain until {what}");
+}
+
+#[tokio::test]
+async fn the_escrow_subscription_pays_a_ticket_as_soon_as_arkade_reports_its_escrow() {
+    let f = Fixture::new().await;
+    let ticket = f.ticket(21, PRICE).await;
+    let paid = outpoint(0xc1, 0);
+    let events = crate::metrics::ESCROW_EVENTS.get();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let driver = async {
+        until("the escrow is watched", || async {
+            f.arkd.subscribed_scripts() == vec![escrow_script(&ticket.escrow_address)]
+        })
+        .await;
+        f.swap_reports(&ticket, SwapState::Settled, Some(paid), Some(paid.txid));
+        f.arkade_lists(&ticket.escrow_address, paid, PRICE, false);
+        assert!(f.arkd.announce_vtxo(paid));
+        until("the ticket is paid", || async {
+            f.paid_by(&ticket).await.is_some()
+        })
+        .await;
+        until("its escrow is no longer watched", || async {
+            f.arkd.subscribed_scripts().is_empty()
+        })
+        .await;
+        cancel.cancel();
+    };
+    let (watched, ()) = tokio::join!(f.coordinator.watch_ark_escrows(cancel.clone()), driver);
+    watched.unwrap();
+    assert_eq!(f.paid_by(&ticket).await, Some((paid.to_string(), PRICE)));
+    assert!(
+        f.arkd.listings().is_empty(),
+        "the VTXO the event carried was verified without listing the escrow"
+    );
+    assert!(crate::metrics::ESCROW_EVENTS.get() > events);
+    assert_eq!(f.pending().await, 0);
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_escrow_reported_before_ark_swapd_settles_is_paid_on_the_next_check_without_a_listing() {
+    let f = Fixture::new().await;
+    let ticket = f.ticket(21, PRICE).await;
+    let paid = outpoint(0xc2, 0);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let driver = async {
+        until("the escrow is watched", || async {
+            !f.arkd.subscribed_scripts().is_empty()
+        })
+        .await;
+        // ark-swapd paid the escrow, and Arkade reported it, but the player's invoice is not
+        // settled yet.
+        f.swap_reports(&ticket, SwapState::EscrowPaid, Some(paid), Some(paid.txid));
+        f.arkade_lists(&ticket.escrow_address, paid, PRICE, false);
+        assert!(f.arkd.announce_vtxo(paid));
+        until("the event is taken in", || async {
+            !f.coordinator
+                .escrow_watch
+                .seen(&ticket.escrow_address)
+                .is_empty()
+        })
+        .await;
+        assert_eq!(f.paid_by(&ticket).await, None);
+        cancel.cancel();
+    };
+    let (watched, ()) = tokio::join!(f.coordinator.watch_ark_escrows(cancel.clone()), driver);
+    watched.unwrap();
+
+    f.swap_reports(&ticket, SwapState::Settled, Some(paid), Some(paid.txid));
+    f.coordinator.check_ark_swaps().await.unwrap();
+    assert_eq!(f.paid_by(&ticket).await, Some((paid.to_string(), PRICE)));
+    assert!(f.arkd.listings().is_empty());
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_dropped_escrow_subscription_resubscribes_with_the_swaps_pending_then() {
+    let f = Fixture::new().await;
+    let first = f.ticket(21, PRICE).await;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let driver = async {
+        until("the first escrow is watched", || async {
+            f.arkd.subscribed_scripts() == vec![escrow_script(&first.escrow_address)]
+        })
+        .await;
+        // Another swap is made meanwhile, as by another coordinator process, and the server
+        // drops the subscription.
+        let second = f.ticket(23, PRICE).await;
+        f.arkd.drop_subscription();
+        let mut both = vec![
+            escrow_script(&first.escrow_address),
+            escrow_script(&second.escrow_address),
+        ];
+        both.sort();
+        until("a new subscription watches both escrows", || async {
+            f.arkd.state.lock().unwrap().subscriptions == 2 && f.arkd.subscribed_scripts() == both
+        })
+        .await;
+
+        // The new stream delivers.
+        let paid = outpoint(0xc3, 0);
+        f.swap_reports(&second, SwapState::Settled, Some(paid), Some(paid.txid));
+        f.arkade_lists(&second.escrow_address, paid, PRICE, false);
+        assert!(f.arkd.announce_vtxo(paid));
+        until("the second ticket is paid", || async {
+            f.paid_by(&second).await.is_some()
+        })
+        .await;
+        cancel.cancel();
+    };
+    let (watched, ()) = tokio::join!(f.coordinator.watch_ark_escrows(cancel.clone()), driver);
+    watched.unwrap();
+    assert_eq!(f.paid_by(&first).await, None);
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_escrow_listing_finds_a_payment_the_subscription_missed() {
+    let f = Fixture::new().await;
+    let ticket = f.ticket(21, PRICE).await;
+    let paid = outpoint(0xc4, 0);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let driver = async {
+        until("the escrow is watched", || async {
+            !f.arkd.subscribed_scripts().is_empty()
+        })
+        .await;
+        // Arkade lists the escrow VTXO, but the event never came.
+        f.swap_reports(&ticket, SwapState::Settled, Some(paid), Some(paid.txid));
+        f.arkade_lists(&ticket.escrow_address, paid, PRICE, false);
+        f.coordinator.check_ark_swaps().await.unwrap();
+        assert_eq!(f.paid_by(&ticket).await, Some((paid.to_string(), PRICE)));
+        until("its escrow is no longer watched", || async {
+            f.arkd.subscribed_scripts().is_empty()
+        })
+        .await;
+        cancel.cancel();
+    };
+    let (watched, ()) = tokio::join!(f.coordinator.watch_ark_escrows(cancel.clone()), driver);
+    watched.unwrap();
+    assert_eq!(f.arkd.listings(), vec![vec![ticket.escrow_address.clone()]]);
+    f.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn pending_escrows_are_listed_together_not_one_by_one() {
+    let f = Fixture::new().await;
+    // One Ark transaction paid two escrows, and ark-swapd names only that transaction.
+    let batch = outpoint(0xc5, 0).txid;
+    let first = f.ticket(21, PRICE).await;
+    let second = f.ticket(23, PRICE).await;
+    f.swap_reports(&first, SwapState::Settled, None, Some(batch));
+    f.swap_reports(&second, SwapState::Settled, None, Some(batch));
+    f.arkade_lists(&first.escrow_address, OutPoint::new(batch, 0), PRICE, false);
+    f.arkade_lists(
+        &second.escrow_address,
+        OutPoint::new(batch, 1),
+        PRICE,
+        false,
+    );
+    let third = f.ticket(25, PRICE).await;
+    let paid = outpoint(0xc6, 0);
+    f.swap_reports(&third, SwapState::Settled, Some(paid), Some(paid.txid));
+    f.arkade_lists(&third.escrow_address, paid, PRICE, false);
+    // One whose player has not paid is not looked up.
+    let unpaid = f.ticket(27, PRICE).await;
+
+    f.coordinator.check_ark_swaps().await.unwrap();
+    let listings = f.arkd.listings();
+    assert_eq!(
+        listings.len(),
+        1,
+        "one listing for every escrow: {listings:?}"
+    );
+    let mut listed = listings[0].clone();
+    listed.sort();
+    let mut expected = vec![
+        first.escrow_address.clone(),
+        second.escrow_address.clone(),
+        third.escrow_address.clone(),
+    ];
+    expected.sort();
+    assert_eq!(listed, expected);
+    assert_eq!(
+        f.paid_by(&first).await,
+        Some((OutPoint::new(batch, 0).to_string(), PRICE))
+    );
+    assert_eq!(
+        f.paid_by(&second).await,
+        Some((OutPoint::new(batch, 1).to_string(), PRICE))
+    );
+    assert_eq!(f.paid_by(&third).await, Some((paid.to_string(), PRICE)));
+    assert_eq!(f.paid_by(&unpaid).await, None);
     f.database.close().await.unwrap();
 }
 
