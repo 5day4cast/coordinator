@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["vendor/esplora-client"]
 members = [
     "crates/coordinator",
     "crates/coordinator-core",
@@ -179,6 +180,8 @@ opt-level = 3
 # and refuses to submit an unsigned commitment TX. Remove this once upstream releases the fix.
 # Every ark crate comes from the fork, so ark-client and our own ark-core/ark-grpc share one ark-core.
 [patch.crates-io]
+# Preserve the Ark/BDK 0.11 API while removing the vulnerable legacy HTTP/2 stack.
+esplora-client = { path = "vendor/esplora-client" }
 ark-bdk-wallet = { git = "https://github.com/tee8z/rust-sdk", branch = "fix/batch-events-by-id" }
 ark-client = { git = "https://github.com/tee8z/rust-sdk", branch = "fix/batch-events-by-id" }
 ark-core = { git = "https://github.com/tee8z/rust-sdk", branch = "fix/batch-events-by-id" }
