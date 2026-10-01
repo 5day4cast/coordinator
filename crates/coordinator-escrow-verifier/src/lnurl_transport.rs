@@ -340,18 +340,7 @@ impl PayRequest {
         // than sending ambiguous duplicate values. Cross-host callbacks work.
         // Match decoded keys but retain the original bytes of opaque provider
         // parameters. Reencoding spaces or percent escapes can break signed URLs.
-        let query = {
-            let mut decoded = callback.query_pairs();
-            callback
-                .query()
-                .unwrap_or_default()
-                .split('&')
-                .filter(|raw| {
-                    raw.is_empty() || decoded.next().is_some_and(|(key, _)| key != "amount")
-                })
-                .collect::<Vec<_>>()
-                .join("&")
-        };
+        let query = callback_query_without_amount(&callback);
         callback.set_query(if query.is_empty() { None } else { Some(&query) });
         callback
             .query_pairs_mut()
@@ -498,22 +487,8 @@ pub mod fixtures {
                 ));
             }
             for (host, pin, path, body) in exchanges {
-                let (mut dns, _) = listener.accept().await.unwrap();
-                match read_control::<_, RelayRequest>(&mut dns).await.unwrap() {
-                    RelayRequest::Resolve {
-                        host: requested,
-                        port,
-                    } => {
-                        assert_eq!(requested, host);
-                        assert_eq!(port, 443);
-                    }
-                    _ => panic!("Expected hostname resolution"),
-                }
                 let pin: SocketAddr = pin.parse().unwrap();
-                write_control(&mut dns, &RelayResponse::Addresses(vec![pin]))
-                    .await
-                    .unwrap();
-                drop(dns);
+                serve_fixture_dns(&listener, host, pin).await;
                 let (mut socket, _) = listener.accept().await.unwrap();
                 match read_control::<_, RelayRequest>(&mut socket).await.unwrap() {
                     RelayRequest::Connect { address } => assert_eq!(address, pin),
@@ -553,6 +528,35 @@ pub mod fixtures {
         client.tls = Arc::new(tls_config(roots).unwrap());
         (client, task)
     }
+}
+
+/// Return owned provider parameters before mutating the callback URL.
+fn callback_query_without_amount(url: &Url) -> String {
+    let mut decoded = url.query_pairs();
+    url.query()
+        .unwrap_or_default()
+        .split('&')
+        .filter(|raw| raw.is_empty() || decoded.next().is_some_and(|(key, _)| key != "amount"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+#[cfg(any(test, feature = "test-support"))]
+async fn serve_fixture_dns(listener: &tokio::net::TcpListener, host: &str, pin: SocketAddr) {
+    let (mut socket, _) = listener.accept().await.unwrap();
+    match read_control::<_, RelayRequest>(&mut socket).await.unwrap() {
+        RelayRequest::Resolve {
+            host: requested,
+            port,
+        } => {
+            assert_eq!(requested, host);
+            assert_eq!(port, 443);
+        }
+        _ => panic!("Expected hostname resolution"),
+    }
+    write_control(&mut socket, &RelayResponse::Addresses(vec![pin]))
+        .await
+        .unwrap();
 }
 
 #[cfg(test)]
@@ -852,21 +856,7 @@ pub(crate) mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (mut dns, _) = listener.accept().await.unwrap();
-            match read_control::<_, RelayRequest>(&mut dns).await.unwrap() {
-                RelayRequest::Resolve { host, port } => {
-                    assert_eq!(host, "fixture.invalid");
-                    assert_eq!(port, 443);
-                }
-                _ => panic!("Expected DNS request"),
-            }
-            write_control(
-                &mut dns,
-                &RelayResponse::Addresses(vec!["8.8.8.8:443".parse().unwrap()]),
-            )
-            .await
-            .unwrap();
-            drop(dns);
+            serve_fixture_dns(&listener, "fixture.invalid", "8.8.8.8:443".parse().unwrap()).await;
             let (mut stream, _) = listener.accept().await.unwrap();
             match read_control::<_, RelayRequest>(&mut stream).await.unwrap() {
                 RelayRequest::Connect { address } => {

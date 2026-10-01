@@ -1862,14 +1862,8 @@ impl Coordinator {
             // Traditional MuSig2 flow: Generate local nonces
             let (ticketed_dlc, funding_outpoint) = legacy_funding
                 .ok_or_else(|| anyhow!("An Arkade competition needs Keymeld to sign"))?;
-            let signing_session = {
-                let mut rng = create_deterministic_rng(
-                    &funding_outpoint,
-                    self.private_key,
-                    &contract_params,
-                )?;
-                SigningSession::<NonceSharingRound>::new(ticketed_dlc, &mut rng, self.private_key)?
-            };
+            let signing_session =
+                self.create_signing_session(ticketed_dlc, &funding_outpoint, &contract_params)?;
             debug!("Started musig nonce sharing round");
             if competition.public_nonces.is_none() {
                 competition.public_nonces = Some(signing_session.our_public_nonces().to_owned());
@@ -1880,6 +1874,16 @@ impl Coordinator {
         competition.errors = vec![];
 
         Ok(competition)
+    }
+
+    fn create_signing_session(
+        &self,
+        dlc: TicketedDLC,
+        funding_outpoint: &OutPoint,
+        parameters: &ContractParameters,
+    ) -> Result<SigningSession<NonceSharingRound>, anyhow::Error> {
+        let mut rng = create_deterministic_rng(funding_outpoint, self.private_key, parameters)?;
+        Ok(SigningSession::new(dlc, &mut rng, self.private_key)?)
     }
 
     /// Aggregate nonces from all participants and generate coordinator's partial signatures
@@ -1927,11 +1931,8 @@ impl Coordinator {
         let ticketed_dlc =
             TicketedDLC::new(contract_parameters.to_owned(), funding_outpoint.to_owned())?;
 
-        let signing_session = {
-            let mut rng =
-                create_deterministic_rng(funding_outpoint, self.private_key, contract_parameters)?;
-            SigningSession::<NonceSharingRound>::new(ticketed_dlc, &mut rng, self.private_key)?
-        };
+        let signing_session =
+            self.create_signing_session(ticketed_dlc, funding_outpoint, contract_parameters)?;
 
         // Verify our stored nonces match what would be generated
         if signing_session.our_public_nonces() != our_nonces {
@@ -2098,14 +2099,8 @@ impl Coordinator {
                 return Err(anyhow!("coordinator nonces missing"));
             };
 
-            let signing_session = {
-                let mut rng = create_deterministic_rng(
-                    funding_outpoint,
-                    self.private_key,
-                    contract_parameters,
-                )?;
-                SigningSession::<NonceSharingRound>::new(ticketed_dlc, &mut rng, self.private_key)?
-            };
+            let signing_session =
+                self.create_signing_session(ticketed_dlc, funding_outpoint, contract_parameters)?;
 
             if signing_session.our_public_nonces() != coordinator_nonces {
                 return Err(anyhow!("coordinator nonce mismatch"));
@@ -2295,93 +2290,103 @@ impl Coordinator {
         &self,
         competition: &'a mut Competition,
     ) -> Result<&'a mut Competition, anyhow::Error> {
-        if competition.attestation.is_some() {
+        // A saved outcome is final even if the oracle later recovers or attests.
+        if competition.attestation.is_some() || competition.expiry_broadcasted_at.is_some() {
             return Ok(competition);
         }
-
-        let Some(signed_contract) = competition.signed_contract.as_ref() else {
+        if competition.signed_contract.is_none() {
             return Err(anyhow!(
                 "No signed contract found for competition {}",
                 competition.id
             ));
-        };
+        }
 
+        let oracle_result = self.record_oracle_attestation(competition).await;
+        if matches!(&oracle_result, Ok(true)) {
+            competition.errors.clear();
+            return Ok(competition);
+        }
+        // Oracle transport, decoding and signature failures must not disable the
+        // independently signed expiry transaction. Preserve the oracle error if
+        // the chain has not yet admitted that fallback.
+        if self.broadcast_expiry_if_due(competition).await? {
+            if let Err(error) = oracle_result {
+                warn!(
+                    "Competition {} refunded despite oracle failure: {error}",
+                    competition.id
+                );
+            }
+            competition.errors.clear();
+            return Ok(competition);
+        }
+        oracle_result?;
+        Ok(competition)
+    }
+
+    async fn record_oracle_attestation(
+        &self,
+        competition: &mut Competition,
+    ) -> Result<bool, anyhow::Error> {
         let event = self.oracle_client.get_event(&competition.id).await?;
         let Some(attestation) = event.attestation else {
-            info!(
-                "No oracle attestation found for competition {} yet, skipping add",
-                competition.id
-            );
-            if let Some(expiry) = signed_contract.dlc().params().event.expiry {
-                let current_time = self
-                    .bitcoin
-                    .get_confirmed_blockchain_time(REQUIRED_CONFIRMATIONS_FOR_TIME)
-                    .await?;
-
-                if current_time > expiry as u64 {
-                    // Get the expiry transaction
-                    let Some(expiry_tx) = signed_contract.expiry_tx() else {
-                        return Err(anyhow!(
-                            "No expiry transaction found for competition {}",
-                            competition.id
-                        ));
-                    };
-
-                    debug!(
-                        "Broadcasting expiry transaction, current time {} expiry_tx lock time {} : {:?}",
-                        current_time, expiry_tx.lock_time, expiry_tx
-                    );
-
-                    if competition.expiry_broadcasted_at.is_none() {
-                        debug!("expiry_tx: {:?}", expiry_tx);
-                        self.bitcoin.broadcast(&expiry_tx).await?;
-                        let now = OffsetDateTime::now_utc();
-                        info!(
-                            "Competition {} expired unattested; expiry tx broadcast: txid={}",
-                            competition.id,
-                            expiry_tx.compute_txid()
-                        );
-                        competition.expiry_broadcasted_at = Some(now);
-                        // The expiry transaction is the contract's outcome transaction for
-                        // Outcome::Expiry: the players are paid their refund shares, and the
-                        // output is split and reclaimed like any outcome's.
-                        competition.outcome_transaction = Some(expiry_tx);
-                        competition.outcome_broadcasted_at = Some(now);
-                    };
-
-                    return Ok(competition);
-                }
-            }
-            return Ok(competition);
+            return Ok(false);
         };
-        debug!("attestation above verification: {:?}", attestation);
-
-        match competition.verify_event_attestation(&attestation) {
-            Ok(outcome) => {
-                info!(
-                    "Oracle attestation verified for competition {}: {}",
-                    competition.id, outcome
-                );
-            }
-            Err(e) => {
-                error!(
-                    "Oracle attestation verification failed for competition {}: {}",
-                    competition.id, e
-                );
-                return Err(anyhow!("Oracle attestation verification failed: {}", e));
-            }
-        }
-        if competition.attestation.is_none() {
-            competition.attestation = Some(attestation);
-        }
-
+        let outcome = competition
+            .verify_event_attestation(&attestation)
+            .map_err(|error| anyhow!("Oracle attestation verification failed: {error}"))?;
         info!(
-            "Oracle attestation added for competition {}",
-            competition.id
+            "Oracle attestation verified for competition {}: {}",
+            competition.id, outcome
         );
-        competition.errors = vec![];
+        competition.attestation = Some(attestation);
+        Ok(true)
+    }
 
-        Ok(competition)
+    async fn broadcast_expiry_if_due(
+        &self,
+        competition: &mut Competition,
+    ) -> Result<bool, anyhow::Error> {
+        if competition.expiry_broadcasted_at.is_some() {
+            return Ok(true);
+        }
+        if competition.attestation.is_some() || competition.outcome_broadcasted_at.is_some() {
+            return Ok(false);
+        }
+        let signed_contract = competition.signed_contract.as_ref().ok_or_else(|| {
+            anyhow!(
+                "No signed contract found for competition {}",
+                competition.id
+            )
+        })?;
+        let Some(expiry) = signed_contract.dlc().params().event.expiry else {
+            return Ok(false);
+        };
+        let current_time = self
+            .bitcoin
+            .get_confirmed_blockchain_time(REQUIRED_CONFIRMATIONS_FOR_TIME)
+            .await?;
+        if current_time <= u64::from(expiry) {
+            return Ok(false);
+        }
+        let expiry_tx = signed_contract.expiry_tx().ok_or_else(|| {
+            anyhow!(
+                "No expiry transaction found for competition {}",
+                competition.id
+            )
+        })?;
+        // Repeating this exact transaction after an uncertain response is safe;
+        // only a successful broadcast selects and persists the expiry outcome.
+        self.bitcoin.broadcast(&expiry_tx).await?;
+        let now = OffsetDateTime::now_utc();
+        info!(
+            "Competition {} expired unattested; expiry tx broadcast: txid={}",
+            competition.id,
+            expiry_tx.compute_txid()
+        );
+        competition.expiry_broadcasted_at = Some(now);
+        competition.outcome_transaction = Some(expiry_tx);
+        competition.outcome_broadcasted_at = Some(now);
+        Ok(true)
     }
 
     pub async fn publish_outcome_transaction<'a>(
@@ -3559,23 +3564,30 @@ impl Coordinator {
         competition_id: Uuid,
         pubkey: &str,
     ) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = {
-            let mut locks = self
-                .ticket_requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            let key = (competition_id, pubkey.to_owned());
-            match locks.get(&key).and_then(std::sync::Weak::upgrade) {
-                Some(lock) => lock,
-                None => {
-                    let lock = Arc::new(tokio::sync::Mutex::new(()));
-                    locks.insert(key, Arc::downgrade(&lock));
-                    lock
-                }
+        self.ticket_request_lock(competition_id, pubkey)
+            .lock_owned()
+            .await
+    }
+
+    fn ticket_request_lock(
+        &self,
+        competition_id: Uuid,
+        pubkey: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .ticket_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let key = (competition_id, pubkey.to_owned());
+        match locks.get(&key).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
             }
-        };
-        lock.lock_owned().await
+        }
     }
 
     /// Release the reservation a failed ticket request was handed, so the player's next

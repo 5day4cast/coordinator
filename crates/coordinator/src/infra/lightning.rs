@@ -855,68 +855,45 @@ impl Ln for LnClient {
     }
 
     async fn subscribe_invoices(&self) -> Result<mpsc::Receiver<InvoiceUpdate>, anyhow::Error> {
+        let response = open_subscription(
+            &self.client,
+            &format!("{}v1/invoices/subscribe", self.base_url),
+            &self.macaroon,
+        )
+        .await?;
         let (tx, rx) = mpsc::channel(100);
-        let base_url = self.base_url.clone();
-        let macaroon = self.macaroon.clone();
-        // The same verified client as every other LND call.
-        let client = self.client.clone();
-
+        // The supervising subscriber owns reconnects. The sender exists only
+        // for this established transport and closes when it fails or ends.
         tokio::spawn(async move {
-            let url = format!("{}v1/invoices/subscribe", base_url);
-            info!("Starting invoice subscription at {}", url);
-
-            // Ends when the subscriber drops its receiver, which shutdown does;
-            // until then, reconnect after a short pause.
-            while !tx.is_closed() {
-                tokio::select! {
-                    result = process_invoice_stream(&client, &url, &macaroon, &tx) => {
-                        if let Err(e) = result { warn!("Invoice subscription error: {}", e); }
-                    }
-                    _ = tx.closed() => break,
+            tokio::select! {
+                result = process_invoice_stream(response, &tx) => {
+                    if let Err(error) = result { warn!("Invoice subscription error: {error}"); }
                 }
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                        info!("Invoice subscription reconnecting...");
-                    }
-                    _ = tx.closed() => {}
-                }
+                _ = tx.closed() => {}
             }
-            info!("Invoice subscription stopped");
         });
-
         Ok(rx)
     }
 
     async fn subscribe_payments(&self) -> Result<mpsc::Receiver<PaymentUpdate>, anyhow::Error> {
+        let response = open_subscription(
+            &self.client,
+            &format!(
+                "{}v2/router/payments?no_inflight_updates=false",
+                self.base_url
+            ),
+            &self.macaroon,
+        )
+        .await?;
         let (tx, rx) = mpsc::channel(100);
-        let base_url = self.base_url.clone();
-        let macaroon = self.macaroon.clone();
-        // The same verified client as every other LND call.
-        let client = self.client.clone();
-
         tokio::spawn(async move {
-            let url = format!("{}v2/router/payments", base_url);
-            info!("Starting payment subscription at {}", url);
-
-            // Ends when the subscriber drops its receiver, which shutdown does;
-            // until then, reconnect after a short pause.
-            while !tx.is_closed() {
-                tokio::select! {
-                    result = process_payment_stream(&client, &url, &macaroon, &tx) => {
-                        if let Err(e) = result { warn!("Payment subscription error: {}", e); }
-                    }
-                    _ = tx.closed() => break,
+            tokio::select! {
+                result = process_payment_stream(response, &tx) => {
+                    if let Err(error) = result { warn!("Payment subscription error: {error}"); }
                 }
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                        info!("Payment subscription reconnecting...");
-                    }
-                    _ = tx.closed() => {}
-                }
+                _ = tx.closed() => {}
             }
-            info!("Payment subscription stopped");
         });
-
         Ok(rx)
     }
 }
@@ -968,22 +945,26 @@ fn parse_payment_update(line: &str) -> Option<PaymentUpdate> {
     })
 }
 
-async fn process_invoice_stream(
+async fn open_subscription(
     client: &ClientWithMiddleware,
     url: &str,
     macaroon: &SecretString,
-    tx: &mpsc::Sender<InvoiceUpdate>,
-) -> Result<(), anyhow::Error> {
+) -> Result<reqwest::Response, anyhow::Error> {
     let response = client
         .get(url)
         .header(MACAROON_HEADER, macaroon.expose_secret())
         .send()
         .await?;
-
     if !response.status().is_success() {
         return Err(anyhow!("Subscription failed: {}", response.status()));
     }
+    Ok(response)
+}
 
+async fn process_invoice_stream(
+    response: reqwest::Response,
+    tx: &mpsc::Sender<InvoiceUpdate>,
+) -> Result<(), anyhow::Error> {
     let mut stream = response.bytes_stream();
     let mut lines = JsonLines::default();
     while let Some(chunk) = stream.next().await {
@@ -1004,21 +985,9 @@ async fn process_invoice_stream(
 }
 
 async fn process_payment_stream(
-    client: &ClientWithMiddleware,
-    url: &str,
-    macaroon: &SecretString,
+    response: reqwest::Response,
     tx: &mpsc::Sender<PaymentUpdate>,
 ) -> Result<(), anyhow::Error> {
-    let response = client
-        .get(format!("{}?no_inflight_updates=false", url))
-        .header(MACAROON_HEADER, macaroon.expose_secret())
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        return Err(anyhow!("Subscription failed: {}", response.status()));
-    }
-
     let mut stream = response.bytes_stream();
     let mut lines = JsonLines::default();
     while let Some(chunk) = stream.next().await {
@@ -1305,6 +1274,40 @@ mod tests {
         assert_eq!(state.body.lock().unwrap()["cltv_limit"], 54);
         assert_eq!(state.body.lock().unwrap()["cancelable"], true);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn subscription_admission_and_channel_lifetime_follow_the_transport() {
+        use axum::{routing::get, Router};
+        let router = Router::new()
+            .route(
+                "/v1/invoices/subscribe",
+                get(|| async { reqwest::StatusCode::UNAUTHORIZED }),
+            )
+            .route("/v2/router/payments", get(|| async { "" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let client = LnClient {
+            base_url: Url::parse(&format!("http://{address}/")).unwrap(),
+            client: ClientBuilder::new(Client::new()).build(),
+            payment_client: Client::new(),
+            macaroon: SecretString::from("test-macaroon"),
+        };
+        // Rejected transport setup must not give the subscriber an apparently live channel.
+        assert!(client.subscribe_invoices().await.is_err());
+        let mut payments = client.subscribe_payments().await.unwrap();
+        // EOF belongs to the supervisor: no hidden reconnect loop keeps the channel alive.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), payments.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        server.abort();
+        let _ = server.await;
     }
 
     /// Runs only against an explicitly supplied disposable regtest LND node.

@@ -57,9 +57,9 @@ impl CompetitionStore {
         ttl: Duration,
     ) -> Result<Option<Lease>, DatabaseWriteError> {
         let (resource, holder) = (resource.to_owned(), holder.to_owned());
-        let (expires_at, now) = (expiry(ttl), unix_now_ms());
         self.db_connection
             .execute_write(move |pool| async move {
+                let (expires_at, now) = (expiry(ttl), unix_now_ms());
                 let token: Option<i64> = sqlx::query_scalar(
                     "INSERT INTO leases (resource, holder, token, expires_at) VALUES (?1, ?2, 1, ?3)
                      ON CONFLICT (resource) DO UPDATE SET
@@ -92,9 +92,9 @@ impl CompetitionStore {
         ttl: Duration,
     ) -> Result<bool, DatabaseWriteError> {
         let lease = lease.clone();
-        let expires_at = expiry(ttl);
         self.db_connection
             .execute_write(move |pool| async move {
+                let expires_at = expiry(ttl);
                 let renewed = sqlx::query(
                     "UPDATE leases SET expires_at = ?
                      WHERE resource = ? AND holder = ? AND token = ?",

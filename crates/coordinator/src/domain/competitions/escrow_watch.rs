@@ -70,7 +70,7 @@ impl EscrowWatch {
         let Some(script) = escrow_script(address) else {
             return;
         };
-        if self.state().scripts.insert(script) {
+        if self.add_script(script) {
             self.changed.notify_one();
         }
     }
@@ -78,14 +78,9 @@ impl EscrowWatch {
     /// Watch exactly the escrows at `addresses`.
     pub(crate) fn replace<'a>(&self, addresses: impl IntoIterator<Item = &'a str>) {
         let scripts: HashSet<String> = addresses.into_iter().filter_map(escrow_script).collect();
-        let mut state = self.state();
-        if state.scripts == scripts {
-            return;
+        if self.replace_scripts(scripts) {
+            self.changed.notify_one();
         }
-        state.seen.retain(|script, _| scripts.contains(script));
-        state.scripts = scripts;
-        drop(state);
-        self.changed.notify_one();
     }
 
     /// Stop watching the escrow at `address`, whose swap is done.
@@ -93,12 +88,29 @@ impl EscrowWatch {
         let Some(script) = escrow_script(address) else {
             return;
         };
-        let mut state = self.state();
-        state.seen.remove(&script);
-        if state.scripts.remove(&script) {
-            drop(state);
+        if self.remove_script(&script) {
             self.changed.notify_one();
         }
+    }
+
+    fn add_script(&self, script: String) -> bool {
+        self.state().scripts.insert(script)
+    }
+
+    fn replace_scripts(&self, scripts: HashSet<String>) -> bool {
+        let mut state = self.state();
+        if state.scripts == scripts {
+            return false;
+        }
+        state.seen.retain(|script, _| scripts.contains(script));
+        state.scripts = scripts;
+        true
+    }
+
+    fn remove_script(&self, script: &str) -> bool {
+        let mut state = self.state();
+        state.seen.remove(script);
+        state.scripts.remove(script)
     }
 
     /// The VTXOs the subscription reported at the escrow at `address`.

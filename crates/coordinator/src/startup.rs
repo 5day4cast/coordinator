@@ -341,6 +341,80 @@ pub struct AppState {
     pub forgot_password_challenges: Arc<RwLock<HashMap<String, (String, std::time::Instant)>>>,
 }
 
+async fn create_bitcoin_client(config: &Settings) -> Result<Arc<dyn Bitcoin>, anyhow::Error> {
+    #[cfg(any(feature = "e2e-testing", debug_assertions))]
+    if config.bitcoin_settings.mock_enabled {
+        info!("Mock Bitcoin client configured");
+        return Ok(Arc::new(MockBitcoinClient::new(
+            config.bitcoin_settings.network,
+        )));
+    }
+    #[cfg(not(any(feature = "e2e-testing", debug_assertions)))]
+    if config.bitcoin_settings.mock_enabled {
+        return Err(anyhow!(
+            "Mock Bitcoin client requires e2e-testing feature or debug build"
+        ));
+    }
+    let client = BitcoinClient::new(&config.bitcoin_settings, &config.ln_settings).await?;
+    info!("Bitcoin service configured");
+    Ok(Arc::new(client))
+}
+
+async fn create_lightning_client(
+    config: &Settings,
+    client: ClientWithMiddleware,
+) -> Result<Arc<dyn Ln>, anyhow::Error> {
+    #[cfg(any(feature = "e2e-testing", debug_assertions))]
+    if config.ln_settings.mock_enabled {
+        let mock = match config.ln_settings.mock_auto_accept_secs {
+            Some(seconds) => MockLnClient::with_auto_accept(Duration::from_secs(seconds)),
+            None => MockLnClient::new(),
+        };
+        mock.ping().await?;
+        info!(
+            "Mock LN client configured (auto_accept: {:?})",
+            config.ln_settings.mock_auto_accept_secs
+        );
+        return Ok(Arc::new(mock));
+    }
+    #[cfg(not(any(feature = "e2e-testing", debug_assertions)))]
+    if config.ln_settings.mock_enabled {
+        return Err(anyhow!(
+            "Mock LN client requires e2e-testing feature or debug build"
+        ));
+    }
+    let ln = LnClient::new(client, config.ln_settings.clone()).await?;
+    ln.ping().await?;
+    info!("LND client configured");
+    Ok(Arc::new(ln))
+}
+
+fn create_oracle_client(
+    config: &Settings,
+    client: Client,
+) -> Result<Arc<dyn Oracle>, anyhow::Error> {
+    #[cfg(any(feature = "e2e-testing", debug_assertions))]
+    if config.coordinator_settings.mock_oracle {
+        info!("Mock Oracle configured");
+        return Ok(Arc::new(MockOracle::new([0u8; 32])));
+    }
+    #[cfg(not(any(feature = "e2e-testing", debug_assertions)))]
+    if config.coordinator_settings.mock_oracle {
+        return Err(anyhow!(
+            "Mock Oracle requires e2e-testing feature or debug build"
+        ));
+    }
+    let url = Url::parse(&config.coordinator_settings.oracle_url)
+        .map_err(|error| anyhow!("Failed to parse oracle url: {error}"))?;
+    let oracle = OracleClient::new(
+        build_oracle_reqwest_client(client),
+        &url,
+        &config.coordinator_settings.private_key_file,
+    )?;
+    info!("Oracle client configured");
+    Ok(Arc::new(oracle))
+}
+
 pub async fn build_app(
     config: Settings,
 ) -> Result<(AppState, TaskTracker, CancellationToken, Vec<DBConnection>), anyhow::Error> {
@@ -349,108 +423,11 @@ pub async fn build_app(
         config.ui_settings.ui_dir
     );
 
-    // Create Bitcoin client (real or mock based on config)
-    #[cfg(any(feature = "e2e-testing", debug_assertions))]
-    let bitcoin_client: Arc<dyn Bitcoin> = if config.bitcoin_settings.mock_enabled {
-        info!("Mock Bitcoin client configured");
-        Arc::new(MockBitcoinClient::new(config.bitcoin_settings.network))
-    } else {
-        let client = BitcoinClient::new(&config.bitcoin_settings, &config.ln_settings)
-            .await
-            .map(Arc::new)?;
-        info!("Bitcoin service configured");
-        client
-    };
-
-    #[cfg(not(any(feature = "e2e-testing", debug_assertions)))]
-    let bitcoin_client: Arc<dyn Bitcoin> = {
-        if config.bitcoin_settings.mock_enabled {
-            return Err(anyhow!(
-                "Mock Bitcoin client requires e2e-testing feature or debug build"
-            ));
-        }
-        let client = BitcoinClient::new(&config.bitcoin_settings, &config.ln_settings)
-            .await
-            .map(Arc::new)?;
-        info!("Bitcoin service configured");
-        client
-    };
-
+    let bitcoin_client = create_bitcoin_client(&config).await?;
     let http_client = Client::new();
     let reqwest_client = build_reqwest_client(http_client.clone());
-
-    // Create LN client (real or mock based on config)
-    #[cfg(any(feature = "e2e-testing", debug_assertions))]
-    let ln: Arc<dyn Ln> = if config.ln_settings.mock_enabled {
-        let mock_ln = if let Some(auto_accept_secs) = config.ln_settings.mock_auto_accept_secs {
-            MockLnClient::with_auto_accept(Duration::from_secs(auto_accept_secs))
-        } else {
-            MockLnClient::new()
-        };
-        mock_ln.ping().await?;
-        info!(
-            "Mock LN client configured (auto_accept: {:?})",
-            config.ln_settings.mock_auto_accept_secs
-        );
-        Arc::new(mock_ln)
-    } else {
-        let ln_client = LnClient::new(reqwest_client.clone(), config.ln_settings.clone())
-            .await
-            .map(Arc::new)?;
-        ln_client.ping().await?;
-        info!("LND client configured");
-        ln_client
-    };
-
-    #[cfg(not(any(feature = "e2e-testing", debug_assertions)))]
-    let ln: Arc<dyn Ln> = {
-        if config.ln_settings.mock_enabled {
-            return Err(anyhow!(
-                "Mock LN client requires e2e-testing feature or debug build"
-            ));
-        }
-        let ln_client = LnClient::new(reqwest_client.clone(), config.ln_settings.clone())
-            .await
-            .map(Arc::new)?;
-        ln_client.ping().await?;
-        info!("LND client configured");
-        ln_client
-    };
-
-    // Create Oracle client (real or mock based on config)
-    #[cfg(any(feature = "e2e-testing", debug_assertions))]
-    let oracle_client: Arc<dyn Oracle> = if config.coordinator_settings.mock_oracle {
-        info!("Mock Oracle configured");
-        Arc::new(MockOracle::new([0u8; 32]))
-    } else {
-        let oracle_url = Url::parse(&config.coordinator_settings.oracle_url)
-            .map_err(|e| anyhow!("Failed to parse oracle url: {}", e))?;
-        let real_oracle = OracleClient::new(
-            build_oracle_reqwest_client(http_client.clone()),
-            &oracle_url,
-            &config.coordinator_settings.private_key_file,
-        )?;
-        info!("Oracle client configured");
-        Arc::new(real_oracle)
-    };
-
-    #[cfg(not(any(feature = "e2e-testing", debug_assertions)))]
-    let oracle_client: Arc<dyn Oracle> = {
-        if config.coordinator_settings.mock_oracle {
-            return Err(anyhow!(
-                "Mock Oracle requires e2e-testing feature or debug build"
-            ));
-        }
-        let oracle_url = Url::parse(&config.coordinator_settings.oracle_url)
-            .map_err(|e| anyhow!("Failed to parse oracle url: {}", e))?;
-        let real_oracle = OracleClient::new(
-            build_oracle_reqwest_client(http_client.clone()),
-            &oracle_url,
-            &config.coordinator_settings.private_key_file,
-        )?;
-        info!("Oracle client configured");
-        Arc::new(real_oracle)
-    };
+    let ln = create_lightning_client(&config, reqwest_client.clone()).await?;
+    let oracle_client = create_oracle_client(&config, http_client.clone())?;
     create_folder(&config.db_settings.data_folder.clone());
 
     let pool_config: DatabasePoolConfig = config.db_settings.clone().into();

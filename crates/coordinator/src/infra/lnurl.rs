@@ -285,17 +285,7 @@ impl PayRequest {
         let mut url = self.callback.clone();
         // Preserve opaque provider parameters byte-for-byte, replacing decoded
         // amount keys so providers cannot interpret ambiguous duplicate values.
-        let query = {
-            let mut decoded = url.query_pairs();
-            url.query()
-                .unwrap_or_default()
-                .split('&')
-                .filter(|raw| {
-                    raw.is_empty() || decoded.next().is_some_and(|(key, _)| key != "amount")
-                })
-                .collect::<Vec<_>>()
-                .join("&")
-        };
+        let query = callback_query_without_amount(&url);
         url.set_query(if query.is_empty() { None } else { Some(&query) });
         url.query_pairs_mut()
             .append_pair("amount", &amount_msat.to_string());
@@ -646,6 +636,17 @@ fn is_public(ip: IpAddr) -> bool {
                 && !(a == 0x3fff && b < 0x1000) // Documentation (RFC 9637).
         }
     }
+}
+
+/// Return owned provider parameters before mutating the callback URL.
+fn callback_query_without_amount(url: &Url) -> String {
+    let mut decoded = url.query_pairs();
+    url.query()
+        .unwrap_or_default()
+        .split('&')
+        .filter(|raw| raw.is_empty() || decoded.next().is_some_and(|(key, _)| key != "amount"))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 #[cfg(test)]

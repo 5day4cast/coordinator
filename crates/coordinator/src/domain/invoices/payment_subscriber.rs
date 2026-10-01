@@ -42,9 +42,7 @@ impl PaymentSubscriber {
             if let Err(e) = self.run_subscription().await {
                 error!("Payment subscription error: {}", e);
             }
-            if !self.cancel_token.is_cancelled() {
-                self.health.set_down();
-            }
+            self.health.set_down();
 
             tokio::select! {
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {}
@@ -57,7 +55,11 @@ impl PaymentSubscriber {
     }
 
     async fn run_subscription(&self) -> Result<(), anyhow::Error> {
-        let mut rx = self.ln.subscribe_payments().await?;
+        let mut rx = tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => return Ok(()),
+            subscription = self.ln.subscribe_payments() => subscription?,
+        };
         self.health.set_up();
 
         loop {
