@@ -578,6 +578,28 @@ function currentPayButton(competitionId) {
   return form?.dataset.competitionId === competitionId ? document.getElementById("submitEntry") : null;
 }
 
+function showEntrySuccess(competitionId) {
+  const button = currentPayButton(competitionId);
+  if (!button) return;
+  document.getElementById("errorMessage")?.classList.add("hidden");
+  document.getElementById("successMessage")?.classList.remove("hidden");
+  button.textContent = "Entered";
+  button.disabled = true;
+  button.classList.remove("is-loading");
+  button.classList.add("is-success");
+}
+
+function showEntryFailure(competitionId, message) {
+  const button = currentPayButton(competitionId);
+  if (!button) return;
+  const error = document.getElementById("errorMessage");
+  if (error) {
+    error.textContent = message;
+    error.classList.remove("hidden");
+  }
+  setBusy(button, false);
+}
+
 /**
  * Submit entry - handles the full flow:
  * 1. Collect picks from form
@@ -587,6 +609,7 @@ function currentPayButton(competitionId) {
  */
 async function submitEntry() {
   const form = document.getElementById("entryForm");
+  const competitionId = form.dataset.competitionId;
   const submitBtn = document.getElementById("submitEntry");
   const errorMsg = document.getElementById("errorMessage");
   const successMsg = document.getElementById("successMessage");
@@ -627,7 +650,7 @@ async function submitEntry() {
   // A ticket already issued for this competition: show its invoice again, with the picks as
   // they are now. The call that issued it still waits for the payment and enters the picks
   // once it arrives.
-  if (pendingEntry && pendingEntry.competition.id !== form.dataset.competitionId) {
+  if (pendingEntry && pendingEntry.competition.id !== competitionId) {
     errorMsg.textContent = "Finish your pending entry in the other competition before starting another payment.";
     errorMsg.classList.remove("hidden");
     if (pendingEntry.awaitingPayment) pendingEntry.reopenPayment();
@@ -649,7 +672,7 @@ async function submitEntry() {
 
   submissionBusy = true;
   setBusy(submitBtn, true);
-  const payButton = () => currentPayButton(form.dataset.competitionId);
+  const payButton = () => currentPayButton(competitionId);
 
   try {
     let currentEntry = pending;
@@ -668,10 +691,7 @@ async function submitEntry() {
     pendingEntry = null;
     forgetEntry(currentEntry.competition.id);
 
-    successMsg.classList.remove("hidden");
-    submitBtn.textContent = "Entered";
-    submitBtn.classList.remove("is-loading");
-    submitBtn.classList.add("is-success");
+    showEntrySuccess(competitionId);
   } catch (caught) {
     console.error("Entry submission failed:", caught);
     // A ticket that failed or was never paid is done with; a paid one is entered on the next Pay.
@@ -693,9 +713,7 @@ async function submitEntry() {
       userMessage = UNREACHABLE;
     }
 
-    errorMsg.textContent = userMessage;
-    errorMsg.classList.remove("hidden");
-    setBusy(submitBtn, false);
+    showEntryFailure(competitionId, userMessage);
   } finally {
     submissionBusy = false;
   }
