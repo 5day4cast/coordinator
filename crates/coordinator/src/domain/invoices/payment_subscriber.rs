@@ -3,7 +3,7 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
-use super::payout_watcher::record_payment_failure;
+use super::{payout_watcher::record_payment_failure, SubscriptionHealth};
 use crate::{
     domain::{Coordinator, PaymentStatus},
     infra::lightning::{Ln, PaymentUpdate},
@@ -13,6 +13,7 @@ pub struct PaymentSubscriber {
     coordinator: Arc<Coordinator>,
     ln: Arc<dyn Ln>,
     cancel_token: CancellationToken,
+    health: Arc<SubscriptionHealth>,
 }
 
 impl PaymentSubscriber {
@@ -20,11 +21,13 @@ impl PaymentSubscriber {
         coordinator: Arc<Coordinator>,
         ln: Arc<dyn Ln>,
         cancel_token: CancellationToken,
+        health: Arc<SubscriptionHealth>,
     ) -> Self {
         Self {
             coordinator,
             ln,
             cancel_token,
+            health,
         }
     }
 
@@ -39,6 +42,9 @@ impl PaymentSubscriber {
             if let Err(e) = self.run_subscription().await {
                 error!("Payment subscription error: {}", e);
             }
+            if !self.cancel_token.is_cancelled() {
+                self.health.set_down();
+            }
 
             tokio::select! {
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {}
@@ -52,7 +58,7 @@ impl PaymentSubscriber {
 
     async fn run_subscription(&self) -> Result<(), anyhow::Error> {
         let mut rx = self.ln.subscribe_payments().await?;
-        info!("Payment subscription connected");
+        self.health.set_up();
 
         loop {
             tokio::select! {

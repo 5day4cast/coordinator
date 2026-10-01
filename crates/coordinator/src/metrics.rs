@@ -122,6 +122,26 @@ pub static ARKADE_UNAVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("valid metric")
 });
 
+/// Whether the LND invoice subscription is connected (1) or not (0). While it is not, the
+/// invoice watcher polls at its fallback interval. Set by `SubscriptionHealth`.
+pub static LN_INVOICE_SUBSCRIPTION_UP: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "coordinator_ln_invoice_subscription_up",
+        "Whether the LND invoice subscription is connected",
+    )
+    .expect("valid metric")
+});
+
+/// Whether the LND payment subscription is connected (1) or not (0). While it is not, the
+/// payout watcher polls at its fallback interval. Set by `SubscriptionHealth`.
+pub static LN_PAYMENT_SUBSCRIPTION_UP: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "coordinator_ln_payment_subscription_up",
+        "Whether the LND payment subscription is connected",
+    )
+    .expect("valid metric")
+});
+
 /// Whether the Arkade subscription watching pending escrows is open (1) or not (0).
 pub static ESCROW_SUBSCRIPTION_UP: LazyLock<IntGauge> = LazyLock::new(|| {
     IntGauge::new(
@@ -254,6 +274,12 @@ impl Metrics {
         metrics
             .registry
             .register(Box::new(ARKADE_UNAVAILABLE.clone()))?;
+        metrics
+            .registry
+            .register(Box::new(LN_INVOICE_SUBSCRIPTION_UP.clone()))?;
+        metrics
+            .registry
+            .register(Box::new(LN_PAYMENT_SUBSCRIPTION_UP.clone()))?;
         metrics
             .registry
             .register(Box::new(ESCROW_SUBSCRIPTION_UP.clone()))?;

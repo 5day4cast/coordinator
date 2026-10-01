@@ -25,11 +25,11 @@ use crate::{
     config::Settings,
     domain::{
         leaderboard::Leaderboards, CompetitionRunners, CompetitionStore, CompetitionWakes,
-        Coordinator, InvoiceSubscriber, InvoiceWatcher, PaymentSubscriber, PayoutWatcher, UserInfo,
-        UserStore, ARK_SWAP_BOARDS_EVERY,
+        Coordinator, InvoiceSubscriber, InvoiceWatcher, PaymentSubscriber, PayoutWatcher,
+        SubscriptionHealth, UserInfo, UserStore, ARK_SWAP_BOARDS_EVERY,
     },
     infra::{
-        bitcoin::{Bitcoin, BitcoinClient, BitcoinSyncWatcher},
+        bitcoin::{Bitcoin, BitcoinClient, BitcoinSyncWatcher, ElectrumHeaders},
         db::{DBConnection, DatabasePoolConfig, DatabaseType},
         file_utils::create_folder,
         keymeld::create_keymeld_service,
@@ -37,7 +37,7 @@ use crate::{
         lnurl::{HttpsLnurlPay, LnurlPay},
         oracle::{Oracle, OracleClient},
     },
-    metrics::{metrics_app, Metrics},
+    metrics::{metrics_app, Metrics, LN_INVOICE_SUBSCRIPTION_UP, LN_PAYMENT_SUBSCRIPTION_UP},
 };
 
 // Mock implementations only available with e2e-testing feature or debug builds
@@ -581,11 +581,19 @@ pub async fn build_app(
         runners.supervise(wake_requests),
     );
 
-    let bitcoin_watcher = BitcoinSyncWatcher::new(
+    let mut bitcoin_watcher = BitcoinSyncWatcher::new(
         bitcoin_client.clone(),
         cancel_token.clone(),
         Duration::from_secs(config.bitcoin_settings.refresh_blocks_secs),
     );
+    if !config.bitcoin_settings.mock_enabled {
+        bitcoin_watcher = bitcoin_watcher.with_headers(
+            Arc::new(ElectrumHeaders::new(
+                config.bitcoin_settings.electrum_url.clone(),
+            )),
+            Duration::from_secs(config.bitcoin_settings.refresh_blocks_secs_subscribed),
+        );
+    }
 
     let bitcoin_watcher_task = spawn_supervised(
         &tracker,
@@ -600,11 +608,21 @@ pub async fn build_app(
     );
     threads.insert(String::from("bitcoin_sync_watcher"), bitcoin_watcher_task);
 
+    // Each watcher sweeps slowly while the matching subscription below is connected.
+    let invoice_subscription =
+        Arc::new(SubscriptionHealth::new("Invoice").with_gauge(LN_INVOICE_SUBSCRIPTION_UP.clone()));
+    let payment_subscription =
+        Arc::new(SubscriptionHealth::new("Payment").with_gauge(LN_PAYMENT_SUBSCRIPTION_UP.clone()));
+
     let invoice_watcher = InvoiceWatcher::new(
         coordinator.clone(),
         ln.clone(),
         cancel_token.clone(),
         Duration::from_secs(config.ln_settings.invoice_watch_interval),
+    )
+    .with_subscription(
+        invoice_subscription.clone(),
+        Duration::from_secs(config.ln_settings.invoice_watch_interval_subscribed),
     );
 
     let invoice_watcher_handle = spawn_supervised(
@@ -621,6 +639,10 @@ pub async fn build_app(
         ln.clone(),
         cancel_token.clone(),
         Duration::from_secs(config.ln_settings.payout_watch_interval),
+    )
+    .with_subscription(
+        payment_subscription.clone(),
+        Duration::from_secs(config.ln_settings.payout_watch_interval_subscribed),
     );
 
     let payout_watcher_handle = spawn_supervised(
@@ -719,8 +741,12 @@ pub async fn build_app(
     // Subscription-based watchers for faster payment detection
     // These run alongside the polling watchers as the primary mechanism,
     // with polling serving as a fallback
-    let invoice_subscriber =
-        InvoiceSubscriber::new(coordinator.clone(), ln.clone(), cancel_token.clone());
+    let invoice_subscriber = InvoiceSubscriber::new(
+        coordinator.clone(),
+        ln.clone(),
+        cancel_token.clone(),
+        invoice_subscription,
+    );
 
     let invoice_subscriber_handle = spawn_supervised(
         &tracker,
@@ -731,8 +757,12 @@ pub async fn build_app(
 
     threads.insert("invoice_subscriber".to_string(), invoice_subscriber_handle);
 
-    let payment_subscriber =
-        PaymentSubscriber::new(coordinator.clone(), ln.clone(), cancel_token.clone());
+    let payment_subscriber = PaymentSubscriber::new(
+        coordinator.clone(),
+        ln.clone(),
+        cancel_token.clone(),
+        payment_subscription,
+    );
 
     let payment_subscriber_handle = spawn_supervised(
         &tracker,

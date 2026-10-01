@@ -2,6 +2,7 @@ use log::{debug, error, info, warn};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+use super::SubscriptionHealth;
 use crate::{
     domain::Coordinator,
     infra::lightning::{InvoiceState, InvoiceUpdate, Ln},
@@ -11,6 +12,7 @@ pub struct InvoiceSubscriber {
     coordinator: Arc<Coordinator>,
     ln: Arc<dyn Ln>,
     cancel_token: CancellationToken,
+    health: Arc<SubscriptionHealth>,
 }
 
 impl InvoiceSubscriber {
@@ -18,11 +20,13 @@ impl InvoiceSubscriber {
         coordinator: Arc<Coordinator>,
         ln: Arc<dyn Ln>,
         cancel_token: CancellationToken,
+        health: Arc<SubscriptionHealth>,
     ) -> Self {
         Self {
             coordinator,
             ln,
             cancel_token,
+            health,
         }
     }
 
@@ -37,6 +41,9 @@ impl InvoiceSubscriber {
             if let Err(e) = self.run_subscription().await {
                 error!("Invoice subscription error: {}", e);
             }
+            if !self.cancel_token.is_cancelled() {
+                self.health.set_down();
+            }
 
             tokio::select! {
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {}
@@ -50,7 +57,7 @@ impl InvoiceSubscriber {
 
     async fn run_subscription(&self) -> Result<(), anyhow::Error> {
         let mut rx = self.ln.subscribe_invoices().await?;
-        info!("Invoice subscription connected");
+        self.health.set_up();
 
         loop {
             tokio::select! {
@@ -97,7 +104,11 @@ impl InvoiceSubscriber {
             .mark_ticket_paid(&ticket.hash, ticket.competition_id)
             .await
         {
-            Ok(_) => self.coordinator.wake_competition(ticket.competition_id),
+            Ok(_) => {
+                self.coordinator.wake_competition(ticket.competition_id);
+                // The invoice watcher publishes the escrow and settles the invoice.
+                self.health.wake();
+            }
             Err(e) => error!("Failed to mark ticket {} as paid: {}", ticket.id, e),
         }
     }

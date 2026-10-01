@@ -1242,10 +1242,171 @@ impl Bitcoin for BitcoinClient {
     }
 }
 
+/// How often the sync watcher reads the header subscription.
+const HEADER_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// First and longest wait before subscribing to block headers again.
+const HEADER_RECONNECT_MIN: Duration = Duration::from_secs(5);
+const HEADER_RECONNECT_MAX: Duration = Duration::from_secs(120);
+
+/// Tells the sync watcher when a new block arrives.
+#[async_trait]
+pub trait HeaderSource: Send + Sync {
+    /// Opens the subscription, replacing any previous one, and returns the tip height.
+    async fn subscribe(&self) -> Result<u32, anyhow::Error>;
+    /// Whether a new header arrived since the last call. An error means the
+    /// subscription is lost and must be opened again.
+    async fn new_header(&self) -> Result<bool, anyhow::Error>;
+}
+
+/// Electrum's `blockchain.headers.subscribe` on a connection of its own. The server
+/// pushes each new header on that connection; the client reads pushed messages only
+/// while it waits for a reply, so every check sends a `server.ping` first.
+pub struct ElectrumHeaders {
+    url: String,
+    client: std::sync::Mutex<Option<Arc<ElectrumClient>>>,
+}
+
+impl ElectrumHeaders {
+    pub fn new(url: String) -> Self {
+        Self {
+            url,
+            client: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn set_client(&self, client: Option<Arc<ElectrumClient>>) {
+        *self.client.lock().unwrap_or_else(|e| e.into_inner()) = client;
+    }
+}
+
+#[async_trait]
+impl HeaderSource for ElectrumHeaders {
+    async fn subscribe(&self) -> Result<u32, anyhow::Error> {
+        self.set_client(None);
+        let url = self.url.clone();
+        let (client, height) = tokio::task::spawn_blocking(move || {
+            let client = ElectrumClient::from_config(
+                &url,
+                ConfigBuilder::new().timeout(Some(10)).retry(0).build(),
+            )?;
+            let tip = client.block_headers_subscribe()?;
+            Ok::<_, electrum_client::Error>((client, tip.height))
+        })
+        .await??;
+        self.set_client(Some(Arc::new(client)));
+        u32::try_from(height).map_err(|_| anyhow!("Invalid chain height {}", height))
+    }
+
+    async fn new_header(&self) -> Result<bool, anyhow::Error> {
+        let client = self
+            .client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or_else(|| anyhow!("Not subscribed to block headers"))?;
+        let result = tokio::task::spawn_blocking(move || {
+            client.ping()?;
+            let mut arrived = false;
+            while client.block_headers_pop()?.is_some() {
+                arrived = true;
+            }
+            Ok::<_, electrum_client::Error>(arrived)
+        })
+        .await?;
+        if result.is_err() {
+            self.set_client(None);
+        }
+        Ok(result?)
+    }
+}
+
+/// When the sync watcher runs its next pass: at once for a new block, otherwise every
+/// `subscribed_interval` while the header subscription is up and every `sync_interval`
+/// while it is down.
+struct SyncSchedule {
+    sync_interval: Duration,
+    subscribed_interval: Duration,
+    subscribed: bool,
+    reconnect_delay: Duration,
+    reconnect_at: tokio::time::Instant,
+    last_pass: Option<tokio::time::Instant>,
+}
+
+impl SyncSchedule {
+    fn new(sync_interval: Duration, subscribed_interval: Duration) -> Self {
+        Self {
+            sync_interval,
+            subscribed_interval,
+            subscribed: false,
+            reconnect_delay: HEADER_RECONNECT_MIN,
+            reconnect_at: tokio::time::Instant::now(),
+            last_pass: None,
+        }
+    }
+
+    fn interval(&self) -> Duration {
+        if self.subscribed {
+            self.subscribed_interval
+        } else {
+            self.sync_interval
+        }
+    }
+
+    /// Reads the header source, subscribing again when due, and returns whether a
+    /// pass is due now.
+    async fn pass_due(&mut self, headers: Option<&dyn HeaderSource>) -> bool {
+        let now = tokio::time::Instant::now();
+        let mut new_block = false;
+        if let Some(headers) = headers {
+            if !self.subscribed && now >= self.reconnect_at {
+                match headers.subscribe().await {
+                    Ok(height) => {
+                        info!("Block header subscription connected at height {}", height);
+                        self.subscribed = true;
+                        self.reconnect_delay = HEADER_RECONNECT_MIN;
+                    }
+                    Err(e) => {
+                        debug!("Block header subscription failed: {}", e);
+                        self.retry_later(now);
+                    }
+                }
+            } else if self.subscribed {
+                match headers.new_header().await {
+                    Ok(arrived) => new_block = arrived,
+                    Err(e) => {
+                        warn!(
+                            "Block header subscription dropped, refreshing every {:?} until it \
+                             reconnects: {}",
+                            self.sync_interval, e
+                        );
+                        self.subscribed = false;
+                        self.retry_later(now);
+                    }
+                }
+            }
+        }
+        let due = new_block
+            || self
+                .last_pass
+                .is_none_or(|at| now.duration_since(at) >= self.interval());
+        if due {
+            self.last_pass = Some(now);
+        }
+        due
+    }
+
+    fn retry_later(&mut self, now: tokio::time::Instant) {
+        self.reconnect_at = now + self.reconnect_delay;
+        self.reconnect_delay = (self.reconnect_delay * 2).min(HEADER_RECONNECT_MAX);
+    }
+}
+
 pub struct BitcoinSyncWatcher {
     bitcoin: Arc<dyn Bitcoin>,
     cancel_token: CancellationToken,
     sync_interval: Duration,
+    subscribed_interval: Duration,
+    headers: Option<Arc<dyn HeaderSource>>,
 }
 
 impl BitcoinSyncWatcher {
@@ -1258,11 +1419,32 @@ impl BitcoinSyncWatcher {
             bitcoin,
             cancel_token,
             sync_interval,
+            subscribed_interval: sync_interval,
+            headers: None,
         }
+    }
+
+    /// Refresh when `headers` reports a new block, and only every `subscribed_interval`
+    /// otherwise while its subscription is up.
+    pub fn with_headers(
+        mut self,
+        headers: Arc<dyn HeaderSource>,
+        subscribed_interval: Duration,
+    ) -> Self {
+        self.headers = Some(headers);
+        self.subscribed_interval = subscribed_interval;
+        self
     }
 
     pub async fn watch(&self) -> Result<(), anyhow::Error> {
         info!("Starting Bitcoin sync watcher");
+        let mut schedule = SyncSchedule::new(self.sync_interval, self.subscribed_interval);
+        // Without a header source, the loop wakes only for each pass.
+        let tick = if self.headers.is_some() {
+            HEADER_CHECK_INTERVAL
+        } else {
+            self.sync_interval
+        };
 
         loop {
             if self.cancel_token.is_cancelled() {
@@ -1270,13 +1452,15 @@ impl BitcoinSyncWatcher {
                 break;
             }
 
-            match self.bitcoin.sync().await {
-                Ok(_) => debug!("Bitcoin wallet sync completed successfully"),
-                Err(e) => error!("Bitcoin wallet sync error: {}", e),
+            if schedule.pass_due(self.headers.as_deref()).await {
+                match self.bitcoin.sync().await {
+                    Ok(_) => debug!("Bitcoin wallet sync completed successfully"),
+                    Err(e) => error!("Bitcoin wallet sync error: {}", e),
+                }
             }
 
             tokio::select! {
-                _ = sleep(self.sync_interval) => continue,
+                _ = sleep(tick) => continue,
                 _ = self.cancel_token.cancelled() => {
                     info!("Bitcoin sync watcher cancelled during sleep");
                     break;
@@ -1285,6 +1469,113 @@ impl BitcoinSyncWatcher {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sync_schedule_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Mutex,
+    };
+
+    const FALLBACK: Duration = Duration::from_secs(15);
+    const SUBSCRIBED: Duration = Duration::from_secs(120);
+
+    #[derive(Default)]
+    struct FakeHeaders {
+        refuse: AtomicBool,
+        subscriptions: AtomicUsize,
+        /// Each check takes the next result; an empty queue means no new header.
+        checks: Mutex<Vec<Result<bool, ()>>>,
+    }
+
+    impl FakeHeaders {
+        fn push(&self, result: Result<bool, ()>) {
+            self.checks.lock().unwrap().insert(0, result);
+        }
+    }
+
+    #[async_trait]
+    impl HeaderSource for FakeHeaders {
+        async fn subscribe(&self) -> Result<u32, anyhow::Error> {
+            if self.refuse.load(Ordering::SeqCst) {
+                return Err(anyhow!("refused"));
+            }
+            self.subscriptions.fetch_add(1, Ordering::SeqCst);
+            Ok(100)
+        }
+
+        async fn new_header(&self) -> Result<bool, anyhow::Error> {
+            match self.checks.lock().unwrap().pop() {
+                Some(Ok(arrived)) => Ok(arrived),
+                Some(Err(())) => Err(anyhow!("connection lost")),
+                None => Ok(false),
+            }
+        }
+    }
+
+    /// Advances one check interval at a time and returns the seconds at which passes ran.
+    async fn passes(
+        schedule: &mut SyncSchedule,
+        headers: Option<&dyn HeaderSource>,
+        seconds: u64,
+    ) -> Vec<u64> {
+        let start = tokio::time::Instant::now();
+        let mut ran = Vec::new();
+        for _ in 0..seconds {
+            if schedule.pass_due(headers).await {
+                ran.push(start.elapsed().as_secs());
+            }
+            tokio::time::advance(HEADER_CHECK_INTERVAL).await;
+        }
+        ran
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_a_subscription_the_pass_runs_at_the_fallback_interval() {
+        let mut schedule = SyncSchedule::new(FALLBACK, SUBSCRIBED);
+        assert_eq!(passes(&mut schedule, None, 46).await, [0, 15, 30, 45]);
+
+        let refusing = FakeHeaders::default();
+        refusing.refuse.store(true, Ordering::SeqCst);
+        let mut schedule = SyncSchedule::new(FALLBACK, SUBSCRIBED);
+        assert_eq!(
+            passes(&mut schedule, Some(&refusing), 46).await,
+            [0, 15, 30, 45]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn while_subscribed_the_sweep_is_slow_and_a_new_block_runs_a_pass_at_once() {
+        let headers = FakeHeaders::default();
+        let mut schedule = SyncSchedule::new(FALLBACK, SUBSCRIBED);
+        assert_eq!(passes(&mut schedule, Some(&headers), 10).await, [0]);
+        assert_eq!(schedule.interval(), SUBSCRIBED);
+
+        headers.push(Ok(true));
+        assert_eq!(passes(&mut schedule, Some(&headers), 1).await, [0]);
+        // The sweep counts from the last pass, which the block ran.
+        assert_eq!(passes(&mut schedule, Some(&headers), 121).await, [119]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_subscription_falls_back_and_reconnects() {
+        let headers = FakeHeaders::default();
+        let mut schedule = SyncSchedule::new(FALLBACK, SUBSCRIBED);
+        assert_eq!(passes(&mut schedule, Some(&headers), 1).await, [0]);
+
+        headers.push(Err(()));
+        headers.refuse.store(true, Ordering::SeqCst);
+        // Lost at second 1: passes return to every 15 s from the last pass.
+        assert_eq!(passes(&mut schedule, Some(&headers), 31).await, [14, 29]);
+        assert_eq!(schedule.interval(), FALLBACK);
+
+        headers.refuse.store(false, Ordering::SeqCst);
+        passes(&mut schedule, Some(&headers), 60).await;
+        assert_eq!(headers.subscriptions.load(Ordering::SeqCst), 2);
+        assert_eq!(schedule.interval(), SUBSCRIBED);
     }
 }
 
