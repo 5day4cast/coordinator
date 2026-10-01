@@ -23,7 +23,8 @@ use tokio::sync::Mutex;
 use crate::ark_swap::{ArkSwap, ArkSwapConfig, ArkWallet};
 use crate::db::{Rebalance, SynthDb};
 use crate::events::{Event, Events};
-use crate::lnd::{Channel, Lnd, LndConfig, NodeIdentity};
+use crate::lnd::{Channel, Lnd, LndConfig, NodeIdentity, Tracked};
+use crate::payment::ValidatedInvoice;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RebalanceConfig {
@@ -175,12 +176,19 @@ pub struct Rebalancer {
     db: SynthDb,
     events: Events,
     last: Arc<Mutex<Observation>>,
+    operation: Arc<Mutex<()>>,
 }
 
 /// The kinds of rebalance the database records.
 const CHANNEL: &str = "channel";
 const ARKADE: &str = "arkade";
 const PAYEE: &str = "payee";
+
+/// A previous transfer consumes this pass even when its final outcome was failure.
+enum RebalanceRecovery {
+    Ready,
+    Reconciled(Option<u64>),
+}
 
 impl Rebalancer {
     pub fn new(
@@ -189,6 +197,14 @@ impl Rebalancer {
         db: SynthDb,
         events: Events,
     ) -> Result<Self> {
+        anyhow::ensure!(
+            config.interval_secs > 0,
+            "rebalance interval must be positive"
+        );
+        validate_shares(config.shares())?;
+        if let Some(shares) = config.payee_shares() {
+            validate_shares(shares)?;
+        }
         let ark_swap = match &config.arkade {
             Some(arkade) => Some(Arc::new(
                 ArkSwap::new(&arkade.ark_swap).context("open ark-swapd")?,
@@ -210,6 +226,7 @@ impl Rebalancer {
             db,
             events,
             last: Arc::new(Mutex::new(Observation::default())),
+            operation: Arc::new(Mutex::new(())),
         })
     }
 
@@ -237,6 +254,15 @@ impl Rebalancer {
     /// Check every leg, moving money on each that has run low. One leg failing does not stop the
     /// others.
     pub async fn rebalance(&self) -> Result<Moved> {
+        let permit = self
+            .operation
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("a rebalance is already in progress"))?;
+        self.rebalance_admitted(permit).await
+    }
+
+    /// Own admission until every network operation and durable result has completed.
+    async fn rebalance_admitted(&self, _permit: tokio::sync::MutexGuard<'_, ()>) -> Result<Moved> {
         self.last.lock().await.checked_at = Some(OffsetDateTime::now_utc());
         let channel = self.rebalance_channel().await;
         let payee = match (&self.payee, self.config.payee_shares()) {
@@ -267,6 +293,9 @@ impl Rebalancer {
 
     /// Check the channel, and pay the payer back if its share is too low.
     async fn rebalance_channel(&self) -> Result<Option<u64>> {
+        if let RebalanceRecovery::Reconciled(moved) = self.reconcile(CHANNEL, &self.source).await? {
+            return Ok(moved);
+        }
         let source = self
             .source
             .identity()
@@ -278,12 +307,7 @@ impl Rebalancer {
             .channel_with(&source.pubkey)
             .await
             .context("read the payer's channels")?;
-        {
-            let mut last = self.last.lock().await;
-            last.channel = channel.clone();
-            last.payer = payer;
-            last.source = Some(source);
-        }
+        self.observe_channel(channel.clone(), payer, source).await;
         let channel =
             channel.context("the payer has no active channel with the source node to rebalance")?;
 
@@ -295,24 +319,17 @@ impl Rebalancer {
             channel.local_sats,
             channel.local_sats + channel.remote_sats
         );
-        let outcome = self.move_sats(&channel, amount).await;
-        self.db
-            .record_rebalance(&Rebalance {
-                kind: CHANNEL,
-                channel_id: channel.id.clone(),
-                amount_sats: amount,
-                local_before_sats: channel.local_sats,
-                capacity_sats: channel.local_sats + channel.remote_sats,
-                txid: None,
-                error: outcome.as_ref().err().map(|e| format!("{e:#}")),
-            })
-            .await?;
-        outcome.map(|()| Some(amount))
+        let rebalance = channel_intent(CHANNEL, &channel, amount, channel.local_sats)?;
+        self.move_sats(&self.source, &self.payer, rebalance).await?;
+        Ok(Some(amount))
     }
 
     /// Check the source's channel with the payee, and have the payee pay the source back if the
     /// source's share is too low.
     async fn rebalance_payee(&self, payee: &Lnd, shares: Shares) -> Result<Option<u64>> {
+        if let RebalanceRecovery::Reconciled(moved) = self.reconcile(PAYEE, payee).await? {
+            return Ok(moved);
+        }
         let source = self
             .source
             .identity()
@@ -323,11 +340,7 @@ impl Rebalancer {
             .channel_with(&source.pubkey)
             .await
             .context("read the payee's channels")?;
-        {
-            let mut last = self.last.lock().await;
-            last.payee_channel = channel.clone();
-            last.payee = identity;
-        }
+        self.observe_payee(channel.clone(), identity).await;
         let channel =
             channel.context("the payee has no active channel with the source node to rebalance")?;
 
@@ -339,19 +352,27 @@ impl Rebalancer {
             channel.remote_sats,
             channel.local_sats + channel.remote_sats
         );
-        let outcome = self.pay_source_back(payee, &channel, amount).await;
-        self.db
-            .record_rebalance(&Rebalance {
-                kind: PAYEE,
-                channel_id: channel.id.clone(),
-                amount_sats: amount,
-                local_before_sats: channel.remote_sats,
-                capacity_sats: channel.local_sats + channel.remote_sats,
-                txid: None,
-                error: outcome.as_ref().err().map(|e| format!("{e:#}")),
-            })
-            .await?;
-        outcome.map(|()| Some(amount))
+        let rebalance = channel_intent(PAYEE, &channel, amount, channel.remote_sats)?;
+        self.move_sats(payee, &self.source, rebalance).await?;
+        Ok(Some(amount))
+    }
+
+    async fn observe_channel(
+        &self,
+        channel: Option<Channel>,
+        payer: Option<NodeIdentity>,
+        source: NodeIdentity,
+    ) {
+        let mut last = self.last.lock().await;
+        last.channel = channel;
+        last.payer = payer;
+        last.source = Some(source);
+    }
+
+    async fn observe_payee(&self, channel: Option<Channel>, payee: Option<NodeIdentity>) {
+        let mut last = self.last.lock().await;
+        last.payee_channel = channel;
+        last.payee = payee;
     }
 
     /// Send ark-swapd's wallet coins on-chain if it is running low and no earlier top-up is still
@@ -392,31 +413,101 @@ impl Rebalancer {
         sent.map(|_| Some(amount))
     }
 
-    async fn move_sats(&self, channel: &Channel, amount: u64) -> Result<()> {
-        let invoice = self
-            .payer
-            .invoice(amount, "synth rebalance")
-            .await
-            .context("have the payer invoice the source")?;
-        self.source
-            .pay_through(&invoice, &channel.id)
-            .await
-            .context("have the source pay the payer")?;
-        Ok(())
+    /// A pending hash owns its leg across restarts. Never replace an uncertain invoice.
+    async fn reconcile(&self, kind: &str, payer: &Lnd) -> Result<RebalanceRecovery> {
+        let Some(pending) = self.db.pending_rebalance(kind).await? else {
+            return Ok(RebalanceRecovery::Ready);
+        };
+        let invoice = pending.invoice()?;
+        match payer.track(invoice.payment_hash()).await? {
+            Tracked::Succeeded(paid) => {
+                invoice.verify_paid(&paid)?;
+                self.db.finish_rebalance_payment(&pending.id, None).await?;
+                Ok(RebalanceRecovery::Reconciled(Some(invoice.amount_sats())))
+            }
+            Tracked::Failed => {
+                self.db
+                    .finish_rebalance_payment(&pending.id, Some("LND confirmed failure"))
+                    .await?;
+                Ok(RebalanceRecovery::Reconciled(None))
+            }
+            // A pre-send crash can leave no payment on LND. Its exact invoice must expire
+            // before releasing the intent, so an old request cannot later start a new transfer.
+            Tracked::NeverMade if invoice.expired() => {
+                self.db
+                    .finish_rebalance_payment(
+                        &pending.id,
+                        Some("invoice expired without a payment on LND"),
+                    )
+                    .await?;
+                Ok(RebalanceRecovery::Reconciled(None))
+            }
+            Tracked::NeverMade | Tracked::InFlight => {
+                self.db
+                    .mark_rebalance_uncertain(
+                        &pending.id,
+                        "payment outcome pending; no replacement invoice will be issued",
+                    )
+                    .await?;
+                anyhow::bail!(
+                    "rebalance {} awaits reconciliation for {}",
+                    pending.id,
+                    invoice.payment_hash()
+                )
+            }
+        }
     }
 
-    async fn pay_source_back(&self, payee: &Lnd, channel: &Channel, amount: u64) -> Result<()> {
-        let invoice = self
-            .source
-            .invoice(amount, "synth rebalance")
-            .await
-            .context("have the source invoice the payee")?;
-        payee
-            .pay_through(&invoice, &channel.id)
-            .await
-            .context("have the payee pay the source")?;
-        Ok(())
+    async fn move_sats(&self, payer: &Lnd, receiver: &Lnd, rebalance: Rebalance) -> Result<()> {
+        let encoded = receiver
+            .invoice(rebalance.amount_sats, "synth rebalance")
+            .await?;
+        let invoice = ValidatedInvoice::validate(
+            &encoded,
+            None,
+            rebalance.amount_sats,
+            rebalance.amount_sats,
+            payer.network().await?,
+        )?;
+        let id = self
+            .db
+            .begin_rebalance_payment(&rebalance, &invoice)
+            .await?;
+        match payer.pay_through(&invoice, &rebalance.channel_id).await {
+            Ok(_) => self.db.finish_rebalance_payment(&id, None).await,
+            Err(error) => {
+                self.db
+                    .mark_rebalance_uncertain(&id, &format!("{error:#}"))
+                    .await?;
+                // Even a lost HTTP response may have paid. Only tracking the saved hash can
+                // establish success or definitive failure.
+                match self.reconcile(rebalance.kind, payer).await {
+                    Ok(RebalanceRecovery::Reconciled(Some(_))) => Ok(()),
+                    _ => Err(error.context("rebalance payment requires reconciliation")),
+                }
+            }
+        }
     }
+}
+
+fn channel_intent(
+    kind: &'static str,
+    channel: &Channel,
+    amount: u64,
+    local_before: u64,
+) -> Result<Rebalance> {
+    Ok(Rebalance {
+        kind,
+        channel_id: channel.id.clone(),
+        amount_sats: amount,
+        local_before_sats: local_before,
+        capacity_sats: channel
+            .local_sats
+            .checked_add(channel.remote_sats)
+            .context("channel capacity overflow")?,
+        txid: None,
+        error: None,
+    })
 }
 
 /// Whether ark-swapd needs coins: it can fund less than the low mark, less than the low mark
@@ -452,16 +543,26 @@ fn amount_to_pay_back(channel: &Channel, shares: Shares) -> Option<u64> {
 /// How much one side of a channel is sent by the other to reach its target share: nothing until
 /// it falls below the low one, and never more than the other side holds.
 fn amount_to_refill(drained_sats: u64, other_sats: u64, shares: Shares) -> Option<u64> {
-    let held = drained_sats + other_sats;
-    if held == 0 || drained_sats * 100 >= held * shares.low_percent {
+    let held = u128::from(drained_sats) + u128::from(other_sats);
+    if held == 0 || u128::from(drained_sats) * 100 >= held * u128::from(shares.low_percent) {
         return None;
     }
-    let target = held * shares.target_percent / 100;
+    let target = held * u128::from(shares.target_percent) / 100;
     let amount = target
-        .saturating_sub(drained_sats)
-        .min(shares.max_sats)
-        .min(other_sats);
+        .saturating_sub(u128::from(drained_sats))
+        .min(u128::from(shares.max_sats))
+        .min(u128::from(other_sats)) as u64;
     (amount > 0).then_some(amount)
+}
+
+fn validate_shares(shares: Shares) -> Result<()> {
+    anyhow::ensure!(
+        shares.low_percent <= shares.target_percent
+            && shares.target_percent <= 100
+            && shares.max_sats > 0,
+        "rebalance shares must satisfy low <= target <= 100 with a positive cap"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,3 +1,5 @@
+pub mod payment_intents;
+
 use anyhow::{Context, Result};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
@@ -233,6 +235,8 @@ impl SynthDb {
         )
         .execute(&self.pool)
         .await?;
+
+        self.migrate_payment_intents().await?;
 
         // Databases made before synth kept ark-swapd's wallet funded.
         self.add_column_if_missing("rebalances", "kind", "TEXT NOT NULL DEFAULT 'channel'")

@@ -4,11 +4,63 @@ Use synth to test staggered players, abandoned entries, and duplicate or late su
 
 These scenarios can pay real entries from the configured node. The remote CLI asks for confirmation unless `--yes` is supplied.
 
+## Authorize operator writes
+
+Browser writes require an allowed Origin and the dashboard's CSRF nonce. The dashboard adds the nonce automatically.
+Cross-origin forms and browser requests without the nonce receive HTTP 403 before a run or payment starts.
+
+Configure the public origin when a reverse proxy changes the Host header. Include the public port:
+
+```toml
+[server]
+allowed_origins = ["https://synth.lab.tee8z.fyi:9443"]
+# Optional: needed only for programmatic writes, including the remote CLI.
+operator_token_file = "/run/secrets/synth-operator-token"
+```
+
+Without `allowed_origins`, synth compares the Origin with the request Host. It ignores forwarded headers.
+The operator network must continue to restrict dashboard access. The CSRF nonce does not replace that access restriction.
+
+Use a randomly generated token of at least 32 characters. Set `SYNTH_OPERATOR_TOKEN_FILE` or pass `--operator-token-file` to the remote CLI.
+Programmatic POST requests require `Authorization: Bearer <token>` and must omit browser Origin and Fetch Metadata headers.
+Without `operator_token_file`, programmatic writes are disabled. Browser controls and scheduled runs remain available.
+
+## Limit ticket payments
+
+`defaults.max_ticket_fees_sats` limits the total coordinator and network fees above the configured `entry_fee`. Its default is 1,000 sats.
+For example, a 5,000-sat stake can pay a ticket of at most 6,000 sats. LND routing fees retain their separate configured cap.
+
+Before payment, synth verifies the signed BOLT11 amount, hash, expiry, and paying-node network. It also checks the planned stake and fee cap.
+Amountless invoices, fractional-sat mismatches, and arithmetic overflows fail before payment.
+The entry trace stores the exact canonical invoice and validated values before LND receives the payment request.
+
+## Recover uncertain rebalances
+
+Scheduled and manual rebalances share one admission guard. A concurrent trigger fails before reading balances or creating invoices.
+Run one synth process per database. The guard coordinates tasks within that process; it is not a distributed lease.
+
+Each Lightning rebalance saves its invoice and payment hash before sending. A pending intent prevents replacement invoices for that leg across restarts.
+The dashboard shows an uncertain result when the send response cannot establish the outcome.
+
+On the next trigger, synth queries LND for the saved hash before reading balances:
+
+| LND result | Action |
+| --- | --- |
+| Succeeded with the expected hash and amount | Record the transfer as moved. |
+| Definitively failed | Record failure and release the intent. |
+| Never initiated, with the invoice expired | Record failure and release the intent. |
+| In flight, unavailable, or not initiated before expiry | Keep the intent pending and issue no replacement. |
+
+A reconciliation pass does not also start a replacement on that leg. Subsequent passes read balances again before calculating another payment.
+Keep LND payment history available until pending intents resolve. Do not delete pending database rows to retry an uncertain payment.
+This recovery protocol covers Lightning channel rebalances. On-chain top-ups retain their existing confirmation handling.
+
 ## Configure entry timing
 
 ```toml
 [defaults]
 users = 3
+max_ticket_fees_sats = 1000
 entry_window_secs = 1200
 observation_windows_secs = [7200, 10800, 14400, 600]
 
@@ -87,7 +139,8 @@ Start a manual case with explicit bounds:
 
 ```sh
 synth run duplicate-submission \
-  --url "$SYNTH_URL" --users 3 --seed 42 \
+  --url "$SYNTH_URL" --operator-token-file "$SYNTH_OPERATOR_TOKEN_FILE" \
+  --users 3 --seed 42 \
   --entry-window-secs 1200 --observation-window-secs 7200 \
   --arrival-min-secs 0 --arrival-max-secs 90 \
   --before-payment-min-secs 5 --before-payment-max-secs 60 \

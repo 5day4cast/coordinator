@@ -55,8 +55,8 @@ pub enum RunsCommand {
 
 #[derive(Debug, Args)]
 pub struct ApiArgs {
-    /// The synth to talk to. Its API has no authentication of its own, so reach it only over
-    /// a network that admits operators alone.
+    /// The synth to talk to. Read access is restricted by the operator network;
+    /// writes additionally require --operator-token-file.
     #[arg(
         long,
         global = true,
@@ -64,6 +64,10 @@ pub struct ApiArgs {
         default_value = "http://127.0.0.1:9980"
     )]
     pub url: String,
+
+    /// File with the bearer token configured at server.operator_token_file.
+    #[arg(long, global = true, env = "SYNTH_OPERATOR_TOKEN_FILE")]
+    pub operator_token_file: Option<std::path::PathBuf>,
 
     /// Print JSON instead of tables.
     #[arg(long, global = true)]
@@ -260,6 +264,7 @@ pub struct Started {
 pub struct SynthApi {
     http: reqwest::Client,
     url: String,
+    operator_token: Option<zeroize::Zeroizing<String>>,
 }
 
 impl SynthApi {
@@ -270,7 +275,19 @@ impl SynthApi {
                 .timeout(Duration::from_secs(60))
                 .build()?,
             url: url.trim_end_matches('/').to_string(),
+            operator_token: None,
         })
+    }
+
+    pub fn with_operator_token_file(mut self, path: Option<&std::path::Path>) -> Result<Self> {
+        if let Some(path) = path {
+            let token = zeroize::Zeroizing::new(
+                std::fs::read_to_string(path).context("read the synth operator token file")?,
+            );
+            anyhow::ensure!(!token.trim().is_empty(), "synth operator token is empty");
+            self.operator_token = Some(token);
+        }
+        Ok(self)
     }
 
     async fn get(&self, path: &str) -> Result<reqwest::Response> {
@@ -284,9 +301,12 @@ impl SynthApi {
     }
 
     async fn post(&self, path: &str) -> Result<reqwest::Response> {
-        let response = self
-            .http
-            .post(format!("{}{path}", self.url))
+        let request = self.http.post(format!("{}{path}", self.url));
+        let request = match self.operator_token.as_ref() {
+            Some(token) => request.bearer_auth(token.trim()),
+            None => request,
+        };
+        let response = request
             .send()
             .await
             .with_context(|| format!("reach synth at {}", self.url))?;
@@ -489,7 +509,8 @@ fn millis(ms: i64) -> String {
 pub async fn run(command: Command) -> Result<i32> {
     match command {
         Command::Run(args) => {
-            let api = SynthApi::new(&args.api.url)?;
+            let api = SynthApi::new(&args.api.url)?
+                .with_operator_token_file(args.api.operator_token_file.as_deref())?;
             let players = args
                 .users
                 .map_or("synth's configured".to_string(), |u| u.to_string());
@@ -526,7 +547,8 @@ pub async fn run(command: Command) -> Result<i32> {
             .await
         }
         Command::Runs { api: flags, action } => {
-            let api = SynthApi::new(&flags.url)?;
+            let api = SynthApi::new(&flags.url)?
+                .with_operator_token_file(flags.operator_token_file.as_deref())?;
             match action {
                 RunsCommand::List { limit } => {
                     let runs = api.runs(limit).await?;

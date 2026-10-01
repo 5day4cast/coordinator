@@ -3,6 +3,7 @@ mod format;
 pub mod live;
 pub mod metrics;
 mod money;
+mod operator;
 pub mod routes;
 pub mod run_detail;
 mod stuck;
@@ -22,6 +23,7 @@ pub async fn start_server(
     rebalancer: Option<Rebalancer>,
     tracker: Tracker,
 ) -> anyhow::Result<()> {
+    let operator = operator::OperatorAccess::new(&config.server)?;
     let dashboard = routes::Dashboard {
         runner,
         scenario_config: config.scenario_config(),
@@ -36,6 +38,10 @@ pub async fn start_server(
         .merge(routes::router(dashboard))
         .merge(assets::router())
         .merge(metrics::router())
+        .layer(axum::middleware::from_fn_with_state(
+            operator,
+            operator::authorize,
+        ))
         .layer(axum::middleware::map_response(secure));
 
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
