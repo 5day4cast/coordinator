@@ -827,7 +827,7 @@ fn a_queued_deposit_refunds_under_refund_or_pool_evidence() {
 #[tokio::test]
 async fn a_queued_refund_pays_the_players_own_address() {
     use super::ark_escrow::{attempt, refund_parameters, MAX_REFUND_FEE_SATS, REFUNDED_SATS};
-    use crate::lnurl_transport::fixtures::{discovery_tls_fixture, FIXTURE_METADATA};
+    use crate::lnurl_transport::fixtures::FIXTURE_METADATA;
 
     let pool = pool_fixture(true);
     let escrow = escrow_with(KEYS[0], MAKER);
@@ -851,14 +851,14 @@ async fn a_queued_refund_pays_the_players_own_address() {
             keys: pool.f.keys.clone(),
             contract: pool.f.contract.clone(),
         };
-        let (client, server) = discovery_tls_fixture().await;
-        let verifier = CoordinatorVerifier::with_lnurl(client);
+        let verifier = CoordinatorVerifier::default();
         let unbound = Payload::default();
         let first = attempt();
         let prepared = verifier
             .prepare(
                 f.prepare_view(&unbound, &first, SIGN_ARK_REFUND, &BTreeMap::new()),
                 &refund_parameters(
+                    &f,
                     refund_of(&escrow, &refund_swap(preimage)),
                     invoice.clone(),
                     MAX_REFUND_FEE_SATS,
@@ -866,7 +866,6 @@ async fn a_queued_refund_pays_the_players_own_address() {
             )
             .await
             .unwrap();
-        server.await.unwrap();
         verifier
             .verify_execution(
                 f.execute_view(&unbound, &first, SIGN_ARK_REFUND),

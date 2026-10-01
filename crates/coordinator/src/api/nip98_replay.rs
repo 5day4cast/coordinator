@@ -79,7 +79,7 @@ impl Nip98ReplayGuard {
         };
         let capacity = i64::try_from(self.capacity).unwrap_or(i64::MAX);
         let id = id.to_hex();
-        let accepted = database
+        database
             .execute_write(move |pool| async move {
                 let mut tx = pool.begin().await?;
                 // The first write acquires SQLite's writer lock before counting/admitting.
@@ -119,8 +119,7 @@ impl Nip98ReplayGuard {
                 Ok(Ok(()))
             })
             .await
-            .map_err(|_| ReplayRejection::Unavailable)?;
-        accepted
+            .map_err(|_| ReplayRejection::Unavailable)?
     }
 
     /// Claim `id` for a single use. Admission also prunes a full guard,

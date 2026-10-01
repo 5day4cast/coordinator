@@ -21,7 +21,7 @@ pub fn verify(
     invoice: &str,
     signature: &str,
 ) -> Result<(), KeyMeldError> {
-    let invalid = |error: String| KeyMeldError::ValidationError(error);
+    let invalid = KeyMeldError::ValidationError;
     let signature: [u8; 64] = hex::decode(signature)
         .map_err(|e| invalid(e.to_string()))?
         .try_into()
