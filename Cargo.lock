@@ -187,25 +187,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ark-bdk-wallet"
-version = "0.11.0"
-source = "git+https://github.com/tee8z/rust-sdk?branch=fix%2Fbatch-events-by-id#36f4f9b9462bd54acba8891cdd864bd1d74d533c"
-dependencies = [
- "anyhow",
- "ark-client",
- "ark-core",
- "async-stream",
- "bdk_esplora",
- "bdk_wallet",
- "bitcoin",
- "esplora-client",
- "getrandom 0.2.17",
- "gloo-timers",
- "jiff",
- "tracing",
-]
-
-[[package]]
 name = "ark-client"
 version = "0.11.0"
 source = "git+https://github.com/tee8z/rust-sdk?branch=fix%2Fbatch-events-by-id#36f4f9b9462bd54acba8891cdd864bd1d74d533c"
@@ -1006,56 +987,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "bdk_chain"
-version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4955734f97b2baed3f36d16ae7c203fdde31ae85391ac44ee3cbcaf0886db5ce"
-dependencies = [
- "bdk_core",
- "bitcoin",
- "miniscript",
- "serde",
-]
-
-[[package]]
-name = "bdk_core"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b545aea1efc090e4f71f1dd5468090d9f54c3de48002064c04895ef811fbe0b2"
-dependencies = [
- "bitcoin",
- "hashbrown 0.14.5",
- "serde",
-]
-
-[[package]]
-name = "bdk_esplora"
-version = "0.20.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d7fdf5efbebabc0c0bb46c0348ef0d4db505856c7d6c5d50cebba1e5eda5fe4"
-dependencies = [
- "async-trait",
- "bdk_core",
- "esplora-client",
- "futures",
- "miniscript",
-]
-
-[[package]]
-name = "bdk_wallet"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "461b92c4e47b688a92740b204f4580e0a51775df16b67dde1d2db6ede1f0ba09"
-dependencies = [
- "bdk_chain",
- "bitcoin",
- "miniscript",
- "rand_core 0.6.4",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "bech32"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1715,12 +1646,12 @@ dependencies = [
  "coordinator-ark-escrow",
  "coordinator-escrow",
  "dlctix",
+ "electrum-client",
  "futures",
  "hex",
  "log",
  "prost 0.14.4",
  "rand 0.9.5",
- "reqwest 0.12.28",
  "rustls",
  "serde",
  "serde_json",
@@ -1746,7 +1677,6 @@ name = "coordinator-ark-swap"
 version = "2.14.9"
 dependencies = [
  "anyhow",
- "ark-bdk-wallet",
  "ark-client",
  "ark-core",
  "axum",
@@ -1755,7 +1685,7 @@ dependencies = [
  "clap",
  "coordinator-ark",
  "coordinator-ark-escrow",
- "esplora-client",
+ "electrum-client",
  "fern",
  "hex",
  "log",
@@ -2480,18 +2410,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "120339709b24832c07464b0838828361b735d793c409b8ca3147db0dae601542"
 
 [[package]]
-name = "esplora-client"
-version = "0.11.0"
-dependencies = [
- "bitcoin",
- "hex-conservative 0.2.2",
- "log",
- "reqwest 0.12.28",
- "serde",
- "tokio",
-]
-
-[[package]]
 name = "etcetera"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2913,7 +2831,6 @@ checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 dependencies = [
  "ahash",
  "allocator-api2",
- "serde",
 ]
 
 [[package]]
@@ -3978,7 +3895,6 @@ checksum = "487906208f38448e186e3deb02f2b8ef046a9078b0de00bdb28bf4fb9b76951c"
 dependencies = [
  "bech32",
  "bitcoin",
- "serde",
 ]
 
 [[package]]

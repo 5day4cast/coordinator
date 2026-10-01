@@ -306,6 +306,25 @@ The wallet balance API now returns `confirmed`, `unconfirmed`, and `locked` amou
 Update clients that read `immature`, `trusted_pending`, or `untrusted_pending`.
 The wallet outputs API returns `outpoint`, `txout`, and `confirmations` for each unspent output.
 
+### Ark swap chain indexing
+
+`ark-swapd` reads Bitcoin chain data from a self-hosted [electrs](https://github.com/romanz/electrs) server.
+Set its required `electrum_url` to the Electrum endpoint on the same network as the Ark server and LND.
+For custom signets, electrs must use the same signet challenge as the Ark server and LND.
+The genesis check rejects other Bitcoin networks but cannot distinguish custom signet challenges.
+For a private network, an example is `electrum_url = "tcp://192.168.1.15:50001"`.
+Use `ssl://` for an endpoint with a publicly trusted TLS certificate.
+Plain TCP needs a trusted private network or an authenticated tunnel.
+There is no public indexer fallback.
+
+Replace the old `esplora_url` setting when upgrading `ark-swapd`.
+The new binary rejects the old setting; previous binaries do not accept `electrum_url`.
+Update the binary and generated configuration together, including the `arkSwap.electrumUrl` NixOS module option.
+For blue/green deployments, stop the old slot before applying the new shared configuration.
+Keep the existing `data_dir`, `wallet.key`, `swaps.sqlite`, and their backups.
+Changing the indexer does not move funds or rotate the wallet key.
+Ark VTXO operations still use the configured Ark server.
+
 ### SQLite ownership and shutdown
 
 Each database has one writable connection and a separate pool of query-only readers.

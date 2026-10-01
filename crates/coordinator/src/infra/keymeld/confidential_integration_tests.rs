@@ -1413,17 +1413,19 @@ struct MutinynetKickoff {
 /// 2. Once every escrow holds a VTXO, kick off the pool in the next batch.
 /// 3. Once the tip reaches the contract's expiry, broadcast Keymeld's expiry transaction.
 ///
-///     ARK_KEYMELD_STATE=run.json cargo test -p coordinator --lib keymeld_kicks_off -- --ignored --nocapture
+/// Set `ELECTRUM_URL` to your electrs instance indexing Mutinynet; there is no public fallback.
+///
+///     ELECTRUM_URL=tcp://127.0.0.1:50001 ARK_KEYMELD_STATE=run.json cargo test -p coordinator --lib keymeld_kicks_off -- --ignored --nocapture
 #[tokio::test]
-#[ignore = "needs Arkade's Mutinynet server and funded escrows"]
+#[ignore = "needs Arkade's Mutinynet server, a configured electrs instance, and funded escrows"]
 async fn keymeld_kicks_off_a_pool_on_mutinynet() {
     use coordinator_ark::testing::{keypair, xonly};
     use coordinator_ark::{
         fund_pool, ArkServer, DlcKickoff, EscrowInput, KeypairSigner, KickoffConfig, PoolFunding,
     };
+    use electrum_client::ElectrumApi;
 
     const SERVER: &str = "https://mutinynet.arkade.sh";
-    const ESPLORA: &str = "https://mutinynet.com/api";
     const EXPIRY_BLOCKS: u32 = 6;
 
     let path = std::path::PathBuf::from(
@@ -1432,19 +1434,22 @@ async fn keymeld_kicks_off_a_pool_on_mutinynet() {
     let save = |run: &MutinynetRun| {
         std::fs::write(&path, serde_json::to_string_pretty(run).unwrap()).unwrap()
     };
-    let http = reqwest::Client::new();
-    let tip = || async {
-        http.get(format!("{ESPLORA}/blocks/tip/height"))
-            .send()
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap()
-            .trim()
-            .parse::<u32>()
-            .unwrap()
-    };
+    let electrum_url = std::env::var("ELECTRUM_URL")
+        .expect("ELECTRUM_URL names your electrs instance indexing Mutinynet");
+    let electrum = electrum_client::Client::from_config(
+        &electrum_url,
+        electrum_client::ConfigBuilder::new()
+            .timeout(Some(10))
+            .retry(0)
+            .build(),
+    )
+    .unwrap();
+    assert_eq!(
+        electrum.block_header(0).unwrap().block_hash(),
+        bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Signet).block_hash(),
+        "ELECTRUM_URL must index the Signet network used by Mutinynet"
+    );
+    let tip = || u32::try_from(electrum.block_headers_subscribe().unwrap().height).unwrap();
     let server = ArkServer::connect(SERVER).await.unwrap();
     let mut run: MutinynetRun = if path.exists() {
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
@@ -1476,7 +1481,7 @@ async fn keymeld_kicks_off_a_pool_on_mutinynet() {
         .collect();
 
     if let Some(kickoff) = &run.kickoff {
-        let tip = tip().await;
+        let tip = tip();
         if tip < kickoff.expiry_height {
             println!(
                 "the expiry transaction is valid from height {}; the tip is {tip}",
@@ -1484,16 +1489,10 @@ async fn keymeld_kicks_off_a_pool_on_mutinynet() {
             );
             return;
         }
-        let response = http
-            .post(format!("{ESPLORA}/tx"))
-            .body(kickoff.expiry_tx.clone())
-            .send()
-            .await
+        let txid = electrum
+            .transaction_broadcast_raw(&hex::decode(&kickoff.expiry_tx).unwrap())
             .unwrap();
-        let status = response.status();
-        let body = response.text().await.unwrap();
-        assert!(status.is_success(), "broadcast failed: {status} {body}");
-        println!("broadcast Keymeld's expiry transaction: https://mutinynet.com/tx/{body}");
+        println!("broadcast Keymeld's expiry transaction: {txid}");
         return;
     }
 
@@ -1519,7 +1518,7 @@ async fn keymeld_kicks_off_a_pool_on_mutinynet() {
     }
 
     let total: Amount = inputs.iter().map(|input| input.amount).sum();
-    let expiry_height = tip().await + EXPIRY_BLOCKS;
+    let expiry_height = tip() + EXPIRY_BLOCKS;
     let mut params = pool_parameters(run.players);
     params.funding_value = total;
     params.event.expiry = Some(expiry_height);
@@ -1581,7 +1580,7 @@ async fn keymeld_kicks_off_a_pool_on_mutinynet() {
     assert_eq!(contract.dlc().funding_outpoint(), kickoff.funding);
     let expiry = contract.expiry_tx().expect("a signed expiry transaction");
     println!(
-        "batch {} committed https://mutinynet.com/tx/{} after {seconds_in_batch:.1}s",
+        "batch {} committed {} after {seconds_in_batch:.1}s",
         kickoff.batch_id, kickoff.commitment_txid
     );
     run.kickoff = Some(MutinynetKickoff {

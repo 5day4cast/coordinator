@@ -13,7 +13,6 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 ark-client = { version = "0.11", default-features = false, features = ["tls-webpki-roots"] }
-ark-bdk-wallet = "0.11"
 ark-core = { workspace = true }
 coordinator-ark-escrow = { workspace = true }
 axum = { workspace = true }
@@ -21,7 +20,7 @@ base64 = { workspace = true }
 bitcoin = { workspace = true }
 clap = { workspace = true }
 coordinator-ark = { workspace = true }
-esplora-client = { version = "0.11", default-features = false, features = ["async-https", "tokio"] }
+electrum-client.workspace = true
 fern = { workspace = true }
 hex = { workspace = true }
 log = { workspace = true }

@@ -301,7 +301,7 @@ impl Keymeld for Enclaves {
     ) -> Result<String, KeymeldError> {
         use crate::infra::lnurl::LnurlPay;
         let provider = MockLnurlPay::new(Network::Regtest);
-        let address = "alice@wallet.example".parse().unwrap();
+        let address = "alice@mock-wallet.dev".parse().unwrap();
         let request = provider.resolve(&address).await.unwrap();
         Ok(provider
             .request_invoice(&request, owed_sats * 1000)
