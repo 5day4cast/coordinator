@@ -233,7 +233,9 @@ Set `keymeld_settings.public_gateway_url` to the browser-reachable gateway addre
 Allow the coordinator's exact browser origin in Keymeld's `server.cors_allowed_origins`.
 For Helm, use `keymeld.trustedPcrs` and `keymeld.publicGatewayUrl`.
 An enabled coordinator rejects missing or invalid trust pins unless `keymeld_settings.dangerous_trust_unattested_enclaves` is set.
-That setting exists for local simulation and for staging where Keymeld runs simulated enclaves with Moto KMS instead of Nitro hardware.
+That setting supports simulated enclaves without Nitro hardware.
+Local helpers use Moto KMS; the deployed simulation service uses a persisted development KMS key.
+Neither configuration provides hardware custody or protection from a compromised application host.
 The coordinator refuses it on mainnet or together with trust pins, warns at startup, and forwards it to browsers in the ticket response so they skip attestation for that gateway only.
 For Helm, use `keymeld.dangerousTrustUnattestedEnclaves`.
 

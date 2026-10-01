@@ -276,6 +276,20 @@ pub trait Keymeld: Send + Sync {
         Ok(signed)
     }
 
+    /// Request and authenticate the actual invoice inside the registered verifier.
+    /// Persist its authorization before returning an invoice to construct a swap.
+    async fn request_ark_refund_invoice(
+        &self,
+        session: &DlcKeygenSession,
+        user: UserId,
+        owed_sats: u64,
+    ) -> Result<String, KeymeldError> {
+        let _ = (session, user, owed_sats);
+        Err(KeymeldError::Signing(
+            "Authenticated refund invoices are not supported".into(),
+        ))
+    }
+
     /// Sign a player's refund of an escrow whose competition never kicked off.
     ///
     /// Unlike a pool's escrow spends this needs no binding: the pool may never have formed. The

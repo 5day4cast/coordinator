@@ -259,3 +259,26 @@ debug while the condition lasts:
 - `Escrow swap … for ticket … paid … with a coin that expires on Arkade at …`: section 4; the ticket is not counted.
 - `Escrow swap … paid the escrow of ticket …, but could not settle…`: an `unsettled` swap.
 - `swap … paid escrow … but its VTXO was not found in N lookups…`: ark-swapd gave up looking.
+
+
+## Refund invoice authorization upgrade
+
+Refund signing requires a verifier-issued signature over the exact invoice and the participant's policy digest.
+The verifier resolves the policy's Lightning Address through its authenticated TLS client before issuing this signature.
+The coordinator stores the signature in `refund_invoice_authorizations` before creating the refund swap.
+Public LNURL metadata does not authorize a payment destination.
+
+Deploy the updated coordinator verifier before admitting new refund work with the updated coordinator.
+Keep the coordinator, verifier, gateway, and browser artifacts compatible with the existing Keymeld protocol.
+Run the normal database migrations, including the new competitions and users migrations.
+The users database stores consumed NIP-98 authentication events across process replacements.
+
+Inventory pending refunds before rollout.
+Existing invoice records and sealed refund preparations lack the new recipient authorization and fail closed.
+For an unsubmitted refund, allow the existing stale-invoice remint path to obtain an authenticated replacement.
+For a submitted or paid refund, reconcile persisted swap, Arkade, and Lightning state before replacing anything.
+Do not fabricate an authorization from LNURL metadata or delete signing history to force a retry.
+Include the authorization table in the same backup and recovery process as the competitions database.
+
+Arkade funding validation remains deferred while the service is paused.
+Source review and regression fixtures do not establish a successful funded lifecycle.

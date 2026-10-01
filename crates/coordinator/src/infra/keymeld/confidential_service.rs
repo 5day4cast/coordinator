@@ -179,10 +179,10 @@ where
             ordered[index] = Some(result);
         }
     }
-    Ok(ordered
+    ordered
         .into_iter()
-        .map(|result| result.expect("every item belongs to one share"))
-        .collect())
+        .map(|result| result.ok_or_else(|| invalid("Enclave omitted an assigned result")))
+        .collect()
 }
 
 impl KeymeldService {
@@ -195,7 +195,7 @@ impl KeymeldService {
         user: UserId,
         stage: &str,
         parameters: generic::ActionParameters,
-    ) -> Result<Vec<(usize, [u8; 64])>, KeymeldError> {
+    ) -> Result<(Vec<(usize, [u8; 64])>, Payload), KeymeldError> {
         let _guard = self.lock_session(&session.session_id).await;
         let (mut state, durable) = self.checkpoint(session).await?;
         let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
@@ -249,7 +249,12 @@ impl KeymeldService {
             &prepare,
         )
         .await?;
-        let inputs: Vec<usize> = prepared.output.decode()?;
+        let output = prepared.output.clone();
+        let inputs: Vec<usize> = if stage == "refund-invoice" {
+            vec![0]
+        } else {
+            output.decode()?
+        };
         let execute = ExecuteEscrowRequest {
             schema_version: escrow::SCHEMA_VERSION,
             prepared_receipt: prepared.sealed_state,
@@ -282,7 +287,7 @@ impl KeymeldService {
                 "Escrow signatures differ from the authorized action",
             ));
         }
-        inputs
+        let signatures = inputs
             .into_iter()
             .zip(signatures)
             .map(|(input, signature)| {
@@ -292,7 +297,8 @@ impl KeymeldService {
                     .map_err(|_| invalid("Invalid BIP340 signature length"))?;
                 Ok((input, bytes))
             })
-            .collect()
+            .collect::<Result<Vec<_>, KeymeldError>>()?;
+        Ok((signatures, output))
     }
 
     fn database(&self) -> Result<&DBConnection, KeymeldError> {
@@ -1448,6 +1454,38 @@ impl Keymeld for KeymeldService {
         .await
     }
 
+    async fn request_ark_refund_invoice(
+        &self,
+        session: &DlcKeygenSession,
+        user: UserId,
+        owed_sats: u64,
+    ) -> Result<String, KeymeldError> {
+        let (signatures, output) = self
+            .sign_unbound_escrow(
+                session,
+                user.clone(),
+                "refund-invoice",
+                generic::ActionParameters::RequestArkRefundInvoice { owed_sats },
+            )
+            .await?;
+        let [(_, signature)] = signatures.as_slice() else {
+            return Err(invalid(
+                "Refund invoice requires one authorization signature",
+            ));
+        };
+        let invoice: String = output.decode()?;
+        let authorization = hex::encode(signature);
+        let saved_invoice = invoice.clone();
+        let keygen_id = session.session_id.to_string();
+        let user_id = user.to_string();
+        self.database()?.execute_write(move |pool| async move {
+            sqlx::query("INSERT INTO refund_invoice_authorizations (keygen_session_id, user_id, invoice, authorization) VALUES (?, ?, ?, ?) ON CONFLICT(keygen_session_id, user_id, invoice) DO UPDATE SET authorization = excluded.authorization")
+                .bind(keygen_id).bind(user_id).bind(saved_invoice).bind(authorization).execute(&pool).await?;
+            Ok(())
+        }).await.map_err(|e| invalid(format!("Cannot persist refund invoice authorization: {e}")))?;
+        Ok(invoice)
+    }
+
     async fn sign_ark_refund(
         &self,
         session: &DlcKeygenSession,
@@ -1456,12 +1494,18 @@ impl Keymeld for KeymeldService {
         invoice: String,
         fee_sats: u64,
     ) -> Result<[u8; 64], KeymeldError> {
+        let invoice_authorization: String = sqlx::query_scalar(
+            "SELECT authorization FROM refund_invoice_authorizations WHERE keygen_session_id = ? AND user_id = ? AND invoice = ?",
+        ).bind(session.session_id.to_string()).bind(user.to_string()).bind(&invoice).fetch_optional(self.database()?.read()).await
+            .map_err(|e| invalid(format!("Cannot load refund invoice authorization: {e}")))?
+            .ok_or_else(|| invalid("Refund invoice has no authenticated recipient receipt"))?;
         let parameters = generic::ActionParameters::RefundArkEscrow {
             spend,
             invoice,
+            invoice_authorization,
             fee_sats,
         };
-        let signed = self
+        let (signed, _) = self
             .sign_unbound_escrow(session, user, "refund", parameters)
             .await?;
         let [(_, signature)] = signed.as_slice() else {
@@ -1478,13 +1522,20 @@ impl Keymeld for KeymeldService {
         invoice: String,
         fee_sats: u64,
     ) -> Result<Vec<(usize, [u8; 64])>, KeymeldError> {
+        let invoice_authorization: String = sqlx::query_scalar(
+            "SELECT authorization FROM refund_invoice_authorizations WHERE keygen_session_id = ? AND user_id = ? AND invoice = ?",
+        ).bind(session.session_id.to_string()).bind(user.to_string()).bind(&invoice).fetch_optional(self.database()?.read()).await
+            .map_err(|e| invalid(format!("Cannot load refund invoice authorization: {e}")))?
+            .ok_or_else(|| invalid("Refund invoice has no authenticated recipient receipt"))?;
         let parameters = generic::ActionParameters::RefundArkEscrow {
             spend,
             invoice,
+            invoice_authorization,
             fee_sats,
         };
         self.sign_unbound_escrow(session, user, "refund-intent", parameters)
             .await
+            .map(|(signed, _)| signed)
     }
 
     async fn sign_ark_intent_delete(
@@ -1496,6 +1547,7 @@ impl Keymeld for KeymeldService {
         let parameters = generic::ActionParameters::DeleteArkIntent { spend };
         self.sign_unbound_escrow(session, user, "intent-delete", parameters)
             .await
+            .map(|(signed, _)| signed)
     }
 }
 
@@ -1647,7 +1699,11 @@ impl KeymeldService {
                 checkpoint.finish(state.clone()).await?;
             }
         }
-        let mut plan = state.signing.as_ref().expect("saved plan").clone();
+        let mut plan = state
+            .signing
+            .as_ref()
+            .ok_or_else(|| invalid("Signing plan was not saved"))?
+            .clone();
         let credentials = SessionCredentials::from_session_secret(&session.session_secret)?;
         let mut journal = std::mem::take(&mut state.journal);
         let mut driver = self

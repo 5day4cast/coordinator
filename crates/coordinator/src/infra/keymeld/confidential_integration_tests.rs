@@ -1607,7 +1607,7 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_funded() {
     use coordinator_ark_escrow::{EntryEscrow, RefundSwap, RelativeTimelock, SwapTerms};
     use coordinator_escrow::ark::{psbt_hex, ArkEscrowSpend, RefundPurpose};
     use coordinator_escrow_verifier::lnurl_transport::fixtures::{
-        discovery_tls_fixture_times, FIXTURE_METADATA,
+        automatic_payout_tls_fixture, FIXTURE_METADATA,
     };
     use dlctix::bitcoin::hashes::sha256;
 
@@ -1677,9 +1677,9 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_funded() {
     })
     .unwrap();
 
-    // Each signature resolves the player's address again, so a provider answers once per one:
+    // The provider is contacted once; later signatures use the persisted authorization:
     // the refund's two transactions, and later the intent of its batch.
-    let (client, provider) = discovery_tls_fixture_times(3).await;
+    let (client, provider) = automatic_payout_tls_fixture(invoice.clone()).await;
     let consent = |lnurl, unfinished_keygen| Consent {
         escrows: Some(std::slice::from_ref(&escrow)),
         lightning_address: Some("alice+prize@wallet.example".into()),
@@ -1706,6 +1706,14 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_funded() {
         checkpoint_psbt: psbt_hex(&refund.checkpoint),
         swap_tap_tree: hex::encode(swap.vtxo_script().encode_tap_tree()),
     };
+    assert_eq!(
+        harness
+            .service
+            .request_ark_refund_invoice(&harness.session, harness.players[0].clone(), paid_sats,)
+            .await
+            .unwrap(),
+        invoice
+    );
     let sign = |purpose| {
         let harness = &harness;
         let invoice = invoice.clone();
@@ -1813,8 +1821,20 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_funded() {
 
     // A competition cancelled before its pool filled never completed keygen, and its escrows
     // must still be refundable.
-    let (client, second_provider) = discovery_tls_fixture_times(1).await;
+    let (client, second_provider) = automatic_payout_tls_fixture(invoice.clone()).await;
     let unfinished = PoolHarness::start_with(pool_parameters(1), consent(Some(client), true)).await;
+    assert_eq!(
+        unfinished
+            .service
+            .request_ark_refund_invoice(
+                &unfinished.session,
+                unfinished.players[0].clone(),
+                paid_sats,
+            )
+            .await
+            .unwrap(),
+        invoice
+    );
     let refunded = unfinished
         .service
         .sign_ark_refund(
@@ -1839,7 +1859,7 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_filled() {
     use coordinator_ark_escrow::{EntryEscrow, RefundSwap, RelativeTimelock, SwapTerms};
     use coordinator_escrow::ark::{psbt_hex, ArkEscrowSpend, RefundPurpose};
     use coordinator_escrow_verifier::lnurl_transport::fixtures::{
-        discovery_tls_fixture_times, FIXTURE_METADATA,
+        automatic_payout_tls_fixture, FIXTURE_METADATA,
     };
     use dlctix::bitcoin::hashes::sha256;
 
@@ -1908,8 +1928,8 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_filled() {
     .unwrap();
 
     // Two tickets, one entry: only its player registered before the competition expired.
-    // Each signature resolves the player's address again, so a provider answers once per one.
-    let (client, provider) = discovery_tls_fixture_times(2).await;
+    // The invoice is authenticated before either transaction is signed.
+    let (client, provider) = automatic_payout_tls_fixture(invoice.clone()).await;
     let harness = PoolHarness::start_with(
         pool_parameters(2),
         Consent {
@@ -1938,6 +1958,18 @@ async fn keymeld_signs_a_refund_for_a_pool_that_never_filled() {
         checkpoint_psbt: psbt_hex(&refund.checkpoint),
         swap_tap_tree: hex::encode(swap.vtxo_script().encode_tap_tree()),
     };
+    assert_eq!(
+        harness
+            .service
+            .request_ark_refund_invoice(
+                &harness.session,
+                harness.players[0].clone(),
+                ESCROW_SATS - REFUND_FEE_SATS,
+            )
+            .await
+            .unwrap(),
+        invoice
+    );
     let sign = |player: usize, purpose| {
         let harness = &harness;
         let invoice = invoice.clone();

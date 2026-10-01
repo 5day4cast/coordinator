@@ -293,6 +293,23 @@ impl Keymeld for Enclaves {
     ) -> Result<DlcSignatureResults, KeymeldError> {
         panic!("no contract here")
     }
+    async fn request_ark_refund_invoice(
+        &self,
+        _: &DlcKeygenSession,
+        _: UserId,
+        owed_sats: u64,
+    ) -> Result<String, KeymeldError> {
+        use crate::infra::lnurl::LnurlPay;
+        let provider = MockLnurlPay::new(Network::Regtest);
+        let address = "alice@wallet.example".parse().unwrap();
+        let request = provider.resolve(&address).await.unwrap();
+        Ok(provider
+            .request_invoice(&request, owed_sats * 1000)
+            .await
+            .unwrap()
+            .to_string())
+    }
+
     /// Sign as the player with their entry key, over the digest the verifier derives.
     async fn sign_ark_refund(
         &self,

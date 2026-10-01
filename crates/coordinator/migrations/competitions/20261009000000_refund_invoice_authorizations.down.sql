@@ -1,0 +1,1 @@
+DROP TABLE refund_invoice_authorizations;

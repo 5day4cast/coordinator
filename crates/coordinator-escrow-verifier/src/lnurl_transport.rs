@@ -91,13 +91,12 @@ fn validate_url(url: &Url) -> Result<()> {
             && url.port() != Some(0),
         LnurlError::UnsafeUrl
     );
+    let host = url.host_str().ok_or(LnurlError::UnsafeUrl)?;
+    let port = url.port_or_known_default().ok_or(LnurlError::UnsafeUrl)?;
     if let Some(ip) = literal_ip(url) {
-        validate_addresses(
-            &[SocketAddr::new(ip, url.port_or_known_default().unwrap())],
-            url.port_or_known_default().unwrap(),
-        )?;
+        validate_addresses(&[SocketAddr::new(ip, port)], port)?;
     } else {
-        validate_dns_host(url.host_str().unwrap())?;
+        validate_dns_host(host)?;
     }
     Ok(())
 }
@@ -117,14 +116,14 @@ pub struct LnurlPayClient {
 }
 
 impl LnurlPayClient {
-    pub fn new(relay: SocketConnector) -> Self {
+    pub fn new(relay: SocketConnector) -> Result<Self> {
         // Compiled into the measured enclave. No environment, gateway command,
         // operating-system certificate directory or proxy can add a trust root.
         let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        Self {
+        Ok(Self {
             relay,
-            tls: Arc::new(tls_config(roots)),
-        }
+            tls: Arc::new(tls_config(roots)?),
+        })
     }
 
     /// Returns a provider-authenticated invoice, never release authorization.
@@ -141,20 +140,6 @@ impl LnurlPayClient {
             "Invalid LNURL invoice size"
         );
         Ok(response.pr)
-    }
-
-    /// The metadata commitment an invoice from `address` must carry, for `amount_msat`.
-    ///
-    /// Only the provider's discovery step runs: no invoice is requested. A caller supplies the
-    /// invoice instead, which is what a refund needs, because its payment hash must be known
-    /// before the transaction paying it exists. See `payout::validate_address_invoice`.
-    pub async fn invoice_binding(&self, address: &str, amount_msat: u64) -> Result<[u8; 32]> {
-        ensure!(amount_msat > 0, "LNURL payout amount must be positive");
-        let address = validate_address(address)?;
-        let params: PayRequest = parse_response(self.get_json(discovery_url(&address)?).await?)?;
-        // Rejects a wrong tag, an unpayable amount and required payer data, as paying would.
-        params.callback_url(amount_msat)?;
-        Ok(keymeld_core::escrow::sha256(params.metadata.as_bytes()))
     }
 
     async fn get_json(&self, url: Url) -> Result<Value> {
@@ -231,16 +216,15 @@ async fn request_with_timeout<T>(
         .map_err(|_| anyhow!("LNURL request timed out"))?
 }
 
-fn tls_config(roots: RootCertStore) -> ClientConfig {
+fn tls_config(roots: RootCertStore) -> Result<ClientConfig> {
     let mut config = ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
     ))
-    .with_safe_default_protocol_versions()
-    .expect("supported TLS versions")
+    .with_safe_default_protocol_versions()?
     .with_root_certificates(roots)
     .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    config
+    Ok(config)
 }
 
 // Aborting the HTTP driver on timeout prevents detached socket tasks surviving
@@ -564,8 +548,9 @@ pub mod fixtures {
                 .unwrap();
             }
         });
-        let mut client = LnurlPayClient::new(SocketConnector::tcp("127.0.0.1", address.port()));
-        client.tls = Arc::new(tls_config(roots));
+        let mut client =
+            LnurlPayClient::new(SocketConnector::tcp("127.0.0.1", address.port())).unwrap();
+        client.tls = Arc::new(tls_config(roots).unwrap());
         (client, task)
     }
 }
@@ -906,9 +891,10 @@ pub(crate) mod tests {
                     .unwrap();
             }
         });
-        let mut client = LnurlPayClient::new(SocketConnector::tcp("127.0.0.1", addr.port()));
+        let mut client =
+            LnurlPayClient::new(SocketConnector::tcp("127.0.0.1", addr.port())).unwrap();
         if trust_fixture {
-            client.tls = Arc::new(tls_config(roots));
+            client.tls = Arc::new(tls_config(roots).unwrap());
         }
         (client, server)
     }
@@ -962,7 +948,7 @@ pub(crate) mod tests {
                     .is_err()
             );
         });
-        let client = LnurlPayClient::new(SocketConnector::tcp("127.0.0.1", addr.port()));
+        let client = LnurlPayClient::new(SocketConnector::tcp("127.0.0.1", addr.port())).unwrap();
         assert!(client
             .get_json(Url::parse("https://fixture.invalid/").unwrap())
             .await
@@ -1071,8 +1057,9 @@ pub(crate) mod tests {
                     .is_err()
             );
         });
-        let mut client = LnurlPayClient::new(SocketConnector::tcp("127.0.0.1", addr.port()));
-        client.tls = Arc::new(tls_config(roots));
+        let mut client =
+            LnurlPayClient::new(SocketConnector::tcp("127.0.0.1", addr.port())).unwrap();
+        client.tls = Arc::new(tls_config(roots).unwrap());
         let error = client
             .request_invoice("alice@fixture.invalid", 42_000)
             .await
