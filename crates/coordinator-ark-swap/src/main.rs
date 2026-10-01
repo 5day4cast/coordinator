@@ -7,6 +7,7 @@
 mod api;
 mod coins;
 mod config;
+mod invoices;
 mod lnd;
 mod refund;
 mod store;
@@ -80,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
         wallet: ArkWallet::open(&config).await?,
         invoice_expiry_secs: config.invoice_expiry_secs,
         invoice_cltv_expiry: config.invoice_cltv_expiry,
+        invoices: Default::default(),
         errors: Default::default(),
         refund_turn: Default::default(),
         renewed: Default::default(),

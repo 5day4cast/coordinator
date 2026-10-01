@@ -81,6 +81,25 @@ pub struct RefundSwap {
     pub error: Option<String>,
 }
 
+/// How ark-swapd's boards last went, as `GET /v1/wallet` reports it. An ark-swapd older than
+/// these fields reports neither.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SwapWallet {
+    #[serde(default)]
+    pub last_board_failure: Option<BoardFailure>,
+    /// UNIX seconds.
+    #[serde(default)]
+    pub last_board_success_at: Option<i64>,
+}
+
+/// A board or renewal the Arkade server failed for ark-swapd.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardFailure {
+    /// UNIX seconds.
+    pub at: i64,
+    pub message: String,
+}
+
 #[async_trait]
 pub trait EscrowSwaps: Send + Sync {
     /// Start a swap of `amount_sat` into `escrow_address`, or return the open one for it.
@@ -112,6 +131,9 @@ pub trait EscrowSwaps: Send + Sync {
 
     /// A refund swap as it stands, for resuming a refund after a restart.
     async fn refund(&self, id: Uuid) -> anyhow::Result<RefundSwap>;
+
+    /// ark-swapd's wallet, for how its boards last went.
+    async fn wallet(&self) -> anyhow::Result<SwapWallet>;
 }
 
 /// ark-swapd answered 503: its wallet cannot fund a swap right now. Asking again later may work.
@@ -230,6 +252,16 @@ impl EscrowSwaps for SwapClient {
             .post(format!("{}/v1/refunds/{id}/paid", self.base_url))
             .bearer_auth(&self.token)
             .json(&serde_json::json!({ "preimage": hex::encode(preimage) }))
+            .send()
+            .await?;
+        Self::checked(response).await
+    }
+
+    async fn wallet(&self) -> anyhow::Result<SwapWallet> {
+        let response = self
+            .http
+            .get(format!("{}/v1/wallet", self.base_url))
+            .bearer_auth(&self.token)
             .send()
             .await?;
         Self::checked(response).await

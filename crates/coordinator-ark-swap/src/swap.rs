@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::coins::{grouped, DAY_SECS};
+use crate::invoices::InvoiceWatches;
 use crate::lnd::{InvoiceState, Lnd};
 use crate::store::{Store, Swap, SwapState};
 use crate::wallet::ArkWallet;
@@ -90,6 +91,8 @@ pub struct Swapper {
     pub wallet: ArkWallet,
     pub invoice_expiry_secs: u64,
     pub invoice_cltv_expiry: u32,
+    /// The hold invoices of the swaps awaiting payment, each followed on its own stream.
+    pub invoices: InvoiceWatches,
     /// The last error each swap logged, so a lasting one is logged once, not every tick.
     pub errors: SwapErrors,
     /// The last refund `refund_tick` reached, so the next pass carries on after it.
@@ -310,6 +313,15 @@ impl Swapper {
                 return;
             }
         };
+        // A swap that left `AwaitingPayment` on the last tick, or was ended some other way,
+        // drops its invoice stream.
+        self.invoices.keep_only(
+            &swaps
+                .iter()
+                .filter(|swap| swap.state == SwapState::AwaitingPayment)
+                .map(|swap| swap.id)
+                .collect(),
+        );
         for swap in swaps {
             let id = swap.id;
             match self.advance(swap).await {
@@ -341,20 +353,29 @@ impl Swapper {
     async fn advance(&self, mut swap: Swap) -> anyhow::Result<()> {
         let payment_hash = bytes32(&swap.payment_hash)?;
         match swap.state {
-            SwapState::AwaitingPayment => match self.lnd.invoice_state(&payment_hash).await? {
-                InvoiceState::Open => {
-                    if unix_now() > swap.expires_at + EXPIRY_GRACE_SECS {
+            // The invoice's stream shows it being paid; a lookup is only the fallback.
+            SwapState::AwaitingPayment => match self
+                .invoices
+                .state(&self.lnd, swap.id, payment_hash, Instant::now())
+                .await?
+            {
+                None => {}
+                Some(InvoiceState::Open) => {
+                    // What was seen may be seconds old, so it is looked up again before cancelling.
+                    if unix_now() > swap.expires_at + EXPIRY_GRACE_SECS
+                        && self.lnd.invoice_state(&payment_hash).await? == InvoiceState::Open
+                    {
                         self.lnd.cancel(&payment_hash).await?;
                         self.transition(&mut swap, SwapState::Expired, None).await?;
                     }
                 }
-                InvoiceState::Canceled => {
+                Some(InvoiceState::Canceled) => {
                     self.transition(&mut swap, SwapState::Expired, None).await?;
                 }
-                InvoiceState::Settled => {
+                Some(InvoiceState::Settled) => {
                     self.transition(&mut swap, SwapState::Settled, None).await?;
                 }
-                InvoiceState::Accepted => {
+                Some(InvoiceState::Accepted) => {
                     self.transition(&mut swap, SwapState::PayingEscrow, None)
                         .await?;
                     self.pay_escrow(&mut swap).await?;
