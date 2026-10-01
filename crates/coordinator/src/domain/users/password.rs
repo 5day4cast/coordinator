@@ -66,13 +66,19 @@ pub fn hash_auth_key(key: &AuthKey) -> Result<String, PasswordError> {
 /// against a real dummy hash, so response time does not reveal whether the
 /// username exists.
 pub fn verify_auth_key(key: &AuthKey, stored_hash: Option<&str>) -> Result<bool, PasswordError> {
-    static DUMMY_HASH: LazyLock<String> = LazyLock::new(|| {
+    static DUMMY_HASH: LazyLock<Result<String, PasswordError>> = LazyLock::new(|| {
         let dummy = AuthKey("0".repeat(AUTH_KEY_HEX_LEN));
-        hash_auth_key(&dummy).expect("argon2 hashes a fixed input")
+        hash_auth_key(&dummy)
     });
 
     let exists = stored_hash.is_some();
-    let hash = stored_hash.unwrap_or(DUMMY_HASH.as_str());
+    let hash = match stored_hash {
+        Some(hash) => hash,
+        None => DUMMY_HASH
+            .as_ref()
+            .map_err(|e| PasswordError::HashError(e.to_string()))?
+            .as_str(),
+    };
     let parsed =
         PasswordHash::new(hash).map_err(|e| PasswordError::MalformedHash(e.to_string()))?;
     let matches = Argon2::default()

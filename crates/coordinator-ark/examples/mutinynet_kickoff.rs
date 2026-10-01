@@ -2,6 +2,7 @@
 //! Escrow VTXOs are spent in one batch into a dlctix funding output, and the contract is signed before any forfeit.
 //!
 //! ```text
+//! export ELECTRUM_URL=tcp://127.0.0.1:50001 # Your electrs instance indexing Mutinynet.
 //! cargo run -p coordinator-ark --example mutinynet_kickoff -- escrows STATE.json [PLAYERS] [SATS]
 //! # Pay each escrow address, for example with ark-client-sample's send-to-ark-addresses.
 //! cargo run -p coordinator-ark --example mutinynet_kickoff -- status STATE.json
@@ -18,6 +19,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
 use async_trait::async_trait;
 use bitcoin::key::{Keypair, Secp256k1};
 use bitcoin::secp256k1::SecretKey;
@@ -32,10 +34,10 @@ use dlctix::{
     attestation_locking_point, hashlock, ContractParameters, ContractSignatures,
     EventLockingConditions, MarketMaker, Outcome, Player, SignedContract, TicketedDLC,
 };
+use electrum_client::ElectrumApi;
 use serde::{Deserialize, Serialize};
 
 const SERVER: &str = "https://mutinynet.arkade.sh";
-const ESPLORA: &str = "https://mutinynet.com/api";
 /// Mutinynet mines a block about every 30 seconds, so this is about three minutes.
 const EXPIRY_BLOCKS: u32 = 6;
 const REFUND_AFTER_SECS: u32 = 2 * 24 * 60 * 60;
@@ -99,30 +101,46 @@ fn keypair(hex: &str) -> anyhow::Result<Keypair> {
     Ok(Keypair::from_secret_key(&Secp256k1::new(), &secret))
 }
 
-fn scalar(keypair: &Keypair) -> Scalar {
-    Scalar::from_slice(&keypair.secret_bytes()).expect("a secp256k1 secret key is a valid scalar")
+fn scalar(keypair: &Keypair) -> anyhow::Result<Scalar> {
+    Scalar::from_slice(&keypair.secret_bytes()).context("invalid signing scalar")
 }
 
 fn fresh_secret() -> String {
     hex::encode(SecretKey::new(&mut bitcoin::secp256k1::rand::thread_rng()).secret_bytes())
 }
 
-fn now() -> u32 {
-    SystemTime::now()
+fn now() -> anyhow::Result<u32> {
+    Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("the clock is after 1970")
-        .as_secs() as u32
+        .context("the clock is before 1970")?
+        .as_secs()
+        .try_into()?)
 }
 
-async fn tip_height(http: &reqwest::Client) -> anyhow::Result<u32> {
-    let body = http
-        .get(format!("{ESPLORA}/blocks/tip/height"))
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    Ok(body.trim().parse()?)
+async fn with_electrum<T: Send + 'static>(
+    request: impl FnOnce(&electrum_client::Client) -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    let url = std::env::var("ELECTRUM_URL")
+        .context("set ELECTRUM_URL to your electrs instance indexing Mutinynet")?;
+    tokio::task::spawn_blocking(move || {
+        let config = electrum_client::ConfigBuilder::new()
+            .timeout(Some(10))
+            .retry(0)
+            .build();
+        let client = electrum_client::Client::from_config(&url, config)?;
+        let expected_genesis =
+            bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Signet).block_hash();
+        anyhow::ensure!(
+            client.block_header(0)?.block_hash() == expected_genesis,
+            "ELECTRUM_URL must index the Signet network used by Mutinynet"
+        );
+        request(&client)
+    })
+    .await?
+}
+
+async fn tip_height() -> anyhow::Result<u32> {
+    with_electrum(|client| Ok(client.block_headers_subscribe()?.height.try_into()?)).await
 }
 
 /// The pool's contract: each player wins one outcome, and expiry splits the pot evenly.
@@ -131,24 +149,24 @@ fn contract(
     funding_value: Amount,
     expiry_height: u32,
 ) -> anyhow::Result<ContractParameters> {
-    let oracle = scalar(&keypair(&state.oracle)?).base_point_mul();
-    let nonce = scalar(&keypair(&state.oracle_nonce)?).base_point_mul();
+    let oracle = scalar(&keypair(&state.oracle)?)?.base_point_mul();
+    let nonce = scalar(&keypair(&state.oracle_nonce)?)?.base_point_mul();
     let players: Vec<Player> = state
         .player_keys()?
         .iter()
         .map(|key| {
             let secret = key.secret_bytes();
-            Player {
-                pubkey: scalar(key).base_point_mul(),
+            Ok(Player {
+                pubkey: scalar(key)?.base_point_mul(),
                 ticket_hash: hashlock::sha256(&hashlock::sha256(
                     &[b"ticket".as_slice(), &secret].concat(),
                 )),
                 payout_hash: hashlock::sha256(&hashlock::sha256(
                     &[b"payout".as_slice(), &secret].concat(),
                 )),
-            }
+            })
         })
-        .collect();
+        .collect::<anyhow::Result<_>>()?;
     let mut outcome_payouts: BTreeMap<Outcome, BTreeMap<usize, u64>> = (0..players.len())
         .map(|index| (Outcome::Attestation(index), BTreeMap::from([(index, 1)])))
         .collect();
@@ -156,7 +174,7 @@ fn contract(
         Outcome::Expiry,
         (0..players.len()).map(|index| (index, 1)).collect(),
     );
-    let coordinator: Point = scalar(&keypair(&state.coordinator)?).base_point_mul();
+    let coordinator: Point = scalar(&keypair(&state.coordinator)?)?.base_point_mul();
     Ok(ContractParameters {
         market_maker: MarketMaker {
             pubkey: coordinator,
@@ -230,7 +248,8 @@ impl log::Log for StderrLogger {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    log::set_logger(&StderrLogger).expect("one logger");
+    log::set_logger(&StderrLogger)
+        .map_err(|error| anyhow::anyhow!("failed to initialize logging: {error}"))?;
     log::set_max_level(log::LevelFilter::Info);
 
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -239,7 +258,6 @@ async fn main() -> anyhow::Result<()> {
         _ => anyhow::bail!("usage: mutinynet_kickoff escrows|status|kickoff|expire STATE.json"),
     };
     let server = ArkServer::connect(SERVER).await?;
-    let http = reqwest::Client::new();
 
     match command {
         "escrows" => {
@@ -252,7 +270,7 @@ async fn main() -> anyhow::Result<()> {
                     .map(|n| n.parse())
                     .transpose()?
                     .unwrap_or(20_000);
-                let created_at = now();
+                let created_at = now()?;
                 let state = State {
                     players: (0..players).map(|_| fresh_secret()).collect(),
                     coordinator: fresh_secret(),
@@ -260,7 +278,9 @@ async fn main() -> anyhow::Result<()> {
                     oracle_nonce: fresh_secret(),
                     escrow_sats,
                     created_at,
-                    refund_at: created_at + REFUND_AFTER_SECS,
+                    refund_at: created_at
+                        .checked_add(REFUND_AFTER_SECS)
+                        .context("refund timestamp overflow")?,
                     kickoff: None,
                 };
                 state.save(&path)?;
@@ -317,13 +337,20 @@ async fn main() -> anyhow::Result<()> {
                 });
             }
             let total: Amount = inputs.iter().map(|input| input.amount).sum();
-            let expiry_height = tip_height(&http).await? + EXPIRY_BLOCKS;
+            let expiry_height = tip_height()
+                .await?
+                .checked_add(EXPIRY_BLOCKS)
+                .context("expiry height overflow")?;
             let hooks = DlcKickoff::new(
                 contract(&state, total, expiry_height)?,
                 SaveBeforeForfeits {
                     signer: LocalContractSigner::new(
-                        scalar(&keypair(&state.coordinator)?),
-                        state.player_keys()?.iter().map(scalar),
+                        scalar(&keypair(&state.coordinator)?)?,
+                        state
+                            .player_keys()?
+                            .iter()
+                            .map(scalar)
+                            .collect::<anyhow::Result<Vec<_>>>()?,
                     ),
                     path: contract_path(&path),
                 },
@@ -357,7 +384,6 @@ async fn main() -> anyhow::Result<()> {
                 kickoff.batch_id, kickoff.commitment_txid
             );
             println!("funding output {}", kickoff.funding);
-            println!("https://mutinynet.com/tx/{}", kickoff.commitment_txid);
             state.kickoff = Some(KickoffRecord {
                 batch_id: kickoff.batch_id,
                 commitment_txid: kickoff.commitment_txid.to_string(),
@@ -377,7 +403,7 @@ async fn main() -> anyhow::Result<()> {
                 serde_json::from_str(&std::fs::read_to_string(contract_path(&path))?)?;
             let funding: OutPoint = record.funding.parse()?;
             anyhow::ensure!(contract.dlc().funding_outpoint() == funding);
-            let tip = tip_height(&http).await?;
+            let tip = tip_height().await?;
             anyhow::ensure!(
                 tip >= record.expiry_height,
                 "the tip is {tip}; the expiry transaction is valid from height {}",
@@ -386,16 +412,9 @@ async fn main() -> anyhow::Result<()> {
             let expiry = contract
                 .expiry_tx()
                 .ok_or_else(|| anyhow::anyhow!("the contract has no expiry transaction"))?;
-            let response = http
-                .post(format!("{ESPLORA}/tx"))
-                .body(bitcoin::consensus::encode::serialize_hex(&expiry))
-                .send()
-                .await?;
-            let status = response.status();
-            let body = response.text().await?;
-            anyhow::ensure!(status.is_success(), "broadcast failed: {status} {body}");
-            println!("broadcast expiry transaction {body}");
-            println!("https://mutinynet.com/tx/{body}");
+            let txid =
+                with_electrum(move |client| Ok(client.transaction_broadcast(&expiry)?)).await?;
+            println!("broadcast expiry transaction {txid}");
         }
         other => anyhow::bail!("unknown command {other}"),
     }

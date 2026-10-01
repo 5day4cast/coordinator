@@ -1730,14 +1730,97 @@ mod ark_escrow {
         }
     }
 
+    #[cfg(feature = "lnurl")]
+    #[tokio::test]
+    async fn refund_invoice_authorization_commits_to_the_provider_invoice_and_policy() {
+        use crate::lnurl_transport::fixtures::{automatic_payout_tls_fixture, FIXTURE_METADATA};
+        let escrow = escrow_with(14, 18);
+        let f = fixture_with(true, Some(policy_for(&escrow)));
+        let owed_sats = REFUNDED_SATS - MAX_REFUND_FEE_SATS;
+        let invoice = address_invoice_for(owed_sats, [9; 32], FIXTURE_METADATA);
+        // Providers may return uppercase BOLT11. The receipt and later database
+        // lookup must use the same canonical representation.
+        let (client, provider) = automatic_payout_tls_fixture(invoice.to_uppercase()).await;
+        let verifier = CoordinatorVerifier::with_lnurl(client);
+        let unbound = Payload::default();
+        let attempt = attempt();
+        let prepared = verifier
+            .prepare(
+                f.prepare_view(&unbound, &attempt, SIGN_ARK_REFUND, &BTreeMap::new()),
+                &Payload::encode(&ActionParameters::RequestArkRefundInvoice { owed_sats }).unwrap(),
+            )
+            .await
+            .unwrap();
+        provider.await.unwrap();
+        assert_eq!(prepared.output.decode::<String>().unwrap(), invoice);
+        verifier
+            .verify_execution(
+                f.execute_view(&unbound, &attempt, SIGN_ARK_REFUND),
+                &prepared,
+                &Payload::default(),
+            )
+            .await
+            .unwrap();
+        verifier
+            .restore_execution(
+                f.execute_view(&unbound, &attempt, SIGN_ARK_REFUND),
+                &prepared,
+            )
+            .await
+            .unwrap();
+        assert!(verifier
+            .verify_execution(
+                f.execute_view(&unbound, &attempt, SIGN_ARK_REFUND),
+                &prepared,
+                &Payload::encode(&"unexpected evidence").unwrap(),
+            )
+            .await
+            .is_err());
+        let key = secp256k1::Keypair::from_secret_key(
+            &secp256k1::Secp256k1::new(),
+            &secp256k1::SecretKey::from_byte_array([14; 32]).unwrap(),
+        );
+        let digest = coordinator_escrow::refund_invoice::digest(&f.policy, &invoice).unwrap();
+        assert_eq!(digests(&prepared.action), vec![digest]);
+        let signature = secp256k1::Secp256k1::new()
+            .sign_schnorr_no_aux_rand(&digest, &key)
+            .to_string();
+        coordinator_escrow::refund_invoice::verify(&f.policy, &invoice, &signature).unwrap();
+        // The attacker chooses another payment hash while retaining the same public metadata.
+        let substituted = address_invoice_for(owed_sats, [8; 32], FIXTURE_METADATA);
+        assert!(
+            coordinator_escrow::refund_invoice::verify(&f.policy, &substituted, &signature)
+                .is_err()
+        );
+        let other = fixture_with(true, Some(policy_for(&escrow)));
+        assert_ne!(
+            f.policy.policy.digest().unwrap(),
+            other.policy.policy.digest().unwrap()
+        );
+        assert!(
+            coordinator_escrow::refund_invoice::verify(&other.policy, &invoice, &signature)
+                .is_err()
+        );
+    }
+
     pub(super) fn refund_parameters(
+        f: &Fixture,
         spend: ArkEscrowSpend,
         invoice: String,
         fee_sats: u64,
     ) -> Payload {
+        let key = secp256k1::Keypair::from_secret_key(
+            &secp256k1::Secp256k1::new(),
+            &secp256k1::SecretKey::from_byte_array([14; 32]).unwrap(),
+        );
+        let digest = coordinator_escrow::refund_invoice::digest(&f.policy, &invoice).unwrap();
+        let invoice_authorization = secp256k1::Secp256k1::new()
+            .sign_schnorr_no_aux_rand(&digest, &key)
+            .to_string();
         Payload::encode(&ActionParameters::RefundArkEscrow {
             spend,
             invoice,
+            invoice_authorization,
             fee_sats,
         })
         .unwrap()
@@ -1745,16 +1828,93 @@ mod ark_escrow {
 
     #[cfg(feature = "lnurl")]
     #[tokio::test]
+    async fn legacy_and_restored_refunds_require_recipient_authorization() {
+        use crate::lnurl_transport::fixtures::FIXTURE_METADATA;
+
+        let escrow = escrow_with(14, 18);
+        let f = fixture_with(true, Some(policy_for(&escrow)));
+        let preimage = [9; 32];
+        let invoice = address_invoice_for(
+            REFUNDED_SATS - MAX_REFUND_FEE_SATS,
+            preimage,
+            FIXTURE_METADATA,
+        );
+        let parameters = refund_parameters(
+            &f,
+            refund_of(&escrow, &refund_swap(preimage)),
+            invoice,
+            MAX_REFUND_FEE_SATS,
+        );
+        let mut legacy: serde_json::Value = parameters.decode().unwrap();
+        assert!(legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("invoice_authorization")
+            .is_some());
+        let legacy = Payload::encode(&legacy).unwrap();
+        assert!(legacy.decode::<ActionParameters>().is_err());
+
+        let verifier = CoordinatorVerifier::default();
+        let attempt = attempt();
+        let unbound = Payload::default();
+        assert!(verifier
+            .prepare(
+                f.prepare_view(&unbound, &attempt, SIGN_ARK_REFUND, &BTreeMap::new()),
+                &legacy,
+            )
+            .await
+            .is_err());
+        let prepared = verifier
+            .prepare(
+                f.prepare_view(&unbound, &attempt, SIGN_ARK_REFUND, &BTreeMap::new()),
+                &parameters,
+            )
+            .await
+            .unwrap();
+
+        for authorization in [None, Some("00".repeat(64))] {
+            let mut restored = prepared.clone();
+            let mut state: serde_json::Value = restored.application_state.decode().unwrap();
+            let fields = state.as_object_mut().unwrap();
+            match authorization {
+                Some(signature) => {
+                    fields.insert("invoice_authorization".into(), signature.into());
+                }
+                None => {
+                    assert!(fields.remove("invoice_authorization").is_some());
+                }
+            }
+            restored.application_state = Payload::encode(&state).unwrap();
+            assert!(verifier
+                .verify_execution(
+                    f.execute_view(&unbound, &attempt, SIGN_ARK_REFUND),
+                    &restored,
+                    &Payload::default(),
+                )
+                .await
+                .is_err());
+            assert!(verifier
+                .restore_execution(
+                    f.execute_view(&unbound, &attempt, SIGN_ARK_REFUND),
+                    &restored,
+                )
+                .await
+                .is_err());
+        }
+    }
+
+    #[cfg(feature = "lnurl")]
+    #[tokio::test]
     async fn a_refund_pays_the_players_own_address_through_a_swap_committed_to_its_invoice() {
-        use crate::lnurl_transport::fixtures::{discovery_tls_fixture, FIXTURE_METADATA};
+        use crate::lnurl_transport::fixtures::FIXTURE_METADATA;
 
         let escrow = escrow_with(14, 18);
         let f = fixture_with(true, Some(policy_for(&escrow)));
         let preimage = [9u8; 32];
         let paid_sats = REFUNDED_SATS - MAX_REFUND_FEE_SATS;
         let invoice = address_invoice_for(paid_sats, preimage, FIXTURE_METADATA);
-        let (client, server) = discovery_tls_fixture().await;
-        let verifier = CoordinatorVerifier::with_lnurl(client);
+
+        let verifier = CoordinatorVerifier::default();
         let swap = refund_swap(preimage);
         let first = attempt();
         let unbound = Payload::default();
@@ -1762,6 +1922,7 @@ mod ark_escrow {
             .prepare(
                 f.prepare_view(&unbound, &first, SIGN_ARK_REFUND, &BTreeMap::new()),
                 &refund_parameters(
+                    &f,
                     refund_of(&escrow, &swap),
                     invoice.clone(),
                     MAX_REFUND_FEE_SATS,
@@ -1769,18 +1930,19 @@ mod ark_escrow {
             )
             .await
             .unwrap();
-        server.await.unwrap();
+
         assert_eq!(digests(&prepared.action).len(), 1);
 
         // The server co-signs between the two, so the checkpoint is signed in its own attempt,
         // over its own digest.
-        let (client, server) = discovery_tls_fixture().await;
-        let second = CoordinatorVerifier::with_lnurl(client);
+
+        let second = CoordinatorVerifier::default();
         let later = attempt();
         let checkpoint = second
             .prepare(
                 f.prepare_view(&unbound, &later, SIGN_ARK_REFUND, &BTreeMap::new()),
                 &refund_parameters(
+                    &f,
                     refund_signing(&escrow, &swap, RefundPurpose::Checkpoint),
                     invoice.clone(),
                     MAX_REFUND_FEE_SATS,
@@ -1788,7 +1950,7 @@ mod ark_escrow {
             )
             .await
             .unwrap();
-        server.await.unwrap();
+
         assert_ne!(digests(&checkpoint.action), digests(&prepared.action));
 
         // Executing and restoring recheck the refund without resolving the address again.
@@ -1811,7 +1973,7 @@ mod ark_escrow {
     #[cfg(feature = "lnurl")]
     #[tokio::test]
     async fn a_refund_of_an_expired_escrow_is_signed_as_a_batch_intent_paying_its_swap() {
-        use crate::lnurl_transport::fixtures::{discovery_tls_fixture, FIXTURE_METADATA};
+        use crate::lnurl_transport::fixtures::FIXTURE_METADATA;
 
         let escrow = escrow_with(14, 18);
         let f = fixture_with(true, Some(policy_for(&escrow)));
@@ -1822,13 +1984,13 @@ mod ark_escrow {
         let message = register_message(now().unwrap() + 120);
         let unbound = Payload::default();
 
-        let (client, server) = discovery_tls_fixture().await;
-        let verifier = CoordinatorVerifier::with_lnurl(client);
+        let verifier = CoordinatorVerifier::default();
         let first = attempt();
         let prepared = verifier
             .prepare(
                 f.prepare_view(&unbound, &first, SIGN_ARK_REFUND, &BTreeMap::new()),
                 &refund_parameters(
+                    &f,
                     refund_intent_of(&escrow, &swap, &message),
                     invoice.clone(),
                     MAX_REFUND_FEE_SATS,
@@ -1836,7 +1998,7 @@ mod ark_escrow {
             )
             .await
             .unwrap();
-        server.await.unwrap();
+
         // The message input and the escrow, both signed by the entry key.
         let inputs: Vec<usize> = prepared.output.decode().unwrap();
         assert_eq!(inputs, vec![0, 1]);
@@ -1855,12 +2017,13 @@ mod ark_escrow {
             .unwrap();
 
         // A swap that commits to a different invoice cannot be claimed by paying this one.
-        let (client, server) = discovery_tls_fixture().await;
+
         let other = refund_swap([1u8; 32]);
-        assert!(CoordinatorVerifier::with_lnurl(client)
+        assert!(CoordinatorVerifier::default()
             .prepare(
                 f.prepare_view(&unbound, &attempt(), SIGN_ARK_REFUND, &BTreeMap::new()),
                 &refund_parameters(
+                    &f,
                     refund_intent_of(&escrow, &other, &message),
                     invoice.clone(),
                     MAX_REFUND_FEE_SATS,
@@ -1868,17 +2031,16 @@ mod ark_escrow {
             )
             .await
             .is_err());
-        server.await.unwrap();
 
         // An intent that expired, or one valid for longer than a batch needs, is refused
         // before the address is resolved at all.
         for expire_at in [now().unwrap() - 1, now().unwrap() + 24 * 60 * 60] {
-            let (client, server) = discovery_tls_fixture().await;
             let stale = register_message(expire_at);
-            assert!(CoordinatorVerifier::with_lnurl(client)
+            assert!(CoordinatorVerifier::default()
                 .prepare(
                     f.prepare_view(&unbound, &attempt(), SIGN_ARK_REFUND, &BTreeMap::new()),
                     &refund_parameters(
+                        &f,
                         refund_intent_of(&escrow, &swap, &stale),
                         invoice.clone(),
                         MAX_REFUND_FEE_SATS,
@@ -1886,7 +2048,6 @@ mod ark_escrow {
                 )
                 .await
                 .is_err());
-            server.abort();
         }
     }
 
@@ -1927,7 +2088,7 @@ mod ark_escrow {
                     SIGN_ARK_REFUND,
                     &BTreeMap::new(),
                 ),
-                &refund_parameters(spend, invoice_for(1_000, [9u8; 32]), 0),
+                &refund_parameters(&f, spend, invoice_for(1_000, [9u8; 32]), 0),
             )
             .await;
         let Err(error) = refused else {
@@ -1964,7 +2125,7 @@ mod ark_escrow {
     #[cfg(feature = "lnurl")]
     #[tokio::test]
     async fn a_refund_is_refused_unless_the_invoice_and_swap_are_the_players() {
-        use crate::lnurl_transport::fixtures::{discovery_tls_fixture, FIXTURE_METADATA};
+        use crate::lnurl_transport::fixtures::FIXTURE_METADATA;
 
         let escrow = escrow_with(14, 18);
         let f = fixture_with(true, Some(policy_for(&escrow)));
@@ -1973,7 +2134,7 @@ mod ark_escrow {
         let attempt = attempt();
         let unbound = Payload::default();
         let refund = |swap: &RefundSwap, invoice: String, fee: u64| {
-            refund_parameters(refund_of(&escrow, swap), invoice, fee)
+            refund_parameters(&f, refund_of(&escrow, swap), invoice, fee)
         };
         let prepare = |verifier: CoordinatorVerifier, params: Payload| {
             let f = &f;
@@ -1989,41 +2150,49 @@ mod ark_escrow {
             }
         };
 
-        // An invoice from another provider, or for another address, commits to other metadata.
-        let (client, server) = discovery_tls_fixture().await;
+        // Public metadata copied into an attacker invoice cannot replace a valid authorization.
+
         let params = refund(
             &refund_swap(preimage),
-            address_invoice_for(paid_sats, preimage, "[[\"text/plain\",\"Someone else\"]]"),
+            address_invoice_for(paid_sats, preimage, FIXTURE_METADATA),
             MAX_REFUND_FEE_SATS,
         );
-        assert!(prepare(CoordinatorVerifier::with_lnurl(client), params)
-            .await
-            .is_err());
-        server.await.unwrap();
+        let mut copied_metadata: ActionParameters = params.decode().unwrap();
+        if let ActionParameters::RefundArkEscrow {
+            invoice_authorization,
+            ..
+        } = &mut copied_metadata
+        {
+            *invoice_authorization = "00".repeat(64);
+        }
+        assert!(prepare(
+            CoordinatorVerifier::default(),
+            Payload::encode(&copied_metadata).unwrap()
+        )
+        .await
+        .is_err());
 
         // A swap that commits to a different invoice cannot be claimed by paying this one.
-        let (client, server) = discovery_tls_fixture().await;
+
         let params = refund(
             &refund_swap([1u8; 32]),
             address_invoice_for(paid_sats, preimage, FIXTURE_METADATA),
             MAX_REFUND_FEE_SATS,
         );
-        assert!(prepare(CoordinatorVerifier::with_lnurl(client), params)
+        assert!(prepare(CoordinatorVerifier::default(), params)
             .await
             .is_err());
-        server.await.unwrap();
 
         // A fee above the player's cap is refused before the address is resolved at all.
-        let (client, server) = discovery_tls_fixture().await;
+
         let params = refund(
             &refund_swap(preimage),
             address_invoice_for(paid_sats, preimage, FIXTURE_METADATA),
             MAX_REFUND_FEE_SATS + 1,
         );
-        assert!(prepare(CoordinatorVerifier::with_lnurl(client), params)
+        assert!(prepare(CoordinatorVerifier::default(), params)
             .await
             .is_err());
-        server.abort();
     }
 
     #[tokio::test]
@@ -2039,6 +2208,7 @@ mod ark_escrow {
             .prepare(
                 f.prepare_view(&unbound, &attempt, SIGN_ARK_ESCROW, &BTreeMap::new()),
                 &refund_parameters(
+                    &f,
                     refund_of(&escrow, &refund_swap([9u8; 32])),
                     invoice_for(1_000, [9u8; 32]),
                     0

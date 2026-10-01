@@ -247,7 +247,9 @@ The browser uses the SDK's verified enclave-key lookup before `UserCredentials::
 The browser performs verification itself before encrypting its private key; the coordinator does not proxy attestation.
 The SDK's development attestation bypass is reachable only through `keymeld_settings.dangerous_trust_unattested_enclaves`.
 The coordinator refuses that setting on mainnet or together with pinned measurements, warns at startup, and forwards it to browsers in the ticket response.
-It exists so local simulation and Moto-backed staging can exercise the full funding, signing, and invoice flow against Keymeld without Nitro hardware.
+It supports local and deployed simulation without Nitro hardware.
+Local helpers use Moto KMS; deployed simulation uses a persisted development KMS key.
+Simulation does not protect signing keys from a compromised application host.
 
 Session creation signs an `EnclaveRecipientAuthorization` after verifying every assigned enclave.
 That proof is stored with the manifest and compared during every restoration.

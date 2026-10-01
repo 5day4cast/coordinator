@@ -16,7 +16,7 @@ pub fn from_env() -> Result<CoordinatorVerifier> {
     #[cfg(feature = "lnurl")]
     {
         Ok(CoordinatorVerifier::with_lnurl(
-            crate::lnurl_transport::LnurlPayClient::new(relay_connector()?),
+            crate::lnurl_transport::LnurlPayClient::new(relay_connector()?)?,
         ))
     }
     #[cfg(not(feature = "lnurl"))]

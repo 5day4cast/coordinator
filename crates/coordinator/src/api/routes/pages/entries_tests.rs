@@ -28,7 +28,7 @@ async fn get(
     if let Some(keys) = keys {
         // The default origins name the UI served on port 9990.
         let url = format!("http://localhost:9990{path}");
-        let event = create_auth_event("GET", &url, None, keys).await;
+        let event = create_auth_event("GET", &url, None, keys).await.unwrap();
         request = request.header(
             header::AUTHORIZATION,
             format!(

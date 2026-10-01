@@ -17,7 +17,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub network: Network,
     pub ark_server_url: String,
-    pub esplora_url: String,
+    /// The self-hosted electrs Electrum endpoint, using `tcp://` or `ssl://`.
+    pub electrum_url: String,
     /// How long a swap's hold invoice stays payable.
     #[serde(default = "default_invoice_expiry_secs")]
     pub invoice_expiry_secs: u64,
@@ -103,7 +104,7 @@ mod tests {
         data_dir = "/var/lib/ark-swapd"
         network = "signet"
         ark_server_url = "https://arkd.example"
-        esplora_url = "https://esplora.example"
+        electrum_url = "tcp://127.0.0.1:50001"
 
         [lnd]
         rest_url = "https://127.0.0.1:8080/"

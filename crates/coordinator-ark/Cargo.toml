@@ -28,12 +28,12 @@ tonic-prost = { workspace = true }
 test-utils = []
 
 [dev-dependencies]
+electrum-client.workspace = true
 coordinator-ark = { path = ".", features = ["test-utils"] }
 # Proves the transactions this crate builds are the ones the verifier authorizes.
 coordinator-escrow = { workspace = true }
 anyhow = { workspace = true }
 hex = { workspace = true }
-reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

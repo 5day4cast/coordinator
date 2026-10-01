@@ -179,7 +179,6 @@ opt-level = 3
 # and refuses to submit an unsigned commitment TX. Remove this once upstream releases the fix.
 # Every ark crate comes from the fork, so ark-client and our own ark-core/ark-grpc share one ark-core.
 [patch.crates-io]
-ark-bdk-wallet = { git = "https://github.com/tee8z/rust-sdk", branch = "fix/batch-events-by-id" }
 ark-client = { git = "https://github.com/tee8z/rust-sdk", branch = "fix/batch-events-by-id" }
 ark-core = { git = "https://github.com/tee8z/rust-sdk", branch = "fix/batch-events-by-id" }
 ark-delegator = { git = "https://github.com/tee8z/rust-sdk", branch = "fix/batch-events-by-id" }

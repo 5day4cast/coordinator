@@ -13,3 +13,4 @@ pub mod payout_capabilities;
 pub mod payout_protocol;
 pub mod pools;
 pub mod queued;
+pub mod refund_invoice;

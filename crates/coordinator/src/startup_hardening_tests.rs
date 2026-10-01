@@ -8,7 +8,8 @@ async fn forwarded_headers_do_not_bypass_a_peer_limit() {
         &RateLimitSettings::default(),
         1,
         1,
-    );
+    )
+    .unwrap();
     let request = |peer: &str, claimed: &str| {
         Request::builder()
             .uri("/test")

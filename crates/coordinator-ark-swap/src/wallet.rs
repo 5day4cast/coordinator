@@ -17,11 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use ark_bdk_wallet::Wallet;
-use ark_client::{
-    Blockchain, Client, Error, InMemorySwapStorage, OfflineClient, OfflineClientConfig,
-    SpendStatus, TxStatus,
-};
+use ark_client::{Blockchain, Client, InMemorySwapStorage, OfflineClient, OfflineClientConfig};
 use ark_core::send::{
     build_offchain_transactions, sign_ark_transaction, sign_checkpoint_transaction,
     OffchainTransactions, SendReceiver, VtxoInput,
@@ -32,13 +28,15 @@ use bitcoin::key::{Keypair, Secp256k1};
 use bitcoin::psbt;
 use bitcoin::secp256k1::SecretKey;
 use bitcoin::secp256k1::{self, schnorr};
-use bitcoin::{Address, Amount, OutPoint, Transaction, Txid};
+use bitcoin::{Address, Amount, OutPoint, Txid};
 use coordinator_ark::{ArkServer, ArkTransport};
 use coordinator_ark_escrow::{RefundSwap, SwapPath};
 use serde::Serialize;
 
 use crate::coins::{self, Coins, Margins};
 use crate::config::Config;
+use crate::electrum::Electrum;
+use crate::onchain_wallet::BoardingOnlyWallet;
 use crate::swap::unix_now;
 
 /// How many VTXOs the indexer is asked for at a time.
@@ -50,7 +48,7 @@ const VIEW_TTL: Duration = Duration::from_secs(10);
 /// A reading of the wallet slower than this is logged.
 const SLOW_VIEW: Duration = Duration::from_secs(5);
 
-type ArkClient = Client<Esplora, Wallet, InMemorySwapStorage>;
+type ArkClient = Client<Electrum, BoardingOnlyWallet, InMemorySwapStorage>;
 
 /// Where Arkade carries a condition's witness, for the server to finalize with.
 fn condition_key() -> psbt::raw::Key {
@@ -62,12 +60,11 @@ fn condition_key() -> psbt::raw::Key {
 
 /// The witness elements, as the server decodes them: a count, then each length and value.
 fn encode_witness(elements: &[Vec<u8>]) -> Vec<u8> {
-    use bitcoin::consensus::Encodable;
-    let mut bytes = vec![elements.len() as u8];
+    let mut bytes = bitcoin::consensus::serialize(&bitcoin::VarInt(elements.len() as u64));
     for element in elements {
-        bitcoin::VarInt::from(element.len() as u64)
-            .consensus_encode(&mut bytes)
-            .expect("a vector encodes into memory");
+        bytes.extend(bitcoin::consensus::serialize(&bitcoin::VarInt(
+            element.len() as u64,
+        )));
         bytes.extend_from_slice(element);
     }
     bytes
@@ -87,7 +84,7 @@ pub struct ArkWallet {
     /// One send at a time, so concurrent swaps never select the same VTXOs.
     sending: tokio::sync::Mutex<()>,
     /// Where the boarding address's on-chain coins are read from.
-    chain: Arc<Esplora>,
+    chain: Arc<Electrum>,
     margins: Margins,
     /// The last reading of the wallet, for `view`.
     view: Cached<WalletView>,
@@ -224,8 +221,8 @@ impl ArkWallet {
             config.network
         );
         let keypair = load_or_create_key(&config.data_dir.join("wallet.key"))?;
-        let blockchain = Arc::new(Esplora::new(&config.esplora_url)?);
-        let wallet = Arc::new(Wallet::new(keypair, config.network, &config.esplora_url)?);
+        let blockchain = Arc::new(Electrum::connect(&config.electrum_url, config.network).await?);
+        let wallet = Arc::new(BoardingOnlyWallet);
         let client = OfflineClient::with_keypair(
             OfflineClientConfig {
                 ark_server_url: config.ark_server_url.clone(),
@@ -620,110 +617,6 @@ fn load_or_create_key(path: &Path) -> anyhow::Result<Keypair> {
         .with_context(|| format!("create {}", path.display()))?;
     writeln!(file, "{}", hex::encode(secret.secret_bytes()))?;
     Ok(Keypair::from_secret_key(&secp, &secret))
-}
-
-/// Chain data for ark-client, from an Esplora server.
-///
-/// Adapted from `ark-client-sample` in arkade-os/rust-sdk (MIT).
-pub struct Esplora {
-    client: esplora_client::AsyncClient,
-}
-
-impl Esplora {
-    fn new(url: &str) -> anyhow::Result<Self> {
-        Ok(Self {
-            client: esplora_client::Builder::new(url).build_async()?,
-        })
-    }
-}
-
-impl Blockchain for Esplora {
-    async fn find_outpoints(&self, address: &Address) -> Result<Vec<ExplorerUtxo>, Error> {
-        let tip = self.client.get_height().await.map_err(Error::consumer)?;
-        let script_pubkey = address.script_pubkey();
-        let txs = self
-            .client
-            .scripthash_txs(&script_pubkey, None)
-            .await
-            .map_err(Error::consumer)?;
-        let spent: HashSet<OutPoint> = txs
-            .iter()
-            .flat_map(|tx| tx.vin.iter())
-            .filter(|input| {
-                input
-                    .prevout
-                    .as_ref()
-                    .is_some_and(|prevout| prevout.scriptpubkey == script_pubkey)
-            })
-            .map(|input| OutPoint::new(input.txid, input.vout))
-            .collect();
-        Ok(txs
-            .iter()
-            .flat_map(|tx| {
-                tx.vout
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, output)| output.scriptpubkey == script_pubkey)
-                    .map(|(vout, output)| {
-                        let outpoint = OutPoint::new(tx.txid, vout as u32);
-                        let confirmations = tx
-                            .status
-                            .block_height
-                            .and_then(|height| tip.checked_sub(height))
-                            .map_or(0, |depth| depth + 1);
-                        ExplorerUtxo {
-                            outpoint,
-                            amount: Amount::from_sat(output.value),
-                            confirmation_blocktime: tx.status.block_time,
-                            confirmations: u64::from(confirmations),
-                            is_spent: spent.contains(&outpoint),
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect())
-    }
-
-    async fn find_tx(&self, txid: &Txid) -> Result<Option<Transaction>, Error> {
-        self.client.get_tx(txid).await.map_err(Error::consumer)
-    }
-
-    async fn get_tx_status(&self, txid: &Txid) -> Result<TxStatus, Error> {
-        let info = self
-            .client
-            .get_tx_info(txid)
-            .await
-            .map_err(Error::consumer)?;
-        Ok(TxStatus {
-            confirmed_at: info.and_then(|info| info.status.block_time.map(|time| time as i64)),
-        })
-    }
-
-    async fn get_output_status(&self, txid: &Txid, vout: u32) -> Result<SpendStatus, Error> {
-        let status = self
-            .client
-            .get_output_status(txid, u64::from(vout))
-            .await
-            .map_err(Error::consumer)?;
-        Ok(SpendStatus {
-            spend_txid: status.and_then(|status| status.txid),
-        })
-    }
-
-    async fn broadcast(&self, tx: &Transaction) -> Result<(), Error> {
-        self.client.broadcast(tx).await.map_err(Error::consumer)
-    }
-
-    async fn get_fee_rate(&self) -> Result<f64, Error> {
-        Ok(1.0)
-    }
-
-    async fn broadcast_package(&self, txs: &[&Transaction]) -> Result<(), Error> {
-        for tx in txs {
-            self.broadcast(tx).await?;
-        }
-        Ok(())
-    }
 }
 
 /// The VTXO among an address's `vtxos` that a payment of `amount` created: the output of

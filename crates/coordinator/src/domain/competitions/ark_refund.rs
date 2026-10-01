@@ -3,8 +3,8 @@
 //! The player runs no Ark wallet, so the escrow is refunded into a swap that pays their Lightning
 //! Address, and the swap service takes the VTXO in exchange:
 //!
-//! 1. Resolve the player's address for the escrow less the fee they capped, and ask `ark-swapd`
-//!    for a swap committed to that invoice.
+//! 1. Ask the Keymeld verifier to resolve the player's address and authorize its invoice.
+//!    Persist that proof, then ask `ark-swapd` for a swap committed to the invoice.
 //! 2. Spend the escrow into the swap on Arkade, with Keymeld signing as the player. That takes
 //!    two signatures with the server's co-signature between them.
 //! 3. Pay the invoice, and give `ark-swapd` the preimage so it can claim the swap.
@@ -740,7 +740,14 @@ impl Coordinator {
                     return Err(awaiting_sweep(outpoint, sats, &listed));
                 }
                 let refund = self
-                    .mint_refund(ark, &escrow, player, &script, sats)
+                    .mint_refund(
+                        ark,
+                        session.context("the refund needs Keymeld")?,
+                        &escrow,
+                        player,
+                        &script,
+                        sats,
+                    )
                     .await?;
                 self.competition_store
                     .store_ticket_ark_refund(refund.clone())
@@ -781,6 +788,7 @@ impl Coordinator {
                                 refund = self
                                     .remint_refund(
                                         ark,
+                                        session,
                                         &escrow,
                                         player,
                                         &script,
@@ -893,38 +901,37 @@ impl Coordinator {
     async fn mint_refund(
         &self,
         ark: &super::Arkade,
+        session: &DlcKeygenSession,
         escrow: &TicketArkEscrow,
         player: &RefundPlayer,
         escrow_script: &EntryEscrow,
         sats: u64,
     ) -> Result<TicketArkRefund, Error> {
-        let policy = player
+        // The coordinator never authenticates the recipient by copying LNURL metadata.
+        // Keymeld resolves the exact invoice and persists its policy-bound signature first.
+        let _ = player
             .registration()?
             .payout_policy
             .as_ref()
-            .context("the ticket has no payout policy")?;
-        let address = policy
-            .automatic_lightning_address
-            .as_deref()
-            .context(NO_ADDRESS)?
-            .parse()
-            .map_err(|e| anyhow!("The player's Lightning Address is invalid: {e}"))?;
+            .and_then(|policy| policy.automatic_lightning_address.as_ref())
+            .context(NO_ADDRESS)?;
         let fee_sats = ark.max_refund_fee_sats.min(sats.saturating_sub(1));
-        let owed_msat = sats
+        let owed_sats = sats
             .checked_sub(fee_sats)
             .filter(|owed| *owed > 0)
-            .and_then(|owed| owed.checked_mul(1000))
             .context("the refund fee leaves the player nothing")?;
-        let request = self
-            .lnurl
-            .resolve(&address)
+        let authenticated = self
+            .keymeld
+            .request_ark_refund_invoice(
+                session,
+                keymeld_sdk::UserId::from(escrow.ticket_id),
+                owed_sats,
+            )
             .await
-            .map_err(|e| anyhow!("Cannot resolve the player's Lightning Address: {e}"))?;
-        let invoice = self
-            .lnurl
-            .request_invoice(&request, owed_msat)
-            .await
-            .map_err(|e| anyhow!("Cannot get an invoice for the player: {e}"))?;
+            .map_err(|e| anyhow!("Cannot authenticate the refund invoice: {e}"))?;
+        let invoice: lightning_invoice::Bolt11Invoice = authenticated
+            .parse()
+            .map_err(|e| anyhow!("The authenticated refund invoice is invalid: {e}"))?;
         let payment_hash = hex::encode(invoice.payment_hash().as_ref() as &[u8]);
         let deadline = u32::try_from(
             OffsetDateTime::now_utc().unix_timestamp() + SWAP_DEADLINE.as_secs() as i64,
@@ -995,6 +1002,7 @@ impl Coordinator {
     async fn remint_refund(
         &self,
         ark: &super::Arkade,
+        session: &DlcKeygenSession,
         escrow: &TicketArkEscrow,
         player: &RefundPlayer,
         escrow_script: &EntryEscrow,
@@ -1015,7 +1023,7 @@ impl Coordinator {
         let fresh = TicketArkRefund {
             recovery_remints,
             ..self
-                .mint_refund(ark, escrow, player, escrow_script, sats)
+                .mint_refund(ark, session, escrow, player, escrow_script, sats)
                 .await?
         };
         if !self
@@ -1295,6 +1303,7 @@ impl Coordinator {
             refund = self
                 .remint_refund(
                     ark,
+                    session,
                     escrow,
                     player,
                     &input.escrow,
