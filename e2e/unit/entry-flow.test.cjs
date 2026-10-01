@@ -677,7 +677,7 @@ function payingPlayer({ ticket = () => ({ ok: true, json: async () => ({ ticket_
   };
   const tickets = () => requests.filter(({ url }) => url.endsWith("/ticket"));
   const entries = () => requests.filter(({ url }) => url.endsWith("/api/v1/entries"));
-  const announce = (type, detail) => [...(documentListeners[type] ?? [])].forEach((listener) => listener({ detail }));
+  const announce = (type, detail = {}) => [...(documentListeners[type] ?? [])].forEach((listener) => listener({ detail: { ticket_id: "ticket", ...detail } }));
   return { sandbox, elements, modal, pay, settle, tickets, entries, polled, announce };
 }
 
@@ -728,6 +728,91 @@ function closeDialog(modal) {
   modal.classList.remove("is-active");
   modal.dispatch("fw:modal-closed");
 }
+
+test("another competition cannot replace an unpaid invoice or its poller", async () => {
+  const { sandbox, elements, modal, pay, tickets, polled, announce } = payingPlayer();
+  const { done } = await pay();
+  closeDialog(modal);
+  const invoice = elements.walletLinkLightning.href;
+  elements.entryForm.dataset.competitionId = "another-competition";
+  await sandbox.submitEntry();
+  assert.equal(tickets().length, 1);
+  assert.equal(polled.length, 1);
+  assert.equal(elements.walletLinkLightning.href, invoice);
+  assert.equal(modal.dataset.ticketId, "ticket");
+  assert.match(elements.errorMessage.textContent, /pending entry in the other competition/);
+  announce("fw:ticket-failed", { message: "expired" });
+  await done;
+});
+
+test("a different ticket's completion cannot finish the active payment", async () => {
+  const { elements, modal, pay, settle, entries, announce } = payingPlayer();
+  const { done } = await pay();
+  const poller = elements.paymentStatus;
+  announce("fw:ticket-paid", { ticket_id: "older-ticket" });
+  announce("fw:ticket-failed", { ticket_id: "older-ticket", message: "expired" });
+  await settle();
+  assert.equal(entries().length, 0);
+  assert.equal(elements.paymentStatus, poller);
+  assert.ok(modal.classList.contains("is-active"));
+  announce("fw:ticket-paid");
+  await done;
+  assert.equal(entries().length, 1);
+});
+
+function replaceEntryForm(elements, competitionId = COMPETITION) {
+  const replacement = entryPage().elements;
+  replacement.entryForm.dataset.competitionId = competitionId;
+  for (const id of ["entryForm", "submitEntry", "errorMessage", "successMessage"]) {
+    elements[id] = replacement[id];
+  }
+}
+
+test("payment completion updates the form reopened while its invoice was pending", async () => {
+  const { sandbox, elements, modal, pay, tickets, entries, announce } = payingPlayer();
+  const { done } = await pay();
+  closeDialog(modal);
+  replaceEntryForm(elements);
+  await sandbox.submitEntry();
+  assert.ok(elements.submitEntry.classList.contains("is-loading"));
+  announce("fw:ticket-paid");
+  await done;
+  assert.equal(tickets().length, 1);
+  assert.equal(entries().length, 1);
+  assert.equal(elements.submitEntry.textContent, "Entered");
+  assert.equal(elements.submitEntry.disabled, true);
+  assert.ok(!elements.submitEntry.classList.contains("is-loading"));
+  assert.ok(!elements.successMessage.classList.contains("hidden"));
+});
+
+test("payment failure releases the reopened form for retry", async () => {
+  const { sandbox, elements, modal, pay, announce } = payingPlayer();
+  const { done } = await pay();
+  closeDialog(modal);
+  replaceEntryForm(elements);
+  await sandbox.submitEntry();
+  announce("fw:ticket-failed", { message: "Ticket payment expired." });
+  await done;
+  assert.equal(elements.submitEntry.disabled, false);
+  assert.ok(!elements.submitEntry.classList.contains("is-loading"));
+  assert.equal(elements.errorMessage.textContent, "Ticket payment expired.");
+  assert.ok(!elements.errorMessage.classList.contains("hidden"));
+});
+
+test("payment completion leaves another competition's form unchanged", async () => {
+  for (const outcome of ["fw:ticket-paid", "fw:ticket-failed"]) {
+    const { elements, modal, pay, announce } = payingPlayer();
+    const { done } = await pay();
+    closeDialog(modal);
+    replaceEntryForm(elements, "another-competition");
+    announce(outcome, { message: "Ticket payment expired." });
+    await done;
+    assert.equal(elements.submitEntry.disabled, false);
+    assert.equal(elements.submitEntry.textContent, "");
+    assert.ok(elements.successMessage.classList.contains("hidden"));
+    assert.ok(elements.errorMessage.classList.contains("hidden"));
+  }
+});
 
 test("reopening enters the picks as they are when Pay is clicked again", async () => {
   const { sandbox, elements, modal, pay, settle, entries, announce } = payingPlayer();

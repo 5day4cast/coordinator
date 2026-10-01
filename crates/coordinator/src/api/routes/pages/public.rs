@@ -693,7 +693,7 @@ pub async fn ticket_status_fragment(
     let url = format!("/competitions/{competition_id}/tickets/{ticket_id}/status");
     let mut response = fragment(ticket_status(&url, progress), Caching::Private);
     if let Some(event) = progress
-        .event()
+        .event(&ticket_id.to_string())
         .and_then(|event| HeaderValue::from_str(&event).ok())
     {
         response
