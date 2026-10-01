@@ -1,5 +1,6 @@
-//! Export the player pages (home, entry form, help, live leaderboard, picks dialog) with
-//! synthetic data and the bundled assets, for offline screenshots and browser QA.
+//! Export the player pages (home, entry form, a queued competition's entry form, help, live
+//! leaderboard, picks dialog) with synthetic data and the bundled assets, for offline
+//! screenshots and browser QA.
 //! cargo run -p coordinator --example player_ui_fixtures -- /tmp/player-ui
 //! Serve the directory (python3 -m http.server) and open `<page>-<theme>.html`. Scripts are left
 //! out so nothing loads or rewrites the page: each file is exactly what the server renders.
@@ -21,6 +22,7 @@ use coordinator::{
             competitions::{competitions_page, CompetitionView, ListOptions, Queue, QueueView},
             help_page,
         },
+        shared_map::{lat_lon_to_svg, StationPin},
     },
 };
 use maud::{html, Markup, PreEscaped};
@@ -57,14 +59,34 @@ fn main() -> Result<(), Box<dyn Error>> {
             8.0,
         ),
     ];
-    let entry = entry_form(
-        &open,
-        &Forecasts::Ready {
-            stations,
-            pins: vec![],
-        },
+    // The pins sit beside the stations' picks; a queued competition's form adds a "?" to
+    // its Win and Entries.
+    let forecasts = Forecasts::Ready {
+        stations,
+        pins: vec![
+            pin(
+                "KORD",
+                "ORD",
+                "Chicago/O'Hare International, IL",
+                41.98,
+                -87.90,
+            ),
+            pin(
+                "KJFK",
+                "JFK",
+                "New York/JF Kennedy International, NY",
+                40.64,
+                -73.78,
+            ),
+        ],
+    };
+    let payout = PayoutDestination::Address("player@lightning.example".into());
+    let entry = entry_form(&open, &forecasts, None, &payout, NetworkFee::Estimate(437));
+    let entry_queued = entry_form(
+        &queued,
+        &forecasts,
         None,
-        &PayoutDestination::Address("player@lightning.example".into()),
+        &payout,
         NetworkFee::Estimate(437),
     );
 
@@ -169,16 +191,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    let pages: [(&str, Markup); 5] = [
+    let pages: [(&str, Markup); 6] = [
         (
             "home",
             competitions_page(
-                &[open.clone(), queued, live.clone(), finished],
+                &[open.clone(), queued.clone(), live.clone(), finished],
                 ListOptions::default(),
                 now,
             ),
         ),
         ("entry", entry),
+        ("entry-queued", entry_queued),
         ("help", help_page(false)),
         ("leaderboard", PreEscaped(board_page)),
         ("picks", html! { (PreEscaped(scores)) (dialog) }),
@@ -257,6 +280,17 @@ fn station(id: &str, name: &str, high: f64, low: f64, wind: f64) -> StationForec
             (Metric::TempLow, Some(low), Some(line(0.4, 4.0))),
             (Metric::WindSpeed, Some(wind), Some(line(0.5, 2.5))),
         ],
+    }
+}
+
+fn pin(id: &str, label: &str, name: &str, lat: f64, lon: f64) -> StationPin {
+    let (svg_x, svg_y) = lat_lon_to_svg(lat, lon).expect("in the continental US");
+    StationPin {
+        station_id: id.into(),
+        label: label.into(),
+        name: name.into(),
+        svg_x,
+        svg_y,
     }
 }
 

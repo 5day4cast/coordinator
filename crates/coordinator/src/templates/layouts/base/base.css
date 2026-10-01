@@ -67,7 +67,8 @@ a.competition-row.htmx-request {
 }
 
 /* Touch screens: every small control takes a tap of at least 44 px. The copy button keeps its
-   size in the row and takes the tap around it. */
+   size in the row and takes the tap around it, 46 px tall, since a 44 px tap between whole
+   pixels covers only 43 of them. */
 @media (pointer: coarse) {
   .copy-button {
     position: relative;
@@ -78,8 +79,8 @@ a.competition-row.htmx-request {
     position: absolute;
     top: 50%;
     left: 50%;
-    width: max(calc(100% + 8px), 44px);
-    height: 44px;
+    width: max(calc(100% + 8px), 46px);
+    height: 46px;
     transform: translate(-50%, -50%);
   }
 

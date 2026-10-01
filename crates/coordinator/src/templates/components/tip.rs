@@ -66,14 +66,15 @@ mod tests {
         );
     }
 
-    /// On a touch screen a "?" takes a 44 px tap, sized outright: inset from the "?", its
-    /// border took 2 px off and left 42.
+    /// On a touch screen a "?" takes a tap of at least 44 px, sized outright: inset from the
+    /// "?", its border took 2 px off and left 42. It is 46 px, since 44 between whole pixels
+    /// covered only 43 of them.
     #[test]
     fn a_tip_takes_a_44_px_tap_on_a_touch_screen() {
         let touch = &CSS[CSS.find("@media (pointer: coarse)").unwrap()..];
         let tap = rule(touch, ".tip::before");
-        assert_eq!(value(tap, "width"), "44px");
-        assert_eq!(value(tap, "height"), "44px");
+        assert_eq!(value(tap, "width"), "46px");
+        assert_eq!(value(tap, "height"), "46px");
         assert_eq!(value(tap, "transform"), "translate(-50%, -50%)");
     }
 

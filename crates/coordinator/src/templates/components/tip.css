@@ -85,16 +85,17 @@
   transform: none;
 }
 
-/* On touch screens a "?" takes a 44 px tap around it, centred on it. Sized outright rather
-   than inset from the "?", whose border would take 2 px off it. */
+/* On touch screens a "?" takes a tap of at least 44 px around it, centred on it. Sized
+   outright rather than inset from the "?", whose border would take 2 px off it; 46 px, since a
+   44 px tap between whole pixels covers only 43 of them. */
 @media (pointer: coarse) {
   .tip::before {
     content: "";
     position: absolute;
     top: 50%;
     left: 50%;
-    width: 44px;
-    height: 44px;
+    width: 46px;
+    height: 46px;
     transform: translate(-50%, -50%);
   }
 }
