@@ -334,6 +334,9 @@ impl CompetitionRunners {
             let (held, step) = match self.step_with_capacity(competition_id, &signal).await {
                 Ok(admitted) => admitted,
                 Err(StepError::LeaseLost) => {
+                    if self.cancel.is_cancelled() {
+                        break;
+                    }
                     lease = None;
                     if !self.sleep(&signal, self.pacing.lease_retry).await {
                         break;
