@@ -46,6 +46,12 @@ struct FakeSteps {
 }
 
 impl FakeSteps {
+    fn record_step(&self, competition_id: Uuid, holder: &str) -> usize {
+        let mut log = self.log.lock().unwrap();
+        log.push((competition_id, holder.to_owned()));
+        log.iter().filter(|(id, _)| *id == competition_id).count()
+    }
+
     fn steps(&self, competition_id: Uuid) -> Vec<String> {
         self.log
             .lock()
@@ -69,11 +75,7 @@ impl CompetitionSteps for FakeSteps {
         let delay = self.delays.lock().unwrap().get(&id).copied();
         tokio::time::sleep(delay.unwrap_or(Duration::from_millis(5))).await;
         self.in_step.lock().unwrap().remove(&id);
-        let taken = {
-            let mut log = self.log.lock().unwrap();
-            log.push((id, lease.holder.clone()));
-            log.iter().filter(|(logged, _)| *logged == id).count()
-        };
+        let taken = self.record_step(id, &lease.holder);
         if self
             .finish_after
             .lock()
@@ -504,4 +506,62 @@ async fn a_wake_reaches_the_coordinator_driving_the_competition() {
     assert_eq!(steps.overlaps.load(Ordering::SeqCst), 0);
     blue.stop().await;
     green.stop().await;
+}
+
+async fn hold_step_capacity(permit: tokio::sync::OwnedSemaphorePermit, release: Arc<Notify>) {
+    let _permit = permit;
+    release.notified().await;
+}
+
+#[tokio::test]
+async fn capacity_wait_revalidates_the_competition_lease_before_side_effects() {
+    let directory = tempfile::tempdir().unwrap();
+    let steps = Arc::new(FakeSteps::default());
+    let process = Process::start(&directory, "blue", steps.clone()).await;
+    let competition_id = Uuid::now_v7();
+    let resource = Lease::competition_resource(competition_id);
+    process
+        .store
+        .acquire_lease(
+            &resource,
+            &process.runners.holder,
+            Duration::from_millis(30),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let release = Arc::new(Notify::new());
+    let permit = process
+        .runners
+        .permits
+        .clone()
+        .acquire_many_owned(16)
+        .await
+        .unwrap();
+    let capacity = tokio::spawn(hold_step_capacity(permit, release.clone()));
+    let runners = process.runners.clone();
+    let waiting = tokio::spawn(async move {
+        runners
+            .step_with_capacity(competition_id, &Notify::new())
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let green = process
+        .store
+        .acquire_lease(&resource, "green", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .unwrap();
+    release.notify_one();
+    capacity.await.unwrap();
+    assert!(matches!(waiting.await.unwrap(), Err(StepError::LeaseLost)));
+    assert!(steps.steps(competition_id).is_empty());
+    process.store.release_lease(&green).await.unwrap();
+    assert!(process
+        .runners
+        .step_with_capacity(competition_id, &Notify::new())
+        .await
+        .is_ok());
+    assert_eq!(steps.steps(competition_id).len(), 1);
+    process.stop().await;
 }

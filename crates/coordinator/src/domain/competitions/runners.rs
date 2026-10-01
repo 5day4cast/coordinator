@@ -326,51 +326,32 @@ impl CompetitionRunners {
 
     async fn run(self: Arc<Self>, competition_id: Uuid) {
         let signal = self.wakes.signal(competition_id);
-        let resource = Lease::competition_resource(competition_id);
         let mut lease: Option<Lease> = None;
         let mut failures: u32 = 0;
         let mut immediate = 0;
         let mut finished = false;
         while !self.cancel.is_cancelled() {
-            let held = match lease.take() {
-                Some(held) => held,
-                None => match self
-                    .store
-                    .acquire_lease(&resource, &self.holder, self.pacing.lease_ttl)
-                    .await
-                {
-                    Ok(Some(held)) => held,
-                    Ok(None) => {
-                        // Another coordinator drives it; take over once it lets go.
-                        if !self.sleep(&signal, self.pacing.lease_retry).await {
-                            break;
-                        }
-                        continue;
+            let (held, step) = match self.step_with_capacity(competition_id, &signal).await {
+                Ok(admitted) => admitted,
+                Err(StepError::LeaseLost) => {
+                    if self.cancel.is_cancelled() {
+                        break;
                     }
-                    Err(e) => {
-                        failures += 1;
-                        warn!("Cannot take the lease on competition {competition_id}: {e}");
-                        if !self.sleep(&signal, self.backoff(failures)).await {
-                            break;
-                        }
-                        continue;
+                    lease = None;
+                    if !self.sleep(&signal, self.pacing.lease_retry).await {
+                        break;
                     }
-                },
+                    continue;
+                }
+                Err(StepError::Failed(error)) => {
+                    failures += 1;
+                    warn!("Cannot admit competition {competition_id}: {error:#}");
+                    if !self.sleep(&signal, self.backoff(failures)).await {
+                        break;
+                    }
+                    continue;
+                }
             };
-
-            let permit = self
-                .permits
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("the step semaphore is never closed");
-            // This step sees every change woken so far; only a wake during it asks for another.
-            let _ = signal.notified().now_or_never();
-            let step = self
-                .leased(&held, self.steps.step(competition_id, &held, &self.pacing))
-                .await
-                .and_then(|step| step);
-            drop(permit);
 
             let wait = match step {
                 Ok(Step::Finished) => {
@@ -430,6 +411,47 @@ impl CompetitionRunners {
             self.wakes.forget(competition_id);
         }
         self.running.remove(&competition_id);
+    }
+
+    /// Capacity waiting can outlive a retained lease. Acquire or revalidate
+    /// ownership only after admission, before polling any lifecycle work. This
+    /// helper owns the permit so retry and idle waits never retain capacity.
+    async fn step_with_capacity(
+        &self,
+        competition_id: Uuid,
+        signal: &Notify,
+    ) -> Result<(Lease, Result<Step, StepError>), StepError> {
+        let _permit = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return Err(StepError::LeaseLost),
+            permit = self.permits.clone().acquire_owned() => {
+                permit.map_err(|_| StepError::Failed(anyhow::anyhow!("competition step capacity closed")))?
+            }
+        };
+        let held = self
+            .store
+            .acquire_lease(
+                &Lease::competition_resource(competition_id),
+                &self.holder,
+                self.pacing.lease_ttl,
+            )
+            .await
+            .map_err(anyhow::Error::from)?
+            .ok_or(StepError::LeaseLost)?;
+        if self.cancel.is_cancelled() {
+            self.store
+                .release_lease(&held)
+                .await
+                .map_err(anyhow::Error::from)?;
+            return Err(StepError::LeaseLost);
+        }
+        // This step sees all earlier wakes; only a wake during it asks for another.
+        let _ = signal.notified().now_or_never();
+        let step = self
+            .leased(&held, self.steps.step(competition_id, &held, &self.pacing))
+            .await
+            .and_then(|step| step);
+        Ok((held, step))
     }
 
     async fn leased<F: std::future::Future>(

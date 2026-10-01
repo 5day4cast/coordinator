@@ -389,6 +389,9 @@ impl UnpaidWinners {
             .expect_get_derived_private_key()
             .returning(move || Ok(market_maker));
         chain.expect_get_current_height().returning(|| Ok(1_000));
+        chain
+            .expect_get_confirmed_blockchain_time()
+            .returning(|_| Ok(1_790_000_001));
         // The outcome and split transactions confirmed long ago.
         chain
             .expect_get_tx_confirmation_height()
@@ -757,4 +760,57 @@ async fn an_expired_contract_settles_on_its_expiry_outcome() {
         attested.get_current_outcome().unwrap(),
         Outcome::Attestation(0)
     );
+}
+
+/// The mock oracle has no event and returns an error. Expiry remains usable.
+#[tokio::test]
+async fn an_oracle_error_cannot_disable_a_mature_expiry_refund() {
+    let mut fixture = UnpaidWinners::with_contract(
+        signed_contract_expiring(Amount::from_sat(30_000), Some(1_790_000_000)),
+        Amount::from_sat(30_000),
+        HashMap::new(),
+    )
+    .await;
+    fixture.competition.attestation = None;
+    fixture.competition.outcome_transaction = None;
+    fixture.competition.outcome_broadcasted_at = None;
+    fixture
+        .coordinator
+        .check_oracle_attestation(&mut fixture.competition)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.competition.get_current_outcome().unwrap(),
+        Outcome::Expiry
+    );
+    assert!(fixture.competition.expiry_broadcasted_at.is_some());
+    assert_eq!(fixture.broadcasts.lock().unwrap().len(), 1);
+    fixture
+        .coordinator
+        .check_oracle_attestation(&mut fixture.competition)
+        .await
+        .unwrap();
+    assert_eq!(fixture.broadcasts.lock().unwrap().len(), 1);
+    fixture.database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_oracle_error_before_chain_expiry_preserves_the_failure() {
+    let mut fixture = UnpaidWinners::with_contract(
+        signed_contract_expiring(Amount::from_sat(30_000), Some(1_790_000_002)),
+        Amount::from_sat(30_000),
+        HashMap::new(),
+    )
+    .await;
+    fixture.competition.attestation = None;
+    fixture.competition.outcome_transaction = None;
+    fixture.competition.outcome_broadcasted_at = None;
+    assert!(fixture
+        .coordinator
+        .check_oracle_attestation(&mut fixture.competition)
+        .await
+        .is_err());
+    assert!(fixture.competition.expiry_broadcasted_at.is_none());
+    assert!(fixture.broadcasts.lock().unwrap().is_empty());
+    fixture.database.close().await.unwrap();
 }
