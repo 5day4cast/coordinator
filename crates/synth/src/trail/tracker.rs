@@ -37,8 +37,12 @@ use crate::settlement::Settlement;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct TrailConfig {
-    /// How often the followed runs' competitions are looked at.
+    /// How often the followed runs' competitions are looked at, and how often a run's trail is
+    /// refreshed for the first two minutes after its competition moves.
     pub interval_secs: u64,
+    /// How often a run's trail is refreshed while its competition does not move: payouts show up
+    /// on the nodes and in ark-swapd without the competition's state changing.
+    pub slow_interval_secs: u64,
     /// How long after a run starts synth stops following its money. A lifecycle competition
     /// pays out about three hours after its run ends, once its outcome has 144 blocks on it.
     pub follow_timeout_secs: u64,
@@ -60,6 +64,7 @@ impl Default for TrailConfig {
     fn default() -> Self {
         Self {
             interval_secs: 20,
+            slow_interval_secs: REFRESH_AT_LEAST_EVERY.as_secs(),
             follow_timeout_secs: 8 * 3600,
             stuck_watch_secs: 14 * 24 * 3600,
             explorer_url: "https://mutinynet.com".to_string(),
@@ -84,8 +89,15 @@ pub struct PayeeConfig {
 }
 
 /// How long a run's trail may go without a full look, even if its competition seems not to move:
-/// payouts show up on the nodes and in ark-swapd without the competition's state changing.
+/// the default `slow_interval_secs`.
 const REFRESH_AT_LEAST_EVERY: Duration = Duration::from_secs(5 * 60);
+
+/// How long after a run's competition moves its trail is refreshed every `interval_secs`, to see
+/// the money follow: an entry paid, the kickoff, the attestation, a payout.
+const FAST_AFTER_CHANGE: Duration = Duration::from_secs(2 * 60);
+
+/// The most outpoints asked of the Arkade indexer at once, and the page size it is asked for.
+const INDEXER_PAGE: usize = 100;
 
 /// How often stuck money is looked at, to notice it move.
 const STUCK_RECHECK: Duration = Duration::from_secs(15 * 60);
@@ -226,7 +238,7 @@ struct Inner {
     /// Runs being refreshed now, so a page asking twice does not look everything up twice.
     busy: Mutex<HashSet<String>>,
     /// Each followed run's competition as last looked at, and when its trail was last refreshed.
-    seen: Mutex<HashMap<String, (String, Instant)>>,
+    seen: Mutex<HashMap<String, Seen>>,
     unrecorded: Mutex<Option<(Instant, UnrecordedSwaps)>>,
     unrefunded: Mutex<Option<(Instant, UnrefundedCompetitions)>>,
 }
@@ -308,8 +320,11 @@ impl Tracker {
     /// Follow the runs' money for as long as synth runs.
     pub async fn run(&self) {
         info!(
-            "Following each run's money every {}s, for up to {}s after it starts",
-            self.inner.config.interval_secs, self.inner.config.follow_timeout_secs
+            "Following each run's money every {}s for two minutes after its competition moves \
+             and every {}s otherwise, for up to {}s after it starts",
+            self.inner.config.interval_secs,
+            self.inner.config.slow_interval_secs,
+            self.inner.config.follow_timeout_secs
         );
         loop {
             if let Err(e) = self.tick().await {
@@ -330,12 +345,29 @@ impl Tracker {
                 .expect("seen lock")
                 .retain(|id, _| followed.contains(id.as_str()));
         }
+        // Every due run is looked up first, so the Arkade indexer is asked about all their escrow
+        // outputs together.
+        let mut due = Vec::new();
         for run in &runs {
             let Some(competition_id) = competition_of(run) else {
                 continue;
             };
-            if let Err(e) = self.follow(run, competition_id).await {
-                warn!("Cannot follow run {}'s money: {e:#}", run.id);
+            match self.follow(run, competition_id).await {
+                Ok(Some(gathered)) => due.push(gathered),
+                Ok(None) => {}
+                Err(e) => warn!("Cannot follow run {}'s money: {e:#}", run.id),
+            }
+        }
+        let vtxos = self
+            .vtxos(due.iter().flat_map(|(gathered, _)| gathered.outpoints()))
+            .await;
+        for (gathered, fingerprint) in due {
+            let run_id = gathered.run.id.clone();
+            let concluded = self.conclude(gathered, &vtxos).await;
+            self.finish(&run_id);
+            match concluded {
+                Ok(_) => self.saw(&run_id, fingerprint, Instant::now()),
+                Err(e) => warn!("Cannot follow run {run_id}'s money: {e:#}"),
             }
         }
         self.check_unrecorded_swaps().await;
@@ -343,9 +375,14 @@ impl Tracker {
         Ok(())
     }
 
-    /// Look at a run's competition, and refresh the run's trail if it moved or is due. Stuck
-    /// money is only looked at every so often.
-    async fn follow(&self, run: &TestRun, competition_id: Uuid) -> Result<()> {
+    /// Look at a run's competition, and look the run's money up if it moved or is due, but for
+    /// its escrow outputs; with the competition's fingerprint. Stuck money is only looked at
+    /// every so often.
+    async fn follow(
+        &self,
+        run: &TestRun,
+        competition_id: Uuid,
+    ) -> Result<Option<(Gathered, String)>> {
         let last = self
             .inner
             .seen
@@ -356,9 +393,9 @@ impl Tracker {
         if run.money.as_deref() == Some("stuck")
             && last
                 .as_ref()
-                .is_some_and(|(_, at)| at.elapsed() < STUCK_RECHECK)
+                .is_some_and(|seen| seen.refreshed.elapsed() < STUCK_RECHECK)
         {
-            return Ok(());
+            return Ok(None);
         }
         let competition = self.inner.client.get_competition(&competition_id).await;
         let fingerprint = format!(
@@ -369,22 +406,43 @@ impl Tracker {
                 .map(fingerprint)
                 .unwrap_or_else(|_| "unavailable".into())
         );
-        let due = match &last {
-            Some((seen, at)) => *seen != fingerprint || at.elapsed() >= REFRESH_AT_LEAST_EVERY,
-            None => true,
-        };
+        let config = &self.inner.config;
+        let due = is_due(
+            last.as_ref(),
+            &fingerprint,
+            Duration::from_secs(config.interval_secs),
+            Duration::from_secs(config.slow_interval_secs),
+            Instant::now(),
+        );
         if !due || !self.start(&run.id) {
-            return Ok(());
+            return Ok(None);
         }
-        let refreshed = self.refresh_run(run, competition_id, competition).await;
-        self.finish(&run.id);
-        refreshed?;
-        self.inner
-            .seen
-            .lock()
-            .expect("seen lock")
-            .insert(run.id.clone(), (fingerprint, Instant::now()));
-        Ok(())
+        match self.gather(run, competition_id, competition).await {
+            Ok(gathered) => Ok(Some((gathered, fingerprint))),
+            Err(e) => {
+                self.finish(&run.id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Note that a run's trail was refreshed at `now` with its competition as `fingerprint`.
+    fn saw(&self, run_id: &str, fingerprint: String, now: Instant) {
+        let mut seen = self.inner.seen.lock().expect("seen lock");
+        let changed = match seen.get(run_id) {
+            Some(last) if last.fingerprint == fingerprint => last.changed,
+            Some(_) => Some(now),
+            // A run first seen, as every run is when synth starts, starts at the slow cadence.
+            None => None,
+        };
+        seen.insert(
+            run_id.to_string(),
+            Seen {
+                fingerprint,
+                refreshed: now,
+                changed,
+            },
+        );
     }
 
     /// Refresh a run's trail in the background, unless it is being refreshed already: for a page
@@ -435,11 +493,24 @@ impl Tracker {
         competition_id: Uuid,
         competition: Result<CompetitionResponse>,
     ) -> Result<Trail> {
+        let gathered = self.gather(run, competition_id, competition).await?;
+        let vtxos = self.vtxos(gathered.outpoints()).await;
+        self.conclude(gathered, &vtxos).await
+    }
+
+    /// Look everything about a run's money up but its escrow outputs, which the Arkade indexer
+    /// is asked about for every run due at once.
+    async fn gather(
+        &self,
+        run: &TestRun,
+        competition_id: Uuid,
+        competition: Result<CompetitionResponse>,
+    ) -> Result<Gathered> {
         let now = OffsetDateTime::now_utc();
         let steps = self.inner.db.get_steps(&run.id).await?;
         let entries = entries_of(&steps);
-        let previous = self.inner.db.get_trail(&run.id).await?;
-        let previous = previous.as_ref();
+        let previous_trail = self.inner.db.get_trail(&run.id).await?;
+        let previous = previous_trail.as_ref();
         let mut gaps = Vec::new();
 
         let competition = match competition {
@@ -528,7 +599,7 @@ impl Tracker {
             Vec::new()
         };
 
-        let mut trail = Trail {
+        let trail = Trail {
             refreshed_at: now,
             competition_id,
             competition: competition
@@ -547,6 +618,45 @@ impl Tracker {
             held: None,
             gaps,
         };
+        Ok(Gathered {
+            run: run.clone(),
+            entries,
+            previous: previous_trail,
+            trail,
+            unverified_entries,
+            inspect_vtxos: inspect && self.inner.config.arkd_url.is_some(),
+            now,
+        })
+    }
+
+    /// Fill in a run's escrow outputs from what the Arkade indexer said of them, judge where its
+    /// money stands, and save the trail.
+    async fn conclude(&self, gathered: Gathered, vtxos: &Vtxos) -> Result<Trail> {
+        let asked = gathered.outpoints();
+        let Gathered {
+            run,
+            entries,
+            previous,
+            mut trail,
+            unverified_entries,
+            now,
+            ..
+        } = gathered;
+        let run = &run;
+        let previous = previous.as_ref();
+        for swap in &mut trail.swaps {
+            let Some(outpoint) = swap.escrow_vtxo.as_ref().filter(|o| asked.contains(*o)) else {
+                continue;
+            };
+            match vtxos.get(outpoint) {
+                Some(Ok(found)) => swap.vtxo = Some(found.clone()),
+                Some(Err(e)) => trail.gaps.push(format!("the Arkade indexer: {e}")),
+                None => trail.gaps.push(format!(
+                    "the Arkade indexer does not know {}'s escrow output",
+                    swap.user
+                )),
+            }
+        }
         trail.money = judge(&Evidence {
             running: run.status == "running",
             competition: trail.competition.as_ref(),
@@ -795,8 +905,8 @@ impl Tracker {
         swaps
     }
 
-    /// Look up what holds an entry's money: its invoice on the node that issued it, and its
-    /// escrow output in the Arkade server's indexer.
+    /// Look up what holds an entry's money: its invoice on the node that issued it. Its escrow
+    /// output is asked of the Arkade server's indexer with every other due run's; see `vtxos`.
     async fn inspect_swap(&self, entry: &EntryTrace, swap: &mut SwapSeen, gaps: &mut Vec<String>) {
         let issuer = entry
             .invoice
@@ -817,24 +927,29 @@ impl Tracker {
                 }
             }
         }
-        let (Some(arkd), Some(outpoint)) = (&self.inner.config.arkd_url, &swap.escrow_vtxo) else {
-            return;
+    }
+
+    /// Ask the Arkade indexer about `outpoints`, at most `INDEXER_PAGE` in each request, and
+    /// never one request per outpoint. An outpoint missing from the answer is one the indexer
+    /// does not know.
+    async fn vtxos(&self, outpoints: impl IntoIterator<Item = String>) -> Vtxos {
+        let Some(arkd) = &self.inner.config.arkd_url else {
+            return Vtxos::new();
         };
-        if swap
-            .vtxo
-            .as_ref()
-            .is_some_and(|vtxo| vtxo.spent || vtxo.swept)
-        {
-            return;
+        let mut outpoints: Vec<String> = outpoints.into_iter().collect();
+        outpoints.sort();
+        outpoints.dedup();
+        let mut answers = Vtxos::new();
+        for asked in outpoints.chunks(INDEXER_PAGE) {
+            match indexed_vtxos(&self.inner.http, arkd, asked).await {
+                Ok(found) => answers.extend(found.into_iter().map(|(at, vtxo)| (at, Ok(vtxo)))),
+                Err(e) => {
+                    let e = format!("{e:#}");
+                    answers.extend(asked.iter().map(|at| (at.clone(), Err(e.clone()))));
+                }
+            }
         }
-        match vtxo(&self.inner.http, arkd, outpoint).await {
-            Ok(Some(found)) => swap.vtxo = Some(found),
-            Ok(None) => gaps.push(format!(
-                "the Arkade indexer does not know {}'s escrow output",
-                entry.user
-            )),
-            Err(e) => gaps.push(format!("the Arkade indexer: {e:#}")),
-        }
+        answers
     }
 
     /// The reachable node with this public key.
@@ -1292,16 +1407,37 @@ fn payee_of(invoice: &lightning_invoice::Bolt11Invoice) -> String {
         .to_string()
 }
 
-/// An Arkade output, from the server's indexer. None if it does not know the output.
-async fn vtxo(http: &reqwest::Client, arkd: &str, outpoint: &str) -> Result<Option<VtxoSeen>> {
+/// Arkade outputs by `txid:vout`, from the server's indexer, in one request per page of at most
+/// `INDEXER_PAGE`. Outputs it does not know are left out.
+async fn indexed_vtxos(
+    http: &reqwest::Client,
+    arkd: &str,
+    outpoints: &[String],
+) -> Result<HashMap<String, VtxoSeen>> {
     #[derive(Deserialize)]
     struct Found {
         #[serde(default)]
         vtxos: Vec<Indexed>,
+        #[serde(default)]
+        page: Option<Page>,
+    }
+    #[derive(Deserialize)]
+    struct Page {
+        #[serde(default, deserialize_with = "number")]
+        next: u64,
+        #[serde(default, deserialize_with = "number")]
+        total: u64,
+    }
+    #[derive(Deserialize)]
+    struct Outpoint {
+        txid: String,
+        #[serde(default, deserialize_with = "number")]
+        vout: u64,
     }
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Indexed {
+        outpoint: Outpoint,
         #[serde(default, deserialize_with = "number")]
         amount: u64,
         #[serde(default, deserialize_with = "number", alias = "expires_at")]
@@ -1328,26 +1464,49 @@ async fn vtxo(http: &reqwest::Client, arkd: &str, outpoint: &str) -> Result<Opti
             Number::Plain(number) => Ok(number),
         }
     }
-    let response = http
-        .get(format!("{}/v1/indexer/vtxos", arkd.trim_end_matches('/')))
-        .query(&[("outpoints", outpoint)])
-        .send()
-        .await
-        .context("ask the Arkade indexer")?;
-    anyhow::ensure!(response.status().is_success(), "{}", response.status());
-    let found: Found = response.json().await.context("read the Arkade indexer")?;
     let non_empty = |text: String| Some(text).filter(|text| !text.is_empty());
-    Ok(found.vtxos.into_iter().next().map(|vtxo| VtxoSeen {
-        amount_sat: vtxo.amount,
-        // The indexer gives seconds; some versions give milliseconds.
-        expires_at: Some(vtxo.expires_at)
-            .filter(|at| *at > 0)
-            .map(|at| if at > 10_000_000_000 { at / 1000 } else { at } as i64),
-        spent: vtxo.is_spent,
-        swept: vtxo.is_swept,
-        spent_by: non_empty(vtxo.spent_by),
-        settled_by: non_empty(vtxo.settled_by),
-    }))
+    let url = format!("{}/v1/indexer/vtxos", arkd.trim_end_matches('/'));
+    let mut query: Vec<(&str, String)> = outpoints
+        .iter()
+        .map(|outpoint| ("outpoints", outpoint.clone()))
+        .collect();
+    query.push(("page.size", INDEXER_PAGE.to_string()));
+    let mut found = HashMap::new();
+    let mut index = 0;
+    loop {
+        let response = http
+            .get(&url)
+            .query(&query)
+            .query(&[("page.index", index)])
+            .send()
+            .await
+            .context("ask the Arkade indexer")?;
+        anyhow::ensure!(response.status().is_success(), "{}", response.status());
+        let page: Found = response.json().await.context("read the Arkade indexer")?;
+        found.extend(page.vtxos.into_iter().map(|vtxo| {
+            (
+                format!("{}:{}", vtxo.outpoint.txid, vtxo.outpoint.vout),
+                VtxoSeen {
+                    amount_sat: vtxo.amount,
+                    // The indexer gives seconds; some versions give milliseconds.
+                    expires_at: Some(vtxo.expires_at)
+                        .filter(|at| *at > 0)
+                        .map(|at| if at > 10_000_000_000 { at / 1000 } else { at } as i64),
+                    spent: vtxo.is_spent,
+                    swept: vtxo.is_swept,
+                    spent_by: non_empty(vtxo.spent_by),
+                    settled_by: non_empty(vtxo.settled_by),
+                },
+            )
+        }));
+        // Pages of `INDEXER_PAGE` outpoints fit in one page of answers; a further page is
+        // followed only if the indexer says there is one.
+        match page.page {
+            Some(page) if page.next > index && page.next < page.total => index = page.next,
+            _ => break,
+        }
+    }
+    Ok(found)
 }
 
 /// What is held while money is stuck, and what happened to it once it moved.
@@ -1495,6 +1654,87 @@ fn unverified_entries(
         })
         .count();
     unreadable + unanswered
+}
+
+/// What was last seen of a followed run.
+#[derive(Debug, Clone)]
+struct Seen {
+    /// Its competition, as `fingerprint` gives it.
+    fingerprint: String,
+    /// When its trail was last refreshed.
+    refreshed: Instant,
+    /// When its competition was last seen to move, if it was since synth started.
+    changed: Option<Instant>,
+}
+
+/// Whether a run's trail is due a refresh at `now`, its competition being `fingerprint`: at once
+/// when the competition moved, every `fast` for `FAST_AFTER_CHANGE` after, and every `slow`
+/// otherwise.
+fn is_due(
+    last: Option<&Seen>,
+    fingerprint: &str,
+    fast: Duration,
+    slow: Duration,
+    now: Instant,
+) -> bool {
+    let Some(last) = last else {
+        return true;
+    };
+    if last.fingerprint != fingerprint {
+        return true;
+    }
+    let moved_lately = last
+        .changed
+        .is_some_and(|changed| now.saturating_duration_since(changed) < FAST_AFTER_CHANGE);
+    let every = if moved_lately { fast } else { slow };
+    now.saturating_duration_since(last.refreshed) >= every
+}
+
+/// Arkade outputs by `txid:vout`, as the indexer answered for them, or why it did not.
+type Vtxos = HashMap<String, std::result::Result<VtxoSeen, String>>;
+
+/// A run's money, looked up but for its escrow outputs and not judged yet.
+struct Gathered {
+    run: TestRun,
+    entries: Vec<EntryTrace>,
+    previous: Option<Trail>,
+    trail: Trail,
+    unverified_entries: usize,
+    /// Held money is looked at closely, down to its escrow outputs, when the indexer is known.
+    inspect_vtxos: bool,
+    now: OffsetDateTime,
+}
+
+impl Gathered {
+    /// The escrow outputs to ask the Arkade indexer about: those that can still change. One seen
+    /// spent or swept, or whose entry's refund has settled, is not asked about again.
+    fn outpoints(&self) -> Vec<String> {
+        if !self.inspect_vtxos {
+            return Vec::new();
+        }
+        self.trail
+            .swaps
+            .iter()
+            .filter(|swap| {
+                !swap
+                    .vtxo
+                    .as_ref()
+                    .is_some_and(|vtxo| vtxo.spent || vtxo.swept)
+            })
+            .filter(|swap| {
+                !self
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.payment_hash.as_ref() == Some(&swap.payment_hash))
+                    .any(|entry| {
+                        self.trail
+                            .refund_of(entry)
+                            .is_some_and(RefundSeen::is_settled)
+                    })
+            })
+            .filter_map(|swap| swap.escrow_vtxo.clone())
+            .collect()
+    }
 }
 
 fn competition_of(run: &TestRun) -> Option<Uuid> {
@@ -2416,5 +2656,216 @@ mod tests {
 
         // Before its window opens, a competition waiting for entries may still run.
         assert!(unrefunded(&[unfilled], datetime!(2026-09-28 20:00:00 UTC)).is_empty());
+    }
+
+    #[test]
+    fn a_run_is_refreshed_often_only_for_two_minutes_after_its_competition_moves() {
+        let fast = Duration::from_secs(20);
+        let slow = Duration::from_secs(300);
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        assert!(is_due(None, "paid", fast, slow, start));
+
+        let moved = Seen {
+            fingerprint: "paid".into(),
+            refreshed: start,
+            changed: Some(start),
+        };
+        assert!(!is_due(Some(&moved), "paid", fast, slow, at(19)));
+        assert!(is_due(Some(&moved), "paid", fast, slow, at(20)));
+
+        let settled = Seen {
+            refreshed: at(120),
+            ..moved.clone()
+        };
+        assert!(
+            !is_due(Some(&settled), "paid", fast, slow, at(140)),
+            "two minutes on, it slows down"
+        );
+        assert!(!is_due(Some(&settled), "paid", fast, slow, at(419)));
+        assert!(is_due(Some(&settled), "paid", fast, slow, at(420)));
+        assert!(
+            is_due(Some(&settled), "kicked off", fast, slow, at(121)),
+            "a move is refreshed at once"
+        );
+
+        let first_seen = Seen {
+            changed: None,
+            ..moved
+        };
+        assert!(
+            !is_due(Some(&first_seen), "paid", fast, slow, at(20)),
+            "a run first seen, as when synth starts, is refreshed slowly"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_move_starts_the_fast_cadence_and_a_first_look_does_not() {
+        let fixture = fixture(Router::new(), false, false).await;
+        let start = Instant::now();
+        let tracker = &fixture.tracker;
+        let seen = |run: &str| {
+            tracker
+                .inner
+                .seen
+                .lock()
+                .unwrap()
+                .get(run)
+                .cloned()
+                .unwrap()
+        };
+        tracker.saw("run", "paid".into(), start);
+        assert_eq!(seen("run").changed, None);
+        tracker.saw("run", "paid".into(), start + Duration::from_secs(300));
+        assert_eq!(seen("run").changed, None);
+        let kickoff = start + Duration::from_secs(600);
+        tracker.saw("run", "kicked off".into(), kickoff);
+        assert_eq!(seen("run").changed, Some(kickoff));
+        tracker.saw(
+            "run",
+            "kicked off".into(),
+            kickoff + Duration::from_secs(20),
+        );
+        assert_eq!(seen("run").changed, Some(kickoff));
+    }
+
+    /// An Arkade indexer that knows every outpoint it is asked about, spent when its txid starts
+    /// with `a1`, and keeps the outpoints of each request.
+    fn indexer(asked: Arc<Mutex<Vec<Vec<String>>>>) -> Router {
+        Router::new().route(
+            "/v1/indexer/vtxos",
+            get(
+                move |axum::extract::RawQuery(query): axum::extract::RawQuery| {
+                    let asked = asked.clone();
+                    async move {
+                        let outpoints: Vec<String> = query
+                            .unwrap_or_default()
+                            .split('&')
+                            .filter_map(|pair| pair.strip_prefix("outpoints="))
+                            .map(|outpoint| outpoint.replace("%3A", ":"))
+                            .collect();
+                        asked.lock().unwrap().push(outpoints.clone());
+                        let vtxos: Vec<serde_json::Value> = outpoints
+                            .iter()
+                            .map(|outpoint| {
+                                let (txid, vout) = outpoint.split_once(':').unwrap();
+                                serde_json::json!({
+                                    "outpoint": { "txid": txid, "vout": vout.parse::<u32>().unwrap() },
+                                    "amount": "1100",
+                                    "expiresAt": "1790000000",
+                                    "isSpent": txid.starts_with("a1"),
+                                    "isSwept": false,
+                                })
+                            })
+                            .collect();
+                        let total = vtxos.len();
+                        Json(serde_json::json!({
+                            "vtxos": vtxos,
+                            "page": { "current": 0, "next": total, "total": total },
+                        }))
+                    }
+                },
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_indexer_is_asked_in_pages_of_at_most_a_hundred_outpoints() {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let mut fixture = fixture(indexer(asked.clone()), false, false).await;
+        Arc::get_mut(&mut fixture.tracker.inner)
+            .unwrap()
+            .config
+            .arkd_url = Some(fixture.url.clone());
+        let outpoints: Vec<String> = (0..150).map(|n| format!("{n:064x}:1")).collect();
+
+        let vtxos = fixture.tracker.vtxos(outpoints.clone()).await;
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(
+            asked.iter().map(Vec::len).collect::<Vec<_>>(),
+            [100, 50],
+            "never one request per outpoint"
+        );
+        assert_eq!(vtxos.len(), 150);
+        assert!(outpoints
+            .iter()
+            .all(|outpoint| vtxos[outpoint].as_ref().unwrap().amount_sat == 1100));
+    }
+
+    /// Two runs whose competitions were cancelled hold their players' escrows. One request asks
+    /// about both escrow outputs, and an output seen spent is not asked about again.
+    #[tokio::test]
+    async fn one_indexer_request_serves_every_due_run_and_a_spent_output_is_not_asked_again() {
+        let an_hour_ago = (OffsetDateTime::now_utc() - time::Duration::hours(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let router =
+            Router::new()
+                .route(
+                    "/api/v1/competitions/{id}",
+                    get(move |axum::extract::Path(id): axum::extract::Path<Uuid>| {
+                        let an_hour_ago = an_hour_ago.clone();
+                        async move {
+                            Json(serde_json::json!({
+                                "id": id,
+                                "created_at": "2026-09-24T01:00:00Z",
+                                "event_submission": {},
+                                "cancelled_at": an_hour_ago,
+                            }))
+                        }
+                    }),
+                )
+                .route(
+                    "/v1/swaps",
+                    get(
+                        |axum::extract::Query(query): axum::extract::Query<
+                            HashMap<String, String>,
+                        >| async move {
+                            let Some(hash) = query.get("payment_hash") else {
+                                return Json(serde_json::json!([])).into_response();
+                            };
+                            let txid = if hash.starts_with("aa") { "a1" } else { "b1" };
+                            Json(serde_json::json!({
+                                "id": Uuid::now_v7(), "escrow_address": "tark1escrow",
+                                "amount_sat": 1100, "payment_hash": hash, "state": "settled",
+                                "escrow_vtxo": format!("{}:0", txid.repeat(32)),
+                            }))
+                            .into_response()
+                        },
+                    ),
+                )
+                .merge(indexer(asked.clone()));
+        let mut fixture = fixture(router, false, true).await;
+        fixture.follow_for(3600);
+        Arc::get_mut(&mut fixture.tracker.inner)
+            .unwrap()
+            .config
+            .arkd_url = Some(fixture.url.clone());
+        let entry = |user: &str, hash: &str| {
+            serde_json::json!({
+                "user": user, "nostr_pubkey": "00", "paid": true, "amount_sats": 1100,
+                "payment_hash": hash.repeat(32)
+            })
+        };
+        let alice = fixture.run(Uuid::now_v7(), &[entry("alice", "aa")]).await;
+        fixture.run(Uuid::now_v7(), &[entry("bob", "bb")]).await;
+        let spent = format!("{}:0", "a1".repeat(32));
+        let unspent = format!("{}:0", "b1".repeat(32));
+
+        fixture.tracker.tick().await.unwrap();
+        assert_eq!(*asked.lock().unwrap(), [vec![spent, unspent.clone()]]);
+        let trail = fixture.db().get_trail(&alice.id).await.unwrap().unwrap();
+        assert!(trail.swaps[0].vtxo.as_ref().unwrap().spent);
+
+        // Both runs are due again, as after a restart.
+        fixture.tracker.inner.seen.lock().unwrap().clear();
+        fixture.tracker.tick().await.unwrap();
+        assert_eq!(asked.lock().unwrap()[1], [unspent]);
+        let trail = fixture.db().get_trail(&alice.id).await.unwrap().unwrap();
+        assert!(
+            trail.swaps[0].vtxo.as_ref().unwrap().spent,
+            "what was seen is kept"
+        );
     }
 }

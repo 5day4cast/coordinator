@@ -7,8 +7,13 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::config::LndConfig;
+use crate::invoices::{InvoiceSource, SeenState};
 
 const MACAROON_HEADER: &str = "Grpc-Metadata-macaroon";
+
+/// How long an invoice stream may stay open. It is dropped once its swap leaves
+/// `AwaitingPayment`, well within this; the other calls keep the client's 20 second timeout.
+const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// A hold invoice's state in LND.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -21,6 +26,7 @@ pub enum InvoiceState {
     Canceled,
 }
 
+#[derive(Clone)]
 pub struct Lnd {
     client: reqwest::Client,
     base_url: String,
@@ -92,6 +98,56 @@ impl Lnd {
         Ok(response.json::<Lookup>().await?.state)
     }
 
+    /// Follow one invoice on LND's `SubscribeSingleInvoice` stream, recording each state it
+    /// shows in `seen`, until the stream ends. LND sends the invoice's current state first.
+    pub async fn follow_invoice(
+        &self,
+        payment_hash: [u8; 32],
+        seen: SeenState,
+    ) -> anyhow::Result<()> {
+        #[derive(Deserialize)]
+        struct Update {
+            result: Option<Invoice>,
+            error: Option<serde_json::Value>,
+        }
+        #[derive(Deserialize)]
+        struct Invoice {
+            state: InvoiceState,
+        }
+        let response = self
+            .client
+            .get(format!(
+                "{}v2/invoices/subscribe/{}",
+                self.base_url,
+                URL_SAFE.encode(payment_hash)
+            ))
+            .header(MACAROON_HEADER, &self.macaroon)
+            .timeout(STREAM_TIMEOUT)
+            .send()
+            .await?;
+        let mut response = checked(response, "subscribe to the invoice").await?;
+        // One JSON object per line, which may arrive split across chunks.
+        let mut pending = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            pending.extend_from_slice(&chunk);
+            while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = pending.drain(..=end).collect();
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                let update: Update =
+                    serde_json::from_slice(&line).context("read an invoice stream update")?;
+                if let Some(error) = update.error {
+                    return Err(anyhow!("LND invoice stream error: {error}"));
+                }
+                if let Some(invoice) = update.result {
+                    seen.record(invoice.state);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn settle(&self, preimage: &[u8; 32]) -> anyhow::Result<()> {
         self.post(
             "v2/invoices/settle",
@@ -119,6 +175,16 @@ impl Lnd {
             .send()
             .await?;
         checked(response, path).await
+    }
+}
+
+impl InvoiceSource for Lnd {
+    async fn invoice_state(&self, payment_hash: &[u8; 32]) -> anyhow::Result<InvoiceState> {
+        Lnd::invoice_state(self, payment_hash).await
+    }
+
+    async fn follow_invoice(&self, payment_hash: [u8; 32], seen: SeenState) -> anyhow::Result<()> {
+        Lnd::follow_invoice(self, payment_hash, seen).await
     }
 }
 
