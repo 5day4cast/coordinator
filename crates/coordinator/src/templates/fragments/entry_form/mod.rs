@@ -890,8 +890,9 @@ mod tests {
     }
 
     /// A fact's 44 px "?" takes its own room above, below and after it: hanging into the next
-    /// fact, that fact covered 13 px of it. The total that opens the price's parts is a 44 px
-    /// tall tap too.
+    /// fact, that fact covered 13 px of it. It is square, since a tap follows rounded corners
+    /// and the term took them. The total that opens the price's parts is a 44 px tall tap too,
+    /// padded rather than set in bigger text.
     #[test]
     fn the_facts_taps_are_44_px_and_not_covered() {
         use crate::templates::css_check::{rule, value};
@@ -904,10 +905,66 @@ mod tests {
             value(tip, "margin-left"),
             "calc(0.3rem + (1.05rem - 44px) / 2)"
         );
+        assert_eq!(value(tip, "border-radius"), "0");
+        let coarse = &CSS[CSS.rfind("@media (pointer: coarse)").unwrap()..];
+        let total = rule(coarse, ".price-details summary");
+        assert_eq!(value(total, "padding"), "calc((44px - 1lh) / 2) 0");
+        assert!(!total.contains("font-size"));
+    }
+
+    /// A pin and its label are one link, whose tap on a touch screen is a square around the
+    /// pin of at least 46 px: 1 map unit scaled up as far as 46 px over the narrowest map each
+    /// width draws (398 px at most, 58 px under the screen's width). Elsewhere it takes no taps.
+    #[test]
+    fn a_pin_takes_a_46_px_tap_on_a_touch_screen() {
+        use crate::templates::css_check::{rule, value};
+        use crate::templates::shared_map::{station_map, StationPin};
+        let map = station_map(&[StationPin {
+            station_id: "KORD".into(),
+            label: "ORD".into(),
+            name: "Chicago/O'Hare International, IL".into(),
+            svg_x: 382.5,
+            svg_y: 110.0,
+        }])
+        .into_string();
+        let link = &map[map.find("<a ").unwrap()..map.find("</a>").unwrap()];
+        assert!(link.contains(
+            r#"<rect class="station-pin-hit" x="382.0" y="109.5" width="1" height="1"></rect>"#
+        ));
+        assert!(link.contains(r#"class="station-pin-label""#));
+        let idle = rule(CSS, ".station-pin-hit");
+        assert_eq!(value(idle, "pointer-events"), "none");
+        // Scaled up, a 1 unit outline would add half the square again on each side.
+        assert_eq!(value(idle, "stroke-width"), "0");
+        assert_eq!(value(idle, "transform-box"), "fill-box");
+        assert_eq!(value(idle, "transform-origin"), "center");
         let coarse = &CSS[CSS.find("@media (pointer: coarse)").unwrap()..];
         assert_eq!(
-            value(rule(coarse, ".price-details summary"), "min-height"),
-            "44px"
+            value(rule(coarse, ".station-pin-hit"), "pointer-events"),
+            "all"
         );
+        // (media query, narrowest screen it covers, scale)
+        for (media, screen, scale) in [
+            ("@media (pointer: coarse)", 456.0, 70.0),
+            (
+                "@media screen and (max-width: 455px) and (pointer: coarse)",
+                360.0,
+                92.0,
+            ),
+            (
+                "@media screen and (max-width: 359px) and (pointer: coarse)",
+                320.0,
+                106.0,
+            ),
+        ] {
+            let block = &CSS[CSS.find(media).unwrap()..];
+            assert_eq!(
+                value(rule(block, ".station-pin-hit"), "transform"),
+                format!("scale({scale})")
+            );
+            let map_width = f64::min(screen - 58.0, 398.0);
+            let tap = scale * map_width / 599.96;
+            assert!(tap >= 46.0, "{media}: {tap:.1} px");
+        }
     }
 }

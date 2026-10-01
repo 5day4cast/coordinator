@@ -100,6 +100,9 @@ pub fn station_map(pins: &[StationPin]) -> Markup {
                 @for pin in pins {
                     a href=(format!("#station-{}", pin.station_id)) aria-label=(format!("{}: jump to picks", pin.name)) {
                         title { (pin.name) }
+                        // The pin's tap on a touch screen (entry_form.css).
+                        rect class="station-pin-hit" x=(format!("{:.1}", pin.svg_x - 0.5)) y=(format!("{:.1}", pin.svg_y - 0.5))
+                             width="1" height="1" {}
                         circle class="station-pin" cx=(format!("{:.1}", pin.svg_x)) cy=(format!("{:.1}", pin.svg_y)) r="6" {}
                         text class="station-pin-label"
                              x=(format!("{:.1}", pin.svg_x + if pin.svg_x > 520.0 { -9.0 } else { 9.0 }))

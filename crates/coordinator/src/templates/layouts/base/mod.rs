@@ -131,16 +131,16 @@ mod tests {
         ));
     }
 
-    /// On a touch screen Copy takes a tap 44 px tall, and at least as wide, centred on it: an
-    /// inset around the button left 42.
+    /// On a touch screen Copy takes a tap at least 44 px tall and wide, centred on it: an inset
+    /// around the button left 42. It is 46 px, since 44 between whole pixels covered only 43.
     #[test]
     fn copy_takes_a_44_px_tap_on_a_touch_screen() {
         use crate::templates::css_check::{rule, value};
         let base = include_str!("base.css");
         let touch = &base[base.find("@media (pointer: coarse)").unwrap()..];
         let tap = rule(touch, ".copy-button::before");
-        assert_eq!(value(tap, "height"), "44px");
-        assert_eq!(value(tap, "width"), "max(calc(100% + 8px), 44px)");
+        assert_eq!(value(tap, "height"), "46px");
+        assert_eq!(value(tap, "width"), "max(calc(100% + 8px), 46px)");
     }
 
     /// Phone tables shrink small buttons to 32 px (styles.css); on a touch screen Picks keeps

@@ -40,7 +40,9 @@
 /* The usual 44 px tap around a "?" hangs from the "?" itself (tip.css); here the "?" is not
    positioned, so the tap is its own transparent border and the ring is drawn inside it. It
    takes its own room above, below and after it, so the next fact never covers part of it; it
-   reaches back only over its own term. */
+   reaches back only over its own term. The box is square, since a tap follows its rounded
+   corners: round, its corners fell through to the term and left about 30 px of it near the
+   edges. The ring, and the focus ring, are drawn round on it instead. */
 @media screen and (max-width: 768px) and (pointer: coarse) {
   .entry-facts .tip {
     width: 44px;
@@ -48,9 +50,27 @@
     margin: 0;
     margin-left: calc(0.3rem + (1.05rem - 44px) / 2);
     border: calc((44px - 1.05rem) / 2) solid transparent;
-    box-shadow: inset 0 0 0 1px var(--bulma-border);
-    background-clip: padding-box;
-    outline-offset: calc((1.05rem - 44px) / 2 + 1px);
+    border-radius: 0;
+    background: radial-gradient(
+        circle,
+        transparent calc(0.525rem - 1px),
+        var(--bulma-border) calc(0.525rem - 1px) 0.525rem,
+        transparent 0.525rem
+      )
+      border-box;
+  }
+
+  /* Transparent, so forced colours still draw an outline. */
+  .entry-facts .tip:focus-visible {
+    outline: 2px solid transparent;
+    background-image: radial-gradient(
+      circle,
+      transparent calc(0.525rem - 1px),
+      var(--bulma-border) calc(0.525rem - 1px) 0.525rem,
+      transparent 0.525rem calc(0.525rem + 1px),
+      var(--bulma-link) calc(0.525rem + 1px) calc(0.525rem + 3px),
+      transparent calc(0.525rem + 3px)
+    );
   }
 
   .entry-facts .tip::before {
@@ -135,6 +155,42 @@
 @media screen and (max-width: 480px) {
   .station-pin-label {
     font-size: 26px;
+  }
+}
+
+/* A pin and its label are one link. On a phone the pin is 7 px across, so on touch screens
+   each pin takes a square tap of at least 46 px around it, never painted: a 1 unit square
+   scaled about its centre. The map is drawn 398 px wide at most, and 58 px narrower than a
+   narrower screen, so the scale grows as the screen narrows. (A stroke that keeps its width in
+   screen pixels would need no steps, but Chromium hit-tests it at its width in map units.) A
+   tap counts the outline too, painted or not, so it has none. */
+.station-pin-hit {
+  fill: none;
+  stroke: none;
+  stroke-width: 0;
+  pointer-events: none;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+@media (pointer: coarse) {
+  .station-pin-hit {
+    pointer-events: all;
+    transform: scale(70);
+  }
+}
+
+/* From 360 px wide. */
+@media screen and (max-width: 455px) and (pointer: coarse) {
+  .station-pin-hit {
+    transform: scale(92);
+  }
+}
+
+/* From 320 px wide. */
+@media screen and (max-width: 359px) and (pointer: coarse) {
+  .station-pin-hit {
+    transform: scale(106);
   }
 }
 
@@ -337,12 +393,12 @@
   content: " ▴";
 }
 
-/* On touch screens the total is a 44 px tall tap. */
+/* On touch screens the total is a 44 px tall tap: padding above and below its line, at the
+   same size of text. */
 @media (pointer: coarse) {
   .price-details summary {
-    display: inline-flex;
-    align-items: center;
-    min-height: 44px;
+    display: inline-block;
+    padding: calc((44px - 1lh) / 2) 0;
   }
 }
 
