@@ -370,12 +370,14 @@ impl From<&TicketStatus> for TicketProgress {
 impl TicketProgress {
     /// The `HX-Trigger` header that tells `entry_form.js` the payment is
     /// over, once it is.
-    pub fn event(self) -> Option<String> {
+    pub fn event(self, ticket_id: &str) -> Option<String> {
         match self {
             TicketProgress::Waiting => None,
-            TicketProgress::Paid => Some("fw:ticket-paid".into()),
+            TicketProgress::Paid => {
+                Some(serde_json::json!({ "fw:ticket-paid": { "ticket_id": ticket_id } }).to_string())
+            }
             TicketProgress::Failed(message) => {
-                Some(serde_json::json!({ "fw:ticket-failed": { "message": message } }).to_string())
+                Some(serde_json::json!({ "fw:ticket-failed": { "ticket_id": ticket_id, "message": message } }).to_string())
             }
         }
     }
@@ -462,16 +464,18 @@ mod tests {
         assert!(waiting.contains(
             r#"hx-get="/competitions/c1/tickets/t1/status" hx-trigger="every 2s" hx-sync="drop""#
         ));
-        assert_eq!(TicketProgress::Waiting.event(), None);
+        assert_eq!(TicketProgress::Waiting.event("t1"), None);
 
         let paid = TicketProgress::from(&TicketStatus::Settled);
         assert!(!ticket_status(url, paid).into_string().contains("hx-get"));
-        assert_eq!(paid.event().as_deref(), Some("fw:ticket-paid"));
+        let event: serde_json::Value = serde_json::from_str(&paid.event("t1").unwrap()).unwrap();
+        assert_eq!(event["fw:ticket-paid"]["ticket_id"], "t1");
 
         let expired = TicketProgress::from(&TicketStatus::Expired);
         let html = ticket_status(url, expired).into_string();
         assert!(!html.contains("hx-get") && html.contains("expired"));
-        let event: serde_json::Value = serde_json::from_str(&expired.event().unwrap()).unwrap();
+        let event: serde_json::Value = serde_json::from_str(&expired.event("t1").unwrap()).unwrap();
+        assert_eq!(event["fw:ticket-failed"]["ticket_id"], "t1");
         assert!(event["fw:ticket-failed"]["message"]
             .as_str()
             .unwrap()

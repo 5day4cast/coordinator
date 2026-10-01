@@ -165,8 +165,12 @@
 
 @media screen and (max-width: 600px) {
   .picks-detail .scored-pick {
-    grid-template-columns: 2.75rem minmax(0, 1fr) auto minmax(3.5rem, max-content);
+    grid-template-columns: minmax(3.25rem, max-content) minmax(0, 1fr) auto minmax(3.5rem, max-content);
     font-size: 0.85rem;
+  }
+
+  .picks-detail .picks-header {
+    font-size: 0.7rem;
   }
 }
 

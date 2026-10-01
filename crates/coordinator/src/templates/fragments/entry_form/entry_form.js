@@ -159,6 +159,9 @@ class Entry {
   // the same invoice again.
   async showPaymentModal() {
     const $modal = document.getElementById("ticketPaymentModal");
+    const ticketId = this.ticket.id;
+    $modal.dataset.ticketId = ticketId;
+    const ownsModal = () => $modal.dataset.ticketId === ticketId;
     const $copyFeedback = document.getElementById("copyFeedback");
     const $error = document.getElementById("ticketPaymentError");
     const $qrContainer = document.getElementById("qrContainer");
@@ -240,21 +243,20 @@ class Entry {
     openModal($modal);
 
     return new Promise((resolve, reject) => {
+      let finished = false;
       // Closing (the backdrop, Esc, the close button) only hides the invoice.
-      const closed = () => this.onDialogClosed?.();
+      const closed = () => { if (ownsModal()) this.onDialogClosed?.(); };
       const finish = (error) => {
+        if (finished) return;
+        finished = true;
         document.removeEventListener("fw:ticket-paid", paid);
         document.removeEventListener("fw:ticket-failed", failed);
         $modal.removeEventListener("fw:modal-closed", closed);
         clearTimeout(giveUp);
         this.awaitingPayment = false;
-        // A poller that leaves the page stops; close the dialog.
-        const idle = document.createElement("div");
-        idle.id = "paymentStatus";
-        document.getElementById("paymentStatus")?.replaceWith(idle);
-        $qrContainer.replaceChildren();
-        document.querySelectorAll("#walletLinks a").forEach((a) => a.removeAttribute("href"));
-        closeModal($modal);
+        if (ownsModal()) {
+          clearPaymentModal($modal, $qrContainer);
+        }
         if (error) {
           // The ticket expired or failed: the next Pay starts a new entry.
           this.renew = true;
@@ -267,8 +269,12 @@ class Entry {
           resolve(true);
         }
       };
-      const paid = () => finish();
-      const failed = (event) => finish(new Error(event.detail?.message || "The ticket payment failed"));
+      const paid = (event) => { if (event.detail?.ticket_id === ticketId) finish(); };
+      const failed = (event) => {
+        if (event.detail?.ticket_id === ticketId) {
+          finish(new Error(event.detail.message || "The ticket payment failed"));
+        }
+      };
       // Only if the coordinator never answers: it fails an unpaid ticket after 10 minutes.
       const giveUp = setTimeout(
         () => finish(new Error("The payment wasn't confirmed; check your wallet, then try again")),
@@ -282,7 +288,8 @@ class Entry {
 
   // The invoice of the ticket already issued, shown again after its dialog was closed.
   reopenPayment() {
-    openModal(document.getElementById("ticketPaymentModal"));
+    const modal = document.getElementById("ticketPaymentModal");
+    if (modal?.dataset.ticketId === this.ticket.id) openModal(modal);
   }
 
   // Pays for the ticket, unless it is paid already, then enters the picks as they are now
@@ -553,6 +560,23 @@ function forgetEntry(competitionId) {
 // The entry whose ticket was issued and which isn't entered yet. Pay picks it up again rather
 // than asking for another ticket: its invoice while that is unpaid, the entry itself once paid.
 let pendingEntry = null;
+// Admission is synchronous: navigating while terms load must not start another ticket.
+let submissionBusy = false;
+
+function clearPaymentModal(modal, qrContainer) {
+  const idle = document.createElement("div");
+  idle.id = "paymentStatus";
+  document.getElementById("paymentStatus")?.replaceWith(idle);
+  qrContainer.replaceChildren();
+  document.querySelectorAll("#walletLinks a").forEach((a) => a.removeAttribute("href"));
+  closeModal(modal);
+  delete modal.dataset.ticketId;
+}
+
+function currentPayButton(competitionId) {
+  const form = document.getElementById("entryForm");
+  return form?.dataset.competitionId === competitionId ? document.getElementById("submitEntry") : null;
+}
 
 /**
  * Submit entry - handles the full flow:
@@ -603,7 +627,13 @@ async function submitEntry() {
   // A ticket already issued for this competition: show its invoice again, with the picks as
   // they are now. The call that issued it still waits for the payment and enters the picks
   // once it arrives.
-  const pending = pendingEntry?.competition.id === form.dataset.competitionId ? pendingEntry : null;
+  if (pendingEntry && pendingEntry.competition.id !== form.dataset.competitionId) {
+    errorMsg.textContent = "Finish your pending entry in the other competition before starting another payment.";
+    errorMsg.classList.remove("hidden");
+    if (pendingEntry.awaitingPayment) pendingEntry.reopenPayment();
+    return;
+  }
+  const pending = pendingEntry;
   if (pending?.awaitingPayment) {
     pending.entry.submit = picks;
     setBusy(submitBtn, true);
@@ -611,8 +641,15 @@ async function submitEntry() {
     return;
   }
 
+  if (submissionBusy) {
+    errorMsg.textContent = "Your entry is still being prepared or submitted. Please wait for it to finish.";
+    errorMsg.classList.remove("hidden");
+    return;
+  }
+
+  submissionBusy = true;
   setBusy(submitBtn, true);
-  const payButton = () => document.getElementById("submitEntry");
+  const payButton = () => currentPayButton(form.dataset.competitionId);
 
   try {
     let currentEntry = pending;
@@ -659,6 +696,8 @@ async function submitEntry() {
     errorMsg.textContent = userMessage;
     errorMsg.classList.remove("hidden");
     setBusy(submitBtn, false);
+  } finally {
+    submissionBusy = false;
   }
 }
 
@@ -807,4 +846,3 @@ function setupEntryForm() {
   });
   document.addEventListener("keydown", unpickWithSpace);
 }
-
