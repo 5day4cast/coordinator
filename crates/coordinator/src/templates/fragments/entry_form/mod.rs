@@ -331,7 +331,7 @@ fn station_picks(station: &StationForecast) -> Markup {
                 }
                 span class="station-code" { (station.station_id) }
             }
-            div class="pick-row pick-heading" aria-hidden="true" {
+            div class="pick-heading" aria-hidden="true" {
                 span class="pick-metric" { "NOAA forecast" }
                 span { "Your pick" }
             }

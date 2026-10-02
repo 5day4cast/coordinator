@@ -211,7 +211,8 @@
   font-weight: 600;
 }
 
-.entry-form .pick-row {
+.entry-form .pick-row,
+.entry-form .pick-heading {
   display: flex;
   flex-wrap: wrap;
   justify-content: space-between;

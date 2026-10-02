@@ -39,6 +39,18 @@ async function registerAndLogin(page: Page): Promise<string> {
   return username;
 }
 
+async function chooseRequiredPicks(page: Page): Promise<void> {
+  const form = page.locator("#entryForm");
+  const required = Number(await form.getAttribute("data-max-values"));
+  expect(required).toBeGreaterThan(0);
+  const categories = form.locator(".pick-options");
+  await expect(categories.nth(required - 1)).toBeVisible();
+  for (let i = 0; i < required; i++) {
+    await categories.nth(i).locator(".pick-option").first().click();
+  }
+  await expect(form.locator("input[type=radio]:checked")).toHaveCount(required);
+}
+
 test.describe("Full Entry Submission Flow", () => {
   test("complete entry flow: login → competition → picks → payment → submission", async ({
     page,
@@ -83,16 +95,7 @@ test.describe("Full Entry Submission Flow", () => {
 
     await page.waitForSelector("#entryForm .pick-option", { timeout: 10000 });
 
-    const allPickButtons = page.locator("#entryForm .pick-option");
-    const buttonCount = await allPickButtons.count();
-
-    if (buttonCount > 0) {
-      for (let i = 0; i < Math.min(3, buttonCount); i++) {
-        const button = allPickButtons.nth(i);
-        await button.click();
-        await expect(button.locator("input")).toBeChecked();
-      }
-    }
+    await chooseRequiredPicks(page);
 
     const submitButton = page.locator("#submitEntry");
     await expect(submitButton).toBeVisible();
@@ -201,7 +204,7 @@ test.describe("Full Entry Submission Flow", () => {
     const advanced = page.locator("#entryContainer details.entry-advanced");
     await expect(advanced).toContainText("On-chain fees for the contract are capped at 100 sat/vB");
     await expect(advanced).toContainText("Winner shares by rank: 45%, 35%, 20%");
-    await page.locator("#entryForm .pick-option").first().click();
+    await chooseRequiredPicks(page);
     await page.locator("#submitEntry").click();
     await expect(page.locator("#errorMessage")).toContainText("The ticket omitted the approved payout escrow policy");
     await expect(page.locator("#ticketPaymentModal")).not.toHaveClass(/is-active/);
