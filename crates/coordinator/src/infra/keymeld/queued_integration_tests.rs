@@ -136,8 +136,9 @@ fn queued_terms() -> QueuedTerms {
                 LineTerms {
                     target: "KORD".into(),
                     metric: "temp_high".into(),
-                    lower: -2.5,
-                    upper: -0.5,
+                    // Observed line values that change bits under approximate JSON parsing.
+                    lower: -2.990000000000002,
+                    upper: 0.019999999999999574,
                     window_hours: 24,
                 },
                 LineTerms {
