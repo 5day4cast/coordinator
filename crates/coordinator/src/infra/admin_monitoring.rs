@@ -57,15 +57,30 @@ pub struct Metric {
 
 pub struct AdminMonitoring {
     configuration_error: bool,
-    client: Option<reqwest::Client>,
-    query_url: String,
-    dashboard_url: String,
+    pub(super) client: Option<reqwest::Client>,
+    pub(super) query_url: String,
+    pub(super) dashboard_url: String,
+    pub(super) signals:
+        Arc<RefreshCache<super::admin_signals::Panel, super::admin_signals::Snapshot>>,
+    pub(super) capabilities: Arc<RefreshCache<(), crate::infra::keymeld::PayoutCapabilities>>,
     cache: Arc<RefreshCache<(), Vec<Metric>>>,
 }
 
 impl AdminMonitoring {
     pub fn from_settings(settings: Option<&MonitoringSettings>) -> Self {
-        match Self::new(settings) {
+        let environment = match (
+            std::env::var("COORDINATOR_GRAFANA_URL"),
+            std::env::var("COORDINATOR_GRAFANA_DATASOURCE"),
+            std::env::var("COORDINATOR_GRAFANA_TOKEN_FILE"),
+        ) {
+            (Ok(grafana_url), Ok(datasource_uid), Ok(token_file)) => Some(MonitoringSettings {
+                grafana_url,
+                datasource_uid,
+                token_file,
+            }),
+            _ => None,
+        };
+        match Self::new(settings.or(environment.as_ref())) {
             Ok(service) => service,
             Err(error) => {
                 log::warn!("Admin monitoring is unavailable: {error}");
@@ -83,6 +98,8 @@ impl AdminMonitoring {
             query_url: String::new(),
             dashboard_url: String::new(),
             cache: Arc::new(RefreshCache::new()),
+            signals: Arc::new(RefreshCache::new()),
+            capabilities: Arc::new(RefreshCache::new()),
         };
         let Some(settings) = settings else {
             return Ok(service);

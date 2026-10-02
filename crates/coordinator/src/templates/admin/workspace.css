@@ -442,3 +442,9 @@
 .admin-workspace .wallet-links { display:flex; flex-wrap:wrap; gap:1.2rem; margin-top:1rem; }
 .admin-workspace .wallet-path { padding:.8rem 1rem; border-left:3px solid var(--accent); margin:.8rem 0; background:var(--panel); }
 @media (max-width:1000px) { .admin-workspace .wallet-grid { grid-template-columns:1fr; } }
+
+.admin-workspace .service-signals { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr)); gap:.8rem; margin:1rem 0; }
+.admin-workspace .service-signal { min-width:0; border:1px solid var(--line); background:var(--panel); border-radius:10px; padding:1rem; }
+.admin-workspace .service-signal summary { cursor:pointer; }
+.admin-workspace .service-signal summary .notice { display:inline; border:0; padding:0; color:#c78024; }
+.admin-workspace .service-signal p,.admin-workspace .service-signal code { overflow-wrap:anywhere; }

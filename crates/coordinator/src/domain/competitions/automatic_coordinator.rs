@@ -261,6 +261,14 @@ impl Coordinator {
         Ok(self)
     }
 
+    /// Read-only confidential capability check for the operator page.
+    pub async fn admin_keymeld_capabilities(
+        &self,
+    ) -> anyhow::Result<crate::infra::keymeld::PayoutCapabilities> {
+        anyhow::ensure!(self.is_keymeld_enabled(), "Keymeld is not enabled");
+        Ok(self.keymeld.payout_capabilities().await?)
+    }
+
     pub(super) async fn require_payout_capabilities(&self, lnurl: bool) -> Result<(), Error> {
         if !self.is_keymeld_enabled() {
             return Err(Error::BadRequest("Payout escrow requires Keymeld".into()));

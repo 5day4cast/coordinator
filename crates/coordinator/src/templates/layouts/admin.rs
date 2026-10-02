@@ -57,6 +57,8 @@ pub fn admin_base(config: &AdminPageConfig, content: Markup) -> Markup {
                     a href="/admin/funds" aria-current=[config.title.starts_with("Funds").then_some("page")] { "Find customer funds" }
                     a href="/admin/competition" aria-current=[config.title.starts_with("Weather").then_some("page")] { "Discover games" }
                     a href="/admin/wallet" aria-current=[config.title.starts_with("Node").then_some("page")] { "Node & wallets" }
+                    a href="/admin/keymeld" aria-current=[config.title.starts_with("Keymeld").then_some("page")] { "Keymeld" }
+                    a href="/admin/services" aria-current=[(config.title == "Services").then_some("page")] { "Services" }
                     label.admin-appearance hidden { "Appearance"
                         select id="admin-theme" {
                             option value="light" { "Light" }
