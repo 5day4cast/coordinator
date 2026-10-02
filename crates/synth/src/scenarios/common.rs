@@ -113,6 +113,21 @@ pub(super) async fn wait_for_pools_state(
     Ok(())
 }
 
+/// When the competition stops taking entries: the start of its observations.
+pub(super) async fn entry_deadline(
+    client: &CoordinatorClient,
+    competition_id: &Uuid,
+) -> Result<OffsetDateTime> {
+    let competition = client.get_competition(competition_id).await?;
+    let value = competition
+        .event_submission
+        .get("start_observation_date")
+        .and_then(|value| value.as_str())
+        .context("Competition omitted its entry deadline")?;
+    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .context("Invalid competition entry deadline")
+}
+
 /// Check if `current` is a later state than `target` in the lifecycle
 fn is_past_state(current: &str, target: &str) -> bool {
     let order = [

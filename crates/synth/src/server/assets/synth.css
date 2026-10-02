@@ -43,6 +43,15 @@ button.copy:hover { border-color: var(--accent); }
 textarea { width: 100%; background: var(--panel); color: var(--text); border: 1px solid var(--rule); font-family: inherit; font-size: 0.8em; }
 details summary { cursor: pointer; }
 
+/* The create-a-competition form: one field a line, its label above it. */
+details.create { margin: 0 0 16px; }
+form.create { display: grid; gap: 10px; max-width: 32em; padding: 12px 15px; background: var(--panel); border-radius: 8px; margin-top: 8px; }
+form.create label { display: grid; gap: 4px; }
+form.create fieldset { border: 1px solid var(--rule); border-radius: 4px; display: flex; gap: 16px; }
+form.create fieldset label { display: inline; }
+form.create input, form.create select { background: var(--bg); color: var(--text); border: 1px solid var(--rule); border-radius: 4px; padding: 6px; font-family: inherit; }
+form.create button { justify-self: start; }
+
 /* Where the money went: one box per stage, left to right. */
 .flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 6px; margin: 16px 0; }
 .box { flex: 1 1 150px; background: var(--panel); border: 2px solid #444; border-radius: 10px; padding: 10px; min-width: 150px; }

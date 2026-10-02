@@ -1,12 +1,16 @@
 mod common;
 pub mod escrow_refund;
 pub mod full_lifecycle;
+pub mod manual;
 pub mod queued;
+pub mod stress;
 pub mod types;
 pub mod user_behavior;
 
 pub use escrow_refund::run_escrow_refund;
 pub use full_lifecycle::run_full_lifecycle;
+pub use manual::run_manual_competition;
+pub use stress::run_stress_full_pool;
 pub use types::*;
 pub use user_behavior::{
     run_abandoned_unpaid, run_duplicate_submission, run_late_submission, run_paid_abandonment,

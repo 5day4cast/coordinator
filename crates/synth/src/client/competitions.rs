@@ -4,6 +4,39 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+/// The network fee a ticket issued now would carry, as the coordinator quotes it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+pub struct NetworkFeeQuote {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub network_fee_sats: u64,
+    /// No ticket is issued while the fee is more than this share of the entry fee, in basis
+    /// points; 0 never pauses.
+    #[serde(default)]
+    pub pause_above_entry_bps: u64,
+    /// No ticket for an Arkade competition is issued while the Arkade server is failing.
+    #[serde(default)]
+    pub arkade_unavailable: bool,
+}
+
+impl NetworkFeeQuote {
+    /// What a player is told when no ticket for an `entry_fee_sats` entry is issued now, as the
+    /// coordinator says it; None while tickets are issued.
+    pub fn paused(&self, entry_fee_sats: u64) -> Option<&'static str> {
+        if self.arkade_unavailable {
+            return Some(
+                "Entries are paused while the Arkade network recovers; try again in a little while",
+            );
+        }
+        (self.enabled
+            && self.pause_above_entry_bps > 0
+            && u128::from(self.network_fee_sats) * 10_000
+                > u128::from(entry_fee_sats) * u128::from(self.pause_above_entry_bps))
+        .then_some("Entries are paused while Bitcoin network fees are high")
+    }
+}
+
 /// Request body for creating a competition
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateCompetition {
@@ -438,6 +471,20 @@ impl CoordinatorClient {
             .await
             .context("Failed to parse the network fee")?
             .sat_per_vb)
+    }
+
+    /// What a ticket issued now would carry in network fees, and whether entries are paused.
+    pub async fn network_fee_quote(&self) -> Result<NetworkFeeQuote> {
+        let url = format!("{}/api/v1/network-fee", self.base_url());
+        let resp = super::retry_transport(3, || async {
+            anyhow::Ok(self.http().get(&url).send().await?)
+        })
+        .await
+        .context("Failed to get the network fee")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Get network fee failed ({})", resp.status());
+        }
+        resp.json().await.context("Failed to parse the network fee")
     }
 
     /// List all competitions

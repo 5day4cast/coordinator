@@ -63,6 +63,7 @@ fn initialize() {
     }
     LIFECYCLE_HEALTHY.set(f64::NAN);
     LAST_SUCCESS.set(f64::NAN);
+    crate::scenarios::stress::initialize_metrics();
 }
 
 fn lifecycle_health(run: Option<&TestRun>) -> f64 {

@@ -482,7 +482,7 @@ const LIFECYCLE: [&str; 9] = [
 /// what synth's players did not do: a kickoff check failed on fees that rose after the run drew
 /// its players, or other players held or paid for seats and never entered. Then every paid
 /// ticket's refund is collected instead.
-async fn follow_lifecycle(
+pub(super) async fn follow_lifecycle(
     client: &CoordinatorClient,
     users: &[SynthUser],
     competition_id: &Uuid,
@@ -540,7 +540,7 @@ pub(super) fn expected_cancellation(
 
 /// Wait for a competition expected to close unfilled to be cancelled: false. True if it filled
 /// instead, when other players paid for the seats synth's `ours` paid entries left empty.
-async fn wait_cancelled_or_filled(
+pub(super) async fn wait_cancelled_or_filled(
     client: &CoordinatorClient,
     competition_id: &Uuid,
     config: &ScenarioConfig,
@@ -702,7 +702,7 @@ async fn wait_until(
     Ok(())
 }
 
-fn ensure_payment_time(deadline: OffsetDateTime, config: &ScenarioConfig) -> Result<()> {
+pub(super) fn ensure_payment_time(deadline: OffsetDateTime, config: &ScenarioConfig) -> Result<()> {
     let margin = config.entry_timing.deadline_margin_secs.max(60);
     ensure!(
         OffsetDateTime::now_utc() < deadline - time::Duration::seconds(margin as i64),
@@ -711,7 +711,10 @@ fn ensure_payment_time(deadline: OffsetDateTime, config: &ScenarioConfig) -> Res
     Ok(())
 }
 
-fn ensure_submission_time(deadline: OffsetDateTime, config: &ScenarioConfig) -> Result<()> {
+pub(super) fn ensure_submission_time(
+    deadline: OffsetDateTime,
+    config: &ScenarioConfig,
+) -> Result<()> {
     ensure!(
         OffsetDateTime::now_utc()
             < deadline - time::Duration::seconds(config.entry_timing.deadline_margin_secs as i64),
@@ -721,7 +724,7 @@ fn ensure_submission_time(deadline: OffsetDateTime, config: &ScenarioConfig) -> 
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_actor(
+pub(super) async fn run_actor(
     client: &CoordinatorClient,
     user: &SynthUser,
     players: &[SynthUser],
