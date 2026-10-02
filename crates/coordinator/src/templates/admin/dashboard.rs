@@ -190,7 +190,7 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
 
                             div class="column" {
                                 div class="field" {
-                                    label class="label" { "Entry Fee (sats)" }
+                                    label class="label" { "Pot contribution per entry (sats)" }
                                     div class="control" {
                                         input class="input" type="number" name="entry_fee"
                                               value="5000" min="1";
@@ -202,7 +202,7 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
                         div class="columns" {
                             div class="column" {
                                 div class="field" {
-                                    label class="label" { "Coordinator Fee (%)" }
+                                    label class="label" { "Service fee (%)" }
                                     div class="control" {
                                         input class="input" type="number" name="coordinator_fee_percentage"
                                               value="5" min="0" max="100" step="0.01";
@@ -212,7 +212,7 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
 
                             div class="column" {
                                 div class="field" {
-                                    label class="label" { "Number of Places Win" }
+                                    label class="label" { "Paid places" }
                                     div class="control" {
                                         input class="input" type="number" name="number_of_places_win"
                                               value="1" min="1";
@@ -296,6 +296,20 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
                                 }
                             }
                         }
+                    }
+
+                    div class="box content" {
+                        h3 class="subtitle is-5" { "Where the entry fee goes" }
+                        p { "Player payment → entry escrow → competition pool → winners" }
+                        table class="table is-fullwidth" {
+                            thead { tr { th { "Part of the payment" } th { "Destination" } } }
+                            tbody {
+                                tr { td { "Pot contribution" } td { "The prize pool. Multiply by the paid entries in each pool." } }
+                                tr { td { "Service fee" } td { "The coordinator. Added to the contribution, outside the prize pool." } }
+                                tr { td { "Network fee" } td { "Settlement costs. Quoted when the ticket is issued." } }
+                            }
+                        }
+                        p { "Players see the sum as one Entry fee. If the competition does not run, its entry payments are refunded." }
                     }
 
                     // Location selector with map, table, and Create Competition button
