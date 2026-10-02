@@ -521,7 +521,8 @@ mod tests {
             (0, Some(MAX_POOL_PLAYERS), false)
         );
         assert_eq!(defaults.entry_fee, base.entry_fee);
-        assert_eq!(defaults.entry_window_secs, DEFAULT_ENTRY_WINDOW);
+        // The default hour stretches to the half-day boundary the window starts on.
+        assert_eq!(defaults.entry_window_secs, 5400);
         assert_eq!(defaults.observation_window_secs, HALF_DAY);
         // A half-day window starts on the half after the entry window: noon, from 10:30.
         assert_eq!(

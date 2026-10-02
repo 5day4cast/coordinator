@@ -48,7 +48,7 @@ impl OperatorAccess {
             })
             .transpose()?;
         let mut bytes = [0; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         Ok(Self {
             nonce: hex::encode(bytes).into(),
             origins: config.allowed_origins.clone().into(),
