@@ -20,6 +20,7 @@ mod ledger;
 #[cfg(test)]
 mod list_store_tests;
 mod metrics_store;
+mod operator_payouts;
 mod payout;
 mod queued;
 mod queued_store;
@@ -56,6 +57,7 @@ pub use lease_store::*;
 pub use ledger::*;
 use log::{debug, error};
 pub use metrics_store::*;
+pub use operator_payouts::OperatorPayoutProgress;
 pub use payout::*;
 pub use queued::{
     CompetitionKind, CreateQueuedCompetition, PoolSummary, QueueSummary, DEFAULT_MAX_ENTRIES,

@@ -15,7 +15,9 @@ use uuid::Uuid;
 
 use crate::{
     api::{admin_auth::AdminCsrf, routes::OperatorCompetition},
-    domain::{leaderboard::Phase, Competition, CompetitionKind, RefundProgress},
+    domain::{
+        leaderboard::Phase, Competition, CompetitionKind, OperatorPayoutProgress, RefundProgress,
+    },
     startup::AppState,
 };
 
@@ -57,6 +59,8 @@ enum QueueShow {
     Pending,
     Live,
     AwaitingResult,
+    Finished,
+    PaidOut,
     Attention,
     #[default]
     #[serde(other)]
@@ -64,11 +68,13 @@ enum QueueShow {
 }
 
 impl QueueShow {
-    const VIEWS: [Self; 5] = [
+    const VIEWS: [Self; 7] = [
         Self::All,
         Self::Pending,
         Self::Live,
         Self::AwaitingResult,
+        Self::Finished,
+        Self::PaidOut,
         Self::Attention,
     ];
 
@@ -78,6 +84,8 @@ impl QueueShow {
             Self::Pending => "pending",
             Self::Live => "live",
             Self::AwaitingResult => "awaiting_result",
+            Self::Finished => "finished",
+            Self::PaidOut => "paid_out",
             Self::Attention => "attention",
         }
     }
@@ -88,6 +96,8 @@ impl QueueShow {
             Self::Pending => "Pending / open",
             Self::Live => "Live weather",
             Self::AwaitingResult => "Awaiting result",
+            Self::Finished => "Finished",
+            Self::PaidOut => "Paid out (Lightning)",
             Self::Attention => "Needs review",
         }
     }
@@ -97,6 +107,7 @@ impl QueueShow {
         c: &Competition,
         refunds: Option<&RefundProgress>,
         now: OffsetDateTime,
+        payout: Option<&OperatorPayoutProgress>,
     ) -> bool {
         match self {
             Self::All => true,
@@ -107,8 +118,14 @@ impl QueueShow {
             Self::Pending => Phase::of(c, now) == Phase::Upcoming,
             Self::Live => Phase::of(c, now) == Phase::Live,
             Self::AwaitingResult => Phase::of(c, now) == Phase::AwaitingResult,
+            Self::Finished => finished(c, now),
+            Self::PaidOut => finished(c, now) && payout.is_some_and(|p| p.all_paid()),
         }
     }
+}
+
+fn finished(c: &Competition, now: OffsetDateTime) -> bool {
+    c.completed_at.is_some() || matches!(Phase::of(c, now), Phase::Scored | Phase::Expired)
 }
 
 const PAGE_SIZE: usize = 100;
@@ -260,12 +277,22 @@ pub async fn operations_page(
     let content = match (competitions, refunds) {
         (Ok(mut competitions), Ok(refunds)) => {
             let now = OffsetDateTime::now_utc();
+            let payout_progress = state
+                .coordinator
+                .operator_payout_progress(&competitions)
+                .await;
             sort_competitions(&mut competitions, filter.sort);
             let search = filter.q.trim().to_lowercase();
             let rows: Vec<_> = competitions
                 .iter()
                 .filter(|c| {
-                    matches_search(c, &search) && filter.show.includes(c, refunds.get(&c.id), now)
+                    matches_search(c, &search)
+                        && filter.show.includes(
+                            c,
+                            refunds.get(&c.id),
+                            now,
+                            payout_progress.as_ref().ok().and_then(|p| p.get(&c.id)),
+                        )
                 })
                 .collect();
             let (page, start, pages) = page_bounds(rows.len(), filter.page);
@@ -276,7 +303,7 @@ pub async fn operations_page(
                     (state.admin_monitoring.render(&monitoring))
                     nav.discovery-filters aria-label="Competition views" {
                         @for show in QueueShow::VIEWS {
-                            @let count = competitions.iter().filter(|c| show.includes(c, refunds.get(&c.id), now)).count();
+                            @let count = competitions.iter().filter(|c| show.includes(c, refunds.get(&c.id), now, payout_progress.as_ref().ok().and_then(|p| p.get(&c.id)))).count();
                             a href=(queue_url(&QueueFilter { show, ..QueueFilter::default() }, 0)) aria-current=[(filter.show == show && search.is_empty()).then_some("page")] {
                                 (show.label()) " (" (count) ")"
                             }
@@ -301,22 +328,37 @@ pub async fn operations_page(
                     }
                     h2 { (rows.len()) " competitions" }
                     p.note { "Pending / open means the observation window has not started; a game may already be full. Live weather means observations are in progress, even when the contract state says awaiting_attestation. View counts include all stations and reset the search." }
+                    @if matches!(filter.show, QueueShow::Finished | QueueShow::PaidOut) {
+                        p.note { "Finished includes signed results and ended contracts. Paid out requires successful recorded Lightning payments for every recipient and amount in the settled outcome. On-chain claims and unknown payout coverage remain in Finished; inspect the fund trace. Contract cleanup can continue after payment." }
+                    }
+                    @if payout_progress.is_err() { p.notice { "Payout evidence is unavailable. Finished competitions remain listed; paid-out coverage is unknown." } }
                     @if rows.is_empty() { p.notice { "No competitions match these filters. " a href="/admin/operations" { "Show all competitions" } } }
                     div.scroll { table.ops-table {
-                        thead { tr { th { "Competition" } th { "Created (UTC)" } th { "State" } th { "Entries" } th { "Next step" } } }
+                        thead { tr { th { "Competition" } th { "Created (UTC)" } th { "State" } th { "Entries" } th { "Payouts" } th { "Next step" } } }
                         tbody {
                             @for c in rows.iter().skip(start).take(PAGE_SIZE) {
                                 @let action = next(c, refunds.get(&c.id), now);
                                 @let created = c.created_at.to_offset(time::UtcOffset::UTC);
+                                @let payout = payout_progress.as_ref().ok().and_then(|p| p.get(&c.id));
                                 tr {
                                     td { a href=(format!("/admin/operations/{}", c.id)) { (c.event_submission.locations.join(" · ")) }
                                         p.note { code { (c.id) } " · " (c.kind.as_str()) }
+                                        a href=(format!("/admin/funds?competition={}", c.id)) { "Trace funds" }
                                     }
                                     td { time datetime=(created.format(&Rfc3339).unwrap_or_default()) {
                                         (created.date()) br; (format!("{:02}:{:02}:{:02}", created.hour(), created.minute(), created.second()))
                                     } }
                                     td { span.status { (phase_label(c, now)) } p.note { (c.get_state()) } }
                                     td { (c.total_paid_entries) " paid / " (c.total_entries) " entered" }
+                                    td {
+                                        @if finished(c, now) && c.kind != CompetitionKind::Queued {
+                                            a href=(format!("/admin/funds?competition={}", c.id)) {
+                                                @if let Some(payout) = payout { (payout.paid) " / " (payout.expected) " LN paid" }
+                                                @else { "Coverage unknown" }
+                                            }
+                                            p.note { @if c.completed_at.is_some() { "Contract cleanup complete" } @else { "Contract cleanup pending" } }
+                                        } @else { "—" }
+                                    }
                                     td { strong class=[action.2.then_some("attention")] { (action.0) } p.note { (action.1) } }
                                 }
                             }
@@ -509,8 +551,8 @@ mod tests {
         assert_eq!(rows[0].id, recent_id);
         sort_competitions(&mut rows, QueueSort::CreatedAsc);
         assert_eq!(rows[0].id, old_id);
-        assert!(QueueShow::Attention.includes(&rows[0], None, now));
-        assert!(!QueueShow::Attention.includes(&rows[1], None, now));
+        assert!(QueueShow::Attention.includes(&rows[0], None, now, None));
+        assert!(!QueueShow::Attention.includes(&rows[1], None, now, None));
     }
 
     #[test]
@@ -542,30 +584,30 @@ mod tests {
         live.kind = CompetitionKind::Pool;
         live.event_submission.unlisted = true;
         assert_eq!(live.get_state().to_string(), "awaiting_attestation");
-        assert!(QueueShow::Pending.includes(&open, None, now));
-        assert!(!QueueShow::Live.includes(&open, None, now));
-        assert!(QueueShow::Live.includes(&live, None, now));
+        assert!(QueueShow::Pending.includes(&open, None, now, None));
+        assert!(!QueueShow::Live.includes(&open, None, now, None));
+        assert!(QueueShow::Live.includes(&live, None, now, None));
         assert_eq!(phase_label(&live, now), "Live weather");
-        assert!(!QueueShow::AwaitingResult.includes(&live, None, now));
-        assert!(!QueueShow::Attention.includes(&live, None, now));
+        assert!(!QueueShow::AwaitingResult.includes(&live, None, now, None));
+        assert!(!QueueShow::Attention.includes(&live, None, now, None));
 
         let after_window = live.event_submission.end_observation_date;
-        assert!(!QueueShow::Live.includes(&live, None, after_window));
-        assert!(QueueShow::AwaitingResult.includes(&live, None, after_window));
+        assert!(!QueueShow::Live.includes(&live, None, after_window, None));
+        assert!(QueueShow::AwaitingResult.includes(&live, None, after_window, None));
         assert_eq!(phase_label(&live, after_window), "Awaiting result");
 
         // Parent queues still remain in All, without counting the same active games twice.
         open.pools_formed_at = Some(now);
         open.event_submission.start_observation_date = now - time::Duration::HOUR;
         assert_eq!(phase_label(&open, now), "Pools formed");
-        assert!(QueueShow::All.includes(&open, None, now));
-        assert!(!QueueShow::Live.includes(&open, None, now));
+        assert!(QueueShow::All.includes(&open, None, now, None));
+        assert!(!QueueShow::Live.includes(&open, None, now, None));
 
         let mut cancelled = competition(now);
         cancelled.cancelled_at = Some(now);
-        assert!(!QueueShow::Pending.includes(&cancelled, None, now));
-        assert!(!QueueShow::Live.includes(&cancelled, None, now));
-        assert!(QueueShow::Attention.includes(&cancelled, None, now));
+        assert!(!QueueShow::Pending.includes(&cancelled, None, now, None));
+        assert!(!QueueShow::Live.includes(&cancelled, None, now, None));
+        assert!(QueueShow::Attention.includes(&cancelled, None, now, None));
     }
 
     #[test]
@@ -620,6 +662,41 @@ mod tests {
         c.completed_at = Some(now);
         assert_eq!(next(&c, None, now).0, "Review payout evidence");
         assert!(!next(&c, None, now).2);
+    }
+
+    #[test]
+    fn finished_and_paid_views_distinguish_results_cleanup_and_receipts() {
+        let now = OffsetDateTime::now_utc();
+        let mut c = competition(now);
+        c.completed_at = Some(now);
+        c.total_paid_out_entries = 1;
+        assert!(QueueShow::Finished.includes(&c, None, now, None));
+        assert!(!QueueShow::PaidOut.includes(&c, None, now, None));
+        let partial = OperatorPayoutProgress {
+            paid: 1,
+            expected: 3,
+        };
+        assert!(!QueueShow::PaidOut.includes(&c, None, now, Some(&partial)));
+
+        c.completed_at = None;
+        c.attestation = Some(dlctix::secp::Scalar::one().into());
+        assert!(QueueShow::Finished.includes(&c, None, now, None));
+        let paid = OperatorPayoutProgress {
+            paid: 3,
+            expected: 3,
+        };
+        assert!(QueueShow::PaidOut.includes(&c, None, now, Some(&paid)));
+        assert!(!QueueShow::Live.includes(&c, None, now, Some(&paid)));
+
+        for (query, expected) in [
+            ("finished", QueueShow::Finished),
+            ("paid_out", QueueShow::PaidOut),
+        ] {
+            let url = format!("/admin/operations?show={query}");
+            let Query(filter) = Query::<QueueFilter>::try_from_uri(&url.parse().unwrap()).unwrap();
+            assert_eq!(filter.show, expected);
+            assert_eq!(filter.sort, QueueSort::CreatedDesc);
+        }
     }
 
     #[test]
