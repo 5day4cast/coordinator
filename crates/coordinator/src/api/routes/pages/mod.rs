@@ -1,3 +1,7 @@
+mod funds;
+pub use funds::*;
+mod operations;
+pub use operations::*;
 mod admin;
 #[cfg(test)]
 mod entries_tests;

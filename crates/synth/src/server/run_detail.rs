@@ -738,6 +738,8 @@ pub(super) async fn run_live(state: &Dashboard, id: &str) -> Option<Markup> {
         @for scope in money::scopes(&run) {
             @if let Some(stuck) = stuck::block(&scope.run(&run), now) { (stuck) }
         }
+        (super::funds_flow::graph(&run))
+        details { summary { "Individual transfer diagrams" } (transfer_diagrams(&rows)) }
         (hops_section(&view, &rows))
         (ledger_sections(&run))
         (competition_section(&view, now))
@@ -838,6 +840,42 @@ fn money_section(view: &RunView, now: OffsetDateTime) -> Markup {
                 @if let Some(evidence) = scope.trail.filter(|trail| !trail.pools.is_empty() || trail.competition.as_ref().is_some_and(|competition| competition.parent_id.is_some())) {
                     @if let Some(reason) = evidence.money.reason() { p.note { (reason) } }
                     @for gap in &evidence.gaps { p.note { (gap) } }
+                }
+            }
+        }
+    }
+}
+
+/// Every arrow is backed by a recorded hop; identifiers never imply an unobserved transfer.
+fn transfer_diagrams(rows: &[Row]) -> Markup {
+    let transfers: Vec<_> = rows
+        .iter()
+        .filter(|row| !row.from.is_empty() && !row.to.is_empty())
+        .collect();
+    html! {
+        section {
+            h2 { "Transfer diagrams" }
+            p.note { "Each arrow follows one recorded transfer. Amounts and fees remain unknown when the tracker has no evidence. Expand a transfer for its identifiers." }
+            @for row in transfers {
+                details.transfer {
+                    summary { (row.step) " · " (row.status.class()) " · "
+                        @if let Some(amount) = row.amount_sats { (format::sats(amount)) " sats" } @else { "amount unknown" }
+                    }
+                    div.transfer-flow {
+                        div.transfer-node { span.note { "From" } (endpoint(&row.from)) }
+                        div.transfer-arrow aria-hidden="true" { "→" }
+                        div.transfer-node {
+                            strong { (row.step) }
+                            p { span class=(format!("badge {}", row.status.class())) { (row.status.class()) } }
+                            p { "Amount: " @if let Some(amount) = row.amount_sats { (format::sats(amount)) " sats" } @else { "unknown" } }
+                            p { "Fee: " @if let Some(fee) = &row.fee_sats { (format::group(fee)) " sats" } @else { "unknown" } }
+                            (format::copyable_short(&row.id))
+                            @if let Some(link) = &row.link { p { a href=(link) rel="noreferrer" { "Inspect evidence" } } }
+                        }
+                        div.transfer-arrow aria-hidden="true" { "→" }
+                        div.transfer-node { span.note { "To" } (endpoint(&row.to)) }
+                    }
+                    @if let Some(note) = &row.note { p.note { (note) } }
                 }
             }
         }
@@ -1098,6 +1136,74 @@ fn pretty(json: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn customer_graph_joins_payouts_by_entry_and_distinguishes_test_payments() {
+        let mut entries = [
+            entry("same-name", true, true),
+            entry("same-name", true, true),
+        ];
+        entries[0].settled_by_test_endpoint = true;
+        let mut trail = trail_of(competition(serde_json::json!({})), None);
+        trail.payouts = vec![PayoutSeen {
+            entry_id: entries[1].entry_id.unwrap(),
+            user: "same-name".into(),
+            owed_sats: 1234,
+            payment_hash: Some("payout-for-second-entry".into()),
+            ..Default::default()
+        }];
+        let links = Links {
+            explorer: String::new(),
+            oracle: String::new(),
+            coordinator: String::new(),
+            ark_swap: None,
+            arkd: None,
+        };
+        let run = Run {
+            competition_id: Some(trail.competition_id),
+            entries: &entries,
+            scenario_refunds: &[],
+            trail: Some(&trail),
+            links: &links,
+            paid_by_node: Some(true),
+        };
+        let rendered = super::super::funds_flow::graph(&run).into_string();
+        assert_eq!(rendered.matches("payout-for-second-entry").count(), 1);
+        assert!(rendered.contains("Test settlement · no real payment"));
+        assert!(rendered.contains("No payout evidence for this entry"));
+        if let Ok(out) = std::env::var("ADMIN_PREVIEW_DIR") {
+            std::fs::create_dir_all(&out).unwrap();
+            std::fs::write(std::path::Path::new(&out).join("synth-customer-funds.html"),format!("<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><style>{}</style></head><body><main><h1>Synthetic customer flow</h1>{rendered}</main></body></html>",include_str!("assets/synth.css"))).unwrap();
+        }
+    }
+
+    #[test]
+    fn transfer_diagram_preserves_unknown_amounts_and_escapes_labels() {
+        let rows = vec![Row {
+            step: "Funding <pending>".into(),
+            status: Status::Active,
+            from: "payer <script>".into(),
+            to: "contract".into(),
+            amount_sats: None,
+            fee_sats: None,
+            id: "fixture-transaction".into(),
+            preimage: None,
+            lookups: vec![],
+            link: None,
+            note: None,
+        }];
+        let rendered = transfer_diagrams(&rows).into_string();
+        assert!(rendered.contains("payer &lt;script&gt;"));
+        assert!(rendered.contains("Amount: unknown"));
+        assert!(rendered.contains("Fee: unknown"));
+        assert!(!rendered.contains("0 sats"));
+        assert!(!rendered.contains("<script>"));
+        if let Ok(out) = std::env::var("ADMIN_PREVIEW_DIR") {
+            std::fs::create_dir_all(&out).unwrap();
+            std::fs::write(std::path::Path::new(&out).join("synth-transfer.html"), format!("<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><style>{}</style></head><body><main><h1>Transfer layout fixture</h1>{rendered}</main></body></html>", include_str!("assets/synth.css"))).unwrap();
+        }
+    }
+
     use crate::server::routes::short_id;
     use crate::trail::{EntryPayment, Money, RefundSeen};
 

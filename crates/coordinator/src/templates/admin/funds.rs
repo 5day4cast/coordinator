@@ -1,0 +1,360 @@
+//! A customer's transfers and the shared pool they fund; no browser-side data fetching.
+use crate::domain::{
+    admin_funds::{invoice_sats, FundsPage, FundsTicket, TicketFlow},
+    Competition,
+};
+use maud::{html, Markup};
+
+fn fact(label: &str, value: Option<&str>) -> Markup {
+    html! { div.trace-fact { dt { (label) } dd { @if let Some(value)=value { code { (value) } } @else { "Not recorded" } } } }
+}
+fn amount(value: Option<u64>) -> Markup {
+    html! { @if let Some(value)=value { (value) " sats" } @else { "Amount unknown" } }
+}
+fn identifier(value: &str) -> String {
+    format!(
+        "{}…{}",
+        value.chars().take(4).collect::<String>(),
+        value
+            .chars()
+            .rev()
+            .take(8)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
+    )
+}
+fn sats(value: Option<i64>) -> Option<u64> {
+    value.and_then(|v| v.try_into().ok())
+}
+fn payout_owed(c: &Competition, ticket: &FundsTicket) -> Option<u64> {
+    let outcome = c.get_current_outcome().ok()?;
+    let params = c.contract_parameters.as_ref()?;
+    let key = dlctix::secp::Point::from_hex(ticket.entry_pubkey.as_deref()?).ok()?;
+    let index = params.players.iter().position(|p| p.pubkey == key)?;
+    let weights = params.outcome_payouts.get(&outcome)?;
+    if !weights.contains_key(&index) {
+        return Some(0);
+    }
+    crate::domain::winner_payout_sats(params, &outcome, &key).ok()
+}
+pub fn position(flow: &TicketFlow) -> &'static str {
+    let t = &flow.ticket;
+    if flow.payouts.iter().any(|p| p.succeeded_at.is_some()) {
+        "Lightning payout recorded successful"
+    } else if matches!(t.refund_state.as_deref(), Some("paid" | "settled")) {
+        "Lightning refund recorded paid"
+    } else if t.released_at.is_some() {
+        "Held Lightning payment released"
+    } else if t.write_off.is_some() {
+        "Refund written off · support review required"
+    } else if t.refund_state.is_some() {
+        "Escrow refund in progress"
+    } else if flow.payouts.iter().any(|p| p.failed_at.is_none()) {
+        "Lightning payout pending · check sender"
+    } else if t.sellback_at.is_some() || t.reclaimed_at.is_some() {
+        "On-chain recovery recorded · verify destination"
+    } else if t.funded_at.is_some() {
+        "Escrow funded · follow pool and payout evidence"
+    } else if t.paid_at.is_some() {
+        "Entry payment recorded · verify its next handoff"
+    } else {
+        "Payment not recorded settled · inspect swap or invoice"
+    }
+}
+fn node_summary(rail: &str, t: &FundsTicket, value: Option<u64>, status: &str) -> Markup {
+    let (kind, id) = t
+        .entry_id
+        .as_deref()
+        .map(|id| ("entry", id))
+        .unwrap_or(("ticket", &t.ticket_id));
+    html! { summary {
+        strong.node-rail { (rail) }
+        span.node-id { (kind) " " (identifier(id)) }
+        span.node-amount { (amount(value)) }
+        span.node-status { (status) }
+    } }
+}
+fn identity(t: &FundsTicket) -> Markup {
+    html! { dl { (fact("Competition",Some(&t.competition_id))) (fact("Entry",t.entry_id.as_deref())) (fact("Ticket",Some(&t.ticket_id))) } }
+}
+pub fn funds_graph(c: &Competition, page: &FundsPage, network: &str, explorer: &str) -> Markup {
+    html! {
+        section.funds-trace {
+            h2 { "Where is the money?" }
+            details.flow-key { summary { "Reading this flow" }
+                p.note { "Open any node for its evidence. Arrows connect payment obligations and their backing. Outgoing Lightning uses coordinator liquidity; shared pool funding appears once. Amounts marked owed are contract entitlements, not payment receipts." }
+            }
+            @if page.tickets.is_empty() { p.notice { "No matching reserved or paid tickets in this scope. Tickets assigned to child pools are shown on those pools." } }
+            @else {
+                div.money-network {
+                    div.money-entries {
+                        h3 { "Payment → escrow" }
+                        @for flow in &page.tickets {
+                            (payment_nodes(c,flow,network,explorer))
+                        }
+                    }
+                    div.money-bridge aria-hidden="true" { "→" }
+                    (pool_node(c,page,explorer))
+                    div.money-bridge aria-hidden="true" { "→" }
+                    div.money-payouts {
+                        h3 { "Payout / return" }
+                        @for flow in &page.tickets {
+                            (payout_nodes(c,flow))
+                        }
+                    }
+                }
+            }
+            (transaction_records(c,network,explorer))
+
+        }
+    }
+}
+fn payment_nodes(c: &Competition, flow: &TicketFlow, network: &str, explorer: &str) -> Markup {
+    let t = &flow.ticket;
+    html! { article.money-entry id=(format!("ticket-{}",t.ticket_id)) {
+        div.entry-flow {
+            details.money-node {
+                (node_summary("LN in",t,t.invoice.as_deref().and_then(invoice_sats),if t.settled_at.is_some(){"Settled"}else if t.released_at.is_some(){"Released"}else if t.paid_at.is_some(){"Accepted"}else{"Unknown"}))
+                div.node-detail {
+                    (identity(t))
+                    dl { (fact("Payment hash",Some(&t.payment_hash))) (fact("Accepted",t.paid_at.as_deref())) (fact("Settled",t.settled_at.as_deref())) (fact("Released",t.released_at.as_deref())) }
+                    p { "Stake: " (c.event_submission.entry_fee) " sats; service fee: " (c.event_submission.coordinator_fee.fee_for(c.event_submission.entry_fee as u64)) " sats; recorded network fee: " (t.network_fee_sats) " sats." }
+                    p.note { "Invoice face value excludes payer routing fees, which this coordinator cannot observe." }
+                }
+            }
+            span.fund-arrow aria-hidden="true" { "→" }
+            details.money-node {
+                (node_summary(if t.escrow_address.is_some(){"Ark"}else{"Legacy"},t,sats(t.escrow_sats),if t.funded_at.is_some(){"Funded"}else{"Unknown"}))
+                div.node-detail {
+                    p.trace-position { (position(flow)) }
+                    (identity(t))
+                    dl { (fact("Swap",t.swap_id.as_deref())) (fact("VTXO outpoint",t.vtxo.as_deref())) (fact("Escrow address",t.escrow_address.as_deref())) }
+                    p.note { "Escrow funding alone does not prove the customer's Lightning payment settled. Check current swap and spend evidence." }
+                    @if let Some(tx)=&t.legacy_escrow_tx { @if let Ok(tx)=bitcoin::consensus::encode::deserialize_hex::<bitcoin::Transaction>(tx) { (super::transactions::transaction_diagram(&tx,network,explorer,"Legacy escrow","Recorded escrow transaction",None,None)) } }
+                    dl { (fact("Legacy escrow reclaimed",t.legacy_reclaimed_at.as_deref())) }
+                    @if let Some(reason)=&t.write_off { p.attention { "Written off: " (reason) } p.note { "A write-off is not payment to the customer." } }
+                    a href=(format!("/admin/funds/tickets/{}",t.ticket_id)) hx-get=(format!("/admin/funds/tickets/{}",t.ticket_id)) hx-target=(format!("#live-{}",t.ticket_id)) hx-swap="innerHTML" { "Check services now" }
+                    div id=(format!("live-{}",t.ticket_id)) aria-live="polite" {}
+                }
+            }
+        }
+    } }
+}
+fn payout_nodes(c: &Competition, flow: &TicketFlow) -> Markup {
+    let t = &flow.ticket;
+    html! { div.entry-payouts {
+        details.money-node {
+            @let latest=flow.payouts.iter().rev().find(|p|p.succeeded_at.is_some()).or_else(||flow.payouts.iter().rev().find(|p|p.failed_at.is_none())).or_else(||flow.payouts.last());
+            (node_summary("LN out",t,latest.and_then(|p|sats(Some(p.amount_sats))).or_else(||payout_owed(c,t)),if flow.payouts.iter().any(|p|p.succeeded_at.is_some()){"Success recorded"}else if flow.payouts.iter().any(|p|p.failed_at.is_none()){"Pending"}else if !flow.payouts.is_empty(){"Failed"}else{"No payout · owed"}))
+            div.node-detail {
+                (identity(t))
+                p { "Contract entitlement: " (amount(payout_owed(c,t))) }
+                @if flow.payouts.is_empty() { p.note { "No outgoing payout recorded. Missing payment records do not establish a zero entitlement." } }
+                @for p in &flow.payouts {
+                    details.payout-attempt {
+                        summary { (p.amount_sats) " sats · " @if p.succeeded_at.is_some() { "Success recorded" } @else if p.failed_at.is_some() { "Failed attempt" } @else { "Pending" } }
+                        dl { (fact("Payment hash",p.payment_hash.as_deref())) (fact("Payout ID",Some(&p.id))) (fact("Destination",p.lightning_address.as_deref())) (fact("Initiated",Some(&p.initiated_at))) (fact("Succeeded",p.succeeded_at.as_deref())) (fact("Failed",p.failed_at.as_deref())) }
+                        p.note { (p.send_attempts) " failed sends of this invoice. " @if let Some(at)=p.next_send_at { "Next send at Unix " (at) "." } }
+                    }
+                }
+                @if !flow.jobs.is_empty() { details { summary { "Preparation / release jobs (" (flow.jobs.len()) ")" }
+                    @for job in &flow.jobs { dl { (fact("Job",Some(&job.id))) (fact("Payout",job.payout_id.as_deref())) } p.note { (job.attempts) " attempts · " @if job.completed_at.is_some() { "completed" } @else if job.failed_at.is_some() { "failed" } @else { "retry at Unix " (job.retry_at) } } }
+                } }
+            }
+        }
+        @if t.sellback_at.is_some() || t.reclaimed_at.is_some() { details.money-node.recovery-branch {
+            (node_summary("↳ Chain recovery",t,None,"Verify receipt"))
+            div.node-detail { (identity(t)) dl { (fact("Sellback broadcast",t.sellback_at.as_deref())) (fact("Reclaim broadcast",t.reclaimed_at.as_deref())) } p.note { "These timestamps do not prove receipt by the customer. Inspect the spending transactions and destinations." } }
+        } }
+        @if t.refund_id.is_some() || t.write_off.is_some() || t.released_at.is_some() {
+            details.money-node.refund-branch {
+                (node_summary("↳ LN refund",t,t.refund_invoice.as_deref().and_then(invoice_sats),if matches!(t.refund_state.as_deref(),Some("paid"|"settled")){"Paid"}else if t.write_off.is_some(){"Written off"}else if t.released_at.is_some(){"Released"}else{t.refund_state.as_deref().unwrap_or("Unknown")}))
+                div.node-detail {
+                    (identity(t))
+                    p { "Escrow → refund swap → Lightning" }
+                    dl { (fact("Refund swap",t.refund_id.as_deref())) (fact("Ark transaction",t.refund_ark_txid.as_deref())) (fact("Lightning hash",t.refund_hash.as_deref())) (fact("Write-off",t.write_off.as_deref())) }
+                    @if t.write_off.is_some() { p.note { "A write-off is not payment to the customer." } }
+                    @if let Some(fee)=t.refund_fee_sats { p.note { "Recorded refund fee: " (fee) " sats" } }
+                    @if t.refund_error.is_some() { p.attention { "Refund has a recorded error; check current service evidence." } }
+                }
+            }
+        }
+    } }
+}
+fn pool_node(c: &Competition, page: &FundsPage, explorer: &str) -> Markup {
+    let funding = c.funding_outpoint;
+    let funding_amount = funding
+        .and_then(|outpoint| {
+            c.funding_transaction
+                .as_ref()
+                .filter(|tx| tx.compute_txid() == outpoint.txid)
+                .and_then(|tx| tx.output.get(outpoint.vout as usize))
+        })
+        .map(|out| out.value.to_sat());
+    html! { div.money-pool {
+        h3 { "Shared funding" }
+        details.money-node {
+            summary {
+                strong.node-rail { "DLC" }
+                span.node-id { "pool " (identifier(&c.id.to_string())) }
+                span.node-amount { (amount(funding_amount)) }
+                span.node-status { @if c.funding_confirmed_at.is_some() { "Confirmed" } @else if c.funding_broadcasted_at.is_some() { "Broadcast" } @else { "Not broadcast" } }
+            }
+            div.node-detail {
+                dl { (fact("Competition",Some(&c.id.to_string()))) }
+                @if let Some(outpoint)=funding { (chain_id("Funding",&outpoint.txid.to_string(),explorer)) p { "DLC output: " (outpoint.vout) } }
+                @else { p { "No funding outpoint recorded" } }
+                @if let Some(batch)=&page.commitment { dl { (fact("Arkade batch",Some(&batch.batch_id))) } p.note { "Batch funding output " (batch.funding_vout) ". A batch can also contain unrelated outputs." } }
+                p.note { "Escrow membership follows the ticket's current competition. Verify the transfer with the Arkade indexer's settled-into-batch field." }
+                a href="#recorded-transactions" { "Transaction records ↓" }
+                a href=(format!("/admin/operations/{}#chain-evidence",c.id)) { "Operations and chain evidence" }
+                a href=(format!("/admin/funds/chain/{}",c.id)) hx-get=(format!("/admin/funds/chain/{}",c.id)) hx-target="#chain-live" hx-swap="innerHTML" { "Check chain spends now" }
+                div id="chain-live" aria-live="polite" {}
+            }
+        }
+    } }
+}
+fn transaction_records(c: &Competition, network: &str, explorer: &str) -> Markup {
+    html! { @if c.funding_transaction.is_some() || c.outcome_transaction.is_some() {
+        section id="recorded-transactions" { h3 { "Transactions" }
+            @if let Some(tx)=&c.funding_transaction { (super::transactions::transaction_diagram(tx,network,explorer,"Funding","Recorded transaction; use chain check for current confirmation",None,None)) }
+            @if let Some(tx)=&c.outcome_transaction { (super::transactions::transaction_diagram(tx,network,explorer,if c.expiry_broadcasted_at.is_some(){"Expiry"}else{"Outcome"},"Recorded transaction; use chain check for current confirmation",None,c.funding_transaction.as_ref())) }
+        }
+    } }
+}
+
+/// Navigation uses the queue's actual membership; the stake is not a receipt of funding.
+pub fn pool_navigation(parent: &Competition, selected: uuid::Uuid) -> Markup {
+    let Some(queue) = &parent.queue else {
+        return html! {};
+    };
+    if queue.pools.is_empty() {
+        return html! {};
+    }
+    html! {
+        section.pool-navigation {
+            p { a href=(format!("/admin/funds?competition={}",parent.id)) aria-current=[(selected==parent.id).then_some("page")] { "Competition overview" } " · " (queue.entries) " paid entries · " (queue.pools.len()) " pools" }
+            nav.pool-choices aria-label="Competition pools" {
+                @for pool in &queue.pools {
+                    a.pool-choice href=(format!("/admin/funds?competition={}",pool.competition_id)) aria-current=[(selected==pool.competition_id).then_some("page")] {
+                        strong { "Pool " (u64::from(pool.pool_index)+1) }
+                        span { (pool.players) " entries" }
+                        span.note { @if let Some(stake)=(pool.players as u64).checked_mul(queue.stake_sats) { (stake) " sats stake" } @else { "Stake unknown" } }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn outgoing(c: &Competition, flow: &TicketFlow) -> (Option<u64>, &'static str) {
+    let t = &flow.ticket;
+    if let Some(p) = flow.payouts.iter().rev().find(|p| p.succeeded_at.is_some()) {
+        return (sats(Some(p.amount_sats)), "LN payout · success");
+    }
+    if matches!(t.refund_state.as_deref(), Some("paid" | "settled")) {
+        return (
+            t.refund_invoice.as_deref().and_then(invoice_sats),
+            "LN refund · paid",
+        );
+    }
+    if t.released_at.is_some() {
+        return (t.invoice.as_deref().and_then(invoice_sats), "Hold released");
+    }
+    if t.write_off.is_some() {
+        return (
+            t.refund_invoice.as_deref().and_then(invoice_sats),
+            "Written off",
+        );
+    }
+    if t.refund_state.is_some() {
+        return (
+            t.refund_invoice.as_deref().and_then(invoice_sats),
+            "LN refund · pending",
+        );
+    }
+    if let Some(p) = flow.payouts.iter().rev().find(|p| p.failed_at.is_none()) {
+        return (sats(Some(p.amount_sats)), "LN payout · pending");
+    }
+    if let Some(p) = flow.payouts.last() {
+        return (sats(Some(p.amount_sats)), "LN payout · failed");
+    }
+    if t.sellback_at.is_some() || t.reclaimed_at.is_some() {
+        return (None, "Chain recovery");
+    }
+    if payout_owed(c, t) == Some(0) {
+        return (Some(0), "No payout owed");
+    }
+    (payout_owed(c, t), "No payout recorded")
+}
+
+/// A pool remains one contract; each row expands into that customer's payment rails.
+pub fn pool_funds(c: &Competition, page: &FundsPage, network: &str, explorer: &str) -> Markup {
+    html! {
+        section.pool-funds {
+            div.pool-heading {
+                div { h2 { @if let Some(index)=c.pool_index { "Pool " (u64::from(index)+1) } @else { "Pool funds" } }
+                    p.note { (page.tickets.len()) " tickets shown · " (page.total) " in this pool" }
+                    p.note { "LN payment → Ark escrow → shared DLC → LN payout. Expand a row for its evidence." }
+                    a href=(format!("/admin/funds?competition={}&view=flow",c.id)) { "Show all nodes" }
+                }
+                (pool_node(c,page,explorer))
+            }
+            div.pool-row-heading aria-hidden="true" { span { "Entry / ticket" } span { "Lightning in" } span { "Ark escrow" } span { "Payout / return" } span {} }
+            div.pool-entries {
+                @for flow in &page.tickets {
+                    @let t=&flow.ticket;
+                    @let out=outgoing(c,flow);
+                    details.pool-entry {
+                        summary {
+                            span.pool-entry-id { @if let Some(id)=&t.entry_id { "Entry " (identifier(id)) } @else { "Ticket " (identifier(&t.ticket_id)) } }
+                            span.pool-cell { span.pool-cell-label { "LN in" } strong { (amount(t.invoice.as_deref().and_then(invoice_sats))) } small { @if t.settled_at.is_some(){"Settled"}@else if t.released_at.is_some(){"Released"}@else if t.paid_at.is_some(){"Accepted"}@else{"Unknown"} } }
+                            span.pool-cell { span.pool-cell-label { "Ark" } strong { (amount(sats(t.escrow_sats))) } small { @if t.funded_at.is_some(){"Funded"}@else{"Unknown"} } }
+                            span.pool-cell { span.pool-cell-label { "Out" } strong { (amount(out.0)) } small { (out.1) } }
+                        }
+                        div.pool-entry-detail {
+                            p { (position(flow)) " · " a href=(format!("/admin/funds?competition={}&ticket={}",c.id,t.ticket_id)) { "Open full entry trace ↗" } }
+                            div.pool-entry-nodes {
+                                div { h3 { "Payment → escrow" } (payment_nodes(c,flow,network,explorer)) }
+                                div { h3 { "Payout / return" } (payout_nodes(c,flow)) }
+                            }
+                        }
+                    }
+                }
+            }
+            (transaction_records(c,network,explorer))
+        }
+    }
+}
+
+pub fn chain_id(label: &str, id: &str, explorer: &str) -> Markup {
+    html! { dl { div.trace-fact { dt { (label) } dd { @if explorer.is_empty() { code { (id) } } @else { a href=(format!("{}/tx/{id}",explorer.trim_end_matches('/'))) rel="noreferrer" { code { (id) } } } } } }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::admin_funds::FundsPayout;
+    #[test]
+    fn customer_position_keeps_payment_success_separate_from_writeoffs_and_attempts() {
+        let mut flow = TicketFlow::default();
+        flow.ticket.write_off = Some("unrecoverable".into());
+        assert!(position(&flow).contains("support review"));
+        flow.payouts.push(FundsPayout {
+            failed_at: Some("failed".into()),
+            ..Default::default()
+        });
+        assert!(!position(&flow).contains("successful"));
+        flow.payouts.push(FundsPayout {
+            succeeded_at: Some("paid".into()),
+            ..Default::default()
+        });
+        assert!(position(&flow).contains("successful"));
+        let escaped = fact("Hash", Some("<script>bad</script>")).into_string();
+        assert!(!escaped.contains("<script>"));
+        assert!(amount(None).into_string().contains("unknown"));
+    }
+}

@@ -56,14 +56,11 @@ export default async function globalSetup() {
   // NOAA requires UUIDv7: preserve random/variant bits and use the current 48-bit timestamp.
   const randomId = crypto.randomUUID();
   const timestamp = Date.now().toString(16).padStart(12, "0");
-  formData.append(
-    "id",
-    `${timestamp.slice(0, 8)}-${timestamp.slice(8)}-7${randomId.slice(15, 18)}-${randomId.slice(19)}`,
-  );
+  const competitionId = `${timestamp.slice(0, 8)}-${timestamp.slice(8)}-7${randomId.slice(15, 18)}-${randomId.slice(19)}`;
+  formData.append("id", competitionId);
   formData.append("signing_date", signingDate.toISOString());
   formData.append("start_observation_date", startDate.toISOString());
   formData.append("end_observation_date", endDate.toISOString());
-  formData.append("number_of_values_per_entry", "9");
   formData.append("total_allowed_entries", "10");
   // About $5: large enough that the network fee is under the 10% share that pauses entries.
   formData.append("entry_fee", "5000");
@@ -83,10 +80,17 @@ export default async function globalSetup() {
     });
 
     const responseText = await response.text();
-    if (!response.ok() || !responseText.includes("Competition created successfully!")) {
+    if (!response.ok() || !responseText.includes(`/admin/operations/${competitionId}`)) {
       throw new Error(
         `Competition seed failed (${response.status()}): ${responseText}`,
       );
+    }
+    const publicContext = await request.newContext({ baseURL });
+    try {
+      const seeded = await publicContext.get(`/api/v1/competitions/${competitionId}`);
+      if (!seeded.ok()) throw new Error(`Seeded competition is unavailable: ${seeded.status()}`);
+    } finally {
+      await publicContext.dispose();
     }
     console.log("Seeded test competition successfully");
   } finally {

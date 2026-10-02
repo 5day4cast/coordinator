@@ -24,10 +24,12 @@ function forecastRows(params) {
     throw new Error("Expected the coordinator's Fahrenheit query");
   }
   // One synthetic issue before the window, eligible only inside the requested issue cutoff.
-  if (!Number.isFinite(generatedStart) || !Number.isFinite(generatedEnd)) {
-    throw new Error("Expected the coordinator's explicit forecast issue cutoff");
+  if (params.has("generated_start") || params.has("generated_end")) {
+    if (!Number.isFinite(generatedStart) || !Number.isFinite(generatedEnd)) {
+      throw new Error("Expected both forecast issue cutoff bounds");
+    }
+    if (issued < generatedStart || issued > generatedEnd) return [];
   }
-  if (issued < generatedStart || issued > generatedEnd) return [];
   const ids = new Set((params.get("station_ids") || "").split(","));
   const rows = [];
   for (const { station_id } of stations.filter((station) => ids.has(station.station_id))) {
@@ -52,6 +54,17 @@ const server = createServer((request, response) => {
   try {
     if (request.method !== "GET") {
       response.writeHead(405).end(JSON.stringify({ error: "Read-only weather fixture" }));
+    } else if (url.pathname === "/stations/eligible") {
+      const days = Number(url.searchParams.get("days"));
+      const hours = Number(url.searchParams.get("window_hours"));
+      if (!Number.isInteger(days) || days < 1 || days > 31 || ![12, 24].includes(hours)) {
+        throw new Error("Expected a supported station eligibility window");
+      }
+      response.end(JSON.stringify(stations.map(station => ({
+        ...station, clean_days: days, days_checked: days,
+        last_report: new Date().toISOString(),
+        forecast_through: new Date(Date.now() + 7 * DAY).toISOString(),
+      }))));
     } else if (url.pathname === "/stations") {
       response.end(JSON.stringify(stations));
     } else if (/^\/oracle\/events\/[^/]+$/.test(url.pathname)) {

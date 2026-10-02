@@ -320,6 +320,8 @@ async fn drain_http(name: &str, mut task: HttpTask, finished: bool) -> Option<an
 
 #[derive(Clone)]
 pub struct AppState {
+    pub admin_monitoring: Arc<crate::infra::admin_monitoring::AdminMonitoring>,
+    pub admin_weather: Arc<crate::infra::admin_weather::WeatherDiscovery>,
     pub ui_dir: String,
     /// Hash of the WASM package in `ui_dir`; pages request it by this version.
     pub wasm_version: String,
@@ -418,6 +420,14 @@ fn create_oracle_client(
 pub async fn build_app(
     config: Settings,
 ) -> Result<(AppState, TaskTracker, CancellationToken, Vec<DBConnection>), anyhow::Error> {
+    let admin_weather = Arc::new(crate::infra::admin_weather::WeatherDiscovery::new(
+        &config.coordinator_settings.oracle_url,
+    )?);
+    let admin_monitoring = Arc::new(
+        crate::infra::admin_monitoring::AdminMonitoring::from_settings(
+            config.admin_settings.monitoring.as_ref(),
+        ),
+    );
     info!(
         "Static UI assets configured at {}",
         config.ui_settings.ui_dir
@@ -771,6 +781,8 @@ pub async fn build_app(
         );
     }
     let app_state = AppState {
+        admin_monitoring,
+        admin_weather,
         ui_dir: config.ui_settings.ui_dir,
         wasm_version,
         private_url: config.ui_settings.private_url,
@@ -1040,6 +1052,14 @@ pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Ne
     let mut admin_htmx_routes = Router::new()
         .route("/", get(admin_page_handler))
         .route("/competition", get(admin_competition_fragment))
+        .route("/operations", get(crate::api::routes::operations_page))
+        .route("/funds", get(crate::api::routes::funds_page))
+        .route("/funds/tickets/{id}", get(crate::api::routes::funds_ticket))
+        .route("/funds/chain/{id}", get(crate::api::routes::funds_chain))
+        .route(
+            "/operations/{id}",
+            get(crate::api::routes::operation_detail),
+        )
         .route("/wallet", get(admin_wallet_fragment))
         .route("/wallet/balance", get(admin_wallet_balance_fragment))
         .route("/wallet/address", get(admin_wallet_address_fragment))
@@ -1271,6 +1291,15 @@ mod startup_tests {
 
     /// Every operator route, including the sign-in form, as (method, path).
     const OPERATOR_ROUTES: &[(&str, &str)] = &[
+        ("GET", "/admin/funds"),
+        (
+            "GET",
+            "/admin/funds/tickets/00000000-0000-0000-0000-000000000001",
+        ),
+        (
+            "GET",
+            "/admin/funds/chain/00000000-0000-0000-0000-000000000001",
+        ),
         ("GET", "/admin"),
         ("GET", "/admin/competition"),
         ("GET", "/admin/wallet"),

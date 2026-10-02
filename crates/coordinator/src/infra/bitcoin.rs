@@ -201,6 +201,16 @@ pub trait Bitcoin: Send + Sync {
         outpoint: OutPoint,
         output: TxOut,
     ) -> Result<PayoutOutputStatus, anyhow::Error>;
+    /// Read-only support lookup. `None` means the bounded history was checked completely.
+    async fn spending_transaction(
+        &self,
+        _outpoint: OutPoint,
+        _output: TxOut,
+    ) -> Result<Option<Transaction>, anyhow::Error> {
+        Err(anyhow!(
+            "Spending transaction lookup is not available for this backend"
+        ))
+    }
     async fn broadcast(&self, transaction: &Transaction) -> Result<(), anyhow::Error>;
     async fn get_next_address(&self) -> Result<Address, anyhow::Error>;
     async fn get_public_key(&self) -> Result<PublicKey, anyhow::Error>;
@@ -1012,6 +1022,48 @@ impl Bitcoin for BitcoinClient {
         })
         .await?
         .map_err(Into::into)
+    }
+
+    async fn spending_transaction(
+        &self,
+        outpoint: OutPoint,
+        output: TxOut,
+    ) -> Result<Option<Transaction>, anyhow::Error> {
+        let url = self.payout_electrum_url.clone();
+        tokio::task::spawn_blocking(move || -> Result<_, anyhow::Error> {
+            let started = std::time::Instant::now();
+            let client = ElectrumClient::from_config(
+                &url,
+                ConfigBuilder::new().timeout(Some(2)).retry(0).build(),
+            )?;
+            let history = client.script_get_history(&output.script_pubkey)?;
+            // Avoid an unbounded script-history crawl on reused addresses.
+            if history.len() > 32 {
+                return Err(anyhow!("Script history exceeds support lookup limit"));
+            }
+            for item in history
+                .iter()
+                .rev()
+                .filter(|item| item.tx_hash != outpoint.txid)
+            {
+                if started.elapsed() > Duration::from_secs(2) {
+                    return Err(anyhow!("Support lookup deadline reached"));
+                }
+                let tx = client.transaction_get(&item.tx_hash)?;
+                if tx.compute_txid() != item.tx_hash {
+                    return Err(anyhow!("Transaction identity mismatch"));
+                }
+                if tx
+                    .input
+                    .iter()
+                    .any(|input| input.previous_output == outpoint)
+                {
+                    return Ok(Some(tx));
+                }
+            }
+            Ok(None)
+        })
+        .await?
     }
 
     async fn get_tx_confirmation_height(&self, txid: &Txid) -> Result<Option<u32>, anyhow::Error> {

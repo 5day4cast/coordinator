@@ -1,3 +1,4 @@
+pub mod admin_funds;
 mod admission;
 #[cfg(test)]
 mod admission_tests;

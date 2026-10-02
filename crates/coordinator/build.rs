@@ -22,8 +22,6 @@ use sha2::{Digest, Sha256};
 const PUBLIC_DIRS: &[&str] = &["shared", "components", "fragments", "pages", "layouts"];
 /// The public bundle's entry point; it runs after every other script.
 const PUBLIC_ENTRY: &str = "base.js";
-/// Directories whose scripts make up the operator dashboard's bundle.
-const ADMIN_DIRS: &[&str] = &["admin"];
 
 struct Asset {
     /// Rust constant naming the asset in `assets.rs`.
@@ -61,18 +59,31 @@ fn main() -> Result<(), Box<dyn Error>> {
     let static_dir = templates.join("static");
     let assets = [
         Asset {
+            constant: "ADMIN_THEME_JS",
+            stem: "admin-theme",
+            extension: "js",
+            content_type: "text/javascript; charset=utf-8",
+            bytes: private_scope(bundle_scripts(
+                &[templates.join("admin/theme.js")],
+                "admin-theme",
+            )?),
+        },
+        Asset {
+            constant: "WEATHER_MAP_JS",
+            stem: "weather-map",
+            extension: "js",
+            content_type: "text/javascript; charset=utf-8",
+            bytes: private_scope(bundle_scripts(
+                &[templates.join("admin/weather_map.js")],
+                "weather-map",
+            )?),
+        },
+        Asset {
             constant: "APP_JS",
             stem: "app",
             extension: "js",
             content_type: "text/javascript; charset=utf-8",
             bytes: private_scope(bundle_scripts(&public_scripts(&templates, &files)?, "app")?),
-        },
-        Asset {
-            constant: "ADMIN_JS",
-            stem: "admin",
-            extension: "js",
-            content_type: "text/javascript; charset=utf-8",
-            bytes: bundle_scripts(&scripts_in(&templates, ADMIN_DIRS, &files), "admin")?,
         },
         Asset {
             constant: "BULMA_CSS",

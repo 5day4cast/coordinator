@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse},
     Extension, Json,
@@ -10,20 +10,19 @@ use axum_extra::extract::Form;
 use log::{error, info};
 use maud::Markup;
 use serde::Deserialize;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
+use time::{OffsetDateTime, UtcOffset};
 use uuid::Uuid;
 
 use crate::{
     api::admin_auth::AdminCsrf,
-    infra::bitcoin::SendOptions,
+    infra::{
+        admin_weather::{Filters, Window},
+        bitcoin::SendOptions,
+    },
     startup::AppState,
     templates::{
         admin::{
-            dashboard::{
-                admin_dashboard, competition_error, competition_success, CompetitionDefaults,
-                Forecast, Observation, Station, StationWithWeather,
-            },
-            is_allowed_station,
+            dashboard::{competition_error, competition_success},
             wallet::{
                 fee_estimates_rows, send_error, send_success, wallet_balance_section,
                 wallet_outputs_rows, wallet_page, WalletBalance, WalletOutput,
@@ -34,7 +33,7 @@ use crate::{
 };
 
 /// Helper to render a fragment or wrap it in the admin base layout for direct navigation.
-fn render_admin_fragment(
+pub(super) fn render_admin_fragment(
     headers: &HeaderMap,
     state: &AppState,
     csrf: &AdminCsrf,
@@ -58,85 +57,41 @@ fn render_admin_fragment(
     }
 }
 
-/// Admin dashboard page (competition tab)
+/// Weather discovery is rendered on the server. The filters are ordinary GET parameters.
 pub async fn admin_page_handler(
     State(state): State<Arc<AppState>>,
     Extension(csrf): Extension<AdminCsrf>,
+    Query(filters): Query<Filters>,
+    headers: HeaderMap,
 ) -> Html<String> {
-    let config = AdminPageConfig {
-        title: "5day4cast Admin",
-        api_base: &state.private_url,
-        oracle_base: &state.oracle_url,
-        explorer_url: &state.explorer_url,
-        network: &state.network,
-        csrf_token: csrf.0.as_deref(),
-    };
-
-    // Fetch stations from oracle and filter to top 200 cities
-    let stations: Vec<Station> = fetch_stations(&state.oracle_url)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|s| is_allowed_station(&s.station_id))
-        .collect();
-
-    // Fetch weather data (forecasts and observations) for all stations
-    let station_ids: Vec<&str> = stations.iter().map(|s| s.station_id.as_str()).collect();
-    let (forecasts, observations) = tokio::join!(
-        fetch_forecasts(&state.oracle_url, &station_ids),
-        fetch_observations(&state.oracle_url, &station_ids)
-    );
-
-    // Merge stations with weather data
-    let stations_with_weather = merge_stations_with_weather(
-        stations,
-        forecasts.unwrap_or_default(),
-        observations.unwrap_or_default(),
-    );
-
-    let defaults = CompetitionDefaults::default();
-
-    let content = admin_dashboard(&stations_with_weather, &defaults);
-    Html(admin_base(&config, content).into_string())
+    admin_discovery(&state, &csrf, &headers, &filters).await
 }
 
-/// Admin competition tab fragment (for HTMX tab switching)
 pub async fn admin_competition_fragment(
     State(state): State<Arc<AppState>>,
     Extension(csrf): Extension<AdminCsrf>,
+    Query(filters): Query<Filters>,
     headers: HeaderMap,
 ) -> Html<String> {
-    // Fetch stations from oracle and filter to top 200 cities
-    let stations: Vec<Station> = fetch_stations(&state.oracle_url)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|s| is_allowed_station(&s.station_id))
-        .collect();
+    admin_discovery(&state, &csrf, &headers, &filters).await
+}
 
-    // Fetch weather data (forecasts and observations) for all stations
-    let station_ids: Vec<&str> = stations.iter().map(|s| s.station_id.as_str()).collect();
-    let (forecasts, observations) = tokio::join!(
-        fetch_forecasts(&state.oracle_url, &station_ids),
-        fetch_observations(&state.oracle_url, &station_ids)
-    );
-
-    // Merge stations with weather data
-    let stations_with_weather = merge_stations_with_weather(
-        stations,
-        forecasts.unwrap_or_default(),
-        observations.unwrap_or_default(),
-    );
-
-    let defaults = CompetitionDefaults::default();
-    let content = admin_dashboard(&stations_with_weather, &defaults);
-    render_admin_fragment(
-        &headers,
-        &state,
-        &csrf,
-        "5day4cast Admin - Competition",
-        content,
-    )
+async fn admin_discovery(
+    state: &Arc<AppState>,
+    csrf: &AdminCsrf,
+    headers: &HeaderMap,
+    filters: &Filters,
+) -> Html<String> {
+    let content = match filters.window(OffsetDateTime::now_utc()) {
+        Ok(window) => {
+            let data = state.admin_weather.read(window.clone()).await;
+            crate::templates::admin::discovery::discovery(filters, &window, &data, &state.network)
+        }
+        Err(error) => {
+            maud::html! { main.admin-workspace { h1 { "Check the discovery filters" } p { (error) } a href="/admin/competition" { "Start again" } } }
+        }
+    };
+    render_admin_fragment(headers, state, csrf, "Weather discovery", content)
 }
 
 /// Admin wallet page (full page for direct navigation, fragment for HTMX)
@@ -204,6 +159,7 @@ pub async fn admin_wallet_outputs_fragment(State(state): State<Arc<AppState>>) -
 /// Form data for creating a competition
 #[derive(Debug, Deserialize)]
 pub struct CreateCompetitionForm {
+    pub history_days: Option<u32>,
     pub id: Uuid,
     pub signing_date: String,
     pub start_observation_date: String,
@@ -283,6 +239,29 @@ pub async fn admin_create_competition_handler(
         return Html(competition_error(crate::domain::WindowShape::RULE).into_string());
     };
     let number_of_values_per_entry = form.locations.len() * shape.metrics().len();
+
+    if form.locations.len() > 50 {
+        return Html(competition_error("Select no more than 50 stations").into_string());
+    }
+    {
+        if start_observation_date <= OffsetDateTime::now_utc()
+            || end_observation_date <= start_observation_date
+        {
+            return Html(
+                competition_error("Choose a future, ordered observation window").into_string(),
+            );
+        }
+        let window = Window {
+            history_days: form.history_days.unwrap_or(3),
+            start: start_observation_date,
+            end: end_observation_date,
+        };
+        match state.admin_weather.eligible(&window).await {
+            Ok(stations) if form.locations.iter().all(|id| stations.iter().any(|s| &s.station.station_id == id)) => {},
+            Ok(_) => return Html(competition_error("A selected station is no longer eligible or lacks forecast coverage through this window. Refresh discovery and review the selection.").into_string()),
+            Err(_) => return Html(competition_error("The oracle could not verify current station eligibility. Retry after discovery refreshes.").into_string()),
+        }
+    }
 
     let max_entries_per_player = form
         .max_entries_per_player
@@ -405,191 +384,6 @@ pub async fn admin_send_bitcoin_handler(
 }
 
 // Helper functions
-
-async fn fetch_stations(oracle_url: &str) -> Result<Vec<Station>, anyhow::Error> {
-    let client = reqwest_middleware::reqwest::Client::new();
-    let response = client
-        .get(format!("{}/stations", oracle_url))
-        .send()
-        .await?;
-
-    if response.status().is_success() {
-        let stations: Vec<Station> = response.json().await?;
-        Ok(stations)
-    } else {
-        Ok(vec![])
-    }
-}
-
-async fn fetch_forecasts(
-    oracle_url: &str,
-    station_ids: &[&str],
-) -> Result<Vec<Forecast>, anyhow::Error> {
-    if station_ids.is_empty() {
-        return Ok(vec![]);
-    }
-
-    // Fetch forecasts for today and tomorrow (end date is exclusive, so +2 days)
-    let today = time::OffsetDateTime::now_utc();
-    let end_date = today + time::Duration::days(2);
-
-    let start = today.format(&Rfc3339).unwrap_or_default();
-    let end = end_date.format(&Rfc3339).unwrap_or_default();
-
-    fetch_station_weather(oracle_url, "forecasts", station_ids, &start, &end).await
-}
-
-async fn fetch_observations(
-    oracle_url: &str,
-    station_ids: &[&str],
-) -> Result<Vec<Observation>, anyhow::Error> {
-    if station_ids.is_empty() {
-        return Ok(vec![]);
-    }
-
-    // Fetch observations for today only
-    let today = time::OffsetDateTime::now_utc();
-    let tomorrow = today + time::Duration::days(1);
-
-    let start = today.format(&Rfc3339).unwrap_or_default();
-    let end = tomorrow.format(&Rfc3339).unwrap_or_default();
-
-    fetch_station_weather(oracle_url, "observations", station_ids, &start, &end).await
-}
-
-async fn fetch_station_weather<T: serde::de::DeserializeOwned>(
-    oracle_url: &str,
-    kind: &str,
-    station_ids: &[&str],
-    start: &str,
-    end: &str,
-) -> Result<Vec<T>, anyhow::Error> {
-    // NOAA Oracle 2.0 accepts at most 100 stations per weather query. The admin
-    // selector can contain 200 stations, so retain all of them across bounded requests.
-    let client = reqwest_middleware::reqwest::Client::new();
-    let mut weather = Vec::new();
-    for stations in station_ids.chunks(100) {
-        let station_ids = stations.join(",");
-        let mut batch = client
-            .get(format!(
-                "{}/stations/{kind}",
-                oracle_url.trim_end_matches('/')
-            ))
-            .query(&[
-                ("station_ids", station_ids.as_str()),
-                ("start", start),
-                ("end", end),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Vec<T>>()
-            .await?;
-        weather.append(&mut batch);
-    }
-    Ok(weather)
-}
-
-fn merge_stations_with_weather(
-    stations: Vec<Station>,
-    forecasts: Vec<Forecast>,
-    observations: Vec<Observation>,
-) -> Vec<StationWithWeather> {
-    use std::collections::HashMap;
-
-    // Get today and tomorrow date strings
-    let today = time::OffsetDateTime::now_utc();
-    let tomorrow = today + time::Duration::days(1);
-
-    let today_str = today.date().to_string();
-    let tomorrow_str = tomorrow.date().to_string();
-
-    // Index forecasts by station_id and date
-    let mut forecast_map: HashMap<(&str, &str), &Forecast> = HashMap::new();
-    for forecast in &forecasts {
-        // The date field format is "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM:SS..."
-        let date_part = forecast.date.split('T').next().unwrap_or(&forecast.date);
-        forecast_map.insert((forecast.station_id.as_str(), date_part), forecast);
-    }
-
-    // Index observations by station_id (we only fetch today's)
-    let mut observation_map: HashMap<&str, &Observation> = HashMap::new();
-    for observation in &observations {
-        observation_map.insert(observation.station_id.as_str(), observation);
-    }
-
-    stations
-        .into_iter()
-        .map(|station| {
-            let today_forecast =
-                forecast_map.get(&(station.station_id.as_str(), today_str.as_str()));
-            let tomorrow_forecast =
-                forecast_map.get(&(station.station_id.as_str(), tomorrow_str.as_str()));
-            let today_observation = observation_map.get(station.station_id.as_str());
-
-            StationWithWeather {
-                today_actual_high: today_observation.map(|o| o.temp_high),
-                today_actual_low: today_observation.map(|o| o.temp_low),
-                today_forecast_high: today_forecast.map(|f| f.temp_high),
-                today_forecast_low: today_forecast.map(|f| f.temp_low),
-                tomorrow_forecast_high: tomorrow_forecast.map(|f| f.temp_high),
-                tomorrow_forecast_low: tomorrow_forecast.map(|f| f.temp_low),
-                station,
-            }
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod oracle_weather_tests {
-    use super::*;
-    use axum::{extract::Query, routing::get, Router};
-    use std::{collections::HashMap, sync::Mutex};
-
-    #[tokio::test]
-    async fn weather_queries_respect_the_oracle_station_limit_without_dropping_stations() {
-        let counts = Arc::new(Mutex::new(Vec::new()));
-        let requests = counts.clone();
-        let app = Router::new().route(
-            "/stations/{kind}",
-            get(move |Query(query): Query<HashMap<String, String>>| {
-                let requests = requests.clone();
-                async move {
-                    let stations: Vec<_> = query["station_ids"].split(',').collect();
-                    assert!(stations.len() <= 100);
-                    requests.lock().unwrap().push(stations.len());
-                    Json(
-                        stations
-                            .into_iter()
-                            .map(|station| {
-                                serde_json::json!({
-                                    "station_id": station,
-                                    "date": "2030-01-01",
-                                    "temp_high": 25,
-                                    "temp_low": 10,
-                                })
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let stations: Vec<String> = (0..201).map(|index| format!("S{index:03}")).collect();
-        let station_ids: Vec<_> = stations.iter().map(String::as_str).collect();
-        let forecasts = fetch_forecasts(&url, &station_ids).await.unwrap();
-        let observations = fetch_observations(&url, &station_ids).await.unwrap();
-        assert_eq!(forecasts.len(), stations.len());
-        assert_eq!(observations.len(), stations.len());
-        assert_eq!(forecasts.last().unwrap().station_id, "S200");
-        assert_eq!(observations.last().unwrap().station_id, "S200");
-        assert_eq!(*counts.lock().unwrap(), vec![100, 100, 1, 100, 100, 1]);
-        server.abort();
-        let _ = server.await;
-    }
-}
 
 async fn fetch_balance(state: &AppState) -> Result<WalletBalance, anyhow::Error> {
     let balance = state.bitcoin.get_balance().await?;
