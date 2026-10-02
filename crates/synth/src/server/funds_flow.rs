@@ -112,11 +112,17 @@ fn short(value: &str) -> String {
 fn summary(rail: &str, entry: &EntryTrace, value: Option<u64>, status: &str) -> Markup {
     let label = entry
         .entry_id
+        .filter(|_| entry.entry_submitted)
         .map(|id| format!("entry {}", short(&id.to_string())))
         .or_else(|| {
             entry
                 .ticket_id
                 .map(|id| format!("ticket {}", short(&id.to_string())))
+        })
+        .or_else(|| {
+            entry
+                .entry_id
+                .map(|id| format!("planned {}", short(&id.to_string())))
         })
         .unwrap_or_else(|| "Unassigned".into());
     html! { summary {
@@ -126,7 +132,16 @@ fn summary(rail: &str, entry: &EntryTrace, value: Option<u64>, status: &str) -> 
     } }
 }
 fn identity(entry: &EntryTrace) -> Markup {
-    html! { strong { (entry.user) } (id("Ticket",entry.ticket_id.map(|id|id.to_string()).as_deref())) (id("Entry",entry.entry_id.map(|id|id.to_string()).as_deref())) }
+    html! {
+        strong { (entry.user) }
+        (id("Ticket", entry.ticket_id.map(|id| id.to_string()).as_deref()))
+        @if entry.entry_submitted {
+            (id("Entry", entry.entry_id.map(|id| id.to_string()).as_deref()))
+        } @else {
+            (id("Planned entry ID", entry.entry_id.map(|id| id.to_string()).as_deref()))
+            p.note { "Entry submission is not confirmed in this trace." }
+        }
+    }
 }
 fn transaction(tx: &ChainTx, links: &money::Links, title: &str) -> Markup {
     html! { details.transaction-record {
@@ -296,5 +311,34 @@ mod tests {
         trail.refunds[0].state = "submitted".into();
         trail.refunds[0].written_off = true;
         assert!(!draw(&trail).contains("Paid recorded"));
+    }
+    #[test]
+    fn generated_entry_ids_do_not_replace_ticket_identity_before_acceptance() {
+        let entry_id = uuid::Uuid::now_v7();
+        let ticket_id = uuid::Uuid::now_v7();
+        let mut entry = EntryTrace {
+            user: "alice".into(),
+            entry_id: Some(entry_id),
+            ticket_id: Some(ticket_id),
+            paid: true,
+            ..Default::default()
+        };
+        let compact = summary("Ark", &entry, Some(5330), "Funded").into_string();
+        assert!(compact.contains(&format!("ticket {}", short(&ticket_id.to_string()))));
+        assert!(!compact.contains(&format!("entry {}", short(&entry_id.to_string()))));
+        let detail = identity(&entry).into_string();
+        assert!(detail.contains("Planned entry ID"));
+        assert!(detail.contains(&entry_id.to_string()));
+        assert!(detail.contains("Entry submission is not confirmed in this trace"));
+        entry.ticket_id = None;
+        let without_ticket = summary("Ark", &entry, Some(5330), "Funded").into_string();
+        assert!(without_ticket.contains(&format!("planned {}", short(&entry_id.to_string()))));
+        entry.ticket_id = Some(ticket_id);
+        entry.entry_submitted = true;
+        let compact = summary("Ark", &entry, Some(5330), "Funded").into_string();
+        assert!(compact.contains(&format!("entry {}", short(&entry_id.to_string()))));
+        let detail = identity(&entry).into_string();
+        assert!(!detail.contains("Planned entry"));
+        assert!(!detail.contains("not confirmed"));
     }
 }

@@ -13,6 +13,8 @@ pub fn discovery(
     network: &str,
 ) -> Markup {
     let day = window.start.date().to_string();
+    let refresh_path = nearby_link(filters, window, &filters.near, &filters.weather);
+    let loading = data.latest.is_none() && data.refreshing;
     let selection = data.value().map(|data| filters.select(data));
     let usable = data
         .latest
@@ -48,18 +50,29 @@ pub fn discovery(
                 button type="submit" { "Find games" }
             }
             p.note { "Forecasts are discovery signals. Temperature and wind are scored by the contract; precipitation helps identify weather to watch. Nearby stations are a geographic comparison, not a confirmed storm track." }
+            // Only empty results poll. Cached results stay in place while the operator
+            // selects stations or edits a game; filters also remain outside this region.
+            section id="weather-discovery-results"
+                hx-get=[loading.then_some(refresh_path.as_str())]
+                hx-trigger=[loading.then_some("every 2s")]
+                hx-select="#weather-discovery-results" hx-target="this" hx-swap="outerHTML"
+                hx-sync="this:drop" hx-push-url="false" aria-busy=(loading.to_string()) {
             @if let Some(latest) = &data.latest {
                 p.note {
                     (latest.value.eligible_count) " eligible stations with forecast coverage through this window. Updated "
                     time datetime=(latest.fetched_at.format(&Rfc3339).unwrap_or_default()) { (latest.fetched_at.format(&Rfc3339).unwrap_or_default()) }
                     ". " (latest.value.missing_forecasts) " without forecast rows."
-                    @if data.refreshing { " Refresh in progress; reload to see the new data." }
+                    @if data.refreshing { " Refresh in progress. Your current station choices stay in place." }
                     @if !usable { " These results are stale. Refresh before creating a game." }
                 }
             }
+            @if data.refreshing || !usable {
+                p.note { a href=(&refresh_path) { "Refresh results" } }
+            }
             @match selection {
                 None => div.notice role="status" {
-                    @if data.refreshing { "Loading eligible stations and forecasts. Reload this page shortly." }
+                    @if data.refreshing { "Loading eligible stations and forecasts. Results appear here when ready."
+                        noscript { p { "Automatic updates need JavaScript. Use Refresh results to check progress." } } }
                     @else { "Weather discovery is unavailable. Retry shortly; the oracle could not supply a complete forecast set." }
                 },
                 Some(Err(error)) => div.notice role="alert" { (error) },
@@ -149,6 +162,7 @@ pub fn discovery(
                     }
                 }
             }
+            }
         }
     }
 }
@@ -169,4 +183,103 @@ pub(super) fn nearby_link(
         .append_pair("history_days", &window.history_days.to_string())
         .append_pair("weather", weather);
     format!("{}?{}", url.path(), url.query().unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infra::{admin_weather::Candidate, refresh_cache::Fetched};
+    use std::sync::Arc;
+
+    fn window() -> Window {
+        Filters::default()
+            .window(time::macros::datetime!(2026-10-02 12:00 UTC))
+            .unwrap()
+    }
+
+    #[test]
+    fn cold_loading_polls_only_until_a_result_or_failure_and_keeps_a_native_link() {
+        let filters = Filters {
+            location: "Portland & coast".into(),
+            near: "KPDX".into(),
+            weather: "wind".into(),
+            radius_km: Some(250),
+            ..Default::default()
+        };
+        let window = window();
+        let path = nearby_link(&filters, &window, &filters.near, &filters.weather);
+        let uri = path.parse().unwrap();
+        let parsed = axum::extract::Query::<Filters>::try_from_uri(&uri)
+            .unwrap()
+            .0;
+        assert_eq!(parsed.location, filters.location);
+        assert_eq!(parsed.near, filters.near);
+        assert_eq!(parsed.weather, filters.weather);
+        assert_eq!(parsed.radius_km, filters.radius_km);
+        assert_eq!(parsed.day, "2026-10-03");
+        assert_eq!(parsed.history_days, Some(3));
+        let mut data = Cached {
+            latest: None,
+            refreshing: true,
+        };
+        let loading = discovery(&filters, &window, &data, "signet").into_string();
+        assert!(loading.contains("hx-trigger=\"every 2s\""));
+        assert!(loading.contains("hx-select=\"#weather-discovery-results\""));
+        assert!(loading.contains("hx-sync=\"this:drop\""));
+        assert!(loading.contains("<noscript>"));
+        assert!(loading.contains("Refresh results</a>"));
+        assert!(!loading.contains("id=\"game-creation\""));
+        assert!(
+            loading.find("</form>").unwrap()
+                < loading.find("id=\"weather-discovery-results\"").unwrap()
+        );
+
+        data.refreshing = false;
+        let failed = discovery(&filters, &window, &data, "signet").into_string();
+        assert!(!failed.contains("hx-get="));
+        assert!(failed.contains("Weather discovery is unavailable"));
+        assert!(failed.contains("Refresh results</a>"));
+
+        data.latest = Some(Arc::new(Fetched::new(Discovery {
+            candidates: Vec::new(),
+            eligible_count: 0,
+            missing_forecasts: 0,
+        })));
+        let finished = discovery(&Filters::default(), &window, &data, "signet").into_string();
+        assert!(!finished.contains("hx-get="));
+        assert!(!finished.contains("hx-trigger="));
+        assert!(finished.contains("0 matching stations"));
+    }
+
+    #[test]
+    fn a_background_refresh_does_not_replace_cached_results_or_game_choices() {
+        let candidate = Candidate {
+            eligible: serde_json::from_value(serde_json::json!({
+                "station_id":"KPDX", "station_name":"Portland", "state":"OR", "iata_id":"PDX",
+                "latitude":45.58, "longitude":-122.6, "clean_days":3, "days_checked":3,
+                "last_report":"2026-10-02T10:00:00Z", "forecast_through":"2026-10-05T00:00:00Z"
+            }))
+            .unwrap(),
+            high: 68,
+            low: 50,
+            wind_knots: None,
+            rain_chance: None,
+            forecasts: Vec::new(),
+        };
+        let data = Cached {
+            latest: Some(Arc::new(Fetched::new(Discovery {
+                candidates: vec![candidate],
+                eligible_count: 1,
+                missing_forecasts: 0,
+            }))),
+            refreshing: true,
+        };
+        let html = discovery(&Filters::default(), &window(), &data, "signet").into_string();
+        assert!(html.contains("id=\"game-creation\""));
+        assert!(html.contains("name=\"locations\" value=\"KPDX\""));
+        assert!(html.contains("Your current station choices stay in place"));
+        assert!(!html.contains("hx-get="));
+        assert!(!html.contains("hx-trigger="));
+        assert!(html.contains("Refresh results</a>"));
+    }
 }

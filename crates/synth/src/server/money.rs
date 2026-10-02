@@ -514,28 +514,29 @@ fn entry_rows(run: &Run, entry: &EntryTrace) -> Vec<Row> {
         );
     }
     if let Some(entry_id) = entry.entry_id {
-        rows.push(
-            Row::new(
-                format!("entry · {who}"),
-                if entry.entry_submitted {
-                    Status::Done
-                } else if paid {
-                    Status::Failed
-                } else {
-                    Status::Active
-                },
-                entry_id.to_string(),
-            )
+        let (progress, status) = super::run_detail::entry_progress(entry, paid, false);
+        let label = if entry.entry_submitted {
+            "entry"
+        } else {
+            "planned entry"
+        };
+        let mut row = Row::new(format!("{label} · {who}"), status, entry_id.to_string())
             .between(who.clone(), "coordinator")
-            .link(format!(
+            .note(if entry.entry_submitted {
+                format!("{progress}; coordinator acceptance recorded")
+            } else {
+                format!("{progress}; generated ID, entry submission not confirmed")
+            });
+        if entry.entry_submitted {
+            row = row.link(format!(
                 "{}/api/v1/entries?event_id={}",
                 links.coordinator(),
                 run.competition_id
                     .map(|id| id.to_string())
                     .unwrap_or_default()
-            ))
-            .note("signed by the player"),
-        );
+            ));
+        }
+        rows.push(row);
     }
     rows
 }
@@ -1571,5 +1572,75 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("test endpoint"));
+    }
+    #[test]
+    fn planned_entry_rows_use_scenario_progress_without_claiming_acceptance() {
+        use crate::scenarios::EntryBehavior;
+        let links = links();
+        let run = Run {
+            competition_id: Some(Uuid::now_v7()),
+            entries: &[],
+            scenario_refunds: &[],
+            trail: None,
+            links: &links,
+            paid_by_node: Some(true),
+        };
+        let mut trace = EntryTrace {
+            user: "alice".into(),
+            entry_id: Some(Uuid::now_v7()),
+            ticket_id: Some(Uuid::now_v7()),
+            behavior: Some(EntryBehavior::AbandonPaid),
+            paid: true,
+            ..Default::default()
+        };
+        let planned = entry_rows(&run, &trace)
+            .into_iter()
+            .find(|r| r.step == "planned entry · alice")
+            .unwrap();
+        assert_eq!(planned.status, Status::Done);
+        assert!(planned
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("left before submitting (planned)"));
+        assert!(planned
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("entry submission not confirmed"));
+        assert!(planned.link.is_none());
+
+        trace.entry_submitted = true;
+        let unexpected = entry_rows(&run, &trace)
+            .into_iter()
+            .find(|r| r.step == "entry · alice")
+            .unwrap();
+        assert_eq!(unexpected.status, Status::Failed);
+        assert!(unexpected
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("unexpectedly entered"));
+        assert!(unexpected.link.is_some());
+
+        trace.behavior = None;
+        let accepted = entry_rows(&run, &trace)
+            .into_iter()
+            .find(|r| r.step == "entry · alice")
+            .unwrap();
+        assert_eq!(accepted.status, Status::Done);
+        assert!(accepted
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("coordinator acceptance recorded"));
+        trace.entry_submitted = false;
+        trace.submission_attempts = 1;
+        let incomplete = entry_rows(&run, &trace)
+            .into_iter()
+            .find(|r| r.step == "planned entry · alice")
+            .unwrap();
+        assert_eq!(incomplete.status, Status::Failed);
+        assert!(incomplete.link.is_none());
     }
 }
