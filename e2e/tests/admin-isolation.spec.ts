@@ -48,3 +48,37 @@ test("operator browser session authenticates and enforces CSRF", async ({ page, 
   expect(statuses.accepted).toBe(200);
   expect(statuses.body).toContain("Invalid competition ID");
 });
+
+test.describe("native operator investigations", () => {
+  test.use({ javaScriptEnabled: false });
+  test("sorts operations and opens dependency checks without JavaScript", async ({ page, request }) => {
+    for (const path of ["/admin/services", "/admin/keymeld"]) {
+      expect((await request.get(path)).status()).toBe(404);
+    }
+    await page.goto(`${adminURL}/admin/login`);
+    await page.getByLabel("Admin token").fill(adminToken);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await page.goto(`${adminURL}/admin/operations`);
+    await expect(page.getByLabel("Sort by")).toHaveValue("review");
+    for (const sort of ["created_desc", "created_asc"]) {
+      await page.getByLabel("Sort by").selectOption(sort);
+      await page.locator('form[action="/admin/operations"] button[type="submit"]').click();
+      await expect(page).toHaveURL(new RegExp(`sort=${sort}`));
+      const times = await page.locator("table time[datetime]").evaluateAll(nodes =>
+        nodes.map(n => Date.parse(n.getAttribute("datetime")!)));
+      expect(times.length).toBeGreaterThan(0);
+      expect(times.every(Number.isFinite)).toBeTruthy();
+      expect(times).toEqual([...times].sort((a, b) => sort === "created_desc" ? b - a : a - b));
+    }
+    for (const [path, title] of [["services", "Services"], ["keymeld", "Keymeld & enclaves"]]) {
+      await page.goto(`${adminURL}/admin/${path}`);
+      await expect(page.getByRole("heading", { name: title, exact: true })).toBeVisible();
+      await expect(page.getByText("Grafana data is unavailable or not configured.", { exact: false })).toBeVisible();
+      const detail = page.locator("details.service-signal").first();
+      await detail.locator("summary").first().click();
+      await expect(detail).toHaveAttribute("open", "");
+      await page.setViewportSize({ width: 390, height: 844 });
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBeTruthy();
+    }
+  });
+});
