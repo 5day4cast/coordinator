@@ -10,7 +10,9 @@ function localizeTimes(root) {
     const options =
       element.dataset.local === "time"
         ? { hour: "numeric", minute: "2-digit" }
-        : { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" };
+        : element.dataset.local === "weekday"
+          ? { weekday: "short", hour: "numeric", minute: "2-digit" }
+          : { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" };
     if ("zone" in element.dataset) options.timeZoneName = "short";
     element.textContent = date.toLocaleString(undefined, options);
     element.title = date.toLocaleString();

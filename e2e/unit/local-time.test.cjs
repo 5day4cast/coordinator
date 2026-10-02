@@ -25,3 +25,14 @@ test("a window's end names the reader's zone once; other times don't", () => {
   assert.equal(end.textContent.replace(/\s/g, " "), "Sep 30, 10:02 PM EDT");
   assert.equal(sameDay.textContent.replace(/\s/g, " "), "10:00 AM EDT");
 });
+
+
+test("competition starts show a weekday and the local daylight-saving zone", () => {
+  const summer = time("2026-10-04T17:00:00Z", "weekday", true);
+  const winter = time("2026-11-08T18:00:00Z", "weekday", true);
+  const { localizeTimes } = loadBundle(["shared/page.js"], { Date, console }, ["localizeTimes"]);
+  localizeTimes({ querySelectorAll: () => [summer, winter] });
+  assert.equal(summer.textContent.replace(/\s/g, " "), "Sun, 1:00 PM EDT");
+  assert.equal(winter.textContent.replace(/\s/g, " "), "Sun, 1:00 PM EST");
+  assert.ok(summer.title.includes("2026"));
+});

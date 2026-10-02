@@ -2159,7 +2159,12 @@ async fn the_registration_sent_before_paying_is_the_one_the_entry_registers() {
         ephemeral_pubkey: registration.ephemeral_pubkey.clone(),
         payout_hash: hex::encode([23; 32]),
         event_id: f.competition_id,
-        expected_observations: vec![],
+        expected_observations: vec![WeatherChoices {
+            stations: "KDEN".into(),
+            temp_high: Some(crate::infra::oracle::ValueOptions::Par),
+            temp_low: Some(crate::infra::oracle::ValueOptions::Par),
+            wind_speed: Some(crate::infra::oracle::ValueOptions::Par),
+        }],
         encrypted_keymeld_private_key: Some(sealed.into()),
         keymeld_auth_pubkey: Some(registration.keymeld_auth_pubkey.clone()),
         keymeld_registration_context: Some(registration.keymeld_registration_context.clone()),

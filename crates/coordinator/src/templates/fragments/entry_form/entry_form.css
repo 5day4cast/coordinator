@@ -211,7 +211,8 @@
   font-weight: 600;
 }
 
-.entry-form .pick-row {
+.entry-form .pick-row,
+.entry-form .pick-heading {
   display: flex;
   flex-wrap: wrap;
   justify-content: space-between;
@@ -373,42 +374,5 @@
   }
 }
 
-/* The price is one total; tapping it opens what it is made of. */
-.price-details summary {
-  cursor: pointer;
-  list-style: none;
-}
-
-.price-details summary::-webkit-details-marker {
-  display: none;
-}
-
-.price-details summary::after {
-  content: " ▾";
-  font-size: 0.75em;
-  color: var(--entry-muted);
-}
-
-.price-details[open] summary::after {
-  content: " ▴";
-}
-
-/* On touch screens the total is a 44 px tall tap: padding above and below its line, at the
-   same size of text. */
-@media (pointer: coarse) {
-  .price-details summary {
-    display: inline-block;
-    padding: calc((44px - 1lh) / 2) 0;
-  }
-}
-
-.price-lines {
-  margin-top: 0.25rem;
-  font-size: 0.8rem;
-  font-weight: 400;
-  color: var(--entry-muted);
-}
-
-.price-lines span {
-  white-space: nowrap;
-}
+.city-heading { margin-bottom: 0.75rem; }
+.pick-heading { color: var(--entry-muted); font-size: 0.8rem; }

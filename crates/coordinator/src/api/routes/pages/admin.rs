@@ -208,7 +208,6 @@ pub struct CreateCompetitionForm {
     pub signing_date: String,
     pub start_observation_date: String,
     pub end_observation_date: String,
-    pub number_of_values_per_entry: usize,
     pub total_allowed_entries: usize,
     pub entry_fee: usize,
     /// A percentage with up to two decimals, such as 2.5.
@@ -279,12 +278,11 @@ pub async fn admin_create_competition_handler(
         return Html(competition_error("At least 1 location must be selected").into_string());
     }
 
-    // Validate number_of_values_per_entry is at least 1
-    if form.number_of_values_per_entry < 1 {
-        return Html(
-            competition_error("Number of values per entry must be at least 1").into_string(),
-        );
-    }
+    let Some(shape) = crate::domain::WindowShape::of(start_observation_date, end_observation_date)
+    else {
+        return Html(competition_error(crate::domain::WindowShape::RULE).into_string());
+    };
+    let number_of_values_per_entry = form.locations.len() * shape.metrics().len();
 
     let max_entries_per_player = form
         .max_entries_per_player
@@ -308,7 +306,7 @@ pub async fn admin_create_competition_handler(
             start_observation_date,
             end_observation_date,
             locations: form.locations,
-            number_of_values_per_entry: form.number_of_values_per_entry,
+            number_of_values_per_entry,
             entry_fee: form.entry_fee,
             coordinator_fee,
             relative_locktime_block_delta: form.relative_locktime_block_delta,
@@ -357,7 +355,7 @@ pub async fn admin_create_competition_handler(
         start_observation_date,
         end_observation_date,
         locations: form.locations,
-        number_of_values_per_entry: form.number_of_values_per_entry,
+        number_of_values_per_entry,
         number_of_places_win: form.number_of_places_win,
         total_allowed_entries: form.total_allowed_entries,
         entry_fee: form.entry_fee,
