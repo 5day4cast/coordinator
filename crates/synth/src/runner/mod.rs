@@ -14,7 +14,7 @@ use log::{error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
-use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use uuid::Uuid;
 
 /// The scenarios synth runs, by the names runs are started with.
@@ -492,15 +492,16 @@ impl Runner {
             keep_open.validate(lanes)?;
         }
         let early = keep_open.map(|keep_open| {
-            let start = Arc::new(Notify::new());
+            let start = Arc::new(keep_open::LaneStart::default());
             tokio::spawn(
-                keep_open::KeepOpen::new(keep_open.clone(), base.entry_fee as u64).run(
-                    self.client.clone(),
-                    start.clone(),
-                    self.open.clone(),
-                ),
+                keep_open::KeepOpen::new(keep_open.clone(), base.entry_fee as u64, start.clone())
+                    .run(self.client.clone(), self.open.clone()),
             );
-            (keep_open.lane.clone(), start)
+            (
+                keep_open.lane.clone(),
+                start,
+                std::time::Duration::from_secs(keep_open.min_minutes_left * 60),
+            )
         });
         info!(
             "Starting {} lanes: {}",
@@ -518,8 +519,8 @@ impl Runner {
                 let (runner, base) = (self.clone(), base.clone());
                 let start = early
                     .as_ref()
-                    .filter(|(name, _)| *name == lane.name)
-                    .map(|(_, start)| start.clone());
+                    .filter(|(name, _, _)| *name == lane.name)
+                    .map(|(_, start, grace)| (start.clone(), *grace));
                 tokio::spawn(async move { runner.run_lane(lane, base, start).await })
             })
             .collect();
@@ -531,7 +532,7 @@ impl Runner {
         &self,
         lane: lanes::LaneConfig,
         base: ScenarioConfig,
-        early: Option<Arc<Notify>>,
+        early: Option<(Arc<keep_open::LaneStart>, std::time::Duration)>,
     ) {
         lane_loop(&lane, &base, early, |scenario, config| {
             let runner = self.clone();
@@ -588,7 +589,7 @@ impl Runner {
 async fn lane_loop(
     lane: &lanes::LaneConfig,
     base: &ScenarioConfig,
-    early: Option<Arc<Notify>>,
+    early: Option<(Arc<keep_open::LaneStart>, std::time::Duration)>,
     mut start: impl FnMut(String, ScenarioConfig),
 ) {
     let mut after = OffsetDateTime::now_utc();
@@ -596,14 +597,21 @@ async fn lane_loop(
     loop {
         let (mut at, mut close) = lane.next_start(base, after);
         match &early {
-            Some(early) => tokio::select! {
+            Some((early, grace)) => tokio::select! {
                 _ = sleep_until(at) => {}
-                _ = early.notified() => {
+                _ = early.notify.notified() => {
+                    // A check may have requested this before the scheduled run started.
+                    if early.recent(*grace) {
+                        continue;
+                    }
                     (at, close) = lane.next_start(base, OffsetDateTime::now_utc());
                     info!("Lane {} starts its next run early, to keep a competition open", lane.name);
                 }
             },
             None => sleep_until(at).await,
+        }
+        if let Some((early, _)) = &early {
+            early.record();
         }
         let (scenario, config) = lane.run_config(base, cycle, close);
         info!("Lane {} starts {scenario} (cycle {cycle})", lane.name);
@@ -820,22 +828,28 @@ mod tests {
         };
         let base = ScenarioConfig::default();
         lane.validate(&base).unwrap();
-        let early = Arc::new(Notify::new());
+        let early = Arc::new(keep_open::LaneStart::default());
         let (started, mut starts) = mpsc::unbounded_channel();
         let begun = tokio::time::Instant::now();
+        early.notify.notify_one();
         let running = tokio::spawn({
             let early = early.clone();
             async move {
-                lane_loop(&lane, &base, Some(early), |scenario, config| {
-                    started
-                        .send((
-                            begun.elapsed().as_secs(),
-                            scenario,
-                            config.observation_window_secs,
-                            config.backfill,
-                        ))
-                        .unwrap();
-                })
+                lane_loop(
+                    &lane,
+                    &base,
+                    Some((early, std::time::Duration::from_secs(300))),
+                    |scenario, config| {
+                        started
+                            .send((
+                                begun.elapsed().as_secs(),
+                                scenario,
+                                config.observation_window_secs,
+                                config.backfill,
+                            ))
+                            .unwrap();
+                    },
+                )
                 .await
             }
         });
@@ -845,9 +859,15 @@ mod tests {
             (0, "queued_one_pool", 86_400)
         );
         assert_eq!(backfill.map(|backfill| backfill.margin), Some(1));
+        early.notify.notify_one();
+        tokio::task::yield_now().await;
+        assert!(
+            starts.try_recv().is_err(),
+            "the startup check must not duplicate the run"
+        );
 
         tokio::time::sleep(std::time::Duration::from_secs(1000)).await;
-        early.notify_one();
+        early.notify.notify_one();
         let (at, _, window, _) = starts.recv().await.unwrap();
         assert_eq!(
             (at, window),

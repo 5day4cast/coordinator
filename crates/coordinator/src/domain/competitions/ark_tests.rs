@@ -679,6 +679,8 @@ impl Fixture {
 
     /// Whether the ticket is paid, settled, and its escrow recorded as funded by `vtxo`.
     async fn paid_by(&self, ticket: &ArkTicket) -> Option<(String, u64)> {
+        // Both reads must see the same side of the subscription's atomic payment update.
+        let _settling = self.coordinator.escrow_watch.settling.lock().await;
         let stored = self.store().get_ticket(ticket.id).await.unwrap();
         let escrow = self
             .store()

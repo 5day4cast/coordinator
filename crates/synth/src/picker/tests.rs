@@ -422,3 +422,18 @@ recent_runs_to_avoid = 6
     );
     assert!(unknown.is_err());
 }
+
+/// A short-history lane must not fill the cache for one requiring a longer record.
+#[tokio::test]
+async fn eligible_cache_keeps_each_history_window_separate() {
+    let f = fixture(Oracle {
+        eligible: Some(vec![station("KDEN", "DEN", DENVER)]),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(f.picker.eligible(3, 24).await.unwrap().len(), 1);
+    f.oracle.lock().unwrap().eligible = Some(vec![]);
+    assert!(f.picker.eligible(30, 24).await.is_none());
+    assert_eq!(f.picker.eligible(3, 24).await.unwrap().len(), 1);
+    assert_eq!(f.oracle.lock().unwrap().eligible_calls, 2);
+}
