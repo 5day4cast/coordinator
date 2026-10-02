@@ -446,5 +446,16 @@
 .admin-workspace .service-signals { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr)); gap:.8rem; margin:1rem 0; }
 .admin-workspace .service-signal { min-width:0; border:1px solid var(--line); background:var(--panel); border-radius:10px; padding:1rem; }
 .admin-workspace .service-signal summary { cursor:pointer; }
-.admin-workspace .service-signal summary .notice { display:inline; border:0; padding:0; color:#c78024; }
 .admin-workspace .service-signal p,.admin-workspace .service-signal code { overflow-wrap:anywhere; }
+.admin-workspace .signal-heading { display:flex; align-items:baseline; justify-content:space-between; gap:.8rem; flex-wrap:wrap; }
+.admin-workspace .signal-heading h3 { margin:0; }
+.admin-workspace .signal-actions { display:flex; gap:1rem; flex-wrap:wrap; font-size:.85rem; }
+.admin-workspace .signal-status { font-size:.75rem; font-weight:650; color:var(--muted); }
+.admin-workspace .signal-ok { color:var(--accent); }
+.admin-workspace .signal-review { color:#a65d00; }
+html[data-theme=dark] .admin-workspace .signal-review { color:#efb15b; }
+.admin-workspace .signal-values { margin:.8rem 0; }
+.admin-workspace .signal-values > div { display:flex; justify-content:space-between; gap:1rem; padding:.45rem 0; border-bottom:1px solid var(--line); }
+.admin-workspace .signal-values dt { color:var(--muted); overflow-wrap:anywhere; }
+.admin-workspace .signal-values dd { margin:0; font-weight:650; text-align:right; }
+.admin-workspace .service-signal details { font-size:.85rem; }

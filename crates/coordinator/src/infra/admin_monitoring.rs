@@ -166,10 +166,10 @@ impl AdminMonitoring {
         }
         let service = self.clone();
         self.cache
-            .get(
+            .get_fresh(
                 (),
                 Duration::from_secs(60),
-                Duration::from_millis(500),
+                Duration::from_secs(9),
                 move || async move {
                     let client = service
                         .client
@@ -181,21 +181,29 @@ impl AdminMonitoring {
                             client.get(&service.query_url).query(&[("query", query)])
                         })
                         .collect();
-                    Ok(stream::iter(requests)
-                        .map(|request| async move {
-                            let value = async {
-                                let response: serde_json::Value =
-                                    request.send().await?.error_for_status()?.json().await?;
-                                metric_value(&response)
-                                    .context("Grafana returned no single finite sample")
-                            }
-                            .await
-                            .ok();
-                            Metric { value }
-                        })
-                        .buffered(3)
-                        .collect::<Vec<_>>()
-                        .await)
+                    let metrics = tokio::time::timeout(
+                        Duration::from_secs(8),
+                        stream::iter(requests)
+                            .map(|request| async move {
+                                let value = async {
+                                    let response: serde_json::Value =
+                                        request.send().await?.error_for_status()?.json().await?;
+                                    metric_value(&response)
+                                        .context("Grafana returned no single finite sample")
+                                }
+                                .await
+                                .ok();
+                                Metric { value }
+                            })
+                            .buffered(3)
+                            .collect::<Vec<_>>(),
+                    )
+                    .await?;
+                    ensure!(
+                        metrics.iter().any(|metric| metric.value.is_some()),
+                        "Grafana did not answer any operation metric query"
+                    );
+                    Ok(metrics)
                 },
             )
             .await

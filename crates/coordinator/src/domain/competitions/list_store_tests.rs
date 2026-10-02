@@ -238,3 +238,46 @@ async fn the_list_reads_the_same_rows_order_and_pages_as_the_full_read() {
     assert!(first.contains("no winner · pot shared back"));
     database.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn operator_summaries_keep_signing_errors_without_loading_contracts() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = DBConnection::new(
+        directory.path().to_str().unwrap(),
+        "competitions",
+        DatabasePoolConfig::default(),
+        DatabaseType::Competitions,
+    )
+    .await
+    .unwrap();
+    let store = CompetitionStore::new(database.clone());
+    let now = OffsetDateTime::now_utc();
+    let mut c = competition(now + Duration::DAY, true);
+    c.contract_parameters = Some(pot_return_contract().0);
+    c.contracted_at = Some(now);
+    c.cancelled_at = Some(now);
+    c.errors.push(CompetitionError::InvalidStateTransition(
+        "Keymeld enclave signing failed".into(),
+    ));
+    store
+        .add_competition_with_tickets(c.clone(), vec![])
+        .await
+        .unwrap();
+    store.update_competitions(vec![c.clone()]).await.unwrap();
+
+    let public = store.list_competitions().await.unwrap();
+    let operator = store.list_operator_competitions().await.unwrap();
+    assert_eq!(public.len(), 1);
+    assert_eq!(operator.len(), 1);
+    assert_eq!(operator[0].id, c.id);
+    assert_eq!(operator[0].get_state(), public[0].get_state());
+    assert!(public[0].errors.is_empty());
+    assert_eq!(
+        serde_json::to_value(&operator[0].errors).unwrap(),
+        serde_json::to_value(&c.errors).unwrap()
+    );
+    assert!(operator[0].contract_parameters.is_none());
+    assert!(operator[0].funding_transaction.is_none());
+    assert!(operator[0].signed_contract.is_none());
+    database.close().await.unwrap();
+}

@@ -59,7 +59,7 @@ test.describe("native operator investigations", () => {
     await page.getByLabel("Admin token").fill(adminToken);
     await page.getByRole("button", { name: "Sign in" }).click();
     await page.goto(`${adminURL}/admin/operations`);
-    await expect(page.getByLabel("Sort by")).toHaveValue("review");
+    await expect(page.getByLabel("Sort by")).toHaveValue("created_desc");
     for (const sort of ["created_desc", "created_asc"]) {
       await page.getByLabel("Sort by").selectOption(sort);
       await page.locator('form[action="/admin/operations"] button[type="submit"]').click();
@@ -74,7 +74,9 @@ test.describe("native operator investigations", () => {
       await page.goto(`${adminURL}/admin/${path}`);
       await expect(page.getByRole("heading", { name: title, exact: true })).toBeVisible();
       await expect(page.getByText("Grafana data is unavailable or not configured.", { exact: false })).toBeVisible();
-      const detail = page.locator("details.service-signal").first();
+      await expect(page.getByText("Metric query", { exact: true })).toHaveCount(0);
+      await expect(page.getByRole("link", { name: "Refresh values", exact: true })).toBeVisible();
+      const detail = page.locator("article.service-signal details").first();
       await detail.locator("summary").first().click();
       await expect(detail).toHaveAttribute("open", "");
       await page.setViewportSize({ width: 390, height: 844 });

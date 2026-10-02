@@ -1,10 +1,9 @@
 //! Values fetched from a slow service, kept fresh in the background.
 //!
-//! A reader gets the value it finds at once, even a stale one, and a stale or missing value
-//! starts one refresh in the background. Only a reader that finds nothing (or nothing it can
-//! use) waits, for no longer than it asks to, and it stops waiting as soon as that refresh ends,
-//! whether it succeeded or not. A failed refresh keeps the last good value and is not retried for [`RETRY_AFTER`], so an
-//! outage costs the slow service one request per key per interval.
+//! A stale or missing value starts one shared refresh in the background. Readers can use
+//! the last value at once, or wait for fresh data with [`RefreshCache::get_fresh`]. A bounded
+//! wait ends when the refresh succeeds or fails. A failed refresh keeps the last good value
+//! and is not retried for [`RETRY_AFTER`], so an outage costs one request per key per interval.
 
 use std::{
     collections::HashMap,
@@ -121,6 +120,36 @@ where
         Fut: Future<Output = anyhow::Result<V>> + Send + 'static,
     {
         self.get_usable(key, ttl, wait, |_| true, fetch).await
+    }
+
+    /// Wait for an overdue refresh so a server-rendered page gets the new value
+    /// on its first load. Concurrent readers still share one request. A failure
+    /// or the bounded wait returns the last observation with its original age.
+    pub async fn get_fresh<F, Fut>(
+        self: &Arc<Self>,
+        key: K,
+        ttl: Duration,
+        wait: Duration,
+        fetch: F,
+    ) -> Cached<V>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = anyhow::Result<V>> + Send + 'static,
+    {
+        let mut updates = self.read(&key, ttl, fetch);
+        let settled = |state: &Cached<V>| {
+            !state.refreshing || state.latest.as_ref().is_some_and(|v| v.age() < ttl)
+        };
+        let current = updates.borrow_and_update().clone();
+        if settled(&current) || wait.is_zero() {
+            return current;
+        }
+        let ended = tokio::time::timeout(wait, updates.wait_for(settled))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|state| state.clone());
+        ended.unwrap_or_else(|| updates.borrow().clone())
     }
 
     /// Like [`get`](Self::get), but a cached value that `usable` rejects counts as missing
@@ -349,6 +378,68 @@ mod tests {
         let fresh = counting(&calls, Duration::ZERO, Ok(3));
         assert_eq!(cache.get(1, HOUR, wait, fresh).await.value(), Some(&2));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fresh_readers_after_idle_wait_for_one_shared_refresh() {
+        let cache = Arc::new(RefreshCache::<u8, u32>::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ttl = Duration::from_secs(60);
+        let wait = Duration::from_secs(2);
+        cache
+            .get_fresh(1, ttl, wait, counting(&calls, MS, Ok(1)))
+            .await;
+        tokio::time::sleep(ttl * 3).await;
+        let readers =
+            (0..10).map(|_| cache.get_fresh(1, ttl, wait, counting(&calls, 100 * MS, Ok(2))));
+        let results = futures::future::join_all(readers).await;
+        assert!(results
+            .iter()
+            .all(|r| r.value() == Some(&2) && !r.refreshing));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fresh_read_failure_preserves_age_and_obeys_backoff() {
+        let cache = Arc::new(RefreshCache::<u8, u32>::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ttl = Duration::from_secs(60);
+        let wait = Duration::from_secs(2);
+        cache
+            .get_fresh(1, ttl, wait, counting(&calls, MS, Ok(1)))
+            .await;
+        tokio::time::sleep(ttl * 3).await;
+        let failed = cache
+            .get_fresh(
+                1,
+                ttl,
+                wait,
+                counting(&calls, MS, Err(anyhow::anyhow!("offline"))),
+            )
+            .await;
+        assert_eq!(failed.value(), Some(&1));
+        assert!(!failed.refreshing);
+        assert!(failed.latest.unwrap().age() >= ttl * 3);
+        let backed_off = cache
+            .get_fresh(1, ttl, wait, counting(&calls, MS, Ok(2)))
+            .await;
+        assert_eq!(backed_off.value(), Some(&1));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fresh_read_has_a_bounded_wait_and_reuses_the_inflight_request() {
+        let cache = Arc::new(RefreshCache::<u8, u32>::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let read = cache
+            .get_fresh(1, HOUR, 20 * MS, counting(&calls, 200 * MS, Ok(7)))
+            .await;
+        assert!(read.latest.is_none() && read.refreshing);
+        let read = cache
+            .get_fresh(1, HOUR, HOUR, counting(&calls, MS, Ok(8)))
+            .await;
+        assert_eq!(read.value(), Some(&7));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(start_paused = true)]

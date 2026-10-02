@@ -95,10 +95,10 @@ impl AdminMonitoring {
         }
         let service = self.clone();
         self.signals
-            .get(
+            .get_fresh(
                 panel,
                 Duration::from_secs(60),
-                Duration::from_millis(500),
+                Duration::from_secs(9),
                 move || async move {
                     let client = service
                         .client
@@ -112,11 +112,27 @@ impl AdminMonitoring {
                         .into_iter()
                         .map(|query| client.get(&service.query_url).query(&[("query", query)]))
                         .collect();
-                    Ok(stream::iter(requests)
-                        .map(|request| async move { query_samples(request).await.ok() })
-                        .buffered(3)
-                        .collect()
-                        .await)
+                    let snapshot: Snapshot = tokio::time::timeout(
+                        Duration::from_secs(8),
+                        stream::iter(requests)
+                            .map(|request| async move {
+                                match query_samples(request).await {
+                                    Ok(samples) => Some(samples),
+                                    Err(error) => {
+                                        log::warn!("Admin Grafana request failed: {error:#}");
+                                        None
+                                    }
+                                }
+                            })
+                            .buffered(3)
+                            .collect(),
+                    )
+                    .await?;
+                    ensure!(
+                        snapshot.iter().any(Option::is_some),
+                        "Grafana did not answer any signal query"
+                    );
+                    Ok(snapshot)
                 },
             )
             .await
@@ -126,10 +142,10 @@ impl AdminMonitoring {
         coordinator: Arc<crate::domain::Coordinator>,
     ) -> Cached<crate::infra::keymeld::PayoutCapabilities> {
         self.capabilities
-            .get(
+            .get_fresh(
                 (),
                 Duration::from_secs(60),
-                Duration::from_millis(500),
+                Duration::from_secs(9),
                 move || async move {
                     tokio::time::timeout(
                         Duration::from_secs(8),
