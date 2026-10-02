@@ -1048,6 +1048,9 @@ fn ledger_table(ledger: &Ledger, trail: Option<&Trail>) -> Markup {
                 @if ledger.pot.is_some() {
                     tr.total { td { "Pot" } td.num { (sats(ledger.pot)) } td {} }
                     tr { td { @if pot_return { "→ allocated for pot return" } @else { "→ owed to winners" } } td.num { (format::sats(ledger.owed)) } td.note { "their shares under the outcome" } }
+                    @if ledger.others_entries > 0 {
+                        tr { td { "→ owed to other players" } td.num { (format::sats(ledger.owed_others)) } td.note { (ledger.others_entries) " entries synth's players did not make; their payouts are theirs to follow" } }
+                    }
                     tr { td { "→ confirmed paid over Lightning" } td.num { (format::sats(ledger.paid_out)) } td.note { (ledger.confirmed_payouts) " payouts" } }
                     tr class=(if assessed && ledger.unpaid > 0 { "flag" } else { "" }) {
                         td { "→ owed, not confirmed paid" } td.num { (format::sats(ledger.unpaid)) }

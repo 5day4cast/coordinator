@@ -10,7 +10,7 @@ use rand::seq::IndexedRandom;
 use serde::Deserialize;
 use time::{Duration, OffsetDateTime, Time};
 
-use crate::scenarios::ScenarioConfig;
+use crate::scenarios::{queued::QUEUED_ONE_POOL, Backfill, Fill, ScenarioConfig};
 
 /// When a lane's runs close their entries.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -50,10 +50,42 @@ pub struct LaneConfig {
     /// How the stations are chosen; drawn at random from `stations` otherwise.
     #[serde(default)]
     pub picker: Option<crate::picker::PickerConfig>,
+    /// Set false to put a stress run's competitions on the oracle's public list. Every other
+    /// scenario's competitions stay unlisted.
+    #[serde(default)]
+    pub unlisted: Option<bool>,
+    /// How the lane's stress runs push their competition; the defaults otherwise.
+    #[serde(default)]
+    pub stress: Option<crate::scenarios::stress::StressSettings>,
+    /// How its runs fill their competitions: every drawn player enters, or the competition stays
+    /// open to anyone and synth fills it late with the players it still needs.
+    #[serde(default)]
+    pub fill: Fill,
+    /// When backfilling: drawn players who enter over the window, so the page is not empty.
+    #[serde(default = "default_early_players")]
+    pub early_players: usize,
+    /// When backfilling: how long before entries close synth enters the players still needed.
+    #[serde(default = "default_backfill_before_close_secs")]
+    pub backfill_before_close_secs: u64,
+    /// When backfilling: players above the competition's minimum synth makes sure of.
+    #[serde(default = "default_backfill_margin")]
+    pub backfill_margin: u64,
 }
 
 fn default_interval_secs() -> u64 {
     3600
+}
+
+fn default_early_players() -> usize {
+    1
+}
+
+fn default_backfill_before_close_secs() -> u64 {
+    1800
+}
+
+fn default_backfill_margin() -> u64 {
+    1
 }
 
 const HALF_DAY: u64 = 43_200;
@@ -109,11 +141,40 @@ impl LaneConfig {
         base.entry_timing
             .validate(entry_window)
             .map_err(|error| anyhow::anyhow!("lane {name}: {error:#}"))?;
+        let stress = crate::scenarios::stress::STRESS_FULL_POOL;
+        if self.scenarios.iter().any(|scenario| scenario == stress) {
+            self.stress
+                .clone()
+                .unwrap_or_default()
+                .validate(entry_window)
+                .map_err(|error| anyhow::anyhow!("lane {name}: {error:#}"))?;
+        }
+        anyhow::ensure!(
+            self.unlisted != Some(false)
+                || self.scenarios.iter().all(|scenario| scenario == stress),
+            "lane {name}: only {stress} runs can list their competitions; set unlisted = false \
+             on a lane of those alone"
+        );
         if self.align == Align::UtcHalf {
             anyhow::ensure!(
                 entry_window < HALF_DAY,
                 "lane {name}: the entry window must be shorter than the 12 hours between runs"
             );
+        }
+        if let Some(backfill) = self.backfill() {
+            // A single competition that is not full when entries close is cancelled; a queue
+            // forms a pool of whoever entered, if they are enough.
+            anyhow::ensure!(
+                self.scenarios
+                    .iter()
+                    .all(|scenario| scenario == QUEUED_ONE_POOL),
+                "lane {name}: a backfilled lane runs only {QUEUED_ONE_POOL}, whose queue starts \
+                 with whoever entered; a single competition that is not full when entries close \
+                 is cancelled"
+            );
+            backfill
+                .validate(&base.entry_timing, entry_window)
+                .map_err(|error| anyhow::anyhow!("lane {name}: {error:#}"))?;
         }
         Ok(())
     }
@@ -121,6 +182,15 @@ impl LaneConfig {
     /// The stations the lane lists, or the defaults'.
     pub fn configured_stations<'a>(&'a self, base: &'a ScenarioConfig) -> &'a [String] {
         self.stations.as_ref().unwrap_or(&base.stations)
+    }
+
+    /// How its runs backfill, if they do.
+    pub fn backfill(&self) -> Option<Backfill> {
+        (self.fill == Fill::Backfill).then_some(Backfill {
+            early_players: self.early_players,
+            before_close_secs: self.backfill_before_close_secs,
+            margin: self.backfill_margin,
+        })
     }
 
     fn windows(&self, base: &ScenarioConfig) -> Vec<u64> {
@@ -163,6 +233,8 @@ impl LaneConfig {
         config.seed = base.seed.map(|seed| seed.wrapping_add(cycle as u64));
         config.competition_id = None;
         config.observation_start = close;
+        config.listed = self.unlisted == Some(false);
+        config.stress = self.stress.clone();
         if let Some(entry_window) = self.entry_window_secs {
             config.entry_window_secs = entry_window;
         }
@@ -174,6 +246,11 @@ impl LaneConfig {
                 .collect(),
             None => stations.clone(),
         };
+        config.backfill = self.backfill();
+        if config.backfill.is_some() {
+            // Pools as large as the coordinator allows, so the queue takes anyone who comes.
+            config.max_pool_players = None;
+        }
         (scenario, config)
     }
 }
@@ -214,6 +291,12 @@ mod tests {
             ]),
             stations_per_run: Some(2),
             picker: None,
+            unlisted: None,
+            stress: None,
+            fill: Fill::Immediate,
+            early_players: 1,
+            backfill_before_close_secs: 1800,
+            backfill_margin: 1,
         }
     }
 
@@ -289,5 +372,28 @@ mod tests {
         let mut too_many = lane(Align::Interval, &[DAY]);
         too_many.stations_per_run = Some(5);
         assert!(too_many.validate(&base).is_err());
+    }
+
+    /// A stress lane's runs are unlisted unless it says otherwise, and only stress runs may be
+    /// listed.
+    #[test]
+    fn only_a_stress_lane_lists_its_competitions() {
+        let base = ScenarioConfig::default();
+        let mut stress = lane(Align::Interval, &[DAY]);
+        stress.scenarios = vec![crate::scenarios::stress::STRESS_FULL_POOL.into()];
+        stress.validate(&base).unwrap();
+        let (_, config) = stress.run_config(&base, 0, None);
+        assert!(!config.listed);
+        stress.unlisted = Some(false);
+        stress.validate(&base).unwrap();
+        let (scenario, config) = stress.run_config(&base, 0, None);
+        assert_eq!(scenario, "stress_full_pool");
+        assert!(config.listed);
+        let mut mixed = lane(Align::Interval, &[DAY]);
+        mixed.unlisted = Some(false);
+        assert!(mixed.validate(&base).is_err());
+        // The burst must fit the lane's entry window.
+        stress.entry_window_secs = Some(120);
+        assert!(stress.validate(&base).is_err());
     }
 }

@@ -1,7 +1,8 @@
+pub mod keep_open;
 pub mod lanes;
 
 use crate::client::CoordinatorClient;
-use crate::config::SchedulerConfig;
+use crate::config::{KeepOpenConfig, SchedulerConfig};
 use crate::db::SynthDb;
 use crate::events::{Event, Events};
 use crate::scenarios::{
@@ -13,7 +14,7 @@ use log::{error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use uuid::Uuid;
 
 /// The scenarios synth runs, by the names runs are started with.
@@ -28,7 +29,14 @@ pub const SCENARIOS: &[&str] = &[
     scenarios::queued::QUEUED_ONE_POOL,
     scenarios::queued::QUEUED_TOO_FEW,
     scenarios::queued::QUEUED_LEFTOVER_REFUND,
+    scenarios::stress::STRESS_FULL_POOL,
 ];
+
+/// Whether a run of `scenario` can be recorded: one of [`SCENARIOS`], or a competition an
+/// operator asked for, which no schedule runs.
+fn recordable(scenario: &str) -> bool {
+    SCENARIOS.contains(&scenario) || scenario == scenarios::manual::MANUAL_COMPETITION
+}
 
 /// Cover every case/window pair instead of coupling two cycles of equal length.
 fn scheduled_selection<'a>(scenarios: &[&'a str], windows: &[u64], cycle: usize) -> (&'a str, u64) {
@@ -62,6 +70,8 @@ pub struct Runner {
     live: Live,
     /// Chooses the stations of lanes that pick them for the weather.
     picker: Option<Arc<crate::picker::Picker>>,
+    /// What the keep-open check last found, for the dashboard.
+    open: keep_open::SharedOpenStatus,
 }
 
 /// Runs in progress, by competition id.
@@ -214,6 +224,7 @@ impl Runner {
             last_result: Arc::new(Mutex::new(None)),
             live: Arc::new(DashMap::new()),
             picker: None,
+            open: Arc::default(),
         }
     }
 
@@ -221,6 +232,14 @@ impl Runner {
     pub fn with_picker(mut self, picker: crate::picker::Picker) -> Self {
         self.picker = Some(Arc::new(picker));
         self
+    }
+
+    /// What the keep-open check last found: None before its first check, or without one.
+    pub fn open_status(&self) -> Option<keep_open::OpenStatus> {
+        *self
+            .open
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Run a scenario by name, saving each step as it finishes.
@@ -236,7 +255,7 @@ impl Runner {
     /// Check `scenario` is one synth runs, and record a run of it, returning the run's id. Run
     /// it with [`Runner::run_recorded`].
     pub async fn record_run(&self, scenario: &str, config: &ScenarioConfig) -> Result<String> {
-        if !SCENARIOS.contains(&scenario) {
+        if !recordable(scenario) {
             error!("Unknown scenario: {}", scenario);
             return Err(anyhow::anyhow!(
                 "Unknown scenario: {scenario}; expected one of {}",
@@ -353,6 +372,12 @@ impl Runner {
                     scenarios::queued::QUEUED_LEFTOVER_REFUND => {
                         scenarios::run_queued_leftover_refund(&self.client, &self.db, &config).await
                     }
+                    scenarios::stress::STRESS_FULL_POOL => {
+                        scenarios::run_stress_full_pool(&self.client, &self.db, &config).await
+                    }
+                    scenarios::manual::MANUAL_COMPETITION => {
+                        scenarios::run_manual_competition(&self.client, &self.db, &config).await
+                    }
                     _ => unreachable!("record_run validates scenario names"),
                 }
             })
@@ -452,11 +477,31 @@ impl Runner {
     }
 
     /// Run every lane side by side, each starting its runs on its own cadence without waiting
-    /// for its earlier ones. Returns only if a lane is invalid.
-    pub async fn run_lanes(&self, lanes: &[lanes::LaneConfig], base: ScenarioConfig) -> Result<()> {
+    /// for its earlier ones, and with `keep_open`, its lane's next run early whenever no
+    /// competition is open for visitors. Returns only if a lane is invalid.
+    pub async fn run_lanes(
+        &self,
+        lanes: &[lanes::LaneConfig],
+        base: ScenarioConfig,
+        keep_open: Option<&KeepOpenConfig>,
+    ) -> Result<()> {
         for lane in lanes {
             lane.validate(&base)?;
         }
+        if let Some(keep_open) = keep_open {
+            keep_open.validate(lanes)?;
+        }
+        let early = keep_open.map(|keep_open| {
+            let start = Arc::new(Notify::new());
+            tokio::spawn(
+                keep_open::KeepOpen::new(keep_open.clone(), base.entry_fee as u64).run(
+                    self.client.clone(),
+                    start.clone(),
+                    self.open.clone(),
+                ),
+            );
+            (keep_open.lane.clone(), start)
+        });
         info!(
             "Starting {} lanes: {}",
             lanes.len(),
@@ -471,35 +516,35 @@ impl Runner {
             .cloned()
             .map(|lane| {
                 let (runner, base) = (self.clone(), base.clone());
-                tokio::spawn(async move { runner.run_lane(lane, base).await })
+                let start = early
+                    .as_ref()
+                    .filter(|(name, _)| *name == lane.name)
+                    .map(|(_, start)| start.clone());
+                tokio::spawn(async move { runner.run_lane(lane, base, start).await })
             })
             .collect();
         futures::future::join_all(lanes).await;
         Ok(())
     }
 
-    async fn run_lane(&self, lane: lanes::LaneConfig, base: ScenarioConfig) {
-        let mut after = OffsetDateTime::now_utc();
-        let mut cycle = 0usize;
-        loop {
-            let (start, close) = lane.next_start(&base, after);
-            sleep_until(start).await;
-            let (scenario, mut config) = lane.run_config(&base, cycle, close);
-            info!("Lane {} starts {scenario} (cycle {cycle})", lane.name);
-            let (runner, picking, defaults) = (self.clone(), lane.clone(), base.clone());
+    async fn run_lane(
+        &self,
+        lane: lanes::LaneConfig,
+        base: ScenarioConfig,
+        early: Option<Arc<Notify>>,
+    ) {
+        lane_loop(&lane, &base, early, |scenario, config| {
+            let runner = self.clone();
+            let (picking, defaults) = (lane.clone(), base.clone());
             tokio::spawn(async move {
+                let mut config = config;
                 if let Some(picker) = &runner.picker {
                     picker.choose(&picking, &defaults, &mut config).await;
                 }
                 runner.run_or_redraw(&scenario, config).await
             });
-            after = match close {
-                // The next half after this one.
-                Some(close) => close + time::Duration::seconds(1) - (close - start),
-                None => start + time::Duration::seconds(lane.interval_secs as i64),
-            };
-            cycle = cycle.wrapping_add(1);
-        }
+        })
+        .await
     }
 
     /// Start the scheduled runner loop
@@ -534,6 +579,41 @@ impl Runner {
             )
             .await;
         }
+    }
+}
+
+/// Start `lane`'s runs through `start` on its cadence, for ever. When `early` is notified, the
+/// lane's next run starts at once instead of when it was due: its scenario and window rotation
+/// carry on from it, and its next run follows a whole cadence after it.
+async fn lane_loop(
+    lane: &lanes::LaneConfig,
+    base: &ScenarioConfig,
+    early: Option<Arc<Notify>>,
+    mut start: impl FnMut(String, ScenarioConfig),
+) {
+    let mut after = OffsetDateTime::now_utc();
+    let mut cycle = 0usize;
+    loop {
+        let (mut at, mut close) = lane.next_start(base, after);
+        match &early {
+            Some(early) => tokio::select! {
+                _ = sleep_until(at) => {}
+                _ = early.notified() => {
+                    (at, close) = lane.next_start(base, OffsetDateTime::now_utc());
+                    info!("Lane {} starts its next run early, to keep a competition open", lane.name);
+                }
+            },
+            None => sleep_until(at).await,
+        }
+        let (scenario, config) = lane.run_config(base, cycle, close);
+        info!("Lane {} starts {scenario} (cycle {cycle})", lane.name);
+        start(scenario, config);
+        after = match close {
+            // The next half after this one.
+            Some(close) => close + time::Duration::seconds(1) - (close - at),
+            None => at + time::Duration::seconds(lane.interval_secs as i64),
+        };
+        cycle = cycle.wrapping_add(1);
     }
 }
 
@@ -677,6 +757,7 @@ mod tests {
             scenario: "full_lifecycle".into(),
             scenarios: None,
             lanes: Vec::new(),
+            keep_open: None,
         };
         assert!(runner
             .run_scheduled(&scheduler, ScenarioConfig::default(), vec![7200, 0])
@@ -714,6 +795,67 @@ mod tests {
         running.abort();
         server.abort();
         assert_eq!(observed.unwrap(), vec![7200, 10800, 14400, 600, 7200]);
+    }
+
+    /// A keep-open start runs the lane's next run at once, and the lane's next scheduled run
+    /// follows a whole interval after it, not when it was first due.
+    #[tokio::test(start_paused = true)]
+    async fn a_lane_started_early_restarts_its_timer_from_that_run() {
+        let lane = lanes::LaneConfig {
+            name: "open".into(),
+            interval_secs: 3600,
+            align: lanes::Align::Interval,
+            scenarios: vec![scenarios::queued::QUEUED_ONE_POOL.into()],
+            observation_windows_secs: Some(vec![86_400, 172_800]),
+            entry_window_secs: Some(7200),
+            stations: None,
+            stations_per_run: None,
+            fill: scenarios::Fill::Backfill,
+            early_players: 1,
+            backfill_before_close_secs: 1800,
+            backfill_margin: 1,
+        };
+        let base = ScenarioConfig::default();
+        lane.validate(&base).unwrap();
+        let early = Arc::new(Notify::new());
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let begun = tokio::time::Instant::now();
+        let running = tokio::spawn({
+            let early = early.clone();
+            async move {
+                lane_loop(&lane, &base, Some(early), |scenario, config| {
+                    started
+                        .send((
+                            begun.elapsed().as_secs(),
+                            scenario,
+                            config.observation_window_secs,
+                            config.backfill,
+                        ))
+                        .unwrap();
+                })
+                .await
+            }
+        });
+        let (at, scenario, window, backfill) = starts.recv().await.unwrap();
+        assert_eq!(
+            (at, scenario.as_str(), window),
+            (0, "queued_one_pool", 86_400)
+        );
+        assert_eq!(backfill.map(|backfill| backfill.margin), Some(1));
+
+        tokio::time::sleep(std::time::Duration::from_secs(1000)).await;
+        early.notify_one();
+        let (at, _, window, _) = starts.recv().await.unwrap();
+        assert_eq!(
+            (at, window),
+            (1000, 172_800),
+            "at once, and the rotation goes on"
+        );
+        // Not at 3600, when it was first due: a whole interval after the early run.
+        let (at, _, window, _) = starts.recv().await.unwrap();
+        assert!((4595..=4600).contains(&at), "next run at {at} s");
+        assert_eq!(window, 86_400);
+        running.abort();
     }
 
     /// A page watching a run sees each step as soon as it is recorded, not when the run ends.

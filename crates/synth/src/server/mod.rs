@@ -1,4 +1,5 @@
 mod assets;
+mod create;
 mod format;
 pub mod live;
 pub mod metrics;
@@ -16,6 +17,9 @@ use axum::http::{header, HeaderValue};
 use axum::Router;
 use log::info;
 use std::net::SocketAddr;
+
+/// Where a competition is created, as the dashboard's form and the CLI post it.
+pub const CREATE_COMPETITION_PATH: &str = create::PATH;
 
 pub async fn start_server(
     config: &SynthConfig,
@@ -36,6 +40,7 @@ pub async fn start_server(
     tokio::spawn(live::render_changes(dashboard.clone()));
     let metrics = metrics::router(dashboard.runner.db().clone());
     let app = Router::new()
+        .merge(create::router(dashboard.clone()))
         .merge(routes::router(dashboard))
         .layer(axum::middleware::from_fn_with_state(
             operator,
