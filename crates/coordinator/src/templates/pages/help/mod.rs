@@ -48,7 +48,7 @@ pub fn help_page(open_advanced: bool) -> Markup {
                 ul {
                     li {
                         "Complete every category for every city. The entry page shows the required number of picks "
-                        "and checks it before you pay. Older competitions may require a smaller, fixed number."
+                        "and checks it before you pay."
                     }
                     li {
                         strong { "Par is a range" } " around the forecast, set from how that airport's "
@@ -60,7 +60,6 @@ pub fn help_page(open_advanced: bool) -> Markup {
                         "with Par 80.4–83.0°F, 83.0°F is Par and 83.1°F is Over."
                     }
                     li { "An incorrect pick scores 0. There are no negative points." }
-                    li { "Some older competitions use fixed scoring: a correct Par scores 20, and a correct Under or Over scores 10. Their pick buttons show the applicable rules." }
                 }
             }
 
@@ -103,7 +102,7 @@ pub fn help_page(open_advanced: bool) -> Markup {
                     }
                     li {
                         "When the oracle signs, the competition is " strong { "finished" } ": the leaderboard "
-                        "stops changing and payouts go out."
+                        "stops changing and payout processing begins."
                     }
                     li {
                         "Tied scores share a rank. If a tie spans the last paid place, the entry submitted "
@@ -139,14 +138,14 @@ pub fn help_page(open_advanced: bool) -> Markup {
                         "unless its page says it allows more."
                     }
                     li {
-                        "A competition takes any number of entries and splits them into pools of up to 25 "
+                        "A competition accepts entries up to its listed limit and splits them into pools of up to 25 "
                         "when entries close. Each pool runs as its own competition, with its own pot and leaderboard."
                     }
                     li {
-                        "A pool needs a minimum number of players. When Bitcoin network fees spike, that "
-                        "minimum rises to 5 entries."
+                        "A pool needs a minimum number of players. The entry page shows the current minimum, "
+                        "which can rise when Bitcoin network fees increase."
                     }
-                    li { "If a competition or pool doesn't get enough entries, it doesn't run, and every entry fee is refunded." }
+                    li { "If a competition or pool doesn't get enough entries, it doesn't run. Funded entries follow the refund process below." }
                 }
             }
 
@@ -157,13 +156,15 @@ pub fn help_page(open_advanced: bool) -> Markup {
                         "The entry fee is the total you pay over Lightning. The payment button and invoice show that total."
                     }
                     li {
-                        "Prizes are sent automatically to the Lightning Address on your account. "
-                        "If the competition uses invoice payouts, submit a Lightning invoice on the Payouts page. "
+                        "Prizes are sent automatically to the Lightning Address you confirm when entering. "
+                        "If you use invoice payouts, submit a Lightning invoice on the Payouts page. "
                         "The entry page tells you where prizes and refunds will go before you pay."
                     }
                     li {
-                        "If a competition doesn't run, your payment comes back: to your Lightning Address, "
-                        "or, for a held payment, it is never collected and returns to your wallet."
+                        "If a competition doesn't run, its funded entry payments are refunded to the Lightning "
+                        "Address confirmed when entering. Refund processing starts after the escrow's refund "
+                        "time; cancellation does not return the payment immediately. "
+                        "Refunds return the escrow amount minus the refund swap fee."
                     }
                 }
             }
