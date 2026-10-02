@@ -1,5 +1,5 @@
 //! Operator work queue and transaction evidence. All routes here are read-only.
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     extract::{Path, Query, State},
@@ -27,6 +27,39 @@ pub struct QueueFilter {
     q: String,
     #[serde(default)]
     show: String,
+    #[serde(default)]
+    sort: QueueSort,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum QueueSort {
+    CreatedDesc,
+    CreatedAsc,
+    #[default]
+    #[serde(other)]
+    Review,
+}
+
+fn sort_competitions(
+    competitions: &mut [Competition],
+    refunds: &HashMap<Uuid, RefundProgress>,
+    now: OffsetDateTime,
+    sort: QueueSort,
+) {
+    competitions.sort_by(|left, right| {
+        let created = left
+            .created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id));
+        match sort {
+            QueueSort::CreatedDesc => created.reverse(),
+            QueueSort::CreatedAsc => created,
+            QueueSort::Review => (!next(left, refunds.get(&left.id), now).2)
+                .cmp(&(!next(right, refunds.get(&right.id), now).2))
+                .then(created.reverse()),
+        }
+    });
 }
 
 fn next(
@@ -122,12 +155,7 @@ pub async fn operations_page(
     let content = match (competitions, refunds) {
         (Ok(mut competitions), Ok(refunds)) => {
             let now = OffsetDateTime::now_utc();
-            competitions.sort_by_key(|c| {
-                (
-                    !next(c, refunds.get(&c.id), now).2,
-                    std::cmp::Reverse(c.created_at),
-                )
-            });
+            sort_competitions(&mut competitions, &refunds, now, filter.sort);
             let search = filter.q.trim().to_lowercase();
             let rows: Vec<_> = competitions
                 .iter()
@@ -149,19 +177,35 @@ pub async fn operations_page(
                     form.discovery-filters method="get" action="/admin/operations" {
                         label { "Competition or station" input name="q" value=(filter.q) maxlength="100"; }
                         label { "Show" select name="show" { option value="all" selected[filter.show != "attention"] { "All competitions" } option value="attention" selected[filter.show == "attention"] { "Needs review" } } }
+                        label { "Sort by" select name="sort" {
+                            option value="review" selected[matches!(filter.sort, QueueSort::Review)] { "Needs review first" }
+                            option value="created_desc" selected[matches!(filter.sort, QueueSort::CreatedDesc)] { "Newest created" }
+                            option value="created_asc" selected[matches!(filter.sort, QueueSort::CreatedAsc)] { "Oldest created" }
+                        } }
                         button type="submit" { "Filter" }
                     }
-                    p.note { "Review order uses recorded milestones and scheduled times. Retained errors and historical failed jobs do not establish that money is still unpaid." }
+                    p.note {
+                        @match filter.sort {
+                            QueueSort::Review => { "Review order uses recorded milestones and scheduled times. " },
+                            QueueSort::CreatedDesc => { "Newest competitions first, by creation time. " },
+                            QueueSort::CreatedAsc => { "Oldest competitions first, by creation time. " },
+                        }
+                        "Creation times are UTC. Retained errors and historical failed jobs do not establish that money is still unpaid."
+                    }
                     h2 { (rows.len()) " competitions" }
                     div.scroll { table.ops-table {
-                        thead { tr { th { "Competition" } th { "State" } th { "Entries" } th { "Next step" } } }
+                        thead { tr { th { "Competition" } th { "Created (UTC)" } th { "State" } th { "Entries" } th { "Next step" } } }
                         tbody {
                             @for c in rows.iter().take(200) {
                                 @let action = next(c, refunds.get(&c.id), now);
+                                @let created = c.created_at.to_offset(time::UtcOffset::UTC);
                                 tr {
                                     td { a href=(format!("/admin/operations/{}", c.id)) { (c.event_submission.locations.join(" · ")) }
                                         p.note { code { (c.id) } " · " (c.kind.as_str()) }
                                     }
+                                    td { time datetime=(created.format(&Rfc3339).unwrap_or_default()) {
+                                        (created.date()) br; (format!("{:02}:{:02}:{:02}", created.hour(), created.minute(), created.second()))
+                                    } }
                                     td { span.status { (c.get_state()) } }
                                     td { (c.total_paid_entries) " paid / " (c.total_entries) " entered" }
                                     td { strong class=[action.2.then_some("attention")] { (action.0) } p.note { (action.1) } }
@@ -333,6 +377,26 @@ mod tests {
             scoring_fields: None,
             max_entries_per_player: 1,
         })
+    }
+
+    #[test]
+    fn creation_sort_keeps_recent_progress_ahead_of_older_refunds() {
+        let now = OffsetDateTime::now_utc();
+        let mut old_refund = competition(now);
+        old_refund.created_at = now - time::Duration::DAY;
+        old_refund.cancelled_at = Some(now);
+        let mut recent = competition(now);
+        recent.created_at = now;
+        let old_id = old_refund.id;
+        let recent_id = recent.id;
+        let mut rows = vec![old_refund, recent];
+        let refunds = HashMap::new();
+        sort_competitions(&mut rows, &refunds, now, QueueSort::CreatedDesc);
+        assert_eq!(rows[0].id, recent_id);
+        sort_competitions(&mut rows, &refunds, now, QueueSort::CreatedAsc);
+        assert_eq!(rows[0].id, old_id);
+        sort_competitions(&mut rows, &refunds, now, QueueSort::Review);
+        assert_eq!(rows[0].id, old_id);
     }
 
     #[test]
