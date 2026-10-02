@@ -38,9 +38,22 @@ pub fn duration(duration: time::Duration) -> String {
     }
 }
 
+/// The observation duration, without implying when the final result will arrive.
+pub fn competition_duration(start: OffsetDateTime, end: OffsetDateTime) -> String {
+    let length = end - start;
+    if length.whole_hours() > 0 && length.whole_minutes() % 60 == 0 {
+        let hours = length.whole_hours();
+        format!("{hours} {}", if hours == 1 { "hour" } else { "hours" })
+    } else {
+        duration(length)
+    }
+}
+
 /// How a `<time>` element is shown once the browser converts it to local time.
 #[derive(Clone, Copy)]
 pub enum TimeStyle {
+    /// `Sun, 1:00 PM`, with the full date available in the title.
+    Weekday,
     /// `Sep 24, 11:44 AM`
     DateTime,
     /// `11:54 AM`, for the end of a window that starts the same day.
@@ -62,6 +75,9 @@ pub fn zoned_time(at: OffsetDateTime, style: TimeStyle) -> Markup {
 fn local_time(at: OffsetDateTime, style: TimeStyle, zoned: bool) -> Markup {
     let utc = at.to_offset(time::UtcOffset::UTC);
     let fallback = match style {
+        TimeStyle::Weekday => utc.format(format_description!(
+            "[weekday repr:short], [hour]:[minute] UTC"
+        )),
         TimeStyle::DateTime => utc.format(format_description!(
             "[month repr:short] [day padding:none], [hour]:[minute] UTC"
         )),
@@ -69,6 +85,7 @@ fn local_time(at: OffsetDateTime, style: TimeStyle, zoned: bool) -> Markup {
     }
     .unwrap_or_default();
     let style = match style {
+        TimeStyle::Weekday => "weekday",
         TimeStyle::DateTime => "datetime",
         TimeStyle::Time => "time",
     };

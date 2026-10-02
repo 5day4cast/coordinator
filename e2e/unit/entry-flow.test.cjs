@@ -50,7 +50,7 @@ function entryPage(checked = [{ name: "KPWM_temp_high", value: "over" }]) {
         networkFee: "50",
         totalPool: "15000",
         winnerCount: "1",
-        maxValues: "2",
+        maxValues: "1",
       },
       querySelectorAll: (selector) => {
         assert.equal(selector, 'input[type="radio"]:checked');
@@ -302,7 +302,7 @@ test("too many picks are refused before any payment", async () => {
   ]);
   const sandbox = load(loggedIn({ dlcWallet: {} }), document, async () => assert.fail("nothing fetched"));
   await sandbox.submitEntry();
-  assert.match(elements.errorMessage.textContent, /up to 2 picks/);
+  assert.match(elements.errorMessage.textContent, /Make exactly 1 pick/);
 });
 
 // A player whose ticket has an Arkade escrow: the wallet seals their entry key
@@ -579,7 +579,7 @@ test("paying with no picks says to make one and focuses the first pick", async (
   const sandbox = load({ isLoggedIn: () => false, openModal: () => assert.fail("no log-in for no picks") },
     document, async () => assert.fail("nothing fetched"));
   await sandbox.submitEntry();
-  assert.equal(elements.picksMessage.textContent, "Make at least one pick");
+  assert.equal(elements.picksMessage.textContent, "Make exactly 1 pick before paying.");
   assert.ok(!elements.picksMessage.classList.contains("hidden"));
   assert.equal(focused, first);
   assert.equal(elements.submitEntry.disabled, false);
@@ -591,7 +591,7 @@ test("with the picks still loading, the message shows under Pay", async () => {
   elements.entryForm.querySelector = () => null;
   const sandbox = load({}, document, async () => assert.fail("nothing fetched"));
   await sandbox.submitEntry();
-  assert.equal(elements.errorMessage.textContent, "Make at least one pick");
+  assert.equal(elements.errorMessage.textContent, "Make exactly 1 pick before paying.");
   assert.ok(!elements.errorMessage.classList.contains("hidden"));
 });
 
@@ -1005,4 +1005,15 @@ test("an expired ticket renews the entry, and the next request gets a ticket", a
   assert.ok(modal.classList.contains("is-active"));
   assert.ok(elements.errorMessage.classList.contains("hidden"), "no 409");
   assert.equal(elements.walletLinkLightning.href, "lightning:lnbc53000n1ticket-2");
+});
+
+
+test("missing required picks are refused before login or payment", async () => {
+  const { elements, document } = entryPage();
+  elements.entryForm.dataset.maxValues = "3";
+  const sandbox = load({ isLoggedIn: () => assert.fail("no login before complete picks") },
+    document, async () => assert.fail("no request before complete picks"));
+  await sandbox.submitEntry();
+  assert.match(elements.errorMessage.textContent, /Make exactly 3 picks; you made 1/);
+  assert.ok(!elements.errorMessage.classList.contains("hidden"));
 });

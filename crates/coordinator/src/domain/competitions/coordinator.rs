@@ -5405,6 +5405,23 @@ async fn validate_entry(entry: AddEventEntry, competition: Competition) -> Resul
         }
     }
 
+    if choice_count != competition.event_submission.number_of_values_per_entry {
+        return Err(Error::BadRequest(format!(
+            "Make exactly {} picks; you made {choice_count}",
+            competition.event_submission.number_of_values_per_entry,
+        )));
+    }
+    let mut locations = std::collections::HashSet::new();
+    if entry
+        .expected_observations
+        .iter()
+        .any(|choice| !locations.insert(&choice.stations))
+    {
+        return Err(Error::BadRequest(
+            "Each city may appear only once in an entry".into(),
+        ));
+    }
+
     let locations_choose: Vec<String> = entry
         .expected_observations
         .clone()
@@ -5985,5 +6002,71 @@ mod tests {
             reclaim_readiness(Some(5_000), 4_990, 288),
             ReclaimReadiness::Wait { blocks: 288 }
         );
+    }
+}
+
+#[cfg(test)]
+mod required_pick_tests {
+    use super::*;
+    use crate::infra::oracle::{ValueOptions, WeatherChoices};
+
+    #[tokio::test]
+    async fn entries_require_the_advertised_count_without_repeating_a_city() {
+        let now = OffsetDateTime::now_utc();
+        let mut event = CreateEvent {
+            id: Uuid::now_v7(),
+            signing_date: now + time::Duration::days(2),
+            start_observation_date: now,
+            end_observation_date: now + time::Duration::DAY,
+            locations: vec!["KORD".into(), "KJFK".into()],
+            number_of_values_per_entry: 6,
+            number_of_places_win: 1,
+            total_allowed_entries: 2,
+            entry_fee: 1000,
+            coordinator_fee: crate::domain::CoordinatorFee::whole_percent(3),
+            total_competition_pool: 2000,
+            relative_locktime_block_delta: None,
+            unlisted: true,
+            scoring_rules: None,
+            scoring_fields: None,
+            max_entries_per_player: 1,
+        };
+        let choice = |station: &str| WeatherChoices {
+            stations: station.into(),
+            temp_high: Some(ValueOptions::Over),
+            temp_low: Some(ValueOptions::Par),
+            wind_speed: Some(ValueOptions::Under),
+        };
+        let mut entry = AddEventEntry {
+            id: Uuid::now_v7(),
+            event_id: event.id,
+            expected_observations: vec![choice("KORD"), choice("KJFK")],
+        };
+        assert!(validate_entry(entry.clone(), Competition::new(&event))
+            .await
+            .is_ok());
+        entry.expected_observations[1].wind_speed = None;
+        assert!(validate_entry(entry.clone(), Competition::new(&event))
+            .await
+            .is_err());
+        entry.expected_observations[1] = choice("KORD");
+        assert!(validate_entry(entry.clone(), Competition::new(&event))
+            .await
+            .is_err());
+        // An older capped competition keeps its advertised count.
+        event.number_of_values_per_entry = 1;
+        entry.expected_observations = vec![WeatherChoices {
+            stations: "KORD".into(),
+            temp_high: Some(ValueOptions::Over),
+            temp_low: None,
+            wind_speed: None,
+        }];
+        assert!(validate_entry(entry.clone(), Competition::new(&event))
+            .await
+            .is_ok());
+        entry.expected_observations.clear();
+        assert!(validate_entry(entry, Competition::new(&event))
+            .await
+            .is_err());
     }
 }

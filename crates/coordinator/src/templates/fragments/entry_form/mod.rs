@@ -91,14 +91,6 @@ pub fn entry_form(
     };
     let picks_allowed = competition.number_of_values_per_entry;
     let queue = competition.queue.queued();
-    let pickable = match forecasts {
-        Forecasts::Ready { stations, .. } => stations
-            .iter()
-            .flat_map(|station| &station.forecasts)
-            .filter(|(_, forecast, _)| forecast.is_some())
-            .count(),
-        Forecasts::Pending(_) => 0,
-    };
     html! {
         div id="entryContainer" class="entry-form" {
             a class="back-link" href="/competitions" hx-get="/competitions"
@@ -108,7 +100,7 @@ pub fn entry_form(
             dl class="entry-facts" {
                 div {
                     dt { "Entries close" (tip_start("Picks lock then, and the readings count from that moment on.")) }
-                    dd { (format::zoned_time(competition.start, TimeStyle::DateTime)) }
+                    dd { (format::zoned_time(competition.start, TimeStyle::Weekday)) }
                 }
                 div {
                     dt { "Entry fee" }
@@ -116,7 +108,7 @@ pub fn entry_form(
                 }
                 div {
                     dt {
-                        "Win"
+                        "Prizes"
                         @if queue.is_some() {
                             (tip("What a pool's winner takes; it grows as more players enter."))
                         }
@@ -137,11 +129,9 @@ pub fn entry_form(
                     }
                     dd { (competition.entries()) }
                 }
-                @if picks_allowed < pickable {
-                    div {
-                        dt { "Picks" }
-                        dd { "up to " (picks_allowed) }
-                    }
+                div {
+                    dt { "Picks required" }
+                    dd { (picks_allowed) }
                 }
                 // One entry per player needs no line; only a competition allowing more says so.
                 @if competition.max_entries_per_player > 1 {
@@ -231,36 +221,13 @@ pub fn entry_form(
     }
 }
 
-/// What entering costs, all in: one total, which opens to what it is made of (the pot
-/// contribution, the service fee and the network fee). Only this form shows the parts. The total
-/// and the network fee carry ids, so the ticket's own fee can replace the estimate once the
-/// ticket is issued (`entry_form.js`).
+/// The total the player pays. The issued ticket can replace the estimate through its id.
 fn price(competition: &CompetitionView, network_fee: NetworkFee) -> Markup {
-    let network_fee = network_fee.sats();
-    let service = competition
-        .ticket_price
-        .saturating_sub(competition.entry_fee);
     html! {
-        details class="price-details" {
-            summary {
-                span id="ticketTotal" { (sats(competition.ticket_price + network_fee.unwrap_or(0))) }
-            }
-            ul class="price-lines" {
-                li { "Pot contribution " span { (sats(competition.entry_fee)) } }
-                @if service > 0 {
-                    li { "Service fee (" (competition.service_fee_percent) ") " span { (sats(service)) } }
-                }
-                @if network_fee != Some(0) {
-                    li {
-                        "Network fee "
-                        span id="networkFee" {
-                            @match network_fee {
-                                Some(fee) => (sats(fee)),
-                                None => "unavailable right now",
-                            }
-                        }
-                    }
-                }
+        span id="ticketTotal" {
+            @match network_fee.sats() {
+                Some(fee) => (sats(competition.ticket_price + fee)),
+                None => "Unavailable right now",
             }
         }
     }
@@ -284,6 +251,10 @@ pub fn forecast_choices(competition_id: &str, forecasts: &Forecasts, asked: u8) 
                 // Says so when Pay is clicked with nothing picked (`entry_form.js`), right above
                 // the first pick, which then takes focus.
                 p id="picksMessage" class="notification is-danger hidden" role="alert" {}
+                p class="city-heading" {
+                    strong { "City" }
+                    (tip_start("Weather is measured at each city's named airport station. The forecast is NOAA's; the pick ranges use historical forecast errors."))
+                }
                 @for station in stations { (station_picks(station)) }
             }
         },
@@ -329,14 +300,40 @@ pub fn payout_line(
     }
 }
 
+/// Lead with the city; the original station name remains in its tooltip.
+fn city_name(name: &str) -> String {
+    let (name, state) = name.rsplit_once(", ").unwrap_or((name, ""));
+    let city = name.split('/').next().unwrap_or(name);
+    let city = [
+        " International Airport",
+        " International",
+        " Intl",
+        " Municipal Airport",
+        " Municipal",
+    ]
+    .iter()
+    .find_map(|suffix| city.strip_suffix(suffix))
+    .unwrap_or(city);
+    if state.is_empty() {
+        city.to_owned()
+    } else {
+        format!("{city}, {state}")
+    }
+}
+
 fn station_picks(station: &StationForecast) -> Markup {
     html! {
         fieldset class="station-picks" id=(format!("station-{}", station.station_id)) data-station=(station.station_id) {
             legend {
                 @if let Some(name) = &station.station_name {
-                    (name) " "
+                    (city_name(name)) " "
+                    (tip(&format!("Weather station: {name} ({})", station.station_id)))
                 }
                 span class="station-code" { (station.station_id) }
+            }
+            div class="pick-row pick-heading" aria-hidden="true" {
+                span class="pick-metric" { "NOAA forecast" }
+                span { "Your pick" }
             }
             @for (metric, forecast, rule) in &station.forecasts {
                 (pick_row(&station.station_id, *metric, *forecast, *rule))
@@ -531,26 +528,11 @@ mod tests {
         assert!(html.contains(r#"<dt>Entries close<span class="tip tip-start""#));
     }
 
-    /// The entry fee is one total, "what it costs me"; tapping it opens the pot contribution,
-    /// service and network fees. The total and the network fee carry ids for the ticket's own fee.
     #[test]
-    fn entry_form_shows_one_price_that_opens_to_its_fees() {
+    fn entry_form_shows_only_the_total_and_does_not_understate_an_unknown_fee() {
         let html = form(PayoutDestination::LoggedOut);
-        let details = html.find(r#"<details class="price-details">"#).unwrap();
-        let total = html
-            .find(r#"<span id="ticketTotal">5,300 sats</span>"#)
-            .unwrap();
-        let lines = html.find(r#"<ul class="price-lines">"#).unwrap();
-        assert!(details < total && total < lines, "the total is the summary");
-        // One all-in number, labelled as players know it; the parts only in the disclosure.
-        assert!(html.contains(r#"<dt>Entry fee</dt><dd><details class="price-details">"#));
-        assert!(!html.contains("<dt>Price</dt>"));
-        assert!(html.contains("Pot contribution <span>5,000 sats</span>"));
-        assert!(html.contains("Service fee (5%) <span>250 sats</span>"));
-        assert!(html.contains(r#"Network fee <span id="networkFee">50 sats</span>"#));
-        assert!(!html.contains(">Ticket<") && !html.contains(">Pot<"));
-
-        // Without an estimate no price is claimed for it, and no ticket can be issued either.
+        assert!(html.contains(r#"<dt>Entry fee</dt><dd><span id="ticketTotal">5,300 sats</span>"#));
+        assert!(!html.contains("price-details") && !html.contains("Pot contribution"));
         let unavailable = entry_form(
             &view("c1", Phase::Upcoming, 60),
             &Forecasts::Pending(Pending::Loading),
@@ -559,31 +541,19 @@ mod tests {
             NetworkFee::Unavailable,
         )
         .into_string();
-        assert!(unavailable.contains(r#"<span id="ticketTotal">5,250 sats</span>"#));
-        assert!(!unavailable.contains("+ network fee"));
-        assert!(unavailable.contains(r#"<span id="networkFee">unavailable right now</span>"#));
+        assert!(unavailable.contains(r#"<span id="ticketTotal">Unavailable right now</span>"#));
         assert!(!unavailable.contains("data-network-fee"));
         assert!(unavailable.contains("Pay and enter"));
-
-        // With network fees off there is no line for one.
-        let off = entry_form(
-            &view("c1", Phase::Upcoming, 60),
-            &Forecasts::Pending(Pending::Loading),
-            Some(&terms(true)),
-            &PayoutDestination::LoggedOut,
-            NetworkFee::Estimate(0),
-        )
-        .into_string();
-        assert!(off.contains(r#"<span id="ticketTotal">5,250 sats</span>"#));
-        assert!(!off.contains("networkFee"));
-        assert!(off.contains("Pay 5,250 sats and enter"));
     }
 
     /// What winning pays sits beside the price: first place's prize.
     #[test]
     fn entry_form_shows_what_first_place_wins() {
         let html = form(PayoutDestination::LoggedOut);
-        assert!(html.contains("<dt>Win</dt><dd>15,000 sats</dd>"), "{html}");
+        assert!(
+            html.contains("<dt>Prizes</dt><dd>15,000 sats</dd>"),
+            "{html}"
+        );
         let mut two = view("c1", Phase::Upcoming, 60);
         two.paid_places = 2;
         let html = entry_form(
@@ -895,8 +865,7 @@ mod tests {
 
     /// A fact's 44 px "?" takes its own room above, below and after it: hanging into the next
     /// fact, that fact covered 13 px of it. It is square, since a tap follows rounded corners
-    /// and the term took them. The total that opens the price's parts is a 44 px tall tap too,
-    /// padded rather than set in bigger text.
+    /// and the term took them.
     #[test]
     fn the_facts_taps_are_44_px_and_not_covered() {
         use crate::templates::css_check::{rule, value};
@@ -910,10 +879,6 @@ mod tests {
             "calc(0.3rem + (1.05rem - 44px) / 2)"
         );
         assert_eq!(value(tip, "border-radius"), "0");
-        let coarse = &CSS[CSS.rfind("@media (pointer: coarse)").unwrap()..];
-        let total = rule(coarse, ".price-details summary");
-        assert_eq!(value(total, "padding"), "calc((44px - 1lh) / 2) 0");
-        assert!(!total.contains("font-size"));
     }
 
     /// A pin and its label are one link, whose tap on a touch screen is a square around the

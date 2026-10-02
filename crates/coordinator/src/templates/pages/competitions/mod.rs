@@ -678,18 +678,21 @@ fn featured_card(competition: &CompetitionView, now: OffsetDateTime) -> Markup {
                 (list_badge(competition))
                 span class="countdown" {
                     @if competition.phase == Phase::Live {
-                        "Results in " (format::duration(competition.end - now))
+                        "Observations end in " (format::duration(competition.end - now))
                     } @else {
                         "Entries close in " (format::duration(competition.start - now))
                     }
                 }
             }
-            p class="featured-window" { (format::window(competition.start, competition.end)) }
+            p class="featured-window" {
+                (format::zoned_time(competition.start, format::TimeStyle::Weekday))
+                " · " (format::competition_duration(competition.start, competition.end))
+            }
             dl class="featured-facts" {
                 @if competition.can_enter {
                     div { dt { "Entry fee" } dd { (sats(competition.price())) } }
                 }
-                div { dt { "Win" } dd { (competition.win()) } }
+                div { dt { "Prizes" } dd { (competition.win()) } }
                 div { dt { "Entries" } dd { (competition.entries()) } }
             }
             a class=(if competition.can_enter { "button is-primary is-fullwidth" } else { "button is-fullwidth" })
@@ -717,9 +720,10 @@ fn list(competitions: &[&CompetitionView], now: OffsetDateTime) -> Markup {
         div class="competition-list" {
             div class="competition-header" aria-hidden="true" {
                 span { "Status" }
-                span { "Window" }
+                span { "Starts" }
+                span { "Duration" }
                 span { "Entry fee" }
-                span { "Win" }
+                span { "Prizes" }
                 span { "Entries" }
                 span {}
             }
@@ -746,8 +750,12 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
         facts.push(format!("Entry fee {}", sats(competition.price())));
     }
     if competition.top_prize().is_some() {
-        facts.push(format!("Win {}", competition.win()));
+        facts.push(format!("Prizes {}", competition.win()));
     }
+    facts.push(format::competition_duration(
+        competition.start,
+        competition.end,
+    ));
     facts.push(match competition.queue {
         Queue::Queued(_) => competition.entries(),
         _ => format!("{} entries", competition.entries()),
@@ -759,10 +767,10 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
           hx-target="#main-content" hx-push-url="true" {
             span class="cell-status" { (list_badge(competition)) }
             span class="cell-window" {
-                (format::window(competition.start, competition.end))
+                (format::zoned_time(competition.start, format::TimeStyle::Weekday))
                 @match competition.phase {
                     Phase::Upcoming => { span class="cell-note" { "starts in " (format::duration(competition.start - now)) } }
-                    Phase::Live => { span class="cell-note" { "ends in " (format::duration(competition.end - now)) } }
+                    Phase::Live => { span class="cell-note" { "observations end in " (format::duration(competition.end - now)) } }
                     Phase::Expired => { span class="cell-note" { "no result · pot shared back" } }
                     Phase::Scored if competition.pot_refunded => { span class="cell-note" { "no winner · pot shared back" } }
                     _ => {}
@@ -780,10 +788,13 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
                     Queue::Single => {}
                 }
             }
+            span class="cell-duration" data-label="Duration" {
+                (format::competition_duration(competition.start, competition.end))
+            }
             span class="cell-fee" data-label="Entry fee" {
                 @if competition.can_enter { (sats(competition.price())) } @else { "—" }
             }
-            span class="cell-win" data-label="Win" { (competition.win()) }
+            span class="cell-win" data-label="Prizes" { (competition.win()) }
             span class="cell-entries" data-label="Entries" { (competition.entries()) }
             span class="cell-action" { (action) " →" }
         }
@@ -883,13 +894,13 @@ pub(crate) mod tests {
         // once known.
         assert!(html.contains("<dt>Entry fee</dt><dd>5,250 sats</dd>"));
         assert!(!html.contains(">Price<"));
-        assert!(html.contains("<dt>Win</dt><dd>15,000 sats</dd>"));
+        assert!(html.contains("<dt>Prizes</dt><dd>15,000 sats</dd>"));
         assert!(!html.contains("Paid places") && !html.contains(">Pot<"));
         let mut priced = view("open", Phase::Upcoming, 133);
         priced.network_fee = Some(437);
         let row = competition_row(&priced, NOW).into_string();
         assert!(row.contains(r#"data-label="Entry fee">5,687 sats</span>"#));
-        assert!(row.contains("Entry fee 5,687 sats · Win 15,000 sats · 1 of 3 entries"));
+        assert!(row.contains("Entry fee 5,687 sats · Prizes 15,000 sats · 10 min · 1 of 3 entries"));
     }
 
     #[test]
@@ -1236,8 +1247,8 @@ pub(crate) mod tests {
         refunded.pot_refunded = true;
         for competition in [refunded, view("cancelled", Phase::Cancelled, -60)] {
             let html = competition_row(&competition, NOW).into_string();
-            assert!(html.contains(r#"data-label="Win">—</span>"#));
-            assert!(!html.contains("Win 15,000"));
+            assert!(html.contains(r#"data-label="Prizes">—</span>"#));
+            assert!(!html.contains("Prizes 15,000"));
             // Nothing to buy either.
             assert!(html.contains(r#"data-label="Entry fee">—</span>"#));
         }
@@ -1255,7 +1266,7 @@ pub(crate) mod tests {
         );
         assert!(row.contains("pools of up to 25"));
         // Forty entries make two pools of twenty.
-        assert!(row.contains("Entry fee 5,250 sats · Win 100,000 sats · 40 entered"));
+        assert!(row.contains("Entry fee 5,250 sats · Prizes 100,000 sats · 10 min · 40 entered"));
         assert_eq!(queue.pot(), "100,000 sats per pool");
         let six = queued("q", 6);
         assert_eq!(six.win(), "30,000 sats");

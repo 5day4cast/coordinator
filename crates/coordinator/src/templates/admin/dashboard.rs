@@ -160,10 +160,10 @@ pub fn admin_dashboard(stations: &[StationWithWeather], defaults: &CompetitionDe
                         div class="columns" {
                             div class="column" {
                                 div class="field" {
-                                    label class="label" { "Number of Values Per Entry" }
+                                    label class="label" { "Required picks" }
                                     div class="control" {
-                                        input class="input" type="number" name="number_of_values_per_entry"
-                                              value="1" min="1";
+                                        p { "Every weather category for every selected city" }
+                                        p class="help" { "Calculated from the cities and observation window." }
                                     }
                                 }
                             }

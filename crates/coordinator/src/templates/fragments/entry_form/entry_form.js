@@ -513,7 +513,8 @@ function setBusy(button, busy) {
 // Without the picks on the page (forecasts still loading), the message goes under Pay.
 function askForPicks(form, errorMsg) {
   const message = document.getElementById("picksMessage") ?? errorMsg;
-  message.textContent = "Make at least one pick";
+  const count = Number(form.dataset.maxValues);
+  message.textContent = `Make exactly ${count} ${count === 1 ? "pick" : "picks"} before paying.`;
   message.classList.remove("hidden");
   const first = form.querySelector?.(`${PICK}:not(:disabled)`);
   first?.focus();
@@ -630,8 +631,8 @@ async function submitEntry() {
     return;
   }
   const maxValues = parseInt(form.dataset.maxValues, 10) || 1;
-  if (choiceCount > maxValues) {
-    errorMsg.textContent = `You can make up to ${maxValues} picks; you made ${choiceCount}`;
+  if (choiceCount !== maxValues) {
+    errorMsg.textContent = `Make exactly ${maxValues} ${maxValues === 1 ? "pick" : "picks"}; you made ${choiceCount}.`;
     errorMsg.classList.remove("hidden");
     return;
   }

@@ -5,13 +5,7 @@
 use maud::{html, Markup};
 
 use crate::domain::leaderboard::{progress::LINE_POINTS, Metric, PickState, Rule};
-use crate::templates::{
-    assets::{
-        Asset, HOW_IT_WORKS_DESKTOP_JPG, HOW_IT_WORKS_DESKTOP_MP4, HOW_IT_WORKS_JPG,
-        HOW_IT_WORKS_MP4,
-    },
-    fragments::{entry_form::pick_row, picks::state_badge},
-};
+use crate::templates::fragments::{entry_form::pick_row, picks::state_badge};
 
 /// A numbered marker tying a spot in the walkthrough to its note.
 fn callout(number: u8) -> Markup {
@@ -26,7 +20,10 @@ pub fn help_page(open_advanced: bool) -> Markup {
             a class="back-link" href="/competitions" hx-get="/competitions"
               hx-target="#main-content" hx-push-url="true" { "← All competitions" }
             h1 class="title is-4" { "How it works" }
-            (video())
+            p class="content" {
+                "Daily Fantasy Weather works like daily fantasy sports: make weather picks for a roster of US cities, "
+                "then compete on how well your picks match the observed weather."
+            }
 
             nav class="help-contents" aria-label="On this page" {
                 a href="#walkthrough" { "Entering" }
@@ -44,14 +41,14 @@ pub fn help_page(open_advanced: bool) -> Markup {
             section id="scoring" class="content" {
                 h2 { "Scoring" }
                 p {
-                    "Each competition covers a few airport weather stations. For each reading — high, "
-                    "low, wind — pick whether it lands " strong { "Under" } ", in " strong { "Par" }
+                    "Each competition lists its cities and weather categories. For each category — high temperature, "
+                    "low temperature or sustained wind speed — choose one of three ranges: " strong { "Under" } ", in " strong { "Par" }
                     " or " strong { "Over" } "."
                 }
                 ul {
                     li {
-                        "Pick as many readings as you like. A wrong or skipped pick scores 0 and costs "
-                        "nothing, so filling in every pick is always your best play."
+                        "Complete every category for every city. The entry page shows the required number of picks "
+                        "and checks it before you pay. Older competitions may require a smaller, fixed number."
                     }
                     li {
                         strong { "Par is a range" } " around the forecast, set from how that airport's "
@@ -62,7 +59,8 @@ pub fn help_page(open_advanced: bool) -> Markup {
                         "Par includes both ends of the range, and the reading is compared before rounding: "
                         "with Par 80.4–83.0°F, 83.0°F is Par and 83.1°F is Over."
                     }
-                    li { "When a competition caps how many picks you make, its page says so beside the entry fee." }
+                    li { "An incorrect pick scores 0. There are no negative points." }
+                    li { "Some older competitions use fixed scoring: a correct Par scores 20, and a correct Under or Over scores 10. Their pick buttons show the applicable rules." }
                 }
             }
 
@@ -74,8 +72,14 @@ pub fn help_page(open_advanced: bool) -> Markup {
                     li { strong { "Wind" } ": the highest sustained wind speed observed during the window, in knots." }
                 }
                 p {
-                    "Readings come from NOAA's reports for each airport station. A daytime window has "
-                    "highs and wind only; a night window has lows and wind only."
+                    "All observations come from NOAA's reports for the airport station named beside each city. "
+                    "A full-day competition scores all three categories; a daytime window has highs and wind, "
+                    "and a night window has lows and wind."
+                }
+                p {
+                    "The bold forecast values are NOAA's forecasts. They are not adjusted by the historical model. "
+                    "The model sets the three pick ranges from past forecast errors. Forecasts help you choose; "
+                    "observed weather decides the score."
                 }
             }
 
@@ -83,8 +87,9 @@ pub fn help_page(open_advanced: bool) -> Markup {
                 h2 { "Deadlines and results" }
                 ul {
                     li {
-                        strong { "Entries close when the window starts." }
-                        " Every entry's picks become public then."
+                        strong { "Submit your picks and finish paying before entries close." }
+                        " Observations start at that time, and every entry's picks become public. "
+                        "Start times use your local time zone. Duration is the length of the observation window."
                     }
                     li {
                         "While the window is " strong { "live" } ", the leaderboard scores the readings so far "
@@ -92,8 +97,9 @@ pub fn help_page(open_advanced: bool) -> Markup {
                     }
                     li {
                         "Once the window ends, the competition is " strong { "awaiting results" } ". "
-                        "Stations report hourly and NOAA can take up to 24 hours to publish, so the oracle "
-                        "signs the result at a set time after the window."
+                        "Stations report hourly, so the final result can arrive later than the observation window's end. "
+                        "The oracle signs once the signing time has passed and all required observations are verified. "
+                        "If coverage never becomes complete, the contract expires and entrants can recover their funds."
                     }
                     li {
                         "When the oracle signs, the competition is " strong { "finished" } ": the leaderboard "
@@ -145,16 +151,15 @@ pub fn help_page(open_advanced: bool) -> Markup {
             }
 
             section id="payouts" class="content" {
-                h2 { "Paying and payouts" }
+                h2 { "Entry fees and prizes" }
                 ul {
                     li {
-                        "You pay one entry fee over Lightning, all in. "
-                        a href="/help?open=advanced#where-your-sats-go" { "What's in it" }
-                        " is under How the tech works."
+                        "The entry fee is the total you pay over Lightning. The payment button and invoice show that total."
                     }
                     li {
-                        "Winnings go to the Lightning Address on your account. Without one, you submit an "
-                        "invoice on the Payouts page to collect."
+                        "Prizes are sent automatically to the Lightning Address on your account. "
+                        "If the competition uses invoice payouts, submit a Lightning invoice on the Payouts page. "
+                        "The entry page tells you where prizes and refunds will go before you pay."
                     }
                     li {
                         "If a competition doesn't run, your payment comes back: to your Lightning Address, "
@@ -166,31 +171,11 @@ pub fn help_page(open_advanced: bool) -> Markup {
             section id="advanced" class="content" {
                 details open[open_advanced] {
                     summary { h2 class="is-inline" { "How the tech works" } }
-                    h3 id="where-your-sats-go" { "Where your sats go" }
-                    ul {
-                        li {
-                            strong { "Pot contribution" } ": goes into the pot. Every entrant's contribution "
-                            "together is what the winners share."
-                        }
-                        li {
-                            strong { "Service fee" } ": a percentage of the pot contribution that runs the site. "
-                            "It is not part of the pot."
-                        }
-                        li {
-                            strong { "Network fee" } ": your share of the Bitcoin transaction fees the "
-                            "competition's contract needs, estimated for a full pool at the fee rate when "
-                            "your ticket is issued, and fixed from then on. If fees later rise, the site "
-                            "absorbs the difference; if they fall, it keeps the surplus."
-                        }
-                        li {
-                            "When the network fee would be too large a share of the entry, new tickets pause "
-                            "until fees come down. Entries already taken are unaffected."
-                        }
-                    }
+                    h3 id="where-your-sats-go" { "Entry fees and the prize pool" }
                     p {
-                        "For example, an entry fee of 5,330 sats is 5,000 sats pot contribution + 150 sats "
-                        "service fee (3%) + 180 sats network fee. Every entrant pays the same entry fee, so "
-                        "five entrants make a 25,000-sat pot."
+                        "Your entry fee includes the costs of running and settling the competition. "
+                        "The Prizes amount shows what a winner receives. For a queued competition, "
+                        "that prize grows as more players join its pool."
                     }
                     h3 { "The network underneath" }
                     ul {
@@ -227,39 +212,6 @@ pub fn help_page(open_advanced: bool) -> Markup {
     }
 }
 
-/// A minute's walk through entering, the leaderboard and a player's picks, recorded from these
-/// pages (`just help-video`), once on a phone and once on a desktop screen; help.css shows the
-/// one that fits. It loads only when played; the sections below say it all in words.
-fn video() -> Markup {
-    html! {
-        figure class="help-video" {
-            (recording("is-phone", &HOW_IT_WORKS_MP4, &HOW_IT_WORKS_JPG, (540, 1168)))
-            (recording("is-desktop", &HOW_IT_WORKS_DESKTOP_MP4, &HOW_IT_WORKS_DESKTOP_JPG, (960, 600)))
-            figcaption {
-                "How it works, in under a minute."
-                br;
-                "Music: "
-                a href="https://incompetech.com/music/royalty-free/index.html?isrc=USUAN1300010" {
-                    "Local Forecast"
-                }
-                " by Kevin MacLeod (incompetech.com), "
-                a href="https://creativecommons.org/licenses/by/4.0/" { "CC BY 4.0" }
-            }
-        }
-    }
-}
-
-fn recording(class: &str, mp4: &Asset, poster: &Asset, (width, height): (u32, u32)) -> Markup {
-    html! {
-        video class=(class) controls playsinline preload="metadata" width=(width) height=(height)
-              poster=(poster.url)
-              aria-label="How it works: entering a competition, then following the leaderboard and your picks" {
-            source src=(mp4.url) type="video/mp4";
-            a href=(mp4.url) { "Watch how it works" }
-        }
-    }
-}
-
 /// An entry form as it looks, inert, with numbered notes.
 fn walkthrough() -> Markup {
     let band = Rule::Line {
@@ -268,16 +220,22 @@ fn walkthrough() -> Markup {
     };
     html! {
         section id="walkthrough" {
-            h2 class="title is-4" { "Entering a competition" }
+            h2 class="title is-4" { "Selection process" }
+            p class="content" {
+                "Choose one range for each weather category shown. For example, a high-temperature pick below 66°F "
+                "scores only if the highest observed temperature stays below 66°F for the entire window. "
+                "A low-temperature range of 43.1–46.7°F scores when the lowest observation falls within that range, "
+                "including either boundary. A wind pick above 11.5 knots scores if the highest sustained wind exceeds 11.5 knots."
+            }
             div class="help-walkthrough" {
                 figure class="help-shot entry-form" inert aria-label="An example entry form" {
                     dl class="entry-facts" {
-                        div { dt { "Entries close" (callout(1)) } dd { "Sep 30, 6:56 PM" } }
+                        div { dt { "Entries close" (callout(1)) } dd { "Sun, 1:00 PM EDT" } }
                         div { dt { "Entry fee" (callout(2)) } dd { "5,687 sats" } }
-                        div { dt { "Win" (callout(3)) } dd { "30,000 sats" } }
+                        div { dt { "Prizes" (callout(3)) } dd { "30,000 sats" } }
                     }
                     fieldset class="station-picks" {
-                        legend { "Chicago/O'Hare International, IL " span class="station-code" { "KORD" } (callout(4)) }
+                        legend { "Chicago, IL " span class="station-code" { "KORD" } (callout(4)) }
                         (pick_row("KORD", Metric::TempHigh, Some(77.0), Some(band)))
                         p class="help-pointer" { "↑ " (callout(5)) }
                     }
@@ -285,12 +243,12 @@ fn walkthrough() -> Markup {
                 }
                 ol class="help-callouts content" {
                     li { "The deadline. Picks lock when the observation window starts." }
-                    li { "What entering costs, all in. Tap it to see the fees it's made of." }
+                    li { "The total you pay. The invoice and payment button show the same entry fee." }
                     li { "What first place wins once the result is final." }
-                    li { "Each airport and its forecast: here, a 77°F high at Chicago O'Hare." }
+                    li { "The city and NOAA forecast: here, a 77°F high for Chicago. The city tooltip identifies the airport station." }
                     li {
                         "Your pick, left to right: Under, Par (73.4–76.0°F, both ends included) or Over. "
-                        "Tap a chosen pick again to clear it; a skipped reading scores 0 and costs nothing."
+                        "Choose one range for each category. You can change a pick before paying."
                     }
                     li { "Pay the Lightning invoice and you're in. Your picks show on the leaderboard once entries close." }
                 }
@@ -307,7 +265,6 @@ mod tests {
     fn links_into_the_folded_section_open_it() {
         let folded = help_page(false).into_string();
         assert!(folded.contains("<details>"), "{folded}");
-        assert!(folded.contains(r##"href="/help?open=advanced#where-your-sats-go""##));
         assert!(folded.contains(r##"href="/help?open=advanced#advanced""##));
         assert!(folded.contains(r#"<h3 id="where-your-sats-go">"#));
 
@@ -328,36 +285,12 @@ mod tests {
         assert!(!html.contains("entryForm") && !html.contains("submitEntry"));
     }
 
-    /// Both recordings load only when played, from this site's own hashed assets.
     #[test]
-    fn the_video_waits_to_be_played() {
+    fn the_help_uses_current_examples_and_explains_forecast_provenance() {
         let html = help_page(false).into_string();
-        for (class, mp4, poster) in [
-            ("is-phone", &HOW_IT_WORKS_MP4, &HOW_IT_WORKS_JPG),
-            (
-                "is-desktop",
-                &HOW_IT_WORKS_DESKTOP_MP4,
-                &HOW_IT_WORKS_DESKTOP_JPG,
-            ),
-        ] {
-            assert!(html.contains(&format!(
-                r#"<video class="{class}" controls playsinline preload="metadata""#
-            )));
-            assert!(html.contains(&format!(r#"poster="{}""#, poster.url)));
-            assert!(html.contains(&format!(r#"<source src="{}" type="video/mp4">"#, mp4.url)));
-        }
-        assert_eq!(html.matches("<video ").count(), 2);
-        assert!(!html.contains("autoplay"));
-        assert!(!video().into_string().contains("muted"));
-    }
-
-    /// The video's music is credited as its CC BY 4.0 licence asks.
-    #[test]
-    fn the_video_credits_its_music() {
-        let html = help_page(false).into_string();
-        let credit = r#"Music: <a href="https://incompetech.com/music/royalty-free/index.html?isrc=USUAN1300010">Local Forecast</a> by Kevin MacLeod (incompetech.com), <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>"#;
-        // Once, under both recordings.
-        assert_eq!(html.matches(credit).count(), 1);
+        assert!(!html.contains("<video") && !html.contains("Pick as many"));
+        assert!(html.contains("bold forecast values are NOAA"));
+        assert!(html.contains("There are no negative points"));
     }
 
     #[test]
@@ -376,6 +309,6 @@ mod tests {
             assert!(html.contains(&format!(r#"id="{id}""#)), "{id}");
         }
         assert!(html.contains("highest sustained wind speed"));
-        assert!(html.contains("scores 0 and costs nothing"));
+        assert!(html.contains("An incorrect pick scores 0"));
     }
 }
