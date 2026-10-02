@@ -403,7 +403,7 @@ recent_runs_to_avoid = 6
     assert_eq!(picker.candidates, Candidates::Configured);
     assert_eq!(picker.recent_runs_to_avoid, 6);
     assert_eq!(picker.weights, Weights::default());
-    assert_eq!(picker.eligible_days, 30);
+    assert_eq!(picker.eligible_days, 3);
 
     let base = ScenarioConfig::default();
     for bad in [

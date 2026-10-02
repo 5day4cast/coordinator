@@ -198,11 +198,15 @@ impl Pick {
 type Cached<T> = Option<(Instant, T)>;
 
 /// Picks the stations of lanes that choose them for the weather.
+/// Eligible station lists by window hours, with when each was fetched; None when the oracle
+/// has no such list.
+type EligibleCache = HashMap<u64, (Instant, Option<Vec<StationInfo>>)>;
+
 pub struct Picker {
     oracle: OracleClient,
     db: SynthDb,
     /// The eligible stations by window length, None where the oracle does not offer the list.
-    eligible: Mutex<HashMap<u64, (Instant, Option<Vec<StationInfo>>)>>,
+    eligible: Mutex<EligibleCache>,
     /// Every station the oracle knows, to place a lane's own stations.
     directory: Mutex<Cached<Vec<StationInfo>>>,
     /// Whether the missing eligible list has been warned about since it was last read.
