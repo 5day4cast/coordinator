@@ -133,7 +133,7 @@ fn default_prefer_known_airports() -> bool {
 }
 
 fn default_eligible_days() -> u32 {
-    30
+    3
 }
 
 impl PickerConfig {
