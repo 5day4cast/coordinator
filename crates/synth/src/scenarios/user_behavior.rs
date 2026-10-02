@@ -211,12 +211,16 @@ async fn run_steps(
     let (loaded, users) = run_step("load_users", || load_users(db, config.users + extra)).await?;
     steps.push(loaded);
 
-    let mut actors = FuturesUnordered::new();
-    for plan in &config.entry_plan {
-        let user = &users[plan.user_index];
-        actors.push(run_actor(
+    // A backfilled run's early players enter now, and the others wait for the backfill.
+    let drawn = config.entry_plan.len();
+    let early = config
+        .backfill
+        .map_or(drawn, |backfill| backfill.early_players.min(drawn));
+    let actor = |index: usize| {
+        let plan = &config.entry_plan[index];
+        run_actor(
             client,
-            user,
+            &users[plan.user_index],
             &users,
             &competition_id,
             config,
@@ -224,18 +228,49 @@ async fn run_steps(
             plan,
             arrival_anchor,
             deadline,
-        ));
-    }
+        )
+    };
+    let mut actors: FuturesUnordered<_> = (0..early).map(actor).collect();
+    let backfill = async {
+        match config.backfill {
+            Some(backfill) => {
+                backfill_step(client, &competition_id, backfill, deadline, drawn - early).await
+            }
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(backfill);
+    let mut backfilling = config.backfill.is_some();
+    let mut entered = early;
     let mut traces = Vec::new();
     let mut failure = None;
     // A failed actor must not cancel another actor in the middle of paying.
-    while let Some((step, trace)) = actors.next().await {
-        if step.status == StepStatus::Failed {
-            failure = Some(step.error.clone().unwrap_or_default());
+    loop {
+        tokio::select! {
+            Some((step, trace)) = actors.next(), if !actors.is_empty() => {
+                if step.status == StepStatus::Failed {
+                    failure = Some(step.error.clone().unwrap_or_default());
+                }
+                steps.push(step);
+                traces.push(trace);
+            }
+            (step, entering) = &mut backfill, if backfilling => {
+                backfilling = false;
+                steps.push(step);
+                actors.extend((early..early + entering).map(actor));
+                entered += entering;
+            }
+            else => break,
         }
-        steps.push(step);
-        traces.push(trace);
     }
+    // A backfilled queue expects the players who entered, not every drawn one.
+    let queue = queue.map(|shape| match config.backfill {
+        Some(_) => super::queued::QueueShape {
+            players: entered,
+            ..shape
+        },
+        None => shape,
+    });
     if let Some(error) = failure {
         return Err(Box::new(StepResult {
             name: "entry_wave".into(),
@@ -463,6 +498,62 @@ async fn run_steps(
         steps.push(step);
     }
     follow_lifecycle(client, &users, &competition_id, config, &traces, steps).await
+}
+
+/// Wait until `backfill.before_close_secs` before `deadline`, then work out how many of the
+/// `waiting` players the competition still needs to start, counting everyone's paid entries, and
+/// return the step and how many enter. A competition that cannot be read gets them all.
+async fn backfill_step(
+    client: &CoordinatorClient,
+    competition_id: &Uuid,
+    backfill: Backfill,
+    deadline: OffsetDateTime,
+    waiting: usize,
+) -> (StepResult, usize) {
+    let at = deadline - time::Duration::seconds(backfill.before_close_secs as i64);
+    let wait = (at - OffsetDateTime::now_utc()).max(time::Duration::ZERO);
+    tokio::time::sleep(wait.unsigned_abs()).await;
+    let counted = run_step("backfill", || async {
+        let competition = client.get_competition(competition_id).await?;
+        Ok(BackfillCount::new(
+            competition.min_players(),
+            backfill.margin,
+            competition.paid_entries(),
+            waiting,
+        ))
+    })
+    .await;
+    match counted {
+        Ok((mut step, count)) => {
+            if count.short() {
+                log::warn!(
+                    "Competition {competition_id} needs {} more players but the run drew only {} \
+                     more; its pool may still be short",
+                    count.needed,
+                    count.waiting
+                );
+            }
+            crate::server::metrics::record_backfill(count.entering);
+            step.details = Some(serde_json::to_value(count).unwrap_or_default());
+            (step, count.entering)
+        }
+        Err(step) => {
+            log::warn!(
+                "Cannot count competition {competition_id}'s entries for its backfill; all {waiting} \
+                 waiting players enter: {}",
+                step.error.as_deref().unwrap_or_default()
+            );
+            crate::server::metrics::record_backfill(waiting);
+            let mut step = *step;
+            step.status = StepStatus::Passed;
+            step.details = Some(serde_json::json!({
+                "waiting": waiting,
+                "entering": waiting,
+                "uncounted": step.error.take(),
+            }));
+            (step, waiting)
+        }
+    }
 }
 
 /// The states a single competition passes through on its way to its attestation.

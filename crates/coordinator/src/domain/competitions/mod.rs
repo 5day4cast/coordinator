@@ -1173,6 +1173,10 @@ pub struct Competition {
     /// fills it in for the API.
     #[serde(default)]
     pub kickoff_check: Option<KickoffCheck>,
+    /// The fewest players it would start with at the current network fee estimate, while it
+    /// still takes entries. Not stored on the row; the coordinator fills it in for the API.
+    #[serde(default)]
+    pub min_players_now: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1263,6 +1267,10 @@ pub struct ExtendCompetition {
     /// Why an Arkade competition was built or cancelled at kickoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kickoff_check: Option<KickoffCheck>,
+    /// The fewest players it would start with at the current network fee estimate; only while
+    /// it takes entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_players_now: Option<u64>,
 }
 
 impl From<Competition> for ExtendCompetition {
@@ -1312,6 +1320,7 @@ impl From<Competition> for ExtendCompetition {
             pools_formed_at: competition.pools_formed_at,
             queue: competition.queue,
             kickoff_check: competition.kickoff_check,
+            min_players_now: competition.min_players_now,
         }
     }
 }
@@ -1701,6 +1710,7 @@ impl Competition {
             pools_formed_at: None,
             queue: None,
             kickoff_check: None,
+            min_players_now: None,
         }
     }
     pub fn has_full_entries(&self) -> bool {
@@ -2034,6 +2044,7 @@ impl FromRow<'_, SqliteRow> for Competition {
                 .transpose()?,
             queue: None,
             kickoff_check: None,
+            min_players_now: None,
         })
     }
 }

@@ -1,12 +1,15 @@
 //! Entry deadlines are independent of background lifecycle progress.
 
-use super::{Competition, CompetitionState, CompetitionStore, Error, Lease};
+use super::{Competition, CompetitionKind, CompetitionState, CompetitionStore, Error, Lease};
+use crate::config::KickoffCheckSettings;
 use crate::infra::db::DatabaseWriteError;
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
 pub(super) const TICKETS_CLOSED: &str =
     "Ticket requests close one minute before observations start";
 pub(super) const ENTRIES_CLOSED: &str = "Competition is no longer accepting entries";
+/// The fewest players a single competition's terms allow, as its kickoff check counts them.
+pub(super) const SINGLE_COMPETITION_MIN_PLAYERS: u64 = 2;
 
 pub(super) fn entry_write_error(error: DatabaseWriteError, ticket_has_entry: bool) -> Error {
     match error {
@@ -46,6 +49,28 @@ impl Competition {
             return Err(Error::BadRequest(TICKETS_CLOSED.into()));
         }
         Ok(())
+    }
+
+    /// The fewest players it would start with at `sat_per_vb`, while it still takes entries: its
+    /// terms' minimum (a queue's smallest pool, or two players for a single competition, as its
+    /// kickoff check counts them), raised as the check raises it at that rate. None for a pool,
+    /// whose players come from its queue, and once entries have closed.
+    pub fn min_players_to_start(
+        &self,
+        settings: &KickoffCheckSettings,
+        sat_per_vb: u64,
+        now: OffsetDateTime,
+    ) -> Option<u64> {
+        if self.kind == CompetitionKind::Pool || self.require_entry_admission(now).is_err() {
+            return None;
+        }
+        let template_min = self
+            .queue
+            .as_ref()
+            .map_or(SINGLE_COMPETITION_MIN_PLAYERS, |queue| {
+                queue.pool_rules.min_players() as u64
+            });
+        Some(settings.min_players_at(template_min, sat_per_vb))
     }
 
     pub(super) fn require_entry_admission(&self, now: OffsetDateTime) -> Result<(), Error> {

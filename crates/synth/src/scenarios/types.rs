@@ -103,6 +103,95 @@ impl EntryTiming {
     }
 }
 
+/// How a run fills its competition.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Fill {
+    /// Every drawn player enters, as the arrival pattern plans.
+    #[default]
+    Immediate,
+    /// The competition stays open to anyone: a few players enter early, so its page is not
+    /// empty, and the rest wait until shortly before entries close, when synth enters only as
+    /// many as the competition still needs to start. See [`Backfill`].
+    Backfill,
+}
+
+/// A run that fills its competition late, with only the players it still needs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Backfill {
+    /// Drawn players who enter over the window before the backfill.
+    pub early_players: usize,
+    /// How long before entries close synth works out how many more players it needs.
+    pub before_close_secs: u64,
+    /// Players above the competition's minimum synth makes sure of.
+    pub margin: u64,
+}
+
+impl Backfill {
+    /// Check the backfill leaves its players time to pay and submit, and the early players a
+    /// window to arrive in, in an `entry_window_secs` window.
+    pub fn validate(&self, timing: &EntryTiming, entry_window_secs: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.before_close_secs < entry_window_secs,
+            "backfill_before_close_secs must be shorter than the entry window"
+        );
+        let waits = timing
+            .before_payment
+            .max_secs
+            .saturating_add(timing.before_submit.max_secs)
+            .saturating_add(timing.deadline_margin_secs.max(60))
+            .saturating_add(SPREAD_SLACK_SECS);
+        anyhow::ensure!(
+            self.before_close_secs > waits,
+            "backfill_before_close_secs must leave the late players their payment and submission \
+             waits, the deadline margin and {SPREAD_SLACK_SECS} seconds ({waits} seconds)"
+        );
+        timing
+            .validate(self.early_window_secs(entry_window_secs))
+            .map_err(|error| anyhow::anyhow!("the window before the backfill: {error:#}"))
+    }
+
+    /// The part of an `entry_window_secs` window the early players arrive in: up to the backfill.
+    pub fn early_window_secs(&self, entry_window_secs: u64) -> u64 {
+        entry_window_secs.saturating_sub(self.before_close_secs)
+    }
+}
+
+/// What a backfill found and does.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct BackfillCount {
+    /// Everyone's paid entries, other people's included.
+    pub paid_entries: u64,
+    pub min_players: u64,
+    pub margin: u64,
+    /// Players the competition needs to reach its minimum and the margin.
+    pub needed: u64,
+    /// Drawn players still waiting to enter.
+    pub waiting: usize,
+    /// Of them, those who enter now.
+    pub entering: usize,
+}
+
+impl BackfillCount {
+    pub fn new(min_players: u64, margin: u64, paid_entries: u64, waiting: usize) -> Self {
+        let needed = (min_players + margin).saturating_sub(paid_entries);
+        Self {
+            paid_entries,
+            min_players,
+            margin,
+            needed,
+            waiting,
+            entering: usize::try_from(needed).unwrap_or(usize::MAX).min(waiting),
+        }
+    }
+
+    /// The run drew too few players to make up what the competition needs.
+    pub fn short(&self) -> bool {
+        self.needed > self.entering as u64
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryBehavior {
@@ -343,6 +432,10 @@ pub struct ScenarioConfig {
     /// How a stress run pushes its competition; the defaults when unset.
     #[serde(default)]
     pub stress: Option<super::stress::StressSettings>,
+    /// Fill the competition late, with only the players it needs; every drawn player enters
+    /// otherwise.
+    #[serde(default)]
+    pub backfill: Option<Backfill>,
 }
 
 /// What an observation window can score, as the oracle attests it: a window of 24 hours or more
@@ -426,6 +519,7 @@ impl Default for ScenarioConfig {
             seats: None,
             listed: false,
             stress: None,
+            backfill: None,
         }
     }
 }
@@ -511,6 +605,15 @@ impl ScenarioConfig {
             config.entry_window_secs = config.entry_window_secs.max(required);
         }
         self.entry_timing.validate(config.entry_window_secs)?;
+        if let Some(backfill) = &self.backfill {
+            anyhow::ensure!(
+                scenario == super::queued::QUEUED_ONE_POOL,
+                "{scenario} cannot be backfilled: only {} is, since a single competition that is \
+                 not full when entries close is cancelled",
+                super::queued::QUEUED_ONE_POOL
+            );
+            backfill.validate(&self.entry_timing, config.entry_window_secs)?;
+        }
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed);
         anyhow::ensure!(
             self.observation_window_choices
@@ -551,11 +654,17 @@ impl ScenarioConfig {
         };
         config.seed = Some(seed);
         config.planned_scenario = Some(scenario.to_string());
+        // A backfilled run's early players arrive before the backfill, and the others when it is
+        // due, if they are needed then.
+        let early_window = self.backfill.map_or(config.entry_window_secs, |backfill| {
+            backfill.early_window_secs(config.entry_window_secs)
+        });
+        let early_players = self
+            .backfill
+            .map_or(config.users, |backfill| backfill.early_players);
         let spread = match self.entry_timing.arrival_pattern {
             ArrivalPattern::Range => None,
-            ArrivalPattern::Spread => self
-                .entry_timing
-                .latest_spread_arrival(config.entry_window_secs),
+            ArrivalPattern::Spread => self.entry_timing.latest_spread_arrival(early_window),
         };
         let abandons = matches!(
             behavior,
@@ -565,6 +674,7 @@ impl ScenarioConfig {
             .map(|user_index| EntryPlan {
                 user_index,
                 arrival_secs: match spread {
+                    _ if user_index >= early_players => early_window,
                     // A replacement follows an abandoned ticket, so it is left early.
                     Some(latest) if !(abandons && user_index == exceptional_user) => {
                         self.entry_timing.spread_arrival(latest, &mut rng)
@@ -886,6 +996,51 @@ mod plan_tests {
         let mut short = spread_config(0);
         short.entry_window_secs = 300;
         assert!(short.resolve_plan("full_lifecycle").is_err());
+    }
+
+    #[test]
+    fn a_backfill_enters_only_the_players_the_competition_still_needs() {
+        // Fees ask for five players, and synth keeps one more. Synth's early player and two
+        // strangers have paid, so three of the five waiting players enter.
+        let count = BackfillCount::new(5, 1, 3, 5);
+        assert_eq!((count.needed, count.entering, count.short()), (3, 3, false));
+        // Strangers already cover the minimum and the margin: nobody else enters.
+        let count = BackfillCount::new(5, 1, 7, 5);
+        assert_eq!((count.needed, count.entering, count.short()), (0, 0, false));
+        // The run drew too few: every waiting player enters, and the pool may still be short.
+        let count = BackfillCount::new(5, 1, 1, 2);
+        assert_eq!((count.needed, count.entering, count.short()), (5, 2, true));
+    }
+
+    #[test]
+    fn a_backfilled_plan_spreads_its_early_players_before_the_backfill() {
+        let mut config = spread_config(3);
+        config.backfill = Some(Backfill {
+            early_players: 1,
+            before_close_secs: 1800,
+            margin: 1,
+        });
+        let plan = config.resolve_plan("queued_one_pool").unwrap();
+        assert_eq!(plan.users, 5);
+        let latest = config.entry_timing.latest_spread_arrival(1800).unwrap();
+        assert!(plan.entry_plan[0].arrival_secs <= latest);
+        assert!(plan.entry_plan[1..]
+            .iter()
+            .all(|player| player.arrival_secs == 1800));
+        assert_eq!(
+            plan.resolve_plan("queued_one_pool").unwrap().entry_plan,
+            plan.entry_plan,
+            "a recorded plan resolves to itself"
+        );
+        // A single competition that is not full when entries close is cancelled.
+        assert!(config.resolve_plan("full_lifecycle").is_err());
+        // The late players need time to pay and submit before entries close.
+        config.backfill = Some(Backfill {
+            early_players: 1,
+            before_close_secs: 300,
+            margin: 1,
+        });
+        assert!(config.resolve_plan("queued_one_pool").is_err());
     }
 
     #[test]

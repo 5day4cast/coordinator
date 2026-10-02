@@ -10,7 +10,7 @@ use rand::seq::IndexedRandom;
 use serde::Deserialize;
 use time::{Duration, OffsetDateTime, Time};
 
-use crate::scenarios::ScenarioConfig;
+use crate::scenarios::{queued::QUEUED_ONE_POOL, Backfill, Fill, ScenarioConfig};
 
 /// When a lane's runs close their entries.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -54,10 +54,35 @@ pub struct LaneConfig {
     /// How the lane's stress runs push their competition; the defaults otherwise.
     #[serde(default)]
     pub stress: Option<crate::scenarios::stress::StressSettings>,
+    /// How its runs fill their competitions: every drawn player enters, or the competition stays
+    /// open to anyone and synth fills it late with the players it still needs.
+    #[serde(default)]
+    pub fill: Fill,
+    /// When backfilling: drawn players who enter over the window, so the page is not empty.
+    #[serde(default = "default_early_players")]
+    pub early_players: usize,
+    /// When backfilling: how long before entries close synth enters the players still needed.
+    #[serde(default = "default_backfill_before_close_secs")]
+    pub backfill_before_close_secs: u64,
+    /// When backfilling: players above the competition's minimum synth makes sure of.
+    #[serde(default = "default_backfill_margin")]
+    pub backfill_margin: u64,
 }
 
 fn default_interval_secs() -> u64 {
     3600
+}
+
+fn default_early_players() -> usize {
+    1
+}
+
+fn default_backfill_before_close_secs() -> u64 {
+    1800
+}
+
+fn default_backfill_margin() -> u64 {
+    1
 }
 
 const HALF_DAY: u64 = 43_200;
@@ -128,7 +153,31 @@ impl LaneConfig {
                 "lane {name}: the entry window must be shorter than the 12 hours between runs"
             );
         }
+        if let Some(backfill) = self.backfill() {
+            // A single competition that is not full when entries close is cancelled; a queue
+            // forms a pool of whoever entered, if they are enough.
+            anyhow::ensure!(
+                self.scenarios
+                    .iter()
+                    .all(|scenario| scenario == QUEUED_ONE_POOL),
+                "lane {name}: a backfilled lane runs only {QUEUED_ONE_POOL}, whose queue starts \
+                 with whoever entered; a single competition that is not full when entries close \
+                 is cancelled"
+            );
+            backfill
+                .validate(&base.entry_timing, entry_window)
+                .map_err(|error| anyhow::anyhow!("lane {name}: {error:#}"))?;
+        }
         Ok(())
+    }
+
+    /// How its runs backfill, if they do.
+    pub fn backfill(&self) -> Option<Backfill> {
+        (self.fill == Fill::Backfill).then_some(Backfill {
+            early_players: self.early_players,
+            before_close_secs: self.backfill_before_close_secs,
+            margin: self.backfill_margin,
+        })
     }
 
     fn windows(&self, base: &ScenarioConfig) -> Vec<u64> {
@@ -184,6 +233,11 @@ impl LaneConfig {
                 .collect(),
             None => stations.clone(),
         };
+        config.backfill = self.backfill();
+        if config.backfill.is_some() {
+            // Pools as large as the coordinator allows, so the queue takes anyone who comes.
+            config.max_pool_players = None;
+        }
         (scenario, config)
     }
 }
@@ -225,6 +279,10 @@ mod tests {
             stations_per_run: Some(2),
             unlisted: None,
             stress: None,
+            fill: Fill::Immediate,
+            early_players: 1,
+            backfill_before_close_secs: 1800,
+            backfill_margin: 1,
         }
     }
 

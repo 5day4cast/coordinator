@@ -192,6 +192,12 @@ impl OperatorCompetition {
     }
 }
 
+/// What the coordinator tells a player while the Arkade server is failing batch steps.
+pub const ENTRIES_PAUSED_FOR_ARKADE: &str =
+    "Entries are paused while the Arkade network recovers; try again in a little while";
+/// What the coordinator tells a player while network fees are too high for the entry fee.
+pub const ENTRIES_PAUSED_FOR_FEES: &str = "Entries are paused while Bitcoin network fees are high";
+
 /// Competition response from the API
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompetitionResponse {
@@ -288,6 +294,10 @@ pub struct CompetitionResponse {
     /// The kickoff check an Arkade competition or pool passes before its contract is built.
     #[serde(default)]
     pub kickoff_check: Option<KickoffCheck>,
+    /// The fewest players it would start with at the current network fees, while it takes
+    /// entries; not every coordinator says.
+    #[serde(default)]
+    pub min_players_now: Option<u64>,
 }
 
 /// What a competition's kickoff check found.
@@ -308,6 +318,53 @@ impl CompetitionResponse {
         self.event_submission
             .get("total_allowed_entries")
             .and_then(serde_json::Value::as_u64)
+    }
+
+    /// The fewest players it would start with now: as the coordinator says, or else its terms'
+    /// minimum, a queue's smallest pool or two players.
+    pub fn min_players(&self) -> u64 {
+        self.min_players_now.unwrap_or_else(|| {
+            self.pool_rules
+                .map_or(2, |rules| rules.min_players() as u64)
+        })
+    }
+
+    /// On the public lists: a queue or pool always, a single competition unless unlisted.
+    pub fn listed(&self) -> bool {
+        self.kind != CompetitionKind::Single
+            || !self
+                .event_submission
+                .get("unlisted")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+    }
+
+    /// When its entries close: when its observations start.
+    pub fn entries_close(&self) -> Option<OffsetDateTime> {
+        let at = self
+            .event_submission
+            .get("start_observation_date")?
+            .as_str()?;
+        OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok()
+    }
+
+    /// Anyone can still enter: it is taking entries and has room. A pool's players come from its
+    /// queue, so a pool never is.
+    pub fn open_to_enter(&self, now: OffsetDateTime) -> bool {
+        let room = match self.kind {
+            CompetitionKind::Single => self.seats().is_none_or(|seats| self.total_entries < seats),
+            CompetitionKind::Queued => self
+                .max_entries
+                .is_none_or(|max| self.paid_entries() < u64::from(max)),
+            CompetitionKind::Pool => false,
+        };
+        room && matches!(self.inferred_status(), "created" | "collecting_entries")
+            && self.entries_close().is_some_and(|close| now < close)
+    }
+
+    /// Everyone's paid entries: a queue's, in it and in its pools, or a single competition's.
+    pub fn paid_entries(&self) -> u64 {
+        self.entries.unwrap_or(self.total_paid_entries)
     }
 
     /// Other players paid for every seat of a single competition, so none is left to take.
@@ -485,6 +542,50 @@ impl CoordinatorClient {
             anyhow::bail!("Get network fee failed ({})", resp.status());
         }
         resp.json().await.context("Failed to parse the network fee")
+    }
+
+    /// Why the coordinator would refuse a ticket for an `entry_fee` entry now, or None if it
+    /// would issue one: entries are paused while the Arkade network recovers or while network
+    /// fees are high, or it answered 503 for want of a fee estimate.
+    pub async fn entries_paused(&self, entry_fee: u64) -> Result<Option<String>> {
+        #[derive(Deserialize)]
+        struct Quote {
+            #[serde(default)]
+            enabled: bool,
+            #[serde(default)]
+            network_fee_sats: u64,
+            #[serde(default)]
+            pause_above_entry_bps: u64,
+            #[serde(default)]
+            arkade_unavailable: bool,
+        }
+        let url = format!("{}/api/v1/network-fee", self.base_url());
+        let resp = super::retry_transport(3, || async {
+            anyhow::Ok(self.http().get(&url).send().await?)
+        })
+        .await
+        .context("Failed to get the network fee")?;
+        if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            return Ok(Some(resp.text().await.unwrap_or_default()));
+        }
+        if !resp.status().is_success() {
+            anyhow::bail!("Get network fee failed ({})", resp.status());
+        }
+        let quote: Quote = resp
+            .json()
+            .await
+            .context("Failed to parse the network fee")?;
+        Ok(if quote.arkade_unavailable {
+            Some(ENTRIES_PAUSED_FOR_ARKADE.into())
+        } else if quote.enabled
+            && quote.pause_above_entry_bps > 0
+            && u128::from(quote.network_fee_sats) * 10_000
+                > u128::from(entry_fee) * u128::from(quote.pause_above_entry_bps)
+        {
+            Some(ENTRIES_PAUSED_FOR_FEES.into())
+        } else {
+            None
+        })
     }
 
     /// List all competitions
