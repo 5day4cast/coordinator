@@ -1,9 +1,9 @@
-use maud::{html, Markup, PreEscaped, DOCTYPE};
+use maud::{html, Markup, DOCTYPE};
 use serde_json::json;
 
 use crate::{
     api::admin_auth::CSRF_HEADER,
-    templates::assets::{ADMIN_JS, BULMA_CSS, HTMX_JS, STYLES_CSS},
+    templates::assets::{ADMIN_THEME_JS, BULMA_CSS, HTMX_JS, STYLES_CSS},
 };
 
 pub struct AdminPageConfig<'a> {
@@ -28,11 +28,11 @@ pub fn admin_base(config: &AdminPageConfig, content: Markup) -> Markup {
                 meta name="viewport" content="width=device-width, initial-scale=1.0";
                 title { (config.title) }
 
+                script src=(ADMIN_THEME_JS.url) {}
                 link rel="stylesheet" href=(BULMA_CSS.url);
                 link rel="stylesheet" href=(STYLES_CSS.url);
 
                 script src=(HTMX_JS.url) defer {}
-                script src=(ADMIN_JS.url) defer {}
 
                 style {
                     r#"
@@ -45,42 +45,30 @@ pub fn admin_base(config: &AdminPageConfig, content: Markup) -> Markup {
                     "#
                 }
             }
-            body data-api-base=(config.api_base)
+            body.admin-shell data-api-base=(config.api_base)
                  data-oracle-base=(config.oracle_base)
                  data-explorer-url=(config.explorer_url)
                  data-network=(config.network)
                  // Every htmx request on the page carries the CSRF token.
                  hx-headers:inherited=[csrf_headers] {
-                script {
-                    "const API_BASE = document.body.dataset.apiBase;
-                     const ORACLE_BASE = document.body.dataset.oracleBase;
-                     const EXPLORER_URL = document.body.dataset.explorerUrl;"
-                }
-
-                div class="tabs is-centered" {
-                    ul {
-                        li class="is-active" hx-get="/admin/competition" hx-target="#admin-content" hx-swap="innerHTML" hx-push-url="true" {
-                            a { "Competition" }
-                        }
-                        li hx-get="/admin/wallet" hx-target="#admin-content" hx-swap="innerHTML" hx-push-url="true" {
-                            a { "Wallet" }
+                nav.admin-nav aria-label="Administration" {
+                    strong { "5day4cast / Admin" }
+                    a href="/admin/operations" aria-current=[config.title.starts_with("Competition").then_some("page")] { "Operations" }
+                    a href="/admin/funds" aria-current=[config.title.starts_with("Funds").then_some("page")] { "Find customer funds" }
+                    a href="/admin/competition" aria-current=[config.title.starts_with("Weather").then_some("page")] { "Discover games" }
+                    a href="/admin/wallet" aria-current=[config.title.contains("Wallet").then_some("page")] { "Wallet" }
+                    label.admin-appearance hidden { "Appearance"
+                        select id="admin-theme" {
+                            option value="system" { "System" }
+                            option value="light" { "Light" }
+                            option value="dark" { "Dark" }
                         }
                     }
+                    noscript { span.note { "Theme follows device" } }
                 }
 
                 div id="admin-content" {
                     (content)
-                }
-
-                script {
-                    (PreEscaped(r#"
-                        document.querySelectorAll('.tabs li').forEach(tab => {
-                            tab.addEventListener('htmx:after:request', function() {
-                                document.querySelectorAll('.tabs li').forEach(t => t.classList.remove('is-active'));
-                                this.classList.add('is-active');
-                            });
-                        });
-                    "#))
                 }
             }
         }

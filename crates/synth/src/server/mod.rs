@@ -1,6 +1,7 @@
 mod assets;
 mod create;
 mod format;
+mod funds_flow;
 pub mod live;
 pub mod metrics;
 mod money;

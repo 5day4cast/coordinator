@@ -654,6 +654,9 @@ impl CoordinatorSettings {
 /// private network and reach it through a tunnel or an operator-only gateway name.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdminSettings {
+    /// Optional server-side Grafana signals for the operator dashboard.
+    #[serde(default)]
+    pub monitoring: Option<crate::infra::admin_monitoring::MonitoringSettings>,
     /// Socket address of the operator listener, for example "127.0.0.1:9991".
     pub listen_addr: SocketAddr,
     /// File holding the operator bearer token: at least 32 characters, surrounding
@@ -668,6 +671,7 @@ pub struct AdminSettings {
 impl Default for AdminSettings {
     fn default() -> Self {
         AdminSettings {
+            monitoring: None,
             listen_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 9991)),
             token_file: String::from("./creds/admin_token"),
             dangerous_allow_unauthenticated: false,
