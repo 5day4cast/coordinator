@@ -58,6 +58,10 @@ pub async fn keymeld_page(
             .read_capabilities(state.coordinator.clone()),
         state.coordinator.list_competitions(),
     );
+    let competitions = competitions.map(|mut competitions| {
+        competitions.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+        competitions
+    });
     let content = html! { main.admin-workspace {
         p.eyebrow { "Registration · signing · escrow" } h1 { "Keymeld & enclaves" }
         @if let Some(url) = std::env::var("COORDINATOR_KEYMELD_ADMIN_URL").ok().and_then(|u| reqwest::Url::parse(&u).ok()).filter(|u| u.scheme() == "https" && u.username().is_empty() && u.password().is_none() && u.query().is_none() && u.fragment().is_none()) { p { a href=(url.as_str()) rel="noreferrer" { "Open Keymeld admin" } } }
@@ -78,10 +82,9 @@ pub async fn keymeld_page(
         p.note { "Newest first. These records have signing in progress or retained signing errors; inclusion does not establish a current Keymeld fault." }
         form.discovery-filters method="get" action="/admin/keymeld" { label { "Competition ID or station" input name="q" value=(&filter.q) maxlength="256"; } button type="submit" { "Filter competitions" } }
         @match competitions {
-            Ok(mut competitions) => {
-                competitions.sort_by(|a,b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
-                let search = filter.q.trim().to_lowercase();
-                let candidates: Vec<_> = competitions.iter().filter(|c| {
+            Ok(competitions) => {
+                @let search = filter.q.trim().to_lowercase();
+                @let candidates: Vec<_> = competitions.iter().filter(|c| {
                     let signing = c.contracted_at.is_some() && c.signed_at.is_none() && c.failed_at.is_none() && c.cancelled_at.is_none();
                     let retained = c.errors.iter().any(|e| { let text = format!("{e:?}").to_lowercase(); ["keymeld", "enclave", "verifier", "signing"].iter().any(|term| text.contains(term)) });
                     (signing || retained) && (search.is_empty() || c.id.to_string().contains(&search) || c.event_submission.locations.iter().any(|s| s.to_lowercase().contains(&search)))
@@ -122,9 +125,9 @@ fn signals(state: &AppState, panel: Panel, data: &Cached<Snapshot>) -> Markup {
         @else { p.notice { @if data.refreshing { "Fetching Grafana data. Reload shortly." } @else { "Grafana data is unavailable or not configured. Entry records and direct wallet checks remain available." } } }
         div.service-signals {
             @for (index, spec) in panel.signals().iter().enumerate() {
-                let samples = data.value().and_then(|d| d.get(index)).and_then(|v| v.as_ref());
-                let known = cache_fresh && samples.is_some_and(|s| !s.is_empty() && s.iter().all(|v| v.fresh_number(now).is_some()));
-                let review = known && samples.is_some_and(|s| s.iter().filter_map(|v|v.fresh_number(now)).any(spec.review));
+                @let samples = data.value().and_then(|d| d.get(index)).and_then(|v| v.as_ref());
+                @let known = cache_fresh && samples.is_some_and(|s| !s.is_empty() && s.iter().all(|v| v.fresh_number(now).is_some()));
+                @let review = known && samples.is_some_and(|s| s.iter().filter_map(|v|v.fresh_number(now)).any(spec.review));
                 details.service-signal {
                     summary { strong { (spec.title) } " · " span class=(if !known { "note" } else if review { "notice" } else { "note" }) { @if !known { "Unknown" } @else if review { "Review" } @else { "Within check range" } } }
                     p { (spec.help) } p { a href=(spec.link) { "Inspect related records" } }
@@ -169,8 +172,8 @@ fn enclaves(data: &Cached<Snapshot>) -> Markup {
     html! { section { h2 { "Enclave observations" }
         @if rows.is_empty() { p.note { "No enclave observations available. Check the Keymeld scrape and gateway version." } }
         div.metric-grid { @for (id, samples) in rows {
-            let observed = samples.iter().find(|s| s.metric.get("field").is_some_and(|f| f == "observed_at")).and_then(|s| s.fresh_number(now));
-            let observed_fresh = observed.is_some_and(|at| now - at <= 120.0 && at <= now + 30.0);
+            @let observed = samples.iter().find(|s| s.metric.get("field").is_some_and(|f| f == "observed_at")).and_then(|s| s.fresh_number(now));
+            @let observed_fresh = observed.is_some_and(|at| now - at <= 120.0 && at <= now + 30.0);
             article.metric { h3 { "Enclave " (id) }
                 @for sample in &samples {
                     @if sample.metric.get("__name__").is_some_and(|n| n == "keymeld_enclave_deployment_info") {
