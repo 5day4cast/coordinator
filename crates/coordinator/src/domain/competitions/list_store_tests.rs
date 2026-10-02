@@ -281,3 +281,127 @@ async fn operator_summaries_keep_signing_errors_without_loading_contracts() {
     assert!(operator[0].signed_contract.is_none());
     database.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn operator_payment_coverage_reads_only_successful_outcome_recipients() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = DBConnection::new(
+        directory.path().to_str().unwrap(),
+        "competitions",
+        DatabasePoolConfig::default(),
+        DatabaseType::Competitions,
+    )
+    .await
+    .unwrap();
+    let store = CompetitionStore::new(database.clone());
+    let now = OffsetDateTime::now_utc();
+    let (mut params, mut event, attestation) = pot_return_contract();
+    event.expiry = Some((now + Duration::DAY).unix_timestamp() as u32);
+    params.event = event.clone();
+    params.outcome_payouts.insert(
+        Outcome::Expiry,
+        PayoutWeights::from([(0, 1), (1, 1), (2, 1)]),
+    );
+    let mut c = competition(now - Duration::DAY, false);
+    c.event_announcement = Some(event);
+    c.contract_parameters = Some(params.clone());
+    c.attestation = Some(attestation);
+    c.completed_at = Some(now);
+    store
+        .add_competition_with_tickets(c.clone(), vec![])
+        .await
+        .unwrap();
+    store.update_competitions(vec![c.clone()]).await.unwrap();
+    enter(&database, c.id, 3, 3).await;
+    let entries: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM entries WHERE event_id=? ORDER BY id")
+            .bind(c.id.to_string())
+            .fetch_all(database.read())
+            .await
+            .unwrap();
+    let assign = entries.clone();
+    database
+        .execute_write(move |pool| async move {
+            for (entry, player) in assign.iter().zip(params.players) {
+                sqlx::query("UPDATE entries SET ephemeral_pubkey=? WHERE id=?")
+                    .bind(player.pubkey.to_string())
+                    .bind(entry)
+                    .execute(&pool)
+                    .await?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let read = |c: Competition| {
+        let store = store.clone();
+        async move { store.operator_payout_progress(&[c]).await.unwrap() }
+    };
+    let before = read(c.clone()).await;
+    assert_eq!(
+        before.get(&c.id),
+        Some(&OperatorPayoutProgress {
+            paid: 0,
+            expected: 3
+        })
+    );
+
+    let payments = entries.clone();
+    database.execute_write(move |pool| async move {
+        // Pending and failed attempts cannot imply all paid. The schema permits only one
+        // live attempt per entry; duplicate and wrong-amount evidence is tested separately.
+        for (entry, success, failed, amount) in [(&payments[0], true, false, 1000), (&payments[1], false, false, 1000), (&payments[2], false, true, 1000)] {
+            sqlx::query("INSERT INTO payouts(id,entry_id,payout_payment_request,payout_amount_sats,initiated_at,succeed_at,failed_at) VALUES (?,?,'invoice',?,datetime('now'),CASE WHEN ? THEN datetime('now') END,CASE WHEN ? THEN datetime('now') END)")
+                .bind(Uuid::now_v7().to_string()).bind(entry).bind(amount).bind(success).bind(failed).execute(&pool).await?;
+        }
+        Ok(())
+    }).await.unwrap();
+    let partial = read(c.clone()).await;
+    assert_eq!(
+        partial.get(&c.id),
+        Some(&OperatorPayoutProgress {
+            paid: 1,
+            expected: 3
+        })
+    );
+    assert!(!partial[&c.id].all_paid());
+
+    database.execute_write(move |pool| async move {
+        sqlx::query("UPDATE payouts SET failed_at=datetime('now') WHERE entry_id=? AND succeed_at IS NULL").bind(&entries[1]).execute(&pool).await?;
+        for entry in &entries[1..] {
+            sqlx::query("INSERT INTO payouts(id,entry_id,payout_payment_request,payout_amount_sats,initiated_at,succeed_at) VALUES (?,?,'invoice',1000,datetime('now'),datetime('now'))").bind(Uuid::now_v7().to_string()).bind(entry).execute(&pool).await?;
+        }
+        Ok(())
+    }).await.unwrap();
+    assert!(read(c.clone()).await[&c.id].all_paid());
+
+    c.attestation = None;
+    c.expiry_broadcasted_at = Some(now);
+    store.update_competitions(vec![c.clone()]).await.unwrap();
+    assert_eq!(
+        read(c.clone()).await[&c.id],
+        OperatorPayoutProgress {
+            paid: 3,
+            expected: 3
+        }
+    );
+    // A retained expiry marker alongside a later attestation cannot choose the expiry weights.
+    c.attestation = Some(attestation);
+    store.update_competitions(vec![c.clone()]).await.unwrap();
+    assert!(!read(c.clone()).await.contains_key(&c.id));
+    c.expiry_broadcasted_at = None;
+    store.update_competitions(vec![c.clone()]).await.unwrap();
+    let id = c.id.to_string();
+    database
+        .execute_write(move |pool| async move {
+            sqlx::query("UPDATE competitions SET contract_parameters='invalid json' WHERE id=?")
+                .bind(id)
+                .execute(&pool)
+                .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(!read(c.clone()).await.contains_key(&c.id));
+    database.close().await.unwrap();
+}

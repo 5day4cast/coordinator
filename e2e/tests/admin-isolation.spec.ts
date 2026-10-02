@@ -70,6 +70,16 @@ test.describe("native operator investigations", () => {
       expect(times.every(Number.isFinite)).toBeTruthy();
       expect(times).toEqual([...times].sort((a, b) => sort === "created_desc" ? b - a : a - b));
     }
+    for (const show of ["finished", "paid_out"]) {
+      await page.locator('select[name="show"]').selectOption(show);
+      await page.locator('form[action="/admin/operations"] button[type="submit"]').click();
+      await expect(page).toHaveURL(new RegExp(`show=${show}`));
+      await expect(page.locator('select[name="show"]')).toHaveValue(show);
+      await expect(page.getByLabel("Sort by")).toHaveValue("created_asc");
+    }
+    await page.getByRole("link", { name: "Clear filters", exact: true }).click();
+    await expect(page.locator('select[name="show"]')).toHaveValue("all");
+    await expect(page.getByLabel("Sort by")).toHaveValue("created_desc");
     for (const [path, title] of [["services", "Services"], ["keymeld", "Keymeld & enclaves"]]) {
       await page.goto(`${adminURL}/admin/${path}`);
       await expect(page.getByRole("heading", { name: title, exact: true })).toBeVisible();
