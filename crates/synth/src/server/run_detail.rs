@@ -1723,6 +1723,8 @@ mod tests {
             fee_msat: None,
             paid_by: None,
             written_off: false,
+            created_at: None,
+            updated_at: None,
         });
         let boxes = flow(
             &entries,

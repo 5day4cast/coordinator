@@ -1473,9 +1473,11 @@ impl Tracker {
             };
             let earlier =
                 previous.and_then(|p| p.refunds.iter().find(|r| r.ticket_id == ticket_id));
-            if let Some(done) = earlier
-                .filter(|r| r.is_settled() && (r.payment_hash.is_none() || r.preimage.is_some()))
-            {
+            if let Some(done) = earlier.filter(|r| {
+                r.is_settled()
+                    && r.updated_at.is_some()
+                    && (r.payment_hash.is_none() || r.preimage.is_some())
+            }) {
                 refunds.push(done.clone());
                 continue;
             }
@@ -1498,6 +1500,8 @@ impl Tracker {
                         fee_msat: None,
                         paid_by: None,
                         written_off: refund.written_off,
+                        created_at: refund.created_at,
+                        updated_at: Some(refund.updated_at),
                     };
                     if let Some(hash) = seen.payment_hash.clone() {
                         for node in &self.inner.nodes {
@@ -2878,6 +2882,8 @@ mod tests {
                 fee_msat: None,
                 paid_by: None,
                 written_off: false,
+                created_at: None,
+                updated_at: None,
             }],
             funding_tx: None,
             outcome_tx: None,

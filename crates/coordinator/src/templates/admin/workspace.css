@@ -365,6 +365,10 @@
 .node-detail a { display:inline-block; margin:.4rem 0; }
 .node-detail details { margin:.7rem 0; }
 .refund-branch,.recovery-branch { border-left:3px solid #bb8d49; }
+.escrow-refund { margin:.55rem 0 1.25rem; padding:.65rem 0 0 .7rem; border-left:1px dashed #bb8d49; }
+.admin-workspace .refund-caption { display:flex; flex-wrap:wrap; gap:.2rem .6rem; margin:0 0 .55rem; color:var(--muted); font-size:.68rem; }
+.refund-caption strong { color:var(--ink); }
+.refund-caption time { font-variant-numeric:tabular-nums; }
 .flow-key { color:var(--muted); font-size:.8rem; margin-bottom:.8rem; }
 .live-facts { padding:.75rem; background:var(--panel); border:1px solid var(--line); border-radius:8px; margin:1rem 0; overflow-wrap:anywhere; font-size:.85rem; }
 .transaction-record { border:1px solid var(--line); border-radius:6px; background:var(--panel); margin:1rem 0; min-width:0; font-size:.8rem; overflow-wrap:anywhere; }

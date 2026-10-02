@@ -67,6 +67,8 @@ pub struct TicketRefund {
     pub invoice: Option<String>,
     #[serde(default)]
     pub payment_hash: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<i64>,
     pub updated_at: i64,
     /// An operator wrote the refund off: it will not finish, and is no longer owed. Older
     /// coordinators leave it out.

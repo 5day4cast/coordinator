@@ -1449,6 +1449,8 @@ mod tests {
             fee_msat: None,
             paid_by: None,
             written_off: false,
+            created_at: None,
+            updated_at: None,
         });
         let ledger = ledger_of(&entries, &cancelled);
         assert_eq!(ledger.refunded, 1080);

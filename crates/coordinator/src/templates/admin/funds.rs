@@ -4,6 +4,7 @@ use crate::domain::{
     Competition,
 };
 use maud::{html, Markup};
+use time::OffsetDateTime;
 
 fn fact(label: &str, value: Option<&str>) -> Markup {
     html! { div.trace-fact { dt { (label) } dd { @if let Some(value)=value { code { (value) } } @else { "Not recorded" } } } }
@@ -79,6 +80,121 @@ fn node_summary(rail: &str, t: &FundsTicket, value: Option<u64>, status: &str) -
 fn identity(t: &FundsTicket) -> Markup {
     html! { dl { (fact("Competition",Some(&t.competition_id))) (fact("Entry",t.entry_id.as_deref())) (fact("Ticket",Some(&t.ticket_id))) } }
 }
+
+fn refund_trigger(c: &Competition) -> Option<(&'static str, OffsetDateTime)> {
+    c.cancelled_at
+        .map(|at| ("Competition cancelled", at))
+        .or_else(|| c.failed_at.map(|at| ("Competition failed", at)))
+        .or_else(|| {
+            (c.kind == crate::domain::CompetitionKind::Queued)
+                .then_some(c.pools_formed_at)
+                .flatten()
+                .map(|at| ("Queue closed; ticket was not assigned to a pool", at))
+        })
+}
+
+fn refund_stage(c: &Competition, t: &FundsTicket, now: i64) -> &'static str {
+    if matches!(t.refund_state.as_deref(), Some("paid" | "settled")) {
+        return "Paid recorded";
+    }
+    if t.write_off.is_some() {
+        return "Written off";
+    }
+    if t.refund_error.is_some() {
+        return "Needs attention";
+    }
+    match t.refund_state.as_deref() {
+        Some("minted") => return "Swap prepared",
+        Some("submitting") => return "Submitting to Arkade",
+        Some("submitted") => return "Awaiting Lightning",
+        Some(_) => return "Check refund state",
+        None => {}
+    }
+    if t.escrow_pooled {
+        return "Moved into DLC";
+    }
+    if t.funded_at.is_none() {
+        return "Escrow funding unconfirmed";
+    }
+    if refund_trigger(c).is_none() {
+        return "Fallback only";
+    }
+    match t.refund_opens_at {
+        Some(at) if at > now => "Timelocked",
+        Some(_) => "Awaiting chain / worker",
+        None => "Opening time unknown",
+    }
+}
+
+fn timestamp(at: Option<i64>) -> Markup {
+    let at = at.and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok());
+    html! { @if let Some(at)=at {
+        time datetime=(at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default()) {
+            (at.format(time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second] UTC")).unwrap_or_default())
+        }
+    } @else { "Not recorded" } }
+}
+
+/// The return branches from the escrow, before the shared contract. The opening time is a
+/// locktime, never a promise of a payment at that wall-clock instant.
+fn refund_nodes(c: &Competition, t: &FundsTicket) -> Markup {
+    let recorded = t.refund_id.is_some() || t.refund_state.is_some() || t.write_off.is_some();
+    let visible = recorded || (t.escrow_address.is_some() && !t.escrow_pooled);
+    let paid = matches!(t.refund_state.as_deref(), Some("paid" | "settled"));
+    let returned = t.refund_invoice.as_deref().and_then(invoice_sats);
+    html! {
+        @if visible {
+            section.escrow-refund aria-label=(format!("Refund path for ticket {}",t.ticket_id)) {
+                p.refund-caption { strong { "↳ Escrow refund" } span { (refund_stage(c,t,OffsetDateTime::now_utc().unix_timestamp())) }
+                    @if let Some(at)=t.refund_updated_at { span { "Updated " (timestamp(Some(at))) } }
+                    @else { span { "Opens " (timestamp(t.refund_opens_at)) } }
+                }
+                div.entry-flow {
+                    details.money-node.refund-branch {
+                        (node_summary("Ark return",t,sats(t.escrow_sats),if matches!(t.refund_state.as_deref(),Some("submitted"|"paid"|"settled")){"Transfer recorded"}else if t.refund_ark_txid.is_some(){"Transaction prepared"}else{"No transfer record"}))
+                        div.node-detail {
+                            (identity(t))
+                            dl {
+                                div.trace-fact { dt { "Trigger" } dd { @if let Some((reason,at))=refund_trigger(c) { (reason) " · " (timestamp(Some(at.unix_timestamp()))) } @else { "Cancellation, failure, or a ticket left outside the formed pools. No trigger recorded." } } }
+                                div.trace-fact { dt { "Refund opens" } dd { (timestamp(t.refund_opens_at)) } }
+                                div.trace-fact { dt { "Current swap created" } dd { (timestamp(t.refund_created_at)) } }
+                                div.trace-fact { dt { "Last state update" } dd { (timestamp(t.refund_updated_at)) } }
+                                (fact("Refund state",t.refund_state.as_deref()))
+                                (fact("Refund swap",t.refund_id.as_deref()))
+                                (fact("Ark return transaction",t.refund_ark_txid.as_deref()))
+                            }
+                            p.note { "Cleanup retries after the trigger and escrow locktime. Confirmed chain time can lag the clock. These records do not retain every retry or the exact Lightning settlement time." }
+                            @if let Some(error)=&t.refund_error { p.attention { (error) } }
+                            @if t.write_off.is_some() { dl { (fact("Write-off reason",t.write_off.as_deref())) div.trace-fact { dt { "Written off" } dd { (timestamp(t.write_off_at)) } } } }
+                            a href=(format!("/admin/funds/tickets/{}",t.ticket_id)) { "Check refund services now" }
+                        }
+                    }
+                    span.fund-arrow aria-hidden="true" { "→" }
+                    details.money-node.refund-branch {
+                        (node_summary("LN refund",t,returned,if paid{"Paid recorded"}else if t.write_off.is_some(){"Written off"}else if returned.is_some(){"Invoice · not paid"}else{"No payment record"}))
+                        div.node-detail {
+                            (identity(t))
+                            dl { (fact("Lightning hash",t.refund_hash.as_deref()))
+                                div.trace-fact { dt { "Last state update" } dd { (timestamp(t.refund_updated_at)) } }
+                            }
+                            @if let Some(fee)=t.refund_fee_sats { p { "Refund fee: " (fee) " sats." } }
+                            @if paid { p.note { "The coordinator recorded payment success. Check services for current sender evidence." } }
+                            @else { p.note { "The invoice amount is what the refund intends to return after fees. A transfer to the swap or a write-off does not prove payment to the customer." } }
+                        }
+                    }
+                }
+            }
+        }
+        @if t.released_at.is_some() {
+            details.money-node.refund-branch {
+                (node_summary("↳ LN release",t,t.invoice.as_deref().and_then(invoice_sats),"Hold cancelled"))
+                div.node-detail { (identity(t)) dl { (fact("Released",t.released_at.as_deref())) (fact("Original payment hash",Some(&t.payment_hash))) }
+                    p.note { "The held payment was released back to the payer. This is a cancellation of the original payment." }
+                }
+            }
+        }
+    }
+}
 pub fn funds_graph(c: &Competition, page: &FundsPage, network: &str, explorer: &str) -> Markup {
     html! {
         section.funds-trace {
@@ -140,6 +256,7 @@ fn payment_nodes(c: &Competition, flow: &TicketFlow, network: &str, explorer: &s
                 }
             }
         }
+        (refund_nodes(c,t))
     } }
 }
 fn payout_nodes(c: &Competition, flow: &TicketFlow) -> Markup {
@@ -147,7 +264,7 @@ fn payout_nodes(c: &Competition, flow: &TicketFlow) -> Markup {
     html! { div.entry-payouts {
         details.money-node {
             @let latest=flow.payouts.iter().rev().find(|p|p.succeeded_at.is_some()).or_else(||flow.payouts.iter().rev().find(|p|p.failed_at.is_none())).or_else(||flow.payouts.last());
-            (node_summary("LN out",t,latest.and_then(|p|sats(Some(p.amount_sats))).or_else(||payout_owed(c,t)),if flow.payouts.iter().any(|p|p.succeeded_at.is_some()){"Success recorded"}else if flow.payouts.iter().any(|p|p.failed_at.is_none()){"Pending"}else if !flow.payouts.is_empty(){"Failed"}else{"No payout · owed"}))
+            (node_summary("LN out",t,latest.and_then(|p|sats(Some(p.amount_sats))).or_else(||payout_owed(c,t)),if flow.payouts.iter().any(|p|p.succeeded_at.is_some()){"Success recorded"}else if flow.payouts.iter().any(|p|p.failed_at.is_none()){"Pending"}else if !flow.payouts.is_empty(){"Failed"}else if payout_owed(c,t)==Some(0){"No payout owed"}else{"No payout recorded"}))
             div.node-detail {
                 (identity(t))
                 p { "Contract entitlement: " (amount(payout_owed(c,t))) }
@@ -168,19 +285,6 @@ fn payout_nodes(c: &Competition, flow: &TicketFlow) -> Markup {
             (node_summary("↳ Chain recovery",t,None,"Verify receipt"))
             div.node-detail { (identity(t)) dl { (fact("Sellback broadcast",t.sellback_at.as_deref())) (fact("Reclaim broadcast",t.reclaimed_at.as_deref())) } p.note { "These timestamps do not prove receipt by the customer. Inspect the spending transactions and destinations." } }
         } }
-        @if t.refund_id.is_some() || t.write_off.is_some() || t.released_at.is_some() {
-            details.money-node.refund-branch {
-                (node_summary("↳ LN refund",t,t.refund_invoice.as_deref().and_then(invoice_sats),if matches!(t.refund_state.as_deref(),Some("paid"|"settled")){"Paid"}else if t.write_off.is_some(){"Written off"}else if t.released_at.is_some(){"Released"}else{t.refund_state.as_deref().unwrap_or("Unknown")}))
-                div.node-detail {
-                    (identity(t))
-                    p { "Escrow → refund swap → Lightning" }
-                    dl { (fact("Refund swap",t.refund_id.as_deref())) (fact("Ark transaction",t.refund_ark_txid.as_deref())) (fact("Lightning hash",t.refund_hash.as_deref())) (fact("Write-off",t.write_off.as_deref())) }
-                    @if t.write_off.is_some() { p.note { "A write-off is not payment to the customer." } }
-                    @if let Some(fee)=t.refund_fee_sats { p.note { "Recorded refund fee: " (fee) " sats" } }
-                    @if t.refund_error.is_some() { p.attention { "Refund has a recorded error; check current service evidence." } }
-                }
-            }
-        }
     } }
 }
 fn pool_node(c: &Competition, page: &FundsPage, explorer: &str) -> Markup {
@@ -275,6 +379,12 @@ fn outgoing(c: &Competition, flow: &TicketFlow) -> (Option<u64>, &'static str) {
             "LN refund · pending",
         );
     }
+    if refund_trigger(c).is_some() && t.funded_at.is_some() && !t.escrow_pooled {
+        return (
+            None,
+            refund_stage(c, t, OffsetDateTime::now_utc().unix_timestamp()),
+        );
+    }
     if let Some(p) = flow.payouts.iter().rev().find(|p| p.failed_at.is_none()) {
         return (sats(Some(p.amount_sats)), "LN payout · pending");
     }
@@ -338,6 +448,84 @@ pub fn chain_id(label: &str, id: &str, explorer: &str) -> Markup {
 mod tests {
     use super::*;
     use crate::domain::admin_funds::FundsPayout;
+
+    fn competition() -> Competition {
+        Competition::new(&serde_json::from_value(serde_json::json!({
+            "id":uuid::Uuid::now_v7(),"signing_date":"2026-10-04T01:00:00Z",
+            "start_observation_date":"2026-10-03T00:00:00Z","end_observation_date":"2026-10-04T00:00:00Z",
+            "locations":["KSEA"],"number_of_values_per_entry":3,"number_of_places_win":1,
+            "total_allowed_entries":3,"entry_fee":5000,"coordinator_fee_percentage":5,"total_competition_pool":15000
+        })).unwrap())
+    }
+
+    #[test]
+    fn refund_path_is_visible_before_a_swap_and_never_promises_a_clock_time_payment() {
+        let mut c = competition();
+        let mut t = FundsTicket {
+            escrow_address: Some("ark-escrow".into()),
+            funded_at: Some(1),
+            refund_opens_at: Some(1_800_000_100),
+            ..Default::default()
+        };
+        assert_eq!(refund_stage(&c, &t, 1_800_000_000), "Fallback only");
+        c.cancelled_at = OffsetDateTime::from_unix_timestamp(1_800_000_000).ok();
+        assert_eq!(refund_stage(&c, &t, 1_800_000_000), "Timelocked");
+        assert_eq!(
+            refund_stage(&c, &t, 1_800_000_101),
+            "Awaiting chain / worker"
+        );
+        let html = refund_nodes(&c, &t).into_string();
+        assert!(
+            html.contains("Ark return")
+                && html.contains("LN refund")
+                && html.contains("Refund opens")
+        );
+        assert!(html.contains("Competition cancelled") && html.contains("chain time can lag"));
+        t.escrow_pooled = true;
+        assert!(
+            refund_nodes(&c, &t).into_string().is_empty(),
+            "spent escrows must not promise another refund"
+        );
+        t.escrow_pooled = false;
+        t.refund_opens_at = None;
+        assert_eq!(refund_stage(&c, &t, 1_800_000_000), "Opening time unknown");
+        c.cancelled_at = None;
+        c.kind = crate::domain::CompetitionKind::Queued;
+        c.pools_formed_at = Some(OffsetDateTime::UNIX_EPOCH);
+        assert!(refund_trigger(&c).unwrap().0.contains("not assigned"));
+    }
+
+    #[test]
+    fn refund_transfer_and_writeoff_do_not_claim_lightning_payment() {
+        let c = competition();
+        let mut t = FundsTicket {
+            refund_id: Some("refund-id".into()),
+            refund_state: Some("submitted".into()),
+            refund_ark_txid: Some("ark-tx".into()),
+            refund_created_at: Some(1_800_000_000),
+            refund_updated_at: Some(1_800_000_010),
+            ..Default::default()
+        };
+        let html = refund_nodes(&c, &t).into_string();
+        assert!(
+            html.contains("Transfer recorded")
+                && html.contains("Current swap created")
+                && html.contains("Last state update")
+        );
+        assert!(!html.contains("Paid recorded"));
+        t.write_off = Some("<script>unsafe</script>".into());
+        let html = refund_nodes(&c, &t).into_string();
+        assert!(html.contains("Written off") && !html.contains("<script>"));
+        assert!(!html.contains("Paid recorded"));
+        t.refund_state = Some("paid".into());
+        assert_eq!(refund_stage(&c, &t, 0), "Paid recorded");
+        let hold = FundsTicket {
+            released_at: Some("2026-10-02 12:00:00".into()),
+            ..Default::default()
+        };
+        let html = refund_nodes(&c, &hold).into_string();
+        assert!(html.contains("LN release") && !html.contains("Ark return"));
+    }
     #[test]
     fn customer_position_keeps_payment_success_separate_from_writeoffs_and_attempts() {
         let mut flow = TicketFlow::default();

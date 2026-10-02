@@ -424,6 +424,11 @@ pub struct RefundSeen {
     /// An operator wrote the refund off, so nothing will move it and it is no longer owed.
     #[serde(default)]
     pub written_off: bool,
+    /// Timestamps reported by the coordinator, absent from older saved trails.
+    #[serde(default)]
+    pub created_at: Option<i64>,
+    #[serde(default)]
+    pub updated_at: Option<i64>,
 }
 
 impl RefundSeen {
@@ -1331,6 +1336,8 @@ mod tests {
             fee_msat: None,
             paid_by: None,
             written_off: false,
+            created_at: None,
+            updated_at: None,
         }
     }
 

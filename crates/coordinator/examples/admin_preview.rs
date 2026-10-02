@@ -190,6 +190,8 @@ fn funds_preview(out: &std::path::Path, tx: &bitcoin::Transaction) -> anyhow::Re
             vtxo: Some(format!("{:064x}:0", 400 + index)),
             escrow_sats: Some(6000),
             funded_at: Some(now.unix_timestamp()),
+            refund_opens_at: Some(now.unix_timestamp() + 3600),
+            escrow_pooled: true,
             ..Default::default()
         };
         let mut flow = TicketFlow {
@@ -253,6 +255,10 @@ fn funds_preview(out: &std::path::Path, tx: &bitcoin::Transaction) -> anyhow::Re
     refund.commitment = None;
     for flow in &mut refund.tickets {
         flow.payouts.clear();
+        flow.ticket.escrow_pooled = false;
+        flow.ticket.refund_created_at = Some(now.unix_timestamp() - 90);
+        flow.ticket.refund_updated_at = Some(now.unix_timestamp() - 20);
+        flow.ticket.refund_opens_at = Some(now.unix_timestamp() - 120);
         flow.ticket.entry_id = None;
         flow.ticket.refund_id = Some(uuid::Uuid::now_v7().to_string());
         flow.ticket.refund_hash = Some("d".repeat(64));
@@ -269,6 +275,47 @@ fn funds_preview(out: &std::path::Path, tx: &bitcoin::Transaction) -> anyhow::Re
         admin_base(
             &AdminPageConfig {
                 title: "Funds support preview",
+                api_base: "",
+                oracle_base: "",
+                explorer_url: "",
+                network: "signet",
+                csrf_token: None,
+            },
+            content,
+        )
+        .into_string(),
+    )?;
+    let mut waiting = coordinator::domain::admin_funds::FundsPage {
+        total: 3,
+        tickets: refund.tickets.clone(),
+        commitment: None,
+    };
+    waiting.tickets.push(waiting.tickets[0].clone());
+    for (index, flow) in waiting.tickets.iter_mut().enumerate() {
+        let t = &mut flow.ticket;
+        t.ticket_id = uuid::Uuid::from_u128(700 + index as u128).to_string();
+        t.entry_id = Some(uuid::Uuid::from_u128(800 + index as u128).to_string());
+        t.refund_id = None;
+        t.refund_state = None;
+        t.refund_hash = None;
+        t.refund_invoice = None;
+        t.refund_ark_txid = None;
+        t.refund_fee_sats = None;
+        t.refund_created_at = None;
+        t.refund_updated_at = None;
+        t.write_off = None;
+        t.refund_opens_at = match index {
+            0 => Some(now.unix_timestamp() + 3600),
+            1 => Some(now.unix_timestamp() - 120),
+            _ => None,
+        };
+    }
+    let content = maud::html! {main.admin-workspace {p.eyebrow {"Synthetic refund fixture · no real customer payments"} h1 {"Refunds before the worker starts"} (coordinator::templates::admin::funds::funds_graph(&c,&waiting,"signet",""))}};
+    std::fs::write(
+        out.join("refund-waiting.html"),
+        admin_base(
+            &AdminPageConfig {
+                title: "Refund timing preview",
                 api_base: "",
                 oracle_base: "",
                 explorer_url: "",
@@ -395,6 +442,14 @@ fn large_pools_preview(
                 flow.payouts.push(payout);
             }
             if index == 2 {
+                flow.ticket.escrow_pooled = false;
+                flow.ticket.refund_opens_at =
+                    Some(time::OffsetDateTime::now_utc().unix_timestamp() - 180);
+                flow.ticket.refund_ark_txid = Some(format!("{:064x}", 60000 + row));
+                flow.ticket.refund_created_at =
+                    Some(time::OffsetDateTime::now_utc().unix_timestamp() - 120);
+                flow.ticket.refund_updated_at =
+                    Some(time::OffsetDateTime::now_utc().unix_timestamp() - 60);
                 flow.ticket.refund_id = Some(Uuid::from_u128(50000 + row).to_string());
                 flow.ticket.refund_hash = Some(format!("{:064x}", 50000 + row));
                 flow.ticket.refund_state =
