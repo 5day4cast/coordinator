@@ -125,6 +125,7 @@ fn main() -> anyhow::Result<()> {
     std::fs::write(out.join("funds.html"), page)?;
 
     funds_preview(&out, &tx)?;
+    wallet_preview(&out)?;
     Ok(())
 }
 
@@ -497,6 +498,57 @@ fn large_pools_preview(
                 ),
             )?;
         }
+    }
+    Ok(())
+}
+
+fn wallet_preview(out: &std::path::Path) -> anyhow::Result<()> {
+    use coordinator::{
+        domain::admin_wallet::WalletOverview,
+        infra::{
+            ark_swap::SwapWallet,
+            bitcoin::WalletBalance,
+            lightning::{ChannelBalance, NodeInfo},
+        },
+        templates::admin::wallet::wallet_page,
+    };
+    let data = WalletOverview {
+        node: Some(serde_json::from_value::<NodeInfo>(
+            serde_json::json!({"alias":"Example coordinator node", "identity_pubkey":"02abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345678901", "synced_to_chain":true, "synced_to_graph":true, "num_active_channels":3, "num_inactive_channels":1,"num_pending_channels":0,"block_height":283000}),
+        )?),
+        channels: Some(serde_json::from_value::<ChannelBalance>(
+            serde_json::json!({"local_balance":{"sat":"1250000"},"remote_balance":{"sat":"2800000"},"unsettled_local_balance":{"sat":"15000"}}),
+        )?),
+        onchain: Some(WalletBalance {
+            confirmed: bitcoin::Amount::from_sat(500000),
+            unconfirmed: bitcoin::Amount::from_sat(20000),
+            locked: bitcoin::Amount::from_sat(150000),
+        }),
+        ark_configured: true,
+        ark: Some(SwapWallet {
+            payable_sat: Some(120000),
+            expiring_sat: Some(25000),
+            boarding_sat: Some(30000),
+            recoverable_sat: Some(0),
+            confirmed_sat: Some(100000),
+            pre_confirmed_sat: Some(45000),
+            earliest_expiry: Some(1791100000),
+            boarding_address: Some("Preview only · verify the live address in ark-swapd".into()),
+            ..Default::default()
+        }),
+    };
+    for (name, data) in [
+        ("wallet", data),
+        (
+            "wallet-unavailable",
+            WalletOverview {
+                ark_configured: true,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let page = admin_base(&AdminPageConfig { title: "Node & wallets preview", api_base:"", oracle_base:"", explorer_url:"", network:"signet", csrf_token:None }, maud::html! { p.notice { "Synthetic layout preview · balances are examples" } (wallet_page("signet", &data)) }).into_string();
+        std::fs::write(out.join(format!("{name}.html")), page)?;
     }
     Ok(())
 }

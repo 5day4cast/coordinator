@@ -1,4 +1,5 @@
 pub mod admin_funds;
+pub mod admin_wallet;
 mod admission;
 #[cfg(test)]
 mod admission_tests;

@@ -426,3 +426,19 @@
  .pool-entry-nodes { grid-template-columns:1fr; gap:.5rem; }
  .pool-entry-detail { padding:.7rem; }
 }
+.admin-workspace .wallet-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:1rem; align-items:start; }
+.admin-workspace .wallet-card { min-width:0; padding:1.3rem; border:1px solid var(--line); border-radius:12px; background:var(--panel); }
+.admin-workspace .wallet-card h2 { margin:.4rem 0; }
+.admin-workspace .wallet-card p { margin:.6rem 0; }
+.admin-workspace .wallet-metrics { margin:1rem 0; }
+.admin-workspace .wallet-metrics > div { padding:.65rem 0; border-bottom:1px solid var(--line); }
+.admin-workspace .wallet-metrics dt { color:var(--muted); font-size:.8rem; }
+.admin-workspace .wallet-metrics dd { margin:0; font-weight:600; overflow-wrap:anywhere; }
+.admin-workspace .wallet-card details { margin-top:1rem; }
+.admin-workspace .wallet-card summary { cursor:pointer; color:var(--accent); font-weight:600; }
+.admin-workspace .wallet-card li { margin:.8rem 0; }
+.admin-workspace .wallet-card ol,.admin-workspace .wallet-card ul { padding-left:1.2rem; }
+.admin-workspace .wallet-card pre { color:var(--ink); background:transparent; border:1px solid var(--line); margin:1rem 0; overflow-wrap:anywhere; white-space:pre-wrap; }
+.admin-workspace .wallet-links { display:flex; flex-wrap:wrap; gap:1.2rem; margin-top:1rem; }
+.admin-workspace .wallet-path { padding:.8rem 1rem; border-left:3px solid var(--accent); margin:.8rem 0; background:var(--panel); }
+@media (max-width:1000px) { .admin-workspace .wallet-grid { grid-template-columns:1fr; } }
