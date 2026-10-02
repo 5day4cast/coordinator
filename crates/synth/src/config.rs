@@ -81,10 +81,68 @@ pub struct SchedulerConfig {
     /// overlapping. When set, `interval_secs` and the scenarios above are not used.
     #[serde(default)]
     pub lanes: Vec<crate::runner::lanes::LaneConfig>,
+    /// Keep a competition open for visitors: when none is, start a lane's next run at once.
+    #[serde(default)]
+    pub keep_open: Option<KeepOpenConfig>,
 }
 
 fn default_scenario() -> String {
     "full_lifecycle".into()
+}
+
+/// Keep a competition anyone can enter on the public site. Every check, synth counts the listed
+/// competitions still taking entries, not full, whose entries close at least `min_minutes_left`
+/// ahead. When there are none, and it has not started a run for this in the last
+/// `min_minutes_left`, it starts `lane`'s next run at once, and that lane's timer restarts from it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeepOpenConfig {
+    /// The lane whose next run starts early; it must backfill.
+    pub lane: String,
+    #[serde(default = "default_min_minutes_left")]
+    pub min_minutes_left: u64,
+    #[serde(default = "default_check_interval_secs")]
+    pub check_interval_secs: u64,
+}
+
+fn default_min_minutes_left() -> u64 {
+    30
+}
+
+fn default_check_interval_secs() -> u64 {
+    60
+}
+
+impl KeepOpenConfig {
+    /// Check it names a lane among `lanes` that backfills and can start whenever a run is needed.
+    pub fn validate(&self, lanes: &[crate::runner::lanes::LaneConfig]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.check_interval_secs > 0,
+            "scheduler.keep_open.check_interval_secs must be positive"
+        );
+        let lane = lanes
+            .iter()
+            .find(|lane| lane.name == self.lane)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "scheduler.keep_open.lane names {}, which is not a lane",
+                    self.lane
+                )
+            })?;
+        anyhow::ensure!(
+            lane.backfill().is_some(),
+            "scheduler.keep_open.lane {} must set fill = \"backfill\": a competition kept open \
+             for visitors is one synth fills late, with only the players it still needs",
+            self.lane
+        );
+        anyhow::ensure!(
+            lane.align == crate::runner::lanes::Align::Interval,
+            "scheduler.keep_open.lane {} must not be aligned to the UTC halves, whose runs \
+             cannot start whenever one is needed",
+            self.lane
+        );
+        Ok(())
+    }
 }
 
 impl SchedulerConfig {
@@ -229,6 +287,7 @@ impl Default for SynthConfig {
                 scenario: "full_lifecycle".to_string(),
                 scenarios: None,
                 lanes: Vec::new(),
+                keep_open: None,
             },
             trail: Default::default(),
             defaults: DefaultsConfig {
@@ -323,6 +382,9 @@ pub fn load_config(path: Option<&str>) -> anyhow::Result<SynthConfig> {
         let base = config.scenario_config();
         for lane in &config.scheduler.lanes {
             lane.validate(&base)?;
+        }
+        if let Some(keep_open) = &config.scheduler.keep_open {
+            keep_open.validate(&config.scheduler.lanes)?;
         }
     }
     Ok(config)
@@ -419,6 +481,76 @@ deadline_margin_secs = 60
         assert_eq!(config.defaults.users, None, "counts are drawn");
         // A 12-hour window starting whenever a run happens to is refused.
         std::fs::write(&path, lanes("43200").replace("align = \"utc_half\"\n", "")).unwrap();
+        assert!(load_config(Some(path.to_str().unwrap())).is_err());
+    }
+
+    #[test]
+    fn a_lane_kept_open_for_visitors_must_backfill() {
+        let _environment = CONFIG_ENV.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synth.toml");
+        let config = |fill: &str, scenarios: &str| {
+            format!(
+                r#"
+[scheduler]
+enabled = true
+
+[scheduler.keep_open]
+lane = "open"
+min_minutes_left = 30
+check_interval_secs = 60
+
+[[scheduler.lanes]]
+name = "open"
+interval_secs = 43200
+entry_window_secs = 43200
+scenarios = [{scenarios}]
+observation_windows_secs = [86400]
+{fill}
+
+[defaults]
+stations = ["KDEN", "KJFK", "KORD"]
+observation_windows_secs = [86400]
+entry_window_secs = 3600
+[defaults.entry_timing]
+arrival_pattern = "spread"
+before_payment = {{ min_secs = 5, max_secs = 60 }}
+before_submit = {{ min_secs = 10, max_secs = 120 }}
+deadline_margin_secs = 60
+"#
+            )
+        };
+        let backfill = "fill = \"backfill\"\nearly_players = 1\nbackfill_before_close_secs = 1800\nbackfill_margin = 1";
+        std::fs::write(&path, config(backfill, "\"queued_one_pool\"")).unwrap();
+        let loaded = load_config(Some(path.to_str().unwrap())).unwrap();
+        let keep_open = loaded.scheduler.keep_open.unwrap();
+        assert_eq!(
+            (keep_open.lane.as_str(), keep_open.min_minutes_left),
+            ("open", 30)
+        );
+        assert_eq!(
+            loaded.scheduler.lanes[0]
+                .backfill()
+                .map(|b| b.before_close_secs),
+            Some(1800)
+        );
+
+        // Not backfilled: refused with the reason.
+        std::fs::write(&path, config("", "\"queued_one_pool\"")).unwrap();
+        let error = load_config(Some(path.to_str().unwrap())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("must set fill = \"backfill\""),
+            "{error:#}"
+        );
+        // A single competition is cancelled when not full, so it cannot be backfilled.
+        std::fs::write(&path, config(backfill, "\"full_lifecycle\"")).unwrap();
+        assert!(load_config(Some(path.to_str().unwrap())).is_err());
+        // Nor can a lane that is not there be kept open.
+        std::fs::write(
+            &path,
+            config(backfill, "\"queued_one_pool\"").replace("lane = \"open\"", "lane = \"gone\""),
+        )
+        .unwrap();
         assert!(load_config(Some(path.to_str().unwrap())).is_err());
     }
 

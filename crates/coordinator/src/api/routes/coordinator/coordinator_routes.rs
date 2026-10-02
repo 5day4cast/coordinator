@@ -259,7 +259,7 @@ pub async fn get_competitions(
         error!("error getting competitions: {:?}", e);
         e
     })?;
-    let competitions = competitions
+    let mut competitions = competitions
         .into_iter()
         .map(|mut comp| {
             if !comp.is_funding_broadcasted() {
@@ -268,6 +268,10 @@ pub async fn get_competitions(
             comp
         })
         .collect::<Vec<_>>();
+    state
+        .coordinator
+        .attach_min_players_now(&mut competitions)
+        .await;
 
     Ok(Json(competitions))
 }
@@ -288,6 +292,10 @@ pub async fn get_competition(
     if !competition.is_funding_broadcasted() {
         competition.funding_transaction = None;
     }
+    state
+        .coordinator
+        .attach_min_players_now(std::slice::from_mut(&mut competition))
+        .await;
 
     Ok(Json(competition))
 }
@@ -507,5 +515,94 @@ mod entries_query_tests {
         let Query(all) =
             Query::<EntriesQuery>::try_from_uri(&"/api/v1/entries".parse().unwrap()).unwrap();
         assert_eq!(all.event_id, None);
+    }
+}
+
+#[cfg(test)]
+mod min_players_now_tests {
+    use crate::config::KickoffCheckSettings;
+    use crate::domain::{Competition, CompetitionKind, CoordinatorFee, CreateEvent, QueueSummary};
+    use coordinator_escrow::pools::PoolRules;
+    use time::{Duration, OffsetDateTime};
+    use uuid::Uuid;
+
+    fn competition(start: OffsetDateTime) -> Competition {
+        Competition::new(&CreateEvent {
+            id: Uuid::now_v7(),
+            signing_date: start + Duration::days(2),
+            start_observation_date: start,
+            end_observation_date: start + Duration::days(1),
+            locations: vec!["KORD".into()],
+            number_of_values_per_entry: 3,
+            number_of_places_win: 1,
+            total_allowed_entries: 25,
+            entry_fee: 1_000,
+            coordinator_fee: CoordinatorFee::whole_percent(3),
+            total_competition_pool: 25_000,
+            relative_locktime_block_delta: None,
+            unlisted: false,
+            scoring_rules: None,
+            scoring_fields: None,
+            max_entries_per_player: 1,
+        })
+    }
+
+    fn queue(start: OffsetDateTime, min_players: usize) -> Competition {
+        let mut queue = competition(start);
+        queue.kind = CompetitionKind::Queued;
+        queue.queue = Some(QueueSummary {
+            pool_rules: PoolRules::new(min_players, 25).unwrap(),
+            entries: 1,
+            max_entries: 100,
+            stake_sats: 1_000,
+            terms_digest: String::new(),
+            pools: Vec::new(),
+        });
+        queue
+    }
+
+    #[test]
+    fn the_api_gives_the_players_a_competition_needs_now_while_it_takes_entries() {
+        let settings = KickoffCheckSettings::default();
+        let now = OffsetDateTime::now_utc();
+        let open = now + Duration::hours(6);
+
+        // The terms' minimum while fees allow small pools, raised to five above them.
+        let single = competition(open);
+        assert_eq!(single.min_players_to_start(&settings, 1, now), Some(2));
+        assert_eq!(single.min_players_to_start(&settings, 3, now), Some(5));
+        let small = queue(open, 3);
+        assert_eq!(small.min_players_to_start(&settings, 2, now), Some(3));
+        assert_eq!(small.min_players_to_start(&settings, 9, now), Some(5));
+        assert_eq!(
+            queue(open, 7).min_players_to_start(&settings, 9, now),
+            Some(7)
+        );
+        let off = KickoffCheckSettings {
+            enabled: false,
+            ..KickoffCheckSettings::default()
+        };
+        assert_eq!(small.min_players_to_start(&off, 9, now), Some(3));
+
+        // Not once entries close, nor for a pool or a cancelled competition.
+        assert_eq!(
+            competition(now - Duration::minutes(1)).min_players_to_start(&settings, 1, now),
+            None
+        );
+        let mut pool = competition(open);
+        pool.kind = CompetitionKind::Pool;
+        assert_eq!(pool.min_players_to_start(&settings, 1, now), None);
+        let mut cancelled = queue(open, 2);
+        cancelled.cancelled_at = Some(now);
+        assert_eq!(cancelled.min_players_to_start(&settings, 1, now), None);
+
+        // Serialised only when filled in.
+        let mut shown = small.clone();
+        let json = serde_json::to_value(&shown).unwrap();
+        assert!(json.get("min_players_now").is_none());
+        shown.min_players_now = shown.min_players_to_start(&settings, 9, now);
+        let json = serde_json::to_value(&shown).unwrap();
+        assert_eq!(json["min_players_now"], 5);
+        assert_eq!(json["pool_rules"]["min_players"], 3);
     }
 }

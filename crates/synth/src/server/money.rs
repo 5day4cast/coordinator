@@ -741,8 +741,14 @@ pub struct Ledger {
     pub pot: Option<u64>,
     /// What the players paid beyond the pot.
     pub coordinator_fee: Option<u64>,
-    /// What the pot owes the winners under the deciding outcome.
+    /// Entries in the contract that synth's players did not make: other people's, whose stakes
+    /// and shares are theirs to follow, not synth's.
+    pub others_entries: usize,
+    /// What the pot owes synth's players under the deciding outcome; with no other players, or
+    /// before synth knows its own shares, everything it owes.
     pub owed: u64,
+    /// What the pot owes the other players.
+    pub owed_others: u64,
     /// Confirmed paid to the winners.
     pub paid_out: u64,
     pub confirmed_payouts: usize,
@@ -839,11 +845,29 @@ fn scope_ledger(run: &Run) -> Ledger {
 
     let pot = trail.settlement.as_ref().map(|s| s.pot_sats);
     ledger.pot = pot;
-    ledger.coordinator_fee = pot.map(|pot| paid_in.saturating_sub(pot));
-    ledger.owed = trail.settlement.as_ref().map_or_else(
+    let entry_fee = trail
+        .competition
+        .as_ref()
+        .and_then(|c| c.event_submission.get("entry_fee")?.as_u64());
+    // Anyone can enter synth's competitions. The contract's players beyond synth's paid entries
+    // are other people's, and so is their part of the pot.
+    ledger.others_entries = trail.settlement.as_ref().map_or(0, |settlement| {
+        settlement.shares.len().saturating_sub(ledger.entries_paid)
+    });
+    let ours =
+        pot.map(|pot| pot.saturating_sub(entry_fee.unwrap_or(0) * ledger.others_entries as u64));
+    ledger.coordinator_fee = ours.map(|ours| paid_in.saturating_sub(ours));
+    let shares: u64 = trail.settlement.as_ref().map_or_else(
         || trail.payouts.iter().map(|p| p.owed_sats).sum(),
         |settlement| settlement.shares.iter().map(|share| share.owed_sats).sum(),
     );
+    // Synth's own shares, once it has found every one; until then every share stays owed.
+    ledger.owed = if ledger.others_entries > 0 && trail.payouts.len() >= ledger.entries_paid {
+        trail.payouts.iter().map(|p| p.owed_sats).sum()
+    } else {
+        shares
+    };
+    ledger.owed_others = shares.saturating_sub(ledger.owed);
     let states = payout_states(&trail.payouts, trail.ended());
     let confirmed: Vec<_> = trail
         .payouts
@@ -868,7 +892,7 @@ fn scope_ledger(run: &Run) -> Ledger {
         .as_ref()
         .is_some_and(|s| s.decided.is_some())
     {
-        ledger.rounding = pot.unwrap_or(0).saturating_sub(ledger.owed);
+        ledger.rounding = pot.unwrap_or(0).saturating_sub(shares);
     }
     ledger.refund_fees = refund_fees(run, trail);
     ledger.funding_batch_fee = trail.funding_tx.as_ref().and_then(|tx| tx.fee_sat);
@@ -880,35 +904,35 @@ fn scope_ledger(run: &Run) -> Ledger {
         .then(|| confirmed.iter().map(|p| p.fee_msat).sum())
         .flatten();
 
-    // Real checks: the pot is what the entries buy, and the escrows could fund it.
-    if let Some(pot) = pot {
-        let entry_fee = trail
-            .competition
-            .as_ref()
-            .and_then(|c| c.event_submission.get("entry_fee")?.as_u64());
+    // Real checks: the pot is what the entries buy, and synth's escrows could fund its part.
+    if let (Some(pot), Some(ours)) = (pot, ours) {
         if let Some(entry_fee) = entry_fee {
-            let expected = entry_fee * ledger.entries_paid as u64;
+            let entries = ledger.entries_paid + ledger.others_entries;
+            let expected = entry_fee * entries as u64;
             if pot != expected {
                 ledger.flags.push(format!(
                     "the pot holds {} sats, but {} entries of {} make {}",
                     sats(pot),
-                    ledger.entries_paid,
+                    entries,
                     sats(entry_fee),
                     sats(expected)
                 ));
             }
         }
-        if let Some(escrowed) = ledger.escrowed.filter(|escrowed| pot > *escrowed) {
+        let holds = if ledger.others_entries > 0 {
+            format!("synth's players' part of the pot is {} sats", sats(ours))
+        } else {
+            format!("the pot holds {} sats", sats(ours))
+        };
+        if let Some(escrowed) = ledger.escrowed.filter(|escrowed| ours > *escrowed) {
             ledger.flags.push(format!(
-                "the pot holds {} sats, more than the {} the escrows held",
-                sats(pot),
+                "{holds}, more than the {} the escrows held",
                 sats(escrowed)
             ));
         }
-        if pot > paid_in {
+        if ours > paid_in {
             ledger.flags.push(format!(
-                "the pot holds {} sats, more than the {} the players paid",
-                sats(pot),
+                "{holds}, more than the {} the players paid",
                 sats(paid_in)
             ));
         }
@@ -1221,6 +1245,63 @@ mod tests {
         assert_eq!(ledger.payout_routing_fee_msat, Some(6000));
         assert_eq!(ledger.remainder, 0);
         assert!(ledger.flags.is_empty(), "{:?}", ledger.flags);
+    }
+
+    /// Someone else entered too, paid 1,000 sats into the pot beside synth's three players, and
+    /// won all of it. Synth's players are owed nothing and were paid nothing; the stranger's share
+    /// is theirs to follow. The run's money is paid out and nothing is flagged.
+    #[test]
+    fn a_stranger_who_entered_and_won_leaves_synths_money_balanced() {
+        let mut won = trail(Money::PaidOut, false);
+        let settlement = won.settlement.as_mut().unwrap();
+        settlement.pot_sats = 4000;
+        for share in &mut settlement.shares {
+            share.owed_sats = 0;
+        }
+        settlement.shares.push(Share {
+            pubkey: "stranger".into(),
+            weight: 1,
+            owed_sats: 4000,
+        });
+        for payout in &mut won.payouts {
+            payout.owed_sats = 0;
+        }
+        let ledger = ledger_of(&entries(), &won);
+        assert_eq!((ledger.entries_paid, ledger.others_entries), (3, 1));
+        assert_eq!(
+            (ledger.pot, ledger.coordinator_fee),
+            (Some(4000), Some(300))
+        );
+        assert_eq!((ledger.owed, ledger.owed_others), (0, 4000));
+        assert_eq!((ledger.paid_out, ledger.unpaid, ledger.rounding), (0, 0, 0));
+        assert_eq!(ledger.remainder, 0);
+        assert!(ledger.flags.is_empty(), "{:?}", ledger.flags);
+
+        // The run is judged on synth's own money: paid out, once the competition completed.
+        let mut completed = won.competition.clone().unwrap();
+        completed.completed_at = Some(OffsetDateTime::now_utc());
+        let money = crate::trail::judge(&crate::trail::Evidence {
+            running: false,
+            competition: Some(&completed),
+            decided: true,
+            payout_terms_known: true,
+            payouts: &won.payouts,
+            refunds: &[],
+            paid_entries: 3,
+            unverified_entries: 0,
+            give_up: false,
+            refunds_open_at: None,
+            now: OffsetDateTime::now_utc(),
+        });
+        assert_eq!(money, Money::PaidOut);
+
+        // Synth's part of the pot is still checked against what its escrows held.
+        won.swaps[0].amount_sat = 800;
+        let short = ledger_of(&entries(), &won);
+        assert_eq!(
+            short.flags,
+            ["synth's players' part of the pot is 3,000 sats, more than the 2,980 the escrows held"]
+        );
     }
 
     /// Escrows that could not have funded the pot, and one that got more than its player paid,

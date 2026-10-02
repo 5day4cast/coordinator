@@ -127,6 +127,19 @@ pub(super) fn html_by_hx_request(markup: Markup) -> Response {
     ([(header::VARY, "HX-Request")], Html(markup.into_string())).into_response()
 }
 
+/// The competitions open for visitors, as the keep-open check last found them: "Open for
+/// visitors: 1 · entries close in 5 h", or "none · starting a run" while one is on its way.
+fn open_for_visitors(status: crate::runner::keep_open::OpenStatus, now: OffsetDateTime) -> String {
+    match status.open.competitions {
+        0 if status.starting => "Open for visitors: none · starting a run".into(),
+        0 => "Open for visitors: none".into(),
+        open => format!(
+            "Open for visitors: {open} · entries close in {}",
+            format::span_between(now, now + time::Duration::minutes(status.open.minutes_left))
+        ),
+    }
+}
+
 /// The dashboard's live part: what the page shows, and what is pushed to it as things change.
 pub(super) async fn dashboard_live(
     Dashboard {
@@ -174,8 +187,12 @@ pub(super) async fn dashboard_live(
     let unrecorded = tracker.unrecorded_swaps();
     let unrefunded = tracker.unrefunded_competitions();
     let coordinator = runner.client().base_url();
+    let open = runner.open_status();
 
     html! {
+        @if let Some(open) = open {
+            p.open { (open_for_visitors(open, now)) }
+        }
         @if !live.is_empty() {
             section.running {
                 p { "Running now: " (live.len()) }
@@ -1205,6 +1222,31 @@ mod tests {
         assert!(css.contains(".error { color: var(--failed); overflow-wrap: anywhere; }"));
         let phone = between(css, "@media (max-width: 640px)", "\n}\n");
         assert!(phone.contains("table.facts th { width: auto;"), "{phone}");
+    }
+
+    #[test]
+    fn the_dashboard_says_what_is_open_for_visitors() {
+        use crate::runner::keep_open::{Open, OpenStatus};
+        let now = OffsetDateTime::now_utc();
+        let status = |competitions, minutes_left, starting| OpenStatus {
+            open: Open {
+                competitions,
+                minutes_left,
+            },
+            starting,
+        };
+        assert_eq!(
+            open_for_visitors(status(1, 300, false), now),
+            "Open for visitors: 1 · entries close in 5 h"
+        );
+        assert_eq!(
+            open_for_visitors(status(0, 0, true), now),
+            "Open for visitors: none · starting a run"
+        );
+        assert_eq!(
+            open_for_visitors(status(0, 0, false), now),
+            "Open for visitors: none"
+        );
     }
 
     /// With nothing run since synth started, the Last Run panel shows the newest recorded run

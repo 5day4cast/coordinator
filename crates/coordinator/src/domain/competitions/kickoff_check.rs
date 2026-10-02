@@ -15,6 +15,7 @@
 
 use super::*;
 use crate::config::{KickoffCheckSettings, NetworkFeeSettings};
+use crate::domain::competitions::admission::SINGLE_COMPETITION_MIN_PLAYERS;
 use crate::domain::competitions::CompetitionKind;
 use crate::infra::bitcoin::fee_rate_for_target;
 use bitcoin::{Amount, FeeRate};
@@ -322,7 +323,31 @@ impl Coordinator {
                 settings.terms.max_fee_rate,
                 settings.terms.pool_rules.min_players() as u64,
             )),
-            None => Ok((self.automatic_payout_max_fee_rate, 2)),
+            None => Ok((
+                self.automatic_payout_max_fee_rate,
+                SINGLE_COMPETITION_MIN_PLAYERS,
+            )),
+        }
+    }
+
+    /// Fill in `min_players_now` for each competition still taking entries, at the rate the
+    /// network fee shown beside prices is priced at. Left out while there is no fee estimate.
+    pub async fn attach_min_players_now(&self, competitions: &mut [Competition]) {
+        let now = OffsetDateTime::now_utc();
+        let settings = &self.kickoff_check;
+        if !competitions
+            .iter()
+            .any(|competition| competition.min_players_to_start(settings, 0, now).is_some())
+        {
+            return;
+        }
+        let Ok(quote) = self.shown_network_fee_quote().await else {
+            return;
+        };
+        let sat_per_vb = quote.sat_per_vb.ceil() as u64;
+        for competition in competitions {
+            competition.min_players_now =
+                competition.min_players_to_start(settings, sat_per_vb, now);
         }
     }
 
