@@ -60,6 +60,7 @@ pub async fn keymeld_page(
     );
     let content = html! { main.admin-workspace {
         p.eyebrow { "Registration · signing · escrow" } h1 { "Keymeld & enclaves" }
+        @if let Some(url) = std::env::var("COORDINATOR_KEYMELD_ADMIN_URL").ok().and_then(|u| reqwest::Url::parse(&u).ok()).filter(|u| u.scheme() == "https" && u.username().is_empty() && u.password().is_none() && u.query().is_none() && u.fragment().is_none()) { p { a href=(url.as_str()) rel="noreferrer" { "Open Keymeld admin" } } }
         (lookup(&filter.q))
         p.note { "The gateway relays confidential traffic. Its session list does not include that work. Use competition records to identify affected entries; transport activity alone cannot prove signing or payout success." }
         section { h2 { "Coordinator verifier" }

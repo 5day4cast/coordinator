@@ -108,9 +108,12 @@ impl AdminMonitoring {
                     if panel == Panel::Keymeld {
                         queries.push(ENCLAVE_QUERY);
                     }
-                    let url = &service.query_url;
-                    Ok(stream::iter(queries)
-                        .map(|query| async move { query_samples(client, url, query).await.ok() })
+                    let requests: Vec<_> = queries
+                        .into_iter()
+                        .map(|query| client.get(&service.query_url).query(&[("query", query)]))
+                        .collect();
+                    Ok(stream::iter(requests)
+                        .map(|request| async move { query_samples(request).await.ok() })
                         .buffered(3)
                         .collect()
                         .await)
@@ -147,17 +150,8 @@ impl AdminMonitoring {
         })
     }
 }
-async fn query_samples(
-    client: &reqwest::Client,
-    url: &str,
-    query: &str,
-) -> anyhow::Result<Vec<Sample>> {
-    let mut response = client
-        .get(url)
-        .query(&[("query", query)])
-        .send()
-        .await?
-        .error_for_status()?;
+async fn query_samples(request: reqwest::RequestBuilder) -> anyhow::Result<Vec<Sample>> {
+    let mut response = request.send().await?.error_for_status()?;
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         ensure!(
