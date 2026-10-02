@@ -798,6 +798,8 @@ mod tests {
             early_players: 1,
             backfill_before_close_secs: 1800,
             backfill_margin: 1,
+            unlisted: None,
+            stress: None,
         };
         let base = ScenarioConfig::default();
         lane.validate(&base).unwrap();
