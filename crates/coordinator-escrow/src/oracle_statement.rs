@@ -351,6 +351,37 @@ pub(crate) mod tests {
         );
     }
 
+    /// Public event 01a0fcbe-f701-7110-badf-62e8928d0dcd failed kickoff because
+    /// approximate JSON parsing changed a signed line by one ULP. Keep the oracle's
+    /// original JSON and signature so the signer and verifier cannot share that bug.
+    #[test]
+    fn decimal_line_signature_survives_json_and_enclave_payloads() {
+        let json = include_str!("../tests/fixtures/oracle-statement-decimal-lines.json");
+        let oracle = XOnlyPublicKey::from_str(
+            "5daff8ad80b4986dc3e3932d8d9e632e347e49af7d44e322d6da4f1a227bdcb5",
+        )
+        .unwrap();
+        let signed: SignedStatement = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            hex::encode(signed.statement.digest().unwrap()),
+            "066c42009c28c41ab5dae974d9429d695ee54a620deed6bd1fc8e1abd16b3b0c"
+        );
+        assert_eq!(signed.verify(&oracle), Ok(()));
+
+        let stored = serde_json::to_vec(&signed).unwrap();
+        let restored: SignedStatement = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(restored.verify(&oracle), Ok(()));
+        let payload = keymeld_core::escrow::protocol::Payload::encode(&restored).unwrap();
+        let relayed: SignedStatement = payload.decode().unwrap();
+        assert_eq!(relayed.verify(&oracle), Ok(()));
+
+        // Precision preservation must not make changed terms acceptable.
+        let mut changed = relayed;
+        let Terms::Observation(terms) = &mut changed.statement.terms;
+        terms.lines[0].upper = f64::from_bits(terms.lines[0].upper.to_bits() + 1);
+        assert_eq!(changed.verify(&oracle), Err(StatementError::BadSignature));
+    }
+
     #[test]
     fn outcomes_follow_the_oracle_order() {
         assert_eq!(

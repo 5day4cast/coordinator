@@ -1,0 +1,100 @@
+{
+  "statement": {
+    "event_id": "01a0fcbe-f701-7110-badf-62e8928d0dcd",
+    "signing_date": 1791033408,
+    "expiry": 1791119808,
+    "nonce_point": "0319e58c86b87a35eacfdcfbe3e9562e8b933c6890b0ddf9c394c2d885d06ce7f9",
+    "outcomes": {
+      "kind": "ranking",
+      "number_of_places_win": 1,
+      "entry_ids": [
+        "01a0fc8d-7ea4-7752-86d0-c0e9a07afb16",
+        "01a0fc8d-9de3-72e0-8ac7-6ddd15951b63"
+      ]
+    },
+    "terms": {
+      "kind": "observation",
+      "source": "noaa_weather",
+      "start_observation_date": 1790946708,
+      "end_observation_date": 1791033108,
+      "targets": [
+        "KDEN",
+        "KJFK",
+        "KORD"
+      ],
+      "scoring_fields": [
+        "temp_high",
+        "temp_low",
+        "wind_speed"
+      ],
+      "number_of_values_per_entry": 9,
+      "scoring_rules": "lines",
+      "lines": [
+        {
+          "target": "KDEN",
+          "metric": "temp_high",
+          "lower": -2.990000000000002,
+          "upper": 0.019999999999999574,
+          "window_hours": 24
+        },
+        {
+          "target": "KDEN",
+          "metric": "temp_low",
+          "lower": -0.8699999999999974,
+          "upper": 2.650000000000002,
+          "window_hours": 24
+        },
+        {
+          "target": "KDEN",
+          "metric": "wind_speed",
+          "lower": 0.5,
+          "upper": 2.5,
+          "window_hours": 24
+        },
+        {
+          "target": "KJFK",
+          "metric": "temp_high",
+          "lower": -2.990000000000002,
+          "upper": 0.019999999999999574,
+          "window_hours": 24
+        },
+        {
+          "target": "KJFK",
+          "metric": "temp_low",
+          "lower": -0.8699999999999974,
+          "upper": 2.650000000000002,
+          "window_hours": 24
+        },
+        {
+          "target": "KJFK",
+          "metric": "wind_speed",
+          "lower": 0.5,
+          "upper": 2.5,
+          "window_hours": 24
+        },
+        {
+          "target": "KORD",
+          "metric": "temp_high",
+          "lower": -2.990000000000002,
+          "upper": 0.019999999999999574,
+          "window_hours": 24
+        },
+        {
+          "target": "KORD",
+          "metric": "temp_low",
+          "lower": -0.8699999999999974,
+          "upper": 2.650000000000002,
+          "window_hours": 24
+        },
+        {
+          "target": "KORD",
+          "metric": "wind_speed",
+          "lower": 0.5,
+          "upper": 2.5,
+          "window_hours": 24
+        }
+      ]
+    }
+  },
+  "signature": "17fa6be77608ab4b62713d78791bdfba8eb3efad7ab7f42308451046e4438d2a2b893bd1d0d46b0ce9e57f7b2416fe907b3364a30975bfdb65a22d473e51fa51"
+}
