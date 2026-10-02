@@ -1238,7 +1238,8 @@ pub(crate) mod tests {
         let html = competition_row(&view("live", Phase::Live, -5), NOW).into_string();
         assert!(html.starts_with("<a class=\"competition-row\""));
         assert!(html.contains(r#"href="/competitions/live/leaderboard""#));
-        assert!(html.contains("ends in 5 min"));
+        assert!(html.contains(r#"data-label="Duration">10 min</span>"#));
+        assert!(!html.contains("ends in"));
     }
 
     #[test]
