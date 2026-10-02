@@ -265,6 +265,7 @@ impl WeatherDiscovery {
                         ("station_ids", ids.as_str()),
                         ("start", &start),
                         ("end", &end),
+                        ("temperature_unit", "fahrenheit"),
                     ])
             })
             .collect();
@@ -329,6 +330,7 @@ mod tests {
             .route("/stations/forecasts", get(|Query(query): Query<HashMap<String, String>>| async move {
                 assert_eq!(query["station_ids"], "KSEA");
                 assert_eq!(query["start"], "2026-10-03T00:00:00Z");
+                assert_eq!(query["temperature_unit"], "fahrenheit");
                 Json(json!([{ "station_id":"KSEA", "temp_high":68, "temp_low":50 }]))
             }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
