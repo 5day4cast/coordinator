@@ -29,7 +29,14 @@ pub const SCENARIOS: &[&str] = &[
     scenarios::queued::QUEUED_ONE_POOL,
     scenarios::queued::QUEUED_TOO_FEW,
     scenarios::queued::QUEUED_LEFTOVER_REFUND,
+    scenarios::stress::STRESS_FULL_POOL,
 ];
+
+/// Whether a run of `scenario` can be recorded: one of [`SCENARIOS`], or a competition an
+/// operator asked for, which no schedule runs.
+fn recordable(scenario: &str) -> bool {
+    SCENARIOS.contains(&scenario) || scenario == scenarios::manual::MANUAL_COMPETITION
+}
 
 /// Cover every case/window pair instead of coupling two cycles of equal length.
 fn scheduled_selection<'a>(scenarios: &[&'a str], windows: &[u64], cycle: usize) -> (&'a str, u64) {
@@ -239,7 +246,7 @@ impl Runner {
     /// Check `scenario` is one synth runs, and record a run of it, returning the run's id. Run
     /// it with [`Runner::run_recorded`].
     pub async fn record_run(&self, scenario: &str, config: &ScenarioConfig) -> Result<String> {
-        if !SCENARIOS.contains(&scenario) {
+        if !recordable(scenario) {
             error!("Unknown scenario: {}", scenario);
             return Err(anyhow::anyhow!(
                 "Unknown scenario: {scenario}; expected one of {}",
@@ -355,6 +362,12 @@ impl Runner {
                     }
                     scenarios::queued::QUEUED_LEFTOVER_REFUND => {
                         scenarios::run_queued_leftover_refund(&self.client, &self.db, &config).await
+                    }
+                    scenarios::stress::STRESS_FULL_POOL => {
+                        scenarios::run_stress_full_pool(&self.client, &self.db, &config).await
+                    }
+                    scenarios::manual::MANUAL_COMPETITION => {
+                        scenarios::run_manual_competition(&self.client, &self.db, &config).await
                     }
                     _ => unreachable!("record_run validates scenario names"),
                 }
@@ -785,6 +798,8 @@ mod tests {
             early_players: 1,
             backfill_before_close_secs: 1800,
             backfill_margin: 1,
+            unlisted: None,
+            stress: None,
         };
         let base = ScenarioConfig::default();
         lane.validate(&base).unwrap();

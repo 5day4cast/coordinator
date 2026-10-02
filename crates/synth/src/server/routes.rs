@@ -112,7 +112,10 @@ async fn dashboard(State(state): State<Dashboard>, headers: HeaderMap) -> Respon
     if from_htmx(&headers) {
         return html_by_hx_request(live);
     }
-    let header = html! { h1 { "Synth Dashboard" } };
+    let header = html! {
+        h1 { "Synth Dashboard" }
+        (super::create::form(&state))
+    };
     html_by_hx_request(live::page(
         "Synth - Synthetic Testing Dashboard",
         live::DASHBOARD,

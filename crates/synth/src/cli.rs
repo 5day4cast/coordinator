@@ -3,6 +3,7 @@
 
 use crate::db::{TestRun, TestStep};
 use crate::runner::SCENARIOS;
+use crate::scenarios::manual::MANUAL_COMPETITION;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
@@ -98,7 +99,75 @@ pub struct RunArgs {
     #[arg(long)]
     pub yes: bool,
     #[command(flatten)]
+    pub competition: CompetitionArgs,
+    #[command(flatten)]
     pub api: ApiArgs,
+}
+
+/// What `manual-competition` creates: the dashboard's "Create a competition" form, from the
+/// command line. Synth checks it as the form is checked.
+#[derive(Debug, Clone, Default, Args)]
+pub struct CompetitionArgs {
+    /// manual-competition: its stations, separated by commas.
+    #[arg(long, value_delimiter = ',')]
+    pub stations: Vec<String>,
+    /// manual-competition: how long it takes entries, such as 90m or 1h; an hour if unset.
+    #[arg(long, value_parser = parse_duration)]
+    pub entry_window: Option<Duration>,
+    /// manual-competition: its observation window, one of synth's configured ones, such as 1d
+    /// or 12h; the first the oracle attests if unset.
+    #[arg(long, value_parser = parse_duration)]
+    pub window: Option<Duration>,
+    /// manual-competition: synth players who enter it over its entry window. None leaves it
+    /// open for people.
+    #[arg(long)]
+    pub players: Option<usize>,
+    /// manual-competition: the entry fee in sats; synth's configured one if unset.
+    #[arg(long)]
+    pub entry_fee: Option<u64>,
+    /// manual-competition: its seats; the pool cap if unset.
+    #[arg(long)]
+    pub seats: Option<usize>,
+    /// manual-competition: put it on the oracle's public list.
+    #[arg(long)]
+    pub listed: bool,
+}
+
+impl CompetitionArgs {
+    fn is_set(&self) -> bool {
+        !self.stations.is_empty()
+            || self.entry_window.is_some()
+            || self.window.is_some()
+            || self.players.is_some()
+            || self.entry_fee.is_some()
+            || self.seats.is_some()
+            || self.listed
+    }
+
+    /// The form's fields, as the dashboard sends them.
+    fn form(&self) -> Vec<(&'static str, String)> {
+        let mut fields: Vec<(&'static str, String)> = self
+            .stations
+            .iter()
+            .map(|station| ("stations", station.clone()))
+            .collect();
+        let optional = [
+            ("entry_window_secs", self.entry_window.map(|d| d.as_secs())),
+            ("window_secs", self.window.map(|d| d.as_secs())),
+            ("players", self.players.map(|n| n as u64)),
+            ("entry_fee", self.entry_fee),
+            ("seats", self.seats.map(|n| n as u64)),
+        ];
+        fields.extend(
+            optional
+                .into_iter()
+                .filter_map(|(key, value)| Some((key, value?.to_string()))),
+        );
+        if self.listed {
+            fields.push(("listed", "listed".into()));
+        }
+        fields
+    }
 }
 
 /// Optional per-run overrides shared by the remote and direct operator CLIs.
@@ -209,16 +278,17 @@ impl EntryTimingArgs {
     }
 }
 
-/// A scenario name as synth knows it, from either spelling.
+/// A scenario name as synth knows it, from either spelling, or `manual-competition`.
 fn parse_kind(value: &str) -> Result<String, String> {
     let kind = value.trim().to_ascii_lowercase().replace('-', "_");
-    if SCENARIOS.contains(&kind.as_str()) {
+    if SCENARIOS.contains(&kind.as_str()) || kind == MANUAL_COMPETITION {
         Ok(kind)
     } else {
         Err(format!(
             "expected one of: {}",
             SCENARIOS
                 .iter()
+                .chain([&MANUAL_COMPETITION])
                 .map(|s| s.replace('_', "-"))
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -253,11 +323,15 @@ pub struct RunView {
     pub current_step: Option<String>,
 }
 
-/// What `/api/run` answers.
+/// What `/api/run` answers, and `/api/competitions` with the competition it made.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Started {
     pub run_id: String,
     pub scenario: String,
+    #[serde(default)]
+    pub competition_id: Option<String>,
+    #[serde(default)]
+    pub link: Option<String>,
 }
 
 /// A client of synth's HTTP API.
@@ -301,7 +375,11 @@ impl SynthApi {
     }
 
     async fn post(&self, path: &str) -> Result<reqwest::Response> {
-        let request = self.http.post(format!("{}{path}", self.url));
+        self.send(self.http.post(format!("{}{path}", self.url)))
+            .await
+    }
+
+    async fn send(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
         let request = match self.operator_token.as_ref() {
             Some(token) => request.bearer_auth(token.trim()),
             None => request,
@@ -334,6 +412,21 @@ impl SynthApi {
             bail!("synth started the run but did not say its id; it needs a newer synth");
         }
         Ok(serde_json::from_value(started)?)
+    }
+
+    /// Create a competition as the dashboard's form does, recorded as a `manual_competition` run.
+    /// Answers once the coordinator has taken it, or has not answered within a minute.
+    pub async fn create_competition(&self, competition: &CompetitionArgs) -> Result<Started> {
+        let request = self
+            .http
+            .post(format!(
+                "{}{}",
+                self.url,
+                crate::server::CREATE_COMPETITION_PATH
+            ))
+            .timeout(Duration::from_secs(90))
+            .form(&competition.form());
+        Ok(self.send(request).await?.json().await?)
     }
 
     pub async fn run(&self, id: &str) -> Result<RunView> {
@@ -511,24 +604,56 @@ pub async fn run(command: Command) -> Result<i32> {
         Command::Run(args) => {
             let api = SynthApi::new(&args.api.url)?
                 .with_operator_token_file(args.api.operator_token_file.as_deref())?;
-            let players = args
-                .users
-                .map_or("synth's configured".to_string(), |u| u.to_string());
-            confirm(
-                &format!(
-                    "Start a {} run with {players} players, paying for their entries from \
-                     synth's node",
-                    args.kind.replace('_', "-")
-                ),
-                args.yes,
-            )?;
-            let started = api
-                .start_with_options(&args.kind, args.users, &args.timing)
-                .await?;
+            let started = if args.kind == MANUAL_COMPETITION {
+                let what = match args.competition.players.unwrap_or(0) {
+                    0 => "Create a competition and leave it open for people".to_string(),
+                    players => format!(
+                        "Create a competition and enter {players} synth players, paying for \
+                         their entries from synth's node"
+                    ),
+                };
+                confirm(&what, args.yes)?;
+                let started = api.create_competition(&args.competition).await?;
+                if let Some(competition) = &started.competition_id {
+                    eprintln!(
+                        "Created competition {competition}{}",
+                        started
+                            .link
+                            .as_deref()
+                            .map(|link| format!(": {link}"))
+                            .unwrap_or_default()
+                    );
+                }
+                started
+            } else {
+                if args.competition.is_set() {
+                    bail!(
+                        "--stations, --entry-window, --window, --players, --entry-fee, --seats \
+                         and --listed are for manual-competition"
+                    );
+                }
+                let players = args
+                    .users
+                    .map_or("synth's configured".to_string(), |u| u.to_string());
+                confirm(
+                    &format!(
+                        "Start a {} run with {players} players, paying for their entries from \
+                         synth's node",
+                        args.kind.replace('_', "-")
+                    ),
+                    args.yes,
+                )?;
+                api.start_with_options(&args.kind, args.users, &args.timing)
+                    .await?
+            };
             if args.api.json && !args.wait {
                 println!(
                     "{}",
-                    serde_json::json!({ "run_id": started.run_id, "scenario": started.scenario })
+                    serde_json::json!({
+                        "run_id": started.run_id,
+                        "scenario": started.scenario,
+                        "competition_id": started.competition_id,
+                    })
                 );
                 return Ok(0);
             }
@@ -900,6 +1025,49 @@ mod tests {
         assert!(
             Cli::try_parse_from(["synth", "run", "full-lifecycle", "--interval", "0"]).is_err()
         );
+    }
+
+    #[test]
+    fn manual_competition_takes_the_forms_fields() {
+        let cli = Cli::try_parse_from([
+            "synth",
+            "run",
+            "manual-competition",
+            "--stations",
+            "KDEN,KJFK",
+            "--entry-window",
+            "1h",
+            "--window",
+            "1d",
+            "--players",
+            "5",
+            "--listed",
+            "--yes",
+        ])
+        .unwrap();
+        let Some(Command::Run(args)) = cli.command else {
+            panic!("expected run");
+        };
+        assert_eq!(args.kind, MANUAL_COMPETITION);
+        assert_eq!(
+            args.competition.form(),
+            [
+                ("stations", "KDEN".to_string()),
+                ("stations", "KJFK".to_string()),
+                ("entry_window_secs", "3600".to_string()),
+                ("window_secs", "86400".to_string()),
+                ("players", "5".to_string()),
+                ("listed", "listed".to_string()),
+            ]
+        );
+        // Without its fields, nothing but the kind.
+        let bare = Cli::try_parse_from(["synth", "run", "manual_competition", "--yes"]).unwrap();
+        let Some(Command::Run(bare)) = bare.command else {
+            panic!("expected run");
+        };
+        assert!(!bare.competition.is_set());
+        assert!(bare.competition.form().is_empty());
+        assert!(Cli::try_parse_from(["synth", "run", "stress-full-pool", "--yes"]).is_ok());
     }
 
     #[test]

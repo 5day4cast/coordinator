@@ -47,6 +47,13 @@ pub struct LaneConfig {
     /// How many of `stations` each competition takes, drawn per run; all of them otherwise.
     #[serde(default)]
     pub stations_per_run: Option<usize>,
+    /// Set false to put a stress run's competitions on the oracle's public list. Every other
+    /// scenario's competitions stay unlisted.
+    #[serde(default)]
+    pub unlisted: Option<bool>,
+    /// How the lane's stress runs push their competition; the defaults otherwise.
+    #[serde(default)]
+    pub stress: Option<crate::scenarios::stress::StressSettings>,
     /// How its runs fill their competitions: every drawn player enters, or the competition stays
     /// open to anyone and synth fills it late with the players it still needs.
     #[serde(default)]
@@ -126,6 +133,20 @@ impl LaneConfig {
         base.entry_timing
             .validate(entry_window)
             .map_err(|error| anyhow::anyhow!("lane {name}: {error:#}"))?;
+        let stress = crate::scenarios::stress::STRESS_FULL_POOL;
+        if self.scenarios.iter().any(|scenario| scenario == stress) {
+            self.stress
+                .clone()
+                .unwrap_or_default()
+                .validate(entry_window)
+                .map_err(|error| anyhow::anyhow!("lane {name}: {error:#}"))?;
+        }
+        anyhow::ensure!(
+            self.unlisted != Some(false)
+                || self.scenarios.iter().all(|scenario| scenario == stress),
+            "lane {name}: only {stress} runs can list their competitions; set unlisted = false \
+             on a lane of those alone"
+        );
         if self.align == Align::UtcHalf {
             anyhow::ensure!(
                 entry_window < HALF_DAY,
@@ -199,6 +220,8 @@ impl LaneConfig {
         config.seed = base.seed.map(|seed| seed.wrapping_add(cycle as u64));
         config.competition_id = None;
         config.observation_start = close;
+        config.listed = self.unlisted == Some(false);
+        config.stress = self.stress.clone();
         if let Some(entry_window) = self.entry_window_secs {
             config.entry_window_secs = entry_window;
         }
@@ -254,6 +277,8 @@ mod tests {
                 "KSEA".into(),
             ]),
             stations_per_run: Some(2),
+            unlisted: None,
+            stress: None,
             fill: Fill::Immediate,
             early_players: 1,
             backfill_before_close_secs: 1800,
@@ -333,5 +358,28 @@ mod tests {
         let mut too_many = lane(Align::Interval, &[DAY]);
         too_many.stations_per_run = Some(5);
         assert!(too_many.validate(&base).is_err());
+    }
+
+    /// A stress lane's runs are unlisted unless it says otherwise, and only stress runs may be
+    /// listed.
+    #[test]
+    fn only_a_stress_lane_lists_its_competitions() {
+        let base = ScenarioConfig::default();
+        let mut stress = lane(Align::Interval, &[DAY]);
+        stress.scenarios = vec![crate::scenarios::stress::STRESS_FULL_POOL.into()];
+        stress.validate(&base).unwrap();
+        let (_, config) = stress.run_config(&base, 0, None);
+        assert!(!config.listed);
+        stress.unlisted = Some(false);
+        stress.validate(&base).unwrap();
+        let (scenario, config) = stress.run_config(&base, 0, None);
+        assert_eq!(scenario, "stress_full_pool");
+        assert!(config.listed);
+        let mut mixed = lane(Align::Interval, &[DAY]);
+        mixed.unlisted = Some(false);
+        assert!(mixed.validate(&base).is_err());
+        // The burst must fit the lane's entry window.
+        stress.entry_window_secs = Some(120);
+        assert!(stress.validate(&base).is_err());
     }
 }

@@ -421,6 +421,17 @@ pub struct ScenarioConfig {
     /// night half.
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub observation_start: Option<OffsetDateTime>,
+    /// Seats in the competition, instead of one per player: for a competition left open for
+    /// people as well as synth's players.
+    #[serde(default)]
+    pub seats: Option<usize>,
+    /// Put the competition on the oracle's public list. Only the scenarios that take it set it;
+    /// the others' competitions are always unlisted.
+    #[serde(default)]
+    pub listed: bool,
+    /// How a stress run pushes its competition; the defaults when unset.
+    #[serde(default)]
+    pub stress: Option<super::stress::StressSettings>,
     /// Fill the competition late, with only the players it needs; every drawn player enters
     /// otherwise.
     #[serde(default)]
@@ -505,6 +516,9 @@ impl Default for ScenarioConfig {
             min_players: None,
             competition_id: None,
             observation_start: None,
+            seats: None,
+            listed: false,
+            stress: None,
             backfill: None,
         }
     }
@@ -540,9 +554,11 @@ impl ScenarioConfig {
 
     pub fn resolve_plan(&self, scenario: &str) -> anyhow::Result<Self> {
         use rand::{Rng, SeedableRng};
+        // A manual competition may be left to people alone.
+        let fewest = usize::from(scenario != super::manual::MANUAL_COMPETITION);
         anyhow::ensure!(
-            (1..=100).contains(&self.users),
-            "users must be between 1 and 100"
+            (fewest..=100).contains(&self.users),
+            "users must be between {fewest} and 100"
         );
         let seed = self.seed.unwrap_or_else(rand::random);
         let mut config = self.clone();
@@ -559,6 +575,12 @@ impl ScenarioConfig {
                 Some(players) => config.users = players,
                 None => {}
             }
+        }
+        if scenario == super::stress::STRESS_FULL_POOL {
+            // A stress run's player count is part of what it tests.
+            let stress = self.stress.clone().unwrap_or_default();
+            stress.validate(config.entry_window_secs)?;
+            config.users = stress.users;
         }
         if let Some(shape) = super::queued::QueueShape::of(scenario, &config)? {
             // A queued scenario's player count is part of what it tests.
@@ -612,6 +634,9 @@ impl ScenarioConfig {
         );
         let behavior = match scenario {
             "full_lifecycle" | "escrow_refund" => EntryBehavior::Complete,
+            super::stress::STRESS_FULL_POOL | super::manual::MANUAL_COMPETITION => {
+                EntryBehavior::Complete
+            }
             super::queued::QUEUED_SPLIT
             | super::queued::QUEUED_ONE_POOL
             | super::queued::QUEUED_TOO_FEW => EntryBehavior::Complete,
@@ -623,7 +648,10 @@ impl ScenarioConfig {
             "late_submission" => EntryBehavior::LateSubmission,
             _ => anyhow::bail!("Unknown scenario: {scenario}"),
         };
-        let exceptional_user = rng.random_range(0..config.users);
+        let exceptional_user = match config.users {
+            0 => 0,
+            users => rng.random_range(0..users),
+        };
         config.seed = Some(seed);
         config.planned_scenario = Some(scenario.to_string());
         // A backfilled run's early players arrive before the backfill, and the others when it is
@@ -670,6 +698,9 @@ impl ScenarioConfig {
                 },
             })
             .collect();
+        if scenario == super::stress::STRESS_FULL_POOL {
+            super::stress::burst(&mut config, &mut rng);
+        }
         Ok(config)
     }
 }

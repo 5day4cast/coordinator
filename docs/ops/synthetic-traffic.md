@@ -118,6 +118,7 @@ The example's 1,200-second entry window exceeds its 1,050-second minimum. The sa
 | `queued_one_pool` | 5 players enter a queued competition. It must form one pool of all 5, which is followed like a split's pools. |
 | `queued_too_few` | 2 players enter a queued competition that needs 3 per pool. It must be cancelled without pools and refund both escrows to the players' Lightning Address. |
 | `queued_leftover_refund` | 4 players pay into a queued competition and one never submits an entry. The pool must form from the 3 complete tickets and run, and the incomplete ticket must be refunded from the queue. |
+| `stress_full_pool` | Players, 25 by default, arrive in a burst for a competition at the pool cap of 25 seats. See [Stress a full pool](#stress-a-full-pool). |
 
 The planner chooses one exceptional player for each named behavior case. Other players follow the complete-entry plan.
 
@@ -158,6 +159,69 @@ A replay creates new identifiers and timestamps. Network timing and weather outc
 
 The direct operator command `coord synth run` accepts the same timing flags. The dashboard lists all supported cases from the runner's scenario registry.
 
+## Create a competition by hand
+
+The dashboard's "Create a competition" form, above the live panels, makes one competition the way the scenarios make theirs. It is recorded as a `manual_competition` run, so the money tracker follows it like any other run.
+
+| Field | Default | Rule |
+| --- | --- | --- |
+| Stations | All configured stations | 1 to 50 distinct IDs; add others as free text, separated by commas or spaces. |
+| Entry fee | `defaults.entry_fee` | At least 1 sat. |
+| Entry window | 1 hour | 61 seconds to 24 hours. |
+| Observation window | The first configured window the oracle attests | One of `defaults.observation_windows_secs`, and 24 hours to 7 days or a 12-hour UTC half. A 12-hour window starts at the next 00:00 or 12:00 UTC after the entry window. |
+| Seats | The pool cap, 25 | 2 to 25. |
+| Listed | Unlisted | Listed puts the oracle event on the public list. |
+| Fill with synth players | 0 | Up to the seats. |
+
+With 0 players the competition is created and left open for people. With more, synth's players arrive spread over the entry window, using the configured entry timing, and pay from the configured node.
+They are refused before anything is recorded while the coordinator pauses entries for network fees or the Arkade server.
+
+The form waits up to a minute for the coordinator, then shows the competition's link and id, or the coordinator's refusal in its own words.
+The CLI posts the same form:
+
+```sh
+synth run manual-competition \
+  --url "$SYNTH_URL" --operator-token-file "$SYNTH_OPERATOR_TOKEN_FILE" \
+  --stations KDEN,KJFK --entry-window 1h --window 1d [--players 5] \
+  [--entry-fee 5000] [--seats 25] [--listed] --yes
+```
+
+No schedule or lane runs `manual_competition`.
+
+## Stress a full pool
+
+`stress_full_pool` pushes one competition to its upper bound. It creates a competition with as many seats as the coordinator gives one pool (25), unlisted unless the lane sets `unlisted = false`. Then `users` players arrive at random within `burst_window_secs` of its creation.
+At most `concurrency` players at a time request a ticket, register, pay and submit, with no wait between steps. A refused player tries again after a short backoff, up to `retries` times.
+
+Each player's step records how long each of its steps took and every refusal, with the HTTP status and the coordinator's message. The `stress_entries` step counts players admitted and refused, by reason, and names the slowest step.
+The run passes when at least `min_admitted` players got in, the competition kicked off with all of them, and its money settled like `full_lifecycle`. Otherwise `stress_result` fails with the counts.
+
+A player who has started paying never pays again, and a paid ticket holds its seat. The run pays for at most 25 tickets of at most `entry_fee + max_ticket_fees_sats` each, plus LND routing fees.
+With the defaults' 1,000-sat entry fee and 1,000-sat fee cap, that is 50,000 sats.
+Before creating anything, the run refuses to start if the coordinator's fee for a ticket now plus its network fee is above `max_ticket_fees_sats`. Synth's LND client reads no wallet balance, so the node's balance is not checked; keep the payer funded for the maximum.
+
+It is off by default: no default schedule includes it. Run it from the dashboard or `synth run stress-full-pool`, or give it a lane of its own:
+
+```toml
+[[scheduler.lanes]]
+name = "stress"
+scenarios = ["stress_full_pool"]
+interval_secs = 604800
+entry_window_secs = 3600
+observation_windows_secs = [86400]
+# Set false to list its competitions on the oracle; only a lane of stress runs may.
+unlisted = true
+
+[scheduler.lanes.stress]
+users = 25
+burst_window_secs = 60
+concurrency = 10
+retries = 3
+min_admitted = 25
+```
+
+The burst must end at least 180 seconds before entries close. Every setting is optional; the values shown are the defaults.
+
 ## Preserve older configurations
 
 Without `scheduler.scenarios`, synth uses the existing `scheduler.scenario` value. Its default remains `full_lifecycle`.
@@ -188,5 +252,7 @@ An expected rejection must have the specific entry error being tested. Authentic
 `synth_competition_lifecycle_healthy` reads persisted settlement evidence. It is `1` for the latest assessed full lifecycle with verified payouts, `0` for a failed or stuck outcome, and `NaN` when evidence is absent or unverified. A newer run still within its settlement deadline does not erase an earlier assessed result. An overdue unresolved run does. The gauge also becomes `NaN` if no full-lifecycle money trail has refreshed for 30 minutes.
 
 `synth_last_successful_run_timestamp` is the persisted time when payouts were first verified, not the earlier time when scenario steps ended. Repeated refreshes do not advance it. Read this timestamp with the health gauge to distinguish recent success from old evidence. Existing verified rows migrate using their last stored trail refresh time because earlier verification timestamps were not retained.
+
+Stress runs add `synth_stress_step_seconds{step}` for each ticket, registration, payment and submission, refused or not. They also add `synth_stress_admitted_total` and `synth_stress_refused_total{reason}`. The reason is one of `paused`, `full`, `ticket`, `payment`, `registration`, `submission` or `other`.
 
 The dashboard's Last Run card reads the latest completed run and its money verdict from the database. Its link and steps belong to that same run, including after a restart or while a newer run is in progress.

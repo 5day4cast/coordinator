@@ -35,6 +35,18 @@ pub(super) async fn create_competition(
     client: &CoordinatorClient,
     config: &ScenarioConfig,
 ) -> Result<Uuid> {
+    // A test competition: kept off the oracle's public events list.
+    create_single(client, config, config.users, true).await
+}
+
+/// A single competition of `seats` seats paying one winner, as every scenario but the queued
+/// ones makes it.
+pub(super) async fn create_single(
+    client: &CoordinatorClient,
+    config: &ScenarioConfig,
+    seats: usize,
+    unlisted: bool,
+) -> Result<Uuid> {
     // start_observation_date must be far enough in the future for ticket purchases
     // (coordinator requires start_observation_date - 1min > now for ticket expiry)
     let times = config.competition_times(OffsetDateTime::now_utc());
@@ -45,19 +57,21 @@ pub(super) async fn create_competition(
         end_observation_date: times.end,
         locations: config.stations.clone(),
         number_of_values_per_entry: config.values_per_entry(),
-        number_of_places_win: 1.min(config.users),
-        total_allowed_entries: config.users,
+        number_of_places_win: 1.min(seats),
+        total_allowed_entries: seats,
         entry_fee: config.entry_fee,
-        coordinator_fee_basis_points: 300,
-        coordinator_fee_percentage: 3,
-        total_competition_pool: config.entry_fee * config.users,
-        // A test competition: kept off the oracle's public events list.
-        unlisted: true,
+        coordinator_fee_basis_points: COORDINATOR_FEE_BASIS_POINTS,
+        coordinator_fee_percentage: COORDINATOR_FEE_BASIS_POINTS / 100,
+        total_competition_pool: config.entry_fee * seats,
+        unlisted,
     };
 
     let resp = client.create_competition(&competition).await?;
     Ok(resp.id)
 }
+
+/// The coordinator's cut of each entry that synth's competitions ask for: 3%.
+pub(super) const COORDINATOR_FEE_BASIS_POINTS: u32 = 300;
 
 /// How a scenario pays an entry's invoice.
 pub(super) enum Payer<'a> {
