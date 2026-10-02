@@ -2,7 +2,7 @@
 //!
 //! Every check lists the coordinator's competitions and counts those that are listed, still take
 //! entries, have room, and close their entries at least `min_minutes_left` from now. When none
-//! do, the keep-open lane's next run starts at once, unless one was started for this in the last
+//! do, the keep-open lane's next run starts at once, unless that lane started a run in the last
 //! `min_minutes_left`: its competition can take that long to show up. While the coordinator
 //! would refuse tickets anyway, as it does while the Arkade network recovers, no run is started;
 //! the next check tries again.
@@ -56,22 +56,44 @@ pub struct OpenStatus {
 /// keep-open lane.
 pub type SharedOpenStatus = Arc<Mutex<Option<OpenStatus>>>;
 
+/// Starts requested by keep-open and the last run started by its lane.
+#[derive(Default)]
+pub struct LaneStart {
+    pub notify: tokio::sync::Notify,
+    last: Mutex<Option<tokio::time::Instant>>,
+}
+
+impl LaneStart {
+    pub fn record(&self) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(tokio::time::Instant::now());
+    }
+
+    pub fn recent(&self, grace: std::time::Duration) -> bool {
+        self.last
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|at| at.elapsed() < grace)
+    }
+}
+
 /// Decides, check by check, when the keep-open lane's next run starts early.
 pub struct KeepOpen {
     config: KeepOpenConfig,
     /// What a ticket of the lane's runs costs before fees, to tell if fees pause entries.
     entry_fee: u64,
     last_start: Option<tokio::time::Instant>,
+    lane_start: Arc<LaneStart>,
     /// The pause is logged when it starts, not at every check.
     paused: bool,
 }
 
 impl KeepOpen {
-    pub fn new(config: KeepOpenConfig, entry_fee: u64) -> Self {
+    pub fn new(config: KeepOpenConfig, entry_fee: u64, lane_start: Arc<LaneStart>) -> Self {
         Self {
             config,
             entry_fee,
             last_start: None,
+            lane_start,
             paused: false,
         }
     }
@@ -88,9 +110,9 @@ impl KeepOpen {
         let now = OffsetDateTime::now_utc();
         let open = open_competitions(&client.list_competitions().await?, now, self.min_left());
         crate::server::metrics::record_open(open.competitions, open.minutes_left);
-        let recently = self.last_start.is_some_and(|at| {
-            at.elapsed() < std::time::Duration::from_secs(self.config.min_minutes_left * 60)
-        });
+        let grace = std::time::Duration::from_secs(self.config.min_minutes_left * 60);
+        let recently =
+            self.last_start.is_some_and(|at| at.elapsed() < grace) || self.lane_start.recent(grace);
         if open.competitions > 0 || recently {
             return Ok((
                 OpenStatus {
@@ -132,14 +154,9 @@ impl KeepOpen {
         ))
     }
 
-    /// Check every `check_interval_secs`, waking the lane through `start` when a run is needed,
+    /// Check every `check_interval_secs`, waking the lane through `lane_start` when a run is needed,
     /// and keeping `status` current for the dashboard.
-    pub async fn run(
-        mut self,
-        client: CoordinatorClient,
-        start: Arc<tokio::sync::Notify>,
-        status: SharedOpenStatus,
-    ) {
+    pub async fn run(mut self, client: CoordinatorClient, status: SharedOpenStatus) {
         let mut checks = tokio::time::interval(std::time::Duration::from_secs(
             self.config.check_interval_secs,
         ));
@@ -152,7 +169,7 @@ impl KeepOpen {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(open);
                     if starting {
-                        start.notify_one();
+                        self.lane_start.notify.notify_one();
                     }
                 }
                 Err(e) => warn!("Cannot check for a competition open for visitors: {e:#}"),
@@ -221,6 +238,7 @@ mod tests {
                 check_interval_secs: 60,
             },
             1000,
+            Arc::new(LaneStart::default()),
         );
 
         let (status, start) = keep.check(&client).await.unwrap();
@@ -231,6 +249,12 @@ mod tests {
         assert!(start, "tried again at the next check");
         assert!(status.starting && !keep.paused);
         // Started: the next check waits for its competition rather than starting another.
+        let (status, start) = keep.check(&client).await.unwrap();
+        assert!(!start && status.starting);
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+        // A regular lane start gets the same grace period, without a keep-open request.
+        keep.last_start = None;
+        keep.lane_start.record();
         let (status, start) = keep.check(&client).await.unwrap();
         assert!(!start && status.starting);
         assert_eq!(asked.load(Ordering::SeqCst), 2);

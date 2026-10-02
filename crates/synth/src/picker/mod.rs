@@ -156,8 +156,8 @@ impl PickerConfig {
             "picker cluster_km must be zero or more"
         );
         anyhow::ensure!(
-            self.eligible_days > 0,
-            "picker eligible_days must be positive"
+            (1..=31).contains(&self.eligible_days),
+            "picker eligible_days must be between 1 and 31"
         );
         Ok(())
     }
@@ -198,14 +198,14 @@ impl Pick {
 type Cached<T> = Option<(Instant, T)>;
 
 /// Picks the stations of lanes that choose them for the weather.
-/// Eligible station lists by window hours, with when each was fetched; None when the oracle
+/// Eligible station lists by history days and window hours, with when each was fetched; None when the oracle
 /// has no such list.
-type EligibleCache = HashMap<u64, (Instant, Option<Vec<StationInfo>>)>;
+type EligibleCache = HashMap<(u32, u64), (Instant, Option<Vec<StationInfo>>)>;
 
 pub struct Picker {
     oracle: OracleClient,
     db: SynthDb,
-    /// The eligible stations by window length, None where the oracle does not offer the list.
+    /// The eligible stations by history days and window length, None without a list.
     eligible: Mutex<EligibleCache>,
     /// Every station the oracle knows, to place a lane's own stations.
     directory: Mutex<Cached<Vec<StationInfo>>>,
@@ -350,7 +350,7 @@ impl Picker {
     /// offer the list or cannot be asked, which is warned about once until it can again.
     async fn eligible(&self, days: u32, window_hours: u64) -> Option<Vec<StationInfo>> {
         let mut cache = self.eligible.lock().await;
-        if let Some((read, stations)) = cache.get(&window_hours) {
+        if let Some((read, stations)) = cache.get(&(days, window_hours)) {
             if read.elapsed() < LIST_TTL {
                 return stations.clone();
             }
@@ -372,7 +372,7 @@ impl Picker {
                 None
             }
         };
-        cache.insert(window_hours, (Instant::now(), stations.clone()));
+        cache.insert((days, window_hours), (Instant::now(), stations.clone()));
         stations
     }
 
