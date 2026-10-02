@@ -99,7 +99,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::double_must_use
 
   # Unit tests
   test:

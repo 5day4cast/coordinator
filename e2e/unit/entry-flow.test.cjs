@@ -971,7 +971,8 @@ test("after an entry is made, Pay starts a new entry", async () => {
   const sessionStorage = tabStorage();
   const { elements, pay, tickets, entries, announce } = payingPlayer({ ticket: server.ticket, entry: server.entry, sessionStorage });
   const { done } = await pay();
-  announce("fw:ticket-paid");
+  // The reserving stub names its tickets ticket-1, ticket-2, … and the flow only listens for its own.
+  announce("fw:ticket-paid", { ticket_id: "ticket-1" });
   await done;
   assert.equal(entries().length, 1);
   assert.equal(elements.submitEntry.textContent, "Entered");
@@ -994,7 +995,7 @@ test("an expired ticket renews the entry, and the next request gets a ticket", a
   const { done } = await pay();
   closeDialog(modal);
   server.expire();
-  announce("fw:ticket-failed", { message: "Ticket payment expired. Please request a new ticket." });
+  announce("fw:ticket-failed", { ticket_id: "ticket-1", message: "Ticket payment expired. Please request a new ticket." });
   await done;
   assert.match(elements.errorMessage.textContent, /expired/);
 
