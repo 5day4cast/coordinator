@@ -117,7 +117,12 @@ fn deliberately_unpaid(entry: &EntryTrace, paid: bool) -> bool {
         && !paid
 }
 
-fn entry_line(entry: &EntryTrace, paid: bool, run_failed: bool) -> Line {
+/// Shared by the overview and detailed money rows. A planned scenario outcome is not an error.
+pub(super) fn entry_progress(
+    entry: &EntryTrace,
+    paid: bool,
+    run_failed: bool,
+) -> (&'static str, Status) {
     let incomplete = if run_failed {
         Status::Failed
     } else {
@@ -129,9 +134,12 @@ fn entry_line(entry: &EntryTrace, paid: bool, run_failed: bool) -> Line {
                 || (entry.behavior == Some(EntryBehavior::DuplicateSubmission)
                     && rejection.message == "Ticket has already been used"))
     });
-    let (value, status) = match entry.behavior {
+    match entry.behavior {
         Some(EntryBehavior::LateSubmission) if entry.entry_submitted => {
             ("late entry unexpectedly accepted", Status::Failed)
+        }
+        Some(EntryBehavior::AbandonPaid) if entry.entry_submitted => {
+            ("paid abandonment unexpectedly entered", Status::Failed)
         }
         Some(EntryBehavior::AbandonUnpaid) if paid || entry.entry_submitted => {
             ("unpaid abandonment unexpectedly advanced", Status::Failed)
@@ -162,7 +170,11 @@ fn entry_line(entry: &EntryTrace, paid: bool, run_failed: bool) -> Line {
         Some(_) if paid && !run_failed => ("waiting to submit", Status::Active),
         _ if paid || run_failed => ("not entered", Status::Failed),
         _ => ("not entered yet", Status::Waiting),
-    };
+    }
+}
+
+fn entry_line(entry: &EntryTrace, paid: bool, run_failed: bool) -> Line {
+    let (value, status) = entry_progress(entry, paid, run_failed);
     Line {
         label: entry.user.clone(),
         value: value.into(),
