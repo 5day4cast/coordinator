@@ -73,5 +73,5 @@ pub async fn pick_for(db: &SynthDb, competition_id: Uuid) -> Option<Pick> {
             .await
             .inspect_err(|error| log::warn!("Cannot read the pick for {competition_id}: {error:#}"))
             .ok()??;
-    serde_json::from_str(&row).ok()
+    serde_json::from_str(row.as_deref()?).ok()
 }

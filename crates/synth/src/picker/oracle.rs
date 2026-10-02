@@ -140,8 +140,13 @@ impl OracleClient {
         end: OffsetDateTime,
     ) -> Result<Vec<Forecast>> {
         let (start, end) = (start.format(&Rfc3339)?, end.format(&Rfc3339)?);
-        let batches = futures::stream::iter(station_ids.chunks(FORECAST_BATCH))
+        // The requests are built up front: a closure over a chunk of ids would need a lifetime
+        // the stream combinators cannot express.
+        let requests: Vec<_> = station_ids
+            .chunks(FORECAST_BATCH)
             .map(|batch| self.forecast_batch(batch.join(","), &start, &end))
+            .collect();
+        let batches = futures::stream::iter(requests)
             .buffer_unordered(FORECAST_REQUESTS_AT_ONCE)
             .collect::<Vec<_>>()
             .await;
