@@ -68,6 +68,8 @@ pub struct Runner {
     /// Every run in progress, by its competition: runs overlap, each moving its own competition
     /// through its states.
     live: Live,
+    /// Chooses the stations of lanes that pick them for the weather.
+    picker: Option<Arc<crate::picker::Picker>>,
     /// What the keep-open check last found, for the dashboard.
     open: keep_open::SharedOpenStatus,
 }
@@ -221,8 +223,15 @@ impl Runner {
             events,
             last_result: Arc::new(Mutex::new(None)),
             live: Arc::new(DashMap::new()),
+            picker: None,
             open: Arc::default(),
         }
+    }
+
+    /// Let lanes with a `picker` choose their stations for the weather.
+    pub fn with_picker(mut self, picker: crate::picker::Picker) -> Self {
+        self.picker = Some(Arc::new(picker));
+        self
     }
 
     /// What the keep-open check last found: None before its first check, or without one.
@@ -526,7 +535,14 @@ impl Runner {
     ) {
         lane_loop(&lane, &base, early, |scenario, config| {
             let runner = self.clone();
-            tokio::spawn(async move { runner.run_or_redraw(&scenario, config).await });
+            let (picking, defaults) = (lane.clone(), base.clone());
+            tokio::spawn(async move {
+                let mut config = config;
+                if let Some(picker) = &runner.picker {
+                    picker.choose(&picking, &defaults, &mut config).await;
+                }
+                runner.run_or_redraw(&scenario, config).await
+            });
         })
         .await
     }
@@ -800,6 +816,7 @@ mod tests {
             backfill_margin: 1,
             unlisted: None,
             stress: None,
+            picker: None,
         };
         let base = ScenarioConfig::default();
         lane.validate(&base).unwrap();

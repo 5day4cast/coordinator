@@ -726,6 +726,10 @@ pub(super) async fn run_live(state: &Dashboard, id: &str) -> Option<Markup> {
         .runner
         .live_run(&view.run.id)
         .and_then(|live| live.current_step);
+    let pick = match view.competition_id {
+        Some(id) => crate::picker::store::pick_for(state.runner.db(), id).await,
+        None => None,
+    };
     let run = view.money();
     let rows = money::rows(&run);
     Some(html! {
@@ -737,6 +741,7 @@ pub(super) async fn run_live(state: &Dashboard, id: &str) -> Option<Markup> {
         (hops_section(&view, &rows))
         (ledger_sections(&run))
         (competition_section(&view, now))
+        @if let Some(pick) = &pick { (crate::picker::view::section(pick)) }
         (steps_section(&view.steps))
         p.note { "Updated " (format::time(now, now)) }
     })

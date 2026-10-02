@@ -98,7 +98,8 @@ async fn main() -> anyhow::Result<()> {
         ark_swap,
         config.trail.clone(),
     )?;
-    let runner = Runner::new(client, db, events);
+    let picker = coordinator_synth::picker::Picker::new(&config.oracle.url, db.clone());
+    let runner = Runner::new(client, db, events).with_picker(picker);
     let following = tracker.clone();
     tokio::spawn(async move { following.run().await });
 

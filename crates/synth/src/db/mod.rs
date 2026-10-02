@@ -237,6 +237,7 @@ impl SynthDb {
         .await?;
 
         self.migrate_payment_intents().await?;
+        crate::picker::store::migrate(&self.pool).await?;
 
         // Databases made before synth kept ark-swapd's wallet funded.
         self.add_column_if_missing("rebalances", "kind", "TEXT NOT NULL DEFAULT 'channel'")
@@ -307,6 +308,11 @@ impl SynthDb {
         }
 
         Ok(())
+    }
+
+    /// For the modules that keep their own tables.
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
     }
 
     async fn add_column_if_missing(
