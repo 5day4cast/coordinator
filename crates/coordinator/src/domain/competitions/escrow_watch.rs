@@ -42,7 +42,7 @@ pub(crate) struct EscrowWatch {
     changed: tokio::sync::Notify,
     last_sweep: Mutex<Option<Instant>>,
     /// Held while a swap is settled, one at a time.
-    pub(super) settling: tokio::sync::Mutex<()>,
+    pub(in crate::domain::competitions) settling: tokio::sync::Mutex<()>,
     /// Every sweep is due and every retry immediate: for tests.
     immediate: AtomicBool,
 }
