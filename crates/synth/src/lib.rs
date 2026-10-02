@@ -7,6 +7,7 @@ pub mod db;
 pub mod events;
 pub mod lnd;
 pub mod payment;
+pub mod picker;
 pub mod rebalance;
 pub mod runner;
 pub mod scenarios;

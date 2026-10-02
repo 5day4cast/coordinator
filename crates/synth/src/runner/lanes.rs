@@ -47,6 +47,9 @@ pub struct LaneConfig {
     /// How many of `stations` each competition takes, drawn per run; all of them otherwise.
     #[serde(default)]
     pub stations_per_run: Option<usize>,
+    /// How the stations are chosen; drawn at random from `stations` otherwise.
+    #[serde(default)]
+    pub picker: Option<crate::picker::PickerConfig>,
 }
 
 fn default_interval_secs() -> u64 {
@@ -88,7 +91,7 @@ impl LaneConfig {
                  (24 hours to 7 days, or 12 hours in a lane aligned to the UTC halves)"
             );
         }
-        let stations = self.stations.as_ref().unwrap_or(&base.stations);
+        let stations = self.configured_stations(base);
         anyhow::ensure!(!stations.is_empty(), "lane {name}: needs stations");
         if let Some(count) = self.stations_per_run {
             anyhow::ensure!(
@@ -96,6 +99,11 @@ impl LaneConfig {
                 "lane {name}: stations_per_run must be 1 to the {} stations",
                 stations.len()
             );
+        }
+        if let Some(picker) = &self.picker {
+            picker
+                .validate()
+                .map_err(|error| anyhow::anyhow!("lane {name}: {error:#}"))?;
         }
         let entry_window = self.entry_window_secs.unwrap_or(base.entry_window_secs);
         base.entry_timing
@@ -108,6 +116,11 @@ impl LaneConfig {
             );
         }
         Ok(())
+    }
+
+    /// The stations the lane lists, or the defaults'.
+    pub fn configured_stations<'a>(&'a self, base: &'a ScenarioConfig) -> &'a [String] {
+        self.stations.as_ref().unwrap_or(&base.stations)
     }
 
     fn windows(&self, base: &ScenarioConfig) -> Vec<u64> {
@@ -200,6 +213,7 @@ mod tests {
                 "KSEA".into(),
             ]),
             stations_per_run: Some(2),
+            picker: None,
         }
     }
 

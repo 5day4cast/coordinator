@@ -60,6 +60,8 @@ pub struct Runner {
     /// Every run in progress, by its competition: runs overlap, each moving its own competition
     /// through its states.
     live: Live,
+    /// Chooses the stations of lanes that pick them for the weather.
+    picker: Option<Arc<crate::picker::Picker>>,
 }
 
 /// Runs in progress, by competition id.
@@ -211,7 +213,14 @@ impl Runner {
             events,
             last_result: Arc::new(Mutex::new(None)),
             live: Arc::new(DashMap::new()),
+            picker: None,
         }
+    }
+
+    /// Let lanes with a `picker` choose their stations for the weather.
+    pub fn with_picker(mut self, picker: crate::picker::Picker) -> Self {
+        self.picker = Some(Arc::new(picker));
+        self
     }
 
     /// Run a scenario by name, saving each step as it finishes.
@@ -475,10 +484,15 @@ impl Runner {
         loop {
             let (start, close) = lane.next_start(&base, after);
             sleep_until(start).await;
-            let (scenario, config) = lane.run_config(&base, cycle, close);
+            let (scenario, mut config) = lane.run_config(&base, cycle, close);
             info!("Lane {} starts {scenario} (cycle {cycle})", lane.name);
-            let runner = self.clone();
-            tokio::spawn(async move { runner.run_or_redraw(&scenario, config).await });
+            let (runner, picking, defaults) = (self.clone(), lane.clone(), base.clone());
+            tokio::spawn(async move {
+                if let Some(picker) = &runner.picker {
+                    picker.choose(&picking, &defaults, &mut config).await;
+                }
+                runner.run_or_redraw(&scenario, config).await
+            });
             after = match close {
                 // The next half after this one.
                 Some(close) => close + time::Duration::seconds(1) - (close - start),
