@@ -115,7 +115,11 @@ async fn main() -> anyhow::Result<()> {
                     .await
             } else {
                 scheduler_runner
-                    .run_lanes(&scheduler.lanes, scenario_config)
+                    .run_lanes(
+                        &scheduler.lanes,
+                        scenario_config,
+                        scheduler.keep_open.as_ref(),
+                    )
                     .await
             };
             if let Err(error) = stopped {

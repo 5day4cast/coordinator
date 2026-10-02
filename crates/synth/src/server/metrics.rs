@@ -7,7 +7,8 @@ use axum::{
     Router,
 };
 use prometheus::{
-    register_counter_vec, register_gauge, register_histogram_vec, Encoder, TextEncoder,
+    register_counter, register_counter_vec, register_gauge, register_histogram_vec, Encoder,
+    TextEncoder,
 };
 
 lazy_static::lazy_static! {
@@ -40,6 +41,26 @@ lazy_static::lazy_static! {
         "synth_last_successful_run_timestamp",
         "Unix timestamp when full lifecycle payouts were last verified"
     ).unwrap();
+
+    pub static ref OPEN_COMPETITIONS: prometheus::Gauge = register_gauge!(
+        "synth_open_competitions",
+        "Listed competitions taking entries, not full, whose entries close far enough ahead"
+    ).unwrap();
+
+    pub static ref OPEN_COMPETITION_MINUTES_LEFT: prometheus::Gauge = register_gauge!(
+        "synth_open_competition_minutes_left",
+        "Minutes until entries close for the open competition with the most time left (0 when none)"
+    ).unwrap();
+
+    pub static ref KEEP_OPEN_STARTS: prometheus::Counter = register_counter!(
+        "synth_keep_open_starts_total",
+        "Runs started early because no competition was open for visitors"
+    ).unwrap();
+
+    pub static ref BACKFILL_PLAYERS: prometheus::Counter = register_counter!(
+        "synth_backfill_players_total",
+        "Players synth entered late so a competition reaches its minimum"
+    ).unwrap();
 }
 
 pub fn router(db: SynthDb) -> Router {
@@ -55,6 +76,10 @@ fn initialize() {
     lazy_static::initialize(&STEP_DURATION);
     lazy_static::initialize(&LIFECYCLE_HEALTHY);
     lazy_static::initialize(&LAST_SUCCESS);
+    lazy_static::initialize(&OPEN_COMPETITIONS);
+    lazy_static::initialize(&OPEN_COMPETITION_MINUTES_LEFT);
+    lazy_static::initialize(&KEEP_OPEN_STARTS);
+    lazy_static::initialize(&BACKFILL_PLAYERS);
     for scenario in crate::runner::SCENARIOS {
         for status in ["passed", "failed"] {
             SCENARIO_RUNS.with_label_values(&[scenario, status]);
@@ -126,6 +151,23 @@ pub fn record_scenario(
             .with_label_values(&[scenario, step_name])
             .observe(*step_duration as f64 / 1000.0);
     }
+}
+
+/// Record the competitions open for visitors at a keep-open check: how many, and the most
+/// minutes left before one's entries close.
+pub fn record_open(open: usize, minutes_left: i64) {
+    OPEN_COMPETITIONS.set(open as f64);
+    OPEN_COMPETITION_MINUTES_LEFT.set(minutes_left.max(0) as f64);
+}
+
+/// Record a run started early to keep a competition open.
+pub fn record_keep_open_start() {
+    KEEP_OPEN_STARTS.inc();
+}
+
+/// Record players entered by a backfill.
+pub fn record_backfill(players: usize) {
+    BACKFILL_PLAYERS.inc_by(players as f64);
 }
 
 #[cfg(test)]
