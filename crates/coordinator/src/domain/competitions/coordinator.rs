@@ -3449,6 +3449,13 @@ impl Coordinator {
         Ok(competitions)
     }
 
+    /// Operator list with retained errors and queue details, omitting contract blobs.
+    pub async fn list_operator_competitions(&self) -> Result<Vec<Competition>, Error> {
+        let mut competitions = self.competition_store.list_operator_competitions().await?;
+        self.attach_queue_details(&mut competitions).await?;
+        Ok(competitions)
+    }
+
     pub async fn request_ticket(
         &self,
         pubkey: String,

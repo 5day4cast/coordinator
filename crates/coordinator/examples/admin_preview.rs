@@ -125,6 +125,7 @@ fn main() -> anyhow::Result<()> {
     std::fs::write(out.join("funds.html"), page)?;
 
     funds_preview(&out, &tx)?;
+    wallet_preview(&out)?;
     Ok(())
 }
 
@@ -190,6 +191,8 @@ fn funds_preview(out: &std::path::Path, tx: &bitcoin::Transaction) -> anyhow::Re
             vtxo: Some(format!("{:064x}:0", 400 + index)),
             escrow_sats: Some(6000),
             funded_at: Some(now.unix_timestamp()),
+            refund_opens_at: Some(now.unix_timestamp() + 3600),
+            escrow_pooled: true,
             ..Default::default()
         };
         let mut flow = TicketFlow {
@@ -253,6 +256,10 @@ fn funds_preview(out: &std::path::Path, tx: &bitcoin::Transaction) -> anyhow::Re
     refund.commitment = None;
     for flow in &mut refund.tickets {
         flow.payouts.clear();
+        flow.ticket.escrow_pooled = false;
+        flow.ticket.refund_created_at = Some(now.unix_timestamp() - 90);
+        flow.ticket.refund_updated_at = Some(now.unix_timestamp() - 20);
+        flow.ticket.refund_opens_at = Some(now.unix_timestamp() - 120);
         flow.ticket.entry_id = None;
         flow.ticket.refund_id = Some(uuid::Uuid::now_v7().to_string());
         flow.ticket.refund_hash = Some("d".repeat(64));
@@ -269,6 +276,47 @@ fn funds_preview(out: &std::path::Path, tx: &bitcoin::Transaction) -> anyhow::Re
         admin_base(
             &AdminPageConfig {
                 title: "Funds support preview",
+                api_base: "",
+                oracle_base: "",
+                explorer_url: "",
+                network: "signet",
+                csrf_token: None,
+            },
+            content,
+        )
+        .into_string(),
+    )?;
+    let mut waiting = coordinator::domain::admin_funds::FundsPage {
+        total: 3,
+        tickets: refund.tickets.clone(),
+        commitment: None,
+    };
+    waiting.tickets.push(waiting.tickets[0].clone());
+    for (index, flow) in waiting.tickets.iter_mut().enumerate() {
+        let t = &mut flow.ticket;
+        t.ticket_id = uuid::Uuid::from_u128(700 + index as u128).to_string();
+        t.entry_id = Some(uuid::Uuid::from_u128(800 + index as u128).to_string());
+        t.refund_id = None;
+        t.refund_state = None;
+        t.refund_hash = None;
+        t.refund_invoice = None;
+        t.refund_ark_txid = None;
+        t.refund_fee_sats = None;
+        t.refund_created_at = None;
+        t.refund_updated_at = None;
+        t.write_off = None;
+        t.refund_opens_at = match index {
+            0 => Some(now.unix_timestamp() + 3600),
+            1 => Some(now.unix_timestamp() - 120),
+            _ => None,
+        };
+    }
+    let content = maud::html! {main.admin-workspace {p.eyebrow {"Synthetic refund fixture · no real customer payments"} h1 {"Refunds before the worker starts"} (coordinator::templates::admin::funds::funds_graph(&c,&waiting,"signet",""))}};
+    std::fs::write(
+        out.join("refund-waiting.html"),
+        admin_base(
+            &AdminPageConfig {
+                title: "Refund timing preview",
                 api_base: "",
                 oracle_base: "",
                 explorer_url: "",
@@ -395,6 +443,14 @@ fn large_pools_preview(
                 flow.payouts.push(payout);
             }
             if index == 2 {
+                flow.ticket.escrow_pooled = false;
+                flow.ticket.refund_opens_at =
+                    Some(time::OffsetDateTime::now_utc().unix_timestamp() - 180);
+                flow.ticket.refund_ark_txid = Some(format!("{:064x}", 60000 + row));
+                flow.ticket.refund_created_at =
+                    Some(time::OffsetDateTime::now_utc().unix_timestamp() - 120);
+                flow.ticket.refund_updated_at =
+                    Some(time::OffsetDateTime::now_utc().unix_timestamp() - 60);
                 flow.ticket.refund_id = Some(Uuid::from_u128(50000 + row).to_string());
                 flow.ticket.refund_hash = Some(format!("{:064x}", 50000 + row));
                 flow.ticket.refund_state =
@@ -442,6 +498,57 @@ fn large_pools_preview(
                 ),
             )?;
         }
+    }
+    Ok(())
+}
+
+fn wallet_preview(out: &std::path::Path) -> anyhow::Result<()> {
+    use coordinator::{
+        domain::admin_wallet::WalletOverview,
+        infra::{
+            ark_swap::SwapWallet,
+            bitcoin::WalletBalance,
+            lightning::{ChannelBalance, NodeInfo},
+        },
+        templates::admin::wallet::wallet_page,
+    };
+    let data = WalletOverview {
+        node: Some(serde_json::from_value::<NodeInfo>(
+            serde_json::json!({"alias":"Example coordinator node", "identity_pubkey":"02abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345678901", "synced_to_chain":true, "synced_to_graph":true, "num_active_channels":3, "num_inactive_channels":1,"num_pending_channels":0,"block_height":283000}),
+        )?),
+        channels: Some(serde_json::from_value::<ChannelBalance>(
+            serde_json::json!({"local_balance":{"sat":"1250000"},"remote_balance":{"sat":"2800000"},"unsettled_local_balance":{"sat":"15000"}}),
+        )?),
+        onchain: Some(WalletBalance {
+            confirmed: bitcoin::Amount::from_sat(500000),
+            unconfirmed: bitcoin::Amount::from_sat(20000),
+            locked: bitcoin::Amount::from_sat(150000),
+        }),
+        ark_configured: true,
+        ark: Some(SwapWallet {
+            payable_sat: Some(120000),
+            expiring_sat: Some(25000),
+            boarding_sat: Some(30000),
+            recoverable_sat: Some(0),
+            confirmed_sat: Some(100000),
+            pre_confirmed_sat: Some(45000),
+            earliest_expiry: Some(1791100000),
+            boarding_address: Some("Preview only · verify the live address in ark-swapd".into()),
+            ..Default::default()
+        }),
+    };
+    for (name, data) in [
+        ("wallet", data),
+        (
+            "wallet-unavailable",
+            WalletOverview {
+                ark_configured: true,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let page = admin_base(&AdminPageConfig { title: "Node & wallets preview", api_base:"", oracle_base:"", explorer_url:"", network:"signet", csrf_token:None }, maud::html! { p.notice { "Synthetic layout preview · balances are examples" } (wallet_page("signet", &data)) }).into_string();
+        std::fs::write(out.join(format!("{name}.html")), page)?;
     }
     Ok(())
 }

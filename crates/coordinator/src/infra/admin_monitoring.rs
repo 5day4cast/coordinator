@@ -57,15 +57,30 @@ pub struct Metric {
 
 pub struct AdminMonitoring {
     configuration_error: bool,
-    client: Option<reqwest::Client>,
-    query_url: String,
-    dashboard_url: String,
+    pub(super) client: Option<reqwest::Client>,
+    pub(super) query_url: String,
+    pub(super) dashboard_url: String,
+    pub(super) signals:
+        Arc<RefreshCache<super::admin_signals::Panel, super::admin_signals::Snapshot>>,
+    pub(super) capabilities: Arc<RefreshCache<(), crate::infra::keymeld::PayoutCapabilities>>,
     cache: Arc<RefreshCache<(), Vec<Metric>>>,
 }
 
 impl AdminMonitoring {
     pub fn from_settings(settings: Option<&MonitoringSettings>) -> Self {
-        match Self::new(settings) {
+        let environment = match (
+            std::env::var("COORDINATOR_GRAFANA_URL"),
+            std::env::var("COORDINATOR_GRAFANA_DATASOURCE"),
+            std::env::var("COORDINATOR_GRAFANA_TOKEN_FILE"),
+        ) {
+            (Ok(grafana_url), Ok(datasource_uid), Ok(token_file)) => Some(MonitoringSettings {
+                grafana_url,
+                datasource_uid,
+                token_file,
+            }),
+            _ => None,
+        };
+        match Self::new(settings.or(environment.as_ref())) {
             Ok(service) => service,
             Err(error) => {
                 log::warn!("Admin monitoring is unavailable: {error}");
@@ -83,6 +98,8 @@ impl AdminMonitoring {
             query_url: String::new(),
             dashboard_url: String::new(),
             cache: Arc::new(RefreshCache::new()),
+            signals: Arc::new(RefreshCache::new()),
+            capabilities: Arc::new(RefreshCache::new()),
         };
         let Some(settings) = settings else {
             return Ok(service);
@@ -149,10 +166,10 @@ impl AdminMonitoring {
         }
         let service = self.clone();
         self.cache
-            .get(
+            .get_fresh(
                 (),
                 Duration::from_secs(60),
-                Duration::from_millis(500),
+                Duration::from_secs(9),
                 move || async move {
                     let client = service
                         .client
@@ -164,21 +181,29 @@ impl AdminMonitoring {
                             client.get(&service.query_url).query(&[("query", query)])
                         })
                         .collect();
-                    Ok(stream::iter(requests)
-                        .map(|request| async move {
-                            let value = async {
-                                let response: serde_json::Value =
-                                    request.send().await?.error_for_status()?.json().await?;
-                                metric_value(&response)
-                                    .context("Grafana returned no single finite sample")
-                            }
-                            .await
-                            .ok();
-                            Metric { value }
-                        })
-                        .buffered(3)
-                        .collect::<Vec<_>>()
-                        .await)
+                    let metrics = tokio::time::timeout(
+                        Duration::from_secs(8),
+                        stream::iter(requests)
+                            .map(|request| async move {
+                                let value = async {
+                                    let response: serde_json::Value =
+                                        request.send().await?.error_for_status()?.json().await?;
+                                    metric_value(&response)
+                                        .context("Grafana returned no single finite sample")
+                                }
+                                .await
+                                .ok();
+                                Metric { value }
+                            })
+                            .buffered(3)
+                            .collect::<Vec<_>>(),
+                    )
+                    .await?;
+                    ensure!(
+                        metrics.iter().any(|metric| metric.value.is_some()),
+                        "Grafana did not answer any operation metric query"
+                    );
+                    Ok(metrics)
                 },
             )
             .await

@@ -22,7 +22,7 @@ pub fn admin_base(config: &AdminPageConfig, content: Markup) -> Markup {
         .map(|token| json!({ CSRF_HEADER: token }).to_string());
     html! {
         (DOCTYPE)
-        html lang="en" {
+        html lang="en" data-theme="dark" {
             head {
                 meta charset="UTF-8";
                 meta name="viewport" content="width=device-width, initial-scale=1.0";
@@ -56,15 +56,15 @@ pub fn admin_base(config: &AdminPageConfig, content: Markup) -> Markup {
                     a href="/admin/operations" aria-current=[config.title.starts_with("Competition").then_some("page")] { "Operations" }
                     a href="/admin/funds" aria-current=[config.title.starts_with("Funds").then_some("page")] { "Find customer funds" }
                     a href="/admin/competition" aria-current=[config.title.starts_with("Weather").then_some("page")] { "Discover games" }
-                    a href="/admin/wallet" aria-current=[config.title.contains("Wallet").then_some("page")] { "Wallet" }
+                    a href="/admin/wallet" aria-current=[config.title.starts_with("Node").then_some("page")] { "Node & wallets" }
+                    a href="/admin/keymeld" aria-current=[config.title.starts_with("Keymeld").then_some("page")] { "Keymeld" }
+                    a href="/admin/services" aria-current=[(config.title == "Services").then_some("page")] { "Services" }
                     label.admin-appearance hidden { "Appearance"
                         select id="admin-theme" {
-                            option value="system" { "System" }
                             option value="light" { "Light" }
-                            option value="dark" { "Dark" }
+                            option value="dark" selected { "Dark" }
                         }
                     }
-                    noscript { span.note { "Theme follows device" } }
                 }
 
                 div id="admin-content" {

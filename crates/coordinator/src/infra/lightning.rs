@@ -96,6 +96,13 @@ pub struct PaymentUpdate {
 
 #[async_trait]
 pub trait Ln: Send + Sync {
+    /// Read-only, explicitly projected operator information. Unsupported backends stay unknown.
+    async fn node_info(&self) -> anyhow::Result<NodeInfo> {
+        anyhow::bail!("Node information is unavailable for this backend")
+    }
+    async fn channel_balance(&self) -> anyhow::Result<ChannelBalance> {
+        anyhow::bail!("Channel balances are unavailable for this backend")
+    }
     async fn ping(&self) -> Result<(), anyhow::Error>;
     async fn add_hold_invoice(
         &self,
@@ -139,6 +146,33 @@ pub trait Ln: Send + Sync {
 
     async fn subscribe_invoices(&self) -> Result<mpsc::Receiver<InvoiceUpdate>, anyhow::Error>;
     async fn subscribe_payments(&self) -> Result<mpsc::Receiver<PaymentUpdate>, anyhow::Error>;
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct NodeInfo {
+    pub alias: Option<String>,
+    pub identity_pubkey: Option<String>,
+    pub version: Option<String>,
+    pub synced_to_chain: Option<bool>,
+    pub synced_to_graph: Option<bool>,
+    pub block_height: Option<u32>,
+    pub num_active_channels: Option<u32>,
+    pub num_inactive_channels: Option<u32>,
+    pub num_pending_channels: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ChannelBalance {
+    pub local_balance: Option<ChannelAmount>,
+    pub remote_balance: Option<ChannelAmount>,
+    pub unsettled_local_balance: Option<ChannelAmount>,
+    pub pending_open_local_balance: Option<ChannelAmount>,
+}
+
+/// LND REST represents uint64 amounts as decimal strings.
+#[derive(Debug, Deserialize)]
+pub struct ChannelAmount {
+    pub sat: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -236,6 +270,18 @@ pub struct LnClient {
 }
 
 impl LnClient {
+    async fn operator_read<T: serde::de::DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
+        Ok(self
+            .payment_client
+            .get(self.base_url.join(path)?)
+            .header(MACAROON_HEADER, self.macaroon.expose_secret())
+            .timeout(Duration::from_secs(4))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
     async fn send_payment_inner(
         &self,
         payout_payment_request: String,
@@ -541,6 +587,14 @@ pub struct PaymentTrackResult {
 
 #[async_trait]
 impl Ln for LnClient {
+    async fn node_info(&self) -> anyhow::Result<NodeInfo> {
+        self.operator_read("/v1/getinfo").await
+    }
+
+    async fn channel_balance(&self) -> anyhow::Result<ChannelBalance> {
+        self.operator_read("/v1/balance/channels").await
+    }
+
     async fn ping(&self) -> Result<(), anyhow::Error> {
         let response = self
             .client
@@ -1273,6 +1327,34 @@ mod tests {
         assert_eq!(state.sends.load(Ordering::SeqCst), 1);
         assert_eq!(state.body.lock().unwrap()["cltv_limit"], 54);
         assert_eq!(state.body.lock().unwrap()["cancelable"], true);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn admin_wallet_reads_use_authenticated_gets_and_reject_service_errors() {
+        use axum::{routing::get, Json, Router};
+        let router = Router::new()
+            .route("/v1/getinfo", get(|headers: axum::http::HeaderMap| async move {
+                assert_eq!(headers.get(MACAROON_HEADER).unwrap(), "test-macaroon");
+                Json(serde_json::json!({"alias":"test node", "synced_to_chain":false, "num_active_channels":0}))
+            }))
+            .route("/v1/balance/channels", get(|| async { reqwest::StatusCode::UNAUTHORIZED }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let client = LnClient {
+            base_url: Url::parse(&format!("http://{address}/")).unwrap(),
+            client: ClientBuilder::new(Client::new()).build(),
+            payment_client: Client::new(),
+            macaroon: SecretString::from("test-macaroon"),
+        };
+        let node = client.node_info().await.unwrap();
+        assert_eq!(node.synced_to_chain, Some(false));
+        assert_eq!(node.num_active_channels, Some(0));
+        assert_eq!(node.block_height, None);
+        assert!(client.channel_balance().await.is_err());
         server.abort();
     }
 

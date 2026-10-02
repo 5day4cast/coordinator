@@ -1053,6 +1053,8 @@ pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Ne
         .route("/", get(admin_page_handler))
         .route("/competition", get(admin_competition_fragment))
         .route("/operations", get(crate::api::routes::operations_page))
+        .route("/keymeld", get(crate::api::routes::keymeld_page))
+        .route("/services", get(crate::api::routes::services_page))
         .route("/funds", get(crate::api::routes::funds_page))
         .route("/funds/tickets/{id}", get(crate::api::routes::funds_ticket))
         .route("/funds/chain/{id}", get(crate::api::routes::funds_chain))

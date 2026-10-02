@@ -86,6 +86,24 @@ pub struct RefundSwap {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SwapWallet {
     #[serde(default)]
+    pub ark_address: Option<String>,
+    #[serde(default)]
+    pub boarding_address: Option<String>,
+    #[serde(default)]
+    pub confirmed_sat: Option<u64>,
+    #[serde(default)]
+    pub pre_confirmed_sat: Option<u64>,
+    #[serde(default)]
+    pub payable_sat: Option<u64>,
+    #[serde(default)]
+    pub expiring_sat: Option<u64>,
+    #[serde(default)]
+    pub recoverable_sat: Option<u64>,
+    #[serde(default)]
+    pub boarding_sat: Option<u64>,
+    #[serde(default)]
+    pub earliest_expiry: Option<i64>,
+    #[serde(default)]
     pub last_board_failure: Option<BoardFailure>,
     /// UNIX seconds.
     #[serde(default)]

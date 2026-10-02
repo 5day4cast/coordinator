@@ -23,6 +23,10 @@ pub struct FundsTicket {
     pub vtxo: Option<String>,
     pub escrow_sats: Option<i64>,
     pub funded_at: Option<i64>,
+    /// Derived from the escrow script; the script itself never leaves the store projection.
+    #[sqlx(skip)]
+    pub refund_opens_at: Option<i64>,
+    pub escrow_pooled: bool,
     pub sellback_at: Option<String>,
     pub reclaimed_at: Option<String>,
     pub legacy_escrow_tx: Option<String>,
@@ -33,9 +37,29 @@ pub struct FundsTicket {
     pub refund_state: Option<String>,
     pub refund_ark_txid: Option<String>,
     pub refund_fee_sats: Option<i64>,
+    pub refund_created_at: Option<i64>,
     pub refund_updated_at: Option<i64>,
     pub refund_error: Option<String>,
     pub write_off: Option<String>,
+    pub write_off_at: Option<i64>,
+}
+
+#[derive(FromRow)]
+struct FundsTicketRow {
+    #[sqlx(flatten)]
+    ticket: FundsTicket,
+    escrow_tap_tree: Option<String>,
+}
+
+impl FundsTicketRow {
+    fn into_ticket(mut self) -> FundsTicket {
+        self.ticket.refund_opens_at = self
+            .escrow_tap_tree
+            .as_deref()
+            .and_then(super::ark_refund::refund_opens_at)
+            .map(|at| at.unix_timestamp());
+        self.ticket
+    }
 }
 #[derive(Debug, Clone, Default, FromRow)]
 pub struct FundsPayout {
@@ -82,11 +106,13 @@ pub struct FundsMatch {
 const TICKET_SELECT: &str = "SELECT t.id ticket_id,t.event_id competition_id,e.id entry_id,t.hash payment_hash,
  e.ephemeral_pubkey entry_pubkey,t.payment_request invoice,t.paid_at,t.settled_at,t.invoice_cancelled_at released_at,
  CASE WHEN t.network_fee_hash = t.hash THEN t.network_fee_sats ELSE 0 END network_fee_sats,
- a.escrow_address,a.swap_id,a.vtxo_outpoint vtxo,a.vtxo_sats escrow_sats,a.funded_at,
+ a.escrow_address,a.swap_id,a.vtxo_outpoint vtxo,a.vtxo_sats escrow_sats,a.funded_at,a.escrow_tap_tree,
+ EXISTS(SELECT 1 FROM ark_funded_competitions b WHERE b.event_id=t.event_id AND b.commitment_tx IS NOT NULL) escrow_pooled,
  e.sellback_broadcasted_at sellback_at,e.reclaimed_broadcasted_at reclaimed_at,
  t.escrow_transaction legacy_escrow_tx,t.escrow_reclaimed_at legacy_reclaimed_at,
  r.refund_id,r.payment_hash refund_hash,r.invoice refund_invoice,r.state refund_state,r.ark_txid refund_ark_txid,
- r.fee_sats refund_fee_sats,r.updated_at refund_updated_at,r.error refund_error,w.reason write_off
+ r.fee_sats refund_fee_sats,r.created_at refund_created_at,r.updated_at refund_updated_at,r.error refund_error,
+ w.reason write_off,w.written_off_at write_off_at
  FROM tickets t LEFT JOIN entries e ON e.ticket_id=t.id
  LEFT JOIN ticket_ark_escrows a ON a.ticket_id=t.id AND a.ticket_hash=t.hash
  LEFT JOIN ticket_ark_refunds r ON r.ticket_id=a.ticket_id
@@ -107,7 +133,7 @@ impl CompetitionStore {
         .bind(ticket.map(|id| id.to_string()))
         .fetch_one(self.db_connection.read())
         .await?;
-        let records: Vec<FundsTicket> = sqlx::query_as(&format!(
+        let records: Vec<FundsTicketRow> = sqlx::query_as(&format!(
             "{TICKET_SELECT}{condition} ORDER BY t.id LIMIT 25 OFFSET ?3"
         ))
         .bind(competition.to_string())
@@ -116,7 +142,7 @@ impl CompetitionStore {
         .fetch_all(self.db_connection.read())
         .await?;
         let flows: Vec<_> = stream::iter(records)
-            .map(|ticket| self.ticket_flow(ticket))
+            .map(|row| self.ticket_flow(row.into_ticket()))
             .buffered(4)
             .collect()
             .await;
@@ -127,12 +153,13 @@ impl CompetitionStore {
         })
     }
     pub async fn funds_ticket(&self, ticket: Uuid) -> Result<Option<TicketFlow>, sqlx::Error> {
-        let record = sqlx::query_as(&format!("{TICKET_SELECT} WHERE t.id=?"))
-            .bind(ticket.to_string())
-            .fetch_optional(self.db_connection.read())
-            .await?;
+        let record: Option<FundsTicketRow> =
+            sqlx::query_as(&format!("{TICKET_SELECT} WHERE t.id=?"))
+                .bind(ticket.to_string())
+                .fetch_optional(self.db_connection.read())
+                .await?;
         match record {
-            Some(record) => self.ticket_flow(record).await.map(Some),
+            Some(record) => self.ticket_flow(record.into_ticket()).await.map(Some),
             None => Ok(None),
         }
     }
@@ -386,6 +413,38 @@ mod tests {
     use super::*;
     use crate::infra::db::{DBConnection, DatabasePoolConfig, DatabaseType};
     #[test]
+    fn refund_deadline_comes_from_the_escrow_script_without_retaining_it() {
+        use coordinator_ark::testing::{keypair, xonly};
+        use coordinator_ark_escrow::{EntryEscrow, RelativeTimelock, ServerRules};
+        let rules = ServerRules {
+            signer: xonly(&keypair(3)),
+            min_exit_delay: RelativeTimelock::Seconds(512),
+            block_timelocks_allowed: false,
+        };
+        let opens = 1_800_000_000;
+        let terms = coordinator_ark::escrow_terms(
+            &rules,
+            xonly(&keypair(1)),
+            xonly(&keypair(2)),
+            opens,
+            opens - 3600,
+        )
+        .unwrap();
+        let script = hex::encode(
+            EntryEscrow::new(terms)
+                .unwrap()
+                .vtxo_script()
+                .encode_tap_tree(),
+        );
+        let t = FundsTicketRow {
+            ticket: FundsTicket::default(),
+            escrow_tap_tree: Some(script.clone()),
+        }
+        .into_ticket();
+        assert_eq!(t.refund_opens_at, Some(i64::from(opens)));
+        assert!(!format!("{t:?}").contains(&script));
+    }
+    #[test]
     fn lightning_hash_matching_accepts_lnd_base64_and_rejects_other_payments() {
         let hash = "ab".repeat(32);
         assert!(same_hash(
@@ -518,5 +577,22 @@ mod tests {
             .unwrap()
             .tickets
             .is_empty());
+        db.execute_write(move |pool|async move {
+            sqlx::query("UPDATE ticket_ark_escrows SET ticket_hash='current-hash',funded_at=100 WHERE ticket_id=?")
+                .bind(ticket.to_string()).execute(&pool).await?;
+            sqlx::query("INSERT INTO ticket_ark_refunds(ticket_id,refund_id,invoice,payment_hash,fee_sats,state,created_at,updated_at,error) VALUES (?,'refund','refund-invoice','refund-hash',50,'submitted',110,120,'awaiting payment')")
+                .bind(ticket.to_string()).execute(&pool).await?;
+            Ok(())
+        }).await.unwrap();
+        let refund = store.funds_ticket(ticket).await.unwrap().unwrap();
+        assert_eq!(refund.ticket.refund_created_at, Some(110));
+        assert_eq!(refund.ticket.refund_updated_at, Some(120));
+        assert_eq!(refund.ticket.refund_state.as_deref(), Some("submitted"));
+        assert_eq!(
+            refund.ticket.refund_opens_at, None,
+            "invalid scripts must not invent a deadline"
+        );
+        assert!(!refund.ticket.escrow_pooled);
+        assert!(!format!("{refund:?}").contains("PRIVATE-TREE"));
     }
 }

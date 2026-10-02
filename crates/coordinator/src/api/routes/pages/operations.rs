@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     api::{admin_auth::AdminCsrf, routes::OperatorCompetition},
-    domain::{Competition, CompetitionKind, RefundProgress},
+    domain::{leaderboard::Phase, Competition, CompetitionKind, RefundProgress},
     startup::AppState,
 };
 
@@ -26,7 +26,145 @@ pub struct QueueFilter {
     #[serde(default)]
     q: String,
     #[serde(default)]
-    show: String,
+    show: QueueShow,
+    #[serde(default)]
+    sort: QueueSort,
+    #[serde(default)]
+    page: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum QueueSort {
+    CreatedAsc,
+    #[default]
+    #[serde(other)]
+    CreatedDesc,
+}
+
+impl QueueSort {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CreatedDesc => "created_desc",
+            Self::CreatedAsc => "created_asc",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum QueueShow {
+    Pending,
+    Live,
+    AwaitingResult,
+    Attention,
+    #[default]
+    #[serde(other)]
+    All,
+}
+
+impl QueueShow {
+    const VIEWS: [Self; 5] = [
+        Self::All,
+        Self::Pending,
+        Self::Live,
+        Self::AwaitingResult,
+        Self::Attention,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Pending => "pending",
+            Self::Live => "live",
+            Self::AwaitingResult => "awaiting_result",
+            Self::Attention => "attention",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All competitions",
+            Self::Pending => "Pending / open",
+            Self::Live => "Live weather",
+            Self::AwaitingResult => "Awaiting result",
+            Self::Attention => "Needs review",
+        }
+    }
+
+    fn includes(
+        self,
+        c: &Competition,
+        refunds: Option<&RefundProgress>,
+        now: OffsetDateTime,
+    ) -> bool {
+        match self {
+            Self::All => true,
+            Self::Attention => next(c, refunds, now).2,
+            // A queue that formed its pools is a navigation record. Its child pools carry
+            // the active weather and settlement work, so do not count it a second time.
+            _ if c.kind == CompetitionKind::Queued && c.pools_formed_at.is_some() => false,
+            Self::Pending => Phase::of(c, now) == Phase::Upcoming,
+            Self::Live => Phase::of(c, now) == Phase::Live,
+            Self::AwaitingResult => Phase::of(c, now) == Phase::AwaitingResult,
+        }
+    }
+}
+
+const PAGE_SIZE: usize = 100;
+
+fn page_bounds(matches: usize, requested_page: usize) -> (usize, usize, usize) {
+    let pages = matches.div_ceil(PAGE_SIZE).max(1);
+    let page = requested_page.min(pages - 1);
+    (page, page * PAGE_SIZE, pages)
+}
+
+fn queue_url(filter: &QueueFilter, page: usize) -> String {
+    let mut url = reqwest::Url::parse("http://localhost/admin/operations").expect("static URL");
+    url.query_pairs_mut()
+        .append_pair("q", &filter.q)
+        .append_pair("show", filter.show.as_str())
+        .append_pair("sort", filter.sort.as_str())
+        .append_pair("page", &page.to_string());
+    format!("{}?{}", url.path(), url.query().unwrap_or_default())
+}
+
+fn phase_label(c: &Competition, now: OffsetDateTime) -> &'static str {
+    if c.kind == CompetitionKind::Queued && c.pools_formed_at.is_some() {
+        return "Pools formed";
+    }
+    match Phase::of(c, now) {
+        Phase::Upcoming => "Pending / open",
+        Phase::Live => "Live weather",
+        Phase::AwaitingResult => "Awaiting result",
+        Phase::Scored => "Result signed",
+        Phase::Expired => "Expired",
+        Phase::Unfilled => "Unfilled",
+        Phase::Cancelled => "Cancelled",
+        Phase::Failed => "Failed",
+    }
+}
+
+fn matches_search(c: &Competition, search: &str) -> bool {
+    search.is_empty()
+        || c.id.to_string().contains(search)
+        || c.event_submission
+            .locations
+            .iter()
+            .any(|station| station.to_lowercase().contains(search))
+}
+
+fn sort_competitions(competitions: &mut [Competition], sort: QueueSort) {
+    competitions.sort_by(|left, right| {
+        let created = left
+            .created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id));
+        match sort {
+            QueueSort::CreatedDesc => created.reverse(),
+            QueueSort::CreatedAsc => created,
+        }
+    });
 }
 
 fn next(
@@ -122,54 +260,75 @@ pub async fn operations_page(
     let content = match (competitions, refunds) {
         (Ok(mut competitions), Ok(refunds)) => {
             let now = OffsetDateTime::now_utc();
-            competitions.sort_by_key(|c| {
-                (
-                    !next(c, refunds.get(&c.id), now).2,
-                    std::cmp::Reverse(c.created_at),
-                )
-            });
+            sort_competitions(&mut competitions, filter.sort);
             let search = filter.q.trim().to_lowercase();
             let rows: Vec<_> = competitions
                 .iter()
                 .filter(|c| {
-                    (search.is_empty()
-                        || c.id.to_string().contains(&search)
-                        || c.event_submission
-                            .locations
-                            .iter()
-                            .any(|s| s.to_lowercase().contains(&search)))
-                        && (filter.show != "attention" || next(c, refunds.get(&c.id), now).2)
+                    matches_search(c, &search) && filter.show.includes(c, refunds.get(&c.id), now)
                 })
                 .collect();
+            let (page, start, pages) = page_bounds(rows.len(), filter.page);
             html! {
                 main.admin-workspace {
                     p.eyebrow { "Operator desk" } h1 { "Competition operations" }
                     p { "Follow the next step, inspect the money, and distinguish expected waiting from a competition that needs review." }
                     (state.admin_monitoring.render(&monitoring))
-                    form.discovery-filters method="get" action="/admin/operations" {
-                        label { "Competition or station" input name="q" value=(filter.q) maxlength="100"; }
-                        label { "Show" select name="show" { option value="all" selected[filter.show != "attention"] { "All competitions" } option value="attention" selected[filter.show == "attention"] { "Needs review" } } }
-                        button type="submit" { "Filter" }
+                    nav.discovery-filters aria-label="Competition views" {
+                        @for show in QueueShow::VIEWS {
+                            @let count = competitions.iter().filter(|c| show.includes(c, refunds.get(&c.id), now)).count();
+                            a href=(queue_url(&QueueFilter { show, ..QueueFilter::default() }, 0)) aria-current=[(filter.show == show && search.is_empty()).then_some("page")] {
+                                (show.label()) " (" (count) ")"
+                            }
+                        }
                     }
-                    p.note { "Review order uses recorded milestones and scheduled times. Retained errors and historical failed jobs do not establish that money is still unpaid." }
+                    form.discovery-filters method="get" action="/admin/operations" {
+                        label { "Competition or station" input name="q" value=(&filter.q) maxlength="100"; }
+                        label { "Show" select name="show" { @for show in QueueShow::VIEWS { option value=(show.as_str()) selected[filter.show == show] { (show.label()) } } } }
+                        label { "Sort by" select name="sort" {
+                            option value="created_desc" selected[matches!(filter.sort, QueueSort::CreatedDesc)] { "Newest created" }
+                            option value="created_asc" selected[matches!(filter.sort, QueueSort::CreatedAsc)] { "Oldest created" }
+                        } }
+                        button type="submit" { "Filter" }
+                        a href="/admin/operations" { "Clear filters" }
+                    }
+                    p.note {
+                        @match filter.sort {
+                            QueueSort::CreatedDesc => { "Newest competitions first, by creation time. " },
+                            QueueSort::CreatedAsc => { "Oldest competitions first, by creation time. " },
+                        }
+                        "Creation times are UTC. Retained errors and historical failed jobs do not establish that money is still unpaid."
+                    }
                     h2 { (rows.len()) " competitions" }
+                    p.note { "Pending / open means the observation window has not started; a game may already be full. Live weather means observations are in progress, even when the contract state says awaiting_attestation. View counts include all stations and reset the search." }
+                    @if rows.is_empty() { p.notice { "No competitions match these filters. " a href="/admin/operations" { "Show all competitions" } } }
                     div.scroll { table.ops-table {
-                        thead { tr { th { "Competition" } th { "State" } th { "Entries" } th { "Next step" } } }
+                        thead { tr { th { "Competition" } th { "Created (UTC)" } th { "State" } th { "Entries" } th { "Next step" } } }
                         tbody {
-                            @for c in rows.iter().take(200) {
+                            @for c in rows.iter().skip(start).take(PAGE_SIZE) {
                                 @let action = next(c, refunds.get(&c.id), now);
+                                @let created = c.created_at.to_offset(time::UtcOffset::UTC);
                                 tr {
                                     td { a href=(format!("/admin/operations/{}", c.id)) { (c.event_submission.locations.join(" · ")) }
                                         p.note { code { (c.id) } " · " (c.kind.as_str()) }
                                     }
-                                    td { span.status { (c.get_state()) } }
+                                    td { time datetime=(created.format(&Rfc3339).unwrap_or_default()) {
+                                        (created.date()) br; (format!("{:02}:{:02}:{:02}", created.hour(), created.minute(), created.second()))
+                                    } }
+                                    td { span.status { (phase_label(c, now)) } p.note { (c.get_state()) } }
                                     td { (c.total_paid_entries) " paid / " (c.total_entries) " entered" }
                                     td { strong class=[action.2.then_some("attention")] { (action.0) } p.note { (action.1) } }
                                 }
                             }
                         }
                     } }
-                    @if rows.len() > 200 { p.notice { "Showing the first 200 matches. Filter by competition or station to narrow the work queue." } }
+                    @if pages > 1 {
+                        nav.discovery-filters aria-label="Competition pages" {
+                            @if page > 0 { a href=(queue_url(&filter, page - 1)) { "← Previous" } }
+                            span { "Page " (page + 1) " of " (pages) " · " (start + 1) "–" ((start + PAGE_SIZE).min(rows.len())) " of " (rows.len()) }
+                            @if page + 1 < pages { a href=(queue_url(&filter, page + 1)) { "Next →" } }
+                        }
+                    }
                 }
             }
         }
@@ -333,6 +492,115 @@ mod tests {
             scoring_fields: None,
             max_entries_per_player: 1,
         })
+    }
+
+    #[test]
+    fn creation_sort_keeps_recent_progress_ahead_of_older_refunds() {
+        let now = OffsetDateTime::now_utc();
+        let mut old_refund = competition(now);
+        old_refund.created_at = now - time::Duration::DAY;
+        old_refund.cancelled_at = Some(now);
+        let mut recent = competition(now);
+        recent.created_at = now;
+        let old_id = old_refund.id;
+        let recent_id = recent.id;
+        let mut rows = vec![old_refund, recent];
+        sort_competitions(&mut rows, QueueFilter::default().sort);
+        assert_eq!(rows[0].id, recent_id);
+        sort_competitions(&mut rows, QueueSort::CreatedAsc);
+        assert_eq!(rows[0].id, old_id);
+        assert!(QueueShow::Attention.includes(&rows[0], None, now));
+        assert!(!QueueShow::Attention.includes(&rows[1], None, now));
+    }
+
+    #[test]
+    fn old_review_links_fall_back_to_creation_order_and_keep_the_review_filter() {
+        let Query(filter) = Query::<QueueFilter>::try_from_uri(
+            &"/admin/operations?show=attention&sort=review"
+                .parse()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(filter.sort, QueueSort::CreatedDesc);
+        assert_eq!(filter.show, QueueShow::Attention);
+        let Query(default) =
+            Query::<QueueFilter>::try_from_uri(&"/admin/operations".parse().unwrap()).unwrap();
+        assert_eq!(default.sort, QueueSort::CreatedDesc);
+        assert_eq!(default.show, QueueShow::All);
+    }
+
+    #[test]
+    fn pending_and_live_filters_use_the_weather_window_not_contract_state() {
+        let now = OffsetDateTime::now_utc();
+        let mut open = competition(now);
+        open.kind = CompetitionKind::Queued;
+        open.event_submission.unlisted = true;
+        let mut live = competition(now);
+        live.event_submission.start_observation_date = now - time::Duration::HOUR;
+        live.awaiting_attestation_at = Some(now - time::Duration::minutes(30));
+        live.funding_confirmed_at = Some(now - time::Duration::minutes(30));
+        live.kind = CompetitionKind::Pool;
+        live.event_submission.unlisted = true;
+        assert_eq!(live.get_state().to_string(), "awaiting_attestation");
+        assert!(QueueShow::Pending.includes(&open, None, now));
+        assert!(!QueueShow::Live.includes(&open, None, now));
+        assert!(QueueShow::Live.includes(&live, None, now));
+        assert_eq!(phase_label(&live, now), "Live weather");
+        assert!(!QueueShow::AwaitingResult.includes(&live, None, now));
+        assert!(!QueueShow::Attention.includes(&live, None, now));
+
+        let after_window = live.event_submission.end_observation_date;
+        assert!(!QueueShow::Live.includes(&live, None, after_window));
+        assert!(QueueShow::AwaitingResult.includes(&live, None, after_window));
+        assert_eq!(phase_label(&live, after_window), "Awaiting result");
+
+        // Parent queues still remain in All, without counting the same active games twice.
+        open.pools_formed_at = Some(now);
+        open.event_submission.start_observation_date = now - time::Duration::HOUR;
+        assert_eq!(phase_label(&open, now), "Pools formed");
+        assert!(QueueShow::All.includes(&open, None, now));
+        assert!(!QueueShow::Live.includes(&open, None, now));
+
+        let mut cancelled = competition(now);
+        cancelled.cancelled_at = Some(now);
+        assert!(!QueueShow::Pending.includes(&cancelled, None, now));
+        assert!(!QueueShow::Live.includes(&cancelled, None, now));
+        assert!(QueueShow::Attention.includes(&cancelled, None, now));
+    }
+
+    #[test]
+    fn pages_reach_every_match_beyond_the_old_two_hundred_row_limit() {
+        let now = OffsetDateTime::now_utc();
+        let mut rows: Vec<_> = (0..205)
+            .map(|index| {
+                let mut c = competition(now);
+                c.created_at = now - time::Duration::minutes(index);
+                c
+            })
+            .collect();
+        sort_competitions(&mut rows, QueueSort::CreatedDesc);
+        let mut shown = Vec::new();
+        for page in 0..3 {
+            let (actual, start, pages) = page_bounds(rows.len(), page);
+            assert_eq!((actual, pages), (page, 3));
+            shown.extend(rows.iter().skip(start).take(PAGE_SIZE).map(|c| c.id));
+        }
+        assert_eq!(shown, rows.iter().map(|c| c.id).collect::<Vec<_>>());
+        assert_eq!(page_bounds(rows.len(), usize::MAX), (2, 200, 3));
+        assert_eq!(page_bounds(0, usize::MAX), (0, 0, 1));
+
+        let filter = QueueFilter {
+            q: "KSEA & KPDX".into(),
+            show: QueueShow::Live,
+            sort: QueueSort::CreatedAsc,
+            page: 0,
+        };
+        let url = queue_url(&filter, 1);
+        let Query(parsed) = Query::<QueueFilter>::try_from_uri(&url.parse().unwrap()).unwrap();
+        assert_eq!(parsed.q, filter.q);
+        assert_eq!(parsed.show, filter.show);
+        assert_eq!(parsed.sort, filter.sort);
+        assert_eq!(parsed.page, 1);
     }
 
     #[test]

@@ -100,20 +100,9 @@ pub async fn admin_wallet_fragment(
     Extension(csrf): Extension<AdminCsrf>,
     headers: HeaderMap,
 ) -> Html<String> {
-    let balance = fetch_balance(&state)
-        .await
-        .inspect_err(|e| error!("Failed to fetch wallet balance: {e}"))
-        .unwrap_or(WalletBalance {
-            confirmed: 0,
-            unconfirmed: 0,
-        });
-    let address = fetch_address(&state)
-        .await
-        .inspect_err(|e| error!("Failed to fetch wallet address: {e}"))
-        .unwrap_or_default();
-
-    let content = wallet_page(&state.explorer_url, &balance, &address);
-    render_admin_fragment(&headers, &state, &csrf, "5day4cast Admin - Wallet", content)
+    let overview = state.coordinator.admin_wallet_overview().await;
+    let content = wallet_page(&state.network, &overview);
+    render_admin_fragment(&headers, &state, &csrf, "Node & wallets", content)
 }
 
 /// Wallet balance fragment (for HTMX refresh)

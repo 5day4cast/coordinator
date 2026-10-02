@@ -161,6 +161,9 @@ pub struct TicketRefund {
     pub invoice: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub payment_hash: String,
+    /// Creation of the current refund swap, in UNIX seconds. A remint starts a new swap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
     /// UNIX seconds.
     pub updated_at: i64,
     /// An operator wrote the refund off: it will not finish on its own, and is no longer owed.
@@ -238,6 +241,7 @@ impl Coordinator {
                 ark_txid: None,
                 invoice: String::new(),
                 payment_hash: String::new(),
+                created_at: None,
                 updated_at: at,
                 written_off: true,
             }));
@@ -256,6 +260,7 @@ impl Coordinator {
             ark_txid: refund.ark_txid,
             invoice: refund.invoice,
             payment_hash: refund.payment_hash,
+            created_at: Some(refund.created_at),
             updated_at: refund.updated_at,
             written_off: written_off_at.is_some(),
         }))

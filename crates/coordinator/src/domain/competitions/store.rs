@@ -1560,6 +1560,16 @@ impl CompetitionStore {
     /// else would read as just created; those few are read in full, so
     /// [`Competition::get_state`] reads as it does for [`Self::get_competitions`].
     pub async fn list_competitions(&self) -> Result<Vec<Competition>, sqlx::Error> {
+        self.list_summaries(false).await
+    }
+
+    /// The same lean list, retaining errors for operator investigations without loading
+    /// every competition's contract, transaction, nonce and signature blobs.
+    pub async fn list_operator_competitions(&self) -> Result<Vec<Competition>, sqlx::Error> {
+        self.list_summaries(true).await
+    }
+
+    async fn list_summaries(&self, include_errors: bool) -> Result<Vec<Competition>, sqlx::Error> {
         let rows = sqlx::query(
             r#"
             WITH entry_counts AS (
@@ -1618,7 +1628,7 @@ impl CompetitionStore {
                 completed_at,
                 failed_at,
                 keymeld_keygen_completed_at,
-                NULL AS errors,
+                CASE WHEN ? THEN errors ELSE NULL END AS errors,
                 competitions.kind AS kind,
                 competitions.parent_id AS parent_id,
                 competitions.pool_index AS pool_index,
@@ -1629,6 +1639,7 @@ impl CompetitionStore {
             LEFT JOIN payout_stats ON payout_stats.event_id = competitions.id
             ORDER BY competitions.id"#,
         )
+        .bind(include_errors)
         .fetch_all(self.db_connection.read())
         .await?;
 

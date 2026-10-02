@@ -1587,6 +1587,7 @@ async fn ark_swapds_failed_boards_pause_entries() {
     *f.swaps.wallet.lock().unwrap() = Some(SwapWallet {
         last_board_failure: Some(rescan.clone()),
         last_board_success_at: Some(now - 600),
+        ..Default::default()
     });
     f.coordinator.read_ark_swap_boards().await;
     assert!(f.coordinator.arkade_unavailable());
@@ -1601,6 +1602,7 @@ async fn ark_swapds_failed_boards_pause_entries() {
     *f.swaps.wallet.lock().unwrap() = Some(SwapWallet {
         last_board_failure: Some(rescan),
         last_board_success_at: Some(now),
+        ..Default::default()
     });
     f.coordinator.read_ark_swap_boards().await;
     assert!(!f.coordinator.arkade_unavailable());

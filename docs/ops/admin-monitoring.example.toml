@@ -2,12 +2,12 @@
 # The token stays on the server. Mount a read-only Grafana service-account
 # token file into the coordinator service; do not put the token in this file.
 # Give the account permission to query the chosen Prometheus data source.
-# Requests use Grafana's data-source proxy and fixed queries for job="coordinator".
+# Requests use Grafana's data-source proxy and fixed queries for coordinator, Keymeld, Oracle, and application backups.
 # See https://grafana.com/docs/grafana/latest/administration/service-accounts/
 # and https://grafana.com/docs/grafana/latest/developer-resources/api-reference/http-api/api-legacy/data_source/
 
 [admin_settings.monitoring]
-grafana_url = "https://grafana.lab.tee8z.fyi:9443"
+grafana_url = "https://grafana.lab.tee8z.fyi"
 datasource_uid = "prometheus"
 token_file = "/run/credentials/coordinator.service/grafana-token"
 
@@ -15,3 +15,11 @@ token_file = "/run/credentials/coordinator.service/grafana-token"
 # Reads wait at most 500 ms for an initial cached result. The cache refreshes
 # every 60 seconds on demand; panels show unknown values if a query fails.
 # Competition state and transaction evidence come from the coordinator.
+
+# Equivalent environment variables, used when the TOML section is absent:
+# COORDINATOR_GRAFANA_URL=https://grafana.lab.tee8z.fyi
+# COORDINATOR_GRAFANA_DATASOURCE=prometheus
+# COORDINATOR_GRAFANA_TOKEN_FILE=/var/lib/coordinator/secrets/grafana-token
+# Permit HTTPS to the monitoring host in the container's egress policy.
+# /admin/keymeld and /admin/services share bounded, server-side query caches.
+# Enclave deployment labels describe configured releases, not attested identity.
