@@ -5,11 +5,13 @@ const { loadBundle } = require("./bundle.cjs");
 // The reader's zone, as the browser has it.
 process.env.TZ = "America/New_York";
 
-function time(datetime, local, zoned = false) {
+function time(datetime, local, zoned = false, since = undefined) {
+  const dataset = zoned ? { local, zone: "" } : { local };
+  if (since) dataset.since = since;
   return {
     textContent: "fallback UTC",
     title: "",
-    dataset: zoned ? { local, zone: "" } : { local },
+    dataset,
     getAttribute: (name) => (assert.equal(name, "datetime"), datetime),
   };
 }
@@ -35,4 +37,14 @@ test("competition starts show a weekday and the local daylight-saving zone", () 
   assert.equal(summer.textContent.replace(/\s/g, " "), "Sun, 1:00 PM EDT");
   assert.equal(winter.textContent.replace(/\s/g, " "), "Sun, 1:00 PM EST");
   assert.ok(summer.title.includes("2026"));
+});
+
+test("a window's end on the next local day keeps its date", () => {
+  // Oct 3 00:00–12:00 UTC is one UTC day, but 8 PM to 8 AM in New York.
+  const overnight = time("2026-10-03T12:00:00Z", "time", true, "2026-10-03T00:00:00Z");
+  const daytime = time("2026-10-03T22:00:00Z", "time", true, "2026-10-03T12:00:00Z");
+  const { localizeTimes } = loadBundle(["shared/page.js"], { Date, console }, ["localizeTimes"]);
+  localizeTimes({ querySelectorAll: () => [overnight, daytime] });
+  assert.equal(overnight.textContent.replace(/\s/g, " "), "Oct 3, 8:00 AM EDT");
+  assert.equal(daytime.textContent.replace(/\s/g, " "), "6:00 PM EDT");
 });
