@@ -477,6 +477,38 @@ async fn a_singleton_worker_runs_in_one_coordinator_until_it_stops() {
     assert_eq!(blue.tick("payout-watcher", async { 6 }).await, None);
 }
 
+/// A worker that ticks every few seconds extends its lease only every third of the ttl,
+/// not with a write on every tick.
+#[tokio::test]
+async fn a_held_worker_lease_is_extended_only_every_third_of_its_ttl() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = open(&directory).await;
+    let ttl = Duration::from_millis(600);
+    let blue = super::super::WorkerLeases::new(
+        Arc::new(CompetitionStore::new(database.clone())),
+        "blue".into(),
+        ttl,
+    );
+    let expiry = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT expires_at FROM leases WHERE resource = 'worker:escrow-swaps'",
+        )
+        .fetch_one(database.read())
+        .await
+        .unwrap()
+    };
+
+    assert_eq!(blue.tick("escrow-swaps", async { 1 }).await, Some(1));
+    let first = expiry().await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(blue.tick("escrow-swaps", async { 2 }).await, Some(2));
+    assert_eq!(expiry().await, first, "a recent lease is not written again");
+
+    tokio::time::sleep(ttl / 3).await;
+    assert_eq!(blue.tick("escrow-swaps", async { 3 }).await, Some(3));
+    assert!(expiry().await > first, "it is extended before it runs low");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wake_reaches_the_coordinator_driving_the_competition() {
     let directory = tempfile::tempdir().unwrap();

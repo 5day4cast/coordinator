@@ -138,6 +138,9 @@ impl Coordinator {
             .await
             .map_err(|e| anyhow!("Cannot reserve funding inputs: {e}"))?;
 
+        // Most steps find nothing to do. Their competition is not saved again: each save
+        // rewrites the whole row, signed contract included, and the database replicates it.
+        let loaded = CompetitionStore::update_columns(&competition).ok();
         let status: CompetitionStatus = competition.into();
         let before = status.state_name();
         let next = self.process_status(status).await;
@@ -169,7 +172,9 @@ impl Coordinator {
         let competition = stored.into_competition();
         let died = competition.is_failed() || competition.is_cancelled();
         let failed_at = competition.failed_at;
-        self.save_leased(competition, lease).await?;
+        if loaded.is_none() || CompetitionStore::update_columns(&competition).ok() != loaded {
+            self.save_leased(competition, lease).await?;
+        }
         if after != before {
             info!("Competition {competition_id} transitioned {before} -> {after}");
         } else {
@@ -350,6 +355,46 @@ mod tests {
             CompetitionStatus::from(next.into_competition()).state_name(),
             "contract_created",
             "the state a waiting legacy contract moves to is the one it reloads as"
+        );
+        database.close().await.unwrap();
+    }
+
+    /// A step that changes nothing skips its save, which compares the stored columns of the
+    /// competition it loaded with those after the step. A reloaded competition must compare
+    /// equal to its stored self, and any change must show.
+    #[tokio::test]
+    async fn an_unchanged_competition_compares_equal_after_a_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let (coordinator, database) = test_coordinator(directory.path()).await;
+        let store = &coordinator.competition_store;
+        let competition = funded_competition();
+        store
+            .add_competition_with_tickets(competition.clone(), vec![])
+            .await
+            .unwrap();
+        store
+            .update_competitions(vec![competition.clone()])
+            .await
+            .unwrap();
+
+        let loaded = store.get_competition(competition.id).await.unwrap();
+        let columns = CompetitionStore::update_columns(&loaded).unwrap();
+        let reloaded = store.get_competition(competition.id).await.unwrap();
+        assert_eq!(
+            CompetitionStore::update_columns(&reloaded).unwrap(),
+            columns
+        );
+
+        let mut errored = loaded.clone();
+        errored
+            .errors
+            .push(CompetitionError::FailedCreateTransaction("retry".into()));
+        assert_ne!(CompetitionStore::update_columns(&errored).unwrap(), columns);
+        let mut completed = loaded;
+        completed.completed_at = Some(OffsetDateTime::now_utc());
+        assert_ne!(
+            CompetitionStore::update_columns(&completed).unwrap(),
+            columns
         );
         database.close().await.unwrap();
     }

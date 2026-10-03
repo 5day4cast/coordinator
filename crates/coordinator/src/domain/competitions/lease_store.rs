@@ -185,11 +185,15 @@ pub async fn while_leased<F: Future>(
 /// Leases on background workers that must run in one coordinator process at a time, such as
 /// the ones that pay winners. Each keeps its lease between ticks, so work stays in one process
 /// until it stops.
+///
+/// A lease is extended at most every third of its `ttl`, as `while_leased` renews it, not on
+/// every tick: a worker that ticks every few seconds would otherwise commit a write each time.
 pub struct WorkerLeases {
     store: Arc<CompetitionStore>,
     holder: String,
     ttl: Duration,
-    held: DashMap<String, Lease>,
+    /// Each held lease, and when its expiry was last set (taken before the write).
+    held: DashMap<String, (Lease, tokio::time::Instant)>,
 }
 
 impl WorkerLeases {
@@ -206,22 +210,36 @@ impl WorkerLeases {
     /// `None` if another coordinator runs it.
     pub async fn tick<F: Future>(&self, worker: &str, work: F) -> Option<F::Output> {
         let resource = format!("worker:{worker}");
-        let lease = match self
-            .store
-            .acquire_lease(&resource, &self.holder, self.ttl)
-            .await
-        {
-            Ok(Some(lease)) => lease,
-            Ok(None) => {
-                self.held.remove(&resource);
-                return None;
-            }
-            Err(e) => {
-                warn!("Cannot take the {worker} lease: {e}");
-                return None;
+        let recent = self
+            .held
+            .get(&resource)
+            .filter(|held| held.1.elapsed() < self.ttl / 3)
+            .map(|held| held.0.clone());
+        let lease = match recent {
+            // Still held for at least two thirds of its ttl; fenced writes check it anyway.
+            Some(lease) => lease,
+            None => {
+                let extended_at = tokio::time::Instant::now();
+                let lease = match self
+                    .store
+                    .acquire_lease(&resource, &self.holder, self.ttl)
+                    .await
+                {
+                    Ok(Some(lease)) => lease,
+                    Ok(None) => {
+                        self.held.remove(&resource);
+                        return None;
+                    }
+                    Err(e) => {
+                        warn!("Cannot take the {worker} lease: {e}");
+                        return None;
+                    }
+                };
+                self.held
+                    .insert(resource.clone(), (lease.clone(), extended_at));
+                lease
             }
         };
-        self.held.insert(resource.clone(), lease.clone());
         match while_leased(&self.store, &lease, self.ttl, work).await {
             Ok(output) => Some(output),
             Err(LeaseLost) => {
@@ -234,7 +252,7 @@ impl WorkerLeases {
 
     /// Hand `worker` over at once, when it stops.
     pub async fn release(&self, worker: &str) {
-        if let Some((_, lease)) = self.held.remove(&format!("worker:{worker}")) {
+        if let Some((_, (lease, _))) = self.held.remove(&format!("worker:{worker}")) {
             if let Err(e) = self.store.release_lease(&lease).await {
                 warn!("Cannot release lease {}: {e}", lease.resource);
             }
@@ -246,7 +264,7 @@ impl WorkerLeases {
         let held: Vec<Lease> = self
             .held
             .iter()
-            .map(|entry| entry.value().clone())
+            .map(|entry| entry.value().0.clone())
             .collect();
         for lease in held {
             if let Err(e) = self.store.release_lease(&lease).await {

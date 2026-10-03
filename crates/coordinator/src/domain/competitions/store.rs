@@ -993,6 +993,198 @@ impl CompetitionStore {
         Ok(competition)
     }
 
+    /// The values `write_competitions` stores for `competition`, in its UPDATE's column order.
+    /// Equal values mean saving the competition again would change nothing.
+    pub(crate) fn update_columns(
+        competition: &Competition,
+    ) -> Result<Vec<Option<String>>, sqlx::Error> {
+        let event_announcement = competition
+            .event_announcement
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let outcome_transaction = competition
+            .outcome_transaction
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let funding_psbt_base64 = competition.funding_psbt_base64.clone();
+        let funding_transaction = competition
+            .funding_transaction
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let funding_outpoint = competition
+            .funding_outpoint
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let contract_parameters = competition
+            .contract_parameters
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let public_nonces = competition
+            .public_nonces
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let aggregated_nonces = competition
+            .aggregated_nonces
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let partial_signatures = competition
+            .partial_signatures
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let signed_contract = competition
+            .signed_contract
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let attestation = competition
+            .attestation
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let cancelled_at = competition
+            .cancelled_at
+            .map(|ts| ts.format(&Rfc3339))
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let contracted_at = competition
+            .contracted_at
+            .map(|ts| ts.format(&Rfc3339))
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let signed_at = competition
+            .signed_at
+            .map(|ts| ts.format(&Rfc3339))
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let escrow_funds_confirmed_at = competition
+            .escrow_funds_confirmed_at
+            .map(|ts| ts.format(&Rfc3339))
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let event_created_at = competition
+            .event_created_at
+            .map(|ts| ts.format(&Rfc3339))
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let entries_submitted_at = competition
+            .entries_submitted_at
+            .map(|ts| ts.format(&Rfc3339))
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let funding_broadcasted_at = competition
+            .funding_broadcasted_at
+            .map(|ts| ts.format(&Rfc3339))
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let funding_confirmed_at = competition
+            .funding_confirmed_at
+            .map(|ts| ts.format(&Rfc3339))
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let funding_settled_at = competition
+            .funding_settled_at
+            .map(|ts| ts.format(&Rfc3339))
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let awaiting_attestation_at = competition
+            .awaiting_attestation_at
+            .map(|ts| ts.format(&Rfc3339))
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let expiry_broadcasted_at = competition
+            .expiry_broadcasted_at
+            .map(|ts| ts.format(&Rfc3339))
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let outcome_broadcasted_at = competition
+            .outcome_broadcasted_at
+            .map(|ts| ts.format(&Rfc3339))
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let delta_broadcasted_at = competition
+            .delta_broadcasted_at
+            .map(|ts| ts.format(&Rfc3339))
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let completed_at = competition
+            .completed_at
+            .map(|ts| ts.format(&Rfc3339))
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let failed_at = competition
+            .failed_at
+            .map(|ts| ts.format(&Rfc3339))
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let keymeld_keygen_completed_at = competition
+            .keymeld_keygen_completed_at
+            .map(|ts| ts.format(&Rfc3339))
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let invoices_settled_at = competition
+            .invoices_settled_at
+            .map(|ts| ts.format(&Rfc3339))
+            .transpose()
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let errors = if !competition.errors.is_empty() {
+            Some(
+                serde_json::to_string(&competition.errors)
+                    .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
+            )
+        } else {
+            None
+        };
+        Ok(vec![
+            event_announcement,
+            outcome_transaction,
+            funding_psbt_base64,
+            funding_transaction,
+            funding_outpoint,
+            contract_parameters,
+            public_nonces,
+            aggregated_nonces,
+            partial_signatures,
+            signed_contract,
+            attestation,
+            cancelled_at,
+            contracted_at,
+            signed_at,
+            escrow_funds_confirmed_at,
+            event_created_at,
+            entries_submitted_at,
+            funding_broadcasted_at,
+            funding_confirmed_at,
+            funding_settled_at,
+            awaiting_attestation_at,
+            expiry_broadcasted_at,
+            outcome_broadcasted_at,
+            delta_broadcasted_at,
+            completed_at,
+            failed_at,
+            keymeld_keygen_completed_at,
+            invoices_settled_at,
+            errors,
+        ])
+    }
+
     pub async fn update_competitions(
         &self,
         competitions: Vec<Competition>,
@@ -1022,198 +1214,15 @@ impl CompetitionStore {
         fence: Option<super::Lease>,
     ) -> Result<u64, DatabaseWriteError> {
         // Prepare all competition data before moving into closure
-        let mut prepared_updates = Vec::with_capacity(competitions.len());
-
-        for competition in competitions {
-            let event_announcement = competition
-                .event_announcement
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let outcome_transaction = competition
-                .outcome_transaction
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let funding_psbt_base64 = competition.funding_psbt_base64.clone();
-            let funding_transaction = competition
-                .funding_transaction
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let funding_outpoint = competition
-                .funding_outpoint
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let contract_parameters = competition
-                .contract_parameters
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let public_nonces = competition
-                .public_nonces
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let aggregated_nonces = competition
-                .aggregated_nonces
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let partial_signatures = competition
-                .partial_signatures
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let signed_contract = competition
-                .signed_contract
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let attestation = competition
-                .attestation
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let cancelled_at = competition
-                .cancelled_at
-                .map(|ts| ts.format(&Rfc3339))
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let contracted_at = competition
-                .contracted_at
-                .map(|ts| ts.format(&Rfc3339))
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let signed_at = competition
-                .signed_at
-                .map(|ts| ts.format(&Rfc3339))
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let escrow_funds_confirmed_at = competition
-                .escrow_funds_confirmed_at
-                .map(|ts| ts.format(&Rfc3339))
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let event_created_at = competition
-                .event_created_at
-                .map(|ts| ts.format(&Rfc3339))
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let entries_submitted_at = competition
-                .entries_submitted_at
-                .map(|ts| ts.format(&Rfc3339))
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let funding_broadcasted_at = competition
-                .funding_broadcasted_at
-                .map(|ts| ts.format(&Rfc3339))
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let funding_confirmed_at = competition
-                .funding_confirmed_at
-                .map(|ts| ts.format(&Rfc3339))
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let funding_settled_at = competition
-                .funding_settled_at
-                .map(|ts| ts.format(&Rfc3339))
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let awaiting_attestation_at = competition
-                .awaiting_attestation_at
-                .map(|ts| ts.format(&Rfc3339))
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let expiry_broadcasted_at = competition
-                .expiry_broadcasted_at
-                .map(|ts| ts.format(&Rfc3339))
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let outcome_broadcasted_at = competition
-                .outcome_broadcasted_at
-                .map(|ts| ts.format(&Rfc3339))
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let delta_broadcasted_at = competition
-                .delta_broadcasted_at
-                .map(|ts| ts.format(&Rfc3339))
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let completed_at = competition
-                .completed_at
-                .map(|ts| ts.format(&Rfc3339))
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let failed_at = competition
-                .failed_at
-                .map(|ts| ts.format(&Rfc3339))
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let keymeld_keygen_completed_at = competition
-                .keymeld_keygen_completed_at
-                .map(|ts| ts.format(&Rfc3339))
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let invoices_settled_at = competition
-                .invoices_settled_at
-                .map(|ts| ts.format(&Rfc3339))
-                .transpose()
-                .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-            let errors = if !competition.errors.is_empty() {
-                Some(
-                    serde_json::to_string(&competition.errors)
-                        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?,
-                )
-            } else {
-                None
-            };
-            let competition_id = competition.id.to_string();
-
-            prepared_updates.push((
-                event_announcement,
-                outcome_transaction,
-                funding_psbt_base64,
-                funding_transaction,
-                funding_outpoint,
-                contract_parameters,
-                public_nonces,
-                aggregated_nonces,
-                partial_signatures,
-                signed_contract,
-                attestation,
-                cancelled_at,
-                contracted_at,
-                signed_at,
-                escrow_funds_confirmed_at,
-                event_created_at,
-                entries_submitted_at,
-                funding_broadcasted_at,
-                funding_confirmed_at,
-                funding_settled_at,
-                awaiting_attestation_at,
-                expiry_broadcasted_at,
-                outcome_broadcasted_at,
-                delta_broadcasted_at,
-                completed_at,
-                failed_at,
-                keymeld_keygen_completed_at,
-                invoices_settled_at,
-                errors,
-                competition_id,
-            ));
-        }
+        let prepared_updates = competitions
+            .iter()
+            .map(|competition| {
+                Ok((
+                    Self::update_columns(competition)?,
+                    competition.id.to_string(),
+                ))
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
         self.db_connection
             .execute_write(move |pool| async move {
@@ -1254,74 +1263,16 @@ impl CompetitionStore {
                 );
                 let mut written = 0;
 
-                for (
-                    event_announcement,
-                    outcome_transaction,
-                    funding_psbt_base64,
-                    funding_transaction,
-                    funding_outpoint,
-                    contract_parameters,
-                    public_nonces,
-                    aggregated_nonces,
-                    partial_signatures,
-                    signed_contract,
-                    attestation,
-                    cancelled_at,
-                    contracted_at,
-                    signed_at,
-                    escrow_funds_confirmed_at,
-                    event_created_at,
-                    entries_submitted_at,
-                    funding_broadcasted_at,
-                    funding_confirmed_at,
-                    funding_settled_at,
-                    awaiting_attestation_at,
-                    expiry_broadcasted_at,
-                    outcome_broadcasted_at,
-                    delta_broadcasted_at,
-                    completed_at,
-                    failed_at,
-                    keymeld_keygen_completed_at,
-                    invoices_settled_at,
-                    errors,
-                    competition_id,
-                ) in prepared_updates
-                {
+                for (columns, competition_id) in prepared_updates {
                     let mut update = sqlx::query(if fence.is_some() {
                         fenced_query.as_str()
                     } else {
                         query
-                    })
-                    .bind(event_announcement)
-                    .bind(outcome_transaction)
-                    .bind(funding_psbt_base64)
-                    .bind(funding_transaction)
-                    .bind(funding_outpoint)
-                    .bind(contract_parameters)
-                    .bind(public_nonces)
-                    .bind(aggregated_nonces)
-                    .bind(partial_signatures)
-                    .bind(signed_contract)
-                    .bind(attestation)
-                    .bind(cancelled_at)
-                    .bind(contracted_at)
-                    .bind(signed_at)
-                    .bind(escrow_funds_confirmed_at)
-                    .bind(event_created_at)
-                    .bind(entries_submitted_at)
-                    .bind(funding_broadcasted_at)
-                    .bind(funding_confirmed_at)
-                    .bind(funding_settled_at)
-                    .bind(awaiting_attestation_at)
-                    .bind(expiry_broadcasted_at)
-                    .bind(outcome_broadcasted_at)
-                    .bind(delta_broadcasted_at)
-                    .bind(completed_at)
-                    .bind(failed_at)
-                    .bind(keymeld_keygen_completed_at)
-                    .bind(invoices_settled_at)
-                    .bind(errors)
-                    .bind(competition_id);
+                    });
+                    for column in columns {
+                        update = update.bind(column);
+                    }
+                    update = update.bind(competition_id);
                     if let Some(lease) = &fence {
                         update = update
                             .bind(&lease.resource)

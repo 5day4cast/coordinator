@@ -106,8 +106,10 @@ impl InvoiceSubscriber {
             .mark_ticket_paid(&ticket.hash, ticket.competition_id)
             .await
         {
-            Ok(_) => {
-                self.coordinator.wake_competition(ticket.competition_id);
+            Ok(newly_paid) => {
+                if newly_paid {
+                    self.coordinator.wake_competition(ticket.competition_id);
+                }
                 // The invoice watcher publishes the escrow and settles the invoice.
                 self.health.wake();
             }
