@@ -1038,8 +1038,11 @@ fn default_sweep_interval_secs() -> u64 {
     60
 }
 
+// Each held lease is renewed every third of this, and every renewal is a write that
+// replication has to ship. A clean shutdown releases leases at once, so the length
+// only delays takeover after a crash.
 fn default_lease_ttl_secs() -> u64 {
-    30
+    120
 }
 
 fn default_max_concurrent_steps() -> usize {
