@@ -771,6 +771,7 @@ pub async fn build_app(
         &config.coordinator_settings.oracle_url,
     )?);
     leaderboards.spawn_refresher(&tracker, cancel_token.clone());
+    admin_weather.spawn_refresher(&tracker, cancel_token.clone());
     tracker.close();
 
     let wasm_version = crate::api::ui_files::package_version(&config.ui_settings.ui_dir);

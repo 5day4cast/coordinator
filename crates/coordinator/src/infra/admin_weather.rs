@@ -2,9 +2,10 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{ensure, Context};
-use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, Date, OffsetDateTime};
+
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use super::{
     oracle_weather::Station,
@@ -183,6 +184,12 @@ fn distance_km(a: &Station, b: &Station) -> f64 {
             .asin()
 }
 
+#[derive(Debug, Deserialize)]
+struct DiscoveryForecasts {
+    stations: Vec<EligibleStation>,
+    forecasts: Vec<Forecast>,
+}
+
 pub struct WeatherDiscovery {
     http: reqwest::Client,
     base: String,
@@ -199,6 +206,30 @@ impl WeatherDiscovery {
             base: base.trim_end_matches('/').to_owned(),
             cache: Arc::new(RefreshCache::new()),
         })
+    }
+
+    /// Prepare tomorrow's default view before an operator opens the page.
+    /// The minute tick refreshes near expiry and follows the UTC date rollover.
+    pub fn spawn_refresher(self: &Arc<Self>, tracker: &TaskTracker, cancel: CancellationToken) {
+        let service = self.clone();
+        tracker.spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = tick.tick() => {
+                        if let Ok(window) = Filters::default().window(OffsetDateTime::now_utc()) {
+                            let fetcher = service.clone();
+                            service.cache.refresh(window.clone(), Duration::from_secs(240), move || async move {
+                                tokio::time::timeout(Duration::from_secs(60), fetcher.fetch(&window)).await?
+                            });
+                        }
+                    }
+                }
+            }
+        });
     }
 
     pub async fn read(self: &Arc<Self>, window: Window) -> Cached<Discovery> {
@@ -244,48 +275,39 @@ impl WeatherDiscovery {
     }
 
     async fn fetch(&self, window: &Window) -> anyhow::Result<Discovery> {
-        let eligible = self.eligible(window).await?;
+        let response: DiscoveryForecasts = self
+            .http
+            .get(format!("{}/stations/eligible/forecasts", self.base))
+            .query(&[
+                ("days", window.history_days.to_string()),
+                ("start", window.start.format(&Rfc3339)?),
+                ("end", window.end.format(&Rfc3339)?),
+            ])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         ensure!(
-            eligible.len() <= 5000,
+            response.stations.len() <= 5000,
             "Oracle returned too many eligible stations"
         );
-        let start = window.start.format(&Rfc3339)?;
-        let end = window.end.format(&Rfc3339)?;
-        let requests: Vec<_> = eligible
-            .chunks(100)
-            .map(|batch| {
-                let ids = batch
-                    .iter()
-                    .map(|s| s.station.station_id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                self.http
-                    .get(format!("{}/stations/forecasts", self.base))
-                    .query(&[
-                        ("station_ids", ids.as_str()),
-                        ("start", &start),
-                        ("end", &end),
-                        ("temperature_unit", "fahrenheit"),
-                    ])
+        // Keep the future-window check here as well as in Oracle. Creation always
+        // rechecks the original eligible endpoint instead of trusting this cache.
+        let eligible: Vec<_> = response
+            .stations
+            .into_iter()
+            .filter(|station| {
+                OffsetDateTime::parse(&station.forecast_through, &Rfc3339)
+                    .is_ok_and(|through| through >= window.end)
             })
             .collect();
-        let batches: Vec<anyhow::Result<Vec<Forecast>>> =
-            stream::iter(requests)
-                .map(|request| async move {
-                    Ok(request.send().await?.error_for_status()?.json().await?)
-                })
-                .buffer_unordered(3)
-                .collect()
-                .await;
         let mut forecasts: HashMap<String, Vec<Forecast>> = HashMap::new();
-        // Partial retrieval must not silently change the candidate ranking.
-        for batch in batches {
-            for forecast in batch? {
-                forecasts
-                    .entry(forecast.station_id.clone())
-                    .or_default()
-                    .push(forecast);
-            }
+        for forecast in response.forecasts {
+            forecasts
+                .entry(forecast.station_id.clone())
+                .or_default()
+                .push(forecast);
         }
         let eligible_count = eligible.len();
         let candidates: Vec<_> = eligible
@@ -318,21 +340,22 @@ mod tests {
     async fn discovery_requires_future_coverage_and_preserves_unknown_weather() {
         use axum::{extract::Query, routing::get, Json, Router};
         use serde_json::json;
-        let app = Router::new()
-            .route("/stations/eligible", get(|Query(query): Query<HashMap<String, String>>| async move {
-                assert_eq!(query["days"], "3");
-                assert_eq!(query["window_hours"], "24");
-                Json(json!([
+        let app = Router::new().route("/stations/eligible/forecasts", get(|Query(query): Query<HashMap<String, String>>| async move {
+            assert_eq!(query["days"], "3");
+            assert_eq!(query["start"], "2026-10-03T00:00:00Z");
+            assert_eq!(query["end"], "2026-10-04T00:00:00Z");
+            Json(json!({
+                "stations": [
                     {"station_id":"KSEA","station_name":"Seattle","state":"WA","iata_id":"SEA","latitude":47.45,"longitude":-122.3,"clean_days":3,"days_checked":3,"last_report":"2026-10-02T10:00:00Z","forecast_through":"2026-10-05T00:00:00Z"},
                     {"station_id":"KPDX","station_name":"Portland","state":"OR","iata_id":"PDX","latitude":45.58,"longitude":-122.6,"clean_days":3,"days_checked":3,"last_report":"2026-10-02T10:00:00Z","forecast_through":"2026-10-03T00:00:00Z"}
-                ]))
+                ],
+                "forecasts": [
+                    {"station_id":"KSEA", "temp_high":68, "temp_low":50},
+                    {"station_id":"KPDX", "temp_high":95, "temp_low":50},
+                    {"station_id":"KORD", "temp_high":100, "temp_low":30}
+                ]
             }))
-            .route("/stations/forecasts", get(|Query(query): Query<HashMap<String, String>>| async move {
-                assert_eq!(query["station_ids"], "KSEA");
-                assert_eq!(query["start"], "2026-10-03T00:00:00Z");
-                assert_eq!(query["temperature_unit"], "fahrenheit");
-                Json(json!([{ "station_id":"KSEA", "temp_high":68, "temp_low":50 }]))
-            }));
+        }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
@@ -374,6 +397,76 @@ mod tests {
         let mut other_history = window.clone();
         other_history.history_days = 30;
         assert_ne!(window, other_history);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn warmer_prepares_default_view_and_stops_on_shutdown() {
+        use axum::{routing::get, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let app = Router::new().route(
+            "/stations/eligible/forecasts",
+            get(move || {
+                let observed = observed.clone();
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({"stations":[],"forecasts":[]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let service = Arc::new(
+            WeatherDiscovery::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap(),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let tracker = TaskTracker::new();
+        let cancel = CancellationToken::new();
+        service.spawn_refresher(&tracker, cancel.clone());
+        let window = Filters::default()
+            .window(OffsetDateTime::now_utc())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while service.cache.peek(&window).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(service.read(window).await.latest.is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        cancel.cancel();
+        tracker.close();
+        tokio::time::timeout(Duration::from_secs(1), tracker.wait())
+            .await
+            .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unavailable_bulk_discovery_is_not_replaced_by_partial_or_unverified_data() {
+        use axum::{http::StatusCode, routing::get, Router};
+        let app = Router::new().route(
+            "/stations/eligible/forecasts",
+            get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let service = Arc::new(
+            WeatherDiscovery::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap(),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let window = Filters::default()
+            .window(OffsetDateTime::now_utc())
+            .unwrap();
+        let data = service.read(window).await;
+        assert!(data.latest.is_none());
+        assert!(!data.refreshing);
         server.abort();
     }
 
