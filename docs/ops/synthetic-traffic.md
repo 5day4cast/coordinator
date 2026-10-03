@@ -4,6 +4,20 @@ Use synth to test staggered players, abandoned entries, and duplicate or late su
 
 These scenarios can pay real entries from the configured node. The remote CLI asks for confirmation unless `--yes` is supplied.
 
+## Control scenarios
+
+Use **Scenarios** on the Synth dashboard to pause or enable each scenario. The table shows its configured lanes or **Manual only**, its recent results, and its last run. Changes are stored in Synth's database and survive service restarts.
+
+Pause stops new scheduled and manual runs of that scenario. Runs already recorded continue, including entry payments, payout tracking, and refunds. Enabling a scenario permits the next scheduled run; it does not start one immediately or add a manual-only scenario to the scheduler. Browser controls use the dashboard's existing HTMX script and operator-write protection.
+
+## Select eligible stations
+
+Every new Synth competition checks Oracle's `/stations/eligible` endpoint. Scheduled lanes and manual scenario triggers rank eligible stations by forecast weather. A lane without a `picker` block uses weather selection. `mode = "fixed"` or `candidates = "configured"` restricts selection to configured stations that are also eligible.
+
+The **Create competition** form preserves the operator's station choices and checks each against the eligible list. Each selected station must have a forecast in the requested observation window. Missing eligibility, an empty list, or insufficient forecast data stops creation before entry payments. Synth does not substitute stations from the general station directory. Successful eligibility responses are cached for up to ten minutes; failed requests are retried on the next attempt.
+
+The default eligibility lookback is three days. Eligibility describes recent coverage; it cannot guarantee future reports. Settlement still waits for the Oracle's observation and coverage checks. Use the saved weather selection and the competition's Oracle event to investigate a delay.
+
 ## Authorize operator writes
 
 Browser writes require an allowed Origin and the dashboard's CSRF nonce. The dashboard adds the nonce automatically.

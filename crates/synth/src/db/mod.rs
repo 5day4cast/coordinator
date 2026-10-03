@@ -1,5 +1,55 @@
 pub mod payment_intents;
 
+#[cfg(test)]
+mod scenario_control_tests {
+    use super::SynthDb;
+
+    #[tokio::test]
+    async fn pause_survives_restart_and_only_blocks_new_runs() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synth.db");
+        let db = SynthDb::new(path.to_str().unwrap()).await.unwrap();
+        assert!(db.scenario_enabled("full_lifecycle").await.unwrap());
+        let existing = db.create_run("full_lifecycle", None).await.unwrap();
+        db.set_scenario_enabled("full_lifecycle", false)
+            .await
+            .unwrap();
+        db.pool().close().await;
+        let reopened = SynthDb::new(path.to_str().unwrap()).await.unwrap();
+        assert!(!reopened.scenario_enabled("full_lifecycle").await.unwrap());
+        assert!(reopened.create_run("full_lifecycle", None).await.is_err());
+        reopened.complete_run(&existing, None).await.unwrap();
+        assert_eq!(
+            reopened.get_run(&existing).await.unwrap().unwrap().status,
+            "passed"
+        );
+        assert!(reopened.create_run("late_submission", None).await.is_ok());
+        reopened
+            .set_scenario_enabled("full_lifecycle", true)
+            .await
+            .unwrap();
+        assert!(reopened.create_run("full_lifecycle", None).await.is_ok());
+        assert!(reopened
+            .set_scenario_enabled("not_a_scenario", false)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn unreadable_controls_block_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = SynthDb::new(directory.path().join("synth.db").to_str().unwrap())
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE scenario_controls")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(db.scenario_enabled("full_lifecycle").await.is_err());
+        assert!(db.create_run("full_lifecycle", None).await.is_err());
+    }
+}
+
 use anyhow::{Context, Result};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
@@ -236,6 +286,8 @@ impl SynthDb {
         .execute(&self.pool)
         .await?;
 
+        sqlx::query("CREATE TABLE IF NOT EXISTS scenario_controls (scenario TEXT PRIMARY KEY, enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)), updated_at TEXT NOT NULL)")
+            .execute(&self.pool).await?;
         self.migrate_payment_intents().await?;
         crate::picker::store::migrate(&self.pool).await?;
 
@@ -393,6 +445,39 @@ impl SynthDb {
         Ok(rebalances)
     }
 
+    /// Missing controls preserve the existing enabled schedule. Database errors never enable runs.
+    pub async fn scenario_enabled(&self, scenario: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT enabled FROM scenario_controls WHERE scenario = ?",
+        )
+        .bind(scenario)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(true))
+    }
+
+    pub async fn disabled_scenarios(&self) -> Result<std::collections::HashSet<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT scenario FROM scenario_controls WHERE enabled = 0",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .collect())
+    }
+
+    pub async fn set_scenario_enabled(&self, scenario: &str, enabled: bool) -> Result<()> {
+        anyhow::ensure!(
+            crate::runner::SCENARIOS.contains(&scenario),
+            "Unknown scenario: {scenario}"
+        );
+        sqlx::query("INSERT INTO scenario_controls (scenario, enabled, updated_at) VALUES (?, ?, ?) ON CONFLICT(scenario) DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at")
+            .bind(scenario).bind(enabled)
+            .bind(OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
     // --- Test Runs ---
 
     pub async fn create_run(&self, scenario: &str, config_json: Option<&str>) -> Result<String> {
@@ -400,15 +485,20 @@ impl SynthDb {
         let now =
             OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
 
-        sqlx::query(
-            "INSERT INTO test_runs (id, scenario, status, started_at, config_json) VALUES (?, ?, 'running', ?, ?)",
+        let created = sqlx::query(
+            "INSERT INTO test_runs (id, scenario, status, started_at, config_json) SELECT ?, ?, 'running', ?, ? WHERE NOT EXISTS (SELECT 1 FROM scenario_controls WHERE scenario = ? AND enabled = 0)",
         )
         .bind(&id)
         .bind(scenario)
         .bind(&now)
         .bind(config_json)
+        .bind(scenario)
         .execute(&self.pool)
         .await?;
+        anyhow::ensure!(
+            created.rows_affected() == 1,
+            "Scenario {scenario} is paused; no new run was started"
+        );
 
         Ok(id)
     }

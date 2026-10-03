@@ -47,7 +47,7 @@ pub struct LaneConfig {
     /// How many of `stations` each competition takes, drawn per run; all of them otherwise.
     #[serde(default)]
     pub stations_per_run: Option<usize>,
-    /// How the stations are chosen; drawn at random from `stations` otherwise.
+    /// How eligible stations are ranked; weather selection is the default.
     #[serde(default)]
     pub picker: Option<crate::picker::PickerConfig>,
     /// Set false to put a stress run's competitions on the oracle's public list. Every other

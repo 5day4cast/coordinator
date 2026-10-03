@@ -31,6 +31,10 @@ struct Cli {
     #[arg(long, env = "COORDINATOR_ADMIN_TOKEN_FILE")]
     admin_token_file: Option<String>,
 
+    /// Oracle URL used to require eligible stations for synthetic runs
+    #[arg(long, env = "ORACLE_URL", default_value = "https://4casttruth.win")]
+    oracle_url: String,
+
     /// SQLite database path for synth data
     #[arg(long, env = "SYNTH_DB_PATH", default_value = "./data/synth.db")]
     db_path: String,
@@ -222,7 +226,9 @@ async fn main() -> Result<()> {
         },
         Commands::Synth { action } => {
             let db = SynthDb::new(&cli.db_path).await?;
-            let runner = Runner::new(client, db, coordinator_synth::events::Events::new());
+            let picker = coordinator_synth::picker::Picker::new(&cli.oracle_url, db.clone());
+            let runner = Runner::new(client, db, coordinator_synth::events::Events::new())
+                .with_picker(picker);
 
             match action {
                 SynthCommands::Run {

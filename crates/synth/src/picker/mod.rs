@@ -1,11 +1,10 @@
-//! Choosing a lane's stations for the weather: from every station the oracle can attest, or the
-//! lane's own list, the ones with the most going on in the competition's window.
+//! Choose weather stations only from the oracle's eligible list.
 //!
 //! For each run of a lane with `picker.mode = "weather"`, the picker drops the stations the lane
 //! used in its last few competitions, scores the rest on their forecast for the window, and takes
 //! the best as the leader. The others are the best near the leader, in the same weather, or the
 //! best far enough from each other. The pick and why are saved with the competition and shown on
-//! the run's page. Whatever the oracle cannot answer, the lane's own stations fill in for.
+//! the run's page. If eligibility or enough forecasts are unavailable, creation stops.
 
 pub mod oracle;
 pub mod score;
@@ -13,7 +12,6 @@ pub mod store;
 pub mod view;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use log::{info, warn};
@@ -26,7 +24,7 @@ use crate::db::SynthDb;
 use crate::runner::lanes::LaneConfig;
 use crate::scenarios::ScenarioConfig;
 use oracle::{OracleClient, StationInfo};
-use score::{Picked, Role};
+use score::Picked;
 
 /// How long the oracle's station lists are reused before being asked for again.
 const LIST_TTL: Duration = Duration::from_secs(600);
@@ -35,10 +33,10 @@ const LIST_TTL: Duration = Duration::from_secs(600);
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
-    /// `stations_per_run` drawn at random from the lane's stations.
-    #[default]
+    /// Rank eligible stations from the lane's configured list.
     Fixed,
     /// The stations with the most weather in the competition's window.
+    #[default]
     Weather,
 }
 
@@ -136,6 +134,20 @@ fn default_eligible_days() -> u32 {
     3
 }
 
+impl Default for PickerConfig {
+    fn default() -> Self {
+        Self {
+            mode: Mode::Weather,
+            candidates: Candidates::Eligible,
+            prefer_known_airports: true,
+            cluster_km: 600.0,
+            recent_runs_to_avoid: 0,
+            eligible_days: default_eligible_days(),
+            weights: Weights::default(),
+        }
+    }
+}
+
 impl PickerConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         let weights = [
@@ -194,23 +206,13 @@ impl Pick {
     }
 }
 
-/// A list from the oracle and when it was read.
-type Cached<T> = Option<(Instant, T)>;
-
-/// Picks the stations of lanes that choose them for the weather.
-/// Eligible station lists by history days and window hours, with when each was fetched; None when the oracle
-/// has no such list.
-type EligibleCache = HashMap<(u32, u64), (Instant, Option<Vec<StationInfo>>)>;
+/// Successful eligible lists are reused for at most ten minutes. Failures are never cached.
+type EligibleCache = HashMap<(u32, u64), (Instant, Vec<StationInfo>)>;
 
 pub struct Picker {
     oracle: OracleClient,
     db: SynthDb,
-    /// The eligible stations by history days and window length, None without a list.
     eligible: Mutex<EligibleCache>,
-    /// Every station the oracle knows, to place a lane's own stations.
-    directory: Mutex<Cached<Vec<StationInfo>>>,
-    /// Whether the missing eligible list has been warned about since it was last read.
-    warned: AtomicBool,
 }
 
 impl Picker {
@@ -219,24 +221,18 @@ impl Picker {
             oracle: OracleClient::new(oracle_url),
             db,
             eligible: Mutex::new(HashMap::new()),
-            directory: Mutex::new(None),
-            warned: AtomicBool::new(false),
         }
     }
 
-    /// Choose `config`'s stations for the weather, if `lane` picks that way, and save the pick
-    /// with the competition, whose id is chosen here if it is not yet. Returns the pick. Any
-    /// station the oracle cannot help with comes from the lane's own list.
+    /// Choose only eligible stations with forecasts. Missing evidence stops this run.
     pub async fn choose(
         &self,
         lane: &LaneConfig,
         base: &ScenarioConfig,
         config: &mut ScenarioConfig,
-    ) -> Option<Pick> {
-        let settings = lane.picker.as_ref()?;
-        if settings.mode != Mode::Weather {
-            return None;
-        }
+    ) -> anyhow::Result<Pick> {
+        let defaults = PickerConfig::default();
+        let settings = lane.picker.as_ref().unwrap_or(&defaults);
         let configured = lane.configured_stations(base);
         let count = lane.stations_per_run.unwrap_or(configured.len());
         let start = config.observation_start.unwrap_or_else(|| {
@@ -257,7 +253,7 @@ impl Picker {
                 }
             };
         let window_hours = (config.observation_window_secs / 3600).clamp(1, 24);
-        let (source, all) = self.candidates(settings, configured, window_hours).await;
+        let (source, all) = self.candidates(settings, configured, window_hours).await?;
         let (avoided, candidates): (Vec<StationInfo>, Vec<StationInfo>) = all
             .into_iter()
             .partition(|station| recent.contains(&station.station_id));
@@ -276,17 +272,10 @@ impl Picker {
         let scored = score::score(&candidates, &forecasts, &settings.weights);
         let scored_count = scored.len();
         let ranked = score::rank(scored, settings.prefer_known_airports);
-        let mut picked = score::choose(&ranked, count, settings.cluster_km);
-        if picked.len() < count {
-            warn!(
-                "Lane {}: {} of {} candidates have a forecast for the window; the rest of its \
-                 {count} stations come from its own list",
-                lane.name,
-                scored_count,
-                candidates.len()
-            );
-            fill(&mut picked, count, &config.stations, configured, &recent);
-        }
+        let picked = score::choose(&ranked, count, settings.cluster_km);
+        anyhow::ensure!(picked.len() == count,
+            "Only {} eligible stations have forecasts for this window; need {count}. No competition was created",
+            picked.len());
 
         let pick = Pick {
             lane: lane.name.clone(),
@@ -308,126 +297,121 @@ impl Picker {
         if let Err(error) = store::record(&self.db, &pick).await {
             warn!("Lane {}: cannot save its pick: {error:#}", lane.name);
         }
-        Some(pick)
+        Ok(pick)
     }
 
-    /// The candidates, and where they came from in words: the eligible stations, or the lane's
-    /// own if it ranks only those or the oracle does not offer the list.
     async fn candidates(
         &self,
         settings: &PickerConfig,
         configured: &[String],
         window_hours: u64,
-    ) -> (String, Vec<StationInfo>) {
-        let eligible = self.eligible(settings.eligible_days, window_hours).await;
-        if settings.candidates == Candidates::Eligible {
-            if let Some(eligible) = eligible {
-                return ("the oracle's eligible stations".into(), eligible);
-            }
-        }
-        let known = match eligible {
-            Some(eligible) => eligible,
-            None => self.directory().await,
-        };
-        let located = configured
-            .iter()
-            .map(|id| {
-                known
-                    .iter()
-                    .find(|station| &station.station_id == id)
-                    .cloned()
-                    .unwrap_or_else(|| StationInfo::unknown(id))
-            })
-            .collect();
-        let source = match settings.candidates {
-            Candidates::Configured => "the lane's stations",
-            Candidates::Eligible => "the lane's stations, for want of the oracle's eligible list",
-        };
-        (source.into(), located)
+    ) -> anyhow::Result<(String, Vec<StationInfo>)> {
+        let eligible = self.eligible(settings.eligible_days, window_hours).await?;
+        let candidates =
+            if settings.candidates == Candidates::Configured || settings.mode == Mode::Fixed {
+                eligible
+                    .into_iter()
+                    .filter(|station| configured.contains(&station.station_id))
+                    .collect()
+            } else {
+                eligible
+            };
+        Ok(("the oracle's eligible stations".into(), candidates))
     }
 
-    /// The oracle's eligible stations, read at most every [`LIST_TTL`]; None if it does not
-    /// offer the list or cannot be asked, which is warned about once until it can again.
-    async fn eligible(&self, days: u32, window_hours: u64) -> Option<Vec<StationInfo>> {
+    /// Check explicit manual choices and already selected plans before recording a run.
+    pub async fn validate_stations(&self, config: &ScenarioConfig) -> anyhow::Result<()> {
+        let eligible = self
+            .eligible(
+                default_eligible_days(),
+                (config.observation_window_secs / 3600).clamp(1, 24),
+            )
+            .await?;
+        anyhow::ensure!(
+            !config.stations.is_empty(),
+            "Choose at least one eligible station"
+        );
+        let rejected: Vec<_> = config
+            .stations
+            .iter()
+            .filter(|id| !eligible.iter().any(|s| &s.station_id == *id))
+            .collect();
+        anyhow::ensure!(
+            rejected.is_empty(),
+            "Stations are not currently eligible: {}. No competition was created",
+            rejected.into_iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+        let start = config.observation_start.unwrap_or_else(|| {
+            OffsetDateTime::now_utc() + time::Duration::seconds(config.entry_window_secs as i64)
+        });
+        let end = start + time::Duration::seconds(config.observation_window_secs as i64);
+        let forecasts = self.oracle.forecasts(&config.stations, start, end).await?;
+        anyhow::ensure!(
+            config
+                .stations
+                .iter()
+                .all(|id| forecasts.iter().any(|row| &row.station_id == id)),
+            "Every selected station needs a forecast for this window. No competition was created"
+        );
+        Ok(())
+    }
+
+    pub async fn choose_default(&self, config: &mut ScenarioConfig) -> anyhow::Result<Pick> {
+        let lane: LaneConfig = serde_json::from_value(serde_json::json!({
+            "name": "automatic", "scenarios": ["full_lifecycle"],
+            "stations_per_run": config.stations.len(),
+            "observation_windows_secs": [config.observation_window_secs]
+        }))?;
+        self.choose(&lane, &config.clone(), config).await
+    }
+
+    async fn eligible(&self, days: u32, window_hours: u64) -> anyhow::Result<Vec<StationInfo>> {
         let mut cache = self.eligible.lock().await;
         if let Some((read, stations)) = cache.get(&(days, window_hours)) {
             if read.elapsed() < LIST_TTL {
-                return stations.clone();
+                return Ok(stations.clone());
             }
         }
-        let stations = match self.oracle.eligible(days, window_hours).await {
-            Ok(Some(stations)) if !stations.is_empty() => {
-                self.warned.store(false, Ordering::Relaxed);
-                Some(stations)
-            }
-            other => {
-                if !self.warned.swap(true, Ordering::Relaxed) {
-                    let why = match other {
-                        Ok(Some(_)) => "lists no stations".to_string(),
-                        Ok(None) => "does not offer it yet".to_string(),
-                        Err(error) => format!("{error:#}"),
-                    };
-                    warn!("Picking from the lanes' own stations: the oracle's eligible list {why}");
-                }
-                None
-            }
-        };
+        // Never extend an expired success after an error, and never substitute a directory list.
+        let stations = self
+            .oracle
+            .eligible(days, window_hours)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Oracle eligibility is unavailable; no competition was created")
+            })?;
+        anyhow::ensure!(
+            !stations.is_empty(),
+            "Oracle lists no eligible stations; no competition was created"
+        );
         cache.insert((days, window_hours), (Instant::now(), stations.clone()));
-        stations
-    }
-
-    /// Every station the oracle knows, read at most every [`LIST_TTL`]; none if it cannot say.
-    async fn directory(&self) -> Vec<StationInfo> {
-        let mut cache = self.directory.lock().await;
-        if let Some((read, stations)) = cache.as_ref() {
-            if read.elapsed() < LIST_TTL {
-                return stations.clone();
-            }
-        }
-        let stations = self.oracle.stations().await.unwrap_or_else(|error| {
-            warn!("Cannot place the lanes' stations: {error:#}");
-            Vec::new()
-        });
-        *cache = Some((Instant::now(), stations.clone()));
-        stations
-    }
-}
-
-/// Make `picked` up to `count` from the lane's own stations: those `drawn` for the run first,
-/// then the rest of its list, those not used recently before those that were.
-fn fill(
-    picked: &mut Vec<Picked>,
-    count: usize,
-    drawn: &[String],
-    configured: &[String],
-    recent: &HashSet<String>,
-) {
-    let fresh = drawn
-        .iter()
-        .chain(configured)
-        .filter(|id| !recent.contains(*id));
-    let stale = drawn
-        .iter()
-        .chain(configured)
-        .filter(|id| recent.contains(*id));
-    for id in fresh.chain(stale) {
-        if picked.len() >= count {
-            break;
-        }
-        if picked.iter().all(|pick| &pick.station_id != id) {
-            picked.push(Picked {
-                station_id: id.clone(),
-                role: Role::Fallback,
-                scored: None,
-                km_from_leader: None,
-            });
-        }
+        Ok(stations)
     }
 }
 
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::oracle::{Forecast, StationInfo};
+
+    /// A local Oracle fixture for runner tests; exercises the real HTTP eligibility boundary.
+    pub fn picker(db: crate::db::SynthDb) -> super::Picker {
+        use axum::{routing::get, Json, Router};
+        let app = Router::new()
+            .route("/stations/eligible", get(|| async {
+                Json(["KDEN", "KJFK", "KORD", "KSEA", "KBOS", "KATL", "KLAX"].into_iter()
+                    .map(|id| serde_json::json!({"station_id":id,"latitude":40.0,"longitude":-100.0})).collect::<Vec<_>>())
+            }))
+            .route("/stations/forecasts", get(|| async {
+                Json(["KDEN", "KJFK", "KORD", "KSEA", "KBOS", "KATL", "KLAX"].into_iter()
+                    .map(|id| serde_json::json!({"station_id":id,"temp_low":30,"temp_high":70,"wind_speed":20})).collect::<Vec<_>>())
+            }));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        super::Picker::new(&url, db)
+    }
 
     pub fn station(id: &str, iata: &str, at: (f64, f64)) -> StationInfo {
         StationInfo {

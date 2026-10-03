@@ -25,6 +25,7 @@ pub enum Event {
         passed: bool,
     },
     Rebalanced,
+    ScenarioControlsChanged,
     /// Synth learned more about where a run's money went, which carries on after the run ends:
     /// attestation, payouts, refunds.
     TrailUpdated {

@@ -306,7 +306,7 @@ async fn concurrent_actors_preserve_durable_recorder_before_either_payment() {
         ..Default::default()
     })
     .await;
-    let runner = crate::runner::Runner::new(
+    let runner = crate::runner::Runner::for_tests(
         mock.client.clone(),
         db.clone(),
         crate::events::Events::new(),
@@ -344,7 +344,7 @@ async fn seats_taken_by_other_players_do_not_fail_the_run() {
             ..Default::default()
         })
         .await;
-        let runner = crate::runner::Runner::new(
+        let runner = crate::runner::Runner::for_tests(
             mock.client.clone(),
             db.clone(),
             crate::events::Events::new(),
@@ -413,7 +413,7 @@ async fn overlapping_runs_are_each_tracked_by_their_competition() {
         ..Default::default()
     })
     .await;
-    let runner = crate::runner::Runner::new(
+    let runner = crate::runner::Runner::for_tests(
         mock.client.clone(),
         db.clone(),
         crate::events::Events::new(),

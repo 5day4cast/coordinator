@@ -7,9 +7,9 @@ use crate::scenarios::ScenarioConfig;
 use crate::trail::tracker::{Tracker, UnrecordedSwaps, UnrefundedCompetitions};
 use crate::trail::{label_words, Held};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Form, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -50,7 +50,7 @@ impl Dashboard {
         )
         .expect("a tracker that reaches nothing");
         Self {
-            runner: Runner::new(client, db, events),
+            runner: Runner::for_tests(client, db, events),
             scenario_config: ScenarioConfig::default(),
             observation_windows_secs: crate::scenarios::types::default_observation_windows(),
             rebalancer: None,
@@ -70,6 +70,7 @@ pub fn router(state: Dashboard) -> Router {
     Router::new()
         .route("/", get(dashboard))
         .route("/api/run", post(trigger_run))
+        .route("/api/scenarios/{scenario}", post(set_scenario))
         .route("/api/status", get(status))
         .route("/api/history", get(history))
         .route("/api/rebalance", post(trigger_rebalance))
@@ -186,6 +187,7 @@ pub(super) async fn dashboard_live(
         .scenario_health(HEALTH_WINDOW)
         .await
         .unwrap_or_default();
+    let controls = runner.db().disabled_scenarios().await;
     let held = runner.db().held_runs().await.unwrap_or_default();
     let unrecorded = tracker.unrecorded_swaps();
     let unrefunded = tracker.unrefunded_competitions();
@@ -210,32 +212,44 @@ pub(super) async fn dashboard_live(
             }
         }
 
-        section.health {
+        section.health id="scenarios" {
             h2 { "Scenarios" }
-            @if health.is_empty() {
-                p { "No runs yet" }
-            } @else {
-                div.scroll { table {
-                    thead { tr { th { "Scenario" } th { "Last" } th { "Passing" } th { "Last run" } } }
-                    tbody {
-                        @for scenario in &health {
-                            tr {
-                                td { (scenario.scenario) }
-                                td { span class=(format!("badge {}", scenario.last_status)) { (scenario.last_status) } }
-                                td {
-                                    (scenario.passed) "/" (scenario.runs)
-                                    @if scenario.failed > 0 { " (" (scenario.failed) " failed)" }
-                                }
-                                td { (format::time_text(&scenario.last_started_at, now)) }
+            p.note { "Pause stops new scheduled and manual runs. Existing runs, payouts and refunds continue. Changes survive restarts." }
+            p.note { "Every new competition uses Oracle eligibility. Missing eligible stations or forecasts prevent creation." }
+            @if controls.is_err() { p.error { "Scenario controls could not be read. New runs are blocked until controls are available." } }
+            div.scroll { table {
+                thead { tr { th { "Scenario" } th { "Enabled" } th { "Schedule" } th { "Last" } th { "Passing" } th { "Last run" } } }
+                tbody {
+                    @for name in crate::runner::SCENARIOS {
+                        @let record = health.iter().find(|row| row.scenario == *name);
+                        tr {
+                            td { (*name) }
+                            td {
+                                @if let Ok(disabled) = &controls {
+                                    @let enabled = !disabled.contains(*name);
+                                    form method="post" action=(format!("/api/scenarios/{name}"))
+                                        hx-post=(format!("/api/scenarios/{name}")) hx-target="#scenario-control-result" {
+                                        input type="hidden" name="enabled" value=(if enabled { "false" } else { "true" });
+                                        span.badge { (if enabled { "On" } else { "Paused" }) }
+                                        " " button type="submit" aria-label=(format!("{} {name}", if enabled { "Pause" } else { "Enable" })) {
+                                            (if enabled { "Pause" } else { "Enable" })
+                                        }
+                                    }
+                                } @else { "Unknown" }
                             }
+                            td { (runner.schedule_for(name)) }
+                            @if let Some(record) = record {
+                                td { span class=(format!("badge {}", record.last_status)) { (&record.last_status) } }
+                                td { (record.passed) "/" (record.runs) @if record.failed > 0 { " (" (record.failed) " failed)" } }
+                                td { (format::time_text(&record.last_started_at, now)) }
+                            } @else { td { "No runs" } td { "—" } td { "—" } }
                         }
                     }
-                } }
-                p.note {
-                    "Of the last " (HEALTH_WINDOW) " runs of each scenario. A run whose money "
-                    "got stuck counts as failed; money synth could not verify does not."
                 }
-            }
+            } }
+            p id="scenario-control-result" role="status" {}
+            p.note { "Enabled scenarios follow their configured schedule; manual-only scenarios run from Actions. Of the last " (HEALTH_WINDOW)
+                " runs of each scenario. A run whose money got stuck counts as failed; money synth could not verify does not." }
         }
 
         (stuck_money(&held, unrecorded.as_ref(), unrefunded.as_ref(), coordinator, now))
@@ -629,6 +643,47 @@ pub(super) fn from_htmx(headers: &HeaderMap) -> bool {
     headers.contains_key("hx-request")
 }
 
+#[derive(Deserialize)]
+struct ScenarioControl {
+    enabled: bool,
+}
+
+async fn set_scenario(
+    State(state): State<Dashboard>,
+    Path(scenario): Path<String>,
+    headers: HeaderMap,
+    Form(control): Form<ScenarioControl>,
+) -> Response {
+    if !crate::runner::SCENARIOS.contains(&scenario.as_str()) {
+        return (StatusCode::BAD_REQUEST, "Unknown scenario").into_response();
+    }
+    if let Err(error) = state
+        .runner
+        .db()
+        .set_scenario_enabled(&scenario, control.enabled)
+        .await
+    {
+        log::error!("Cannot save scenario control: {error:#}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not save scenario control",
+        )
+            .into_response();
+    }
+    state
+        .runner
+        .events()
+        .send(crate::events::Event::ScenarioControlsChanged);
+    if from_htmx(&headers) {
+        return Html(
+            html! { (scenario) " " (if control.enabled { "enabled" } else { "paused" }) "." }
+                .into_string(),
+        )
+        .into_response();
+    }
+    Redirect::to("/#scenarios").into_response()
+}
+
 async fn trigger_run(
     State(Dashboard {
         runner,
@@ -860,6 +915,69 @@ mod tests {
     use super::*;
     use crate::db::{SynthDb, TestRun};
     use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn scenario_controls_require_authorization_and_update_the_dashboard() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let directory = tempfile::tempdir().unwrap();
+        let db = SynthDb::new(directory.path().join("synth.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let dashboard = Dashboard::for_tests(db.clone());
+        let token_path = directory.path().join("operator-token");
+        let token = "test-operator-token-with-at-least-32-characters";
+        std::fs::write(&token_path, token).unwrap();
+        let config = crate::config::ServerConfig {
+            host: "127.0.0.1".into(),
+            port: 0,
+            allowed_origins: vec!["https://synth.example".into()],
+            operator_token_file: Some(token_path),
+        };
+        let app = router(dashboard.clone()).layer(axum::middleware::from_fn_with_state(
+            super::super::operator::OperatorAccess::new(&config).unwrap(),
+            super::super::operator::authorize,
+        ));
+        let request = |scenario: &str, authorized: bool| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenarios/{scenario}"))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+            if authorized {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            request.body(Body::from("enabled=false")).unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(request("full_lifecycle", false))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(db.scenario_enabled("full_lifecycle").await.unwrap());
+        assert_eq!(
+            app.clone()
+                .oneshot(request("unknown", true))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let response = app.oneshot(request("full_lifecycle", true)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::LOCATION], "/#scenarios");
+        assert!(!db.scenario_enabled("full_lifecycle").await.unwrap());
+        let page = dashboard_live(&dashboard).await.into_string();
+        let controls = between(&page, "id=\"scenarios\"", "</section>");
+        assert!(controls.contains("Paused"));
+        assert!(controls.contains("Enable full_lifecycle"));
+        assert!(controls.contains("Manual only"));
+        for scenario in crate::runner::SCENARIOS {
+            assert!(controls.contains(scenario));
+        }
+    }
 
     /// The load-time budget: anything slower to load is a bug.
     const BUDGET: Duration = Duration::from_millis(400);

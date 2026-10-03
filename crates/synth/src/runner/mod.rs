@@ -72,6 +72,7 @@ pub struct Runner {
     picker: Option<Arc<crate::picker::Picker>>,
     /// What the keep-open check last found, for the dashboard.
     open: keep_open::SharedOpenStatus,
+    schedules: Arc<HashMap<String, Vec<String>>>,
 }
 
 /// Runs in progress, by competition id.
@@ -225,10 +226,49 @@ impl Runner {
             live: Arc::new(DashMap::new()),
             picker: None,
             open: Arc::default(),
+            schedules: Arc::default(),
         }
     }
 
-    /// Let lanes with a `picker` choose their stations for the weather.
+    pub fn with_schedule(mut self, scheduler: &SchedulerConfig) -> Self {
+        let mut schedules: HashMap<String, Vec<String>> = HashMap::new();
+        if scheduler.enabled {
+            if scheduler.lanes.is_empty() {
+                for scenario in scheduler.scenario_names() {
+                    schedules
+                        .entry(scenario.into())
+                        .or_default()
+                        .push("Scheduled".into());
+                }
+            } else {
+                for lane in &scheduler.lanes {
+                    for scenario in &lane.scenarios {
+                        schedules
+                            .entry(scenario.clone())
+                            .or_default()
+                            .push(lane.name.clone());
+                    }
+                }
+            }
+        }
+        self.schedules = Arc::new(schedules);
+        self
+    }
+
+    pub fn schedule_for(&self, scenario: &str) -> String {
+        self.schedules
+            .get(scenario)
+            .map(|lanes| lanes.join(", "))
+            .unwrap_or_else(|| "Manual only".into())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(client: CoordinatorClient, db: SynthDb, events: Events) -> Self {
+        let picker = crate::picker::fixtures::picker(db.clone());
+        Self::new(client, db, events).with_picker(picker)
+    }
+
+    /// Use this Oracle to require eligible stations for every new run.
     pub fn with_picker(mut self, picker: crate::picker::Picker) -> Self {
         self.picker = Some(Arc::new(picker));
         self
@@ -262,11 +302,27 @@ impl Runner {
                 SCENARIOS.join(", ")
             ));
         }
+        anyhow::ensure!(
+            self.db.scenario_enabled(scenario).await?,
+            "Scenario {scenario} is paused; no new run was started"
+        );
+        let picker = self.picker.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Oracle eligibility is not configured; no competition was created")
+        })?;
         let mut config = config.clone();
         if let (Some(mix), None) = (&config.player_mix, config.min_players) {
             config.min_players = mix.floor_at(self.network_fee_rate().await);
         }
-        let config_json = serde_json::to_string(&config.resolve_plan(scenario)?)?;
+        let mut config = config.resolve_plan(scenario)?;
+        let selected = match config.competition_id {
+            Some(id) => crate::picker::store::pick_for(&self.db, id).await.is_some(),
+            None => false,
+        };
+        if scenario != scenarios::manual::MANUAL_COMPETITION && !selected {
+            picker.choose_default(&mut config).await?;
+        }
+        picker.validate_stations(&config).await?;
+        let config_json = serde_json::to_string(&config)?;
         self.db.create_run(scenario, Some(&config_json)).await
     }
 
@@ -459,6 +515,17 @@ impl Runner {
     /// Run `scenario`, logging a failure. If the coordinator refused its competition as too small
     /// for the fees, which rose since the count was drawn, draw again, large enough.
     async fn run_or_redraw(&self, scenario: &str, mut config: ScenarioConfig) {
+        match self.db.scenario_enabled(scenario).await {
+            Ok(false) => {
+                info!("Skipping paused scenario {scenario}");
+                return;
+            }
+            Err(error) => {
+                error!("Cannot read scenario controls; no run started: {error:#}");
+                return;
+            }
+            Ok(true) => {}
+        }
         match self.run_scenario(scenario, config.clone()).await {
             Ok(result) if result.refused_as_small() => {
                 config.min_players = config
@@ -539,8 +606,22 @@ impl Runner {
             let (picking, defaults) = (lane.clone(), base.clone());
             tokio::spawn(async move {
                 let mut config = config;
+                match runner.db.scenario_enabled(&scenario).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        info!("Skipping paused scenario {scenario}");
+                        return;
+                    }
+                    Err(error) => {
+                        error!("Cannot read scenario controls; no run started: {error:#}");
+                        return;
+                    }
+                }
                 if let Some(picker) = &runner.picker {
-                    picker.choose(&picking, &defaults, &mut config).await;
+                    if let Err(error) = picker.choose(&picking, &defaults, &mut config).await {
+                        warn!("Lane {} skipped: {error:#}", picking.name);
+                        return;
+                    }
                 }
                 runner.run_or_redraw(&scenario, config).await
             });
@@ -636,6 +717,39 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn paused_runs_and_missing_oracle_stop_before_execution() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = SynthDb::new(directory.path().join("synth.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let runner = Runner::new(
+            CoordinatorClient::new("http://127.0.0.1:1", None),
+            db.clone(),
+            Events::new(),
+        );
+        db.set_scenario_enabled("full_lifecycle", false)
+            .await
+            .unwrap();
+        let config = ScenarioConfig::default();
+        assert!(runner
+            .record_run("full_lifecycle", &config)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("paused"));
+        db.set_scenario_enabled("full_lifecycle", true)
+            .await
+            .unwrap();
+        assert!(runner
+            .record_run("full_lifecycle", &config)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("eligibility is not configured"));
+        assert!(db.list_runs(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn failed_progress_write_stops_work_before_payment() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("synth.db");
@@ -710,7 +824,7 @@ mod tests {
         let db = SynthDb::new(directory.path().join("synth.db").to_str().unwrap())
             .await
             .unwrap();
-        let runner = Runner::new(
+        let runner = Runner::for_tests(
             CoordinatorClient::new("http://127.0.0.1:1", None),
             db.clone(),
             Events::new(),
@@ -754,7 +868,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let runner = Runner::new(
+        let runner = Runner::for_tests(
             CoordinatorClient::new(&url, None),
             db.clone(),
             Events::new(),
