@@ -14,7 +14,8 @@ use axum::{
 };
 use log::warn;
 use prometheus::{
-    Encoder, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+    Encoder, Gauge, GaugeVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+    TextEncoder,
 };
 use std::{
     collections::HashMap,
@@ -25,7 +26,7 @@ use tokio::{sync::Mutex, task::JoinHandle};
 
 use crate::{
     domain::{ArkadeHealth, CompetitionStore, TicketStatus},
-    infra::lightning::PAYMENT_FAILURE_REASONS,
+    infra::{ark_swap::SwapWallet, lightning::PAYMENT_FAILURE_REASONS},
 };
 
 /// How long database-derived gauges are reused between scrapes.
@@ -160,6 +161,93 @@ pub static ESCROW_EVENTS: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("valid metric")
 });
 
+/// ark-swapd's Ark wallet by balance, in sats, as the coordinator last read it: what may pay an
+/// escrow (`payable`), what waits at the boarding address for a batch (`boarding`), what is too
+/// close to expiry to pay one (`expiring`), and what a batch must recover (`recoverable`). NaN
+/// until a read reports it, so a missing observation never reads as an empty wallet.
+pub static ARK_WALLET_SAT: LazyLock<GaugeVec> = LazyLock::new(|| {
+    let gauge = GaugeVec::new(
+        Opts::new(
+            "coordinator_ark_wallet_sat",
+            "ark-swapd's Ark wallet by balance, in sats, at the last read",
+        ),
+        &["balance"],
+    )
+    .expect("valid metric");
+    for (balance, _) in ark_wallet_balances(&SwapWallet::default()) {
+        gauge.with_label_values(&[balance]).set(f64::NAN);
+    }
+    gauge
+});
+
+/// When the Ark wallet's first spendable VTXO expires, in UNIX seconds; NaN when none.
+pub static ARK_WALLET_EARLIEST_EXPIRY: LazyLock<Gauge> = LazyLock::new(|| {
+    unknown(Gauge::new(
+        "coordinator_ark_wallet_earliest_expiry_timestamp_seconds",
+        "When the Ark wallet's first spendable VTXO expires",
+    ))
+});
+
+/// When a batch last took one of ark-swapd's boards or renewals, in UNIX seconds.
+pub static ARK_WALLET_LAST_BOARD_SUCCESS: LazyLock<Gauge> = LazyLock::new(|| {
+    unknown(Gauge::new(
+        "coordinator_ark_wallet_last_board_success_timestamp_seconds",
+        "When a batch last took one of ark-swapd's boards or renewals",
+    ))
+});
+
+/// When the Arkade server last failed one of ark-swapd's boards or renewals, in UNIX seconds.
+pub static ARK_WALLET_LAST_BOARD_FAILURE: LazyLock<Gauge> = LazyLock::new(|| {
+    unknown(Gauge::new(
+        "coordinator_ark_wallet_last_board_failure_timestamp_seconds",
+        "When the Arkade server last failed one of ark-swapd's boards or renewals",
+    ))
+});
+
+/// When the coordinator last read ark-swapd's wallet, in UNIX seconds, so a stale reading shows.
+pub static ARK_WALLET_READ: LazyLock<Gauge> = LazyLock::new(|| {
+    unknown(Gauge::new(
+        "coordinator_ark_wallet_read_timestamp_seconds",
+        "When the coordinator last read ark-swapd's wallet",
+    ))
+});
+
+/// The balances `coordinator_ark_wallet_sat` reports, each with its value from `wallet`.
+fn ark_wallet_balances(wallet: &SwapWallet) -> [(&'static str, f64); 4] {
+    let sat = |value: Option<u64>| value.map_or(f64::NAN, |sat| sat as f64);
+    [
+        ("payable", sat(wallet.payable_sat)),
+        ("boarding", sat(wallet.boarding_sat)),
+        ("expiring", sat(wallet.expiring_sat)),
+        ("recoverable", sat(wallet.recoverable_sat)),
+    ]
+}
+
+/// A gauge that reads NaN until it is first set.
+fn unknown(gauge: prometheus::Result<Gauge>) -> Gauge {
+    let gauge = gauge.expect("valid metric");
+    gauge.set(f64::NAN);
+    gauge
+}
+
+fn timestamp(seconds: Option<i64>) -> f64 {
+    seconds.map_or(f64::NAN, |at| at as f64)
+}
+
+/// Record what a read of ark-swapd's wallet reported. A field an older ark-swapd leaves out
+/// reads NaN.
+pub fn record_ark_wallet(wallet: &SwapWallet, read_at: time::OffsetDateTime) {
+    for (balance, value) in ark_wallet_balances(wallet) {
+        ARK_WALLET_SAT.with_label_values(&[balance]).set(value);
+    }
+    ARK_WALLET_EARLIEST_EXPIRY.set(timestamp(wallet.earliest_expiry));
+    ARK_WALLET_LAST_BOARD_SUCCESS.set(timestamp(wallet.last_board_success_at));
+    ARK_WALLET_LAST_BOARD_FAILURE.set(timestamp(
+        wallet.last_board_failure.as_ref().map(|failure| failure.at),
+    ));
+    ARK_WALLET_READ.set(read_at.unix_timestamp() as f64);
+}
+
 /// Record a payout reaching its final result for the first time.
 pub fn record_payout_result(succeeded: bool) {
     PAYOUT_ATTEMPTS
@@ -284,6 +372,17 @@ impl Metrics {
             .registry
             .register(Box::new(ESCROW_SUBSCRIPTION_UP.clone()))?;
         metrics.registry.register(Box::new(ESCROW_EVENTS.clone()))?;
+        metrics
+            .registry
+            .register(Box::new(ARK_WALLET_SAT.clone()))?;
+        for gauge in [
+            &*ARK_WALLET_EARLIEST_EXPIRY,
+            &*ARK_WALLET_LAST_BOARD_SUCCESS,
+            &*ARK_WALLET_LAST_BOARD_FAILURE,
+            &*ARK_WALLET_READ,
+        ] {
+            metrics.registry.register(Box::new(gauge.clone()))?;
+        }
         // Show both results from the start, so a rate over them is defined.
         for result in ["succeeded", "failed"] {
             PAYOUT_ATTEMPTS.with_label_values(&[result]);
@@ -464,6 +563,11 @@ mod tests {
             "coordinator_payout_send_failures_total",
             "coordinator_competition_step_failures_total",
             "coordinator_arkade_unavailable",
+            "coordinator_ark_wallet_sat",
+            "coordinator_ark_wallet_earliest_expiry_timestamp_seconds",
+            "coordinator_ark_wallet_last_board_success_timestamp_seconds",
+            "coordinator_ark_wallet_last_board_failure_timestamp_seconds",
+            "coordinator_ark_wallet_read_timestamp_seconds",
             "coordinator_build_info",
         ] {
             assert!(
@@ -489,6 +593,25 @@ mod tests {
             env!("CARGO_PKG_VERSION")
         )));
         database.close().await.unwrap();
+    }
+
+    /// Each balance ark-swapd reports is exported as it is; one an older ark-swapd leaves out is
+    /// NaN, never zero.
+    #[test]
+    fn ark_wallet_balances_keep_missing_ones_unknown() {
+        let wallet: SwapWallet = serde_json::from_str(
+            r#"{"boarding_address":"tb1p","payable_sat":142572,"expiring_sat":0,"boarding_sat":0,
+                "earliest_expiry":1791344880,"last_board_success_at":1791022847}"#,
+        )
+        .unwrap();
+        let balances = ark_wallet_balances(&wallet);
+        assert_eq!(balances[0], ("payable", 142_572.0));
+        assert_eq!(balances[1], ("boarding", 0.0));
+        assert_eq!(balances[2], ("expiring", 0.0));
+        assert_eq!(balances[3].0, "recoverable");
+        assert!(balances[3].1.is_nan(), "not reported");
+        assert_eq!(timestamp(wallet.earliest_expiry), 1_791_344_880.0);
+        assert!(timestamp(None).is_nan());
     }
 
     #[tokio::test]

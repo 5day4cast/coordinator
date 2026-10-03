@@ -34,8 +34,8 @@ impl Coordinator {
     }
 
     /// Learn from ark-swapd how its boards last went, since the Arkade server failing those is
-    /// an outage too while the coordinator runs no batch step of its own. A failed or slow read
-    /// is ignored.
+    /// an outage too while the coordinator runs no batch step of its own, and export its
+    /// balances as metrics. A failed or slow read is ignored.
     pub async fn read_ark_swap_boards(&self) {
         let Some(ark) = self.ark() else {
             return;
@@ -54,6 +54,7 @@ impl Coordinator {
                 return;
             }
         };
+        crate::metrics::record_ark_wallet(&wallet, OffsetDateTime::now_utc());
         let at = |seconds: i64| OffsetDateTime::from_unix_timestamp(seconds).ok();
         let failure = wallet
             .last_board_failure

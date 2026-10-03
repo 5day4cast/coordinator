@@ -30,6 +30,9 @@ const BATCH: Duration = Duration::from_millis(300);
 
 pub(super) const DASHBOARD: &str = "dashboard";
 
+/// The Ark wallet refill history.
+pub(super) const ARK_REFILL: &str = "ark-refill";
+
 pub(super) fn run_topic(run_id: &str) -> String {
     format!("run:{run_id}")
 }
@@ -122,6 +125,7 @@ fn topics_of(event: &Event) -> Vec<String> {
         | Event::RunFinished { run_id, .. }
         | Event::TrailUpdated { run_id } => vec![DASHBOARD.to_string(), run_topic(run_id)],
         Event::Rebalanced | Event::ScenarioControlsChanged => vec![DASHBOARD.to_string()],
+        Event::ArkRefillChecked => vec![DASHBOARD.to_string(), ARK_REFILL.to_string()],
     }
 }
 
@@ -164,6 +168,7 @@ async fn render(state: &Dashboard, topic: &str) -> Option<Markup> {
     match topic.strip_prefix("run:") {
         Some(run_id) => run_live(state, run_id).await,
         None if topic == DASHBOARD => Some(dashboard_live(state).await),
+        None if topic == ARK_REFILL => Some(super::ark_wallet::history_live(state).await),
         None => None,
     }
 }
@@ -255,6 +260,10 @@ mod tests {
         };
         assert_eq!(topics_of(&step), ["dashboard", "run:r1"]);
         assert_eq!(topics_of(&Event::Rebalanced), ["dashboard"]);
+        assert_eq!(
+            topics_of(&Event::ArkRefillChecked),
+            ["dashboard", "ark-refill"]
+        );
         let traced = Event::TrailUpdated {
             run_id: "r1".into(),
         };

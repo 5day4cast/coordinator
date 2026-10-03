@@ -290,6 +290,7 @@ impl SynthDb {
             .execute(&self.pool).await?;
         self.migrate_payment_intents().await?;
         crate::picker::store::migrate(&self.pool).await?;
+        crate::ark_refill::migrate(&self.pool).await?;
 
         // Databases made before synth kept ark-swapd's wallet funded.
         self.add_column_if_missing("rebalances", "kind", "TEXT NOT NULL DEFAULT 'channel'")

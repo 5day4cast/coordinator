@@ -1,3 +1,4 @@
+mod ark_wallet;
 mod assets;
 mod create;
 mod format;
@@ -26,6 +27,7 @@ pub async fn start_server(
     config: &SynthConfig,
     runner: Runner,
     rebalancer: Option<Rebalancer>,
+    ark_refiller: Option<crate::ark_refill::ArkRefiller>,
     tracker: Tracker,
 ) -> anyhow::Result<()> {
     let operator = operator::OperatorAccess::new(&config.server)?;
@@ -34,6 +36,7 @@ pub async fn start_server(
         scenario_config: config.scenario_config(),
         observation_windows_secs: config.defaults.observation_windows_secs.values().to_vec(),
         rebalancer,
+        ark_refiller,
         tracker,
         live: live::Live::new(),
     };
@@ -42,6 +45,7 @@ pub async fn start_server(
     let metrics = metrics::router(dashboard.runner.db().clone());
     let app = Router::new()
         .merge(create::router(dashboard.clone()))
+        .merge(ark_wallet::router(dashboard.clone()))
         .merge(routes::router(dashboard))
         .layer(axum::middleware::from_fn_with_state(
             operator,

@@ -377,6 +377,84 @@ impl Lnd {
         Ok(sent.txid)
     }
 
+    /// The chain this node is on, as `v1/getinfo` names it (`mainnet`, `signet`, ...), and its
+    /// block height.
+    pub async fn chain(&self) -> Result<ChainInfo> {
+        #[derive(Deserialize)]
+        struct Info {
+            #[serde(default)]
+            block_height: u64,
+            chains: Vec<Chain>,
+        }
+        #[derive(Deserialize)]
+        struct Chain {
+            chain: String,
+            network: String,
+        }
+        let info: Info = self.get("v1/getinfo").await?;
+        let chain = info
+            .chains
+            .into_iter()
+            .find(|chain| chain.chain == "bitcoin")
+            .context("the node did not report a Bitcoin network")?;
+        Ok(ChainInfo {
+            network: chain.network,
+            block_height: info.block_height,
+        })
+    }
+
+    /// Send `sats` on-chain to `address` with `label`, at `sat_per_vbyte` or at the fee rate
+    /// LND estimates when that is unset, returning the transaction's id. Needs a macaroon with
+    /// `onchain:write`.
+    pub async fn send_coins(
+        &self,
+        address: &str,
+        sats: u64,
+        label: &str,
+        sat_per_vbyte: Option<u64>,
+    ) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Sent {
+            txid: String,
+        }
+        let response = self
+            .client
+            .post(format!("{}v1/transactions", self.base_url))
+            .header(MACAROON_HEADER, &self.macaroon)
+            .json(&send_coins_request(address, sats, label, sat_per_vbyte))
+            .send()
+            .await
+            .context("send coins on-chain")?;
+        let sent: Sent = Self::read(response).await?;
+        anyhow::ensure!(!sent.txid.is_empty(), "LND sent no transaction id");
+        Ok(sent.txid)
+    }
+
+    /// The wallet's transactions from `start_height` on, unconfirmed ones included. Needs a
+    /// macaroon with `onchain:read`.
+    pub async fn transactions_since(&self, start_height: u64) -> Result<Vec<WalletTransaction>> {
+        #[derive(Deserialize)]
+        struct Transactions {
+            #[serde(default)]
+            transactions: Vec<WalletTransaction>,
+        }
+        let response = self
+            .client
+            .get(format!("{}v1/transactions", self.base_url))
+            // An end height of -1 includes transactions not yet in a block.
+            .query(&[
+                ("start_height", start_height.to_string()),
+                ("end_height", "-1".to_string()),
+            ])
+            .header(MACAROON_HEADER, &self.macaroon)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .context("list the wallet's transactions")?;
+        let listed: Transactions = Self::read(response).await?;
+        Ok(listed.transactions)
+    }
+
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let response = self
             .client
@@ -396,6 +474,62 @@ impl Lnd {
         }
         Ok(response.json().await?)
     }
+}
+
+/// The body of `POST /v1/transactions`. LND estimates the fee rate when it is given neither a
+/// rate nor a confirmation target.
+fn send_coins_request(
+    address: &str,
+    sats: u64,
+    label: &str,
+    sat_per_vbyte: Option<u64>,
+) -> serde_json::Value {
+    let mut request = json!({
+        "addr": address,
+        "amount": sats.to_string(),
+        "label": label,
+    });
+    if let Some(rate) = sat_per_vbyte {
+        request["sat_per_vbyte"] = json!(rate.to_string());
+    }
+    request
+}
+
+/// The chain a node is on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainInfo {
+    pub network: String,
+    pub block_height: u64,
+}
+
+/// A transaction in a node's on-chain wallet, as `GET /v1/transactions` lists it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct WalletTransaction {
+    #[serde(default)]
+    pub tx_hash: String,
+    #[serde(default, with = "number")]
+    pub num_confirmations: u64,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub output_details: Vec<OutputDetail>,
+}
+
+impl WalletTransaction {
+    /// Whether it pays exactly `sats` to `address`.
+    pub fn pays(&self, address: &str, sats: u64) -> bool {
+        self.output_details
+            .iter()
+            .any(|output| output.address == address && output.amount == sats)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct OutputDetail {
+    #[serde(default)]
+    pub address: String,
+    #[serde(default, with = "number")]
+    pub amount: u64,
 }
 
 /// Where a payment a node may have made stands.
@@ -690,6 +824,90 @@ mod tests {
         assert!(!never_made(
             r#"{"error":{"code":14,"message":"payment isn't initiated"}}"#
         ));
+    }
+
+    #[test]
+    fn a_send_names_its_fee_rate_only_when_one_is_set() {
+        let estimated = send_coins_request("tb1pboard", 250_000, "synth-ark-refill", None);
+        assert_eq!(
+            estimated,
+            serde_json::json!({ "addr": "tb1pboard", "amount": "250000", "label": "synth-ark-refill" })
+        );
+        let fixed = send_coins_request("tb1pboard", 250_000, "synth-ark-refill", Some(2));
+        assert_eq!(fixed["sat_per_vbyte"], "2");
+        assert!(fixed.get("target_conf").is_none());
+    }
+
+    /// What LND's REST gateway sends for a wallet transaction: 64-bit numbers as strings, 32-bit
+    /// ones as numbers.
+    #[test]
+    fn a_wallet_transaction_is_read_with_its_outputs() {
+        let listed: WalletTransaction = serde_json::from_str(
+            r#"{"tx_hash":"ab","amount":"-250141","num_confirmations":2,"block_height":2400000,
+                "label":"synth-ark-refill","output_details":[
+                  {"output_type":"SCRIPT_TYPE_WITNESS_V1_TAPROOT","address":"tb1pboard","amount":"250000","is_our_address":false},
+                  {"output_type":"SCRIPT_TYPE_WITNESS_V1_TAPROOT","address":"tb1pchange","amount":"9000","is_our_address":true}]}"#,
+        )
+        .unwrap();
+        assert_eq!(listed.num_confirmations, 2);
+        assert!(listed.pays("tb1pboard", 250_000));
+        assert!(!listed.pays("tb1pboard", 9_000));
+        let unconfirmed: WalletTransaction =
+            serde_json::from_str(r#"{"tx_hash":"cd","label":""}"#).unwrap();
+        assert_eq!(unconfirmed.num_confirmations, 0);
+    }
+
+    /// The request reaches LND's REST endpoint as `POST /v1/transactions`, with the macaroon in
+    /// its header and the amount as a string.
+    #[tokio::test]
+    async fn coins_are_sent_with_the_macaroon_and_the_request_lnd_expects() {
+        use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+        type Seen = Arc<Mutex<Option<(String, serde_json::Value)>>>;
+        async fn sent(
+            State(seen): State<Seen>,
+            headers: HeaderMap,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            let macaroon = headers[MACAROON_HEADER].to_str().unwrap().to_string();
+            *seen.lock().unwrap() = Some((macaroon, body));
+            Json(serde_json::json!({ "txid": "f00d" }))
+        }
+        let seen: Seen = Arc::default();
+        let app = Router::new()
+            .route("/v1/transactions", post(sent))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let directory = tempfile::tempdir().unwrap();
+        let macaroon = directory.path().join("payer.macaroon");
+        std::fs::write(&macaroon, [0xab, 0xcd]).unwrap();
+        let lnd = Lnd::new(&LndConfig {
+            rest_url: format!("http://{address}"),
+            macaroon_file: macaroon,
+            tls_cert_file: None,
+            fee_limit_sats: 0,
+            payment_timeout_secs: 5,
+        })
+        .unwrap();
+        let txid = lnd
+            .send_coins("tb1pboard", 250_000, "synth-ark-refill", Some(2))
+            .await
+            .unwrap();
+        assert_eq!(txid, "f00d");
+        let (header, body) = seen.lock().unwrap().clone().expect("a request");
+        assert_eq!(header, "abcd");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "addr": "tb1pboard",
+                "amount": "250000",
+                "label": "synth-ark-refill",
+                "sat_per_vbyte": "2",
+            })
+        );
     }
 
     #[test]
