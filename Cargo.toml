@@ -48,9 +48,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 
 # Keymeld: released SDK and services on the published dlctix crate.
 # keymeld-sdk and the coordinator must resolve dlctix from the same source.
-# Pinned to Keymeld v0.6.1. Every crate that names Keymeld pins the same rev.
-keymeld-sdk = { git = "https://github.com/tee8z/keymeld", rev = "425508fd6cca2deec64543098e15e907507d514e", default-features = false, features = ["escrow", "dlctix"] }
-keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "425508fd6cca2deec64543098e15e907507d514e", default-features = false, features = ["escrow"] }
+# Pinned to Keymeld 0.8.2 plus #95 (optional operator fields on the enclave listing).
+# Every crate that names Keymeld pins the same rev.
+keymeld-sdk = { git = "https://github.com/tee8z/keymeld", rev = "9c471b8c039a3c766b0d7f9131797bf8f8f7aeae", default-features = false, features = ["escrow", "dlctix"] }
+keymeld-core = { git = "https://github.com/tee8z/keymeld", rev = "9c471b8c039a3c766b0d7f9131797bf8f8f7aeae", default-features = false, features = ["escrow"] }
 
 # Bitcoin
 bitcoin = { version = "0.32", features = ["serde", "base64", "rand-std"] }

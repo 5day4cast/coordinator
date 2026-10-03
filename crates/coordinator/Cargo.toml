@@ -107,7 +107,7 @@ pem-rfc7468.workspace = true
 coordinator-ark = { workspace = true, features = ["test-utils"] }
 # The LNURL provider fixtures let enclave tests exercise a refund end to end.
 coordinator-escrow-verifier = { path = "../coordinator-escrow-verifier", features = ["test-support"] }
-keymeld-enclave = { git = "https://github.com/tee8z/keymeld", rev = "425508fd6cca2deec64543098e15e907507d514e", default-features = false, features = ["escrow", "test-support"] }
+keymeld-enclave = { git = "https://github.com/tee8z/keymeld", rev = "9c471b8c039a3c766b0d7f9131797bf8f8f7aeae", default-features = false, features = ["escrow", "test-support"] }
 tempfile = "3"
 # Drives routers directly in route-isolation tests.
 tower = { version = "0.5", features = ["util"] }
