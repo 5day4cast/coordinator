@@ -26,6 +26,8 @@ pub struct Dashboard {
     pub observation_windows_secs: Vec<u64>,
     /// Absent when no rebalancing is configured.
     pub rebalancer: Option<Rebalancer>,
+    /// Absent unless refilling ark-swapd's Ark wallet is enabled.
+    pub ark_refiller: Option<crate::ark_refill::ArkRefiller>,
     /// Follows each run's money after its steps.
     pub tracker: Tracker,
     /// The pages being watched, and what is pushed to them.
@@ -54,6 +56,7 @@ impl Dashboard {
             scenario_config: ScenarioConfig::default(),
             observation_windows_secs: crate::scenarios::types::default_observation_windows(),
             rebalancer: None,
+            ark_refiller: None,
             tracker,
             live: Live::new(),
         }
@@ -145,15 +148,15 @@ fn open_for_visitors(status: crate::runner::keep_open::OpenStatus, now: OffsetDa
 }
 
 /// The dashboard's live part: what the page shows, and what is pushed to it as things change.
-pub(super) async fn dashboard_live(
-    Dashboard {
+pub(super) async fn dashboard_live(state: &Dashboard) -> Markup {
+    let Dashboard {
         runner,
         rebalancer,
         tracker,
         ..
-    }: &Dashboard,
-) -> Markup {
+    } = state;
     let now = OffsetDateTime::now_utc();
+    let ark_wallet = super::ark_wallet::card(state, now).await;
     let last = runner.db().last_completed_run().await.unwrap_or_default();
     let last_steps = match &last {
         Some(run) => runner.db().get_steps(&run.id).await.unwrap_or_default(),
@@ -388,6 +391,8 @@ pub(super) async fn dashboard_live(
                 } }
             }
         }
+
+        (ark_wallet)
 
         section.actions {
             h2 { "Actions" }
@@ -1576,6 +1581,7 @@ mod tests {
             confirmed_sat: 700,
             pre_confirmed_sat: 500,
             boarding_sat,
+            ..Default::default()
         };
         let line = arkade_liquidity(&arkade, &wallet(400_000)).into_string();
         assert!(

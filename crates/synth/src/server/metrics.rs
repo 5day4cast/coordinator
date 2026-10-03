@@ -61,6 +61,26 @@ lazy_static::lazy_static! {
         "synth_backfill_players_total",
         "Players synth entered late so a competition reaches its minimum"
     ).unwrap();
+
+    pub static ref ARK_REFILLS: prometheus::Counter = register_counter!(
+        "synth_ark_refill_total",
+        "On-chain refills of ark-swapd's Ark wallet the payer sent"
+    ).unwrap();
+
+    pub static ref ARK_REFILL_SATS: prometheus::Counter = register_counter!(
+        "synth_ark_refill_sat_total",
+        "Sats the payer sent on-chain to refill ark-swapd's Ark wallet"
+    ).unwrap();
+
+    pub static ref ARK_REFILL_LAST_SUCCESS: prometheus::Gauge = register_gauge!(
+        "synth_ark_refill_last_success_timestamp_seconds",
+        "Unix timestamp when the payer last sent a refill of ark-swapd's Ark wallet"
+    ).unwrap();
+
+    pub static ref ARK_REFILL_FAILURES: prometheus::Counter = register_counter!(
+        "synth_ark_refill_failures_total",
+        "Refills of ark-swapd's Ark wallet that were refused, dropped, or never reached it"
+    ).unwrap();
 }
 
 pub fn router(db: SynthDb) -> Router {
@@ -80,6 +100,13 @@ fn initialize() {
     lazy_static::initialize(&OPEN_COMPETITION_MINUTES_LEFT);
     lazy_static::initialize(&KEEP_OPEN_STARTS);
     lazy_static::initialize(&BACKFILL_PLAYERS);
+    lazy_static::initialize(&ARK_REFILLS);
+    lazy_static::initialize(&ARK_REFILL_SATS);
+    lazy_static::initialize(&ARK_REFILL_FAILURES);
+    // Set before the router is built when a refill was ever sent.
+    if ARK_REFILL_LAST_SUCCESS.get() == 0.0 {
+        ARK_REFILL_LAST_SUCCESS.set(f64::NAN);
+    }
     for scenario in crate::runner::SCENARIOS {
         for status in ["passed", "failed"] {
             SCENARIO_RUNS.with_label_values(&[scenario, status]);
@@ -164,6 +191,26 @@ pub fn record_open(open: usize, minutes_left: i64) {
 /// Record a run started early to keep a competition open.
 pub fn record_keep_open_start() {
     KEEP_OPEN_STARTS.inc();
+}
+
+/// Record a refill of ark-swapd's Ark wallet the payer sent at `at`, in UNIX seconds.
+pub fn record_ark_refill(sats: u64, at: i64) {
+    ARK_REFILLS.inc();
+    ARK_REFILL_SATS.inc_by(sats as f64);
+    record_ark_refill_last_success(at);
+}
+
+/// Record when the payer last sent a refill, in UNIX seconds.
+pub fn record_ark_refill_last_success(at: i64) {
+    let at = at as f64;
+    if ARK_REFILL_LAST_SUCCESS.get().is_nan() || ARK_REFILL_LAST_SUCCESS.get() < at {
+        ARK_REFILL_LAST_SUCCESS.set(at);
+    }
+}
+
+/// Record a refill that was refused, dropped, or never reached ark-swapd.
+pub fn record_ark_refill_failure() {
+    ARK_REFILL_FAILURES.inc();
 }
 
 /// Record players entered by a backfill.

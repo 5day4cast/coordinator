@@ -69,6 +69,41 @@ A reconciliation pass does not also start a replacement on that leg. Subsequent 
 Keep LND payment history available until pending intents resolve. Do not delete pending database rows to retry an uncertain payment.
 This recovery protocol covers Lightning channel rebalances. On-chain top-ups retain their existing confirmation handling.
 
+## Refill the Ark swap wallet
+
+ark-swapd pays each Arkade escrow from its own Ark wallet, so the wallet only drains. `[ark_refill]` sends it coins on-chain from an LND payer. It is off by default:
+
+```toml
+[ark_refill]
+enabled = true
+low_water_sats = 100000     # refill when payable + boarding + an unshown refill fall below this
+target_sats = 400000        # send enough to reach this
+max_send_sats = 500000      # per refill
+max_daily_sats = 1500000    # over any 24 hours
+min_interval_secs = 1800    # between refills, including refused ones
+check_interval_secs = 300
+
+[ark_refill.ark_swap]       # where the wallet is read
+url = "http://127.0.0.1:9737"
+token_file = "/run/secrets/ark-swap.token"
+
+[ark_refill.lnd]            # the payer
+rest_url = "https://127.0.0.1:8080"
+macaroon_file = "/run/secrets/ark-refill.macaroon"
+tls_cert_file = "/run/secrets/payer-tls.cert"
+sat_per_vbyte = 2           # optional; LND estimates a rate when unset
+```
+
+The payer's macaroon needs `onchain:read`, `onchain:write` and `info:read`, and nothing else. Bake one with `lncli bakemacaroon onchain:read onchain:write info:read`.
+
+Each check reads `GET /v1/wallet` on ark-swapd. It sends nothing while coins wait at the boarding address, while synth's last refill is unconfirmed or not yet shown by ark-swapd, within `min_interval_secs` of the last attempt, or when the send would pass `max_daily_sats`. Otherwise it checks that the boarding address belongs to the payer's network and calls `POST /v1/transactions` with the label `synth-ark-refill`.
+
+Each refill is saved before the send. A refill whose response was lost stays pending, and the next check looks for it in the payer's wallet by label, address and amount. A refill missing from the payer's wallet after an hour is recorded as dropped. One that confirmed but that ark-swapd has not shown after six hours is recorded as unseen. Neither holds back the next refill.
+
+While `ark_refill` is enabled, `rebalance.arkade` sends nothing. The dashboard's Ark wallet card shows the wallet, the last refill and the next check, and pauses refills as a scenario is paused. `/ark-refill` lists every refill.
+
+Synth exports `synth_ark_refill_total`, `synth_ark_refill_sat_total`, `synth_ark_refill_last_success_timestamp_seconds` and `synth_ark_refill_failures_total`. The coordinator exports the wallet itself at each read: `coordinator_ark_wallet_sat{balance="payable|boarding|expiring|recoverable"}`, `coordinator_ark_wallet_earliest_expiry_timestamp_seconds`, `coordinator_ark_wallet_last_board_success_timestamp_seconds`, `coordinator_ark_wallet_last_board_failure_timestamp_seconds` and `coordinator_ark_wallet_read_timestamp_seconds`. A value ark-swapd did not report reads `NaN`.
+
 ## Configure entry timing
 
 ```toml

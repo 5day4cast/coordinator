@@ -16,7 +16,7 @@ pub struct ArkSwapConfig {
 }
 
 /// ark-swapd's wallet, as `GET /v1/wallet` reports it.
-#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 pub struct ArkWallet {
     pub boarding_address: String,
     pub confirmed_sat: u64,
@@ -25,12 +25,31 @@ pub struct ArkWallet {
     /// than this field reports none.
     #[serde(default)]
     pub boarding_sat: u64,
+    /// The part of the spendable coins with enough life left to pay an escrow. An ark-swapd
+    /// older than this field reports none, and [`ArkWallet::payable`] falls back to all of them.
+    #[serde(default)]
+    pub payable_sat: Option<u64>,
+    #[serde(default)]
+    pub expiring_sat: Option<u64>,
+    #[serde(default)]
+    pub recoverable_sat: Option<u64>,
+    /// UNIX seconds.
+    #[serde(default)]
+    pub earliest_expiry: Option<i64>,
+    /// UNIX seconds. When a batch last took one of ark-swapd's boards or renewals.
+    #[serde(default)]
+    pub last_board_success_at: Option<i64>,
 }
 
 impl ArkWallet {
     /// What the wallet can pay escrows from now.
     pub fn spendable_sat(&self) -> u64 {
         self.confirmed_sat + self.pre_confirmed_sat
+    }
+
+    /// What the wallet can pay new escrows from: its payable coins where ark-swapd reports them.
+    pub fn payable(&self) -> u64 {
+        self.payable_sat.unwrap_or_else(|| self.spendable_sat())
     }
 }
 

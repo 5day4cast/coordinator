@@ -26,6 +26,8 @@ pub enum Event {
     },
     Rebalanced,
     ScenarioControlsChanged,
+    /// The Ark wallet refill checked the wallet, and may have sent a refill.
+    ArkRefillChecked,
     /// Synth learned more about where a run's money went, which carries on after the run ends:
     /// attestation, payouts, refunds.
     TrailUpdated {

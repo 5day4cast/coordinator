@@ -9,6 +9,10 @@ pub struct SynthConfig {
     /// Paying `lnd` back as scenarios drain it.
     #[serde(default)]
     pub rebalance: Option<crate::rebalance::RebalanceConfig>,
+    /// Keeping ark-swapd's Ark wallet funded from an on-chain payer. While enabled it replaces
+    /// `rebalance.arkade`.
+    #[serde(default)]
+    pub ark_refill: Option<crate::ark_refill::ArkRefillConfig>,
     pub oracle: OracleConfig,
     pub server: ServerConfig,
     pub db: DbConfig,
@@ -262,6 +266,7 @@ impl Default for SynthConfig {
         Self {
             lnd: None,
             rebalance: None,
+            ark_refill: None,
             coordinator: CoordinatorConfig {
                 url: "http://coordinator.coordinator.svc.cluster.local:9990".to_string(),
                 admin_url: Some(
@@ -371,6 +376,9 @@ pub fn load_config(path: Option<&str>) -> anyhow::Result<SynthConfig> {
     let config: SynthConfig = builder.build()?.try_deserialize()?;
     validate_windows(config.defaults.observation_windows_secs.values())?;
     config.defaults.players.validate()?;
+    if let Some(refill) = &config.ark_refill {
+        refill.validate()?;
+    }
     config
         .defaults
         .entry_timing

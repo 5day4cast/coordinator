@@ -1,3 +1,4 @@
+use coordinator_synth::ark_refill::ArkRefiller;
 use coordinator_synth::ark_swap::ArkSwap;
 use coordinator_synth::cli;
 use coordinator_synth::client::CoordinatorClient;
@@ -38,13 +39,33 @@ async fn main() -> anyhow::Result<()> {
         client = client.with_admin_token_file(path)?;
     }
     let events = Events::new();
-    let rebalancer = match (&config.lnd, &config.rebalance) {
-        (Some(payer), Some(rebalance)) => Some(Rebalancer::new(
-            payer,
-            rebalance.clone(),
+    let refilling = config
+        .ark_refill
+        .as_ref()
+        .is_some_and(|refill| refill.enabled);
+    // Its secrets are read only once it is enabled, so they may be placed after the settings.
+    let ark_refiller = match &config.ark_refill {
+        Some(refill) if refill.enabled => Some(ArkRefiller::new(
+            refill.clone(),
             db.clone(),
             events.clone(),
         )?),
+        _ => None,
+    };
+    let rebalancer = match (&config.lnd, &config.rebalance) {
+        (Some(payer), Some(rebalance)) => {
+            let mut rebalance = rebalance.clone();
+            // Two refills of the same wallet would each send for the same shortfall.
+            if refilling && rebalance.arkade.take().is_some() {
+                warn!("ark_refill is enabled, so rebalance.arkade no longer tops up ark-swapd");
+            }
+            Some(Rebalancer::new(
+                payer,
+                rebalance,
+                db.clone(),
+                events.clone(),
+            )?)
+        }
         (None, Some(_)) => anyhow::bail!("rebalance needs lnd, the node it pays back"),
         _ => None,
     };
@@ -84,8 +105,14 @@ async fn main() -> anyhow::Result<()> {
         .rebalance
         .as_ref()
         .and_then(|rebalance| rebalance.arkade.as_ref())
+        .map(|arkade| &arkade.ark_swap)
+        .or(config
+            .ark_refill
+            .as_ref()
+            .filter(|refill| refill.enabled)
+            .map(|refill| &refill.ark_swap))
     {
-        Some(arkade) => Some(ArkSwap::new(&arkade.ark_swap)?),
+        Some(ark_swap) => Some(ArkSwap::new(ark_swap)?),
         None => None,
     };
     let tracker = Tracker::new(
@@ -134,9 +161,12 @@ async fn main() -> anyhow::Result<()> {
     if let Some(rebalancer) = rebalancer.clone().filter(|r| r.config().enabled) {
         tokio::spawn(async move { rebalancer.run_scheduled().await });
     }
+    if let Some(refiller) = ark_refiller.clone() {
+        tokio::spawn(async move { refiller.run_scheduled().await });
+    }
 
     // Start HTTP server
-    server::start_server(&config, runner, rebalancer, tracker).await?;
+    server::start_server(&config, runner, rebalancer, ark_refiller, tracker).await?;
 
     Ok(())
 }
