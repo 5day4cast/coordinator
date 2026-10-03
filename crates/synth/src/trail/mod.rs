@@ -85,6 +85,10 @@ pub struct EntryTrace {
     /// refused a seat. Some and above zero when an outside player took the seat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outside_entries: Option<u64>,
+    /// What synth found when it took the entry up again after a restart, if it was part way
+    /// through then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed: Option<String>,
 }
 
 impl EntryTrace {

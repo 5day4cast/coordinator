@@ -1088,6 +1088,15 @@ impl ScenarioResult {
             .iter()
             .any(|step| step.name == REFUSED_AS_SMALL_STEP && step.status == StepStatus::Skipped)
     }
+
+    /// Why the coordinator did not create the run's competition, if it failed to: a lane tries
+    /// such a run again later.
+    pub fn creation_error(&self) -> Option<String> {
+        self.steps
+            .iter()
+            .find(|step| step.name == REFUSED_AS_SMALL_STEP && step.status == StepStatus::Failed)
+            .map(|step| step.error.clone().unwrap_or_default())
+    }
 }
 
 /// The step a run records when the coordinator refuses its competition as too small for the

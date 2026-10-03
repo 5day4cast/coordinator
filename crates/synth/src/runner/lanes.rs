@@ -255,6 +255,35 @@ impl LaneConfig {
     }
 }
 
+/// Between the first runs of two lanes after synth starts. Lanes started together sent the
+/// oracle more requests at once than it takes.
+pub const LANE_STAGGER: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// How long the `index`th lane waits after synth starts before its first run.
+pub fn start_offset(index: usize) -> std::time::Duration {
+    LANE_STAGGER * index as u32
+}
+
+/// Tries a lane makes again at a run that created no competition.
+pub const START_RETRIES: u32 = 3;
+/// Between those tries.
+pub const START_RETRY: Duration = Duration::minutes(5);
+
+/// When a lane tries again at a run that created no competition, after `failed` tries at it
+/// failed, at `now`: None once it has tried [`START_RETRIES`] more times, or for a run whose
+/// entries close at `close`, when trying again would leave less than half its entry window of
+/// `entry_window_secs` to enter.
+pub fn retry_start(
+    failed: u32,
+    now: OffsetDateTime,
+    close: Option<OffsetDateTime>,
+    entry_window_secs: u64,
+) -> Option<OffsetDateTime> {
+    let at = now + START_RETRY;
+    let half_window = Duration::seconds((entry_window_secs / 2) as i64);
+    (failed <= START_RETRIES && close.is_none_or(|close| close - at >= half_window)).then_some(at)
+}
+
 /// The first 00:00 or 12:00 UTC at or after `at`.
 pub fn next_half(at: OffsetDateTime) -> OffsetDateTime {
     let at = at.to_offset(time::UtcOffset::UTC);
@@ -350,6 +379,27 @@ mod tests {
         assert_eq!(config.observation_window_secs, DAY);
         assert_eq!(config.window_shape(), WindowShape::FullDay);
         assert_eq!(config.values_per_entry(), 6);
+    }
+
+    #[test]
+    fn lanes_start_apart_and_retry_a_failed_start_a_few_times() {
+        assert_eq!(start_offset(0), std::time::Duration::ZERO);
+        assert_eq!(start_offset(2), std::time::Duration::from_secs(90));
+        let now = datetime!(2026-10-03 15:42 UTC);
+        // An interval lane's run takes its entries from when it is created.
+        assert_eq!(retry_start(1, now, None, 7200), Some(now + START_RETRY));
+        assert_eq!(
+            retry_start(START_RETRIES, now, None, 7200),
+            Some(now + START_RETRY)
+        );
+        assert_eq!(retry_start(START_RETRIES + 1, now, None, 7200), None);
+        // An aligned lane's run closes entries at the half, whatever time it starts.
+        let close = datetime!(2026-10-04 00:00 UTC);
+        assert!(retry_start(1, datetime!(2026-10-03 23:00 UTC), Some(close), 3600).is_some());
+        assert!(
+            retry_start(1, datetime!(2026-10-03 23:30 UTC), Some(close), 3600).is_none(),
+            "a retry at 23:35 leaves less than half the hour to enter"
+        );
     }
 
     #[test]

@@ -1,9 +1,10 @@
 pub mod keep_open;
 pub mod lanes;
+pub mod resume;
 
 use crate::client::CoordinatorClient;
 use crate::config::{KeepOpenConfig, SchedulerConfig};
-use crate::db::SynthDb;
+use crate::db::{SynthDb, TestRun};
 use crate::events::{Event, Events};
 use crate::scenarios::{
     self, ScenarioConfig, ScenarioResult, ScenarioStatus, StepResult, StepStatus,
@@ -37,6 +38,11 @@ pub const SCENARIOS: &[&str] = &[
 fn recordable(scenario: &str) -> bool {
     SCENARIOS.contains(&scenario) || scenario == scenarios::manual::MANUAL_COMPETITION
 }
+
+/// Tries at reaching a resumed run's competition, and the wait between them: five minutes for
+/// a coordinator restarting with synth.
+const RESUME_TRIES: u32 = 30;
+const RESUME_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Cover every case/window pair instead of coupling two cycles of equal length.
 fn scheduled_selection<'a>(scenarios: &[&'a str], windows: &[u64], cycle: usize) -> (&'a str, u64) {
@@ -91,6 +97,8 @@ struct Recorder {
     events: Events,
     live: Live,
     steps: mpsc::UnboundedSender<Record>,
+    /// What the run did before a restart, if it is a resumed run.
+    prior: Option<Arc<resume::Prior>>,
 }
 
 /// What a scenario records about a step, saved in the order recorded.
@@ -148,17 +156,71 @@ pub(crate) async fn step_progress(step: &str, details: serde_json::Value) -> Res
         .map_err(anyhow::Error::msg)
 }
 
-/// Save each step in the order recorded, announcing each once it is saved.
+/// The latest row of step `name` saved before a restart, when the running scenario is a resumed
+/// run. None outside a run, for a new run, or for a step the run had not reached.
+pub(crate) fn prior_step(name: &str) -> Option<crate::db::TestStep> {
+    RECORDER
+        .try_with(|recorder| {
+            recorder
+                .prior
+                .as_ref()
+                .and_then(|prior| prior.step(name).cloned())
+        })
+        .ok()
+        .flatten()
+}
+
+/// The competition a resumed run made before the restart, which it carries on with instead of
+/// making another. None outside a run, or for a new run.
+pub(crate) fn resumed_competition() -> Option<Uuid> {
+    RECORDER
+        .try_with(|recorder| recorder.prior.as_ref().map(|_| recorder.competition_id))
+        .ok()
+        .flatten()
+}
+
+/// When a resumed run first started, as an instant now, so its players keep the arrival times
+/// they were planned at. None outside a run, or for a new run.
+pub(crate) fn resumed_start() -> Option<std::time::Instant> {
+    RECORDER
+        .try_with(|recorder| {
+            recorder.prior.as_ref().map(|prior| {
+                let since = (OffsetDateTime::now_utc() - prior.started_at)
+                    .max(time::Duration::ZERO)
+                    .unsigned_abs();
+                let now = std::time::Instant::now();
+                now.checked_sub(since).unwrap_or(now)
+            })
+        })
+        .ok()
+        .flatten()
+}
+
+/// Save each step in the order recorded, announcing each once it is saved. A resumed run's
+/// steps still running at the restart finish in their own rows, and steps it had finished are
+/// not saved again when they end the same way.
 async fn save_steps(
     db: SynthDb,
     events: Events,
     run_id: String,
+    prior: Option<Arc<resume::Prior>>,
     mut records: mpsc::UnboundedReceiver<Record>,
 ) {
     // Steps saved before they finished, by name, and their rows.
-    let mut open: HashMap<String, String> = HashMap::new();
+    let mut open: HashMap<String, String> = prior
+        .as_ref()
+        .map(|prior| prior.open_rows())
+        .unwrap_or_default();
+    let mut replay = prior
+        .as_ref()
+        .map(|prior| prior.replay())
+        .unwrap_or_default();
     while let Some(record) = records.recv().await {
         match record {
+            Record::Progress { step, saved, .. } if replay.finished(&step) => {
+                // It finished before the restart, and what it saved then stands.
+                let _ = saved.send(Ok(()));
+            }
             Record::Progress {
                 step,
                 details,
@@ -183,6 +245,13 @@ async fn save_steps(
                 events.send(Event::StepStarted {
                     run_id: run_id.clone(),
                     step,
+                });
+            }
+            Record::Finished(step) if replay.repeats(&step.name, step.error.is_some()) => {
+                events.send(Event::StepFinished {
+                    run_id: run_id.clone(),
+                    step: step.name.clone(),
+                    passed: step.status == StepStatus::Passed,
                 });
             }
             Record::Finished(step) => {
@@ -349,22 +418,105 @@ impl Runner {
             run.scenario == scenario,
             "Recorded scenario does not match requested execution"
         );
-        let config: ScenarioConfig = serde_json::from_str(
-            run.config_json
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("Recorded run has no resolved plan"))?,
-        )?;
-        anyhow::ensure!(
-            config.seed.is_some() && config.entry_plan.len() == config.users,
-            "Recorded run has no resolved entry plan"
+        let (config, competition_id) = resume::recorded_plan(&run)?;
+        self.execute(run_id, scenario, config, competition_id, None)
+            .await
+    }
+
+    /// Carry on every run the last shutdown left running from its last finished step, and mark
+    /// those that cannot carry on as interrupted, saying why. Call once, before any new run
+    /// starts. Returns how many runs were taken up again; each goes on in its own task.
+    pub async fn resume_unfinished(&self) -> Result<usize> {
+        let mut resumed = 0;
+        for run in self.db.unfinished_runs().await? {
+            let steps = self.db.get_steps(&run.id).await?;
+            match resume::resume_point(&run, &steps) {
+                Ok(point) => {
+                    let runner = self.clone();
+                    tokio::spawn(async move { runner.resume(run, point, steps).await });
+                    resumed += 1;
+                }
+                Err(why) => {
+                    warn!("Run {} ({}) cannot be resumed: {why}", run.id, run.scenario);
+                    self.db.interrupt_run(&run.id, &why).await?;
+                }
+            }
+        }
+        Ok(resumed)
+    }
+
+    /// Carry on `run` from `point`, once the coordinator answers for its competition.
+    async fn resume(
+        &self,
+        run: TestRun,
+        point: resume::ResumePoint,
+        steps: Vec<crate::db::TestStep>,
+    ) {
+        if let Err(error) = self.reach_competition(&point.competition_id).await {
+            let why = if point.created {
+                format!("the coordinator did not answer for its competition: {error:#}")
+            } else {
+                format!("it restarted before its competition was created: {error:#}")
+            };
+            warn!("Run {} ({}) cannot be resumed: {why}", run.id, run.scenario);
+            if let Err(error) = self.db.interrupt_run(&run.id, &why).await {
+                error!("Cannot mark run {} interrupted: {error:#}", run.id);
+            }
+            return;
+        }
+        let started_at = OffsetDateTime::parse(
+            &run.started_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap_or_else(|_| OffsetDateTime::now_utc());
+        info!(
+            "Resuming run {} ({}) from its last finished step",
+            run.id, run.scenario
         );
-        anyhow::ensure!(
-            config.planned_scenario.as_deref() == Some(scenario),
-            "Recorded plan belongs to another scenario"
-        );
-        let competition_id = config
-            .competition_id
-            .ok_or_else(|| anyhow::anyhow!("Recorded plan has no competition id"))?;
+        crate::server::metrics::record_resumed_run();
+        let prior = Arc::new(resume::Prior::new(started_at, steps));
+        if let Err(error) = self
+            .execute(
+                run.id.clone(),
+                &run.scenario,
+                point.config,
+                point.competition_id,
+                Some(prior),
+            )
+            .await
+        {
+            error!("Resumed run {} stopped: {error:#}", run.id);
+        }
+    }
+
+    /// Ask for a resumed run's competition until the coordinator answers, as it may be
+    /// restarting with synth. Fails at once if the coordinator has no such competition, and
+    /// after [`RESUME_TRIES`] tries without an answer.
+    async fn reach_competition(&self, competition_id: &Uuid) -> Result<()> {
+        let mut tries = 1;
+        loop {
+            match self.client.get_competition(competition_id).await {
+                Ok(_) => return Ok(()),
+                Err(error) if tries >= RESUME_TRIES || format!("{error:#}").contains("(404") => {
+                    return Err(error)
+                }
+                Err(_) => {
+                    tries += 1;
+                    tokio::time::sleep(RESUME_RETRY).await;
+                }
+            }
+        }
+    }
+
+    /// Run a recorded plan, or carry on one a restart cut short from what it did before.
+    async fn execute(
+        &self,
+        run_id: String,
+        scenario: &str,
+        config: ScenarioConfig,
+        competition_id: Uuid,
+        prior: Option<Arc<resume::Prior>>,
+    ) -> Result<ScenarioResult> {
         info!("Starting scenario '{scenario}' (run: {run_id}, competition: {competition_id})");
         self.live.insert(
             competition_id,
@@ -372,7 +524,9 @@ impl Runner {
                 run_id: run_id.clone(),
                 competition_id,
                 scenario: scenario.to_string(),
-                started_at: OffsetDateTime::now_utc(),
+                started_at: prior
+                    .as_ref()
+                    .map_or_else(OffsetDateTime::now_utc, |prior| prior.started_at),
                 current_step: None,
             },
         );
@@ -386,6 +540,7 @@ impl Runner {
             self.db.clone(),
             self.events.clone(),
             run_id.clone(),
+            prior.clone(),
             to_save,
         ));
         let recorder = Recorder {
@@ -394,6 +549,7 @@ impl Runner {
             events: self.events.clone(),
             live: self.live.clone(),
             steps,
+            prior,
         };
         let result = RECORDER
             .scope(recorder, async {
@@ -513,20 +669,21 @@ impl Runner {
     }
 
     /// Run `scenario`, logging a failure. If the coordinator refused its competition as too small
-    /// for the fees, which rose since the count was drawn, draw again, large enough.
-    async fn run_or_redraw(&self, scenario: &str, mut config: ScenarioConfig) {
+    /// for the fees, which rose since the count was drawn, draw again, large enough. Returns why
+    /// if the run made no competition, which a lane tries again later.
+    async fn run_or_redraw(&self, scenario: &str, mut config: ScenarioConfig) -> Option<String> {
         match self.db.scenario_enabled(scenario).await {
             Ok(false) => {
                 info!("Skipping paused scenario {scenario}");
-                return;
+                return None;
             }
             Err(error) => {
                 error!("Cannot read scenario controls; no run started: {error:#}");
-                return;
+                return None;
             }
             Ok(true) => {}
         }
-        match self.run_scenario(scenario, config.clone()).await {
+        match self.attempt(scenario, config.clone()).await {
             Ok(result) if result.refused_as_small() => {
                 config.min_players = config
                     .player_mix
@@ -534,12 +691,62 @@ impl Runner {
                     .map(|mix| mix.min_players_high_fees);
                 config.seed = config.seed.map(|seed| seed.wrapping_add(0x5245_4452_4157));
                 config.competition_id = None;
-                if let Err(e) = self.run_scenario(scenario, config).await {
-                    error!("Scheduled run failed: {:?}", e);
-                }
+                self.attempt(scenario, config).await.err()
             }
-            Ok(_) => {}
-            Err(e) => error!("Scheduled run failed: {:?}", e),
+            Ok(_) => None,
+            Err(why) => Some(why),
+        }
+    }
+
+    /// Record and run one run of `scenario`. Err, saying why, if it made no competition. A run
+    /// that could not even be recorded, as when the oracle could not confirm its stations, is
+    /// recorded here as a failed run, so history and metrics show it.
+    async fn attempt(
+        &self,
+        scenario: &str,
+        config: ScenarioConfig,
+    ) -> std::result::Result<ScenarioResult, String> {
+        let run_id = match self.record_run(scenario, &config).await {
+            Ok(run_id) => run_id,
+            Err(error) => {
+                let why = format!("{error:#}");
+                error!("Scheduled run of {scenario} failed before it started: {why}");
+                if !why.contains("is paused") {
+                    self.record_failed_start(scenario, &config, "plan_run", &why)
+                        .await;
+                }
+                return Err(why);
+            }
+        };
+        match self.run_recorded(run_id, scenario).await {
+            Ok(result) => match result.creation_error() {
+                Some(why) => Err(why),
+                None => Ok(result),
+            },
+            Err(error) => {
+                error!("Scheduled run failed: {error:#}");
+                Err(format!("{error:#}"))
+            }
+        }
+    }
+
+    /// Record a run of `scenario` that failed at `step` before it was under way, in the history
+    /// and the metrics.
+    async fn record_failed_start(
+        &self,
+        scenario: &str,
+        config: &ScenarioConfig,
+        step: &str,
+        why: &str,
+    ) {
+        crate::server::metrics::record_scenario(scenario, false, 0, &[(step.to_string(), 0)]);
+        let config = serde_json::to_string(config).ok();
+        if let Err(error) = self
+            .db
+            .record_failed_start(scenario, config.as_deref(), step, why)
+            .await
+        {
+            error!("Cannot record the run of {scenario} that failed to start: {error:#}");
         }
     }
 
@@ -582,13 +789,16 @@ impl Runner {
         let lanes: Vec<_> = lanes
             .iter()
             .cloned()
-            .map(|lane| {
+            .enumerate()
+            .map(|(index, lane)| {
                 let (runner, base) = (self.clone(), base.clone());
                 let start = early
                     .as_ref()
                     .filter(|(name, _, _)| *name == lane.name)
                     .map(|(_, start, grace)| (start.clone(), *grace));
-                tokio::spawn(async move { runner.run_lane(lane, base, start).await })
+                // Lanes started together asked the oracle for more than it takes at once.
+                let offset = lanes::start_offset(index);
+                tokio::spawn(async move { runner.run_lane(lane, base, start, offset).await })
             })
             .collect();
         futures::future::join_all(lanes).await;
@@ -600,33 +810,107 @@ impl Runner {
         lane: lanes::LaneConfig,
         base: ScenarioConfig,
         early: Option<(Arc<keep_open::LaneStart>, std::time::Duration)>,
+        offset: std::time::Duration,
     ) {
-        lane_loop(&lane, &base, early, |scenario, config| {
+        let start = early.as_ref().map(|(start, _)| start.clone());
+        lane_loop(&lane, &base, early, offset, |scenario, config| {
             let runner = self.clone();
-            let (picking, defaults) = (lane.clone(), base.clone());
+            let (picking, defaults, start) = (lane.clone(), base.clone(), start.clone());
             tokio::spawn(async move {
-                let mut config = config;
-                match runner.db.scenario_enabled(&scenario).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        info!("Skipping paused scenario {scenario}");
-                        return;
-                    }
-                    Err(error) => {
-                        error!("Cannot read scenario controls; no run started: {error:#}");
-                        return;
-                    }
-                }
-                if let Some(picker) = &runner.picker {
-                    if let Err(error) = picker.choose(&picking, &defaults, &mut config).await {
-                        warn!("Lane {} skipped: {error:#}", picking.name);
-                        return;
-                    }
-                }
-                runner.run_or_redraw(&scenario, config).await
+                runner
+                    .start_with_retries(&picking, &defaults, &scenario, config, start)
+                    .await
             });
         })
         .await
+    }
+
+    /// Start a lane's run. If it made no competition, it is in the history as failed; try again
+    /// a few times, minutes apart, unless the lane started another run meanwhile. A keep-open
+    /// lane's next check also starts one, if nothing else is open.
+    async fn start_with_retries(
+        &self,
+        lane: &lanes::LaneConfig,
+        base: &ScenarioConfig,
+        scenario: &str,
+        config: ScenarioConfig,
+        start: Option<Arc<keep_open::LaneStart>>,
+    ) {
+        let mut failed = 0;
+        loop {
+            let Some(why) = self
+                .start_lane_run(lane, base, scenario, config.clone())
+                .await
+            else {
+                return;
+            };
+            failed += 1;
+            let failed_at = tokio::time::Instant::now();
+            if let Some(start) = &start {
+                start.failed();
+            }
+            let Some(at) = lanes::retry_start(
+                failed,
+                OffsetDateTime::now_utc(),
+                config.observation_start,
+                config.entry_window_secs,
+            ) else {
+                warn!(
+                    "Lane {}: {scenario} made no competition in {failed} tries; it waits for its \
+                     next run: {why}",
+                    lane.name
+                );
+                return;
+            };
+            warn!(
+                "Lane {}: {scenario} made no competition; trying again at {at}: {why}",
+                lane.name
+            );
+            sleep_until(at).await;
+            if start
+                .as_ref()
+                .is_some_and(|start| start.started_since(failed_at))
+            {
+                info!(
+                    "Lane {} started another run meanwhile; {scenario} is not tried again",
+                    lane.name
+                );
+                return;
+            }
+            crate::server::metrics::record_lane_retry(&lane.name);
+        }
+    }
+
+    /// Pick a lane's stations for its run and run it. Returns why if it made no competition;
+    /// None if it did, or its scenario is paused.
+    async fn start_lane_run(
+        &self,
+        lane: &lanes::LaneConfig,
+        base: &ScenarioConfig,
+        scenario: &str,
+        mut config: ScenarioConfig,
+    ) -> Option<String> {
+        match self.db.scenario_enabled(scenario).await {
+            Ok(true) => {}
+            Ok(false) => {
+                info!("Skipping paused scenario {scenario}");
+                return None;
+            }
+            Err(error) => {
+                error!("Cannot read scenario controls; no run started: {error:#}");
+                return None;
+            }
+        }
+        if let Some(picker) = &self.picker {
+            if let Err(error) = picker.choose(lane, base, &mut config).await {
+                let why = format!("{error:#}");
+                warn!("Lane {} could not pick its stations: {why}", lane.name);
+                self.record_failed_start(scenario, &config, "pick_stations", &why)
+                    .await;
+                return Some(why);
+            }
+        }
+        self.run_or_redraw(scenario, config).await
     }
 
     /// Start the scheduled runner loop
@@ -654,7 +938,7 @@ impl Runner {
             let (scenario, window) = scheduled_selection(&scenarios, &windows, cycle);
             next.observation_window_secs = window;
             next.seed = config.seed.map(|seed| seed.wrapping_add(cycle as u64));
-            self.run_or_redraw(scenario, next).await;
+            let _ = self.run_or_redraw(scenario, next).await;
             cycle = cycle.wrapping_add(1);
             tokio::time::sleep_until(
                 started + std::time::Duration::from_secs(scheduler.interval_secs),
@@ -664,19 +948,24 @@ impl Runner {
     }
 }
 
-/// Start `lane`'s runs through `start` on its cadence, for ever. When `early` is notified, the
-/// lane's next run starts at once instead of when it was due: its scenario and window rotation
-/// carry on from it, and its next run follows a whole cadence after it.
+/// Start `lane`'s runs through `start` on its cadence, for ever, none sooner than `offset` from
+/// now. When `early` is notified, the lane's next run starts at once instead of when it was due:
+/// its scenario and window rotation carry on from it, and its next run follows a whole cadence
+/// after it.
 async fn lane_loop(
     lane: &lanes::LaneConfig,
     base: &ScenarioConfig,
     early: Option<(Arc<keep_open::LaneStart>, std::time::Duration)>,
+    offset: std::time::Duration,
     mut start: impl FnMut(String, ScenarioConfig),
 ) {
     let mut after = OffsetDateTime::now_utc();
+    let not_before = after + offset;
     let mut cycle = 0usize;
     loop {
         let (mut at, mut close) = lane.next_start(base, after);
+        // An aligned lane keeps its close; only its start waits.
+        at = at.max(not_before);
         match &early {
             Some((early, grace)) => tokio::select! {
                 _ = sleep_until(at) => {}
@@ -685,6 +974,7 @@ async fn lane_loop(
                     if early.recent(*grace) {
                         continue;
                     }
+                    sleep_until(not_before).await;
                     (at, close) = lane.next_start(base, OffsetDateTime::now_utc());
                     info!("Lane {} starts its next run early, to keep a competition open", lane.name);
                 }
@@ -765,13 +1055,20 @@ mod tests {
         pool.close().await;
         let events = Events::new();
         let (steps, records) = mpsc::unbounded_channel();
-        let saving = tokio::spawn(save_steps(db, events.clone(), run_id.clone(), records));
+        let saving = tokio::spawn(save_steps(
+            db,
+            events.clone(),
+            run_id.clone(),
+            None,
+            records,
+        ));
         let recorder = Recorder {
             run_id,
             competition_id: Uuid::now_v7(),
             events,
             live: Arc::new(DashMap::new()),
             steps,
+            prior: None,
         };
         let mut paid = false;
         let result = RECORDER
@@ -953,6 +1250,7 @@ mod tests {
                     &lane,
                     &base,
                     Some((early, std::time::Duration::from_secs(300))),
+                    std::time::Duration::ZERO,
                     |scenario, config| {
                         started
                             .send((
@@ -995,6 +1293,204 @@ mod tests {
         running.abort();
     }
 
+    /// A run that cannot start is in the history and the metrics as a failed run, saying why,
+    /// and a lane hears why, to try again later.
+    #[tokio::test]
+    async fn a_run_that_cannot_start_is_recorded_as_failed() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = SynthDb::new(directory.path().join("synth.db").to_str().unwrap())
+            .await
+            .unwrap();
+        // Without an oracle to confirm its stations, no run can be planned.
+        let runner = Runner::new(
+            CoordinatorClient::new("http://127.0.0.1:1", None),
+            db.clone(),
+            Events::new(),
+        );
+        let failed_before = crate::server::metrics::SCENARIO_RUNS
+            .with_label_values(&["late_submission", "failed"])
+            .get();
+        let why = runner
+            .run_or_redraw("late_submission", ScenarioConfig::default())
+            .await
+            .expect("no competition was made");
+        assert!(why.contains("eligibility is not configured"), "{why}");
+        let runs = db.list_runs(10).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "failed");
+        assert_eq!(runs[0].error_message.as_deref(), Some(why.as_str()));
+        let steps = db.get_steps(&runs[0].id).await.unwrap();
+        assert_eq!(steps[0].step_name, "plan_run");
+        assert!(
+            crate::server::metrics::SCENARIO_RUNS
+                .with_label_values(&["late_submission", "failed"])
+                .get()
+                >= failed_before + 1.0
+        );
+        // A paused scenario tries nothing, so there is nothing to record or try again.
+        db.set_scenario_enabled("late_submission", false)
+            .await
+            .unwrap();
+        assert!(runner
+            .run_or_redraw("late_submission", ScenarioConfig::default())
+            .await
+            .is_none());
+        assert_eq!(db.list_runs(10).await.unwrap().len(), 1);
+    }
+
+    /// Runs the last shutdown left running that cannot carry on are marked interrupted, saying
+    /// why: a stress run, and one whose plan was never saved.
+    #[tokio::test]
+    async fn runs_that_cannot_resume_say_why() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = SynthDb::new(directory.path().join("synth.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let runner = Runner::new(
+            CoordinatorClient::new("http://127.0.0.1:1", None),
+            db.clone(),
+            Events::new(),
+        );
+        let stress = db.create_run("stress_full_pool", None).await.unwrap();
+        let unplanned = db.create_run("escrow_refund", None).await.unwrap();
+        db.create_step(&unplanned, "prepare_user_behavior")
+            .await
+            .unwrap();
+        assert_eq!(runner.resume_unfinished().await.unwrap(), 0);
+        let stress = db.get_run(&stress).await.unwrap().unwrap();
+        assert_eq!(stress.status, "interrupted");
+        assert!(stress
+            .error_message
+            .unwrap()
+            .ends_with("a stress_full_pool run is not resumed after a restart"));
+        let unplanned_run = db.get_run(&unplanned).await.unwrap().unwrap();
+        assert_eq!(unplanned_run.status, "interrupted");
+        assert!(unplanned_run
+            .error_message
+            .unwrap()
+            .contains("its plan cannot be read"));
+        assert_eq!(
+            db.get_steps(&unplanned).await.unwrap()[0].status,
+            "interrupted"
+        );
+    }
+
+    /// A resumed run carries on with the competition it made. A step still running at the
+    /// restart finishes in its own row, and a step it had finished is not saved again when its
+    /// check passes again.
+    #[tokio::test]
+    async fn a_resumed_run_finishes_open_steps_in_place_and_keeps_finished_ones() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = SynthDb::new(directory.path().join("synth.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let run_id = db.create_run("escrow_refund", None).await.unwrap();
+        let competition_id = Uuid::now_v7();
+        let created = serde_json::json!({ "competition_id": competition_id }).to_string();
+        db.add_step(&run_id, "create_competition", 5, None, Some(&created))
+            .await
+            .unwrap();
+        let waiting = db.create_step(&run_id, "wait_cancelled").await.unwrap();
+        let prior = Arc::new(resume::Prior::new(
+            OffsetDateTime::now_utc() - time::Duration::minutes(1),
+            db.get_steps(&run_id).await.unwrap(),
+        ));
+        let events = Events::new();
+        let (steps, to_save) = mpsc::unbounded_channel();
+        let saving = tokio::spawn(save_steps(
+            db.clone(),
+            events.clone(),
+            run_id.clone(),
+            Some(prior.clone()),
+            to_save,
+        ));
+        let recorder = Recorder {
+            run_id: run_id.clone(),
+            competition_id,
+            events,
+            live: Arc::new(DashMap::new()),
+            steps,
+            prior: Some(prior),
+        };
+        let step = |name: &str| StepResult {
+            name: name.into(),
+            status: StepStatus::Passed,
+            duration_ms: 1,
+            details: None,
+            error: None,
+        };
+        RECORDER
+            .scope(recorder, async {
+                assert_eq!(resumed_competition(), Some(competition_id));
+                let anchor = resumed_start().unwrap();
+                assert!(anchor.elapsed() >= std::time::Duration::from_secs(55));
+                assert_eq!(
+                    prior_step("wait_cancelled").map(|row| row.status),
+                    Some("running".to_string())
+                );
+                assert!(prior_step("refund_alice").is_none());
+                let mut created = step("create_competition");
+                created.details = Some(serde_json::json!({ "competition_id": competition_id }));
+                step_finished(&created);
+                step_finished(&step("wait_cancelled"));
+                step_finished(&step("refund_alice"));
+            })
+            .await;
+        saving.await.unwrap();
+        let saved = db.get_steps(&run_id).await.unwrap();
+        assert_eq!(
+            saved
+                .iter()
+                .map(|step| (step.step_name.as_str(), step.status.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("create_competition", "passed"),
+                ("wait_cancelled", "passed"),
+                ("refund_alice", "passed"),
+            ]
+        );
+        assert_eq!(
+            saved[1].id, waiting,
+            "finished in the row it was running in"
+        );
+        // Outside a run, nothing is resumed.
+        assert!(resumed_competition().is_none() && prior_step("wait_cancelled").is_none());
+    }
+
+    /// Lanes start apart, so their first runs do not ask the oracle at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_lane_waits_its_offset_before_its_first_run() {
+        let lane = lanes::LaneConfig {
+            name: "queued".into(),
+            interval_secs: 3600,
+            align: lanes::Align::Interval,
+            scenarios: vec![scenarios::queued::QUEUED_ONE_POOL.into()],
+            observation_windows_secs: Some(vec![86_400]),
+            entry_window_secs: Some(7200),
+            stations: None,
+            stations_per_run: None,
+            fill: scenarios::Fill::Immediate,
+            early_players: 1,
+            backfill_before_close_secs: 1800,
+            backfill_margin: 1,
+            unlisted: None,
+            stress: None,
+            picker: None,
+        };
+        let base = ScenarioConfig::default();
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let begun = tokio::time::Instant::now();
+        let running = tokio::spawn(async move {
+            lane_loop(&lane, &base, None, lanes::start_offset(2), |_, _| {
+                started.send(begun.elapsed().as_secs()).unwrap()
+            })
+            .await
+        });
+        let first = starts.recv().await.unwrap();
+        assert!((89..=90).contains(&first), "first run at {first} s");
+        running.abort();
+    }
+
     /// A page watching a run sees each step as soon as it is recorded, not when the run ends.
     #[tokio::test]
     async fn a_step_is_saved_and_announced_while_its_run_goes_on() {
@@ -1022,6 +1518,7 @@ mod tests {
             db.clone(),
             events.clone(),
             run_id.clone(),
+            None,
             to_save,
         ));
         let recorder = Recorder {
@@ -1030,6 +1527,7 @@ mod tests {
             events: events.clone(),
             live: live.clone(),
             steps,
+            prior: None,
         };
 
         RECORDER
