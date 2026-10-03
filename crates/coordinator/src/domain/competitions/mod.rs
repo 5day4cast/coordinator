@@ -1169,6 +1169,9 @@ pub struct Competition {
     /// When a queued competition formed its pools. It has no lifecycle of its own after that.
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub pools_formed_at: Option<OffsetDateTime>,
+    /// When every pool a queued competition formed had finished.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub pools_finished_at: Option<OffsetDateTime>,
     /// A queued competition's settings, entries and pools. Not stored on the row; the
     /// coordinator fills it in for the API.
     #[serde(flatten)]
@@ -1265,6 +1268,13 @@ pub struct ExtendCompetition {
         skip_serializing_if = "Option::is_none"
     )]
     pub pools_formed_at: Option<OffsetDateTime>,
+    /// When every pool a queued competition formed had finished.
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pools_finished_at: Option<OffsetDateTime>,
     /// A queued competition's `pool_rules`, `entries`, `max_entries`, `stake_sats` and `pools`.
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub queue: Option<QueueSummary>,
@@ -1322,6 +1332,7 @@ impl From<Competition> for ExtendCompetition {
             parent_id: competition.parent_id,
             pool_index: competition.pool_index,
             pools_formed_at: competition.pools_formed_at,
+            pools_finished_at: competition.pools_finished_at,
             queue: competition.queue,
             kickoff_check: competition.kickoff_check,
             min_players_now: competition.min_players_now,
@@ -1639,6 +1650,9 @@ pub enum CompetitionState {
     Cancelled,
     /// A queued competition split its entries into pools, which each run on their own.
     PoolsFormed,
+    /// Every pool a queued competition formed has finished. Its leftover tickets' refunds
+    /// still run in cleanup.
+    PoolsFinished,
 }
 
 impl fmt::Display for CompetitionState {
@@ -1664,6 +1678,7 @@ impl fmt::Display for CompetitionState {
             CompetitionState::Failed => write!(f, "failed"),
             CompetitionState::Cancelled => write!(f, "cancelled"),
             CompetitionState::PoolsFormed => write!(f, "pools_formed"),
+            CompetitionState::PoolsFinished => write!(f, "pools_finished"),
         }
     }
 }
@@ -1712,6 +1727,7 @@ impl Competition {
             parent_id: None,
             pool_index: None,
             pools_formed_at: None,
+            pools_finished_at: None,
             queue: None,
             kickoff_check: None,
             min_players_now: None,
@@ -1899,6 +1915,8 @@ impl Competition {
                 CompetitionState::Cancelled
             } else if self.is_failed() {
                 CompetitionState::Failed
+            } else if self.pools_finished_at.is_some() {
+                CompetitionState::PoolsFinished
             } else if self.pools_formed_at.is_some() {
                 CompetitionState::PoolsFormed
             } else {
@@ -2042,6 +2060,15 @@ impl FromRow<'_, SqliteRow> for Competition {
                     OffsetDateTime::parse(&at, &time::format_description::well_known::Rfc3339)
                         .map_err(|e| sqlx::Error::ColumnDecode {
                             index: "pools_formed_at".into(),
+                            source: Box::new(e),
+                        })
+                })
+                .transpose()?,
+            pools_finished_at: queued::optional_column::<String>(row, "pools_finished_at")?
+                .map(|at| {
+                    OffsetDateTime::parse(&at, &time::format_description::well_known::Rfc3339)
+                        .map_err(|e| sqlx::Error::ColumnDecode {
+                            index: "pools_finished_at".into(),
                             source: Box::new(e),
                         })
                 })

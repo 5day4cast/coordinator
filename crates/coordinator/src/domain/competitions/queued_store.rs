@@ -641,6 +641,36 @@ impl CompetitionStore {
             .transpose()
     }
 
+    /// Mark queued competitions finished once every pool they formed has finished: completed,
+    /// or cancelled before its contract was funded. A pool cancelled after funding may still
+    /// settle, so it is not finished. Nothing about money changes here: a queue's leftover
+    /// tickets are refunded by cleanup, which keys on `pools_formed_at`, as before.
+    /// Returns how many were marked.
+    pub async fn finish_formed_queues(&self) -> Result<u64, DatabaseWriteError> {
+        let now = rfc3339(OffsetDateTime::now_utc())?;
+        self.db_connection
+            .execute_write(move |pool| async move {
+                Ok(sqlx::query(
+                    "UPDATE competitions SET pools_finished_at = ?
+                     WHERE kind = 'queued' AND pools_formed_at IS NOT NULL
+                       AND pools_finished_at IS NULL
+                       AND cancelled_at IS NULL AND failed_at IS NULL
+                       AND EXISTS (SELECT 1 FROM competitions pools
+                                   WHERE pools.parent_id = competitions.id)
+                       AND NOT EXISTS (SELECT 1 FROM competitions pools
+                                       WHERE pools.parent_id = competitions.id
+                                         AND pools.completed_at IS NULL
+                                         AND (pools.cancelled_at IS NULL
+                                              OR pools.funding_confirmed_at IS NOT NULL))",
+                )
+                .bind(now)
+                .execute(&pool)
+                .await?
+                .rows_affected())
+            })
+            .await
+    }
+
     /// Cancel a queued competition that formed no pools, under its lease.
     pub async fn cancel_queued_competition(
         &self,

@@ -194,6 +194,8 @@ impl Coordinator {
     /// processing, but their invoices and time-locked escrows still need retries after outages
     /// or maturity.
     ///
+    /// A queued competition whose pools have all finished is marked finished too.
+    ///
     /// Then the Keymeld registrations players sent before paying are deleted once nothing will
     /// use them: those of released reservations, and those of competitions that ended with no
     /// refund left to sign.
@@ -206,6 +208,10 @@ impl Coordinator {
             self.release_held_invoices(competition_id).await;
             self.reclaim_escrows(competition_id).await;
             self.refund_ark_escrows(competition_id).await;
+        }
+        let finished = self.competition_store.finish_formed_queues().await?;
+        if finished > 0 {
+            info!("{finished} queued competitions finished with all their pools");
         }
         let purged = self.competition_store.purge_ticket_registrations().await?;
         if purged > 0 {

@@ -190,9 +190,10 @@ pub const STATES: &[&str] = &[
     "failed",
     "cancelled",
     "pools_formed",
+    "pools_finished",
 ];
 
-const FINISHED: &[&str] = &["completed", "failed", "cancelled"];
+const FINISHED: &[&str] = &["completed", "failed", "cancelled", "pools_finished"];
 
 fn parse_state_filter(value: &str) -> Result<String, String> {
     let value = value.trim().to_ascii_lowercase().replace('-', "_");

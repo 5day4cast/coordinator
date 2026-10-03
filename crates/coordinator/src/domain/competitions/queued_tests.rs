@@ -867,6 +867,50 @@ async fn kickoff_forms_pools_from_the_seed_and_moves_their_tickets() {
         .await
         .unwrap();
     assert_eq!(pools, 3);
+
+    // The queue finishes once every pool has, and its leftover ticket is still refunded.
+    let store = queue.store();
+    assert_eq!(
+        store.finish_formed_queues().await.unwrap(),
+        0,
+        "its pools run"
+    );
+    let now = OffsetDateTime::now_utc();
+    let mut pools = Vec::new();
+    for record in &records {
+        pools.push(store.get_competition(record.competition_id).await.unwrap());
+    }
+    pools[0].completed_at = Some(now);
+    pools[1].completed_at = Some(now);
+    // Cancelled after its contract was funded, a pool may still settle.
+    pools[2].cancelled_at = Some(now);
+    pools[2].funding_confirmed_at = Some(now);
+    store.update_competitions(pools.clone()).await.unwrap();
+    assert_eq!(store.finish_formed_queues().await.unwrap(), 0);
+    pools[2].funding_confirmed_at = None;
+    store
+        .update_competitions(vec![pools[2].clone()])
+        .await
+        .unwrap();
+    assert_eq!(store.finish_formed_queues().await.unwrap(), 1);
+    assert_eq!(store.finish_formed_queues().await.unwrap(), 0, "once");
+    let parent = store.get_competition(queue.competition.id).await.unwrap();
+    assert!(parent.pools_finished_at.is_some());
+    assert_eq!(parent.get_state(), CompetitionState::PoolsFinished);
+    assert_eq!(parent.get_state().to_string(), "pools_finished");
+    assert!(
+        store
+            .get_competitions_pending_cleanup(false)
+            .await
+            .unwrap()
+            .contains(&queue.competition.id),
+        "the leftover ticket's escrow is still refunded"
+    );
+    assert!(!store
+        .active_competition_ids()
+        .await
+        .unwrap()
+        .contains(&queue.competition.id));
 }
 
 #[tokio::test]

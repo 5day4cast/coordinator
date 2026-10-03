@@ -1401,7 +1401,8 @@ impl CompetitionStore {
                 competitions.kind as kind,
                 competitions.parent_id as parent_id,
                 competitions.pool_index as pool_index,
-                competitions.pools_formed_at as pools_formed_at
+                competitions.pools_formed_at as pools_formed_at,
+                competitions.pools_finished_at as pools_finished_at
             FROM competitions
             LEFT JOIN payout_stats ON competitions.id = payout_stats.event_id
             LEFT JOIN entries ON entries.event_id = competitions.id
@@ -1447,6 +1448,7 @@ impl CompetitionStore {
                     competitions.parent_id,
                     competitions.pool_index,
                     competitions.pools_formed_at,
+                    competitions.pools_finished_at,
                     payout_stats.total_paid_out_entries",
                 base_query
             )
@@ -1490,6 +1492,7 @@ impl CompetitionStore {
                     competitions.parent_id,
                     competitions.pool_index,
                     competitions.pools_formed_at,
+                    competitions.pools_finished_at,
                     payout_stats.total_paid_out_entries",
                 base_query
             )
@@ -1584,6 +1587,7 @@ impl CompetitionStore {
                 competitions.parent_id AS parent_id,
                 competitions.pool_index AS pool_index,
                 competitions.pools_formed_at AS pools_formed_at,
+                competitions.pools_finished_at AS pools_finished_at,
                 competitions.contract_parameters IS NOT NULL AS has_contract
             FROM competitions
             LEFT JOIN entry_counts ON entry_counts.event_id = competitions.id
@@ -1659,7 +1663,8 @@ impl CompetitionStore {
                 competitions.kind as kind,
                 competitions.parent_id as parent_id,
                 competitions.pool_index as pool_index,
-                competitions.pools_formed_at as pools_formed_at
+                competitions.pools_formed_at as pools_formed_at,
+                competitions.pools_finished_at as pools_finished_at
             FROM competitions
             LEFT JOIN payout_stats ON competitions.id = payout_stats.event_id
             LEFT JOIN entries ON entries.event_id = competitions.id
@@ -1701,7 +1706,8 @@ impl CompetitionStore {
                 competitions.kind,
                 competitions.parent_id,
                 competitions.pool_index,
-                competitions.pools_formed_at"#;
+                competitions.pools_formed_at,
+                competitions.pools_finished_at"#;
 
         let competition = sqlx::query_as::<_, Competition>(query_str)
             .bind(competition_id.to_string())
