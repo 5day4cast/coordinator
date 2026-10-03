@@ -8,7 +8,7 @@ use dlctix::{
     musig2::{AggNonce, PartialSignature, PubNonce},
     SigMap,
 };
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use nostr::ToBech32;
 use serde::Deserialize;
 use std::str::FromStr;
@@ -39,7 +39,7 @@ pub async fn create_competition(
         .create_competition(body)
         .await
         .map_err(|e| {
-            error!("error creating competition: {:?}", e);
+            log_failure("creating competition", &e);
             ApiError::from(e)
         })?;
     // Its entry form reads forecasts from the cache; fill it before anyone opens it.
@@ -58,7 +58,7 @@ pub async fn create_queued_competition(
         .create_queued_competition(body)
         .await
         .map_err(|e| {
-            error!("error creating queued competition: {:?}", e);
+            log_failure("creating queued competition", &e);
             ApiError::from(e)
         })?;
     state.leaderboards.warm(&competition);
@@ -117,7 +117,7 @@ pub async fn request_competition_ticket(
     }: AuthedJson<TicketRequest>,
 ) -> Result<Json<TicketResponse>, ApiError> {
     let btc_pubkey = PublicKey::from_str(&request.btc_pubkey).map_err(|e| {
-        error!("Invalid Bitcoin public key: {:?}", e);
+        info!("Invalid Bitcoin public key in a ticket request: {e}");
         ApiError::Status(StatusCode::BAD_REQUEST)
     })?;
 
@@ -139,6 +139,16 @@ pub async fn request_competition_ticket(
         })
 }
 
+/// Refusals a client can act on, such as an unknown ticket or one not reserved by this
+/// player, are expected answers and logged at info, so errors mean something is broken.
+fn log_failure(action: &str, e: &DomainError) {
+    if e.is_refusal() {
+        info!("{action} refused: {e}");
+    } else {
+        error!("error {action}: {}", e.detail());
+    }
+}
+
 pub async fn get_ticket_status(
     NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
@@ -150,7 +160,7 @@ pub async fn get_ticket_status(
         .await
         .map(Json)
         .map_err(|e| {
-            error!("error getting ticket status: {:?}", e);
+            log_failure("getting ticket status", &e);
             e.into()
         })
 }
@@ -172,7 +182,7 @@ pub async fn register_ticket(
         .await
         .map(|()| StatusCode::NO_CONTENT)
         .map_err(|e| {
-            error!("error registering ticket: {:?}", e);
+            log_failure("registering ticket", &e);
             e.into()
         })
 }
@@ -189,7 +199,7 @@ pub async fn get_ticket_refund(
         .await
         .map(Json)
         .map_err(|e| {
-            error!("error getting ticket refund: {:?}", e);
+            log_failure("getting ticket refund", &e);
             e.into()
         })
 }
@@ -246,7 +256,7 @@ pub async fn get_entries(
         .await
         .map(Json)
         .map_err(|e| {
-            error!("error getting entries: {:?}", e);
+            log_failure("getting entries", &e);
             e.into()
         })
 }
@@ -255,10 +265,13 @@ pub async fn get_entries(
 pub async fn get_competitions(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<Competition>>, ApiError> {
-    let competitions = state.coordinator.get_competitions().await.map_err(|e| {
-        error!("error getting competitions: {:?}", e);
-        e
-    })?;
+    let competitions = state
+        .coordinator
+        .get_competitions()
+        .await
+        .inspect_err(|e| {
+            log_failure("getting competitions", e);
+        })?;
     let mut competitions = competitions
         .into_iter()
         .map(|mut comp| {
@@ -284,9 +297,8 @@ pub async fn get_competition(
         .coordinator
         .get_competition(competition_id)
         .await
-        .map_err(|e| {
-            error!("error getting competition: {:?}", e);
-            e
+        .inspect_err(|e| {
+            log_failure("getting competition", e);
         })?;
 
     if !competition.is_funding_broadcasted() {
@@ -312,7 +324,7 @@ pub async fn get_contract_parameters(
         .await
         .map(Json)
         .map_err(|e| {
-            error!("error getting contract parameters: {:?}", e);
+            log_failure("getting contract parameters", &e);
             e.into()
         })
 }
@@ -334,7 +346,7 @@ pub async fn submit_public_nonces(
         .await
         .map(|_| StatusCode::OK)
         .map_err(|e| {
-            error!("error submitting public nonces: {:?}", e);
+            log_failure("submitting public nonces", &e);
             e.into()
         })
 }
@@ -351,7 +363,7 @@ pub async fn get_aggregate_nonces(
         .await
         .map(Json)
         .map_err(|e| {
-            error!("error getting aggregate nonces: {:?}", e);
+            log_failure("getting aggregate nonces", &e);
             e.into()
         })
 }
@@ -382,7 +394,7 @@ pub async fn submit_final_signatures(
         .await
         .map(|_| StatusCode::OK)
         .map_err(|e| {
-            error!("error submitting partial signatures: {:?}", e);
+            log_failure("submitting partial signatures", &e);
             e.into()
         })
 }
@@ -404,7 +416,7 @@ pub async fn submit_ticket_payout(
         .await
         .map(|_| StatusCode::OK)
         .map_err(|e| {
-            error!("error submitting payout information: {:?}", e);
+            log_failure("submitting payout information", &e);
             e.into()
         })
 }
@@ -440,7 +452,7 @@ pub async fn claim_ticket_payout(
         .await
         .map(Json)
         .map_err(|e| {
-            error!("error claiming payout: {:?}", e);
+            log_failure("claiming payout", &e);
             e.into()
         })
 }
