@@ -95,7 +95,7 @@ The `leases` table has one row per resource: `competition:<id>` or `worker:<name
 - **Handover:**
   - On shutdown, each runner finishes its step and releases its lease.
     The other coordinator's runner, retrying every 2 seconds, takes it.
-  - After a crash, the leases expire after `lease_ttl_secs`, 30 seconds by default.
+  - After a crash, the leases expire after `lease_ttl_secs`, 120 seconds by default.
 
 ### Singleton workers
 
@@ -148,7 +148,7 @@ In `[coordinator_settings]`:
 | --- | --- | --- |
 | `sync_interval_secs` | 15 | The longest a competition waits without a wake |
 | `sweep_interval_secs` | 60 | How often the sweep runs |
-| `lease_ttl_secs` | 30 | How long a lease lasts without renewal |
+| `lease_ttl_secs` | 120 | How long a lease lasts without renewal |
 | `max_concurrent_steps` | 8 | Steps running at once |
 | `instance_name` | `name` | Names this process in leases and logs, such as its slot |
 
