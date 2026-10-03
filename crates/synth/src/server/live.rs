@@ -121,7 +121,7 @@ fn topics_of(event: &Event) -> Vec<String> {
         | Event::StepFinished { run_id, .. }
         | Event::RunFinished { run_id, .. }
         | Event::TrailUpdated { run_id } => vec![DASHBOARD.to_string(), run_topic(run_id)],
-        Event::Rebalanced => vec![DASHBOARD.to_string()],
+        Event::Rebalanced | Event::ScenarioControlsChanged => vec![DASHBOARD.to_string()],
     }
 }
 

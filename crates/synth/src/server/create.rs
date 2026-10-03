@@ -226,6 +226,7 @@ pub(super) fn form(state: &Dashboard) -> Markup {
     html! {
         details.create {
             summary { "Create a competition" }
+            p.note { "Selected stations must be currently eligible in the Oracle. An unavailable eligibility check stops creation." }
             form.create hx-post=(PATH) hx-target="#create-result"
                 hx-confirm="Create this competition? Synth's players, if any, pay real entries from the payer's node." {
                 label { "Stations"
@@ -679,7 +680,7 @@ mod tests {
             .await
             .unwrap();
         let mut dashboard = Dashboard::for_tests(db.clone());
-        dashboard.runner = crate::runner::Runner::new(
+        dashboard.runner = crate::runner::Runner::for_tests(
             crate::client::CoordinatorClient::new(url, None),
             db,
             crate::events::Events::new(),

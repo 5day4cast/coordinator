@@ -14,6 +14,7 @@ use time::macros::datetime;
 
 use super::fixtures::{forecast, station};
 use super::oracle::{Forecast, StationInfo, FORECAST_BATCH};
+use super::score::Role;
 use super::*;
 
 const DENVER: (f64, f64) = (39.86, -104.67);
@@ -272,72 +273,85 @@ async fn the_last_runs_stations_are_not_picked_again() {
 }
 
 #[tokio::test]
-async fn without_the_eligible_list_the_lanes_own_stations_are_ranked() {
+async fn missing_eligibility_stops_creation_and_does_not_cache_failure() {
     let (stations, forecasts) = weather();
-    let picking = fixture(Oracle {
+    let f = fixture(Oracle {
         eligible: None,
-        stations,
+        stations: stations.clone(),
         forecasts,
         ..Default::default()
     })
     .await;
     let lane = lane("[picker]\nmode = \"weather\"\n");
-    let base = ScenarioConfig::default();
     let mut config = run(&lane);
-    let pick = picking
+    assert!(f
         .picker
-        .choose(&lane, &base, &mut config)
+        .choose(&lane, &ScenarioConfig::default(), &mut config)
         .await
-        .unwrap();
-    assert_eq!(
-        pick.source,
-        "the lane's stations, for want of the oracle's eligible list"
-    );
-    assert_eq!(pick.candidates, 4);
-    // Placed from the oracle's station list, so the spread rule holds.
-    assert_eq!(config.stations, ["KDEN", "KORD", "KSEA"]);
-    assert!(pick.picked[1].km_from_leader.is_some());
-    // The missing list is asked for again only once the cache runs out.
-    let mut again = run(&lane);
-    picking
+        .is_err());
+    assert!(config.competition_id.is_none());
+    f.oracle.lock().unwrap().eligible = Some(stations);
+    assert!(f
         .picker
-        .choose(&lane, &base, &mut again)
+        .choose(&lane, &ScenarioConfig::default(), &mut config)
         .await
-        .unwrap();
-    assert_eq!(picking.oracle.lock().unwrap().eligible_calls, 1);
+        .is_ok());
+    assert_eq!(f.oracle.lock().unwrap().eligible_calls, 2);
 }
 
 #[tokio::test]
-async fn stations_without_a_forecast_are_dropped_and_the_lanes_list_fills_in() {
-    let picking = fixture(Oracle {
-        eligible: Some(vec![
-            station("KDEN", "DEN", DENVER),
-            station("KXXX", "", CHICAGO),
-            station("KSEA", "SEA", SEATTLE),
-        ]),
+async fn insufficient_forecasts_never_fill_from_configured_stations() {
+    let f = fixture(Oracle {
+        eligible: Some(vec![station("KDEN", "DEN", DENVER)]),
         forecasts: vec![forecast("KDEN", 25, 60, 30, 80)],
         ..Default::default()
     })
     .await;
     let lane = lane("[picker]\nmode = \"weather\"\n");
     let mut config = run(&lane);
-    let drawn = config.stations.clone();
-    let pick = picking
+    assert!(f
         .picker
         .choose(&lane, &ScenarioConfig::default(), &mut config)
         .await
+        .is_err());
+    assert!(config.competition_id.is_none());
+}
+
+#[tokio::test]
+async fn lanes_without_picker_settings_always_use_eligibility() {
+    let (stations, forecasts) = weather();
+    let f = fixture(Oracle {
+        eligible: Some(stations),
+        forecasts,
+        ..Default::default()
+    })
+    .await;
+    let lane = lane("");
+    let mut config = run(&lane);
+    f.picker
+        .choose(&lane, &ScenarioConfig::default(), &mut config)
+        .await
         .unwrap();
-    assert_eq!(pick.scored, 1);
-    assert_eq!(config.stations.len(), 3);
-    assert_eq!(config.stations[0], "KDEN");
-    assert_eq!(
-        pick.picked.iter().map(|p| p.role).collect::<Vec<_>>(),
-        [Role::Leader, Role::Fallback, Role::Fallback]
+    assert_eq!(config.stations, ["KDEN", "KCOS", "KCYS"]);
+    assert_eq!(f.oracle.lock().unwrap().eligible_calls, 1);
+}
+
+#[tokio::test]
+async fn explicit_manual_stations_must_all_be_eligible() {
+    let f = fixture(Oracle {
+        eligible: Some(vec![station("KDEN", "DEN", DENVER)]),
+        ..Default::default()
+    })
+    .await;
+    let mut config = ScenarioConfig::default();
+    assert!(f.picker.validate_stations(&config).await.is_err());
+    config.stations = vec!["KDEN".into()];
+    assert!(
+        f.picker.validate_stations(&config).await.is_err(),
+        "eligibility alone does not provide the requested forecast"
     );
-    // From the run's draw from the lane's list, first.
-    let fill: Vec<_> = drawn.iter().filter(|id| *id != "KDEN").take(2).collect();
-    assert_eq!(config.stations[1..].iter().collect::<Vec<_>>(), fill);
-    assert!(pick.explanation.ends_with("from the lane's list"));
+    f.oracle.lock().unwrap().forecasts = vec![forecast("KDEN", 30, 70, 20, 10)];
+    f.picker.validate_stations(&config).await.unwrap();
 }
 
 #[tokio::test]
@@ -373,18 +387,16 @@ async fn forecasts_are_asked_for_in_batches() {
 }
 
 #[tokio::test]
-async fn a_fixed_lane_keeps_its_draw() {
-    let picking = fixture(Oracle::default()).await;
+async fn a_fixed_lane_cannot_bypass_eligibility() {
+    let f = fixture(Oracle::default()).await;
     let lane = lane("[picker]\nmode = \"fixed\"\n");
     let mut config = run(&lane);
-    let drawn = config.stations.clone();
-    assert!(picking
+    assert!(f
         .picker
         .choose(&lane, &ScenarioConfig::default(), &mut config)
         .await
-        .is_none());
-    assert_eq!(config.stations, drawn);
-    assert_eq!(picking.oracle.lock().unwrap().eligible_calls, 0);
+        .is_err());
+    assert_eq!(f.oracle.lock().unwrap().eligible_calls, 1);
 }
 
 #[test]
@@ -433,7 +445,7 @@ async fn eligible_cache_keeps_each_history_window_separate() {
     .await;
     assert_eq!(f.picker.eligible(3, 24).await.unwrap().len(), 1);
     f.oracle.lock().unwrap().eligible = Some(vec![]);
-    assert!(f.picker.eligible(30, 24).await.is_none());
+    assert!(f.picker.eligible(30, 24).await.is_err());
     assert_eq!(f.picker.eligible(3, 24).await.unwrap().len(), 1);
     assert_eq!(f.oracle.lock().unwrap().eligible_calls, 2);
 }

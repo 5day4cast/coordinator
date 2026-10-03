@@ -135,7 +135,11 @@ pub async fn operator_competitions(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<OperatorCompetition>>, ApiError> {
     let competitions = state.coordinator.get_competitions().await?;
-    let refunds = state.coordinator.refund_progress(None).await?;
+    let ids: Vec<_> = competitions
+        .iter()
+        .map(|competition| competition.id)
+        .collect();
+    let refunds = state.coordinator.refund_status(&ids).await?;
     let write_offs = state.coordinator.refund_write_offs(None).await?;
     let mut competitions: Vec<_> = competitions
         .iter()
@@ -161,7 +165,7 @@ pub async fn operator_competition(
         .get_competition(id)
         .await
         .map_err(|e| found(id, e))?;
-    let refunds = state.coordinator.refund_progress(Some(id)).await?;
+    let refunds = state.coordinator.refund_status(&[id]).await?;
     let write_offs = state.coordinator.refund_write_offs(Some(id)).await?;
     Ok(Json(OperatorCompetition::new(
         &competition,
