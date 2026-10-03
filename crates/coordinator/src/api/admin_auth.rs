@@ -295,7 +295,11 @@ pub async fn operator_response_headers(request: Request, next: Next) -> Response
         HeaderName::from_static("content-security-policy"),
         HeaderValue::from_static("frame-ancestors 'none'"),
     );
-    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    // Operator responses are not stored unless the handler chose a policy: the
+    // hashed assets are immutable, and the discovery map revalidates its ETag.
+    if !headers.contains_key(CACHE_CONTROL) {
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     response
 }
 

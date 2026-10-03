@@ -4,12 +4,13 @@ use crate::{
     },
     api::nip98_replay::Nip98ReplayGuard,
     api::routes::{
-        add_event_entry, admin_competition_fragment, admin_create_competition_handler,
-        admin_delete_competition_handler, admin_fee_estimates_fragment, admin_page_handler,
-        admin_send_bitcoin_handler, admin_settle_test_invoice_handler,
-        admin_wallet_address_fragment, admin_wallet_balance_fragment, admin_wallet_fragment,
-        admin_wallet_outputs_fragment, change_password, claim_ticket_payout, competitions_fragment,
-        create_competition, create_queued_competition, entries_fragment, entry_detail_fragment,
+        add_event_entry, admin_competition_fragment, admin_competition_map,
+        admin_create_competition_handler, admin_delete_competition_handler,
+        admin_fee_estimates_fragment, admin_page_handler, admin_send_bitcoin_handler,
+        admin_settle_test_invoice_handler, admin_wallet_address_fragment,
+        admin_wallet_balance_fragment, admin_wallet_fragment, admin_wallet_outputs_fragment,
+        change_password, claim_ticket_payout, competitions_fragment, create_competition,
+        create_queued_competition, entries_fragment, entry_detail_fragment,
         entry_forecasts_fragment, entry_form_fragment, entry_payout_fragment,
         forgot_password_challenge, forgot_password_reset, get_aggregate_nonces, get_balance,
         get_competition, get_competitions, get_contract_parameters, get_entries,
@@ -87,10 +88,7 @@ use tower_governor::{
     governor::GovernorConfigBuilder, key_extractor::PeerIpKeyExtractor, GovernorLayer,
 };
 use tower_http::{
-    compression::{
-        predicate::{DefaultPredicate, NotForContentType, Predicate},
-        CompressionLayer,
-    },
+    compression::CompressionLayer,
     cors::{AllowOrigin, CorsLayer},
 };
 type HttpServer = Serve<
@@ -772,6 +770,7 @@ pub async fn build_app(
     )?);
     leaderboards.spawn_refresher(&tracker, cancel_token.clone());
     admin_weather.spawn_refresher(&tracker, cancel_token.clone());
+    admin_monitoring.spawn_refresher(&tracker, cancel_token.clone(), coordinator.clone());
     tracker.close();
 
     let wasm_version = crate::api::ui_files::package_version(&config.ui_settings.ui_dir);
@@ -995,7 +994,7 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
 
     Ok(Router::new()
         .merge(api_routes)
-        .merge(static_files(&app_state))
+        .merge(static_files(&app_state).layer(compression()))
         .layer(Extension(replay))
         .layer(Extension(Arc::new(nip98_origins)))
         .layer(middleware::from_fn_with_state(
@@ -1053,6 +1052,7 @@ pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Ne
     let mut admin_htmx_routes = Router::new()
         .route("/", get(admin_page_handler))
         .route("/competition", get(admin_competition_fragment))
+        .route("/competition/map", get(admin_competition_map))
         .route("/operations", get(crate::api::routes::operations_page))
         .route("/keymeld", get(crate::api::routes::keymeld_page))
         .route("/services", get(crate::api::routes::services_page))
@@ -1121,6 +1121,7 @@ pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Ne
         .merge(static_files(&app_state))
         .with_state(app_state)
         .layer(middleware::from_fn(operator_response_headers))
+        .layer(compression())
         .layer(middleware::from_fn(log_request))
 }
 
@@ -1158,16 +1159,17 @@ async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {
     response
 }
 
-/// The WASM package (`/ui`) and the embedded scripts and styles (`/assets`),
-/// gzipped for browsers that accept it.
+/// The WASM package (`/ui`) and the embedded scripts and styles (`/assets`).
 fn static_files(state: &AppState) -> Router<Arc<AppState>> {
     crate::api::ui_files::router(&state.ui_dir, state.wasm_version.clone())
         .route("/assets/{file}", get(crate::templates::assets::serve_asset))
-        // Video is compressed already, and a byte range must be of the bytes as stored.
-        .layer(
-            CompressionLayer::new()
-                .compress_when(DefaultPredicate::new().and(NotForContentType::const_new("video/"))),
-        )
+}
+
+/// Gzip for browsers that accept it. The public listener compresses its static
+/// files; the operator listener compresses every response, pages included. Byte
+/// ranges, event streams and responses that already carry an encoding pass as they are.
+fn compression() -> CompressionLayer {
+    CompressionLayer::new()
 }
 
 #[cfg(any(feature = "e2e-testing", debug_assertions))]
@@ -1305,6 +1307,7 @@ mod startup_tests {
         ),
         ("GET", "/admin"),
         ("GET", "/admin/competition"),
+        ("GET", "/admin/competition/map"),
         ("GET", "/admin/wallet"),
         ("GET", "/admin/wallet/balance"),
         ("GET", "/admin/wallet/address"),
@@ -1735,6 +1738,34 @@ mod startup_tests {
 
         server.abort();
         let _ = server.await;
+        test.stop().await;
+    }
+
+    #[tokio::test]
+    async fn operator_responses_are_gzipped_and_only_assets_are_cached() {
+        let test = TestState::start().await;
+        let admin = test.admin(token_access(), Network::Regtest);
+        let gzip = [("authorization", BEARER), ("accept-encoding", "gzip")];
+        for path in ["/admin/wallet", "/admin/services", "/admin/competition"] {
+            let (status, headers, _) = send(&admin, request("GET", path, &gzip, "")).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert_eq!(headers["content-encoding"], "gzip", "{path}");
+            assert_eq!(headers["cache-control"], "no-store", "{path}");
+        }
+        let asset = crate::templates::assets::WEATHER_MAP_JS.url;
+        let (status, headers, _) = send(&admin, request("GET", asset, &gzip, "")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["content-encoding"], "gzip");
+        assert!(headers["cache-control"]
+            .to_str()
+            .unwrap()
+            .contains("immutable"));
+        let (_, headers, _) = send(
+            &admin,
+            request("GET", "/admin/wallet", &[("authorization", BEARER)], ""),
+        )
+        .await;
+        assert!(!headers.contains_key("content-encoding"));
         test.stop().await;
     }
 

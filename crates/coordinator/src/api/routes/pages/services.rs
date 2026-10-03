@@ -194,7 +194,7 @@ fn verifier(capabilities: &Cached<crate::infra::keymeld::PayoutCapabilities>) ->
         p { code { (coordinator_escrow::generic::VERIFIER_ID) } " · protocol " (coordinator_escrow::generic::VERIFIER_VERSION) }
         @if let Some(value) = &capabilities.latest {
             p.note { "Checked across advertised enclaves using the confidential protocol at " (value.fetched_at.format(&Rfc3339).unwrap_or_default()) "." }
-            @if value.age() > Duration::from_secs(120) { p.notice { "Capability check is stale. Treat support as unknown until a fresh check succeeds." } }
+            @if value.age() > crate::infra::admin_monitoring::CAPABILITIES_TTL + Duration::from_secs(120) { p.notice { "Capability check is stale. Treat support as unknown until a fresh check succeeds." } }
             @else { p { "Payout authorization: " strong { (if value.value.payout { "Supported" } else { "Unavailable" }) } " · Lightning Address resolution: " strong { (if value.value.lnurl { "Supported" } else { "Unavailable" }) } } }
         } @else { p.notice { @if capabilities.refreshing { "Checking verifier capabilities. Reload shortly." } @else { "Verifier capabilities are unknown. Check Keymeld connectivity and the enclave configuration." } } }
         p.note { "Capability support describes configuration. It does not prove a particular entry is authorized, paid, or signed." }

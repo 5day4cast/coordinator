@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
-    response::{Html, IntoResponse},
+    http::{header, HeaderMap, StatusCode},
+    response::{Html, IntoResponse, Response},
     Extension, Json,
 };
 use axum_extra::extract::Form;
@@ -92,6 +92,83 @@ async fn admin_discovery(
         }
     };
     render_admin_fragment(headers, state, csrf, "Weather discovery", content)
+}
+
+/// The discovery map, loaded after the discovery page. It reads the same cached
+/// discovery as the page and is sent gzipped; a browser holding the current map
+/// revalidates its ETag instead of downloading it again.
+pub async fn admin_competition_map(
+    State(state): State<Arc<AppState>>,
+    Extension(csrf): Extension<AdminCsrf>,
+    Query(filters): Query<Filters>,
+    headers: HeaderMap,
+) -> Response {
+    let window = match filters.window(OffsetDateTime::now_utc()) {
+        Ok(window) => window,
+        Err(error) => {
+            let content = maud::html! { p.notice { (error) } };
+            return render_admin_fragment(&headers, &state, &csrf, "Station map", content)
+                .into_response();
+        }
+    };
+    let data = state.admin_weather.read(window.clone()).await;
+    let Some(latest) = data.latest else {
+        let content = maud::html! { p.notice role="status" { "The map appears when the discovery results are ready." } };
+        return render_admin_fragment(&headers, &state, &csrf, "Station map", content)
+            .into_response();
+    };
+    let usable = latest.age().as_secs() <= 900;
+    let standalone = headers.get("HX-Request").is_none();
+    let tag = map_tag(&filters, latest.fetched_at, usable, standalone);
+    let revalidate = [
+        (header::ETAG, tag.clone()),
+        (header::CACHE_CONTROL, "private, no-cache".to_owned()),
+        (header::VARY, "HX-Request".to_owned()),
+    ];
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|candidate| candidate.trim() == tag))
+    {
+        return (StatusCode::NOT_MODIFIED, revalidate).into_response();
+    }
+    let content = match filters.select(&latest.value) {
+        Ok(candidates) => crate::templates::admin::weather_map::weather_map(
+            &candidates,
+            &filters,
+            &window,
+            usable,
+            standalone,
+        ),
+        Err(error) => maud::html! { p.notice role="alert" { (error) } },
+    };
+    let content = if standalone {
+        maud::html! { main.admin-workspace { (content) } }
+    } else {
+        content
+    };
+    (
+        revalidate,
+        render_admin_fragment(&headers, &state, &csrf, "Station map", content),
+    )
+        .into_response()
+}
+
+/// Names one rendering of the map: the filters, the discovery it was drawn from,
+/// whether stations can be selected, and whether it is the page or the fragment.
+fn map_tag(
+    filters: &Filters,
+    fetched_at: OffsetDateTime,
+    usable: bool,
+    standalone: bool,
+) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{filters:?}").hash(&mut hasher);
+    fetched_at.unix_timestamp_nanos().hash(&mut hasher);
+    usable.hash(&mut hasher);
+    standalone.hash(&mut hasher);
+    format!("\"map-{:016x}\"", hasher.finish())
 }
 
 /// Admin wallet page (full page for direct navigation, fragment for HTMX)

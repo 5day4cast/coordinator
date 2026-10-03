@@ -17,6 +17,14 @@ pub struct MonitoringSettings {
     pub token_file: String,
 }
 
+/// Pages wait for a refresh of values older than this, for up to [`PAGE_WAIT`].
+pub(super) const PAGE_TTL: Duration = Duration::from_secs(60);
+pub(super) const PAGE_WAIT: Duration = Duration::from_secs(9);
+/// The background refresh renews values this old, ahead of [`PAGE_TTL`].
+pub(super) const PREWARM_TTL: Duration = Duration::from_secs(40);
+/// Capability support is configuration; it is rechecked every ten minutes.
+pub const CAPABILITIES_TTL: Duration = Duration::from_secs(600);
+
 const QUERIES: &[(&str, &str, &str)] = &[
     (
         "Coordinator scrape",
@@ -158,6 +166,47 @@ impl AdminMonitoring {
     }
 
     pub async fn read(self: &Arc<Self>) -> Cached<Vec<Metric>> {
+        self.read_within(PAGE_TTL, PAGE_WAIT).await
+    }
+
+    /// Keep the operator cards fresh in the background, so opening a page does not
+    /// wait for Grafana. Values are refreshed before pages would count them overdue.
+    /// Keymeld capabilities use real enclave requests, so they are checked less often.
+    pub fn spawn_refresher(
+        self: &Arc<Self>,
+        tracker: &tokio_util::task::TaskTracker,
+        cancel: tokio_util::sync::CancellationToken,
+        coordinator: Arc<crate::domain::Coordinator>,
+    ) {
+        if self.client.is_none() {
+            return;
+        }
+        let service = self.clone();
+        tracker.spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(15));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = tick.tick() => {
+                        // A zero wait starts any due refresh and returns at once.
+                        service.read_within(PREWARM_TTL, Duration::ZERO).await;
+                        for panel in [super::admin_signals::Panel::Services, super::admin_signals::Panel::Keymeld] {
+                            service.read_signals_within(panel, PREWARM_TTL, Duration::ZERO).await;
+                        }
+                        if coordinator.is_keymeld_enabled() {
+                            service
+                                .read_capabilities_within(coordinator.clone(), CAPABILITIES_TTL, Duration::ZERO)
+                                .await;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    async fn read_within(self: &Arc<Self>, ttl: Duration, wait: Duration) -> Cached<Vec<Metric>> {
         if self.client.is_none() {
             return Cached {
                 latest: None,
@@ -166,46 +215,39 @@ impl AdminMonitoring {
         }
         let service = self.clone();
         self.cache
-            .get_fresh(
-                (),
-                Duration::from_secs(60),
-                Duration::from_secs(9),
-                move || async move {
-                    let client = service
-                        .client
-                        .as_ref()
-                        .context("Grafana is not configured")?;
-                    let requests: Vec<_> = QUERIES
-                        .iter()
-                        .map(|(_, query, _)| {
-                            client.get(&service.query_url).query(&[("query", query)])
+            .get_fresh((), ttl, wait, move || async move {
+                let client = service
+                    .client
+                    .as_ref()
+                    .context("Grafana is not configured")?;
+                let requests: Vec<_> = QUERIES
+                    .iter()
+                    .map(|(_, query, _)| client.get(&service.query_url).query(&[("query", query)]))
+                    .collect();
+                let metrics = tokio::time::timeout(
+                    Duration::from_secs(8),
+                    stream::iter(requests)
+                        .map(|request| async move {
+                            let value = async {
+                                let response: serde_json::Value =
+                                    request.send().await?.error_for_status()?.json().await?;
+                                metric_value(&response)
+                                    .context("Grafana returned no single finite sample")
+                            }
+                            .await
+                            .ok();
+                            Metric { value }
                         })
-                        .collect();
-                    let metrics = tokio::time::timeout(
-                        Duration::from_secs(8),
-                        stream::iter(requests)
-                            .map(|request| async move {
-                                let value = async {
-                                    let response: serde_json::Value =
-                                        request.send().await?.error_for_status()?.json().await?;
-                                    metric_value(&response)
-                                        .context("Grafana returned no single finite sample")
-                                }
-                                .await
-                                .ok();
-                                Metric { value }
-                            })
-                            .buffered(3)
-                            .collect::<Vec<_>>(),
-                    )
-                    .await?;
-                    ensure!(
-                        metrics.iter().any(|metric| metric.value.is_some()),
-                        "Grafana did not answer any operation metric query"
-                    );
-                    Ok(metrics)
-                },
-            )
+                        .buffered(3)
+                        .collect::<Vec<_>>(),
+                )
+                .await?;
+                ensure!(
+                    metrics.iter().any(|metric| metric.value.is_some()),
+                    "Grafana did not answer any operation metric query"
+                );
+                Ok(metrics)
+            })
             .await
     }
 

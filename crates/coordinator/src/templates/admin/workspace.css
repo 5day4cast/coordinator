@@ -303,7 +303,7 @@
 .admin-shell .admin-nav a[aria-current="page"] {
   border-bottom:2px solid var(--accent);
 }
-.weather-map { margin:1.5rem 0; padding:1.2rem; background:var(--panel); border:1px solid var(--line); border-radius:12px; }
+.weather-map,.weather-map-slot { margin:1.5rem 0; padding:1.2rem; background:var(--panel); border:1px solid var(--line); border-radius:12px; }
 .map-controls { display:flex; gap:1rem; align-items:end; flex-wrap:wrap; }
 .map-controls label { flex:1 1 180px; }
 .map-controls .check { flex:0 1 180px; padding-bottom:.6rem; }

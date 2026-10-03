@@ -11,23 +11,27 @@ const htmx = readFileSync(path.join(root, 'vendor/htmx/4.0.0/htmx.min.js'));
 const mapScript = readFileSync(path.join(root, 'crates/coordinator/src/templates/admin/weather_map.js'));
 const filters = '/admin/competition?day=2026-10-03&weather=wind&location=Portland';
 
-const map = `<form id="game-creation"><input name="entry_fee" value="5000">
-<section class="weather-map" data-usable="true"><div class="map-controls">
+// The map loads after the station cards, from its own route, as the server renders it.
+const mapPath = '/admin/competition/map?day=2026-10-03&weather=wind&location=Portland';
+const form = `<form id="game-creation"><input name="entry_fee" value="5000">
+<section class="weather-map-slot" hx-get="${mapPath}" hx-trigger="load" hx-swap="outerHTML">Loading the station map
+<noscript><a href="${mapPath}">Open the station map</a></noscript></section><div id="map-selections"></div>
+<label><input name="locations" type="checkbox" value="KPDX">Portland</label></form>`;
+const map = `<section class="weather-map" data-usable="true"><div class="map-controls">
 <select data-map-layer disabled><option value="high">High</option><option value="wind">Wind</option></select>
 <select data-map-time disabled><option value="">Whole window</option></select>
 <input data-map-wind type="checkbox" checked disabled>
 <button type="button" data-map-zoom="0.6">Zoom</button><button type="button" data-map-reset>Reset</button></div>
 <div data-map-legend></div><svg viewBox="0 0 10 10"><a data-station="KPDX" data-name="Portland"
  data-high="68" data-low="50" data-wind="8" data-rain="10" data-forecasts="[]"><title>Portland</title><circle r="1"/><path class="map-wind"/></a></svg>
-<p data-map-inspector></p><p data-map-count></p></section><div id="map-selections"></div>
-<label><input name="locations" type="checkbox" value="KPDX">Portland</label></form>
+<p data-map-inspector></p><p data-map-count></p></section>
 <script src="/weather-map.js" defer></script>`;
 
 function region(state) {
   const loading = state === 'loading';
   return `<section id="weather-discovery-results" ${loading ? `hx-get="${filters}" hx-trigger="every 2s"` : ''}
  hx-select="#weather-discovery-results" hx-target="this" hx-swap="outerHTML" hx-sync="this:drop" hx-push-url="false" aria-busy="${loading}">
- ${loading ? 'Loading eligible stations and forecasts.' : state === 'failed' ? 'Weather discovery is unavailable.' : map}
+ ${loading ? 'Loading eligible stations and forecasts.' : state === 'failed' ? 'Weather discovery is unavailable.' : form}
  <a href="${filters}">Refresh results</a></section>`;
 }
 function content(state) {
@@ -38,7 +42,7 @@ function page(state) {
 }
 
 test('cold results appear, map initializes, polling stops and native fallback works', async () => {
-  let state = 'loading', polls = 0, active = 0, maxActive = 0, fail = false;
+  let state = 'loading', polls = 0, maps = 0, active = 0, maxActive = 0, fail = false;
   const methods = [];
   const server = createServer(async (req, res) => {
     methods.push(req.method);
@@ -47,6 +51,10 @@ test('cold results appear, map initializes, polling stops and native fallback wo
       return res.end(req.url === '/htmx.js' ? htmx : mapScript);
     }
     res.setHeader('Content-Type', 'text/html');
+    if (req.url === mapPath) {
+      maps++;
+      return res.end(map);
+    }
     if (req.headers['hx-request']) {
       polls++; active++; maxActive = Math.max(maxActive, active);
       // A slow response overlaps a polling tick; the next tick must be dropped.
@@ -76,6 +84,7 @@ test('cold results appear, map initializes, polling stops and native fallback wo
     await p.waitForTimeout(2500);
     assert.equal(polls, completedPolls, 'Ready results must stop polling');
     assert.equal(maxActive, 1, 'Slow result reads must not queue concurrent polls');
+    assert.equal(maps, 1, 'The map loads once, after the results');
     assert.equal(await p.locator('input[name=entry_fee]').inputValue(), '7000');
     assert.equal(await p.locator('input[name=locations]').isChecked(), true);
     assert.deepEqual(errors, []);
@@ -99,7 +108,8 @@ test('cold results appear, map initializes, polling stops and native fallback wo
     state = 'ready';
     await n.getByRole('link', { name: 'Refresh results' }).click();
     assert.equal(await n.locator('input[name=locations]').count(), 1);
-    assert.equal(await n.locator('[data-map-layer]').isDisabled(), true);
+    assert.equal(await n.locator('[data-map-layer]').count(), 0);
+    assert.equal(await n.getByRole('link', { name: 'Open the station map' }).getAttribute('href'), mapPath);
     assert.equal(polls, beforeNative, 'No-script refresh is an ordinary navigation');
     assert(methods.every(method => method === 'GET'));
     await native.close();
