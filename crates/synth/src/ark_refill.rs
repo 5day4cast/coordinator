@@ -1070,7 +1070,7 @@ sat_per_vbyte = 2
             ..transaction("beef", 1)
         };
         assert_eq!(
-            progress(&sending, &[unlabelled.clone()], &wallet, 1_100),
+            progress(&sending, std::slice::from_ref(&unlabelled), &wallet, 1_100),
             Progress::Waiting
         );
         assert_eq!(
