@@ -7,7 +7,8 @@ function initWeatherMaps() {
     const wind = map.querySelector('[data-map-wind]'), inspector = map.querySelector('[data-map-inspector]');
     const markers = [...map.querySelectorAll('[data-station]')];
     const initial = svg.getAttribute('viewBox').split(' ').map(Number);
-    const inputs = new Map([...form.querySelectorAll('input[name="locations"]')].map(el => [el.value, el]));
+    // Outside the game form (the map's own page) station links keep their nearby search.
+    const inputs = new Map(form ? [...form.querySelectorAll('input[name="locations"]')].map(el => [el.value, el]) : []);
     const records = new Map(markers.map(el => [el, JSON.parse(el.dataset.forecasts).map(f => ({...f, start: Date.parse(f.start_time), end: Date.parse(f.end_time)}))]));
     const palette = ['#6865c7','#408cca','#39a99b','#dfbb4d','#ed853c','#d34857'];
     const scales = {high:[32,50,65,80,95], low:[32,50,65,80,95], wind:[5,10,20,30,40], rain:[10,25,50,75,90]};
@@ -45,13 +46,14 @@ function initWeatherMaps() {
       inspector.textContent = time.value ? 'Forecasts covering the selected time. Focus a station to see its actual period.' : 'Whole-window extremes. Choose a forecast time to compare wind direction.';
     }
     function selected() {
+      if (!form) return;
       markers.forEach(el => el.classList.toggle('selected',!!inputs.get(el.dataset.station)?.checked));
       map.querySelector('[data-map-count]').textContent = `${[...inputs.values()].filter(el => el.checked).length} stations selected · maximum 50`;
     }
     markers.forEach(el => {
       el.addEventListener('pointerenter',() => inspector.textContent = description(el));
       el.addEventListener('focus',() => inspector.textContent = description(el));
-      el.addEventListener('click',event => {
+      if (form) el.addEventListener('click',event => {
         if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
         event.preventDefault();
         if (map.dataset.usable !== 'true') { inspector.textContent = 'Refresh stale forecasts before selecting stations.'; return; }
@@ -66,7 +68,7 @@ function initWeatherMaps() {
       });
     });
     [layer,time,wind].forEach(el => el.addEventListener('change',render));
-    form.addEventListener('change',selected);
+    form?.addEventListener('change',selected);
     const setView = view => svg.setAttribute('viewBox',view.join(' '));
     map.querySelectorAll('[data-map-zoom]').forEach(button => button.addEventListener('click',() => {
       const [x,y,w,h]=svg.getAttribute('viewBox').split(' ').map(Number), scale=Number(button.dataset.mapZoom);
@@ -89,4 +91,5 @@ function initWeatherMaps() {
   });
 }
 initWeatherMaps();
-document.addEventListener('htmx:afterSwap',initWeatherMaps);
+// The map arrives after the page, swapped in by htmx.
+document.addEventListener('htmx:after:swap',initWeatherMaps);

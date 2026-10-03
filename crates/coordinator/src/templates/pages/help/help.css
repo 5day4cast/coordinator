@@ -9,47 +9,6 @@
   margin-bottom: 2rem;
 }
 
-/* The walkthrough video: the phone recording, never wider than a phone, below 768px; the
-   desktop recording across the column from 768px. The other is not displayed, and with
-   preload="none" it never loads. */
-.help-video {
-  max-width: 20rem;
-  margin: 0 0 1.5rem;
-}
-
-.help-video video.is-desktop {
-  display: none;
-}
-
-@media (min-width: 768px) {
-  .help-video {
-    max-width: none;
-  }
-
-  .help-video video.is-phone {
-    display: none;
-  }
-
-  .help-video video.is-desktop {
-    display: block;
-  }
-}
-
-.help-video video {
-  display: block;
-  width: 100%;
-  height: auto;
-  border: 1px solid var(--bulma-border);
-  border-radius: 0.75rem;
-  background: var(--bulma-scheme-main-bis);
-}
-
-.help-video figcaption {
-  margin-top: 0.4rem;
-  font-size: 0.85rem;
-  color: var(--bulma-text-weak);
-}
-
 .help-contents {
   display: flex;
   flex-wrap: wrap;

@@ -198,16 +198,22 @@ impl InvoiceWatcher {
                         // The subscription may already have marked this ticket
                         // paid, or a previous process may have stopped after that
                         // commit. Continue from current durable state either way.
-                        if let Err(error) = self
+                        match self
                             .coordinator
                             .competition_store
                             .mark_ticket_paid(&ticket.hash, ticket.competition_id)
                             .await
                         {
-                            error!("Failed to mark ticket {} paid: {}", ticket.id, error);
-                            continue;
+                            // Only a new payment wakes the competition. A ticket held across
+                            // sweeps would otherwise wake it, and record the wake, every
+                            // sweep; a restarted runner steps at once anyway.
+                            Ok(true) => self.coordinator.wake_competition(ticket.competition_id),
+                            Ok(false) => {}
+                            Err(error) => {
+                                error!("Failed to mark ticket {} paid: {}", ticket.id, error);
+                                continue;
+                            }
                         }
-                        self.coordinator.wake_competition(ticket.competition_id);
                         let current = self
                             .coordinator
                             .competition_store

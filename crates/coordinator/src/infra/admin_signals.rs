@@ -1,5 +1,8 @@
 //! Fixed operator queries. A missing or stale sample never means a healthy zero.
-use super::{admin_monitoring::AdminMonitoring, refresh_cache::Cached};
+use super::{
+    admin_monitoring::{AdminMonitoring, CAPABILITIES_TTL, PAGE_TTL, PAGE_WAIT},
+    refresh_cache::Cached,
+};
 use anyhow::{ensure, Context};
 use futures::{stream, StreamExt};
 use serde::Deserialize;
@@ -87,6 +90,15 @@ impl Panel {
 
 impl AdminMonitoring {
     pub async fn read_signals(self: &Arc<Self>, panel: Panel) -> Cached<Snapshot> {
+        self.read_signals_within(panel, PAGE_TTL, PAGE_WAIT).await
+    }
+
+    pub(super) async fn read_signals_within(
+        self: &Arc<Self>,
+        panel: Panel,
+        ttl: Duration,
+        wait: Duration,
+    ) -> Cached<Snapshot> {
         if self.client.is_none() {
             return Cached {
                 latest: None,
@@ -95,65 +107,67 @@ impl AdminMonitoring {
         }
         let service = self.clone();
         self.signals
-            .get_fresh(
-                panel,
-                Duration::from_secs(60),
-                Duration::from_secs(9),
-                move || async move {
-                    let client = service
-                        .client
-                        .as_ref()
-                        .context("Monitoring is not configured")?;
-                    let mut queries: Vec<_> = panel.signals().iter().map(|s| s.query).collect();
-                    if panel == Panel::Keymeld {
-                        queries.push(ENCLAVE_QUERY);
-                    }
-                    let requests: Vec<_> = queries
-                        .into_iter()
-                        .map(|query| client.get(&service.query_url).query(&[("query", query)]))
-                        .collect();
-                    let snapshot: Snapshot = tokio::time::timeout(
-                        Duration::from_secs(8),
-                        stream::iter(requests)
-                            .map(|request| async move {
-                                match query_samples(request).await {
-                                    Ok(samples) => Some(samples),
-                                    Err(error) => {
-                                        log::warn!("Admin Grafana request failed: {error:#}");
-                                        None
-                                    }
+            .get_fresh(panel, ttl, wait, move || async move {
+                let client = service
+                    .client
+                    .as_ref()
+                    .context("Monitoring is not configured")?;
+                let mut queries: Vec<_> = panel.signals().iter().map(|s| s.query).collect();
+                if panel == Panel::Keymeld {
+                    queries.push(ENCLAVE_QUERY);
+                }
+                let requests: Vec<_> = queries
+                    .into_iter()
+                    .map(|query| client.get(&service.query_url).query(&[("query", query)]))
+                    .collect();
+                let snapshot: Snapshot = tokio::time::timeout(
+                    Duration::from_secs(8),
+                    stream::iter(requests)
+                        .map(|request| async move {
+                            match query_samples(request).await {
+                                Ok(samples) => Some(samples),
+                                Err(error) => {
+                                    log::warn!("Admin Grafana request failed: {error:#}");
+                                    None
                                 }
-                            })
-                            .buffered(3)
-                            .collect(),
-                    )
-                    .await?;
-                    ensure!(
-                        snapshot.iter().any(Option::is_some),
-                        "Grafana did not answer any signal query"
-                    );
-                    Ok(snapshot)
-                },
-            )
+                            }
+                        })
+                        .buffered(3)
+                        .collect(),
+                )
+                .await?;
+                ensure!(
+                    snapshot.iter().any(Option::is_some),
+                    "Grafana did not answer any signal query"
+                );
+                Ok(snapshot)
+            })
             .await
     }
+    /// The last capability check, refreshed in the background. A page waits only
+    /// when there is no check yet.
     pub async fn read_capabilities(
         self: &Arc<Self>,
         coordinator: Arc<crate::domain::Coordinator>,
     ) -> Cached<crate::infra::keymeld::PayoutCapabilities> {
+        self.read_capabilities_within(coordinator, CAPABILITIES_TTL, PAGE_WAIT)
+            .await
+    }
+
+    pub(super) async fn read_capabilities_within(
+        self: &Arc<Self>,
+        coordinator: Arc<crate::domain::Coordinator>,
+        ttl: Duration,
+        wait: Duration,
+    ) -> Cached<crate::infra::keymeld::PayoutCapabilities> {
         self.capabilities
-            .get_fresh(
-                (),
-                Duration::from_secs(60),
-                Duration::from_secs(9),
-                move || async move {
-                    tokio::time::timeout(
-                        Duration::from_secs(8),
-                        coordinator.admin_keymeld_capabilities(),
-                    )
-                    .await?
-                },
-            )
+            .get((), ttl, wait, move || async move {
+                tokio::time::timeout(
+                    Duration::from_secs(8),
+                    coordinator.admin_keymeld_capabilities(),
+                )
+                .await?
+            })
             .await
     }
     pub fn grafana_link(&self, keymeld: bool) -> Option<String> {

@@ -73,6 +73,7 @@ impl OperatorCompetition {
         let mut milestones: Vec<Milestone> = [
             ("created", Some(c.created_at)),
             ("pools_formed", c.pools_formed_at),
+            ("pools_finished", c.pools_finished_at),
             ("event_created", c.event_created_at),
             ("entries_submitted", c.entries_submitted_at),
             ("escrow_funds_confirmed", c.escrow_funds_confirmed_at),

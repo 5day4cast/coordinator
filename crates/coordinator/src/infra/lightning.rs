@@ -36,6 +36,44 @@ pub const PAYOUT_SETTLEMENT_MARGIN_BLOCKS: u32 = 12;
 pub const MAX_PAYOUT_CLTV_DELTA: u32 = 432;
 const LND_FINAL_CLTV_PADDING: u32 = 3;
 
+/// How long LND may report itself unsynced before that is believed. LND marks itself
+/// unsynced for a few seconds while it processes each new block, which on a fast chain
+/// is a large share of the time.
+pub const UNSYNCED_GRACE: Duration = Duration::from_secs(120);
+
+/// Blocks LND may be behind while it reports itself unsynced within [`UNSYNCED_GRACE`].
+/// A payout's HTLC limit is computed as if the chain were this much further on.
+pub const UNSYNCED_LAG_BLOCKS: u32 = 2;
+
+/// LND's "not synced to chain" readings, believed only once they have lasted.
+#[derive(Debug, Default)]
+pub struct SyncDebounce {
+    /// When the current run of unsynced readings began, and the latest reading in it.
+    unsynced: std::sync::Mutex<Option<(std::time::Instant, std::time::Instant)>>,
+}
+
+impl SyncDebounce {
+    /// Whether to treat LND as synced: it says so, or it has said otherwise for less than
+    /// [`UNSYNCED_GRACE`]. Readings further apart than the grace start a new run, since LND
+    /// may have been synced between them.
+    pub fn synced(&self, reported: bool, now: std::time::Instant) -> bool {
+        let mut unsynced = self
+            .unsynced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reported {
+            *unsynced = None;
+            return true;
+        }
+        let since = match *unsynced {
+            Some((since, last)) if now.saturating_duration_since(last) <= UNSYNCED_GRACE => since,
+            _ => now,
+        };
+        *unsynced = Some((since, now));
+        now.saturating_duration_since(since) < UNSYNCED_GRACE
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PaymentDeadline {
     pub max_htlc_expiry_height: u32,
@@ -267,6 +305,7 @@ pub struct LnClient {
     /// Payments must not be transparently retried after their chain check.
     pub(crate) payment_client: Client,
     pub macaroon: SecretString,
+    pub(crate) sync: std::sync::Arc<SyncDebounce>,
 }
 
 impl LnClient {
@@ -320,7 +359,8 @@ impl LnClient {
                 return Err(anyhow!("LND chain status unavailable"));
             }
             let info: serde_json::Value = response.json().await?;
-            if info["synced_to_chain"].as_bool() != Some(true) {
+            let reported = info["synced_to_chain"].as_bool() == Some(true);
+            if !self.sync.synced(reported, std::time::Instant::now()) {
                 return Err(anyhow!("LND is not synchronized to the chain"));
             }
             let height = info["block_height"]
@@ -332,11 +372,17 @@ impl LnClient {
                 })
                 .and_then(|value| u32::try_from(value).ok())
                 .ok_or_else(|| anyhow!("LND returned an invalid chain height"))?;
-            Some(payout_cltv_limit(
-                deadline,
-                height,
-                invoice.min_final_cltv_expiry_delta(),
-            )?)
+            let limit = payout_cltv_limit(deadline, height, invoice.min_final_cltv_expiry_delta())?;
+            if reported {
+                Some(limit)
+            } else {
+                // Briefly unsynced: LND may not have the latest blocks yet, so leave room for them.
+                Some(payout_cltv_limit(
+                    deadline,
+                    height.saturating_add(UNSYNCED_LAG_BLOCKS),
+                    invoice.min_final_cltv_expiry_delta(),
+                )?)
+            }
         } else {
             None
         };
@@ -440,6 +486,7 @@ impl LnClient {
             client,
             payment_client,
             macaroon,
+            sync: Default::default(),
         })
     }
 }
@@ -587,8 +634,13 @@ pub struct PaymentTrackResult {
 
 #[async_trait]
 impl Ln for LnClient {
+    /// `synced_to_chain` is false only once LND has reported it for [`UNSYNCED_GRACE`].
     async fn node_info(&self) -> anyhow::Result<NodeInfo> {
-        self.operator_read("/v1/getinfo").await
+        let mut info: NodeInfo = self.operator_read("/v1/getinfo").await?;
+        info.synced_to_chain = info
+            .synced_to_chain
+            .map(|reported| self.sync.synced(reported, std::time::Instant::now()));
+        Ok(info)
     }
 
     async fn channel_balance(&self) -> anyhow::Result<ChannelBalance> {
@@ -1301,11 +1353,19 @@ mod tests {
             client: build_reqwest_tls_client(None, false).unwrap(),
             payment_client: Client::new(),
             macaroon: SecretString::from("test-macaroon"),
+            sync: Default::default(),
         };
         let deadline = PaymentDeadline {
             max_htlc_expiry_height: 159,
             minimum_chain_height: 100,
         };
+        // LND has reported itself unsynced for three minutes.
+        let now = std::time::Instant::now();
+        for ago in [180, 90, 1] {
+            client
+                .sync
+                .synced(false, now.checked_sub(Duration::from_secs(ago)).unwrap());
+        }
         assert!(client
             .send_payment_before_height(fresh_test_invoice(), 10, 2, 1000, deadline)
             .await
@@ -1327,7 +1387,48 @@ mod tests {
         assert_eq!(state.sends.load(Ordering::SeqCst), 1);
         assert_eq!(state.body.lock().unwrap()["cltv_limit"], 54);
         assert_eq!(state.body.lock().unwrap()["cancelable"], true);
+
+        // Briefly unsynced after a block: the payout goes ahead, leaving room for the block
+        // LND may not have processed yet.
+        state.synced.store(false, Ordering::SeqCst);
+        let mut briefly = client.clone();
+        briefly.sync = Default::default();
+        assert!(briefly
+            .send_payment_before_height(fresh_test_invoice(), 10, 2, 1000, deadline)
+            .await
+            .is_err());
+        assert_eq!(state.sends.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            state.body.lock().unwrap()["cltv_limit"],
+            54 - UNSYNCED_LAG_BLOCKS
+        );
+        // Still behind the checked outcome tip: refused, synced or not.
+        state.height.store(99, Ordering::SeqCst);
+        assert!(briefly
+            .send_payment_before_height(fresh_test_invoice(), 10, 2, 1000, deadline)
+            .await
+            .is_err());
+        assert_eq!(state.sends.load(Ordering::SeqCst), 2);
         server.abort();
+    }
+
+    #[test]
+    fn unsynced_readings_count_only_once_they_last() {
+        let sync = SyncDebounce::default();
+        let start = std::time::Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        assert!(sync.synced(false, at(0)));
+        assert!(sync.synced(false, at(60)));
+        assert!(sync.synced(false, at(119)));
+        assert!(!sync.synced(false, at(121)));
+        // A synced reading ends the run.
+        assert!(sync.synced(true, at(130)));
+        assert!(sync.synced(false, at(140)));
+        assert!(sync.synced(false, at(250)));
+        // Readings further apart than the grace start a new run.
+        assert!(sync.synced(false, at(500)));
+        assert!(sync.synced(false, at(600)));
+        assert!(!sync.synced(false, at(620)));
     }
 
     #[tokio::test]
@@ -1349,7 +1450,21 @@ mod tests {
             client: ClientBuilder::new(Client::new()).build(),
             payment_client: Client::new(),
             macaroon: SecretString::from("test-macaroon"),
+            sync: Default::default(),
         };
+        // One unsynced reading is within the grace LND gets after each block.
+        let node = client.node_info().await.unwrap();
+        assert_eq!(node.synced_to_chain, Some(true));
+        let now = std::time::Instant::now();
+        // A synced reading ends that run; then LND reports itself unsynced for 150 s.
+        client
+            .sync
+            .synced(true, now.checked_sub(Duration::from_secs(200)).unwrap());
+        for ago in [150, 60] {
+            client
+                .sync
+                .synced(false, now.checked_sub(Duration::from_secs(ago)).unwrap());
+        }
         let node = client.node_info().await.unwrap();
         assert_eq!(node.synced_to_chain, Some(false));
         assert_eq!(node.num_active_channels, Some(0));
@@ -1377,6 +1492,7 @@ mod tests {
             client: ClientBuilder::new(Client::new()).build(),
             payment_client: Client::new(),
             macaroon: SecretString::from("test-macaroon"),
+            sync: Default::default(),
         };
         // Rejected transport setup must not give the subscriber an apparently live channel.
         assert!(client.subscribe_invoices().await.is_err());
@@ -1596,6 +1712,7 @@ mod tests {
             client: ClientBuilder::new(Client::new()).build(),
             payment_client: Client::new(),
             macaroon: SecretString::from("test-macaroon"),
+            sync: Default::default(),
         };
         let response = tokio::time::timeout(
             Duration::from_secs(2),

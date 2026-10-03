@@ -147,6 +147,9 @@ fn queue_url(filter: &QueueFilter, page: usize) -> String {
 }
 
 fn phase_label(c: &Competition, now: OffsetDateTime) -> &'static str {
+    if c.kind == CompetitionKind::Queued && c.pools_finished_at.is_some() {
+        return "Pools finished";
+    }
     if c.kind == CompetitionKind::Queued && c.pools_formed_at.is_some() {
         return "Pools formed";
     }

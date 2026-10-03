@@ -110,7 +110,7 @@ pub fn discovery(
                             input type="hidden" name="end_observation_date" value=(window.end.format(&Rfc3339).unwrap_or_default());
                             input type="hidden" name="signing_date" value=((window.end + time::Duration::HOUR).format(&Rfc3339).unwrap_or_default());
                             input type="hidden" name="history_days" value=(window.history_days);
-                            (super::weather_map::weather_map(&candidates, filters, window, usable))
+                            (super::weather_map::map_slot(filters, window))
                             div id="map-selections" {}
                             div.station-grid {
                                 @for c in candidates.iter().take(100) {
@@ -278,8 +278,13 @@ mod tests {
         assert!(html.contains("id=\"game-creation\""));
         assert!(html.contains("name=\"locations\" value=\"KPDX\""));
         assert!(html.contains("Your current station choices stay in place"));
-        assert!(!html.contains("hx-get="));
-        assert!(!html.contains("hx-trigger="));
+        assert!(!html.contains("every 2s"));
         assert!(html.contains("Refresh results</a>"));
+        // The map loads once, after the cards, and is not polled.
+        assert_eq!(html.matches("hx-get=").count(), 1);
+        assert!(html.contains("hx-get=\"/admin/competition/map?day=2026-10-03"));
+        assert!(html.contains("hx-trigger=\"load\""));
+        assert!(!html.contains("<svg"));
+        assert!(html.contains("Open the station map</a>"));
     }
 }

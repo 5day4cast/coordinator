@@ -24,6 +24,8 @@ pub struct EligibleStation {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Forecast {
+    /// Each map marker already names its station.
+    #[serde(skip_serializing)]
     pub station_id: String,
     pub temp_high: i64,
     pub temp_low: i64,

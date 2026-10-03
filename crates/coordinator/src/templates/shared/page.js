@@ -2,13 +2,16 @@
 
 // <time data-local> elements carry UTC; show them in the reader's time zone. One marked
 // data-zone (a window's end) also names the zone, "Sep 30, 10:02 PM EDT", so the reader
-// knows the times are their own.
+// knows the times are their own. A window's end marked data-since (its start) keeps its date
+// when it falls on a later day in the reader's zone: "Oct 2, 8:00 PM – Oct 3, 8:00 AM EDT".
 function localizeTimes(root) {
   for (const element of root.querySelectorAll("time[data-local]")) {
     const date = new Date(element.getAttribute("datetime"));
     if (Number.isNaN(date.getTime())) continue;
+    const since = element.dataset.since ? new Date(element.dataset.since) : null;
+    const nextDay = since !== null && since.toDateString() !== date.toDateString();
     const options =
-      element.dataset.local === "time"
+      element.dataset.local === "time" && !nextDay
         ? { hour: "numeric", minute: "2-digit" }
         : element.dataset.local === "weekday"
           ? { weekday: "short", hour: "numeric", minute: "2-digit" }

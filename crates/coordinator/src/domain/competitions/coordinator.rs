@@ -3912,11 +3912,11 @@ impl Coordinator {
             .competition_store
             .get_competition(entry.event_id)
             .await
-            .map_err(|e| {
-                error!("error {:?}", e);
-                match e {
-                    sqlx::Error::RowNotFound => Error::BadRequest("Competition not found".into()),
-                    e => Error::from(e),
+            .map_err(|e| match e {
+                sqlx::Error::RowNotFound => Error::BadRequest("Competition not found".into()),
+                e => {
+                    error!("error {:?}", e);
+                    Error::from(e)
                 }
             })?;
 
@@ -3932,11 +3932,11 @@ impl Coordinator {
             .competition_store
             .get_ticket(entry.ticket_id)
             .await
-            .map_err(|e| {
-                error!("error {:?}", e);
-                match e {
-                    sqlx::Error::RowNotFound => Error::BadRequest("Ticket not found".into()),
-                    e => Error::from(e),
+            .map_err(|e| match e {
+                sqlx::Error::RowNotFound => Error::BadRequest("Ticket not found".into()),
+                e => {
+                    error!("error {:?}", e);
+                    Error::from(e)
                 }
             })?;
 

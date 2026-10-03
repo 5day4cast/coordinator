@@ -762,6 +762,7 @@ mod tests {
                 client: reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build(),
                 payment_client: reqwest::Client::new(),
                 macaroon: secrecy::SecretString::from("test-macaroon"),
+                sync: Default::default(),
             }),
             sync_interval: Duration::from_secs(1),
             subscribed_interval: Duration::from_secs(1),

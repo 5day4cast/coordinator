@@ -3,7 +3,7 @@ use blake2::{
     digest::{consts::U32, KeyInit, Mac},
     Blake2bMac,
 };
-use log::{debug, error};
+use log::{debug, error, info};
 use nostr::{Event, ToBech32};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, LazyLock};
@@ -78,7 +78,8 @@ pub async fn login(
     match state.users_info.login(pubkey).await {
         Ok(user_info) => Ok((StatusCode::CREATED, Json(user_info))),
         Err(domain::Error::NotFound(e)) => {
-            error!("Failed to login: {}", e);
+            // A key with no account yet: the client offers registration.
+            info!("Login for an unknown account: {}", e);
             Err(ApiError::from(AuthError::InvalidLogin))
         }
         Err(e) => {
