@@ -253,7 +253,27 @@ impl Picker {
                 }
             };
         let window_hours = (config.observation_window_secs / 3600).clamp(1, 24);
-        let (source, all) = self.candidates(settings, configured, window_hours).await?;
+        // One request for the stations and their forecasts where the oracle offers it, rather
+        // than one per batch of stations: lanes starting together sent the oracle more than it
+        // takes at once.
+        let (source, all, forecasts) = match self
+            .oracle
+            .eligible_forecasts(settings.eligible_days, start, end)
+            .await?
+        {
+            Some((eligible, forecasts)) => {
+                anyhow::ensure!(
+                    !eligible.is_empty(),
+                    "Oracle lists no eligible stations; no competition was created"
+                );
+                let (source, all) = narrow(settings, configured, eligible);
+                (source, all, Some(forecasts))
+            }
+            None => {
+                let (source, all) = self.candidates(settings, configured, window_hours).await?;
+                (source, all, None)
+            }
+        };
         let (avoided, candidates): (Vec<StationInfo>, Vec<StationInfo>) = all
             .into_iter()
             .partition(|station| recent.contains(&station.station_id));
@@ -261,14 +281,17 @@ impl Picker {
             .iter()
             .map(|station| station.station_id.clone())
             .collect();
-        let forecasts = self
-            .oracle
-            .forecasts(&ids, start, end)
-            .await
-            .unwrap_or_else(|error| {
-                warn!("Lane {}: no forecasts: {error:#}", lane.name);
-                Vec::new()
-            });
+        let forecasts = match forecasts {
+            Some(forecasts) => forecasts,
+            None => self
+                .oracle
+                .forecasts(&ids, start, end)
+                .await
+                .unwrap_or_else(|error| {
+                    warn!("Lane {}: no forecasts: {error:#}", lane.name);
+                    Vec::new()
+                }),
+        };
         let scored = score::score(&candidates, &forecasts, &settings.weights);
         let scored_count = scored.len();
         let ranked = score::rank(scored, settings.prefer_known_airports);
@@ -307,16 +330,7 @@ impl Picker {
         window_hours: u64,
     ) -> anyhow::Result<(String, Vec<StationInfo>)> {
         let eligible = self.eligible(settings.eligible_days, window_hours).await?;
-        let candidates =
-            if settings.candidates == Candidates::Configured || settings.mode == Mode::Fixed {
-                eligible
-                    .into_iter()
-                    .filter(|station| configured.contains(&station.station_id))
-                    .collect()
-            } else {
-                eligible
-            };
-        Ok(("the oracle's eligible stations".into(), candidates))
+        Ok(narrow(settings, configured, eligible))
     }
 
     /// Check explicit manual choices and already selected plans before recording a run.
@@ -387,6 +401,24 @@ impl Picker {
         cache.insert((days, window_hours), (Instant::now(), stations.clone()));
         Ok(stations)
     }
+}
+
+/// The eligible stations a lane draws from: all of them, or those of its own it lists.
+fn narrow(
+    settings: &PickerConfig,
+    configured: &[String],
+    eligible: Vec<StationInfo>,
+) -> (String, Vec<StationInfo>) {
+    let candidates =
+        if settings.candidates == Candidates::Configured || settings.mode == Mode::Fixed {
+            eligible
+                .into_iter()
+                .filter(|station| configured.contains(&station.station_id))
+                .collect()
+        } else {
+            eligible
+        };
+    ("the oracle's eligible stations".into(), candidates)
 }
 
 #[cfg(test)]

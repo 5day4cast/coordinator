@@ -26,11 +26,6 @@ async fn main() -> anyhow::Result<()> {
     info!("  Oracle: {}", config.oracle.url);
 
     let db = SynthDb::new(&config.db.path).await?;
-    // Nothing runs yet, so a run still marked running was cut short by the last shutdown.
-    let interrupted = db.interrupt_unfinished_runs().await?;
-    if interrupted > 0 {
-        warn!("Marked {interrupted} run(s) the last shutdown cut short as interrupted");
-    }
     let mut client = CoordinatorClient::new(
         &config.coordinator.url,
         config.coordinator.admin_url.as_deref(),
@@ -129,6 +124,19 @@ async fn main() -> anyhow::Result<()> {
     let runner = Runner::new(client, db, events)
         .with_picker(picker)
         .with_schedule(&config.scheduler);
+    // Nothing runs yet, so a run still marked running was cut short by the last shutdown: each
+    // carries on from its last finished step, or is marked interrupted, saying why.
+    match runner.resume_unfinished().await {
+        Ok(0) => {}
+        Ok(resumed) => info!("Resuming {resumed} run(s) the last shutdown cut short"),
+        Err(error) => {
+            warn!("Cannot resume the runs the last shutdown cut short: {error:#}");
+            let interrupted = runner.db().interrupt_unfinished_runs().await?;
+            if interrupted > 0 {
+                warn!("Marked {interrupted} run(s) the last shutdown cut short as interrupted");
+            }
+        }
+    }
     let following = tracker.clone();
     tokio::spawn(async move { following.run().await });
 

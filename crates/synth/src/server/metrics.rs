@@ -34,12 +34,12 @@ lazy_static::lazy_static! {
 
     pub static ref LIFECYCLE_HEALTHY: prometheus::Gauge = register_gauge!(
         "synth_competition_lifecycle_healthy",
-        "Latest assessed full lifecycle outcome (1=paid out, 0=failed, NaN=unverified or absent)"
+        "Latest assessed outcome of a run meant to pay out, full lifecycle or queued (1=paid out, 0=failed, NaN=unverified or absent)"
     ).unwrap();
 
     pub static ref LAST_SUCCESS: prometheus::Gauge = register_gauge!(
         "synth_last_successful_run_timestamp",
-        "Unix timestamp when full lifecycle payouts were last verified"
+        "Unix timestamp when a run's payouts, full lifecycle or queued, were last verified"
     ).unwrap();
 
     pub static ref OPEN_COMPETITIONS: prometheus::Gauge = register_gauge!(
@@ -81,6 +81,17 @@ lazy_static::lazy_static! {
         "synth_ark_refill_failures_total",
         "Refills of ark-swapd's Ark wallet that were refused, dropped, or never reached it"
     ).unwrap();
+
+    pub static ref LANE_START_RETRIES: prometheus::CounterVec = register_counter_vec!(
+        "synth_lane_start_retries_total",
+        "Runs a lane tried again after an attempt that created no competition",
+        &["lane"]
+    ).unwrap();
+
+    pub static ref RESUMED_RUNS: prometheus::Counter = register_counter!(
+        "synth_resumed_runs_total",
+        "Runs carried on after a restart from their last finished step"
+    ).unwrap();
 }
 
 pub fn router(db: SynthDb) -> Router {
@@ -107,6 +118,8 @@ fn initialize() {
     if ARK_REFILL_LAST_SUCCESS.get() == 0.0 {
         ARK_REFILL_LAST_SUCCESS.set(f64::NAN);
     }
+    lazy_static::initialize(&LANE_START_RETRIES);
+    lazy_static::initialize(&RESUMED_RUNS);
     for scenario in crate::runner::SCENARIOS {
         for status in ["passed", "failed"] {
             SCENARIO_RUNS.with_label_values(&[scenario, status]);
@@ -118,7 +131,7 @@ fn initialize() {
     crate::scenarios::stress::initialize_metrics();
 }
 
-fn lifecycle_health(run: Option<&TestRun>) -> f64 {
+pub(crate) fn lifecycle_health(run: Option<&TestRun>) -> f64 {
     match run {
         Some(run) if matches!(run.status.as_str(), "failed" | "interrupted") => 0.0,
         Some(run) if matches!(run.money.as_deref(), Some("stuck" | "written_off")) => 0.0,
@@ -216,6 +229,16 @@ pub fn record_ark_refill_failure() {
 /// Record players entered by a backfill.
 pub fn record_backfill(players: usize) {
     BACKFILL_PLAYERS.inc_by(players as f64);
+}
+
+/// Record a lane trying a run again after it created no competition.
+pub fn record_lane_retry(lane: &str) {
+    LANE_START_RETRIES.with_label_values(&[lane]).inc();
+}
+
+/// Record a run carried on after a restart.
+pub fn record_resumed_run() {
+    RESUMED_RUNS.inc();
 }
 
 #[cfg(test)]

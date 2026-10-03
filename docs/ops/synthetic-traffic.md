@@ -16,6 +16,10 @@ Every new Synth competition checks Oracle's `/stations/eligible` endpoint. Sched
 
 The **Create competition** form preserves the operator's station choices and checks each against the eligible list. Each selected station must have a forecast in the requested observation window. Missing eligibility, an empty list, or insufficient forecast data stops creation before entry payments. Synth does not substitute stations from the general station directory. Successful eligibility responses are cached for up to ten minutes; failed requests are retried on the next attempt.
 
+When the observation window starts in the future and lasts 1 to 48 whole hours, a lane reads the eligible stations and their forecasts in one request to Oracle's `/stations/eligible/forecasts` (Oracle 2.7.0 and later). Longer windows, and Oracles without that endpoint, use the eligible list and forecast batches of 50 stations. All lanes share four Oracle requests in flight. A request Oracle sheds (503), a 429, another server error or a transport error is tried up to four times, waiting 2, 4 and 8 seconds plus up to a second of jitter.
+
+After synth starts, each lane's first run waits 45 seconds more than the lane before it. If a lane's run creates no competition, because its stations could not be picked or confirmed or the coordinator refused creation, the attempt is recorded as a failed run with the step it failed at (`pick_stations`, `plan_run` or `create_competition`) and counted in `synth_scenario_runs_total`. The lane tries again five minutes later, up to three times, and counts each retry in `synth_lane_start_retries_total{lane}`. A retry is skipped if the lane started another run meanwhile, or if it would leave less than half of an aligned lane's entry window. A failed start does not hold back the keep-open check, which starts the keep-open lane again at its next check when nothing else is open.
+
 The default eligibility lookback is three days. Eligibility describes recent coverage; it cannot guarantee future reports. Settlement still waits for the Oracle's observation and coverage checks. Use the saved weather selection and the competition's Oracle event to investigate a delay.
 
 ## Authorize operator writes
@@ -282,6 +286,12 @@ The scalar `defaults.observation_window_secs` remains supported. The plural fiel
 An omitted seed is generated before the run is saved. Set `defaults.seed` for a reproducible scheduled sequence; each successive run increments that seed.
 The sequence restarts when synth restarts.
 
+## Resume runs after a restart
+
+At startup, synth carries on each run the last shutdown left running from its last finished step. Finished steps stand as saved. Waits on the coordinator run again and return at once for states already reached. Entries that had not started run as planned, at their planned arrival times. An entry that stopped before payment, holding a ticket it had not paid, starts again with a new ticket. An entry that had reached payment is never paid again. Synth asks the coordinator whether its ticket is paid and closes the step with that result in the trace's `resumed` note. A step that was running at the restart finishes in its own row. `synth_resumed_runs_total` counts resumed runs.
+
+A run is marked interrupted, with the reason in its error, when its plan cannot be read, when it is a stress run, or when the coordinator does not have its competition. If the coordinator is unavailable during startup, synth retries every 10 seconds for five minutes before marking the run interrupted.
+
 ## Check recorded results
 
 The run's `config_json` records `planned_scenario`, `seed`, `entry_plan`, and its resolved duration. The executor loads this saved configuration.
@@ -298,9 +308,9 @@ An expected rejection must have the specific entry error being tested. Authentic
 
 `/metrics` registers collectors at server startup. Run counters and duration histograms describe scenarios completed by the current process; they reset on restart.
 
-`synth_competition_lifecycle_healthy` reads persisted settlement evidence. It is `1` for the latest assessed full lifecycle with verified payouts, `0` for a failed or stuck outcome, and `NaN` when evidence is absent or unverified. A newer run still within its settlement deadline does not erase an earlier assessed result. An overdue unresolved run does. The gauge also becomes `NaN` if no full-lifecycle money trail has refreshed for 30 minutes.
+`synth_competition_lifecycle_healthy` reads persisted settlement evidence from runs meant to pay out: `full_lifecycle`, `queued_split` and `queued_one_pool`. It is `1` for the latest assessed run with verified payouts, `0` for a failed or stuck outcome, and `NaN` when evidence is absent or unverified. A newer run still within its settlement deadline does not erase an earlier assessed result. An overdue unresolved run does. Interrupted runs, runs that failed before creating a competition, and runs that ended refunded or with nothing paid are skipped. The gauge also becomes `NaN` if none of these runs' money trails has refreshed for 30 minutes.
 
-`synth_last_successful_run_timestamp` is the persisted time when payouts were first verified, not the earlier time when scenario steps ended. Repeated refreshes do not advance it. Read this timestamp with the health gauge to distinguish recent success from old evidence. Existing verified rows migrate using their last stored trail refresh time because earlier verification timestamps were not retained.
+`synth_last_successful_run_timestamp` is the persisted time when payouts of any of those runs were first verified, not the earlier time when scenario steps ended. Repeated refreshes do not advance it. Read this timestamp with the health gauge to distinguish recent success from old evidence. Existing verified rows migrate using their last stored trail refresh time because earlier verification timestamps were not retained.
 
 Stress runs add `synth_stress_step_seconds{step}` for each ticket, registration, payment and submission, refused or not. They also add `synth_stress_admitted_total` and `synth_stress_refused_total{reason}`. The reason is one of `paused`, `full`, `ticket`, `payment`, `registration`, `submission` or `other`.
 

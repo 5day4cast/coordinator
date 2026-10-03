@@ -61,6 +61,8 @@ pub type SharedOpenStatus = Arc<Mutex<Option<OpenStatus>>>;
 pub struct LaneStart {
     pub notify: tokio::sync::Notify,
     last: Mutex<Option<tokio::time::Instant>>,
+    /// The lane's last run created no competition, which keep-open has not yet heard.
+    start_failed: std::sync::atomic::AtomicBool,
 }
 
 impl LaneStart {
@@ -73,6 +75,28 @@ impl LaneStart {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some_and(|at| at.elapsed() < grace)
+    }
+
+    /// Whether the lane started a run after `at`.
+    pub fn started_since(&self, at: tokio::time::Instant) -> bool {
+        self.last
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|last| last > at)
+    }
+
+    /// The lane's run created no competition: it no longer counts as a recent start, so the next
+    /// check starts another if nothing else is open.
+    pub fn failed(&self) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.start_failed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the lane's run failed since this was last asked.
+    fn take_failed(&self) -> bool {
+        self.start_failed
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -111,6 +135,10 @@ impl KeepOpen {
         let open = open_competitions(&client.list_competitions().await?, now, self.min_left());
         crate::server::metrics::record_open(open.competitions, open.minutes_left);
         let grace = std::time::Duration::from_secs(self.config.min_minutes_left * 60);
+        // A start that created no competition is not one to wait for.
+        if self.lane_start.take_failed() {
+            self.last_start = None;
+        }
         let recently =
             self.last_start.is_some_and(|at| at.elapsed() < grace) || self.lane_start.recent(grace);
         if open.competitions > 0 || recently {
@@ -258,6 +286,11 @@ mod tests {
         let (status, start) = keep.check(&client).await.unwrap();
         assert!(!start && status.starting);
         assert_eq!(asked.load(Ordering::SeqCst), 2);
+        // A start that created no competition does not hold the next one back.
+        keep.lane_start.failed();
+        let (status, start) = keep.check(&client).await.unwrap();
+        assert!(start && status.starting, "tried again at the next check");
+        assert_eq!(asked.load(Ordering::SeqCst), 3);
         server.abort();
     }
 

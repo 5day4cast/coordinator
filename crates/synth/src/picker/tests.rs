@@ -32,6 +32,9 @@ struct Oracle {
     stations: Vec<StationInfo>,
     forecasts: Vec<Forecast>,
     eligible_calls: usize,
+    /// Whether it answers eligible stations and their forecasts in one request.
+    discovery: bool,
+    discovery_calls: usize,
     /// The station ids of each forecast request.
     forecast_batches: Vec<Vec<String>>,
 }
@@ -81,28 +84,48 @@ async fn forecasts(
         .forecasts
         .iter()
         .filter(|row| ids.contains(&row.station_id))
-        .map(|row| {
-            serde_json::json!({
-                "station_id": row.station_id,
-                "date": "2026-10-02",
-                "start_time": "2026-10-02T00:00:00Z",
-                "end_time": "2026-10-02T06:00:00Z",
-                "temp_low": row.temp_low,
-                "temp_high": row.temp_high,
-                "wind_speed": row.wind_speed,
-                "wind_direction": 270,
-                "humidity_min": 30,
-                "humidity_max": 80,
-                "temp_unit_code": "F",
-                "precip_chance": row.precip_chance,
-                "rain_amt": row.rain_amt,
-                "snow_amt": row.snow_amt,
-                "ice_amt": row.ice_amt,
-            })
-        })
+        .map(forecast_json)
         .collect();
     oracle.forecast_batches.push(ids);
     Json(rows).into_response()
+}
+
+fn forecast_json(row: &Forecast) -> serde_json::Value {
+    serde_json::json!({
+        "station_id": row.station_id,
+        "date": "2026-10-02",
+        "start_time": "2026-10-02T00:00:00Z",
+        "end_time": "2026-10-02T06:00:00Z",
+        "temp_low": row.temp_low,
+        "temp_high": row.temp_high,
+        "wind_speed": row.wind_speed,
+        "wind_direction": 270,
+        "humidity_min": 30,
+        "humidity_max": 80,
+        "temp_unit_code": "F",
+        "precip_chance": row.precip_chance,
+        "rain_amt": row.rain_amt,
+        "snow_amt": row.snow_amt,
+        "ice_amt": row.ice_amt,
+    })
+}
+
+/// The eligible stations and their forecasts in one answer, as the oracle has since 2.7.0.
+async fn eligible_forecasts(
+    State(oracle): State<Shared>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let mut oracle = oracle.lock().unwrap();
+    if !oracle.discovery {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    assert!(["days", "start", "end"]
+        .iter()
+        .all(|key| query.contains_key(*key)));
+    oracle.discovery_calls += 1;
+    let stations: Vec<_> = oracle.eligible.iter().flatten().map(json).collect();
+    let forecasts: Vec<_> = oracle.forecasts.iter().map(forecast_json).collect();
+    Json(serde_json::json!({ "stations": stations, "forecasts": forecasts })).into_response()
 }
 
 struct Fixture {
@@ -125,6 +148,7 @@ async fn fixture(oracle: Oracle) -> Fixture {
         .route("/stations", get(stations))
         .route("/stations/eligible", get(eligible))
         .route("/stations/forecasts", get(forecasts))
+        .route("/stations/eligible/forecasts", get(eligible_forecasts))
         .with_state(oracle.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -384,6 +408,36 @@ async fn forecasts_are_asked_for_in_batches() {
         .forecast_batches
         .iter()
         .all(|batch| batch.len() <= FORECAST_BATCH));
+}
+
+/// Where the oracle offers it, the eligible stations and their forecasts come in one request
+/// instead of a list and a request per batch of stations.
+#[tokio::test]
+async fn eligible_forecasts_come_in_one_request_where_the_oracle_offers_them() {
+    let (stations, forecasts) = weather();
+    let picking = fixture(Oracle {
+        eligible: Some(stations),
+        forecasts,
+        discovery: true,
+        ..Default::default()
+    })
+    .await;
+    let lane = lane("[picker]\nmode = \"weather\"\ncluster_km = 600\n");
+    let close = crate::runner::lanes::next_half(OffsetDateTime::now_utc() + time::Duration::DAY);
+    let mut config = lane
+        .run_config(&ScenarioConfig::default(), 0, Some(close))
+        .1;
+    let pick = picking
+        .picker
+        .choose(&lane, &ScenarioConfig::default(), &mut config)
+        .await
+        .unwrap();
+    assert_eq!(config.stations, ["KDEN", "KCOS", "KCYS"]);
+    assert_eq!((pick.candidates, pick.scored), (6, 6));
+    let oracle = picking.oracle.lock().unwrap();
+    assert_eq!(oracle.discovery_calls, 1);
+    assert_eq!(oracle.eligible_calls, 0);
+    assert!(oracle.forecast_batches.is_empty());
 }
 
 #[tokio::test]

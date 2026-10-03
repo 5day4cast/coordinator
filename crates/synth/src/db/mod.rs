@@ -172,6 +172,10 @@ pub struct SynthUserRecord {
 const RUN_COLUMNS: &str = "SELECT test_runs.*, money_trails.money AS money FROM test_runs \
      LEFT JOIN money_trails ON money_trails.run_id = test_runs.id";
 
+/// The scenarios whose runs end in a payout when everything goes as planned, as SQL: the
+/// lifecycle gauges follow these.
+const PAYOUT_SCENARIOS: &str = "('full_lifecycle', 'queued_split', 'queued_one_pool')";
+
 /// Bumped with each migration that rewrites existing rows, so each runs once.
 const SCHEMA_VERSION: i64 = 2;
 
@@ -545,30 +549,38 @@ impl SynthDb {
     }
 
     /// Durable lifecycle evidence for metrics; scenario completion alone is not settlement.
+    ///
+    /// Every scenario meant to end in a payout counts, not only `full_lifecycle`: the lanes run
+    /// queued competitions far more often. A run a restart interrupted, or one that failed before
+    /// it made a competition, says nothing about the lifecycle and is passed over, as is a run
+    /// whose money ended refunded or unpaid as its scenario allowed.
     pub async fn lifecycle_metrics(&self) -> Result<(Option<TestRun>, Option<i64>, Option<i64>)> {
         let latest = sqlx::query_as::<_, TestRun>(&format!(
-            "{RUN_COLUMNS} WHERE scenario = 'full_lifecycle' \
-             AND test_runs.status != 'running' \
-             AND (money_trails.money IS NULL OR money_trails.money != 'following' \
-                  OR test_runs.status IN ('failed', 'interrupted') \
-                  OR CAST(strftime('%s', json_extract(money_trails.trail_json, '$.follow_until')) AS INTEGER) <= unixepoch()) \
+            "{RUN_COLUMNS} WHERE scenario IN {PAYOUT_SCENARIOS} \
+             AND (test_runs.status = 'passed' \
+                  OR (test_runs.status = 'failed' AND test_runs.competition_id IS NOT NULL)) \
+             AND (money_trails.money IS NULL \
+                  OR money_trails.money IN ('paid_out', 'stuck', 'written_off', 'unverified') \
+                  OR test_runs.status = 'failed' \
+                  OR (money_trails.money = 'following' \
+                      AND CAST(strftime('%s', json_extract(money_trails.trail_json, '$.follow_until')) AS INTEGER) <= unixepoch())) \
              ORDER BY started_at DESC, test_runs.id DESC LIMIT 1"
         ))
         .fetch_optional(&self.pool)
         .await?;
-        let success: Option<i64> = sqlx::query_scalar(
+        let success: Option<i64> = sqlx::query_scalar(&format!(
             "SELECT MAX(CAST(strftime('%s', money_trails.verified_at) AS INTEGER)) \
              FROM test_runs JOIN money_trails ON money_trails.run_id = test_runs.id \
-             WHERE test_runs.scenario = 'full_lifecycle' AND test_runs.status = 'passed' \
-             AND money_trails.money = 'paid_out'",
-        )
+             WHERE test_runs.scenario IN {PAYOUT_SCENARIOS} AND test_runs.status = 'passed' \
+             AND money_trails.money = 'paid_out'"
+        ))
         .fetch_one(&self.pool)
         .await?;
-        let observed: Option<i64> = sqlx::query_scalar(
+        let observed: Option<i64> = sqlx::query_scalar(&format!(
             "SELECT MAX(CAST(strftime('%s', money_trails.updated_at) AS INTEGER)) \
              FROM money_trails JOIN test_runs ON test_runs.id = money_trails.run_id \
-             WHERE test_runs.scenario = 'full_lifecycle'",
-        )
+             WHERE test_runs.scenario IN {PAYOUT_SCENARIOS}"
+        ))
         .fetch_one(&self.pool)
         .await?;
         Ok((latest, success, observed))
@@ -650,6 +662,85 @@ impl SynthDb {
             .await?;
 
         Ok(run)
+    }
+
+    /// The runs the last shutdown left running, oldest first.
+    pub async fn unfinished_runs(&self) -> Result<Vec<TestRun>> {
+        sqlx::query_as::<_, TestRun>(&format!(
+            "{RUN_COLUMNS} WHERE test_runs.status = 'running' ORDER BY started_at"
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .context("list the runs the last shutdown left running")
+    }
+
+    /// Mark a run a restart cut short and could not carry on as interrupted, saying why, and the
+    /// step it was on.
+    pub async fn interrupt_run(&self, id: &str, why: &str) -> Result<()> {
+        let now = now_rfc3339()?;
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE test_runs SET status = 'interrupted', completed_at = ?, error_message = ? \
+             WHERE id = ? AND status = 'running'",
+        )
+        .bind(&now)
+        .bind(format!(
+            "synth restarted and could not resume the run: {why}"
+        ))
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE test_steps SET status = 'interrupted', completed_at = ?, \
+             error_message = 'synth restarted before the step finished' \
+             WHERE run_id = ? AND status = 'running'",
+        )
+        .bind(&now)
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Record a run that failed before it was under way, at `step`, so history and metrics show
+    /// it: a lane whose stations or plan could not be settled made no competition.
+    pub async fn record_failed_start(
+        &self,
+        scenario: &str,
+        config_json: Option<&str>,
+        step: &str,
+        error: &str,
+    ) -> Result<String> {
+        let id = Uuid::now_v7().to_string();
+        let now = now_rfc3339()?;
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO test_runs (id, scenario, status, started_at, completed_at, \
+             error_message, config_json) VALUES (?, ?, 'failed', ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(scenario)
+        .bind(&now)
+        .bind(&now)
+        .bind(error)
+        .bind(config_json)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO test_steps (id, run_id, step_name, status, started_at, completed_at, \
+             duration_ms, error_message) VALUES (?, ?, ?, 'failed', ?, ?, 0, ?)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&id)
+        .bind(step)
+        .bind(&now)
+        .bind(&now)
+        .bind(error)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(id)
     }
 
     /// Mark the runs a restart cut short, and the steps they were on, which would otherwise read
@@ -1143,6 +1234,103 @@ mod tests {
                 .as_deref(),
             Some("paid_out")
         );
+    }
+
+    /// The lifecycle gauges follow every scenario meant to pay out, queued ones too, and pass
+    /// over a run a restart interrupted or one that failed before it made a competition. A
+    /// start that failed is still in the history, with the step it failed at.
+    #[tokio::test]
+    async fn lifecycle_gauges_follow_queued_payouts_and_pass_over_interruptions() {
+        use crate::trail::Money;
+        let directory = tempfile::tempdir().unwrap();
+        let db = SynthDb::new(directory.path().join("synth.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        let started = |id: String, at: &'static str| {
+            let pool = db.pool.clone();
+            async move {
+                sqlx::query("UPDATE test_runs SET started_at = ? WHERE id = ?")
+                    .bind(at)
+                    .bind(&id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        };
+        let queued = db.create_run("queued_one_pool", None).await.unwrap();
+        started(queued.clone(), "2026-10-03T11:00:00Z").await;
+        db.complete_run(&queued, None).await.unwrap();
+        let paid_out = trail(Money::PaidOut);
+        db.record_money(
+            &queued,
+            &Verdict {
+                trail: &paid_out,
+                follow: false,
+                step: None,
+                fail_passed_run: None,
+            },
+        )
+        .await
+        .unwrap();
+        // Later: a lifecycle run a restart interrupted, a refund scenario that passed, and a
+        // queued run whose stations could not be picked.
+        let cut_short = db.create_run("full_lifecycle", None).await.unwrap();
+        started(cut_short.clone(), "2026-10-03T12:00:00Z").await;
+        db.interrupt_run(&cut_short, "its plan was not saved")
+            .await
+            .unwrap();
+        let refund = db.create_run("escrow_refund", None).await.unwrap();
+        started(refund.clone(), "2026-10-03T13:00:00Z").await;
+        db.complete_run(&refund, None).await.unwrap();
+        let not_started = db
+            .record_failed_start(
+                "queued_one_pool",
+                None,
+                "pick_stations",
+                "Oracle eligibility is unavailable",
+            )
+            .await
+            .unwrap();
+
+        let (latest, success, observed) = db.lifecycle_metrics().await.unwrap();
+        let latest = latest.unwrap();
+        assert_eq!(
+            latest.id, queued,
+            "the queued payout is the latest evidence"
+        );
+        assert_eq!(crate::server::metrics::lifecycle_health(Some(&latest)), 1.0);
+        assert!(success.is_some(), "a queued payout is a successful run");
+        assert!(observed.is_some());
+        let run = db.get_run(&cut_short).await.unwrap().unwrap();
+        assert_eq!(run.status, "interrupted");
+        assert!(run
+            .error_message
+            .unwrap()
+            .ends_with("could not resume the run: its plan was not saved"));
+        let failed = db.get_run(&not_started).await.unwrap().unwrap();
+        assert_eq!(failed.status, "failed");
+        assert!(failed.completed_at.is_some());
+        let steps = db.get_steps(&not_started).await.unwrap();
+        assert_eq!(
+            (steps[0].step_name.as_str(), steps[0].status.as_str()),
+            ("pick_stations", "failed")
+        );
+
+        // A run that failed after it made its competition is evidence against the lifecycle.
+        let broken = db.create_run("queued_split", None).await.unwrap();
+        started(broken.clone(), "2026-10-03T14:00:00Z").await;
+        sqlx::query("UPDATE test_runs SET competition_id = ? WHERE id = ?")
+            .bind(Uuid::now_v7().to_string())
+            .bind(&broken)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db.complete_run(&broken, Some("pools never formed"))
+            .await
+            .unwrap();
+        let latest = db.lifecycle_metrics().await.unwrap().0.unwrap();
+        assert_eq!(latest.id, broken);
+        assert_eq!(crate::server::metrics::lifecycle_health(Some(&latest)), 0.0);
     }
 
     #[tokio::test]

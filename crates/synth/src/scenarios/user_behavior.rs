@@ -153,7 +153,8 @@ async fn run_steps(
     payer: &Payer<'_>,
     steps: &mut Steps,
 ) -> std::result::Result<(), Box<StepResult>> {
-    let arrival_anchor = Instant::now();
+    // A resumed run's players keep the arrival times they were planned at.
+    let arrival_anchor = crate::runner::resumed_start().unwrap_or_else(Instant::now);
     let queue = super::queued::QueueShape::of(scenario.name(), config).map_err(|error| {
         Box::new(StepResult {
             name: "create_competition".into(),
@@ -164,6 +165,10 @@ async fn run_steps(
         })
     })?;
     let created = run_step(REFUSED_AS_SMALL_STEP, || async {
+        // A resumed run made its competition before the restart.
+        if let Some(competition_id) = crate::runner::resumed_competition() {
+            return Ok(competition_id);
+        }
         if let Some(shape) = &queue {
             super::queued::create_queue(client, config, shape).await
         } else if scenario == Scenario::EscrowRefund {
@@ -216,20 +221,41 @@ async fn run_steps(
     let early = config
         .backfill
         .map_or(drawn, |backfill| backfill.early_players.min(drawn));
+    let players = &users;
     let actor = |index: usize| {
         let plan = &config.entry_plan[index];
-        run_actor(
-            client,
-            &users[plan.user_index],
-            &users,
-            &competition_id,
-            config,
-            payer,
-            plan,
-            arrival_anchor,
-            deadline,
-        )
+        let user = &players[plan.user_index];
+        async move {
+            let name = format!("user_{}_enter", user.name);
+            match resume_entry(client, user, &competition_id, &name).await {
+                Some(resumed) => resumed,
+                None => {
+                    run_actor(
+                        client,
+                        user,
+                        players,
+                        &competition_id,
+                        config,
+                        payer,
+                        plan,
+                        arrival_anchor,
+                        deadline,
+                    )
+                    .await
+                }
+            }
+        }
     };
+    // A resumed run whose backfill was counted before the restart enters those players now.
+    let backfilled = config
+        .backfill
+        .and_then(|_| crate::runner::prior_step("backfill"))
+        .filter(|row| row.status == "passed")
+        .and_then(|row| {
+            let step = crate::runner::resume::finished_step(&row);
+            let entering = step.details.as_ref()?.get("entering")?.as_u64()?;
+            Some((step, (entering as usize).min(drawn - early)))
+        });
     let mut actors: FuturesUnordered<_> = (0..early).map(actor).collect();
     let backfill = async {
         match config.backfill {
@@ -242,6 +268,12 @@ async fn run_steps(
     tokio::pin!(backfill);
     let mut backfilling = config.backfill.is_some();
     let mut entered = early;
+    if let Some((step, entering)) = backfilled {
+        backfilling = false;
+        steps.push(step);
+        actors.extend((early..early + entering).map(actor));
+        entered += entering;
+    }
     let mut traces = Vec::new();
     let mut failure = None;
     // A failed actor must not cancel another actor in the middle of paying.
@@ -297,6 +329,14 @@ async fn run_steps(
             details: None,
             error: None,
         }));
+    } else if let Some((step, trace)) =
+        resume_replacement(client, &users, &competition_id, config, scenario).await
+    {
+        if step.status == StepStatus::Failed {
+            return Err(Box::new(step));
+        }
+        steps.push(step);
+        traces.extend(trace);
     } else if scenario == Scenario::AbandonedUnpaid {
         let abandoned = abandoner.expect("resolved abandonment plan");
         let abandoner_user = users
@@ -498,6 +538,86 @@ async fn run_steps(
         steps.push(step);
     }
     follow_lifecycle(client, &users, &competition_id, config, &traces, steps).await
+}
+
+/// What became of an entry step a resumed run had saved before the restart: None if it is to run
+/// from the start, as one that never began or never reached its payment does. One that finished
+/// stands as saved. One that reached its payment is never run again: the coordinator says
+/// whether its ticket is paid, and it ends there.
+async fn resume_entry(
+    client: &CoordinatorClient,
+    user: &SynthUser,
+    competition_id: &Uuid,
+    name: &str,
+) -> Option<(StepResult, EntryTrace)> {
+    use crate::runner::resume::{self, EntryResume};
+    let row = crate::runner::prior_step(name)?;
+    let trace: Option<EntryTrace> = row
+        .details_json
+        .as_deref()
+        .and_then(|details| serde_json::from_str(details).ok());
+    match resume::entry_resume(Some(&row.status), trace.as_ref()) {
+        EntryResume::Run => None,
+        EntryResume::Finished => {
+            let trace = trace.unwrap_or_else(|| EntryTrace::new(user));
+            Some((resume::finished_entry(&row, &trace), trace))
+        }
+        EntryResume::Reconcile => {
+            let mut trace = trace.unwrap_or_else(|| EntryTrace::new(user));
+            if !trace.paid {
+                if let Some(ticket_id) = trace.ticket_id {
+                    match client
+                        .check_ticket_status(&user.nostr_keys, competition_id, &ticket_id)
+                        .await
+                    {
+                        Ok(TicketStatus::Paid | TicketStatus::Settled) => trace.paid = true,
+                        Ok(_) => {}
+                        Err(error) => log::warn!(
+                            "Cannot check {}'s ticket {ticket_id} after the restart; taking it as \
+                             unpaid: {error:#}",
+                            user.name
+                        ),
+                    }
+                }
+            }
+            let (status, why) = resume::reconciled(&trace);
+            trace.resumed = Some(why.to_string());
+            let step = trace.attach(StepResult {
+                name: name.to_string(),
+                status,
+                duration_ms: 0,
+                details: None,
+                error: None,
+            });
+            Some((step, trace))
+        }
+    }
+}
+
+/// The replacement player's step of an abandonment scenario, if a resumed run had saved it
+/// before the restart and it is not to run again; with its trace, for the replacement who
+/// entered.
+async fn resume_replacement(
+    client: &CoordinatorClient,
+    users: &[SynthUser],
+    competition_id: &Uuid,
+    config: &ScenarioConfig,
+    scenario: Scenario,
+) -> Option<(StepResult, Option<EntryTrace>)> {
+    let user = users.get(config.users)?;
+    match scenario {
+        Scenario::AbandonedUnpaid => {
+            let name = format!("user_{}_enter", user.name);
+            let (step, trace) = resume_entry(client, user, competition_id, &name).await?;
+            Some((step, Some(trace)))
+        }
+        Scenario::PaidAbandonment => {
+            let name = format!("user_{}_replacement_blocked", user.name);
+            let (step, _) = resume_entry(client, user, competition_id, &name).await?;
+            Some((step, None))
+        }
+        _ => None,
+    }
 }
 
 /// Wait until `backfill.before_close_secs` before `deadline`, then work out how many of the
