@@ -1566,7 +1566,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator"
-version = "2.17.1"
+version = "2.17.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1635,7 +1635,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-ark"
-version = "2.17.1"
+version = "2.17.2"
 dependencies = [
  "anyhow",
  "ark-core",
@@ -1663,7 +1663,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-ark-escrow"
-version = "2.17.1"
+version = "2.17.2"
 dependencies = [
  "bitcoin",
  "hex",
@@ -1674,7 +1674,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-ark-swap"
-version = "2.17.1"
+version = "2.17.2"
 dependencies = [
  "anyhow",
  "ark-client",
@@ -1705,7 +1705,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-core"
-version = "2.17.1"
+version = "2.17.2"
 dependencies = [
  "axum",
  "coordinator-escrow",
@@ -1721,7 +1721,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-escrow"
-version = "2.17.1"
+version = "2.17.2"
 dependencies = [
  "anyhow",
  "coordinator-ark-escrow",
@@ -1742,7 +1742,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-escrow-verifier"
-version = "2.17.1"
+version = "2.17.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1774,7 +1774,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-lnurl-relay"
-version = "2.17.1"
+version = "2.17.2"
 dependencies = [
  "anyhow",
  "coordinator-escrow",
@@ -1785,8 +1785,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "coordinator-payout-witness"
+version = "2.17.2"
+dependencies = [
+ "anyhow",
+ "axum",
+ "coordinator-escrow",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "coordinator-synth"
-version = "2.17.1"
+version = "2.17.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -1831,24 +1847,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "coordinator-payout-witness"
-version = "2.17.1"
-dependencies = [
- "anyhow",
- "axum",
- "coordinator-escrow",
- "serde",
- "serde_json",
- "sqlx",
- "tempfile",
- "tokio",
- "uuid",
- "zeroize",
-]
-
-[[package]]
 name = "coordinator-verifier-enclave"
-version = "2.17.1"
+version = "2.17.2"
 dependencies = [
  "anyhow",
  "coordinator-escrow-verifier",
@@ -1859,7 +1859,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-wasm"
-version = "2.17.1"
+version = "2.17.2"
 dependencies = [
  "base64 0.22.1",
  "bitcoin",

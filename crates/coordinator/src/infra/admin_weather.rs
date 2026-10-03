@@ -401,6 +401,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discovery_negotiates_and_decodes_compressed_oracle_responses() {
+        use axum::{
+            http::{header, HeaderMap},
+            routing::get,
+            Router,
+        };
+        // Gzip of {"stations":[],"forecasts":[]}; the wire body must be decoded
+        // before JSON parsing. Without gzip support this regression fails.
+        const BODY: &[u8] = &[
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 86, 42, 46, 73, 44, 201, 204, 207, 43, 86, 178,
+            138, 142, 213, 81, 74, 203, 47, 74, 77, 78, 44, 46, 1, 115, 107, 1, 222, 124, 41, 140,
+            30, 0, 0, 0,
+        ];
+        let app = Router::new().route(
+            "/stations/eligible/forecasts",
+            get(|headers: HeaderMap| async move {
+                assert!(headers[header::ACCEPT_ENCODING]
+                    .to_str()
+                    .unwrap()
+                    .split(',')
+                    .any(|encoding| encoding.trim() == "gzip"));
+                (
+                    [
+                        (header::CONTENT_ENCODING, "gzip"),
+                        (header::CONTENT_TYPE, "application/json"),
+                    ],
+                    BODY,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let service =
+            WeatherDiscovery::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let window = Filters::default()
+            .window(OffsetDateTime::now_utc())
+            .unwrap();
+        let data = service.fetch(&window).await.unwrap();
+        assert_eq!(data.eligible_count, 0);
+        assert!(data.candidates.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn warmer_prepares_default_view_and_stops_on_shutdown() {
         use axum::{routing::get, Json, Router};
         use std::sync::atomic::{AtomicUsize, Ordering};
