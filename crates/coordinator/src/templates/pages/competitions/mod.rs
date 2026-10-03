@@ -138,16 +138,17 @@ impl CompetitionView {
             .flatten();
     }
 
-    /// `3 of 25`, or `40 entered` for a queue, which has no seat count.
+    /// `3 of 25`, or `40 entered` for a queue, which has no seat count. It counts the
+    /// entries the page lists; a fee paid for an entry that never arrived is in the refund note.
     pub fn entries(&self) -> String {
         match &self.queue {
             Queue::Queued(queue) => format!("{} entered", self.entry_count(queue)),
-            _ => format!("{} of {}", self.entered(), self.total_allowed_entries),
+            _ => format!("{} of {}", self.total_entries, self.total_allowed_entries),
         }
     }
 
-    /// Its entries. For one that didn't run, every paid entry fee counts, as its refunds count
-    /// them, even one whose entry never arrived.
+    /// Whether anyone took part. For one that didn't run, every paid entry fee counts, as its
+    /// refunds count them, even one whose entry never arrived.
     pub fn entered(&self) -> u64 {
         match self.phase {
             Phase::Unfilled | Phase::Cancelled | Phase::Failed => {
@@ -1029,8 +1030,20 @@ pub(crate) mod tests {
         assert_eq!(written_off.refunds(NOW), Refunds::Partly);
         assert_eq!(line(&written_off).as_deref(), Some("Not all refunded"));
         assert!(!badge(&written_off).contains("no entry fees were paid"));
-        // Its entries count the fee its refunds count, though its entry never arrived.
-        assert_eq!(written_off.entries(), "1 of 3");
+        // Its entries are the ones that arrived; the refund line counts the fee.
+        assert_eq!(written_off.entries(), "0 of 3");
+        assert_eq!(written_off.entered(), 1);
+
+        // A paid ticket whose entry never arrived is not a tenth entry beside "didn't fill".
+        let mut short = view("short", Phase::Cancelled, -600);
+        short.total_entries = 9;
+        short.total_allowed_entries = 10;
+        short.refunds = RefundProgress {
+            escrowed: 10,
+            ..Default::default()
+        };
+        assert_eq!(short.entries(), "9 of 10");
+        assert!(short.did_not_fill());
 
         // Held Lightning payments are released when it is cancelled.
         let mut held = view("held", Phase::Cancelled, -600);

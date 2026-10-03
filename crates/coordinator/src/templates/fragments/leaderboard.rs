@@ -813,8 +813,8 @@ mod tests {
         let page = leaderboard(&competition, NOW).into_string();
         assert!(page.contains("Refunds are finished: 0 of 1"), "{page}");
         assert!(!page.contains("No entry fees were paid."));
-        // Its entries count the fee it counts, with no "No entries yet" beside it.
-        assert!(page.contains("<dd>1 of 3</dd>"), "{page}");
+        // Its entries are the rows; the paid fee keeps "No entries yet" away.
+        assert!(page.contains("<dd>0 of 3</dd>"), "{page}");
         assert!(!page.contains("No entries yet."), "{page}");
     }
 
