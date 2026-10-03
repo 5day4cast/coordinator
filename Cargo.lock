@@ -3562,8 +3562,8 @@ dependencies = [
 
 [[package]]
 name = "keymeld-core"
-version = "0.7.0"
-source = "git+https://github.com/tee8z/keymeld?rev=425508fd6cca2deec64543098e15e907507d514e#425508fd6cca2deec64543098e15e907507d514e"
+version = "0.8.2"
+source = "git+https://github.com/tee8z/keymeld?rev=9c471b8c039a3c766b0d7f9131797bf8f8f7aeae#9c471b8c039a3c766b0d7f9131797bf8f8f7aeae"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3573,11 +3573,12 @@ dependencies = [
  "dashmap",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "hex",
  "hkdf",
  "musig2",
  "p384",
- "rand 0.9.5",
+ "rand 0.10.3",
  "rustls-pki-types",
  "rustls-webpki",
  "secp256k1 0.31.1",
@@ -3601,8 +3602,8 @@ dependencies = [
 
 [[package]]
 name = "keymeld-enclave"
-version = "0.7.0"
-source = "git+https://github.com/tee8z/keymeld?rev=425508fd6cca2deec64543098e15e907507d514e#425508fd6cca2deec64543098e15e907507d514e"
+version = "0.8.2"
+source = "git+https://github.com/tee8z/keymeld?rev=9c471b8c039a3c766b0d7f9131797bf8f8f7aeae#9c471b8c039a3c766b0d7f9131797bf8f8f7aeae"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3617,10 +3618,11 @@ dependencies = [
  "der 0.7.10",
  "hex",
  "keymeld-core",
+ "miniz_oxide 0.9.1",
  "musig2",
  "openssl",
  "pkcs1",
- "rand 0.9.5",
+ "rand 0.10.3",
  "secp256k1 0.31.1",
  "serde",
  "serde_bytes",
@@ -3638,13 +3640,14 @@ dependencies = [
 
 [[package]]
 name = "keymeld-sdk"
-version = "0.7.0"
-source = "git+https://github.com/tee8z/keymeld?rev=425508fd6cca2deec64543098e15e907507d514e#425508fd6cca2deec64543098e15e907507d514e"
+version = "0.8.2"
+source = "git+https://github.com/tee8z/keymeld?rev=9c471b8c039a3c766b0d7f9131797bf8f8f7aeae#9c471b8c039a3c766b0d7f9131797bf8f8f7aeae"
 dependencies = [
  "dlctix",
  "flate2",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "gloo-timers",
  "hex",
  "keymeld-core",
