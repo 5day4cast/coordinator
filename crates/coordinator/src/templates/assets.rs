@@ -3,8 +3,7 @@
 //! Each asset's URL contains a hash of its bytes, so a URL never changes
 //! meaning and browsers may cache it for a year. A request for any other
 //! `/assets/` path, including an old hash, is not found. Compression is left
-//! to the router's `CompressionLayer`. A single byte range is served as asked,
-//! as Safari needs to play the help page's video.
+//! to the router's `CompressionLayer`. A single byte range is served as asked.
 
 use axum::{
     extract::Path,
@@ -68,8 +67,7 @@ pub async fn serve_asset(Path(file): Path<String>, request: HeaderMap) -> Respon
     );
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     // Stated outright: a cache in front of the site serves byte ranges of a
-    // stored copy only when it knows the whole length, and without it the
-    // help video cannot be scrubbed.
+    // stored copy only when it knows the whole length.
     headers.insert(header::CONTENT_LENGTH, HeaderValue::from(body.len()));
     if let Some(range) = range.and_then(|range| HeaderValue::from_str(&range).ok()) {
         headers.insert(header::CONTENT_RANGE, range);
@@ -159,10 +157,9 @@ mod tests {
         }
     }
 
-    /// Safari plays a video only from a server that serves byte ranges.
     #[tokio::test]
     async fn a_byte_range_is_served_as_asked() {
-        let asset = &HOW_IT_WORKS_MP4;
+        let asset = &USA_MAP_SVG;
         let len = asset.bytes.len();
         let get = |range: &'static str| {
             router().oneshot(
@@ -180,7 +177,7 @@ mod tests {
             format!("bytes 0-1/{len}").as_str()
         );
         assert_eq!(first.headers()[header::ACCEPT_RANGES], "bytes");
-        assert_eq!(first.headers()[header::CONTENT_TYPE], "video/mp4");
+        assert_eq!(first.headers()[header::CONTENT_TYPE], "image/svg+xml");
         let body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body.as_ref(), &asset.bytes[..2]);
 
