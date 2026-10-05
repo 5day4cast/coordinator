@@ -227,7 +227,7 @@ async fn run_steps(
         let user = &players[plan.user_index];
         async move {
             let name = format!("user_{}_enter", user.name);
-            match resume_entry(client, user, &competition_id, &name).await {
+            match resume_entry(client, user, &competition_id, config, &name).await {
                 Some(resumed) => resumed,
                 None => {
                     run_actor(
@@ -487,15 +487,38 @@ async fn run_steps(
             elapsed_ms: None,
         });
         let result = run_step(&name, || async {
-            wait_until(&name, &mut trace, 0, Instant::now() + Duration::from_millis(wait_ms)).await?;
+            wait_until(
+                &name,
+                &mut trace,
+                0,
+                Instant::now() + Duration::from_millis(wait_ms),
+            )
+            .await?;
             ensure_payment_time(deadline, config)?;
-            let result = full_lifecycle::request_entry(client, user, &competition_id, config.lightning_address.as_deref(), &name, &mut trace).await;
+            let result = full_lifecycle::request_entry(
+                client,
+                user,
+                &competition_id,
+                config.lightning_address.as_deref(),
+                &name,
+                &mut trace,
+            )
+            .await;
             match result {
-                Err(error) if error.downcast_ref::<ApiRejection>().is_some_and(ApiRejection::is_no_capacity) => Ok(()),
+                Err(error)
+                    if error
+                        .downcast_ref::<ApiRejection>()
+                        .is_some_and(ApiRejection::is_no_capacity) =>
+                {
+                    Ok(())
+                }
                 Err(error) => Err(error),
-                Ok(_) => anyhow::bail!("paid abandoned ticket unexpectedly released capacity; replacement was not paid"),
+                Ok(_) => anyhow::bail!(
+                    "paid abandoned ticket unexpectedly released capacity; replacement was not paid"
+                ),
             }
-        }).await;
+        })
+        .await;
         match result {
             Ok((step, ())) => steps.push(trace.attach(step)),
             Err(step) => return Err(Box::new(trace.attach(*step))),
@@ -542,12 +565,13 @@ async fn run_steps(
 
 /// What became of an entry step a resumed run had saved before the restart: None if it is to run
 /// from the start, as one that never began or never reached its payment does. One that finished
-/// stands as saved. One that reached its payment is never run again: the coordinator says
-/// whether its ticket is paid, and it ends there.
+/// stands as saved. One that reached its payment is never paid again. A normal paid entry
+/// can submit its saved body while entries remain open; older traces wait for their refund.
 async fn resume_entry(
     client: &CoordinatorClient,
     user: &SynthUser,
     competition_id: &Uuid,
+    config: &ScenarioConfig,
     name: &str,
 ) -> Option<(StepResult, EntryTrace)> {
     use crate::runner::resume::{self, EntryResume};
@@ -570,7 +594,9 @@ async fn resume_entry(
                         .check_ticket_status(&user.nostr_keys, competition_id, &ticket_id)
                         .await
                     {
-                        Ok(TicketStatus::Paid | TicketStatus::Settled) => trace.paid = true,
+                        Ok(TicketStatus::Paid | TicketStatus::Settled | TicketStatus::Used) => {
+                            trace.paid = true
+                        }
                         Ok(_) => {}
                         Err(error) => log::warn!(
                             "Cannot check {}'s ticket {ticket_id} after the restart; taking it as \
@@ -580,18 +606,168 @@ async fn resume_entry(
                     }
                 }
             }
-            let (status, why) = resume::reconciled(&trace);
-            trace.resumed = Some(why.to_string());
+            let recovery =
+                resume_paid_submission(client, user, competition_id, config, name, &mut trace)
+                    .await;
+            let (status, error) = match recovery {
+                Ok(true) => {
+                    trace.resumed =
+                        Some("submitted the saved entry after restart without paying again".into());
+                    (StepStatus::Passed, None)
+                }
+                Ok(false) => {
+                    let (status, why) = resume::reconciled(&trace);
+                    trace.resumed = Some(why.to_string());
+                    (status, None)
+                }
+                Err(error) => {
+                    let why = format!("Could not recover the paid entry submission: {error:#}");
+                    trace.resumed = Some(why.clone());
+                    (StepStatus::Failed, Some(why))
+                }
+            };
             let step = trace.attach(StepResult {
                 name: name.to_string(),
                 status,
                 duration_ms: 0,
                 details: None,
-                error: None,
+                error,
             });
             Some((step, trace))
         }
     }
+}
+
+/// Recover only submission: no ticket request, registration, or payment is repeated.
+/// Intentional abandonment, duplicate, and late-submission scenarios retain their own semantics.
+pub(super) async fn resume_paid_submission(
+    client: &CoordinatorClient,
+    user: &SynthUser,
+    competition_id: &Uuid,
+    config: &ScenarioConfig,
+    step: &str,
+    trace: &mut EntryTrace,
+) -> Result<bool> {
+    if !trace.paid || trace.entry_submitted || trace.behavior != Some(EntryBehavior::Complete) {
+        return Ok(false);
+    }
+    let Some(entry) = trace.pending_submission.clone() else {
+        return Ok(false);
+    };
+    ensure!(
+        Some(entry.id) == trace.entry_id
+            && Some(entry.ticket_id) == trace.ticket_id
+            && entry.event_id == *competition_id,
+        "saved entry does not match its ticket and competition"
+    );
+    let key = user.derive_ephemeral_key(
+        &trace
+            .key_derivation_id
+            .context("saved key derivation ID missing")?,
+    )?;
+    ensure!(
+        entry.ephemeral_pubkey == key.public_key,
+        "saved entry uses another key"
+    );
+    let (_, hash) = crate::crypto::payout::generate_payout_pair(&key.secret_bytes);
+    ensure!(
+        entry.payout_hash == hash,
+        "saved entry uses another payout hash"
+    );
+
+    // A lost response may hide a successful submission. Verify the ticket's entry first.
+    if saved_entry_exists(client, user, &entry).await? {
+        trace.entry_submitted = true;
+        trace.pending_submission = None;
+        return Ok(true);
+    }
+    let competition = client.get_competition(competition_id).await?;
+    let deadline = competition
+        .event_submission
+        .get("start_observation_date")
+        .and_then(|value| value.as_str())
+        .context("competition omitted its entry deadline")?;
+    let deadline = OffsetDateTime::parse(deadline, &Rfc3339)?;
+    if ensure_submission_time(deadline, config).is_err() {
+        return Ok(false);
+    }
+    if trace.submission_not_before.is_none() {
+        let delay = trace
+            .waits
+            .iter()
+            .find(|wait| wait.stage == "before_submit")
+            .map_or(0, |wait| {
+                wait.planned_ms.saturating_sub(wait.elapsed_ms.unwrap_or(0))
+            });
+        trace.submission_not_before = Some(
+            OffsetDateTime::now_utc()
+                + time::Duration::milliseconds(
+                    i64::try_from(delay).context("submission delay exceeds i64")?,
+                ),
+        );
+        crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
+    }
+    if let Some(target) = trace.submission_not_before {
+        if target
+            >= deadline - time::Duration::seconds(config.entry_timing.deadline_margin_secs as i64)
+        {
+            return Ok(false);
+        }
+        let remaining = (target - OffsetDateTime::now_utc())
+            .whole_milliseconds()
+            .max(0) as u64;
+        tokio::time::sleep(Duration::from_millis(remaining)).await;
+    }
+    ensure_submission_time(deadline, config)?;
+    trace.submission_attempts += 1;
+    crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
+    match client.attempt_submit_entry(&user.nostr_keys, &entry).await {
+        Ok(EntrySubmission::Accepted(response)) => {
+            ensure!(
+                response.id == entry.id
+                    && response.ticket_id == entry.ticket_id
+                    && response.event_id == entry.event_id,
+                "accepted entry differs from the saved submission"
+            );
+        }
+        response => {
+            // The server may have accepted it before the connection was interrupted.
+            if !saved_entry_exists(client, user, &entry).await? {
+                match response {
+                    Ok(EntrySubmission::Rejected(error)) => return Err(error.into()),
+                    Err(error) => return Err(error),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+    trace.entry_submitted = true;
+    trace.pending_submission = None;
+    crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
+    Ok(true)
+}
+
+async fn saved_entry_exists(
+    client: &CoordinatorClient,
+    user: &SynthUser,
+    saved: &crate::client::entries::AddEntry,
+) -> Result<bool> {
+    // A queue may have moved the accepted entry to a child pool while Synth was down.
+    let competition = client.get_competition(&saved.event_id).await?;
+    let mut events = vec![saved.event_id];
+    events.extend(competition.pools.iter().map(|pool| pool.competition_id));
+    let entries = client.list_entries_in(&user.nostr_keys, &events).await?;
+    if let Some(entry) = entries
+        .into_iter()
+        .find(|entry| entry.ticket_id == saved.ticket_id)
+    {
+        ensure!(
+            entry.id == saved.id && entry.ephemeral_pubkey == saved.ephemeral_pubkey,
+            "ticket is assigned to a different entry"
+        );
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// The replacement player's step of an abandonment scenario, if a resumed run had saved it
@@ -608,12 +784,12 @@ async fn resume_replacement(
     match scenario {
         Scenario::AbandonedUnpaid => {
             let name = format!("user_{}_enter", user.name);
-            let (step, trace) = resume_entry(client, user, competition_id, &name).await?;
+            let (step, trace) = resume_entry(client, user, competition_id, config, &name).await?;
             Some((step, Some(trace)))
         }
         Scenario::PaidAbandonment => {
             let name = format!("user_{}_replacement_blocked", user.name);
-            let (step, _) = resume_entry(client, user, competition_id, &name).await?;
+            let (step, _) = resume_entry(client, user, competition_id, config, &name).await?;
             Some((step, None))
         }
         _ => None,
@@ -1161,6 +1337,11 @@ async fn finish_entry(
     step: &str,
     trace: &mut EntryTrace,
 ) -> Result<()> {
+    if plan.behavior == EntryBehavior::Complete {
+        trace.submission_not_before = Some(
+            OffsetDateTime::now_utc() + time::Duration::seconds(plan.before_submit_secs as i64),
+        );
+    }
     wait_until(
         step,
         trace,

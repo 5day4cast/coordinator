@@ -239,12 +239,9 @@ pub async fn add_event_entry(
 /// `GET /api/v1/entries?event_id=<id>` narrows the list to one competition. The query
 /// cannot carry `SearchBy::event_ids`, a list, so clients asked with `event_id` and were
 /// sent every entry the player has ever made.
-#[derive(Debug, Default, Deserialize)]
-pub struct EntriesQuery {
-    event_id: Option<Uuid>,
-    #[serde(flatten)]
-    page: ListQuery,
-}
+// Keep URL scalars in one struct. Serde flatten buffers query values as strings,
+// which prevents the nested usize and bool fields from using URL deserialization.
+pub type EntriesQuery = ListQuery;
 
 pub async fn get_entries(
     NostrAuth { pubkey, .. }: NostrAuth,
@@ -253,7 +250,7 @@ pub async fn get_entries(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let pubkey = pubkey.to_hex();
-    let mut page = query.page.page()?;
+    let mut page = query.page()?;
     if query.event_id.is_some() {
         page.history = true;
     }
@@ -631,5 +628,48 @@ mod min_players_now_tests {
         let json = serde_json::to_value(&shown).unwrap();
         assert_eq!(json["min_players_now"], 5);
         assert_eq!(json["pool_rules"]["min_players"], 3);
+    }
+}
+
+#[cfg(test)]
+mod entry_query_tests {
+    use super::EntriesQuery;
+    use axum::{extract::Query, http::Uri};
+    use uuid::Uuid;
+
+    #[test]
+    fn paginated_entries_parse_the_actual_synth_query() {
+        let event = Uuid::now_v7();
+        let cursor = Uuid::now_v7();
+        let uri: Uri =
+            format!("/api/v1/entries?event_id={event}&limit=100&cursor={cursor}&history=true")
+                .parse()
+                .unwrap();
+        let Query(query) = Query::<EntriesQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(query.event_id, Some(event));
+        let page = query.page().unwrap();
+        assert_eq!(page.limit, 100);
+        assert_eq!(page.before, Some(cursor));
+        assert!(page.history);
+        for value in ["-1", "abc"] {
+            let uri: Uri = format!("/api/v1/entries?limit={value}").parse().unwrap();
+            assert!(Query::<EntriesQuery>::try_from_uri(&uri).is_err());
+        }
+        for value in ["0", "101"] {
+            let uri: Uri = format!("/api/v1/entries?limit={value}").parse().unwrap();
+            assert!(Query::<EntriesQuery>::try_from_uri(&uri)
+                .unwrap()
+                .page()
+                .is_err());
+        }
+        let uri: Uri = "/api/v1/entries".parse().unwrap();
+        assert_eq!(
+            Query::<EntriesQuery>::try_from_uri(&uri)
+                .unwrap()
+                .page()
+                .unwrap()
+                .limit,
+            50
+        );
     }
 }

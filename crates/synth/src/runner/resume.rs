@@ -4,8 +4,8 @@
 //! synth can take a run up where it was: its finished steps stand as they were saved, and the
 //! steps after them run again. Those are waits on the coordinator, which answer at once for a
 //! state already reached, and entries that had not begun. Nothing is paid twice: an entry that
-//! reached its payment is never run again; synth asks the coordinator what became of its ticket
-//! instead.
+//! reached its payment is never paid again. Synth checks its ticket and can finish a normal
+//! entry's saved submission while entries remain open.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -59,7 +59,7 @@ impl Prior {
 /// Whether a saved step had finished: passed or failed. A step still running, or marked
 /// interrupted by an older synth, had not.
 fn finished(status: &str) -> bool {
-    matches!(status, "passed" | "failed")
+    matches!(status, "passed" | "failed" | "skipped")
 }
 
 /// The steps a resumed run finished before the restart. A step that runs again and ends the way
@@ -205,7 +205,7 @@ pub fn reconciled(trace: &EntryTrace) -> (StepStatus, &'static str) {
 
 /// An entry step that finished before the restart, as it was saved.
 pub fn finished_entry(row: &TestStep, trace: &EntryTrace) -> StepResult {
-    let status = if trace.seat_taken {
+    let status = if trace.seat_taken || row.status == "skipped" {
         StepStatus::Skipped
     } else if row.status == "failed" {
         StepStatus::Failed
@@ -225,7 +225,9 @@ pub fn finished_entry(row: &TestStep, trace: &EntryTrace) -> StepResult {
 pub fn finished_step(row: &TestStep) -> StepResult {
     StepResult {
         name: row.step_name.clone(),
-        status: if row.status == "failed" {
+        status: if row.status == "skipped" {
+            StepStatus::Skipped
+        } else if row.status == "failed" {
             StepStatus::Failed
         } else {
             StepStatus::Passed
@@ -351,6 +353,21 @@ mod tests {
             EntryResume::Finished
         );
         assert_eq!(entry_resume(Some("failed"), None), EntryResume::Finished);
+    }
+
+    #[test]
+    fn skipped_entries_remain_skipped_across_restarts() {
+        let saved = row("user_alice_enter", "skipped");
+        let trace = EntryTrace::default();
+        assert_eq!(
+            entry_resume(Some("skipped"), Some(&trace)),
+            EntryResume::Finished
+        );
+        assert_eq!(finished_entry(&saved, &trace).status, StepStatus::Skipped);
+        assert_eq!(finished_step(&saved).status, StepStatus::Skipped);
+        assert!(Prior::new(OffsetDateTime::now_utc(), vec![saved])
+            .open_rows()
+            .is_empty());
     }
 
     #[test]

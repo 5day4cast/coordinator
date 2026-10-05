@@ -247,7 +247,9 @@ async fn save_steps(
                     step,
                 });
             }
-            Record::Finished(step) if replay.repeats(&step.name, step.error.is_some()) => {
+            Record::Finished(step)
+                if replay.repeats(&step.name, step.status == StepStatus::Failed) =>
+            {
                 events.send(Event::StepFinished {
                     run_id: run_id.clone(),
                     step: step.name.clone(),
@@ -262,11 +264,16 @@ async fn save_steps(
                 };
                 let saved = match row {
                     Ok(row) => {
-                        db.complete_step(
+                        db.complete_step_with_status(
                             &row,
                             step.duration_ms,
                             step.error.as_deref(),
                             details.as_deref(),
+                            match step.status {
+                                StepStatus::Passed => "passed",
+                                StepStatus::Failed => "failed",
+                                StepStatus::Skipped => "skipped",
+                            },
                         )
                         .await
                     }
@@ -498,7 +505,7 @@ impl Runner {
             match self.client.get_competition(competition_id).await {
                 Ok(_) => return Ok(()),
                 Err(error) if tries >= RESUME_TRIES || format!("{error:#}").contains("(404") => {
-                    return Err(error)
+                    return Err(error);
                 }
                 Err(_) => {
                     tries += 1;
@@ -1434,6 +1441,9 @@ mod tests {
                 step_finished(&created);
                 step_finished(&step("wait_cancelled"));
                 step_finished(&step("refund_alice"));
+                let mut skipped = step("user_bob_enter");
+                skipped.status = StepStatus::Skipped;
+                step_finished(&skipped);
             })
             .await;
         saving.await.unwrap();
@@ -1447,6 +1457,7 @@ mod tests {
                 ("create_competition", "passed"),
                 ("wait_cancelled", "passed"),
                 ("refund_alice", "passed"),
+                ("user_bob_enter", "skipped"),
             ]
         );
         assert_eq!(
