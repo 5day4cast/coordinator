@@ -14,11 +14,18 @@
 //! [`RefreshCache`](crate::infra::refresh_cache::RefreshCache) and never
 //! wait on the oracle for long; see `domain::leaderboard`.
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    time::Duration,
+};
 
 use anyhow::Context;
+use log::warn;
 use serde::Deserialize;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
+use time::{
+    format_description::well_known::Rfc3339, macros::format_description, Date, OffsetDateTime,
+    UtcOffset,
+};
 use uuid::Uuid;
 
 /// Longest a single oracle request may take. Only background refreshes make these requests.
@@ -49,6 +56,30 @@ pub struct EventLine {
     pub upper: f64,
 }
 
+/// Why the oracle could not settle an event at its last check of the data, in its own words.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct SettlementBlock {
+    /// The oracle's name for the reason: `incomplete_readings`.
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub message: String,
+    /// When the oracle last checked, as it reports it.
+    #[serde(default)]
+    pub checked_at: Option<String>,
+}
+
+impl SettlementBlock {
+    /// The oracle's name for the reason, or `blocked` when it gave none.
+    pub fn code(&self) -> &str {
+        if self.code.is_empty() {
+            "blocked"
+        } else {
+            &self.code
+        }
+    }
+}
+
 /// What the oracle holds for a competition's event.
 #[derive(Debug, Clone, Default)]
 pub struct EventReadings {
@@ -61,8 +92,10 @@ pub struct EventReadings {
     pub entry_count: usize,
     pub attested: bool,
     /// The oracle could not settle the event unsigned: its last check of the data failed.
-    /// Why is the oracle operator's business, so only that it happened is kept.
-    pub settlement_blocked: bool,
+    /// Players are told only that it happened; why is for the operator pages.
+    pub settlement_block: Option<SettlementBlock>,
+    /// When the event's contract expires unsigned, from the oracle's announcement.
+    pub expiry: Option<OffsetDateTime>,
 }
 
 impl EventReadings {
@@ -165,6 +198,8 @@ impl OracleWeather {
             lines: Vec<EventLine>,
             #[serde(default)]
             settlement_block: Option<serde_json::Value>,
+            #[serde(default)]
+            event_announcement: Option<serde_json::Value>,
         }
         let url = format!("{}/oracle/events/{event_id}", self.base_url);
         let response = self.http.get(&url).send().await?;
@@ -186,7 +221,15 @@ impl OracleWeather {
             readings: event.readings,
             lines: event.lines,
             attested: event.attestation.is_some_and(|value| !value.is_null()),
-            settlement_blocked: event.settlement_block.is_some_and(|value| !value.is_null()),
+            // A block the oracle words another way is still a block.
+            settlement_block: event
+                .settlement_block
+                .filter(|value| !value.is_null())
+                .map(|value| serde_json::from_value(value).unwrap_or_default()),
+            expiry: event
+                .event_announcement
+                .and_then(|announcement| announcement.get("expiry")?.as_i64())
+                .and_then(|expiry| OffsetDateTime::from_unix_timestamp(expiry).ok()),
         })
     }
 
@@ -259,6 +302,24 @@ impl OracleWeather {
             ))
             .await
             .context("forecasts")?;
+        // Said here, where an operator reads it; the form shows the forecasts it has.
+        let days = window_days(start, end);
+        let expected = (days.1 - days.0).whole_days() + 1;
+        let short: Vec<&str> = stations
+            .iter()
+            .filter(|station| {
+                let given = station_days(station, days, &rows).0.len() as i64;
+                given > 0 && given < expected
+            })
+            .map(String::as_str)
+            .collect();
+        if !short.is_empty() {
+            warn!(
+                "The oracle's forecasts from {start} to {end} leave out some of the window's \
+                 days at {}; picks there use the days it gave",
+                short.join(", ")
+            );
+        }
         Ok(stations
             .iter()
             .flat_map(|station| baselines(station, start, end, &rows))
@@ -280,22 +341,21 @@ struct DailyForecast {
     wind_speed: Option<f64>,
 }
 
-/// A station's baselines over the window's UTC days, as noaa-oracle's `station_readings`
-/// aggregates them: the high as the days' maximum, the low as their minimum, the wind as its
-/// maximum. Every day must have exactly one forecast, or there is no baseline.
-fn baselines(
-    station: &str,
-    start: OffsetDateTime,
-    end: OffsetDateTime,
-    rows: &[DailyForecast],
-) -> Vec<Reading> {
-    use std::collections::BTreeMap;
-    use time::{macros::format_description, Date};
+/// The first and last UTC day a window touches.
+fn window_days(start: OffsetDateTime, end: OffsetDateTime) -> (Date, Date) {
     let first_day = start.to_offset(UtcOffset::UTC).date();
     let last_day = (end - time::Duration::NANOSECOND)
         .to_offset(UtcOffset::UTC)
         .date();
-    let expected_days = (last_day - first_day).whole_days() + 1;
+    (first_day, last_day)
+}
+
+/// A station's forecast for each of the window's days that has one, and whether no day has two.
+fn station_days<'a>(
+    station: &str,
+    (first_day, last_day): (Date, Date),
+    rows: &'a [DailyForecast],
+) -> (BTreeMap<Date, &'a DailyForecast>, bool) {
     let mut daily = BTreeMap::new();
     let mut unique = true;
     for row in rows.iter().filter(|row| row.station_id == station) {
@@ -310,12 +370,26 @@ fn baselines(
             unique &= daily.insert(day, row).is_none();
         }
     }
+    (daily, unique)
+}
+
+/// A station's baselines over the window's UTC days, as noaa-oracle's `station_readings`
+/// aggregates them: the high as the days' maximum, the low as their minimum, the wind as its
+/// maximum. A day with two forecasts leaves no baseline, and so does a forecast without a value
+/// for the metric. A day with no forecast at all is left out: the days that have one still
+/// give a forecast to pick against, where requiring every day left the whole form without any.
+fn baselines(
+    station: &str,
+    start: OffsetDateTime,
+    end: OffsetDateTime,
+    rows: &[DailyForecast],
+) -> Vec<Reading> {
+    let (daily, unique) = station_days(station, window_days(start, end), rows);
     if daily.is_empty() {
         return vec![];
     }
-    let complete = unique && daily.len() as i64 == expected_days;
     let aggregate = |field: fn(&DailyForecast) -> Option<f64>, reduce: fn(f64, f64) -> f64| {
-        if !complete {
+        if !unique {
             return None;
         }
         daily
@@ -387,12 +461,22 @@ mod tests {
         }
     }
 
+    /// The oracle once answered a two-day window with the second day's row only. The days it
+    /// does give still make a forecast; a value it leaves out, or a day it gives twice, does not.
     #[test]
-    fn a_missing_day_or_value_leaves_no_baseline() {
+    fn a_missing_day_uses_the_days_given_and_a_missing_value_leaves_no_baseline() {
         let start = OffsetDateTime::parse("2030-01-01T12:00:00Z", &Rfc3339).unwrap();
         let end = OffsetDateTime::parse("2030-01-02T12:00:00Z", &Rfc3339).unwrap();
-        let one_day = vec![row("KORD", "2030-01-01", 50.0, 30.0, Some(8.0))];
+        let one_day = vec![row("KORD", "2030-01-02", 50.0, 30.0, Some(8.0))];
         let readings = baselines("KORD", start, end, &one_day);
+        assert_eq!(baseline(&readings, "temp_high"), Some(50.0));
+        assert_eq!(baseline(&readings, "temp_low"), Some(30.0));
+        assert_eq!(baseline(&readings, "wind_speed"), Some(8.0));
+        let twice = vec![
+            row("KORD", "2030-01-02", 50.0, 30.0, Some(8.0)),
+            row("KORD", "2030-01-02", 51.0, 31.0, Some(9.0)),
+        ];
+        let readings = baselines("KORD", start, end, &twice);
         assert_eq!(baseline(&readings, "temp_high"), None);
         let no_wind = vec![
             row("KORD", "2030-01-01", 50.0, 30.0, None),
@@ -431,7 +515,8 @@ mod tests {
                 "code": "source_check_failed",
                 "message": "KPWM: observations disagree",
                 "checked_at": "2026-09-24T13:00:00Z"
-            }
+            },
+            "event_announcement": { "locking_points": [], "expiry": 1790341200 }
         });
         let app = Router::new()
             .route(
@@ -466,9 +551,18 @@ mod tests {
 
         let readings = oracle.event_readings(id).await.unwrap();
         assert!(readings.is_final());
-        assert!(!readings.settlement_blocked);
+        assert!(readings.settlement_block.is_none());
         let blocked = oracle.event_readings(blocked_id).await.unwrap();
-        assert!(blocked.settlement_blocked && !blocked.is_final());
+        assert!(!blocked.is_final());
+        let block = blocked.settlement_block.expect("blocked");
+        assert_eq!(block.code, "source_check_failed");
+        assert_eq!(block.message, "KPWM: observations disagree");
+        assert_eq!(block.checked_at.as_deref(), Some("2026-09-24T13:00:00Z"));
+        assert_eq!(
+            blocked.expiry,
+            Some(OffsetDateTime::parse("2026-09-25T13:00:00Z", &Rfc3339).unwrap())
+        );
+        assert_eq!(readings.expiry, None);
         assert_eq!(readings.scores.get(&entry_id), Some(&10));
         assert_eq!(
             readings.reading("KPWM", "wind_speed").unwrap().observed,

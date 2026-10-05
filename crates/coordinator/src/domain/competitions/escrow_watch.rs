@@ -216,6 +216,36 @@ fn subscription_recovered(live: &Option<LiveSubscription>) -> bool {
         .is_some_and(|live| live.opened_at.elapsed() >= Duration::from_secs(60))
 }
 
+/// How the subscription stands, for the metrics. With no escrow pending there is nothing to
+/// subscribe to: that is idle, not down, and reads as healthy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscriptionState {
+    /// Open, watching this many escrows.
+    Open(usize),
+    /// Not open because there is nothing for this process to watch.
+    Idle,
+    /// Not open though there may be escrows to watch.
+    Down,
+}
+
+impl SubscriptionState {
+    /// The values of `coordinator_escrow_subscription_up` and
+    /// `coordinator_escrow_subscription_escrows`.
+    fn gauges(self) -> (i64, i64) {
+        match self {
+            Self::Open(escrows) => (1, i64::try_from(escrows).unwrap_or(i64::MAX)),
+            Self::Idle => (1, 0),
+            Self::Down => (0, 0),
+        }
+    }
+
+    fn record(self) {
+        let (up, escrows) = self.gauges();
+        crate::metrics::ESCROW_SUBSCRIPTION_UP.set(up);
+        crate::metrics::ESCROW_SUBSCRIPTION_ESCROWS.set(escrows);
+    }
+}
+
 /// Why a subscription ended.
 enum SubscriptionEnd {
     Cancelled,
@@ -241,11 +271,23 @@ impl Coordinator {
         let mut failures = 0u32;
         loop {
             let end = self.escrow_subscription(ark, &cancel).await;
-            crate::metrics::ESCROW_SUBSCRIPTION_UP.set(0);
             let wait = match end {
-                SubscriptionEnd::Cancelled => return Ok(()),
-                SubscriptionEnd::NotLeased => self.escrow_watch.check_lease_every(),
+                SubscriptionEnd::Cancelled => {
+                    SubscriptionState::Down.record();
+                    return Ok(());
+                }
+                // The process that checks the escrow swaps watches them; this one need not.
+                SubscriptionEnd::NotLeased => {
+                    SubscriptionState::Idle.record();
+                    self.escrow_watch.check_lease_every()
+                }
                 SubscriptionEnd::Dropped { recovered, reason } => {
+                    // A stream that drops with nothing left to watch leaves nothing unwatched.
+                    if self.escrow_watch.scripts().is_empty() {
+                        SubscriptionState::Idle.record();
+                    } else {
+                        SubscriptionState::Down.record();
+                    }
                     if recovered {
                         failures = 0;
                     }
@@ -358,7 +400,7 @@ impl Coordinator {
         let scripts = self.escrow_watch.scripts();
         match live {
             // The server is not asked for a subscription to nothing.
-            None if scripts.is_empty() => {}
+            None if scripts.is_empty() => SubscriptionState::Idle.record(),
             None => {
                 let id = ark
                     .transport
@@ -369,7 +411,7 @@ impl Coordinator {
                     "Watching {} pending escrows on Arkade in subscription {id}",
                     scripts.len()
                 );
-                crate::metrics::ESCROW_SUBSCRIPTION_UP.set(1);
+                SubscriptionState::Open(scripts.len()).record();
                 *live = Some(LiveSubscription {
                     id,
                     events,
@@ -389,6 +431,7 @@ impl Coordinator {
                 if !removed.is_empty() {
                     ark.transport.unsubscribe_scripts(&live.id, removed).await?;
                 }
+                SubscriptionState::Open(scripts.len()).record();
                 live.scripts = scripts;
             }
         }
@@ -498,6 +541,14 @@ mod tests {
         assert_eq!(resubscribe_delay(5).as_secs(), 32);
         assert_eq!(resubscribe_delay(6).as_secs(), 60);
         assert_eq!(resubscribe_delay(40).as_secs(), 60);
+    }
+
+    /// With no escrow pending the subscription is not open, and that is not an outage.
+    #[test]
+    fn an_idle_subscription_reads_as_up_with_nothing_watched() {
+        assert_eq!(SubscriptionState::Open(3).gauges(), (1, 3));
+        assert_eq!(SubscriptionState::Idle.gauges(), (1, 0));
+        assert_eq!(SubscriptionState::Down.gauges(), (0, 0));
     }
 
     #[test]

@@ -16,12 +16,13 @@ use uuid::Uuid;
 use crate::{
     api::{admin_auth::AdminCsrf, routes::OperatorCompetition},
     domain::{
-        leaderboard::Phase, Competition, CompetitionKind, OperatorPayoutProgress, RefundProgress,
+        leaderboard::{Phase, FIRST_READ_WAIT},
+        Competition, CompetitionKind, OperatorPayoutProgress, RefundProgress,
     },
     startup::AppState,
 };
 
-use super::admin::render_admin_fragment;
+use super::{admin::render_admin_fragment, late_results};
 
 #[derive(Default, Deserialize)]
 pub struct QueueFilter {
@@ -299,6 +300,16 @@ pub async fn operations_page(
                 })
                 .collect();
             let (page, start, pages) = page_bounds(rows.len(), filter.page);
+            // Why a result is late, for the rows this page shows: read from the weather cache,
+            // so the page does not wait on the oracle.
+            let mut late = std::collections::HashMap::new();
+            for c in rows.iter().skip(start).take(PAGE_SIZE) {
+                if let Some(result) =
+                    late_results::read(&state, c, std::time::Duration::ZERO, now).await
+                {
+                    late.insert(c.id, result);
+                }
+            }
             html! {
                 main.admin-workspace {
                     p.eyebrow { "Operator desk" } h1 { "Competition operations" }
@@ -362,7 +373,11 @@ pub async fn operations_page(
                                             p.note { @if c.completed_at.is_some() { "Contract cleanup complete" } @else { "Contract cleanup pending" } }
                                         } @else { "—" }
                                     }
-                                    td { strong class=[action.2.then_some("attention")] { (action.0) } p.note { (action.1) } }
+                                    td { strong class=[action.2.then_some("attention")] { (action.0) } p.note { (action.1) }
+                                        @if let Some(late) = late.get(&c.id) {
+                                            p.note { (late.oracle_line()) ". " (late.expiry_line()) "." }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -398,7 +413,9 @@ pub async fn operation_detail(
     );
     let content = match (competition, refunds, written_off) {
         (Ok(c), Ok(refunds), Ok(written_off)) => {
-            let action = next(&c, refunds.get(&id), OffsetDateTime::now_utc());
+            let now = OffsetDateTime::now_utc();
+            let action = next(&c, refunds.get(&id), now);
+            let late = late_results::read(&state, &c, FIRST_READ_WAIT, now).await;
             let operator = OperatorCompetition::new(&c, refunds.get(&id).copied(), written_off);
             let funding = transaction(
                 &state,
@@ -429,6 +446,7 @@ pub async fn operation_detail(
                     p.note { code { (id) } " · " (c.get_state()) }
                     @if let Some(parent) = c.parent_id { p { "Pool of " a href=(format!("/admin/operations/{parent}")) { (parent) } } }
                     div.notice { strong { (action.0) } p { (action.1) } }
+                    @if let Some(late) = &late { (late.notice()) }
                     @if let Some(queue) = &c.queue {
                         h2 { "Child pools" }
                         @for pool in &queue.pools { p { a href=(format!("/admin/operations/{}", pool.competition_id)) { "Pool " (pool.pool_index) } " · " (pool.players) " players" } }

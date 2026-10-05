@@ -122,6 +122,19 @@ pub fn leaderboard(competition: &CompetitionView, now: OffsetDateTime) -> Markup
                 (queue_pools(&competition.id, queue, None))
             }
 
+            @if !split && competition.result_is_late(now) {
+                p class="notice" {
+                    "Results are late. "
+                    @match competition.expiry {
+                        Some(expiry) => {
+                            "If none arrive by " (format::zoned_time(expiry, TimeStyle::DateTime))
+                            ", the pot is shared back among the entries."
+                        }
+                        None => { "If none arrive, the pot is shared back among the entries." }
+                    }
+                }
+            }
+
             @if competition.pot_refunded || competition.phase == Phase::Expired {
                 p class="notice" {
                     "The competition's terms set these shares; payment may still be pending."
@@ -470,6 +483,43 @@ mod tests {
         assert!(!html.contains("earlier entry is paid") && !html.contains("Select an entry"));
         let one = leaderboard(&view("c1", Phase::Scored, -60), NOW).into_string();
         assert!(one.contains("Winner takes all") && !one.contains("1st"));
+    }
+
+    /// Past its signing time without a result, the page says so in one line, with when the
+    /// pot goes back if none comes. Until then, and once the result is in, it says nothing.
+    #[test]
+    fn a_late_result_says_when_the_pot_is_shared_back() {
+        // Ended ten minutes after its start; signing was due five minutes after that.
+        let mut late = view("c1", Phase::AwaitingResult, -60);
+        late.expiry = Some(NOW + time::Duration::hours(23));
+        let html = leaderboard(&late, NOW).into_string();
+        assert!(
+            html.contains("Results are late. If none arrive by <time"),
+            "{html}"
+        );
+        assert!(html.contains(r#"datetime="2026-09-25T11:00:00Z""#));
+        assert!(html.contains("the pot is shared back among the entries."));
+        for jargon in ["oracle", "attest", "expir", "contract", "refund"] {
+            let notice = &html[html.find("Results are late").unwrap()..];
+            let notice = &notice[..notice.find("</p>").unwrap()];
+            assert!(
+                !notice.to_lowercase().contains(jargon),
+                "{jargon}: {notice}"
+            );
+        }
+
+        late.expiry = None;
+        let html = leaderboard(&late, NOW).into_string();
+        assert!(html.contains("Results are late. If none arrive, the pot is shared back"));
+
+        let due_soon = view("c1", Phase::AwaitingResult, -14);
+        assert!(!leaderboard(&due_soon, NOW)
+            .into_string()
+            .contains("Results are late"));
+        let scored = view("c1", Phase::Scored, -60);
+        assert!(!leaderboard(&scored, NOW)
+            .into_string()
+            .contains("Results are late"));
     }
 
     #[test]

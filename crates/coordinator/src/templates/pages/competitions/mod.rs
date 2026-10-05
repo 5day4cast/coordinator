@@ -25,6 +25,11 @@ pub struct CompetitionView {
     pub phase: Phase,
     pub start: OffsetDateTime,
     pub end: OffsetDateTime,
+    /// When the oracle is due to sign the result.
+    pub signing: OffsetDateTime,
+    /// When the contract expires without a signed result and shares the pot back; `None` for
+    /// a competition read without its oracle event, as the lists read them.
+    pub expiry: Option<OffsetDateTime>,
     pub entry_fee: u64,
     /// What the entrant pays before the network fee: the entry fee plus the coordinator fee.
     pub ticket_price: u64,
@@ -101,6 +106,14 @@ impl CompetitionView {
             phase,
             start: event.start_observation_date,
             end: event.end_observation_date,
+            signing: event.signing_date,
+            expiry: competition
+                .event_announcement
+                .as_ref()
+                .and_then(|announcement| announcement.expiry)
+                // Below this, a locktime is a block height, not a time.
+                .filter(|expiry| *expiry >= 500_000_000)
+                .and_then(|expiry| OffsetDateTime::from_unix_timestamp(i64::from(expiry)).ok()),
             entry_fee: event.entry_fee as u64,
             ticket_price: competition.calculate_invoice_amount(),
             network_fee: None,
@@ -163,14 +176,36 @@ impl CompetitionView {
         queue.entries.unwrap_or(self.total_entries)
     }
 
-    /// The pot. A queue's is what its entries so far put in each pool, which its winner takes:
-    /// its pools split them evenly, so the smaller pools' pot when they don't split exactly.
+    /// Whether the result is late: the window has closed, and the oracle's signing time has
+    /// passed without a result.
+    pub fn result_is_late(&self, now: OffsetDateTime) -> bool {
+        self.phase == Phase::AwaitingResult && now >= self.signing
+    }
+
+    /// The smallest and the largest pot among a queue's pools, and how many pools there are:
+    /// the pools it formed, or the ones its entries so far would make. Pools split the entries
+    /// evenly, so they differ by one player's entry when the entries don't divide exactly.
+    fn pool_pots(&self, queue: &QueueView) -> (u64, u64, u64) {
+        let pot = |players: u64| self.entry_fee.saturating_mul(players);
+        let sizes: Vec<u64> = queue.pools.iter().filter_map(|pool| pool.size).collect();
+        if !sizes.is_empty() && sizes.len() == queue.pools.len() {
+            let (min, max) = sizes.iter().fold((u64::MAX, 0), |(min, max), size| {
+                (min.min(*size), max.max(*size))
+            });
+            return (pot(min), pot(max), sizes.len() as u64);
+        }
+        let entries = self.entry_count(queue);
+        let pools = entries.div_ceil(queue.max_players.max(1)).max(1);
+        (pot(entries / pools), pot(entries.div_ceil(pools)), pools)
+    }
+
+    /// The pot. A queue's is what its entries put in each pool, which its winner takes: a
+    /// range when its pools are not all the same size.
     pub fn pot(&self) -> String {
         match &self.queue {
             Queue::Queued(queue) => {
-                let entries = self.entry_count(queue);
-                let pools = entries.div_ceil(queue.max_players.max(1)).max(1);
-                let pot = sats(self.entry_fee.saturating_mul(entries / pools));
+                let (smallest, largest, pools) = self.pool_pots(queue);
+                let pot = sats_range(smallest, largest);
                 if pools > 1 {
                     format!("{pot} per pool")
                 } else {
@@ -191,23 +226,32 @@ impl CompetitionView {
     /// the entries so far, and never less than a smallest pool's. `None` when nothing is won
     /// by rank (the competition didn't run, or returned its pot).
     pub fn top_prize(&self) -> Option<u64> {
+        self.prize_range().map(|(smallest, _)| smallest)
+    }
+
+    /// [`Self::top_prize`], with the largest pool's pot too for a queue whose pools differ.
+    fn prize_range(&self) -> Option<(u64, u64)> {
         if !self.has_ranked_prizes() {
             return None;
         }
         match &self.queue {
             Queue::Queued(queue) => {
-                let entries = self.entry_count(queue);
-                let pools = entries.div_ceil(queue.max_players.max(1)).max(1);
-                let players = (entries / pools).max(queue.min_players.unwrap_or(2));
-                Some(self.entry_fee.saturating_mul(players))
+                let (smallest, largest, _) = self.pool_pots(queue);
+                let least = self
+                    .entry_fee
+                    .saturating_mul(queue.min_players.unwrap_or(2));
+                Some((smallest.max(least), largest.max(least)))
             }
-            _ => self.prizes().first().map(|(_, amount)| *amount),
+            _ => self.prizes().first().map(|(_, amount)| (*amount, *amount)),
         }
     }
 
-    /// [`Self::top_prize`] as the pages show it.
+    /// What first place wins, as the pages show it: a range for a queue whose pools differ.
     pub fn win(&self) -> String {
-        self.top_prize().map_or_else(|| "—".to_owned(), sats)
+        self.prize_range().map_or_else(
+            || "—".to_owned(),
+            |(smallest, largest)| sats_range(smallest, largest),
+        )
     }
 
     /// Each paid place's share in percent and in sats, first place first.
@@ -300,6 +344,15 @@ impl CompetitionView {
         } else {
             format!("/competitions/{}/leaderboard", self.id)
         }
+    }
+}
+
+/// `65,000–70,000 sats`, or one amount when both ends are the same.
+fn sats_range(smallest: u64, largest: u64) -> String {
+    if smallest == largest {
+        sats(smallest)
+    } else {
+        format!("{}–{}", format::thousands(smallest), sats(largest))
     }
 }
 
@@ -772,6 +825,7 @@ pub fn competition_row(competition: &CompetitionView, now: OffsetDateTime) -> Ma
                 @match competition.phase {
                     Phase::Upcoming => { span class="cell-note" { "starts in " (format::duration(competition.start - now)) } }
                     Phase::Live => { span class="cell-note" { "observations end in " (format::duration(competition.end - now)) } }
+                    Phase::AwaitingResult if competition.result_is_late(now) => { span class="cell-note" { "results are late" } }
                     Phase::Expired => { span class="cell-note" { "no result · pot shared back" } }
                     Phase::Scored if competition.pot_refunded => { span class="cell-note" { "no winner · pot shared back" } }
                     _ => {}
@@ -816,6 +870,8 @@ pub(crate) mod tests {
             phase,
             start,
             end: start + time::Duration::minutes(10),
+            signing: start + time::Duration::minutes(15),
+            expiry: None,
             entry_fee: 5000,
             ticket_price: 5250,
             network_fee: None,
@@ -1299,6 +1355,59 @@ pub(crate) mod tests {
         closed.can_enter = false;
         let badge = phase_badge(&closed).into_string();
         assert!(badge.contains("Entries closed") && !badge.contains("Full"));
+    }
+
+    /// Twenty-seven entries make pools of fourteen and thirteen: the pot and the prize are a
+    /// range, never the smaller pool's alone.
+    #[test]
+    fn a_queue_with_uneven_pools_shows_the_range_of_their_pots() {
+        let queue = queued("q", 27);
+        assert_eq!(queue.pot(), "65,000–70,000 sats per pool");
+        assert_eq!(queue.win(), "65,000–70,000 sats");
+        assert_eq!(queue.top_prize(), Some(65_000));
+        let row = competition_row(&queue, NOW).into_string();
+        assert!(row.contains(r#"data-label="Prizes">65,000–70,000 sats</span>"#));
+
+        // Once formed, the pools' own sizes decide, whatever the entry count says.
+        let mut split = queued("q", 30);
+        split.phase = Phase::Scored;
+        split.can_enter = false;
+        if let Queue::Queued(queue) = &mut split.queue {
+            queue.pools = [(0, 14), (1, 13)]
+                .into_iter()
+                .map(|(index, size)| PoolLink {
+                    id: POOL.into(),
+                    index: Some(index),
+                    size: Some(size),
+                })
+                .collect();
+        }
+        assert_eq!(split.pot(), "65,000–70,000 sats per pool");
+        assert_eq!(split.win(), "65,000–70,000 sats");
+
+        // Pools of one size keep one figure.
+        if let Queue::Queued(queue) = &mut split.queue {
+            queue.pools[0].size = Some(13);
+        }
+        assert_eq!(split.pot(), "65,000 sats per pool");
+        assert_eq!(split.win(), "65,000 sats");
+    }
+
+    /// A result past its signing time is said to be late in the list; one still due is not.
+    #[test]
+    fn a_result_past_its_signing_time_is_late() {
+        // Ends ten minutes after its start; signing is due five minutes after that.
+        let due_soon = view("w", Phase::AwaitingResult, -14);
+        assert!(!due_soon.result_is_late(NOW));
+        assert!(!competition_row(&due_soon, NOW)
+            .into_string()
+            .contains("results are late"));
+        let late = view("w", Phase::AwaitingResult, -60);
+        assert!(late.result_is_late(NOW));
+        assert!(competition_row(&late, NOW)
+            .into_string()
+            .contains(r#"<span class="cell-note">results are late</span>"#));
+        assert!(!view("w", Phase::Scored, -60).result_is_late(NOW));
     }
 
     #[test]

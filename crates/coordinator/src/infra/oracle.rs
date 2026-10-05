@@ -443,9 +443,10 @@ impl TryFrom<String> for ValueOptions {
 /// How the oracle scores an event's picks. Chosen when the event is created.
 ///
 /// - `Lines`: each station and metric has a Par band on the miss (observed minus forecast),
-///   fitted on how that station's forecasts missed over the last 60 days so Over, Par, and Under
-///   each happened about a third of the time. The oracle copies the bands into the event when it
-///   is created. Every right pick earns 10 points.
+///   fitted on how recent forecasts missed, the station's own once it has enough windows and
+///   every station's pooled until then, so Over, Par, and Under each happened about a third of
+///   the time. The oracle copies the bands into the event when it is created. Every right pick
+///   earns 10 points.
 /// - `Fixed`: each metric's fixed Par rule (temperatures to the whole degree, exact knots). Par
 ///   earns 20 points, a right Over or Under 10. Competitions created before lines keep it.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

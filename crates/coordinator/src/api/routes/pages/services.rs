@@ -30,7 +30,19 @@ pub async fn services_page(
     Extension(csrf): Extension<AdminCsrf>,
     headers: HeaderMap,
 ) -> Html<String> {
-    let data = state.admin_monitoring.read_signals(Panel::Services).await;
+    let (data, competitions) = tokio::join!(
+        state.admin_monitoring.read_signals(Panel::Services),
+        state.coordinator.list_competitions()
+    );
+    // Counted from the coordinator's own contracts: the oracle's metrics do not count every
+    // reason an event cannot be signed.
+    let late = match &competitions {
+        Ok(competitions) => Some(
+            super::late_results::late_competitions(&state, competitions, OffsetDateTime::now_utc())
+                .await,
+        ),
+        Err(_) => None,
+    };
     let content = html! { main.admin-workspace {
         p.eyebrow { "Operator checks" } h1 { "Services" }
         p { "Find the affected entry first, then check the dependency that can block its next step." }
@@ -39,6 +51,12 @@ pub async fn services_page(
             article.metric { h2 { "Signing & escrow" } p { "Gateway, enclaves, and the coordinator verifier." } a href="/admin/keymeld" { "Check Keymeld" } }
             article.metric { h2 { "Lightning & Ark" } p { "LND sync, channel liquidity, on-chain balances, and Ark expiry. A ticket's service check gives its current payment and swap status." } a href="/admin/wallet" { "Node & wallets" } " · " a href="/admin/funds" { "Trace a payment" } }
             article.metric { h2 { "Recent competitions" } p { "Separate recent progress from refunds caused by earlier failures." } a href="/admin/operations?sort=created_desc" { "Newest created" } }
+        }
+        div.service-signals {
+            @match &late {
+                Some(late) => (super::late_results::services_card(late)),
+                None => p.notice { "Competition records are unavailable, so late results are unknown." },
+            }
         }
         (signals(&state, Panel::Services, &data, "/admin/services", None))
     }};

@@ -25,7 +25,7 @@ use std::{
 use tokio::{sync::Mutex, task::JoinHandle};
 
 use crate::{
-    domain::{ArkadeHealth, CompetitionStore, TicketStatus},
+    domain::{ArkadeHealth, CompetitionStore, Coordinator, TicketStatus},
     infra::{ark_swap::SwapWallet, lightning::PAYMENT_FAILURE_REASONS},
 };
 
@@ -143,13 +143,59 @@ pub static LN_PAYMENT_SUBSCRIPTION_UP: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("valid metric")
 });
 
-/// Whether the Arkade subscription watching pending escrows is open (1) or not (0).
+/// Whether the Arkade subscription watching pending escrows is as it should be (1) or down (0).
+/// With no escrow pending there is nothing to subscribe to, and that reads 1 too: only a
+/// subscription that should be open and is not reads 0. See [`ESCROW_SUBSCRIPTION_ESCROWS`].
 pub static ESCROW_SUBSCRIPTION_UP: LazyLock<IntGauge> = LazyLock::new(|| {
     IntGauge::new(
         "coordinator_escrow_subscription_up",
-        "Whether the Arkade subscription watching pending escrows is open",
+        "Whether the Arkade escrow subscription is open, or idle with no escrow pending (1), or down (0)",
     )
     .expect("valid metric")
+});
+
+/// How many pending escrows the open Arkade subscription watches; 0 while it is idle or down.
+pub static ESCROW_SUBSCRIPTION_ESCROWS: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "coordinator_escrow_subscription_escrows",
+        "Pending escrows the open Arkade subscription watches, 0 while it is idle or down",
+    )
+    .expect("valid metric")
+});
+
+/// Competitions taking entries whose entry form cannot be completed because forecasts are
+/// missing. Set each time the leaderboards refresh the open competitions' weather.
+pub static ENTRY_FORM_UNAVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "coordinator_entry_form_unavailable",
+        "Competitions taking entries whose entry form cannot be completed because forecasts are missing",
+    )
+    .expect("valid metric")
+});
+
+/// What the chain holds at the address of the coordinator's own key, where the closing
+/// transactions of settled contracts pay: its unspent outputs' total, in sats. NaN until read.
+pub static SETTLED_OUTPUTS_SAT: LazyLock<Gauge> = LazyLock::new(|| {
+    unknown(Gauge::new(
+        "coordinator_settled_contract_outputs_sat",
+        "Sats in unspent outputs at the coordinator key's address, where settled contracts pay",
+    ))
+});
+
+/// How many unspent outputs the chain holds at the coordinator key's address. NaN until read.
+pub static SETTLED_OUTPUTS: LazyLock<Gauge> = LazyLock::new(|| {
+    unknown(Gauge::new(
+        "coordinator_settled_contract_outputs",
+        "Unspent outputs at the coordinator key's address, where settled contracts pay",
+    ))
+});
+
+/// When the outputs at the coordinator key's address were last read, in UNIX seconds.
+pub static SETTLED_OUTPUTS_READ: LazyLock<Gauge> = LazyLock::new(|| {
+    unknown(Gauge::new(
+        "coordinator_settled_contract_outputs_read_timestamp_seconds",
+        "When the outputs at the coordinator key's address were last read",
+    ))
 });
 
 /// Transactions the Arkade escrow subscription reported.
@@ -248,6 +294,13 @@ pub fn record_ark_wallet(wallet: &SwapWallet, read_at: time::OffsetDateTime) {
     ARK_WALLET_READ.set(read_at.unix_timestamp() as f64);
 }
 
+/// Record a read of the outputs at the coordinator key's address.
+pub fn record_settled_outputs(outputs: u64, sats: u64, read_at: time::OffsetDateTime) {
+    SETTLED_OUTPUTS.set(outputs as f64);
+    SETTLED_OUTPUTS_SAT.set(sats as f64);
+    SETTLED_OUTPUTS_READ.set(read_at.unix_timestamp() as f64);
+}
+
 /// Record a payout reaching its final result for the first time.
 pub fn record_payout_result(succeeded: bool) {
     PAYOUT_ATTEMPTS
@@ -268,6 +321,8 @@ pub struct Metrics {
     background_threads: Arc<HashMap<String, JoinHandle<()>>>,
     /// Decided again at each scrape, so a pause that lapsed with nothing running reads 0.
     arkade: Option<Arc<ArkadeHealth>>,
+    /// Reads the outputs at its key's address again when a scrape finds the last read old.
+    coordinator: Option<Arc<Coordinator>>,
     last_refresh: Mutex<Option<Instant>>,
     competitions: IntGaugeVec,
     entries: IntGaugeVec,
@@ -320,7 +375,7 @@ impl Metrics {
             )?,
             payout_jobs_failed: gauge(
                 "coordinator_payout_jobs_failed",
-                "Retained failed automatic payout job records, including replaced jobs; not a count of unpaid entries",
+                "Failed automatic payout jobs whose entry is still unpaid and has no later job",
             )?,
             payout_jobs_retrying: gauge(
                 "coordinator_payout_jobs_retrying",
@@ -339,6 +394,7 @@ impl Metrics {
             store,
             background_threads,
             arkade: None,
+            coordinator: None,
             last_refresh: Mutex::new(None),
         };
 
@@ -371,7 +427,13 @@ impl Metrics {
         metrics
             .registry
             .register(Box::new(ESCROW_SUBSCRIPTION_UP.clone()))?;
+        metrics
+            .registry
+            .register(Box::new(ESCROW_SUBSCRIPTION_ESCROWS.clone()))?;
         metrics.registry.register(Box::new(ESCROW_EVENTS.clone()))?;
+        metrics
+            .registry
+            .register(Box::new(ENTRY_FORM_UNAVAILABLE.clone()))?;
         metrics
             .registry
             .register(Box::new(ARK_WALLET_SAT.clone()))?;
@@ -380,6 +442,9 @@ impl Metrics {
             &*ARK_WALLET_LAST_BOARD_SUCCESS,
             &*ARK_WALLET_LAST_BOARD_FAILURE,
             &*ARK_WALLET_READ,
+            &*SETTLED_OUTPUTS_SAT,
+            &*SETTLED_OUTPUTS,
+            &*SETTLED_OUTPUTS_READ,
         ] {
             metrics.registry.register(Box::new(gauge.clone()))?;
         }
@@ -398,11 +463,21 @@ impl Metrics {
         self
     }
 
+    /// Have each scrape renew the read of the outputs at `coordinator`'s key's address once it
+    /// is old. The scrape does not wait for it: the gauges carry the last read and its time.
+    pub fn with_settled_outputs(mut self, coordinator: Arc<Coordinator>) -> Self {
+        self.coordinator = Some(coordinator);
+        self
+    }
+
     /// Render every metric in the Prometheus text format.
     pub async fn render(&self) -> String {
         self.refresh_threads();
         if let Some(arkade) = &self.arkade {
             arkade.unavailable(time::OffsetDateTime::now_utc());
+        }
+        if let Some(coordinator) = &self.coordinator {
+            coordinator.settled_outputs(Duration::ZERO).await;
         }
         self.refresh_database().await;
         let mut buffer = Vec::new();
@@ -563,6 +638,12 @@ mod tests {
             "coordinator_payout_send_failures_total",
             "coordinator_competition_step_failures_total",
             "coordinator_arkade_unavailable",
+            "coordinator_escrow_subscription_up",
+            "coordinator_escrow_subscription_escrows",
+            "coordinator_entry_form_unavailable",
+            "coordinator_settled_contract_outputs_sat",
+            "coordinator_settled_contract_outputs",
+            "coordinator_settled_contract_outputs_read_timestamp_seconds",
             "coordinator_ark_wallet_sat",
             "coordinator_ark_wallet_earliest_expiry_timestamp_seconds",
             "coordinator_ark_wallet_last_board_success_timestamp_seconds",

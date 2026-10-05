@@ -513,6 +513,8 @@ fn wallet_preview(out: &std::path::Path) -> anyhow::Result<()> {
         templates::admin::wallet::wallet_page,
     };
     let data = WalletOverview {
+        settled_address: None,
+        settled: None,
         node: Some(serde_json::from_value::<NodeInfo>(
             serde_json::json!({"alias":"Example coordinator node", "identity_pubkey":"02abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345678901", "synced_to_chain":true, "synced_to_graph":true, "num_active_channels":3, "num_inactive_channels":1,"num_pending_channels":0,"block_height":283000}),
         )?),

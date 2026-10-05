@@ -116,7 +116,8 @@ fn weather(scores: HashMap<Uuid, u64>, entries: usize, attested: bool) -> Compet
             scores,
             attested,
             lines: vec![],
-            settlement_blocked: false,
+            settlement_block: None,
+            expiry: None,
         },
         observations: Some(vec![StationObservations {
             station_id: "KPWM".into(),
@@ -620,4 +621,55 @@ fn lines_competitions_score_picks_against_the_event_bands() {
         .picks
         .iter()
         .all(|pick| pick.state == PickState::Pending && pick.rule.is_none()));
+}
+
+/// The entry form needs a forecast on as many lines as an entry has picks. Weather that never
+/// arrived counts once its fetch has failed, not while the first fetch is still running.
+#[test]
+fn an_entry_form_without_enough_forecasts_is_unavailable() {
+    // Two stations with three metrics each; the oracle has forecasts for KPWM only.
+    let mut competition = competition();
+    let half = weather(HashMap::new(), 0, false);
+    competition.event_submission.number_of_values_per_entry = 6;
+    assert_eq!(
+        entry_form_unavailable(&competition, &cached(half.clone())),
+        Some(true)
+    );
+    competition.event_submission.number_of_values_per_entry = 3;
+    assert_eq!(
+        entry_form_unavailable(&competition, &cached(half)),
+        Some(false)
+    );
+
+    let loading = Cached {
+        latest: None,
+        refreshing: true,
+    };
+    assert_eq!(entry_form_unavailable(&competition, &loading), None);
+    let failed = Cached {
+        latest: None,
+        refreshing: false,
+    };
+    assert_eq!(entry_form_unavailable(&competition, &failed), Some(true));
+
+    // Neither the oracle's readings nor forecasts computed ahead of them.
+    let mut none = weather(HashMap::new(), 0, false);
+    none.event.readings.clear();
+    assert_eq!(
+        entry_form_unavailable(&competition, &cached(none)),
+        Some(true)
+    );
+}
+
+#[test]
+fn a_full_competition_and_a_pool_offer_no_entry_form() {
+    let mut competition = competition();
+    assert!(!takes_entries(&competition), "every seat is taken");
+    competition.total_entries = 1;
+    assert!(takes_entries(&competition));
+    competition.kind = CompetitionKind::Pool;
+    assert!(!takes_entries(&competition));
+    competition.kind = CompetitionKind::Queued;
+    competition.total_entries = 40;
+    assert!(takes_entries(&competition));
 }
