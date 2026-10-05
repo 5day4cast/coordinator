@@ -262,7 +262,8 @@ macaroon_file = "{}"
         let mut dashboard = Dashboard::for_tests(db.clone());
         let now = OffsetDateTime::now_utc();
         let off = card(&dashboard, now).await.into_string();
-        assert!(off.contains("not enabled"), "{off}");
+        assert!(off.contains("Automatic wallet refills are off."), "{off}");
+        assert!(off.contains("Refill history"));
 
         dashboard.ark_refiller = Some(refiller(directory.path(), &db));
         let token_path = directory.path().join("operator-token");
