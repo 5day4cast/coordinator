@@ -449,39 +449,33 @@ impl CoordinatorClient {
         ))
     }
 
+    /// A player's entries in each of `competitions`, asked for one competition at a time: the
+    /// narrowest list the coordinator serves. A player's whole list grows with every competition
+    /// they ever entered, to a megabyte and more.
+    pub async fn list_entries_in(
+        &self,
+        keys: &Keys,
+        competitions: &[Uuid],
+    ) -> Result<Vec<EntryResponse>> {
+        let mut entries = Vec::new();
+        for id in competitions {
+            let listed = self.list_entries(keys, Some(id)).await?;
+            // A coordinator that does not know the filter sends every entry.
+            entries.extend(listed.into_iter().filter(|entry| entry.event_id == *id));
+        }
+        Ok(entries)
+    }
+
     /// List entries for a user (requires Nostr auth)
     pub async fn list_entries(
         &self,
         keys: &Keys,
         competition_id: Option<&Uuid>,
     ) -> Result<Vec<EntryResponse>> {
-        let mut url = format!("{}/api/v1/entries", self.base_url());
-        if let Some(id) = competition_id {
-            url = format!("{}?event_id={}", url, id);
-        }
-
-        let resp = super::retry_transport(3, || async {
-            let auth = create_auth_header(keys, "GET", &url, None).await?;
-            anyhow::Ok(
-                self.http()
-                    .get(&url)
-                    .header("Authorization", auth)
-                    .send()
-                    .await?,
-            )
-        })
-        .await
-        .context("Failed to list entries")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("List entries failed ({}): {}", status, body);
-        }
-
-        resp.json()
-            .await
-            .context("Failed to parse entries response")
+        let query = competition_id
+            .map(|id| vec![("event_id", id.to_string())])
+            .unwrap_or_default();
+        self.list_page("entries", &query, Some(keys)).await
     }
 }
 

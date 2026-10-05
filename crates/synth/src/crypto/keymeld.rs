@@ -50,15 +50,16 @@ pub async fn prepare_for_ticket(
         let preimage: [u8; 32] = hex::decode(payout_preimage_hex)?
             .try_into()
             .map_err(|_| anyhow::anyhow!("Payout preimage must be 32 bytes"))?;
-        let registration = prepare_payout_registration(&private_key, &preimage, assignment)
-            .await
-            .context("Failed to prepare payout escrow registration")?;
+        let registration =
+            retry_key_read(|| prepare_payout_registration(&private_key, &preimage, assignment))
+                .await
+                .context("Failed to prepare payout escrow registration")?;
         Ok(PreparedTicket {
             registration,
             consent,
         })
     } else {
-        let registration = prepare_registration(&private_key, assignment)
+        let registration = retry_key_read(|| prepare_registration(&private_key, assignment))
             .await
             .context("Failed to prepare authorized Keymeld registration")?;
         Ok(PreparedTicket {
@@ -69,6 +70,27 @@ pub async fn prepare_for_ticket(
             },
         })
     }
+}
+
+/// Preparation reads the enclave key and seals data locally. Retry only connection failures;
+/// policy, attestation and authorization rejections must remain visible.
+async fn retry_key_read<F, Fut, T>(mut prepare: F) -> Result<T, keymeld_sdk::SdkError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, keymeld_sdk::SdkError>>,
+{
+    use keymeld_sdk::{error::NetworkError, SdkError};
+    for attempt in 0..3 {
+        match prepare().await {
+            Err(SdkError::Network(
+                NetworkError::ConnectionFailed(_) | NetworkError::Timeout(_),
+            )) if attempt < 2 => {
+                tokio::time::sleep(std::time::Duration::from_millis(500 * (attempt + 1))).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!()
 }
 
 /// Check a ticket's payout policy against what the synth player asked for, as a wallet does
@@ -137,6 +159,43 @@ mod tests {
         MarketMaker,
     };
     use std::collections::BTreeMap;
+
+    #[tokio::test(start_paused = true)]
+    async fn key_reads_retry_connections_but_preserve_authorization_errors() {
+        use keymeld_sdk::{error::NetworkError, SdkError};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = AtomicUsize::new(0);
+        let result = retry_key_read(|| async {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(SdkError::Network(NetworkError::ConnectionFailed(
+                    "closed".into(),
+                )))
+            } else {
+                Ok(7)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, 7);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        attempts.store(0, Ordering::SeqCst);
+        let result = retry_key_read(|| async {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(SdkError::InvalidInput("attestation rejected".into()))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        attempts.store(0, Ordering::SeqCst);
+        let _ = retry_key_read(|| async {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(SdkError::Network(NetworkError::ConnectionFailed(
+                "closed".into(),
+            )))
+        })
+        .await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
 
     const START: i64 = 1_790_000_000;
 

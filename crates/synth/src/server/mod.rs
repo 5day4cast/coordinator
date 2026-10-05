@@ -53,7 +53,8 @@ pub async fn start_server(
         ))
         .merge(assets::router())
         .merge(metrics)
-        .layer(axum::middleware::map_response(secure));
+        .layer(axum::middleware::map_response(secure))
+        .layer(tower_http::compression::CompressionLayer::new());
 
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
     info!("Synth server listening on {}", addr);

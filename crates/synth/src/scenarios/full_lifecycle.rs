@@ -108,8 +108,21 @@ pub(super) async fn request_entry(
     step: &str,
     trace: &mut EntryTrace,
 ) -> Result<RequestedEntry> {
-    let entry_id = Uuid::now_v7();
+    let prior: Option<EntryTrace> = crate::runner::prior_step(step)
+        .and_then(|row| row.details_json)
+        .and_then(|json| serde_json::from_str(&json).ok());
+    let entry_id = trace
+        .key_derivation_id
+        .or_else(|| {
+            prior
+                .as_ref()
+                .and_then(|saved| saved.key_derivation_id.or(saved.entry_id))
+        })
+        .or(trace.entry_id)
+        .unwrap_or_else(Uuid::now_v7);
+    trace.key_derivation_id = Some(entry_id);
     trace.entry_id = Some(entry_id);
+    crate::runner::step_progress(step, serde_json::to_value(&*trace)?).await?;
     let ephemeral = user.derive_ephemeral_key(&entry_id)?;
     let (payout_preimage, payout_hash) =
         crypto::payout::generate_payout_pair(&ephemeral.secret_bytes);

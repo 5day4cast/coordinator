@@ -16,6 +16,7 @@ use tokio::sync::Barrier;
 struct Protocol {
     capacity: usize,
     tickets: BTreeMap<Uuid, String>,
+    ticket_requests: Vec<Value>,
     paid: BTreeSet<Uuid>,
     entries: Vec<Value>,
     events: Vec<String>,
@@ -85,12 +86,10 @@ async fn competition(State(state): State<Shared>, Path(id): Path<Uuid>) -> Json<
     )
 }
 
-async fn ticket(
-    State(state): State<Shared>,
-    Json(_body): Json<Value>,
-) -> (StatusCode, Json<Value>) {
+async fn ticket(State(state): State<Shared>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
     let mut state = state.lock().unwrap();
     state.attempts += 1;
+    state.ticket_requests.push(body);
     if state.tickets_closed {
         return (
             StatusCode::BAD_REQUEST,
@@ -1200,4 +1199,36 @@ async fn missing_required_refund_registration_stops_before_payment() {
         .events
         .iter()
         .all(|event| !event.starts_with("pay:")));
+}
+
+#[tokio::test]
+async fn resumed_ticket_uses_the_saved_key_even_after_a_queue_assigns_an_entry_id() {
+    let mock = Mock::new(Protocol {
+        capacity: 2,
+        ..Default::default()
+    })
+    .await;
+    let user = SynthUser::new_random("alice").unwrap();
+    let competition = Uuid::now_v7();
+    let mut trace = EntryTrace::new(&user);
+    full_lifecycle::request_entry(&mock.client, &user, &competition, None, "entry", &mut trace)
+        .await
+        .unwrap();
+    let key_id = trace.key_derivation_id.unwrap();
+    trace.entry_id = trace.ticket_id;
+    let mut restored: EntryTrace =
+        serde_json::from_slice(&serde_json::to_vec(&trace).unwrap()).unwrap();
+    full_lifecycle::request_entry(
+        &mock.client,
+        &user,
+        &competition,
+        None,
+        "entry",
+        &mut restored,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.key_derivation_id, Some(key_id));
+    let protocol = mock.state.lock().unwrap();
+    assert_eq!(protocol.ticket_requests[0], protocol.ticket_requests[1]);
 }

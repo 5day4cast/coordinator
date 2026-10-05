@@ -96,8 +96,9 @@ fn default_scenario() -> String {
 
 /// Keep a competition anyone can enter on the public site. Every check, synth counts the listed
 /// competitions still taking entries, not full, whose entries close at least `min_minutes_left`
-/// ahead. When there are none, and it has not started a run for this in the last
-/// `min_minutes_left`, it starts `lane`'s next run at once, and that lane's timer restarts from it.
+/// ahead. When none of them will still count `start_ahead_minutes` from now, and it has not
+/// started a run for this in the last `min_minutes_left`, it starts `lane`'s next run at once,
+/// and that lane's timer restarts from it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeepOpenConfig {
@@ -107,10 +108,18 @@ pub struct KeepOpenConfig {
     pub min_minutes_left: u64,
     #[serde(default = "default_check_interval_secs")]
     pub check_interval_secs: u64,
+    /// How long before the last open competition stops counting the next run starts, so its
+    /// competition is up before that one goes. A run takes a minute or two to make one.
+    #[serde(default = "default_start_ahead_minutes")]
+    pub start_ahead_minutes: u64,
 }
 
 fn default_min_minutes_left() -> u64 {
     30
+}
+
+fn default_start_ahead_minutes() -> u64 {
+    5
 }
 
 fn default_check_interval_secs() -> u64 {

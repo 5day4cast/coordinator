@@ -612,12 +612,15 @@ impl Tracker {
     ) -> Placement {
         let players = self.players(&entries).await;
         let mut listed = HashMap::new();
+        let competitions: Vec<_> = std::iter::once(root_id)
+            .chain(pool_ids.iter().copied())
+            .collect();
         for (user, player) in &players {
             listed.insert(
                 user.clone(),
                 self.inner
                     .client
-                    .list_entries(&player.nostr_keys, None)
+                    .list_entries_in(&player.nostr_keys, &competitions)
                     .await,
             );
         }

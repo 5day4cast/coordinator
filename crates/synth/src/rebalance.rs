@@ -410,6 +410,13 @@ impl Rebalancer {
                 error: sent.as_ref().err().map(|e| format!("{e:#}")),
             })
             .await?;
+        match &sent {
+            Ok(_) => crate::server::metrics::record_arkade_topup(
+                amount,
+                OffsetDateTime::now_utc().unix_timestamp(),
+            ),
+            Err(_) => crate::server::metrics::record_arkade_topup_failure(),
+        }
         sent.map(|_| Some(amount))
     }
 

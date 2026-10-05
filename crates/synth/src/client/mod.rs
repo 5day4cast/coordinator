@@ -2,6 +2,7 @@ pub mod admin;
 pub mod auth;
 pub mod competitions;
 pub mod entries;
+pub mod visitor;
 pub mod wallet;
 
 use anyhow::{Context, Result};
@@ -22,10 +23,12 @@ pub struct CoordinatorClient {
 impl CoordinatorClient {
     pub fn new(base_url: &str, admin_url: Option<&str>) -> Self {
         Self {
-            // A page or the tracker waiting on the coordinator must give up eventually.
+            // A page or the tracker waiting on the coordinator must give up eventually. Its
+            // lists run to a megabyte, so every request says it takes gzip.
             http: Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .timeout(std::time::Duration::from_secs(30))
+                .gzip(true)
                 .build()
                 .unwrap_or_default(),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -81,6 +84,66 @@ impl CoordinatorClient {
             None => request,
         }
     }
+
+    /// Follow bounded list pages. Older coordinators return one page without a cursor.
+    async fn list_page<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+        keys: Option<&nostr::Keys>,
+    ) -> Result<Vec<T>> {
+        let mut base = reqwest::Url::parse(&format!("{}/api/v1/{path}", self.base_url()))?;
+        base.query_pairs_mut()
+            .append_pair("limit", "100")
+            .extend_pairs(query.iter().map(|(name, value)| (*name, value.as_str())));
+        let mut cursor = None::<uuid::Uuid>;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut items = Vec::new();
+        for _ in 0..100 {
+            let mut url = base.clone();
+            if let Some(cursor) = cursor {
+                url.query_pairs_mut()
+                    .append_pair("cursor", &cursor.to_string());
+            }
+            let response = retry_transport(3, || async {
+                let mut request = self.http().get(url.clone());
+                if let Some(keys) = keys {
+                    let header = auth::create_auth_header(keys, "GET", url.as_str(), None).await?;
+                    request = request.header("Authorization", header);
+                }
+                Ok(request.send().await?)
+            })
+            .await
+            .with_context(|| format!("Failed to list {path}"))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                anyhow::bail!(
+                    "List {path} failed ({status}): {}",
+                    response.text().await.unwrap_or_default()
+                );
+            }
+            cursor = response
+                .headers()
+                .get("X-Next-Cursor")
+                .map(|value| -> Result<uuid::Uuid> { Ok(value.to_str()?.parse()?) })
+                .transpose()
+                .context("Invalid list continuation cursor")?;
+            items.extend(
+                response
+                    .json::<Vec<T>>()
+                    .await
+                    .context("Invalid list response")?,
+            );
+            match cursor {
+                None => return Ok(items),
+                Some(next) if !seen.insert(next) => {
+                    anyhow::bail!("List {path} repeated its continuation cursor")
+                }
+                Some(_) => {}
+            }
+        }
+        anyhow::bail!("List {path} exceeded 100 pages")
+    }
 }
 
 /// How long to wait before sending a request again after it failed to reach the coordinator,
@@ -121,6 +184,71 @@ mod tests {
     use axum::{http::HeaderMap, routing::get, Json, Router};
 
     #[tokio::test]
+    async fn list_pages_keep_filters_and_authentication_on_each_page() {
+        use axum::{extract::Query, response::IntoResponse};
+        use std::collections::HashMap;
+        let cursor = uuid::Uuid::from_u128(12);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = Router::new().route(
+            "/api/v1/entries",
+            get(
+                move |headers: HeaderMap, Query(query): Query<HashMap<String, String>>| async move {
+                    assert!(headers["authorization"]
+                        .to_str()
+                        .unwrap()
+                        .starts_with("Nostr "));
+                    assert_eq!(query["event_id"], uuid::Uuid::nil().to_string());
+                    assert_eq!(query["limit"], "100");
+                    match query.get("cursor") {
+                        None => {
+                            ([("X-Next-Cursor", cursor.to_string())], Json(vec![1])).into_response()
+                        }
+                        Some(next) => {
+                            assert_eq!(next, &cursor.to_string());
+                            Json(vec![2]).into_response()
+                        }
+                    }
+                },
+            ),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let keys = nostr::Keys::generate();
+        let values: Vec<i32> = CoordinatorClient::new(&url, None)
+            .list_page(
+                "entries",
+                &[("event_id", uuid::Uuid::nil().to_string())],
+                Some(&keys),
+            )
+            .await
+            .unwrap();
+        assert_eq!(values, vec![1, 2]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn list_pages_reject_a_repeated_cursor_instead_of_looping() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = Router::new().route(
+            "/api/v1/competitions",
+            get(|| async {
+                (
+                    [("X-Next-Cursor", uuid::Uuid::nil().to_string())],
+                    Json(vec![1]),
+                )
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let error = CoordinatorClient::new(&url, None)
+            .list_page::<i32>("competitions", &[], None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("repeated"));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn a_request_that_never_reached_the_coordinator_is_sent_again() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let live = format!("http://{}", listener.local_addr().unwrap());
@@ -151,6 +279,40 @@ mod tests {
         };
         assert!(retry_transport(3, not_transport).await.is_err());
         assert_eq!(failed.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// The coordinator's lists run to a megabyte; it may compress them for a client that asks.
+    #[tokio::test]
+    async fn requests_say_they_take_gzip() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = Router::new().route(
+            "/api/v1/competitions",
+            get(|headers: HeaderMap| async move {
+                let accepted = headers
+                    .get("accept-encoding")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                Json(serde_json::json!([{
+                    "id": uuid::Uuid::nil(),
+                    "created_at": "2026-10-05T00:00:00Z",
+                    "event_submission": { "accept_encoding": accepted },
+                }]))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let listed = CoordinatorClient::new(&url, None)
+            .list_competitions()
+            .await
+            .unwrap();
+        let accepted = listed[0].event_submission["accept_encoding"]
+            .as_str()
+            .unwrap();
+        assert!(accepted.contains("gzip"), "{accepted}");
 
         server.abort();
         let _ = server.await;

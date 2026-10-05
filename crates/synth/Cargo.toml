@@ -26,7 +26,7 @@ keymeld-sdk.workspace = true
 axum.workspace = true
 # Reads the create-competition form, whose stations field repeats.
 axum-extra.workspace = true
-tower-http.workspace = true
+tower-http = { workspace = true, features = ["compression-gzip"] }
 maud.workspace = true
 # gzip: the oracle compresses its eligible forecasts, a megabyte and more unpacked.
 reqwest = { workspace = true, features = ["gzip"] }

@@ -100,6 +100,23 @@ pub struct Verdict<'a> {
     pub fail_passed_run: Option<&'a str>,
 }
 
+/// What the lifecycle gauges are worked out from: the latest verdicts on the runs meant to end
+/// in a payout. The times are UNIX seconds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LifecycleEvidence {
+    /// When such a run last failed after making its competition.
+    pub last_failed: Option<i64>,
+    /// When such a run last finished with every step passed.
+    pub last_passed: Option<i64>,
+    /// When a payout of such a run was last verified.
+    pub last_paid_out: Option<i64>,
+    /// Where the money of the newest such run to have a verdict ended: `paid_out`, `stuck` or
+    /// `written_off`.
+    pub newest_money: Option<String>,
+    /// When the tracker last looked at any such run's money.
+    pub observed: Option<i64>,
+}
+
 /// A scenario's recent record, for the dashboard.
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
 pub struct ScenarioHealth {
@@ -450,6 +467,16 @@ impl SynthDb {
         Ok(rebalances)
     }
 
+    /// Legacy Ark wallet top-ups, independently of channel rebalances.
+    pub async fn list_arkade_topups(&self, limit: i64) -> Result<Vec<RebalanceRecord>> {
+        Ok(sqlx::query_as::<_, RebalanceRecord>(
+            "SELECT * FROM rebalances WHERE kind = 'arkade' ORDER BY rowid DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// Missing controls preserve the existing enabled schedule. Database errors never enable runs.
     pub async fn scenario_enabled(&self, scenario: &str) -> Result<bool> {
         Ok(sqlx::query_scalar::<_, bool>(
@@ -548,33 +575,44 @@ impl SynthDb {
         .context("read the last completed run")
     }
 
-    /// Durable lifecycle evidence for metrics; scenario completion alone is not settlement.
+    /// Durable lifecycle evidence for metrics; see [`crate::server::metrics::lifecycle_health`]
+    /// for the rule it feeds.
     ///
     /// Every scenario meant to end in a payout counts, not only `full_lifecycle`: the lanes run
     /// queued competitions far more often. A run a restart interrupted, or one that failed before
-    /// it made a competition, says nothing about the lifecycle and is passed over, as is a run
-    /// whose money ended refunded or unpaid as its scenario allowed.
-    pub async fn lifecycle_metrics(&self) -> Result<(Option<TestRun>, Option<i64>, Option<i64>)> {
-        let latest = sqlx::query_as::<_, TestRun>(&format!(
-            "{RUN_COLUMNS} WHERE scenario IN {PAYOUT_SCENARIOS} \
-             AND (test_runs.status = 'passed' \
-                  OR (test_runs.status = 'failed' AND test_runs.competition_id IS NOT NULL)) \
-             AND (money_trails.money IS NULL \
-                  OR money_trails.money IN ('paid_out', 'stuck', 'written_off', 'unverified') \
-                  OR test_runs.status = 'failed' \
-                  OR (money_trails.money = 'following' \
-                      AND CAST(strftime('%s', json_extract(money_trails.trail_json, '$.follow_until')) AS INTEGER) <= unixepoch())) \
-             ORDER BY started_at DESC, test_runs.id DESC LIMIT 1"
-        ))
-        .fetch_optional(&self.pool)
-        .await?;
-        let success: Option<i64> = sqlx::query_scalar(&format!(
+    /// it made a competition, says nothing about the lifecycle and is passed over. Verdicts are
+    /// taken by when they were reached, not by when their run started: a run that takes a day to
+    /// pay out must not hide behind a later run that failed in its first hour, nor the reverse.
+    pub async fn lifecycle_metrics(&self) -> Result<LifecycleEvidence> {
+        let finished = |status: &str, made_competition: &str| {
+            format!(
+                "SELECT MAX(CAST(strftime('%s', completed_at) AS INTEGER)) FROM test_runs \
+                 WHERE scenario IN {PAYOUT_SCENARIOS} AND status = '{status}'{made_competition}"
+            )
+        };
+        let last_failed: Option<i64> =
+            sqlx::query_scalar(&finished("failed", " AND competition_id IS NOT NULL"))
+                .fetch_one(&self.pool)
+                .await?;
+        let last_passed: Option<i64> = sqlx::query_scalar(&finished("passed", ""))
+            .fetch_one(&self.pool)
+            .await?;
+        let last_paid_out: Option<i64> = sqlx::query_scalar(&format!(
             "SELECT MAX(CAST(strftime('%s', money_trails.verified_at) AS INTEGER)) \
              FROM test_runs JOIN money_trails ON money_trails.run_id = test_runs.id \
              WHERE test_runs.scenario IN {PAYOUT_SCENARIOS} AND test_runs.status = 'passed' \
              AND money_trails.money = 'paid_out'"
         ))
         .fetch_one(&self.pool)
+        .await?;
+        let newest_money: Option<String> = sqlx::query_scalar(&format!(
+            "SELECT money_trails.money \
+             FROM test_runs JOIN money_trails ON money_trails.run_id = test_runs.id \
+             WHERE test_runs.scenario IN {PAYOUT_SCENARIOS} \
+             AND money_trails.money IN ('paid_out', 'stuck', 'written_off') \
+             ORDER BY test_runs.started_at DESC, test_runs.id DESC LIMIT 1"
+        ))
+        .fetch_optional(&self.pool)
         .await?;
         let observed: Option<i64> = sqlx::query_scalar(&format!(
             "SELECT MAX(CAST(strftime('%s', money_trails.updated_at) AS INTEGER)) \
@@ -583,7 +621,13 @@ impl SynthDb {
         ))
         .fetch_one(&self.pool)
         .await?;
-        Ok((latest, success, observed))
+        Ok(LifecycleEvidence {
+            last_failed,
+            last_passed,
+            last_paid_out,
+            newest_money,
+            observed,
+        })
     }
 
     /// Pending money must stay visible even after newer runs fill the dashboard's page.
@@ -1199,9 +1243,7 @@ mod tests {
             db.lifecycle_metrics()
                 .await
                 .unwrap()
-                .0
-                .unwrap()
-                .money
+                .last_paid_out
                 .is_none(),
             "steps alone cannot report healthy"
         );
@@ -1217,11 +1259,11 @@ mod tests {
         .await
         .unwrap();
         let reopened = SynthDb::new(path.to_str().unwrap()).await.unwrap();
-        let (latest, success, observed) = reopened.lifecycle_metrics().await.unwrap();
-        assert!(observed.is_some());
-        assert_eq!(latest.unwrap().id, finished);
+        let evidence = reopened.lifecycle_metrics().await.unwrap();
+        assert!(evidence.observed.is_some());
+        assert_eq!(evidence.newest_money.as_deref(), Some("paid_out"));
         assert!(
-            success.is_some(),
+            evidence.last_paid_out.is_some(),
             "verified success survives process state loss"
         );
         assert_eq!(
@@ -1292,15 +1334,20 @@ mod tests {
             .await
             .unwrap();
 
-        let (latest, success, observed) = db.lifecycle_metrics().await.unwrap();
-        let latest = latest.unwrap();
+        let evidence = db.lifecycle_metrics().await.unwrap();
+        assert_eq!(evidence.newest_money.as_deref(), Some("paid_out"));
         assert_eq!(
-            latest.id, queued,
-            "the queued payout is the latest evidence"
+            crate::server::metrics::lifecycle_health(
+                &evidence,
+                OffsetDateTime::now_utc().unix_timestamp()
+            ),
+            1.0
         );
-        assert_eq!(crate::server::metrics::lifecycle_health(Some(&latest)), 1.0);
-        assert!(success.is_some(), "a queued payout is a successful run");
-        assert!(observed.is_some());
+        assert!(
+            evidence.last_paid_out.is_some(),
+            "a queued payout is a successful run"
+        );
+        assert!(evidence.observed.is_some());
         let run = db.get_run(&cut_short).await.unwrap().unwrap();
         assert_eq!(run.status, "interrupted");
         assert!(run
@@ -1328,9 +1375,15 @@ mod tests {
         db.complete_run(&broken, Some("pools never formed"))
             .await
             .unwrap();
-        let latest = db.lifecycle_metrics().await.unwrap().0.unwrap();
-        assert_eq!(latest.id, broken);
-        assert_eq!(crate::server::metrics::lifecycle_health(Some(&latest)), 0.0);
+        let evidence = db.lifecycle_metrics().await.unwrap();
+        assert!(evidence.last_failed.is_some());
+        assert_eq!(
+            crate::server::metrics::lifecycle_health(
+                &evidence,
+                OffsetDateTime::now_utc().unix_timestamp()
+            ),
+            0.0
+        );
     }
 
     #[tokio::test]

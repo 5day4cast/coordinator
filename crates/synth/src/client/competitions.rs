@@ -339,6 +339,20 @@ impl CompetitionResponse {
                 .unwrap_or(false)
     }
 
+    /// The stations its entries pick for.
+    pub fn stations(&self) -> Vec<String> {
+        self.event_submission
+            .get("locations")
+            .and_then(serde_json::Value::as_array)
+            .map(|stations| {
+                stations
+                    .iter()
+                    .filter_map(|station| station.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// When its entries close: when its observations start.
     pub fn entries_close(&self) -> Option<OffsetDateTime> {
         let at = self
@@ -588,24 +602,15 @@ impl CoordinatorClient {
         })
     }
 
-    /// List all competitions
+    /// Current and recently completed competitions, following every response page.
     pub async fn list_competitions(&self) -> Result<Vec<CompetitionResponse>> {
-        let url = format!("{}/api/v1/competitions", self.base_url());
-        let resp = super::retry_transport(3, || async {
-            anyhow::Ok(self.http().get(&url).send().await?)
-        })
-        .await
-        .context("Failed to list competitions")?;
+        self.list_page("competitions", &[], None).await
+    }
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("List competitions failed ({}): {}", status, body);
-        }
-
-        resp.json()
+    /// Ask only for competitions that could still take entries.
+    pub async fn list_open_competitions(&self) -> Result<Vec<CompetitionResponse>> {
+        self.list_page("competitions", &[("status", "open".into())], None)
             .await
-            .context("Failed to parse competitions response")
     }
 
     /// Every competition as the operator listener reports it, with its escrow refunds.

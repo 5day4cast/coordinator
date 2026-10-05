@@ -769,7 +769,7 @@ impl Runner {
             let start = Arc::new(keep_open::LaneStart::default());
             tokio::spawn(
                 keep_open::KeepOpen::new(keep_open.clone(), base.entry_fee as u64, start.clone())
-                    .run(self.client.clone(), self.open.clone()),
+                    .run(self.client.clone(), self.db.clone(), self.open.clone()),
             );
             (
                 keep_open.lane.clone(),
