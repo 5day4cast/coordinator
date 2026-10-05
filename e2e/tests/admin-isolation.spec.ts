@@ -19,7 +19,7 @@ test("operator browser session authenticates and enforces CSRF", async ({ page, 
   await page.goto(`${adminURL}/admin/login`);
   await page.getByLabel("Admin token").fill(adminToken);
   await page.getByRole("button", { name: "Sign in" }).click();
-  await expect(page).toHaveURL(`${adminURL}/admin`);
+  await expect(page).toHaveURL(`${adminURL}/admin/operations`);
   await page.goto(`${adminURL}/admin/wallet`);
   const csrfHeaders = await page.locator("body").getAttribute("hx-headers:inherited");
   expect(csrfHeaders).not.toBeNull();
