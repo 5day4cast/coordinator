@@ -814,3 +814,58 @@ async fn an_oracle_error_before_chain_expiry_preserves_the_failure() {
     assert!(fixture.broadcasts.lock().unwrap().is_empty());
     fixture.database.close().await.unwrap();
 }
+
+/// The step that broadcasts the expiry transaction returns the state the stored fields reload
+/// as: the competition settles from the expiry transaction, its outcome transaction. Returning
+/// "awaiting attestation" instead made the runner report a state that cannot progress.
+#[tokio::test]
+async fn the_step_that_broadcasts_expiry_moves_on_to_settling_it() {
+    let mut fixture = UnpaidWinners::with_contract(
+        signed_contract_expiring(Amount::from_sat(30_000), Some(1_790_000_000)),
+        Amount::from_sat(30_000),
+        HashMap::new(),
+    )
+    .await;
+    let competition = &mut fixture.competition;
+    competition.attestation = None;
+    competition.outcome_transaction = None;
+    competition.outcome_broadcasted_at = None;
+    competition.delta_broadcasted_at = None;
+    competition.awaiting_attestation_at = Some(OffsetDateTime::now_utc());
+    let status = CompetitionStatus::from(competition.clone());
+    assert_eq!(status.state_name(), "awaiting_attestation");
+
+    let next = fixture.coordinator.process_status(status).await;
+    assert_eq!(next.state_name(), "outcome_broadcasted");
+    let settling = next.into_competition();
+    assert!(settling.settled_by_expiry());
+    assert_eq!(settling.get_current_outcome().unwrap(), Outcome::Expiry);
+    assert_eq!(fixture.broadcasts().len(), 1);
+    assert_eq!(
+        CompetitionStatus::from(settling).state_name(),
+        "outcome_broadcasted"
+    );
+    fixture.database.close().await.unwrap();
+}
+
+/// Past the contract's expiry an attestation is accepted only if it opens one of the event's
+/// outcomes, as before it. One that opens none used to be taken for the expiry outcome and
+/// stored, and a stored attestation stops the expiry transaction from being broadcast.
+#[tokio::test]
+async fn an_attestation_past_expiry_must_still_open_an_outcome() {
+    let fixture = UnpaidWinners::with_contract(
+        signed_contract_expiring(Amount::from_sat(30_000), Some(1_790_000_000)),
+        Amount::from_sat(30_000),
+        HashMap::new(),
+    )
+    .await;
+    let competition = &fixture.competition;
+    let stray = Scalar::from_slice(&[11; 32]).unwrap().into();
+    assert!(competition.verify_event_attestation(&stray).is_err());
+    let attested = Scalar::from_slice(&[10; 32]).unwrap().into();
+    assert_eq!(
+        competition.verify_event_attestation(&attested).unwrap(),
+        Outcome::Attestation(0)
+    );
+    fixture.database.close().await.unwrap();
+}

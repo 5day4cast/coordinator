@@ -20,8 +20,8 @@ pub struct StoreCounts {
     pub payouts_failed: i64,
     /// Automatic payout jobs neither completed nor failed.
     pub payout_jobs_open: i64,
-    /// All retained failed job records, including replaced jobs for entries later paid.
-    /// This is not the number of unpaid entries or currently open jobs.
+    /// Failed jobs whose entry is still unpaid and has no other job, open or completed. A job
+    /// that failed and was replaced by one that paid, or is still trying, is not counted.
     pub payout_jobs_failed: i64,
     /// Open jobs that have failed at least once and wait for another try.
     pub payout_jobs_retrying: i64,
@@ -98,10 +98,19 @@ impl CompetitionStore {
         .fetch_one(pool)
         .await?;
 
+        // A failed job counts while nothing has made up for it: its entry has no payout that
+        // succeeded and no job that is open or completed. At most one job per entry is not
+        // failed (`one_live_payout_job_per_entry`).
         let jobs = sqlx::query(
             "SELECT
                 COALESCE(SUM(completed_at IS NULL AND failed_at IS NULL), 0) AS open,
-                COALESCE(SUM(failed_at IS NOT NULL), 0) AS failed,
+                COALESCE(SUM(failed_at IS NOT NULL
+                    AND NOT EXISTS (SELECT 1 FROM payout_jobs AS later
+                                    WHERE later.entry_id = payout_jobs.entry_id
+                                      AND later.failed_at IS NULL)
+                    AND NOT EXISTS (SELECT 1 FROM payouts
+                                    WHERE payouts.entry_id = payout_jobs.entry_id
+                                      AND payouts.succeed_at IS NOT NULL)), 0) AS failed,
                 COALESCE(SUM(completed_at IS NULL AND failed_at IS NULL AND attempts > 0), 0)
                     AS retrying,
                 MIN(CASE WHEN completed_at IS NULL AND failed_at IS NULL THEN created_at END)
@@ -147,7 +156,7 @@ mod tests {
             locations: vec!["KORD".into()],
             number_of_values_per_entry: 3,
             number_of_places_win: 1,
-            total_allowed_entries: 5,
+            total_allowed_entries: 6,
             entry_fee: 1_000,
             coordinator_fee: crate::domain::CoordinatorFee::whole_percent(10),
             total_competition_pool: 4_500,
@@ -198,6 +207,8 @@ mod tests {
                     ),
                     ("t-used-2", Some("-9 minutes"), Some("-8 minutes"), None),
                     ("t-used-3", Some("-9 minutes"), Some("-8 minutes"), None),
+                    ("t-used-4", Some("-9 minutes"), Some("-8 minutes"), None),
+                    ("t-used-5", Some("-9 minutes"), Some("-8 minutes"), None),
                 ] {
                     sqlx::query(
                         "INSERT INTO tickets (id, event_id, encrypted_preimage, hash,
@@ -218,6 +229,8 @@ mod tests {
                     ("e-1", "t-used-1", true),
                     ("e-2", "t-used-2", false),
                     ("e-3", "t-used-3", false),
+                    ("e-4", "t-used-4", false),
+                    ("e-5", "t-used-5", false),
                 ] {
                     sqlx::query(
                         "INSERT INTO entries (id, event_id, ticket_id, pubkey, ephemeral_pubkey,
@@ -238,6 +251,7 @@ mod tests {
                     ("p-failed", "e-1", false, true),
                     ("p-succeeded", "e-1", true, false),
                     ("p-pending", "e-2", false, false),
+                    ("p-by-invoice", "e-5", true, false),
                 ] {
                     sqlx::query(
                         "INSERT INTO payouts (id, entry_id, payout_payment_request,
@@ -253,11 +267,16 @@ mod tests {
                     .execute(&pool)
                     .await?;
                 }
+                // e-1's failed job was replaced by one that paid, e-3's by one still trying,
+                // and e-5 was paid by a payout no job records; only e-4's stands.
                 for (job, entry, age, attempts, completed, failed) in [
                     ("j-done", "e-1", 900, 0, true, false),
                     ("j-gave-up", "e-1", 800, 3, false, true),
                     ("j-open", "e-2", 600, 0, false, false),
                     ("j-retrying", "e-3", 60, 2, false, false),
+                    ("j-replaced", "e-3", 700, 1, false, true),
+                    ("j-failed", "e-4", 500, 1, false, true),
+                    ("j-failed-then-paid", "e-5", 400, 1, false, true),
                 ] {
                     sqlx::query(
                         "INSERT INTO payout_jobs (id, entry_id, request_json, created_at,
@@ -282,7 +301,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Three entries without a full field: the competition still collects entries.
+        // Five entries without a full field: the competition still collects entries.
         assert_eq!(
             store.competition_state_counts().await.unwrap(),
             vec![("collecting_entries", 1)]
@@ -296,7 +315,7 @@ mod tests {
             (TicketStatus::Reserved, 1),
             (TicketStatus::Expired, 1),
             (TicketStatus::Paid, 1),
-            (TicketStatus::Used, 3),
+            (TicketStatus::Used, 5),
         ];
         expected_tickets.sort_by_key(|(status, _)| format!("{status:?}"));
         assert!(
@@ -306,11 +325,11 @@ mod tests {
         assert_eq!(
             counts,
             StoreCounts {
-                entries_paid: 3,
+                entries_paid: 5,
                 entries_signed: 1,
                 tickets: expected_tickets,
                 payouts_pending: 1,
-                payouts_succeeded: 1,
+                payouts_succeeded: 2,
                 payouts_failed: 1,
                 payout_jobs_open: 2,
                 payout_jobs_failed: 1,

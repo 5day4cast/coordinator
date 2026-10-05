@@ -1463,18 +1463,10 @@ impl Competition {
             return Err(Error::BadRequest("Signed contract not found".into()));
         };
 
-        if let Some(expiry) = event_announcement.expiry {
-            let current_time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| Error::BadRequest(format!("Failed to get current time: {}", e)))?
-                .as_secs() as u32;
-
-            if current_time >= expiry {
-                debug!("Contract has expired, returning Expiry outcome");
-                return Ok(Outcome::Expiry);
-            }
-        }
-
+        // The clock is not consulted: past the contract's expiry an attestation is still only
+        // good if it opens one of the event's locking points. Accepting any attestation then
+        // stored one that matched no outcome, and a stored attestation stops the expiry
+        // transaction from ever being broadcast.
         let attestation_point = attestation.base_point_mul();
         debug!("Calculated attestation point: {:?}", attestation_point);
 

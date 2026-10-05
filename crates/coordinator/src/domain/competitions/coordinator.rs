@@ -14,6 +14,8 @@ mod network_fee;
 mod queued_coordinator;
 #[path = "queued_kickoff.rs"]
 mod queued_kickoff;
+#[path = "settled_outputs.rs"]
+mod settled_outputs;
 pub use ark_coordinator::{ARK_SWAP_BOARDS_EVERY, SWAPS_UNAVAILABLE};
 pub use automatic::{InvoiceFallbackRequest, PayoutAuthorizationInfo, PayoutTermsQuote};
 pub use kickoff_check::{KickoffCheck, KickoffPool};
@@ -1210,6 +1212,10 @@ impl Coordinator {
                     Ok(_) => {
                         if let Some(attestation) = state.competition().attestation {
                             state.attested(attestation)
+                        } else if state.competition().expiry_broadcasted_at.is_some() {
+                            // The expiry transaction went out as the outcome transaction, so
+                            // the competition settles from there, as its stored fields say.
+                            CompetitionStatus::from(state.into_competition())
                         } else {
                             CompetitionStatus::AwaitingAttestation(state)
                         }

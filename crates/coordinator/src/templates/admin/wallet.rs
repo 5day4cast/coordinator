@@ -161,6 +161,7 @@ pub fn wallet_page(network: &str, data: &crate::domain::admin_wallet::WalletOver
                     }
                 }
             }
+            (settled_outputs(data))
             section.wallet-support {
                 h2 { "Where is a customer's money?" }
                 p { "These wallets show service liquidity. Use the customer funds view to trace each competition, pool, entry, and ticket." }
@@ -173,13 +174,50 @@ pub fn wallet_page(network: &str, data: &crate::domain::admin_wallet::WalletOver
     }
 }
 
+/// The outputs of settled contracts at the coordinator's own key, which no wallet above holds.
+fn settled_outputs(data: &crate::domain::admin_wallet::WalletOverview) -> Markup {
+    let funds = data.settled.as_ref().map(|(funds, _)| funds);
+    html! {
+        section.wallet-card {
+            p.eyebrow { "04 / Coordinator key" }
+            h2 { "Settled contract outputs" }
+            p { "When a contract settles, its closing transaction pays the pot to the coordinator's own key: the players were paid from the Lightning node above. LND does not hold that key, so these outputs are in no balance above, and nothing spends them yet." }
+            @if data.settled.is_none() {
+                p.notice { "Not read from the chain yet. Reload shortly; if it stays unread, check the chain index." }
+            }
+            dl.wallet-metrics {
+                (fact("Unspent total", &sats(funds.map(|f| f.sats))))
+                (fact("Unspent outputs", &count(funds.map(|f| f.outputs))))
+                @if let Some(funds) = funds.filter(|f| f.unconfirmed_outputs > 0) {
+                    (fact("Of which unconfirmed", &format!(
+                        "{} in {}",
+                        sats(Some(funds.unconfirmed_sats)),
+                        count(Some(funds.unconfirmed_outputs))
+                    )))
+                }
+                (fact("Address", data.settled_address.as_deref().unwrap_or("Unavailable")))
+                (fact("Read from the chain at", &at(data.settled.as_ref().map(|(_, read_at)| read_at.unix_timestamp()))))
+            }
+            p.note { "Read again every five minutes. A spend needs a signature made with the coordinator's key file; the on-chain wallet's tools cannot move these outputs." }
+        }
+    }
+}
+
+fn count(value: Option<u64>) -> String {
+    match value {
+        Some(1) => "1 output".into(),
+        Some(n) => format!("{} outputs", crate::templates::format::thousands(n)),
+        None => "Unknown".into(),
+    }
+}
+
 fn fact(label: &str, value: &str) -> Markup {
     html! { div { dt { (label) } dd { (value) } } }
 }
 
 fn sats(value: Option<u64>) -> String {
     value
-        .map(|n| format!("{n} sats"))
+        .map(crate::templates::format::sats)
         .unwrap_or_else(|| "Unknown".into())
 }
 
@@ -337,13 +375,42 @@ mod tests {
         assert!(!rendered.contains("Swap wallet unavailable"));
     }
 
+    /// Settled contracts pay the coordinator's own key, which LND's balance leaves out: the
+    /// page shows what is there, or says it has not been read rather than showing nothing.
+    #[test]
+    fn admin_wallet_shows_the_settled_contract_outputs_at_the_coordinator_key() {
+        let unread = wallet_page("signet", &WalletOverview::default()).into_string();
+        assert!(unread.contains("Settled contract outputs"));
+        assert!(unread.contains("Not read from the chain yet"));
+        let read = WalletOverview {
+            settled_address: Some("tb1pcoordinatorkey".into()),
+            settled: Some((
+                crate::infra::bitcoin::ScriptFunds {
+                    outputs: 237,
+                    sats: 3_270_900,
+                    unconfirmed_outputs: 1,
+                    unconfirmed_sats: 34_690,
+                },
+                time::macros::datetime!(2026-10-05 11:30 UTC),
+            )),
+            ..Default::default()
+        };
+        let rendered = wallet_page("signet", &read).into_string();
+        assert!(!rendered.contains("Not read from the chain yet"));
+        assert!(rendered.contains("<dt>Unspent total</dt><dd>3,270,900 sats</dd>"));
+        assert!(rendered.contains("<dt>Unspent outputs</dt><dd>237 outputs</dd>"));
+        assert!(rendered.contains("<dd>34,690 sats in 1 output</dd>"));
+        assert!(rendered.contains("<dd>tb1pcoordinatorkey</dd>"));
+        assert!(rendered.contains("<dd>2026-10-05T11:30:00Z</dd>"));
+    }
+
     #[test]
     fn admin_wallet_channel_amounts_reject_invalid_or_missing_values() {
         let amounts: crate::infra::lightning::ChannelBalance = serde_json::from_str(
             r#"{"local_balance":{"sat":"42000"},"remote_balance":{"sat":"-1"}}"#,
         )
         .unwrap();
-        assert_eq!(channel_sats(amounts.local_balance.as_ref()), "42000 sats");
+        assert_eq!(channel_sats(amounts.local_balance.as_ref()), "42,000 sats");
         assert_eq!(channel_sats(amounts.remote_balance.as_ref()), "Unknown");
         assert_eq!(
             channel_sats(amounts.unsettled_local_balance.as_ref()),

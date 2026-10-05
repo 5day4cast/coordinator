@@ -64,6 +64,7 @@ pub async fn funds_page(
                     (Ok(c),Ok(page))=> {
                         h2 { (c.event_submission.locations.join(" · ")) }
                         p { code { (id) } " · " (c.get_state()) " · " a href=(format!("/admin/operations/{id}")) { "Operations and retained errors" } }
+                        @if let Some(late) = super::late_results::read(&state, &c, crate::domain::leaderboard::FIRST_READ_WAIT, time::OffsetDateTime::now_utc()).await { (late.notice()) }
                         @if let Some(parent)=c.parent_id {
                             @match state.coordinator.get_competition(parent).await {
                                 Ok(parent)=>(pool_navigation(&parent,c.id)),

@@ -159,6 +159,32 @@ pub struct PayoutOutputStatus {
     pub unspent: bool,
 }
 
+/// The unspent outputs the chain holds at one script, mempool included.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScriptFunds {
+    pub outputs: u64,
+    pub sats: u64,
+    /// How many of the outputs, and of the sats, are not in a block yet.
+    pub unconfirmed_outputs: u64,
+    pub unconfirmed_sats: u64,
+}
+
+impl ScriptFunds {
+    /// The total of unspent outputs given as (value in sats, whether it is in a block).
+    pub fn of(unspent: impl IntoIterator<Item = (u64, bool)>) -> Self {
+        let mut funds = Self::default();
+        for (sats, confirmed) in unspent {
+            funds.outputs += 1;
+            funds.sats = funds.sats.saturating_add(sats);
+            if !confirmed {
+                funds.unconfirmed_outputs += 1;
+                funds.unconfirmed_sats = funds.unconfirmed_sats.saturating_add(sats);
+            }
+        }
+        funds
+    }
+}
+
 #[async_trait]
 pub trait Bitcoin: Send + Sync {
     fn get_network(&self) -> Network;
@@ -210,6 +236,10 @@ pub trait Bitcoin: Send + Sync {
         Err(anyhow!(
             "Spending transaction lookup is not available for this backend"
         ))
+    }
+    /// Read-only. `None` when this backend cannot list a script's outputs.
+    async fn script_funds(&self, _script: ScriptBuf) -> Result<Option<ScriptFunds>, anyhow::Error> {
+        Ok(None)
     }
     async fn broadcast(&self, transaction: &Transaction) -> Result<(), anyhow::Error>;
     async fn get_next_address(&self) -> Result<Address, anyhow::Error>;
@@ -1019,6 +1049,24 @@ impl Bitcoin for BitcoinClient {
                 current_height,
                 unspent,
             })
+        })
+        .await?
+        .map_err(Into::into)
+    }
+
+    async fn script_funds(&self, script: ScriptBuf) -> Result<Option<ScriptFunds>, anyhow::Error> {
+        let url = self.payout_electrum_url.clone();
+        // Its own connection: a script with hundreds of outputs takes the index a while to
+        // list, and must not hold up the lookups that share the main one.
+        tokio::task::spawn_blocking(move || -> Result<_, electrum_client::Error> {
+            let client = ElectrumClient::from_config(
+                &url,
+                ConfigBuilder::new().timeout(Some(20)).retry(0).build(),
+            )?;
+            let unspent = client.script_list_unspent(&script)?;
+            Ok(Some(ScriptFunds::of(
+                unspent.iter().map(|item| (item.value, item.height > 0)),
+            )))
         })
         .await?
         .map_err(Into::into)

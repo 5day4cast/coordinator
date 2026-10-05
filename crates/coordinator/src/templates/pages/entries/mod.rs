@@ -216,6 +216,14 @@ fn returned(row: &EntryRow) -> Markup {
     match row.returned {
         Returned::InPlay => nothing("in play"),
         Returned::AwaitingResult => nothing("awaiting results"),
+        // After an expiry every entry is owed its share of the pot, paid yet or not.
+        Returned::NoPayout
+            if row
+                .competition
+                .is_some_and(|competition| competition.phase == Phase::Expired) =>
+        {
+            nothing("pot share due; see Payouts")
+        }
         Returned::NoPayout => nothing("no payout"),
         Returned::NoRefund => nothing("no refund recorded"),
         Returned::RefundWrittenOff => nothing("refund stopped; contact support"),
@@ -465,6 +473,9 @@ mod tests {
     fn each_row_says_what_came_back_and_where_it_stands() {
         assert!(returned_cell(&entry(), Phase::AwaitingResult).contains("awaiting results"));
         assert!(returned_cell(&entry(), Phase::Scored).contains("no payout"));
+        // An expired contract owes every entry its share, before any payout is recorded.
+        let expired = returned_cell(&entry(), Phase::Expired);
+        assert!(expired.contains("pot share due; see Payouts") && !expired.contains("no payout"));
         assert!(returned_cell(&entry(), Phase::Cancelled).contains("no refund recorded"));
 
         let paid_out = |state| LedgerEntry {

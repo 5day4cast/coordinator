@@ -7,6 +7,7 @@ pub use operations::*;
 mod admin;
 #[cfg(test)]
 mod entries_tests;
+mod late_results;
 #[cfg(test)]
 mod leaderboard_tests;
 mod oracle_view;

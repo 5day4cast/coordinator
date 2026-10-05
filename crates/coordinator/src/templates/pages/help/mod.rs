@@ -51,9 +51,10 @@ pub fn help_page(open_advanced: bool) -> Markup {
                         "and checks it before you pay."
                     }
                     li {
-                        strong { "Par is a range" } " around the forecast, set from how that airport's "
-                        "forecasts have missed over the last 60 days, so Under, Par and Over are about "
-                        "equally likely. A right pick scores " (LINE_POINTS) " points."
+                        strong { "Par is a range" } " around the forecast, set from how recent forecasts "
+                        "have missed: that airport's own once it has enough history, and all airports' "
+                        "together until then. Under, Par and Over are about equally likely. A right pick "
+                        "scores " (LINE_POINTS) " points."
                     }
                     li {
                         "Par includes both ends of the range, and the reading is compared before rounding: "
@@ -292,6 +293,16 @@ mod tests {
         assert!(!html.contains("<video") && !html.contains("Pick as many"));
         assert!(html.contains("bold forecast values are NOAA"));
         assert!(html.contains("There are no negative points"));
+    }
+
+    /// How much history a Par range is fitted on is the oracle's setting, and an airport with
+    /// too little of its own uses every airport's: the help names no number of days.
+    #[test]
+    fn par_is_explained_without_a_number_of_days() {
+        let html = help_page(false).into_string().replace("&#39;", "'");
+        assert!(html.contains("that airport's own once it has enough history"));
+        assert!(html.contains("all airports' together until then"));
+        assert!(!html.contains("60 days"), "{html}");
     }
 
     #[test]

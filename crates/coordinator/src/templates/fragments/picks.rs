@@ -183,7 +183,7 @@ fn detail(
                     p class="notice" { "Not enough entries arrived before the window started, so nothing is scored and entry fees are refunded." }
                 }
                 Phase::Expired => {
-                    p class="notice" { "The oracle never published a result, so every entry was refunded." }
+                    p class="notice" { "The oracle never signed a result in time, so the pot is shared back among the entries." }
                 }
                 Phase::Cancelled | Phase::Failed => {
                     p class="notice" { "This competition did not run, so nothing is scored." }
@@ -220,7 +220,7 @@ fn detail(
                         span class="station-code" { (station) }
                     }
                     @for view in station_picks {
-                        @if live { (live_pick_row(view.pick)) } @else { (pick_row(view.pick)) }
+                        @if live { (live_pick_row(view.pick)) } @else { (pick_row(view.pick, phase != Phase::Expired)) }
                     }
                 }
             }
@@ -297,8 +297,9 @@ fn pick_cells(pick: &PickProgress) -> Markup {
 }
 
 /// A pick outside the open window: before it, just the pick; after it, the reading and
-/// whether it scored.
-fn pick_row(pick: &PickProgress) -> Markup {
+/// whether it scored. `badge` is false once the contract has expired: its picks' state still
+/// says they await the oracle, and nothing is awaited any more.
+fn pick_row(pick: &PickProgress, badge: bool) -> Markup {
     let scored = pick.forecast.is_some() && pick.observed.is_some();
     let class = match (scored, pick.hit) {
         (true, true) => "scored-pick is-hit",
@@ -311,7 +312,7 @@ fn pick_row(pick: &PickProgress) -> Markup {
             span class="pick-result" {
                 @if scored {
                     @if pick.hit { "✓ +" (pick.points) } @else { "✗ 0" }
-                    (state_badge(pick.state))
+                    @if badge { (state_badge(pick.state)) }
                 }
             }
         }
@@ -442,6 +443,24 @@ mod tests {
         );
         assert!(!html.contains(">Final<"));
         assert!(!html.contains("hx-trigger"));
+    }
+
+    /// Once the contract has expired unsigned nothing is awaited any more, and the pot's
+    /// shares may not have been paid yet: the dialog claims neither.
+    #[test]
+    fn an_expired_competition_awaits_nothing_and_does_not_say_refunds_are_done() {
+        let picks = [pick(
+            Metric::TempHigh,
+            ValueOptions::Over,
+            69.0,
+            Some(71.0),
+            PickState::AwaitingResult,
+        )];
+        let html = picks_detail("e1", &views(&picks), Phase::Expired, None, NOW).into_string();
+        assert!(html.contains("so the pot is shared back among the entries."));
+        assert!(!html.contains("was refunded"));
+        assert!(!html.contains("Awaiting oracle"));
+        assert!(html.contains(r#"<span class="pick-reading">71°F</span>"#));
     }
 
     /// The status fits its column: short, with the reason in its tip.

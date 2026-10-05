@@ -33,7 +33,7 @@ pub use phase::Phase;
 pub use progress::{Metric, PickState, Rule, Standing};
 
 use crate::{
-    domain::{Competition, Coordinator, EntryStatus, Error, UserEntry, UserInfo},
+    domain::{Competition, CompetitionKind, Coordinator, EntryStatus, Error, UserEntry, UserInfo},
     infra::{
         oracle::{ScoringRules, ValueOptions},
         oracle_weather::{EventReadings, OracleWeather, Reading, Station, StationObservations},
@@ -91,6 +91,16 @@ impl EarlyForecasts {
 }
 
 impl CompetitionWeather {
+    /// What the oracle holds for an event, with no observations beside it.
+    #[cfg(test)]
+    pub(crate) fn of_event(event: EventReadings) -> Self {
+        Self {
+            event,
+            observations: None,
+            early_forecasts: None,
+        }
+    }
+
     /// The forecast the oracle compares `metric` at `station` with.
     pub fn forecast(&self, station: &str, metric: Metric) -> Option<f64> {
         // Once present, the oracle's reading is authoritative, including a missing baseline.
@@ -361,9 +371,11 @@ impl Leaderboards {
             }
         };
         let now = OffsetDateTime::now_utc();
+        let mut forms_unavailable = 0;
         for competition in competitions {
             // Upcoming ones too: the entry form shows their forecasts.
-            let current = match Phase::of(&competition, now) {
+            let phase = Phase::of(&competition, now);
+            let current = match phase {
                 Phase::Upcoming | Phase::Live => true,
                 // Scored too, so the attested result reaches the cache without a page asking.
                 // Once it has, it is refreshed hourly at most.
@@ -372,11 +384,56 @@ impl Leaderboards {
                 }
                 _ => false,
             };
-            if current {
+            if !current {
+                continue;
+            }
+            if phase == Phase::Upcoming && takes_entries(&competition) {
+                // A zero wait reads what is cached, and starts the refresh that is due.
+                let weather = self.weather(&competition, Duration::ZERO).await;
+                if entry_form_unavailable(&competition, &weather) == Some(true) {
+                    forms_unavailable += 1;
+                }
+            } else {
                 self.warm(&competition);
             }
         }
+        crate::metrics::ENTRY_FORM_UNAVAILABLE.set(forms_unavailable);
     }
+}
+
+/// Whether the entry form of `competition`, before its window, is still offered: a pool's
+/// players come from its queue, and a full competition takes no more.
+fn takes_entries(competition: &Competition) -> bool {
+    match competition.kind {
+        CompetitionKind::Pool => false,
+        CompetitionKind::Single => !competition.has_full_entries(),
+        CompetitionKind::Queued => true,
+    }
+}
+
+/// Whether the entry form of `competition` cannot be completed for want of forecasts: the last
+/// fetch of its weather failed, or fewer of its lines have a forecast to pick against than an
+/// entry needs picks. `None` while the first fetch is still on its way.
+pub fn entry_form_unavailable(
+    competition: &Competition,
+    weather: &Cached<CompetitionWeather>,
+) -> Option<bool> {
+    let Some(weather) = weather.value() else {
+        return (!weather.refreshing).then_some(true);
+    };
+    let event = &competition.event_submission;
+    let lines = event
+        .locations
+        .iter()
+        .flat_map(|station| {
+            event
+                .metrics()
+                .into_iter()
+                .map(move |metric| (station, metric))
+        })
+        .filter(|(station, metric)| weather.forecast(station, *metric).is_some())
+        .count();
+    Some(weather.forecasts_unavailable() || lines < event.number_of_values_per_entry)
 }
 
 /// The oracle's weather for each competition, and its stations, refreshed in the background.
@@ -626,7 +683,8 @@ pub fn build(
         weather_fetched_at: weather.latest.as_ref().map(|weather| weather.fetched_at),
         refreshing: weather.refreshing,
         observed_until,
-        settlement_blocked: weather_value.is_some_and(|weather| weather.event.settlement_blocked),
+        settlement_blocked: weather_value
+            .is_some_and(|weather| weather.event.settlement_block.is_some()),
     }
 }
 

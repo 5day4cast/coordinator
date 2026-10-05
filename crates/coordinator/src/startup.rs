@@ -147,7 +147,8 @@ impl Application {
                         app_state.coordinator.competition_store.clone(),
                         app_state.background_threads.clone(),
                     )?
-                    .with_arkade_health(app_state.coordinator.arkade_health());
+                    .with_arkade_health(app_state.coordinator.arkade_health())
+                    .with_settled_outputs(app_state.coordinator.clone());
                     Some(build_server(address, metrics_app(Arc::new(metrics))).await?)
                 }
                 None => None,
@@ -994,7 +995,8 @@ pub fn app(app_state: Arc<AppState>, api: &APISettings) -> Result<Router, anyhow
 
     Ok(Router::new()
         .merge(api_routes)
-        .merge(static_files(&app_state).layer(compression()))
+        .merge(static_files(&app_state))
+        .layer(compression())
         .layer(Extension(replay))
         .layer(Extension(Arc::new(nip98_origins)))
         .layer(middleware::from_fn_with_state(
@@ -1050,7 +1052,11 @@ fn limited<S: Clone + Send + Sync + 'static>(
 /// which marks tickets paid without a payment, is never registered on mainnet.
 pub fn admin_app(app_state: Arc<AppState>, access: Arc<AdminAccess>, network: Network) -> Router {
     let mut admin_htmx_routes = Router::new()
-        .route("/", get(admin_page_handler))
+        .route(
+            "/",
+            get(|| async { axum::response::Redirect::to("/admin/operations") }),
+        )
+        .route("/competitions", get(admin_page_handler))
         .route("/competition", get(admin_competition_fragment))
         .route("/competition/map", get(admin_competition_map))
         .route("/operations", get(crate::api::routes::operations_page))
