@@ -594,7 +594,9 @@ async fn resume_entry(
                         .check_ticket_status(&user.nostr_keys, competition_id, &ticket_id)
                         .await
                     {
-                        Ok(TicketStatus::Paid | TicketStatus::Settled) => trace.paid = true,
+                        Ok(TicketStatus::Paid | TicketStatus::Settled | TicketStatus::Used) => {
+                            trace.paid = true
+                        }
                         Ok(_) => {}
                         Err(error) => log::warn!(
                             "Cannot check {}'s ticket {ticket_id} after the restart; taking it as \

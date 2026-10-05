@@ -1405,3 +1405,40 @@ async fn restart_leaves_closed_entries_for_refunds_and_rejects_mismatched_saved_
     .is_err());
     assert!(mock.state.lock().unwrap().events.is_empty());
 }
+
+#[tokio::test]
+async fn restart_preserves_the_submission_wait_and_does_not_overrun_the_deadline() {
+    let user = SynthUser::new_random("alice").unwrap();
+    let competition = Uuid::now_v7();
+    let mut trace = saved_paid_entry(&user, competition);
+    trace.waits.push(EntryWait {
+        stage: "before_submit".into(),
+        planned_ms: 7_200_000,
+        elapsed_ms: None,
+    });
+    let mock = Mock::new(Protocol::default()).await;
+    assert!(!resume_paid_submission(
+        &mock.client,
+        &user,
+        &competition,
+        &config(1),
+        "user_alice_enter",
+        &mut trace
+    )
+    .await
+    .unwrap());
+    let target = trace.submission_not_before.unwrap();
+    assert!(target > OffsetDateTime::now_utc() + time::Duration::minutes(119));
+    assert!(!resume_paid_submission(
+        &mock.client,
+        &user,
+        &competition,
+        &config(1),
+        "user_alice_enter",
+        &mut trace
+    )
+    .await
+    .unwrap());
+    assert_eq!(trace.submission_not_before, Some(target));
+    assert!(mock.state.lock().unwrap().events.is_empty());
+}
