@@ -11,6 +11,7 @@ use keymeld_core::escrow::SignedEscrowPolicy;
 mod confidential_integration_tests;
 mod confidential_service;
 mod confidential_store;
+mod protocol_parts;
 #[cfg(test)]
 mod queued_integration_tests;
 pub use coordinator_escrow::{

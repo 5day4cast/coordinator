@@ -4,12 +4,14 @@
 //! never finish.
 
 use axum::{
+    body::Bytes,
     extract::{Path, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -134,14 +136,45 @@ fn found(id: Uuid, error: Error) -> ApiError {
 /// Every competition, newest first.
 pub async fn operator_competitions(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<OperatorCompetition>>, ApiError> {
-    let competitions = state.coordinator.get_competitions().await?;
+) -> Result<Response, ApiError> {
+    let coordinator = state.coordinator.clone();
+    let cached = state
+        .operator_inventory
+        .get_fresh(
+            (),
+            Duration::from_secs(5),
+            Duration::from_millis(250),
+            move || async move { load_operator_inventory(&coordinator).await },
+        )
+        .await;
+    let latest = cached
+        .latest
+        .filter(|value| value.age() <= Duration::from_secs(30))
+        .ok_or(ApiError::Status(StatusCode::SERVICE_UNAVAILABLE))?;
+    Ok((
+        [
+            ("content-type", "application/json".to_owned()),
+            ("cache-control", "private, no-store".to_owned()),
+            (
+                "x-inventory-age-seconds",
+                latest.age().as_secs().to_string(),
+            ),
+        ],
+        latest.value.clone(),
+    )
+        .into_response())
+}
+
+async fn load_operator_inventory(
+    coordinator: &crate::domain::Coordinator,
+) -> anyhow::Result<Bytes> {
+    let competitions = coordinator.list_operator_competitions().await?;
     let ids: Vec<_> = competitions
         .iter()
         .map(|competition| competition.id)
         .collect();
-    let refunds = state.coordinator.refund_status(&ids).await?;
-    let write_offs = state.coordinator.refund_write_offs(None).await?;
+    let refunds = coordinator.refund_status(&ids).await?;
+    let write_offs = coordinator.refund_write_offs(None).await?;
     let mut competitions: Vec<_> = competitions
         .iter()
         .map(|c| {
@@ -154,7 +187,7 @@ pub async fn operator_competitions(
         })
         .collect();
     competitions.sort_by_key(|c| std::cmp::Reverse(c.created_at));
-    Ok(Json(competitions))
+    Ok(serde_json::to_vec(&competitions)?.into())
 }
 
 pub async fn operator_competition(

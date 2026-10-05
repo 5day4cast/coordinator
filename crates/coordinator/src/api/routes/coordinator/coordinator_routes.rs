@@ -1,13 +1,17 @@
+#[path = "list_response.rs"]
+mod list_response;
 use axum::http::StatusCode;
 use axum::{
     extract::{Path, Query, State},
     Json,
 };
+use axum::{http::HeaderMap, response::Response};
 use bitcoin::PublicKey;
 use dlctix::{
     musig2::{AggNonce, PartialSignature, PubNonce},
     SigMap,
 };
+use list_response::ListQuery;
 use log::{debug, error, info, warn};
 use nostr::ToBech32;
 use serde::Deserialize;
@@ -238,55 +242,66 @@ pub async fn add_event_entry(
 #[derive(Debug, Default, Deserialize)]
 pub struct EntriesQuery {
     event_id: Option<Uuid>,
+    #[serde(flatten)]
+    page: ListQuery,
 }
 
 pub async fn get_entries(
     NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
     Query(query): Query<EntriesQuery>,
-) -> Result<Json<Vec<UserEntry>>, ApiError> {
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
     let pubkey = pubkey.to_hex();
-    let filter = SearchBy {
-        event_ids: query.event_id.map(|id| vec![id]),
-    };
-
-    state
+    let mut page = query.page.page()?;
+    if query.event_id.is_some() {
+        page.history = true;
+    }
+    let events: Vec<_> = query.event_id.into_iter().collect();
+    let mut ids = state
         .coordinator
-        .get_entries(pubkey, filter)
+        .competition_store
+        .entry_page_ids(&pubkey, &events, &page)
         .await
-        .map(Json)
-        .map_err(|e| {
-            log_failure("getting entries", &e);
-            e.into()
-        })
+        .map_err(DomainError::from)?;
+    let more = ids.len() > page.limit;
+    ids.truncate(page.limit);
+    let next = more.then(|| ids.last().copied()).flatten();
+    let rows = state
+        .coordinator
+        .competition_store
+        .get_user_entries_selected(pubkey, SearchBy { event_ids: None }, Some(&ids))
+        .await
+        .map_err(DomainError::from)?;
+    list_response::response(&headers, &rows, next, true)
 }
 
-//TODO: add the ability to filter competition list
 pub async fn get_competitions(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<Competition>>, ApiError> {
-    let competitions = state
+    Query(query): Query<ListQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let page = query.page()?;
+    let mut ids = state
         .coordinator
-        .get_competitions()
+        .competition_store
+        .competition_page_ids(&page)
         .await
-        .inspect_err(|e| {
-            log_failure("getting competitions", e);
-        })?;
-    let mut competitions = competitions
-        .into_iter()
-        .map(|mut comp| {
-            if !comp.is_funding_broadcasted() {
-                comp.funding_transaction = None;
-            }
-            comp
-        })
-        .collect::<Vec<_>>();
+        .map_err(DomainError::from)?;
+    let more = ids.len() > page.limit;
+    ids.truncate(page.limit);
+    let next = more.then(|| ids.last().copied()).flatten();
+    let mut competitions = state.coordinator.get_competitions_page(&ids).await?;
+    for competition in &mut competitions {
+        if !competition.is_funding_broadcasted() {
+            competition.funding_transaction = None;
+        }
+    }
     state
         .coordinator
         .attach_min_players_now(&mut competitions)
         .await;
-
-    Ok(Json(competitions))
+    list_response::response(&headers, &competitions, next, false)
 }
 
 pub async fn get_competition(
