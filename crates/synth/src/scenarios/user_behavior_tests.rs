@@ -38,6 +38,7 @@ struct Protocol {
     durable_before_pay: Vec<bool>,
     lose_submission_response: bool,
     entry_deadline: Option<OffsetDateTime>,
+    formed_pool: Option<Uuid>,
     /// Seats other people paid for and entered.
     others: usize,
     /// Refunds settle only from then, as an escrow opens its refund leaf.
@@ -84,7 +85,7 @@ impl Mock {
 async fn competition(State(state): State<Shared>, Path(id): Path<Uuid>) -> Json<Value> {
     let state = state.lock().unwrap();
     Json(
-        json!({"id":id,"created_at":"2026-01-01T00:00:00Z", "event_submission":{"start_observation_date":state.entry_deadline.unwrap_or_else(|| OffsetDateTime::now_utc()+time::Duration::hours(1)).format(&Rfc3339).unwrap(), "total_allowed_entries":state.capacity}, "total_entries":state.entries.len() + state.others, "total_paid_entries":state.paid.len() + state.others, "awaiting_attestation_at":if state.entries.len() + state.others==state.capacity { Some("2026-01-01T00:01:00Z") }else{None} }),
+        json!({"id":id,"created_at":"2026-01-01T00:00:00Z", "event_submission":{"start_observation_date":state.entry_deadline.unwrap_or_else(|| OffsetDateTime::now_utc()+time::Duration::hours(1)).format(&Rfc3339).unwrap(), "total_allowed_entries":state.capacity}, "pools":state.formed_pool.map(|id| json!([{ "competition_id":id, "pool_index":0, "players":1 }])).unwrap_or_else(|| json!([])), "total_entries":state.entries.len() + state.others, "total_paid_entries":state.paid.len() + state.others, "awaiting_attestation_at":if state.entries.len() + state.others==state.capacity { Some("2026-01-01T00:01:00Z") }else{None} }),
     )
 }
 
@@ -1302,6 +1303,14 @@ async fn restart_submits_saved_paid_entry_once_even_when_the_response_is_lost() 
         .await
         .unwrap());
         assert!(trace.entry_submitted && trace.pending_submission.is_none());
+        // The queue can move this accepted entry to a pool while Synth is down.
+        {
+            let mut state = mock.state.lock().unwrap();
+            let pool = Uuid::now_v7();
+            state.formed_pool = Some(pool);
+            state.entry_deadline = Some(OffsetDateTime::now_utc() - time::Duration::minutes(1));
+            state.entries[0]["event_id"] = json!(pool);
+        }
         // Simulate another crash before recording the accepted response.
         let mut trace = original;
         assert!(resume_paid_submission(

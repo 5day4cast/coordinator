@@ -752,17 +752,17 @@ async fn saved_entry_exists(
     user: &SynthUser,
     saved: &crate::client::entries::AddEntry,
 ) -> Result<bool> {
-    let entries = client
-        .list_entries(&user.nostr_keys, Some(&saved.event_id))
-        .await?;
+    // A queue may have moved the accepted entry to a child pool while Synth was down.
+    let competition = client.get_competition(&saved.event_id).await?;
+    let mut events = vec![saved.event_id];
+    events.extend(competition.pools.iter().map(|pool| pool.competition_id));
+    let entries = client.list_entries_in(&user.nostr_keys, &events).await?;
     if let Some(entry) = entries
         .into_iter()
         .find(|entry| entry.ticket_id == saved.ticket_id)
     {
         ensure!(
-            entry.id == saved.id
-                && entry.event_id == saved.event_id
-                && entry.ephemeral_pubkey == saved.ephemeral_pubkey,
+            entry.id == saved.id && entry.ephemeral_pubkey == saved.ephemeral_pubkey,
             "ticket is assigned to a different entry"
         );
         return Ok(true);
