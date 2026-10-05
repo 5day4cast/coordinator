@@ -332,6 +332,8 @@ pub struct AppState {
     pub network: String,
     pub bitcoin: Arc<dyn Bitcoin>,
     pub coordinator: Arc<Coordinator>,
+    /// One serialized operator inventory, refreshed without decoding contract blobs.
+    pub operator_inventory: Arc<crate::infra::refresh_cache::RefreshCache<(), axum::body::Bytes>>,
     pub users_info: Arc<UserInfo>,
     /// Leaderboards and the oracle weather pages show, served from a background cache.
     pub leaderboards: Arc<Leaderboards>,
@@ -817,6 +819,7 @@ pub async fn build_app(
             .then(|| config.keymeld_settings.browser_gateway_url().to_owned()),
         network: config.bitcoin_settings.network.to_string(),
         coordinator,
+        operator_inventory: Arc::new(crate::infra::refresh_cache::RefreshCache::new()),
         users_info,
         leaderboards,
         lnurl,

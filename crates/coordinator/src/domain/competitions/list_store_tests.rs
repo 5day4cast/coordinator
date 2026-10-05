@@ -279,6 +279,20 @@ async fn operator_summaries_keep_signing_errors_without_loading_contracts() {
     assert!(operator[0].contract_parameters.is_none());
     assert!(operator[0].funding_transaction.is_none());
     assert!(operator[0].signed_contract.is_none());
+    let full = store.get_competition(c.id).await.unwrap();
+    let as_api = |competition: &Competition| {
+        serde_json::to_value(crate::api::routes::OperatorCompetition::new(
+            competition,
+            None,
+            vec![],
+        ))
+        .unwrap()
+    };
+    assert_eq!(
+        as_api(&operator[0]),
+        as_api(&full),
+        "lean inventory preserves every operator field"
+    );
     database.close().await.unwrap();
 }
 
