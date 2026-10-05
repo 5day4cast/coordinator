@@ -13,6 +13,8 @@ use uuid::Uuid;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ListQuery {
+    /// The entries endpoint can restrict the list to one competition.
+    pub event_id: Option<Uuid>,
     pub ids: Option<String>,
     pub cursor: Option<Uuid>,
     pub limit: Option<usize>,
