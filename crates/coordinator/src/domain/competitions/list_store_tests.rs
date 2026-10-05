@@ -515,3 +515,43 @@ async fn api_pages_bound_history_preserve_fields_and_keep_entry_owners_separate(
     assert_eq!(store.competition_page_ids(&changed).await.unwrap().len(), 3);
     database.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn payout_transition_waits_for_an_independent_sqlite_writer() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = DBConnection::new(
+        directory.path().to_str().unwrap(),
+        "busy",
+        DatabasePoolConfig::default(),
+        DatabaseType::Competitions,
+    )
+    .await
+    .unwrap();
+    let store = CompetitionStore::new(database.clone());
+    let row = competition(OffsetDateTime::now_utc() + Duration::HOUR, false);
+    let id = row.id;
+    store
+        .add_competition_with_tickets(row, vec![])
+        .await
+        .unwrap();
+    let other = sqlx::SqlitePool::connect(&format!("sqlite:{}", database.database_path))
+        .await
+        .unwrap();
+    let mut held = other.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::query("UPDATE competitions SET entries_submitted_at = datetime('now') WHERE id = ?")
+        .bind(id.to_string())
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let transition = tokio::spawn(async move { store.close_payout_window(id).await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!transition.is_finished(), "a busy writer is waited for");
+    held.commit().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), transition)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    other.close().await;
+    database.close().await.unwrap();
+}
