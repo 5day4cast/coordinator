@@ -553,6 +553,24 @@ pub async fn build_app(
     let tracker = TaskTracker::new();
     let mut threads = HashMap::new();
     let cancel_token = CancellationToken::new();
+    // Integrity scans grow with the database. Keep them off the readiness probe.
+    let integrity_coordinator = coordinator.clone();
+    let integrity_cancel = cancel_token.clone();
+    let integrity_task = spawn_supervised(
+        &tracker,
+        "database integrity",
+        cancel_token.clone(),
+        async move {
+            loop {
+                integrity_coordinator.quick_check().await?;
+                tokio::select! {
+                    () = integrity_cancel.cancelled() => return Ok(()),
+                    () = tokio::time::sleep(Duration::from_secs(15 * 60)) => {}
+                }
+            }
+        },
+    );
+    threads.insert("database integrity".to_string(), integrity_task);
     let runners = CompetitionRunners::new(
         coordinator.clone(),
         coordinator.competition_store.clone(),

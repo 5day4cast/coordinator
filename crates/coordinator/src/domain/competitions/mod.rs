@@ -17,9 +17,11 @@ mod coordinator_fee;
 mod eligible_payouts;
 mod lease_store;
 mod ledger;
+mod list_api;
 #[cfg(test)]
 mod list_store_tests;
 mod metrics_store;
+pub use list_api::ListPage;
 mod operator_payouts;
 mod payout;
 mod queued;
