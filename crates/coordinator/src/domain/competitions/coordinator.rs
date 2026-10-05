@@ -3440,6 +3440,17 @@ impl Coordinator {
         Ok(competitions)
     }
 
+    pub async fn get_competitions_page(&self, ids: &[Uuid]) -> Result<Vec<Competition>, Error> {
+        let mut competitions = self
+            .competition_store
+            .get_competitions_selected(false, Some(ids))
+            .await?;
+        self.attach_queue_details(&mut competitions).await?;
+        self.attach_kickoff_checks(&mut competitions).await?;
+        competitions.sort_by_key(|competition| std::cmp::Reverse(competition.id));
+        Ok(competitions)
+    }
+
     /// Every competition as the public lists show it, with its queue: without its contract,
     /// signatures or transactions (see [`CompetitionStore::list_competitions`]).
     pub async fn list_competitions(&self) -> Result<Vec<Competition>, Error> {
