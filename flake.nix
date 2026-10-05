@@ -10,11 +10,9 @@
     };
     crane.url = "github:ipetkov/crane";
 
-    # Keymeld for e2e testing
-    # Finalize this immutable pin with Cargo.toml after committing Keymeld payout support.
-    # Local verification: --override-input keymeld git+file:///path/to/keymeld-auto
+    # Match the SDK and verifier to the Keymeld 0.8.4 release.
     keymeld = {
-      url = "github:tee8z/keymeld/v0.7.0";
+      url = "github:tee8z/keymeld/9caa57575c1f0eed3d001235a1ce8121cce9474f";
     };
   };
 

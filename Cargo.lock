@@ -1566,7 +1566,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator"
-version = "2.18.2"
+version = "2.18.3"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1637,7 +1637,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-ark"
-version = "2.18.2"
+version = "2.18.3"
 dependencies = [
  "anyhow",
  "ark-core",
@@ -1665,7 +1665,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-ark-escrow"
-version = "2.18.2"
+version = "2.18.3"
 dependencies = [
  "bitcoin",
  "hex",
@@ -1676,7 +1676,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-ark-swap"
-version = "2.18.2"
+version = "2.18.3"
 dependencies = [
  "anyhow",
  "ark-client",
@@ -1707,7 +1707,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-core"
-version = "2.18.2"
+version = "2.18.3"
 dependencies = [
  "axum",
  "coordinator-escrow",
@@ -1723,7 +1723,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-escrow"
-version = "2.18.2"
+version = "2.18.3"
 dependencies = [
  "anyhow",
  "coordinator-ark-escrow",
@@ -1744,7 +1744,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-escrow-verifier"
-version = "2.18.2"
+version = "2.18.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1776,7 +1776,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-lnurl-relay"
-version = "2.18.2"
+version = "2.18.3"
 dependencies = [
  "anyhow",
  "coordinator-escrow",
@@ -1788,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-payout-witness"
-version = "2.18.2"
+version = "2.18.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -1804,7 +1804,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-synth"
-version = "2.18.2"
+version = "2.18.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -1850,7 +1850,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-verifier-enclave"
-version = "2.18.2"
+version = "2.18.3"
 dependencies = [
  "anyhow",
  "coordinator-escrow-verifier",
@@ -1861,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "coordinator-wasm"
-version = "2.18.2"
+version = "2.18.3"
 dependencies = [
  "base64 0.22.1",
  "bitcoin",
@@ -3564,8 +3564,8 @@ dependencies = [
 
 [[package]]
 name = "keymeld-core"
-version = "0.8.2"
-source = "git+https://github.com/tee8z/keymeld?rev=9c471b8c039a3c766b0d7f9131797bf8f8f7aeae#9c471b8c039a3c766b0d7f9131797bf8f8f7aeae"
+version = "0.8.4"
+source = "git+https://github.com/tee8z/keymeld?rev=9caa57575c1f0eed3d001235a1ce8121cce9474f#9caa57575c1f0eed3d001235a1ce8121cce9474f"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3604,8 +3604,8 @@ dependencies = [
 
 [[package]]
 name = "keymeld-enclave"
-version = "0.8.2"
-source = "git+https://github.com/tee8z/keymeld?rev=9c471b8c039a3c766b0d7f9131797bf8f8f7aeae#9c471b8c039a3c766b0d7f9131797bf8f8f7aeae"
+version = "0.8.4"
+source = "git+https://github.com/tee8z/keymeld?rev=9caa57575c1f0eed3d001235a1ce8121cce9474f#9caa57575c1f0eed3d001235a1ce8121cce9474f"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3642,8 +3642,8 @@ dependencies = [
 
 [[package]]
 name = "keymeld-sdk"
-version = "0.8.2"
-source = "git+https://github.com/tee8z/keymeld?rev=9c471b8c039a3c766b0d7f9131797bf8f8f7aeae#9c471b8c039a3c766b0d7f9131797bf8f8f7aeae"
+version = "0.8.4"
+source = "git+https://github.com/tee8z/keymeld?rev=9caa57575c1f0eed3d001235a1ce8121cce9474f#9caa57575c1f0eed3d001235a1ce8121cce9474f"
 dependencies = [
  "dlctix",
  "flate2",
