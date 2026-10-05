@@ -52,7 +52,8 @@ async-trait.workspace = true
 
 # Serialization
 serde.workspace = true
-serde_json.workspace = true
+# Raw values let the protocol store split a serialized state without re-encoding it.
+serde_json = { workspace = true, features = ["raw_value"] }
 toml.workspace = true
 
 # Database
@@ -88,6 +89,9 @@ base64.workspace = true
 itertools.workspace = true
 secrecy.workspace = true
 zeroize.workspace = true
+# Compresses protocol state parts before they are sealed.
+flate2 = "1"
+hmac = "0.12"
 
 # CLI
 clap.workspace = true

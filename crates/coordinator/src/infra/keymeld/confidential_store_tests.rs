@@ -355,3 +355,146 @@ async fn assert_stale_checkpoint_stops_command(db: &DBConnection) -> tokio::task
     assert_eq!(row(db, &session_id).await.0, 1);
     server
 }
+
+#[tokio::test]
+async fn partitioned_checkpoints_reuse_ciphertext_and_fail_closed_on_missing_parts() {
+    let (_directory, db) = database().await;
+    let session = SessionId::new_v7();
+    let key = SessionSecret::from_bytes([41; 32]);
+    let mut original = state(&session);
+    original.session.encrypted_session_secret = "large private checkpoint ".repeat(8192);
+    original.session.aggregate_key = (0..=255).cycle().take(64 * 1024).collect();
+    create(&db, &key, &session, &original).await.unwrap();
+    let mut checkpoint = DurableCheckpoint::new(
+        db.clone(),
+        key.clone(),
+        session.clone(),
+        0,
+        original.clone(),
+    );
+    checkpoint.parts = true;
+    checkpoint.finish(original.clone()).await.unwrap();
+    let read_parts = || async {
+        sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>(
+            "SELECT digest, body FROM keymeld_protocol_parts WHERE session_id = ? ORDER BY digest",
+        )
+        .bind(session.to_string())
+        .fetch_all(db.read())
+        .await
+        .unwrap()
+    };
+    let first = read_parts().await;
+    assert!(!first.is_empty());
+    assert!(
+        first.len() < 100,
+        "binary vectors must not create a part per byte"
+    );
+    let encoded_bytes: usize = first.iter().map(|(_, body)| body.len()).sum();
+    assert!(encoded_bytes < serde_json::to_vec(&original).unwrap().len() / 4);
+    checkpoint.finish(original.clone()).await.unwrap();
+    assert_eq!(
+        read_parts().await,
+        first,
+        "unchanged ciphertext is never rewritten"
+    );
+    let (version, restored) = load(&db, &key, &session).await.unwrap().unwrap();
+    assert_eq!(version, 2);
+    assert_eq!(
+        serde_json::to_value(&restored).unwrap(),
+        serde_json::to_value(&original).unwrap()
+    );
+    let mut stale = DurableCheckpoint::new(
+        db.clone(),
+        key.clone(),
+        session.clone(),
+        1,
+        original.clone(),
+    );
+    stale.parts = true;
+    assert!(stale.finish(original.clone()).await.is_err());
+    assert_eq!(
+        read_parts().await,
+        first,
+        "failed CAS must leave parts unchanged"
+    );
+    let mut changed = original.clone();
+    changed.session.encrypted_session_secret = "another private checkpoint ".repeat(8192);
+    checkpoint.finish(changed.clone()).await.unwrap();
+    let after = read_parts().await;
+    assert!(
+        after.iter().any(|part| first.contains(part)),
+        "unchanged protocol fields keep their ciphertext"
+    );
+    let wanted = Parts::encode(&key, &session, &changed)
+        .unwrap()
+        .bodies
+        .len();
+    assert_eq!(
+        after.len(),
+        wanted,
+        "only parts outside the current manifest are pruned"
+    );
+    assert!(load(&db, &SessionSecret::from_bytes([42; 32]), &session)
+        .await
+        .is_err());
+    let id = session.to_string();
+    let digest = after[0].0.clone();
+    db.execute_write(move |pool| async move {
+        sqlx::query("DELETE FROM keymeld_protocol_parts WHERE session_id=? AND digest=?")
+            .bind(id)
+            .bind(digest)
+            .execute(&pool)
+            .await
+            .map(|_| ())
+    })
+    .await
+    .unwrap();
+    assert!(
+        load(&db, &key, &session).await.is_err(),
+        "a missing part never becomes empty protocol state"
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn compatible_reader_can_write_a_partitioned_checkpoint_back_to_legacy_format() {
+    let (_directory, db) = database().await;
+    let session = SessionId::new_v7();
+    let key = SessionSecret::from_bytes([43; 32]);
+    let original = state(&session);
+    create(&db, &key, &session, &original).await.unwrap();
+    let mut writer = DurableCheckpoint::new(
+        db.clone(),
+        key.clone(),
+        session.clone(),
+        0,
+        original.clone(),
+    );
+    writer.parts = true;
+    writer.finish(original.clone()).await.unwrap();
+    let (version, restored) = load(&db, &key, &session).await.unwrap().unwrap();
+    let mut legacy =
+        DurableCheckpoint::new(db.clone(), key.clone(), session.clone(), version, restored);
+    legacy.parts = false;
+    legacy.finish(original.clone()).await.unwrap();
+    let (version, ciphertext) = row(&db, &session).await;
+    let plaintext = key
+        .decrypt(
+            &EncryptedData::from_hex(&ciphertext).unwrap(),
+            &context(&session, version),
+        )
+        .unwrap();
+    let restored: ProtocolState = serde_json::from_slice(&plaintext).unwrap();
+    assert_eq!(
+        serde_json::to_value(restored).unwrap(),
+        serde_json::to_value(original).unwrap()
+    );
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM keymeld_protocol_parts WHERE session_id=?")
+            .bind(session.to_string())
+            .fetch_one(db.read())
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+    db.close().await.unwrap();
+}

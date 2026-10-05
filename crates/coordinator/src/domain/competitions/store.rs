@@ -787,6 +787,18 @@ impl CompetitionStore {
         pubkey: String,
         filter: SearchBy,
     ) -> Result<Vec<UserEntry>, sqlx::Error> {
+        self.get_user_entries_selected(pubkey, filter, None).await
+    }
+
+    pub async fn get_user_entries_selected(
+        &self,
+        pubkey: String,
+        filter: SearchBy,
+        ids: Option<&[Uuid]>,
+    ) -> Result<Vec<UserEntry>, sqlx::Error> {
+        if ids.is_some_and(|ids| ids.is_empty()) {
+            return Ok(Vec::new());
+        }
         let base_query = "WITH latest_payouts AS (
               SELECT
                   entry_id,
@@ -828,7 +840,7 @@ impl CompetitionStore {
           LEFT JOIN latest_payouts ON entries.id = latest_payouts.entry_id AND latest_payouts.rn = 1
           WHERE pubkey = ?";
 
-        let (final_query, params) = if let Some(event_ids) = filter.event_ids {
+        let (mut final_query, mut params) = if let Some(event_ids) = filter.event_ids {
             if !event_ids.is_empty() {
                 let placeholders = event_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 let query = format!("{} AND entries.event_id IN ({})", base_query, placeholders);
@@ -842,6 +854,14 @@ impl CompetitionStore {
             (base_query.to_string(), vec![pubkey])
         };
 
+        if let Some(ids) = ids {
+            final_query.push_str(&format!(
+                " AND entries.id IN ({})",
+                vec!["?"; ids.len()].join(",")
+            ));
+            params.extend(ids.iter().map(Uuid::to_string));
+        }
+        final_query.push_str(" ORDER BY entries.id DESC");
         let mut query_builder = sqlx::query_as::<_, UserEntry>(&final_query);
 
         for param in params {
@@ -1351,6 +1371,17 @@ impl CompetitionStore {
         &self,
         active_only: bool,
     ) -> Result<Vec<Competition>, sqlx::Error> {
+        self.get_competitions_selected(active_only, None).await
+    }
+
+    pub async fn get_competitions_selected(
+        &self,
+        active_only: bool,
+        ids: Option<&[Uuid]>,
+    ) -> Result<Vec<Competition>, sqlx::Error> {
+        if ids.is_some_and(|ids| ids.is_empty()) {
+            return Ok(Vec::new());
+        }
         let base_query = r#"
             WITH payout_stats AS (
                 SELECT
@@ -1408,6 +1439,16 @@ impl CompetitionStore {
             LEFT JOIN entries ON entries.event_id = competitions.id
             LEFT JOIN tickets ON entries.ticket_id = tickets.id"#;
 
+        let base_query = match ids {
+            Some(ids) => base_query.replace(
+                "FROM competitions",
+                &format!(
+                    "FROM (SELECT * FROM competitions WHERE id IN ({})) AS competitions",
+                    vec!["?"; ids.len()].join(",")
+                ),
+            ),
+            None => base_query.to_owned(),
+        };
         let final_query = if active_only {
             format!(
                 "{} WHERE expiry_broadcasted_at IS NULL AND completed_at IS NULL AND cancelled_at IS NULL
@@ -1498,9 +1539,13 @@ impl CompetitionStore {
             )
         };
 
-        let competitions = sqlx::query_as::<_, Competition>(&final_query)
-            .fetch_all(self.db_connection.read())
-            .await?;
+        let mut query = sqlx::query_as::<_, Competition>(&final_query);
+        if let Some(ids) = ids {
+            for id in ids {
+                query = query.bind(id.to_string());
+            }
+        }
+        let competitions = query.fetch_all(self.db_connection.read()).await?;
 
         Ok(competitions)
     }

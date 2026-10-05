@@ -279,6 +279,20 @@ async fn operator_summaries_keep_signing_errors_without_loading_contracts() {
     assert!(operator[0].contract_parameters.is_none());
     assert!(operator[0].funding_transaction.is_none());
     assert!(operator[0].signed_contract.is_none());
+    let full = store.get_competition(c.id).await.unwrap();
+    let as_api = |competition: &Competition| {
+        serde_json::to_value(crate::api::routes::OperatorCompetition::new(
+            competition,
+            None,
+            vec![],
+        ))
+        .unwrap()
+    };
+    assert_eq!(
+        as_api(&operator[0]),
+        as_api(&full),
+        "lean inventory preserves every operator field"
+    );
     database.close().await.unwrap();
 }
 
@@ -403,5 +417,155 @@ async fn operator_payment_coverage_reads_only_successful_outcome_recipients() {
         .await
         .unwrap();
     assert!(!read(c.clone()).await.contains_key(&c.id));
+    database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn api_pages_bound_history_preserve_fields_and_keep_entry_owners_separate() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = DBConnection::new(
+        directory.path().to_str().unwrap(),
+        "pages",
+        DatabasePoolConfig::default(),
+        DatabaseType::Competitions,
+    )
+    .await
+    .unwrap();
+    let store = CompetitionStore::new(database.clone());
+    let now = OffsetDateTime::now_utc();
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        let row = competition(now + Duration::HOUR, false);
+        ids.push(row.id);
+        store
+            .add_competition_with_tickets(row, vec![])
+            .await
+            .unwrap();
+    }
+    ids.sort_by_key(|id| std::cmp::Reverse(*id));
+    let page = ListPage {
+        limit: 2,
+        history: true,
+        ..Default::default()
+    };
+    assert_eq!(store.competition_page_ids(&page).await.unwrap(), ids[..3]);
+    let next = ListPage {
+        before: Some(ids[1]),
+        ..page.clone()
+    };
+    assert_eq!(store.competition_page_ids(&next).await.unwrap(), ids[2..]);
+    let selected = store
+        .get_competitions_selected(false, Some(&ids[..2]))
+        .await
+        .unwrap();
+    assert_eq!(selected.len(), 2);
+    for row in selected {
+        let full = store
+            .get_competitions(false)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|full| full.id == row.id)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(row).unwrap(),
+            serde_json::to_value(full).unwrap()
+        );
+    }
+    enter(&database, ids[0], 3, 1).await;
+    assert_eq!(
+        store
+            .entry_page_ids("owner", &[ids[0]], &page)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(store
+        .entry_page_ids("someone else", &[ids[0]], &page)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .entry_page_ids("owner", &[ids[1]], &page)
+        .await
+        .unwrap()
+        .is_empty());
+    let old = ids[0].to_string();
+    database.execute_write(move |pool| async move {
+        sqlx::query("UPDATE competitions SET cancelled_at = '2000-01-01T00:00:00Z' WHERE id = ?").bind(&old).execute(&pool).await?;
+        sqlx::query("UPDATE list_updates SET updated_at = '2000-01-01T00:00:00Z' WHERE kind='competition' AND id = ?").bind(&old).execute(&pool).await?;
+        Ok(())
+    }).await.unwrap();
+    let current = ListPage {
+        limit: 100,
+        ..Default::default()
+    };
+    assert!(!store
+        .competition_page_ids(&current)
+        .await
+        .unwrap()
+        .contains(&ids[0]));
+    let explicit = ListPage {
+        ids: vec![ids[0]],
+        ..current.clone()
+    };
+    assert_eq!(
+        store.competition_page_ids(&explicit).await.unwrap(),
+        vec![ids[0]]
+    );
+    let cancelled = ListPage {
+        status: Some("cancelled".into()),
+        ..current.clone()
+    };
+    assert_eq!(
+        store.competition_page_ids(&cancelled).await.unwrap(),
+        vec![ids[0]]
+    );
+    let changed = ListPage {
+        since: Some(now - Duration::MINUTE),
+        ..current
+    };
+    assert_eq!(store.competition_page_ids(&changed).await.unwrap().len(), 3);
+    database.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn payout_transition_waits_for_an_independent_sqlite_writer() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = DBConnection::new(
+        directory.path().to_str().unwrap(),
+        "busy",
+        DatabasePoolConfig::default(),
+        DatabaseType::Competitions,
+    )
+    .await
+    .unwrap();
+    let store = CompetitionStore::new(database.clone());
+    let row = competition(OffsetDateTime::now_utc() + Duration::HOUR, false);
+    let id = row.id;
+    store
+        .add_competition_with_tickets(row, vec![])
+        .await
+        .unwrap();
+    let other = sqlx::SqlitePool::connect(&format!("sqlite:{}", database.database_path))
+        .await
+        .unwrap();
+    let mut held = other.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::query("UPDATE competitions SET entries_submitted_at = datetime('now') WHERE id = ?")
+        .bind(id.to_string())
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let transition = tokio::spawn(async move { store.close_payout_window(id).await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!transition.is_finished(), "a busy writer is waited for");
+    held.commit().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), transition)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    other.close().await;
     database.close().await.unwrap();
 }

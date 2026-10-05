@@ -1,0 +1,11 @@
+DROP TRIGGER competitions_list_insert;
+DROP TRIGGER competitions_list_update;
+DROP TRIGGER entries_list_insert;
+DROP TRIGGER entries_list_update;
+DROP TRIGGER payouts_list_insert;
+DROP TRIGGER payouts_list_update;
+DROP TRIGGER tickets_list_insert;
+DROP TRIGGER tickets_list_update;
+DROP INDEX entries_event_page;
+DROP INDEX entries_user_page;
+DROP TABLE list_updates;

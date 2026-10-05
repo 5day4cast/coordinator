@@ -1,6 +1,9 @@
 //! Authorized application storage for private protocol retries. The Keymeld
 //! gateway has no access to these records. Persist before any enclave side effect.
-use super::{KeymeldError, StoredDlcKeygenSession};
+use super::{
+    protocol_parts::{Manifest, Parts},
+    KeymeldError, StoredDlcKeygenSession,
+};
 use crate::infra::db::DBConnection;
 use keymeld_core::{
     authorization::SignedRoster,
@@ -49,7 +52,7 @@ pub(super) struct ProtocolState {
     pub settlements: BTreeMap<UserId, SettlementPlan>,
 }
 
-fn failure(message: impl Into<String>) -> KeymeldError {
+pub(super) fn failure(message: impl Into<String>) -> KeymeldError {
     KeymeldError::Session(message.into())
 }
 fn context(session: &SessionId, version: i64) -> String {
@@ -72,11 +75,16 @@ pub(super) async fn load(
     key: &SessionSecret,
     session: &SessionId,
 ) -> Result<Option<(i64, ProtocolState)>, KeymeldError> {
+    let mut snapshot = db
+        .read()
+        .begin()
+        .await
+        .map_err(|e| failure(e.to_string()))?;
     let row = sqlx::query(
-        "SELECT version, encrypted_state FROM keymeld_protocol_state WHERE session_id = ?",
+        "SELECT version, encrypted_state, format FROM keymeld_protocol_state WHERE session_id = ?",
     )
     .bind(session.to_string())
-    .fetch_optional(db.read())
+    .fetch_optional(&mut *snapshot)
     .await
     .map_err(|e| failure(e.to_string()))?;
     let Some(row) = row else { return Ok(None) };
@@ -90,8 +98,32 @@ pub(super) async fn load(
         key.decrypt(&encrypted, &context(session, version))
             .map_err(|_| failure("Confidential checkpoint authentication failed"))?,
     );
-    let state: ProtocolState = serde_json::from_slice(&plaintext)
-        .map_err(|_| failure("Invalid confidential checkpoint schema"))?;
+    let format: i64 = row.try_get("format").map_err(|e| failure(e.to_string()))?;
+    let state = match format {
+        1 => serde_json::from_slice::<ProtocolState>(&plaintext)
+            .map_err(|_| failure("Invalid confidential checkpoint schema"))?,
+        2 => {
+            let manifest: Manifest = serde_json::from_slice(&plaintext)
+                .map_err(|_| failure("Invalid confidential checkpoint manifest"))?;
+            let rows =
+                sqlx::query("SELECT digest, body FROM keymeld_protocol_parts WHERE session_id = ?")
+                    .bind(session.to_string())
+                    .fetch_all(&mut *snapshot)
+                    .await
+                    .map_err(|e| failure(e.to_string()))?;
+            let bodies: BTreeMap<Vec<u8>, Vec<u8>> = rows
+                .into_iter()
+                .map(|row| Ok((row.try_get("digest")?, row.try_get("body")?)))
+                .collect::<Result<_, sqlx::Error>>()
+                .map_err(|e| failure(e.to_string()))?;
+            snapshot
+                .commit()
+                .await
+                .map_err(|e| failure(e.to_string()))?;
+            manifest.decode(key, session, &bodies)?
+        }
+        _ => return Err(failure("Unsupported confidential checkpoint format")),
+    };
     if state.schema_version != 1 || state.session.session_id != session.to_string() {
         return Err(failure(
             "Confidential checkpoint belongs to another session or version",
@@ -120,6 +152,8 @@ pub(super) struct DurableCheckpoint {
     key: SessionSecret,
     session: SessionId,
     current: Mutex<(i64, ProtocolState)>,
+    /// Enable only after every process and rollback artifact can read format 2.
+    parts: bool,
 }
 impl DurableCheckpoint {
     pub fn new(
@@ -134,18 +168,57 @@ impl DurableCheckpoint {
             key,
             session,
             current: Mutex::new((version, state)),
+            parts: std::env::var("COORDINATOR_PROTOCOL_PARTS")
+                .is_ok_and(|value| value == "1" || value == "true"),
         }
     }
     async fn persist(&self, previous: i64, state: &ProtocolState) -> Result<i64, SdkError> {
         let next = previous.checked_add(1).ok_or_else(|| {
             SdkError::Internal("Confidential checkpoint version exhausted".into())
         })?;
-        let encrypted = seal(&self.key, &self.session, next, state)
+        let parts = self
+            .parts
+            .then(|| Parts::encode(&self.key, &self.session, state))
+            .transpose()
             .map_err(|e| SdkError::Internal(e.to_string()))?;
+        let encrypted = if let Some(parts) = &parts {
+            let plaintext = Zeroizing::new(
+                serde_json::to_vec(&parts.manifest)
+                    .map_err(|e| SdkError::Internal(e.to_string()))?,
+            );
+            self.key
+                .encrypt(&plaintext, &context(&self.session, next))
+                .and_then(|value| value.to_hex())
+                .map_err(|_| SdkError::Internal("Cannot seal checkpoint manifest".into()))?
+        } else {
+            seal(&self.key, &self.session, next, state)
+                .map_err(|e| SdkError::Internal(e.to_string()))?
+        };
         let id = self.session.to_string();
-        let count=self.db.execute_write(move |pool|async move {
-            sqlx::query("UPDATE keymeld_protocol_state SET version=?, encrypted_state=? WHERE session_id=? AND version=?")
-                .bind(next).bind(encrypted).bind(id).bind(previous).execute(&pool).await.map(|result|result.rows_affected())
+        let format = if parts.is_some() { 2 } else { 1 };
+        let count = self.db.execute_write(move |pool| async move {
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+            let count = sqlx::query("UPDATE keymeld_protocol_state SET version=?, encrypted_state=?, format=? WHERE session_id=? AND version=?")
+                .bind(next).bind(encrypted).bind(format).bind(&id).bind(previous).execute(&mut *tx).await?.rows_affected();
+            if count != 1 { tx.rollback().await?; return Ok(count); }
+            let mut keep = std::collections::BTreeSet::new();
+            if let Some(parts) = parts {
+                parts.manifest.digests(&mut keep);
+                for (digest, body) in parts.bodies {
+                    sqlx::query("INSERT INTO keymeld_protocol_parts(session_id, digest, body) VALUES (?, ?, ?) ON CONFLICT(session_id,digest) DO NOTHING")
+                        .bind(&id).bind(digest.to_vec()).bind(body).execute(&mut *tx).await?;
+                }
+            }
+            let stored: Vec<Vec<u8>> = sqlx::query_scalar("SELECT digest FROM keymeld_protocol_parts WHERE session_id = ?")
+                .bind(&id).fetch_all(&mut *tx).await?;
+            for digest in stored {
+                if !keep.iter().any(|kept| kept.as_slice() == digest) {
+                    sqlx::query("DELETE FROM keymeld_protocol_parts WHERE session_id = ? AND digest = ?")
+                        .bind(&id).bind(digest).execute(&mut *tx).await?;
+                }
+            }
+            tx.commit().await?;
+            Ok(count)
         }).await.map_err(|e|SdkError::Internal(format!("Confidential checkpoint write failed: {e}")))?;
         if count != 1 {
             return Err(SdkError::Internal(

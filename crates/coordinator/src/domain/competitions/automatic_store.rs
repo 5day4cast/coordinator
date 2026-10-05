@@ -60,7 +60,7 @@ impl CompetitionStore {
     /// with an outbox row remain locked until their payment is reconciled.
     pub async fn close_payout_window(&self, event_id: Uuid) -> Result<(), DatabaseWriteError> {
         self.db_connection.execute_write(move |pool| async move {
-            let mut tx = pool.begin().await?;
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
             let now = OffsetDateTime::now_utc().unix_timestamp();
             sqlx::query("UPDATE automatic_payout_competitions SET payout_window_closed_at = COALESCE(payout_window_closed_at, ?) WHERE event_id = ?")
                 .bind(now).bind(event_id.to_string()).execute(&mut *tx).await?;
@@ -103,7 +103,7 @@ impl CompetitionStore {
     ) -> Result<Option<PayoutSendState>, DatabaseWriteError> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         self.db_connection.execute_write(move |pool| async move {
-            let mut tx = pool.begin().await?;
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
             let failed: Option<u32> = sqlx::query_scalar("SELECT send_attempts FROM payouts WHERE id = ? AND succeed_at IS NULL AND failed_at IS NULL AND next_send_at IS NULL")
                 .bind(payout_id.to_string()).fetch_optional(&mut *tx).await?;
             let Some(failed) = failed else { return Ok(None); };
@@ -162,7 +162,7 @@ impl CompetitionStore {
             return Ok(());
         }
         self.db_connection.execute_write(move |pool| async move {
-            let mut tx = pool.begin().await?;
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
             for (hash, id) in pairs {
                 sqlx::query("INSERT OR IGNORE INTO payout_payment_hashes(payment_hash, payout_id) VALUES (?, ?)")
                     .bind(hash).bind(id).execute(&mut *tx).await?;
@@ -194,7 +194,7 @@ impl CompetitionStore {
         policy_json: String,
     ) -> Result<Option<FixedTicketPayoutPolicy>, DatabaseWriteError> {
         self.db_connection.execute_write(move |pool| async move {
-            let mut tx = pool.begin().await?;
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
             // A recycled unpaid ticket has a new hash and may accept a new policy.
             sqlx::query("DELETE FROM ticket_payout_policies WHERE ticket_id = ? AND ticket_hash != ?")
                 .bind(ticket_id.to_string()).bind(&ticket_hash).execute(&mut *tx).await?;
@@ -284,7 +284,7 @@ impl CompetitionStore {
         policy_json: String,
     ) -> Result<(), DatabaseWriteError> {
         self.db_connection.execute_write(move |pool| async move {
-            let mut tx = pool.begin().await?;
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
             sqlx::query("INSERT OR IGNORE INTO entry_payout_policies(entry_id, policy_json) VALUES (?, ?)")
                 .bind(entry_id.to_string()).bind(&policy_json).execute(&mut *tx).await?;
             let stored: String = sqlx::query_scalar("SELECT policy_json FROM entry_payout_policies WHERE entry_id = ?")
@@ -322,7 +322,7 @@ impl CompetitionStore {
         let id = Uuid::now_v7();
         let now = OffsetDateTime::now_utc().unix_timestamp();
         self.db_connection.execute_write(move |pool| async move {
-            let mut tx = pool.begin().await?;
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
             let closed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM entries e JOIN automatic_payout_competitions a ON a.event_id = e.event_id WHERE e.id = ? AND a.payout_window_closed_at IS NOT NULL)")
                 .bind(entry_id.to_string()).fetch_one(&mut *tx).await?;
             if closed { return Err(sqlx::Error::Protocol("Lightning payout window is closed".into())); }
@@ -355,7 +355,7 @@ impl CompetitionStore {
     ) -> Result<Uuid, DatabaseWriteError> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         self.db_connection.execute_write(move |pool| async move {
-            let mut tx = pool.begin().await?;
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
             let closed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM entries e JOIN automatic_payout_competitions a ON a.event_id = e.event_id WHERE e.id = ? AND a.payout_window_closed_at IS NOT NULL)")
                 .bind(entry_id.to_string()).fetch_one(&mut *tx).await?;
             if closed { return Err(sqlx::Error::Protocol("Lightning payout window is closed".into())); }
@@ -450,7 +450,7 @@ impl CompetitionStore {
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| invalid(e.to_string()))?;
         self.db_connection.execute_write(move |pool| async move {
-            let mut tx = pool.begin().await?;
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
             let row = sqlx::query("SELECT entry_id, payout_id, prepared_json FROM payout_jobs WHERE id = ? AND failed_at IS NULL")
                 .bind(job_id.to_string()).fetch_one(&mut *tx).await?;
             if let Some(existing) = row.try_get::<Option<String>, _>("payout_id")? {
@@ -521,7 +521,7 @@ impl CompetitionStore {
         payout_preimage: String,
     ) -> Result<(), DatabaseWriteError> {
         self.db_connection.execute_write(move |pool| async move {
-            let mut tx = pool.begin().await?;
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
             let row = sqlx::query("SELECT e.id, e.ephemeral_pubkey, e.payout_hash, e.ephemeral_privatekey, e.payout_preimage FROM payout_jobs j JOIN entries e ON e.id = j.entry_id JOIN payouts p ON p.id = j.payout_id WHERE j.id = ? AND j.failed_at IS NULL AND p.succeed_at IS NOT NULL AND p.payment_preimage IS NOT NULL")
                 .bind(id.to_string()).fetch_one(&mut *tx).await?;
             let pubkey: String = row.try_get("ephemeral_pubkey")?;
