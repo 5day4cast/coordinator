@@ -457,8 +457,6 @@ impl CoordinatorClient {
         keys: &Keys,
         competitions: &[Uuid],
     ) -> Result<Vec<EntryResponse>> {
-        // HOOK(entries-filters): once `GET /api/v1/entries` takes several competitions, a state
-        // or pages, ask once here instead of once per competition.
         let mut entries = Vec::new();
         for id in competitions {
             let listed = self.list_entries(keys, Some(id)).await?;
@@ -474,34 +472,10 @@ impl CoordinatorClient {
         keys: &Keys,
         competition_id: Option<&Uuid>,
     ) -> Result<Vec<EntryResponse>> {
-        // HOOK(entries-filters): `event_id` is the only filter the coordinator takes today.
-        let mut url = format!("{}/api/v1/entries", self.base_url());
-        if let Some(id) = competition_id {
-            url = format!("{}?event_id={}", url, id);
-        }
-
-        let resp = super::retry_transport(3, || async {
-            let auth = create_auth_header(keys, "GET", &url, None).await?;
-            anyhow::Ok(
-                self.http()
-                    .get(&url)
-                    .header("Authorization", auth)
-                    .send()
-                    .await?,
-            )
-        })
-        .await
-        .context("Failed to list entries")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("List entries failed ({}): {}", status, body);
-        }
-
-        resp.json()
-            .await
-            .context("Failed to parse entries response")
+        let query = competition_id
+            .map(|id| vec![("event_id", id.to_string())])
+            .unwrap_or_default();
+        self.list_page("entries", &query, Some(keys)).await
     }
 }
 

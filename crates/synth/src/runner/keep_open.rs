@@ -208,7 +208,7 @@ impl KeepOpen {
         client: &CoordinatorClient,
     ) -> anyhow::Result<(OpenStatus, bool)> {
         let now = OffsetDateTime::now_utc();
-        let listed = client.list_competitions().await?;
+        let listed = client.list_open_competitions().await?;
         let open = open_competitions(&listed, now, self.min_left());
         // Those with long enough left that the next run need not start yet.
         let lasting = open_competitions(&listed, now, self.min_left() + self.start_ahead());

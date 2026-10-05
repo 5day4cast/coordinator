@@ -602,27 +602,15 @@ impl CoordinatorClient {
         })
     }
 
-    /// List all competitions
+    /// Current and recently completed competitions, following every response page.
     pub async fn list_competitions(&self) -> Result<Vec<CompetitionResponse>> {
-        // HOOK(competitions-filters): the list carries every competition's contract and
-        // signatures. Once the coordinator takes a filter or pages, ask only for those taking
-        // entries here: the keep-open check, its one frequent caller, reads nothing else.
-        let url = format!("{}/api/v1/competitions", self.base_url());
-        let resp = super::retry_transport(3, || async {
-            anyhow::Ok(self.http().get(&url).send().await?)
-        })
-        .await
-        .context("Failed to list competitions")?;
+        self.list_page("competitions", &[], None).await
+    }
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("List competitions failed ({}): {}", status, body);
-        }
-
-        resp.json()
+    /// Ask only for competitions that could still take entries.
+    pub async fn list_open_competitions(&self) -> Result<Vec<CompetitionResponse>> {
+        self.list_page("competitions", &[("status", "open".into())], None)
             .await
-            .context("Failed to parse competitions response")
     }
 
     /// Every competition as the operator listener reports it, with its escrow refunds.
